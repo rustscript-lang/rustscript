@@ -22,10 +22,10 @@ pub use assembler::{AsmParseError, Assembler, AssemblerError, BytecodeBuilder, a
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::print::{PrintHostFunction, PrintlnHostFunction, format_value};
 pub use builtins::{
-    BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec, CallableDef, CallableParam,
+    BuiltinFunction, BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec, CallableDef, CallableParam,
     CallableParamType, CallableSignature, LanguageBuiltinSpec, builtin_namespace_specs,
-    callable_signatures_for_builtin_namespace_member, default_host_callables,
-    language_builtin_specs,
+    callable_signatures_for_builtin_namespace_member, default_host_callables, is_builtin_namespace,
+    language_builtin_specs, resolve_builtin_namespace_call,
 };
 pub use bytecode::{HostImport, OpCode, Program, TypeMap, Value, ValueType};
 pub fn builtin_call_index(name: &str) -> Option<u16> {
@@ -45,17 +45,21 @@ pub fn builtin_call_index(name: &str) -> Option<u16> {
 pub use compiler::diagnostics::{render_compile_error, render_source_error};
 pub use compiler::source_map::{LineSpanMapping, LoweredSource, SourceId, SourceMap, Span};
 pub use compiler::{
-    CompileError, CompileSourceFileOptions, CompiledProgram, CompiledReplProgram, Compiler, Expr,
-    FormatError, FunctionDecl, InferredLocalTypeHint, ParseError, ReplLocalBinding, SourceError,
-    SourceFlavor, SourcePathError, Stmt, UnknownInferredLocal, collect_inferred_local_type_hints,
-    collect_inferred_local_type_hints_at_path_with_options,
+    AssignmentKind, ClosureExpr, CompileError, CompileSourceFileOptions, CompiledProgram,
+    CompiledReplProgram, Compiler, Expr, FormatError, FrontendImportSyntax, FrontendIr,
+    FunctionDecl, ImportClause, InferredLocalTypeHint, LocalIrBuilder, LocalSlot, ModuleImport,
+    NamedImport, ParseError, ParserDialect, ReplLocalBinding, SharedParserOptions, SourceError,
+    SourceFlavor, SourcePathError, SourcePlugin, Stmt, UnknownInferredLocal,
+    collect_inferred_local_type_hints, collect_inferred_local_type_hints_at_path_with_options,
     collect_inferred_local_type_hints_with_options, compile_source,
     compile_source_at_path_with_flavor_and_options, compile_source_file,
     compile_source_file_with_options, compile_source_for_repl, compile_source_for_repl_with_locals,
     compile_source_with_flavor, compile_source_with_flavor_and_options, format_source,
-    format_source_with_flavor, lint_trailing_function_return_semicolons,
-    lint_unknown_inferred_local_types, lint_unknown_inferred_local_types_at_path_with_options,
+    format_source_with_flavor, format_source_with_flavor_and_options,
+    lint_trailing_function_return_semicolons, lint_unknown_inferred_local_types,
+    lint_unknown_inferred_local_types_at_path_with_options,
     lint_unknown_inferred_local_types_with_options, lint_unknown_type_annotations,
+    parse_source_with_dialect,
 };
 pub use debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
 #[cfg(feature = "runtime")]

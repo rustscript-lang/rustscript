@@ -378,7 +378,7 @@ fn render_builtin_catalog(
     )
     .unwrap();
     writeln!(&mut out, "#[repr(u16)]").unwrap();
-    writeln!(&mut out, "pub(crate) enum BuiltinFunction {{").unwrap();
+    writeln!(&mut out, "pub enum BuiltinFunction {{").unwrap();
     for (index, variant) in builtin_variant_order.iter().enumerate() {
         if index == 0 {
             writeln!(&mut out, "    {variant} = 0,").unwrap();
@@ -514,7 +514,7 @@ fn render_builtin_catalog(
 
     writeln!(
         &mut out,
-        "pub(crate) fn is_builtin_namespace(namespace: &str) -> bool {{"
+        "pub fn is_builtin_namespace(namespace: &str) -> bool {{"
     )
     .unwrap();
     writeln!(
@@ -527,7 +527,7 @@ fn render_builtin_catalog(
 
     writeln!(
         &mut out,
-        "pub(crate) fn resolve_builtin_namespace_call(namespace: &str, member: &str) -> Option<BuiltinFunction> {{"
+        "pub fn resolve_builtin_namespace_call(namespace: &str, member: &str) -> Option<BuiltinFunction> {{"
     )
     .unwrap();
     writeln!(
@@ -589,13 +589,13 @@ fn render_builtin_catalog(
     render_builtin_signature_method(&mut out, &builtin_variant_order);
     writeln!(
         &mut out,
-        "    pub(crate) fn from_namespaced_name(name: &str) -> Option<Self> {{"
+        "    pub fn from_namespaced_name(name: &str) -> Option<Self> {{"
     )
     .unwrap();
     writeln!(&mut out, "        resolve_namespaced_builtin(name)").unwrap();
     writeln!(&mut out, "    }}").unwrap();
     writeln!(&mut out).unwrap();
-    writeln!(&mut out, "    pub(crate) fn call_index(self) -> u16 {{").unwrap();
+    writeln!(&mut out, "    pub fn call_index(self) -> u16 {{").unwrap();
     writeln!(&mut out, "        match self {{").unwrap();
     writeln!(
         &mut out,
@@ -1078,7 +1078,7 @@ fn render_builtin_arity_method(
     builtin_variant_order: &[String],
     actual_builtin_by_variant: &HashMap<String, Vec<&CallableDecl>>,
 ) {
-    writeln!(out, "    pub(crate) fn arity(self) -> u8 {{").unwrap();
+    writeln!(out, "    pub fn arity(self) -> u8 {{").unwrap();
     writeln!(out, "        match self {{").unwrap();
     for variant in builtin_variant_order {
         let arity = actual_builtin_by_variant
@@ -1103,11 +1103,7 @@ fn render_builtin_accepts_arity_method(
     builtin_variant_order: &[String],
     actual_builtin_by_variant: &HashMap<String, Vec<&CallableDecl>>,
 ) {
-    writeln!(
-        out,
-        "    pub(crate) fn accepts_arity(self, arity: u8) -> bool {{"
-    )
-    .unwrap();
+    writeln!(out, "    pub fn accepts_arity(self, arity: u8) -> bool {{").unwrap();
     writeln!(out, "        match self {{").unwrap();
     for variant in builtin_variant_order {
         let mut conditions = actual_builtin_by_variant

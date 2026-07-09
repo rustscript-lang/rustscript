@@ -1,6 +1,6 @@
 # RustScript
 
-RustScript is the language, VM, Lua/JavaScript frontends, standard library, examples, bytecode/AOT tooling, wasm runtime support, and debugger-facing runtime contract for the RustScript family.
+RustScript is the language, VM/compiler core, standard library, examples, bytecode/AOT tooling, wasm runtime support, and debugger-facing runtime contract for the RustScript family. Compatibility language frontends now live in source-plugin crates.
 
 ## Related projects
 
@@ -9,6 +9,7 @@ RustScript is the language, VM, Lua/JavaScript frontends, standard library, exam
 - CLR VM: https://github.com/rustscript-lang/rustscript-clr-vm
 - Edge runtime and ABI: https://github.com/rustscript-lang/pd-edge
 - Controller: https://github.com/rustscript-lang/pd-controller
+- Compatibility frontends: https://github.com/rustscript-lang/rustscript-compat-frontends
 
 ## Crate usage
 
@@ -26,8 +27,7 @@ cargo test --workspace --jobs 4
 cargo build --workspace --release --jobs 4
 ```
 
-`pd-vm` is a stack-based virtual machine plus compiler toolchain used as a backend for multiple
-source syntaxes (`.rss`, `.js`, `.lua`).
+`pd-vm` is a stack-based virtual machine plus compiler toolchain. It includes the RustScript (`.rss`) frontend and exposes a source-plugin API for compatibility languages such as JavaScript and Lua.
 
 ## Contents
 
@@ -80,15 +80,10 @@ than optional hints.
 Run with the VM runner binary:
 
 ```powershell
-cargo run -p pd-vm --bin pd-vm-run -- --fuel 100000 examples/example.lua
+cargo run -p pd-vm --bin pd-vm-run -- --fuel 100000 examples/example.rss
 ```
 
-Other supported flavors:
-
-```powershell
-cargo run -p pd-vm --bin pd-vm-run -- examples/example.js
-cargo run -p pd-vm --bin pd-vm-run -- examples/example.rss
-```
+Compatibility frontends such as JavaScript and Lua are provided by source-plugin crates. Use `CompileSourceFileOptions::with_source_plugin(...)` when compiling those files from an embedding crate.
 
 ### REPL
 
@@ -104,13 +99,13 @@ cargo run -p pd-vm --bin pd-vm-run -- --repl
 Run with interactive `pdb` debugger on stdio:
 
 ```powershell
-cargo run -p pd-vm --bin pd-vm-run -- --debug examples/example.lua
+cargo run -p pd-vm --bin pd-vm-run -- --debug examples/example.rss
 ```
 
 Run debugger over TCP:
 
 ```powershell
-cargo run -p pd-vm --bin pd-vm-run -- --debug --tcp 127.0.0.1:9002 examples/example.lua
+cargo run -p pd-vm --bin pd-vm-run -- --debug --tcp 127.0.0.1:9002 examples/example.rss
 ```
 
 Useful commands: `break`, `break line`, `step`, `next`, `out`, `stack`, `locals`, `where`, `continue`, `fuel`, `epoch`.
@@ -120,7 +115,7 @@ Useful commands: `break`, `break line`, `step`, `next`, `out`, `stack`, `locals`
 Record execution:
 
 ```powershell
-cargo run -p pd-vm --bin pd-vm-run -- --record out/example.pdr examples/example.lua
+cargo run -p pd-vm --bin pd-vm-run -- --record out/example.pdr examples/example.rss
 ```
 
 Replay execution:
@@ -473,7 +468,7 @@ The end-to-end stack is split into layers. Not every entrypoint uses every layer
 
 1. Module/source loading (`compile_source_file()` path)
 1. Unit linking (`linker::merge_units`)
-1. Frontend lowering (`rustscript`, `javascript`, `lua`)
+1. Frontend lowering (built-in `rustscript`, plus any registered source plugins)
 1. Frontend-independent IR
 1. Type-consistency validation on legalized IR (for example rejecting known `if`/`else` branch mismatches)
 1. Lifetime/liveness lowering plus type metadata collection
@@ -504,8 +499,7 @@ monomorphic runtime fast paths, not to provide a full source-language static typ
 
 #### Compiler APIs
 
-Use `compile_source()` for RustScript, or `compile_source_file()` for extension-based flavor
-selection (`.rss`, `.js`, `.lua`).
+Use `compile_source()` for RustScript, or `compile_source_file()` for built-in `.rss` path loading. For compatibility languages, build options with `CompileSourceFileOptions::with_source_plugin(...)` and call `compile_source_file_with_options(...)`.
 
 ```text
 fn print(x);
@@ -526,23 +520,17 @@ let add = |value| value + base;
 add(5);
 ```
 
-Lua closure equivalent lowered by frontend:
-
-```lua
-local add = function(value) return value + base end
-```
+Compatibility frontends can lower equivalent closure forms through the source-plugin API.
 
 Built-in print aliases (no declaration needed):
 
 - RustScript: `print(value);`, `print("... {}", a);`, `println(value);`, `println("... {}", a);`
-- JavaScript subset: `console.log(value);` and `print(value);`
-- Lua subset: `print(value)`
+- Compatibility frontends may provide their own print aliases through plugin lowering.
 
 Host calls must be explicitly imported:
 
 - RustScript: `use runtime;`, `use http;`, `use rate_limit;`
-- JavaScript: `import * as runtime from "runtime";`, `import * as http from "http";`
-- Lua: `require("runtime")`, `require("http")`
+- Compatibility frontends own their import syntax through `SourcePlugin::parse_imports(...)` and `SourcePlugin::strip_imports(...)`.
 
 #### Assembler API
 
@@ -633,18 +621,11 @@ Module/source loading:
 
 - `crate::...` module paths are not supported in RustScript source loading; use relative module paths
 
-JavaScript frontend:
+Source plugins:
 
-- arrow closures with block bodies are not supported (expression-body arrows only)
-- `return <expr>;` is lowered to `<expr>;` (function results still follow final-expression semantics)
-
-Lua frontend:
-
-- Lua pattern API string methods (`:match`, `:gsub`, etc.) are not supported
-- function literal bodies are limited to `function(...) end`, `function(...) return end`, or `function(...) return <expr[, expr...]> end`
-- direct `function`/`local function` bodies are still minimal: empty/fallthrough, `return`, `return <expr[, expr...]>`, or a single return-only `if`/`elseif`/`else` chain
-- `pcall(...)` / `xpcall(...)` lower with success-only semantics and always prefix `true` before the callee return values
-- multi-return unpacking is currently limited to compiler-known Lua function/closure return shapes; extra return values are dropped, missing locals are filled with `null`, but plain assignment destructuring and arbitrary host-call unpacking are not supported
+- Compatibility-language parsing, lowering, and source import scanning belong in plugin crates.
+- `pd-vm` exposes `SourcePlugin`, `FrontendIr`, parser dialect helpers, and IR builder types for plugin authors.
+- `compile_source_file()` without options only handles built-in `.rss`; use `compile_source_file_with_options()` for plugin-backed extensions.
 
 ### JIT Internals
 

@@ -3,14 +3,21 @@ use std::path::PathBuf;
 
 use super::super::linker::ParsedUnit;
 
-#[derive(Clone, Debug)]
-pub(super) struct NamedImport {
-    pub(super) imported: String,
-    pub(super) local: String,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrontendImportSyntax {
+    RustScript,
+    JavaScript,
+    Lua,
 }
 
 #[derive(Clone, Debug)]
-pub(super) enum ImportClause {
+pub struct NamedImport {
+    pub imported: String,
+    pub local: String,
+}
+
+#[derive(Clone, Debug)]
+pub enum ImportClause {
     AllPublic,
     Named(Vec<NamedImport>),
     Namespace(String),
@@ -18,10 +25,10 @@ pub(super) enum ImportClause {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct ModuleImport {
-    pub(super) spec: String,
-    pub(super) clause: ImportClause,
-    pub(super) line: usize,
+pub struct ModuleImport {
+    pub spec: String,
+    pub clause: ImportClause,
+    pub line: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -27,7 +27,7 @@ use super::{
     },
 };
 
-pub(super) trait ParserDialect {
+pub trait ParserDialect {
     fn is_import_keyword(&self, _ident: &str) -> bool {
         false
     }

@@ -705,7 +705,9 @@ pub fn lint_trailing_function_return_semicolons(
     source: &str,
     flavor: SourceFlavor,
 ) -> Result<Vec<ParseError>, ParseError> {
-    let Some(dialect) = frontends::parser_dialect_for_flavor(flavor) else {
+    let Some(dialect) =
+        frontends::parser_dialect_for_flavor(flavor, &CompileSourceFileOptions::default())
+    else {
         return Ok(Vec::new());
     };
     parser::lint_trailing_function_return_semicolons(source, 0, dialect)
@@ -717,9 +719,10 @@ pub fn lint_unknown_type_annotations(
 ) -> Result<Vec<crate::compiler::source_map::Span>, SourceError> {
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source("<source>", source.to_string());
-    let parsed = frontends::parse_source(source, flavor).map_err(|err| {
-        SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
-    })?;
+    let parsed = frontends::parse_source(source, flavor, &CompileSourceFileOptions::default())
+        .map_err(|err| {
+            SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
+        })?;
     Ok(parsed.unknown_type_spans)
 }
 
@@ -801,9 +804,10 @@ fn lint_unknown_inferred_local_types_impl(
 ) -> Result<Vec<UnknownInferredLocal>, SourceError> {
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source("<source>", source.to_string());
-    let parsed = frontends::parse_source(source, flavor).map_err(|err| {
-        SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
-    })?;
+    let parsed = frontends::parse_source(source, flavor, &CompileSourceFileOptions::default())
+        .map_err(|err| {
+            SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
+        })?;
     Ok(collect_unknown_inferred_local_types(
         &source_map,
         source_id,
@@ -817,9 +821,10 @@ fn collect_inferred_local_type_hints_impl(
 ) -> Result<Vec<InferredLocalTypeHint>, SourceError> {
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source("<source>", source.to_string());
-    let parsed = frontends::parse_source(source, flavor).map_err(|err| {
-        SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
-    })?;
+    let parsed = frontends::parse_source(source, flavor, &CompileSourceFileOptions::default())
+        .map_err(|err| {
+            SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
+        })?;
     Ok(collect_named_local_type_hints(parsed))
 }
 
@@ -828,7 +833,7 @@ fn lint_unknown_inferred_local_types_with_options_impl(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<Vec<UnknownInferredLocal>, SourcePathError> {
-    if !options.has_module_overrides() {
+    if !options.has_module_overrides() && !options.has_source_plugins() {
         return lint_unknown_inferred_local_types_impl(source, flavor)
             .map_err(SourcePathError::Source);
     }
@@ -842,7 +847,7 @@ fn collect_inferred_local_type_hints_with_options_impl(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<Vec<InferredLocalTypeHint>, SourcePathError> {
-    if !options.has_module_overrides() {
+    if !options.has_module_overrides() && !options.has_source_plugins() {
         return collect_inferred_local_type_hints_impl(source, flavor)
             .map_err(SourcePathError::Source);
     }
@@ -1230,9 +1235,10 @@ fn compile_source_with_flavor_impl(
 ) -> Result<CompiledProgram, SourceError> {
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source("<source>", source.to_string());
-    let parsed = frontends::parse_source(source, flavor).map_err(|err| {
-        SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
-    })?;
+    let parsed = frontends::parse_source(source, flavor, &CompileSourceFileOptions::default())
+        .map_err(|err| {
+            SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
+        })?;
     match compile_parsed_output(
         source.to_string(),
         parsed,
@@ -1252,7 +1258,7 @@ fn compile_source_with_flavor_and_options_impl(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    if !options.has_module_overrides() {
+    if !options.has_module_overrides() && !options.has_source_plugins() {
         return compile_source_with_flavor_impl(source, flavor, CompileBehavior::DEFAULT)
             .map_err(SourcePathError::Source);
     }
@@ -1293,7 +1299,6 @@ fn virtual_inmemory_entry_path(flavor: SourceFlavor) -> PathBuf {
         SourceFlavor::RustScript => "rss",
         SourceFlavor::JavaScript => "js",
         SourceFlavor::Lua => "lua",
-        SourceFlavor::Scheme => "scm",
     };
     PathBuf::from("__pd_vm_inmemory__").join(format!("main.{ext}"))
 }
@@ -1314,7 +1319,7 @@ fn compile_source_file_impl(
     path: &Path,
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    let flavor = SourceFlavor::from_path(path)?;
+    let flavor = SourceFlavor::from_path_with_options(path, options)?;
     let source_raw = std::fs::read_to_string(path)?;
     let (_root_parse_source, units) =
         load_units_for_source_file(path, flavor, &source_raw, options)?;

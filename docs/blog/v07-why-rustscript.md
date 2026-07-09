@@ -6,9 +6,9 @@
 
 ## The Starting Point
 
-pd-vm already runs four source-language frontends on the same stack-based VM with the same bytecode. All four lower into a shared `FrontendIr` before compilation, and all four run on a runtime that uses no garbage collector and relies on deterministic ownership for memory management.
+pd-vm runs RustScript on a stack-based VM with bytecode that plugin frontends can also target. Built-in RustScript and plugin sources lower into a shared `FrontendIr` before compilation, then run on a runtime that uses no garbage collector and relies on deterministic ownership for memory management.
 
-Given those other frontends, a fair question is: why add another one? What does a Rust-shaped scripting syntax buy a VM that already works?
+Given the plugin path for compatibility languages, a fair question is: what does a Rust-shaped scripting syntax buy this VM?
 
 The short answer is that RustScript exists because its syntax carries **intent that the compiler can act on**. Move-vs-copy distinctions, borrow annotations, and mutability declarations are not runtime features. They are compiler inputs. And they happen to be in a syntax that AI models already know well.
 
@@ -34,14 +34,14 @@ let b = a;           // move: `a` is consumed, slot is cleared
 
 The compiler sees the local-to-local rebind of a non-copyable value, lowers it as a consuming load (`MoveVar` in the IR), and emits the null-clear sequence. Using `a` after this point is a compile-time error, not a runtime surprise.
 
-Compare the same logic in the JavaScript frontend:
+Compare the same logic in a copy-by-default compatibility frontend:
 
 ```javascript
 let a = [1, 2, 3];
 let b = a;           // copy: both `a` and `b` share the array
 ```
 
-Both programs compile to valid bytecode on the same VM. The difference is what the compiler knows at the point of the assignment. RustScript's syntax tells it "this is a transfer of ownership." The JS frontend's syntax tells it nothing, so it defaults to shared copy.
+Both programs compile to valid bytecode on the same VM. The difference is what the compiler knows at the point of the assignment. RustScript's syntax tells it "this is a transfer of ownership." A copy-by-default plugin syntax tells it nothing, so it defaults to shared copy.
 
 ### `.copy()` and Borrows
 
@@ -70,7 +70,7 @@ The core of RustScript's value is the availability analysis in `availability.rs`
 
 When `enable_local_move_semantics` is active (RustScript only), the pass enforces stricter rules:
 
-| Situation | RustScript behavior | JS / Lua behavior |
+| Situation | RustScript behavior | Compatibility plugin behavior |
 |---|---|---|
 | Local-to-local rebind of a collection | Move source, reject reuse | Copy (shared ownership) |
 | Local read after move | Compile error | N/A (no moves) |
@@ -113,7 +113,7 @@ The capture binding modes are:
 | **BorrowMut** | `&mut x` in capture position | Non-consuming; mutation tracked |
 | **Move** | `x` (default for non-copyable) | Outer local consumed |
 
-In the JS and Lua frontends, all captures degrade to `Copy` mode. The capture slot still gets a value, but the outer scope keeps its own copy unconditionally.
+Compatibility frontends can choose to degrade captures to `Copy` mode. The capture slot still gets a value, but the outer scope keeps its own copy unconditionally.
 
 ## Type Inference and the Ownership Surface
 
@@ -128,12 +128,12 @@ These are all DX-layer decisions. They catch mistakes before bytecode is generat
 
 ## The AI Angle: Syntax Proximity to Rust
 
-There is a practical benefit that was not part of the original design but became increasingly clear as the project grew: **AI code-generation models produce better RustScript than they produce JavaScript or Lua for this VM**.
+There is a practical benefit that was not part of the original design but became increasingly clear as the project grew: **AI code-generation models produce better RustScript than they produce compatibility languages for this VM**.
 
 The reason is corpus proximity. Large language models trained on significant amounts of Rust code have internalized Rust's ownership patterns, borrow semantics, and idiomatic structures. When asked to write RustScript for pd-vm — which lives in the same repository as the Rust runtime — the model:
 
 1. **Naturally uses ownership-aware patterns.** It writes `let b = a;` as a move and `let b = a.copy();` when it needs the source to survive. It does not try to share mutable state through aliasing.
-2. **Avoids GC-dependent patterns.** Rust-trained models do not reach for garbage-collected idioms like long-lived closures over mutable state or circular references. Those patterns would be valid in the JS frontend but counterproductive for a GC-free runtime.
+2. **Avoids GC-dependent patterns.** Rust-trained models do not reach for garbage-collected idioms like long-lived closures over mutable state or circular references. Those patterns can be natural in compatibility-language frontends but counterproductive for a GC-free runtime.
 3. **Matches the surrounding code style.** The pd-vm runtime is Rust. The compiler is Rust. The test harness is Rust. When the scripting language is also Rust-shaped, the model does not need to context-switch between two different programming idioms within the same codebase.
 4. **Produces more accurate type annotations.** Because the model knows Rust's type annotation syntax, it generates valid RustScript type hints that feed into the compiler's inference pipeline rather than leaving locals at `Unknown`.
 

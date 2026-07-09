@@ -1,28 +1,14 @@
-mod javascript;
-mod lua;
 mod rustscript;
-mod scheme;
 
 use std::collections::HashMap;
 
 use crate::compiler::source_map::{LoweredSource, SourceMap};
 
 use super::{
-    ParseError, ReplLocalBinding, SourceFlavor,
+    CompileSourceFileOptions, ParseError, ReplLocalBinding, SharedParserOptions, SourceFlavor,
     ir::{FrontendIr, LocalSlot},
     parser::{Parser, ParserDialect},
 };
-
-pub(crate) use scheme::SchemeImportContext;
-
-trait FrontendCompiler {
-    fn lower_to_ir(&self, source: &str) -> Result<FrontendIr, ParseError>;
-}
-
-struct RustScriptCompiler;
-struct JavaScriptCompiler;
-struct LuaCompiler;
-struct SchemeCompiler;
 
 // REPL snippets need a small amount of extra state that normal source compilation
 // does not carry: the persisted binding table and which slots are live on entry.
@@ -32,24 +18,52 @@ pub(super) struct ParsedRustScriptReplSource {
     pub entry_definite_locals: Vec<LocalSlot>,
 }
 
-pub(super) fn parse_source(source: &str, flavor: SourceFlavor) -> Result<FrontendIr, ParseError> {
-    let frontend: &dyn FrontendCompiler = match flavor {
-        SourceFlavor::RustScript => &RustScriptCompiler,
-        SourceFlavor::JavaScript => &JavaScriptCompiler,
-        SourceFlavor::Lua => &LuaCompiler,
-        SourceFlavor::Scheme => &SchemeCompiler,
-    };
-    frontend.lower_to_ir(source)
+pub(super) fn parse_source(
+    source: &str,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+) -> Result<FrontendIr, ParseError> {
+    match flavor {
+        SourceFlavor::RustScript => {
+            let lowered = rustscript::lower(source)?;
+            parse_lowered_with_mapping(source, lowered, false, false, true)
+        }
+        SourceFlavor::JavaScript | SourceFlavor::Lua => {
+            let Some(plugin) = options.source_plugin_for_flavor(flavor) else {
+                return Err(ParseError::new(format!(
+                    "no frontend plugin registered for {flavor:?} source"
+                )));
+            };
+            plugin.parse_source(source)
+        }
+    }
 }
 
 pub(crate) fn parser_dialect_for_flavor(
     flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
 ) -> Option<&'static dyn ParserDialect> {
     match flavor {
         SourceFlavor::RustScript => Some(rustscript::parser_dialect()),
-        SourceFlavor::JavaScript => Some(javascript::parser_dialect()),
-        SourceFlavor::Lua | SourceFlavor::Scheme => None,
+        SourceFlavor::JavaScript | SourceFlavor::Lua => options
+            .source_plugin_for_flavor(flavor)
+            .and_then(|plugin| plugin.parser_dialect()),
     }
+}
+
+pub fn parse_source_with_dialect(
+    source: &str,
+    dialect: &'static dyn ParserDialect,
+    options: SharedParserOptions,
+) -> Result<FrontendIr, ParseError> {
+    parse_with_parser(
+        source,
+        options.source_id,
+        options.allow_implicit_externs,
+        options.allow_implicit_semicolons,
+        options.enforce_mutable_bindings,
+        dialect,
+    )
 }
 
 pub(super) fn parse_rustscript_repl_source(
@@ -60,52 +74,12 @@ pub(super) fn parse_rustscript_repl_source(
     parse_lowered_repl_with_mapping(source, lowered, predefined_locals, false, false, true)
 }
 
-pub(super) fn parse_source_with_scheme_import_context(
-    source: &str,
-    flavor: SourceFlavor,
-    scheme_import_context: Option<&SchemeImportContext>,
-) -> Result<FrontendIr, ParseError> {
-    match flavor {
-        SourceFlavor::Scheme => {
-            scheme::lower_to_ir_with_import_context(source, scheme_import_context)
-        }
-        SourceFlavor::RustScript | SourceFlavor::JavaScript | SourceFlavor::Lua => {
-            parse_source(source, flavor)
-        }
-    }
-}
-
-pub(super) fn is_ident_start(ch: char) -> bool {
+pub fn is_ident_start(ch: char) -> bool {
     ch.is_ascii_alphabetic() || ch == '_'
 }
 
-pub(super) fn is_ident_continue(ch: char) -> bool {
+pub fn is_ident_continue(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
-}
-
-impl FrontendCompiler for RustScriptCompiler {
-    fn lower_to_ir(&self, source: &str) -> Result<FrontendIr, ParseError> {
-        let lowered = rustscript::lower(source)?;
-        parse_lowered_with_mapping(source, lowered, false, false, true)
-    }
-}
-
-impl FrontendCompiler for JavaScriptCompiler {
-    fn lower_to_ir(&self, source: &str) -> Result<FrontendIr, ParseError> {
-        javascript::lower_to_ir(source)
-    }
-}
-
-impl FrontendCompiler for LuaCompiler {
-    fn lower_to_ir(&self, source: &str) -> Result<FrontendIr, ParseError> {
-        lua::lower_to_ir(source)
-    }
-}
-
-impl FrontendCompiler for SchemeCompiler {
-    fn lower_to_ir(&self, source: &str) -> Result<FrontendIr, ParseError> {
-        scheme::lower_to_ir(source)
-    }
 }
 
 fn parse_with_parser(
@@ -158,8 +132,6 @@ fn parse_repl_with_parser(
     )?;
     let stmts = parser.parse_program()?;
     let bindings = parser.local_bindings_with_mutability();
-    // These slots are carried in from earlier REPL entries, so availability starts
-    // with them marked as definitely present.
     let predeclared = parser
         .local_bindings()
         .into_iter()
@@ -271,15 +243,15 @@ fn parse_lowered_repl_with_mapping(
         enforce_mutable_bindings,
         rustscript::parser_dialect(),
     ) {
-        Ok(mut result) => {
+        Ok(mut parsed) => {
             map_spans_to_original_source(
-                &mut result.ir.unknown_type_spans,
+                &mut parsed.ir.unknown_type_spans,
                 &lowered,
                 &source_map,
                 lowered_source_id,
                 original_source_id,
             );
-            Ok(result)
+            Ok(parsed)
         }
         Err(mut err) => {
             err = err.with_line_span_from_source(&source_map, lowered_source_id);
@@ -322,7 +294,7 @@ fn map_spans_to_original_source(
     lowered_source_id: u32,
     original_source_id: u32,
 ) {
-    for span in spans.iter_mut() {
+    for span in spans {
         if let Some(mapped) =
             lowered
                 .mapping

@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use super::super::frontends::{SchemeImportContext, is_ident_continue, is_ident_start};
+use super::super::frontends::{is_ident_continue, is_ident_start};
 use super::super::{CompileSourceFileOptions, SourceFlavor, SourcePathError};
-use super::graph::collect_imported_module_functions;
+
 use super::imports::{
     host_namespace_root_from_spec, is_builtin_host_namespace_spec, is_module_specifier,
     is_valid_ident, is_virtual_host_namespace_spec, resolve_module_path,
@@ -16,43 +16,6 @@ struct ImportCallResolution {
     namespace_prefix_calls: HashMap<String, String>,
 }
 
-pub(super) fn build_scheme_import_context(
-    path: &Path,
-    imports: &[ModuleImport],
-    module_exports: &HashMap<PathBuf, HashMap<String, ExportedFunctionSignature>>,
-    options: &CompileSourceFileOptions,
-) -> Result<SchemeImportContext, SourcePathError> {
-    let resolution =
-        resolve_import_call_paths(SourceFlavor::Scheme, path, imports, module_exports, options)?;
-
-    let mut declared_functions = HashMap::<String, Option<u8>>::new();
-    for (name, signature) in
-        collect_imported_module_functions(path, imports, module_exports, options)?
-    {
-        let arity = signature.arity;
-        declared_functions
-            .entry(name)
-            .and_modify(|existing| {
-                if let Some(existing_arity) = existing {
-                    *existing_arity = (*existing_arity).max(arity);
-                } else {
-                    *existing = Some(arity);
-                }
-            })
-            .or_insert(Some(arity));
-    }
-
-    let mut declared_functions = declared_functions.into_iter().collect::<Vec<_>>();
-    declared_functions.sort_by(|(lhs_name, _), (rhs_name, _)| lhs_name.cmp(rhs_name));
-
-    Ok(SchemeImportContext {
-        declared_functions,
-        direct_aliases: resolution.alias_calls,
-        namespace_imports: resolution.namespace_calls,
-        namespace_prefixes: resolution.namespace_prefix_calls,
-    })
-}
-
 fn resolve_import_call_paths(
     flavor: SourceFlavor,
     path: &Path,
@@ -62,7 +25,7 @@ fn resolve_import_call_paths(
 ) -> Result<ImportCallResolution, SourcePathError> {
     let mut alias_calls = HashMap::<String, String>::new();
     let mut namespace_calls = HashMap::<String, HashSet<String>>::new();
-    let mut namespace_prefix_calls = HashMap::<String, String>::new();
+    let namespace_prefix_calls = HashMap::<String, String>::new();
     for import in imports {
         if is_builtin_host_namespace_spec(&import.spec) {
             continue;
@@ -73,13 +36,7 @@ fn resolve_import_call_paths(
                 && let Some(host_prefix) = virtual_host_namespace_prefix(flavor, &host_root)
             {
                 match &import.clause {
-                    ImportClause::AllPublic => {
-                        if flavor == SourceFlavor::Scheme
-                            && let Some(namespace) = module_default_namespace(&import.spec)
-                        {
-                            namespace_prefix_calls.insert(namespace, host_prefix.clone());
-                        }
-                    }
+                    ImportClause::AllPublic => {}
                     ImportClause::Named(named) => {
                         for binding in named {
                             alias_calls.insert(
@@ -88,11 +45,7 @@ fn resolve_import_call_paths(
                             );
                         }
                     }
-                    ImportClause::Namespace(namespace) => {
-                        if flavor == SourceFlavor::Scheme {
-                            namespace_prefix_calls.insert(namespace.clone(), host_prefix.clone());
-                        }
-                    }
+                    ImportClause::Namespace(_namespace) => {}
                     ImportClause::Prefix(_) => {}
                 }
             }
@@ -106,13 +59,7 @@ fn resolve_import_call_paths(
                 && let Some(host_prefix) = virtual_host_namespace_prefix(flavor, &host_root)
             {
                 match &import.clause {
-                    ImportClause::AllPublic => {
-                        if flavor == SourceFlavor::Scheme
-                            && let Some(namespace) = module_default_namespace(&import.spec)
-                        {
-                            namespace_prefix_calls.insert(namespace, host_prefix.clone());
-                        }
-                    }
+                    ImportClause::AllPublic => {}
                     ImportClause::Named(named) => {
                         for binding in named {
                             alias_calls.insert(
@@ -121,11 +68,7 @@ fn resolve_import_call_paths(
                             );
                         }
                     }
-                    ImportClause::Namespace(namespace) => {
-                        if flavor == SourceFlavor::Scheme {
-                            namespace_prefix_calls.insert(namespace.clone(), host_prefix.clone());
-                        }
-                    }
+                    ImportClause::Namespace(_namespace) => {}
                     ImportClause::Prefix(_) => {}
                 }
             }
@@ -183,7 +126,7 @@ fn resolve_import_call_paths(
 
 fn virtual_host_namespace_prefix(flavor: SourceFlavor, host_root: &str) -> Option<String> {
     match flavor {
-        SourceFlavor::RustScript | SourceFlavor::Scheme => Some(host_root.to_string()),
+        SourceFlavor::RustScript => Some(host_root.to_string()),
         SourceFlavor::JavaScript | SourceFlavor::Lua => None,
     }
 }
@@ -213,28 +156,16 @@ pub(super) fn rewrite_imported_call_sites(
         return Ok(ImportRewriteResult { source: rewritten });
     }
 
-    if flavor == SourceFlavor::Scheme {
-        Ok(ImportRewriteResult {
-            source: rewrite_scheme_call_heads(
-                &rewritten,
-                &alias_calls,
-                &namespace_calls,
-                &namespace_wildcards,
-                &prefix_aliases,
-            ),
-        })
-    } else {
-        Ok(ImportRewriteResult {
-            source: rewrite_function_call_paths(
-                &rewritten,
-                flavor,
-                &alias_calls,
-                &namespace_calls,
-                &namespace_wildcards,
-                &prefix_aliases,
-            ),
-        })
-    }
+    Ok(ImportRewriteResult {
+        source: rewrite_function_call_paths(
+            &rewritten,
+            flavor,
+            &alias_calls,
+            &namespace_calls,
+            &namespace_wildcards,
+            &prefix_aliases,
+        ),
+    })
 }
 
 fn rewrite_host_namespace_call_paths(
@@ -658,127 +589,6 @@ fn rewrite_function_call_paths(
     out
 }
 
-fn rewrite_scheme_call_heads(
-    source: &str,
-    alias_calls: &HashMap<String, String>,
-    namespace_calls: &HashMap<String, HashSet<String>>,
-    namespace_wildcards: &HashSet<String>,
-    prefix_aliases: &[String],
-) -> String {
-    let bytes = source.as_bytes();
-    let mut out = String::with_capacity(source.len());
-    let mut i = 0usize;
-    let mut in_line_comment = false;
-    let mut in_string = false;
-    let mut escaped = false;
-
-    while i < bytes.len() {
-        let b = bytes[i];
-
-        if in_line_comment {
-            out.push(b as char);
-            if b == b'\n' {
-                in_line_comment = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        if in_string {
-            out.push(b as char);
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        if b == b';' {
-            in_line_comment = true;
-            out.push(';');
-            i += 1;
-            continue;
-        }
-
-        if b == b'"' {
-            in_string = true;
-            escaped = false;
-            out.push('"');
-            i += 1;
-            continue;
-        }
-
-        if b == b'(' {
-            out.push('(');
-            i += 1;
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                out.push(bytes[i] as char);
-                i += 1;
-            }
-
-            let symbol_start = i;
-            while i < bytes.len() {
-                let ch = bytes[i];
-                if ch.is_ascii_whitespace() || ch == b'(' || ch == b')' || ch == b';' {
-                    break;
-                }
-                i += 1;
-            }
-            if i == symbol_start {
-                continue;
-            }
-
-            let symbol = &source[symbol_start..i];
-            if let Some(target) = alias_calls.get(symbol) {
-                out.push_str(target);
-                continue;
-            }
-
-            if let Some((namespace, member)) = symbol.split_once('.')
-                && let Some(entries) = namespace_calls.get(namespace)
-                && entries.contains(member)
-            {
-                out.push_str(member);
-                continue;
-            }
-
-            if let Some((namespace, member)) = symbol.split_once('.')
-                && namespace_wildcards.contains(namespace)
-                && !member.is_empty()
-            {
-                out.push_str(member);
-                continue;
-            }
-
-            let mut rewritten_by_prefix = false;
-            for prefix in prefix_aliases {
-                if let Some(rem) = symbol.strip_prefix(prefix)
-                    && !rem.is_empty()
-                {
-                    out.push_str(rem);
-                    rewritten_by_prefix = true;
-                    break;
-                }
-            }
-            if rewritten_by_prefix {
-                continue;
-            }
-
-            out.push_str(symbol);
-            continue;
-        }
-
-        out.push(b as char);
-        i += 1;
-    }
-
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -966,28 +776,5 @@ is_empty("");
         .expect("rewrite should succeed");
 
         assert_eq!(rewritten.source.trim(), "sleep(3);");
-    }
-
-    #[test]
-    fn javascript_virtual_host_namespace_imports_keep_namespace_calls() {
-        let source = "runtime.sleep(3);\n";
-        let path = Path::new("tests/main.js");
-        let imports = vec![ModuleImport {
-            spec: "runtime".to_string(),
-            clause: ImportClause::Namespace("runtime".to_string()),
-            line: 1,
-        }];
-
-        let rewritten = rewrite_imported_call_sites(
-            source,
-            SourceFlavor::JavaScript,
-            path,
-            &imports,
-            &HashMap::new(),
-            &CompileSourceFileOptions::default(),
-        )
-        .expect("rewrite should succeed");
-
-        assert_eq!(rewritten.source.trim(), "runtime.sleep(3);");
     }
 }

@@ -116,7 +116,6 @@ fn parse_flavor(raw: &str) -> SourceFlavor {
     match raw.trim().to_ascii_lowercase().as_str() {
         "javascript" | "js" => SourceFlavor::JavaScript,
         "lua" => SourceFlavor::Lua,
-        "scheme" | "scm" => SourceFlavor::Scheme,
         _ => SourceFlavor::RustScript,
     }
 }
@@ -276,9 +275,8 @@ fn fuel_state_to_json(fuel: FuelState) -> FuelStateJson {
 }
 
 fn completion_catalog_to_json(catalog: CompletionCatalog) -> Vec<u8> {
-    serde_json::to_vec(&catalog).unwrap_or_else(|_| {
-        b"{\"rustscript\":[],\"javascript\":[],\"lua\":[],\"scheme\":[]}".to_vec()
-    })
+    serde_json::to_vec(&catalog)
+        .unwrap_or_else(|_| b"{\"rustscript\":[],\"javascript\":[],\"lua\":[]}".to_vec())
 }
 
 fn local_type_hint_to_json(hint: InferredLocalTypeHint) -> LocalTypeHintJson {
@@ -782,44 +780,10 @@ pub extern "C" fn completion_catalog_json() -> u64 {
 mod lint_tests {
     use std::path::Path;
 
-    use super::{parse_flavor, parse_module_overrides};
+    use super::parse_module_overrides;
     use crate::analyzer::{lint_source_with_flavor, lint_source_with_flavor_at_path};
-    use crate::completions::build_completion_catalog;
     use serde_json::Value;
     use vm::{SourceFlavor, collect_inferred_local_type_hints};
-
-    #[test]
-    fn parse_flavor_accepts_aliases() {
-        assert_eq!(parse_flavor("js"), SourceFlavor::JavaScript);
-        assert_eq!(parse_flavor("scm"), SourceFlavor::Scheme);
-        assert_eq!(parse_flavor("lua"), SourceFlavor::Lua);
-        assert_eq!(parse_flavor("rss"), SourceFlavor::RustScript);
-    }
-
-    #[test]
-    fn lint_reports_no_errors_for_all_supported_frontends() {
-        let cases = [
-            (
-                SourceFlavor::RustScript,
-                include_str!("../../examples/example.rss"),
-            ),
-            (
-                SourceFlavor::JavaScript,
-                include_str!("../../examples/example.js"),
-            ),
-            (SourceFlavor::Lua, "local a = 1\na = a + 1\na"),
-            (SourceFlavor::Scheme, "(define a 1)\n(set! a (+ a 1))\na"),
-        ];
-
-        for (flavor, source) in cases {
-            let report = lint_source_with_flavor(source, flavor);
-            assert!(
-                report.diagnostics.is_empty(),
-                "lint should succeed for {flavor:?}, got diagnostics: {:?}",
-                report.diagnostics
-            );
-        }
-    }
 
     #[test]
     fn lint_accepts_bytes_literals_and_native_bytes_helpers() {
@@ -837,25 +801,6 @@ mod lint_tests {
             report.diagnostics.is_empty(),
             "expected bytes literal lint to pass, got {:?}",
             report.diagnostics
-        );
-    }
-
-    #[test]
-    fn completion_catalog_contains_edge_and_runtime_hosts() {
-        let catalog = build_completion_catalog();
-        assert!(
-            catalog
-                .rustscript
-                .iter()
-                .any(|entry| entry.label == "http::request::get_id"),
-            "expected pd-edge host completion"
-        );
-        assert!(
-            catalog
-                .rustscript
-                .iter()
-                .any(|entry| entry.label == "runtime::sleep"),
-            "expected playground runtime host completion"
         );
     }
 
@@ -1113,39 +1058,6 @@ mod runtime_tests {
     }
 
     #[test]
-    fn parse_flavor_accepts_aliases() {
-        assert_eq!(parse_flavor("js"), SourceFlavor::JavaScript);
-        assert_eq!(parse_flavor("scm"), SourceFlavor::Scheme);
-        assert_eq!(parse_flavor("lua"), SourceFlavor::Lua);
-        assert_eq!(parse_flavor("rss"), SourceFlavor::RustScript);
-    }
-
-    #[test]
-    fn lint_reports_no_errors_for_all_supported_frontends() {
-        let cases = [
-            (
-                SourceFlavor::RustScript,
-                include_str!("../../examples/example.rss"),
-            ),
-            (
-                SourceFlavor::JavaScript,
-                include_str!("../../examples/example.js"),
-            ),
-            (SourceFlavor::Lua, "local a = 1\na = a + 1\na"),
-            (SourceFlavor::Scheme, "(define a 1)\n(set! a (+ a 1))\na"),
-        ];
-
-        for (flavor, source) in cases {
-            let report = lint_source_with_flavor(source, flavor);
-            assert!(
-                report.diagnostics.is_empty(),
-                "lint should succeed for {flavor:?}, got diagnostics: {:?}",
-                report.diagnostics
-            );
-        }
-    }
-
-    #[test]
     fn playground_rss_examples_are_formatted_lint_clean_and_runnable() {
         let options = embedded_stdlib_compile_options();
 
@@ -1197,35 +1109,6 @@ mod runtime_tests {
             "playground example 'Collections and Iter Example' should be lint clean, got {:?}",
             lint.diagnostics
         );
-    }
-
-    #[test]
-    fn run_returns_output_for_all_supported_frontends() {
-        let cases = [
-            (SourceFlavor::RustScript, "print(1 + 1);"),
-            (SourceFlavor::JavaScript, "console.log(1 + 1);"),
-            (SourceFlavor::Lua, "print(1 + 1)"),
-            (SourceFlavor::Scheme, "(print (+ 1 1))"),
-        ];
-
-        for (flavor, source) in cases {
-            let report = run_source_with_flavor(source, flavor);
-            assert!(
-                report.error.is_none(),
-                "run should succeed for {flavor:?}, got error: {:?}",
-                report.error
-            );
-            assert!(
-                report.output.iter().any(|line| line == "2"),
-                "expected output to contain '2' for {flavor:?}, got {:?}",
-                report.output
-            );
-            assert!(
-                report.stack.iter().any(|value| value == "2"),
-                "expected stack to contain '2' for {flavor:?}, got {:?}",
-                report.stack
-            );
-        }
     }
 
     #[test]
@@ -1952,25 +1835,6 @@ mod runtime_tests {
     }
 
     #[test]
-    fn run_supports_multi_arg_print_for_javascript() {
-        let source = r#"
-            print(1, 2);
-            1;
-        "#;
-        let report = run_source_with_flavor(source, SourceFlavor::JavaScript);
-        assert!(
-            report.error.is_none(),
-            "expected run to succeed with multi-arg print, got {:?}",
-            report.error
-        );
-        assert!(
-            report.output.iter().any(|line| line == "1 2"),
-            "expected output to include joined print line, got {:?}",
-            report.output
-        );
-    }
-
-    #[test]
     fn run_supports_mixed_print_call_arities_for_rustscript() {
         let source = r#"
             print(1);
@@ -1992,99 +1856,6 @@ mod runtime_tests {
             report.output.iter().any(|line| line == "2"),
             "expected output to include formatted print line, got {:?}",
             report.output
-        );
-    }
-
-    #[test]
-    fn completion_catalog_reports_stdlib_and_host_entries() {
-        let catalog = build_completion_catalog();
-        assert!(
-            catalog
-                .rustscript
-                .iter()
-                .any(|entry| entry.label == "string::trim"),
-            "expected RustScript stdlib completion entry"
-        );
-        assert!(
-            catalog
-                .rustscript
-                .iter()
-                .any(|entry| entry.label == "parse::try_parse_int_base"),
-            "expected RustScript parse stdlib completion entry"
-        );
-        assert!(
-            catalog
-                .rustscript
-                .iter()
-                .any(|entry| entry.label == "json::encode"),
-            "expected RustScript json namespace completion entry"
-        );
-        assert!(
-            catalog
-                .rustscript
-                .iter()
-                .any(|entry| entry.label == "math::sqrt"),
-            "expected RustScript math namespace completion entry"
-        );
-        assert!(
-            catalog
-                .rustscript
-                .iter()
-                .any(|entry| entry.label == "re::match"),
-            "expected RustScript regex namespace completion entry"
-        );
-        assert!(
-            catalog
-                .rustscript
-                .iter()
-                .any(|entry| entry.label == "runtime::sleep"),
-            "expected RustScript runtime host namespace completion entry"
-        );
-    }
-
-    #[test]
-    fn completion_catalog_details_include_callable_signatures() {
-        let catalog = build_completion_catalog();
-        let runtime_sleep = catalog
-            .rustscript
-            .iter()
-            .find(|entry| entry.label == "runtime::sleep")
-            .expect("runtime::sleep completion should exist");
-        assert!(
-            runtime_sleep
-                .detail
-                .contains("runtime::sleep(ms: int) -> bool"),
-            "expected runtime host signature in completion detail, got {:?}",
-            runtime_sleep.detail
-        );
-
-        let len = catalog
-            .rustscript
-            .iter()
-            .find(|entry| entry.label == "len")
-            .expect("len completion should exist");
-        assert!(
-            len.detail.contains("len(text: string) -> int"),
-            "expected string overload in len detail, got {:?}",
-            len.detail
-        );
-        assert!(
-            len.detail.contains("len(items: array) -> int"),
-            "expected array overload in len detail, got {:?}",
-            len.detail
-        );
-
-        let re_match = catalog
-            .rustscript
-            .iter()
-            .find(|entry| entry.label == "re::match")
-            .expect("re::match completion should exist");
-        assert!(
-            re_match
-                .detail
-                .contains("re::match(pattern: string, text: string) -> bool"),
-            "expected regex signature in completion detail, got {:?}",
-            re_match.detail
         );
     }
 

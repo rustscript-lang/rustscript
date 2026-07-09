@@ -1,220 +1,54 @@
-# Compiler Frontends: Supported Syntax and Features
+# Compiler Frontends and Source Plugins
 
-This document describes the currently supported source syntax for the three `pd-vm` compiler
-frontends:
+`pd-vm` keeps the built-in frontend surface focused on RustScript (`.rss`). Additional source languages are provided by crates that implement the `SourcePlugin` trait and pass themselves through `CompileSourceFileOptions`.
 
-- RustScript (`.rss`)
-- JavaScript subset (`.js`)
-- Lua subset (`.lua`)
+The compatibility JavaScript and Lua frontends live outside this repository in:
 
-All frontends lower to the same frontend IR and VM bytecode model.
+- `pd-vm-compat-frontends`
 
-## Contents
-
-- [Quick Syntax Map](#quick-syntax-map)
-- [RustScript (.rss)](#rustscript-rss)
-- [JavaScript Subset (.js)](#javascript-subset-js)
-- [Lua Subset (.lua)](#lua-subset-lua)
-- [Frontend-wide Policy Notes](#frontend-wide-policy-notes)
-
-## Quick Syntax Map
-
-| Feature | RustScript | JavaScript | Lua |
-| --- | --- | --- | --- |
-| Local binding | `let x = 1;` | `let x = 1;` / `const x = 1;` | `local x = 1` / `local a, b = f()` |
-| Assignment | `x = 2;` | `x = 2;` | `x = 2` |
-| Function declaration | `fn add(x) { x + 1 }` | `function add(x) { x + 1 }` | `local function add(x) return x + 1 end` |
-| Closure literal | `|x| x + 1` | `(x) => x + 1` | `function(x) return x + 1 end` |
-| If statement | `if cond { ... } else { ... }` | `if (cond) { ... } else { ... }` | `if cond then ... elseif/elif ... else ... end` |
-| While loop | `while cond { ... }` | `while (cond) { ... }` | `while cond do ... end` |
-| For loop | `for i in 0..n { ... }` / `for i in 0..=n { ... }` | `for (let i = 0; i < n; i = i + 1) { ... }` | `for i = 0, n, 1 do ... end` / `for k,v in pairs(t) do ... end` |
-| Collection literals | `[1, 2]`, `{x: 1}` | `[1, 2]`, `{ x: 1 }` | `{1, 2, x = 1}` |
-| Index/member access | `a[i]`, `m.key` | `a[i]`, `m.key` | `a[i]`, `m.key` |
-| Optional chain | `a?.b?.c` | `a?.b?.c` | `a?.b?.c` |
-| Slice | `v[start:end]` | `v[start:end]` | `v[start:end]` |
-| Host import | `use runtime;` | `import * as runtime from "runtime";` | `local runtime = require("runtime")` |
-| Print | `print(x);` / `print("{}", x);` / `println(x);` / `println("{}", x);` | `console.log(x);` / `print(x);` | `print(x)` |
-
-## RustScript (`.rss`)
+## Built-in RustScript (`.rss`)
 
 Supported syntax and features:
 
-- Statements: `use`, `fn`, `pub fn`, `let`, assignment, indexed/member assignment, `if`/`else`,
-  `while`, C-style `for`, `break`, `continue`.
-- Expressions: literals (`int`, `float`, `bool`, `string`, `null`), arithmetic (`+ - * / %`),
-  logical (`! && ||`), comparison (`== != < >`), function calls, closures (`|...| expr`),
-  if-expression form (`if cond => { ... } else => { ... }`), match expressions.
-- Match patterns: int/string/null literals, wildcard `_`, `None`, non-null binding patterns
-  `Some(name)`, and type constructors `Some(TypeName)` / `Option::Some(TypeName)`.
-- Collections: array literal `[]`, brace literals for arrays/maps, `obj.member`, `obj[key]`,
-  optional chaining (`?.` and `?.[key]`), slice syntax (`[a:b]`, `[:b]`, `[a:]`), map key
-  literals including `null`.
-- Runtime map semantics:
-  - Bare keys in brace literals (`{a: 1}`, `{"x": 2}`, `{null: 3}`) are limited to
-    identifier/string/int/float/bool/null literals.
-  - Bracketed keys (`{[expr]: value}`) allow any runtime expression as a key.
-  - Runtime map keys and values may be any VM value (`null`, `int`, `float`, `bool`, `string`,
-    `array`, `map`). Callable values are still excluded by the existing collection limits.
-  - Scalar and string keys compare by value. Array and map keys compare by heap identity, so
-    separately allocated but structurally equal arrays/maps are different keys.
-  - Duplicate inserts are last-write-wins; `0.0` and `-0.0` are treated as the same key; `NaN`
-    keys match by bit pattern rather than normal float `==`.
-  - Setting a map entry to `null`/`None` removes that key, including during map/object literal
-    construction, so `{a: null}` omits `a`.
-  - Composite keys are stable after insertion because container writes detach before mutation, so
-    mutating an alias later creates a new value instead of changing a key already stored in a map.
-  - Membership checks use method-like lowering on arrays/maps: `container.has(key)`.
+- Statements: `use`, `fn`, `pub fn`, `let`, assignment, indexed/member assignment, `if`/`else`, `while`, C-style `for`, `break`, `continue`.
+- Expressions: literals (`int`, `float`, `bool`, `string`, `null`), arithmetic (`+ - * / %`), logical (`! && ||`), comparison (`== != < >`), function calls, closures (`|...| expr`), if-expression form (`if cond => { ... } else => { ... }`), match expressions.
+- Match patterns: int/string/null literals, wildcard `_`, `None`, non-null binding patterns `Some(name)`, and type constructors `Some(TypeName)` / `Option::Some(TypeName)`.
+- Collections: array literal `[]`, brace literals for arrays/maps, `obj.member`, `obj[key]`, optional chaining (`?.` and `?.[key]`), slice syntax (`[a:b]`, `[:b]`, `[a:]`), map key literals including `null`.
 - Host/runtime calls:
   - builtins via namespaces: `io::...`, `re::...`, `json::...`, `jit::...`, `math::...`
-  - host namespaces via `use <namespace>;` / `use <namespace> as <alias>;` / `use <namespace>::{name as local};`
-- RustScript frontend rewrites:
+  - host namespaces via `use <namespace>;`, `use <namespace> as <alias>;`, or `use <namespace>::{name as local};`
+- RustScript rewrites:
   - `Option::None` -> `null`
   - `Option::Some(expr)` -> `(expr)`
   - `print("...", ...)` and `println("...", ...)` support Rust-style `std::fmt` formatting
 - RustScript compile-time type rules:
-  - RustScript requires compile-time types for accepted programs; unresolved `unknown` states are
-    compile errors on the RustScript path.
-  - `+` is inferred as string concatenation when either side is known `string`, so expressions such
-    as `"text" + 123` are valid and lower as string concat.
-  - Known mixed numeric arithmetic widens to `float`.
-  - `if`-expression branches and `if`/`else` local merges with conflicting known concrete types are
-    rejected during compilation.
-  - Nullable or optional schemas are spelled with `?` after the inner type, for example `int?`,
-    `Profile?`, or `fn(int) -> string?`.
-  - `null` is only accepted where the declared schema is explicitly optional; non-optional locals,
-    parameters, and returns reject `null`.
-  - Optional chaining in RustScript requires the container to come from a user-declared schema.
-  - Values produced by RustScript optional chaining stay optional until handled with
-    `.unwrap_or(...)`, a `!= null` refinement, or a `match` arm that binds `Some(name)`.
-  - After `.unwrap_or(...)`, a successful `!= null` refinement, or a `Some(name)` match arm, the
-    compiler and lint layer keep the concrete inner type instead of degrading to `unknown`.
-- RustScript ownership and liveness behavior (current):
-  - `let` bindings are immutable by default; use `let mut` for mutable bindings.
-  - Reassignment (`x = ...`), indexed/member mutation (`x[i] = ...`, `x.k = ...`), and `&mut`
-    borrows require a mutable binding.
-  - Non-copyable field reads (for example `p.a`) are move-by-default.
-  - Direct moved field reads (`let x = p.a;`, `p.a;`) also update runtime local state by
-    clearing the moved field on the owning container.
-  - Literal index element moves (`let x = arr[0];`) now also update runtime local state by
-    clearing the moved element on the owning container.
-  - Non-copyable local-to-local rebinds (for example `let b = a`, `b = a`) move the source local
-    by default.
-  - RustScript function calls now apply consumed-parameter inference at call sites (based on
-    direct move ops and return-forwarded parameter rebinds), so reusing a consumed caller local
-    after the call is rejected.
-  - The source-local move above is compiled as a consuming local load at runtime; plain local
-    reads remain copy-like by default.
-  - Collection locals continue to use alias tracking semantics on plain local reads and local
-    rebinds.
-  - Use `.copy()` to explicitly clone/detach a value before reusing or mutating related state.
-  - `&expr` and `&mut expr` are accepted borrow forms; in the current subset they act as
-    non-consuming access forms and still participate in move/liveness checks.
-  - `&mut` requires a mutable-place target (`local`, `local.field`, `local[index]`) and rejects
-    temporaries/derived expressions (for example `&mut (a + b)`).
-  - Collection aliases are tracked through assignment, borrow binding, and passthrough calls;
-    mutating a collection while an alias exists is rejected unless one side is detached (for
-    example via `.copy()`) or reassigned.
-  - Locals must be definitely available on every control-flow path before use.
-  - Closures and `fn` declarations capture outer locals at definition/declaration time.
-  - In RustScript, capture mode follows expression semantics (`x` can move, `x.copy()` copies,
-    and `&x` / `&mut x` keep borrow-style capture behavior). Non-RustScript frontends keep
-    copy-style capture behavior.
-  - Inline `fn` and closure calls clear per-call frame slots after producing the call result
-    (deterministic descending-slot order). Closure capture slots are excluded from per-call clears.
-  - Closure capture slots and other hidden locals now participate in liveness null-clears once
-    the owning closure/value is dead.
-  - While waiting on pending host operations, VM local state is stable (no replayed drop/clear)
-    until completion and resume.
-- Module import syntax (for `.rss` modules): `use module;`, `use module::*;`, `use module::{...}`,
-  plus relative paths with `self::` / `super::`.
+  - unresolved `unknown` states are compile errors on the RustScript path
+  - `+` is inferred as string concatenation when either side is known `string`
+  - known mixed numeric arithmetic widens to `float`
+  - incompatible known `if`/`else` expression results and branch-local merges are compile errors
 
-Current subset limits:
+## Source Plugin Contract
 
-- Function declarations are inlined; recursive declarations are not supported.
-- `fn` declarations can be nested and implicitly capture outer locals.
-- Callable values cannot currently be stored in arrays/maps or returned.
-- Calling callable-valued locals captured inside closure bodies is currently rejected.
-- Match patterns are limited to the forms listed above.
-- `break`/`continue` are only valid inside loops.
-- `crate::...` module paths are not supported in RustScript module loading.
+A source plugin supplies three things:
 
-## JavaScript Subset (`.js`)
+1. `parse_source(...) -> FrontendIr`
+2. `parse_imports(...) -> Vec<ModuleImport>`
+3. `strip_imports(...) -> String`
 
-Supported syntax and features:
+Register the plugin on compile options:
 
-- Statements: `let`/`const`, assignment, indexed/member assignment, `if`/`else if`/`else`,
-  `while`, C-style `for`, `break`, `continue`.
-- Functions:
-  - `function` declarations are lowered to RustScript-style function declarations.
-  - Arrow closures with expression bodies are supported, including empty parameter list (`() => 42`).
-- Expressions: literals, arithmetic (`+ - * / %`), logical (`! && ||`), comparison (`== != < >`),
-  calls, arrays/objects, index/member access, optional chaining, slice syntax (`[a:b]` family).
-- JavaScript frontend rewrites:
-  - `console.log(...)` -> `print(...)`
-  - `typeof value` -> `type(value)`
-  - `const` -> `let`
-  - `function` -> `fn`
-  - `return <expr>;` -> `<expr>;` (final-expression function body model)
-- Imports/host calls:
-  - `import * as runtime from "runtime";` / `import * as http from "http";` for namespace calls
-  - named imports from host namespaces (`import { sleep as nap } from "runtime";`)
-  - `require("runtime")` / `require("http")` forms for host namespace aliasing
-  - module imports from `.rss` are recognized from `import`/`require` forms
-- Semicolons may be omitted at line ends (frontend enables implicit statement terminators).
+```rust
+use pd_vm::{compile_source_file_with_options, CompileSourceFileOptions};
 
-Current subset limits:
+let options = CompileSourceFileOptions::new()
+    .with_source_plugin(pd_vm_compat_frontends::plugin());
+let compiled = compile_source_file_with_options("examples/example.js", options)?;
+```
 
-- Arrow closures with block bodies are rejected (`(x) => { ... }`).
-- Direct calls to VM helper builtins like `len/get/set/count/...` are rejected; use language syntax
-  (`.length`, `.keys`, `.has(...)`, indexing, assignment, `typeof`, namespace forms).
-- Undeclared host calls are rejected (import the relevant host namespace first).
-
-## Lua Subset (`.lua`)
-
-Supported syntax and features:
-
-- Statements:
-  - `local` bindings, including compiler-known unpacking forms like `local a, b = f()`
-  - assignment, indexed/member assignment
-  - `local function` and `function` declarations
-  - `if`/`elseif`/`elif`/`else`/`end` (`elif` is accepted as an alias)
-  - `while ... do ... end`
-  - numeric `for i = start, end [, step] do ... end`
-  - generic loops with `pairs(...)` and `ipairs(...)` (single or key/value loop vars)
-  - `repeat ... until ...`
-  - `do ... end`
-  - `break`, `continue`, and `goto continue` compatibility lowering
-- Expressions:
-  - literals (`nil`, bool, int/float, single/double-quoted strings)
-  - operators: `+ - * / %`, `not`, `and`, `or`, `~=` and `..` (lowered)
-  - function literals (`function(args) return <expr[, expr...]> end`, plus fallthrough `function(args) end`)
-  - table literals (array parts, map parts, and mixed forms)
-  - member/index access, optional chaining, slice syntax
-  - method-call lowering for `receiver:method(args)`
-- Lua-specific lowering helpers:
-  - string methods `:sub(...)` and `:len()`
-  - length operator `#value` with Lua-style helpers for arrays/maps/strings
-  - `pcall(func, ...)` / `xpcall(func, handler, ...)` lowering with success-only semantics (`true, ...results`)
-- Imports/host calls:
-  - `local runtime = require("runtime")`
-  - `local alias = require("runtime").sleep`
-  - `local http = require("http")`
-  - direct `require("...")` module import forms (including `.rss` modules)
-
-Current subset limits:
-
-- Function literals are limited to `function(args) end`, `function(args) return end`, or `function(args) return <expr[, expr...]> end`.
-- Direct `function`/`local function` bodies are still minimal: empty/fallthrough, `return`, `return <expr[, expr...]>`, or a single return-only `if`/`elseif`/`else` chain.
-- Multi-return unpacking is currently limited to compiler-known Lua function/closure return shapes; extra return values are dropped, missing locals are filled with `null`, but plain assignment destructuring and arbitrary host-call unpacking are not supported.
-- Lua pattern API string methods (`:find`, `:match`, `:gsub`) are currently rejected.
-- Direct VM helper builtin calls are not exposed as frontend functions.
+`compile_source_file()` without options only handles built-in `.rss` files. `.js` and `.lua` paths need a plugin registered for their `SourceFlavor`.
 
 ## Frontend-wide Policy Notes
 
-- VM helper builtin names such as `count` are not exposed as direct frontend functions.
-- Host calls must be imported/declared in frontend-appropriate syntax.
-- The shared compiler performs lightweight inference after frontend lowering and emits operand type
-  metadata into bytecode programs for interpreter/JIT fast paths and compile diagnostics.
-- Source-level type inference is best observed through emitted operand metadata and compile
-  diagnostics, not through raw local-slot summaries, because hidden slots and compiler-inserted
-  `null` clears can widen local slot metadata to `Unknown`/`Null`.
+- All accepted sources lower into `FrontendIr`, then use the same linker, type metadata pass, bytecode backend, debugger metadata, and VM runtime.
+- Plugin frontends can reuse the shared expression parser through `parse_source_with_dialect(...)`, or build `FrontendIr` directly.
+- Plugins own compatibility-language import parsing and import stripping so core module loading does not encode language-specific import syntax.

@@ -1,7 +1,7 @@
 use vm::{
     BytecodeBuilder, CallOutcome, HostFunction, JitConfig, JitTraceTerminal, OpCode, Program,
-    SourceFlavor, Value, ValueType, Vm, VmStatus, VmYieldReason, builtin_call_index,
-    compile_source, compile_source_with_flavor, disassemble_program,
+    Value, ValueType, Vm, VmStatus, VmYieldReason, builtin_call_index, compile_source,
+    disassemble_program,
 };
 
 fn native_jit_supported() -> bool {
@@ -1785,91 +1785,6 @@ fn trace_jit_links_between_nested_loop_native_traces() {
     assert!(
         dump.contains("native trace handoffs:"),
         "expected native handoff diagnostics in JIT dump, dump:\n{dump}"
-    );
-}
-
-#[test]
-fn trace_jit_lowers_non_entry_unbox_in_nested_lua_hot_loop() {
-    if !native_jit_supported() {
-        return;
-    }
-
-    let mut expected = 0i64;
-    for outer in 0..12i64 {
-        let mut acc = outer + 1;
-        for i in 0..256i64 {
-            acc += i * 3 + 7 - outer * 2;
-            if acc > 100_000 {
-                acc -= 100_000;
-            }
-        }
-        expected += acc;
-    }
-
-    let source = r#"
-local __batch_total = 0
-local __batch_repeat = 0
-while __batch_repeat < 1 do
-    do
-        local total = 0
-        local outer = 0
-        while outer < 12 do
-            local i = 0
-            local acc = outer + 1
-            while i < 256 do
-                acc = acc + i * 3 + 7 - outer * 2
-                if acc > 100000 then
-                    acc = acc - 100000
-                end
-                i = i + 1
-            end
-            total = total + acc
-            outer = outer + 1
-        end
-        __batch_total = __batch_total + (total)
-    end
-    __batch_repeat = __batch_repeat + 1
-end
-__batch_total
-    "#;
-
-    let compiled = compile_source_with_flavor(source, SourceFlavor::Lua)
-        .expect("lua hot loop compile should succeed");
-    let mut vm = Vm::new(compiled.program);
-    vm.set_jit_config(JitConfig {
-        enabled: true,
-        hot_loop_threshold: 1,
-        max_trace_len: 512,
-    });
-
-    let status = vm.run().expect("lua hot loop vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(expected)]);
-    assert!(
-        vm.jit_native_exec_count() >= 20,
-        "expected nested lua hot loop to execute native SSA traces repeatedly, dump:\n{}",
-        vm.dump_jit_info()
-    );
-
-    let dump = vm.dump_jit_info();
-    let snapshot = vm.jit_snapshot();
-    assert!(
-        dump.contains("lowering=ssa"),
-        "expected nested lua hot loop to lower through SSA, dump:\n{dump}"
-    );
-    assert!(
-        snapshot.traces.iter().any(|trace| {
-            trace.terminal == JitTraceTerminal::LoopBack
-                && trace.executions >= 12
-                && trace.op_names().iter().any(|op| op == "jump_root")
-                && trace.ssa_text().contains("b2(")
-                && trace.ssa_text().contains("= unbox_int")
-        }),
-        "expected a native loopback trace with a non-entry unbox_int in the nested lua loop, dump:\n{dump}"
-    );
-    assert_eq!(
-        snapshot.metrics.helper_fallback_count, 0,
-        "nested lua hot loop should not need interpreter fallback, dump:\n{dump}"
     );
 }
 

@@ -1,5 +1,4 @@
 #![cfg(feature = "runtime")]
-use std::collections::HashSet;
 use std::path::Path;
 
 use vm::{
@@ -76,51 +75,6 @@ fn run_compiled_source(flavor: SourceFlavor, source: &str) -> Vec<Value> {
 }
 
 #[test]
-fn examples_run() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
-
-    let runnable_examples = [
-        ("example.rss", vec![Value::Int(6)]),
-        ("example.js", vec![Value::Int(6)]),
-        ("example.lua", vec![Value::Int(6)]),
-        ("example.scm", vec![Value::Int(6)]),
-        ("example_complex.rss", vec![Value::Int(12)]),
-        ("example_complex.js", vec![Value::Int(12)]),
-        ("example_complex.lua", vec![Value::Int(12)]),
-        ("example_complex.scm", vec![Value::Int(12)]),
-    ];
-
-    let mut covered = HashSet::new();
-    for (name, expected_stack) in runnable_examples {
-        let stack = run_compiled_file(&root.join(name));
-        assert_eq!(stack, expected_stack, "unexpected stack for {name}");
-        covered.insert(name);
-    }
-
-    let discovered = std::fs::read_dir(&root)
-        .expect("examples directory should be readable")
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| name.starts_with("example.") || name.starts_with("example_complex."))
-        .collect::<HashSet<_>>();
-    let expected = covered
-        .iter()
-        .map(|name| (*name).to_string())
-        .collect::<HashSet<_>>();
-    assert_eq!(
-        discovered, expected,
-        "example fixture coverage drifted; update examples_run matrix"
-    );
-
-    // AES fixture should also be consumable as a module from another RSS program.
-    let stack = run_compiled_file(&root.join("aes_128_cbc_usage.rss"));
-    assert_eq!(
-        stack,
-        vec![Value::string("7649abac8119b246cee98e9b12e9197d")]
-    );
-}
-
-#[test]
 fn ifft_math_example_runs() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
     let stack = run_compiled_file(&root.join("ifft_math.rss"));
@@ -154,20 +108,6 @@ missing?.b?.c.unwrap_or(0);
 }
 
 #[test]
-fn javascript_nullable_chain_maps_work() {
-    let js_source = r#"
-const a = { b: { c: 7 } };
-a?.b?.c;
-const m = { b: {} };
-m?.b?.c;
-"#;
-    assert_eq!(
-        run_compiled_source(SourceFlavor::JavaScript, js_source),
-        vec![Value::Int(7), Value::Null]
-    );
-}
-
-#[test]
 fn rustscript_optional_chain_handles_declared_array_and_string_indexes() {
     let rss_source = r#"
 struct Data {
@@ -189,42 +129,5 @@ data?.text?.[5].unwrap_or("");
             Value::string("b"),
             Value::string(""),
         ]
-    );
-}
-
-#[test]
-fn javascript_nullable_chain_handles_array_and_string_indexes() {
-    let js_source = r#"
-const arr = [10, 20];
-arr?.[1];
-arr?.[2];
-arr?.["x"];
-const text = "abc";
-text?.[1];
-text?.[5];
-"#;
-    assert_eq!(
-        run_compiled_source(SourceFlavor::JavaScript, js_source),
-        vec![
-            Value::Int(20),
-            Value::Null,
-            Value::Null,
-            Value::string("b"),
-            Value::Null,
-        ]
-    );
-}
-
-#[test]
-fn javascript_nullable_map_lookup_does_not_mutate_source_map() {
-    let source = r#"
-const m = { present: 1 };
-m?.missing;
-m.length;
-m.present;
-"#;
-    assert_eq!(
-        run_compiled_source(SourceFlavor::JavaScript, source),
-        vec![Value::Null, Value::Int(1), Value::Int(1)]
     );
 }

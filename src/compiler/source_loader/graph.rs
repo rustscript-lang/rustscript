@@ -21,7 +21,7 @@ pub(super) fn collect_module_units(
     options: &CompileSourceFileOptions,
     state: &mut ModuleCollectState,
 ) -> Result<(), SourcePathError> {
-    let imports = parse_module_imports(source, flavor, path)?;
+    let imports = parse_module_imports(source, flavor, path, options)?;
     for import in imports {
         let spec = import.spec;
         if is_builtin_host_namespace_spec(&spec) {
@@ -68,11 +68,12 @@ pub(super) fn collect_module_units(
         )?;
         state.visiting.pop();
 
-        let module_source = strip_import_directives(&module_source_raw, SourceFlavor::RustScript);
+        let module_source =
+            strip_import_directives(&module_source_raw, SourceFlavor::RustScript, options)?;
         let mut module_source_map = SourceMap::new();
         let module_source_id =
             module_source_map.add_source(resolved.display().to_string(), module_source.clone());
-        let parsed = frontends::parse_source(&module_source, SourceFlavor::RustScript)
+        let parsed = frontends::parse_source(&module_source, SourceFlavor::RustScript, options)
             .map_err(|err| {
                 SourceError::Parse(
                     err.with_line_span_from_source(&module_source_map, module_source_id),

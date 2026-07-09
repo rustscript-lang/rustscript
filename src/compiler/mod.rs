@@ -23,11 +23,15 @@ mod typing;
 use self::source_map::{SourceMap, Span};
 
 pub use self::codegen::Compiler;
-pub use self::format::{FormatError, format_source, format_source_with_flavor};
+pub use self::format::{
+    FormatError, format_source, format_source_with_flavor, format_source_with_flavor_and_options,
+};
+pub use self::frontends::parse_source_with_dialect;
 pub use self::ir::{
     AssignmentKind, ClosureExpr, Expr, FrontendIr, FunctionDecl, FunctionImpl, FunctionParam,
-    LocalSlot, MatchPattern, MatchTypePattern, Stmt, StructDecl, TypeSchema,
+    LocalIrBuilder, LocalSlot, MatchPattern, MatchTypePattern, Stmt, StructDecl, TypeSchema,
 };
+pub use self::parser::ParserDialect;
 pub use self::pipeline::{
     InferredLocalTypeHint, UnknownInferredLocal, collect_inferred_local_type_hints,
     collect_inferred_local_type_hints_at_path_with_options,
@@ -39,6 +43,7 @@ pub use self::pipeline::{
     lint_unknown_inferred_local_types_at_path_with_options,
     lint_unknown_inferred_local_types_with_options, lint_unknown_type_annotations,
 };
+pub use self::source_loader::{FrontendImportSyntax, ImportClause, ModuleImport, NamedImport};
 
 #[derive(Debug)]
 pub enum CompileError {
@@ -256,6 +261,7 @@ pub enum SourcePathError {
     Io(std::io::Error),
     MissingExtension,
     UnsupportedExtension(String),
+    MissingFrontendPlugin(SourceFlavor),
     ImportCycle(PathBuf),
     NonRustScriptModule(PathBuf),
     ImportWithoutParent(PathBuf),
@@ -274,8 +280,11 @@ impl fmt::Display for SourcePathError {
             SourcePathError::MissingExtension => write!(f, "source file must have an extension"),
             SourcePathError::UnsupportedExtension(ext) => write!(
                 f,
-                "unsupported source extension '.{ext}', expected .rss, .js, .lua, or .scm"
+                "unsupported source extension '.{ext}', expected .rss, .js, or .lua"
             ),
+            SourcePathError::MissingFrontendPlugin(flavor) => {
+                write!(f, "no frontend plugin registered for {flavor:?} source")
+            }
             SourcePathError::ImportCycle(path) => {
                 write!(f, "import cycle detected at '{}'", path.display())
             }
@@ -322,7 +331,51 @@ pub enum SourceFlavor {
     RustScript,
     JavaScript,
     Lua,
-    Scheme,
+}
+
+pub trait SourcePlugin: Sync {
+    fn flavor(&self) -> SourceFlavor;
+
+    fn extensions(&self) -> &'static [&'static str];
+
+    fn import_syntax(&self) -> FrontendImportSyntax;
+
+    fn parse_source(&self, source: &str) -> Result<FrontendIr, ParseError>;
+
+    fn parser_dialect(&self) -> Option<&'static dyn ParserDialect> {
+        None
+    }
+
+    fn parse_module_imports(
+        &self,
+        _source: &str,
+        _path: &Path,
+    ) -> Result<Vec<ModuleImport>, SourcePathError> {
+        Ok(Vec::new())
+    }
+
+    fn strip_import_directives(&self, source: &str) -> String {
+        source.to_string()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SharedParserOptions {
+    pub source_id: u32,
+    pub allow_implicit_externs: bool,
+    pub allow_implicit_semicolons: bool,
+    pub enforce_mutable_bindings: bool,
+}
+
+impl Default for SharedParserOptions {
+    fn default() -> Self {
+        Self {
+            source_id: 0,
+            allow_implicit_externs: false,
+            allow_implicit_semicolons: false,
+            enforce_mutable_bindings: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,9 +388,7 @@ impl TypingMode {
     pub(crate) fn for_flavor(flavor: SourceFlavor) -> Self {
         match flavor {
             SourceFlavor::RustScript => Self::StrictRustScript,
-            SourceFlavor::JavaScript | SourceFlavor::Lua | SourceFlavor::Scheme => {
-                Self::DynamicHints
-            }
+            SourceFlavor::JavaScript | SourceFlavor::Lua => Self::DynamicHints,
         }
     }
 
@@ -352,16 +403,30 @@ impl SourceFlavor {
             "rss" => Some(Self::RustScript),
             "js" => Some(Self::JavaScript),
             "lua" => Some(Self::Lua),
-            "scm" => Some(Self::Scheme),
             _ => None,
         }
     }
 
-    pub(crate) fn from_path(path: &Path) -> Result<Self, SourcePathError> {
+    pub fn from_path(path: &Path) -> Result<Self, SourcePathError> {
         let ext = path
             .extension()
             .and_then(|value| value.to_str())
             .ok_or(SourcePathError::MissingExtension)?;
+        SourceFlavor::from_extension(ext)
+            .ok_or_else(|| SourcePathError::UnsupportedExtension(ext.to_string()))
+    }
+
+    pub(crate) fn from_path_with_options(
+        path: &Path,
+        options: &CompileSourceFileOptions,
+    ) -> Result<Self, SourcePathError> {
+        let ext = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .ok_or(SourcePathError::MissingExtension)?;
+        if let Some(plugin) = options.source_plugin_for_extension(ext) {
+            return Ok(plugin.flavor());
+        }
         SourceFlavor::from_extension(ext)
             .ok_or_else(|| SourcePathError::UnsupportedExtension(ext.to_string()))
     }
@@ -393,10 +458,21 @@ pub struct CompiledReplProgram {
     pub bindings: Vec<ReplLocalBinding>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct CompileSourceFileOptions {
     module_path_overrides: HashMap<String, PathBuf>,
     module_source_overrides: HashMap<String, String>,
+    source_plugins: Vec<&'static dyn SourcePlugin>,
+}
+
+impl fmt::Debug for CompileSourceFileOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompileSourceFileOptions")
+            .field("module_path_overrides", &self.module_path_overrides)
+            .field("module_source_overrides", &self.module_source_overrides)
+            .field("source_plugin_count", &self.source_plugins.len())
+            .finish()
+    }
 }
 
 impl CompileSourceFileOptions {
@@ -441,6 +517,15 @@ impl CompileSourceFileOptions {
             .insert(key, module_source.into());
     }
 
+    pub fn with_source_plugin(mut self, plugin: &'static dyn SourcePlugin) -> Self {
+        self.add_source_plugin(plugin);
+        self
+    }
+
+    pub fn add_source_plugin(&mut self, plugin: &'static dyn SourcePlugin) {
+        self.source_plugins.push(plugin);
+    }
+
     pub fn module_override_path(&self, import_spec: &str) -> Option<&Path> {
         let key = normalize_import_spec(import_spec.to_string());
         self.module_path_overrides.get(&key).map(PathBuf::as_path)
@@ -453,6 +538,32 @@ impl CompileSourceFileOptions {
 
     pub(crate) fn has_module_overrides(&self) -> bool {
         !self.module_path_overrides.is_empty() || !self.module_source_overrides.is_empty()
+    }
+
+    pub(crate) fn has_source_plugins(&self) -> bool {
+        !self.source_plugins.is_empty()
+    }
+
+    pub(crate) fn source_plugin_for_flavor(
+        &self,
+        flavor: SourceFlavor,
+    ) -> Option<&'static dyn SourcePlugin> {
+        self.source_plugins
+            .iter()
+            .copied()
+            .find(|plugin| plugin.flavor() == flavor)
+    }
+
+    pub(crate) fn source_plugin_for_extension(
+        &self,
+        ext: &str,
+    ) -> Option<&'static dyn SourcePlugin> {
+        self.source_plugins.iter().copied().find(|plugin| {
+            plugin
+                .extensions()
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(ext))
+        })
     }
 }
 

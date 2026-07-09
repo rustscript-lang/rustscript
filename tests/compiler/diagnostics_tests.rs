@@ -32,35 +32,6 @@ fn render_source_error_highlights_exact_range() {
 }
 
 #[test]
-fn compile_source_file_parse_error_uses_original_line() {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be monotonic")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("pd_vm_diag_{unique}.js"));
-    let source = "const broken = ;\n";
-    fs::write(&path, source).expect("temp source should be writable");
-
-    let result = compile_source_file(path.as_path());
-    let _ = fs::remove_file(&path);
-
-    match result {
-        Err(SourcePathError::Source(SourceError::Parse(parse))) => {
-            assert_eq!(parse.line, 1);
-            assert!(parse.span.is_some());
-
-            let mut source_map = SourceMap::new();
-            let source_id = source_map.add_source(path.display().to_string(), source.to_string());
-            let parse = parse.with_line_span_from_source(&source_map, source_id);
-            let rendered = render_source_error(&source_map, &parse, false);
-            assert!(rendered.contains(":1:"));
-            assert!(rendered.contains("const broken = ;"));
-        }
-        _ => panic!("expected parse error"),
-    }
-}
-
-#[test]
 fn render_compile_error_highlights_if_else_mismatch_line() {
     let source =
         "let cond = 1 == 1;\nlet value = if cond => {\n    1\n} else => {\n    \"x\"\n};\n";

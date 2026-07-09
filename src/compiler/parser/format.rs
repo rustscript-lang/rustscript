@@ -1383,27 +1383,14 @@ mod tests {
         let input = "fn mix(seed) {\n    v\n        +\n        seed\n}\n";
         let formatted = format_source(
             input,
-            frontends::parser_dialect_for_flavor(SourceFlavor::RustScript)
-                .expect("rustscript formatter dialect should exist"),
+            frontends::parser_dialect_for_flavor(
+                SourceFlavor::RustScript,
+                &crate::compiler::CompileSourceFileOptions::default(),
+            )
+            .expect("rustscript formatter dialect should exist"),
         )
         .expect("formatting should succeed");
 
         assert_eq!(formatted, "fn mix(seed) {\n    v + seed\n}\n");
-    }
-
-    #[test]
-    fn formats_javascript_numeric_update_operators() {
-        let input = "let total=0;\ntotal+=1;\nlet before=total++;\nlet after=++total;\n";
-        let formatted = format_source(
-            input,
-            frontends::parser_dialect_for_flavor(SourceFlavor::JavaScript)
-                .expect("javascript formatter dialect should exist"),
-        )
-        .expect("formatting should succeed");
-
-        assert_eq!(
-            formatted,
-            "let total = 0;\ntotal += 1;\nlet before = total++;\nlet after = ++total;\n"
-        );
     }
 }

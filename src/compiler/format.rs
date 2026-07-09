@@ -1,6 +1,8 @@
 use std::fmt;
 
-use super::{ParseError, SourceFlavor, frontends, parser, source_map::SourceMap};
+use super::{
+    CompileSourceFileOptions, ParseError, SourceFlavor, frontends, parser, source_map::SourceMap,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormatError {
@@ -29,7 +31,15 @@ pub fn format_source_with_flavor(
     source: &str,
     flavor: SourceFlavor,
 ) -> Result<String, FormatError> {
-    let Some(dialect) = frontends::parser_dialect_for_flavor(flavor) else {
+    format_source_with_flavor_and_options(source, flavor, &CompileSourceFileOptions::default())
+}
+
+pub fn format_source_with_flavor_and_options(
+    source: &str,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+) -> Result<String, FormatError> {
+    let Some(dialect) = frontends::parser_dialect_for_flavor(flavor, options) else {
         return Err(FormatError::UnsupportedFlavor(flavor));
     };
 

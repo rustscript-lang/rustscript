@@ -365,7 +365,7 @@ pub struct FrontendIr {
     pub function_sources: HashMap<u16, String>,
 }
 
-pub(crate) struct LocalIrBuilder {
+pub struct LocalIrBuilder {
     locals: HashMap<String, LocalSlot>,
     next_local: LocalSlot,
     functions: Vec<FunctionDecl>,
@@ -373,7 +373,7 @@ pub(crate) struct LocalIrBuilder {
 }
 
 impl LocalIrBuilder {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             locals: HashMap::new(),
             next_local: 0,
@@ -382,12 +382,7 @@ impl LocalIrBuilder {
         }
     }
 
-    pub(crate) fn lower_local(
-        &mut self,
-        name: &str,
-        expr: Expr,
-        line: u32,
-    ) -> Result<Stmt, ParseError> {
+    pub fn lower_local(&mut self, name: &str, expr: Expr, line: u32) -> Result<Stmt, ParseError> {
         let index = self.alloc_local_named(name)?;
         Ok(Stmt::Let {
             index,
@@ -397,12 +392,7 @@ impl LocalIrBuilder {
         })
     }
 
-    pub(crate) fn lower_assign(
-        &self,
-        name: &str,
-        expr: Expr,
-        line: u32,
-    ) -> Result<Stmt, ParseError> {
+    pub fn lower_assign(&self, name: &str, expr: Expr, line: u32) -> Result<Stmt, ParseError> {
         let Some(index) = self.locals.get(name).copied() else {
             return Err(ParseError {
                 span: None,
@@ -419,23 +409,19 @@ impl LocalIrBuilder {
         })
     }
 
-    pub(crate) fn resolve_local_expr(&self, name: &str) -> Option<Expr> {
+    pub fn resolve_local_expr(&self, name: &str) -> Option<Expr> {
         self.locals.get(name).copied().map(Expr::Var)
     }
 
-    pub(crate) fn has_declared_function(&self, name: &str) -> bool {
+    pub fn has_declared_function(&self, name: &str) -> bool {
         self.function_meta.contains_key(name)
     }
 
-    pub(crate) fn function_index(&self, name: &str) -> Option<u16> {
+    pub fn function_index(&self, name: &str) -> Option<u16> {
         self.function_meta.get(name).map(|(index, _)| *index)
     }
 
-    pub(crate) fn declare_function(
-        &mut self,
-        name: &str,
-        arity: Option<u8>,
-    ) -> Result<(), ParseError> {
+    pub fn declare_function(&mut self, name: &str, arity: Option<u8>) -> Result<(), ParseError> {
         if let Some((index, existing_arity)) = self.function_meta.get(name).copied() {
             match (existing_arity, arity) {
                 (Some(expected), Some(actual))
@@ -487,7 +473,7 @@ impl LocalIrBuilder {
         Ok(())
     }
 
-    pub(crate) fn resolve_call_expr(&mut self, name: &str, args: Vec<Expr>) -> Option<Expr> {
+    pub fn resolve_call_expr(&mut self, name: &str, args: Vec<Expr>) -> Option<Expr> {
         if let Some(local_index) = self.locals.get(name).copied() {
             return Some(Expr::LocalCall(local_index, Vec::new(), args));
         }
@@ -512,7 +498,7 @@ impl LocalIrBuilder {
         Some(Expr::Call(func_index, Vec::new(), args))
     }
 
-    pub(crate) fn finish(self, stmts: Vec<Stmt>) -> FrontendIr {
+    pub fn finish(self, stmts: Vec<Stmt>) -> FrontendIr {
         let mut local_bindings = self
             .locals
             .into_iter()
@@ -531,7 +517,7 @@ impl LocalIrBuilder {
         }
     }
 
-    pub(crate) fn alloc_local_named(&mut self, name: &str) -> Result<LocalSlot, ParseError> {
+    pub fn alloc_local_named(&mut self, name: &str) -> Result<LocalSlot, ParseError> {
         if let Some(index) = self.locals.get(name).copied() {
             return Ok(index);
         }
