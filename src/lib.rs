@@ -13,7 +13,7 @@ pub mod jit {
         JitTraceTerminal, TraceJitEngine,
     };
 }
-#[cfg(feature = "runtime")]
+#[cfg(feature = "cli")]
 pub mod cli;
 #[cfg(feature = "runtime")]
 pub mod vm;
