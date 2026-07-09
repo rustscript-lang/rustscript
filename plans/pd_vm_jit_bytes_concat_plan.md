@@ -15,17 +15,17 @@
 
 Primary touch points:
 
-- [`trace.rs`](../pd-vm/src/vm/jit/trace.rs)
-- [`runtime.rs`](../pd-vm/src/vm/jit/runtime.rs)
-- [`codegen.rs`](../pd-vm/src/vm/jit/native/codegen.rs)
-- [`cranelift.rs`](../pd-vm/src/vm/jit/native/cranelift.rs)
-- [`bridge.rs`](../pd-vm/src/vm/jit/native/bridge.rs)
-- [`core.rs`](../pd-vm/src/builtins/runtime/core.rs)
-- [`bytes.rs`](../pd-vm/src/builtins/runtime/bytes.rs)
-- [`layout.rs`](../pd-vm/src/vm/native/layout.rs)
-- [`bytecode.rs`](../pd-vm/src/bytecode.rs)
-- [`mod.rs`](../pd-vm/src/vm/mod.rs)
-- [`jit_tests.rs`](../pd-vm/tests/jit/jit_tests.rs)
+- [`trace.rs`](../src/vm/jit/trace.rs)
+- [`runtime.rs`](../src/vm/jit/runtime.rs)
+- [`codegen.rs`](../src/vm/jit/native/codegen.rs)
+- [`cranelift.rs`](../src/vm/jit/native/cranelift.rs)
+- [`bridge.rs`](../src/vm/jit/native/bridge.rs)
+- [`core.rs`](../src/builtins/runtime/core.rs)
+- [`bytes.rs`](../src/builtins/runtime/bytes.rs)
+- [`layout.rs`](../src/vm/native/layout.rs)
+- [`bytecode.rs`](../src/bytecode.rs)
+- [`mod.rs`](../src/vm/mod.rs)
+- [`jit_tests.rs`](../tests/jit/jit_tests.rs)
 
 ## Builtin Surface In Scope
 
@@ -56,9 +56,9 @@ Bytes helpers in scope:
 ## Current State
 
 - The VM already has `string_concat_op()` and `bytes_concat_op()` in
-  [`mod.rs`](../pd-vm/src/vm/mod.rs), so interpreter semantics exist for both concat cases.
+  [`mod.rs`](../src/vm/mod.rs), so interpreter semantics exist for both concat cases.
 - The trace recorder only gives `string + string` a dedicated trace step today. In
-  [`trace.rs`](../pd-vm/src/vm/jit/trace.rs), `OpCode::Add` lowers to `TraceStep::SConcat` for
+  [`trace.rs`](../src/vm/jit/trace.rs), `OpCode::Add` lowers to `TraceStep::SConcat` for
   `ValueType::String`, while `bytes + bytes` still falls back to generic `TraceStep::Add`.
 - Native JIT lowering still uses a dedicated `sconcat` helper path for string concat, which means
   it is not yet truly inline native.
@@ -66,7 +66,7 @@ Bytes helpers in scope:
   `bytes::*` codec/conversion builtins, is emitted as `TraceStep::BuiltinCall` and therefore
   always routes through generic helper dispatch today.
 - Native codegen explicitly declines to inline `TraceStep::BuiltinCall` in
-  [`codegen.rs`](../pd-vm/src/vm/jit/native/codegen.rs), so these operations never get dedicated
+  [`codegen.rs`](../src/vm/jit/native/codegen.rs), so these operations never get dedicated
   native lowering.
 
 ## What "Native" Means Here
@@ -167,7 +167,7 @@ Cross-plan note:
 
 ## Implementation Plan
 
-1. Refactor typed string/bytes representation in [`trace.rs`](../pd-vm/src/vm/jit/trace.rs):
+1. Refactor typed string/bytes representation in [`trace.rs`](../src/vm/jit/trace.rs):
    - add `TraceTextBytesKind::{String, Bytes}`
    - replace `TraceStep::SConcat` with `TraceStep::Concat(TraceConcatKind)`
    - add `TraceStep::Len(TraceTextBytesKind)`
@@ -189,7 +189,7 @@ Cross-plan note:
      `TraceStep::BuiltinCall`
    - leave unsupported or untyped cases on the existing builtin-call path
 
-3. Add explicit VM-side string/bytes op methods in [`mod.rs`](../pd-vm/src/vm/mod.rs):
+3. Add explicit VM-side string/bytes op methods in [`mod.rs`](../src/vm/mod.rs):
    - `string_len_op()`
    - `bytes_len_op()`
    - `string_slice_op()`
@@ -209,18 +209,18 @@ Cross-plan note:
    - `bytes_from_array_u8_op()`
    - `bytes_to_array_u8_op()`
    - keep them aligned with the current builtin semantics in
-     [`core.rs`](../pd-vm/src/builtins/runtime/core.rs) and
-     [`bytes.rs`](../pd-vm/src/builtins/runtime/bytes.rs)
+     [`core.rs`](../src/builtins/runtime/core.rs) and
+     [`bytes.rs`](../src/builtins/runtime/bytes.rs)
 
-4. Add the native data-path support needed by [`codegen.rs`](../pd-vm/src/vm/jit/native/codegen.rs):
-   - use the existing probed value layout from [`layout.rs`](../pd-vm/src/vm/native/layout.rs)
+4. Add the native data-path support needed by [`codegen.rs`](../src/vm/jit/native/codegen.rs):
+   - use the existing probed value layout from [`layout.rs`](../src/vm/native/layout.rs)
    - make the plan explicit about the heap-backed representations involved:
      - `Value::String(Arc<String>)`
      - `Value::Bytes(Arc<Vec<u8>>)`
    - define the minimum native-accessible layout information or native-runtime intrinsics needed to
      build, validate, and clone those result values correctly
 
-5. Replace helper-based concat lowering in [`codegen.rs`](../pd-vm/src/vm/jit/native/codegen.rs)
+5. Replace helper-based concat lowering in [`codegen.rs`](../src/vm/jit/native/codegen.rs)
    with real inline native lowering for `TraceStep::Concat(kind)`:
    - verify stack length and operand tags
    - load lhs and rhs payload pointers and lengths
@@ -259,17 +259,17 @@ Cross-plan note:
      - `bytes::to_array_u8`
    - these must not go through generic builtin helper dispatch
 
-8. Update [`cranelift.rs`](../pd-vm/src/vm/jit/native/cranelift.rs):
+8. Update [`cranelift.rs`](../src/vm/jit/native/cranelift.rs):
    - remove concat-helper address plumbing from trace compilation
    - plumb any new dedicated string/bytes intrinsic entry points required by native codegen
    - keep generic builtin helper plumbing only for operations not yet native-lowered
 
-9. Clean up obsolete concat-helper code in [`bridge.rs`](../pd-vm/src/vm/jit/native/bridge.rs):
+9. Clean up obsolete concat-helper code in [`bridge.rs`](../src/vm/jit/native/bridge.rs):
    - remove the dedicated `sconcat` bridge entry once string concat is fully inline
    - do not add a new dedicated `bconcat` bridge op
    - leave the generic helper bridge for non-string/bytes operations unchanged
 
-10. Keep the trace interpreter aligned in [`runtime.rs`](../pd-vm/src/vm/jit/runtime.rs):
+10. Keep the trace interpreter aligned in [`runtime.rs`](../src/vm/jit/runtime.rs):
    - dispatch the new typed string/bytes steps directly to the new VM op methods
    - avoid leaving string/bytes behavior split between typed steps and builtin-call emulation
 
@@ -282,7 +282,7 @@ Cross-plan note:
 
 ## Tests And Acceptance Criteria
 
-Add or update tests in [`jit_tests.rs`](../pd-vm/tests/jit/jit_tests.rs).
+Add or update tests in [`jit_tests.rs`](../tests/jit/jit_tests.rs).
 
 Required coverage:
 

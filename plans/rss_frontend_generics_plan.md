@@ -94,13 +94,13 @@ Those are not part of the base implementation, but they should be documented as 
 
 The current compiler already has most of the machinery needed for compile-time-only generics, but the information is spread across parser, IR, typing, and pipeline layers.
 
-- The parser supports declared local schemas and named struct schemas in [pd-vm/src/compiler/parser/statements.rs](../pd-vm/src/compiler/parser/statements.rs), but every non-primitive type name is currently treated as either a struct schema reference or an error.
-- Struct schemas are currently stored as `HashMap<String, TypeSchema>` in [pd-vm/src/compiler/ir.rs](../pd-vm/src/compiler/ir.rs), which is sufficient for concrete structs but not for `struct Box<T> { ... }` plus `Box<string>`.
-- Function declarations only carry `name`, `arity`, `args`, `exported`, and coarse `return_type` in [pd-vm/src/compiler/ir.rs](../pd-vm/src/compiler/ir.rs), so parameter schema annotations such as `v: T` are not yet represented.
-- Call expressions do not carry explicit type arguments in [pd-vm/src/compiler/ir.rs](../pd-vm/src/compiler/ir.rs).
-- The analyzer already propagates call-site information into RSS function bodies in [pd-vm/src/compiler/typing/context.rs](../pd-vm/src/compiler/typing/context.rs), but its observation maps are keyed only by function index, so different generic instantiations would currently collapse together.
+- The parser supports declared local schemas and named struct schemas in [src/compiler/parser/statements.rs](../src/compiler/parser/statements.rs), but every non-primitive type name is currently treated as either a struct schema reference or an error.
+- Struct schemas are currently stored as `HashMap<String, TypeSchema>` in [src/compiler/ir.rs](../src/compiler/ir.rs), which is sufficient for concrete structs but not for `struct Box<T> { ... }` plus `Box<string>`.
+- Function declarations only carry `name`, `arity`, `args`, `exported`, and coarse `return_type` in [src/compiler/ir.rs](../src/compiler/ir.rs), so parameter schema annotations such as `v: T` are not yet represented.
+- Call expressions do not carry explicit type arguments in [src/compiler/ir.rs](../src/compiler/ir.rs).
+- The analyzer already propagates call-site information into RSS function bodies in [src/compiler/typing/context.rs](../src/compiler/typing/context.rs), but its observation maps are keyed only by function index, so different generic instantiations would currently collapse together.
 - Local inference is still primarily driven by coarse bound types, so `let b = v` inside a generic instantiation needs explicit schema propagation to preserve `b` as `T` instead of only a coarse runtime category.
-- Host functions already expose coarse return types and parameter signatures through [pd-vm/src/compiler/parser/symbols.rs](../pd-vm/src/compiler/parser/symbols.rs), [pd-vm/src/compiler/typing/helpers.rs](../pd-vm/src/compiler/typing/helpers.rs), [pd-vm/src/builtins/metadata.rs](../pd-vm/src/builtins/metadata.rs), and [pd-vm/build.rs](../pd-vm/build.rs), but they do not expose generic metadata or return-schema templates.
+- Host functions already expose coarse return types and parameter signatures through [src/compiler/parser/symbols.rs](../src/compiler/parser/symbols.rs), [src/compiler/typing/helpers.rs](../src/compiler/typing/helpers.rs), [src/builtins/metadata.rs](../src/builtins/metadata.rs), and [build.rs](../build.rs), but they do not expose generic metadata or return-schema templates.
 
 ## High-Level Design
 
@@ -216,17 +216,17 @@ If `v` is schema `T`, then `b` must also be tracked as `T`. Otherwise return inf
 
 Files:
 
-- [pd-vm/src/compiler/ir.rs](../pd-vm/src/compiler/ir.rs)
-- [pd-vm/src/compiler/parser/mod.rs](../pd-vm/src/compiler/parser/mod.rs)
-- [pd-vm/src/compiler/parser/cursor.rs](../pd-vm/src/compiler/parser/cursor.rs)
-- [pd-vm/src/compiler/parser/statements.rs](../pd-vm/src/compiler/parser/statements.rs)
-- [pd-vm/src/compiler/parser/expressions.rs](../pd-vm/src/compiler/parser/expressions.rs)
-- [pd-vm/src/compiler/linker.rs](../pd-vm/src/compiler/linker.rs)
+- [src/compiler/ir.rs](../src/compiler/ir.rs)
+- [src/compiler/parser/mod.rs](../src/compiler/parser/mod.rs)
+- [src/compiler/parser/cursor.rs](../src/compiler/parser/cursor.rs)
+- [src/compiler/parser/statements.rs](../src/compiler/parser/statements.rs)
+- [src/compiler/parser/expressions.rs](../src/compiler/parser/expressions.rs)
+- [src/compiler/linker.rs](../src/compiler/linker.rs)
 
 Changes:
 
 1. Extend `FunctionDecl` with `type_params: Vec<String>` and parameter declaration metadata that can carry optional schemas such as `v: T`.
-2. Add explicit generic struct declaration metadata in [pd-vm/src/compiler/ir.rs](../pd-vm/src/compiler/ir.rs).
+2. Add explicit generic struct declaration metadata in [src/compiler/ir.rs](../src/compiler/ir.rs).
 3. Extend `Expr::Call` and `Expr::LocalCall` to carry `type_args: Vec<TypeSchema>`.
 4. Parse optional generic params after the function name:
 
@@ -265,7 +265,7 @@ let pair: Pair<string, int> = { left: "x", right: 1 };
 
 9. Track active type-param names while parsing generic function bodies, generic function parameter schemas, and generic struct bodies so `T` is accepted as a schema reference inside those scopes.
 10. Update schema-reference validation in the parser so active generic params are not rejected as unknown struct schemas.
-11. Update linker merge logic in [pd-vm/src/compiler/linker.rs](../pd-vm/src/compiler/linker.rs) so it preserves and validates generic structs and generic functions when imported modules are merged.
+11. Update linker merge logic in [src/compiler/linker.rs](../src/compiler/linker.rs) so it preserves and validates generic structs and generic functions when imported modules are merged.
 
 Notes:
 
@@ -276,9 +276,9 @@ Notes:
 
 Files:
 
-- [pd-vm/src/compiler/typing/context.rs](../pd-vm/src/compiler/typing/context.rs)
-- [pd-vm/src/compiler/typing/helpers.rs](../pd-vm/src/compiler/typing/helpers.rs)
-- [pd-vm/src/compiler/typing/state.rs](../pd-vm/src/compiler/typing/state.rs)
+- [src/compiler/typing/context.rs](../src/compiler/typing/context.rs)
+- [src/compiler/typing/helpers.rs](../src/compiler/typing/helpers.rs)
+- [src/compiler/typing/state.rs](../src/compiler/typing/state.rs)
 
 Changes:
 
@@ -290,7 +290,7 @@ Changes:
 4. Update `bound_type_from_schema(...)` so:
    - bound generic params resolve to the bound schema's coarse type
    - unbound generic params behave as opaque / unknown at the coarse `BoundType` level
-5. Update schema mismatch logic in [pd-vm/src/compiler/typing/helpers.rs](../pd-vm/src/compiler/typing/helpers.rs) so:
+5. Update schema mismatch logic in [src/compiler/typing/helpers.rs](../src/compiler/typing/helpers.rs) so:
    - `T` matches the instantiated concrete schema for that call
    - instantiated generic structs are compared as their resolved field schemas
    - unresolved generic params are treated as opaque placeholders rather than structs
@@ -310,10 +310,10 @@ Why this matters:
 
 Files:
 
-- [pd-vm/src/compiler/typing/context.rs](../pd-vm/src/compiler/typing/context.rs)
-- [pd-vm/src/compiler/typing/collect.rs](../pd-vm/src/compiler/typing/collect.rs)
-- [pd-vm/src/compiler/typing/helpers.rs](../pd-vm/src/compiler/typing/helpers.rs)
-- [pd-vm/src/compiler/typing.rs](../pd-vm/src/compiler/typing.rs)
+- [src/compiler/typing/context.rs](../src/compiler/typing/context.rs)
+- [src/compiler/typing/collect.rs](../src/compiler/typing/collect.rs)
+- [src/compiler/typing/helpers.rs](../src/compiler/typing/helpers.rs)
+- [src/compiler/typing.rs](../src/compiler/typing.rs)
 
 Changes:
 
@@ -350,9 +350,9 @@ Recommendation:
 
 Files:
 
-- [pd-vm/src/compiler/typing/context.rs](../pd-vm/src/compiler/typing/context.rs)
-- [pd-vm/src/compiler/typing/helpers.rs](../pd-vm/src/compiler/typing/helpers.rs)
-- [pd-vm/src/compiler/pipeline.rs](../pd-vm/src/compiler/pipeline.rs)
+- [src/compiler/typing/context.rs](../src/compiler/typing/context.rs)
+- [src/compiler/typing/helpers.rs](../src/compiler/typing/helpers.rs)
+- [src/compiler/pipeline.rs](../src/compiler/pipeline.rs)
 
 Changes:
 
@@ -381,11 +381,11 @@ should report the instantiated `string` expectation, not only a generic `T`.
 
 Files:
 
-- [pd-vm/src/builtins/metadata.rs](../pd-vm/src/builtins/metadata.rs)
-- [pd-vm/build.rs](../pd-vm/build.rs)
-- [pd-vm/pd-host-function/src/lib.rs](../pd-vm/pd-host-function/src/lib.rs)
-- [pd-vm/src/compiler/typing/helpers.rs](../pd-vm/src/compiler/typing/helpers.rs)
-- [pd-vm/src/compiler/typing/context.rs](../pd-vm/src/compiler/typing/context.rs)
+- [src/builtins/metadata.rs](../src/builtins/metadata.rs)
+- [build.rs](../build.rs)
+- [pd-host-function/src/lib.rs](../pd-host-function/src/lib.rs)
+- [src/compiler/typing/helpers.rs](../src/compiler/typing/helpers.rs)
+- [src/compiler/typing/context.rs](../src/compiler/typing/context.rs)
 
 Baseline target:
 
@@ -418,9 +418,9 @@ Important scope rule:
 
 Files:
 
-- [pd-vm/src/compiler/pipeline.rs](../pd-vm/src/compiler/pipeline.rs)
-- [pd-vm/pd-vm-wasm/src/lib.rs](../pd-vm/pd-vm-wasm/src/lib.rs)
-- [pd-vm/pd-vm-wasm/src/completions.rs](../pd-vm/pd-vm-wasm/src/completions.rs)
+- [src/compiler/pipeline.rs](../src/compiler/pipeline.rs)
+- [pd-vm-wasm/src/lib.rs](../pd-vm-wasm/src/lib.rs)
+- [pd-vm-wasm/src/completions.rs](../pd-vm-wasm/src/completions.rs)
 - [pd-controller/webui/src/app/monaco/completionCatalog.ts](../pd-controller/webui/src/app/monaco/completionCatalog.ts)
 
 Changes:
@@ -537,9 +537,9 @@ If local binding inference only copies coarse `BoundType`, then `let b = v` insi
 
 Add tests in:
 
-- [pd-vm/tests/compiler/type_inference_tests.rs](../pd-vm/tests/compiler/type_inference_tests.rs)
-- [pd-vm/tests/compiler/compiler_rustscript_tests.rs](../pd-vm/tests/compiler/compiler_rustscript_tests.rs)
-- [pd-vm/tests/compiler/diagnostics_tests.rs](../pd-vm/tests/compiler/diagnostics_tests.rs)
+- [tests/compiler/type_inference_tests.rs](../tests/compiler/type_inference_tests.rs)
+- [tests/compiler/compiler_rustscript_tests.rs](../tests/compiler/compiler_rustscript_tests.rs)
+- [tests/compiler/diagnostics_tests.rs](../tests/compiler/diagnostics_tests.rs)
 
 Coverage:
 

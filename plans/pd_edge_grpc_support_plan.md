@@ -62,7 +62,7 @@ Important current facts:
 - compile-time convenience wrappers already exist for HTTP under
   [`pd-edge/src/compile.rs`](../pd-edge/src/compile.rs) and
   [`pd-edge/stdlib/rss/http/upstream/`](../pd-edge/stdlib/rss/http/upstream/)
-- there is still no `grpc` namespace in [`pd-edge-abi/src/abi_spec/`](../pd-edge-abi/src/abi_spec/)
+- there is still no `grpc` namespace in [`pd-edge-abi/src/abi_spec/`](../../pd-edge/pd-edge-abi/src/abi_spec/)
 - there is no equivalent `edge/grpc/*` RSS convenience layer today
 - there is no descriptor-backed protobuf or JSON transcode engine in the runtime today
 - server-side write support for HTTP response trailers is not yet exposed as a first-class host API,
@@ -283,7 +283,7 @@ Recommended prerequisite work:
 
 ### C. Extend the ABI source of truth
 
-Add `grpc` ABI specs under [`pd-edge-abi/src/abi_spec/`](../pd-edge-abi/src/abi_spec/).
+Add `grpc` ABI specs under [`pd-edge-abi/src/abi_spec/`](../../pd-edge/pd-edge-abi/src/abi_spec/).
 
 The runtime-facing relationship should be:
 

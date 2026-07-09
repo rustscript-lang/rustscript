@@ -16,7 +16,7 @@ The goal is the same architectural win the trace JIT is already pursuing:
   - hard error exits
   - explicit resume checkpoints
 
-This should be implemented as an AOT-specific SSA pipeline under `pd-vm/src/vm/aot/`, not by
+This should be implemented as an AOT-specific SSA pipeline under `src/vm/aot/`, not by
 forcing whole-program AOT through the trace-specific `jit::ir::SsaTrace` model.
 
 Explicit policy for this work:
@@ -36,10 +36,10 @@ Explicit policy for this work:
 
 Today the AOT path already has a real CFG, but it does not keep execution state in SSA:
 
-- `pd-vm/src/vm/aot/cfg.rs` builds bytecode basic blocks.
-- `pd-vm/src/vm/aot/ir.rs` lowers those blocks into `AotIrBlock` plus stack-machine
+- `src/vm/aot/cfg.rs` builds bytecode basic blocks.
+- `src/vm/aot/ir.rs` lowers those blocks into `AotIrBlock` plus stack-machine
   `AotInstruction`.
-- `pd-vm/src/vm/aot/compile.rs` then:
+- `src/vm/aot/compile.rs` then:
   - splits blocks into per-IP `AotSegment`s
   - dispatches by `vm.ip`
   - emits each step through `emit_step`
@@ -54,10 +54,10 @@ That design preserves arbitrary resume points, but it also keeps the AOT backend
 
 In contrast, the trace JIT already has the right conceptual pieces:
 
-- typed SSA values in `pd-vm/src/vm/jit/ir.rs`
+- typed SSA values in `src/vm/jit/ir.rs`
 - block params and SSA terminators
 - exit materialization plans
-- direct SSA-to-Cranelift lowering in `pd-vm/src/vm/jit/native/lower.rs`
+- direct SSA-to-Cranelift lowering in `src/vm/jit/native/lower.rs`
 
 The AOT plan should reuse those ideas, and selectively extract neutral helpers, without trying to
 reuse trace-specific exit semantics wholesale.
@@ -90,7 +90,7 @@ The public/runtime contract already exists and should remain stable during the r
 - `Vm::compile_aot`
 - `Vm::aot_resume_ips`
 - `Vm::execute_aot_entry`
-- `.pat` artifact encode/load in `pd-vm/src/vm/aot/artifact.rs`
+- `.pat` artifact encode/load in `src/vm/aot/artifact.rs`
 
 That means the SSA design must preserve resumability by `vm.ip`, even when hot-path execution no
 longer mutates boxed VM state after every bytecode step.
@@ -118,7 +118,7 @@ SSA form.
 
 ### AOT SSA IR
 
-Add a new IR under `pd-vm/src/vm/aot/`, for example:
+Add a new IR under `src/vm/aot/`, for example:
 
 - `aot/ssa.rs`
 - or `aot/ir/ssa.rs` if the module split grows

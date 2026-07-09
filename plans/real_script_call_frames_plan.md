@@ -113,10 +113,10 @@ Extend real frames to capturing nested `fn` declarations by adding declaration e
 
 Files:
 
-- `pd-vm/src/bytecode.rs`
-- `pd-vm/src/assembler.rs`
-- `pd-vm/src/vmbc.rs`
-- `pd-vm/src/vm/jit/aot.rs`
+- `src/bytecode.rs`
+- `src/assembler.rs`
+- `src/vmbc.rs`
+- `src/vm/jit/aot.rs`
 
 Changes:
 
@@ -137,8 +137,8 @@ Recommendation:
 
 Files:
 
-- `pd-vm/src/vm/mod.rs`
-- `pd-vm/src/vm/host.rs`
+- `src/vm/mod.rs`
+- `src/vm/host.rs`
 
 Add:
 
@@ -181,9 +181,9 @@ Notes:
 
 Files:
 
-- `pd-vm/src/compiler/codegen.rs`
-- `pd-vm/src/compiler/pipeline.rs`
-- `pd-vm/src/compiler/mod.rs`
+- `src/compiler/codegen.rs`
+- `src/compiler/pipeline.rs`
+- `src/compiler/mod.rs`
 
 Add a new compiler path for separately emitted script functions:
 
@@ -215,10 +215,10 @@ Separate function-body emission cannot depend on caller-time `type_state`.
 
 Files:
 
-- `pd-vm/src/compiler/typing.rs`
-- `pd-vm/src/compiler/typing/context.rs`
-- `pd-vm/src/compiler/typing/collect.rs`
-- `pd-vm/src/compiler/codegen.rs`
+- `src/compiler/typing.rs`
+- `src/compiler/typing/context.rs`
+- `src/compiler/typing/collect.rs`
+- `src/compiler/codegen.rs`
 
 Required addition:
 
@@ -264,10 +264,10 @@ Land the interpreter and compiler support before touching the native backends.
 
 Files:
 
-- `pd-vm/src/vm/jit/trace.rs`
-- `pd-vm/src/vm/jit/runtime.rs`
-- `pd-vm/src/vm/jit/native/bridge.rs`
-- `pd-vm/src/vm/jit/native/codegen.rs`
+- `src/vm/jit/trace.rs`
+- `src/vm/jit/runtime.rs`
+- `src/vm/jit/native/bridge.rs`
+- `src/vm/jit/native/codegen.rs`
 
 First cut:
 
@@ -297,9 +297,9 @@ Later:
 
 Files:
 
-- `pd-vm/src/debug_info.rs`
-- `pd-vm/src/debugger/mod.rs`
-- `pd-vm/src/bin/pd-vm-run.rs`
+- `src/debug_info.rs`
+- `src/debugger/mod.rs`
+- `src/bin/pd-vm-run.rs`
 
 Current debug info is flat and local-index based. Real frames need frame-aware introspection.
 

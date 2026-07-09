@@ -11,14 +11,14 @@
 
 Primary touch points:
 
-- [`trace.rs`](../pd-vm/src/vm/jit/trace.rs)
-- [`runtime.rs`](../pd-vm/src/vm/jit/runtime.rs)
-- [`codegen.rs`](../pd-vm/src/vm/jit/native/codegen.rs)
-- [`cranelift.rs`](../pd-vm/src/vm/jit/native/cranelift.rs)
-- [`bridge.rs`](../pd-vm/src/vm/native/bridge.rs)
-- [`core.rs`](../pd-vm/src/builtins/runtime/core.rs)
-- [`bytecode.rs`](../pd-vm/src/bytecode.rs)
-- [`jit_tests.rs`](../pd-vm/tests/jit/jit_tests.rs)
+- [`trace.rs`](../src/vm/jit/trace.rs)
+- [`runtime.rs`](../src/vm/jit/runtime.rs)
+- [`codegen.rs`](../src/vm/jit/native/codegen.rs)
+- [`cranelift.rs`](../src/vm/jit/native/cranelift.rs)
+- [`bridge.rs`](../src/vm/native/bridge.rs)
+- [`core.rs`](../src/builtins/runtime/core.rs)
+- [`bytecode.rs`](../src/bytecode.rs)
+- [`jit_tests.rs`](../tests/jit/jit_tests.rs)
 
 ## Builtin Surface In Scope
 
@@ -48,15 +48,15 @@ Map helpers in scope:
 ## Current State
 
 - `array + array` is not a typed collection op in the trace recorder today. It stays as generic
-  `TraceStep::Add` in [`trace.rs`](../pd-vm/src/vm/jit/trace.rs).
+  `TraceStep::Add` in [`trace.rs`](../src/vm/jit/trace.rs).
 - In native JIT, generic `TraceStep::Add` enters the int fast path in
-  [`codegen.rs`](../pd-vm/src/vm/jit/native/codegen.rs), and non-int operands fall back to the
+  [`codegen.rs`](../src/vm/jit/native/codegen.rs), and non-int operands fall back to the
   generic native helper bridge. That means hot array concat still routes through helper handling.
 - Collection builtins such as `len`, `count`, `slice(array, ...)`, `concat(array, array)`,
   `array_new`, `map_new`, `array_push`, `get`, `has`, `set`, and `keys` are emitted as
   `TraceStep::BuiltinCall` and always go through helper dispatch today.
 - Native codegen explicitly declines to inline `TraceStep::BuiltinCall` in
-  [`codegen.rs`](../pd-vm/src/vm/jit/native/codegen.rs), so these operations never get a dedicated
+  [`codegen.rs`](../src/vm/jit/native/codegen.rs), so these operations never get a dedicated
   native lowering.
 
 ## What "Full Native" Means Here
@@ -136,7 +136,7 @@ Map requirements:
 
 ## Implementation Plan
 
-1. Add typed collection steps in [`trace.rs`](../pd-vm/src/vm/jit/trace.rs):
+1. Add typed collection steps in [`trace.rs`](../src/vm/jit/trace.rs):
    - add `TraceCollectionKind::{Array, Map}`
    - extend `TraceConcatKind` with `Array`
    - add `TraceStep::ArrayNew`
@@ -160,7 +160,7 @@ Map requirements:
      `TraceStep::BuiltinCall`
    - leave unsupported or untyped cases on the existing builtin-call path
 
-3. Add explicit VM-side collection op methods in [`mod.rs`](../pd-vm/src/vm/mod.rs):
+3. Add explicit VM-side collection op methods in [`mod.rs`](../src/vm/mod.rs):
    - `array_new_op()`
    - `map_new_op()`
    - `array_push_op()`
@@ -177,7 +177,7 @@ Map requirements:
    - `array_keys_op()`
    - `map_keys_op()`
    - keep these aligned with the current builtin semantics in
-     [`core.rs`](../pd-vm/src/builtins/runtime/core.rs)
+     [`core.rs`](../src/builtins/runtime/core.rs)
 
 4. Add dedicated native collection intrinsics outside the generic helper dispatcher:
    - create narrow native-runtime entry points for collection operations, such as:
@@ -200,18 +200,18 @@ Map requirements:
      routed through generic `pd_vm_native_step(...)` opcode dispatch
    - they must preserve `Value` clone/drop semantics and `Arc` ownership rules
 
-5. Lower typed collection steps in [`codegen.rs`](../pd-vm/src/vm/jit/native/codegen.rs):
+5. Lower typed collection steps in [`codegen.rs`](../src/vm/jit/native/codegen.rs):
    - replace generic-add fallback for array concat with dedicated array concat lowering
    - replace `BuiltinCall` helper fallback for typed collection builtins in scope with dedicated
      lowering
    - call only the narrow collection intrinsics needed for the operation, not the generic helper
      path
 
-6. Update [`cranelift.rs`](../pd-vm/src/vm/jit/native/cranelift.rs):
+6. Update [`cranelift.rs`](../src/vm/jit/native/cranelift.rs):
    - plumb any new collection-intrinsic entry points required by native codegen
    - keep generic builtin helper plumbing only for operations not yet native-lowered
 
-7. Keep the trace interpreter aligned in [`runtime.rs`](../pd-vm/src/vm/jit/runtime.rs):
+7. Keep the trace interpreter aligned in [`runtime.rs`](../src/vm/jit/runtime.rs):
    - dispatch new typed collection steps directly to the new VM op methods
    - avoid leaving collection behavior split between typed steps and builtin-call emulation
 
@@ -221,7 +221,7 @@ Map requirements:
 
 ## Tests And Acceptance Criteria
 
-Add or update tests in [`jit_tests.rs`](../pd-vm/tests/jit/jit_tests.rs).
+Add or update tests in [`jit_tests.rs`](../tests/jit/jit_tests.rs).
 
 Required coverage:
 

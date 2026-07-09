@@ -98,7 +98,7 @@ registry.register_static("http::upstream_request", 1, upstream_fn)
 Unannotated registrations default to `PURE`. This is safe because a missing annotation just means
 the host won't optimize around that call — it's a conservative default for scheduling purposes.
 
-Builtin functions registered in `pd-vm/src/builtins/` can carry effect annotations directly:
+Builtin functions registered in `src/builtins/` can carry effect annotations directly:
 
 | Builtin Namespace | Default Effect |
 | --- | --- |
@@ -185,12 +185,12 @@ Combined with the fork-friendly VM design (owned `Value` clones, copy-capture cl
 
 **Goal:** `EffectClass` exists, `HostImport` carries it, summary is computable.
 
-1. Add `EffectClass` bitflags type under `pd-vm/src/bytecode/` (or a new `pd-vm/src/effects.rs`).
+1. Add `EffectClass` bitflags type under `src/bytecode/` (or a new `src/effects.rs`).
 2. Add `effects: EffectClass` field to `HostImport` with a `PURE` default.
 3. Add `ProgramEffectSummary` struct and a `Program::effect_summary()` method that performs the
    linear bytecode scan.
 4. Cache the summary alongside `program_cache_key` (lazy, computed on first access).
-5. Tag all existing builtins in `pd-vm/src/builtins/runtime/` with appropriate effect classes.
+5. Tag all existing builtins in `src/builtins/runtime/` with appropriate effect classes.
 
 Effort: ~200-300 lines new. Low risk — purely additive, no existing behavior changes.
 

@@ -25,10 +25,10 @@ recording/lowering architecture does not survive the refactor.
 The current native JIT already has useful type specialization, but the core trace model is still a
 stack/local machine:
 
-- `pd-vm/src/vm/jit/trace.rs` records `TraceStep`, which is fundamentally bytecode-shaped.
-- `pd-vm/src/vm/jit/native/codegen.rs` lowers one step at a time and frequently reloads and
+- `src/vm/jit/trace.rs` records `TraceStep`, which is fundamentally bytecode-shaped.
+- `src/vm/jit/native/codegen.rs` lowers one step at a time and frequently reloads and
   restores `Value` slot state.
-- `pd-vm/src/vm/native/inline.rs` still treats stack and local slots as the primary execution
+- `src/vm/native/inline.rs` still treats stack and local slots as the primary execution
   model, including repeated tag checks and `Value` copies.
 
 That leaves the biggest performance win on the table:
@@ -67,15 +67,15 @@ trace must exit. That is the architectural change this plan targets.
 
 ### 1. New trace IR
 
-Introduce a new IR under `pd-vm/src/vm/jit/` with explicit SSA value IDs and blocks.
+Introduce a new IR under `src/vm/jit/` with explicit SSA value IDs and blocks.
 
 Suggested new modules:
 
-- `pd-vm/src/vm/jit/ir.rs`
-- `pd-vm/src/vm/jit/recorder.rs`
-- `pd-vm/src/vm/jit/deopt.rs`
-- `pd-vm/src/vm/jit/liveness.rs`
-- `pd-vm/src/vm/jit/native/lower.rs`
+- `src/vm/jit/ir.rs`
+- `src/vm/jit/recorder.rs`
+- `src/vm/jit/deopt.rs`
+- `src/vm/jit/liveness.rs`
+- `src/vm/jit/native/lower.rs`
 
 Core IR concepts:
 
@@ -244,7 +244,7 @@ Special attention:
 
 ### Phase 5. Replace per-step native lowering with SSA lowering
 
-- Add a lowerer from the new IR to Cranelift under `pd-vm/src/vm/jit/native/lower.rs`.
+- Add a lowerer from the new IR to Cranelift under `src/vm/jit/native/lower.rs`.
 - Stop lowering through the old `emit_inline_or_helper_step` shape for the new traces.
 - Map:
   - SSA ints -> Cranelift integer values
@@ -274,7 +274,7 @@ Required cutover rule:
 - Remove `TraceStep`-specific optimization passes that only exist to compensate for the old
   bytecode-shaped IR.
 - Remove dead helper glue that only exists to bridge old trace artifacts into native lowering.
-- Shrink or split `pd-vm/src/vm/jit/trace.rs` and `pd-vm/src/vm/jit/native/codegen.rs` around the
+- Shrink or split `src/vm/jit/trace.rs` and `src/vm/jit/native/codegen.rs` around the
   new module boundaries.
 - Re-run benchmarks and update docs/plans that still describe the old architecture as current.
 
@@ -282,29 +282,29 @@ Required cutover rule:
 
 Suggested target ownership:
 
-- `pd-vm/src/vm/jit/ir.rs`
+- `src/vm/jit/ir.rs`
   - trace IR data structures
   - verifier
   - debug printer
-- `pd-vm/src/vm/jit/recorder.rs`
+- `src/vm/jit/recorder.rs`
   - hot-loop recording
   - abstract interpretation
   - guard insertion
   - block construction
-- `pd-vm/src/vm/jit/deopt.rs`
+- `src/vm/jit/deopt.rs`
   - exit snapshots
   - materialization planning
   - deopt metadata
-- `pd-vm/src/vm/jit/native/lower.rs`
+- `src/vm/jit/native/lower.rs`
   - Cranelift lowering from SSA IR
-- `pd-vm/src/vm/jit/runtime.rs`
+- `src/vm/jit/runtime.rs`
   - runtime integration
   - trace execution and side-exit resume
 
 Likely removals or major shrinkage:
 
-- `pd-vm/src/vm/jit/trace.rs`
-- `pd-vm/src/vm/jit/native/codegen.rs`
+- `src/vm/jit/trace.rs`
+- `src/vm/jit/native/codegen.rs`
 
 ## Testing Plan
 

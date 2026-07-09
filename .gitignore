@@ -8,7 +8,7 @@
 *.pat
 *.txt
 *.json
-!pd-vm/editor-assets/monaco/*.json
+!editor-assets/monaco/*.json
 *.vsix
 node_modules
 dist

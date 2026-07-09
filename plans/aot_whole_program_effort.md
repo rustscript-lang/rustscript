@@ -6,8 +6,8 @@ This plan started from a trace-JIT-only baseline. The current codebase has moved
 
 Implemented:
 
-- whole-program AOT lives under `pd-vm/src/vm/aot/`
-- neutral shared native helpers live under `pd-vm/src/vm/native/`
+- whole-program AOT lives under `src/vm/aot/`
+- neutral shared native helpers live under `src/vm/native/`
 - in-memory whole-program native execution is working
 - self-contained persisted PAT bundles are working
 - `pd-vm-run --aot-load <artifact.pat>` can construct and run the VM without a source path
@@ -22,9 +22,9 @@ Remaining phase-3 work is mostly cleanup and optimization:
 
 ## Bottom Line
 
-The previous AOT implementation is gone. There is no live `pd-vm/src/vm/jit/aot.rs`, no
+The previous AOT implementation is gone. There is no live `src/vm/jit/aot.rs`, no
 `prepare_aot`, no bundle loader/decoder, no `AOT_VERSION`, and no encoded-trace machinery left in
-`pd-vm/src`. The current baseline is a trace JIT with optional per-trace native emission through
+`src`. The current baseline is a trace JIT with optional per-trace native emission through
 Cranelift.
 
 That changes the scope materially:
@@ -32,13 +32,13 @@ That changes the scope materially:
 - Whole-program AOT is no longer an extension of an existing AOT pipeline.
 - It is a new compiler/runtime path that can reuse current native opcode lowering, bridge helpers,
   interruption plumbing, and program hashing, but it should not be built under
-  `pd-vm/src/vm/jit`.
+  `src/vm/jit`.
 - The highest-leverage plan is to build whole-program native execution in memory first, then add
   serialization/load only if persisted AOT artifacts are still a product requirement.
 - The implementation boundary should be explicit:
-  - new AOT-specific code lives under `pd-vm/src/vm/aot/`
-  - trace-JIT-specific code stays under `pd-vm/src/vm/jit/`
-  - shared native helpers move to a neutral shared directory such as `pd-vm/src/vm/native/`
+  - new AOT-specific code lives under `src/vm/aot/`
+  - trace-JIT-specific code stays under `src/vm/jit/`
+  - shared native helpers move to a neutral shared directory such as `src/vm/native/`
     and must not branch on "jit vs aot"
 
 ## Historical Baseline (Trace JIT Only)
@@ -61,7 +61,7 @@ graph LR
 | Branch model | Trace guards, loop back-edges inside a trace, explicit trace exits for non-trace control flow |
 | Interrupt model | Fuel/epoch checks injected into trace code and surfaced as status returns |
 | Call model | Host and builtin calls only; no intra-program script call frames |
-| AOT surface | Removed at the time of this re-evaluation; now reintroduced under `pd-vm/src/vm/aot/` |
+| AOT surface | Removed at the time of this re-evaluation; now reintroduced under `src/vm/aot/` |
 | Artifact format | Removed at the time of this re-evaluation; now reintroduced as self-contained `.pat` whole-program bundles |
 | Test state | Historical note: ignored placeholders existed then; they have since been replaced with real AOT coverage |
 
@@ -72,30 +72,30 @@ crate with `501` detected tests.
 
 | File | Lines | Role |
 | --- | ---: | --- |
-| `pd-vm/src/vm/jit/trace.rs` | 1312 | Trace recording, loop-header detection, trace IR |
-| `pd-vm/src/vm/jit/runtime.rs` | 1040 | Interpreter trace execution and native trace runtime |
-| `pd-vm/src/vm/jit/native/codegen.rs` | 3685 | Per-step Cranelift lowering helpers and inline/native helpers |
-| `pd-vm/src/vm/jit/native/cranelift.rs` | 405 | `compile_trace` entry point and Cranelift function assembly |
-| `pd-vm/src/vm/jit/native/bridge.rs` | 278 | Helper bridge for generic/native fallback operations |
-| `pd-vm/src/vm/jit/native/layout.rs` | 323 | Native stack/value layout probing |
-| `pd-vm/src/vm/jit/native/exec.rs` | 160 | Executable memory management |
-| `pd-vm/src/vm/jit/native/mod.rs` | 146 | Native backend surface and status codes |
+| `src/vm/jit/trace.rs` | 1312 | Trace recording, loop-header detection, trace IR |
+| `src/vm/jit/runtime.rs` | 1040 | Interpreter trace execution and native trace runtime |
+| `src/vm/jit/native/codegen.rs` | 3685 | Per-step Cranelift lowering helpers and inline/native helpers |
+| `src/vm/jit/native/cranelift.rs` | 405 | `compile_trace` entry point and Cranelift function assembly |
+| `src/vm/jit/native/bridge.rs` | 278 | Helper bridge for generic/native fallback operations |
+| `src/vm/jit/native/layout.rs` | 323 | Native stack/value layout probing |
+| `src/vm/jit/native/exec.rs` | 160 | Executable memory management |
+| `src/vm/jit/native/mod.rs` | 146 | Native backend surface and status codes |
 
 ### Target Directory Layout
 
 The plan should target this shape rather than extending `vm/jit`:
 
-- `pd-vm/src/vm/aot/`
+- `src/vm/aot/`
   - whole-program CFG construction
   - AOT IR
   - program-level Cranelift lowering
   - AOT runtime entry/resume
   - optional artifact encode/decode
-- `pd-vm/src/vm/jit/`
+- `src/vm/jit/`
   - trace recording
   - trace runtime
   - trace-specific native compilation entry points
-- `pd-vm/src/vm/native/` or equivalent shared-neutral directory
+- `src/vm/native/` or equivalent shared-neutral directory
   - executable buffer management
   - native layout probing
   - Cranelift signatures and low-level emit helpers
@@ -126,7 +126,7 @@ That requires:
 
 - The current Cranelift backend already knows how to lower most VM operations and interact with the
   real `Vm` layout.
-- `pd-vm/src/vm/jit/native/codegen.rs` contains the expensive opcode-specific logic; parts of that
+- `src/vm/jit/native/codegen.rs` contains the expensive opcode-specific logic; parts of that
   are reusable, but only after being extracted into neutral helpers outside `vm/jit`.
 - Host call bridging already returns stable statuses for continue, halt, yield, pending, error, and
   interruption.
@@ -152,7 +152,7 @@ API, no persistent artifact type, and no runtime switch that prefers a program-l
 
 Required work:
 
-- Create a new `pd-vm/src/vm/aot/` module tree.
+- Create a new `src/vm/aot/` module tree.
 - Introduce an explicit whole-program native mode.
 - Add program-level compiled artifact structs and runtime ownership.
 - Decide whether this lives under the existing `cranelift-jit` feature or a more general native
@@ -197,7 +197,7 @@ Recommended direction:
 - Keep trace JIT unchanged.
 - Add a separate whole-program IR such as `AotProgram`, `AotBlock`, and `AotStep`, or lower
   directly from CFG blocks to Cranelift if the IR proves unnecessary.
-- Keep that IR under `pd-vm/src/vm/aot/`, not under `pd-vm/src/vm/jit/`.
+- Keep that IR under `src/vm/aot/`, not under `src/vm/jit/`.
 
 Effort: `250-450` lines new.
 
@@ -205,7 +205,7 @@ Effort: `250-450` lines new.
 
 This is still the largest engineering slice.
 
-Today `compile_trace` in `pd-vm/src/vm/jit/native/cranelift.rs` builds one Cranelift function with:
+Today `compile_trace` in `src/vm/jit/native/cranelift.rs` builds one Cranelift function with:
 
 - one root block
 - one exit block
@@ -246,8 +246,8 @@ Whole-program AOT needs:
 - entry by program start or current `vm.ip`
 - a resume path that re-enters native code after yield, pending, fuel, and epoch events
 - program-level cache keys layered on top of the existing `program_cache_key`
-- an AOT-owned runtime under `pd-vm/src/vm/aot/`, not a special mode hidden inside
-  `pd-vm/src/vm/jit/runtime.rs`
+- an AOT-owned runtime under `src/vm/aot/`, not a special mode hidden inside
+  `src/vm/jit/runtime.rs`
 
 This is simpler than the old trace-AOT runtime in one sense, because there is only one native
 program body to manage. It is harder in another sense, because none of the old AOT load/execute
@@ -283,8 +283,8 @@ rebuilt from scratch.
 
 Minimum new coverage:
 
-- re-enable the five ignored AOT placeholders in `pd-vm/tests/jit/jit_tests.rs` and
-  `pd-vm/tests/jit/jit_nyi_edge_tests.rs`
+- re-enable the five ignored AOT placeholders in `tests/jit/jit_tests.rs` and
+  `tests/jit/jit_nyi_edge_tests.rs`
 - whole non-loop program execution
 - branch diamonds and nested loops
 - backward `Brfalse` to non-root targets
@@ -316,8 +316,8 @@ resume-table requirement.
 
 Goal: prove correctness without serialization.
 
-1. Create `pd-vm/src/vm/aot/` and define its module boundaries first.
-2. Extract neutral native helpers into a shared directory such as `pd-vm/src/vm/native/`.
+1. Create `src/vm/aot/` and define its module boundaries first.
+2. Extract neutral native helpers into a shared directory such as `src/vm/native/`.
 3. Add a program CFG builder and resume-point inventory under `vm/aot`.
 4. Add a separate whole-program IR or direct CFG-to-Cranelift lowering path under `vm/aot`.
 5. Implement `compile_program` in `vm/aot`, using only neutral shared helpers.
@@ -387,14 +387,14 @@ Assuming familiarity with this VM and Cranelift:
 Whole-program AOT is still feasible, but the current codebase changes the nature of the work.
 
 This is not a "revive the old AOT bundle path" task. It is a new whole-program native compiler and
-runtime track built beside the existing trace JIT, with its own `pd-vm/src/vm/aot/` tree. The good
+runtime track built beside the existing trace JIT, with its own `src/vm/aot/` tree. The good
 news is that the hardest per-op native lowering work is already present. The missing pieces are the
 product shell around it: CFG building, program-level dispatch/re-entry, runtime ownership, and
 optionally a new persisted artifact format.
 
 The structural rule matters here:
 
-- AOT should not piggyback on `pd-vm/src/vm/jit/`.
+- AOT should not piggyback on `src/vm/jit/`.
 - Shared code should move to a neutral shared directory.
 - Shared code should expose reusable primitives, not `if jit { ... } else { ... }` control flow.
 

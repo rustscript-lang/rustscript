@@ -29,7 +29,7 @@ The target workload is the existing same-source Lua hot-loop benchmark already a
 
 ### 2. Interpreter performance work
 
-- Add opcode profiling support to the interpreter loop in `pd-vm/src/vm/mod.rs` behind an explicit benchmark/debug toggle so the benchmark can identify the hottest opcode patterns for the shared Lua loop workload.
+- Add opcode profiling support to the interpreter loop in `src/vm/mod.rs` behind an explicit benchmark/debug toggle so the benchmark can identify the hottest opcode patterns for the shared Lua loop workload.
 - Use those measurements to introduce fused superinstructions for the dominant integer-loop patterns emitted by the Lua frontend. The first fused forms should cover:
   - repeated local load/store arithmetic updates
   - integer compare + branch patterns used by `while`

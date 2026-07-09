@@ -57,7 +57,7 @@ The runtime already has the lower-level families needed for the carriers:
 
 Important current constraints:
 
-- there is no `dns` namespace in [`pd-edge-abi/src/abi_spec/`](../pd-edge-abi/src/abi_spec/)
+- there is no `dns` namespace in [`pd-edge-abi/src/abi_spec/`](../../pd-edge/pd-edge-abi/src/abi_spec/)
 - there is no `dns`, `doh`, or `doq` implementation under [`pd-edge/src/abi_impl/`](../pd-edge/src/abi_impl/)
 - downstream UDP is still a reserved placeholder in the one-shot HTTP runtime, so raw downstream
   DNS listener support is not already available
@@ -230,7 +230,7 @@ The split should reflect the DAG model:
 
 ### B. Extend the ABI source of truth
 
-Add a `dns` ABI spec file under [`pd-edge-abi/src/abi_spec/`](../pd-edge-abi/src/abi_spec/).
+Add a `dns` ABI spec file under [`pd-edge-abi/src/abi_spec/`](../../pd-edge/pd-edge-abi/src/abi_spec/).
 
 That keeps the same repo-wide rule intact:
 

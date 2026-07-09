@@ -14,4 +14,4 @@ runtime = ["vm/runtime"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 vm = { package = "pd-vm", path = "..", default-features = false }
-edge_abi = { package = "pd-edge-abi", path = "../../pd-edge-abi" }
+edge_abi = { package = "pd-edge-abi", path = "../../pd-edge/pd-edge-abi" }

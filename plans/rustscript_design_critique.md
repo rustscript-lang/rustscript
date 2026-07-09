@@ -16,7 +16,7 @@ This is an ambitious combination. Let me break down where it's clever, where it'
 
 ### 2.1 The Multi-Frontend Shared IR Is a Genuinely Good Idea
 
-The architecture of lowering four different surface syntaxes (RustScript, JS, Lua, Scheme) into a single [FrontendIr](pd-vm/src/compiler/ir.rs#291-302) before compilation is clean and well-executed. The IR in [ir.rs](pd-vm/src/compiler/ir.rs) is expressive enough to capture ownership semantics (`MoveVar`, `ToOwned`, `Borrow`, `BorrowMut`) while remaining language-agnostic at the bytecode level.
+The architecture of lowering four different surface syntaxes (RustScript, JS, Lua, Scheme) into a single [FrontendIr](src/compiler/ir.rs#291-302) before compilation is clean and well-executed. The IR in [ir.rs](src/compiler/ir.rs) is expressive enough to capture ownership semantics (`MoveVar`, `ToOwned`, `Borrow`, `BorrowMut`) while remaining language-agnostic at the bytecode level.
 
 This means the VM doesn't need to know about Rust syntax, and the JS/Lua/Scheme frontends get the performance benefits of the same optimizer pipeline for free. That's a solid engineering decision.
 
@@ -40,7 +40,7 @@ The `ExecOutcome` / `CallOutcome` / `VmYieldReason` layering for suspension is g
 
 ### 2.4 The Opcode Set Is Lean and Honest
 
-24 opcodes. CIL/MSIL-style stack machine. No specialized opcodes for strings, arrays, or maps — those go through [Call](pd-vm/src/compiler/typing/state.rs#359-363) to host/builtin functions. This is the right call for a VM that needs to stay simple, JIT-friendly, and maintainable. The type-hint overlay ([operand_type_hints](pd-vm/src/bytecode.rs#528-543)) for specializing arithmetic at the interpreter level is a pragmatic optimization that doesn't pollute the ISA.
+24 opcodes. CIL/MSIL-style stack machine. No specialized opcodes for strings, arrays, or maps — those go through [Call](src/compiler/typing/state.rs#359-363) to host/builtin functions. This is the right call for a VM that needs to stay simple, JIT-friendly, and maintainable. The type-hint overlay ([operand_type_hints](src/bytecode.rs#528-543)) for specializing arithmetic at the interpreter level is a pragmatic optimization that doesn't pollute the ISA.
 
 ---
 
@@ -48,7 +48,7 @@ The `ExecOutcome` / `CallOutcome` / `VmYieldReason` layering for suspension is g
 
 ### 3.1 "Rust Ownership for Scripting" — A DX Layer, Not a Safety Guarantee
 
-The borrow/ownership system in RustScript is best understood as a **developer-time lint and diagnostics layer** — analogous to what TypeScript is for JavaScript, rather than what Rust's borrow checker is for native code. The [availability.rs](pd-vm/src/compiler/lifetime/availability.rs) / [liveness.rs](pd-vm/src/compiler/lifetime/liveness.rs) passes catch common mistakes (use-after-move, uninitialized access, alias-while-mutating) at compile time, while the VM runtime remains fully dynamic.
+The borrow/ownership system in RustScript is best understood as a **developer-time lint and diagnostics layer** — analogous to what TypeScript is for JavaScript, rather than what Rust's borrow checker is for native code. The [availability.rs](src/compiler/lifetime/availability.rs) / [liveness.rs](src/compiler/lifetime/liveness.rs) passes catch common mistakes (use-after-move, uninitialized access, alias-while-mutating) at compile time, while the VM runtime remains fully dynamic.
 
 This is a defensible and pragmatic position. The remaining tension is:
 
@@ -63,14 +63,14 @@ This is a defensible and pragmatic position. The remaining tension is:
 
 The type system serves a dual purpose: **dev-time error catching** and **runtime performance hints**. It does both reasonably well:
 
-- Flow-sensitive `BoundType` inference catches type conflicts at compile time (e.g., [if](pd-vm/src/vm/mod.rs#837-844)/`else` branch mismatches, binary operand mismatches).
-- Host function return types are annotated (`return_type: ValueType` on [HostImport](pd-vm/src/bytecode.rs#385-390) / [FunctionDecl](pd-vm/src/compiler/ir.rs#272-280)), feeding back into inference so chains like `host_call().field` preserve type knowledge.
-- Operand type hints ([operand_type_hints](pd-vm/src/bytecode.rs#528-543)) give the interpreter and JIT fast paths for typed arithmetic, comparisons, and string ops.
+- Flow-sensitive `BoundType` inference catches type conflicts at compile time (e.g., [if](src/vm/mod.rs#837-844)/`else` branch mismatches, binary operand mismatches).
+- Host function return types are annotated (`return_type: ValueType` on [HostImport](src/bytecode.rs#385-390) / [FunctionDecl](src/compiler/ir.rs#272-280)), feeding back into inference so chains like `host_call().field` preserve type knowledge.
+- Operand type hints ([operand_type_hints](src/bytecode.rs#528-543)) give the interpreter and JIT fast paths for typed arithmetic, comparisons, and string ops.
 
 The remaining concern is **opacity**: `BoundType::Unknown` is a valid degradation state, and users can't easily predict when inference will succeed vs. give up. The `TypeSchema` system (struct schemas, `ArrayOf`, `MapOf`) is a step toward richer inference, but it doesn't yet compose well across function boundaries or through closures.
 
 > [!NOTE]
-> The lint infrastructure ([lint_unknown_inferred_local_types](pd-vm/src/compiler/pipeline.rs#477-483)) partially addresses opacity by warning when locals degrade to [Unknown](pd-vm/src/compiler/pipeline.rs#24-29). Expanding this to warn about expression-level degradation (not just locals) would further close the gap.
+> The lint infrastructure ([lint_unknown_inferred_local_types](src/compiler/pipeline.rs#477-483)) partially addresses opacity by warning when locals degrade to [Unknown](src/compiler/pipeline.rs#24-29). Expanding this to warn about expression-level degradation (not just locals) would further close the gap.
 
 ### 3.3 Four Frontends Is a Maintenance Liability
 
@@ -106,7 +106,7 @@ This is not a scripting language limitation — it's closer to a macro expansion
 
 ### 4.2 The `Value` Enum Has No Function Variant
 
-Looking at [bytecode.rs](pd-vm/src/bytecode.rs):
+Looking at [bytecode.rs](src/bytecode.rs):
 
 ```rust
 pub enum Value {
@@ -115,14 +115,14 @@ pub enum Value {
 }
 ```
 
-No [Function](pd-vm/src/compiler/ir.rs#282-289), [Closure](pd-vm/src/compiler/ir.rs#78-83), [Callable](pd-vm/src/compiler/typing/state.rs#359-363). This is a consequence of 4.1 — functions aren't values, so they can't be in the value type. But this also means:
-- No [map(array, fn)](pd-vm/src/bytecode.rs#336-339) where `fn` is a user-defined function
+No [Function](src/compiler/ir.rs#282-289), [Closure](src/compiler/ir.rs#78-83), [Callable](src/compiler/typing/state.rs#359-363). This is a consequence of 4.1 — functions aren't values, so they can't be in the value type. But this also means:
+- No [map(array, fn)](src/bytecode.rs#336-339) where `fn` is a user-defined function
 - No callbacks
 - No event handlers passed as values
 
 For an edge proxy runtime that wants user-authored request handlers, this seems like a significant gap.
 
-### 4.3 The [VmMap](pd-vm/src/bytecode.rs#26-29) Uses Identity Equality for Composite Keys
+### 4.3 The [VmMap](src/bytecode.rs#26-29) Uses Identity Equality for Composite Keys
 
 Arrays and maps as map keys compare by `Arc::ptr_eq` (heap identity), not structural equality. This is documented and intentional, but it's surprising behavior:
 
@@ -135,21 +135,21 @@ map[lookup]  // -> null (miss!)
 
 This is a foot-gun for anyone used to Python dicts or Lua tables. It's the right engineering choice (structural hashing of nested mutable containers is expensive and fragile), but it should probably be a loud warning in the docs or even a compile-time lint.
 
-### 4.4 Setting a Map Entry to [null](pd-vm/src/vm/mod.rs#734-745) Deletes the Key
+### 4.4 Setting a Map Entry to [null](src/vm/mod.rs#734-745) Deletes the Key
 
 From the frontends README:
-> Setting a map entry to [null](pd-vm/src/vm/mod.rs#734-745)/`None` removes that key, including during map/object literal construction, so `{a: null}` omits `a`.
+> Setting a map entry to [null](src/vm/mod.rs#734-745)/`None` removes that key, including during map/object literal construction, so `{a: null}` omits `a`.
 
 This is a bold semantic choice. It means:
-- You can't have a key that intentionally maps to [null](pd-vm/src/vm/mod.rs#734-745).
+- You can't have a key that intentionally maps to [null](src/vm/mod.rs#734-745).
 - The pattern `if map[key] == null` conflates "key absent" with "key present with null value".
-- This breaks JSON round-tripping for objects with explicit [null](pd-vm/src/vm/mod.rs#734-745) fields (despite the JSON builtins being strict about other things like duplicate keys).
+- This breaks JSON round-tripping for objects with explicit [null](src/vm/mod.rs#734-745) fields (despite the JSON builtins being strict about other things like duplicate keys).
 
-This decision saves runtime complexity (no tombstone tracking, simpler [get](pd-vm/src/compiler/typing/state.rs#165-171) semantics) but creates a semantic hole that will surprise users coming from any other language.
+This decision saves runtime complexity (no tombstone tracking, simpler [get](src/compiler/typing/state.rs#165-171) semantics) but creates a semantic hole that will surprise users coming from any other language.
 
 ### 4.5 No Real Error Handling
 
-There is no [try](pd-vm/src/bytecode.rs#608-638)/`catch`, no [Result](pd-vm/src/compiler/typing/state.rs#353-357) type in the value system (yet — `Option/Result` plan exists), and host errors bubble up as `VmError::HostError(String)`. The Lua `pcall` lowering has "success-only semantics" (always returns `true`). This means scripts cannot handle errors — they can only crash.
+There is no [try](src/bytecode.rs#608-638)/`catch`, no [Result](src/compiler/typing/state.rs#353-357) type in the value system (yet — `Option/Result` plan exists), and host errors bubble up as `VmError::HostError(String)`. The Lua `pcall` lowering has "success-only semantics" (always returns `true`). This means scripts cannot handle errors — they can only crash.
 
 For an edge proxy runtime, this is a reliability concern. A malformed request header shouldn't crash the entire request handler.
 
@@ -167,17 +167,17 @@ The trace JIT is a reasonable v1, but the architecture should evolve toward meth
 
 ### 5.2 The Compilation Pipeline Has Too Many Implicit Phases
 
-The pipeline in [pipeline.rs](pd-vm/src/compiler/pipeline.rs) has the following implicit ordering:
+The pipeline in [pipeline.rs](src/compiler/pipeline.rs) has the following implicit ordering:
 
 ```
 parse → legalize_builtins → validate_types → enforce_availability → infer_types → codegen
 ```
 
-But these phases communicate through mutation of the same [FrontendIr](pd-vm/src/compiler/ir.rs#291-302) struct (adding/removing nodes, inserting `Drop` stmts). The data flow between phases is implicit. A more explicit phase architecture (each phase consuming one type and producing another) would make it easier to reason about where things happen and add new passes.
+But these phases communicate through mutation of the same [FrontendIr](src/compiler/ir.rs#291-302) struct (adding/removing nodes, inserting `Drop` stmts). The data flow between phases is implicit. A more explicit phase architecture (each phase consuming one type and producing another) would make it easier to reason about where things happen and add new passes.
 
 ### 5.3 The 256-Local Limit Will Bite
 
-Local slots are [u8](pd-vm/src/vm/mod.rs#860-868) in bytecode (`Ldloc`/`Stloc` take a single byte operand). This caps programs at 256 locals (including hidden slots for closures, temporaries, etc.). For non-trivial programs with many variables and closure captures, this will be exhausted. The IR already uses [u16](pd-vm/src/vm/mod.rs#869-873) (`LocalSlot = u16`), but the bytecode encoding doesn't.
+Local slots are [u8](src/vm/mod.rs#860-868) in bytecode (`Ldloc`/`Stloc` take a single byte operand). This caps programs at 256 locals (including hidden slots for closures, temporaries, etc.). For non-trivial programs with many variables and closure captures, this will be exhausted. The IR already uses [u16](src/vm/mod.rs#869-873) (`LocalSlot = u16`), but the bytecode encoding doesn't.
 
 ---
 
@@ -186,12 +186,12 @@ Local slots are [u8](pd-vm/src/vm/mod.rs#860-868) in bytecode (`Ldloc`/`Stloc` t
 | Priority | Recommendation |
 |---|---|
 | 🔴 Critical | Implement real call frames and make functions first-class values |
-| 🔴 Critical | Add error handling (at minimum [Result](pd-vm/src/compiler/typing/state.rs#353-357)-like values or [try](pd-vm/src/bytecode.rs#608-638)/`catch`) |
+| 🔴 Critical | Add error handling (at minimum [Result](src/compiler/typing/state.rs#353-357)-like values or [try](src/bytecode.rs#608-638)/`catch`) |
 | 🟡 Important | Clarify the ownership model's purpose — is it for safety, pedagogy, or performance? |
 | 🟡 Important | Re-evaluate whether 4 frontends is worth the maintenance cost |
 | 🟡 Important | Reconsider null-deletes-key semantics for maps |
 | 🟢 Nice-to-have | Move toward method-level JIT compilation (whole-program AOT) |
-| 🟢 Nice-to-have | Explicit pipeline phase types instead of mutating [FrontendIr](pd-vm/src/compiler/ir.rs#291-302) in place |
+| 🟢 Nice-to-have | Explicit pipeline phase types instead of mutating [FrontendIr](src/compiler/ir.rs#291-302) in place |
 | 🟢 Nice-to-have | Widen bytecode local encoding to u16 |
 
 ---

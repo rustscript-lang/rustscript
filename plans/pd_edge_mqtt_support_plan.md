@@ -56,7 +56,7 @@ The runtime already has the right lower-level building blocks:
 
 Important current constraints:
 
-- there is no `mqtt` namespace in [`pd-edge-abi/src/abi_spec/`](../pd-edge-abi/src/abi_spec/)
+- there is no `mqtt` namespace in [`pd-edge-abi/src/abi_spec/`](../../pd-edge/pd-edge-abi/src/abi_spec/)
 - there is no `mqtt` implementation module under [`pd-edge/src/abi_impl/`](../pd-edge/src/abi_impl/)
 - downstream WebSocket frame execution is still incomplete in the one-shot HTTP runtime, so
   downstream MQTT-over-WebSocket server hosting cannot be treated as already solved
@@ -228,7 +228,7 @@ The target shape is:
 
 ### B. Extend the ABI source of truth
 
-Add a new ABI spec file under [`pd-edge-abi/src/abi_spec/`](../pd-edge-abi/src/abi_spec/) for
+Add a new ABI spec file under [`pd-edge-abi/src/abi_spec/`](../../pd-edge/pd-edge-abi/src/abi_spec/) for
 `mqtt`.
 
 This keeps the current rule intact:
