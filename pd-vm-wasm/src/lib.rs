@@ -968,9 +968,8 @@ mod lint_tests {
 mod runtime_tests {
     use std::time::Duration;
 
-    use super::{format_source_with_flavor, parse_flavor};
+    use super::format_source_with_flavor;
     use crate::analyzer::{LintSeverity, lint_source_with_flavor};
-    use crate::completions::build_completion_catalog;
     use crate::runtime::{
         DebugCommand, FuelConfig, RunCommand, debug_state, run_command, run_debug_command,
         run_source_with_flavor, start_debug_source_with_flavor, start_run_source_with_flavor,

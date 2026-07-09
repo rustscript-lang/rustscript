@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::builtins::BuiltinFunction;
 use crate::bytecode::{Value, ValueType, VmMap};
 use crate::vm::{HostCallExecOutcome, NumericValue, Vm, VmError, VmResult, logical_shr_i64};

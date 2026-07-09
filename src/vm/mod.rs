@@ -757,6 +757,7 @@ impl Vm {
     }
 
     #[inline(always)]
+    #[allow(dead_code)]
     pub(in crate::vm) fn charge_aot_call_boundary_interrupt(&mut self) -> VmResult<()> {
         match self.interrupt_mode {
             InterruptMode::None => Ok(()),

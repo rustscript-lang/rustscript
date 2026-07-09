@@ -222,6 +222,7 @@ pub(super) fn collect_function_types(
     let _ = context.infer_expr_type(&function_impl.body_expr, &state);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn collect_stmt_types(
     stmts: &[Stmt],
     state: &mut LocalTypeState,
@@ -496,6 +497,7 @@ pub(super) fn collect_stmt_types(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_expr_types(
     expr: &Expr,
     state: &LocalTypeState,
@@ -826,6 +828,7 @@ fn collect_expr_types(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_callable_body_types(
     closure: &ClosureExpr,
     nested: &LocalTypeState,

@@ -82,7 +82,7 @@ fn parse_optional_host_return_schema(spec: &str) -> Option<TypeSchema> {
         return None;
     }
     let non_null = parts.iter().copied().find(|part| *part != "null")?;
-    parts.iter().any(|part| *part == "null").then(|| ())?;
+    parts.contains(&"null").then_some(())?;
     parse_simple_host_return_schema(non_null).map(|schema| TypeSchema::Optional(Box::new(schema)))
 }
 

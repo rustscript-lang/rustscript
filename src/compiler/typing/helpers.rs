@@ -613,6 +613,7 @@ fn validate_declared_local_schema(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_declared_return_schema(
     function_name: &str,
     schema: &TypeSchema,

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 #[cfg(not(feature = "cranelift-jit"))]
 use super::super::super::VmError;
 use super::super::super::VmResult;

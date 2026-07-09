@@ -359,23 +359,12 @@ pub trait SourcePlugin: Sync {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SharedParserOptions {
     pub source_id: u32,
     pub allow_implicit_externs: bool,
     pub allow_implicit_semicolons: bool,
     pub enforce_mutable_bindings: bool,
-}
-
-impl Default for SharedParserOptions {
-    fn default() -> Self {
-        Self {
-            source_id: 0,
-            allow_implicit_externs: false,
-            allow_implicit_semicolons: false,
-            enforce_mutable_bindings: false,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

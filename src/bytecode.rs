@@ -109,6 +109,7 @@ impl VmMap {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn vm_map_len_field_offset() -> usize {
     std::mem::offset_of!(VmMap, cached_len)
 }
@@ -256,6 +257,7 @@ fn map_key_eq(lhs: &Value, rhs: &Value) -> bool {
 /// The hasher itself is a small deterministic 64-bit FNV-1a-style accumulator.
 /// Arrays hash recursively in order and maps hash recursively without caring
 /// about entry order, so the result is stable across allocations.
+#[allow(dead_code)]
 pub(crate) fn hash_value(value: &Value, state: &mut impl Hasher) {
     match value {
         Value::Null => {
@@ -428,6 +430,7 @@ pub struct HostImport {
     pub return_type: ValueType,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct DecodedInstructionData {
     pub(crate) ldc_values: Box<[Option<Value>]>,
@@ -484,6 +487,7 @@ pub struct Program {
     pub imports: Vec<HostImport>,
     pub debug: Option<crate::debug_info::DebugInfo>,
     pub type_map: Option<TypeMap>,
+    #[allow(dead_code)]
     decoded_instruction_data_cache: Arc<OnceLock<Arc<DecodedInstructionData>>>,
     operand_type_hints_cache: Arc<OnceLock<Option<Arc<[u8]>>>>,
 }
@@ -551,6 +555,7 @@ impl Program {
         self
     }
 
+    #[allow(dead_code)]
     pub(crate) fn shared_decoded_instruction_data(&self) -> Arc<DecodedInstructionData> {
         Arc::clone(
             self.decoded_instruction_data_cache
@@ -558,6 +563,7 @@ impl Program {
         )
     }
 
+    #[allow(dead_code)]
     pub(crate) fn shared_operand_type_hints(&self) -> Option<Arc<[u8]>> {
         self.operand_type_hints_cache
             .get_or_init(|| build_operand_type_hints(self.code.len(), self.type_map.as_ref()))
@@ -565,6 +571,7 @@ impl Program {
     }
 }
 
+#[allow(dead_code)]
 fn build_operand_type_hints(code_len: usize, type_map: Option<&TypeMap>) -> Option<Arc<[u8]>> {
     let type_map = type_map?;
     if type_map.operand_types.is_empty() {
@@ -581,6 +588,7 @@ fn build_operand_type_hints(code_len: usize, type_map: Option<&TypeMap>) -> Opti
     Some(Arc::from(hints.into_boxed_slice()))
 }
 
+#[allow(dead_code)]
 fn read_u32_at(code: &[u8], offset: usize) -> Option<u32> {
     let bytes = code.get(offset..offset + 4)?;
     Some(u32::from_le_bytes(bytes.try_into().ok()?))

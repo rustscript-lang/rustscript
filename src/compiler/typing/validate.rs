@@ -267,6 +267,7 @@ fn validate_callable_expr_against_schema(
     validate_expr_matches_schema(label, &expected_schema, expr, state, site, context)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn validate_function_argument_schemas(
     callable_name: &str,
     callable_kind: &str,

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use super::ir::{SsaExit, SsaMaterialization, SsaValue, SsaValueId, SsaValueRepr};
 
 pub(crate) fn materialize_ssa_values(

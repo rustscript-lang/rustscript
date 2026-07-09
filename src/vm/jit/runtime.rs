@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use super::super::{ExecOutcome, Vm, VmError, VmResult};
 #[cfg(any(
     all(

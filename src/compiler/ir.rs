@@ -372,6 +372,12 @@ pub struct LocalIrBuilder {
     function_meta: HashMap<String, (u16, Option<u8>)>,
 }
 
+impl Default for LocalIrBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LocalIrBuilder {
     pub fn new() -> Self {
         Self {

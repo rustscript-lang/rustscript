@@ -24,17 +24,6 @@ fn run_halted_vm_with_flavor(source: &str, flavor: SourceFlavor, jit_config: Jit
     vm
 }
 
-struct CountedTrueHost {
-    calls: Arc<AtomicUsize>,
-}
-
-impl HostFunction for CountedTrueHost {
-    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
-        self.calls.fetch_add(1, Ordering::Relaxed);
-        Ok(CallOutcome::Return(vec![Value::Bool(true)].into()))
-    }
-}
-
 #[test]
 fn interpreter_and_jit_match_for_loop_branch_arithmetic_program() {
     let source = r#"

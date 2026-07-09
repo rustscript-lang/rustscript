@@ -552,11 +552,11 @@ fn rewrite_function_call_paths(
                 }
             }
 
-            if let Some(target) = alias_calls.get(ident) {
-                if call_starts_after_position(bytes, i, flavor) {
-                    out.push_str(target);
-                    continue;
-                }
+            if let Some(target) = alias_calls.get(ident)
+                && call_starts_after_position(bytes, i, flavor)
+            {
+                out.push_str(target);
+                continue;
             }
 
             let mut rewritten_by_prefix = false;

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::sync::OnceLock;
 
 use crate::bytecode::{VmMap, vm_map_len_field_offset};
