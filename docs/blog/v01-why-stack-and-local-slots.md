@@ -38,7 +38,7 @@ Local slots keep the operand stack short-lived and expression-oriented.
 
 ## Why Not a Language-Shaped HIR?
 
-Another option is a single language-shaped core IR, such as a Scheme-like or ANF-style HIR, that every frontend must target.
+Another option is a single language-shaped core IR, such as an expression-oriented or ANF-style HIR, that every frontend must target.
 
 That approach has a real benefit: it gives the compiler one canonical semantic model. Rewrites, normalization, and some whole-program analyses become more uniform.
 

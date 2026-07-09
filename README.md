@@ -27,7 +27,7 @@ cargo build --workspace --release --jobs 4
 ```
 
 `pd-vm` is a stack-based virtual machine plus compiler toolchain used as a backend for multiple
-source syntaxes (`.rss`, `.js`, `.lua`, `.scm`).
+source syntaxes (`.rss`, `.js`, `.lua`).
 
 ## Contents
 
@@ -88,7 +88,6 @@ Other supported flavors:
 ```powershell
 cargo run -p pd-vm --bin pd-vm-run -- examples/example.js
 cargo run -p pd-vm --bin pd-vm-run -- examples/example.rss
-cargo run -p pd-vm --bin pd-vm-run -- examples/example.scm
 ```
 
 ### REPL
@@ -474,7 +473,7 @@ The end-to-end stack is split into layers. Not every entrypoint uses every layer
 
 1. Module/source loading (`compile_source_file()` path)
 1. Unit linking (`linker::merge_units`)
-1. Frontend lowering (`rustscript`, `javascript`, `lua`, `scheme`)
+1. Frontend lowering (`rustscript`, `javascript`, `lua`)
 1. Frontend-independent IR
 1. Type-consistency validation on legalized IR (for example rejecting known `if`/`else` branch mismatches)
 1. Lifetime/liveness lowering plus type metadata collection
@@ -506,7 +505,7 @@ monomorphic runtime fast paths, not to provide a full source-language static typ
 #### Compiler APIs
 
 Use `compile_source()` for RustScript, or `compile_source_file()` for extension-based flavor
-selection (`.rss`, `.js`, `.lua`, `.scm`).
+selection (`.rss`, `.js`, `.lua`).
 
 ```text
 fn print(x);
@@ -538,14 +537,12 @@ Built-in print aliases (no declaration needed):
 - RustScript: `print(value);`, `print("... {}", a);`, `println(value);`, `println("... {}", a);`
 - JavaScript subset: `console.log(value);` and `print(value);`
 - Lua subset: `print(value)`
-- Scheme subset: `(print value)`
 
 Host calls must be explicitly imported:
 
 - RustScript: `use runtime;`, `use http;`, `use rate_limit;`
 - JavaScript: `import * as runtime from "runtime";`, `import * as http from "http";`
 - Lua: `require("runtime")`, `require("http")`
-- Scheme: `(import "runtime")`, `(require (prefix-in http. "http"))`
 
 #### Assembler API
 
@@ -648,12 +645,6 @@ Lua frontend:
 - direct `function`/`local function` bodies are still minimal: empty/fallthrough, `return`, `return <expr[, expr...]>`, or a single return-only `if`/`elseif`/`else` chain
 - `pcall(...)` / `xpcall(...)` lower with success-only semantics and always prefix `true` before the callee return values
 - multi-return unpacking is currently limited to compiler-known Lua function/closure return shapes; extra return values are dropped, missing locals are filled with `null`, but plain assignment destructuring and arbitrary host-call unpacking are not supported
-
-Scheme frontend:
-
-- no runtime symbol/procedure type support in VM typing model (`procedure?` and `symbol?` lower to `false`)
-- `string->number` currently lowers to placeholder behavior (`0`) due to missing parse builtin
-- `apply` is limited to `(apply func arglist)` and does not implement full spread/varargs semantics
 
 ### JIT Internals
 

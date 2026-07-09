@@ -70,7 +70,7 @@ The core of RustScript's value is the availability analysis in `availability.rs`
 
 When `enable_local_move_semantics` is active (RustScript only), the pass enforces stricter rules:
 
-| Situation | RustScript behavior | JS / Lua / Scheme behavior |
+| Situation | RustScript behavior | JS / Lua behavior |
 |---|---|---|
 | Local-to-local rebind of a collection | Move source, reject reuse | Copy (shared ownership) |
 | Local read after move | Compile error | N/A (no moves) |
@@ -113,7 +113,7 @@ The capture binding modes are:
 | **BorrowMut** | `&mut x` in capture position | Non-consuming; mutation tracked |
 | **Move** | `x` (default for non-copyable) | Outer local consumed |
 
-In the JS, Lua, and Scheme frontends, all captures degrade to `Copy` mode. The capture slot still gets a value, but the outer scope keeps its own copy unconditionally.
+In the JS and Lua frontends, all captures degrade to `Copy` mode. The capture slot still gets a value, but the outer scope keeps its own copy unconditionally.
 
 ## Type Inference and the Ownership Surface
 

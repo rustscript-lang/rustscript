@@ -6,7 +6,7 @@ A critical review of the design philosophy, architecture, and trade-offs of the 
 
 ## 1. The Core Idea: What Is RustScript Trying to Be?
 
-RustScript occupies a deliberately strange niche: **a scripting language with Rust-like ownership semantics, running on a stack-based VM with no garbage collector, embedded inside an edge proxy runtime**. It also shares its VM and compiler infrastructure with JavaScript, Lua, and Scheme frontends.
+RustScript occupies a deliberately strange niche: **a scripting language with Rust-like ownership semantics, running on a stack-based VM with no garbage collector, embedded inside an edge proxy runtime**. It also shares its VM and compiler infrastructure with JavaScript and Lua frontends.
 
 This is an ambitious combination. Let me break down where it's clever, where it's contradictory, and where it has structural problems.
 
@@ -16,9 +16,9 @@ This is an ambitious combination. Let me break down where it's clever, where it'
 
 ### 2.1 The Multi-Frontend Shared IR Is a Genuinely Good Idea
 
-The architecture of lowering four different surface syntaxes (RustScript, JS, Lua, Scheme) into a single [FrontendIr](src/compiler/ir.rs#291-302) before compilation is clean and well-executed. The IR in [ir.rs](src/compiler/ir.rs) is expressive enough to capture ownership semantics (`MoveVar`, `ToOwned`, `Borrow`, `BorrowMut`) while remaining language-agnostic at the bytecode level.
+The architecture of lowering three different surface syntaxes (RustScript, JS, Lua) into a single [FrontendIr](src/compiler/ir.rs#291-302) before compilation is clean and well-executed. The IR in [ir.rs](src/compiler/ir.rs) is expressive enough to capture ownership semantics (`MoveVar`, `ToOwned`, `Borrow`, `BorrowMut`) while remaining language-agnostic at the bytecode level.
 
-This means the VM doesn't need to know about Rust syntax, and the JS/Lua/Scheme frontends get the performance benefits of the same optimizer pipeline for free. That's a solid engineering decision.
+This means the VM doesn't need to know about Rust syntax, and the JS/Lua frontends get the performance benefits of the same optimizer pipeline for free. That's a solid engineering decision.
 
 ### 2.2 The No-GC Memory Model Is Coherent (For Its Scope)
 
@@ -53,7 +53,7 @@ The borrow/ownership system in RustScript is best understood as a **developer-ti
 This is a defensible and pragmatic position. The remaining tension is:
 
 - **Cognitive cost vs. lint value:** Users pay for ownership concepts (move semantics, `.copy()`, `&mut` rules) in exchange for compile-time diagnostics. The question is whether the lint catches are frequent and valuable enough to justify the syntax overhead, especially for users who could switch to the JS/Lua frontends and skip ownership entirely.
-- **Non-RustScript frontends silently skip it.** JS, Lua, and Scheme degrade to copy-capture semantics. This is fine architecturally, but it means ownership is a per-frontend opt-in, which dilutes the VM-level identity.
+- **Non-RustScript frontends silently skip it.** JS and Lua degrade to copy-capture semantics. This is fine architecturally, but it means ownership is a per-frontend opt-in, which dilutes the VM-level identity.
 - **Positioning matters.** If users expect Rust-grade safety, they'll be disappointed (no lifetime parameters, no generic constraints, no deep borrow tracking into data structures). If they understand it as "smart linting with Rust-flavored syntax that catches the top 80% of foot-guns," it's a strong value proposition.
 
 > [!TIP]
@@ -72,21 +72,20 @@ The remaining concern is **opacity**: `BoundType::Unknown` is a valid degradatio
 > [!NOTE]
 > The lint infrastructure ([lint_unknown_inferred_local_types](src/compiler/pipeline.rs#477-483)) partially addresses opacity by warning when locals degrade to [Unknown](src/compiler/pipeline.rs#24-29). Expanding this to warn about expression-level degradation (not just locals) would further close the gap.
 
-### 3.3 Four Frontends Is a Maintenance Liability
+### 3.3 Three Frontends Is a Maintenance Liability
 
-Supporting JS, Lua, Scheme, and RustScript on one VM is impressive, but each frontend has a growing list of "current subset limits" that reveals the cost:
+Supporting JS, Lua, and RustScript on one VM is impressive, but each frontend has a growing list of "current subset limits" that reveals the cost:
 
 | Frontend | Notable Limitations |
 |---|---|
 | **RustScript** | No recursion, closures can't be stored in collections, callable-in-closure rejection |
 | **JavaScript** | No arrow block bodies, no direct builtins, no `var`/`class` |
 | **Lua** | Minimal function bodies, limited multi-return, no pattern APIs |
-| **Scheme** | `apply` is crippled, `symbol?`/`procedure?` are `false`, `string->number` is a placeholder |
 
-Each frontend is a partial subset of its host language. This creates a **documentation and expectation problem**: users familiar with JavaScript/Lua/Scheme will constantly bump into unsupported features, and the error messages for these are not always clear.
+Each frontend is a partial subset of its host language. This creates a **documentation and expectation problem**: users familiar with JavaScript/Lua will constantly bump into unsupported features, and the error messages for these are not always clear.
 
 > [!IMPORTANT]
-> The question isn't "can you support 4 languages?" but "should you?" Every hour spent making Lua's `pcall` work is an hour not spent making RustScript's type system stronger. Consider whether JS/Lua/Scheme are strategic priorities or research curiosities.
+> The question isn't "can you support 3 languages?" but "should you?" Every hour spent making Lua's `pcall` work is an hour not spent making RustScript's type system stronger. Consider whether JS/Lua are strategic priorities or research curiosities.
 
 ---
 
