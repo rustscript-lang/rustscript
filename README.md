@@ -1,17 +1,17 @@
 # RustScript
 
-RustScript is the language, VM, Lua/JavaScript frontends, standard library, examples, browser playground, bytecode/AOT tooling, and debugger-facing runtime contract from the original `project-d` history.
+RustScript is the language, VM, Lua/JavaScript frontends, standard library, examples, browser playground, bytecode/AOT tooling, and debugger-facing runtime contract for the RustScript family.
 
-## Repository split
+## Related projects
 
 - RustScript core: https://github.com/rustscript-lang/rustscript
 - CLR VM: https://github.com/rustscript-lang/rustscript-clr-vm
 - Edge runtime and ABI: https://github.com/rustscript-lang/pd-edge
 - Controller: https://github.com/rustscript-lang/pd-controller
 
-## Local crates
+## Crate usage
 
-Consumers can refer to the VM crate from the split repository:
+Consumers can refer to the VM crate from this repository:
 
 ```toml
 pd-vm = { git = "https://github.com/rustscript-lang/rustscript", package = "pd-vm" }
