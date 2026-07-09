@@ -1,10 +1,11 @@
 # RustScript
 
-RustScript is the language, VM, Lua/JavaScript frontends, standard library, examples, browser playground, bytecode/AOT tooling, and debugger-facing runtime contract for the RustScript family.
+RustScript is the language, VM, Lua/JavaScript frontends, standard library, examples, bytecode/AOT tooling, wasm runtime support, and debugger-facing runtime contract for the RustScript family.
 
 ## Related projects
 
 - RustScript core: https://github.com/rustscript-lang/rustscript
+- RustScript Playground: https://github.com/rustscript-lang/rustscript-playground
 - CLR VM: https://github.com/rustscript-lang/rustscript-clr-vm
 - Edge runtime and ABI: https://github.com/rustscript-lang/pd-edge
 - Controller: https://github.com/rustscript-lang/pd-controller

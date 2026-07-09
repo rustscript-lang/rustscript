@@ -18,7 +18,7 @@ source syntaxes (`.rss`, `.js`, `.lua`, `.scm`).
   - [Epoch Interruption](#epoch-interruption)
   - [Wasm Lint](#wasm-lint)
   - [Wasm Runtime Playground](#wasm-runtime-playground)
-  - [WebUI Playground](#webui-playground)
+  - [Web Playground](#web-playground)
   - [Test and Perf Commands](#test-and-perf-commands)
 - [Internals](#internals)
   - [VM Internals](#vm-internals)
@@ -293,18 +293,14 @@ Browser playground wasm runtime is provided by sibling crate `pd-vm-wasm` built 
 - `lint_source_json`
 - `run_source_json`
 
-### WebUI Playground
+### Web Playground
 
-Standalone Monaco playground lives in `pd-vm/webui`:
+The Monaco browser playground lives in a standalone repository:
 
-```powershell
-cd pd-vm/webui
-bun install
-bun run dev
-```
+- source: https://github.com/rustscript-lang/rustscript-playground
+- published site: https://rustscript-lang.github.io/rustscript-playground/
 
-This runs `scripts/build-wasm-playground.mjs`, which builds `pd-vm-wasm --features runtime`, copies wasm
-artifacts into `public/wasm`, and syncs RustScript Monaco grammar assets.
+It builds `pd-vm-wasm --features runtime`, copies wasm artifacts into the web app, and uses the Monaco grammar assets kept under `pd-vm/editor-assets/monaco`.
 
 In browser epoch mode, the playground drives one epoch tick from a 1ms JavaScript timer and shows
 the live epoch counter in the interruption panel. Timer delivery still depends on the main thread,

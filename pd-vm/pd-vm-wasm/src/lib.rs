@@ -1038,25 +1038,22 @@ mod runtime_tests {
 
     fn rss_playground_examples() -> [(&'static str, &'static str); 5] {
         [
-            (
-                "Demo",
-                include_str!("../../webui/src/examples/rss-complex-example.rss"),
-            ),
+            ("Demo", include_str!("../examples/rss-complex-example.rss")),
             (
                 "IFFT Example",
-                include_str!("../../webui/src/examples/rss-ifft-example.rss"),
+                include_str!("../examples/rss-ifft-example.rss"),
             ),
             (
                 "LRU Cache Example",
-                include_str!("../../webui/src/examples/rss-lrucache-example.rss"),
+                include_str!("../examples/rss-lrucache-example.rss"),
             ),
             (
                 "Collections and Iter Example",
-                include_str!("../../webui/src/examples/rss-collections-iter-example.rss"),
+                include_str!("../examples/rss-collections-iter-example.rss"),
             ),
             (
                 "Strings and Regex Example",
-                include_str!("../../webui/src/examples/rss-strings-regex-example.rss"),
+                include_str!("../examples/rss-strings-regex-example.rss"),
             ),
         ]
     }
