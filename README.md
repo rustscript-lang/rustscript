@@ -1,8 +1,6 @@
 # RustScript
 
-[![pd-vm on crates.io](https://img.shields.io/crates/v/pd-vm.svg)](https://crates.io/crates/pd-vm)
 [![rustscript on crates.io](https://img.shields.io/crates/v/rustscript.svg)](https://crates.io/crates/rustscript)
-[![pd-host-function on crates.io](https://img.shields.io/crates/v/pd-host-function.svg)](https://crates.io/crates/pd-host-function)
 
 RustScript is the language, VM/compiler core, standard library, examples, bytecode/AOT tooling, wasm runtime support, and debugger-facing runtime contract for the RustScript family. Compatibility language frontends now live in source-plugin crates.
 
