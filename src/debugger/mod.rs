@@ -365,7 +365,14 @@ impl DebugCommandBridge {
                 .state
                 .lock()
                 .expect("debug command bridge lock poisoned");
-            state.closed = false;
+            if state.closed {
+                state.attached = false;
+                state.current_line = None;
+                state.pending_request = None;
+                state.pending_response = None;
+                self.inner.changed.notify_all();
+                return true;
+            }
             state.attached = true;
             state.current_line = current_line(vm);
             state.pending_request = None;
@@ -1030,4 +1037,44 @@ fn resolve_executable_line(info: &DebugInfo, requested_line: u32) -> u32 {
     }
 
     next.or(prev).unwrap_or(requested_line)
+}
+
+#[cfg(test)]
+mod bridge_close_tests {
+    use std::time::Duration;
+
+    use crate::vm::{Program, Vm, VmStatus};
+
+    use super::{DebugCommandBridge, DebugCommandBridgeError, Debugger};
+
+    #[test]
+    fn closed_bridge_does_not_reopen_when_debugger_reaches_stop() {
+        let program = Program::new(
+            vec![],
+            vec![crate::vm::OpCode::Nop as u8, crate::vm::OpCode::Ret as u8],
+        );
+        let bridge = DebugCommandBridge::new();
+        bridge.close();
+        let thread_bridge = bridge.clone();
+
+        let join = std::thread::spawn(move || {
+            let mut debugger = Debugger::with_command_bridge(thread_bridge);
+            debugger.stop_on_entry();
+            let mut vm = Vm::new(program);
+            vm.run_with_debugger(&mut debugger)
+                .expect("closed debugger bridge should detach without blocking")
+        });
+
+        assert_eq!(
+            join.join().expect("debugger thread should join"),
+            VmStatus::Halted
+        );
+        assert!(!bridge.status().attached);
+        assert_eq!(
+            bridge
+                .execute("where", Duration::from_millis(5))
+                .expect_err("closed bridge should remain closed"),
+            DebugCommandBridgeError::Closed
+        );
+    }
 }
