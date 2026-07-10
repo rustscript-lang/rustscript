@@ -333,7 +333,7 @@ cargo check -p pd-vm-nostd --target thumbv6m-none-eabi
 
 Compile `.rss` source to VMBC on a host, then load that VMBC through `pd_vm_nostd` on the target.
 The PlatformIO Arduino-Pico integration lives in
-[`micro-rustscript`](https://github.com/rustscript-lang/rustscript-embedded).
+[`micro-rustscript`](https://github.com/rustscript-lang/micro-rustscript).
 
 ### Web Playground
 
