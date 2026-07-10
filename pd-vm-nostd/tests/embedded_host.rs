@@ -1,6 +1,4 @@
-#![cfg(feature = "embedded-runtime")]
-
-use vm::embedded::{
+use pd_vm_nostd::{
     HostBinding, HostError, Value as EmbeddedValue, Vm as EmbeddedVm, VmError, VmStatus,
     decode_program,
 };
@@ -12,7 +10,7 @@ struct BoardState {
     high: bool,
 }
 
-fn compile_embedded(source: &str) -> vm::embedded::Program {
+fn compile_embedded(source: &str) -> pd_vm_nostd::Program {
     let compiled = compile_source_for_repl(source).expect("RustScript source should compile");
     let bytes = encode_program(&compiled.program.with_local_count(compiled.locals))
         .expect("compiled program should encode");

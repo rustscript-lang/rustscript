@@ -293,7 +293,7 @@ Debugger epoch commands:
 Compiler-only wasm build (without runtime/JIT/debugger/CLI):
 
 ```powershell
-cargo check -p pd-vm --target wasm32-unknown-unknown --no-default-features --features std
+cargo check -p pd-vm --target wasm32-unknown-unknown --no-default-features
 ```
 
 Browser/editor lint integration is provided by sibling crate `pd-vm-wasm` via
@@ -319,22 +319,21 @@ Browser playground wasm runtime is provided by sibling crate `pd-vm-wasm` built 
 
 ### `no_std` Embedded Runtime
 
-The `embedded-runtime` feature provides a VMBC v8 decoder and compact interpreter using only
-`core` and `alloc`. It supports all bytecode instructions, synchronous host callbacks, and
-instruction fuel while leaving source compilation, CLI, debugger, JIT/AOT, async host operations,
-and operating-system integrations behind the `std` feature.
+The sibling crate [`pd-vm-nostd`](pd-vm-nostd) provides the VMBC v8 decoder and compact interpreter
+using only `core` and `alloc`. It supports direct bytecode execution, synchronous host callbacks,
+and instruction fuel while leaving source compilation, CLI, debugger, JIT/AOT, async host
+operations, and operating-system integrations in `pd-vm`.
 
 RP2040 compile check:
 
 ```bash
 rustup target add thumbv6m-none-eabi
-cargo check -p pd-vm --target thumbv6m-none-eabi \
-  --no-default-features --features embedded-runtime
+cargo check -p pd-vm-nostd --target thumbv6m-none-eabi
 ```
 
-Compile `.rss` source to VMBC on a host, then load that VMBC through `vm::embedded` on the target.
+Compile `.rss` source to VMBC on a host, then load that VMBC through `pd_vm_nostd` on the target.
 The PlatformIO Arduino-Pico integration lives in
-[`micro-rustscript`](https://github.com/rustscript-lang/rustscript-embedded/tree/feat/rp2040-platformio).
+[`micro-rustscript`](https://github.com/rustscript-lang/rustscript-embedded).
 
 ### Web Playground
 

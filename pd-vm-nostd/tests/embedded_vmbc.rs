@@ -1,6 +1,4 @@
-#![cfg(feature = "embedded-runtime")]
-
-use vm::embedded::{Value as EmbeddedValue, WireError, decode_program};
+use pd_vm_nostd::{Value as EmbeddedValue, WireError, decode_program};
 use vm::{HostImport, OpCode, Program, Value, ValueType, compile_source, encode_program};
 
 fn encoded_scalar_program() -> Vec<u8> {

@@ -69,9 +69,6 @@ impl fmt::Display for VmError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for VmError {}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireError {
     UnexpectedEof,
@@ -112,6 +109,3 @@ impl fmt::Display for WireError {
         }
     }
 }
-
-#[cfg(feature = "std")]
-impl std::error::Error for WireError {}

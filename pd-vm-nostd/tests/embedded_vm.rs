@@ -1,9 +1,10 @@
-#![cfg(feature = "embedded-runtime")]
-
-use vm::embedded::{Value as EmbeddedValue, Vm as EmbeddedVm, VmError, VmStatus, decode_program};
+use pd_vm_nostd::{
+    Program as EmbeddedProgram, Value as EmbeddedValue, Vm as EmbeddedVm, VmError, VmStatus,
+    decode_program,
+};
 use vm::{OpCode, Program, Value, compile_source_for_repl, encode_program};
 
-fn compile_embedded(source: &str) -> vm::embedded::Program {
+fn compile_embedded(source: &str) -> EmbeddedProgram {
     let compiled = compile_source_for_repl(source).expect("RustScript source should compile");
     let bytes = encode_program(&compiled.program.with_local_count(compiled.locals))
         .expect("compiled program should encode");
@@ -16,7 +17,7 @@ fn run_source(source: &str) -> Result<EmbeddedValue, VmError> {
     vm.stack().last().cloned().ok_or(VmError::StackUnderflow)
 }
 
-fn decode_direct(constants: Vec<Value>, code: Vec<u8>) -> vm::embedded::Program {
+fn decode_direct(constants: Vec<Value>, code: Vec<u8>) -> pd_vm_nostd::Program {
     let bytes = encode_program(&Program::new(constants, code)).expect("program should encode");
     decode_program(&bytes).expect("program should decode")
 }

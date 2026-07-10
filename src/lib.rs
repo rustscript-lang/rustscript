@@ -1,22 +1,11 @@
-#![cfg_attr(not(feature = "std"), no_std)]
-
-extern crate alloc;
-
-#[cfg(feature = "std")]
 mod builtins;
 
-#[cfg(feature = "std")]
 pub mod assembler;
-#[cfg(feature = "std")]
 pub mod bytecode;
-#[cfg(feature = "std")]
 pub mod compiler;
-#[cfg(feature = "std")]
 pub mod debug_info;
 #[cfg(feature = "runtime")]
 pub mod debugger;
-#[cfg(feature = "embedded-runtime")]
-pub mod embedded;
 #[cfg(feature = "runtime")]
 pub mod jit {
     pub use crate::vm::jit::{
@@ -31,20 +20,16 @@ pub mod vm;
 #[cfg(feature = "runtime")]
 pub mod vmbc;
 
-#[cfg(feature = "std")]
 pub use assembler::{AsmParseError, Assembler, AssemblerError, BytecodeBuilder, assemble};
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::print::{PrintHostFunction, PrintlnHostFunction, format_value};
-#[cfg(feature = "std")]
 pub use builtins::{
     BuiltinFunction, BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec, CallableDef, CallableParam,
     CallableParamType, CallableSignature, LanguageBuiltinSpec, builtin_namespace_specs,
     callable_signatures_for_builtin_namespace_member, default_host_callables, is_builtin_namespace,
     language_builtin_specs, resolve_builtin_namespace_call,
 };
-#[cfg(feature = "std")]
 pub use bytecode::{HostImport, OpCode, Program, TypeMap, Value, ValueType};
-#[cfg(feature = "std")]
 pub fn builtin_call_index(name: &str) -> Option<u16> {
     use builtins::BuiltinFunction;
 
@@ -59,11 +44,8 @@ pub fn builtin_call_index(name: &str) -> Option<u16> {
         _ => BuiltinFunction::from_namespaced_name(name).map(|builtin| builtin.call_index()),
     }
 }
-#[cfg(feature = "std")]
 pub use compiler::diagnostics::{render_compile_error, render_source_error};
-#[cfg(feature = "std")]
 pub use compiler::source_map::{LineSpanMapping, LoweredSource, SourceId, SourceMap, Span};
-#[cfg(feature = "std")]
 pub use compiler::{
     AssignmentKind, ClosureExpr, CompileError, CompileSourceFileOptions, CompiledProgram,
     CompiledReplProgram, Compiler, Expr, FormatError, FrontendImportSyntax, FrontendIr,
@@ -81,7 +63,6 @@ pub use compiler::{
     lint_unknown_inferred_local_types_with_options, lint_unknown_type_annotations,
     parse_source_with_dialect,
 };
-#[cfg(feature = "std")]
 pub use debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
 #[cfg(feature = "runtime")]
 pub use debugger::{

@@ -1,7 +1,11 @@
+#![no_std]
+
 //! Minimal `no_std + alloc` RustScript bytecode runtime.
 //!
 //! The implementation is intentionally independent from compiler, CLI, JIT,
 //! debugger, and operating-system integrations.
+
+extern crate alloc;
 
 mod error;
 mod host;

@@ -1,0 +1,19 @@
+[package]
+name = "pd-vm-nostd"
+version.workspace = true
+edition.workspace = true
+description = "no_std + alloc RustScript VMBC interpreter"
+license = "MIT"
+homepage = "https://rustscript.org/"
+repository = "https://github.com/rustscript-lang/rustscript"
+readme = "README.md"
+keywords = ["rustscript", "no-std", "embedded", "vm", "bytecode"]
+categories = ["embedded", "no-std"]
+
+[lib]
+name = "pd_vm_nostd"
+
+[dependencies]
+
+[dev-dependencies]
+vm = { package = "pd-vm", path = ".." }

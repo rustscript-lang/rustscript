@@ -2,6 +2,7 @@
 members = [
     ".",
     "pd-host-function",
+    "pd-vm-nostd",
     "pd-vm-wasm",
     "crates/rustscript",
 ]
@@ -24,22 +25,9 @@ repository = "https://github.com/rustscript-lang/rustscript"
 name = "vm"
 
 [features]
-default = ["std", "runtime", "cli", "cranelift-jit", "http", "tls", "websocket"]
-std = [
-    "dep:base64",
-    "dep:futures-channel",
-    "dep:libc",
-    "dep:paste",
-    "dep:pd-host-function",
-    "dep:regex",
-    "dep:rt-format",
-    "dep:serde",
-    "dep:serde_json",
-    "dep:windows-sys",
-]
-embedded-runtime = []
-runtime = ["std"]
-edge-abi = ["std", "dep:edge_abi"]
+default = ["runtime", "cli", "cranelift-jit", "http", "tls", "websocket"]
+runtime = []
+edge-abi = ["dep:edge_abi"]
 http = ["edge-abi", "edge_abi/http"]
 http2 = ["http", "edge_abi/http2"]
 mqtt = ["edge-abi", "edge_abi/mqtt"]
@@ -62,27 +50,27 @@ path = "src/bin/pd-vm-run.rs"
 required-features = ["cli"]
 
 [dependencies]
-base64 = { version = "0.22", optional = true }
+base64 = "0.22"
 cranelift-codegen = { version = "0.129.1", optional = true }
 cranelift-frontend = { version = "0.129.1", optional = true }
 cranelift-jit = { version = "0.129.1", optional = true }
 cranelift-module = { version = "0.129.1", optional = true }
 cranelift-native = { version = "0.129.1", optional = true }
-pd-host-function = { path = "./pd-host-function", version = "0.1.0", optional = true }
+pd-host-function = { path = "./pd-host-function", version = "0.1.0" }
 edge_abi = { package = "pd-edge-abi", version = "0.1.1", default-features = false, optional = true }
-futures-channel = { version = "0.3", optional = true }
-paste = { version = "1", optional = true }
-regex = { version = "1", optional = true }
-serde = { version = "1", optional = true }
-serde_json = { version = "1", optional = true }
-rt-format = { version = "0.3.1", optional = true }
+futures-channel = "0.3"
+paste = "1"
+regex = "1"
+serde = "1"
+serde_json = "1"
+rt-format = "0.3.1"
 rustyline = { version = "14", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", optional = true, features = ["Win32_System_Diagnostics_Debug", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_System_Diagnostics_Debug", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = { version = "0.2", optional = true }
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "time", "sync"] }
