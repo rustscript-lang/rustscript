@@ -2,6 +2,8 @@
 name = "pd-host-function"
 version.workspace = true
 edition.workspace = true
+description = "Proc macro support for RustScript host functions"
+license = "MIT"
 
 [lib]
 proc-macro = true

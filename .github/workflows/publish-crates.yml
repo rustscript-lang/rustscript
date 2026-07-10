@@ -1,0 +1,135 @@
+name: Publish crates
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - '[0-9]*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish. Defaults to the pushed tag name without leading v.'
+        required: false
+        type: string
+      pd_vm_version:
+        description: 'pd-vm dependency version override'
+        required: false
+        type: string
+      pd_edge_abi_version:
+        description: 'pd-edge-abi dependency version override'
+        required: false
+        type: string
+
+concurrency:
+  group: publish-crates-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      PACKAGE_ORDER: pd-host-function pd-vm
+      PD_VM_VERSION: ${{ inputs.pd_vm_version || inputs.version }}
+      PD_EDGE_ABI_VERSION: ${{ inputs.pd_edge_abi_version || '0.1.1' }}
+    steps:
+      - name: Checkout rustscript
+        uses: actions/checkout@v4
+        with:
+          path: rustscript
+      - name: Checkout pd-edge dependency
+        uses: actions/checkout@v4
+        with:
+          repository: rustscript-lang/pd-edge
+          path: pd-edge
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Publish crates
+        working-directory: rustscript
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "CARGO_REGISTRY_TOKEN is required" >&2
+            exit 1
+          fi
+          version="${INPUT_VERSION:-}"
+          if [[ -z "$version" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          if [[ -z "$version" ]]; then
+            echo "version is required" >&2
+            exit 1
+          fi
+          export PUBLISH_VERSION="$version"
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          version = os.environ['PUBLISH_VERSION']
+          dep_versions = {
+              'pd-host-function': version,
+              'pd-vm': os.environ.get('PD_VM_VERSION') or version,
+              'pd-edge-abi': os.environ.get('PD_EDGE_ABI_VERSION') or version,
+          }
+          dep_re = re.compile(r'^(\s*([A-Za-z0-9_-]+)\s*=\s*\{)(.*)(\}\s*)$')
+          for path in Path('.').rglob('Cargo.toml'):
+              lines = path.read_text().splitlines()
+              out = []
+              section = ''
+              for line in lines:
+                  stripped = line.strip()
+                  if stripped.startswith('[') and stripped.endswith(']'):
+                      section = stripped
+                  if section in ('[workspace.package]', '[package]') and stripped.startswith('version = '):
+                      line = re.sub(r'version\s*=\s*"[^"]*"', f'version = "{version}"', line)
+                  match = dep_re.match(line)
+                  if match and 'path' in match.group(3):
+                      prefix, key, body, suffix = match.groups()
+                      package_match = re.search(r'package\s*=\s*"([^"]+)"', body)
+                      dep_name = package_match.group(1) if package_match else key
+                      dep_version = dep_versions.get(dep_name)
+                      if dep_version:
+                          if re.search(r'version\s*=\s*"[^"]*"', body):
+                              body = re.sub(r'version\s*=\s*"[^"]*"', f'version = "{dep_version}"', body)
+                          else:
+                              body = body.rstrip()
+                              if body and not body.endswith(','):
+                                  body += ','
+                              body += f' version = "{dep_version}"'
+                          line = prefix + body + suffix
+                  out.append(line)
+              path.write_text('\n'.join(out) + '\n')
+          PY
+          python3 - <<'PY'
+          import json, urllib.error, urllib.request, os, subprocess, time, sys
+          version = os.environ['PUBLISH_VERSION']
+          packages = os.environ['PACKAGE_ORDER'].split()
+          token = os.environ['CARGO_REGISTRY_TOKEN']
+          def exists(crate, version):
+              url = f'https://crates.io/api/v1/crates/{crate}/{version}'
+              try:
+                  urllib.request.urlopen(url, timeout=20).read()
+                  return True
+              except urllib.error.HTTPError as exc:
+                  if exc.code == 404:
+                      return False
+                  raise
+          for package in packages:
+              if exists(package, version):
+                  print(f'{package} {version} already published; skipping')
+                  continue
+              for attempt in range(1, 19):
+                  print(f'publishing {package} {version}, attempt {attempt}')
+                  proc = subprocess.run([
+                      'cargo', 'publish', '-p', package, '--no-verify', '--allow-dirty', '--token', token,
+                  ], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                  print(proc.stdout)
+                  if proc.returncode == 0 or exists(package, version):
+                      break
+                  if attempt == 18:
+                      sys.exit(proc.returncode)
+                  time.sleep(20)
+          PY
