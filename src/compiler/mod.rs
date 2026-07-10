@@ -32,6 +32,7 @@ pub use self::ir::{
     LocalIrBuilder, LocalSlot, MatchPattern, MatchTypePattern, Stmt, StructDecl, TypeSchema,
 };
 pub use self::parser::ParserDialect;
+pub(crate) use self::pipeline::compile_source_for_repl_with_state;
 pub use self::pipeline::{
     InferredLocalTypeHint, UnknownInferredLocal, collect_inferred_local_type_hints,
     collect_inferred_local_type_hints_at_path_with_options,
@@ -427,6 +428,12 @@ pub struct ReplLocalBinding {
     pub mutable: bool,
     pub schema: Option<TypeSchema>,
     pub optional: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReplLocalState {
+    pub binding: ReplLocalBinding,
+    pub moved: bool,
 }
 
 pub struct CompiledProgram {

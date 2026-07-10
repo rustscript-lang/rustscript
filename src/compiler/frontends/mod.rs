@@ -6,16 +6,14 @@ use crate::compiler::source_map::{LoweredSource, SourceMap};
 
 use super::{
     CompileSourceFileOptions, ParseError, ReplLocalBinding, SharedParserOptions, SourceFlavor,
-    ir::{FrontendIr, LocalSlot},
+    ir::FrontendIr,
     parser::{Parser, ParserDialect},
 };
 
-// REPL snippets need a small amount of extra state that normal source compilation
-// does not carry: the persisted binding table and which slots are live on entry.
+// REPL snippets carry the persisted binding table alongside the parsed IR.
 pub(super) struct ParsedRustScriptReplSource {
     pub ir: FrontendIr,
     pub bindings: Vec<ReplLocalBinding>,
-    pub entry_definite_locals: Vec<LocalSlot>,
 }
 
 pub(super) fn parse_source(
@@ -132,16 +130,7 @@ fn parse_repl_with_parser(
     )?;
     let stmts = parser.parse_program()?;
     let bindings = parser.local_bindings_with_mutability();
-    let predeclared = parser
-        .local_bindings()
-        .into_iter()
-        .filter_map(|(name, index)| {
-            predefined_locals
-                .iter()
-                .any(|binding| binding.name == name)
-                .then_some(index)
-        })
-        .collect::<Vec<_>>();
+
     Ok(ParsedRustScriptReplSource {
         ir: FrontendIr {
             stmts,
@@ -155,7 +144,6 @@ fn parse_repl_with_parser(
             function_sources: HashMap::new(),
         },
         bindings,
-        entry_definite_locals: predeclared,
     })
 }
 

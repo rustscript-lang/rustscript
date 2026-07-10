@@ -11,8 +11,8 @@ use super::source_loader::load_units_for_source_file;
 use super::source_map::SourceMap;
 use super::{
     CompileError, CompileSourceFileOptions, CompiledProgram, CompiledReplProgram, ParseError,
-    ReplLocalBinding, SourceError, SourceFlavor, SourcePathError, TypingMode, lifetime, parser,
-    typing,
+    ReplLocalBinding, ReplLocalState, SourceError, SourceFlavor, SourcePathError, TypingMode,
+    lifetime, parser, typing,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -358,7 +358,7 @@ fn compile_parsed_output(
 fn compile_parsed_output_with_entry_locals(
     source: String,
     parsed: FrontendIr,
-    entry_definite_locals: &[LocalSlot],
+    entry_locals: &[lifetime::EntryLocalAvailability],
     entry_local_types: &[typing::EntryLocalType],
     behavior: CompileBehavior,
     typing_mode: TypingMode,
@@ -380,7 +380,7 @@ fn compile_parsed_output_with_entry_locals(
     }
     let parsed = lifetime::enforce_local_availability_with_entry_locals(
         parsed,
-        entry_definite_locals,
+        entry_locals,
         behavior.clear_dead_locals,
         enable_local_move_semantics,
     )
@@ -1121,7 +1121,27 @@ pub fn compile_source_for_repl_with_locals(
     let source_owned = source.to_string();
     let predefined_locals = predefined_locals.to_vec();
     run_with_compiler_stack(move || {
-        compile_source_for_repl_with_locals_impl(&source_owned, &predefined_locals)
+        compile_source_for_repl_with_locals_impl(&source_owned, &predefined_locals, &[])
+    })
+}
+
+pub(crate) fn compile_source_for_repl_with_state(
+    source: &str,
+    predefined_locals: &[ReplLocalState],
+) -> Result<CompiledReplProgram, SourceError> {
+    let source_owned = source.to_string();
+    let predefined_locals = predefined_locals.to_vec();
+    run_with_compiler_stack(move || {
+        let bindings = predefined_locals
+            .iter()
+            .map(|state| state.binding.clone())
+            .collect::<Vec<_>>();
+        let moved_names = predefined_locals
+            .iter()
+            .filter(|state| state.moved)
+            .map(|state| state.binding.name.clone())
+            .collect::<Vec<_>>();
+        compile_source_for_repl_with_locals_impl(&source_owned, &bindings, &moved_names)
     })
 }
 
@@ -1170,6 +1190,7 @@ fn compile_source_with_flavor_and_behavior(
 fn compile_source_for_repl_with_locals_impl(
     source: &str,
     predefined_locals: &[ReplLocalBinding],
+    moved_names: &[String],
 ) -> Result<CompiledReplProgram, SourceError> {
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source("<source>", source.to_string());
@@ -1180,10 +1201,12 @@ fn compile_source_for_repl_with_locals_impl(
             SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
         })?;
     let entry_local_types = build_entry_local_types(&parsed.ir, predefined_locals);
+    let entry_availability =
+        build_entry_local_availability(&parsed.ir, predefined_locals, moved_names);
     let compiled = match compile_parsed_output_with_entry_locals(
         source.to_string(),
         parsed.ir,
-        &parsed.entry_definite_locals,
+        &entry_availability,
         &entry_local_types,
         CompileBehavior::REPL,
         TypingMode::StrictRustScript,
@@ -1198,6 +1221,45 @@ fn compile_source_for_repl_with_locals_impl(
         compiled,
         bindings: parsed.bindings,
     })
+}
+
+fn build_entry_local_availability(
+    parsed: &FrontendIr,
+    predefined_locals: &[ReplLocalBinding],
+    moved_names: &[String],
+) -> Vec<lifetime::EntryLocalAvailability> {
+    let predefined_by_name = predefined_locals
+        .iter()
+        .map(|binding| (binding.name.as_str(), binding))
+        .collect::<HashMap<_, _>>();
+    parsed
+        .local_bindings
+        .iter()
+        .filter_map(|(name, slot)| {
+            let binding = predefined_by_name.get(name.as_str())?;
+            let schema = binding
+                .schema
+                .as_ref()
+                .map(|schema| schema.split_optional().0);
+            let copyable = matches!(
+                schema,
+                Some(
+                    TypeSchema::Null
+                        | TypeSchema::Int
+                        | TypeSchema::Float
+                        | TypeSchema::Number
+                        | TypeSchema::Bool
+                )
+            );
+            let movable = matches!(schema, Some(TypeSchema::String | TypeSchema::Bytes));
+            Some(lifetime::EntryLocalAvailability {
+                slot: *slot,
+                copyable,
+                movable,
+                moved: moved_names.iter().any(|moved| moved == name),
+            })
+        })
+        .collect()
 }
 
 fn build_entry_local_types(

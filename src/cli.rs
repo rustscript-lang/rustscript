@@ -8,9 +8,9 @@ use crate as vm;
 use crate::{
     CallOutcome, CallReturn, CompileSourceFileOptions, Debugger, DisassembleOptions, JitConfig,
     Program, ReplLocalBinding, SourceFlavor, SourceMap, SourcePathError, Value, Vm, VmError,
-    VmRecording, VmStatus, compile_source_file_with_options, compile_source_for_repl_with_locals,
-    disassemble_vmbc_with_options, encode_program, format_source_with_flavor_and_options,
-    render_source_error, render_vm_error, replay_recording_stdio,
+    VmRecording, VmStatus, compile_source_file_with_options, disassemble_vmbc_with_options,
+    encode_program, format_source_with_flavor_and_options, render_source_error, render_vm_error,
+    replay_recording_stdio,
 };
 use crate::{HostFunctionRegistry, HostImport};
 use rustyline::DefaultEditor;
@@ -1004,6 +1004,7 @@ struct ReplSessionLocal {
     mutable: bool,
     schema: Option<crate::compiler::TypeSchema>,
     optional: bool,
+    moved: bool,
 }
 
 fn sync_repl_session(vm: &Vm, bindings: &[ReplLocalBinding], session: &mut ReplSession) {
@@ -1024,6 +1025,12 @@ fn sync_repl_session(vm: &Vm, bindings: &[ReplLocalBinding], session: &mut ReplS
             continue;
         };
         let (schema, optional) = repl_local_schema_from_vm(vm, index as usize, value);
+        let moved = !optional
+            && value == &Value::Null
+            && matches!(
+                schema,
+                Some(vm::compiler::TypeSchema::String | vm::compiler::TypeSchema::Bytes)
+            );
         next.insert(
             binding.name.clone(),
             ReplSessionLocal {
@@ -1031,6 +1038,7 @@ fn sync_repl_session(vm: &Vm, bindings: &[ReplLocalBinding], session: &mut ReplS
                 mutable: binding.mutable,
                 schema,
                 optional,
+                moved,
             },
         );
     }
@@ -1073,21 +1081,29 @@ fn compile_repl_snippet(
     let trimmed = input.trim_end();
     let bindings = locals
         .iter()
-        .map(|(name, local)| ReplLocalBinding {
-            name: name.clone(),
-            mutable: local.mutable,
-            schema: local.schema.clone(),
-            optional: local.optional,
+        .map(|(name, local)| vm::compiler::ReplLocalState {
+            binding: ReplLocalBinding {
+                name: name.clone(),
+                mutable: local.mutable,
+                schema: local.schema.clone(),
+                optional: local.optional,
+            },
+            moved: local.moved,
         })
         .collect::<Vec<_>>();
-    match compile_source_for_repl_with_locals(trimmed, &bindings) {
+    match vm::compiler::compile_source_for_repl_with_state(trimmed, &bindings) {
         Ok(compiled) => Ok(compiled),
         Err(first_err) => {
             if trimmed.ends_with(';') {
                 return Err(first_err);
             }
             let fallback = format!("{trimmed};");
-            compile_source_for_repl_with_locals(&fallback, &bindings).map_err(|_| first_err)
+            match vm::compiler::compile_source_for_repl_with_state(&fallback, &bindings) {
+                Ok(compiled) => Ok(compiled),
+                Err(err @ vm::SourceError::Parse(vm::ParseError { code: Some(_), .. })) => Err(err),
+                Err(err @ vm::SourceError::Compile(_)) => Err(err),
+                Err(_) => Err(first_err),
+            }
         }
     }
 }
@@ -1879,6 +1895,7 @@ mod tests {
                 mutable: false,
                 schema: Some(vm::compiler::TypeSchema::Int),
                 optional: false,
+                moved: false,
             },
         );
         let compiled =
@@ -1897,6 +1914,40 @@ mod tests {
 
         let vm = run_repl_snippet_and_sync(&mut session, "x + 1");
         assert_eq!(vm.stack().last(), Some(&Value::Int(42)));
+    }
+
+    #[test]
+    fn repl_session_preserves_move_state_between_entries() {
+        let mut session = super::ReplSession::default();
+        let _ = run_repl_snippet_and_sync(&mut session, "let a = \"payload\";");
+        let _ = run_repl_snippet_and_sync(&mut session, "let b = a;");
+
+        assert_eq!(session.locals.get("a").map(|local| local.moved), Some(true));
+        assert_eq!(
+            session.locals.get("b").map(|local| &local.value),
+            Some(&Value::string("payload"))
+        );
+        match super::compile_repl_snippet("a", &session.locals) {
+            Err(vm::SourceError::Parse(parse)) => {
+                assert_eq!(parse.code.as_deref(), Some("E_LOCAL_MOVED"));
+            }
+            Err(other) => panic!("expected moved-local parse error, got {other}"),
+            Ok(_) => panic!("expected moved-local parse error, got successful compile"),
+        }
+    }
+
+    #[test]
+    fn repl_session_keeps_copy_types_available_after_binding() {
+        let mut session = super::ReplSession::default();
+        let _ = run_repl_snippet_and_sync(&mut session, "let a = 1;");
+        let _ = run_repl_snippet_and_sync(&mut session, "let b = a;");
+        let vm = run_repl_snippet_and_sync(&mut session, "a");
+
+        assert_eq!(vm.stack().last(), Some(&Value::Int(1)));
+        assert_eq!(
+            session.locals.get("a").map(|local| local.moved),
+            Some(false)
+        );
     }
 
     #[test]
@@ -1949,6 +2000,7 @@ mod tests {
                 mutable: false,
                 schema: Some(vm::compiler::TypeSchema::Int),
                 optional: false,
+                moved: false,
             },
         );
         match super::compile_repl_snippet("let y = ;", &locals) {
