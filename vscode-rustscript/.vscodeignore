@@ -1,3 +1,4 @@
 dist
 node_modules
 *.vsix
+!wasm/pd_vm_wasm.wasm

@@ -77,9 +77,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Build language service wasm
+        run: cargo build -p pd-vm-wasm --target wasm32-unknown-unknown --release
+      - name: Stage language service wasm
+        shell: bash
+        run: |
+          mkdir -p vscode-rustscript/wasm
+          cp target/wasm32-unknown-unknown/release/pd_vm_wasm.wasm vscode-rustscript/wasm/pd_vm_wasm.wasm
       - name: Package VS Code extension
         working-directory: vscode-rustscript
         run: |
