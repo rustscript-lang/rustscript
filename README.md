@@ -334,7 +334,7 @@ cargo check -p pd-vm --target thumbv6m-none-eabi \
 
 Compile `.rss` source to VMBC on a host, then load that VMBC through `vm::embedded` on the target.
 The PlatformIO Arduino-Pico integration lives in
-[`rustscript-embedded`](https://github.com/rustscript-lang/rustscript-embedded/tree/feat/rp2040-platformio).
+[`micro-rustscript`](https://github.com/rustscript-lang/rustscript-embedded/tree/feat/rp2040-platformio).
 
 ### Web Playground
 
