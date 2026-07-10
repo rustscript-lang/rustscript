@@ -1,3 +1,5 @@
+#![cfg(feature = "embedded-runtime")]
+
 use vm::embedded::{Value as EmbeddedValue, WireError, decode_program};
 use vm::{HostImport, OpCode, Program, Value, ValueType, compile_source, encode_program};
 

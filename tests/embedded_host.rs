@@ -1,3 +1,5 @@
+#![cfg(feature = "embedded-runtime")]
+
 use vm::embedded::{
     HostBinding, HostError, Value as EmbeddedValue, Vm as EmbeddedVm, VmError, VmStatus,
     decode_program,
