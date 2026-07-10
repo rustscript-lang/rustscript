@@ -117,6 +117,7 @@ pub struct StructDecl {
 }
 
 fn known_host_accepts_arity(name: &str, arity: u8) -> bool {
+    #[cfg(feature = "edge-abi")]
     if let Some(function) = edge_abi::function_by_name(name) {
         return function.param_types.len() == usize::from(arity);
     }

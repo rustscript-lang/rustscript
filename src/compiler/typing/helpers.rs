@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::builtins::{BuiltinFunction, CallableParam, CallableParamType};
+use crate::builtins::BuiltinFunction;
+#[cfg(feature = "edge-abi")]
+use crate::builtins::{CallableParam, CallableParamType};
 
 use super::super::CompileError;
 use super::super::TypingMode;
@@ -1221,23 +1223,30 @@ pub(super) fn known_host_signature(name: &str) -> Option<HostCallableSignature> 
         });
     }
 
-    let function = edge_abi::function_by_name(name)?;
-    Some(HostCallableSignature {
-        name: name.to_string(),
-        params: function
-            .param_names
-            .iter()
-            .copied()
-            .zip(function.param_types.iter().copied())
-            .map(|(param_name, param_type)| CallableParam {
-                name: param_name,
-                ty: callable_param_type_from_abi(param_type),
-                optional: false,
-            })
-            .collect(),
-    })
+    #[cfg(feature = "edge-abi")]
+    {
+        let function = edge_abi::function_by_name(name)?;
+        Some(HostCallableSignature {
+            name: name.to_string(),
+            params: function
+                .param_names
+                .iter()
+                .copied()
+                .zip(function.param_types.iter().copied())
+                .map(|(param_name, param_type)| CallableParam {
+                    name: param_name,
+                    ty: callable_param_type_from_abi(param_type),
+                    optional: false,
+                })
+                .collect(),
+        })
+    }
+
+    #[cfg(not(feature = "edge-abi"))]
+    None
 }
 
+#[cfg(feature = "edge-abi")]
 pub(super) fn callable_param_type_from_abi(value: edge_abi::AbiParamType) -> CallableParamType {
     match value {
         edge_abi::AbiParamType::Any => CallableParamType::Any,

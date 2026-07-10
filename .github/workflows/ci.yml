@@ -19,16 +19,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: rustscript
-      - uses: actions/checkout@v4
-        with:
-          repository: rustscript-lang/pd-edge
-          path: pd-edge
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - name: Format check
         working-directory: rustscript
         run: cargo fmt --all -- --check
+      - name: Runtime-only dependency check
+        working-directory: rustscript
+        run: cargo check -p pd-vm --no-default-features --features runtime
       - name: Clippy
         working-directory: rustscript
         run: cargo clippy --workspace --all-targets --all-features
@@ -47,10 +46,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: rustscript
-      - uses: actions/checkout@v4
-        with:
-          repository: rustscript-lang/pd-edge
-          path: pd-edge
       - uses: dtolnay/rust-toolchain@stable
       - name: Build pd-vm CLI
         working-directory: rustscript

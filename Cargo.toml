@@ -26,9 +26,10 @@ name = "vm"
 [features]
 default = ["runtime", "cli", "cranelift-jit", "http", "tls", "websocket"]
 runtime = []
-http = ["edge_abi/http"]
+edge-abi = ["dep:edge_abi"]
+http = ["edge-abi", "edge_abi/http"]
 http2 = ["http", "edge_abi/http2"]
-mqtt = ["edge_abi/mqtt"]
+mqtt = ["edge-abi", "edge_abi/mqtt"]
 tls = ["http", "edge_abi/tls"]
 websocket = ["http", "edge_abi/websocket"]
 webrtc = ["http", "edge_abi/webrtc"]
@@ -55,7 +56,7 @@ cranelift-jit = { version = "0.129.1", optional = true }
 cranelift-module = { version = "0.129.1", optional = true }
 cranelift-native = { version = "0.129.1", optional = true }
 pd-host-function = { path = "./pd-host-function", version = "0.1.0" }
-edge_abi = { package = "pd-edge-abi", path = "../pd-edge/pd-edge-abi", version = "0.1.0", default-features = false }
+edge_abi = { package = "pd-edge-abi", version = "0.1.1", default-features = false, optional = true }
 futures-channel = "0.3"
 paste = "1"
 regex = "1"

@@ -39,11 +39,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: rustscript
-      - name: Checkout pd-edge dependency
-        uses: actions/checkout@v4
-        with:
-          repository: rustscript-lang/pd-edge
-          path: pd-edge
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Publish crates

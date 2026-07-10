@@ -14,6 +14,7 @@ pub(super) fn is_virtual_host_namespace_spec(spec: &str) -> bool {
     is_ident_start(first) && chars.all(is_ident_continue)
 }
 
+#[cfg(feature = "edge-abi")]
 fn abi_value_type_to_value_type(value: edge_abi::AbiValueType) -> ValueType {
     match value {
         edge_abi::AbiValueType::Unknown => ValueType::Unknown,
@@ -29,13 +30,23 @@ fn abi_value_type_to_value_type(value: edge_abi::AbiValueType) -> ValueType {
 }
 
 fn known_host_return_type(name: &str) -> ValueType {
-    edge_abi::function_by_name(name)
-        .map(|function| abi_value_type_to_value_type(function.return_type))
+    edge_host_return_type(name)
         .or_else(|| {
             default_host_callable(name)
                 .and_then(|callable| parse_host_return_value_type(callable.signature.return_type))
         })
         .unwrap_or(ValueType::Unknown)
+}
+
+#[cfg(feature = "edge-abi")]
+fn edge_host_return_type(name: &str) -> Option<ValueType> {
+    edge_abi::function_by_name(name)
+        .map(|function| abi_value_type_to_value_type(function.return_type))
+}
+
+#[cfg(not(feature = "edge-abi"))]
+fn edge_host_return_type(_name: &str) -> Option<ValueType> {
+    None
 }
 
 fn known_host_return_schema(name: &str) -> Option<TypeSchema> {
@@ -102,6 +113,7 @@ fn parse_simple_host_return_schema(spec: &str) -> Option<TypeSchema> {
 }
 
 fn known_host_accepts_arity(name: &str, arity: u8) -> bool {
+    #[cfg(feature = "edge-abi")]
     if let Some(function) = edge_abi::function_by_name(name) {
         return function.param_types.len() == usize::from(arity);
     }
