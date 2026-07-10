@@ -1,5 +1,7 @@
 use core::fmt;
 
+use alloc::string::String;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmError {
     StackUnderflow,
@@ -10,10 +12,23 @@ pub enum VmError {
     InvalidConstant(u32),
     InvalidLocal(u8),
     InvalidCall(u16),
+    InvalidCallArity {
+        import: String,
+        expected: u8,
+        got: u8,
+    },
+    UnboundImport(String),
     HostCallsUnavailable(u16),
+    HostError(&'static str),
+    HostBindingCapacity,
     InvalidOpcode(u8),
     BytecodeBounds,
     InvalidJump(u32),
+    FuelOverflow,
+    OutOfFuel {
+        needed: u64,
+        remaining: u64,
+    },
 }
 
 impl fmt::Display for VmError {
@@ -29,12 +44,27 @@ impl fmt::Display for VmError {
             Self::InvalidConstant(index) => write!(f, "invalid constant index: {index}"),
             Self::InvalidLocal(index) => write!(f, "invalid local index: {index}"),
             Self::InvalidCall(index) => write!(f, "invalid call index: {index}"),
+            Self::InvalidCallArity {
+                import,
+                expected,
+                got,
+            } => write!(
+                f,
+                "invalid call arity for {import}: expected {expected}, got {got}",
+            ),
+            Self::UnboundImport(name) => write!(f, "unbound host import: {name}"),
             Self::HostCallsUnavailable(index) => {
                 write!(f, "host calls are unavailable for import: {index}")
             }
+            Self::HostError(message) => write!(f, "host error: {message}"),
+            Self::HostBindingCapacity => f.write_str("host binding table is too large"),
             Self::InvalidOpcode(opcode) => write!(f, "invalid opcode: {opcode:#04x}"),
             Self::BytecodeBounds => f.write_str("bytecode operand is out of bounds"),
             Self::InvalidJump(target) => write!(f, "invalid jump target: {target}"),
+            Self::FuelOverflow => f.write_str("fuel arithmetic overflow"),
+            Self::OutOfFuel { needed, remaining } => {
+                write!(f, "out of fuel: needed {needed}, remaining {remaining}")
+            }
         }
     }
 }

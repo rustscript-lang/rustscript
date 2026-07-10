@@ -2,7 +2,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::{OpCode, Program, Value, VmError};
+use super::{HostBinding, HostFunction, OpCode, Program, Value, VmError, resolve_host_functions};
 
 pub type VmResult<T> = Result<T, VmError>;
 
@@ -17,26 +17,48 @@ enum NumericValue {
     Float(f64),
 }
 
-pub struct Vm {
+pub struct Vm<C = ()> {
     program: Program,
     ip: usize,
     stack: Vec<Value>,
     locals: Vec<Value>,
+    host_functions: Vec<HostFunction<C>>,
+    context: C,
+    fuel: Option<u64>,
 }
 
-impl Vm {
+impl Vm<()> {
     pub fn new(program: Program) -> Self {
+        Self::from_parts(program, (), Vec::new())
+    }
+}
+
+impl<C> Vm<C> {
+    pub fn with_host_bindings(
+        program: Program,
+        context: C,
+        bindings: &[HostBinding<C>],
+    ) -> VmResult<Self> {
+        let host_functions = resolve_host_functions(&program, bindings)?;
+        Ok(Self::from_parts(program, context, host_functions))
+    }
+
+    fn from_parts(program: Program, context: C, host_functions: Vec<HostFunction<C>>) -> Self {
         let local_count = program.local_count();
         Self {
             program,
             ip: 0,
             stack: Vec::new(),
             locals: vec![Value::Null; local_count],
+            host_functions,
+            context,
+            fuel: None,
         }
     }
 
     pub fn run(&mut self) -> VmResult<VmStatus> {
         loop {
+            self.charge_fuel()?;
             let raw = self.read_u8()?;
             let opcode = OpCode::try_from(raw).map_err(|()| VmError::InvalidOpcode(raw))?;
             match opcode {
@@ -101,11 +123,8 @@ impl Vm {
                 }
                 OpCode::Call => {
                     let index = self.read_u16()?;
-                    let _arity = self.read_u8()?;
-                    if self.program.imports().get(usize::from(index)).is_none() {
-                        return Err(VmError::InvalidCall(index));
-                    }
-                    return Err(VmError::HostCallsUnavailable(index));
+                    let arity = self.read_u8()?;
+                    self.call_host(index, arity)?;
                 }
                 OpCode::Shl => {
                     let rhs = self.pop_shift()?;
@@ -155,6 +174,86 @@ impl Vm {
 
     pub fn ip(&self) -> usize {
         self.ip
+    }
+
+    pub fn context(&self) -> &C {
+        &self.context
+    }
+
+    pub fn context_mut(&mut self) -> &mut C {
+        &mut self.context
+    }
+
+    pub fn into_context(self) -> C {
+        self.context
+    }
+
+    pub fn set_fuel(&mut self, fuel: u64) {
+        self.fuel = Some(fuel);
+    }
+
+    pub fn clear_fuel(&mut self) {
+        self.fuel = None;
+    }
+
+    pub fn fuel(&self) -> Option<u64> {
+        self.fuel
+    }
+
+    pub fn add_fuel(&mut self, fuel: u64) -> VmResult<()> {
+        self.fuel = Some(
+            self.fuel
+                .unwrap_or(0)
+                .checked_add(fuel)
+                .ok_or(VmError::FuelOverflow)?,
+        );
+        Ok(())
+    }
+
+    fn charge_fuel(&mut self) -> VmResult<()> {
+        let Some(remaining) = self.fuel else {
+            return Ok(());
+        };
+        if remaining == 0 {
+            return Err(VmError::OutOfFuel {
+                needed: 1,
+                remaining: 0,
+            });
+        }
+        self.fuel = Some(remaining - 1);
+        Ok(())
+    }
+
+    fn call_host(&mut self, index: u16, arity: u8) -> VmResult<()> {
+        let import = self
+            .program
+            .imports()
+            .get(usize::from(index))
+            .ok_or(VmError::InvalidCall(index))?;
+        if import.arity != arity {
+            return Err(VmError::InvalidCallArity {
+                import: import.name.clone(),
+                expected: import.arity,
+                got: arity,
+            });
+        }
+        let function = *self
+            .host_functions
+            .get(usize::from(index))
+            .ok_or(VmError::HostCallsUnavailable(index))?;
+        let argument_count = usize::from(arity);
+        let argument_start = self
+            .stack
+            .len()
+            .checked_sub(argument_count)
+            .ok_or(VmError::StackUnderflow)?;
+        let result = function(&mut self.context, &self.stack[argument_start..])
+            .map_err(|error| VmError::HostError(error.message()))?;
+        self.stack.truncate(argument_start);
+        if let Some(value) = result {
+            self.stack.push(value);
+        }
+        Ok(())
     }
 
     fn add(&mut self) -> VmResult<()> {
