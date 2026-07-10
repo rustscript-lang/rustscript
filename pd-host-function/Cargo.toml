@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 description = "Proc macro support for RustScript host functions"
 license = "MIT"
+homepage = "https://rustscript.org/"
+repository = "https://github.com/rustscript-lang/rustscript"
 
 [lib]
 proc-macro = true

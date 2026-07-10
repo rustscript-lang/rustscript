@@ -2,6 +2,8 @@
 name = "pd-vm-wasm"
 version.workspace = true
 edition.workspace = true
+homepage = "https://rustscript.org/"
+repository = "https://github.com/rustscript-lang/rustscript"
 
 [lib]
 crate-type = ["cdylib"]

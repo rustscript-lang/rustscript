@@ -5,7 +5,7 @@ edition.workspace = true
 description = "RustScript scripting language — alias for the pd-vm crate"
 license = "MIT"
 repository = "https://github.com/rustscript-lang/rustscript"
-homepage = "https://rustscript.org"
+homepage = "https://rustscript.org/"
 
 [lib]
 name = "rustscript"
