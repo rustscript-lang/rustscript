@@ -293,7 +293,7 @@ Debugger epoch commands:
 Compiler-only wasm build (without runtime/JIT/debugger/CLI):
 
 ```powershell
-cargo check -p pd-vm --target wasm32-unknown-unknown --no-default-features
+cargo check -p pd-vm --target wasm32-unknown-unknown --no-default-features --features std
 ```
 
 Browser/editor lint integration is provided by sibling crate `pd-vm-wasm` via
