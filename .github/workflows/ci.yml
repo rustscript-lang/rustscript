@@ -37,7 +37,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features
       - name: Tests
         working-directory: rustscript
-        run: cargo test --workspace --jobs 4
+        run: cargo test --workspace
 
   pd-vm-cli:
     name: pd-vm CLI (${{ matrix.os }})
