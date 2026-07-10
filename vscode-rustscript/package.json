@@ -33,7 +33,7 @@
     "grammars": [
       {
         "language": "rustscript",
-        "scopeName": "source.rustscript",
+        "scopeName": "source.rss",
         "path": "./syntaxes/rustscript.tmLanguage.json"
       }
     ]

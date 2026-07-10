@@ -32,6 +32,7 @@ pub use self::ir::{
     LocalIrBuilder, LocalSlot, MatchPattern, MatchTypePattern, Stmt, StructDecl, TypeSchema,
 };
 pub use self::parser::ParserDialect;
+#[cfg(feature = "cli")]
 pub(crate) use self::pipeline::compile_source_for_repl_with_state;
 pub use self::pipeline::{
     InferredLocalTypeHint, UnknownInferredLocal, collect_inferred_local_type_hints,
@@ -431,6 +432,7 @@ pub struct ReplLocalBinding {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(feature = "cli")]
 pub(crate) struct ReplLocalState {
     pub binding: ReplLocalBinding,
     pub moved: bool,

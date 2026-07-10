@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 use crate::HostImport;
 
+#[cfg(feature = "cli")]
+use super::ReplLocalState;
 use super::codegen::Compiler;
 use super::frontends;
 use super::ir::{Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, Stmt, TypeSchema};
@@ -11,8 +13,8 @@ use super::source_loader::load_units_for_source_file;
 use super::source_map::SourceMap;
 use super::{
     CompileError, CompileSourceFileOptions, CompiledProgram, CompiledReplProgram, ParseError,
-    ReplLocalBinding, ReplLocalState, SourceError, SourceFlavor, SourcePathError, TypingMode,
-    lifetime, parser, typing,
+    ReplLocalBinding, SourceError, SourceFlavor, SourcePathError, TypingMode, lifetime, parser,
+    typing,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1125,6 +1127,7 @@ pub fn compile_source_for_repl_with_locals(
     })
 }
 
+#[cfg(feature = "cli")]
 pub(crate) fn compile_source_for_repl_with_state(
     source: &str,
     predefined_locals: &[ReplLocalState],
