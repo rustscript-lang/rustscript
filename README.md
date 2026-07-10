@@ -26,8 +26,8 @@ pd-host-function = { git = "https://github.com/rustscript-lang/rustscript", pack
 ## Test
 
 ```bash
-cargo test
-cargo build --release
+cargo test --workspace
+cargo build --workspace --release
 ```
 
 `pd-vm` is a stack-based virtual machine plus compiler toolchain. It includes the RustScript (`.rss`) frontend and exposes a source-plugin API for compatibility languages such as JavaScript and Lua.
