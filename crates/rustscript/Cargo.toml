@@ -1,0 +1,26 @@
+[package]
+name = "rustscript"
+version.workspace = true
+edition.workspace = true
+description = "RustScript scripting language — alias for the pd-vm crate"
+license = "MIT"
+repository = "https://github.com/rustscript-lang/rustscript"
+homepage = "https://rustscript.org"
+
+[lib]
+name = "rustscript"
+
+[features]
+default = ["runtime", "cli", "cranelift-jit", "http", "tls", "websocket"]
+runtime = ["pd_vm_crate/runtime"]
+http = ["pd_vm_crate/http"]
+http2 = ["pd_vm_crate/http2"]
+mqtt = ["pd_vm_crate/mqtt"]
+tls = ["pd_vm_crate/tls"]
+websocket = ["pd_vm_crate/websocket"]
+webrtc = ["pd_vm_crate/webrtc"]
+cli = ["pd_vm_crate/cli"]
+cranelift-jit = ["pd_vm_crate/cranelift-jit"]
+
+[dependencies]
+pd_vm_crate = { package = "pd-vm", path = "../..", version = ">=0.1.0, <1.0.0" }

@@ -3,6 +3,7 @@ members = [
     ".",
     "pd-host-function",
     "pd-vm-wasm",
+    "crates/rustscript",
 ]
 resolver = "2"
 

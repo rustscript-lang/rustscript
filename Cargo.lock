@@ -610,6 +610,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustscript"
+version = "0.1.0"
+dependencies = [
+ "pd-vm",
+]
+
+[[package]]
 name = "rustyline"
 version = "14.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
