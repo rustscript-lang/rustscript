@@ -2,6 +2,7 @@
 members = [
     ".",
     "pd-host-function",
+    "pd-vm-nostd",
     "pd-vm-wasm",
     "crates/rustscript",
 ]

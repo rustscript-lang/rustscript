@@ -495,6 +495,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pd-vm-nostd"
+version = "0.1.0"
+dependencies = [
+ "pd-vm",
+]
+
+[[package]]
 name = "pd-vm-wasm"
 version = "0.1.0"
 dependencies = [

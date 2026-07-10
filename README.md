@@ -47,6 +47,7 @@ cargo build --workspace --release --jobs 4
   - [Epoch Interruption](#epoch-interruption)
   - [Wasm Lint](#wasm-lint)
   - [Wasm Runtime Playground](#wasm-runtime-playground)
+  - [`no_std` Embedded Runtime](#no_std-embedded-runtime)
   - [Web Playground](#web-playground)
   - [Test and Perf Commands](#test-and-perf-commands)
 - [Internals](#internals)
@@ -315,6 +316,24 @@ Browser playground wasm runtime is provided by sibling crate `pd-vm-wasm` built 
 
 - `lint_source_json`
 - `run_source_json`
+
+### `no_std` Embedded Runtime
+
+The sibling crate [`pd-vm-nostd`](pd-vm-nostd) provides the VMBC v8 decoder and compact interpreter
+using only `core` and `alloc`. It supports direct bytecode execution, synchronous host callbacks,
+and instruction fuel while leaving source compilation, CLI, debugger, JIT/AOT, async host
+operations, and operating-system integrations in `pd-vm`.
+
+RP2040 compile check:
+
+```bash
+rustup target add thumbv6m-none-eabi
+cargo check -p pd-vm-nostd --target thumbv6m-none-eabi
+```
+
+Compile `.rss` source to VMBC on a host, then load that VMBC through `pd_vm_nostd` on the target.
+The PlatformIO Arduino-Pico integration lives in
+[`micro-rustscript`](https://github.com/rustscript-lang/micro-rustscript).
 
 ### Web Playground
 
