@@ -1,6 +1,48 @@
 use core::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VmError {
+    StackUnderflow,
+    TypeMismatch(&'static str),
+    DivisionByZero,
+    IntegerOverflow(&'static str),
+    InvalidShift(i64),
+    InvalidConstant(u32),
+    InvalidLocal(u8),
+    InvalidCall(u16),
+    HostCallsUnavailable(u16),
+    InvalidOpcode(u8),
+    BytecodeBounds,
+    InvalidJump(u32),
+}
+
+impl fmt::Display for VmError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StackUnderflow => f.write_str("stack underflow"),
+            Self::TypeMismatch(expected) => write!(f, "type mismatch: expected {expected}"),
+            Self::DivisionByZero => f.write_str("division by zero"),
+            Self::IntegerOverflow(operation) => {
+                write!(f, "integer overflow in {operation}")
+            }
+            Self::InvalidShift(value) => write!(f, "invalid shift amount: {value}"),
+            Self::InvalidConstant(index) => write!(f, "invalid constant index: {index}"),
+            Self::InvalidLocal(index) => write!(f, "invalid local index: {index}"),
+            Self::InvalidCall(index) => write!(f, "invalid call index: {index}"),
+            Self::HostCallsUnavailable(index) => {
+                write!(f, "host calls are unavailable for import: {index}")
+            }
+            Self::InvalidOpcode(opcode) => write!(f, "invalid opcode: {opcode:#04x}"),
+            Self::BytecodeBounds => f.write_str("bytecode operand is out of bounds"),
+            Self::InvalidJump(target) => write!(f, "invalid jump target: {target}"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for VmError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireError {
     UnexpectedEof,
     InvalidMagic([u8; 4]),
