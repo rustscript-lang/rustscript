@@ -29,6 +29,17 @@ fn gpio_set(
     Ok(None)
 }
 
+fn dispatch_host(
+    state: &mut BoardState,
+    name: &str,
+    args: &[EmbeddedValue],
+) -> Result<Option<EmbeddedValue>, HostError> {
+    if name != "gpio_set" {
+        return Err(HostError::new("unexpected host import"));
+    }
+    gpio_set(state, args)
+}
+
 #[test]
 fn static_host_binding_mutates_board_context() {
     let program = compile_embedded(
@@ -40,6 +51,21 @@ fn static_host_binding_mutates_board_context() {
     let bindings = [HostBinding::new("gpio_set", 2, gpio_set)];
     let mut vm = EmbeddedVm::with_host_bindings(program, BoardState::default(), &bindings)
         .expect("host imports should bind");
+
+    assert_eq!(vm.run(), Ok(VmStatus::Halted));
+    assert_eq!(vm.context().pin, 25);
+    assert!(vm.context().high);
+}
+
+#[test]
+fn dispatcher_receives_import_name_and_arguments() {
+    let program = compile_embedded(
+        r#"
+            fn gpio_set(pin: int, high: bool);
+            gpio_set(25, true);
+        "#,
+    );
+    let mut vm = EmbeddedVm::with_host_dispatcher(program, BoardState::default(), dispatch_host);
 
     assert_eq!(vm.run(), Ok(VmStatus::Halted));
     assert_eq!(vm.context().pin, 25);

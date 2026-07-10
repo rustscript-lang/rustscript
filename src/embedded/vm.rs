@@ -2,7 +2,10 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::{HostBinding, HostFunction, OpCode, Program, Value, VmError, resolve_host_functions};
+use super::{
+    HostBinding, HostDispatcher, HostFunction, OpCode, Program, Value, VmError,
+    resolve_host_functions,
+};
 
 pub type VmResult<T> = Result<T, VmError>;
 
@@ -23,13 +26,14 @@ pub struct Vm<C = ()> {
     stack: Vec<Value>,
     locals: Vec<Value>,
     host_functions: Vec<HostFunction<C>>,
+    host_dispatcher: Option<HostDispatcher<C>>,
     context: C,
     fuel: Option<u64>,
 }
 
 impl Vm<()> {
     pub fn new(program: Program) -> Self {
-        Self::from_parts(program, (), Vec::new())
+        Self::from_parts(program, (), Vec::new(), None)
     }
 }
 
@@ -40,10 +44,23 @@ impl<C> Vm<C> {
         bindings: &[HostBinding<C>],
     ) -> VmResult<Self> {
         let host_functions = resolve_host_functions(&program, bindings)?;
-        Ok(Self::from_parts(program, context, host_functions))
+        Ok(Self::from_parts(program, context, host_functions, None))
     }
 
-    fn from_parts(program: Program, context: C, host_functions: Vec<HostFunction<C>>) -> Self {
+    pub fn with_host_dispatcher(
+        program: Program,
+        context: C,
+        dispatcher: HostDispatcher<C>,
+    ) -> Self {
+        Self::from_parts(program, context, Vec::new(), Some(dispatcher))
+    }
+
+    fn from_parts(
+        program: Program,
+        context: C,
+        host_functions: Vec<HostFunction<C>>,
+        host_dispatcher: Option<HostDispatcher<C>>,
+    ) -> Self {
         let local_count = program.local_count();
         Self {
             program,
@@ -51,6 +68,7 @@ impl<C> Vm<C> {
             stack: Vec::new(),
             locals: vec![Value::Null; local_count],
             host_functions,
+            host_dispatcher,
             context,
             fuel: None,
         }
@@ -237,18 +255,21 @@ impl<C> Vm<C> {
                 got: arity,
             });
         }
-        let function = *self
-            .host_functions
-            .get(usize::from(index))
-            .ok_or(VmError::HostCallsUnavailable(index))?;
         let argument_count = usize::from(arity);
         let argument_start = self
             .stack
             .len()
             .checked_sub(argument_count)
             .ok_or(VmError::StackUnderflow)?;
-        let result = function(&mut self.context, &self.stack[argument_start..])
-            .map_err(|error| VmError::HostError(error.message()))?;
+        let arguments = &self.stack[argument_start..];
+        let result = if let Some(function) = self.host_functions.get(usize::from(index)).copied() {
+            function(&mut self.context, arguments)
+        } else if let Some(dispatcher) = self.host_dispatcher {
+            dispatcher(&mut self.context, import.name.as_str(), arguments)
+        } else {
+            return Err(VmError::HostCallsUnavailable(index));
+        }
+        .map_err(|error| VmError::HostError(error.message()))?;
         self.stack.truncate(argument_start);
         if let Some(value) = result {
             self.stack.push(value);

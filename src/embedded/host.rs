@@ -18,6 +18,7 @@ impl HostError {
 }
 
 pub type HostFunction<C> = fn(&mut C, &[Value]) -> Result<Option<Value>, HostError>;
+pub type HostDispatcher<C> = fn(&mut C, &str, &[Value]) -> Result<Option<Value>, HostError>;
 
 pub struct HostBinding<C> {
     name: &'static str,
