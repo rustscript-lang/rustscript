@@ -33,6 +33,7 @@ jobs:
       PACKAGE_ORDER: pd-host-function pd-vm
       PD_VM_VERSION: ${{ inputs.pd_vm_version || inputs.version }}
       PD_EDGE_ABI_VERSION: ${{ inputs.pd_edge_abi_version || '0.1.1' }}
+      WORKSPACE_VERSION_OVERRIDES: rustscript=${{ inputs.version }} pd-edge=${{ inputs.pd_edge_abi_version || '0.1.1' }}
     steps:
       - name: Checkout rustscript
         uses: actions/checkout@v4
@@ -74,8 +75,17 @@ jobs:
               'pd-vm': os.environ.get('PD_VM_VERSION') or version,
               'pd-edge-abi': os.environ.get('PD_EDGE_ABI_VERSION') or version,
           }
+          workspace_versions = {}
+          for item in os.environ.get('WORKSPACE_VERSION_OVERRIDES', '').split():
+              if '=' in item:
+                  name, value = item.split('=', 1)
+                  if value:
+                      workspace_versions[name] = value
           dep_re = re.compile(r'^(\s*([A-Za-z0-9_-]+)\s*=\s*\{)(.*)(\}\s*)$')
-          for path in Path('.').rglob('Cargo.toml'):
+          for path in Path('..').rglob('Cargo.toml'):
+              if '.git' in path.parts or 'target' in path.parts:
+                  continue
+              manifest_version = workspace_versions.get(path.parent.name, version)
               lines = path.read_text().splitlines()
               out = []
               section = ''
@@ -84,7 +94,7 @@ jobs:
                   if stripped.startswith('[') and stripped.endswith(']'):
                       section = stripped
                   if section in ('[workspace.package]', '[package]') and stripped.startswith('version = '):
-                      line = re.sub(r'version\s*=\s*"[^"]*"', f'version = "{version}"', line)
+                      line = re.sub(r'version\s*=\s*"[^"]*"', f'version = "{manifest_version}"', line)
                   match = dep_re.match(line)
                   if match and 'path' in match.group(3):
                       prefix, key, body, suffix = match.groups()
