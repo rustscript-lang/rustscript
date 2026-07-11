@@ -2,7 +2,7 @@
 
 [![rustscript on crates.io](https://img.shields.io/crates/v/rustscript.svg)](https://crates.io/crates/rustscript)
 
-RustScript is the language, VM/compiler core, standard library, examples, bytecode/AOT tooling, wasm runtime support, and debugger-facing runtime contract for the RustScript family. Compatibility language frontends now live in source-plugin crates.
+This repo contains the RustScript language implementation, VM/compiler core, standard library, examples, bytecode/AOT tooling, wasm runtime support, and debugger-facing runtime contract.
 
 ## Related projects
 
@@ -11,7 +11,7 @@ RustScript is the language, VM/compiler core, standard library, examples, byteco
 - CLR VM: https://github.com/rustscript-lang/rustscript-clr-vm
 - Edge runtime and ABI: https://github.com/rustscript-lang/pd-edge
 - Controller: https://github.com/rustscript-lang/pd-controller
-- Compatibility frontends: https://github.com/rustscript-lang/rustscript-compat-frontends
+- Compatibility frontends (Lua, JavaScript): https://github.com/rustscript-lang/rustscript-compat-frontends
 
 ## Crate usage
 
