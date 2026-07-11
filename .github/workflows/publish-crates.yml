@@ -30,7 +30,7 @@ jobs:
     permissions:
       contents: read
     env:
-      PACKAGE_ORDER: pd-host-function pd-vm-nostd pd-vm rustscript
+      PACKAGE_ORDER: pd-host-function pd-vm pd-vm-nostd rustscript
       PD_VM_VERSION: ${{ inputs.pd_vm_version || inputs.version }}
       PD_EDGE_ABI_VERSION: ${{ inputs.pd_edge_abi_version || '0.1.1' }}
       WORKSPACE_VERSION_OVERRIDES: rustscript=${{ inputs.version }} pd-edge=${{ inputs.pd_edge_abi_version || '0.1.1' }}
@@ -41,6 +41,9 @@ jobs:
           path: rustscript
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+      - name: Verify crate publish order
+        working-directory: rustscript
+        run: python3 scripts/verify_publish_order.py $PACKAGE_ORDER
       - name: Publish crates
         working-directory: rustscript
         env:
