@@ -129,6 +129,13 @@ jobs:
               if exists(package, version):
                   print(f'{package} {version} already published; skipping')
                   continue
+              if package == 'pd-vm':
+                  subprocess.run([
+                      sys.executable,
+                      'scripts/refresh_publish_lock.py',
+                      'pd-host-function',
+                      version,
+                  ], check=True)
               for attempt in range(1, 19):
                   print(f'publishing {package} {version}, attempt {attempt}')
                   proc = subprocess.run([
