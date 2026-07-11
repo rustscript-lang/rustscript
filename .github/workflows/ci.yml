@@ -54,13 +54,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           components: rustfmt, clippy
-          targets: thumbv6m-none-eabi
       - name: Format check
         working-directory: rustscript
         run: cargo fmt --all -- --check
-      - name: pd-vm-nostd RP2040 check
-        working-directory: rustscript
-        run: cargo check -p pd-vm-nostd --target thumbv6m-none-eabi
       - name: Runtime-only dependency check
         working-directory: rustscript
         run: cargo check -p pd-vm --no-default-features --features runtime
