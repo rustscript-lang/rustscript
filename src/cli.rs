@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -7,10 +7,10 @@ use crate as vm;
 
 use crate::{
     CallOutcome, CallReturn, CompileSourceFileOptions, Debugger, DisassembleOptions, JitConfig,
-    Program, ReplLocalBinding, SourceFlavor, SourceMap, SourcePathError, Value, Vm, VmError,
-    VmRecording, VmStatus, compile_source_file_with_options, disassemble_vmbc_with_options,
-    encode_program, format_source_with_flavor_and_options, render_source_error, render_vm_error,
-    replay_recording_stdio,
+    OpCode, Program, ReplLocalBinding, SourceFlavor, SourceMap, SourcePathError, Value, Vm,
+    VmError, VmRecording, VmStatus, compile_source_file_with_options,
+    disassemble_vmbc_with_options, encode_program, format_source_with_flavor_and_options,
+    render_source_error, render_vm_error, replay_recording_stdio,
 };
 use crate::{HostFunctionRegistry, HostImport};
 use rustyline::DefaultEditor;
@@ -928,6 +928,9 @@ fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                 };
+                let moved_by_rebinding =
+                    repl_locals_moved_by_rebinding(&compiled.compiled.program, &session.locals);
+                let no_repl_moves = BTreeSet::new();
                 let mut vm = Vm::new_with_jit_config(
                     compiled
                         .compiled
@@ -948,7 +951,12 @@ fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
                 loop {
                     match vm.run() {
                         Ok(VmStatus::Halted) => {
-                            sync_repl_session(&vm, &compiled.bindings, &mut session);
+                            sync_repl_session(
+                                &vm,
+                                &compiled.bindings,
+                                &moved_by_rebinding,
+                                &mut session,
+                            );
                             if let Some(value) = vm.stack().last() {
                                 println!("=> {}", format_value(value));
                             } else {
@@ -959,14 +967,24 @@ fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(VmStatus::Yielded) => continue,
                         Ok(VmStatus::Waiting(_op_id)) => {
                             if let Err(err) = vm.wait_for_host_op_blocking() {
-                                sync_repl_session(&vm, &compiled.bindings, &mut session);
+                                sync_repl_session(
+                                    &vm,
+                                    &compiled.bindings,
+                                    &no_repl_moves,
+                                    &mut session,
+                                );
                                 println!("{}", render_vm_error(&vm, &err));
                                 break;
                             }
                             continue;
                         }
                         Err(err) => {
-                            sync_repl_session(&vm, &compiled.bindings, &mut session);
+                            sync_repl_session(
+                                &vm,
+                                &compiled.bindings,
+                                &no_repl_moves,
+                                &mut session,
+                            );
                             println!("{}", render_vm_error(&vm, &err));
                             break;
                         }
@@ -1007,7 +1025,56 @@ struct ReplSessionLocal {
     moved: bool,
 }
 
-fn sync_repl_session(vm: &Vm, bindings: &[ReplLocalBinding], session: &mut ReplSession) {
+fn repl_locals_moved_by_rebinding(
+    program: &Program,
+    locals: &BTreeMap<String, ReplSessionLocal>,
+) -> BTreeSet<String> {
+    let Some(debug) = program.debug.as_ref() else {
+        return BTreeSet::new();
+    };
+    let persisted_by_slot = locals
+        .keys()
+        .filter_map(|name| debug.local_index(name).map(|slot| (slot, name.clone())))
+        .collect::<BTreeMap<_, _>>();
+    let mut moved = BTreeSet::new();
+    let mut ip = 0;
+
+    while ip < program.code.len() {
+        let Ok(opcode) = OpCode::try_from(program.code[ip]) else {
+            break;
+        };
+        if opcode == OpCode::Ldloc
+            && let (Some(source), Some(OpCode::Stloc), Some(target)) = (
+                program.code.get(ip + 1).copied(),
+                program
+                    .code
+                    .get(ip + 2)
+                    .copied()
+                    .and_then(|byte| OpCode::try_from(byte).ok()),
+                program.code.get(ip + 3).copied(),
+            )
+            && source != target
+            && let Some(name) = persisted_by_slot.get(&source)
+        {
+            moved.insert(name.clone());
+        }
+        if opcode == OpCode::Stloc
+            && let Some(target) = program.code.get(ip + 1).copied()
+            && let Some(name) = persisted_by_slot.get(&target)
+        {
+            moved.remove(name);
+        }
+        ip += 1 + opcode.operand_len();
+    }
+    moved
+}
+
+fn sync_repl_session(
+    vm: &Vm,
+    bindings: &[ReplLocalBinding],
+    moved_by_rebinding: &BTreeSet<String>,
+    session: &mut ReplSession,
+) {
     if bindings.is_empty() {
         session.locals.clear();
         return;
@@ -1025,12 +1092,13 @@ fn sync_repl_session(vm: &Vm, bindings: &[ReplLocalBinding], session: &mut ReplS
             continue;
         };
         let (schema, optional) = repl_local_schema_from_vm(vm, index as usize, value);
-        let moved = !optional
-            && value == &Value::Null
-            && matches!(
-                schema,
-                Some(vm::compiler::TypeSchema::String | vm::compiler::TypeSchema::Bytes)
-            );
+        let moved = moved_by_rebinding.contains(&binding.name)
+            || (!optional
+                && value == &Value::Null
+                && matches!(
+                    schema,
+                    Some(vm::compiler::TypeSchema::String | vm::compiler::TypeSchema::Bytes)
+                ));
         next.insert(
             binding.name.clone(),
             ReplSessionLocal {
@@ -1422,6 +1490,8 @@ mod tests {
     fn run_repl_snippet_and_sync(session: &mut super::ReplSession, snippet: &str) -> Vm {
         let compiled =
             super::compile_repl_snippet(snippet, &session.locals).expect("compile should succeed");
+        let moved_by_rebinding =
+            super::repl_locals_moved_by_rebinding(&compiled.compiled.program, &session.locals);
         let mut vm = Vm::new(
             compiled
                 .compiled
@@ -1441,7 +1511,7 @@ mod tests {
                     .expect("snippet should not block"),
             }
         }
-        super::sync_repl_session(&vm, &compiled.bindings, session);
+        super::sync_repl_session(&vm, &compiled.bindings, &moved_by_rebinding, session);
         vm
     }
 
@@ -1937,13 +2007,68 @@ mod tests {
     }
 
     #[test]
-    fn repl_session_keeps_copy_types_available_after_binding() {
+    fn repl_session_marks_copy_types_moved_after_binding() {
         let mut session = super::ReplSession::default();
         let _ = run_repl_snippet_and_sync(&mut session, "let a = 1;");
         let _ = run_repl_snippet_and_sync(&mut session, "let b = a;");
+
+        assert_eq!(session.locals.get("a").map(|local| local.moved), Some(true));
+        match super::compile_repl_snippet("a", &session.locals) {
+            Err(vm::SourceError::Parse(parse)) => {
+                assert_eq!(parse.code.as_deref(), Some("E_LOCAL_MOVED"));
+            }
+            Err(other) => panic!("expected moved-local parse error, got {other}"),
+            Ok(_) => panic!("expected moved-local parse error, got successful compile"),
+        }
+    }
+
+    #[test]
+    fn repl_session_marks_all_value_types_moved_after_binding() {
+        let cases = [
+            ("null", "let a = null;"),
+            ("int", "let a = 1;"),
+            ("float", "let a = 1.5;"),
+            ("bool", "let a = true;"),
+            ("string", "let a = \"payload\";"),
+            ("bytes", "use bytes; let a = bytes::from_hex(\"00ff\");"),
+            ("array", "let a = [1, 2];"),
+            ("map", "let a = { key: 1 };"),
+        ];
+
+        for (value_type, initializer) in cases {
+            let mut session = super::ReplSession::default();
+            let _ = run_repl_snippet_and_sync(&mut session, initializer);
+            let _ = run_repl_snippet_and_sync(&mut session, "let b = a;");
+
+            assert_eq!(
+                session.locals.get("a").map(|local| local.moved),
+                Some(true),
+                "expected {value_type} local to be moved after rebinding"
+            );
+            match super::compile_repl_snippet("a", &session.locals) {
+                Err(vm::SourceError::Parse(parse)) => {
+                    assert_eq!(
+                        parse.code.as_deref(),
+                        Some("E_LOCAL_MOVED"),
+                        "expected {value_type} local to reject a later use"
+                    );
+                }
+                Err(other) => {
+                    panic!("expected moved-local parse error for {value_type}, got {other}")
+                }
+                Ok(_) => panic!("expected {value_type} local to reject a later use"),
+            }
+        }
+    }
+
+    #[test]
+    fn repl_session_restores_rebound_copy_local_after_reassignment() {
+        let mut session = super::ReplSession::default();
+        let _ = run_repl_snippet_and_sync(&mut session, "let mut a = 1;");
+        let _ = run_repl_snippet_and_sync(&mut session, "let b = a; a = 2;");
         let vm = run_repl_snippet_and_sync(&mut session, "a");
 
-        assert_eq!(vm.stack().last(), Some(&Value::Int(1)));
+        assert_eq!(vm.stack().last(), Some(&Value::Int(2)));
         assert_eq!(
             session.locals.get("a").map(|local| local.moved),
             Some(false)
