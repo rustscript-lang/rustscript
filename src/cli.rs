@@ -877,7 +877,6 @@ fn binary_version_text(binary: &str) -> String {
 fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
     println!("pd-vm REPL (RustScript)");
     println!("history: up/down arrows, commands: .help, .quit, .cancel");
-    println!("state: locals persist across entries");
     let mut editor = DefaultEditor::new()?;
     let mut session = ReplSession::default();
     let mut pending_input = String::new();
