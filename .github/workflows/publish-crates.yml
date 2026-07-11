@@ -36,11 +36,11 @@ jobs:
       WORKSPACE_VERSION_OVERRIDES: rustscript=${{ inputs.version }} pd-edge=${{ inputs.pd_edge_abi_version || '0.1.1' }}
     steps:
       - name: Checkout rustscript
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           path: rustscript
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
       - name: Verify crate publish order
         working-directory: rustscript
         run: python3 scripts/verify_publish_order.py $PACKAGE_ORDER
