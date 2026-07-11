@@ -6,12 +6,41 @@ on:
 
 permissions:
   contents: write
+  pull-requests: read
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_TARGET_DIR: target
 
 jobs:
+  detect_changes:
+    name: Select CLI matrix
+    runs-on: ubuntu-latest
+    outputs:
+      os: ${{ steps.select.outputs.os }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            vm_jit:
+              - 'src/vm/jit/**'
+              - 'src/vm/native/**'
+              - 'src/vm/mod.rs'
+              - 'src/builtins/runtime/jit.rs'
+              - 'tests/jit/**'
+              - 'tests/jit_tests.rs'
+      - id: select
+        env:
+          VM_JIT_CHANGED: ${{ steps.changes.outputs.vm_jit }}
+        shell: bash
+        run: |
+          if [[ "$VM_JIT_CHANGED" == "true" ]]; then
+            echo 'os=["ubuntu-latest","macos-latest","windows-latest"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'os=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+          fi
+
   rust:
     name: Rust lint and tests
     runs-on: ubuntu-latest
@@ -41,11 +70,12 @@ jobs:
 
   pd-vm-cli:
     name: pd-vm CLI (${{ matrix.os }})
+    needs: detect_changes
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(needs.detect_changes.outputs.os) }}
     steps:
       - uses: actions/checkout@v4
         with:
