@@ -10,7 +10,14 @@ def load_json(path: Path):
         return json.load(handle)
 
 
-def verify_manifest(manifest, grammar, label: str) -> None:
+def verify_manifest(manifest, grammar, label: str, expected_version: str) -> None:
+    languages = manifest["contributes"]["languages"]
+    language = next(item for item in languages if item.get("id") == "rustscript")
+    if ".rss" not in language.get("extensions", []):
+        raise SystemExit(f"{label}: RustScript does not own the .rss extension")
+    if "rss" not in language.get("aliases", []):
+        raise SystemExit(f"{label}: RustScript is missing the legacy rss alias")
+
     contributions = manifest["contributes"]["grammars"]
     rustscript = next(
         item for item in contributions if item.get("language") == "rustscript"
@@ -25,6 +32,12 @@ def verify_manifest(manifest, grammar, label: str) -> None:
     if manifest_scope != "source.rss":
         raise SystemExit(f"{label}: unexpected RustScript scope {manifest_scope!r}")
 
+    if manifest["version"] != expected_version:
+        raise SystemExit(
+            f"{label}: version {manifest['version']!r} does not match "
+            f"source version {expected_version!r}"
+        )
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -35,7 +48,8 @@ def main() -> None:
     extension = root / "vscode-rustscript"
     manifest = load_json(extension / "package.json")
     grammar = load_json(extension / "syntaxes" / "rustscript.tmLanguage.json")
-    verify_manifest(manifest, grammar, "source")
+    source_version = manifest["version"]
+    verify_manifest(manifest, grammar, "source", source_version)
 
     if args.vsix:
         with zipfile.ZipFile(args.vsix) as archive:
@@ -47,7 +61,7 @@ def main() -> None:
                     "extension/syntaxes/rustscript.tmLanguage.json"
                 ).decode("utf-8")
             )
-        verify_manifest(packaged_manifest, packaged_grammar, "VSIX")
+        verify_manifest(packaged_manifest, packaged_grammar, "VSIX", source_version)
 
     print("VS Code grammar registration is valid")
 

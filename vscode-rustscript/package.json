@@ -2,7 +2,7 @@
   "name": "rustscript-vscode",
   "displayName": "RustScript",
   "description": "RustScript language support for Visual Studio Code.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "rustscript-lang",
   "license": "Apache-2.0",
   "repository": {
@@ -22,7 +22,7 @@
         "id": "rustscript",
         "aliases": [
           "RustScript",
-          "rustscript"
+          "rss"
         ],
         "extensions": [
           ".rss"
