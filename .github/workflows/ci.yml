@@ -57,6 +57,9 @@ jobs:
       - name: Format check
         working-directory: rustscript
         run: cargo fmt --all -- --check
+      - name: pd-vm-nostd tests
+        working-directory: rustscript
+        run: cargo test -p pd-vm-nostd
       - name: Runtime-only dependency check
         working-directory: rustscript
         run: cargo check -p pd-vm --no-default-features --features runtime
