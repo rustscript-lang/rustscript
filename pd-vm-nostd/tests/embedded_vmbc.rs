@@ -1,5 +1,9 @@
 use pd_vm_nostd::{Value as EmbeddedValue, WireError, decode_program};
-use vm::{HostImport, OpCode, Program, Value, ValueType, compile_source, encode_program};
+use vm::compiler::TypeSchema;
+use vm::{
+    HostImport, OpCode, Program, ReplLocalBinding, Value, ValueType, compile_source,
+    compile_source_for_repl_with_locals, encode_program,
+};
 
 fn encoded_scalar_program() -> Vec<u8> {
     let mut program = Program::new(
@@ -55,6 +59,31 @@ fn embedded_decoder_accepts_compiler_type_and_debug_metadata() {
     let program = decode_program(&bytes).expect("embedded decoder should skip std-only metadata");
     assert!(!program.code().is_empty());
     assert_eq!(program.local_count(), compiled.locals);
+}
+
+#[test]
+fn embedded_decoder_preserves_metadata_only_repl_locals() {
+    let compiled = compile_source_for_repl_with_locals(
+        "print(42);",
+        &[ReplLocalBinding {
+            name: "saved".to_string(),
+            mutable: false,
+            schema: Some(TypeSchema::Int),
+            optional: false,
+        }],
+    )
+    .expect("REPL source should compile");
+    let bytes = encode_program(
+        &compiled
+            .compiled
+            .program
+            .with_local_count(compiled.compiled.locals),
+    )
+    .expect("REPL output should encode");
+
+    let program = decode_program(&bytes).expect("embedded decoder should accept REPL VMBC");
+    assert_eq!(program.local_count(), compiled.compiled.locals);
+    assert_eq!(program.local_count(), 1);
 }
 
 #[test]

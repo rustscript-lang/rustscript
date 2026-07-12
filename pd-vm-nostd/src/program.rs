@@ -62,6 +62,11 @@ impl Program {
         }
     }
 
+    pub(crate) fn with_local_count(mut self, local_count: usize) -> Self {
+        self.local_count = local_count;
+        self
+    }
+
     pub fn constants(&self) -> &[Value] {
         &self.constants
     }

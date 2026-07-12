@@ -52,13 +52,17 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
         });
     }
 
-    skip_type_map(&mut cursor)?;
+    let encoded_local_count = skip_type_map(&mut cursor)?;
     skip_debug_info(&mut cursor)?;
     if !cursor.is_empty() {
         return Err(WireError::TrailingBytes);
     }
 
-    Ok(Program::new(constants, code, imports))
+    let program = Program::new(constants, code, imports);
+    Ok(match encoded_local_count {
+        Some(local_count) => program.with_local_count(local_count),
+        None => program,
+    })
 }
 
 fn reserve<T>(items: &mut Vec<T>, field: &'static str, count: usize) -> Result<(), WireError> {
@@ -71,9 +75,9 @@ fn read_value_type(raw: u8) -> Result<ValueType, WireError> {
     ValueType::try_from(raw).map_err(|()| WireError::InvalidValueType(raw))
 }
 
-fn skip_type_map(cursor: &mut Cursor<'_>) -> Result<(), WireError> {
+fn skip_type_map(cursor: &mut Cursor<'_>) -> Result<Option<usize>, WireError> {
     match cursor.read_u8()? {
-        0 => Ok(()),
+        0 => Ok(None),
         1 => {
             cursor.read_bool()?;
             let local_count = cursor.read_u32()? as usize;
@@ -96,7 +100,7 @@ fn skip_type_map(cursor: &mut Cursor<'_>) -> Result<(), WireError> {
                 read_value_type(cursor.read_u8()?)?;
                 read_value_type(cursor.read_u8()?)?;
             }
-            Ok(())
+            Ok(Some(local_count))
         }
         value => Err(WireError::InvalidTypeMapFlag(value)),
     }
