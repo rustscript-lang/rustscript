@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 
 use crate::HostImport;
 
-#[cfg(feature = "cli")]
 use super::ReplLocalState;
 use super::codegen::Compiler;
 use super::frontends;
@@ -1127,8 +1126,7 @@ pub fn compile_source_for_repl_with_locals(
     })
 }
 
-#[cfg(feature = "cli")]
-pub(crate) fn compile_source_for_repl_with_state(
+pub fn compile_source_for_repl_with_state(
     source: &str,
     predefined_locals: &[ReplLocalState],
 ) -> Result<CompiledReplProgram, SourceError> {

@@ -32,17 +32,15 @@ pub use self::ir::{
     LocalIrBuilder, LocalSlot, MatchPattern, MatchTypePattern, Stmt, StructDecl, TypeSchema,
 };
 pub use self::parser::ParserDialect;
-#[cfg(feature = "cli")]
-pub(crate) use self::pipeline::compile_source_for_repl_with_state;
 pub use self::pipeline::{
     InferredLocalTypeHint, UnknownInferredLocal, collect_inferred_local_type_hints,
     collect_inferred_local_type_hints_at_path_with_options,
     collect_inferred_local_type_hints_with_options, compile_source,
     compile_source_at_path_with_flavor_and_options, compile_source_file,
     compile_source_file_with_options, compile_source_for_repl, compile_source_for_repl_with_locals,
-    compile_source_with_flavor, compile_source_with_flavor_and_options,
-    lint_trailing_function_return_semicolons, lint_unknown_inferred_local_types,
-    lint_unknown_inferred_local_types_at_path_with_options,
+    compile_source_for_repl_with_state, compile_source_with_flavor,
+    compile_source_with_flavor_and_options, lint_trailing_function_return_semicolons,
+    lint_unknown_inferred_local_types, lint_unknown_inferred_local_types_at_path_with_options,
     lint_unknown_inferred_local_types_with_options, lint_unknown_type_annotations,
 };
 pub use self::source_loader::{FrontendImportSyntax, ImportClause, ModuleImport, NamedImport};
@@ -432,8 +430,7 @@ pub struct ReplLocalBinding {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg(feature = "cli")]
-pub(crate) struct ReplLocalState {
+pub struct ReplLocalState {
     pub binding: ReplLocalBinding,
     pub moved: bool,
 }
