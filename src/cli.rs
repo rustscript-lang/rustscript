@@ -1066,6 +1066,7 @@ fn repl_locals_moved_by_rebinding(
         .filter_map(|name| debug.local_index(name).map(|slot| (slot, name.clone())))
         .collect::<BTreeMap<_, _>>();
     let mut moved = BTreeSet::new();
+    let mut move_store_offsets = BTreeSet::new();
     let mut ip = 0;
 
     while ip < program.code.len() {
@@ -1073,21 +1074,39 @@ fn repl_locals_moved_by_rebinding(
             break;
         };
         if opcode == OpCode::Ldloc
-            && let (Some(source), Some(OpCode::Stloc), Some(target)) = (
-                program.code.get(ip + 1).copied(),
-                program
-                    .code
-                    .get(ip + 2)
-                    .copied()
-                    .and_then(|byte| OpCode::try_from(byte).ok()),
-                program.code.get(ip + 3).copied(),
-            )
-            && source != target
+            && let Some(source) = program.code.get(ip + 1).copied()
             && let Some(name) = persisted_by_slot.get(&source)
         {
-            moved.insert(name.clone());
+            let direct_target = program
+                .code
+                .get(ip + 2)
+                .copied()
+                .and_then(|byte| OpCode::try_from(byte).ok())
+                .filter(|opcode| *opcode == OpCode::Stloc)
+                .and_then(|_| program.code.get(ip + 3).copied());
+            if direct_target.is_some_and(|target| target != source) {
+                moved.insert(name.clone());
+            }
+            let null_store = program
+                .code
+                .get(ip + 2)
+                .copied()
+                .and_then(|byte| OpCode::try_from(byte).ok())
+                .filter(|opcode| *opcode == OpCode::Ldc)
+                .and_then(|_| program.code.get(ip + 3..ip + 7))
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u32::from_le_bytes)
+                .and_then(|index| program.constants.get(index as usize))
+                .is_some_and(|value| value == &Value::Null)
+                && program.code.get(ip + 7).copied() == Some(OpCode::Stloc as u8)
+                && program.code.get(ip + 8).copied() == Some(source);
+            if null_store {
+                moved.insert(name.clone());
+                move_store_offsets.insert(ip + 7);
+            }
         }
         if opcode == OpCode::Stloc
+            && !move_store_offsets.contains(&ip)
             && let Some(target) = program.code.get(ip + 1).copied()
             && let Some(name) = persisted_by_slot.get(&target)
         {
@@ -2050,6 +2069,22 @@ mod tests {
             session.locals.get("b").map(|local| &local.value),
             Some(&Value::string("payload"))
         );
+        match super::compile_repl_snippet("a", &session.locals) {
+            Err(vm::SourceError::Parse(parse)) => {
+                assert_eq!(parse.code.as_deref(), Some("E_LOCAL_MOVED"));
+            }
+            Err(other) => panic!("expected moved-local parse error, got {other}"),
+            Ok(_) => panic!("expected moved-local parse error, got successful compile"),
+        }
+    }
+
+    #[test]
+    fn repl_session_preserves_optional_string_move_state() {
+        let mut session = super::ReplSession::default();
+        let _ = run_repl_snippet_and_sync(&mut session, "let a: string? = \"payload\";");
+        let _ = run_repl_snippet_and_sync(&mut session, "let b = a;");
+
+        assert_eq!(session.locals.get("a").map(|local| local.moved), Some(true));
         match super::compile_repl_snippet("a", &session.locals) {
             Err(vm::SourceError::Parse(parse)) => {
                 assert_eq!(parse.code.as_deref(), Some("E_LOCAL_MOVED"));

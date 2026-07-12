@@ -30,6 +30,24 @@ fn arithmetic_and_boolean_opcodes_match_compiler_output() {
 }
 
 #[test]
+fn array_and_map_literals_execute_core_builtins() {
+    assert_eq!(
+        run_source("[1, 2];"),
+        Ok(EmbeddedValue::array(vec![
+            EmbeddedValue::Int(1),
+            EmbeddedValue::Int(2),
+        ]))
+    );
+    assert_eq!(
+        run_source("{ \"a\": 1 };"),
+        Ok(EmbeddedValue::map(vec![(
+            EmbeddedValue::string("a"),
+            EmbeddedValue::Int(1),
+        )]))
+    );
+}
+
+#[test]
 fn direct_stack_and_logical_shift_opcodes_execute() {
     let mut string_vm = EmbeddedVm::new(decode_direct(
         vec![Value::string("rust"), Value::string("script")],

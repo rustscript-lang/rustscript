@@ -1,3 +1,4 @@
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -243,6 +244,9 @@ impl<C> Vm<C> {
     }
 
     fn call_host(&mut self, index: u16, arity: u8) -> VmResult<()> {
+        if let Some(result) = self.call_core_builtin(index, arity) {
+            return result;
+        }
         let import = self
             .program
             .imports()
@@ -275,6 +279,85 @@ impl<C> Vm<C> {
             self.stack.push(value);
         }
         Ok(())
+    }
+
+    fn call_core_builtin(&mut self, index: u16, arity: u8) -> Option<VmResult<()>> {
+        const BUILTIN_BASE: u16 = 0xFFA3;
+        const ARRAY_NEW: u16 = BUILTIN_BASE + 3;
+        const ARRAY_PUSH: u16 = BUILTIN_BASE + 4;
+        const MAP_NEW: u16 = BUILTIN_BASE + 5;
+        const SET: u16 = BUILTIN_BASE + 8;
+
+        Some(match index {
+            ARRAY_NEW => {
+                if let Err(error) = self.require_builtin_arity("array_new", arity, 0) {
+                    return Some(Err(error));
+                }
+                self.stack.push(Value::array(Vec::new()));
+                Ok(())
+            }
+            ARRAY_PUSH => {
+                if let Err(error) = self.require_builtin_arity("array_push", arity, 2) {
+                    return Some(Err(error));
+                }
+                let start = match self.stack.len().checked_sub(2) {
+                    Some(start) => start,
+                    None => return Some(Err(VmError::StackUnderflow)),
+                };
+                let value = self.stack[start + 1].clone();
+                let Value::Array(mut values) = self.stack[start].clone() else {
+                    return Some(Err(VmError::TypeMismatch("array")));
+                };
+                Rc::make_mut(&mut values).push(value);
+                self.stack.truncate(start);
+                self.stack.push(Value::Array(values));
+                Ok(())
+            }
+            MAP_NEW => {
+                if let Err(error) = self.require_builtin_arity("map_new", arity, 0) {
+                    return Some(Err(error));
+                }
+                self.stack.push(Value::map(Vec::new()));
+                Ok(())
+            }
+            SET => {
+                if let Err(error) = self.require_builtin_arity("set", arity, 3) {
+                    return Some(Err(error));
+                }
+                let start = match self.stack.len().checked_sub(3) {
+                    Some(start) => start,
+                    None => return Some(Err(VmError::StackUnderflow)),
+                };
+                let key = self.stack[start + 1].clone();
+                let value = self.stack[start + 2].clone();
+                let Value::Map(mut entries) = self.stack[start].clone() else {
+                    return Some(Err(VmError::TypeMismatch("map")));
+                };
+                let mutable = Rc::make_mut(&mut entries);
+                if let Some((_, current)) = mutable.iter_mut().find(|(current, _)| current == &key)
+                {
+                    *current = value;
+                } else {
+                    mutable.push((key, value));
+                }
+                self.stack.truncate(start);
+                self.stack.push(Value::Map(entries));
+                Ok(())
+            }
+            _ => return None,
+        })
+    }
+
+    fn require_builtin_arity(&self, name: &str, got: u8, expected: u8) -> VmResult<()> {
+        if got == expected {
+            Ok(())
+        } else {
+            Err(VmError::InvalidCallArity {
+                import: name.into(),
+                expected,
+                got,
+            })
+        }
     }
 
     fn add(&mut self) -> VmResult<()> {
