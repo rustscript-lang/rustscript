@@ -25,15 +25,18 @@ repository = "https://github.com/rustscript-lang/rustscript"
 name = "vm"
 
 [features]
-default = ["runtime", "cli", "cranelift-jit", "http", "tls", "websocket"]
+default = ["runtime", "cli", "cranelift-jit"]
 runtime = []
-edge-abi = ["dep:edge_abi"]
-http = ["edge-abi", "edge_abi/http"]
-http2 = ["http", "edge_abi/http2"]
-mqtt = ["edge-abi", "edge_abi/mqtt"]
-tls = ["http", "edge_abi/tls"]
-websocket = ["http", "edge_abi/websocket"]
-webrtc = ["http", "edge_abi/webrtc"]
+edge-abi = [
+    "dep:edge_abi",
+    "edge_abi/console",
+    "edge_abi/http",
+    "edge_abi/http2",
+    "edge_abi/mqtt",
+    "edge_abi/tls",
+    "edge_abi/websocket",
+    "edge_abi/webrtc",
+]
 cli = ["dep:rustyline", "runtime"]
 cranelift-jit = [
     "runtime",

@@ -8,7 +8,7 @@ use crate as vm;
 use crate::{
     CallOutcome, CallReturn, CompileSourceFileOptions, Debugger, DisassembleOptions, JitConfig,
     OpCode, Program, ReplLocalBinding, SourceFlavor, SourceMap, SourcePathError, Value, Vm,
-    VmError, VmRecording, VmStatus, compile_source_file_with_options,
+    VmError, VmRecording, VmStatus, builtin_namespace_specs, compile_source_file_with_options,
     disassemble_vmbc_with_options, encode_program, format_source_with_flavor_and_options,
     render_source_error, render_vm_error, replay_recording_stdio,
 };
@@ -831,6 +831,8 @@ fn cli_host_registry() -> &'static HostFunctionRegistry {
 }
 
 fn print_usage(binary_name: &str) {
+    println!("features: {}", cli_build_feature_summary());
+    println!();
     println!("Usage:");
     println!("  {binary_name}                  (defaults to REPL)");
     println!("  {binary_name} --version");
@@ -861,6 +863,33 @@ fn print_usage(binary_name: &str) {
     println!("      --check                In fmt mode, fail if formatting would change the file");
 }
 
+fn cli_build_features() -> Vec<String> {
+    let mut features = Vec::new();
+    if cfg!(feature = "cranelift-jit") {
+        features.push("cranelift-jit".to_string());
+    }
+    if cfg!(feature = "runtime") {
+        features.push("runtime".to_string());
+    }
+    if CompileSourceFileOptions::default()
+        .module_override_source("stdlib/rss/strings.rss")
+        .is_some()
+    {
+        features.push("stdlibs".to_string());
+    }
+    let modules = builtin_namespace_specs()
+        .iter()
+        .map(|spec| spec.namespace)
+        .collect::<Vec<_>>()
+        .join(", ");
+    features.push(format!("modules={modules}"));
+    features
+}
+
+fn cli_build_feature_summary() -> String {
+    cli_build_features().join(", ")
+}
+
 fn binary_version_text(binary: &str) -> String {
     let git_tag = option_env!("PD_BUILD_GIT_TAG").unwrap_or("untagged");
     let git_commit = option_env!("PD_BUILD_GIT_COMMIT").unwrap_or("unknown");
@@ -876,6 +905,7 @@ fn binary_version_text(binary: &str) -> String {
 
 fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
     println!("pd-vm REPL (RustScript)");
+    println!("features: {}", cli_build_feature_summary());
     println!("history: up/down arrows, commands: .help, .quit, .cancel");
     let mut editor = DefaultEditor::new()?;
     let mut session = ReplSession::default();
@@ -1463,10 +1493,34 @@ mod tests {
         CliConfig, parse_cli_args, prepare_aot_for_cli, register_imports,
         try_new_cli_vm_from_standalone_aot,
     };
-    use vm::{HostImport, OpCode, Program, Value, ValueType, Vm, VmStatus};
+    use vm::{
+        CompileSourceFileOptions, HostImport, OpCode, Program, Value, ValueType, Vm, VmStatus,
+    };
 
     fn s(value: &str) -> String {
         value.to_string()
+    }
+
+    #[test]
+    fn cli_build_features_report_compiled_capabilities() {
+        let features = super::cli_build_features();
+
+        assert_eq!(
+            features,
+            vec![
+                cfg!(feature = "cranelift-jit").then_some("cranelift-jit".to_string()),
+                cfg!(feature = "runtime").then_some("runtime".to_string()),
+                CompileSourceFileOptions::default()
+                    .module_override_source("stdlib/rss/strings.rss")
+                    .is_some()
+                    .then_some("stdlibs".to_string()),
+                Some("modules=bytes, io, re, json, jit, math".to_string()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+        );
+        assert!(!super::cli_build_feature_summary().contains("enabled"));
     }
 
     fn native_aot_supported() -> bool {
