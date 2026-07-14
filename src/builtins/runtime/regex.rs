@@ -64,6 +64,24 @@ impl RegexCache {
         self.recency.push_back(pattern.to_string());
     }
 
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub(crate) fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity;
+        while self.entries.len() > capacity {
+            let Some(oldest) = self.recency.pop_front() else {
+                self.entries.clear();
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+        if capacity == 0 {
+            self.recency.clear();
+        }
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
@@ -166,5 +184,36 @@ mod tests {
 
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.compile_count(), 3);
+    }
+
+    #[test]
+    fn vm_regex_cache_capacity_can_be_changed_and_shrinks_immediately() {
+        let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+        assert_eq!(vm.regex_cache_capacity(), DEFAULT_REGEX_CACHE_CAPACITY);
+
+        builtin_re_match_impl(&mut vm, "a", "a").expect("pattern should compile");
+        builtin_re_match_impl(&mut vm, "b", "b").expect("pattern should compile");
+        builtin_re_match_impl(&mut vm, "c", "c").expect("pattern should compile");
+        vm.set_regex_cache_capacity(1);
+
+        assert_eq!(vm.regex_cache_capacity(), 1);
+        assert_eq!(vm.regex_cache_entry_count(), 1);
+        builtin_re_match_impl(&mut vm, "c", "c").expect("most recent pattern should remain");
+        assert_eq!(vm.regex_cache_compile_count(), 3);
+        assert_eq!(vm.regex_cache_hit_count(), 1);
+    }
+
+    #[test]
+    fn zero_vm_regex_cache_capacity_disables_caching() {
+        let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+        vm.set_regex_cache_capacity(0);
+
+        builtin_re_match_impl(&mut vm, "same", "same").expect("pattern should compile");
+        builtin_re_match_impl(&mut vm, "same", "same").expect("pattern should compile again");
+
+        assert_eq!(vm.regex_cache_capacity(), 0);
+        assert_eq!(vm.regex_cache_entry_count(), 0);
+        assert_eq!(vm.regex_cache_compile_count(), 2);
+        assert_eq!(vm.regex_cache_hit_count(), 0);
     }
 }
