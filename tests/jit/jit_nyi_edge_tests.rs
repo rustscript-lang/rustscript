@@ -117,6 +117,169 @@ impl HostFunction for UnusedBuiltinOverride {
     }
 }
 
+struct ReturnIntArgument;
+
+impl HostFunction for ReturnIntArgument {
+    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+        Ok(CallOutcome::Return(vec![args[0].clone()].into()))
+    }
+}
+
+fn depth_zero_call_only_loop_program() -> ManualTraceProgram {
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.stloc(0);
+
+    let root_ip = bc.position();
+    bc.ldloc(0);
+    bc.call(0, 1);
+    bc.stloc(0);
+    bc.ldloc(0);
+    bc.ldc(1);
+    bc.add();
+    bc.stloc(0);
+    bc.ldloc(0);
+    bc.ldc(2);
+    bc.clt();
+    let exit_branch_ip = bc.position();
+    bc.brfalse(0);
+    bc.br(root_ip);
+
+    let exit_ip = bc.position();
+    bc.ldloc(0);
+    bc.ret();
+
+    let mut code = bc.finish();
+    patch_branch_target(&mut code, exit_branch_ip, exit_ip);
+    ManualTraceProgram {
+        program: vm::Program::new(vec![Value::Int(0), Value::Int(1), Value::Int(4)], code)
+            .with_local_count(1),
+        root_ip: root_ip as usize,
+    }
+}
+
+#[test]
+fn jit_blocks_depth_zero_zero_benefit_call_boundary_trace() {
+    let case = depth_zero_call_only_loop_program();
+    let mut vm = Vm::new(case.program);
+    configure_jit(&mut vm);
+    vm.register_function(Box::new(ReturnIntArgument));
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(4)]);
+
+    if native_jit_supported() {
+        let snapshot = vm.jit_snapshot();
+        let root_attempts = snapshot
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.root_ip == case.root_ip && attempt.entry_stack_depth == 0)
+            .collect::<Vec<_>>();
+        assert_eq!(root_attempts.len(), 1, "dump:\n{}", vm.dump_jit_info());
+        assert_eq!(
+            root_attempts[0].result,
+            Err(JitNyiReason::UnsupportedTrace(
+                "zero-benefit call-boundary trace".to_string()
+            ))
+        );
+        assert!(
+            snapshot
+                .traces
+                .iter()
+                .all(|trace| trace.root_ip != case.root_ip),
+            "blocked root should have no recorded trace, dump:\n{}",
+            vm.dump_jit_info()
+        );
+        assert_eq!(
+            vm.jit_native_trace_count(),
+            0,
+            "dump:\n{}",
+            vm.dump_jit_info()
+        );
+    }
+}
+
+fn depth_one_call_only_loop_program() -> ManualTraceProgram {
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(3);
+    bc.ldc(0);
+    bc.stloc(0);
+
+    let root_ip = bc.position();
+    bc.ldloc(0);
+    bc.call(0, 1);
+    bc.stloc(0);
+    bc.ldloc(0);
+    bc.ldc(1);
+    bc.add();
+    bc.stloc(0);
+    bc.ldloc(0);
+    bc.ldc(2);
+    bc.clt();
+    let exit_branch_ip = bc.position();
+    bc.brfalse(0);
+    bc.br(root_ip);
+
+    let exit_ip = bc.position();
+    bc.ldloc(0);
+    bc.add();
+    bc.ret();
+
+    let mut code = bc.finish();
+    patch_branch_target(&mut code, exit_branch_ip, exit_ip);
+    ManualTraceProgram {
+        program: vm::Program::new(
+            vec![Value::Int(0), Value::Int(1), Value::Int(4), Value::Int(100)],
+            code,
+        )
+        .with_local_count(1),
+        root_ip: root_ip as usize,
+    }
+}
+
+#[test]
+fn jit_blocks_depth_one_zero_benefit_call_boundary_trace() {
+    let case = depth_one_call_only_loop_program();
+    let mut vm = Vm::new(case.program);
+    configure_jit(&mut vm);
+    vm.register_function(Box::new(ReturnIntArgument));
+
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(104)]);
+
+    if native_jit_supported() {
+        let snapshot = vm.jit_snapshot();
+        let root_attempts = snapshot
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.root_ip == case.root_ip && attempt.entry_stack_depth == 1)
+            .collect::<Vec<_>>();
+        assert_eq!(root_attempts.len(), 1, "dump:\n{}", vm.dump_jit_info());
+        assert_eq!(
+            root_attempts[0].result,
+            Err(JitNyiReason::UnsupportedTrace(
+                "zero-benefit call-boundary trace".to_string()
+            ))
+        );
+        assert!(
+            snapshot
+                .traces
+                .iter()
+                .all(|trace| trace.root_ip != case.root_ip),
+            "blocked root should have no recorded trace, dump:\n{}",
+            vm.dump_jit_info()
+        );
+        assert_eq!(
+            vm.jit_native_trace_count(),
+            0,
+            "dump:\n{}",
+            vm.dump_jit_info()
+        );
+    }
+}
+
 #[test]
 fn jit_supports_backward_brfalse_to_trace_root() {
     let case = loop_if_false_root_program();

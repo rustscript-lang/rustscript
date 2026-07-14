@@ -339,6 +339,27 @@ enum DecodedOp {
     },
 }
 
+impl DecodedOp {
+    fn is_useful_native_computation(self) -> bool {
+        match self {
+            Self::Nop { .. }
+            | Self::Ret { .. }
+            | Self::Ldc { .. }
+            | Self::Ldloc { .. }
+            | Self::Pop { .. }
+            | Self::Dup { .. }
+            | Self::Br { .. }
+            | Self::Call { .. } => false,
+            Self::Stloc { .. }
+            | Self::Neg { .. }
+            | Self::Not { .. }
+            | Self::BinOp { .. }
+            | Self::Compare { .. }
+            | Self::Brfalse { .. } => true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IntBinOpKind {
     Add,
@@ -752,11 +773,13 @@ pub(crate) fn record_trace(
     let mut op_names = Vec::new();
     let mut has_call = false;
     let mut has_yielding_call = false;
+    let mut has_useful_native_computation = false;
 
     loop {
         let Some(decoded) = cursor.next()? else {
             break;
         };
+        let is_useful_native_computation = decoded.is_useful_native_computation();
 
         match decoded {
             DecodedOp::Nop { .. } => op_names.push("nop".to_string()),
@@ -932,6 +955,7 @@ pub(crate) fn record_trace(
                     current_block = next_block;
                     frame = next_frame;
                     cursor.jump_to(target)?;
+                    has_useful_native_computation |= is_useful_native_computation;
                     continue;
                 }
 
@@ -960,6 +984,7 @@ pub(crate) fn record_trace(
                     current_block = next_block;
                     frame = next_frame;
                     cursor.jump_to(target)?;
+                    has_useful_native_computation |= is_useful_native_computation;
                     continue;
                 }
 
@@ -1045,8 +1070,14 @@ pub(crate) fn record_trace(
                         )?;
                         op_names.push(name.to_string());
                         frame.push(out);
+                        has_useful_native_computation = true;
                         continue;
                     }
+                }
+                if !has_useful_native_computation {
+                    return Err(TraceRecordError::UnsupportedTrace(
+                        "zero-benefit call-boundary trace".to_string(),
+                    ));
                 }
                 has_call = true;
                 has_yielding_call |= yields;
@@ -1063,6 +1094,7 @@ pub(crate) fn record_trace(
                 break;
             }
         }
+        has_useful_native_computation |= is_useful_native_computation;
     }
 
     let terminal = terminal.ok_or(TraceRecordError::MissingTerminal)?;
