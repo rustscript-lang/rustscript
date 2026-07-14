@@ -1257,8 +1257,13 @@ impl Vm {
                 continue;
             }
 
+            // SSA traces currently model locals but have no entry operand-stack parameters.
+            // Running one with ambient values would drop values that remain live across a loop
+            // (for example, the left operand of `100 + inlined_loop()`). Keep such loops in the
+            // interpreter until trace entry stacks are represented explicitly.
             if allow_jit
                 && self.jit_config().enabled
+                && self.stack.is_empty()
                 && self.builtin_overrides.is_empty()
                 && !self.drop_contract_events_enabled()
             {

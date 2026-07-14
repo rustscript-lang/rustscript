@@ -3435,3 +3435,38 @@ fn trace_jit_supports_float_comparisons_in_ssa() {
         vm.dump_jit_info()
     );
 }
+
+#[test]
+fn trace_jit_skips_loop_with_live_entry_stack() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        fn sum_to(limit: int) -> int {
+            let mut sum = 0;
+            for i in 0..limit {
+                sum = sum + i;
+            }
+            sum
+        }
+
+        100 + sum_to(10);
+    "#;
+    let compiled = compile_source(source).expect("live entry stack source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    let status = vm.run().expect("live entry stack program should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(145)]);
+    assert_eq!(
+        vm.jit_native_exec_count(),
+        0,
+        "a trace with an unmodeled live entry stack must remain in the interpreter"
+    );
+}
