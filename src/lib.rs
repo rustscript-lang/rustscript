@@ -41,6 +41,9 @@ pub fn builtin_call_index(name: &str) -> Option<u16> {
         "has" => Some(BuiltinFunction::Has.call_index()),
         "set" => Some(BuiltinFunction::Set.call_index()),
         "keys" => Some(BuiltinFunction::Keys.call_index()),
+        "string_contains" => Some(BuiltinFunction::StringContains.call_index()),
+        "string_replace_literal" => Some(BuiltinFunction::StringReplaceLiteral.call_index()),
+        "string_lower_ascii" => Some(BuiltinFunction::StringLowerAscii.call_index()),
         _ => BuiltinFunction::from_namespaced_name(name).map(|builtin| builtin.call_index()),
     }
 }

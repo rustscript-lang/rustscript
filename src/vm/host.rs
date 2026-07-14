@@ -949,6 +949,22 @@ impl Vm {
                     }
                     _ => None,
                 },
+                BuiltinFunction::StringContains => match (lhs, rhs, args) {
+                    (ValueType::String, ValueType::String, [text, needle]) => {
+                        Self::fast_path_string_contains_result(text, needle)
+                    }
+                    _ => None,
+                },
+                BuiltinFunction::StringReplaceLiteral => match (lhs, rhs, args) {
+                    (ValueType::String, ValueType::String, [text, needle, replacement]) => {
+                        Self::fast_path_string_replace_literal_result(text, needle, replacement)
+                    }
+                    _ => None,
+                },
+                BuiltinFunction::StringLowerAscii => match (lhs, args) {
+                    (ValueType::String, [text]) => Self::fast_path_string_lower_ascii_result(text),
+                    _ => None,
+                },
                 BuiltinFunction::BytesFromArrayU8 => match (lhs, args) {
                     (ValueType::Array, [value]) => {
                         Some(Self::fast_path_bytes_from_array_u8_result(value)?)
@@ -1013,6 +1029,46 @@ impl Vm {
             Value::Map(entries) => Some(Value::Int(entries.len() as i64)),
             _ => None,
         }
+    }
+
+    fn fast_path_string_contains_result(text: &Value, needle: &Value) -> Option<Value> {
+        let (Value::String(text), Value::String(needle)) = (text, needle) else {
+            return None;
+        };
+        Some(Value::Bool(
+            crate::builtins::runtime::core::builtin_string_contains_impl(
+                text.as_str(),
+                needle.as_str(),
+            ),
+        ))
+    }
+
+    fn fast_path_string_replace_literal_result(
+        text: &Value,
+        needle: &Value,
+        replacement: &Value,
+    ) -> Option<Value> {
+        let (Value::String(text), Value::String(needle), Value::String(replacement)) =
+            (text, needle, replacement)
+        else {
+            return None;
+        };
+        Some(Value::string(
+            crate::builtins::runtime::core::builtin_string_replace_literal_impl(
+                text.as_str(),
+                needle.as_str(),
+                replacement.as_str(),
+            ),
+        ))
+    }
+
+    fn fast_path_string_lower_ascii_result(text: &Value) -> Option<Value> {
+        let Value::String(text) = text else {
+            return None;
+        };
+        Some(Value::string(
+            crate::builtins::runtime::core::builtin_string_lower_ascii_impl(text.as_str()),
+        ))
     }
 
     fn fast_path_get_result(container: &Value, key: &Value) -> VmResult<Option<Value>> {

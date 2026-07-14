@@ -451,6 +451,9 @@ enum SpecializedBuiltinKind {
     StringGet,
     BytesGet,
     BytesHas,
+    StringContains,
+    StringReplaceLiteral,
+    StringLowerAscii,
     StringConcat,
     BytesConcat,
     BytesFromArrayU8,
@@ -2449,6 +2452,15 @@ fn select_specialized_builtin_kind(
         }
         (BuiltinFunction::Get, HeapContainerKind::Bytes) => Some(SpecializedBuiltinKind::BytesGet),
         (BuiltinFunction::Has, HeapContainerKind::Bytes) => Some(SpecializedBuiltinKind::BytesHas),
+        (BuiltinFunction::StringContains, HeapContainerKind::String) => {
+            Some(SpecializedBuiltinKind::StringContains)
+        }
+        (BuiltinFunction::StringReplaceLiteral, HeapContainerKind::String) => {
+            Some(SpecializedBuiltinKind::StringReplaceLiteral)
+        }
+        (BuiltinFunction::StringLowerAscii, HeapContainerKind::String) => {
+            Some(SpecializedBuiltinKind::StringLowerAscii)
+        }
         (BuiltinFunction::Concat, HeapContainerKind::String) => {
             Some(SpecializedBuiltinKind::StringConcat)
         }
@@ -2517,6 +2529,24 @@ fn analyze_specialized_builtin_call(
             let _ = frame.pop()?;
             frame.push(ValueInfo::bool(None));
             Ok("bytes_has")
+        }
+        SpecializedBuiltinKind::StringContains => {
+            let _ = frame.pop()?;
+            let _ = frame.pop()?;
+            frame.push(ValueInfo::bool(None));
+            Ok("string_contains")
+        }
+        SpecializedBuiltinKind::StringReplaceLiteral => {
+            let _ = frame.pop()?;
+            let _ = frame.pop()?;
+            let _ = frame.pop()?;
+            frame.push(ValueInfo::tagged_typed(ValueType::String));
+            Ok("string_replace_literal")
+        }
+        SpecializedBuiltinKind::StringLowerAscii => {
+            let _ = frame.pop()?;
+            frame.push(ValueInfo::tagged_typed(ValueType::String));
+            Ok("string_lower_ascii")
         }
         SpecializedBuiltinKind::StringConcat => {
             let _ = frame.pop()?;
@@ -2768,6 +2798,102 @@ fn emit_specialized_builtin_call(
                 })
                 .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
             Ok(("bytes_has", out))
+        }
+        SpecializedBuiltinKind::StringContains => {
+            let needle = ensure_heap_ptr(
+                builder,
+                block,
+                ip,
+                frame.pop()?,
+                HeapContainerKind::String.value_type(),
+            )?;
+            let text = ensure_heap_ptr(
+                builder,
+                block,
+                ip,
+                frame.pop()?,
+                HeapContainerKind::String.value_type(),
+            )?;
+            let out = builder
+                .append_value_inst(
+                    block,
+                    ip,
+                    SsaValueRepr::Bool,
+                    SsaInstKind::StringContains {
+                        text: text.value.id,
+                        needle: needle.value.id,
+                    },
+                )
+                .map(|value| SymbolicValue {
+                    value,
+                    info: ValueInfo::bool(None),
+                })
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+            Ok(("string_contains", out))
+        }
+        SpecializedBuiltinKind::StringReplaceLiteral => {
+            let replacement = ensure_heap_ptr(
+                builder,
+                block,
+                ip,
+                frame.pop()?,
+                HeapContainerKind::String.value_type(),
+            )?;
+            let needle = ensure_heap_ptr(
+                builder,
+                block,
+                ip,
+                frame.pop()?,
+                HeapContainerKind::String.value_type(),
+            )?;
+            let text = ensure_heap_ptr(
+                builder,
+                block,
+                ip,
+                frame.pop()?,
+                HeapContainerKind::String.value_type(),
+            )?;
+            let out = builder
+                .append_value_inst(
+                    block,
+                    ip,
+                    SsaValueRepr::Tagged,
+                    SsaInstKind::StringReplaceLiteral {
+                        text: text.value.id,
+                        needle: needle.value.id,
+                        replacement: replacement.value.id,
+                    },
+                )
+                .map(|value| SymbolicValue {
+                    value,
+                    info: ValueInfo::tagged_typed(ValueType::String),
+                })
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+            Ok(("string_replace_literal", out))
+        }
+        SpecializedBuiltinKind::StringLowerAscii => {
+            let text = ensure_heap_ptr(
+                builder,
+                block,
+                ip,
+                frame.pop()?,
+                HeapContainerKind::String.value_type(),
+            )?;
+            let out = builder
+                .append_value_inst(
+                    block,
+                    ip,
+                    SsaValueRepr::Tagged,
+                    SsaInstKind::StringLowerAscii {
+                        text: text.value.id,
+                    },
+                )
+                .map(|value| SymbolicValue {
+                    value,
+                    info: ValueInfo::tagged_typed(ValueType::String),
+                })
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+            Ok(("string_lower_ascii", out))
         }
         SpecializedBuiltinKind::StringConcat => {
             let rhs = frame.pop()?;

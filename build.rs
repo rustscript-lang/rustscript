@@ -334,14 +334,19 @@ fn render_builtin_catalog(
     let host_groups = stable_groups(&host_group_input, |callable| callable.name.clone());
     let (builtin_variant_order, actual_builtin_by_variant) =
         ordered_actual_builtin_variants(namespaces, builtin_callables, metadata_callables);
-    let builtin_call_count = u16::try_from(builtin_variant_order.len())
-        .expect("builtin function count should fit in u16");
+    let builtin_call_count = u16::try_from(
+        builtin_variant_order
+            .len()
+            .checked_sub(appended_builtin_order().len())
+            .expect("appended builtin count should fit catalog"),
+    )
+    .expect("builtin function count should fit in u16");
     let builtin_call_base = u16::MAX
         .checked_sub(builtin_call_count)
         .and_then(|value| value.checked_add(1))
         .expect("builtin call base should fit in u16");
     assert!(
-        builtin_call_base >= 4,
+        builtin_call_base >= 7,
         "builtin call base must leave room for reserved special builtins"
     );
 
@@ -467,6 +472,21 @@ fn render_builtin_catalog(
     writeln!(
         &mut out,
         "    (BUILTIN_CALL_BASE - 1, BuiltinFunction::Assert),"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "    (BUILTIN_CALL_BASE - 7, BuiltinFunction::StringContains),"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "    (BUILTIN_CALL_BASE - 6, BuiltinFunction::StringReplaceLiteral),"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "    (BUILTIN_CALL_BASE - 5, BuiltinFunction::StringLowerAscii),"
     )
     .unwrap();
     writeln!(&mut out, "];").unwrap();
@@ -615,6 +635,21 @@ fn render_builtin_catalog(
     writeln!(
         &mut out,
         "            BuiltinFunction::Assert => BUILTIN_CALL_BASE - 1,"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "            BuiltinFunction::StringContains => BUILTIN_CALL_BASE - 7,"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "            BuiltinFunction::StringReplaceLiteral => BUILTIN_CALL_BASE - 6,"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "            BuiltinFunction::StringLowerAscii => BUILTIN_CALL_BASE - 5,"
     )
     .unwrap();
     writeln!(
@@ -1250,6 +1285,14 @@ fn special_builtin_order() -> &'static [&'static str] {
     &["__format_template", "__to_string", "type", "assert"]
 }
 
+fn appended_builtin_order() -> &'static [&'static str] {
+    &[
+        "string_contains",
+        "string_replace_literal",
+        "string_lower_ascii",
+    ]
+}
+
 fn required_language_builtin_stubs() -> &'static [&'static str] {
     &[
         "len",
@@ -1263,6 +1306,9 @@ fn required_language_builtin_stubs() -> &'static [&'static str] {
         "set",
         "keys",
         "count",
+        "string_contains",
+        "string_replace_literal",
+        "string_lower_ascii",
         "type",
         "assert",
     ]
@@ -1322,6 +1368,9 @@ fn ordered_actual_builtin_variants<'a>(
         push_ordered_variant(&mut ordered, &mut seen, builtin_variant_name(name));
     }
     for name in special_builtin_order() {
+        push_ordered_variant(&mut ordered, &mut seen, builtin_variant_name(name));
+    }
+    for name in appended_builtin_order() {
         push_ordered_variant(&mut ordered, &mut seen, builtin_variant_name(name));
     }
 
@@ -1397,7 +1446,13 @@ fn main_range_builtin_variants(builtin_variant_order: &[String]) -> Vec<String> 
         .filter(|variant| {
             !matches!(
                 variant.as_str(),
-                "FormatTemplate" | "ToString" | "TypeOf" | "Assert"
+                "FormatTemplate"
+                    | "ToString"
+                    | "TypeOf"
+                    | "Assert"
+                    | "StringContains"
+                    | "StringReplaceLiteral"
+                    | "StringLowerAscii"
             )
         })
         .cloned()

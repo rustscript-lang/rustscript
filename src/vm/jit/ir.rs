@@ -135,6 +135,18 @@ pub(crate) enum SsaInstKind {
         bytes: SsaValueId,
         index: SsaValueId,
     },
+    StringContains {
+        text: SsaValueId,
+        needle: SsaValueId,
+    },
+    StringReplaceLiteral {
+        text: SsaValueId,
+        needle: SsaValueId,
+        replacement: SsaValueId,
+    },
+    StringLowerAscii {
+        text: SsaValueId,
+    },
     StringConcat {
         lhs: SsaValueId,
         rhs: SsaValueId,
@@ -334,6 +346,13 @@ impl SsaInstKind {
             Self::StringGet { text, index } => vec![*text, *index],
             Self::BytesGet { bytes, index } => vec![*bytes, *index],
             Self::BytesHas { bytes, index } => vec![*bytes, *index],
+            Self::StringContains { text, needle } => vec![*text, *needle],
+            Self::StringReplaceLiteral {
+                text,
+                needle,
+                replacement,
+            } => vec![*text, *needle, *replacement],
+            Self::StringLowerAscii { text } => vec![*text],
             Self::StringConcat { lhs, rhs } | Self::BytesConcat { lhs, rhs } => vec![*lhs, *rhs],
             Self::BytesFromArrayU8 { array } => vec![*array],
             Self::BytesToArrayU8 { bytes } => vec![*bytes],
@@ -920,6 +939,15 @@ fn render_inst_kind(kind: &SsaInstKind) -> String {
         SsaInstKind::StringGet { text, index } => format!("string_get {text}, {index}"),
         SsaInstKind::BytesGet { bytes, index } => format!("bytes_get {bytes}, {index}"),
         SsaInstKind::BytesHas { bytes, index } => format!("bytes_has {bytes}, {index}"),
+        SsaInstKind::StringContains { text, needle } => {
+            format!("string_contains {text}, {needle}")
+        }
+        SsaInstKind::StringReplaceLiteral {
+            text,
+            needle,
+            replacement,
+        } => format!("string_replace_literal {text}, {needle}, {replacement}"),
+        SsaInstKind::StringLowerAscii { text } => format!("string_lower_ascii {text}"),
         SsaInstKind::StringConcat { lhs, rhs } => format!("string_concat {lhs}, {rhs}"),
         SsaInstKind::BytesConcat { lhs, rhs } => format!("bytes_concat {lhs}, {rhs}"),
         SsaInstKind::BytesFromArrayU8 { array } => format!("bytes_from_array_u8 {array}"),

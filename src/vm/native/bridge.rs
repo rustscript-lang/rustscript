@@ -205,6 +205,18 @@ pub(crate) fn zero_bytes_entry_address() -> usize {
     pd_vm_native_zero_bytes as *const () as usize
 }
 
+pub(crate) fn string_contains_entry_address() -> usize {
+    pd_vm_native_string_contains as *const () as usize
+}
+
+pub(crate) fn string_replace_literal_entry_address() -> usize {
+    pd_vm_native_string_replace_literal as *const () as usize
+}
+
+pub(crate) fn string_lower_ascii_entry_address() -> usize {
+    pd_vm_native_string_lower_ascii as *const () as usize
+}
+
 pub(crate) fn clone_value_to_slot_entry_address() -> usize {
     pd_vm_native_clone_value_to_slot as *const () as usize
 }
@@ -346,6 +358,45 @@ unsafe fn clone_arc_from_repr_ptr<T>(ptr: *mut u8) -> Arc<T> {
     let cloned = arc.clone();
     std::mem::forget(arc);
     cloned
+}
+
+pub(crate) extern "C" fn pd_vm_native_string_contains(
+    text_ptr: *mut u8,
+    needle_ptr: *mut u8,
+) -> i32 {
+    let text = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(text_ptr)) };
+    let needle = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(needle_ptr)) };
+    i32::from(
+        crate::builtins::runtime::core::builtin_string_contains_impl(
+            text.as_str(),
+            needle.as_str(),
+        ),
+    )
+}
+
+pub(crate) extern "C" fn pd_vm_native_string_replace_literal(
+    text_ptr: *mut u8,
+    needle_ptr: *mut u8,
+    replacement_ptr: *mut u8,
+) -> *mut u8 {
+    let text = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(text_ptr)) };
+    let needle = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(needle_ptr)) };
+    let replacement =
+        unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(replacement_ptr)) };
+    arc_into_repr_ptr(Arc::new(
+        crate::builtins::runtime::core::builtin_string_replace_literal_impl(
+            text.as_str(),
+            needle.as_str(),
+            replacement.as_str(),
+        ),
+    ))
+}
+
+pub(crate) extern "C" fn pd_vm_native_string_lower_ascii(text_ptr: *mut u8) -> *mut u8 {
+    let text = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(text_ptr)) };
+    arc_into_repr_ptr(Arc::new(
+        crate::builtins::runtime::core::builtin_string_lower_ascii_impl(text.as_str()),
+    ))
 }
 
 pub(crate) extern "C" fn pd_vm_native_clone_value_to_slot(

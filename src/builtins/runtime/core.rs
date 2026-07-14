@@ -764,6 +764,37 @@ pub(super) fn builtin_assert_impl(condition: bool) -> VmResult<()> {
     }
 }
 
+/// Return true when `needle` is found within `text`.
+#[pd_host_function(name = "string_contains")]
+pub(crate) fn builtin_string_contains_impl(text: VmStringRef<'_>, needle: VmStringRef<'_>) -> bool {
+    text.contains(needle)
+}
+
+/// Replace non-overlapping literal `needle` matches in `text`.
+#[pd_host_function(name = "string_replace_literal")]
+pub(crate) fn builtin_string_replace_literal_impl(
+    text: VmStringRef<'_>,
+    needle: VmStringRef<'_>,
+    replacement: VmStringRef<'_>,
+) -> String {
+    if needle.is_empty() {
+        return text.to_string();
+    }
+    text.replace(needle, replacement)
+}
+
+/// Lower ASCII `A`-`Z` bytes in `text` while preserving UTF-8.
+#[pd_host_function(name = "string_lower_ascii")]
+pub(crate) fn builtin_string_lower_ascii_impl(text: VmStringRef<'_>) -> String {
+    let mut out = text.as_bytes().to_vec();
+    for byte in &mut out {
+        if byte.is_ascii_uppercase() {
+            *byte = byte.to_ascii_lowercase();
+        }
+    }
+    String::from_utf8(out).expect("ASCII-only byte changes preserve UTF-8")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

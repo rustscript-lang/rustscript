@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
 use vm::{
-    ArgInfo, Assembler, BytecodeBuilder, DebugFunction, DebugInfo, DisassembleOptions, HostImport,
-    LineInfo, LocalInfo, Program, TypeMap, ValidationError, Value, ValueType, WireError,
-    decode_program, disassemble_vmbc, disassemble_vmbc_with_options, encode_program,
-    infer_local_count, validate_program,
+    ArgInfo, Assembler, BuiltinFunction, BytecodeBuilder, DebugFunction, DebugInfo,
+    DisassembleOptions, HostImport, LineInfo, LocalInfo, Program, TypeMap, ValidationError, Value,
+    ValueType, WireError, builtin_call_index, decode_program, disassemble_vmbc,
+    disassemble_vmbc_with_options, encode_program, infer_local_count, validate_program,
 };
 
 #[test]
@@ -324,4 +324,27 @@ fn assembler_deduplicates_equal_scalar_constants() {
         program.constants,
         vec![Value::Int(7), Value::Bool(true), Value::Float(3.5)]
     );
+}
+
+#[test]
+fn literal_string_builtin_indices_are_appended_and_publicly_resolved() {
+    assert_eq!(BuiltinFunction::Count.call_index(), 65_531);
+    assert_eq!(BuiltinFunction::FormatTemplate.call_index(), 65_439);
+    assert_eq!(BuiltinFunction::ToString.call_index(), 65_440);
+    assert_eq!(BuiltinFunction::TypeOf.call_index(), 65_441);
+    assert_eq!(BuiltinFunction::Assert.call_index(), 65_442);
+
+    let first = BuiltinFunction::FormatTemplate.call_index() - 3;
+    assert_eq!(builtin_call_index("string_contains"), Some(first));
+    assert_eq!(
+        builtin_call_index("string_replace_literal"),
+        Some(first + 1)
+    );
+    assert_eq!(builtin_call_index("string_lower_ascii"), Some(first + 2));
+    assert_eq!(BuiltinFunction::StringContains.call_index(), first);
+    assert_eq!(
+        BuiltinFunction::StringReplaceLiteral.call_index(),
+        first + 1
+    );
+    assert_eq!(BuiltinFunction::StringLowerAscii.call_index(), first + 2);
 }

@@ -1389,6 +1389,15 @@ impl Parser {
             "assert" => Ok(Some(
                 self.build_builtin_call_expr(BuiltinFunction::Assert, args.to_vec())?,
             )),
+            "string_contains" => Ok(Some(
+                self.build_builtin_call_expr(BuiltinFunction::StringContains, args.to_vec())?,
+            )),
+            "string_replace_literal" => Ok(Some(
+                self.build_builtin_call_expr(BuiltinFunction::StringReplaceLiteral, args.to_vec())?,
+            )),
+            "string_lower_ascii" => Ok(Some(
+                self.build_builtin_call_expr(BuiltinFunction::StringLowerAscii, args.to_vec())?,
+            )),
             _ => Ok(None),
         }
     }

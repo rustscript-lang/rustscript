@@ -3929,3 +3929,123 @@ fn trace_jit_reuses_live_entry_stack_trace_after_reset() {
     assert_eq!(vm.stack(), &[Value::Int(145)]);
     assert!(vm.jit_native_exec_count() > first_native_exec_count);
 }
+
+#[test]
+fn literal_string_builtins_match_interpreter_semantics() {
+    let source = r#"
+        string_contains("a界🙂z", "界🙂");
+        string_contains("abc", "");
+        string_contains("abc", "x");
+        string_replace_literal("aaaa", "aa", "aaX");
+        string_replace_literal("a界a", "", "x");
+        string_replace_literal("a界a", "z", "x");
+        string_lower_ascii("AZ界Ä🙂");
+    "#;
+    let compiled = compile_source(source).expect("literal string builtin compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    disable_trace_jit(&mut vm);
+    assert_eq!(
+        vm.run().expect("literal string vm should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(
+        vm.stack(),
+        &[
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::string("aaXaaX"),
+            Value::string("a界a"),
+            Value::string("a界a"),
+            Value::string("az界Ä🙂"),
+        ]
+    );
+}
+
+#[test]
+fn aot_literal_string_builtins_match_interpreter_semantics() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        string_contains("a界🙂z", "界🙂");
+        string_replace_literal("aaaa", "aa", "aaX");
+        string_lower_ascii("AZ界Ä🙂");
+    "#;
+    let compiled = compile_source(source).expect("literal string builtin compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    install_aot(&mut vm);
+
+    assert_eq!(
+        vm.run().expect("literal string AOT vm should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(
+        vm.stack(),
+        &[
+            Value::Bool(true),
+            Value::string("aaXaaX"),
+            Value::string("az界Ä🙂"),
+        ]
+    );
+    assert!(vm.aot_exec_count() > 0);
+}
+
+#[test]
+fn trace_jit_specializes_literal_string_builtins_without_call_boundary() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        let mut i = 0;
+        let mut found = false;
+        let mut replaced = "";
+        let mut lowered = "";
+        while i < 4 {
+            found = string_contains("a界🙂z", "界🙂");
+            replaced = string_replace_literal("aaaa", "aa", "aaX");
+            lowered = string_lower_ascii("AZ界Ä🙂");
+            i = i + 1;
+        }
+        found;
+        replaced;
+        lowered;
+    "#;
+    let compiled = compile_source(source).expect("literal string builtin compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    vm.set_jit_native_bridge_stats_enabled(true);
+    assert_eq!(
+        vm.run().expect("literal string jit should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(
+        vm.stack(),
+        &[
+            Value::Bool(true),
+            Value::string("aaXaaX"),
+            Value::string("az界Ä🙂"),
+        ]
+    );
+    let snapshot = vm.jit_snapshot();
+    assert_native_ssa_specialized_trace(
+        &vm,
+        &snapshot,
+        "literal string builtin loop",
+        &[
+            "string_contains",
+            "string_replace_literal",
+            "string_lower_ascii",
+        ],
+    );
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    assert!(
+        bridge_hits.iter().all(|(_, count)| *count == 0),
+        "literal string builtin loop should not use native helper bridges: {bridge_hits:?}\n{}",
+        vm.dump_jit_info()
+    );
+}

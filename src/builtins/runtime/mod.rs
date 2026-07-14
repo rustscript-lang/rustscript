@@ -7,7 +7,7 @@ use crate::vm::{CallOutcome, CallReturn, HostOpId, Value, Vm, VmResult};
 
 mod aot;
 mod bytes;
-mod core;
+pub(crate) mod core;
 mod host;
 #[cfg(not(target_arch = "wasm32"))]
 mod io;
@@ -64,6 +64,12 @@ pub(crate) fn execute_builtin_call(
         BuiltinFunction::Set => core::builtin_set(args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Keys => core::builtin_keys(args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Count => core::builtin_count(args).map(BuiltinCallOutcome::Return),
+        BuiltinFunction::StringContains => core::builtin_string_contains(args)
+            .map(IntoBuiltinCallOutcome::into_builtin_call_outcome),
+        BuiltinFunction::StringReplaceLiteral => core::builtin_string_replace_literal(args)
+            .map(IntoBuiltinCallOutcome::into_builtin_call_outcome),
+        BuiltinFunction::StringLowerAscii => core::builtin_string_lower_ascii(args)
+            .map(IntoBuiltinCallOutcome::into_builtin_call_outcome),
         BuiltinFunction::FormatTemplate => core::builtin_format_template(args)
             .map(IntoBuiltinCallOutcome::into_builtin_call_outcome),
         BuiltinFunction::ToString => {
