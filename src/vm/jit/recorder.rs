@@ -454,6 +454,7 @@ enum SpecializedBuiltinKind {
     StringContains,
     StringReplaceLiteral,
     StringLowerAscii,
+    StringSplitLiteral,
     StringConcat,
     BytesConcat,
     BytesFromArrayU8,
@@ -2461,6 +2462,9 @@ fn select_specialized_builtin_kind(
         (BuiltinFunction::StringLowerAscii, HeapContainerKind::String) => {
             Some(SpecializedBuiltinKind::StringLowerAscii)
         }
+        (BuiltinFunction::StringSplitLiteral, HeapContainerKind::String) => {
+            Some(SpecializedBuiltinKind::StringSplitLiteral)
+        }
         (BuiltinFunction::Concat, HeapContainerKind::String) => {
             Some(SpecializedBuiltinKind::StringConcat)
         }
@@ -2547,6 +2551,12 @@ fn analyze_specialized_builtin_call(
             let _ = frame.pop()?;
             frame.push(ValueInfo::tagged_typed(ValueType::String));
             Ok("string_lower_ascii")
+        }
+        SpecializedBuiltinKind::StringSplitLiteral => {
+            let _ = frame.pop()?;
+            let _ = frame.pop()?;
+            frame.push(ValueInfo::tagged_typed(ValueType::Array));
+            Ok("string_split_literal")
         }
         SpecializedBuiltinKind::StringConcat => {
             let _ = frame.pop()?;
@@ -2894,6 +2904,38 @@ fn emit_specialized_builtin_call(
                 })
                 .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
             Ok(("string_lower_ascii", out))
+        }
+        SpecializedBuiltinKind::StringSplitLiteral => {
+            let delimiter = ensure_heap_ptr(
+                builder,
+                block,
+                ip,
+                frame.pop()?,
+                HeapContainerKind::String.value_type(),
+            )?;
+            let text = ensure_heap_ptr(
+                builder,
+                block,
+                ip,
+                frame.pop()?,
+                HeapContainerKind::String.value_type(),
+            )?;
+            let out = builder
+                .append_value_inst(
+                    block,
+                    ip,
+                    SsaValueRepr::Tagged,
+                    SsaInstKind::StringSplitLiteral {
+                        text: text.value.id,
+                        delimiter: delimiter.value.id,
+                    },
+                )
+                .map(|value| SymbolicValue {
+                    value,
+                    info: ValueInfo::tagged_typed(ValueType::Array),
+                })
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+            Ok(("string_split_literal", out))
         }
         SpecializedBuiltinKind::StringConcat => {
             let rhs = frame.pop()?;

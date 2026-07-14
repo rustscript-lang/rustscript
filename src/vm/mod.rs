@@ -252,6 +252,7 @@ pub struct Vm {
     waiting_host_op: Option<WaitingHostOp>,
     next_host_op_id: HostOpId,
     pub(crate) io_state: crate::builtins::runtime::IoState,
+    regex_cache: crate::builtins::runtime::regex::RegexCache,
     epoch_handle: EpochHandle,
     #[allow(dead_code)]
     epoch_counter_ptr: usize,
@@ -507,6 +508,7 @@ impl Vm {
             waiting_host_op: None,
             next_host_op_id: 1,
             io_state: crate::builtins::runtime::IoState::default(),
+            regex_cache: crate::builtins::runtime::regex::RegexCache::default(),
             epoch_handle,
             epoch_counter_ptr,
             interrupt_mode: InterruptMode::None,
@@ -550,6 +552,25 @@ impl Vm {
     #[inline(always)]
     fn interruption_enabled(&self) -> bool {
         self.interrupt_mode != InterruptMode::None
+    }
+
+    pub fn regex_cache_entry_count(&self) -> usize {
+        self.regex_cache.len()
+    }
+
+    pub fn regex_cache_compile_count(&self) -> u64 {
+        self.regex_cache.compile_count()
+    }
+
+    pub fn regex_cache_hit_count(&self) -> u64 {
+        self.regex_cache.hit_count()
+    }
+
+    pub(crate) fn cached_regex(
+        &mut self,
+        pattern: &str,
+    ) -> Result<std::sync::Arc<regex::Regex>, regex::Error> {
+        self.regex_cache.get_or_compile(pattern)
     }
 
     pub fn set_jit_native_bridge_stats_enabled(&mut self, enabled: bool) {

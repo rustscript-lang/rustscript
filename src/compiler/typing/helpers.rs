@@ -1554,6 +1554,7 @@ pub(super) fn display_name_for_builtin(builtin: BuiltinFunction) -> String {
         BuiltinFunction::StringContains => "string_contains".to_string(),
         BuiltinFunction::StringReplaceLiteral => "string_replace_literal".to_string(),
         BuiltinFunction::StringLowerAscii => "string_lower_ascii".to_string(),
+        BuiltinFunction::StringSplitLiteral => "string_split_literal".to_string(),
         BuiltinFunction::TypeOf => "type".to_string(),
         BuiltinFunction::Assert => "assert".to_string(),
         _ => builtin.name().replacen('_', "::", 1),

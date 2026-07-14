@@ -795,6 +795,20 @@ pub(crate) fn builtin_string_lower_ascii_impl(text: VmStringRef<'_>) -> String {
     String::from_utf8(out).expect("ASCII-only byte changes preserve UTF-8")
 }
 
+/// Split `text` on non-overlapping literal `delimiter` matches.
+#[pd_host_function(name = "string_split_literal")]
+pub(crate) fn builtin_string_split_literal_impl(
+    text: VmStringRef<'_>,
+    delimiter: VmStringRef<'_>,
+) -> VmArray {
+    if delimiter.is_empty() {
+        return vec![Value::string(text.to_string())];
+    }
+    text.split(delimiter)
+        .map(|part| Value::string(part.to_string()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

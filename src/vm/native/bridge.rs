@@ -217,6 +217,10 @@ pub(crate) fn string_lower_ascii_entry_address() -> usize {
     pd_vm_native_string_lower_ascii as *const () as usize
 }
 
+pub(crate) fn string_split_literal_entry_address() -> usize {
+    pd_vm_native_string_split_literal as *const () as usize
+}
+
 pub(crate) fn clone_value_to_slot_entry_address() -> usize {
     pd_vm_native_clone_value_to_slot as *const () as usize
 }
@@ -396,6 +400,21 @@ pub(crate) extern "C" fn pd_vm_native_string_lower_ascii(text_ptr: *mut u8) -> *
     let text = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(text_ptr)) };
     arc_into_repr_ptr(Arc::new(
         crate::builtins::runtime::core::builtin_string_lower_ascii_impl(text.as_str()),
+    ))
+}
+
+pub(crate) extern "C" fn pd_vm_native_string_split_literal(
+    text_ptr: *mut u8,
+    delimiter_ptr: *mut u8,
+) -> *mut u8 {
+    let text = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(text_ptr)) };
+    let delimiter =
+        unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(delimiter_ptr)) };
+    arc_into_repr_ptr(Arc::new(
+        crate::builtins::runtime::core::builtin_string_split_literal_impl(
+            text.as_str(),
+            delimiter.as_str(),
+        ),
     ))
 }
 

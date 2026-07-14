@@ -1398,6 +1398,9 @@ impl Parser {
             "string_lower_ascii" => Ok(Some(
                 self.build_builtin_call_expr(BuiltinFunction::StringLowerAscii, args.to_vec())?,
             )),
+            "string_split_literal" => Ok(Some(
+                self.build_builtin_call_expr(BuiltinFunction::StringSplitLiteral, args.to_vec())?,
+            )),
             _ => Ok(None),
         }
     }

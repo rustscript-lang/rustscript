@@ -346,7 +346,7 @@ fn render_builtin_catalog(
         .and_then(|value| value.checked_add(1))
         .expect("builtin call base should fit in u16");
     assert!(
-        builtin_call_base >= 7,
+        builtin_call_base >= 8,
         "builtin call base must leave room for reserved special builtins"
     );
 
@@ -487,6 +487,11 @@ fn render_builtin_catalog(
     writeln!(
         &mut out,
         "    (BUILTIN_CALL_BASE - 5, BuiltinFunction::StringLowerAscii),"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "    (BUILTIN_CALL_BASE - 8, BuiltinFunction::StringSplitLiteral),"
     )
     .unwrap();
     writeln!(&mut out, "];").unwrap();
@@ -650,6 +655,11 @@ fn render_builtin_catalog(
     writeln!(
         &mut out,
         "            BuiltinFunction::StringLowerAscii => BUILTIN_CALL_BASE - 5,"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "            BuiltinFunction::StringSplitLiteral => BUILTIN_CALL_BASE - 8,"
     )
     .unwrap();
     writeln!(
@@ -1290,6 +1300,7 @@ fn appended_builtin_order() -> &'static [&'static str] {
         "string_contains",
         "string_replace_literal",
         "string_lower_ascii",
+        "string_split_literal",
     ]
 }
 
@@ -1309,6 +1320,7 @@ fn required_language_builtin_stubs() -> &'static [&'static str] {
         "string_contains",
         "string_replace_literal",
         "string_lower_ascii",
+        "string_split_literal",
         "type",
         "assert",
     ]
@@ -1453,6 +1465,7 @@ fn main_range_builtin_variants(builtin_variant_order: &[String]) -> Vec<String> 
                     | "StringContains"
                     | "StringReplaceLiteral"
                     | "StringLowerAscii"
+                    | "StringSplitLiteral"
             )
         })
         .cloned()

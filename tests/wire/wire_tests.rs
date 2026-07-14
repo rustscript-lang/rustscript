@@ -341,10 +341,12 @@ fn literal_string_builtin_indices_are_appended_and_publicly_resolved() {
         Some(first + 1)
     );
     assert_eq!(builtin_call_index("string_lower_ascii"), Some(first + 2));
+    assert_eq!(builtin_call_index("string_split_literal"), Some(first - 1));
     assert_eq!(BuiltinFunction::StringContains.call_index(), first);
     assert_eq!(
         BuiltinFunction::StringReplaceLiteral.call_index(),
         first + 1
     );
     assert_eq!(BuiltinFunction::StringLowerAscii.call_index(), first + 2);
+    assert_eq!(BuiltinFunction::StringSplitLiteral.call_index(), first - 1);
 }

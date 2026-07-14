@@ -3940,6 +3940,7 @@ fn literal_string_builtins_match_interpreter_semantics() {
         string_replace_literal("a界a", "", "x");
         string_replace_literal("a界a", "z", "x");
         string_lower_ascii("AZ界Ä🙂");
+        string_split_literal("甲｜乙｜丙", "｜");
     "#;
     let compiled = compile_source(source).expect("literal string builtin compile should succeed");
     let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
@@ -3958,6 +3959,11 @@ fn literal_string_builtins_match_interpreter_semantics() {
             Value::string("a界a"),
             Value::string("a界a"),
             Value::string("az界Ä🙂"),
+            Value::array(vec![
+                Value::string("甲"),
+                Value::string("乙"),
+                Value::string("丙")
+            ]),
         ]
     );
 }
@@ -3971,6 +3977,7 @@ fn aot_literal_string_builtins_match_interpreter_semantics() {
         string_contains("a界🙂z", "界🙂");
         string_replace_literal("aaaa", "aa", "aaX");
         string_lower_ascii("AZ界Ä🙂");
+        string_split_literal("甲｜乙｜丙", "｜");
     "#;
     let compiled = compile_source(source).expect("literal string builtin compile should succeed");
     let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
@@ -3986,6 +3993,11 @@ fn aot_literal_string_builtins_match_interpreter_semantics() {
             Value::Bool(true),
             Value::string("aaXaaX"),
             Value::string("az界Ä🙂"),
+            Value::array(vec![
+                Value::string("甲"),
+                Value::string("乙"),
+                Value::string("丙")
+            ]),
         ]
     );
     assert!(vm.aot_exec_count() > 0);
@@ -4001,15 +4013,18 @@ fn trace_jit_specializes_literal_string_builtins_without_call_boundary() {
         let mut found = false;
         let mut replaced = "";
         let mut lowered = "";
+        let mut pieces: [string] = [];
         while i < 4 {
             found = string_contains("a界🙂z", "界🙂");
             replaced = string_replace_literal("aaaa", "aa", "aaX");
             lowered = string_lower_ascii("AZ界Ä🙂");
+            pieces = string_split_literal("甲｜乙｜丙", "｜");
             i = i + 1;
         }
         found;
         replaced;
         lowered;
+        pieces;
     "#;
     let compiled = compile_source(source).expect("literal string builtin compile should succeed");
     let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
@@ -4029,6 +4044,11 @@ fn trace_jit_specializes_literal_string_builtins_without_call_boundary() {
             Value::Bool(true),
             Value::string("aaXaaX"),
             Value::string("az界Ä🙂"),
+            Value::array(vec![
+                Value::string("甲"),
+                Value::string("乙"),
+                Value::string("丙")
+            ]),
         ]
     );
     let snapshot = vm.jit_snapshot();
@@ -4040,6 +4060,7 @@ fn trace_jit_specializes_literal_string_builtins_without_call_boundary() {
             "string_contains",
             "string_replace_literal",
             "string_lower_ascii",
+            "string_split_literal",
         ],
     );
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();

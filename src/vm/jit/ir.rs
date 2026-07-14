@@ -147,6 +147,10 @@ pub(crate) enum SsaInstKind {
     StringLowerAscii {
         text: SsaValueId,
     },
+    StringSplitLiteral {
+        text: SsaValueId,
+        delimiter: SsaValueId,
+    },
     StringConcat {
         lhs: SsaValueId,
         rhs: SsaValueId,
@@ -353,6 +357,7 @@ impl SsaInstKind {
                 replacement,
             } => vec![*text, *needle, *replacement],
             Self::StringLowerAscii { text } => vec![*text],
+            Self::StringSplitLiteral { text, delimiter } => vec![*text, *delimiter],
             Self::StringConcat { lhs, rhs } | Self::BytesConcat { lhs, rhs } => vec![*lhs, *rhs],
             Self::BytesFromArrayU8 { array } => vec![*array],
             Self::BytesToArrayU8 { bytes } => vec![*bytes],
@@ -948,6 +953,9 @@ fn render_inst_kind(kind: &SsaInstKind) -> String {
             replacement,
         } => format!("string_replace_literal {text}, {needle}, {replacement}"),
         SsaInstKind::StringLowerAscii { text } => format!("string_lower_ascii {text}"),
+        SsaInstKind::StringSplitLiteral { text, delimiter } => {
+            format!("string_split_literal {text}, {delimiter}")
+        }
         SsaInstKind::StringConcat { lhs, rhs } => format!("string_concat {lhs}, {rhs}"),
         SsaInstKind::BytesConcat { lhs, rhs } => format!("bytes_concat {lhs}, {rhs}"),
         SsaInstKind::BytesFromArrayU8 { array } => format!("bytes_from_array_u8 {array}"),

@@ -213,6 +213,22 @@ fn rustscript_builtin_and_namespace_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
+            name: "literal string split preserves unicode and defines empty delimiter behavior",
+            source: r#"
+                let csv = string_split_literal("alpha,beta,,gamma", ",");
+                let unicode = string_split_literal("甲｜乙｜丙", "｜");
+                let unsplit = string_split_literal("value", "");
+                if csv.length == 4 && csv[2] == "" && unicode.length == 3 && unicode[1] == "乙" && unsplit.length == 1 && unsplit[0] == "value" {
+                    1;
+                } else {
+                    0;
+                }
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Int(1)],
+            expected_locals: None,
+        },
+        RuntimeCase {
             name: "json encode decode builtins are supported",
             source: r#"
                 use json;

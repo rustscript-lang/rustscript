@@ -17,7 +17,7 @@ mod jit;
 mod json;
 mod math;
 pub(crate) mod print;
-mod regex;
+pub(crate) mod regex;
 mod typed;
 
 #[cfg(target_arch = "wasm32")]
@@ -69,6 +69,8 @@ pub(crate) fn execute_builtin_call(
         BuiltinFunction::StringReplaceLiteral => core::builtin_string_replace_literal(args)
             .map(IntoBuiltinCallOutcome::into_builtin_call_outcome),
         BuiltinFunction::StringLowerAscii => core::builtin_string_lower_ascii(args)
+            .map(IntoBuiltinCallOutcome::into_builtin_call_outcome),
+        BuiltinFunction::StringSplitLiteral => core::builtin_string_split_literal(args)
             .map(IntoBuiltinCallOutcome::into_builtin_call_outcome),
         BuiltinFunction::FormatTemplate => core::builtin_format_template(args)
             .map(IntoBuiltinCallOutcome::into_builtin_call_outcome),
