@@ -164,6 +164,19 @@ pub(crate) fn restore_exit_signature(
 }
 
 #[cfg(feature = "cranelift-jit")]
+pub(crate) fn sparse_restore_exit_signature(
+    pointer_type: cranelift_codegen::ir::Type,
+    call_conv: cranelift_codegen::isa::CallConv,
+) -> Signature {
+    let mut sig = Signature::new(call_conv);
+    for _ in 0..7 {
+        sig.params.push(AbiParam::new(pointer_type));
+    }
+    sig.returns.push(AbiParam::new(types::I32));
+    sig
+}
+
+#[cfg(feature = "cranelift-jit")]
 pub(crate) fn entry_signature(
     pointer_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,

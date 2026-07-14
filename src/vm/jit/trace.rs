@@ -119,6 +119,15 @@ impl JitTrace {
     pub fn boxed_store_site_count(&self) -> u64 {
         boxed_store_site_count(&self.ssa)
     }
+
+    pub fn ssa_dirty_local_materialization_count(&self) -> u64 {
+        self.ssa
+            .exits
+            .iter()
+            .flat_map(|exit| exit.dirty_locals.iter())
+            .filter(|dirty| **dirty)
+            .count() as u64
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

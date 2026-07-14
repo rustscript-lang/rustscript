@@ -22,7 +22,12 @@ pub(crate) fn materialize_ssa_value(value: SsaValue) -> SsaMaterialization {
 
 pub(crate) fn exit_inputs(exit: &SsaExit) -> Vec<SsaValueId> {
     let mut out = Vec::new();
-    for materialization in exit.stack.iter().chain(exit.locals.iter()) {
+    let dirty_locals = exit
+        .locals
+        .iter()
+        .zip(&exit.dirty_locals)
+        .filter_map(|(materialization, dirty)| dirty.then_some(materialization));
+    for materialization in exit.stack.iter().chain(dirty_locals) {
         let value = match materialization {
             SsaMaterialization::Value(value)
             | SsaMaterialization::BoxInt(value)

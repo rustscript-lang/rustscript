@@ -398,6 +398,7 @@ pub(crate) struct SsaExit {
     pub(crate) exit_ip: usize,
     pub(crate) stack: Vec<SsaMaterialization>,
     pub(crate) locals: Vec<SsaMaterialization>,
+    pub(crate) dirty_locals: Vec<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -527,6 +528,13 @@ impl SsaTrace {
         }
 
         for exit in &self.exits {
+            if exit.dirty_locals.len() != exit.locals.len() {
+                return Err(SsaVerifyError::DirtyLocalLengthMismatch {
+                    exit: exit.id,
+                    locals: exit.locals.len(),
+                    dirty_locals: exit.dirty_locals.len(),
+                });
+            }
             for materialization in exit.stack.iter().chain(exit.locals.iter()) {
                 verify_materialization(materialization, &value_reprs)?;
             }
@@ -581,8 +589,16 @@ impl SsaTrace {
                 .map(render_materialization)
                 .collect::<Vec<_>>()
                 .join(", ");
+            let dirty_locals = exit
+                .dirty_locals
+                .iter()
+                .enumerate()
+                .filter_map(|(index, dirty)| dirty.then_some(index.to_string()))
+                .collect::<Vec<_>>()
+                .join(", ");
             let _ = writeln!(&mut out, "  stack=[{}]", stack);
             let _ = writeln!(&mut out, "  locals=[{}]", locals);
+            let _ = writeln!(&mut out, "  dirty_locals=[{}]", dirty_locals);
         }
         out
     }
@@ -620,6 +636,11 @@ pub(crate) enum SsaVerifyError {
         value: SsaValueId,
         expected: SsaValueRepr,
         actual: SsaValueRepr,
+    },
+    DirtyLocalLengthMismatch {
+        exit: SsaExitId,
+        locals: usize,
+        dirty_locals: usize,
     },
 }
 
@@ -698,6 +719,7 @@ impl SsaTraceBuilder {
         exit_ip: usize,
         stack: Vec<SsaMaterialization>,
         locals: Vec<SsaMaterialization>,
+        dirty_locals: Vec<bool>,
     ) -> SsaExitId {
         let id = SsaExitId::new(self.trace.exits.len() as u32);
         self.trace.exits.push(SsaExit {
@@ -705,8 +727,30 @@ impl SsaTraceBuilder {
             exit_ip,
             stack,
             locals,
+            dirty_locals,
         });
         id
+    }
+
+    pub(crate) fn merge_exit_dirty_locals(&mut self, loop_dirty_locals: &[bool]) -> VmResult<()> {
+        for exit in &mut self.trace.exits {
+            if exit.dirty_locals.len() != loop_dirty_locals.len() {
+                return Err(VmError::JitNative(format!(
+                    "SSA loop dirty-local count {} does not match exit {:?} count {}",
+                    loop_dirty_locals.len(),
+                    exit.id,
+                    exit.dirty_locals.len()
+                )));
+            }
+            for (dirty, loop_dirty) in exit
+                .dirty_locals
+                .iter_mut()
+                .zip(loop_dirty_locals.iter().copied())
+            {
+                *dirty |= loop_dirty;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn set_terminator(
@@ -1001,7 +1045,12 @@ mod tests {
                 },
             )
             .expect("add");
-        let exit = builder.add_exit(20, Vec::new(), vec![SsaMaterialization::BoxInt(inc.id)]);
+        let exit = builder.add_exit(
+            20,
+            Vec::new(),
+            vec![SsaMaterialization::BoxInt(inc.id)],
+            vec![true],
+        );
         builder
             .set_terminator(
                 entry,
@@ -1039,7 +1088,12 @@ mod tests {
                 },
             )
             .expect("jump");
-        let exit = builder.add_exit(2, Vec::new(), vec![SsaMaterialization::BoxInt(value.id)]);
+        let exit = builder.add_exit(
+            2,
+            Vec::new(),
+            vec![SsaMaterialization::BoxInt(value.id)],
+            vec![false],
+        );
         builder
             .set_terminator(next, SsaTerminator::Return { exit })
             .expect("return");
@@ -1058,11 +1112,38 @@ mod tests {
     fn verifier_rejects_entry_stack_depth_beyond_entry_params() {
         let mut builder = SsaTraceBuilder::new(1, 1);
         let entry = builder.entry();
-        let exit = builder.add_exit(2, Vec::new(), Vec::new());
+        let exit = builder.add_exit(2, Vec::new(), Vec::new(), Vec::new());
         builder
             .set_terminator(entry, SsaTerminator::Return { exit })
             .expect("return");
         let trace = builder.finish();
         assert!(trace.verify().is_err());
+    }
+
+    #[test]
+    fn verifier_rejects_dirty_local_length_mismatch() {
+        let mut builder = SsaTraceBuilder::new(1, 0);
+        let entry = builder.entry();
+        let local = builder
+            .append_param(entry, SsaValueRepr::Tagged, "local0")
+            .expect("entry local");
+        let exit = builder.add_exit(
+            2,
+            Vec::new(),
+            vec![SsaMaterialization::Value(local.id)],
+            Vec::new(),
+        );
+        builder
+            .set_terminator(entry, SsaTerminator::Return { exit })
+            .expect("return");
+
+        assert_eq!(
+            builder.finish().verify(),
+            Err(SsaVerifyError::DirtyLocalLengthMismatch {
+                exit,
+                locals: 1,
+                dirty_locals: 0,
+            })
+        );
     }
 }

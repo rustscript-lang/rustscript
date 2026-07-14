@@ -225,6 +225,7 @@ struct SymbolicValue {
 struct SymbolicFrame {
     stack: Vec<SymbolicValue>,
     locals: Vec<SymbolicValue>,
+    dirty_locals: Vec<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -253,7 +254,12 @@ enum LoopSeed {
 
 impl SymbolicFrame {
     fn new(stack: Vec<SymbolicValue>, locals: Vec<SymbolicValue>) -> Self {
-        Self { stack, locals }
+        let dirty_locals = vec![false; locals.len()];
+        Self {
+            stack,
+            locals,
+            dirty_locals,
+        }
     }
 
     fn pop(&mut self) -> Result<SymbolicValue, TraceRecordError> {
@@ -272,11 +278,13 @@ impl SymbolicFrame {
     }
 
     fn store_local(&mut self, index: u8, value: SymbolicValue) -> Result<(), TraceRecordError> {
+        let local = usize::from(index);
         let slot = self
             .locals
-            .get_mut(index as usize)
+            .get_mut(local)
             .ok_or(TraceRecordError::InvalidLocal(index))?;
         *slot = value;
+        self.dirty_locals[local] = true;
         Ok(())
     }
 }
@@ -789,6 +797,7 @@ pub(crate) fn record_trace(
                     ip,
                     materialize_stack(&frame.stack),
                     materialize_locals(&frame.locals),
+                    frame.dirty_locals.clone(),
                 );
                 builder
                     .set_terminator(current_block, SsaTerminator::Return { exit })
@@ -912,6 +921,7 @@ pub(crate) fn record_trace(
                         fallthrough_ip,
                         materialize_stack(&frame.stack),
                         materialize_locals(&frame.locals),
+                        frame.dirty_locals.clone(),
                     );
                     builder
                         .set_terminator(
@@ -926,6 +936,9 @@ pub(crate) fn record_trace(
                             },
                         )
                         .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+                    builder
+                        .merge_exit_dirty_locals(&frame.dirty_locals)
+                        .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
                     terminal = Some(JitTraceTerminal::BranchExit);
                     break;
                 }
@@ -936,6 +949,7 @@ pub(crate) fn record_trace(
                         fallthrough_ip,
                         materialize_stack(&frame.stack),
                         materialize_locals(&frame.locals),
+                        frame.dirty_locals.clone(),
                     );
                     let (next_block, next_frame, args) =
                         continue_with_frame(&mut builder, &frame, "guard")?;
@@ -965,6 +979,7 @@ pub(crate) fn record_trace(
                         fallthrough_ip,
                         materialize_stack(&frame.stack),
                         materialize_locals(&frame.locals),
+                        frame.dirty_locals.clone(),
                     );
                     let (next_block, next_frame, args) =
                         continue_with_frame(&mut builder, &frame, "guard")?;
@@ -993,6 +1008,7 @@ pub(crate) fn record_trace(
                     target,
                     materialize_stack(&frame.stack),
                     materialize_locals(&frame.locals),
+                    frame.dirty_locals.clone(),
                 );
                 let (next_block, next_frame, args) =
                     continue_with_frame(&mut builder, &frame, "guard")?;
@@ -1030,6 +1046,9 @@ pub(crate) fn record_trace(
                             },
                         )
                         .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+                    builder
+                        .merge_exit_dirty_locals(&frame.dirty_locals)
+                        .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
                     terminal = Some(JitTraceTerminal::LoopBack);
                     break;
                 }
@@ -1039,6 +1058,7 @@ pub(crate) fn record_trace(
                         target,
                         materialize_stack(&frame.stack),
                         materialize_locals(&frame.locals),
+                        frame.dirty_locals.clone(),
                     );
                     builder
                         .set_terminator(current_block, SsaTerminator::Exit { exit })
@@ -1086,6 +1106,7 @@ pub(crate) fn record_trace(
                     ip,
                     materialize_stack(&frame.stack),
                     materialize_locals(&frame.locals),
+                    frame.dirty_locals.clone(),
                 );
                 builder
                     .set_terminator(current_block, SsaTerminator::Exit { exit })
@@ -3507,6 +3528,7 @@ fn continue_with_frame(
         SymbolicFrame {
             stack: next_stack,
             locals: next_locals,
+            dirty_locals: frame.dirty_locals.clone(),
         },
         args,
     ))
@@ -3683,6 +3705,62 @@ mod tests {
         let exit = &recorded.ssa.exits[0];
         assert_eq!(exit.exit_ip, ret_ip as usize);
         assert!(matches!(exit.locals[0], SsaMaterialization::BoxInt(_)));
+        assert_eq!(exit.dirty_locals, vec![true]);
+    }
+
+    #[test]
+    fn records_no_dirty_locals_before_any_store() {
+        let mut bc = BytecodeBuilder::new();
+        bc.ldloc(0);
+        bc.ret();
+        let program = Program::new(Vec::new(), bc.finish()).with_local_count(2);
+
+        let recorded = record_trace(&program, 0, 0, 16).expect("recorded trace");
+
+        assert_eq!(recorded.ssa.exits[0].dirty_locals, vec![false, false]);
+        assert!(recorded.ssa.render_text().contains("dirty_locals=[]"));
+    }
+
+    #[test]
+    fn records_exact_dirty_local_after_store() {
+        let mut bc = BytecodeBuilder::new();
+        bc.ldc(0);
+        bc.stloc(3);
+        bc.ret();
+        let program = Program::new(vec![Value::Int(7)], bc.finish()).with_local_count(4);
+
+        let recorded = record_trace(&program, 0, 0, 16).expect("recorded trace");
+
+        assert_eq!(
+            recorded.ssa.exits[0].dirty_locals,
+            vec![false, false, false, true]
+        );
+        assert!(recorded.ssa.render_text().contains("dirty_locals=[3]"));
+    }
+
+    #[test]
+    fn propagates_dirty_locals_through_guard_continuation() {
+        let mut bc = BytecodeBuilder::new();
+        bc.ldc(0);
+        bc.stloc(1);
+        bc.ldloc(0);
+        bc.ldc(1);
+        bc.clt();
+        let guard_ip = bc.position();
+        bc.brfalse(0);
+        bc.ret();
+        let exit_ip = bc.position();
+        bc.ret();
+
+        let mut code = bc.finish();
+        patch_branch_target(&mut code, guard_ip, exit_ip);
+        let program = Program::new(vec![Value::Int(5), Value::Int(10)], code).with_local_count(2);
+
+        let recorded = record_trace(&program, 0, 0, 32).expect("recorded trace");
+
+        assert_eq!(recorded.ssa.exits.len(), 2);
+        assert_eq!(recorded.ssa.exits[0].dirty_locals, vec![false, true]);
+        assert_eq!(recorded.ssa.exits[1].dirty_locals, vec![false, true]);
     }
 
     #[test]
@@ -3716,6 +3794,44 @@ mod tests {
             recorded.ssa.blocks[1].terminator,
             Some(SsaTerminator::BranchBool { .. })
         ));
+    }
+
+    #[test]
+    fn conditional_loop_backedge_merges_dirty_locals_into_earlier_guard_exits() {
+        let mut bc = BytecodeBuilder::new();
+        let root_ip = bc.position();
+        bc.ldloc(0);
+        bc.ldc(1);
+        bc.clt();
+        let guard_ip = bc.position();
+        bc.brfalse(0);
+        bc.ldloc(1);
+        bc.ldc(0);
+        bc.add();
+        bc.stloc(1);
+        bc.ldloc(0);
+        bc.ldc(0);
+        bc.add();
+        bc.stloc(0);
+        bc.ldloc(0);
+        bc.ldc(2);
+        bc.ceq();
+        bc.brfalse(root_ip);
+        bc.ret();
+        let exit_ip = bc.position();
+        bc.ret();
+
+        let mut code = bc.finish();
+        patch_branch_target(&mut code, guard_ip, exit_ip);
+        let program = Program::new(vec![Value::Int(1), Value::Int(10), Value::Int(3)], code)
+            .with_local_count(2);
+
+        let recorded = record_trace(&program, root_ip as usize, 0, 128).expect("recorded trace");
+        assert_eq!(recorded.terminal, JitTraceTerminal::BranchExit);
+        assert_eq!(recorded.ssa.exits.len(), 2);
+        for exit in &recorded.ssa.exits {
+            assert_eq!(exit.dirty_locals, vec![true, true]);
+        }
     }
 
     #[test]
@@ -3754,6 +3870,9 @@ mod tests {
         assert!(recorded.op_names.iter().any(|name| name == "guard_false"));
         assert!(recorded.op_names.iter().any(|name| name == "jump_root"));
         assert_eq!(recorded.ssa.blocks.len(), 3);
+        assert_eq!(recorded.ssa.exits.len(), 1);
+        assert_eq!(recorded.ssa.exits[0].dirty_locals, vec![true, true]);
+        assert!(recorded.ssa.render_text().contains("dirty_locals=[0, 1]"));
         assert!(matches!(
             recorded.ssa.blocks[2].terminator,
             Some(SsaTerminator::Jump { .. })

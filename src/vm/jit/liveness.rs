@@ -21,7 +21,14 @@ pub(crate) fn boxed_store_site_count(trace: &SsaTrace) -> u64 {
     trace
         .exits
         .iter()
-        .flat_map(|exit| exit.stack.iter().chain(exit.locals.iter()))
+        .flat_map(|exit| {
+            let dirty_locals = exit
+                .locals
+                .iter()
+                .zip(&exit.dirty_locals)
+                .filter_map(|(materialization, dirty)| dirty.then_some(materialization));
+            exit.stack.iter().chain(dirty_locals)
+        })
         .filter(|materialization| {
             matches!(
                 materialization,

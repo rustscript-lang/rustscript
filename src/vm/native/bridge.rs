@@ -229,6 +229,10 @@ pub(crate) fn restore_exit_state_entry_address() -> usize {
     pd_vm_native_restore_exit_state as *const () as usize
 }
 
+pub(crate) fn restore_sparse_exit_state_entry_address() -> usize {
+    pd_vm_native_restore_sparse_exit_state as *const () as usize
+}
+
 pub(crate) fn map_has_entry_address() -> usize {
     pd_vm_native_map_has as *const () as usize
 }
@@ -479,6 +483,76 @@ pub(crate) extern "C" fn pd_vm_native_restore_exit_state(
                 VmError::JitNative("native exit restore local index out of range".to_string())
             })?;
             let value = unsafe { std::ptr::read(locals_src.add(index)) };
+            vm.store_local_with_drop_contract(local_index, value)?;
+        }
+
+        vm.jump_to(ip)?;
+        Ok(STATUS_CONTINUE)
+    })
+}
+
+pub(crate) extern "C" fn pd_vm_native_restore_sparse_exit_state(
+    vm: *mut Vm,
+    stack_src: *const Value,
+    stack_len: usize,
+    dirty_local_indices: *const u32,
+    dirty_local_values: *const Value,
+    dirty_local_count: usize,
+    ip: usize,
+) -> i32 {
+    run_step(vm, "restore_sparse_exit_state", |vm| {
+        if stack_len != 0 && stack_src.is_null() {
+            return Err(VmError::JitNative(
+                "native sparse exit restore received null stack buffer".to_string(),
+            ));
+        }
+        if dirty_local_count != 0 && dirty_local_indices.is_null() {
+            return Err(VmError::JitNative(
+                "native sparse exit restore received null local index buffer".to_string(),
+            ));
+        }
+        if dirty_local_count != 0 && dirty_local_values.is_null() {
+            return Err(VmError::JitNative(
+                "native sparse exit restore received null local value buffer".to_string(),
+            ));
+        }
+
+        let mut validated_indices = Vec::with_capacity(dirty_local_count);
+        for compact_index in 0..dirty_local_count {
+            let local_index = unsafe { *dirty_local_indices.add(compact_index) };
+            let local_index_usize = usize::try_from(local_index).map_err(|_| {
+                VmError::JitNative(
+                    "native sparse exit restore local index out of range".to_string(),
+                )
+            })?;
+            if local_index_usize >= vm.locals.len() {
+                return Err(VmError::JitNative(format!(
+                    "native sparse exit restore local index {local_index} out of range for {} locals",
+                    vm.locals.len()
+                )));
+            }
+            let local_index = u8::try_from(local_index).map_err(|_| {
+                VmError::JitNative(
+                    "native sparse exit restore local index exceeds VM local range".to_string(),
+                )
+            })?;
+            if validated_indices.contains(&local_index) {
+                return Err(VmError::JitNative(format!(
+                    "native sparse exit restore received duplicate local index {local_index}"
+                )));
+            }
+            validated_indices.push(local_index);
+        }
+
+        vm.clear_stack_with_drop_contract();
+        vm.stack.reserve(stack_len);
+        for index in 0..stack_len {
+            let value = unsafe { std::ptr::read(stack_src.add(index)) };
+            vm.stack.push(value);
+        }
+
+        for (compact_index, local_index) in validated_indices.into_iter().enumerate() {
+            let value = unsafe { std::ptr::read(dirty_local_values.add(compact_index)) };
             vm.store_local_with_drop_contract(local_index, value)?;
         }
 
@@ -738,4 +812,142 @@ pub(crate) extern "C" fn pd_vm_native_step(vm: *mut Vm, op: i64, a: i64, b: i64,
             ))),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::ManuallyDrop;
+
+    #[test]
+    fn sparse_exit_restore_accepts_null_buffers_for_zero_dirty_locals() {
+        let preserved = Arc::new("preserved".to_string());
+        let program =
+            crate::Program::new(Vec::new(), vec![crate::OpCode::Ret as u8]).with_local_count(2);
+        let mut vm = Vm::new(program);
+        vm.set_local(0, Value::Int(17)).expect("scalar local");
+        vm.set_local(1, Value::String(preserved.clone()))
+            .expect("heap local");
+        vm.stack.push(Value::Int(99));
+
+        let status = pd_vm_native_restore_sparse_exit_state(
+            &mut vm,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            0,
+        );
+
+        assert_eq!(status, STATUS_CONTINUE);
+        assert!(vm.stack().is_empty());
+        assert_eq!(vm.locals()[0], Value::Int(17));
+        let Value::String(local) = &vm.locals()[1] else {
+            panic!("expected preserved heap local");
+        };
+        assert!(Arc::ptr_eq(local, &preserved));
+    }
+
+    #[test]
+    fn sparse_exit_restore_rejects_invalid_dirty_buffers_before_mutation() {
+        clear_bridge_error();
+        let program =
+            crate::Program::new(Vec::new(), vec![crate::OpCode::Ret as u8]).with_local_count(1);
+        let mut vm = Vm::new(program);
+        vm.set_local(0, Value::Int(17)).expect("initial local");
+        vm.stack.push(Value::Int(23));
+        let local_value = Value::Int(99);
+
+        let null_indices = pd_vm_native_restore_sparse_exit_state(
+            &mut vm,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            &local_value,
+            1,
+            0,
+        );
+        assert_eq!(null_indices, STATUS_ERROR);
+        assert_eq!(vm.stack(), &[Value::Int(23)]);
+        assert_eq!(vm.locals(), &[Value::Int(17)]);
+        assert!(take_bridge_error().is_some());
+
+        let invalid_index = [u32::from(u8::MAX) + 1];
+        let out_of_range = pd_vm_native_restore_sparse_exit_state(
+            &mut vm,
+            std::ptr::null(),
+            0,
+            invalid_index.as_ptr(),
+            &local_value,
+            1,
+            0,
+        );
+        assert_eq!(out_of_range, STATUS_ERROR);
+        assert_eq!(vm.stack(), &[Value::Int(23)]);
+        assert_eq!(vm.locals(), &[Value::Int(17)]);
+        assert!(take_bridge_error().is_some());
+    }
+
+    #[test]
+    fn sparse_exit_restore_rejects_duplicate_local_indices_before_mutation() {
+        clear_bridge_error();
+        let program =
+            crate::Program::new(Vec::new(), vec![crate::OpCode::Ret as u8]).with_local_count(2);
+        let mut vm = Vm::new(program);
+        vm.set_local(0, Value::Int(17)).expect("initial local");
+        let local_indices = [0_u32, 0_u32];
+        let local_values = [Value::Int(98), Value::Int(99)];
+
+        let status = pd_vm_native_restore_sparse_exit_state(
+            &mut vm,
+            std::ptr::null(),
+            0,
+            local_indices.as_ptr(),
+            local_values.as_ptr(),
+            2,
+            0,
+        );
+
+        assert_eq!(status, STATUS_ERROR);
+        assert_eq!(vm.locals(), &[Value::Int(17), Value::Null]);
+        assert!(take_bridge_error().is_some());
+    }
+
+    #[test]
+    fn sparse_exit_restore_moves_dirty_values_and_drops_replaced_owners_once() {
+        let old = Arc::new("old".to_string());
+        let replacement = Arc::new("replacement".to_string());
+        let program =
+            crate::Program::new(Vec::new(), vec![crate::OpCode::Ret as u8]).with_local_count(2);
+        let mut vm = Vm::new(program);
+        vm.set_drop_contract_events_enabled(true);
+        vm.set_local(0, Value::Int(1)).expect("old scalar local");
+        vm.set_local(1, Value::String(old.clone()))
+            .expect("old heap local");
+        let stack = ManuallyDrop::new([Value::Bool(true)]);
+        let local_indices = [0_u32, 1_u32];
+        let local_values = ManuallyDrop::new([Value::Int(9), Value::String(replacement.clone())]);
+
+        let status = pd_vm_native_restore_sparse_exit_state(
+            &mut vm,
+            stack.as_ptr(),
+            stack.len(),
+            local_indices.as_ptr(),
+            local_values.as_ptr(),
+            local_indices.len(),
+            0,
+        );
+
+        assert_eq!(status, STATUS_CONTINUE);
+        assert_eq!(vm.stack(), &[Value::Bool(true)]);
+        assert_eq!(vm.locals()[0], Value::Int(9));
+        let Value::String(local) = &vm.locals()[1] else {
+            panic!("expected replacement heap local");
+        };
+        assert!(Arc::ptr_eq(local, &replacement));
+        assert_eq!(Arc::strong_count(&old), 1);
+        assert_eq!(Arc::strong_count(&replacement), 2);
+        assert_eq!(vm.drop_contract_event_count(), 2);
+    }
 }

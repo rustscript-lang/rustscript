@@ -16,10 +16,10 @@ use crate::vm::native::{
     collection_get_signature, collection_predicate_signature, copy_bytes_entry_address,
     copy_bytes_signature, detect_native_stack_layout, entry_signature, free_buffer_signature,
     init_null_value_slot_entry_address, jump_with_status, map_get_entry_address,
-    map_has_entry_address, pack_shared_signature, restore_exit_signature,
-    restore_exit_state_entry_address, shared_array_from_buffer_entry_address,
-    shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
-    value_slot_signature, write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
+    map_has_entry_address, pack_shared_signature, restore_sparse_exit_state_entry_address,
+    shared_array_from_buffer_entry_address, shared_bytes_from_buffer_entry_address,
+    shared_string_from_buffer_entry_address, sparse_restore_exit_signature, value_slot_signature,
+    write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
 };
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::Ieee64;
@@ -99,7 +99,7 @@ fn try_compile_ssa_trace(
     let copy_bytes_sig = copy_bytes_signature(pointer_type, call_conv);
     let map_has_sig = collection_predicate_signature(pointer_type, call_conv);
     let map_get_sig = collection_get_signature(pointer_type, call_conv);
-    let restore_exit_sig = restore_exit_signature(pointer_type, call_conv);
+    let sparse_restore_exit_sig = sparse_restore_exit_signature(pointer_type, call_conv);
     let resume_linked_trace_sig = entry_signature(pointer_type, call_conv);
 
     let trace_id = CRANELIFT_TRACE_ID.fetch_add(1, Ordering::Relaxed);
@@ -138,7 +138,7 @@ fn try_compile_ssa_trace(
             box_heap_value_ref: b.import_signature(box_heap_value_sig),
             map_has_ref: b.import_signature(map_has_sig),
             map_get_ref: b.import_signature(map_get_sig),
-            restore_exit_ref: b.import_signature(restore_exit_sig),
+            sparse_restore_exit_ref: b.import_signature(sparse_restore_exit_sig),
             resume_linked_trace_ref: b.import_signature(resume_linked_trace_sig),
         };
         let deopt_addrs = SsaDeoptHelperAddrs {
@@ -148,7 +148,7 @@ fn try_compile_ssa_trace(
             box_heap_value: write_heap_value_to_slot_entry_address(),
             map_has: map_has_entry_address(),
             map_get: map_get_entry_address(),
-            restore_exit: restore_exit_state_entry_address(),
+            sparse_restore_exit: restore_sparse_exit_state_entry_address(),
             resume_linked_trace: resume_linked_trace_entry_address(),
         };
         let allow_exit_link_handoff = !trace.has_call && !trace.has_yielding_call;
@@ -387,7 +387,7 @@ struct SsaDeoptHelperRefs {
     box_heap_value_ref: cranelift_codegen::ir::SigRef,
     map_has_ref: cranelift_codegen::ir::SigRef,
     map_get_ref: cranelift_codegen::ir::SigRef,
-    restore_exit_ref: cranelift_codegen::ir::SigRef,
+    sparse_restore_exit_ref: cranelift_codegen::ir::SigRef,
     resume_linked_trace_ref: cranelift_codegen::ir::SigRef,
 }
 
@@ -399,7 +399,7 @@ struct SsaDeoptHelperAddrs {
     box_heap_value: usize,
     map_has: usize,
     map_get: usize,
-    restore_exit: usize,
+    sparse_restore_exit: usize,
     resume_linked_trace: usize,
 }
 
@@ -536,7 +536,12 @@ fn ssa_trace_supported(ssa: &SsaTrace) -> bool {
                 | SsaMaterialization::BoxHeapPtr { .. } => {}
             }
         }
-        for materialization in &exit.locals {
+        for materialization in exit
+            .locals
+            .iter()
+            .zip(&exit.dirty_locals)
+            .filter_map(|(materialization, dirty)| dirty.then_some(materialization))
+        {
             match materialization {
                 SsaMaterialization::Value(_)
                 | SsaMaterialization::BoxInt(_)
@@ -2300,13 +2305,32 @@ fn lower_ssa_exit_block(
         ssa_materialize_slot(b, materialize_ctx, materialization, dst_addr, "stack")?;
     }
 
-    let locals_ptr = ssa_alloc_value_buffer(b, pointer_type, exit.locals.len(), layout.value.size)?;
-    for (local_index, materialization) in exit.locals.iter().enumerate() {
+    let dirty_local_count = exit.dirty_locals.iter().filter(|dirty| **dirty).count();
+    let local_indices_ptr = ssa_alloc_u32_buffer(b, pointer_type, dirty_local_count)?;
+    let locals_ptr = ssa_alloc_value_buffer(b, pointer_type, dirty_local_count, layout.value.size)?;
+    for (compact_index, (local_index, materialization)) in exit
+        .locals
+        .iter()
+        .enumerate()
+        .zip(&exit.dirty_locals)
+        .filter_map(|((local_index, materialization), dirty)| {
+            dirty.then_some((local_index, materialization))
+        })
+        .enumerate()
+    {
+        ssa_store_u32_buffer_slot(
+            b,
+            local_indices_ptr,
+            compact_index,
+            u32::try_from(local_index).map_err(|_| {
+                VmError::JitNative("SSA dirty local index out of range".to_string())
+            })?,
+        )?;
         let dst_addr = ssa_value_buffer_slot_addr(
             b,
             pointer_type,
             locals_ptr,
-            local_index,
+            compact_index,
             layout.value.size,
             "local",
         )?;
@@ -2317,10 +2341,10 @@ fn lower_ssa_exit_block(
         i64::try_from(exit.stack.len())
             .map_err(|_| VmError::JitNative("SSA exit stack length out of range".to_string()))?,
     );
-    let locals_len = b.ins().iconst(
+    let dirty_local_count = b.ins().iconst(
         pointer_type,
-        i64::try_from(exit.locals.len())
-            .map_err(|_| VmError::JitNative("SSA exit locals length out of range".to_string()))?,
+        i64::try_from(dirty_local_count)
+            .map_err(|_| VmError::JitNative("SSA dirty local count out of range".to_string()))?,
     );
     let ip_val = b.ins().iconst(
         pointer_type,
@@ -2329,14 +2353,23 @@ fn lower_ssa_exit_block(
     );
     let null_ptr = b.ins().iconst(pointer_type, 0);
     let stack_ptr = stack_ptr.unwrap_or(null_ptr);
+    let local_indices_ptr = local_indices_ptr.unwrap_or(null_ptr);
     let locals_ptr = locals_ptr.unwrap_or(null_ptr);
     ssa_call_status_helper(
         b,
         exit_block,
         pointer_type,
-        deopt_refs.restore_exit_ref,
-        deopt_addrs.restore_exit,
-        &[vm_ptr, stack_ptr, stack_len, locals_ptr, locals_len, ip_val],
+        deopt_refs.sparse_restore_exit_ref,
+        deopt_addrs.sparse_restore_exit,
+        &[
+            vm_ptr,
+            stack_ptr,
+            stack_len,
+            local_indices_ptr,
+            locals_ptr,
+            dirty_local_count,
+            ip_val,
+        ],
     )?;
     let status = if halted {
         b.ins().iconst(types::I32, STATUS_HALTED as i64)
@@ -2453,6 +2486,46 @@ fn ssa_alloc_value_buffer(
         align_shift,
     ));
     Ok(Some(b.ins().stack_addr(pointer_type, slot, 0)))
+}
+
+fn ssa_alloc_u32_buffer(
+    b: &mut FunctionBuilder,
+    pointer_type: cranelift_codegen::ir::Type,
+    slot_count: usize,
+) -> VmResult<Option<cranelift_codegen::ir::Value>> {
+    if slot_count == 0 {
+        return Ok(None);
+    }
+    let bytes = slot_count
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| VmError::JitNative("SSA local index buffer overflow".to_string()))?;
+    let bytes = u32::try_from(bytes)
+        .map_err(|_| VmError::JitNative("SSA local index buffer too large".to_string()))?;
+    let align_shift = std::mem::align_of::<u32>().trailing_zeros() as u8;
+    let slot = b.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        bytes,
+        align_shift,
+    ));
+    Ok(Some(b.ins().stack_addr(pointer_type, slot, 0)))
+}
+
+fn ssa_store_u32_buffer_slot(
+    b: &mut FunctionBuilder,
+    base_ptr: Option<cranelift_codegen::ir::Value>,
+    index: usize,
+    value: u32,
+) -> VmResult<()> {
+    let base_ptr = base_ptr.ok_or_else(|| {
+        VmError::JitNative("SSA local index buffer missing during exit lowering".to_string())
+    })?;
+    let offset = index
+        .checked_mul(std::mem::size_of::<u32>())
+        .and_then(|offset| i32::try_from(offset).ok())
+        .ok_or_else(|| VmError::JitNative("SSA local index offset out of range".to_string()))?;
+    let value = b.ins().iconst(types::I32, i64::from(value));
+    b.ins().store(MemFlags::new(), value, base_ptr, offset);
+    Ok(())
 }
 
 fn ssa_value_buffer_slot_addr(

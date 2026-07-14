@@ -1589,6 +1589,220 @@ fn trace_jit_supports_host_call_loops_with_branch_exit_traces() {
 }
 
 #[test]
+fn trace_jit_sparse_exit_preserves_clean_scalar_and_heap_locals() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let preserved = std::sync::Arc::new("preserved".to_string());
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.stloc(0);
+    bc.ldc(1);
+    bc.stloc(1);
+    let root_ip = bc.position();
+    bc.ldloc(0);
+    bc.ldc(3);
+    bc.clt();
+    let guard_ip = bc.position();
+    bc.brfalse(0);
+    bc.call(0, 0);
+    bc.ldloc(0);
+    bc.ldc(2);
+    bc.add();
+    bc.stloc(0);
+    bc.br(root_ip);
+    let exit_ip = bc.position();
+    bc.ldloc(0);
+    bc.ldloc(1);
+    bc.ret();
+
+    let mut code = bc.finish();
+    patch_branch_target(&mut code, guard_ip, exit_ip);
+    let program = Program::new(
+        vec![
+            Value::Int(0),
+            Value::String(preserved.clone()),
+            Value::Int(1),
+            Value::Int(4),
+        ],
+        code,
+    )
+    .with_local_count(2);
+    let mut vm = Vm::new(program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    vm.register_function(Box::new(PrintNoReturn));
+
+    assert_eq!(vm.run().expect("sparse clean-local run"), VmStatus::Halted);
+    assert_eq!(vm.stack()[0], Value::Int(4));
+    let Value::String(result) = &vm.stack()[1] else {
+        panic!("expected preserved string result");
+    };
+    assert!(std::sync::Arc::ptr_eq(result, &preserved));
+
+    let snapshot = vm.jit_snapshot();
+    let call_trace = snapshot
+        .traces
+        .iter()
+        .find(|trace| trace.has_call)
+        .expect("expected call-boundary trace");
+    assert_eq!(call_trace.ssa_dirty_local_materialization_count(), 0);
+    assert_native_ssa_call_boundary_trace(&vm, &snapshot, "sparse clean-local exit");
+}
+
+#[test]
+fn trace_jit_sparse_exit_restores_one_dirty_scalar_local() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.stloc(0);
+    let root_ip = bc.position();
+    bc.ldloc(0);
+    bc.ldc(2);
+    bc.clt();
+    let guard_ip = bc.position();
+    bc.brfalse(0);
+    bc.ldloc(0);
+    bc.ldc(1);
+    bc.add();
+    bc.stloc(0);
+    bc.call(0, 0);
+    bc.br(root_ip);
+    let exit_ip = bc.position();
+    bc.ldloc(0);
+    bc.ret();
+
+    let mut code = bc.finish();
+    patch_branch_target(&mut code, guard_ip, exit_ip);
+    let program =
+        Program::new(vec![Value::Int(0), Value::Int(1), Value::Int(4)], code).with_local_count(1);
+    let mut vm = Vm::new(program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    vm.register_function(Box::new(PrintNoReturn));
+
+    assert_eq!(vm.run().expect("sparse scalar run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(4)]);
+
+    let snapshot = vm.jit_snapshot();
+    let call_trace = snapshot
+        .traces
+        .iter()
+        .find(|trace| trace.has_call)
+        .expect("expected call-boundary trace");
+    assert_eq!(call_trace.ssa_dirty_local_materialization_count(), 1);
+    assert_native_ssa_call_boundary_trace(&vm, &snapshot, "sparse scalar exit");
+}
+
+#[test]
+fn trace_jit_sparse_heap_exit_transfers_ownership_across_reuse() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let old = std::sync::Arc::new("old".to_string());
+    let replacement = std::sync::Arc::new("replacement".to_string());
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.stloc(0);
+    bc.ldc(1);
+    bc.stloc(1);
+    bc.ldc(2);
+    bc.stloc(2);
+    let root_ip = bc.position();
+    bc.ldloc(0);
+    bc.ldc(4);
+    bc.clt();
+    let guard_ip = bc.position();
+    bc.brfalse(0);
+    bc.ldloc(2);
+    bc.stloc(1);
+    bc.call(0, 0);
+    bc.ldloc(0);
+    bc.ldc(3);
+    bc.add();
+    bc.stloc(0);
+    bc.br(root_ip);
+    let exit_ip = bc.position();
+    bc.ldloc(1);
+    bc.ret();
+
+    let mut code = bc.finish();
+    patch_branch_target(&mut code, guard_ip, exit_ip);
+    let program = Program::new(
+        vec![
+            Value::Int(0),
+            Value::String(old.clone()),
+            Value::String(replacement.clone()),
+            Value::Int(1),
+            Value::Int(3),
+        ],
+        code,
+    )
+    .with_local_count(3);
+    let mut vm = Vm::new(program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    vm.register_function(Box::new(PrintNoReturn));
+
+    let mut retained_counts = None;
+    for run in 0..2 {
+        assert_eq!(
+            vm.run().expect("sparse heap run"),
+            VmStatus::Halted,
+            "run {run}"
+        );
+        let Value::String(result) = &vm.stack()[0] else {
+            panic!("expected replacement string result");
+        };
+        assert!(std::sync::Arc::ptr_eq(result, &replacement));
+        for local_index in [1, 2] {
+            let Value::String(local) = &vm.locals()[local_index] else {
+                panic!("expected replacement string local {local_index}");
+            };
+            assert!(std::sync::Arc::ptr_eq(local, &replacement));
+        }
+        let counts = (
+            std::sync::Arc::strong_count(&old),
+            std::sync::Arc::strong_count(&replacement),
+        );
+        if let Some(expected) = retained_counts {
+            assert_eq!(counts, expected, "owners must not grow across reuse");
+        } else {
+            retained_counts = Some(counts);
+        }
+
+        let snapshot = vm.jit_snapshot();
+        let call_trace = snapshot
+            .traces
+            .iter()
+            .find(|trace| trace.has_call)
+            .expect("expected call-boundary trace");
+        assert_eq!(call_trace.ssa_dirty_local_materialization_count(), 1);
+        assert_native_ssa_call_boundary_trace(&vm, &snapshot, "sparse heap exit");
+
+        if run == 0 {
+            vm.reset_for_reuse();
+            assert_eq!(std::sync::Arc::strong_count(&old), counts.0);
+            assert_eq!(std::sync::Arc::strong_count(&replacement), counts.1 - 3);
+        }
+    }
+}
+
+#[test]
 fn trace_jit_nested_call_loops_use_branch_exit_segments() {
     let source = r#"
         fn print(x);

@@ -14,17 +14,18 @@ pub(crate) use bridge::{
     copy_bytes_entry_address, helper_entry_address, helper_entry_offset,
     init_null_value_slot_entry_address, interrupt_helper_entry_address,
     interrupt_helper_entry_offset, map_get_entry_address, map_has_entry_address,
-    restore_exit_state_entry_address, shared_array_from_buffer_entry_address,
-    shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
-    store_bridge_error, take_bridge_error, value_eq_entry_address,
-    write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
+    restore_exit_state_entry_address, restore_sparse_exit_state_entry_address,
+    shared_array_from_buffer_entry_address, shared_bytes_from_buffer_entry_address,
+    shared_string_from_buffer_entry_address, store_bridge_error, take_bridge_error,
+    value_eq_entry_address, write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
 };
 #[cfg(feature = "cranelift-jit")]
 pub(crate) use codegen::{
     alloc_buffer_signature, box_heap_value_signature, clone_value_signature,
     collection_get_signature, collection_predicate_signature, copy_bytes_signature,
     entry_signature, free_buffer_signature, helper_signature, jump_with_status,
-    pack_shared_signature, restore_exit_signature, value_eq_signature, value_slot_signature,
+    pack_shared_signature, restore_exit_signature, sparse_restore_exit_signature,
+    value_eq_signature, value_slot_signature,
 };
 pub(crate) use exec::{ExecutableBuffer, prepare_for_execution};
 pub(crate) use layout::{
