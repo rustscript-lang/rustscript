@@ -2726,6 +2726,121 @@ fn trace_jit_supports_bytes_has_in_ssa() {
 }
 
 #[test]
+fn trace_jit_uses_call_operand_type_for_string_len_with_reused_local_slot() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let mut bc = BytecodeBuilder::new();
+    let len_call = builtin_call_index("len").expect("len builtin should exist");
+    bc.ldc(0);
+    bc.stloc(0);
+    bc.ldc(1);
+    bc.stloc(1);
+    bc.ldc(1);
+    bc.stloc(2);
+
+    let root_ip = bc.position();
+    bc.ldloc(1);
+    bc.ldc(3);
+    let clt_ip = bc.position();
+    bc.clt();
+    let guard_ip = bc.position();
+    bc.brfalse(0);
+
+    bc.ldloc(0);
+    let len_ip = bc.position();
+    bc.call(len_call, 1);
+    bc.stloc(2);
+
+    bc.ldloc(1);
+    bc.ldc(2);
+    let add_ip = bc.position();
+    bc.add();
+    bc.stloc(1);
+    bc.br(root_ip);
+
+    let exit_ip = bc.position();
+    bc.ldloc(2);
+    bc.ret();
+
+    let mut code = bc.finish();
+    patch_branch_target(&mut code, guard_ip, exit_ip);
+    let program = Program::new(
+        vec![
+            Value::string("a界🙂"),
+            Value::Int(0),
+            Value::Int(1),
+            Value::Int(4),
+        ],
+        code,
+    )
+    .with_local_count(3);
+    let program = force_local_types(
+        program,
+        &[
+            (0, ValueType::Null),
+            (1, ValueType::Int),
+            (2, ValueType::Int),
+        ],
+    );
+    let program = force_operand_types(
+        program,
+        &[
+            (clt_ip as usize, (ValueType::Int, ValueType::Int)),
+            (len_ip as usize, (ValueType::String, ValueType::Unknown)),
+            (add_ip as usize, (ValueType::Int, ValueType::Int)),
+        ],
+    );
+
+    let mut vm = Vm::new(program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    let status = vm.run().expect("string len vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(3)]);
+
+    let snapshot = vm.jit_snapshot();
+    let root_traces = snapshot
+        .traces
+        .iter()
+        .filter(|trace| trace.root_ip == root_ip as usize)
+        .collect::<Vec<_>>();
+    assert!(
+        root_traces.iter().any(|trace| {
+            trace.terminal == JitTraceTerminal::LoopBack
+                && trace.op_names().iter().any(|op| op == "string_len")
+                && trace.op_names().iter().any(|op| op == "jump_root")
+        }),
+        "reused-slot string len trace should specialize and reach loopback, dump:\n{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        root_traces.iter().all(|trace| !trace.has_call),
+        "reused-slot string len root should not retain a call-only trace, dump:\n{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        root_traces
+            .iter()
+            .any(|trace| trace.ssa_text().contains("string_len")),
+        "reused-slot string len root should contain string_len SSA, dump:\n{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        root_traces
+            .iter()
+            .any(|trace| trace.ssa_text().contains("unbox_ptr ")),
+        "reused-slot string len root should retain the runtime heap tag guard, dump:\n{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
 fn trace_jit_supports_string_len_get_slice_in_ssa() {
     if !native_jit_supported() {
         return;

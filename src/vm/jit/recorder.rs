@@ -1033,7 +1033,9 @@ pub(crate) fn record_trace(
                     && argc > 0
                 {
                     let args = call_arg_slice(&frame.stack, usize::from(argc))?;
-                    if let Some(kind) = select_specialized_builtin_kind(builtin, args[0].info) {
+                    if let Some(kind) =
+                        select_specialized_builtin_kind(program, ip, builtin, args[0].info)
+                    {
                         let (name, out) = emit_specialized_builtin_call(
                             &mut builder,
                             current_block,
@@ -1196,6 +1198,7 @@ fn infer_loop_header_plan(
                 }
             }
             DecodedOp::Call {
+                ip,
                 builtin: Some(builtin),
                 argc,
                 ..
@@ -1204,7 +1207,8 @@ fn infer_loop_header_plan(
                     return Ok(None);
                 }
                 let args = call_arg_slice(&frame.stack, usize::from(argc))?;
-                let Some(kind) = select_specialized_builtin_kind(builtin, args[0]) else {
+                let Some(kind) = select_specialized_builtin_kind(program, ip, builtin, args[0])
+                else {
                     return Ok(None);
                 };
                 let _ = analyze_specialized_builtin_call(&mut frame, kind)?;
@@ -2351,10 +2355,32 @@ fn observed_heap_container_kind(info: ValueInfo) -> Option<HeapContainerKind> {
 }
 
 fn select_specialized_builtin_kind(
+    program: &Program,
+    ip: usize,
     builtin: BuiltinFunction,
     container: ValueInfo,
 ) -> Option<SpecializedBuiltinKind> {
-    match (builtin, observed_heap_container_kind(container)?) {
+    let observed_kind = observed_heap_container_kind(container);
+    let container_kind = if matches!(
+        builtin,
+        BuiltinFunction::Len
+            | BuiltinFunction::Slice
+            | BuiltinFunction::Get
+            | BuiltinFunction::Has
+            | BuiltinFunction::Concat
+    ) {
+        match operand_types(program, ip).0 {
+            ValueType::String => Some(HeapContainerKind::String),
+            ValueType::Bytes => Some(HeapContainerKind::Bytes),
+            ValueType::Array => Some(HeapContainerKind::Array),
+            ValueType::Map => Some(HeapContainerKind::Map),
+            _ => observed_kind,
+        }
+    } else {
+        observed_kind
+    }?;
+
+    match (builtin, container_kind) {
         (BuiltinFunction::Len, HeapContainerKind::String) => {
             Some(SpecializedBuiltinKind::StringLen)
         }
