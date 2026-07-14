@@ -43,6 +43,7 @@ cargo build --workspace --release
   - [Recording and Replay](#recording-and-replay)
   - [Bytecode and VMBC](#bytecode-and-vmbc)
   - [JIT](#jit)
+  - [Regex Cache](#regex-cache)
   - [Fuel Metering](#fuel-metering)
   - [Epoch Interruption](#epoch-interruption)
   - [Wasm Lint](#wasm-lint)
@@ -175,6 +176,27 @@ Library hooks:
 - `vm.dump_jit_info()`
 - `vm.jit_native_trace_count()`
 - `vm.jit_native_exec_count()`
+
+### Regex Cache
+
+Each `Vm` keeps a private LRU cache of compiled regular expressions used by the
+`re::match`, `re::find`, `re::replace`, `re::split`, and `re::captures` builtins.
+The default capacity is 512 entries. Rust embedding code can inspect or change
+the capacity directly on the VM:
+
+```rust
+let mut vm = Vm::new(program);
+
+assert_eq!(vm.regex_cache_capacity(), 512);
+vm.set_regex_cache_capacity(128);
+
+// Capacity zero clears existing entries and disables regex caching.
+vm.set_regex_cache_capacity(0);
+```
+
+Reducing the capacity evicts least-recently-used entries immediately. Cache
+statistics are available through `regex_cache_entry_count()`,
+`regex_cache_compile_count()`, and `regex_cache_hit_count()`.
 
 ### Fuel Metering
 
