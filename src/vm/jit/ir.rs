@@ -439,6 +439,7 @@ pub(crate) struct SsaBlock {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SsaTrace {
     pub(crate) root_ip: usize,
+    pub(crate) entry_stack_depth: usize,
     pub(crate) entry: SsaBlockId,
     pub(crate) blocks: Vec<SsaBlock>,
     pub(crate) exits: Vec<SsaExit>,
@@ -460,6 +461,12 @@ impl SsaTrace {
         };
         if entry.id != self.entry {
             return Err(SsaVerifyError::UnknownEntry(self.entry));
+        }
+        if self.entry_stack_depth > entry.params.len() {
+            return Err(SsaVerifyError::EntryStackDepthMismatch {
+                depth: self.entry_stack_depth,
+                params: entry.params.len(),
+            });
         }
 
         let block_param_reprs = self
@@ -531,7 +538,11 @@ impl SsaTrace {
     #[allow(dead_code)]
     pub(crate) fn render_text(&self) -> String {
         let mut out = String::new();
-        let _ = writeln!(&mut out, "trace root_ip={}", self.root_ip);
+        let _ = writeln!(
+            &mut out,
+            "trace root_ip={} entry_stack_depth={}",
+            self.root_ip, self.entry_stack_depth
+        );
         for block in &self.blocks {
             let _ = write!(&mut out, "{}(", block.id);
             for (index, param) in block.params.iter().enumerate() {
@@ -583,6 +594,10 @@ pub(crate) enum SsaVerifyError {
     DuplicateValue(SsaValueId),
     MissingTerminator(SsaBlockId),
     UnknownEntry(SsaBlockId),
+    EntryStackDepthMismatch {
+        depth: usize,
+        params: usize,
+    },
     UseBeforeDef {
         block: SsaBlockId,
         value: SsaValueId,
@@ -614,11 +629,12 @@ pub(crate) struct SsaTraceBuilder {
 }
 
 impl SsaTraceBuilder {
-    pub(crate) fn new(root_ip: usize) -> Self {
+    pub(crate) fn new(root_ip: usize, entry_stack_depth: usize) -> Self {
         let entry = SsaBlockId::new(0);
         Self {
             trace: SsaTrace {
                 root_ip,
+                entry_stack_depth,
                 entry,
                 blocks: vec![SsaBlock {
                     id: entry,
@@ -966,7 +982,7 @@ mod tests {
 
     #[test]
     fn verifier_accepts_simple_loop_shape() {
-        let mut builder = SsaTraceBuilder::new(12);
+        let mut builder = SsaTraceBuilder::new(12, 0);
         let entry = builder.entry();
         let local = builder
             .append_param(entry, SsaValueRepr::I64, "local0")
@@ -1005,7 +1021,7 @@ mod tests {
 
     #[test]
     fn verifier_rejects_jump_arity_mismatch() {
-        let mut builder = SsaTraceBuilder::new(1);
+        let mut builder = SsaTraceBuilder::new(1, 0);
         let entry = builder.entry();
         let next = builder.create_block();
         let value = builder
@@ -1036,5 +1052,17 @@ mod tests {
                 got: 0,
             })
         );
+    }
+
+    #[test]
+    fn verifier_rejects_entry_stack_depth_beyond_entry_params() {
+        let mut builder = SsaTraceBuilder::new(1, 1);
+        let entry = builder.entry();
+        let exit = builder.add_exit(2, Vec::new(), Vec::new());
+        builder
+            .set_terminator(entry, SsaTerminator::Return { exit })
+            .expect("return");
+        let trace = builder.finish();
+        assert!(trace.verify().is_err());
     }
 }

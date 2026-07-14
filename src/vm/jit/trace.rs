@@ -7,6 +7,12 @@ use super::ir::SsaTrace;
 use super::liveness::{boxed_load_site_count, boxed_store_site_count};
 use super::recorder::{RecordedTrace, TraceRecordError, record_trace};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct TraceEntryKey {
+    pub(crate) root_ip: usize,
+    pub(crate) stack_depth: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JitConfig {
     pub enabled: bool,
@@ -79,6 +85,7 @@ impl JitNyiReason {
 pub struct JitTrace {
     pub id: usize,
     pub root_ip: usize,
+    pub entry_stack_depth: usize,
     pub start_line: Option<u32>,
     pub has_call: bool,
     pub has_yielding_call: bool,
@@ -117,6 +124,7 @@ impl JitTrace {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JitAttempt {
     pub root_ip: usize,
+    pub entry_stack_depth: usize,
     pub line: Option<u32>,
     pub result: Result<usize, JitNyiReason>,
 }
@@ -155,9 +163,9 @@ pub struct JitNyiDoc {
 
 pub struct TraceJitEngine {
     config: JitConfig,
-    hot_counts: HashMap<usize, u32>,
-    compiled_by_root: HashMap<usize, usize>,
-    blocked_roots: HashSet<usize>,
+    hot_counts: HashMap<TraceEntryKey, u32>,
+    compiled_by_entry: HashMap<TraceEntryKey, usize>,
+    blocked_entries: HashSet<TraceEntryKey>,
     loop_headers: Option<HashSet<usize>>,
     traces: Vec<JitTrace>,
     attempts: Vec<JitAttempt>,
@@ -174,8 +182,8 @@ impl TraceJitEngine {
         Self {
             config,
             hot_counts: HashMap::new(),
-            compiled_by_root: HashMap::new(),
-            blocked_roots: HashSet::new(),
+            compiled_by_entry: HashMap::new(),
+            blocked_entries: HashSet::new(),
             loop_headers: None,
             traces: Vec::new(),
             attempts: Vec::new(),
@@ -189,25 +197,38 @@ impl TraceJitEngine {
     pub fn set_config(&mut self, config: JitConfig) {
         self.config = config;
         self.hot_counts.clear();
-        self.compiled_by_root.clear();
-        self.blocked_roots.clear();
+        self.compiled_by_entry.clear();
+        self.blocked_entries.clear();
         self.loop_headers = None;
         self.traces.clear();
         self.attempts.clear();
     }
 
     pub fn observe_hot_ip(&mut self, ip: usize, program: &Program) -> Option<usize> {
+        self.observe_hot_entry(ip, 0, program)
+    }
+
+    pub(crate) fn observe_hot_entry(
+        &mut self,
+        ip: usize,
+        stack_depth: usize,
+        program: &Program,
+    ) -> Option<usize> {
         if !self.config.enabled || !native_jit_supported() {
             return None;
         }
-        if let Some(&trace_id) = self.compiled_by_root.get(&ip) {
+        let key = TraceEntryKey {
+            root_ip: ip,
+            stack_depth,
+        };
+        if let Some(&trace_id) = self.compiled_by_entry.get(&key) {
             return Some(trace_id);
         }
-        if self.blocked_roots.contains(&ip) || !self.is_loop_header(program, ip) {
+        if self.blocked_entries.contains(&key) || !self.is_loop_header(program, ip) {
             return None;
         }
 
-        let count = self.hot_counts.entry(ip).or_insert(0);
+        let count = self.hot_counts.entry(key).or_insert(0);
         *count = count.saturating_add(1);
         if *count < self.config.hot_loop_threshold {
             return None;
@@ -220,9 +241,9 @@ impl TraceJitEngine {
         let result = if self.config.hot_loop_threshold == 0 {
             Err(JitNyiReason::HotLoopThresholdZero)
         } else {
-            self.compile_trace(program, ip)
+            self.compile_trace(program, key)
         };
-        self.finish_attempt(ip, line, result)
+        self.finish_attempt(key, line, result)
     }
 
     pub fn trace_clone(&self, trace_id: usize) -> Option<JitTrace> {
@@ -230,16 +251,29 @@ impl TraceJitEngine {
     }
 
     pub fn observe_exit_ip(&mut self, ip: usize, program: &Program) -> Option<usize> {
+        self.observe_exit_entry(ip, 0, program)
+    }
+
+    pub(crate) fn observe_exit_entry(
+        &mut self,
+        ip: usize,
+        stack_depth: usize,
+        program: &Program,
+    ) -> Option<usize> {
         if !self.config.enabled || !native_jit_supported() {
             return None;
         }
         if self.config.hot_loop_threshold > 1 {
             return None;
         }
-        if let Some(&trace_id) = self.compiled_by_root.get(&ip) {
+        let key = TraceEntryKey {
+            root_ip: ip,
+            stack_depth,
+        };
+        if let Some(&trace_id) = self.compiled_by_entry.get(&key) {
             return Some(trace_id);
         }
-        if self.blocked_roots.contains(&ip) {
+        if self.blocked_entries.contains(&key) {
             return None;
         }
 
@@ -250,9 +284,9 @@ impl TraceJitEngine {
         let result = if self.config.hot_loop_threshold == 0 {
             Err(JitNyiReason::HotLoopThresholdZero)
         } else {
-            self.compile_trace(program, ip)
+            self.compile_trace(program, key)
         };
-        self.finish_attempt(ip, line, result)
+        self.finish_attempt(key, line, result)
     }
 
     pub fn trace_has_call(&self, trace_id: usize) -> bool {
@@ -262,7 +296,16 @@ impl TraceJitEngine {
     }
 
     pub fn compiled_trace_for_ip(&self, ip: usize) -> Option<usize> {
-        self.compiled_by_root.get(&ip).copied()
+        self.compiled_trace_for_entry(ip, 0)
+    }
+
+    pub(crate) fn compiled_trace_for_entry(&self, ip: usize, stack_depth: usize) -> Option<usize> {
+        self.compiled_by_entry
+            .get(&TraceEntryKey {
+                root_ip: ip,
+                stack_depth,
+            })
+            .copied()
     }
 
     pub fn mark_trace_executed(&mut self, trace_id: usize) {
@@ -273,8 +316,12 @@ impl TraceJitEngine {
 
     pub(crate) fn block_trace(&mut self, trace_id: usize) {
         if let Some(trace) = self.traces.get(trace_id) {
-            self.compiled_by_root.remove(&trace.root_ip);
-            self.blocked_roots.insert(trace.root_ip);
+            let key = TraceEntryKey {
+                root_ip: trace.root_ip,
+                stack_depth: trace.entry_stack_depth,
+            };
+            self.compiled_by_entry.remove(&key);
+            self.blocked_entries.insert(key);
         }
     }
 
@@ -326,9 +373,10 @@ impl TraceJitEngine {
                 .and_then(|info| trace.start_line.and_then(|l| info.source_line(l)))
                 .unwrap_or_default();
             out.push_str(&format!(
-                "  trace#{} root_ip={} line={} terminal={:?} ops={} executions={}\n",
+                "  trace#{} root_ip={} entry_stack_depth={} line={} terminal={:?} ops={} executions={}\n",
                 trace.id,
                 trace.root_ip,
+                trace.entry_stack_depth,
                 line,
                 trace.terminal,
                 trace.op_names.len(),
@@ -363,8 +411,9 @@ impl TraceJitEngine {
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".to_string());
                 out.push_str(&format!(
-                    "  nyi root_ip={} line={} reason={}\n",
+                    "  nyi root_ip={} entry_stack_depth={} line={} reason={}\n",
                     attempt.root_ip,
+                    attempt.entry_stack_depth,
                     line,
                     reason.message()
                 ));
@@ -382,40 +431,52 @@ impl TraceJitEngine {
 
     fn finish_attempt(
         &mut self,
-        ip: usize,
+        key: TraceEntryKey,
         line: Option<u32>,
         result: Result<usize, JitNyiReason>,
     ) -> Option<usize> {
         match result {
             Ok(trace_id) => {
                 self.attempts.push(JitAttempt {
-                    root_ip: ip,
+                    root_ip: key.root_ip,
+                    entry_stack_depth: key.stack_depth,
                     line,
                     result: Ok(trace_id),
                 });
-                self.compiled_by_root.insert(ip, trace_id);
+                self.compiled_by_entry.insert(key, trace_id);
                 Some(trace_id)
             }
             Err(reason) => {
                 self.attempts.push(JitAttempt {
-                    root_ip: ip,
+                    root_ip: key.root_ip,
+                    entry_stack_depth: key.stack_depth,
                     line,
                     result: Err(reason),
                 });
-                self.blocked_roots.insert(ip);
+                self.blocked_entries.insert(key);
                 None
             }
         }
     }
 
-    fn compile_trace(&mut self, program: &Program, root_ip: usize) -> Result<usize, JitNyiReason> {
-        let recorded = record_trace(program, root_ip, self.config.max_trace_len).map_err(to_nyi)?;
+    fn compile_trace(
+        &mut self,
+        program: &Program,
+        key: TraceEntryKey,
+    ) -> Result<usize, JitNyiReason> {
+        let recorded = record_trace(
+            program,
+            key.root_ip,
+            key.stack_depth,
+            self.config.max_trace_len,
+        )
+        .map_err(to_nyi)?;
         let id = self.traces.len();
         let start_line = program
             .debug
             .as_ref()
-            .and_then(|debug| debug.line_for_offset(root_ip));
-        let trace = build_jit_trace(id, root_ip, start_line, recorded);
+            .and_then(|debug| debug.line_for_offset(key.root_ip));
+        let trace = build_jit_trace(id, key, start_line, recorded);
         self.traces.push(trace);
         Ok(id)
     }
@@ -448,13 +509,14 @@ impl TraceJitEngine {
 
 fn build_jit_trace(
     id: usize,
-    root_ip: usize,
+    key: TraceEntryKey,
     start_line: Option<u32>,
     recorded: RecordedTrace,
 ) -> JitTrace {
     JitTrace {
         id,
-        root_ip,
+        root_ip: key.root_ip,
+        entry_stack_depth: key.stack_depth,
         start_line,
         has_call: recorded.has_call,
         has_yielding_call: recorded.has_yielding_call,
@@ -478,7 +540,7 @@ fn to_nyi(err: TraceRecordError) -> JitNyiReason {
         TraceRecordError::InvalidLocal(_)
         | TraceRecordError::StackUnderflow
         | TraceRecordError::TypeMismatch { .. }
-        | TraceRecordError::LiveStackOnBackedge { .. }
+        | TraceRecordError::StackDepthMismatch { .. }
         | TraceRecordError::InvalidIr(_) => JitNyiReason::UnsupportedTrace(err.to_string()),
     }
 }

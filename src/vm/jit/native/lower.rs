@@ -227,6 +227,14 @@ fn try_compile_ssa_trace(
         );
         b.ins()
             .store(MemFlags::new(), root_ip, vm_ptr, offsets.vm_ip);
+        emit_entry_stack_depth_guard(
+            &mut b,
+            vm_ptr,
+            exit_block,
+            pointer_type,
+            offsets,
+            ssa.entry_stack_depth,
+        )?;
 
         let entry_ssa_block = ssa
             .blocks
@@ -241,7 +249,16 @@ fn try_compile_ssa_trace(
             pointer_type,
             layout,
             offsets,
-            entry_ssa_block.params.len(),
+            ssa.entry_stack_depth,
+            entry_ssa_block
+                .params
+                .len()
+                .checked_sub(ssa.entry_stack_depth)
+                .ok_or_else(|| {
+                    VmError::JitNative(
+                        "SSA entry stack depth exceeds entry parameter count".to_string(),
+                    )
+                })?,
         )?;
         init_owned_value_temps(
             &mut b,
@@ -743,12 +760,30 @@ fn build_entry_args(
     pointer_type: cranelift_codegen::ir::Type,
     layout: crate::vm::native::NativeStackLayout,
     offsets: ResolvedOffsets,
+    stack_depth: usize,
     local_count: usize,
 ) -> VmResult<Vec<cranelift_codegen::ir::Value>> {
+    let stack_ptr = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_ptr);
     let locals_ptr = b
         .ins()
         .load(pointer_type, MemFlags::new(), vm_ptr, offsets.locals_ptr);
-    let mut args = Vec::with_capacity(local_count);
+    let mut args = Vec::with_capacity(stack_depth + local_count);
+    for stack_index in 0..stack_depth {
+        let index = b.ins().iconst(
+            pointer_type,
+            i64::try_from(stack_index)
+                .map_err(|_| VmError::JitNative("SSA stack index out of range".to_string()))?,
+        );
+        args.push(ssa_value_addr(
+            b,
+            pointer_type,
+            stack_ptr,
+            index,
+            layout.value.size,
+        ));
+    }
     for local in 0..local_count {
         let index = b.ins().iconst(
             pointer_type,
@@ -764,6 +799,35 @@ fn build_entry_args(
         ));
     }
     Ok(args)
+}
+
+fn emit_entry_stack_depth_guard(
+    b: &mut FunctionBuilder,
+    vm_ptr: cranelift_codegen::ir::Value,
+    exit_block: Block,
+    pointer_type: cranelift_codegen::ir::Type,
+    offsets: ResolvedOffsets,
+    expected_depth: usize,
+) -> VmResult<()> {
+    let actual_depth = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_len);
+    let expected_depth = b.ins().iconst(
+        pointer_type,
+        i64::try_from(expected_depth)
+            .map_err(|_| VmError::JitNative("SSA entry stack depth out of range".to_string()))?,
+    );
+    let matches = b.ins().icmp(IntCC::Equal, actual_depth, expected_depth);
+    let matched = b.create_block();
+    let mismatch = b.create_block();
+    b.ins().brif(matches, matched, &[], mismatch, &[]);
+
+    b.switch_to_block(mismatch);
+    let status = b.ins().iconst(types::I32, STATUS_CONTINUE as i64);
+    jump_with_status(b, exit_block, status);
+
+    b.switch_to_block(matched);
+    Ok(())
 }
 
 fn ssa_block_args(values: impl IntoIterator<Item = cranelift_codegen::ir::Value>) -> Vec<BlockArg> {
@@ -2989,6 +3053,8 @@ fn ssa_emit_trace_exit_status(
 
 #[derive(Clone, Copy)]
 struct ResolvedOffsets {
+    stack_ptr: i32,
+    stack_len: i32,
     locals_ptr: i32,
     vm_ip: i32,
     fuel_remaining: i32,
@@ -3186,6 +3252,16 @@ fn emit_epoch_tick_inline_core(
 }
 
 fn resolve_offsets(layout: NativeStackLayout) -> VmResult<ResolvedOffsets> {
+    let stack_ptr = checked_add_i32(
+        layout.vm_stack_offset,
+        layout.stack_vec.ptr_offset,
+        "stack ptr offset overflow",
+    )?;
+    let stack_len = checked_add_i32(
+        layout.vm_stack_offset,
+        layout.stack_vec.len_offset,
+        "stack len offset overflow",
+    )?;
     let locals_ptr = checked_add_i32(
         layout.vm_locals_offset,
         layout.stack_vec.ptr_offset,
@@ -3193,6 +3269,8 @@ fn resolve_offsets(layout: NativeStackLayout) -> VmResult<ResolvedOffsets> {
     )?;
 
     Ok(ResolvedOffsets {
+        stack_ptr,
+        stack_len,
         locals_ptr,
         vm_ip: layout.vm_ip_offset,
         fuel_remaining: layout.vm_fuel_remaining_offset,

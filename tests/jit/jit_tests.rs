@@ -3437,7 +3437,7 @@ fn trace_jit_supports_float_comparisons_in_ssa() {
 }
 
 #[test]
-fn trace_jit_skips_loop_with_live_entry_stack() {
+fn trace_jit_executes_loop_with_live_entry_stack() {
     if !native_jit_supported() {
         return;
     }
@@ -3464,9 +3464,139 @@ fn trace_jit_skips_loop_with_live_entry_stack() {
     let status = vm.run().expect("live entry stack program should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(145)]);
-    assert_eq!(
-        vm.jit_native_exec_count(),
-        0,
-        "a trace with an unmodeled live entry stack must remain in the interpreter"
+    assert!(
+        vm.jit_native_exec_count() > 0,
+        "a trace with a modeled live entry stack should execute natively, dump:\n{}",
+        vm.dump_jit_info()
     );
+    assert!(
+        vm.jit_snapshot().traces.iter().any(|trace| {
+            trace.entry_stack_depth == 1
+                && trace.ssa_text().contains("stack0")
+                && trace.ssa_text().contains("loop_stack0")
+        }),
+        "{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
+fn trace_jit_executes_loop_with_two_live_entry_values() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        fn sum_to(limit: int) -> int {
+            let mut sum = 0;
+            for i in 0..limit {
+                sum = sum + i;
+            }
+            sum
+        }
+
+        1 + (2 + sum_to(10));
+    "#;
+    let compiled = compile_source(source).expect("depth-two entry stack source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    let status = vm.run().expect("depth-two entry stack program should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(48)]);
+    assert!(vm.jit_native_exec_count() > 0, "{}", vm.dump_jit_info());
+    assert!(
+        vm.jit_snapshot()
+            .traces
+            .iter()
+            .any(|trace| trace.entry_stack_depth >= 2),
+        "{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
+fn trace_jit_preserves_heap_values_on_live_entry_stack() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        fn sum_to(limit: int) -> int {
+            let mut sum = 0;
+            for i in 0..limit {
+                sum = sum + i;
+            }
+            sum
+        }
+
+        ["left", 7, sum_to(10)];
+    "#;
+    let compiled = compile_source(source).expect("heap entry stack source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    let status = vm.run().expect("heap entry stack program should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[Value::array(vec![
+            Value::string("left"),
+            Value::Int(7),
+            Value::Int(45),
+        ])]
+    );
+    assert!(vm.jit_native_exec_count() > 0, "{}", vm.dump_jit_info());
+    assert!(
+        vm.jit_snapshot()
+            .traces
+            .iter()
+            .any(|trace| trace.entry_stack_depth >= 1),
+        "{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
+fn trace_jit_reuses_live_entry_stack_trace_after_reset() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        fn sum_to(limit: int) -> int {
+            let mut sum = 0;
+            for i in 0..limit {
+                sum = sum + i;
+            }
+            sum
+        }
+
+        100 + sum_to(10);
+    "#;
+    let compiled = compile_source(source).expect("reusable entry stack source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(vm.run().expect("first run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(145)]);
+    let first_native_exec_count = vm.jit_native_exec_count();
+    assert!(first_native_exec_count > 0, "{}", vm.dump_jit_info());
+
+    vm.reset_for_reuse();
+    assert_eq!(vm.run().expect("second run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(145)]);
+    assert!(vm.jit_native_exec_count() > first_native_exec_count);
 }

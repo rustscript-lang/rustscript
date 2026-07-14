@@ -33,8 +33,9 @@ pub(crate) enum TraceRecordError {
         expected: &'static str,
         actual: SsaValueRepr,
     },
-    LiveStackOnBackedge {
-        depth: usize,
+    StackDepthMismatch {
+        expected: usize,
+        got: usize,
     },
     TraceTooLong {
         limit: usize,
@@ -62,10 +63,10 @@ impl fmt::Display for TraceRecordError {
             Self::TypeMismatch { expected, actual } => {
                 write!(f, "expected {expected}, got {actual}")
             }
-            Self::LiveStackOnBackedge { depth } => {
+            Self::StackDepthMismatch { expected, got } => {
                 write!(
                     f,
-                    "backedge requires empty symbolic stack, got depth {depth}"
+                    "backedge stack depth mismatch: expected {expected}, got {got}"
                 )
             }
             Self::TraceTooLong { limit } => {
@@ -170,9 +171,9 @@ struct AnalysisFrame {
 }
 
 impl AnalysisFrame {
-    fn new(program: &Program) -> Self {
+    fn new(program: &Program, entry_stack_depth: usize) -> Self {
         Self {
-            stack: Vec::new(),
+            stack: vec![ValueInfo::tagged(); entry_stack_depth],
             locals: (0..program.local_count)
                 .map(|local| entry_local_info(program, local))
                 .collect(),
@@ -228,6 +229,8 @@ struct SymbolicFrame {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LoopHeaderPlan {
+    stack_reprs: Vec<SsaValueRepr>,
+    stack_known_types: Vec<Option<ValueType>>,
     local_reprs: Vec<SsaValueRepr>,
     local_known_types: Vec<Option<ValueType>>,
     entry_seed: Vec<LoopSeed>,
@@ -249,11 +252,8 @@ enum LoopSeed {
 }
 
 impl SymbolicFrame {
-    fn new(locals: Vec<SymbolicValue>) -> Self {
-        Self {
-            stack: Vec::new(),
-            locals,
-        }
+    fn new(stack: Vec<SymbolicValue>, locals: Vec<SymbolicValue>) -> Self {
+        Self { stack, locals }
     }
 
     fn pop(&mut self) -> Result<SymbolicValue, TraceRecordError> {
@@ -608,11 +608,25 @@ impl<'a> TraceCursor<'a> {
 pub(crate) fn record_trace(
     program: &Program,
     root_ip: usize,
+    entry_stack_depth: usize,
     max_trace_len: usize,
 ) -> Result<RecordedTrace, TraceRecordError> {
-    let loop_header_plan = infer_loop_header_plan(program, root_ip, max_trace_len)?;
-    let mut builder = SsaTraceBuilder::new(root_ip);
+    let loop_header_plan =
+        infer_loop_header_plan(program, root_ip, entry_stack_depth, max_trace_len)?;
+    let mut builder = SsaTraceBuilder::new(root_ip, entry_stack_depth);
     let entry = builder.entry();
+
+    let entry_stack = (0..entry_stack_depth)
+        .map(|index| {
+            builder
+                .append_param(entry, SsaValueRepr::Tagged, format!("stack{index}"))
+                .map(|value| SymbolicValue {
+                    value,
+                    info: ValueInfo::tagged(),
+                })
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let entry_locals = (0..program.local_count)
         .map(|local| {
@@ -628,12 +642,37 @@ pub(crate) fn record_trace(
 
     let (loop_body_block, mut current_block, mut frame) = if let Some(loop_plan) = &loop_header_plan
     {
+        for (index, repr) in loop_plan.stack_reprs.iter().copied().enumerate() {
+            validate_loop_carrier_repr(index, repr)?;
+        }
         for (local, repr) in loop_plan.local_reprs.iter().copied().enumerate() {
             validate_loop_carrier_repr(local, repr)?;
         }
         let body = builder.create_block();
+        let mut body_stack = Vec::with_capacity(loop_plan.stack_reprs.len());
         let mut body_locals = Vec::with_capacity(loop_plan.local_reprs.len());
-        let mut entry_args = Vec::with_capacity(loop_plan.local_reprs.len());
+        let mut entry_args =
+            Vec::with_capacity(loop_plan.stack_reprs.len() + loop_plan.local_reprs.len());
+        for (index, repr) in loop_plan.stack_reprs.iter().copied().enumerate() {
+            let entry_arg =
+                ensure_entry_repr(&mut builder, entry, root_ip, entry_stack[index], repr)?
+                    .value
+                    .id;
+            let value = builder
+                .append_param(body, repr, format!("loop_stack{index}"))
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+            body_stack.push(SymbolicValue {
+                value,
+                info: ValueInfo {
+                    repr,
+                    const_int: None,
+                    const_float: None,
+                    const_bool: None,
+                    known_type: loop_plan.stack_known_types[index],
+                },
+            });
+            entry_args.push(entry_arg);
+        }
         for (local, repr) in loop_plan.local_reprs.iter().copied().enumerate() {
             let entry_arg = match loop_plan.entry_seed[local] {
                 LoopSeed::Entry => {
@@ -699,9 +738,13 @@ pub(crate) fn record_trace(
                 },
             )
             .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-        (body, body, SymbolicFrame::new(body_locals))
+        (body, body, SymbolicFrame::new(body_stack, body_locals))
     } else {
-        (entry, entry, SymbolicFrame::new(entry_locals.clone()))
+        (
+            entry,
+            entry,
+            SymbolicFrame::new(entry_stack.clone(), entry_locals.clone()),
+        )
     };
 
     let mut cursor = TraceCursor::new(program, root_ip, max_trace_len);
@@ -836,9 +879,10 @@ pub(crate) fn record_trace(
                         )));
                     }
                     op_names.push("loop_if_false".to_string());
-                    if !frame.stack.is_empty() {
-                        return Err(TraceRecordError::LiveStackOnBackedge {
-                            depth: frame.stack.len(),
+                    if frame.stack.len() != entry_stack_depth {
+                        return Err(TraceRecordError::StackDepthMismatch {
+                            expected: entry_stack_depth,
+                            got: frame.stack.len(),
                         });
                     }
                     let exit = builder.add_exit(
@@ -854,7 +898,7 @@ pub(crate) fn record_trace(
                                 if_true: SsaBranchTarget::Exit(exit),
                                 if_false: SsaBranchTarget::Block {
                                     target: loop_body_block,
-                                    args: loop_backedge_args(&frame.locals),
+                                    args: loop_backedge_args(&frame.stack, &frame.locals),
                                 },
                             },
                         )
@@ -946,9 +990,10 @@ pub(crate) fn record_trace(
             DecodedOp::Br { target, .. } => {
                 if target == root_ip {
                     op_names.push("jump_root".to_string());
-                    if !frame.stack.is_empty() {
-                        return Err(TraceRecordError::LiveStackOnBackedge {
-                            depth: frame.stack.len(),
+                    if frame.stack.len() != entry_stack_depth {
+                        return Err(TraceRecordError::StackDepthMismatch {
+                            expected: entry_stack_depth,
+                            got: frame.stack.len(),
                         });
                     }
                     builder
@@ -956,7 +1001,7 @@ pub(crate) fn record_trace(
                             current_block,
                             SsaTerminator::Jump {
                                 target: loop_body_block,
-                                args: loop_backedge_args(&frame.locals),
+                                args: loop_backedge_args(&frame.stack, &frame.locals),
                             },
                         )
                         .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
@@ -1035,10 +1080,11 @@ pub(crate) fn record_trace(
 fn infer_loop_header_plan(
     program: &Program,
     root_ip: usize,
+    entry_stack_depth: usize,
     max_trace_len: usize,
 ) -> Result<Option<LoopHeaderPlan>, TraceRecordError> {
     let mut cursor = TraceCursor::new(program, root_ip, max_trace_len);
-    let mut frame = AnalysisFrame::new(program);
+    let mut frame = AnalysisFrame::new(program, entry_stack_depth);
     let mut entry_use = vec![EntryUseState::Untouched; program.local_count];
     let mut local_written = vec![false; program.local_count];
 
@@ -1176,12 +1222,14 @@ fn infer_loop_header_plan(
                             "unsupported backward brfalse target {target}"
                         )));
                     }
-                    if !frame.stack.is_empty() {
-                        return Err(TraceRecordError::LiveStackOnBackedge {
-                            depth: frame.stack.len(),
+                    if frame.stack.len() != entry_stack_depth {
+                        return Err(TraceRecordError::StackDepthMismatch {
+                            expected: entry_stack_depth,
+                            got: frame.stack.len(),
                         });
                     }
                     return Ok(Some(build_loop_header_plan(
+                        &frame.stack,
                         &frame.locals,
                         &entry_use,
                         &local_written,
@@ -1193,12 +1241,14 @@ fn infer_loop_header_plan(
             }
             DecodedOp::Br { target, .. } => {
                 if target == root_ip {
-                    if !frame.stack.is_empty() {
-                        return Err(TraceRecordError::LiveStackOnBackedge {
-                            depth: frame.stack.len(),
+                    if frame.stack.len() != entry_stack_depth {
+                        return Err(TraceRecordError::StackDepthMismatch {
+                            expected: entry_stack_depth,
+                            got: frame.stack.len(),
                         });
                     }
                     return Ok(Some(build_loop_header_plan(
+                        &frame.stack,
                         &frame.locals,
                         &entry_use,
                         &local_written,
@@ -3413,10 +3463,13 @@ fn materialize_locals(locals: &[SymbolicValue]) -> Vec<SsaMaterialization> {
 }
 
 fn build_loop_header_plan(
+    stack: &[ValueInfo],
     locals: &[ValueInfo],
     entry_use: &[EntryUseState],
     local_written: &[bool],
 ) -> LoopHeaderPlan {
+    let stack_reprs = stack.iter().map(|value| value.repr).collect();
+    let stack_known_types = stack.iter().map(|value| value.known_type).collect();
     let mut local_reprs = Vec::with_capacity(locals.len());
     let mut local_known_types = Vec::with_capacity(locals.len());
     let mut entry_seed = Vec::with_capacity(locals.len());
@@ -3442,14 +3495,23 @@ fn build_loop_header_plan(
         }
     }
     LoopHeaderPlan {
+        stack_reprs,
+        stack_known_types,
         local_reprs,
         local_known_types,
         entry_seed,
     }
 }
 
-fn loop_backedge_args(locals: &[SymbolicValue]) -> Vec<super::ir::SsaValueId> {
-    locals.iter().map(|value| value.value.id).collect()
+fn loop_backedge_args(
+    stack: &[SymbolicValue],
+    locals: &[SymbolicValue],
+) -> Vec<super::ir::SsaValueId> {
+    stack
+        .iter()
+        .chain(locals.iter())
+        .map(|value| value.value.id)
+        .collect()
 }
 
 fn validate_loop_carrier_repr(local: usize, repr: SsaValueRepr) -> Result<(), TraceRecordError> {
@@ -3553,7 +3615,7 @@ mod tests {
         bc.ret();
         let program = Program::new(vec![Value::Int(1)], bc.finish()).with_local_count(1);
 
-        let recorded = record_trace(&program, 0, 32).expect("recorded trace");
+        let recorded = record_trace(&program, 0, 0, 32).expect("recorded trace");
         assert_eq!(recorded.terminal, JitTraceTerminal::Halt);
         assert!(recorded.op_names.iter().any(|name| name == "iadd_imm"));
         assert!(matches!(
@@ -3588,7 +3650,7 @@ mod tests {
         let program = Program::new(vec![Value::Int(0), Value::Int(1), Value::Int(4)], code)
             .with_local_count(1);
 
-        let recorded = record_trace(&program, root_ip as usize, 64).expect("recorded trace");
+        let recorded = record_trace(&program, root_ip as usize, 0, 64).expect("recorded trace");
         assert_eq!(recorded.terminal, JitTraceTerminal::BranchExit);
         assert!(recorded.op_names.iter().any(|name| name == "loop_if_false"));
         assert_eq!(recorded.ssa.blocks.len(), 2);
@@ -3629,7 +3691,7 @@ mod tests {
         let program = Program::new(vec![Value::Int(0), Value::Int(6), Value::Int(1)], code)
             .with_local_count(2);
 
-        let recorded = record_trace(&program, root_ip as usize, 128).expect("recorded trace");
+        let recorded = record_trace(&program, root_ip as usize, 0, 128).expect("recorded trace");
         assert_eq!(recorded.terminal, JitTraceTerminal::LoopBack);
         assert!(recorded.op_names.iter().any(|name| name == "guard_false"));
         assert!(recorded.op_names.iter().any(|name| name == "jump_root"));
