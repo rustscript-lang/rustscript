@@ -387,12 +387,10 @@ fn rustscript_untyped_rebinding_does_not_reuse_stale_map_schema() {
     let source = r#"
 let values: map<int> = {a: 1};
 let values = {a: "x"};
-for (key: string, value: int) in &values {
-    value;
-}
+for (key: string, value: int) in &values { value; }
 "#;
     let err = match compile_source_with_flavor(source, SourceFlavor::RustScript) {
-        Ok(_) => panic!("untyped rebinding must not retain the old map<int> schema"),
+        Ok(_) => panic!("untyped rebinding must clear stale map schema"),
         Err(err) => err,
     };
     assert!(err.to_string().contains("map<T> schema"));
@@ -403,9 +401,7 @@ fn rustscript_function_parameter_map_type_is_visible_to_iterators() {
     let source = r#"
 fn sum(values: map<int>) -> int {
     let mut total: int = 0;
-    for (key: string, value: int) in &values {
-        total += value;
-    }
+    for (key: string, value: int) in &values { total += value; }
     total
 }
 sum({a: 1, b: 2});
@@ -422,9 +418,7 @@ fn rustscript_borrowed_map_iterator_propagates_nested_binding_schema() {
 let groups: map<map<int>> = {first: {a: 1, b: 2}};
 let mut total: int = 0;
 for (group_key: string, group: map<int>) in &groups {
-    for (item_key: string, item: int) in &group {
-        total += item;
-    }
+    for (item_key: string, item: int) in &group { total += item; }
 }
 total;
 "#;

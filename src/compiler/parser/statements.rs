@@ -1241,11 +1241,21 @@ impl Parser {
 
         let previous_key_slot = self.replace_current_local_binding(&key_name, key_slot);
         let previous_value_slot = self.replace_current_local_binding(&value_name, value_slot);
+        let previous_key_schema = self.local_schemas.get(&key_slot).cloned();
+        let previous_value_schema = self.local_schemas.get(&value_slot).cloned();
+        if let Some(schema) = key_schema.as_ref() {
+            self.local_schemas.insert(key_slot, schema.clone());
+        }
+        if let Some(schema) = value_schema.as_ref() {
+            self.local_schemas.insert(value_slot, schema.clone());
+        }
         self.borrowed_map_iter_locals.push(map_slot);
         self.loop_depth += 1;
         let body_result = self.parse_block("expected '{' after borrowed map");
         self.loop_depth -= 1;
         self.borrowed_map_iter_locals.pop();
+        self.restore_local_schema(value_slot, previous_value_schema);
+        self.restore_local_schema(key_slot, previous_key_schema);
         self.restore_current_local_binding(&value_name, previous_value_slot);
         self.restore_current_local_binding(&key_name, previous_key_slot);
         let mut body = body_result?;
@@ -1325,6 +1335,14 @@ impl Parser {
             bindings.insert(name.to_string(), slot);
         } else {
             bindings.remove(name);
+        }
+    }
+
+    fn restore_local_schema(&mut self, slot: LocalSlot, previous: Option<TypeSchema>) {
+        if let Some(schema) = previous {
+            self.local_schemas.insert(slot, schema);
+        } else {
+            self.local_schemas.remove(&slot);
         }
     }
 
