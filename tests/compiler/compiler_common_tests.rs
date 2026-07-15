@@ -752,6 +752,8 @@ struct DecodedInstr {
     width: usize,
     u32_operand: Option<u32>,
     u8_operand: Option<u8>,
+    call_index: Option<u16>,
+    call_arity: Option<u8>,
 }
 
 fn decode_instructions(code: &[u8]) -> Vec<DecodedInstr> {
@@ -759,7 +761,8 @@ fn decode_instructions(code: &[u8]) -> Vec<DecodedInstr> {
     let mut instructions = Vec::new();
     while ip < code.len() {
         let op = code[ip];
-        let (width, u32_operand, u8_operand) = if op == vm::OpCode::Ldc as u8
+        let (width, u32_operand, u8_operand, call_index, call_arity) = if op
+            == vm::OpCode::Ldc as u8
             || op == vm::OpCode::Br as u8
             || op == vm::OpCode::Brfalse as u8
         {
@@ -769,21 +772,27 @@ fn decode_instructions(code: &[u8]) -> Vec<DecodedInstr> {
             );
             let mut bytes = [0u8; 4];
             bytes.copy_from_slice(&code[ip + 1..ip + 5]);
-            (5usize, Some(u32::from_le_bytes(bytes)), None)
+            (5usize, Some(u32::from_le_bytes(bytes)), None, None, None)
         } else if op == vm::OpCode::Ldloc as u8 || op == vm::OpCode::Stloc as u8 {
             assert!(
                 ip + 2 <= code.len(),
                 "truncated 1-byte operand at instruction {ip}"
             );
-            (2usize, None, Some(code[ip + 1]))
+            (2usize, None, Some(code[ip + 1]), None, None)
         } else if op == vm::OpCode::Call as u8 {
             assert!(
                 ip + 4 <= code.len(),
                 "truncated call operand at instruction {ip}"
             );
-            (4usize, None, None)
+            (
+                4usize,
+                None,
+                None,
+                Some(u16::from_le_bytes([code[ip + 1], code[ip + 2]])),
+                Some(code[ip + 3]),
+            )
         } else {
-            (1usize, None, None)
+            (1usize, None, None, None, None)
         };
         instructions.push(DecodedInstr {
             ip,
@@ -791,6 +800,8 @@ fn decode_instructions(code: &[u8]) -> Vec<DecodedInstr> {
             width,
             u32_operand,
             u8_operand,
+            call_index,
+            call_arity,
         });
         ip += width;
     }
@@ -863,6 +874,213 @@ fn collect_null_store_pairs(
         null_stores.push((lhs.ip, slot));
     }
     null_stores
+}
+
+#[test]
+fn same_local_collection_set_clears_target_immediately_before_call() {
+    let source = r#"
+        let mut a = [10, 20];
+        a[0] = a[1];
+        a[0];
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let a_index = compiled
+        .program
+        .debug
+        .as_ref()
+        .and_then(|debug| debug.local_index("a"))
+        .expect("a should exist in debug info");
+    let instructions = decode_instructions(&compiled.program.code);
+    let set_index = vm::BuiltinFunction::Set.call_index();
+    let call_position = instructions
+        .iter()
+        .position(|instruction| {
+            instruction.op == OpCode::Call as u8
+                && instruction.call_index == Some(set_index)
+                && instruction.call_arity == Some(3)
+        })
+        .expect("indexed assignment should emit set/3");
+    assert!(
+        call_position >= 2,
+        "set call should have preceding instructions"
+    );
+    assert!(
+        call_position + 1 < instructions.len(),
+        "set call should have a following stloc"
+    );
+
+    let clear_const = instructions[call_position - 2];
+    let clear_store = instructions[call_position - 1];
+    let result_store = instructions[call_position + 1];
+    assert_eq!(clear_const.op, OpCode::Ldc as u8);
+    assert!(matches!(
+        clear_const
+            .u32_operand
+            .and_then(|index| compiled.program.constants.get(index as usize)),
+        Some(Value::Null)
+    ));
+    assert_eq!(clear_store.op, OpCode::Stloc as u8);
+    assert_eq!(clear_store.u8_operand, Some(a_index));
+    assert_eq!(result_store.op, OpCode::Stloc as u8);
+    assert_eq!(result_store.u8_operand, Some(a_index));
+
+    assert!(
+        instructions[..call_position - 2].iter().any(|instruction| {
+            instruction.op == OpCode::Ldloc as u8 && instruction.u8_operand == Some(a_index)
+        }),
+        "target should remain readable while key and rhs are evaluated"
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    assert_eq!(vm.run().expect("vm should run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(20)]);
+}
+
+#[test]
+fn same_local_collection_set_preserves_key_then_rhs_evaluation_order() {
+    let array_new = Expr::Call(
+        vm::BuiltinFunction::ArrayNew.call_index(),
+        Vec::new(),
+        Vec::new(),
+    );
+    let array_with_first = Expr::Call(
+        vm::BuiltinFunction::ArrayPush.call_index(),
+        Vec::new(),
+        vec![array_new, Expr::Int(10)],
+    );
+    let array = Expr::Call(
+        vm::BuiltinFunction::ArrayPush.call_index(),
+        Vec::new(),
+        vec![array_with_first, Expr::Int(20)],
+    );
+    let append_order = |suffix: &str| Stmt::Assign {
+        kind: vm::AssignmentKind::Set,
+        index: 1,
+        expr: Expr::Add(
+            Box::new(Expr::Var(1)),
+            Box::new(Expr::String(suffix.to_string())),
+        ),
+        line: 2,
+    };
+    let key = Expr::Block {
+        stmts: vec![append_order("k")],
+        expr: Box::new(Expr::Int(0)),
+    };
+    let rhs = Expr::Block {
+        stmts: vec![append_order("v")],
+        expr: Box::new(Expr::Call(
+            vm::BuiltinFunction::Get.call_index(),
+            Vec::new(),
+            vec![Expr::Var(0), Expr::Int(1)],
+        )),
+    };
+
+    let mut compiler = Compiler::new();
+    compiler.set_enable_local_move_semantics(true);
+    let program = compiler
+        .compile_program(&[
+            Stmt::Let {
+                index: 0,
+                declared_schema: None,
+                expr: array,
+                line: 1,
+            },
+            Stmt::Let {
+                index: 1,
+                declared_schema: None,
+                expr: Expr::String(String::new()),
+                line: 1,
+            },
+            Stmt::Assign {
+                kind: vm::AssignmentKind::Set,
+                index: 0,
+                expr: Expr::Call(
+                    vm::BuiltinFunction::Set.call_index(),
+                    Vec::new(),
+                    vec![Expr::Var(0), key, rhs],
+                ),
+                line: 2,
+            },
+            Stmt::Expr {
+                expr: Expr::Var(1),
+                line: 3,
+            },
+            Stmt::Expr {
+                expr: Expr::Call(
+                    vm::BuiltinFunction::Get.call_index(),
+                    Vec::new(),
+                    vec![Expr::Var(0), Expr::Int(0)],
+                ),
+                line: 3,
+            },
+        ])
+        .expect("compiler should preserve collection rebind evaluation order");
+
+    let mut vm = Vm::new(program.with_local_count(2));
+    assert_eq!(vm.run().expect("vm should run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("kv"), Value::Int(20)]);
+}
+
+#[test]
+fn same_local_array_push_clears_target_immediately_before_call() {
+    let mut compiler = Compiler::new();
+    compiler.set_enable_local_move_semantics(true);
+    let program = compiler
+        .compile_program(&[
+            Stmt::Let {
+                index: 0,
+                declared_schema: None,
+                expr: Expr::Call(
+                    vm::BuiltinFunction::ArrayNew.call_index(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                line: 1,
+            },
+            Stmt::Assign {
+                kind: vm::AssignmentKind::Set,
+                index: 0,
+                expr: Expr::Call(
+                    vm::BuiltinFunction::ArrayPush.call_index(),
+                    Vec::new(),
+                    vec![Expr::Var(0), Expr::Int(7)],
+                ),
+                line: 2,
+            },
+            Stmt::Expr {
+                expr: Expr::Var(0),
+                line: 3,
+            },
+        ])
+        .expect("compiler should emit array push program");
+    let instructions = decode_instructions(&program.code);
+    let call_position = instructions
+        .iter()
+        .position(|instruction| {
+            instruction.op == OpCode::Call as u8
+                && instruction.call_index == Some(vm::BuiltinFunction::ArrayPush.call_index())
+                && instruction.call_arity == Some(2)
+        })
+        .expect("array rebind should emit array_push/2");
+
+    let clear_const = instructions[call_position - 2];
+    let clear_store = instructions[call_position - 1];
+    let result_store = instructions[call_position + 1];
+    assert!(matches!(
+        clear_const
+            .u32_operand
+            .and_then(|index| program.constants.get(index as usize)),
+        Some(Value::Null)
+    ));
+    assert_eq!(clear_store.op, OpCode::Stloc as u8);
+    assert_eq!(clear_store.u8_operand, Some(0));
+    assert_eq!(result_store.op, OpCode::Stloc as u8);
+    assert_eq!(result_store.u8_operand, Some(0));
+
+    let mut vm = Vm::new(program.with_local_count(1));
+    assert_eq!(vm.run().expect("vm should run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::array(vec![Value::Int(7)])]);
 }
 
 #[test]

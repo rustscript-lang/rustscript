@@ -1233,7 +1233,9 @@ impl Compiler {
             self.infer_bound_type(expr)
         };
         self.callable_bindings.remove(&slot);
-        self.compile_scalar_expr(expr)?;
+        if !self.try_compile_same_local_collection_rebind(slot, expr)? {
+            self.compile_scalar_expr(expr)?;
+        }
         self.emit_stloc(slot)?;
         let schema = slot_declared_schema.clone().or_else(|| {
             if optional {
@@ -1272,6 +1274,40 @@ impl Compiler {
             optional,
         );
         Ok(())
+    }
+
+    fn try_compile_same_local_collection_rebind(
+        &mut self,
+        target: LocalSlot,
+        expr: &Expr,
+    ) -> Result<bool, CompileError> {
+        if !self.enable_local_move_semantics {
+            return Ok(false);
+        }
+        let Expr::Call(index, _, args) = expr else {
+            return Ok(false);
+        };
+        let Some(builtin) = BuiltinFunction::from_call_index(*index) else {
+            return Ok(false);
+        };
+        let expected_arity = match builtin {
+            BuiltinFunction::Set => 3,
+            BuiltinFunction::ArrayPush => 2,
+            _ => return Ok(false),
+        };
+        if args.len() != expected_arity
+            || !matches!(args.first(), Some(Expr::Var(source)) if *source == target)
+        {
+            return Ok(false);
+        }
+
+        for arg in args {
+            self.compile_scalar_expr(arg)?;
+        }
+        self.assembler.push_const(Value::Null);
+        self.emit_stloc(target)?;
+        self.emit_direct_call(*index, args)?;
+        Ok(true)
     }
 
     fn compile_scalar_expr(&mut self, expr: &Expr) -> Result<(), CompileError> {
@@ -1382,6 +1418,10 @@ impl Compiler {
         for arg in args {
             self.compile_scalar_expr(arg)?;
         }
+        self.emit_direct_call(index, args)
+    }
+
+    fn emit_direct_call(&mut self, index: u16, args: &[Expr]) -> Result<(), CompileError> {
         let argc = u8::try_from(args.len()).map_err(|_| CompileError::CallArityOverflow)?;
         if let Some(builtin) = BuiltinFunction::from_call_index(index) {
             debug_assert!(builtin.accepts_arity(argc));
