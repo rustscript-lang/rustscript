@@ -252,6 +252,7 @@ fn try_compile_ssa_trace(
             pointer_type,
             layout,
             offsets,
+            entry_stack_depth: ssa.entry_stack_depth,
             heap_refs,
             heap_addrs,
             string_refs,
@@ -494,6 +495,7 @@ struct SsaLowerCtx<'a> {
     pointer_type: cranelift_codegen::ir::Type,
     layout: crate::vm::native::NativeStackLayout,
     offsets: ResolvedOffsets,
+    entry_stack_depth: usize,
     heap_refs: HeapIntrinsicRefs,
     heap_addrs: HeapIntrinsicAddrs,
     string_refs: SsaStringHelperRefs,
@@ -982,6 +984,7 @@ fn lower_ssa_inst(
         owned_value_temps,
         value_reprs,
         tagged_constant_addrs,
+        ..
     } = ctx;
     let Some(output) = inst.output else {
         return Err(VmError::JitNative(
@@ -2757,6 +2760,8 @@ fn lower_ssa_exit_block(
         exit_block,
         pointer_type,
         layout,
+        offsets,
+        entry_stack_depth,
         helper_refs: deopt_refs,
         helper_addrs: deopt_addrs,
         ..
@@ -2782,6 +2787,66 @@ fn lower_ssa_exit_block(
         deopt_refs,
         deopt_addrs,
     };
+
+    let inline_scalar_restore = entry_stack_depth == 0
+        && exit.stack.is_empty()
+        && exit
+            .locals
+            .iter()
+            .zip(&exit.dirty_locals)
+            .all(|(materialization, dirty)| {
+                !*dirty
+                    || matches!(
+                        materialization,
+                        SsaMaterialization::BoxInt(_)
+                            | SsaMaterialization::BoxBool(_)
+                            | SsaMaterialization::BoxFloat(_)
+                    )
+            });
+    if inline_scalar_restore {
+        let vm_locals_ptr = b
+            .ins()
+            .load(pointer_type, MemFlags::new(), vm_ptr, offsets.locals_ptr);
+        for (local_index, materialization) in
+            exit.locals
+                .iter()
+                .enumerate()
+                .filter_map(|(local_index, materialization)| {
+                    exit.dirty_locals[local_index].then_some((local_index, materialization))
+                })
+        {
+            let index = b.ins().iconst(
+                pointer_type,
+                i64::try_from(local_index).map_err(|_| {
+                    VmError::JitNative("SSA dirty local index out of range".to_string())
+                })?,
+            );
+            let dst_addr = ssa_value_addr(b, pointer_type, vm_locals_ptr, index, layout.value.size);
+            clear_owned_value_temp_slot(b, pointer_type, deopt_refs, deopt_addrs, dst_addr)?;
+            ssa_materialize_slot(b, materialize_ctx, materialization, dst_addr, "local")?;
+        }
+        let ip_val = b.ins().iconst(
+            pointer_type,
+            i64::try_from(exit.exit_ip)
+                .map_err(|_| VmError::JitNative("SSA exit ip out of range".to_string()))?,
+        );
+        b.ins()
+            .store(MemFlags::new(), ip_val, vm_ptr, offsets.vm_ip);
+        let status = if halted {
+            b.ins().iconst(types::I32, STATUS_HALTED as i64)
+        } else if allow_link_handoff {
+            let helper_ptr =
+                iconst_ptr_from_addr(b, pointer_type, deopt_addrs.resume_linked_trace)?;
+            let call =
+                b.ins()
+                    .call_indirect(deopt_refs.resume_linked_trace_ref, helper_ptr, &[vm_ptr]);
+            b.inst_results(call)[0]
+        } else {
+            b.ins().iconst(types::I32, STATUS_TRACE_EXIT as i64)
+        };
+        jump_with_status(b, exit_block, status);
+        return Ok(());
+    }
 
     let stack_ptr = ssa_alloc_value_buffer(b, pointer_type, exit.stack.len(), layout.value.size)?;
     for (stack_index, materialization) in exit.stack.iter().enumerate() {
