@@ -3255,23 +3255,37 @@ fn emit_specialized_builtin_call(
                     actual: array.info.repr,
                 });
             }
+            let is_append = matches!(
+                builder.defining_inst(index.value.id).map(|inst| &inst.kind),
+                Some(SsaInstKind::ArrayLen { array: array_ptr })
+                    if matches!(
+                        builder.defining_inst(*array_ptr).map(|inst| &inst.kind),
+                        Some(SsaInstKind::UnboxHeapPtr {
+                            input,
+                            tag: ValueType::Array,
+                        }) if *input == array.value.id
+                    )
+            );
+            let kind = if is_append {
+                SsaInstKind::ArrayPush {
+                    array: array.value.id,
+                    value: value.value.id,
+                }
+            } else {
+                SsaInstKind::ArraySet {
+                    array: array.value.id,
+                    index: index.value.id,
+                    value: value.value.id,
+                }
+            };
             let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Tagged,
-                    SsaInstKind::ArraySet {
-                        array: array.value.id,
-                        index: index.value.id,
-                        value: value.value.id,
-                    },
-                )
+                .append_value_inst(block, ip, SsaValueRepr::Tagged, kind)
                 .map(|value| SymbolicValue {
                     value,
                     info: ValueInfo::tagged_typed(ValueType::Array),
                 })
                 .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("array_set", out))
+            Ok((if is_append { "array_push" } else { "array_set" }, out))
         }
         SpecializedBuiltinKind::ArrayPush => {
             let value = frame.pop()?;

@@ -735,6 +735,14 @@ impl SsaTraceBuilder {
         self.trace.entry
     }
 
+    pub(crate) fn defining_inst(&self, value: SsaValueId) -> Option<&SsaInst> {
+        self.trace
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .find(|inst| inst.output.is_some_and(|output| output.id == value))
+    }
+
     pub(crate) fn create_block(&mut self) -> SsaBlockId {
         let id = SsaBlockId::new(self.trace.blocks.len() as u32);
         self.trace.blocks.push(SsaBlock {
