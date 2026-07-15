@@ -214,6 +214,34 @@ pub(crate) fn collection_mutation_signature(
 }
 
 #[cfg(feature = "cranelift-jit")]
+pub(crate) fn map_set_signature(
+    pointer_type: cranelift_codegen::ir::Type,
+    call_conv: cranelift_codegen::isa::CallConv,
+) -> Signature {
+    let mut sig = Signature::new(call_conv);
+    sig.params.push(AbiParam::new(pointer_type));
+    sig.params.push(AbiParam::new(pointer_type));
+    sig.params.push(AbiParam::new(pointer_type));
+    sig.params.push(AbiParam::new(pointer_type));
+    sig.returns.push(AbiParam::new(types::I32));
+    sig
+}
+
+#[cfg(feature = "cranelift-jit")]
+pub(crate) fn array_set_signature(
+    pointer_type: cranelift_codegen::ir::Type,
+    call_conv: cranelift_codegen::isa::CallConv,
+) -> Signature {
+    let mut sig = Signature::new(call_conv);
+    sig.params.push(AbiParam::new(pointer_type));
+    sig.params.push(AbiParam::new(pointer_type));
+    sig.params.push(AbiParam::new(types::I64));
+    sig.params.push(AbiParam::new(pointer_type));
+    sig.returns.push(AbiParam::new(types::I32));
+    sig
+}
+
+#[cfg(feature = "cranelift-jit")]
 pub(crate) fn value_slot_signature(
     pointer_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,

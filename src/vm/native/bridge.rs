@@ -276,6 +276,14 @@ pub(crate) fn collection_set_entry_address() -> usize {
     pd_vm_native_collection_set as *const () as usize
 }
 
+pub(crate) fn array_set_entry_address() -> usize {
+    pd_vm_native_array_set as *const () as usize
+}
+
+pub(crate) fn map_set_entry_address() -> usize {
+    pd_vm_native_map_set as *const () as usize
+}
+
 pub(crate) fn array_push_entry_address() -> usize {
     pd_vm_native_array_push as *const () as usize
 }
@@ -782,6 +790,76 @@ pub(crate) extern "C" fn pd_vm_native_collection_set(
     }
 }
 
+pub(crate) extern "C" fn pd_vm_native_array_set(
+    dst: *mut Value,
+    array: *mut Value,
+    index: i64,
+    value: *const Value,
+) -> i32 {
+    if dst.is_null() || array.is_null() || value.is_null() {
+        store_bridge_error(VmError::JitNative(
+            "native array-set helper received null pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    }
+
+    let array = unsafe { std::ptr::replace(array, Value::Null) };
+    let value = unsafe { (&*value).clone() };
+    let result = match array {
+        Value::Array(values) => {
+            crate::builtins::runtime::core::builtin_set_array_shared_impl(values, index, value)
+                .map(Value::Array)
+        }
+        _ => Err(VmError::TypeMismatch("array")),
+    };
+    match result {
+        Ok(result) => {
+            let previous = unsafe { std::ptr::replace(dst, result) };
+            drop(previous);
+            STATUS_CONTINUE
+        }
+        Err(err) => {
+            store_bridge_error(err);
+            STATUS_ERROR
+        }
+    }
+}
+
+pub(crate) extern "C" fn pd_vm_native_map_set(
+    dst: *mut Value,
+    map: *mut Value,
+    key: *const Value,
+    value: *const Value,
+) -> i32 {
+    if dst.is_null() || map.is_null() || key.is_null() || value.is_null() {
+        store_bridge_error(VmError::JitNative(
+            "native map-set helper received null pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    }
+
+    let map = unsafe { std::ptr::replace(map, Value::Null) };
+    let key = unsafe { (&*key).clone() };
+    let value = unsafe { (&*value).clone() };
+    let result = match map {
+        Value::Map(entries) => Ok(Value::Map(
+            crate::builtins::runtime::core::builtin_set_map_shared_impl(entries, key, value),
+        )),
+        _ => Err(VmError::TypeMismatch("map")),
+    };
+    match result {
+        Ok(result) => {
+            let previous = unsafe { std::ptr::replace(dst, result) };
+            drop(previous);
+            STATUS_CONTINUE
+        }
+        Err(err) => {
+            store_bridge_error(err);
+            STATUS_ERROR
+        }
+    }
+}
+
 pub(crate) extern "C" fn pd_vm_native_array_push(
     dst: *mut Value,
     array: *mut Value,
@@ -796,7 +874,13 @@ pub(crate) extern "C" fn pd_vm_native_array_push(
 
     let array = unsafe { std::ptr::replace(array, Value::Null) };
     let value = unsafe { (&*value).clone() };
-    match crate::builtins::runtime::core::builtin_array_push_owned(array, value) {
+    let result = match array {
+        Value::Array(values) => Ok(Value::Array(
+            crate::builtins::runtime::core::builtin_array_push_shared_impl(values, value),
+        )),
+        _ => Err(VmError::TypeMismatch("array")),
+    };
+    match result {
         Ok(result) => {
             let previous = unsafe { std::ptr::replace(dst, result) };
             drop(previous);
@@ -1221,5 +1305,68 @@ mod tests {
         assert_eq!(Arc::strong_count(&old), 1);
         assert_eq!(Arc::strong_count(&replacement), 2);
         assert_eq!(vm.drop_contract_event_count(), 2);
+    }
+
+    #[test]
+    fn typed_array_set_detaches_shared_input() {
+        let shared = Arc::new(vec![Value::Int(10), Value::Int(20)]);
+        let alias = shared.clone();
+        let mut input = Value::Array(shared);
+        let replacement = Value::Int(99);
+        let mut output = Value::Null;
+
+        let status = pd_vm_native_array_set(&mut output, &mut input, 1, &replacement);
+
+        assert_eq!(status, STATUS_CONTINUE);
+        assert_eq!(input, Value::Null);
+        assert_eq!(alias.as_slice(), &[Value::Int(10), Value::Int(20)]);
+        let Value::Array(result) = output else {
+            panic!("expected array result");
+        };
+        assert_eq!(result.as_slice(), &[Value::Int(10), Value::Int(99)]);
+        assert!(!Arc::ptr_eq(&result, &alias));
+    }
+
+    #[test]
+    fn typed_array_push_detaches_shared_input() {
+        let shared = Arc::new(vec![Value::Int(10)]);
+        let alias = shared.clone();
+        let mut input = Value::Array(shared);
+        let appended = Value::Int(20);
+        let mut output = Value::Null;
+
+        let status = pd_vm_native_array_push(&mut output, &mut input, &appended);
+
+        assert_eq!(status, STATUS_CONTINUE);
+        assert_eq!(input, Value::Null);
+        assert_eq!(alias.as_slice(), &[Value::Int(10)]);
+        let Value::Array(result) = output else {
+            panic!("expected array result");
+        };
+        assert_eq!(result.as_slice(), &[Value::Int(10), Value::Int(20)]);
+        assert!(!Arc::ptr_eq(&result, &alias));
+    }
+
+    #[test]
+    fn typed_map_set_detaches_shared_input() {
+        let shared = Arc::new(VmMap::from(vec![(Value::Int(1), Value::Int(10))]));
+        let alias = shared.clone();
+        let mut input = Value::Map(shared);
+        let key = Value::Int(2);
+        let value = Value::Int(20);
+        let mut output = Value::Null;
+
+        let status = pd_vm_native_map_set(&mut output, &mut input, &key, &value);
+
+        assert_eq!(status, STATUS_CONTINUE);
+        assert_eq!(input, Value::Null);
+        assert_eq!(alias.get(&Value::Int(1)), Some(&Value::Int(10)));
+        assert_eq!(alias.get(&Value::Int(2)), None);
+        let Value::Map(result) = output else {
+            panic!("expected map result");
+        };
+        assert_eq!(result.get(&Value::Int(1)), Some(&Value::Int(10)));
+        assert_eq!(result.get(&Value::Int(2)), Some(&Value::Int(20)));
+        assert!(!Arc::ptr_eq(&result, &alias));
     }
 }

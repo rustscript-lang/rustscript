@@ -215,7 +215,10 @@ pub(super) fn builtin_array_push_typed_impl(
     items
 }
 
-fn builtin_array_push_shared_impl(mut items: SharedArray, value: AnyValue) -> SharedArray {
+pub(crate) fn builtin_array_push_shared_impl(
+    mut items: SharedArray,
+    value: AnyValue,
+) -> SharedArray {
     Arc::make_mut(&mut items).push(value);
     items
 }
@@ -632,7 +635,7 @@ pub(super) fn builtin_set_array_impl(
     Ok(items)
 }
 
-fn builtin_set_array_shared_impl(
+pub(crate) fn builtin_set_array_shared_impl(
     mut items: SharedArray,
     index: i64,
     value: AnyValue,
@@ -673,7 +676,7 @@ pub(super) fn builtin_set_map_impl(
     entries
 }
 
-fn builtin_set_map_shared_impl(
+pub(crate) fn builtin_set_map_shared_impl(
     mut entries: SharedMap,
     key: AnyValue,
     value: AnyValue,

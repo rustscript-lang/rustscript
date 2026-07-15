@@ -11,22 +11,22 @@ use crate::vm::native::{
     ExecutableBuffer, HeapIntrinsicAddrs, HeapIntrinsicRefs, NativeInterruptMode,
     NativeInterruptSettings, NativeStackLayout, STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED,
     STATUS_OUT_OF_FUEL, STATUS_TRACE_EXIT, alloc_buffer_signature, alloc_byte_buffer_entry_address,
-    alloc_value_buffer_entry_address, array_push_entry_address, box_heap_value_signature,
-    checked_add_i32, clear_value_slot_entry_address, clone_value_signature,
-    clone_value_to_slot_entry_address, collection_get_signature, collection_mutation_signature,
-    collection_predicate_signature, collection_set_entry_address, copy_bytes_entry_address,
-    copy_bytes_signature, detect_native_stack_layout, entry_signature, free_buffer_signature,
-    init_null_value_slot_entry_address, jump_with_status, map_get_entry_address,
-    map_has_entry_address, map_iter_next_entry_address, map_iter_next_signature,
-    map_iter_take_key_entry_address, map_iter_take_signature, map_iter_take_value_entry_address,
-    non_yielding_host_call_entry_address, non_yielding_host_call_signature,
-    pack_shared_signature, restore_sparse_exit_state_entry_address,
-    shared_array_from_buffer_entry_address, shared_bytes_from_buffer_entry_address,
-    shared_string_from_buffer_entry_address, sparse_restore_exit_signature,
-    string_binary_transform_signature, string_contains_entry_address, string_contains_signature,
-    string_lower_ascii_entry_address, string_replace_literal_entry_address,
-    string_replace_signature, string_split_literal_entry_address, string_unary_transform_signature,
-    value_slot_signature, write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
+    alloc_value_buffer_entry_address, array_push_entry_address, array_set_entry_address,
+    array_set_signature, box_heap_value_signature, checked_add_i32, clear_value_slot_entry_address,
+    clone_value_signature, clone_value_to_slot_entry_address, collection_get_signature,
+    collection_predicate_signature, copy_bytes_entry_address, copy_bytes_signature,
+    detect_native_stack_layout, entry_signature, free_buffer_signature, jump_with_status,
+    map_get_entry_address, map_has_entry_address, map_iter_next_entry_address,
+    map_iter_next_signature, map_iter_take_key_entry_address, map_iter_take_signature,
+    map_iter_take_value_entry_address, map_set_entry_address, map_set_signature,
+    non_yielding_host_call_entry_address, non_yielding_host_call_signature, pack_shared_signature,
+    restore_sparse_exit_state_entry_address, shared_array_from_buffer_entry_address,
+    shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
+    sparse_restore_exit_signature, string_binary_transform_signature,
+    string_contains_entry_address, string_contains_signature, string_lower_ascii_entry_address,
+    string_replace_literal_entry_address, string_replace_signature,
+    string_split_literal_entry_address, string_unary_transform_signature, value_slot_signature,
+    write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
 };
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::Ieee64;
@@ -110,7 +110,8 @@ fn try_compile_ssa_trace(
     let map_iter_next_sig = map_iter_next_signature(pointer_type, call_conv);
     let map_iter_take_sig = map_iter_take_signature(pointer_type, call_conv);
     let array_push_sig = collection_get_signature(pointer_type, call_conv);
-    let collection_set_sig = collection_mutation_signature(pointer_type, call_conv);
+    let array_set_sig = array_set_signature(pointer_type, call_conv);
+    let map_set_sig = map_set_signature(pointer_type, call_conv);
     let sparse_restore_exit_sig = sparse_restore_exit_signature(pointer_type, call_conv);
     let resume_linked_trace_sig = entry_signature(pointer_type, call_conv);
     let string_contains_sig = string_contains_signature(pointer_type, call_conv);
@@ -170,7 +171,8 @@ fn try_compile_ssa_trace(
             map_iter_take_key_ref: b.import_signature(map_iter_take_sig.clone()),
             map_iter_take_value_ref: b.import_signature(map_iter_take_sig),
             array_push_ref: b.import_signature(array_push_sig),
-            collection_set_ref: b.import_signature(collection_set_sig),
+            array_set_ref: b.import_signature(array_set_sig),
+            map_set_ref: b.import_signature(map_set_sig),
             sparse_restore_exit_ref: b.import_signature(sparse_restore_exit_sig),
             resume_linked_trace_ref: b.import_signature(resume_linked_trace_sig),
         };
@@ -185,7 +187,8 @@ fn try_compile_ssa_trace(
             map_iter_take_key: map_iter_take_key_entry_address(),
             map_iter_take_value: map_iter_take_value_entry_address(),
             array_push: array_push_entry_address(),
-            collection_set: collection_set_entry_address(),
+            array_set: array_set_entry_address(),
+            map_set: map_set_entry_address(),
             sparse_restore_exit: restore_sparse_exit_state_entry_address(),
             resume_linked_trace: resume_linked_trace_entry_address(),
         };
@@ -431,7 +434,8 @@ struct SsaDeoptHelperRefs {
     map_iter_take_key_ref: cranelift_codegen::ir::SigRef,
     map_iter_take_value_ref: cranelift_codegen::ir::SigRef,
     array_push_ref: cranelift_codegen::ir::SigRef,
-    collection_set_ref: cranelift_codegen::ir::SigRef,
+    array_set_ref: cranelift_codegen::ir::SigRef,
+    map_set_ref: cranelift_codegen::ir::SigRef,
     sparse_restore_exit_ref: cranelift_codegen::ir::SigRef,
     resume_linked_trace_ref: cranelift_codegen::ir::SigRef,
 }
@@ -448,7 +452,8 @@ struct SsaDeoptHelperAddrs {
     map_iter_take_key: usize,
     map_iter_take_value: usize,
     array_push: usize,
-    collection_set: usize,
+    array_set: usize,
+    map_set: usize,
     sparse_restore_exit: usize,
     resume_linked_trace: usize,
 }
@@ -714,17 +719,16 @@ fn allocate_owned_value_temps(
                 ordered.push(slot);
                 slots.insert(SsaTempValueSlotKey::MapKeyBox(output.id), slot);
             }
-            if matches!(
-                inst.kind,
-                SsaInstKind::ArraySet { .. }
-                    | SsaInstKind::ArrayPush { .. }
-                    | SsaInstKind::MapSet { .. }
-            ) {
-                for arg in 0..2 {
-                    let slot = ssa_create_value_stack_slot(b, value_size)?;
-                    ordered.push(slot);
-                    slots.insert(SsaTempValueSlotKey::MutationArgBox(output.id, arg), slot);
-                }
+            let mutation_args: &[u8] = match inst.kind {
+                SsaInstKind::ArraySet { .. } => &[1],
+                SsaInstKind::ArrayPush { .. } => &[0],
+                SsaInstKind::MapSet { .. } => &[0, 1],
+                _ => &[],
+            };
+            for arg in mutation_args {
+                let slot = ssa_create_value_stack_slot(b, value_size)?;
+                ordered.push(slot);
+                slots.insert(SsaTempValueSlotKey::MutationArgBox(output.id, *arg), slot);
             }
         }
     }
@@ -2091,27 +2095,11 @@ fn lower_ssa_inst(
                 owned_value_temps,
                 SsaTempValueSlotKey::Output(output.id),
             )?;
-            let index_box = owned_value_temp_slot_addr(
-                b,
-                pointer_type,
-                owned_value_temps,
-                SsaTempValueSlotKey::MutationArgBox(output.id, 0),
-            )?;
-            let index_addr = ssa_ensure_boxed_value_addr(
-                b,
-                SsaBoxCtx {
-                    exit_block,
-                    pointer_type,
-                    value_layout: layout.value,
-                    helper_refs,
-                    helper_addrs,
-                },
-                Some(index_box),
-                *value_reprs.get(index).ok_or_else(|| {
-                    VmError::JitNative("SSA array-set index representation missing".to_string())
-                })?,
-                values[index],
-            )?;
+            if value_reprs.get(index) != Some(&SsaValueRepr::I64) {
+                return Err(VmError::JitNative(
+                    "SSA array-set index must be lowered as i64".to_string(),
+                ));
+            }
             let value_box = owned_value_temp_slot_addr(
                 b,
                 pointer_type,
@@ -2133,11 +2121,11 @@ fn lower_ssa_inst(
                 })?,
                 values[value],
             )?;
-            let helper_ptr = iconst_ptr_from_addr(b, pointer_type, helper_addrs.collection_set)?;
+            let helper_ptr = iconst_ptr_from_addr(b, pointer_type, helper_addrs.array_set)?;
             let call = b.ins().call_indirect(
-                helper_refs.collection_set_ref,
+                helper_refs.array_set_ref,
                 helper_ptr,
-                &[out, values[array], index_addr, value_addr],
+                &[out, values[array], values[index], value_addr],
             );
             let status = b.inst_results(call)[0];
             let fail = b.create_block();
@@ -2420,9 +2408,9 @@ fn lower_ssa_inst(
                 })?,
                 values[value],
             )?;
-            let helper_ptr = iconst_ptr_from_addr(b, pointer_type, helper_addrs.collection_set)?;
+            let helper_ptr = iconst_ptr_from_addr(b, pointer_type, helper_addrs.map_set)?;
             let call = b.ins().call_indirect(
-                helper_refs.collection_set_ref,
+                helper_refs.map_set_ref,
                 helper_ptr,
                 &[out, values[map], key_addr, value_addr],
             );
