@@ -162,7 +162,6 @@ fn try_compile_ssa_trace(
         let deopt_refs = SsaDeoptHelperRefs {
             clone_value_ref: b.import_signature(clone_value_sig),
             non_yielding_host_call_ref: b.import_signature(non_yielding_host_call_sig),
-            init_null_slot_ref: b.import_signature(value_slot_sig.clone()),
             clear_value_slot_ref: b.import_signature(value_slot_sig),
             box_heap_value_ref: b.import_signature(box_heap_value_sig),
             map_has_ref: b.import_signature(map_has_sig),
@@ -178,7 +177,6 @@ fn try_compile_ssa_trace(
         let deopt_addrs = SsaDeoptHelperAddrs {
             clone_value: clone_value_to_slot_entry_address(),
             non_yielding_host_call: non_yielding_host_call_entry_address(),
-            init_null_slot: init_null_value_slot_entry_address(),
             clear_value_slot: clear_value_slot_entry_address(),
             box_heap_value: write_heap_value_to_slot_entry_address(),
             map_has: map_has_entry_address(),
@@ -305,14 +303,7 @@ fn try_compile_ssa_trace(
                     )
                 })?,
         )?;
-        init_owned_value_temps(
-            &mut b,
-            exit_block,
-            pointer_type,
-            deopt_refs,
-            deopt_addrs,
-            &owned_value_temps,
-        )?;
+        init_owned_value_temps(&mut b, pointer_type, layout.value, &owned_value_temps)?;
         let entry_args = ssa_block_args(entry_args);
         b.ins().jump(entry_handle, &entry_args);
 
@@ -377,6 +368,7 @@ fn try_compile_ssa_trace(
             &mut b,
             exit_block,
             pointer_type,
+            layout.value,
             deopt_refs,
             deopt_addrs,
             &owned_value_temps,
@@ -428,7 +420,6 @@ struct SsaExitLowering {
 struct SsaDeoptHelperRefs {
     clone_value_ref: cranelift_codegen::ir::SigRef,
     non_yielding_host_call_ref: cranelift_codegen::ir::SigRef,
-    init_null_slot_ref: cranelift_codegen::ir::SigRef,
     clear_value_slot_ref: cranelift_codegen::ir::SigRef,
     box_heap_value_ref: cranelift_codegen::ir::SigRef,
     map_has_ref: cranelift_codegen::ir::SigRef,
@@ -446,7 +437,6 @@ struct SsaDeoptHelperRefs {
 struct SsaDeoptHelperAddrs {
     clone_value: usize,
     non_yielding_host_call: usize,
-    init_null_slot: usize,
     clear_value_slot: usize,
     box_heap_value: usize,
     map_has: usize,
@@ -771,22 +761,13 @@ fn ssa_create_value_stack_slot(b: &mut FunctionBuilder, value_size: i32) -> VmRe
 
 fn init_owned_value_temps(
     b: &mut FunctionBuilder,
-    exit_block: Block,
     pointer_type: cranelift_codegen::ir::Type,
-    helper_refs: SsaDeoptHelperRefs,
-    helper_addrs: SsaDeoptHelperAddrs,
+    value_layout: crate::vm::native::ValueLayout,
     temps: &SsaOwnedValueTemps,
 ) -> VmResult<()> {
-    let _ = exit_block;
     for slot in &temps.ordered {
         let addr = b.ins().stack_addr(pointer_type, *slot, 0);
-        ssa_call_infallible_helper(
-            b,
-            pointer_type,
-            helper_refs.init_null_slot_ref,
-            helper_addrs.init_null_slot,
-            &[addr],
-        )?;
+        ssa_store_tag(b, value_layout, addr, value_layout.null_tag);
     }
     Ok(())
 }
@@ -795,6 +776,7 @@ fn clear_owned_value_temps(
     b: &mut FunctionBuilder,
     exit_block: Block,
     pointer_type: cranelift_codegen::ir::Type,
+    value_layout: crate::vm::native::ValueLayout,
     helper_refs: SsaDeoptHelperRefs,
     helper_addrs: SsaDeoptHelperAddrs,
     temps: &SsaOwnedValueTemps,
@@ -802,12 +784,13 @@ fn clear_owned_value_temps(
     let _ = exit_block;
     for slot in &temps.ordered {
         let addr = b.ins().stack_addr(pointer_type, *slot, 0);
-        ssa_call_infallible_helper(
+        clear_value_slot_if_heap(
             b,
             pointer_type,
-            helper_refs.clear_value_slot_ref,
-            helper_addrs.clear_value_slot,
-            &[addr],
+            value_layout,
+            helper_refs,
+            helper_addrs,
+            addr,
         )?;
     }
     Ok(())
@@ -840,6 +823,28 @@ fn clear_owned_value_temp_slot(
         helper_addrs.clear_value_slot,
         &[addr],
     )
+}
+
+fn clear_value_slot_if_heap(
+    b: &mut FunctionBuilder,
+    pointer_type: cranelift_codegen::ir::Type,
+    layout: crate::vm::native::ValueLayout,
+    helper_refs: SsaDeoptHelperRefs,
+    helper_addrs: SsaDeoptHelperAddrs,
+    addr: cranelift_codegen::ir::Value,
+) -> VmResult<()> {
+    let tag = ssa_load_tag_i32(b, layout, addr);
+    let scalar = ssa_is_scalar_tag(b, layout, tag);
+    let done = b.create_block();
+    let clear = b.create_block();
+    b.ins().brif(scalar, done, &[], clear, &[]);
+
+    b.switch_to_block(clear);
+    clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, addr)?;
+    b.ins().jump(done, &[]);
+
+    b.switch_to_block(done);
+    Ok(())
 }
 
 fn ssa_interrupt_charge_blocks(ssa: &SsaTrace) -> BTreeSet<crate::vm::jit::ir::SsaBlockId> {
