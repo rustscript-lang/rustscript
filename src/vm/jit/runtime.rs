@@ -420,16 +420,15 @@ impl Vm {
                 out.push_str(&format!("    bridge {}: {}\n", name, count));
             }
         }
-        if self.native_traces.is_empty() {
+        let native_trace_count = self.native_traces.iter().flatten().count();
+        if native_trace_count == 0 {
             out.push_str("  native traces: 0\n");
             return out;
         }
 
-        out.push_str(&format!("  native traces: {}\n", self.native_traces.len()));
-        let mut ids: Vec<usize> = self.native_traces.keys().copied().collect();
-        ids.sort_unstable();
-        for id in ids {
-            if let Some(native) = self.native_traces.get(&id) {
+        out.push_str(&format!("  native traces: {}\n", native_trace_count));
+        for (id, native) in self.native_traces.iter().enumerate() {
+            if let Some(native) = native {
                 out.push_str(&format!(
                     "  native trace#{} entry=0x{:X} code_bytes={} lowering={}\n",
                     id,
@@ -651,9 +650,13 @@ impl Vm {
         &self,
         trace_id: usize,
     ) -> VmResult<(NativeTraceEntry, usize, JitTraceTerminal, bool, bool)> {
-        let native = self.native_traces.get(&trace_id).ok_or_else(|| {
-            VmError::JitNative(format!("native trace entry for id {} missing", trace_id))
-        })?;
+        let native = self
+            .native_traces
+            .get(trace_id)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                VmError::JitNative(format!("native trace entry for id {} missing", trace_id))
+            })?;
         Ok((
             native.entry,
             native.root_ip,
@@ -692,14 +695,16 @@ impl Vm {
         compile_profile: native::NativeCompileProfile,
         interrupt_settings: Option<native::NativeInterruptSettings>,
     ) -> VmResult<()> {
-        if let Some(native) = self.native_traces.get(&trace_id)
+        if let Some(native) = self.native_traces.get(trace_id).and_then(Option::as_ref)
             && native.interrupt_settings == interrupt_settings
             && compile_profile_satisfies(native.compile_profile, compile_profile)
             && native.drop_contract_events_enabled == self.drop_contract_events_enabled()
         {
             return Ok(());
         }
-        self.native_traces.remove(&trace_id);
+        if let Some(slot) = self.native_traces.get_mut(trace_id) {
+            *slot = None;
+        }
 
         let program_cache_key = self.ensure_program_cache_key();
         let trace = self.jit.trace_clone(trace_id).ok_or_else(|| {
@@ -723,22 +728,22 @@ impl Vm {
             None
         });
         if let Some(cached) = cached {
-            self.native_traces.insert(
-                trace_id,
-                NativeTrace {
-                    _keepalive: cached.keepalive,
-                    entry: cached.entry,
-                    code: cached.code,
-                    root_ip: trace.root_ip,
-                    terminal: trace.terminal,
-                    has_call: trace.has_call,
-                    has_yielding_call: trace.has_yielding_call,
-                    lowering_kind: cached.lowering_kind,
-                    interrupt_settings,
-                    compile_profile: cached.compile_profile,
-                    drop_contract_events_enabled,
-                },
-            );
+            if self.native_traces.len() <= trace_id {
+                self.native_traces.resize_with(trace_id + 1, || None);
+            }
+            self.native_traces[trace_id] = Some(NativeTrace {
+                _keepalive: cached.keepalive,
+                entry: cached.entry,
+                code: cached.code,
+                root_ip: trace.root_ip,
+                terminal: trace.terminal,
+                has_call: trace.has_call,
+                has_yielding_call: trace.has_yielding_call,
+                lowering_kind: cached.lowering_kind,
+                interrupt_settings,
+                compile_profile: cached.compile_profile,
+                drop_contract_events_enabled,
+            });
             return Ok(());
         }
 
@@ -765,27 +770,27 @@ impl Vm {
             }
             cache.entries.insert(key, cached);
         });
-        self.native_traces.insert(
-            trace_id,
-            NativeTrace {
-                _keepalive: keepalive,
-                entry,
-                code,
-                root_ip: trace.root_ip,
-                terminal: trace.terminal,
-                has_call: trace.has_call,
-                has_yielding_call: trace.has_yielding_call,
-                lowering_kind: compiled.lowering_kind,
-                interrupt_settings,
-                compile_profile,
-                drop_contract_events_enabled,
-            },
-        );
+        if self.native_traces.len() <= trace_id {
+            self.native_traces.resize_with(trace_id + 1, || None);
+        }
+        self.native_traces[trace_id] = Some(NativeTrace {
+            _keepalive: keepalive,
+            entry,
+            code,
+            root_ip: trace.root_ip,
+            terminal: trace.terminal,
+            has_call: trace.has_call,
+            has_yielding_call: trace.has_yielding_call,
+            lowering_kind: compiled.lowering_kind,
+            interrupt_settings,
+            compile_profile,
+            drop_contract_events_enabled,
+        });
         Ok(())
     }
 
     pub fn jit_native_trace_count(&self) -> usize {
-        self.native_traces.len()
+        self.native_traces.iter().flatten().count()
     }
 
     pub fn jit_native_exec_count(&self) -> u64 {
