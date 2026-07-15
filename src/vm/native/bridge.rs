@@ -257,6 +257,14 @@ pub(crate) fn map_get_entry_address() -> usize {
     pd_vm_native_map_get as *const () as usize
 }
 
+pub(crate) fn collection_set_entry_address() -> usize {
+    pd_vm_native_collection_set as *const () as usize
+}
+
+pub(crate) fn array_push_entry_address() -> usize {
+    pd_vm_native_array_push as *const () as usize
+}
+
 pub(crate) fn helper_entry_offset() -> i32 {
     i32::try_from(std::mem::offset_of!(Vm, native_helper_fn))
         .expect("Vm::native_helper_fn offset must fit i32")
@@ -667,6 +675,62 @@ pub(crate) extern "C" fn pd_vm_native_map_get(
     }
     std::mem::forget(entries);
     1
+}
+
+pub(crate) extern "C" fn pd_vm_native_collection_set(
+    dst: *mut Value,
+    container: *mut Value,
+    key: *const Value,
+    value: *const Value,
+) -> i32 {
+    if dst.is_null() || container.is_null() || key.is_null() || value.is_null() {
+        store_bridge_error(VmError::JitNative(
+            "native collection-set helper received null pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    }
+
+    let container = unsafe { std::ptr::replace(container, Value::Null) };
+    let key = unsafe { (&*key).clone() };
+    let value = unsafe { (&*value).clone() };
+    match crate::builtins::runtime::core::builtin_set_owned(container, key, value) {
+        Ok(result) => {
+            let previous = unsafe { std::ptr::replace(dst, result) };
+            drop(previous);
+            STATUS_CONTINUE
+        }
+        Err(err) => {
+            store_bridge_error(err);
+            STATUS_ERROR
+        }
+    }
+}
+
+pub(crate) extern "C" fn pd_vm_native_array_push(
+    dst: *mut Value,
+    array: *mut Value,
+    value: *const Value,
+) -> i32 {
+    if dst.is_null() || array.is_null() || value.is_null() {
+        store_bridge_error(VmError::JitNative(
+            "native array-push helper received null pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    }
+
+    let array = unsafe { std::ptr::replace(array, Value::Null) };
+    let value = unsafe { (&*value).clone() };
+    match crate::builtins::runtime::core::builtin_array_push_owned(array, value) {
+        Ok(result) => {
+            let previous = unsafe { std::ptr::replace(dst, result) };
+            drop(previous);
+            STATUS_CONTINUE
+        }
+        Err(err) => {
+            store_bridge_error(err);
+            STATUS_ERROR
+        }
+    }
 }
 
 pub(crate) extern "C" fn pd_vm_native_step(vm: *mut Vm, op: i64, a: i64, b: i64, c: i64) -> i32 {

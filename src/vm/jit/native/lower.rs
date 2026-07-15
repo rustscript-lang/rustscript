@@ -11,9 +11,10 @@ use crate::vm::native::{
     ExecutableBuffer, HeapIntrinsicAddrs, HeapIntrinsicRefs, NativeInterruptMode,
     NativeInterruptSettings, NativeStackLayout, STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED,
     STATUS_OUT_OF_FUEL, STATUS_TRACE_EXIT, alloc_buffer_signature, alloc_byte_buffer_entry_address,
-    alloc_value_buffer_entry_address, box_heap_value_signature, checked_add_i32,
-    clear_value_slot_entry_address, clone_value_signature, clone_value_to_slot_entry_address,
-    collection_get_signature, collection_predicate_signature, copy_bytes_entry_address,
+    alloc_value_buffer_entry_address, array_push_entry_address, box_heap_value_signature,
+    checked_add_i32, clear_value_slot_entry_address, clone_value_signature,
+    clone_value_to_slot_entry_address, collection_get_signature, collection_mutation_signature,
+    collection_predicate_signature, collection_set_entry_address, copy_bytes_entry_address,
     copy_bytes_signature, detect_native_stack_layout, entry_signature, free_buffer_signature,
     init_null_value_slot_entry_address, jump_with_status, map_get_entry_address,
     map_has_entry_address, pack_shared_signature, restore_sparse_exit_state_entry_address,
@@ -102,6 +103,8 @@ fn try_compile_ssa_trace(
     let copy_bytes_sig = copy_bytes_signature(pointer_type, call_conv);
     let map_has_sig = collection_predicate_signature(pointer_type, call_conv);
     let map_get_sig = collection_get_signature(pointer_type, call_conv);
+    let array_push_sig = collection_get_signature(pointer_type, call_conv);
+    let collection_set_sig = collection_mutation_signature(pointer_type, call_conv);
     let sparse_restore_exit_sig = sparse_restore_exit_signature(pointer_type, call_conv);
     let resume_linked_trace_sig = entry_signature(pointer_type, call_conv);
     let string_contains_sig = string_contains_signature(pointer_type, call_conv);
@@ -157,6 +160,8 @@ fn try_compile_ssa_trace(
             box_heap_value_ref: b.import_signature(box_heap_value_sig),
             map_has_ref: b.import_signature(map_has_sig),
             map_get_ref: b.import_signature(map_get_sig),
+            array_push_ref: b.import_signature(array_push_sig),
+            collection_set_ref: b.import_signature(collection_set_sig),
             sparse_restore_exit_ref: b.import_signature(sparse_restore_exit_sig),
             resume_linked_trace_ref: b.import_signature(resume_linked_trace_sig),
         };
@@ -167,6 +172,8 @@ fn try_compile_ssa_trace(
             box_heap_value: write_heap_value_to_slot_entry_address(),
             map_has: map_has_entry_address(),
             map_get: map_get_entry_address(),
+            array_push: array_push_entry_address(),
+            collection_set: collection_set_entry_address(),
             sparse_restore_exit: restore_sparse_exit_state_entry_address(),
             resume_linked_trace: resume_linked_trace_entry_address(),
         };
@@ -408,6 +415,8 @@ struct SsaDeoptHelperRefs {
     box_heap_value_ref: cranelift_codegen::ir::SigRef,
     map_has_ref: cranelift_codegen::ir::SigRef,
     map_get_ref: cranelift_codegen::ir::SigRef,
+    array_push_ref: cranelift_codegen::ir::SigRef,
+    collection_set_ref: cranelift_codegen::ir::SigRef,
     sparse_restore_exit_ref: cranelift_codegen::ir::SigRef,
     resume_linked_trace_ref: cranelift_codegen::ir::SigRef,
 }
@@ -420,6 +429,8 @@ struct SsaDeoptHelperAddrs {
     box_heap_value: usize,
     map_has: usize,
     map_get: usize,
+    array_push: usize,
+    collection_set: usize,
     sparse_restore_exit: usize,
     resume_linked_trace: usize,
 }
@@ -444,6 +455,7 @@ struct SsaStringHelperAddrs {
 enum SsaTempValueSlotKey {
     Output(SsaValueId),
     MapKeyBox(SsaValueId),
+    MutationArgBox(SsaValueId, u8),
 }
 
 #[derive(Clone)]
@@ -527,9 +539,12 @@ fn ssa_trace_supported(ssa: &SsaTrace) -> bool {
                     | SsaInstKind::ArrayLen { .. }
                     | SsaInstKind::ArrayGet { .. }
                     | SsaInstKind::ArrayHas { .. }
+                    | SsaInstKind::ArraySet { .. }
+                    | SsaInstKind::ArrayPush { .. }
                     | SsaInstKind::MapLen { .. }
                     | SsaInstKind::MapGet { .. }
                     | SsaInstKind::MapHas { .. }
+                    | SsaInstKind::MapSet { .. }
                     | SsaInstKind::IntNeg { .. }
                     | SsaInstKind::IntAdd { .. }
                     | SsaInstKind::IntAddImm { .. }
@@ -655,6 +670,18 @@ fn allocate_owned_value_temps(
                 ordered.push(slot);
                 slots.insert(SsaTempValueSlotKey::MapKeyBox(output.id), slot);
             }
+            if matches!(
+                inst.kind,
+                SsaInstKind::ArraySet { .. }
+                    | SsaInstKind::ArrayPush { .. }
+                    | SsaInstKind::MapSet { .. }
+            ) {
+                for arg in 0..2 {
+                    let slot = ssa_create_value_stack_slot(b, value_size)?;
+                    ordered.push(slot);
+                    slots.insert(SsaTempValueSlotKey::MutationArgBox(output.id, arg), slot);
+                }
+            }
         }
     }
     Ok(SsaOwnedValueTemps { ordered, slots })
@@ -664,7 +691,10 @@ fn ssa_inst_requires_owned_value_slot(kind: &SsaInstKind) -> bool {
     matches!(
         kind,
         SsaInstKind::ArrayGet { .. }
+            | SsaInstKind::ArraySet { .. }
+            | SsaInstKind::ArrayPush { .. }
             | SsaInstKind::MapGet { .. }
+            | SsaInstKind::MapSet { .. }
             | SsaInstKind::StringSlice { .. }
             | SsaInstKind::BytesSlice { .. }
             | SsaInstKind::StringGet { .. }
@@ -1905,6 +1935,127 @@ fn lower_ssa_inst(
             );
             ssa_index_in_range(b, index, len)
         }
+        SsaInstKind::ArraySet {
+            array,
+            index,
+            value,
+        } => {
+            let out = owned_value_temp_slot_addr(
+                b,
+                pointer_type,
+                owned_value_temps,
+                SsaTempValueSlotKey::Output(output.id),
+            )?;
+            let index_box = owned_value_temp_slot_addr(
+                b,
+                pointer_type,
+                owned_value_temps,
+                SsaTempValueSlotKey::MutationArgBox(output.id, 0),
+            )?;
+            let index_addr = ssa_ensure_boxed_value_addr(
+                b,
+                SsaBoxCtx {
+                    exit_block,
+                    pointer_type,
+                    value_layout: layout.value,
+                    helper_refs,
+                    helper_addrs,
+                },
+                Some(index_box),
+                *value_reprs.get(index).ok_or_else(|| {
+                    VmError::JitNative("SSA array-set index representation missing".to_string())
+                })?,
+                values[index],
+            )?;
+            let value_box = owned_value_temp_slot_addr(
+                b,
+                pointer_type,
+                owned_value_temps,
+                SsaTempValueSlotKey::MutationArgBox(output.id, 1),
+            )?;
+            let value_addr = ssa_ensure_boxed_value_addr(
+                b,
+                SsaBoxCtx {
+                    exit_block,
+                    pointer_type,
+                    value_layout: layout.value,
+                    helper_refs,
+                    helper_addrs,
+                },
+                Some(value_box),
+                *value_reprs.get(value).ok_or_else(|| {
+                    VmError::JitNative("SSA array-set value representation missing".to_string())
+                })?,
+                values[value],
+            )?;
+            let helper_ptr = iconst_ptr_from_addr(b, pointer_type, helper_addrs.collection_set)?;
+            let call = b.ins().call_indirect(
+                helper_refs.collection_set_ref,
+                helper_ptr,
+                &[out, values[array], index_addr, value_addr],
+            );
+            let status = b.inst_results(call)[0];
+            let fail = b.create_block();
+            let cont = b.create_block();
+            let is_error = b
+                .ins()
+                .icmp_imm(IntCC::Equal, status, i64::from(STATUS_ERROR));
+            b.ins().brif(is_error, fail, &[], cont, &[]);
+
+            b.switch_to_block(fail);
+            jump_with_status(b, exit_block, status);
+
+            b.switch_to_block(cont);
+            out
+        }
+        SsaInstKind::ArrayPush { array, value } => {
+            let out = owned_value_temp_slot_addr(
+                b,
+                pointer_type,
+                owned_value_temps,
+                SsaTempValueSlotKey::Output(output.id),
+            )?;
+            let value_box = owned_value_temp_slot_addr(
+                b,
+                pointer_type,
+                owned_value_temps,
+                SsaTempValueSlotKey::MutationArgBox(output.id, 0),
+            )?;
+            let value_addr = ssa_ensure_boxed_value_addr(
+                b,
+                SsaBoxCtx {
+                    exit_block,
+                    pointer_type,
+                    value_layout: layout.value,
+                    helper_refs,
+                    helper_addrs,
+                },
+                Some(value_box),
+                *value_reprs.get(value).ok_or_else(|| {
+                    VmError::JitNative("SSA array-push value representation missing".to_string())
+                })?,
+                values[value],
+            )?;
+            let helper_ptr = iconst_ptr_from_addr(b, pointer_type, helper_addrs.array_push)?;
+            let call = b.ins().call_indirect(
+                helper_refs.array_push_ref,
+                helper_ptr,
+                &[out, values[array], value_addr],
+            );
+            let status = b.inst_results(call)[0];
+            let fail = b.create_block();
+            let cont = b.create_block();
+            let is_error = b
+                .ins()
+                .icmp_imm(IntCC::Equal, status, i64::from(STATUS_ERROR));
+            b.ins().brif(is_error, fail, &[], cont, &[]);
+
+            b.switch_to_block(fail);
+            jump_with_status(b, exit_block, status);
+
+            b.switch_to_block(cont);
+            out
+        }
         SsaInstKind::MapLen { map } => {
             let map_ptr = ssa_load_heap_data_ptr(b, layout.value, values[map]);
             b.ins().load(
@@ -2021,6 +2172,75 @@ fn lower_ssa_inst(
 
             b.switch_to_block(cont);
             b.ins().icmp_imm(IntCC::NotEqual, status, 0)
+        }
+        SsaInstKind::MapSet { map, key, value } => {
+            let out = owned_value_temp_slot_addr(
+                b,
+                pointer_type,
+                owned_value_temps,
+                SsaTempValueSlotKey::Output(output.id),
+            )?;
+            let key_box = owned_value_temp_slot_addr(
+                b,
+                pointer_type,
+                owned_value_temps,
+                SsaTempValueSlotKey::MutationArgBox(output.id, 0),
+            )?;
+            let key_addr = ssa_ensure_boxed_value_addr(
+                b,
+                SsaBoxCtx {
+                    exit_block,
+                    pointer_type,
+                    value_layout: layout.value,
+                    helper_refs,
+                    helper_addrs,
+                },
+                Some(key_box),
+                *value_reprs.get(key).ok_or_else(|| {
+                    VmError::JitNative("SSA map-set key representation missing".to_string())
+                })?,
+                values[key],
+            )?;
+            let value_box = owned_value_temp_slot_addr(
+                b,
+                pointer_type,
+                owned_value_temps,
+                SsaTempValueSlotKey::MutationArgBox(output.id, 1),
+            )?;
+            let value_addr = ssa_ensure_boxed_value_addr(
+                b,
+                SsaBoxCtx {
+                    exit_block,
+                    pointer_type,
+                    value_layout: layout.value,
+                    helper_refs,
+                    helper_addrs,
+                },
+                Some(value_box),
+                *value_reprs.get(value).ok_or_else(|| {
+                    VmError::JitNative("SSA map-set value representation missing".to_string())
+                })?,
+                values[value],
+            )?;
+            let helper_ptr = iconst_ptr_from_addr(b, pointer_type, helper_addrs.collection_set)?;
+            let call = b.ins().call_indirect(
+                helper_refs.collection_set_ref,
+                helper_ptr,
+                &[out, values[map], key_addr, value_addr],
+            );
+            let status = b.inst_results(call)[0];
+            let fail = b.create_block();
+            let cont = b.create_block();
+            let is_error = b
+                .ins()
+                .icmp_imm(IntCC::Equal, status, i64::from(STATUS_ERROR));
+            b.ins().brif(is_error, fail, &[], cont, &[]);
+
+            b.switch_to_block(fail);
+            jump_with_status(b, exit_block, status);
+
+            b.switch_to_block(cont);
+            out
         }
         SsaInstKind::IntNeg { input } => b.ins().ineg(values[input]),
         SsaInstKind::IntAdd { lhs, rhs } => b.ins().iadd(values[lhs], values[rhs]),
