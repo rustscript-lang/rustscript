@@ -1,6 +1,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 use common::*;
+use vm::disassemble_program;
 
 struct BoundRuntimeCase<'a> {
     case: RuntimeCase<'a>,
@@ -75,6 +76,49 @@ fn assert_builtin_namespace_stays_builtin(
 
     let _ = std::fs::remove_file(main_path);
     let _ = std::fs::remove_dir(root);
+}
+
+#[test]
+fn collection_local_assignment_uses_specialized_bytecode() {
+    let array_compiled = compile_source(
+        r#"
+            let mut values = [10, 20, 30];
+            values[1] = values[2];
+            values[1];
+        "#,
+    )
+    .expect("array assignment should compile");
+    let array_listing = disassemble_program(&array_compiled.program);
+    assert!(
+        array_listing.contains("array_set_local "),
+        "expected array local lowering:\n{array_listing}"
+    );
+    let mut array_vm = Vm::new(array_compiled.program);
+    assert_eq!(
+        array_vm.run().expect("array program should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(array_vm.stack(), &[Value::Int(30)]);
+
+    let map_compiled = compile_source(
+        r#"
+            let mut values = { };
+            values.key = 7;
+            values.key;
+        "#,
+    )
+    .expect("map assignment should compile");
+    let map_listing = disassemble_program(&map_compiled.program);
+    assert!(
+        map_listing.contains("map_set_local "),
+        "expected map local lowering:\n{map_listing}"
+    );
+    let mut map_vm = Vm::new(map_compiled.program);
+    assert_eq!(
+        map_vm.run().expect("map program should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(map_vm.stack(), &[Value::Int(7)]);
 }
 
 #[test]

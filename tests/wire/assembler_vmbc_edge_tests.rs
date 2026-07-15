@@ -220,6 +220,25 @@ fn validate_rejects_truncated_operands_for_ldc_call_and_branches() {
 }
 
 #[test]
+fn validate_rejects_truncated_collection_local_operands() {
+    for opcode in [
+        OpCode::ArraySetLocal,
+        OpCode::ArrayPushLocal,
+        OpCode::MapSetLocal,
+    ] {
+        let program = Program::new(vec![], vec![opcode as u8]);
+        assert!(matches!(
+            validate_program(&program, 0),
+            Err(ValidationError::TruncatedOperand {
+                opcode: actual,
+                expected_bytes: 1,
+                ..
+            }) if actual == opcode as u8
+        ));
+    }
+}
+
+#[test]
 fn validate_rejects_builtin_call_arity_mismatch() {
     let mut program = compile_source(
         r#"

@@ -293,6 +293,21 @@ impl Assembler {
         self.emit_u8(index);
     }
 
+    pub fn array_set_local(&mut self, index: u8) {
+        self.emit_opcode(OpCode::ArraySetLocal);
+        self.emit_u8(index);
+    }
+
+    pub fn array_push_local(&mut self, index: u8) {
+        self.emit_opcode(OpCode::ArrayPushLocal);
+        self.emit_u8(index);
+    }
+
+    pub fn map_set_local(&mut self, index: u8) {
+        self.emit_opcode(OpCode::MapSetLocal);
+        self.emit_u8(index);
+    }
+
     pub fn call(&mut self, index: u16, argc: u8) {
         self.emit_opcode(OpCode::Call);
         self.emit_u16(index);
@@ -433,6 +448,21 @@ impl BytecodeBuilder {
 
     pub fn stloc(&mut self, index: u8) {
         self.emit_opcode(OpCode::Stloc);
+        self.emit_u8(index);
+    }
+
+    pub fn array_set_local(&mut self, index: u8) {
+        self.emit_opcode(OpCode::ArraySetLocal);
+        self.emit_u8(index);
+    }
+
+    pub fn array_push_local(&mut self, index: u8) {
+        self.emit_opcode(OpCode::ArrayPushLocal);
+        self.emit_u8(index);
+    }
+
+    pub fn map_set_local(&mut self, index: u8) {
+        self.emit_opcode(OpCode::MapSetLocal);
         self.emit_u8(index);
     }
 
@@ -728,6 +758,23 @@ pub fn assemble(source: &str) -> Result<Program, AsmParseError> {
                     })?
                 };
                 assembler.stloc(index);
+            }
+            OpCode::ArraySetLocal | OpCode::ArrayPushLocal | OpCode::MapSetLocal => {
+                let token = next_token(&mut parts, line_no, "local index")?;
+                let index = if let Ok(value) = token.parse::<u8>() {
+                    value
+                } else {
+                    *locals.get(token).ok_or(AsmParseError {
+                        line: line_no,
+                        message: format!("unknown local '{token}'"),
+                    })?
+                };
+                match opcode {
+                    OpCode::ArraySetLocal => assembler.array_set_local(index),
+                    OpCode::ArrayPushLocal => assembler.array_push_local(index),
+                    OpCode::MapSetLocal => assembler.map_set_local(index),
+                    _ => unreachable!(),
+                }
             }
             OpCode::Call => {
                 let index = parse_u16(next_token(&mut parts, line_no, "call id")?, line_no)?;

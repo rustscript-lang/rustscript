@@ -407,6 +407,20 @@ pub fn disassemble_program_with_options(program: &Program, options: DisassembleO
                     truncated = true;
                 }
             }
+            x if x == OpCode::ArraySetLocal as u8
+                || x == OpCode::ArrayPushLocal as u8
+                || x == OpCode::MapSetLocal as u8 =>
+            {
+                let mnemonic = OpCode::try_from(x)
+                    .expect("matched collection-local opcode")
+                    .mnemonic();
+                if let Some(index) = read_u8(code, &mut ip) {
+                    instruction.push_str(&format!("{mnemonic} {index}"));
+                } else {
+                    instruction.push_str(&format!("{mnemonic} <truncated>"));
+                    truncated = true;
+                }
+            }
             x if x == OpCode::Call as u8 => {
                 if let Some(index) = read_u16(code, &mut ip) {
                     if let Some(argc) = read_u8(code, &mut ip) {
@@ -537,7 +551,12 @@ fn analyze_program(
                 })?;
                 jump_targets.push((start, target));
             }
-            x if x == OpCode::Ldloc as u8 || x == OpCode::Stloc as u8 => {
+            x if x == OpCode::Ldloc as u8
+                || x == OpCode::Stloc as u8
+                || x == OpCode::ArraySetLocal as u8
+                || x == OpCode::ArrayPushLocal as u8
+                || x == OpCode::MapSetLocal as u8 =>
+            {
                 let index = read_u8(code, &mut ip).ok_or(ValidationError::TruncatedOperand {
                     offset: start,
                     opcode,
