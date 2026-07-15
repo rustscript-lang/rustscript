@@ -249,8 +249,8 @@ impl TraceJitEngine {
         if let Some(trace_id) = self.compiled_trace_for_key(key) {
             return Some(trace_id);
         }
-        if (!self.blocked_entries.is_empty() && self.blocked_entries.contains(&key))
-            || !self.is_loop_header(program, ip)
+        if !self.is_loop_header(program, ip)
+            || (!self.blocked_entries.is_empty() && self.blocked_entries.contains(&key))
         {
             return None;
         }
