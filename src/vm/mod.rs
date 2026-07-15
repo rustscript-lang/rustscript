@@ -1352,6 +1352,7 @@ impl Vm {
         allow_jit: bool,
     ) -> VmResult<VmStatus> {
         self.ensure_call_bindings()?;
+        self.sync_jit_non_yielding_host_imports();
         if let Some(waiting) = self.waiting_host_op {
             self.last_yield_reason = None;
             let status = VmStatus::Waiting(waiting.op_id);

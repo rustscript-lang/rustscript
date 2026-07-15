@@ -1,6 +1,6 @@
 use vm::{
-    BytecodeBuilder, CallOutcome, HostFunction, JitConfig, JitTraceTerminal, OpCode, Program,
-    Value, ValueType, Vm, VmStatus, VmYieldReason, builtin_call_index, compile_source,
+    BytecodeBuilder, CallOutcome, CallReturn, HostFunction, JitConfig, JitTraceTerminal, OpCode,
+    Program, Value, ValueType, Vm, VmStatus, VmYieldReason, builtin_call_index, compile_source,
     disassemble_program,
 };
 
@@ -1720,6 +1720,58 @@ fn trace_jit_supports_host_call_loops_with_branch_exit_traces() {
             "host call loop traces should terminate through branch exits, dump:\n{dump}"
         );
     }
+}
+
+fn increment_non_yielding(args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+    let Value::Int(value) = args[0] else {
+        return Err(vm::VmError::TypeMismatch("int"));
+    };
+    Ok(CallOutcome::Return(CallReturn::one(Value::Int(value + 1))))
+}
+
+#[test]
+fn trace_jit_keeps_non_yielding_static_args_calls_inside_loop_trace() {
+    if !native_jit_supported() {
+        return;
+    }
+    let compiled = compile_source(
+        r#"
+            fn increment(value) -> int;
+            let mut i = 0;
+            while i < 100 {
+                i = increment(i);
+            }
+            i;
+        "#,
+    )
+    .expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    vm.bind_static_non_yielding_args_function("increment", increment_non_yielding);
+
+    let status = vm.run();
+    assert!(
+        status.is_ok(),
+        "vm should run: {status:?}\n{}",
+        vm.dump_jit_info()
+    );
+    assert_eq!(status.unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(100)]);
+    let snapshot = vm.jit_snapshot();
+    assert!(
+        snapshot.traces.iter().any(|trace| {
+            trace.terminal == JitTraceTerminal::LoopBack
+                && trace.op_names().iter().any(|op| op == "host_call")
+                && trace.ssa_text().contains("host_call")
+        }),
+        "non-yielding call should remain inside a loop-back trace, dump:\n{}",
+        vm.dump_jit_info()
+    );
+    assert!(vm.jit_native_exec_count() > 0);
 }
 
 #[test]

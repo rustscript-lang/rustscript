@@ -429,6 +429,7 @@ pub(super) enum VmHostFunction {
     StackStatic(StaticHostStackFunction),
     ArgsDynamic(Box<dyn HostArgsFunction>),
     ArgsStatic(StaticHostArgsFunction),
+    ArgsStaticNonYielding(StaticHostArgsFunction),
 }
 
 pub(super) enum HostCallExecOutcome {
@@ -511,6 +512,20 @@ impl Vm {
         let index = self.host_functions.len() as u16;
         self.host_functions
             .push(VmHostFunction::ArgsStatic(function));
+        self.resolved_calls_dirty = true;
+        index
+    }
+
+    /// Registers a static args-only host function that always returns synchronously.
+    ///
+    /// Violating this contract by returning `Halt`, `Yield`, or `Pending` is a host error.
+    pub fn register_static_non_yielding_args_function(
+        &mut self,
+        function: StaticHostArgsFunction,
+    ) -> u16 {
+        let index = self.host_functions.len() as u16;
+        self.host_functions
+            .push(VmHostFunction::ArgsStaticNonYielding(function));
         self.resolved_calls_dirty = true;
         index
     }
@@ -646,6 +661,37 @@ impl Vm {
         }
 
         let index = self.register_static_args_function(function);
+        self.host_function_symbols.insert(name, index);
+        self.resolved_calls_dirty = true;
+    }
+
+    /// Binds a static args-only host function that always returns synchronously.
+    ///
+    /// This is equivalent to [`Vm::bind_static_args_function`] except that the VM may keep
+    /// native JIT traces active across the call boundary. Returning `Halt`, `Yield`, or
+    /// `Pending` violates the contract and is reported as a host error.
+    pub fn bind_static_non_yielding_args_function(
+        &mut self,
+        name: impl Into<String>,
+        function: StaticHostArgsFunction,
+    ) {
+        let name = name.into();
+        if let Some(builtin) = builtin_for_binding_name(&name) {
+            self.bind_builtin_overrideslot(
+                builtin.call_index(),
+                VmHostFunction::ArgsStaticNonYielding(function),
+            );
+            return;
+        }
+        if let Some(&index) = self.host_function_symbols.get(&name)
+            && let Some(slot) = self.host_functions.get_mut(index as usize)
+        {
+            *slot = VmHostFunction::ArgsStaticNonYielding(function);
+            self.resolved_calls_dirty = true;
+            return;
+        }
+
+        let index = self.register_static_non_yielding_args_function(function);
         self.host_function_symbols.insert(name, index);
         self.resolved_calls_dirty = true;
     }
@@ -1295,7 +1341,8 @@ impl Vm {
                 VmHostFunction::StackDynamic(_)
                 | VmHostFunction::StackStatic(_)
                 | VmHostFunction::ArgsDynamic(_)
-                | VmHostFunction::ArgsStatic(_) => unreachable!(),
+                | VmHostFunction::ArgsStatic(_)
+                | VmHostFunction::ArgsStaticNonYielding(_) => unreachable!(),
             }
         };
         self.call_depth = self.call_depth.saturating_sub(1);
@@ -1350,7 +1397,9 @@ impl Vm {
             .ok_or(VmError::InvalidCall(resolved_index))?;
         Ok(matches!(
             function,
-            VmHostFunction::ArgsDynamic(_) | VmHostFunction::ArgsStatic(_)
+            VmHostFunction::ArgsDynamic(_)
+                | VmHostFunction::ArgsStatic(_)
+                | VmHostFunction::ArgsStaticNonYielding(_)
         ))
     }
 
@@ -1385,7 +1434,8 @@ impl Vm {
                 .ok_or(VmError::InvalidCall(resolved_index))?;
             match function {
                 VmHostFunction::ArgsDynamic(function) => function.call(args),
-                VmHostFunction::ArgsStatic(function) => function(args),
+                VmHostFunction::ArgsStatic(function)
+                | VmHostFunction::ArgsStaticNonYielding(function) => function(args),
                 VmHostFunction::Dynamic(_)
                 | VmHostFunction::Static(_)
                 | VmHostFunction::StackDynamic(_)
@@ -1446,7 +1496,8 @@ impl Vm {
                 VmHostFunction::Dynamic(_)
                 | VmHostFunction::Static(_)
                 | VmHostFunction::ArgsDynamic(_)
-                | VmHostFunction::ArgsStatic(_) => unreachable!(),
+                | VmHostFunction::ArgsStatic(_)
+                | VmHostFunction::ArgsStaticNonYielding(_) => unreachable!(),
             }
         };
         self.call_depth = self.call_depth.saturating_sub(1);
@@ -1586,6 +1637,22 @@ impl Vm {
         self.resolved_calls = resolved;
         self.resolved_calls_dirty = false;
         Ok(())
+    }
+
+    pub(super) fn sync_jit_non_yielding_host_imports(&mut self) {
+        let imports = self
+            .resolved_calls
+            .iter()
+            .map(|&slot| {
+                matches!(
+                    self.host_functions.get(usize::from(slot)),
+                    Some(VmHostFunction::ArgsStaticNonYielding(_))
+                )
+            })
+            .collect();
+        if self.jit.set_non_yielding_host_imports(imports) {
+            self.native_traces.clear();
+        }
     }
 
     pub(super) fn resolve_call_target(&mut self, index: u16, argc: u8) -> VmResult<u16> {

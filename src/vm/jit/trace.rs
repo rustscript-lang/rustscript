@@ -176,6 +176,7 @@ pub struct TraceJitEngine {
     compiled_by_ip: Vec<Vec<(usize, usize)>>,
     blocked_entries: HashSet<TraceEntryKey>,
     loop_headers: Option<Vec<bool>>,
+    non_yielding_host_imports: Vec<bool>,
     traces: Vec<JitTrace>,
     attempts: Vec<JitAttempt>,
 }
@@ -194,6 +195,7 @@ impl TraceJitEngine {
             compiled_by_ip: Vec::new(),
             blocked_entries: HashSet::new(),
             loop_headers: None,
+            non_yielding_host_imports: Vec::new(),
             traces: Vec::new(),
             attempts: Vec::new(),
         }
@@ -211,6 +213,20 @@ impl TraceJitEngine {
         self.loop_headers = None;
         self.traces.clear();
         self.attempts.clear();
+    }
+
+    pub(crate) fn set_non_yielding_host_imports(&mut self, imports: Vec<bool>) -> bool {
+        if self.non_yielding_host_imports == imports {
+            return false;
+        }
+        self.non_yielding_host_imports = imports;
+        self.hot_counts.clear();
+        self.compiled_by_ip.clear();
+        self.blocked_entries.clear();
+        self.loop_headers = None;
+        self.traces.clear();
+        self.attempts.clear();
+        true
     }
 
     pub fn observe_hot_ip(&mut self, ip: usize, program: &Program) -> Option<usize> {
@@ -478,6 +494,7 @@ impl TraceJitEngine {
             key.root_ip,
             key.stack_depth,
             self.config.max_trace_len,
+            &self.non_yielding_host_imports,
         )
         .map_err(to_nyi)?;
         let id = self.traces.len();

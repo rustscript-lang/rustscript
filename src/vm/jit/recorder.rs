@@ -353,6 +353,7 @@ enum DecodedOp {
     },
     Call {
         ip: usize,
+        index: u16,
         builtin: Option<BuiltinFunction>,
         argc: u8,
         yields: bool,
@@ -636,6 +637,7 @@ impl<'a> TraceCursor<'a> {
                 }
                 DecodedOp::Call {
                     ip: instr_ip,
+                    index,
                     builtin: Some(builtin),
                     argc,
                     yields: false,
@@ -643,6 +645,7 @@ impl<'a> TraceCursor<'a> {
             } else {
                 DecodedOp::Call {
                     ip: instr_ip,
+                    index,
                     builtin: None,
                     argc,
                     yields: true,
@@ -661,9 +664,15 @@ pub(crate) fn record_trace(
     root_ip: usize,
     entry_stack_depth: usize,
     max_trace_len: usize,
+    non_yielding_host_imports: &[bool],
 ) -> Result<RecordedTrace, TraceRecordError> {
-    let loop_header_plan =
-        infer_loop_header_plan(program, root_ip, entry_stack_depth, max_trace_len)?;
+    let loop_header_plan = infer_loop_header_plan(
+        program,
+        root_ip,
+        entry_stack_depth,
+        max_trace_len,
+        non_yielding_host_imports,
+    )?;
     let mut builder = SsaTraceBuilder::new(root_ip, entry_stack_depth);
     let entry = builder.entry();
 
@@ -1096,6 +1105,7 @@ pub(crate) fn record_trace(
             }
             DecodedOp::Call {
                 ip,
+                index,
                 builtin,
                 argc,
                 yields,
@@ -1132,6 +1142,44 @@ pub(crate) fn record_trace(
                         has_useful_native_computation = true;
                         continue;
                     }
+                }
+                if builtin.is_none()
+                    && non_yielding_host_imports
+                        .get(usize::from(index))
+                        .copied()
+                        .unwrap_or(false)
+                {
+                    let args = call_arg_slice(&frame.stack, usize::from(argc))?
+                        .iter()
+                        .map(|arg| arg.value.id)
+                        .collect::<Vec<_>>();
+                    for _ in 0..argc {
+                        let _ = frame.pop()?;
+                    }
+                    let return_type = program
+                        .imports
+                        .get(usize::from(index))
+                        .map(|import| import.return_type)
+                        .unwrap_or(ValueType::Unknown);
+                    let value = builder
+                        .append_value_inst(
+                            current_block,
+                            ip,
+                            SsaValueRepr::Tagged,
+                            SsaInstKind::HostCall {
+                                import: index,
+                                args,
+                            },
+                        )
+                        .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+                    frame.push(SymbolicValue {
+                        value,
+                        info: ValueInfo::tagged_typed(return_type),
+                    });
+                    has_call = true;
+                    op_names.push("host_call".to_string());
+                    has_useful_native_computation = true;
+                    continue;
                 }
                 if !has_useful_native_computation {
                     return Err(TraceRecordError::UnsupportedTrace(
@@ -1176,6 +1224,7 @@ fn infer_loop_header_plan(
     root_ip: usize,
     entry_stack_depth: usize,
     max_trace_len: usize,
+    non_yielding_host_imports: &[bool],
 ) -> Result<Option<LoopHeaderPlan>, TraceRecordError> {
     let mut cursor = TraceCursor::new(program, root_ip, max_trace_len);
     let mut frame = AnalysisFrame::new(program, entry_stack_depth);
@@ -1314,6 +1363,26 @@ fn infer_loop_header_plan(
                     return Ok(None);
                 };
                 let _ = analyze_specialized_builtin_call(&mut frame, kind)?;
+            }
+            DecodedOp::Call {
+                index,
+                builtin: None,
+                argc,
+                ..
+            } if non_yielding_host_imports
+                .get(usize::from(index))
+                .copied()
+                .unwrap_or(false) =>
+            {
+                for _ in 0..argc {
+                    let _ = frame.pop()?;
+                }
+                let return_type = program
+                    .imports
+                    .get(usize::from(index))
+                    .map(|import| import.return_type)
+                    .unwrap_or(ValueType::Unknown);
+                frame.push(ValueInfo::tagged_typed(return_type));
             }
             DecodedOp::Call { .. } => return Ok(None),
             DecodedOp::Brfalse {
@@ -4101,7 +4170,7 @@ mod tests {
         bc.ret();
         let program = Program::new(vec![Value::Int(1)], bc.finish()).with_local_count(1);
 
-        let recorded = record_trace(&program, 0, 0, 32).expect("recorded trace");
+        let recorded = record_trace(&program, 0, 0, 32, &[]).expect("recorded trace");
         assert_eq!(recorded.terminal, JitTraceTerminal::Halt);
         assert!(recorded.op_names.iter().any(|name| name == "iadd_imm"));
         assert!(matches!(
@@ -4121,7 +4190,7 @@ mod tests {
         bc.ret();
         let program = Program::new(Vec::new(), bc.finish()).with_local_count(2);
 
-        let recorded = record_trace(&program, 0, 0, 16).expect("recorded trace");
+        let recorded = record_trace(&program, 0, 0, 16, &[]).expect("recorded trace");
 
         assert_eq!(recorded.ssa.exits[0].dirty_locals, vec![false, false]);
         assert!(recorded.ssa.render_text().contains("dirty_locals=[]"));
@@ -4135,7 +4204,7 @@ mod tests {
         bc.ret();
         let program = Program::new(vec![Value::Int(7)], bc.finish()).with_local_count(4);
 
-        let recorded = record_trace(&program, 0, 0, 16).expect("recorded trace");
+        let recorded = record_trace(&program, 0, 0, 16, &[]).expect("recorded trace");
 
         assert_eq!(
             recorded.ssa.exits[0].dirty_locals,
@@ -4162,7 +4231,7 @@ mod tests {
         patch_branch_target(&mut code, guard_ip, exit_ip);
         let program = Program::new(vec![Value::Int(5), Value::Int(10)], code).with_local_count(2);
 
-        let recorded = record_trace(&program, 0, 0, 32).expect("recorded trace");
+        let recorded = record_trace(&program, 0, 0, 32, &[]).expect("recorded trace");
 
         assert_eq!(recorded.ssa.exits.len(), 2);
         assert_eq!(recorded.ssa.exits[0].dirty_locals, vec![false, true]);
@@ -4192,7 +4261,8 @@ mod tests {
         let program = Program::new(vec![Value::Int(0), Value::Int(1), Value::Int(4)], code)
             .with_local_count(1);
 
-        let recorded = record_trace(&program, root_ip as usize, 0, 64).expect("recorded trace");
+        let recorded =
+            record_trace(&program, root_ip as usize, 0, 64, &[]).expect("recorded trace");
         assert_eq!(recorded.terminal, JitTraceTerminal::BranchExit);
         assert!(recorded.op_names.iter().any(|name| name == "loop_if_false"));
         assert_eq!(recorded.ssa.blocks.len(), 2);
@@ -4232,7 +4302,8 @@ mod tests {
         let program = Program::new(vec![Value::Int(1), Value::Int(10), Value::Int(3)], code)
             .with_local_count(2);
 
-        let recorded = record_trace(&program, root_ip as usize, 0, 128).expect("recorded trace");
+        let recorded =
+            record_trace(&program, root_ip as usize, 0, 128, &[]).expect("recorded trace");
         assert_eq!(recorded.terminal, JitTraceTerminal::BranchExit);
         assert_eq!(recorded.ssa.exits.len(), 2);
         for exit in &recorded.ssa.exits {
@@ -4271,7 +4342,8 @@ mod tests {
         let program = Program::new(vec![Value::Int(0), Value::Int(6), Value::Int(1)], code)
             .with_local_count(2);
 
-        let recorded = record_trace(&program, root_ip as usize, 0, 128).expect("recorded trace");
+        let recorded =
+            record_trace(&program, root_ip as usize, 0, 128, &[]).expect("recorded trace");
         assert_eq!(recorded.terminal, JitTraceTerminal::LoopBack);
         assert!(recorded.op_names.iter().any(|name| name == "guard_false"));
         assert!(recorded.op_names.iter().any(|name| name == "jump_root"));

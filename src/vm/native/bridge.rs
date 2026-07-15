@@ -1,7 +1,10 @@
 #![allow(dead_code)]
 use crate::builtins::BuiltinFunction;
 use crate::bytecode::{Value, ValueType, VmMap};
-use crate::vm::{HostCallExecOutcome, NumericValue, Vm, VmError, VmResult, logical_shr_i64};
+use crate::vm::{
+    CallOutcome, CallReturn, HostCallExecOutcome, NumericValue, Vm, VmError, VmHostFunction,
+    VmResult, logical_shr_i64,
+};
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
@@ -275,6 +278,10 @@ pub(crate) fn collection_set_entry_address() -> usize {
 
 pub(crate) fn array_push_entry_address() -> usize {
     pd_vm_native_array_push as *const () as usize
+}
+
+pub(crate) fn non_yielding_host_call_entry_address() -> usize {
+    pd_vm_native_non_yielding_host_call as *const () as usize
 }
 
 pub(crate) fn helper_entry_offset() -> i32 {
@@ -794,6 +801,68 @@ pub(crate) extern "C" fn pd_vm_native_array_push(
             let previous = unsafe { std::ptr::replace(dst, result) };
             drop(previous);
             STATUS_CONTINUE
+        }
+        Err(err) => {
+            store_bridge_error(err);
+            STATUS_ERROR
+        }
+    }
+}
+
+pub(crate) extern "C" fn pd_vm_native_non_yielding_host_call(
+    vm: *mut Vm,
+    import: usize,
+    args: *const Value,
+    argc: usize,
+    out: *mut Value,
+) -> i32 {
+    const MAX_ARGS: usize = u8::MAX as usize;
+    let Some(vm) = (unsafe { vm.as_mut() }) else {
+        store_bridge_error(VmError::JitNative(
+            "native host-call helper received null vm pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    };
+    if out.is_null() || (argc != 0 && args.is_null()) || argc > MAX_ARGS {
+        store_bridge_error(VmError::JitNative(
+            "native host-call helper received invalid argument storage".to_string(),
+        ));
+        return STATUS_ERROR;
+    }
+    let Some(&resolved) = vm.resolved_calls.get(import) else {
+        store_bridge_error(VmError::InvalidCall(import as u16));
+        return STATUS_ERROR;
+    };
+    let Some(VmHostFunction::ArgsStaticNonYielding(function)) =
+        vm.host_functions.get(usize::from(resolved))
+    else {
+        store_bridge_error(VmError::JitNative(
+            "native host-call binding changed after trace compilation".to_string(),
+        ));
+        return STATUS_ERROR;
+    };
+
+    let args = unsafe { std::slice::from_raw_parts(args, argc) };
+    vm.call_depth = vm.call_depth.saturating_add(1);
+    let outcome = function(args);
+    vm.call_depth = vm.call_depth.saturating_sub(1);
+    match outcome {
+        Ok(CallOutcome::Return(CallReturn::One(value))) => {
+            unsafe { std::ptr::write(out, value) };
+            STATUS_CONTINUE
+        }
+        Ok(CallOutcome::Return(CallReturn::None)) => {
+            store_bridge_error(VmError::HostError(
+                "non-yielding native host call returned no value".to_string(),
+            ));
+            STATUS_ERROR
+        }
+        Ok(CallOutcome::Halt | CallOutcome::Yield | CallOutcome::Pending(_)) => {
+            store_bridge_error(VmError::HostError(
+                "non-yielding native host call violated its synchronous return contract"
+                    .to_string(),
+            ));
+            STATUS_ERROR
         }
         Err(err) => {
             store_bridge_error(err);

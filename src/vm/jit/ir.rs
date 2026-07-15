@@ -210,6 +210,10 @@ pub(crate) enum SsaInstKind {
     MapIterTakeValue {
         slot: SsaValueId,
     },
+    HostCall {
+        import: u16,
+        args: Vec<SsaValueId>,
+    },
     IntNeg {
         input: SsaValueId,
     },
@@ -349,6 +353,7 @@ impl SsaInstKind {
     fn inputs(&self) -> Vec<SsaValueId> {
         match self {
             Self::Constant(_) => Vec::new(),
+            Self::HostCall { args, .. } => args.clone(),
             Self::UnboxInt { input }
             | Self::UnboxFloat { input }
             | Self::UnboxBool { input }
@@ -1011,6 +1016,9 @@ fn render_inst_kind(kind: &SsaInstKind) -> String {
         SsaInstKind::MapIterNext { slot } => format!("map_iter_next {slot}"),
         SsaInstKind::MapIterTakeKey { slot } => format!("map_iter_take_key {slot}"),
         SsaInstKind::MapIterTakeValue { slot } => format!("map_iter_take_value {slot}"),
+        SsaInstKind::HostCall { import, args } => {
+            format!("host_call {import}({})", render_value_list(args))
+        }
         SsaInstKind::IntNeg { input } => format!("ineg {input}"),
         SsaInstKind::IntAdd { lhs, rhs } => format!("iadd {lhs}, {rhs}"),
         SsaInstKind::IntAddImm { lhs, imm } => format!("iadd_imm {lhs}, {imm}"),

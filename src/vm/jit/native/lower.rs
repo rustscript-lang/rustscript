@@ -19,6 +19,7 @@ use crate::vm::native::{
     init_null_value_slot_entry_address, jump_with_status, map_get_entry_address,
     map_has_entry_address, map_iter_next_entry_address, map_iter_next_signature,
     map_iter_take_key_entry_address, map_iter_take_signature, map_iter_take_value_entry_address,
+    non_yielding_host_call_entry_address, non_yielding_host_call_signature,
     pack_shared_signature, restore_sparse_exit_state_entry_address,
     shared_array_from_buffer_entry_address, shared_bytes_from_buffer_entry_address,
     shared_string_from_buffer_entry_address, sparse_restore_exit_signature,
@@ -97,6 +98,7 @@ fn try_compile_ssa_trace(
     let mut ctx = module.make_context();
     ctx.func.signature = entry_signature(pointer_type, call_conv);
     let clone_value_sig = clone_value_signature(pointer_type, call_conv);
+    let non_yielding_host_call_sig = non_yielding_host_call_signature(pointer_type, call_conv);
     let value_slot_sig = value_slot_signature(pointer_type, call_conv);
     let box_heap_value_sig = box_heap_value_signature(pointer_type, call_conv);
     let alloc_buffer_sig = alloc_buffer_signature(pointer_type, call_conv);
@@ -159,6 +161,7 @@ fn try_compile_ssa_trace(
         };
         let deopt_refs = SsaDeoptHelperRefs {
             clone_value_ref: b.import_signature(clone_value_sig),
+            non_yielding_host_call_ref: b.import_signature(non_yielding_host_call_sig),
             init_null_slot_ref: b.import_signature(value_slot_sig.clone()),
             clear_value_slot_ref: b.import_signature(value_slot_sig),
             box_heap_value_ref: b.import_signature(box_heap_value_sig),
@@ -174,6 +177,7 @@ fn try_compile_ssa_trace(
         };
         let deopt_addrs = SsaDeoptHelperAddrs {
             clone_value: clone_value_to_slot_entry_address(),
+            non_yielding_host_call: non_yielding_host_call_entry_address(),
             init_null_slot: init_null_value_slot_entry_address(),
             clear_value_slot: clear_value_slot_entry_address(),
             box_heap_value: write_heap_value_to_slot_entry_address(),
@@ -420,6 +424,7 @@ struct SsaExitLowering {
 #[derive(Clone, Copy)]
 struct SsaDeoptHelperRefs {
     clone_value_ref: cranelift_codegen::ir::SigRef,
+    non_yielding_host_call_ref: cranelift_codegen::ir::SigRef,
     init_null_slot_ref: cranelift_codegen::ir::SigRef,
     clear_value_slot_ref: cranelift_codegen::ir::SigRef,
     box_heap_value_ref: cranelift_codegen::ir::SigRef,
@@ -437,6 +442,7 @@ struct SsaDeoptHelperRefs {
 #[derive(Clone, Copy)]
 struct SsaDeoptHelperAddrs {
     clone_value: usize,
+    non_yielding_host_call: usize,
     init_null_slot: usize,
     clear_value_slot: usize,
     box_heap_value: usize,
@@ -470,6 +476,7 @@ struct SsaStringHelperAddrs {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum SsaTempValueSlotKey {
     Output(SsaValueId),
+    HostArgs(SsaValueId),
     MapKeyBox(SsaValueId),
     MutationArgBox(SsaValueId, u8),
 }
@@ -598,6 +605,7 @@ fn ssa_trace_supported(ssa: &SsaTrace) -> bool {
                     | SsaInstKind::IntCmpLtImm { .. }
                     | SsaInstKind::IntCmpGt { .. }
                     | SsaInstKind::IntCmpGtImm { .. }
+                    | SsaInstKind::HostCall { .. }
             ) {
                 return false;
             }
@@ -681,6 +689,22 @@ fn allocate_owned_value_temps(
                 ordered.push(slot);
                 slots.insert(SsaTempValueSlotKey::Output(output.id), slot);
             }
+            if let SsaInstKind::HostCall { args, .. } = &inst.kind {
+                let arg_bytes = usize::try_from(value_size)
+                    .ok()
+                    .and_then(|value_size| value_size.checked_mul(args.len().max(1)))
+                    .and_then(|bytes| u32::try_from(bytes).ok())
+                    .ok_or_else(|| {
+                        VmError::JitNative("SSA host-call argument storage too large".to_string())
+                    })?;
+                let align_shift = std::mem::align_of::<Value>().trailing_zeros() as u8;
+                let args_slot = b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    arg_bytes,
+                    align_shift,
+                ));
+                slots.insert(SsaTempValueSlotKey::HostArgs(output.id), args_slot);
+            }
             if matches!(
                 inst.kind,
                 SsaInstKind::MapGet { .. } | SsaInstKind::MapHas { .. }
@@ -726,6 +750,7 @@ fn ssa_inst_requires_owned_value_slot(kind: &SsaInstKind) -> bool {
             | SsaInstKind::BytesToArrayU8 { .. }
             | SsaInstKind::StringConcat { .. }
             | SsaInstKind::BytesConcat { .. }
+            | SsaInstKind::HostCall { .. }
     )
 }
 
@@ -2314,6 +2339,61 @@ fn lower_ssa_inst(
             jump_with_status(b, exit_block, status);
 
             b.switch_to_block(cont);
+            out
+        }
+        SsaInstKind::HostCall { import, args } => {
+            let out = owned_value_temp_slot_addr(
+                b,
+                pointer_type,
+                owned_value_temps,
+                SsaTempValueSlotKey::Output(output.id),
+            )?;
+            let arg_values = owned_value_temp_slot_addr(
+                b,
+                pointer_type,
+                owned_value_temps,
+                SsaTempValueSlotKey::HostArgs(output.id),
+            )?;
+            for (index, arg) in args.iter().copied().enumerate() {
+                let repr = *value_reprs.get(&arg).ok_or_else(|| {
+                    VmError::JitNative("SSA host-call argument representation missing".to_string())
+                })?;
+                let value = values[&arg];
+                let index_value = b.ins().iconst(
+                    pointer_type,
+                    i64::try_from(index).map_err(|_| {
+                        VmError::JitNative("SSA host-call argument index out of range".to_string())
+                    })?,
+                );
+                let addr =
+                    ssa_value_addr(b, pointer_type, arg_values, index_value, layout.value.size);
+                match repr {
+                    SsaValueRepr::Tagged => ssa_copy_value_bytes(b, value, addr, layout.value.size),
+                    SsaValueRepr::I64 => ssa_store_int_in_value(b, layout.value, addr, value),
+                    SsaValueRepr::F64 => ssa_store_float_in_value(b, layout.value, addr, value),
+                    SsaValueRepr::Bool => ssa_store_bool_in_value(b, layout.value, addr, value),
+                    SsaValueRepr::HeapPtr(tag) => {
+                        let tag = ssa_heap_tag(layout.value, tag)?;
+                        ssa_store_heap_ptr_in_value(b, layout.value, addr, tag, value);
+                    }
+                }
+            }
+            clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
+            let import = b.ins().iconst(pointer_type, i64::from(*import));
+            let argc = b.ins().iconst(
+                pointer_type,
+                i64::try_from(args.len()).map_err(|_| {
+                    VmError::JitNative("SSA host-call argument count out of range".to_string())
+                })?,
+            );
+            ssa_call_status_helper(
+                b,
+                exit_block,
+                pointer_type,
+                helper_refs.non_yielding_host_call_ref,
+                helper_addrs.non_yielding_host_call,
+                &[vm_ptr, import, arg_values, argc, out],
+            )?;
             out
         }
         SsaInstKind::IntNeg { input } => b.ins().ineg(values[input]),
