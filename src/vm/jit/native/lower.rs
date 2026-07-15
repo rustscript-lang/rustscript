@@ -741,12 +741,22 @@ fn borrowed_array_get_outputs(ssa: &SsaTrace) -> BTreeSet<SsaValueId> {
 
     for block in &ssa.blocks {
         for (index, inst) in block.insts.iter().enumerate() {
-            let host_call = matches!(inst.kind, SsaInstKind::HostCall { .. });
             for input in inst.kind.inputs() {
+                let borrows_input = match &inst.kind {
+                    SsaInstKind::HostCall { .. } => true,
+                    SsaInstKind::ArraySet { value, .. } | SsaInstKind::ArrayPush { value, .. } => {
+                        *value == input
+                    }
+                    SsaInstKind::MapGet { key, .. } | SsaInstKind::MapHas { key, .. } => {
+                        *key == input
+                    }
+                    SsaInstKind::MapSet { key, value, .. } => *key == input || *value == input,
+                    _ => false,
+                };
                 instruction_uses
                     .entry(input)
                     .or_default()
-                    .push((block.id, index, host_call));
+                    .push((block.id, index, borrows_input));
             }
         }
         let Some(terminator) = &block.terminator else {
@@ -4124,6 +4134,15 @@ mod tests {
     use crate::ValueType;
     use crate::vm::jit::ir::SsaTraceBuilder;
 
+    #[derive(Clone, Copy)]
+    enum BorrowingCollectionConsumer {
+        ArraySet,
+        ArrayPush,
+        MapGet,
+        MapHas,
+        MapSet,
+    }
+
     fn array_get_host_call_trace(
         mutate_before_call: bool,
         materialize_get_on_exit: bool,
@@ -4188,10 +4207,104 @@ mod tests {
         (builder.finish(), get.id)
     }
 
+    fn array_get_collection_consumer_trace(
+        consumer: BorrowingCollectionConsumer,
+    ) -> (SsaTrace, SsaValueId) {
+        let mut builder = SsaTraceBuilder::new(0, 0);
+        let entry = builder.entry();
+        let array = builder
+            .append_param(entry, SsaValueRepr::HeapPtr(ValueType::Array), "array")
+            .unwrap();
+        let index = builder
+            .append_param(entry, SsaValueRepr::I64, "index")
+            .unwrap();
+        let map = builder
+            .append_param(entry, SsaValueRepr::HeapPtr(ValueType::Map), "map")
+            .unwrap();
+        let map_key = builder
+            .append_param(entry, SsaValueRepr::Tagged, "map_key")
+            .unwrap();
+        let get = builder
+            .append_value_inst(
+                entry,
+                1,
+                SsaValueRepr::Tagged,
+                SsaInstKind::ArrayGet {
+                    array: array.id,
+                    index: index.id,
+                },
+            )
+            .unwrap();
+        let (repr, kind) = match consumer {
+            BorrowingCollectionConsumer::ArraySet => (
+                SsaValueRepr::Tagged,
+                SsaInstKind::ArraySet {
+                    array: array.id,
+                    index: index.id,
+                    value: get.id,
+                },
+            ),
+            BorrowingCollectionConsumer::ArrayPush => (
+                SsaValueRepr::Tagged,
+                SsaInstKind::ArrayPush {
+                    array: array.id,
+                    value: get.id,
+                },
+            ),
+            BorrowingCollectionConsumer::MapGet => (
+                SsaValueRepr::Tagged,
+                SsaInstKind::MapGet {
+                    map: map.id,
+                    key: get.id,
+                },
+            ),
+            BorrowingCollectionConsumer::MapHas => (
+                SsaValueRepr::Bool,
+                SsaInstKind::MapHas {
+                    map: map.id,
+                    key: get.id,
+                },
+            ),
+            BorrowingCollectionConsumer::MapSet => (
+                SsaValueRepr::Tagged,
+                SsaInstKind::MapSet {
+                    map: map.id,
+                    key: map_key.id,
+                    value: get.id,
+                },
+            ),
+        };
+        let result = builder.append_value_inst(entry, 2, repr, kind).unwrap();
+        let exit = builder.add_exit(
+            3,
+            vec![SsaMaterialization::Value(result.id)],
+            Vec::new(),
+            Vec::new(),
+        );
+        builder
+            .set_terminator(entry, SsaTerminator::Return { exit })
+            .unwrap();
+        (builder.finish(), get.id)
+    }
+
     #[test]
     fn borrows_single_use_array_get_for_immediate_host_call() {
         let (trace, get) = array_get_host_call_trace(false, false);
         assert_eq!(borrowed_array_get_outputs(&trace), BTreeSet::from([get]));
+    }
+
+    #[test]
+    fn borrows_single_use_array_get_for_typed_collection_consumers() {
+        for consumer in [
+            BorrowingCollectionConsumer::ArraySet,
+            BorrowingCollectionConsumer::ArrayPush,
+            BorrowingCollectionConsumer::MapGet,
+            BorrowingCollectionConsumer::MapHas,
+            BorrowingCollectionConsumer::MapSet,
+        ] {
+            let (trace, get) = array_get_collection_consumer_trace(consumer);
+            assert_eq!(borrowed_array_get_outputs(&trace), BTreeSet::from([get]));
+        }
     }
 
     #[test]
