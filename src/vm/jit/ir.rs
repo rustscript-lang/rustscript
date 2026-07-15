@@ -350,7 +350,7 @@ pub(crate) enum SsaInstKind {
 }
 
 impl SsaInstKind {
-    fn inputs(&self) -> Vec<SsaValueId> {
+    pub(crate) fn inputs(&self) -> Vec<SsaValueId> {
         match self {
             Self::Constant(_) => Vec::new(),
             Self::HostCall { args, .. } => args.clone(),

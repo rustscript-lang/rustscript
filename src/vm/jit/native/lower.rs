@@ -4,8 +4,8 @@ use super::super::runtime::resume_linked_trace_entry_address;
 use super::{NativeCompileProfile, TraceLoweringKind};
 use crate::vm::jit::deopt::exit_inputs;
 use crate::vm::jit::ir::{
-    SsaBranchTarget, SsaExitId, SsaInstKind, SsaMaterialization, SsaTerminator, SsaTrace,
-    SsaValueId, SsaValueRepr,
+    SsaBlockId, SsaBranchTarget, SsaExitId, SsaInstKind, SsaMaterialization, SsaTerminator,
+    SsaTrace, SsaValueId, SsaValueRepr,
 };
 use crate::vm::native::{
     ExecutableBuffer, HeapIntrinsicAddrs, HeapIntrinsicRefs, NativeInterruptMode,
@@ -204,7 +204,9 @@ fn try_compile_ssa_trace(
                 }
             }
         }
-        let owned_value_temps = allocate_owned_value_temps(&mut b, ssa, layout.value.size)?;
+        let borrowed_array_gets = borrowed_array_get_outputs(ssa);
+        let owned_value_temps =
+            allocate_owned_value_temps(&mut b, ssa, layout.value.size, &borrowed_array_gets)?;
 
         let mut block_handles = HashMap::new();
         for block in &ssa.blocks {
@@ -260,6 +262,7 @@ fn try_compile_ssa_trace(
             helper_refs: deopt_refs,
             helper_addrs: deopt_addrs,
             owned_value_temps: &owned_value_temps,
+            borrowed_array_gets: &borrowed_array_gets,
             value_reprs: &value_reprs,
             tagged_constant_addrs: &tagged_constant_addrs,
         };
@@ -495,6 +498,7 @@ struct SsaLowerCtx<'a> {
     helper_refs: SsaDeoptHelperRefs,
     helper_addrs: SsaDeoptHelperAddrs,
     owned_value_temps: &'a SsaOwnedValueTemps,
+    borrowed_array_gets: &'a BTreeSet<SsaValueId>,
     value_reprs: &'a HashMap<SsaValueId, SsaValueRepr>,
     tagged_constant_addrs: &'a HashMap<SsaValueId, usize>,
 }
@@ -670,6 +674,7 @@ fn allocate_owned_value_temps(
     b: &mut FunctionBuilder,
     ssa: &SsaTrace,
     value_size: i32,
+    borrowed_array_gets: &BTreeSet<SsaValueId>,
 ) -> VmResult<SsaOwnedValueTemps> {
     let mut ordered = Vec::new();
     let mut slots = HashMap::new();
@@ -678,7 +683,9 @@ fn allocate_owned_value_temps(
             let Some(output) = inst.output else {
                 continue;
             };
-            if ssa_inst_requires_owned_value_slot(&inst.kind) {
+            if ssa_inst_requires_owned_value_slot(&inst.kind)
+                && !borrowed_array_gets.contains(&output.id)
+            {
                 let slot = ssa_create_value_stack_slot(b, value_size)?;
                 ordered.push(slot);
                 slots.insert(SsaTempValueSlotKey::Output(output.id), slot);
@@ -722,6 +729,82 @@ fn allocate_owned_value_temps(
         }
     }
     Ok(SsaOwnedValueTemps { ordered, slots })
+}
+
+fn borrowed_array_get_outputs(ssa: &SsaTrace) -> BTreeSet<SsaValueId> {
+    let mut instruction_uses: HashMap<SsaValueId, Vec<(SsaBlockId, usize, bool)>> = HashMap::new();
+    let mut non_instruction_uses = BTreeSet::new();
+
+    for block in &ssa.blocks {
+        for (index, inst) in block.insts.iter().enumerate() {
+            let host_call = matches!(inst.kind, SsaInstKind::HostCall { .. });
+            for input in inst.kind.inputs() {
+                instruction_uses
+                    .entry(input)
+                    .or_default()
+                    .push((block.id, index, host_call));
+            }
+        }
+        let Some(terminator) = &block.terminator else {
+            continue;
+        };
+        match terminator {
+            SsaTerminator::Jump { args, .. } => non_instruction_uses.extend(args.iter().copied()),
+            SsaTerminator::BranchBool {
+                condition,
+                if_true,
+                if_false,
+            } => {
+                non_instruction_uses.insert(*condition);
+                for target in [if_true, if_false] {
+                    if let SsaBranchTarget::Block { args, .. } = target {
+                        non_instruction_uses.extend(args.iter().copied());
+                    }
+                }
+            }
+            SsaTerminator::Exit { .. } | SsaTerminator::Return { .. } => {}
+        }
+    }
+    for exit in &ssa.exits {
+        non_instruction_uses.extend(exit_inputs(exit));
+    }
+
+    let mut borrowed = BTreeSet::new();
+    for block in &ssa.blocks {
+        for (definition_index, inst) in block.insts.iter().enumerate() {
+            let Some(output) = inst.output else {
+                continue;
+            };
+            if !matches!(inst.kind, SsaInstKind::ArrayGet { .. })
+                || non_instruction_uses.contains(&output.id)
+            {
+                continue;
+            }
+            let Some([(use_block, use_index, true)]) =
+                instruction_uses.get(&output.id).map(Vec::as_slice)
+            else {
+                continue;
+            };
+            if *use_block != block.id || *use_index <= definition_index {
+                continue;
+            }
+            let borrow_stays_valid =
+                block.insts[definition_index + 1..*use_index]
+                    .iter()
+                    .all(|between| {
+                        !matches!(
+                            between.kind,
+                            SsaInstKind::ArraySet { .. }
+                                | SsaInstKind::ArrayPush { .. }
+                                | SsaInstKind::HostCall { .. }
+                        )
+                    });
+            if borrow_stays_valid {
+                borrowed.insert(output.id);
+            }
+        }
+    }
+    borrowed
 }
 
 fn ssa_inst_requires_owned_value_slot(kind: &SsaInstKind) -> bool {
@@ -989,6 +1072,7 @@ fn lower_ssa_inst(
         helper_refs,
         helper_addrs,
         owned_value_temps,
+        borrowed_array_gets,
         value_reprs,
         tagged_constant_addrs,
         ..
@@ -1940,37 +2024,42 @@ fn lower_ssa_inst(
                 layout.stack_vec.ptr_offset,
             );
             let element_addr = ssa_value_addr(b, pointer_type, data_ptr, index, layout.value.size);
-            let out = owned_value_temp_slot_addr(
-                b,
-                pointer_type,
-                owned_value_temps,
-                SsaTempValueSlotKey::Output(output.id),
-            )?;
-            let tag = ssa_load_tag_i32(b, layout.value, element_addr);
-            let scalar = ssa_is_scalar_tag(b, layout.value, tag);
-            let fast = b.create_block();
-            let slow = b.create_block();
-            let clone_done = b.create_block();
-            b.ins().brif(scalar, fast, &[], slow, &[]);
+            let out = if borrowed_array_gets.contains(&output.id) {
+                element_addr
+            } else {
+                let out = owned_value_temp_slot_addr(
+                    b,
+                    pointer_type,
+                    owned_value_temps,
+                    SsaTempValueSlotKey::Output(output.id),
+                )?;
+                let tag = ssa_load_tag_i32(b, layout.value, element_addr);
+                let scalar = ssa_is_scalar_tag(b, layout.value, tag);
+                let fast = b.create_block();
+                let slow = b.create_block();
+                let clone_done = b.create_block();
+                b.ins().brif(scalar, fast, &[], slow, &[]);
 
-            b.switch_to_block(fast);
-            clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
-            ssa_copy_value_bytes(b, element_addr, out, layout.value.size);
-            b.ins().jump(clone_done, &[]);
+                b.switch_to_block(fast);
+                clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
+                ssa_copy_value_bytes(b, element_addr, out, layout.value.size);
+                b.ins().jump(clone_done, &[]);
 
-            b.switch_to_block(slow);
-            clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
-            ssa_call_status_helper(
-                b,
-                exit_block,
-                pointer_type,
-                helper_refs.clone_value_ref,
-                helper_addrs.clone_value,
-                &[out, element_addr],
-            )?;
-            b.ins().jump(clone_done, &[]);
+                b.switch_to_block(slow);
+                clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
+                ssa_call_status_helper(
+                    b,
+                    exit_block,
+                    pointer_type,
+                    helper_refs.clone_value_ref,
+                    helper_addrs.clone_value,
+                    &[out, element_addr],
+                )?;
+                b.ins().jump(clone_done, &[]);
 
-            b.switch_to_block(clone_done);
+                b.switch_to_block(clone_done);
+                out
+            };
             b.ins().jump(done, &[]);
 
             b.switch_to_block(fail);
@@ -4039,4 +4128,93 @@ fn native_isa(profile: NativeCompileProfile) -> VmResult<OwnedTargetIsa> {
             .map_err(|err| format!("failed to finalize cranelift ISA: {err}"))
     });
     cached.clone().map_err(VmError::JitNative)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ValueType;
+    use crate::vm::jit::ir::SsaTraceBuilder;
+
+    fn array_get_host_call_trace(
+        mutate_before_call: bool,
+        materialize_get_on_exit: bool,
+    ) -> (SsaTrace, SsaValueId) {
+        let mut builder = SsaTraceBuilder::new(0, 0);
+        let entry = builder.entry();
+        let array = builder
+            .append_param(entry, SsaValueRepr::HeapPtr(ValueType::Array), "array")
+            .unwrap();
+        let index = builder
+            .append_param(entry, SsaValueRepr::I64, "index")
+            .unwrap();
+        let mutation_value = builder
+            .append_param(entry, SsaValueRepr::Tagged, "mutation_value")
+            .unwrap();
+        let get = builder
+            .append_value_inst(
+                entry,
+                1,
+                SsaValueRepr::Tagged,
+                SsaInstKind::ArrayGet {
+                    array: array.id,
+                    index: index.id,
+                },
+            )
+            .unwrap();
+        if mutate_before_call {
+            builder
+                .append_value_inst(
+                    entry,
+                    2,
+                    SsaValueRepr::Tagged,
+                    SsaInstKind::ArraySet {
+                        array: array.id,
+                        index: index.id,
+                        value: mutation_value.id,
+                    },
+                )
+                .unwrap();
+        }
+        let call = builder
+            .append_value_inst(
+                entry,
+                3,
+                SsaValueRepr::Tagged,
+                SsaInstKind::HostCall {
+                    import: 0,
+                    args: vec![get.id],
+                },
+            )
+            .unwrap();
+        let stack_value = if materialize_get_on_exit { get } else { call };
+        let exit = builder.add_exit(
+            4,
+            vec![SsaMaterialization::Value(stack_value.id)],
+            Vec::new(),
+            Vec::new(),
+        );
+        builder
+            .set_terminator(entry, SsaTerminator::Return { exit })
+            .unwrap();
+        (builder.finish(), get.id)
+    }
+
+    #[test]
+    fn borrows_single_use_array_get_for_immediate_host_call() {
+        let (trace, get) = array_get_host_call_trace(false, false);
+        assert_eq!(borrowed_array_get_outputs(&trace), BTreeSet::from([get]));
+    }
+
+    #[test]
+    fn does_not_borrow_array_get_across_array_mutation() {
+        let (trace, _) = array_get_host_call_trace(true, false);
+        assert!(borrowed_array_get_outputs(&trace).is_empty());
+    }
+
+    #[test]
+    fn does_not_borrow_array_get_that_escapes_to_an_exit() {
+        let (trace, _) = array_get_host_call_trace(false, true);
+        assert!(borrowed_array_get_outputs(&trace).is_empty());
+    }
 }
