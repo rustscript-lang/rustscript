@@ -498,8 +498,8 @@ impl Vm {
         }
         let (mut entry, mut root_ip, mut terminal, _, mut has_yielding_call) =
             self.native_trace_state(current_trace_id)?;
+        native::clear_bridge_error();
         loop {
-            native::clear_bridge_error();
             let status = unsafe { entry(self as *mut Vm) };
             self.native_trace_exec_count = self.native_trace_exec_count.saturating_add(1);
             self.jit.mark_trace_executed(current_trace_id);
@@ -513,19 +513,26 @@ impl Vm {
                     {
                         self.record_jit_link_handoff();
                         current_trace_id = next_trace_id;
-                        if let Err(err) = self.ensure_native_trace(
+                        if let Some(state) = self.cached_native_trace_state(
                             current_trace_id,
                             native::NativeCompileProfile::Jit,
                         ) {
-                            if should_fallback_to_interpreter(&err) {
-                                self.record_jit_helper_fallback();
-                                self.jit.block_trace(current_trace_id);
-                                return Ok(ExecOutcome::Continue);
+                            (entry, root_ip, terminal, _, has_yielding_call) = state;
+                        } else {
+                            if let Err(err) = self.ensure_native_trace(
+                                current_trace_id,
+                                native::NativeCompileProfile::Jit,
+                            ) {
+                                if should_fallback_to_interpreter(&err) {
+                                    self.record_jit_helper_fallback();
+                                    self.jit.block_trace(current_trace_id);
+                                    return Ok(ExecOutcome::Continue);
+                                }
+                                return Err(err);
                             }
-                            return Err(err);
+                            (entry, root_ip, terminal, _, has_yielding_call) =
+                                self.native_trace_state(current_trace_id)?;
                         }
-                        (entry, root_ip, terminal, _, has_yielding_call) =
-                            self.native_trace_state(current_trace_id)?;
                         continue;
                     }
                     return Ok(ExecOutcome::Continue);
@@ -557,19 +564,26 @@ impl Vm {
                         {
                             self.record_jit_link_handoff();
                             current_trace_id = next_trace_id;
-                            if let Err(err) = self.ensure_native_trace(
+                            if let Some(state) = self.cached_native_trace_state(
                                 current_trace_id,
                                 native::NativeCompileProfile::Jit,
                             ) {
-                                if should_fallback_to_interpreter(&err) {
-                                    self.record_jit_helper_fallback();
-                                    self.jit.block_trace(current_trace_id);
-                                    return Ok(ExecOutcome::Continue);
+                                (entry, root_ip, terminal, _, has_yielding_call) = state;
+                            } else {
+                                if let Err(err) = self.ensure_native_trace(
+                                    current_trace_id,
+                                    native::NativeCompileProfile::Jit,
+                                ) {
+                                    if should_fallback_to_interpreter(&err) {
+                                        self.record_jit_helper_fallback();
+                                        self.jit.block_trace(current_trace_id);
+                                        return Ok(ExecOutcome::Continue);
+                                    }
+                                    return Err(err);
                                 }
-                                return Err(err);
+                                (entry, root_ip, terminal, _, has_yielding_call) =
+                                    self.native_trace_state(current_trace_id)?;
                             }
-                            (entry, root_ip, terminal, _, has_yielding_call) =
-                                self.native_trace_state(current_trace_id)?;
                             continue;
                         }
                     }
@@ -660,6 +674,32 @@ impl Vm {
             native.has_call,
             native.has_yielding_call,
         ))
+    }
+
+    #[cfg(any(
+        all(
+            target_arch = "x86_64",
+            any(target_os = "windows", all(unix, not(target_os = "macos")))
+        ),
+        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+    ))]
+    #[inline(always)]
+    fn cached_native_trace_state(
+        &self,
+        trace_id: usize,
+        compile_profile: native::NativeCompileProfile,
+    ) -> Option<(NativeTraceEntry, usize, JitTraceTerminal, bool, bool)> {
+        let native = self.native_traces.get(trace_id)?.as_ref()?;
+        (native.interrupt_settings == self.active_native_interrupt_settings()
+            && compile_profile_satisfies(native.compile_profile, compile_profile)
+            && native.drop_contract_events_enabled == self.drop_contract_events_enabled)
+            .then_some((
+                native.entry,
+                native.root_ip,
+                native.terminal,
+                native.has_call,
+                native.has_yielding_call,
+            ))
     }
 
     #[cfg(any(
