@@ -40,6 +40,8 @@ impl ExecMode {
 
 struct Measurement {
     samples: Vec<Duration>,
+    trace_attempts: usize,
+    recorded_traces: usize,
     native_traces: usize,
     call_boundary_traces: usize,
     loop_back_traces: usize,
@@ -128,12 +130,14 @@ fn run() -> Result<(), String> {
                 .collect::<Vec<_>>()
                 .join(",");
             println!(
-                "workload={} mode={} width={} iterations={} warmup_runs=1 reused_vm=true median_ns={} native_traces={} call_boundary_traces={} loop_back_traces={} native_execs={} trace_exits={} native_loop_backs={} helper_fallbacks={} generic_builtin_calls={} samples_ns={}",
+                "workload={} mode={} width={} iterations={} warmup_runs=1 reused_vm=true median_ns={} trace_attempts={} recorded_traces={} native_traces={} call_boundary_traces={} loop_back_traces={} native_execs={} trace_exits={} native_loop_backs={} helper_fallbacks={} generic_builtin_calls={} samples_ns={}",
                 workload.label(),
                 mode.label(),
                 config.width,
                 config.iterations,
                 median.as_nanos(),
+                measurement.trace_attempts,
+                measurement.recorded_traces,
                 measurement.native_traces,
                 measurement.call_boundary_traces,
                 measurement.loop_back_traces,
@@ -202,7 +206,9 @@ fn measure(
 
     let snapshot_before = vm.jit_snapshot();
     let metrics_before = snapshot_before.metrics;
-    let native_traces = snapshot_before.traces.len();
+    let trace_attempts = snapshot_before.attempts.len();
+    let recorded_traces = snapshot_before.traces.len();
+    let native_traces = vm.jit_native_trace_count();
     let call_boundary_traces = snapshot_before
         .traces
         .iter()
@@ -217,30 +223,45 @@ fn measure(
     let mut generic_builtin_calls = 0u64;
     for _ in 0..config.samples {
         vm.reset_for_reuse();
+        let native_execs_before_sample = vm.jit_native_exec_count();
         let started = Instant::now();
         let status = vm
             .run()
             .map_err(|err| format!("{} {} run failed: {err}", workload.label(), mode.label()))?;
         let elapsed = started.elapsed();
         verify_result(&vm, status, config)?;
+        if matches!(mode, ExecMode::Jit) && vm.jit_native_exec_count() <= native_execs_before_sample
+        {
+            return Err(format!(
+                "{} measured run did not execute a warmed native trace:\n{}",
+                workload.label(),
+                vm.dump_jit_info()
+            ));
+        }
         generic_builtin_calls = generic_builtin_calls
             .saturating_add(vm.interpreter_metrics_snapshot().generic_builtin_call_count);
         black_box(vm.stack());
         samples.push(elapsed);
     }
     let snapshot_after = vm.jit_snapshot();
-    if snapshot_after.traces.len() != native_traces {
+    let measured_trace_attempts = snapshot_after.attempts.len();
+    let measured_recorded_traces = snapshot_after.traces.len();
+    let measured_native_traces = vm.jit_native_trace_count();
+    if measured_trace_attempts != trace_attempts
+        || measured_recorded_traces != recorded_traces
+        || measured_native_traces != native_traces
+    {
         return Err(format!(
-            "{} {} compiled additional traces during measured runs: warmup={} measured={}",
+            "{} {} changed JIT trace state during measured runs: warmup=attempts:{trace_attempts}/recorded:{recorded_traces}/native:{native_traces} measured=attempts:{measured_trace_attempts}/recorded:{measured_recorded_traces}/native:{measured_native_traces}",
             workload.label(),
             mode.label(),
-            native_traces,
-            snapshot_after.traces.len()
         ));
     }
     let metrics_after = snapshot_after.metrics;
     Ok(Measurement {
         samples,
+        trace_attempts,
+        recorded_traces,
         native_traces,
         call_boundary_traces,
         loop_back_traces,

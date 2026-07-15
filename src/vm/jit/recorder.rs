@@ -87,6 +87,7 @@ struct ValueInfo {
     const_float: Option<f64>,
     const_bool: Option<bool>,
     known_type: Option<ValueType>,
+    source_local: Option<u8>,
 }
 
 impl ValueInfo {
@@ -97,6 +98,7 @@ impl ValueInfo {
             const_float: None,
             const_bool: None,
             known_type: None,
+            source_local: None,
         }
     }
 
@@ -107,6 +109,7 @@ impl ValueInfo {
             const_float: None,
             const_bool: None,
             known_type: Some(known_type),
+            source_local: None,
         }
     }
 
@@ -117,6 +120,7 @@ impl ValueInfo {
             const_float: None,
             const_bool: None,
             known_type: Some(ValueType::Int),
+            source_local: None,
         }
     }
 
@@ -127,6 +131,7 @@ impl ValueInfo {
             const_float: value,
             const_bool: None,
             known_type: Some(ValueType::Float),
+            source_local: None,
         }
     }
 
@@ -137,6 +142,7 @@ impl ValueInfo {
             const_float: None,
             const_bool: value,
             known_type: Some(ValueType::Bool),
+            source_local: None,
         }
     }
 
@@ -147,6 +153,7 @@ impl ValueInfo {
             const_float: None,
             const_bool: None,
             known_type: Some(tag),
+            source_local: None,
         }
     }
 
@@ -161,6 +168,11 @@ impl ValueInfo {
             Value::Array(_) => Self::tagged_typed(ValueType::Array),
             Value::Map(_) => Self::tagged_typed(ValueType::Map),
         }
+    }
+
+    fn sourced_from(mut self, local: u8) -> Self {
+        self.source_local = Some(local);
+        self
     }
 }
 
@@ -462,9 +474,12 @@ enum SpecializedBuiltinKind {
     ArrayLen,
     ArrayGet,
     ArrayHas,
+    ArraySet,
+    ArrayPush,
     MapLen,
     MapGet,
     MapHas,
+    MapSet,
 }
 
 struct TraceCursor<'a> {
@@ -702,6 +717,7 @@ pub(crate) fn record_trace(
                     const_float: None,
                     const_bool: None,
                     known_type: loop_plan.stack_known_types[index],
+                    source_local: None,
                 },
             });
             entry_args.push(entry_arg);
@@ -758,6 +774,7 @@ pub(crate) fn record_trace(
                     const_float: None,
                     const_bool: None,
                     known_type: loop_plan.local_known_types[local],
+                    source_local: None,
                 },
             });
             entry_args.push(entry_arg);
@@ -816,7 +833,9 @@ pub(crate) fn record_trace(
             }
             DecodedOp::Ldloc { index, .. } => {
                 op_names.push("ldloc".to_string());
-                frame.push(frame.local(index)?);
+                let mut value = frame.local(index)?;
+                value.info = value.info.sourced_from(index);
+                frame.push(value);
             }
             DecodedOp::Stloc { index, .. } => {
                 op_names.push("stloc".to_string());
@@ -1082,9 +1101,22 @@ pub(crate) fn record_trace(
                     && argc > 0
                 {
                     let args = call_arg_slice(&frame.stack, usize::from(argc))?;
-                    if let Some(kind) =
-                        select_specialized_builtin_kind(program, ip, builtin, args[0].info)
-                    {
+                    let container_source = args[0].info.source_local;
+                    let container_was_moved = container_source.is_some_and(|local| {
+                        frame.dirty_locals[usize::from(local)]
+                            && frame.locals[usize::from(local)].info.known_type
+                                == Some(ValueType::Null)
+                            && args[1..]
+                                .iter()
+                                .all(|arg| arg.info.source_local != Some(local))
+                    });
+                    if let Some(kind) = select_specialized_builtin_kind(
+                        program,
+                        ip,
+                        builtin,
+                        args[0].info,
+                        container_was_moved,
+                    ) {
                         let (name, out) = emit_specialized_builtin_call(
                             &mut builder,
                             current_block,
@@ -1169,7 +1201,7 @@ fn infer_loop_header_plan(
                 {
                     *state = EntryUseState::ReadBeforeWrite;
                 }
-                frame.push(frame.local(index)?)
+                frame.push(frame.local(index)?.sourced_from(index))
             }
             DecodedOp::Stloc { index, .. } => {
                 if let Some(written) = local_written.get_mut(index as usize) {
@@ -1264,8 +1296,18 @@ fn infer_loop_header_plan(
                     return Ok(None);
                 }
                 let args = call_arg_slice(&frame.stack, usize::from(argc))?;
-                let Some(kind) = select_specialized_builtin_kind(program, ip, builtin, args[0])
-                else {
+                let container_source = args[0].source_local;
+                let container_was_moved = container_source.is_some_and(|local| {
+                    frame.locals[usize::from(local)].known_type == Some(ValueType::Null)
+                        && args[1..].iter().all(|arg| arg.source_local != Some(local))
+                });
+                let Some(kind) = select_specialized_builtin_kind(
+                    program,
+                    ip,
+                    builtin,
+                    args[0],
+                    container_was_moved,
+                ) else {
                     return Ok(None);
                 };
                 let _ = analyze_specialized_builtin_call(&mut frame, kind)?;
@@ -2416,6 +2458,7 @@ fn select_specialized_builtin_kind(
     ip: usize,
     builtin: BuiltinFunction,
     container: ValueInfo,
+    container_was_moved: bool,
 ) -> Option<SpecializedBuiltinKind> {
     let observed_kind = observed_heap_container_kind(container);
     let container_kind = if matches!(
@@ -2425,6 +2468,8 @@ fn select_specialized_builtin_kind(
             | BuiltinFunction::Get
             | BuiltinFunction::Has
             | BuiltinFunction::Concat
+            | BuiltinFunction::Set
+            | BuiltinFunction::ArrayPush
     ) {
         match operand_types(program, ip).0 {
             ValueType::String => Some(HeapContainerKind::String),
@@ -2480,9 +2525,18 @@ fn select_specialized_builtin_kind(
         (BuiltinFunction::Len, HeapContainerKind::Array) => Some(SpecializedBuiltinKind::ArrayLen),
         (BuiltinFunction::Get, HeapContainerKind::Array) => Some(SpecializedBuiltinKind::ArrayGet),
         (BuiltinFunction::Has, HeapContainerKind::Array) => Some(SpecializedBuiltinKind::ArrayHas),
+        (BuiltinFunction::Set, HeapContainerKind::Array) if container_was_moved => {
+            Some(SpecializedBuiltinKind::ArraySet)
+        }
+        (BuiltinFunction::ArrayPush, HeapContainerKind::Array) if container_was_moved => {
+            Some(SpecializedBuiltinKind::ArrayPush)
+        }
         (BuiltinFunction::Len, HeapContainerKind::Map) => Some(SpecializedBuiltinKind::MapLen),
         (BuiltinFunction::Get, HeapContainerKind::Map) => Some(SpecializedBuiltinKind::MapGet),
         (BuiltinFunction::Has, HeapContainerKind::Map) => Some(SpecializedBuiltinKind::MapHas),
+        (BuiltinFunction::Set, HeapContainerKind::Map) if container_was_moved => {
+            Some(SpecializedBuiltinKind::MapSet)
+        }
         _ => None,
     }
 }
@@ -2597,6 +2651,19 @@ fn analyze_specialized_builtin_call(
             frame.push(ValueInfo::bool(None));
             Ok("array_has")
         }
+        SpecializedBuiltinKind::ArraySet => {
+            let _ = frame.pop()?;
+            let _ = frame.pop()?;
+            let _ = frame.pop()?;
+            frame.push(ValueInfo::tagged_typed(ValueType::Array));
+            Ok("array_set")
+        }
+        SpecializedBuiltinKind::ArrayPush => {
+            let _ = frame.pop()?;
+            let _ = frame.pop()?;
+            frame.push(ValueInfo::tagged_typed(ValueType::Array));
+            Ok("array_push")
+        }
         SpecializedBuiltinKind::MapLen => {
             let _ = frame.pop()?;
             frame.push(ValueInfo::int(None));
@@ -2613,6 +2680,13 @@ fn analyze_specialized_builtin_call(
             let _ = frame.pop()?;
             frame.push(ValueInfo::bool(None));
             Ok("map_has")
+        }
+        SpecializedBuiltinKind::MapSet => {
+            let _ = frame.pop()?;
+            let _ = frame.pop()?;
+            let _ = frame.pop()?;
+            frame.push(ValueInfo::tagged_typed(ValueType::Map));
+            Ok("map_set")
         }
     }
 }
@@ -3076,6 +3150,60 @@ fn emit_specialized_builtin_call(
                 .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
             Ok(("array_has", out))
         }
+        SpecializedBuiltinKind::ArraySet => {
+            let value = frame.pop()?;
+            let index = ensure_int(builder, block, ip, frame.pop()?)?;
+            let array = frame.pop()?;
+            if array.info.repr != SsaValueRepr::Tagged {
+                return Err(TraceRecordError::TypeMismatch {
+                    expected: "owned tagged array",
+                    actual: array.info.repr,
+                });
+            }
+            let out = builder
+                .append_value_inst(
+                    block,
+                    ip,
+                    SsaValueRepr::Tagged,
+                    SsaInstKind::ArraySet {
+                        array: array.value.id,
+                        index: index.value.id,
+                        value: value.value.id,
+                    },
+                )
+                .map(|value| SymbolicValue {
+                    value,
+                    info: ValueInfo::tagged_typed(ValueType::Array),
+                })
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+            Ok(("array_set", out))
+        }
+        SpecializedBuiltinKind::ArrayPush => {
+            let value = frame.pop()?;
+            let array = frame.pop()?;
+            if array.info.repr != SsaValueRepr::Tagged {
+                return Err(TraceRecordError::TypeMismatch {
+                    expected: "owned tagged array",
+                    actual: array.info.repr,
+                });
+            }
+            let out = builder
+                .append_value_inst(
+                    block,
+                    ip,
+                    SsaValueRepr::Tagged,
+                    SsaInstKind::ArrayPush {
+                        array: array.value.id,
+                        value: value.value.id,
+                    },
+                )
+                .map(|value| SymbolicValue {
+                    value,
+                    info: ValueInfo::tagged_typed(ValueType::Array),
+                })
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+            Ok(("array_push", out))
+        }
         SpecializedBuiltinKind::MapLen => {
             let map = frame.pop()?;
             let map =
@@ -3137,6 +3265,34 @@ fn emit_specialized_builtin_call(
                 })
                 .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
             Ok(("map_has", out))
+        }
+        SpecializedBuiltinKind::MapSet => {
+            let value = frame.pop()?;
+            let key = frame.pop()?;
+            let map = frame.pop()?;
+            if map.info.repr != SsaValueRepr::Tagged {
+                return Err(TraceRecordError::TypeMismatch {
+                    expected: "owned tagged map",
+                    actual: map.info.repr,
+                });
+            }
+            let out = builder
+                .append_value_inst(
+                    block,
+                    ip,
+                    SsaValueRepr::Tagged,
+                    SsaInstKind::MapSet {
+                        map: map.value.id,
+                        key: key.value.id,
+                        value: value.value.id,
+                    },
+                )
+                .map(|value| SymbolicValue {
+                    value,
+                    info: ValueInfo::tagged_typed(ValueType::Map),
+                })
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+            Ok(("map_set", out))
         }
     }
 }
@@ -3666,6 +3822,7 @@ fn continue_with_frame(
                 const_float: None,
                 const_bool: None,
                 known_type: value.info.known_type,
+                source_local: None,
             },
         });
     }
@@ -3687,6 +3844,7 @@ fn continue_with_frame(
                 const_float: None,
                 const_bool: None,
                 known_type: value.info.known_type,
+                source_local: None,
             },
         });
     }

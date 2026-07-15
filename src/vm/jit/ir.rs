@@ -176,6 +176,15 @@ pub(crate) enum SsaInstKind {
         array: SsaValueId,
         index: SsaValueId,
     },
+    ArraySet {
+        array: SsaValueId,
+        index: SsaValueId,
+        value: SsaValueId,
+    },
+    ArrayPush {
+        array: SsaValueId,
+        value: SsaValueId,
+    },
     MapLen {
         map: SsaValueId,
     },
@@ -186,6 +195,11 @@ pub(crate) enum SsaInstKind {
     MapHas {
         map: SsaValueId,
         key: SsaValueId,
+    },
+    MapSet {
+        map: SsaValueId,
+        key: SsaValueId,
+        value: SsaValueId,
     },
     IntNeg {
         input: SsaValueId,
@@ -363,8 +377,15 @@ impl SsaInstKind {
             Self::BytesToArrayU8 { bytes } => vec![*bytes],
             Self::ArrayGet { array, index } => vec![*array, *index],
             Self::ArrayHas { array, index } => vec![*array, *index],
+            Self::ArraySet {
+                array,
+                index,
+                value,
+            } => vec![*array, *index, *value],
+            Self::ArrayPush { array, value } => vec![*array, *value],
             Self::MapGet { map, key } => vec![*map, *key],
             Self::MapHas { map, key } => vec![*map, *key],
+            Self::MapSet { map, key, value } => vec![*map, *key, *value],
             Self::IntAdd { lhs, rhs }
             | Self::IntSub { lhs, rhs }
             | Self::IntMul { lhs, rhs }
@@ -963,9 +984,18 @@ fn render_inst_kind(kind: &SsaInstKind) -> String {
         SsaInstKind::ArrayLen { array } => format!("array_len {array}"),
         SsaInstKind::ArrayGet { array, index } => format!("array_get {array}, {index}"),
         SsaInstKind::ArrayHas { array, index } => format!("array_has {array}, {index}"),
+        SsaInstKind::ArraySet {
+            array,
+            index,
+            value,
+        } => format!("array_set {array}, {index}, {value}"),
+        SsaInstKind::ArrayPush { array, value } => format!("array_push {array}, {value}"),
         SsaInstKind::MapLen { map } => format!("map_len {map}"),
         SsaInstKind::MapGet { map, key } => format!("map_get {map}, {key}"),
         SsaInstKind::MapHas { map, key } => format!("map_has {map}, {key}"),
+        SsaInstKind::MapSet { map, key, value } => {
+            format!("map_set {map}, {key}, {value}")
+        }
         SsaInstKind::IntNeg { input } => format!("ineg {input}"),
         SsaInstKind::IntAdd { lhs, rhs } => format!("iadd {lhs}, {rhs}"),
         SsaInstKind::IntAddImm { lhs, imm } => format!("iadd_imm {lhs}, {imm}"),

@@ -220,15 +220,18 @@ fn builtin_array_push_shared_impl(mut items: SharedArray, value: AnyValue) -> Sh
     items
 }
 
-pub(super) fn builtin_array_push(args: &mut [Value]) -> VmResult<CallReturn> {
-    let items = match take_arg(args, 0, "array_push array")? {
+pub(crate) fn builtin_array_push_owned(items: Value, value: Value) -> VmResult<Value> {
+    let items = match items {
         Value::Array(values) => values,
         _ => return Err(VmError::TypeMismatch("array")),
     };
+    Ok(Value::Array(builtin_array_push_shared_impl(items, value)))
+}
+
+pub(super) fn builtin_array_push(args: &mut [Value]) -> VmResult<CallReturn> {
+    let items = take_arg(args, 0, "array_push array")?;
     let value = take_arg(args, 1, "array_push value")?;
-    Ok(return_one(Value::Array(builtin_array_push_shared_impl(
-        items, value,
-    ))))
+    builtin_array_push_owned(items, value).map(return_one)
 }
 
 /// Create an empty map.
@@ -684,18 +687,21 @@ fn builtin_set_map_shared_impl(
     entries
 }
 
-pub(super) fn builtin_set(args: &mut [Value]) -> VmResult<CallReturn> {
-    let container: Value = take_arg(args, 0, "set container")?;
-    let key: Value = take_arg(args, 1, "set key")?;
-    let value: Value = take_arg(args, 2, "set value")?;
+pub(crate) fn builtin_set_owned(container: Value, key: Value, value: Value) -> VmResult<Value> {
     match container {
-        Value::Array(values) => builtin_set_array_shared_impl(values, key.as_int()?, value)
-            .map(|values| return_one(Value::Array(values))),
-        Value::Map(entries) => Ok(return_one(Value::Map(builtin_set_map_shared_impl(
-            entries, key, value,
-        )))),
+        Value::Array(values) => {
+            builtin_set_array_shared_impl(values, key.as_int()?, value).map(Value::Array)
+        }
+        Value::Map(entries) => Ok(Value::Map(builtin_set_map_shared_impl(entries, key, value))),
         _ => Err(VmError::TypeMismatch("array/map")),
     }
+}
+
+pub(super) fn builtin_set(args: &mut [Value]) -> VmResult<CallReturn> {
+    let container = take_arg(args, 0, "set container")?;
+    let key = take_arg(args, 1, "set key")?;
+    let value = take_arg(args, 2, "set value")?;
+    builtin_set_owned(container, key, value).map(return_one)
 }
 
 /// Return an array of container keys or indices.

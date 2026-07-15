@@ -2210,6 +2210,380 @@ fn trace_jit_supports_array_len_get_has_in_ssa() {
 }
 
 #[test]
+fn trace_jit_specializes_same_local_array_set_through_loop_back() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        let mut values = [1, 2, 3];
+        let mut i = 0;
+        while i < 64 {
+            values[1] = i;
+            i = i + 1;
+        }
+        values[1];
+    "#;
+
+    let compiled = compile_source(source).expect("array-set trace compile should succeed");
+    let program = force_local_types(
+        compiled.program,
+        &[(0, ValueType::Array), (1, ValueType::Int)],
+    );
+    let mut vm = Vm::new(program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    let status = vm.run().expect("array-set trace vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(63)]);
+
+    let dump = vm.dump_jit_info();
+    let snapshot = vm.jit_snapshot();
+    assert!(
+        any_trace_op(&snapshot, "array_set"),
+        "expected array set to remain in SSA, dump:\n{dump}"
+    );
+    let mutation_trace = snapshot
+        .traces
+        .iter()
+        .find(|trace| trace.op_names.iter().any(|op| op == "array_set"))
+        .expect("array-set trace should be present");
+    assert!(
+        !mutation_trace.has_call && mutation_trace.terminal == JitTraceTerminal::LoopBack,
+        "array-set trace should remain native through its backedge, dump:\n{dump}"
+    );
+    assert!(
+        snapshot.metrics.native_loop_back_count > 0,
+        "array-set loop should stay native across backedges, dump:\n{dump}"
+    );
+    assert_eq!(
+        snapshot.metrics.helper_fallback_count, 0,
+        "array-set loop should not need interpreter fallback, dump:\n{dump}"
+    );
+}
+
+#[test]
+fn trace_jit_array_set_preserves_cow_alias() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let mut bc = BytecodeBuilder::new();
+    let set_call = builtin_call_index("set").expect("set builtin should exist");
+    let get_call = builtin_call_index("get").expect("get builtin should exist");
+    bc.ldc(0);
+    bc.stloc(0);
+    bc.ldloc(0);
+    bc.stloc(1);
+    bc.ldc(1);
+    bc.stloc(2);
+
+    let loop_ip = bc.position();
+    bc.ldloc(2);
+    bc.ldc(2);
+    bc.clt();
+    let exit_branch_ip = bc.position();
+    bc.brfalse(0);
+
+    bc.ldloc(0);
+    bc.ldc(3);
+    bc.ldloc(2);
+    bc.ldc(4);
+    bc.stloc(0);
+    bc.call(set_call, 3);
+    bc.stloc(0);
+    bc.ldloc(2);
+    bc.ldc(5);
+    bc.add();
+    bc.stloc(2);
+    bc.br(loop_ip);
+
+    let exit_ip = bc.position();
+    bc.ldloc(1);
+    bc.ldc(3);
+    bc.call(get_call, 2);
+    bc.ldloc(0);
+    bc.ldc(3);
+    bc.call(get_call, 2);
+    bc.add();
+    bc.ret();
+
+    let mut code = bc.finish();
+    patch_branch_target(&mut code, exit_branch_ip, exit_ip);
+    let program = Program::new(
+        vec![
+            Value::array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            Value::Int(0),
+            Value::Int(64),
+            Value::Int(1),
+            Value::Null,
+            Value::Int(1),
+        ],
+        code,
+    )
+    .with_local_count(3);
+    let program = force_local_types(
+        program,
+        &[
+            (0, ValueType::Array),
+            (1, ValueType::Array),
+            (2, ValueType::Int),
+        ],
+    );
+    let mut vm = Vm::new(program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(
+        vm.run().expect("COW array-set trace should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(65)]);
+    let snapshot = vm.jit_snapshot();
+    let mutation_trace = snapshot
+        .traces
+        .iter()
+        .find(|trace| trace.op_names.iter().any(|op| op == "array_set"))
+        .expect("array-set trace should be present");
+    assert_eq!(mutation_trace.terminal, JitTraceTerminal::LoopBack);
+    assert!(!mutation_trace.has_call);
+}
+
+#[test]
+fn trace_jit_does_not_consume_non_moved_array_set_container() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let mut bc = BytecodeBuilder::new();
+    let set_call = builtin_call_index("set").expect("set builtin should exist");
+    let get_call = builtin_call_index("get").expect("get builtin should exist");
+    bc.ldc(0);
+    bc.stloc(0);
+    bc.ldc(1);
+    bc.stloc(1);
+
+    let loop_ip = bc.position();
+    bc.ldloc(1);
+    bc.ldc(2);
+    bc.clt();
+    let exit_branch_ip = bc.position();
+    bc.brfalse(0);
+
+    bc.ldloc(0);
+    bc.ldc(3);
+    bc.ldloc(1);
+    bc.call(set_call, 3);
+    bc.pop();
+    bc.ldloc(1);
+    bc.ldc(4);
+    bc.add();
+    bc.stloc(1);
+    bc.br(loop_ip);
+
+    let exit_ip = bc.position();
+    bc.ldloc(0);
+    bc.ldc(3);
+    bc.call(get_call, 2);
+    bc.ret();
+
+    let mut code = bc.finish();
+    patch_branch_target(&mut code, exit_branch_ip, exit_ip);
+    let program = Program::new(
+        vec![
+            Value::array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            Value::Int(0),
+            Value::Int(64),
+            Value::Int(1),
+            Value::Int(1),
+        ],
+        code,
+    )
+    .with_local_count(2);
+    let program = force_local_types(program, &[(0, ValueType::Array), (1, ValueType::Int)]);
+    let mut vm = Vm::new(program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(
+        vm.run().expect("non-moved array-set trace should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(2)]);
+    let snapshot = vm.jit_snapshot();
+    assert!(
+        snapshot
+            .traces
+            .iter()
+            .all(|trace| !trace.op_names.iter().any(|op| op == "array_set")),
+        "non-moved Set must not consume the local container: {}",
+        vm.dump_jit_info()
+    );
+    assert!(snapshot.traces.iter().any(|trace| trace.has_call));
+}
+
+#[test]
+fn trace_jit_specializes_same_local_array_push_through_loop_back() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let mut bc = BytecodeBuilder::new();
+    let push_call = vm::BuiltinFunction::ArrayPush.call_index();
+    let get_call = builtin_call_index("get").expect("get builtin should exist");
+    bc.ldc(0);
+    bc.stloc(0);
+    bc.ldc(1);
+    bc.stloc(1);
+
+    let loop_ip = bc.position();
+    bc.ldloc(1);
+    bc.ldc(2);
+    bc.clt();
+    let exit_branch_ip = bc.position();
+    bc.brfalse(0);
+
+    bc.ldloc(0);
+    bc.ldloc(1);
+    bc.ldc(3);
+    bc.stloc(0);
+    bc.call(push_call, 2);
+    bc.stloc(0);
+    bc.ldloc(1);
+    bc.ldc(4);
+    bc.add();
+    bc.stloc(1);
+    bc.br(loop_ip);
+
+    let exit_ip = bc.position();
+    bc.ldloc(0);
+    bc.ldc(5);
+    bc.call(get_call, 2);
+    bc.ret();
+
+    let mut code = bc.finish();
+    patch_branch_target(&mut code, exit_branch_ip, exit_ip);
+    let program = Program::new(
+        vec![
+            Value::array(Vec::new()),
+            Value::Int(0),
+            Value::Int(64),
+            Value::Null,
+            Value::Int(1),
+            Value::Int(63),
+        ],
+        code,
+    )
+    .with_local_count(2);
+    let program = force_local_types(program, &[(0, ValueType::Array), (1, ValueType::Int)]);
+    let mut vm = Vm::new(program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    let status = vm.run().expect("array-push trace vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(63)]);
+
+    let dump = vm.dump_jit_info();
+    let snapshot = vm.jit_snapshot();
+    let mutation_trace = snapshot
+        .traces
+        .iter()
+        .find(|trace| trace.op_names.iter().any(|op| op == "array_push"))
+        .expect("array-push trace should be present");
+    assert!(
+        !mutation_trace.has_call && mutation_trace.terminal == JitTraceTerminal::LoopBack,
+        "array-push trace should remain native through its backedge, dump:\n{dump}"
+    );
+    assert!(
+        snapshot.metrics.native_loop_back_count > 0,
+        "array-push loop should stay native across backedges, dump:\n{dump}"
+    );
+    assert_eq!(
+        snapshot.metrics.helper_fallback_count, 0,
+        "array-push loop should not need interpreter fallback, dump:\n{dump}"
+    );
+}
+
+#[test]
+fn trace_jit_specializes_same_local_map_set_through_loop_back() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        let mut values = {"key": 0, "drop": 1};
+        let mut i = 0;
+        while i < 64 {
+            values["key"] = i;
+            values["drop"] = null;
+            i = i + 1;
+        }
+        values["key"];
+    "#;
+
+    let compiled = compile_source(source).expect("map-set trace compile should succeed");
+    let program = force_local_types(
+        compiled.program,
+        &[(0, ValueType::Map), (1, ValueType::Int)],
+    );
+    let mut vm = Vm::new(program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    let status = vm
+        .run()
+        .unwrap_or_else(|err| panic!("map-set trace vm failed: {err:?}\n{}", vm.dump_jit_info()));
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(63)]);
+
+    let dump = vm.dump_jit_info();
+    let snapshot = vm.jit_snapshot();
+    let mutation_trace = snapshot
+        .traces
+        .iter()
+        .find(|trace| trace.op_names.iter().any(|op| op == "map_set"))
+        .expect("map-set trace should be present");
+    assert_eq!(
+        mutation_trace
+            .op_names
+            .iter()
+            .filter(|op| op.as_str() == "map_set")
+            .count(),
+        2,
+        "map-set trace should include overwrite and null-delete mutations, dump:\n{dump}"
+    );
+    assert!(
+        !mutation_trace.has_call && mutation_trace.terminal == JitTraceTerminal::LoopBack,
+        "map-set trace should remain native through its backedge, dump:\n{dump}"
+    );
+    assert!(
+        snapshot.metrics.native_loop_back_count > 0,
+        "map-set loop should stay native across backedges, dump:\n{dump}"
+    );
+    assert_eq!(
+        snapshot.metrics.helper_fallback_count, 0,
+        "map-set loop should not need interpreter fallback, dump:\n{dump}"
+    );
+}
+
+#[test]
 fn trace_jit_supports_map_len_get_has_in_ssa() {
     if !native_jit_supported() {
         return;
