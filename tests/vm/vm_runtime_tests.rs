@@ -2,7 +2,7 @@
 mod common;
 use common::*;
 use std::sync::Arc;
-use vm::{BuiltinFunction, OpCode};
+use vm::OpCode;
 
 fn builtin_call_index_with_arity(source: &str, argc: u8) -> u16 {
     let compiled = compile_source(source).expect("compile should succeed");
@@ -1316,7 +1316,13 @@ fn get_and_set_use_hash_map_overwrite_semantics() {
         "#,
         2,
     );
-    let builtin_set = BuiltinFunction::Set.call_index();
+    let builtin_set = builtin_call_index_with_arity(
+        r#"
+        let mut values = [1];
+        values[0] = 2;
+        "#,
+        3,
+    );
 
     let map = Value::map(vec![
         (Value::string("k"), Value::Int(1)),
@@ -1354,7 +1360,13 @@ fn get_and_set_use_hash_map_overwrite_semantics() {
 
 #[test]
 fn set_rejects_sparse_array_indexes() {
-    let builtin_set = BuiltinFunction::Set.call_index();
+    let builtin_set = builtin_call_index_with_arity(
+        r#"
+        let mut values = [1];
+        values[0] = 2;
+        "#,
+        3,
+    );
 
     let constants = vec![
         Value::array(vec![Value::Int(10), Value::Int(20)]),
