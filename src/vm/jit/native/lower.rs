@@ -2764,6 +2764,7 @@ fn lower_ssa_exit_block(
         layout,
         offsets,
         entry_stack_depth,
+        owned_value_temps,
         helper_refs: deopt_refs,
         helper_addrs: deopt_addrs,
         ..
@@ -2790,22 +2791,31 @@ fn lower_ssa_exit_block(
         deopt_addrs,
     };
 
-    let inline_scalar_restore = entry_stack_depth == 0
+    let mut moved_owned_values = BTreeSet::new();
+    let inline_owned_restore = entry_stack_depth == 0
         && exit.stack.is_empty()
         && exit
             .locals
             .iter()
             .zip(&exit.dirty_locals)
             .all(|(materialization, dirty)| {
-                !*dirty
-                    || matches!(
-                        materialization,
-                        SsaMaterialization::BoxInt(_)
-                            | SsaMaterialization::BoxBool(_)
-                            | SsaMaterialization::BoxFloat(_)
-                    )
+                if !*dirty {
+                    return true;
+                }
+                match materialization {
+                    SsaMaterialization::BoxInt(_)
+                    | SsaMaterialization::BoxBool(_)
+                    | SsaMaterialization::BoxFloat(_) => true,
+                    SsaMaterialization::Value(value) => {
+                        owned_value_temps
+                            .slots
+                            .contains_key(&SsaTempValueSlotKey::Output(*value))
+                            && moved_owned_values.insert(*value)
+                    }
+                    SsaMaterialization::BoxHeapPtr { .. } => false,
+                }
             });
-    if inline_scalar_restore {
+    if inline_owned_restore {
         let vm_locals_ptr = b
             .ins()
             .load(pointer_type, MemFlags::new(), vm_ptr, offsets.locals_ptr);
@@ -2825,7 +2835,15 @@ fn lower_ssa_exit_block(
             );
             let dst_addr = ssa_value_addr(b, pointer_type, vm_locals_ptr, index, layout.value.size);
             clear_owned_value_temp_slot(b, pointer_type, deopt_refs, deopt_addrs, dst_addr)?;
-            ssa_materialize_slot(b, materialize_ctx, materialization, dst_addr, "local")?;
+            if let SsaMaterialization::Value(value) = materialization {
+                let src = *exit_values.get(value).ok_or_else(|| {
+                    VmError::JitNative("SSA exit tagged local value missing".to_string())
+                })?;
+                ssa_copy_value_bytes(b, src, dst_addr, layout.value.size);
+                ssa_store_tag(b, layout.value, src, layout.value.null_tag);
+            } else {
+                ssa_materialize_slot(b, materialize_ctx, materialization, dst_addr, "local")?;
+            }
         }
         let ip_val = b.ins().iconst(
             pointer_type,
