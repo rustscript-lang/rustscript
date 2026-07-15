@@ -175,7 +175,7 @@ pub struct TraceJitEngine {
     hot_counts: HashMap<TraceEntryKey, u32>,
     compiled_by_ip: Vec<Vec<(usize, usize)>>,
     blocked_entries: HashSet<TraceEntryKey>,
-    loop_headers: Option<HashSet<usize>>,
+    loop_headers: Option<Vec<bool>>,
     traces: Vec<JitTrace>,
     attempts: Vec<JitAttempt>,
 }
@@ -233,7 +233,9 @@ impl TraceJitEngine {
         if let Some(trace_id) = self.compiled_trace_for_key(key) {
             return Some(trace_id);
         }
-        if self.blocked_entries.contains(&key) || !self.is_loop_header(program, ip) {
+        if (!self.blocked_entries.is_empty() && self.blocked_entries.contains(&key))
+            || !self.is_loop_header(program, ip)
+        {
             return None;
         }
 
@@ -282,7 +284,7 @@ impl TraceJitEngine {
         if let Some(trace_id) = self.compiled_trace_for_key(key) {
             return Some(trace_id);
         }
-        if self.blocked_entries.contains(&key) {
+        if !self.blocked_entries.is_empty() && self.blocked_entries.contains(&key) {
             return None;
         }
 
@@ -531,7 +533,9 @@ impl TraceJitEngine {
         }
         self.loop_headers
             .as_ref()
-            .is_some_and(|headers| headers.contains(&ip))
+            .and_then(|headers| headers.get(ip))
+            .copied()
+            .unwrap_or(false)
     }
 
     fn aggregate_metrics(&self, mut runtime_metrics: JitMetrics) -> JitMetrics {
@@ -589,9 +593,9 @@ fn to_nyi(err: TraceRecordError) -> JitNyiReason {
     }
 }
 
-fn scan_loop_headers(program: &Program) -> HashSet<usize> {
-    let mut headers = HashSet::new();
+fn scan_loop_headers(program: &Program) -> Vec<bool> {
     let code = &program.code;
+    let mut headers = vec![false; code.len()];
     let mut ip = 0usize;
 
     while ip < code.len() {
@@ -609,8 +613,8 @@ fn scan_loop_headers(program: &Program) -> HashSet<usize> {
                     break;
                 };
                 let target = target_u32 as usize;
-                if target <= instr_ip {
-                    headers.insert(target);
+                if target <= instr_ip && target < headers.len() {
+                    headers[target] = true;
                 }
             }
             x if x == OpCode::Ldloc as u8 || x == OpCode::Stloc as u8 => {
@@ -685,7 +689,7 @@ mod tests {
         let program = Program::new(vec![Value::Int(1)], bc.finish());
 
         let headers = scan_loop_headers(&program);
-        assert!(headers.contains(&(root_ip as usize)));
-        assert!(!headers.contains(&(branch_ip as usize)));
+        assert!(headers[root_ip as usize]);
+        assert!(!headers[branch_ip as usize]);
     }
 }
