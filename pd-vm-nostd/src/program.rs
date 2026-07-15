@@ -112,6 +112,9 @@ pub enum OpCode {
     Or = 0x16,
     Not = 0x17,
     Lshr = 0x18,
+    ArraySetLocal = 0x19,
+    ArrayPushLocal = 0x1A,
+    MapSetLocal = 0x1B,
 }
 
 impl OpCode {
@@ -120,6 +123,7 @@ impl OpCode {
             Self::Ldc | Self::Br | Self::Brfalse => 4,
             Self::Ldloc | Self::Stloc => 1,
             Self::Call => 3,
+            Self::ArraySetLocal | Self::ArrayPushLocal | Self::MapSetLocal => 1,
             _ => 0,
         }
     }
@@ -155,6 +159,9 @@ impl TryFrom<u8> for OpCode {
             0x16 => Ok(Self::Or),
             0x17 => Ok(Self::Not),
             0x18 => Ok(Self::Lshr),
+            0x19 => Ok(Self::ArraySetLocal),
+            0x1A => Ok(Self::ArrayPushLocal),
+            0x1B => Ok(Self::MapSetLocal),
             _ => Err(()),
         }
     }
@@ -172,7 +179,14 @@ fn infer_local_count(code: &[u8]) -> usize {
         if ip.saturating_add(operand_len) > code.len() {
             break;
         }
-        if matches!(opcode, OpCode::Ldloc | OpCode::Stloc) {
+        if matches!(
+            opcode,
+            OpCode::Ldloc
+                | OpCode::Stloc
+                | OpCode::ArraySetLocal
+                | OpCode::ArrayPushLocal
+                | OpCode::MapSetLocal
+        ) {
             let index = code[ip];
             max_local = Some(max_local.map_or(index, |current| current.max(index)));
         }
