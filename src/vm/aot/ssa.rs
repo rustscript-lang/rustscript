@@ -110,6 +110,9 @@ pub(crate) enum AotSsaInstKind {
     ConstSlot {
         index: u32,
     },
+    CloneTagged {
+        input: AotSsaValueId,
+    },
     StringLen {
         text: AotSsaValueId,
     },
@@ -151,6 +154,20 @@ pub(crate) enum AotSsaInstKind {
     },
     BytesToArrayU8 {
         bytes: AotSsaValueId,
+    },
+    ArraySet {
+        array: AotSsaValueId,
+        index: AotSsaValueId,
+        value: AotSsaValueId,
+    },
+    ArrayPush {
+        array: AotSsaValueId,
+        value: AotSsaValueId,
+    },
+    MapSet {
+        map: AotSsaValueId,
+        key: AotSsaValueId,
+        value: AotSsaValueId,
     },
     IntAdd {
         lhs: AotSsaValueId,
@@ -283,6 +300,7 @@ impl AotSsaInstKind {
             | Self::FloatConst(_)
             | Self::BoolConst(_)
             | Self::ConstSlot { .. } => Vec::new(),
+            Self::CloneTagged { input } => vec![*input],
             Self::StringLen { text } => vec![*text],
             Self::BytesLen { bytes } => vec![*bytes],
             Self::StringSlice {
@@ -301,6 +319,13 @@ impl AotSsaInstKind {
             Self::StringConcat { lhs, rhs } | Self::BytesConcat { lhs, rhs } => vec![*lhs, *rhs],
             Self::BytesFromArrayU8 { array } => vec![*array],
             Self::BytesToArrayU8 { bytes } => vec![*bytes],
+            Self::ArraySet {
+                array,
+                index,
+                value,
+            } => vec![*array, *index, *value],
+            Self::ArrayPush { array, value } => vec![*array, *value],
+            Self::MapSet { map, key, value } => vec![*map, *key, *value],
             Self::IntAdd { lhs, rhs }
             | Self::IntSub { lhs, rhs }
             | Self::IntMul { lhs, rhs }
@@ -1565,6 +1590,26 @@ fn apply_direct_instruction<E: InstEmitter>(
             frame.stack.push(value);
             Ok(true)
         }
+        AotInstruction::LdlocOwned { index } => {
+            let value = frame
+                .locals
+                .get(*index as usize)
+                .copied()
+                .ok_or(AotSsaBuildError::InvalidLocal(*index))?;
+            if value.value.repr != AotSsaValueRepr::Tagged {
+                return Ok(false);
+            }
+            frame.stack.push(FrameValue {
+                value: emitter.emit(
+                    ip,
+                    AotSsaInstKind::CloneTagged {
+                        input: value.value.id,
+                    },
+                    AotSsaValueRepr::Tagged,
+                ),
+            });
+            Ok(true)
+        }
         AotInstruction::Stloc { index } => {
             let value = frame.pop(ip, "stloc")?;
             let local = frame
@@ -1719,6 +1764,9 @@ fn apply_direct_instruction<E: InstEmitter>(
             AotSsaValueRepr::Tagged,
             |bytes| AotSsaInstKind::BytesToArrayU8 { bytes },
         ),
+        AotInstruction::ArraySet => emit_collection_set(frame, emitter, ip, false),
+        AotInstruction::MapSet => emit_collection_set(frame, emitter, ip, true),
+        AotInstruction::ArrayPush => emit_array_push(frame, emitter, ip),
         AotInstruction::And => emit_binary(
             frame,
             emitter,
@@ -1874,6 +1922,65 @@ fn apply_direct_instruction<E: InstEmitter>(
         }
         AotInstruction::Call(_) => Ok(false),
     }
+}
+
+fn emit_collection_set<E: InstEmitter>(
+    frame: &mut Frame,
+    emitter: &mut E,
+    ip: usize,
+    is_map: bool,
+) -> Result<bool, AotSsaBuildError> {
+    let value = frame.pop(ip, "collection_set")?;
+    let key = frame.pop(ip, "collection_set")?;
+    let container = frame.pop(ip, "collection_set")?;
+    if container.value.repr != AotSsaValueRepr::Tagged {
+        frame.stack.push(container);
+        frame.stack.push(key);
+        frame.stack.push(value);
+        return Ok(false);
+    }
+    let kind = if is_map {
+        AotSsaInstKind::MapSet {
+            map: container.value.id,
+            key: key.value.id,
+            value: value.value.id,
+        }
+    } else {
+        AotSsaInstKind::ArraySet {
+            array: container.value.id,
+            index: key.value.id,
+            value: value.value.id,
+        }
+    };
+    frame.stack.push(FrameValue {
+        value: emitter.emit(ip, kind, AotSsaValueRepr::Tagged),
+    });
+    Ok(true)
+}
+
+fn emit_array_push<E: InstEmitter>(
+    frame: &mut Frame,
+    emitter: &mut E,
+    ip: usize,
+) -> Result<bool, AotSsaBuildError> {
+    let value = frame.pop(ip, "array_push")?;
+    let array = frame.pop(ip, "array_push")?;
+    if array.value.repr != AotSsaValueRepr::Tagged {
+        frame.stack.push(array);
+        frame.stack.push(value);
+        return Ok(false);
+    }
+    frame.stack.push(FrameValue {
+        value: emitter.emit(
+            ip,
+            AotSsaInstKind::ArrayPush {
+                array: array.value.id,
+                value: value.value.id,
+            },
+            AotSsaValueRepr::Tagged,
+        ),
+    });
+    Ok(true)
 }
 
 fn emit_binary<E: InstEmitter>(

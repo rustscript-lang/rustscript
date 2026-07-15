@@ -351,6 +351,140 @@ fn aot_inlines_typed_numeric_steps_without_bridge_fallback() {
 }
 
 #[test]
+fn aot_inlines_same_local_array_set_without_builtin_boundary() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        let mut values = [1, 2, 3];
+        let mut i = 0;
+        while i < 64 {
+            values[1] = i;
+            i = i + 1;
+        }
+        values[1];
+    "#;
+
+    let compiled = compile_source(source).expect("array-set aot compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_bridge_stats_enabled(true);
+    install_aot(&mut vm);
+
+    assert_eq!(vm.run().expect("aot vm should run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(63)]);
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    assert_eq!(
+        bridge_hits
+            .iter()
+            .find_map(|(name, count)| (*name == "set").then_some(*count)),
+        Some(1),
+        "only the final non-delayed Set should cross the builtin bridge: {bridge_hits:?}"
+    );
+}
+
+#[test]
+fn aot_inlines_same_local_map_set_in_loop() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        let mut m: map<int> = {};
+        for i in 0..64 {
+            m[i] = i + 1;
+        }
+        let mut m2: map<int> = {};
+        for i in 0..64 {
+            m2[i] = i + 1;
+        }
+    "#;
+
+    let compiled = compile_source(source).expect("map-set aot compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_bridge_stats_enabled(true);
+    install_aot(&mut vm);
+    assert_eq!(vm.run().expect("aot vm should run"), VmStatus::Halted);
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    assert_eq!(
+        bridge_hits
+            .iter()
+            .find_map(|(name, count)| (*name == "set").then_some(*count)),
+        None,
+        "loop-delayed MapSet should not cross the builtin bridge: {bridge_hits:?}"
+    );
+}
+
+#[test]
+fn aot_inlines_same_local_array_push_in_loop() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let mut bc = BytecodeBuilder::new();
+    let push_call = vm::BuiltinFunction::ArrayPush.call_index();
+    let get_call = builtin_call_index("get").expect("get builtin should exist");
+    bc.ldc(0);
+    bc.stloc(0);
+    bc.ldc(1);
+    bc.stloc(1);
+
+    let loop_ip = bc.position();
+    bc.ldloc(1);
+    bc.ldc(2);
+    bc.clt();
+    let exit_branch_ip = bc.position();
+    bc.brfalse(0);
+    bc.ldloc(0);
+    bc.ldloc(1);
+    bc.ldc(3);
+    bc.stloc(0);
+    bc.call(push_call, 2);
+    bc.stloc(0);
+    bc.ldloc(1);
+    bc.ldc(4);
+    bc.add();
+    bc.stloc(1);
+    bc.br(loop_ip);
+
+    let exit_ip = bc.position();
+    bc.ldloc(0);
+    bc.ldc(5);
+    bc.call(get_call, 2);
+    bc.ret();
+
+    let mut code = bc.finish();
+    patch_branch_target(&mut code, exit_branch_ip, exit_ip);
+    let program = Program::new(
+        vec![
+            Value::array(Vec::new()),
+            Value::Int(0),
+            Value::Int(64),
+            Value::Null,
+            Value::Int(1),
+            Value::Int(63),
+        ],
+        code,
+    )
+    .with_local_count(2);
+    let program = force_local_types(program, &[(0, ValueType::Array), (1, ValueType::Int)]);
+    let mut vm = Vm::new(program);
+    vm.set_jit_native_bridge_stats_enabled(true);
+    install_aot(&mut vm);
+
+    assert_eq!(vm.run().expect("aot vm should run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(63)]);
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    assert_eq!(
+        bridge_hits
+            .iter()
+            .find_map(|(name, count)| (*name == "array_push").then_some(*count)),
+        None,
+        "loop-delayed ArrayPush should not cross the builtin bridge: {bridge_hits:?}"
+    );
+}
+
+#[test]
 fn aot_handles_scalar_local_clear_sequences() {
     if !native_jit_supported() {
         return;

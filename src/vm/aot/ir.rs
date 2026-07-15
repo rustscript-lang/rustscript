@@ -57,6 +57,9 @@ pub(crate) enum AotInstruction {
     Get(AotTextBytesKind),
     HasBytes,
     BytesCodec(AotBytesCodecKind),
+    ArraySet,
+    ArrayPush,
+    MapSet,
     Sub,
     ISub,
     FSub,
@@ -87,6 +90,7 @@ pub(crate) enum AotInstruction {
     Pop,
     Dup,
     Ldloc { index: u8 },
+    LdlocOwned { index: u8 },
     Stloc { index: u8 },
     Call(AotCall),
 }
@@ -159,6 +163,8 @@ fn lower_block(
 ) -> Result<AotIrBlock, AotLowerError> {
     let code = &program.code;
     let mut instructions = Vec::new();
+    let mut provenance = Some(Vec::<AotStackProvenance>::new());
+    let mut local_nulls = vec![false; program.local_count];
     let mut ip = block.start_ip;
 
     while ip < block.end_ip {
@@ -185,6 +191,13 @@ fn lower_block(
                         kind: "ldc index",
                     })?;
                 instructions.push(AotInstruction::Ldc { const_index });
+                if let Some(stack) = provenance.as_mut() {
+                    let known_null = matches!(
+                        program.constants.get(const_index as usize),
+                        Some(crate::Value::Null)
+                    );
+                    stack.push(AotStackProvenance::Constant { known_null });
+                }
             }
             OpCode::Add => instructions.push(typed_instruction(program, ip, opcode)),
             OpCode::Sub => instructions.push(typed_instruction(program, ip, opcode)),
@@ -209,7 +222,14 @@ fn lower_block(
                     opcode,
                     kind: "ldloc index",
                 })?;
+                let instruction_index = instructions.len();
                 instructions.push(AotInstruction::Ldloc { index });
+                if let Some(stack) = provenance.as_mut() {
+                    stack.push(AotStackProvenance::Local {
+                        index,
+                        instruction_index,
+                    });
+                }
             }
             OpCode::Stloc => {
                 let index = read_u8(code, ip + 1).ok_or(AotLowerError::InvalidImmediate {
@@ -218,6 +238,13 @@ fn lower_block(
                     kind: "stloc index",
                 })?;
                 instructions.push(AotInstruction::Stloc { index });
+                if let Some(stack) = provenance.as_mut() {
+                    if let Some(value) = stack.pop() {
+                        local_nulls[index as usize] = value.known_null();
+                    } else {
+                        provenance = None;
+                    }
+                }
             }
             OpCode::Call => {
                 let index = read_u16(code, ip + 1).ok_or(AotLowerError::InvalidImmediate {
@@ -238,7 +265,29 @@ fn lower_block(
                             kind: "builtin call arity",
                         });
                     }
-                    if let Some(instruction) = typed_builtin_instruction(program, ip, builtin) {
+                    if let Some((instruction, source_instruction)) =
+                        delayed_move_collection_instruction(
+                            program,
+                            code,
+                            ip,
+                            next_ip,
+                            builtin,
+                            argc,
+                            provenance.as_ref(),
+                            &local_nulls,
+                        )
+                    {
+                        let source_local = match instructions.get(source_instruction) {
+                            Some(AotInstruction::Ldloc { index }) => *index,
+                            _ => unreachable!("validated delayed-move source"),
+                        };
+                        instructions[source_instruction] = AotInstruction::LdlocOwned {
+                            index: source_local,
+                        };
+                        instructions.push(instruction);
+                    } else if let Some(instruction) =
+                        typed_builtin_instruction(program, ip, builtin)
+                    {
                         instructions.push(instruction);
                     } else {
                         let call = AotCall {
@@ -264,6 +313,7 @@ fn lower_block(
                     resume_ips.insert(call.resume_ip);
                     instructions.push(AotInstruction::Call(call));
                 }
+                apply_call_provenance(&mut provenance, argc, index);
             }
             OpCode::Ret | OpCode::Br | OpCode::Brfalse => {
                 return Err(AotLowerError::InvalidImmediate {
@@ -274,6 +324,7 @@ fn lower_block(
             }
         }
 
+        apply_non_call_stack_effect(&mut provenance, opcode);
         ip = next_ip;
     }
 
@@ -283,6 +334,134 @@ fn lower_block(
         instructions,
         terminal: block.terminal.clone(),
     })
+}
+
+#[derive(Clone, Copy)]
+enum AotStackProvenance {
+    Derived,
+    Local { index: u8, instruction_index: usize },
+    Constant { known_null: bool },
+}
+
+impl AotStackProvenance {
+    fn known_null(self) -> bool {
+        matches!(self, Self::Constant { known_null: true })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn delayed_move_collection_instruction(
+    program: &Program,
+    code: &[u8],
+    call_ip: usize,
+    next_ip: usize,
+    builtin: BuiltinFunction,
+    argc: u8,
+    provenance: Option<&Vec<AotStackProvenance>>,
+    local_nulls: &[bool],
+) -> Option<(AotInstruction, usize)> {
+    let expected_argc = match builtin {
+        BuiltinFunction::Set => 3,
+        BuiltinFunction::ArrayPush => 2,
+        _ => return None,
+    };
+    if argc != expected_argc {
+        return None;
+    }
+    let stack = provenance?;
+    let args = stack.get(stack.len().checked_sub(argc as usize)?..)?;
+    let AotStackProvenance::Local {
+        index: source_local,
+        instruction_index,
+    } = args[0]
+    else {
+        return None;
+    };
+    if !local_nulls
+        .get(source_local as usize)
+        .copied()
+        .unwrap_or(false)
+        || args[1..].iter().any(
+            |arg| matches!(arg, AotStackProvenance::Local { index, .. } if *index == source_local),
+        )
+        || code.get(next_ip).copied() != Some(OpCode::Stloc as u8)
+        || read_u8(code, next_ip + 1) != Some(source_local)
+    {
+        return None;
+    }
+    match builtin {
+        BuiltinFunction::ArrayPush => Some((AotInstruction::ArrayPush, instruction_index)),
+        BuiltinFunction::Set => match program
+            .type_map
+            .as_ref()
+            .and_then(|type_map| type_map.operand_types.get(&call_ip))
+            .map(|types| types.0)
+        {
+            Some(ValueType::Array) => Some((AotInstruction::ArraySet, instruction_index)),
+            Some(ValueType::Map) => Some((AotInstruction::MapSet, instruction_index)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn apply_call_provenance(
+    provenance: &mut Option<Vec<AotStackProvenance>>,
+    argc: u8,
+    call_index: u16,
+) {
+    let Some(stack) = provenance.as_mut() else {
+        return;
+    };
+    if stack.len() < argc as usize {
+        *provenance = None;
+        return;
+    }
+    stack.truncate(stack.len() - argc as usize);
+    if !matches!(
+        BuiltinFunction::from_call_index(call_index),
+        Some(BuiltinFunction::Assert)
+    ) {
+        stack.push(AotStackProvenance::Derived);
+    }
+}
+
+fn apply_non_call_stack_effect(provenance: &mut Option<Vec<AotStackProvenance>>, opcode: OpCode) {
+    let Some(stack) = provenance.as_mut() else {
+        return;
+    };
+    let (pops, pushes) = match opcode {
+        OpCode::Add
+        | OpCode::Sub
+        | OpCode::Mul
+        | OpCode::Div
+        | OpCode::Mod
+        | OpCode::Shl
+        | OpCode::Shr
+        | OpCode::Lshr
+        | OpCode::And
+        | OpCode::Or
+        | OpCode::Ceq
+        | OpCode::Clt
+        | OpCode::Cgt => (2, 1),
+        OpCode::Not | OpCode::Neg => (1, 1),
+        OpCode::Pop => (1, 0),
+        OpCode::Dup => {
+            if let Some(value) = stack.last().copied() {
+                stack.push(value);
+            } else {
+                *provenance = None;
+            }
+            return;
+        }
+        _ => return,
+    };
+    if stack.len() < pops {
+        *provenance = None;
+        return;
+    }
+    stack.truncate(stack.len() - pops);
+    stack.extend(std::iter::repeat_n(AotStackProvenance::Derived, pushes));
 }
 
 fn is_explicit_terminal_opcode(

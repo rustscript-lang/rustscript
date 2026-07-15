@@ -16,8 +16,9 @@ use crate::vm::native::ExecutableBuffer;
 use crate::vm::native::{
     HeapIntrinsicAddrs, HeapIntrinsicRefs, OP_BUILTIN_CALL, OP_CALL, STATUS_CONTINUE, STATUS_ERROR,
     alloc_buffer_signature, alloc_byte_buffer_entry_address, alloc_value_buffer_entry_address,
-    aot_call_boundary_interrupt_entry_address, box_heap_value_signature,
+    aot_call_boundary_interrupt_entry_address, array_push_entry_address, box_heap_value_signature,
     clear_value_slot_entry_address, clone_value_signature, clone_value_to_slot_entry_address,
+    collection_get_signature, collection_mutation_signature, collection_set_entry_address,
     copy_bytes_entry_address, copy_bytes_signature, detect_native_stack_layout, entry_signature,
     free_buffer_signature, helper_entry_offset, helper_signature,
     init_null_value_slot_entry_address, jump_with_status, pack_shared_signature, resolve_offsets,
@@ -223,6 +224,8 @@ struct AotDeoptHelperRefs {
     init_null_slot_ref: cranelift_codegen::ir::SigRef,
     clear_value_slot_ref: cranelift_codegen::ir::SigRef,
     box_heap_value_ref: cranelift_codegen::ir::SigRef,
+    array_push_ref: cranelift_codegen::ir::SigRef,
+    collection_set_ref: cranelift_codegen::ir::SigRef,
     restore_exit_ref: cranelift_codegen::ir::SigRef,
 }
 
@@ -235,6 +238,8 @@ struct AotDeoptHelperAddrs {
     init_null_slot: usize,
     clear_value_slot: usize,
     box_heap_value: usize,
+    array_push: usize,
+    collection_set: usize,
     restore_exit: usize,
 }
 
@@ -242,6 +247,7 @@ struct AotDeoptHelperAddrs {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum AotTempValueSlotKey {
     Output(AotSsaValueId),
+    MutationArg(AotSsaValueId, u8),
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -306,6 +312,15 @@ struct AotConcatOp {
     rhs: cranelift_codegen::ir::Value,
     result_tag: u32,
     pack_addr: usize,
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[derive(Clone, Copy)]
+struct AotMutationOp {
+    output_id: AotSsaValueId,
+    container: AotSsaValueId,
+    first_arg: AotSsaValueId,
+    second_arg: Option<AotSsaValueId>,
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -375,6 +390,8 @@ fn compile_ssa(
     let value_eq_sig = value_eq_signature(pointer_type, call_conv);
     let value_slot_sig = value_slot_signature(pointer_type, call_conv);
     let box_heap_sig = box_heap_value_signature(pointer_type, call_conv);
+    let array_push_sig = collection_get_signature(pointer_type, call_conv);
+    let collection_set_sig = collection_mutation_signature(pointer_type, call_conv);
     let restore_exit_sig = restore_exit_signature(pointer_type, call_conv);
     let sigs_elapsed = sigs_started.elapsed();
 
@@ -396,6 +413,8 @@ fn compile_ssa(
         init_null_slot: init_null_value_slot_entry_address(),
         clear_value_slot: clear_value_slot_entry_address(),
         box_heap_value: write_heap_value_to_slot_entry_address(),
+        array_push: array_push_entry_address(),
+        collection_set: collection_set_entry_address(),
         restore_exit: restore_exit_state_entry_address(),
     };
     let addr_setup_elapsed = addr_setup_started.elapsed();
@@ -448,6 +467,8 @@ fn compile_ssa(
             init_null_slot_ref: b.import_signature(value_slot_sig.clone()),
             clear_value_slot_ref: b.import_signature(value_slot_sig),
             box_heap_value_ref: b.import_signature(box_heap_sig),
+            array_push_ref: b.import_signature(array_push_sig),
+            collection_set_ref: b.import_signature(collection_set_sig),
             restore_exit_ref: b.import_signature(restore_exit_sig),
         };
         let heap_refs = HeapIntrinsicRefs {
@@ -555,7 +576,7 @@ fn compile_ssa(
                 values.insert(param.value.id, lowered);
             }
             for inst in &block.insts {
-                let lowered = lower_aot_ssa_inst(&mut b, lower_ctx, inst, &values)?;
+                let lowered = lower_aot_ssa_inst(&mut b, lower_ctx, inst, &values, &value_reprs)?;
                 values.insert(inst.output.id, lowered);
             }
             lower_aot_ssa_terminator(
@@ -801,6 +822,7 @@ fn lower_aot_ssa_inst(
     ctx: AotLowerCtx<'_>,
     inst: &super::ssa::AotSsaInst,
     values: &HashMap<AotSsaValueId, cranelift_codegen::ir::Value>,
+    value_reprs: &HashMap<AotSsaValueId, AotSsaValueRepr>,
 ) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
     let AotLowerCtx {
         vm_ptr,
@@ -826,6 +848,24 @@ fn lower_aot_ssa_inst(
                 idx,
                 std::mem::size_of::<Value>() as i32,
             )
+        }
+        AotSsaInstKind::CloneTagged { input } => {
+            let out = owned_value_temp_slot_addr(
+                b,
+                pointer_type,
+                ctx.owned_value_temps,
+                AotTempValueSlotKey::Output(inst.output.id),
+            )?;
+            clear_owned_value_temp_slot(b, pointer_type, ctx.helper_refs, ctx.helper_addrs, out)?;
+            call_status_helper(
+                b,
+                ctx.exit_block,
+                pointer_type,
+                ctx.helper_refs.clone_value_ref,
+                ctx.helper_addrs.clone_value,
+                &[out, values[input]],
+            )?;
+            out
         }
         AotSsaInstKind::StringLen { text } => aot_lower_string_len(
             b,
@@ -942,6 +982,46 @@ fn lower_aot_ssa_inst(
                 ip: inst.ip,
                 value: values[bytes],
             },
+        )?,
+        AotSsaInstKind::ArraySet {
+            array,
+            index,
+            value,
+        } => aot_lower_mutation(
+            b,
+            ctx,
+            AotMutationOp {
+                output_id: inst.output.id,
+                container: *array,
+                first_arg: *index,
+                second_arg: Some(*value),
+            },
+            values,
+            value_reprs,
+        )?,
+        AotSsaInstKind::MapSet { map, key, value } => aot_lower_mutation(
+            b,
+            ctx,
+            AotMutationOp {
+                output_id: inst.output.id,
+                container: *map,
+                first_arg: *key,
+                second_arg: Some(*value),
+            },
+            values,
+            value_reprs,
+        )?,
+        AotSsaInstKind::ArrayPush { array, value } => aot_lower_mutation(
+            b,
+            ctx,
+            AotMutationOp {
+                output_id: inst.output.id,
+                container: *array,
+                first_arg: *value,
+                second_arg: None,
+            },
+            values,
+            value_reprs,
         )?,
         AotSsaInstKind::IntAdd { lhs, rhs } => b.ins().iadd(values[lhs], values[rhs]),
         AotSsaInstKind::IntSub { lhs, rhs } => b.ins().isub(values[lhs], values[rhs]),
@@ -1070,6 +1150,109 @@ fn lower_aot_ssa_inst(
         ),
     };
     Ok(value)
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn aot_lower_mutation(
+    b: &mut FunctionBuilder,
+    ctx: AotLowerCtx<'_>,
+    op: AotMutationOp,
+    values: &HashMap<AotSsaValueId, cranelift_codegen::ir::Value>,
+    value_reprs: &HashMap<AotSsaValueId, AotSsaValueRepr>,
+) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let out = owned_value_temp_slot_addr(
+        b,
+        ctx.pointer_type,
+        ctx.owned_value_temps,
+        AotTempValueSlotKey::Output(op.output_id),
+    )?;
+    clear_owned_value_temp_slot(b, ctx.pointer_type, ctx.helper_refs, ctx.helper_addrs, out)?;
+    let first_addr = aot_ensure_boxed_value_addr(
+        b,
+        ctx,
+        values,
+        value_reprs,
+        op.first_arg,
+        AotTempValueSlotKey::MutationArg(op.output_id, 0),
+    )?;
+    let (helper_ref, helper_addr, args) = if let Some(second_arg) = op.second_arg {
+        let second_addr = aot_ensure_boxed_value_addr(
+            b,
+            ctx,
+            values,
+            value_reprs,
+            second_arg,
+            AotTempValueSlotKey::MutationArg(op.output_id, 1),
+        )?;
+        (
+            ctx.helper_refs.collection_set_ref,
+            ctx.helper_addrs.collection_set,
+            vec![out, values[&op.container], first_addr, second_addr],
+        )
+    } else {
+        (
+            ctx.helper_refs.array_push_ref,
+            ctx.helper_addrs.array_push,
+            vec![out, values[&op.container], first_addr],
+        )
+    };
+    let helper_ptr = iconst_ptr_from_addr(b, ctx.pointer_type, helper_addr)?;
+    let call = b.ins().call_indirect(helper_ref, helper_ptr, &args);
+    let status = b.inst_results(call)[0];
+    let fail = b.create_block();
+    let cont = b.create_block();
+    let is_error = b
+        .ins()
+        .icmp_imm(IntCC::Equal, status, i64::from(STATUS_ERROR));
+    b.ins().brif(is_error, fail, &[], cont, &[]);
+    b.switch_to_block(fail);
+    jump_with_status(b, ctx.exit_block, status);
+    b.switch_to_block(cont);
+    Ok(out)
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn aot_ensure_boxed_value_addr(
+    b: &mut FunctionBuilder,
+    ctx: AotLowerCtx<'_>,
+    values: &HashMap<AotSsaValueId, cranelift_codegen::ir::Value>,
+    value_reprs: &HashMap<AotSsaValueId, AotSsaValueRepr>,
+    value_id: AotSsaValueId,
+    temp_key: AotTempValueSlotKey,
+) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let repr = *value_reprs.get(&value_id).ok_or_else(|| {
+        AotCompileError::Codegen("AOT mutation value representation missing".to_string())
+    })?;
+    if repr == AotSsaValueRepr::Tagged {
+        return Ok(values[&value_id]);
+    }
+    let addr = owned_value_temp_slot_addr(b, ctx.pointer_type, ctx.owned_value_temps, temp_key)?;
+    clear_owned_value_temp_slot(b, ctx.pointer_type, ctx.helper_refs, ctx.helper_addrs, addr)?;
+    let materialization = match repr {
+        AotSsaValueRepr::Tagged => unreachable!(),
+        AotSsaValueRepr::I64 => AotSsaMaterialization::BoxInt(value_id),
+        AotSsaValueRepr::F64 => AotSsaMaterialization::BoxFloat(value_id),
+        AotSsaValueRepr::Bool => AotSsaMaterialization::BoxBool(value_id),
+        AotSsaValueRepr::HeapPtr(tag) => AotSsaMaterialization::BoxHeapPtr {
+            value: value_id,
+            tag,
+        },
+    };
+    materialize_slot(
+        b,
+        AotMaterializeCtx {
+            exit_block: ctx.exit_block,
+            pointer_type: ctx.pointer_type,
+            value_layout: ctx.layout.value,
+            helper_refs: ctx.helper_refs,
+            helper_addrs: ctx.helper_addrs,
+            values,
+        },
+        &materialization,
+        addr,
+        "mutation argument",
+    )?;
+    Ok(addr)
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -1252,13 +1435,17 @@ fn lower_aot_ssa_terminator(
 fn aot_inst_requires_owned_value_slot(kind: &AotSsaInstKind) -> bool {
     matches!(
         kind,
-        AotSsaInstKind::StringSlice { .. }
+        AotSsaInstKind::CloneTagged { .. }
+            | AotSsaInstKind::StringSlice { .. }
             | AotSsaInstKind::BytesSlice { .. }
             | AotSsaInstKind::StringGet { .. }
             | AotSsaInstKind::StringConcat { .. }
             | AotSsaInstKind::BytesConcat { .. }
             | AotSsaInstKind::BytesFromArrayU8 { .. }
             | AotSsaInstKind::BytesToArrayU8 { .. }
+            | AotSsaInstKind::ArraySet { .. }
+            | AotSsaInstKind::ArrayPush { .. }
+            | AotSsaInstKind::MapSet { .. }
     )
 }
 
@@ -1276,6 +1463,21 @@ fn allocate_owned_value_temps(
                 let slot = aot_create_value_stack_slot(b, value_size)?;
                 ordered.push(slot);
                 slots.insert(AotTempValueSlotKey::Output(inst.output.id), slot);
+                if matches!(
+                    inst.kind,
+                    AotSsaInstKind::ArraySet { .. }
+                        | AotSsaInstKind::ArrayPush { .. }
+                        | AotSsaInstKind::MapSet { .. }
+                ) {
+                    for arg in 0..2 {
+                        let arg_slot = aot_create_value_stack_slot(b, value_size)?;
+                        ordered.push(arg_slot);
+                        slots.insert(
+                            AotTempValueSlotKey::MutationArg(inst.output.id, arg),
+                            arg_slot,
+                        );
+                    }
+                }
             }
         }
     }
