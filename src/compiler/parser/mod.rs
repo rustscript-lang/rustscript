@@ -138,6 +138,8 @@ pub(super) struct Parser {
     direct_host_call_aliases: HashMap<String, String>,
     direct_host_wildcard_imports: HashSet<String>,
     mutable_locals: Vec<bool>,
+    borrowed_map_iter_locals: Vec<LocalSlot>,
+    local_schemas: HashMap<LocalSlot, TypeSchema>,
 }
 
 struct ClosureCaptureContext {
@@ -190,6 +192,8 @@ impl Parser {
             direct_host_call_aliases: HashMap::new(),
             direct_host_wildcard_imports: HashSet::new(),
             mutable_locals: Vec::new(),
+            borrowed_map_iter_locals: Vec::new(),
+            local_schemas: HashMap::new(),
         })
     }
 

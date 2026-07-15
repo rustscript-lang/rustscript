@@ -14,7 +14,8 @@ pub(crate) use bridge::{
     clone_value_to_slot_entry_address, collection_set_entry_address, copy_bytes_entry_address,
     helper_entry_address, helper_entry_offset, init_null_value_slot_entry_address,
     interrupt_helper_entry_address, interrupt_helper_entry_offset, map_get_entry_address,
-    map_has_entry_address, restore_exit_state_entry_address,
+    map_has_entry_address, map_iter_next_entry_address, map_iter_take_key_entry_address,
+    map_iter_take_value_entry_address, restore_exit_state_entry_address,
     restore_sparse_exit_state_entry_address, shared_array_from_buffer_entry_address,
     shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
     store_bridge_error, string_contains_entry_address, string_lower_ascii_entry_address,
@@ -26,9 +27,10 @@ pub(crate) use codegen::{
     alloc_buffer_signature, box_heap_value_signature, clone_value_signature,
     collection_get_signature, collection_mutation_signature, collection_predicate_signature,
     copy_bytes_signature, entry_signature, free_buffer_signature, helper_signature,
-    jump_with_status, pack_shared_signature, restore_exit_signature, sparse_restore_exit_signature,
-    string_binary_transform_signature, string_contains_signature, string_replace_signature,
-    string_unary_transform_signature, value_eq_signature, value_slot_signature,
+    jump_with_status, map_iter_next_signature, map_iter_take_signature, pack_shared_signature,
+    restore_exit_signature, sparse_restore_exit_signature, string_binary_transform_signature,
+    string_contains_signature, string_replace_signature, string_unary_transform_signature,
+    value_eq_signature, value_slot_signature,
 };
 pub(crate) use exec::{ExecutableBuffer, prepare_for_execution};
 pub(crate) use layout::{

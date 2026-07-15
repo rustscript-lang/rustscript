@@ -15,6 +15,7 @@ mod io;
 mod io_wasm;
 mod jit;
 mod json;
+mod map_iter;
 mod math;
 pub(crate) mod print;
 pub(crate) mod regex;
@@ -64,6 +65,15 @@ pub(crate) fn execute_builtin_call(
         BuiltinFunction::Set => core::builtin_set(args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Keys => core::builtin_keys(args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Count => core::builtin_count(args).map(BuiltinCallOutcome::Return),
+        BuiltinFunction::MapIterInit => map_iter::init(vm, args).map(BuiltinCallOutcome::Return),
+        BuiltinFunction::MapIterNext => map_iter::next(vm, args).map(BuiltinCallOutcome::Return),
+        BuiltinFunction::MapIterTakeKey => {
+            map_iter::take_key(vm, args).map(BuiltinCallOutcome::Return)
+        }
+        BuiltinFunction::MapIterTakeValue => {
+            map_iter::take_value(vm, args).map(BuiltinCallOutcome::Return)
+        }
+        BuiltinFunction::MapIterClose => map_iter::close(vm, args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::StringContains => core::builtin_string_contains(args)
             .map(IntoBuiltinCallOutcome::into_builtin_call_outcome),
         BuiltinFunction::StringReplaceLiteral => core::builtin_string_replace_literal(args)

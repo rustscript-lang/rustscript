@@ -257,6 +257,18 @@ pub(crate) fn map_get_entry_address() -> usize {
     pd_vm_native_map_get as *const () as usize
 }
 
+pub(crate) fn map_iter_next_entry_address() -> usize {
+    pd_vm_native_map_iter_next as *const () as usize
+}
+
+pub(crate) fn map_iter_take_key_entry_address() -> usize {
+    pd_vm_native_map_iter_take_key as *const () as usize
+}
+
+pub(crate) fn map_iter_take_value_entry_address() -> usize {
+    pd_vm_native_map_iter_take_value as *const () as usize
+}
+
 pub(crate) fn collection_set_entry_address() -> usize {
     pd_vm_native_collection_set as *const () as usize
 }
@@ -675,6 +687,63 @@ pub(crate) extern "C" fn pd_vm_native_map_get(
     }
     std::mem::forget(entries);
     1
+}
+
+pub(crate) extern "C" fn pd_vm_native_map_iter_next(vm: *mut Vm, slot: i64) -> i32 {
+    if vm.is_null() || slot < 0 {
+        store_bridge_error(VmError::JitNative(
+            "native map-iterator next received invalid arguments".to_string(),
+        ));
+        return STATUS_ERROR;
+    }
+    match unsafe { &mut *vm }.advance_map_iterator(slot as usize) {
+        Ok(has_next) => i32::from(has_next),
+        Err(err) => {
+            store_bridge_error(err);
+            STATUS_ERROR
+        }
+    }
+}
+
+fn native_map_iter_take(dst: *mut Value, vm: *mut Vm, slot: i64, key: bool) -> i32 {
+    if dst.is_null() || vm.is_null() || slot < 0 {
+        store_bridge_error(VmError::JitNative(
+            "native map-iterator take received invalid arguments".to_string(),
+        ));
+        return STATUS_ERROR;
+    }
+    let vm = unsafe { &mut *vm };
+    let value = if key {
+        vm.take_map_iterator_key(slot as usize)
+    } else {
+        vm.take_map_iterator_value(slot as usize)
+    };
+    let value = match value {
+        Ok(value) => value,
+        Err(err) => {
+            store_bridge_error(err);
+            return STATUS_ERROR;
+        }
+    };
+    let replaced = unsafe { std::ptr::replace(dst, value) };
+    drop(replaced);
+    1
+}
+
+pub(crate) extern "C" fn pd_vm_native_map_iter_take_key(
+    dst: *mut Value,
+    vm: *mut Vm,
+    slot: i64,
+) -> i32 {
+    native_map_iter_take(dst, vm, slot, true)
+}
+
+pub(crate) extern "C" fn pd_vm_native_map_iter_take_value(
+    dst: *mut Value,
+    vm: *mut Vm,
+    slot: i64,
+) -> i32 {
+    native_map_iter_take(dst, vm, slot, false)
 }
 
 pub(crate) extern "C" fn pd_vm_native_collection_set(

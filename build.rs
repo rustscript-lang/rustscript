@@ -346,7 +346,7 @@ fn render_builtin_catalog(
         .and_then(|value| value.checked_add(1))
         .expect("builtin call base should fit in u16");
     assert!(
-        builtin_call_base >= 8,
+        builtin_call_base >= 14,
         "builtin call base must leave room for reserved special builtins"
     );
 
@@ -492,6 +492,31 @@ fn render_builtin_catalog(
     writeln!(
         &mut out,
         "    (BUILTIN_CALL_BASE - 8, BuiltinFunction::StringSplitLiteral),"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "    (BUILTIN_CALL_BASE - 9, BuiltinFunction::MapIterInit),"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "    (BUILTIN_CALL_BASE - 10, BuiltinFunction::MapIterNext),"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "    (BUILTIN_CALL_BASE - 11, BuiltinFunction::MapIterTakeKey),"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "    (BUILTIN_CALL_BASE - 12, BuiltinFunction::MapIterTakeValue),"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "    (BUILTIN_CALL_BASE - 13, BuiltinFunction::MapIterClose),"
     )
     .unwrap();
     writeln!(&mut out, "];").unwrap();
@@ -660,6 +685,31 @@ fn render_builtin_catalog(
     writeln!(
         &mut out,
         "            BuiltinFunction::StringSplitLiteral => BUILTIN_CALL_BASE - 8,"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "            BuiltinFunction::MapIterInit => BUILTIN_CALL_BASE - 9,"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "            BuiltinFunction::MapIterNext => BUILTIN_CALL_BASE - 10,"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "            BuiltinFunction::MapIterTakeKey => BUILTIN_CALL_BASE - 11,"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "            BuiltinFunction::MapIterTakeValue => BUILTIN_CALL_BASE - 12,"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "            BuiltinFunction::MapIterClose => BUILTIN_CALL_BASE - 13,"
     )
     .unwrap();
     writeln!(
@@ -1301,6 +1351,11 @@ fn appended_builtin_order() -> &'static [&'static str] {
         "string_replace_literal",
         "string_lower_ascii",
         "string_split_literal",
+        "__map_iter_init",
+        "__map_iter_next",
+        "__map_iter_take_key",
+        "__map_iter_take_value",
+        "__map_iter_close",
     ]
 }
 
@@ -1466,6 +1521,11 @@ fn main_range_builtin_variants(builtin_variant_order: &[String]) -> Vec<String> 
                     | "StringReplaceLiteral"
                     | "StringLowerAscii"
                     | "StringSplitLiteral"
+                    | "MapIterInit"
+                    | "MapIterNext"
+                    | "MapIterTakeKey"
+                    | "MapIterTakeValue"
+                    | "MapIterClose"
             )
         })
         .cloned()

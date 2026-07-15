@@ -85,6 +85,51 @@ fn interpreter_and_jit_match_for_loop_branch_arithmetic_program() {
     }
 }
 
+#[test]
+fn interpreter_and_jit_match_for_borrowed_map_iteration() {
+    let source = r#"
+        let values: map<int> = {a: 1, b: 2, c: 3, d: 4, e: 5, f: 6};
+        let mut sum: int = 0;
+        let mut count: int = 0;
+        for (_key: string, value: int) in &values {
+            sum = sum + value;
+            count = count + 1;
+        }
+        [sum, count];
+    "#;
+    let interpreted = run_halted_vm_with_flavor(
+        source,
+        SourceFlavor::RustScript,
+        JitConfig {
+            enabled: false,
+            hot_loop_threshold: 8,
+            max_trace_len: 256,
+        },
+    );
+    let jitted = run_halted_vm_with_flavor(
+        source,
+        SourceFlavor::RustScript,
+        JitConfig {
+            enabled: true,
+            hot_loop_threshold: 1,
+            max_trace_len: 512,
+        },
+    );
+    assert_eq!(jitted.stack(), interpreted.stack());
+    if native_jit_supported() {
+        assert!(
+            jitted.jit_native_exec_count() > 0,
+            "expected borrowed map loop to execute natively, dump:\n{}",
+            jitted.dump_jit_info()
+        );
+        assert!(
+            jitted.dump_jit_info().contains("map_iter_next"),
+            "expected map iterator SSA operations, dump:\n{}",
+            jitted.dump_jit_info()
+        );
+    }
+}
+
 struct YieldThenOne {
     yielded_once: bool,
     return_count: Arc<AtomicUsize>,

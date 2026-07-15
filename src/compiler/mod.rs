@@ -113,6 +113,7 @@ impl CompileError {
             CompileError::StrictTypingRequired { line, .. } => {
                 line.and_then(|value| usize::try_from(value).ok())
             }
+
             _ => None,
         }
     }

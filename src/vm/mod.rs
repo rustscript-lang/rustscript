@@ -8,6 +8,7 @@ mod epoch;
 mod fuel;
 mod host;
 pub(crate) mod jit;
+mod map_iter;
 pub(crate) mod native;
 mod store;
 mod superinstructions;
@@ -253,6 +254,7 @@ pub struct Vm {
     next_host_op_id: HostOpId,
     pub(crate) io_state: crate::builtins::runtime::IoState,
     regex_cache: crate::builtins::runtime::regex::RegexCache,
+    map_iterators: Vec<Vec<Option<map_iter::MapIteratorState>>>,
     epoch_handle: EpochHandle,
     #[allow(dead_code)]
     epoch_counter_ptr: usize,
@@ -509,6 +511,7 @@ impl Vm {
             next_host_op_id: 1,
             io_state: crate::builtins::runtime::IoState::default(),
             regex_cache: crate::builtins::runtime::regex::RegexCache::default(),
+            map_iterators: Vec::new(),
             epoch_handle,
             epoch_counter_ptr,
             interrupt_mode: InterruptMode::None,
@@ -666,7 +669,92 @@ impl Vm {
         self.waiting_host_op = None;
         self.next_host_op_id = 1;
         self.io_state = crate::builtins::runtime::IoState::default();
+        self.map_iterators.clear();
         self.clear_interpreter_metrics();
+    }
+
+    fn validate_map_iterator_slot(&self, slot: usize) -> VmResult<()> {
+        if u8::try_from(slot).is_err() {
+            return Err(VmError::HostError(format!(
+                "invalid map iterator id {slot}; maximum is {}",
+                u8::MAX
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn init_map_iterator(
+        &mut self,
+        slot: usize,
+        map: crate::bytecode::SharedMap,
+    ) -> VmResult<()> {
+        self.validate_map_iterator_slot(slot)?;
+        let depth = self.call_depth;
+        if self.map_iterators.len() <= depth {
+            self.map_iterators.resize_with(depth + 1, Vec::new);
+        }
+        let frame = &mut self.map_iterators[depth];
+        if frame.len() <= slot {
+            frame.resize_with(slot + 1, || None);
+        }
+        frame[slot] = Some(map_iter::MapIteratorState::new(map));
+        Ok(())
+    }
+
+    pub(crate) fn advance_map_iterator(&mut self, slot: usize) -> VmResult<bool> {
+        self.validate_map_iterator_slot(slot)?;
+        let frame = self.map_iterators.get_mut(self.call_depth).ok_or_else(|| {
+            VmError::HostError("map iterator frame is not initialized".to_string())
+        })?;
+        let state = frame
+            .get_mut(slot)
+            .and_then(Option::as_mut)
+            .ok_or_else(|| VmError::HostError("map iterator is not initialized".to_string()))?;
+        let has_next = state.advance();
+        if !has_next {
+            frame[slot] = None;
+        }
+        Ok(has_next)
+    }
+
+    pub(crate) fn take_map_iterator_key(&mut self, slot: usize) -> VmResult<Value> {
+        self.validate_map_iterator_slot(slot)?;
+        self.map_iterators
+            .get_mut(self.call_depth)
+            .and_then(|frame| frame.get_mut(slot))
+            .and_then(Option::as_mut)
+            .and_then(map_iter::MapIteratorState::take_key)
+            .ok_or_else(|| VmError::HostError("map iterator has no current key".to_string()))
+    }
+
+    pub(crate) fn take_map_iterator_value(&mut self, slot: usize) -> VmResult<Value> {
+        self.validate_map_iterator_slot(slot)?;
+        self.map_iterators
+            .get_mut(self.call_depth)
+            .and_then(|frame| frame.get_mut(slot))
+            .and_then(Option::as_mut)
+            .and_then(map_iter::MapIteratorState::take_value)
+            .ok_or_else(|| VmError::HostError("map iterator has no current value".to_string()))
+    }
+
+    pub(crate) fn close_map_iterator(&mut self, slot: usize) -> VmResult<()> {
+        self.validate_map_iterator_slot(slot)?;
+        if let Some(state) = self
+            .map_iterators
+            .get_mut(self.call_depth)
+            .and_then(|frame| frame.get_mut(slot))
+        {
+            *state = None;
+        }
+        Ok(())
+    }
+
+    fn close_all_map_iterators(&mut self) {
+        for frame in &mut self.map_iterators {
+            for state in frame {
+                state.take();
+            }
+        }
     }
 
     #[inline(always)]
@@ -1247,6 +1335,18 @@ impl Vm {
     }
 
     pub(super) fn run_internal(
+        &mut self,
+        debugger: Option<&mut crate::debugger::Debugger>,
+        allow_jit: bool,
+    ) -> VmResult<VmStatus> {
+        let result = self.run_internal_impl(debugger, allow_jit);
+        if result.is_err() {
+            self.close_all_map_iterators();
+        }
+        result
+    }
+
+    fn run_internal_impl(
         &mut self,
         mut debugger: Option<&mut crate::debugger::Debugger>,
         allow_jit: bool,

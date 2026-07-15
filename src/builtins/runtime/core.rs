@@ -815,10 +815,65 @@ pub(crate) fn builtin_string_split_literal_impl(
         .collect()
 }
 
+/// Initialize the hidden iterator used by borrowed map for-in loops.
+#[allow(dead_code)]
+#[pd_host_function(name = "__map_iter_init")]
+fn builtin_map_iter_init_metadata(map: VmMapRef<'_>, _slot: i64) -> VmMapHandle {
+    Arc::new(map.clone())
+}
+
+/// Advance a hidden borrowed-map iterator.
+#[allow(dead_code)]
+#[pd_host_function(name = "__map_iter_next")]
+fn builtin_map_iter_next_metadata(_slot: i64) -> bool {
+    false
+}
+
+/// Move the current iterator key into the loop binding.
+#[allow(dead_code)]
+#[pd_host_function(name = "__map_iter_take_key")]
+fn builtin_map_iter_take_key_metadata(_slot: i64) -> Value {
+    Value::Null
+}
+
+/// Move the current iterator value into the loop binding.
+#[allow(dead_code)]
+#[pd_host_function(name = "__map_iter_take_value")]
+fn builtin_map_iter_take_value_metadata(_slot: i64) -> Value {
+    Value::Null
+}
+
+/// Release a hidden borrowed-map iterator after loop exit.
+#[allow(dead_code)]
+#[pd_host_function(name = "__map_iter_close")]
+fn builtin_map_iter_close_metadata(map: VmMapRef<'_>, _slot: i64) -> VmMapHandle {
+    Arc::new(map.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builtins::{BUILTIN_CALL_BASE, BUILTIN_CALL_COUNT, BuiltinFunction};
     use std::sync::Arc;
+
+    #[test]
+    fn map_iterator_builtins_have_unique_reserved_call_indices() {
+        let reserved = [
+            (BuiltinFunction::MapIterInit, BUILTIN_CALL_BASE - 9),
+            (BuiltinFunction::MapIterNext, BUILTIN_CALL_BASE - 10),
+            (BuiltinFunction::MapIterTakeKey, BUILTIN_CALL_BASE - 11),
+            (BuiltinFunction::MapIterTakeValue, BUILTIN_CALL_BASE - 12),
+            (BuiltinFunction::MapIterClose, BUILTIN_CALL_BASE - 13),
+        ];
+        for (builtin, index) in reserved {
+            assert_eq!(builtin.call_index(), index);
+            assert_eq!(BuiltinFunction::from_call_index(index), Some(builtin));
+        }
+        assert_eq!(BUILTIN_CALL_COUNT, 89);
+        for alias in BUILTIN_CALL_BASE + 89..=BUILTIN_CALL_BASE + 92 {
+            assert_eq!(BuiltinFunction::from_call_index(alias), None);
+        }
+    }
 
     #[test]
     fn array_push_detaches_shared_array_before_write() {

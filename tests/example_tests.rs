@@ -131,3 +131,253 @@ data?.text?.[5].unwrap_or("");
         ]
     );
 }
+
+#[test]
+fn rustscript_borrowed_map_for_in_iterates_entries_without_keys_array() {
+    let source = r#"
+let values: map<int> = {a: 1, b: 2, c: 3};
+let mut sum: int = 0;
+let mut names: string = "";
+for (key: string, value: int) in &values {
+    names = names + key;
+    sum = sum + value;
+}
+[sum, names.length];
+"#;
+    assert_eq!(
+        run_compiled_source(SourceFlavor::RustScript, source),
+        vec![Value::array(vec![Value::Int(6), Value::Int(3)])]
+    );
+}
+
+#[test]
+fn rustscript_borrowed_map_for_in_rejects_mutation() {
+    let source = r#"
+let mut values: map<int> = {a: 1};
+for (key: string, value: int) in &values {
+    values["b"] = value;
+}
+values;
+"#;
+    let err = match compile_source_with_flavor(source, SourceFlavor::RustScript) {
+        Ok(_) => panic!("borrowed map mutation should fail"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("borrowed by a map iterator"));
+}
+
+#[test]
+fn rustscript_borrowed_map_bindings_do_not_alias_source_or_each_other() {
+    // Source alias through the key binding.
+    let key_alias = r#"
+let values: map<int> = {a: 1};
+for (values: string, value: int) in &values {
+    value;
+}
+"#;
+    let err = match compile_source_with_flavor(key_alias, SourceFlavor::RustScript) {
+        Ok(_) => panic!("map iterator key should not shadow the source"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("shadows the borrowed source"));
+
+    // Source alias through the value binding.
+    let value_alias = r#"
+let values: map<int> = {a: 1};
+for (key: string, values: int) in &values {
+    key;
+}
+"#;
+    let err = match compile_source_with_flavor(value_alias, SourceFlavor::RustScript) {
+        Ok(_) => panic!("map iterator value should not shadow the source"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("shadows the borrowed source"));
+
+    // Duplicate binding names.
+    let duplicate = r#"
+let values: map<int> = {a: 1};
+for (item: string, item: int) in &values {
+    item;
+}
+"#;
+    let err = match compile_source_with_flavor(duplicate, SourceFlavor::RustScript) {
+        Ok(_) => panic!("duplicate map iterator bindings should fail"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("duplicate map iterator binding"));
+}
+
+#[test]
+fn rustscript_borrowed_map_bindings_restore_outer_locals() {
+    let source = r#"
+let mut key: int = 7;
+let values: map<int> = {a: 1};
+for (key: string, value: int) in &values {
+    let observed: int = value;
+}
+key = 9;
+key;
+"#;
+    assert_eq!(
+        run_compiled_source(SourceFlavor::RustScript, source),
+        vec![Value::Int(9)]
+    );
+}
+
+#[test]
+fn rustscript_borrowed_map_for_in_rejects_source_rebinding() {
+    let source = r#"
+let values: map<int> = {a: 1};
+for (key: string, value: int) in &values {
+    let values: map<int> = {};
+    key;
+}
+"#;
+    let err = match compile_source_with_flavor(source, SourceFlavor::RustScript) {
+        Ok(_) => panic!("borrowed map source rebinding should fail"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("borrowed by a map iterator"));
+}
+
+#[test]
+fn rustscript_borrowed_map_for_in_validates_binding_schemas() {
+    let bad_key = r#"
+let values: map<int> = {a: 1};
+for (key: int, value: int) in &values {
+    value;
+}
+"#;
+    let err = match compile_source_with_flavor(bad_key, SourceFlavor::RustScript) {
+        Ok(_) => panic!("map iterator keys must be strings"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("map iterator key binding"));
+
+    let bad_value = r#"
+let values: map<int> = {a: 1};
+for (key: string, value: string) in &values {
+    key;
+}
+"#;
+    let err = match compile_source_with_flavor(bad_value, SourceFlavor::RustScript) {
+        Ok(_) => panic!("map iterator value schema must match the map"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("map iterator value binding"));
+}
+
+#[test]
+fn rustscript_borrowed_map_iterator_ids_survive_local_compaction() {
+    let source = r#"
+let a0: int = 0;
+let a1: int = 1;
+let a2: int = 2;
+let a3: int = 3;
+let a4: int = 4;
+let a5: int = 5;
+let a6: int = 6;
+let a7: int = 7;
+let a8: int = 8;
+let values: map<int> = {a: 1, b: 2};
+let mut total: int = 0;
+for (key: string, value: int) in &values {
+    total += value;
+}
+total;
+"#;
+    assert_eq!(
+        run_compiled_source(SourceFlavor::RustScript, source),
+        vec![Value::Int(3)]
+    );
+
+    let nested = r#"
+let a0: int = 0;
+let a1: int = 1;
+let a2: int = 2;
+let a3: int = 3;
+let a4: int = 4;
+let a5: int = 5;
+let a6: int = 6;
+let a7: int = 7;
+let a8: int = 8;
+let outer: map<int> = {a: 1, b: 2};
+let inner: map<int> = {x: 10, y: 20};
+let mut total: int = 0;
+for (outer_key: string, outer_value: int) in &outer {
+    for (inner_key: string, inner_value: int) in &inner {
+        total += outer_value + inner_value;
+    }
+}
+total;
+"#;
+    assert_eq!(
+        run_compiled_source(SourceFlavor::RustScript, nested),
+        vec![Value::Int(66)]
+    );
+}
+
+#[test]
+fn rustscript_function_map_iteration_enforces_borrow_and_schema() {
+    let rebind = r#"
+fn probe() -> int {
+    let values: map<int> = {a: 1};
+    for (key: string, value: int) in &values {
+        let values: map<int> = {};
+    }
+    values.length
+}
+probe();
+"#;
+    let err = match compile_source_with_flavor(rebind, SourceFlavor::RustScript) {
+        Ok(_) => panic!("function-local borrowed source rebinding should fail"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("borrowed by a map iterator"));
+
+    let mismatch = r#"
+fn probe() -> int {
+    let values: map<int> = {a: 1};
+    for (key: string, value: string) in &values {}
+    values.length
+}
+probe();
+"#;
+    let err = match compile_source_with_flavor(mismatch, SourceFlavor::RustScript) {
+        Ok(_) => panic!("function-local iterator schema mismatch should fail"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("map iterator value binding"));
+}
+
+#[test]
+fn rustscript_explicit_iterator_value_schema_requires_typed_source() {
+    let source = r#"
+let values = {a: 1};
+for (key: string, value: int) in &values {}
+"#;
+    let err = match compile_source_with_flavor(source, SourceFlavor::RustScript) {
+        Ok(_) => panic!("explicit iterator schema over an untyped map should fail"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("source map has no declared map<T> schema")
+    );
+}
+
+#[test]
+fn rustscript_borrowed_map_iteration_rejects_non_string_keys() {
+    let source = r#"
+let values: map<int> = {1: 2};
+for (key: string, value: int) in &values {}
+"#;
+    let compiled = compile_source_with_flavor(source, SourceFlavor::RustScript)
+        .expect("typed source should compile");
+    let mut vm = Vm::new(compiled.program);
+    let err = vm
+        .run()
+        .expect_err("non-string map keys should fail at iterator init");
+    assert!(err.to_string().contains("requires string keys"));
+}

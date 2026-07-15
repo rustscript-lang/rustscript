@@ -44,6 +44,81 @@ fn vm_instances_share_decoded_instruction_metadata_across_program_clones() {
 }
 
 #[test]
+fn borrowed_map_iterator_state_is_released_after_break() {
+    let compiled = crate::compile_source_with_flavor(
+        r#"
+        let values: map<int> = {a: 1, b: 2};
+        for (key: string, value: int) in &values {
+            key;
+            value;
+            break;
+        }
+        values;
+        "#,
+        crate::SourceFlavor::RustScript,
+    )
+    .expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+
+    assert_eq!(vm.run().expect("vm should run"), VmStatus::Halted);
+    assert!(
+        vm.map_iterators.iter().flatten().all(Option::is_none),
+        "break must release every iterator owned by the exited loop"
+    );
+}
+
+#[test]
+fn borrowed_map_iterator_state_is_released_after_runtime_error() {
+    let compiled = crate::compile_source_with_flavor(
+        r#"
+        let values: map<int> = {a: 1};
+        let zero: int = 0;
+        for (key: string, value: int) in &values {
+            let failure: int = 1 / zero;
+        }
+        "#,
+        crate::SourceFlavor::RustScript,
+    )
+    .expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+
+    vm.run().expect_err("program should fail at runtime");
+    assert!(
+        vm.map_iterators.iter().flatten().all(Option::is_none),
+        "runtime errors must release active map iterators"
+    );
+}
+
+#[test]
+fn map_iterator_ids_are_isolated_by_call_depth() {
+    let program = Program::new(Vec::new(), vec![OpCode::Ret as u8]);
+    let mut vm = Vm::new(program);
+    let Value::Map(outer) = Value::map(vec![(Value::string("outer"), Value::Int(1))]) else {
+        unreachable!();
+    };
+    let Value::Map(inner) = Value::map(vec![(Value::string("inner"), Value::Int(2))]) else {
+        unreachable!();
+    };
+
+    vm.init_map_iterator(7, outer).expect("outer init");
+    vm.call_depth = 1;
+    vm.init_map_iterator(7, inner).expect("inner init");
+    assert!(vm.advance_map_iterator(7).expect("inner advance"));
+    assert_eq!(
+        vm.take_map_iterator_key(7).expect("inner key"),
+        Value::string("inner")
+    );
+    vm.close_map_iterator(7).expect("inner close");
+
+    vm.call_depth = 0;
+    assert!(vm.advance_map_iterator(7).expect("outer advance"));
+    assert_eq!(
+        vm.take_map_iterator_key(7).expect("outer key"),
+        Value::string("outer")
+    );
+}
+
+#[test]
 #[cfg(any(
     all(
         target_arch = "x86_64",

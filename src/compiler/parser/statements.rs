@@ -888,36 +888,43 @@ impl Parser {
             self.consume_stmt_terminator("expected ';' after let")?;
         }
 
-        if !self.closure_scopes.is_empty() {
+        let (index, created) = if !self.closure_scopes.is_empty() {
             if let Some(index) = self
                 .closure_scopes
                 .last()
                 .and_then(|scope| scope.get(&name))
                 .copied()
             {
-                self.apply_let_binding_mutability(index, declared_mutable, false);
-                return Ok(Stmt::Let {
-                    index,
-                    declared_schema,
-                    expr,
-                    line,
-                });
+                (index, false)
+            } else {
+                let index = self.allocate_hidden_local()?;
+                if let Some(scope) = self.closure_scopes.last_mut() {
+                    scope.insert(name.clone(), index);
+                }
+                self.named_local_bindings.push((name.clone(), index));
+                (index, true)
             }
-            let index = self.allocate_hidden_local()?;
-            if let Some(scope) = self.closure_scopes.last_mut() {
-                scope.insert(name.clone(), index);
-            }
-            self.named_local_bindings.push((name, index));
-            self.apply_let_binding_mutability(index, declared_mutable, true);
-            return Ok(Stmt::Let {
-                index,
-                declared_schema,
-                expr,
-                line,
+        } else {
+            self.get_or_assign_local(&name)?
+        };
+        if !self.borrowed_map_iter_locals.is_empty()
+            && self.borrowed_map_iter_locals.contains(&index)
+        {
+            let display = self
+                .find_local_name_by_slot(index)
+                .unwrap_or_else(|| format!("#{index}"));
+            return Err(ParseError {
+                span: None,
+                code: Some("E_BORROW_CONFLICT".to_string()),
+                line: line as usize,
+                message: format!(
+                    "cannot rebind local '{display}' while it is borrowed by a map iterator"
+                ),
             });
         }
-
-        let (index, created) = self.get_or_assign_local(&name)?;
+        if let Some(declared_schema) = &declared_schema {
+            self.local_schemas.insert(index, declared_schema.clone());
+        }
         self.apply_let_binding_mutability(index, declared_mutable, created);
         Ok(Stmt::Let {
             index,
@@ -998,7 +1005,23 @@ impl Parser {
     }
 
     fn parse_for_in(&mut self, line: u32) -> Result<Stmt, ParseError> {
-        if self.match_kind(&TokenKind::LParen) || self.match_kind(&TokenKind::Let) {
+        if self.check(&TokenKind::LParen) {
+            if matches!(
+                self.tokens.get(self.pos + 1).map(|token| &token.kind),
+                Some(TokenKind::Ident(_))
+            ) {
+                return self.parse_map_for_in(line);
+            }
+            self.match_kind(&TokenKind::LParen);
+            return Err(ParseError {
+                span: Some(self.current_span()),
+                code: None,
+                line: self.last_line() as usize,
+                message: "expected Rust-style for-in loop; write `for i in 0..n { ... }`"
+                    .to_string(),
+            });
+        }
+        if self.match_kind(&TokenKind::Let) {
             return Err(ParseError {
                 span: Some(self.current_span()),
                 code: None,
@@ -1073,6 +1096,225 @@ impl Parser {
             body,
             line,
         })
+    }
+
+    fn parse_map_for_in(&mut self, line: u32) -> Result<Stmt, ParseError> {
+        self.expect(&TokenKind::LParen, "expected '(' after 'for'")?;
+        let key_name = self.expect_ident("expected map key binding")?;
+        let key_schema = if self.match_kind(&TokenKind::Colon) {
+            Some(self.parse_declared_type_schema()?)
+        } else {
+            None
+        };
+        self.expect(
+            &TokenKind::Comma,
+            "expected ',' between map iterator bindings",
+        )?;
+        let value_name = self.expect_ident("expected map value binding")?;
+        if value_name == key_name {
+            return Err(ParseError {
+                span: Some(self.current_span()),
+                code: None,
+                line: self.current_line(),
+                message: format!(
+                    "duplicate map iterator binding '{key_name}'; each binding must have a unique name"
+                ),
+            });
+        }
+        let value_schema = if self.match_kind(&TokenKind::Colon) {
+            Some(self.parse_declared_type_schema()?)
+        } else {
+            None
+        };
+        self.expect(
+            &TokenKind::RParen,
+            "expected ')' after map iterator bindings",
+        )?;
+        if !self.match_ident_literal("in") {
+            return Err(ParseError {
+                span: Some(self.current_span()),
+                code: None,
+                line: self.current_line(),
+                message: "expected 'in' after map iterator bindings".to_string(),
+            });
+        }
+        let map = self.parse_expr()?;
+        let map_slot = if let Expr::Borrow(inner) = &map
+            && let Expr::Var(slot) = inner.as_ref()
+        {
+            *slot
+        } else {
+            return Err(ParseError {
+                span: Some(self.current_span()),
+                code: None,
+                line: self.current_line(),
+                message: "map iteration requires an immutable local borrow; write `for (key, value) in &map { ... }`".to_string(),
+            });
+        };
+
+        // Prevent binding aliasing with the borrowed source or each other.
+        if let (Some(map_name), Some(key_name_str)) = (
+            self.find_local_name_by_slot(map_slot),
+            Some(key_name.as_str()),
+        ) {
+            if key_name_str == map_name {
+                return Err(ParseError {
+                    span: Some(self.current_span()),
+                    code: None,
+                    line: self.current_line(),
+                    message: format!(
+                        "map iterator key binding '{key_name_str}' shadows the borrowed source '{map_name}'"
+                    ),
+                });
+            }
+            if value_name == map_name {
+                return Err(ParseError {
+                    span: Some(self.current_span()),
+                    code: None,
+                    line: self.current_line(),
+                    message: format!(
+                        "map iterator value binding '{value_name}' shadows the borrowed source '{map_name}'"
+                    ),
+                });
+            }
+        }
+
+        let key_slot = self.allocate_hidden_local()?;
+        let value_slot = self.allocate_hidden_local()?;
+        if self.enforce_mutable_bindings {
+            self.set_local_slot_mutable(key_slot, false);
+            self.set_local_slot_mutable(value_slot, false);
+        }
+        let iterator_slot = self.allocate_hidden_local()?;
+        let iterator_id = Expr::Int(i64::from(iterator_slot));
+
+        // Enforce map iterator binding schemas: keys must be strings and
+        // value schema, if declared, must match the map element type.
+        if matches!(key_schema.as_ref(), Some(schema) if !matches!(schema, TypeSchema::String)) {
+            let label = key_schema
+                .as_ref()
+                .map(|schema| format!("{schema:?}"))
+                .unwrap_or_default();
+            return Err(ParseError {
+                span: Some(self.current_span()),
+                code: None,
+                line: self.current_line(),
+                message: format!("map iterator key binding must be 'string', found '{label}'"),
+            });
+        }
+        if let Some(value_schema) = value_schema.as_ref() {
+            let line_context = self.current_line();
+            let Some((map_element_schema, found_label)) =
+                self.infer_map_element_schema(map_slot)?
+            else {
+                return Err(ParseError {
+                    span: Some(self.current_span()),
+                    code: None,
+                    line: line_context,
+                    message: "cannot validate an explicit map iterator value schema because the source map has no declared map<T> schema"
+                        .to_string(),
+                });
+            };
+            let declared_label = format!("{value_schema:?}");
+            if map_element_schema != *value_schema {
+                return Err(ParseError {
+                    span: Some(self.current_span()),
+                    code: None,
+                    line: line_context,
+                    message: format!(
+                        "map iterator value binding expects '{found_label}', found '{declared_label}'"
+                    ),
+                });
+            }
+        }
+
+        let previous_key_slot = self.replace_current_local_binding(&key_name, key_slot);
+        let previous_value_slot = self.replace_current_local_binding(&value_name, value_slot);
+        self.borrowed_map_iter_locals.push(map_slot);
+        self.loop_depth += 1;
+        let body_result = self.parse_block("expected '{' after borrowed map");
+        self.loop_depth -= 1;
+        self.borrowed_map_iter_locals.pop();
+        self.restore_current_local_binding(&value_name, previous_value_slot);
+        self.restore_current_local_binding(&key_name, previous_key_slot);
+        let mut body = body_result?;
+        body.insert(
+            0,
+            Stmt::Let {
+                index: value_slot,
+                declared_schema: value_schema,
+                expr: self.build_builtin_call_expr(
+                    BuiltinFunction::MapIterTakeValue,
+                    vec![iterator_id.clone()],
+                )?,
+                line,
+            },
+        );
+        body.insert(
+            0,
+            Stmt::Let {
+                index: key_slot,
+                declared_schema: key_schema,
+                expr: self.build_builtin_call_expr(
+                    BuiltinFunction::MapIterTakeKey,
+                    vec![iterator_id.clone()],
+                )?,
+                line,
+            },
+        );
+
+        let loop_stmt = Stmt::For {
+            init: Box::new(Stmt::Assign {
+                kind: AssignmentKind::Set,
+                index: map_slot,
+                expr: self.build_builtin_call_expr(
+                    BuiltinFunction::MapIterInit,
+                    vec![map, iterator_id.clone()],
+                )?,
+                line,
+            }),
+            condition: self
+                .build_builtin_call_expr(BuiltinFunction::MapIterNext, vec![iterator_id.clone()])?,
+            post: Box::new(Stmt::Noop { line }),
+            body,
+            line,
+        };
+        let close_stmt = Stmt::Assign {
+            kind: AssignmentKind::Set,
+            index: map_slot,
+            expr: self.build_builtin_call_expr(
+                BuiltinFunction::MapIterClose,
+                vec![Expr::Var(map_slot), iterator_id],
+            )?,
+            line,
+        };
+        Ok(Stmt::IfElse {
+            condition: Expr::Bool(true),
+            then_branch: vec![loop_stmt, close_stmt],
+            else_branch: Vec::new(),
+            line,
+        })
+    }
+
+    fn replace_current_local_binding(&mut self, name: &str, slot: LocalSlot) -> Option<LocalSlot> {
+        if let Some(scope) = self.closure_scopes.last_mut() {
+            scope.insert(name.to_string(), slot)
+        } else {
+            self.locals.insert(name.to_string(), slot)
+        }
+    }
+
+    fn restore_current_local_binding(&mut self, name: &str, previous: Option<LocalSlot>) {
+        let bindings = if let Some(scope) = self.closure_scopes.last_mut() {
+            scope
+        } else {
+            &mut self.locals
+        };
+        if let Some(slot) = previous {
+            bindings.insert(name.to_string(), slot);
+        } else {
+            bindings.remove(name);
+        }
     }
 
     fn bind_for_loop_local(&mut self, name: &str) -> Result<(LocalSlot, bool), ParseError> {
@@ -1207,5 +1449,19 @@ impl Parser {
         }
         self.expect(&TokenKind::RBrace, "expected '}' to close block")?;
         Ok(stmts)
+    }
+
+    fn infer_map_element_schema(
+        &self,
+        slot: LocalSlot,
+    ) -> Result<Option<(TypeSchema, String)>, ParseError> {
+        if let Some(schema) = self.local_schemas.get(&slot) {
+            let element = match schema {
+                TypeSchema::Map(inner) => inner.as_ref().clone(),
+                other => return Ok(Some((other.clone(), format!("{other:?}")))),
+            };
+            return Ok(Some((element.clone(), format!("{element:?}"))));
+        }
+        Ok(None)
     }
 }

@@ -201,6 +201,15 @@ pub(crate) enum SsaInstKind {
         key: SsaValueId,
         value: SsaValueId,
     },
+    MapIterNext {
+        slot: SsaValueId,
+    },
+    MapIterTakeKey {
+        slot: SsaValueId,
+    },
+    MapIterTakeValue {
+        slot: SsaValueId,
+    },
     IntNeg {
         input: SsaValueId,
     },
@@ -386,6 +395,9 @@ impl SsaInstKind {
             Self::MapGet { map, key } => vec![*map, *key],
             Self::MapHas { map, key } => vec![*map, *key],
             Self::MapSet { map, key, value } => vec![*map, *key, *value],
+            Self::MapIterNext { slot }
+            | Self::MapIterTakeKey { slot }
+            | Self::MapIterTakeValue { slot } => vec![*slot],
             Self::IntAdd { lhs, rhs }
             | Self::IntSub { lhs, rhs }
             | Self::IntMul { lhs, rhs }
@@ -996,6 +1008,9 @@ fn render_inst_kind(kind: &SsaInstKind) -> String {
         SsaInstKind::MapSet { map, key, value } => {
             format!("map_set {map}, {key}, {value}")
         }
+        SsaInstKind::MapIterNext { slot } => format!("map_iter_next {slot}"),
+        SsaInstKind::MapIterTakeKey { slot } => format!("map_iter_take_key {slot}"),
+        SsaInstKind::MapIterTakeValue { slot } => format!("map_iter_take_value {slot}"),
         SsaInstKind::IntNeg { input } => format!("ineg {input}"),
         SsaInstKind::IntAdd { lhs, rhs } => format!("iadd {lhs}, {rhs}"),
         SsaInstKind::IntAddImm { lhs, imm } => format!("iadd_imm {lhs}, {imm}"),

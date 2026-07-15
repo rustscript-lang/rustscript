@@ -232,6 +232,20 @@ impl Parser {
         line: u32,
         action: &str,
     ) -> Result<(), ParseError> {
+        if self.borrowed_map_iter_locals.contains(&index) {
+            let display = name_hint
+                .map(str::to_string)
+                .or_else(|| self.find_local_name_by_slot(index))
+                .unwrap_or_else(|| format!("#{index}"));
+            return Err(ParseError {
+                span: None,
+                code: Some("E_BORROW_CONFLICT".to_string()),
+                line: line as usize,
+                message: format!(
+                    "cannot {action} local '{display}' while it is borrowed by a map iterator"
+                ),
+            });
+        }
         if !self.enforce_mutable_bindings || self.is_local_slot_mutable(index) {
             return Ok(());
         }

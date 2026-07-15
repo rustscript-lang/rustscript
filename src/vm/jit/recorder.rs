@@ -480,6 +480,9 @@ enum SpecializedBuiltinKind {
     MapGet,
     MapHas,
     MapSet,
+    MapIterNext,
+    MapIterTakeKey,
+    MapIterTakeValue,
 }
 
 struct TraceCursor<'a> {
@@ -2460,6 +2463,14 @@ fn select_specialized_builtin_kind(
     container: ValueInfo,
     container_was_moved: bool,
 ) -> Option<SpecializedBuiltinKind> {
+    match builtin {
+        BuiltinFunction::MapIterNext => return Some(SpecializedBuiltinKind::MapIterNext),
+        BuiltinFunction::MapIterTakeKey => return Some(SpecializedBuiltinKind::MapIterTakeKey),
+        BuiltinFunction::MapIterTakeValue => {
+            return Some(SpecializedBuiltinKind::MapIterTakeValue);
+        }
+        _ => {}
+    }
     let observed_kind = observed_heap_container_kind(container);
     let container_kind = if matches!(
         builtin,
@@ -2687,6 +2698,21 @@ fn analyze_specialized_builtin_call(
             let _ = frame.pop()?;
             frame.push(ValueInfo::tagged_typed(ValueType::Map));
             Ok("map_set")
+        }
+        SpecializedBuiltinKind::MapIterNext => {
+            let _ = frame.pop()?;
+            frame.push(ValueInfo::bool(None));
+            Ok("map_iter_next")
+        }
+        SpecializedBuiltinKind::MapIterTakeKey => {
+            let _ = frame.pop()?;
+            frame.push(ValueInfo::tagged());
+            Ok("map_iter_take_key")
+        }
+        SpecializedBuiltinKind::MapIterTakeValue => {
+            let _ = frame.pop()?;
+            frame.push(ValueInfo::tagged());
+            Ok("map_iter_take_value")
         }
     }
 }
@@ -3293,6 +3319,60 @@ fn emit_specialized_builtin_call(
                 })
                 .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
             Ok(("map_set", out))
+        }
+        SpecializedBuiltinKind::MapIterNext => {
+            let slot = ensure_int(builder, block, ip, frame.pop()?)?;
+            let out = builder
+                .append_value_inst(
+                    block,
+                    ip,
+                    SsaValueRepr::Bool,
+                    SsaInstKind::MapIterNext {
+                        slot: slot.value.id,
+                    },
+                )
+                .map(|value| SymbolicValue {
+                    value,
+                    info: ValueInfo::bool(None),
+                })
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+            Ok(("map_iter_next", out))
+        }
+        SpecializedBuiltinKind::MapIterTakeKey => {
+            let slot = ensure_int(builder, block, ip, frame.pop()?)?;
+            let out = builder
+                .append_value_inst(
+                    block,
+                    ip,
+                    SsaValueRepr::Tagged,
+                    SsaInstKind::MapIterTakeKey {
+                        slot: slot.value.id,
+                    },
+                )
+                .map(|value| SymbolicValue {
+                    value,
+                    info: ValueInfo::tagged(),
+                })
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+            Ok(("map_iter_take_key", out))
+        }
+        SpecializedBuiltinKind::MapIterTakeValue => {
+            let slot = ensure_int(builder, block, ip, frame.pop()?)?;
+            let out = builder
+                .append_value_inst(
+                    block,
+                    ip,
+                    SsaValueRepr::Tagged,
+                    SsaInstKind::MapIterTakeValue {
+                        slot: slot.value.id,
+                    },
+                )
+                .map(|value| SymbolicValue {
+                    value,
+                    info: ValueInfo::tagged(),
+                })
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+            Ok(("map_iter_take_value", out))
         }
     }
 }
