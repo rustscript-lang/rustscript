@@ -173,7 +173,7 @@ pub struct JitNyiDoc {
 pub struct TraceJitEngine {
     config: JitConfig,
     hot_counts: HashMap<TraceEntryKey, u32>,
-    compiled_by_entry: HashMap<TraceEntryKey, usize>,
+    compiled_by_ip: Vec<Vec<(usize, usize)>>,
     blocked_entries: HashSet<TraceEntryKey>,
     loop_headers: Option<HashSet<usize>>,
     traces: Vec<JitTrace>,
@@ -191,7 +191,7 @@ impl TraceJitEngine {
         Self {
             config,
             hot_counts: HashMap::new(),
-            compiled_by_entry: HashMap::new(),
+            compiled_by_ip: Vec::new(),
             blocked_entries: HashSet::new(),
             loop_headers: None,
             traces: Vec::new(),
@@ -206,7 +206,7 @@ impl TraceJitEngine {
     pub fn set_config(&mut self, config: JitConfig) {
         self.config = config;
         self.hot_counts.clear();
-        self.compiled_by_entry.clear();
+        self.compiled_by_ip.clear();
         self.blocked_entries.clear();
         self.loop_headers = None;
         self.traces.clear();
@@ -230,7 +230,7 @@ impl TraceJitEngine {
             root_ip: ip,
             stack_depth,
         };
-        if let Some(&trace_id) = self.compiled_by_entry.get(&key) {
+        if let Some(trace_id) = self.compiled_trace_for_key(key) {
             return Some(trace_id);
         }
         if self.blocked_entries.contains(&key) || !self.is_loop_header(program, ip) {
@@ -279,7 +279,7 @@ impl TraceJitEngine {
             root_ip: ip,
             stack_depth,
         };
-        if let Some(&trace_id) = self.compiled_by_entry.get(&key) {
+        if let Some(trace_id) = self.compiled_trace_for_key(key) {
             return Some(trace_id);
         }
         if self.blocked_entries.contains(&key) {
@@ -309,12 +309,10 @@ impl TraceJitEngine {
     }
 
     pub(crate) fn compiled_trace_for_entry(&self, ip: usize, stack_depth: usize) -> Option<usize> {
-        self.compiled_by_entry
-            .get(&TraceEntryKey {
-                root_ip: ip,
-                stack_depth,
-            })
-            .copied()
+        self.compiled_trace_for_key(TraceEntryKey {
+            root_ip: ip,
+            stack_depth,
+        })
     }
 
     pub fn mark_trace_executed(&mut self, trace_id: usize) {
@@ -329,7 +327,7 @@ impl TraceJitEngine {
                 root_ip: trace.root_ip,
                 stack_depth: trace.entry_stack_depth,
             };
-            self.compiled_by_entry.remove(&key);
+            self.remove_compiled_trace(key);
             self.blocked_entries.insert(key);
         }
     }
@@ -452,7 +450,7 @@ impl TraceJitEngine {
                     line,
                     result: Ok(trace_id),
                 });
-                self.compiled_by_entry.insert(key, trace_id);
+                self.insert_compiled_trace(key, trace_id);
                 Some(trace_id)
             }
             Err(reason) => {
@@ -488,6 +486,43 @@ impl TraceJitEngine {
         let trace = build_jit_trace(id, key, start_line, recorded);
         self.traces.push(trace);
         Ok(id)
+    }
+
+    #[inline(always)]
+    fn compiled_trace_for_key(&self, key: TraceEntryKey) -> Option<usize> {
+        self.compiled_by_ip
+            .get(key.root_ip)?
+            .iter()
+            .find_map(|(stack_depth, trace_id)| {
+                (*stack_depth == key.stack_depth).then_some(*trace_id)
+            })
+    }
+
+    fn insert_compiled_trace(&mut self, key: TraceEntryKey, trace_id: usize) {
+        if self.compiled_by_ip.len() <= key.root_ip {
+            self.compiled_by_ip.resize_with(key.root_ip + 1, Vec::new);
+        }
+        let entries = &mut self.compiled_by_ip[key.root_ip];
+        if let Some((_, existing_trace_id)) = entries
+            .iter_mut()
+            .find(|(stack_depth, _)| *stack_depth == key.stack_depth)
+        {
+            *existing_trace_id = trace_id;
+        } else {
+            entries.push((key.stack_depth, trace_id));
+        }
+    }
+
+    fn remove_compiled_trace(&mut self, key: TraceEntryKey) {
+        let Some(entries) = self.compiled_by_ip.get_mut(key.root_ip) else {
+            return;
+        };
+        if let Some(index) = entries
+            .iter()
+            .position(|(stack_depth, _)| *stack_depth == key.stack_depth)
+        {
+            entries.swap_remove(index);
+        }
     }
 
     fn is_loop_header(&mut self, program: &Program, ip: usize) -> bool {
