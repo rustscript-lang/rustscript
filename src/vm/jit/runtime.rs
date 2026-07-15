@@ -252,7 +252,7 @@ impl Vm {
             return Err(err);
         }
 
-        let (mut entry, mut root_ip, mut terminal, mut has_call, mut has_yielding_call) =
+        let (mut entry, mut root_ip, mut terminal, _, mut has_yielding_call) =
             self.native_trace_state(current_trace_id)?;
 
         loop {
@@ -281,7 +281,7 @@ impl Vm {
                             }
                             return Err(err);
                         }
-                        (entry, root_ip, terminal, has_call, has_yielding_call) =
+                        (entry, root_ip, terminal, _, has_yielding_call) =
                             self.native_trace_state(current_trace_id)?;
                         continue;
                     }
@@ -289,9 +289,6 @@ impl Vm {
                 }
                 native::STATUS_TRACE_EXIT => {
                     self.jit_trace_exit_count = self.jit_trace_exit_count.saturating_add(1);
-                    if has_call {
-                        return Ok(native::STATUS_LINKED_CONTINUE);
-                    }
                     if !has_yielding_call
                         && terminal == JitTraceTerminal::LoopBack
                         && self.ip == root_ip
@@ -325,7 +322,7 @@ impl Vm {
                                 }
                                 return Err(err);
                             }
-                            (entry, root_ip, terminal, has_call, has_yielding_call) =
+                            (entry, root_ip, terminal, _, has_yielding_call) =
                                 self.native_trace_state(current_trace_id)?;
                             continue;
                         }
@@ -499,7 +496,7 @@ impl Vm {
             }
             return Err(err);
         }
-        let (mut entry, mut root_ip, mut terminal, mut has_call, mut has_yielding_call) =
+        let (mut entry, mut root_ip, mut terminal, _, mut has_yielding_call) =
             self.native_trace_state(current_trace_id)?;
         loop {
             native::clear_bridge_error();
@@ -526,7 +523,7 @@ impl Vm {
                             }
                             return Err(err);
                         }
-                        (entry, root_ip, terminal, has_call, has_yielding_call) =
+                        (entry, root_ip, terminal, _, has_yielding_call) =
                             self.native_trace_state(current_trace_id)?;
                         continue;
                     }
@@ -534,9 +531,6 @@ impl Vm {
                 }
                 native::STATUS_TRACE_EXIT => {
                     self.jit_trace_exit_count = self.jit_trace_exit_count.saturating_add(1);
-                    if has_call {
-                        return Ok(ExecOutcome::Continue);
-                    }
                     // Fast path: if this trace looped back to its own root and cannot yield via host
                     // calls, keep executing in native mode without bouncing through the interpreter.
                     if !has_yielding_call
@@ -572,7 +566,7 @@ impl Vm {
                                 }
                                 return Err(err);
                             }
-                            (entry, root_ip, terminal, has_call, has_yielding_call) =
+                            (entry, root_ip, terminal, _, has_yielding_call) =
                                 self.native_trace_state(current_trace_id)?;
                             continue;
                         }

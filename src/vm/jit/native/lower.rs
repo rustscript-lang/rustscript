@@ -191,7 +191,7 @@ fn try_compile_ssa_trace(
             sparse_restore_exit: restore_sparse_exit_state_entry_address(),
             resume_linked_trace: resume_linked_trace_entry_address(),
         };
-        let allow_exit_link_handoff = !trace.has_call && !trace.has_yielding_call;
+        let allow_exit_link_handoff = !trace.has_yielding_call;
 
         let mut value_reprs = HashMap::new();
         for block in &ssa.blocks {

@@ -290,9 +290,6 @@ impl TraceJitEngine {
         if !self.config.enabled || !native_jit_supported() {
             return None;
         }
-        if self.config.hot_loop_threshold > 1 {
-            return None;
-        }
         let key = TraceEntryKey {
             root_ip: ip,
             stack_depth,
@@ -301,6 +298,12 @@ impl TraceJitEngine {
             return Some(trace_id);
         }
         if !self.blocked_entries.is_empty() && self.blocked_entries.contains(&key) {
+            return None;
+        }
+
+        let count = self.hot_counts.entry(key).or_insert(0);
+        *count = count.saturating_add(1);
+        if *count < self.config.hot_loop_threshold {
             return None;
         }
 
