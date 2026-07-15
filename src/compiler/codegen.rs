@@ -1233,11 +1233,6 @@ impl Compiler {
             self.infer_bound_type(expr)
         };
         self.callable_bindings.remove(&slot);
-        if self.try_emit_collection_local_mutation(slot, expr)? {
-            self.type_state
-                .set_with_optional_schema_origin(slot, ty, None, false, optional);
-            return Ok(());
-        }
         self.compile_scalar_expr(expr)?;
         self.emit_stloc(slot)?;
         let schema = slot_declared_schema.clone().or_else(|| {
@@ -1277,47 +1272,6 @@ impl Compiler {
             optional,
         );
         Ok(())
-    }
-
-    fn try_emit_collection_local_mutation(
-        &mut self,
-        slot: LocalSlot,
-        expr: &Expr,
-    ) -> Result<bool, CompileError> {
-        let Expr::Call(index, _, args) = expr else {
-            return Ok(false);
-        };
-        let Some(builtin) = BuiltinFunction::from_call_index(*index) else {
-            return Ok(false);
-        };
-        let call_slot = local_slot_operand(slot)?;
-        match builtin {
-            BuiltinFunction::Set if args.len() == 3 && is_same_local_expr(&args[0], slot) => {
-                let ty = self.type_state.get(slot);
-                match ty {
-                    typing::BoundType::Array | typing::BoundType::ArrayOf(_) => {
-                        self.compile_scalar_expr(&args[1])?;
-                        self.compile_scalar_expr(&args[2])?;
-                        self.assembler.array_set_local(call_slot);
-                        return Ok(true);
-                    }
-                    typing::BoundType::Map | typing::BoundType::MapOf(_) => {
-                        self.compile_scalar_expr(&args[1])?;
-                        self.compile_scalar_expr(&args[2])?;
-                        self.assembler.map_set_local(call_slot);
-                        return Ok(true);
-                    }
-                    _ => {}
-                }
-            }
-            BuiltinFunction::ArrayPush if args.len() == 2 && is_same_local_expr(&args[0], slot) => {
-                self.compile_scalar_expr(&args[1])?;
-                self.assembler.array_push_local(call_slot);
-                return Ok(true);
-            }
-            _ => {}
-        }
-        Ok(false)
     }
 
     fn compile_scalar_expr(&mut self, expr: &Expr) -> Result<(), CompileError> {
@@ -1744,14 +1698,6 @@ impl Compiler {
         self.assembler
             .label(&done_label)
             .expect("compiler-generated label should be valid");
-    }
-}
-
-fn is_same_local_expr(expr: &Expr, slot: LocalSlot) -> bool {
-    match expr {
-        Expr::Var(var_slot) | Expr::MoveVar(var_slot) => *var_slot == slot,
-        Expr::Borrow(inner) | Expr::BorrowMut(inner) => is_same_local_expr(inner, slot),
-        _ => false,
     }
 }
 

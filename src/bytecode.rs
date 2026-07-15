@@ -462,11 +462,7 @@ impl DecodedInstructionData {
                         jump_targets[ip] = Some(target as usize);
                     }
                 }
-                OpCode::Ldloc
-                | OpCode::Stloc
-                | OpCode::ArraySetLocal
-                | OpCode::ArrayPushLocal
-                | OpCode::MapSetLocal => {
+                OpCode::Ldloc | OpCode::Stloc => {
                     if let Some(index) = program.code.get(ip + 1).copied() {
                         local_indices[ip] = Some(index);
                     }
@@ -612,11 +608,7 @@ fn infer_local_count_from_code(code: &[u8]) -> usize {
             break;
         }
         match opcode {
-            OpCode::Ldloc
-            | OpCode::Stloc
-            | OpCode::ArraySetLocal
-            | OpCode::ArrayPushLocal
-            | OpCode::MapSetLocal => {
+            OpCode::Ldloc | OpCode::Stloc => {
                 let index = code[ip];
                 max_local_index = Some(max_local_index.map_or(index, |prev| prev.max(index)));
             }
@@ -656,9 +648,6 @@ pub enum OpCode {
     Or = 0x16,
     Not = 0x17,
     Lshr = 0x18,
-    ArraySetLocal = 0x19,
-    ArrayPushLocal = 0x1A,
-    MapSetLocal = 0x1B,
 }
 
 impl TryFrom<u8> for OpCode {
@@ -691,9 +680,6 @@ impl TryFrom<u8> for OpCode {
             x if x == Self::Or as u8 => Ok(Self::Or),
             x if x == Self::Not as u8 => Ok(Self::Not),
             x if x == Self::Lshr as u8 => Ok(Self::Lshr),
-            x if x == Self::ArraySetLocal as u8 => Ok(Self::ArraySetLocal),
-            x if x == Self::ArrayPushLocal as u8 => Ok(Self::ArrayPushLocal),
-            x if x == Self::MapSetLocal as u8 => Ok(Self::MapSetLocal),
             _ => Err(()),
         }
     }
@@ -722,11 +708,7 @@ impl OpCode {
             | Self::Not
             | Self::Lshr => 0,
             Self::Ldc | Self::Br | Self::Brfalse => 4,
-            Self::Ldloc
-            | Self::Stloc
-            | Self::ArraySetLocal
-            | Self::ArrayPushLocal
-            | Self::MapSetLocal => 1,
+            Self::Ldloc | Self::Stloc => 1,
             Self::Call => 3,
         }
     }
@@ -758,9 +740,6 @@ impl OpCode {
             OpCode::Or => "or",
             OpCode::Not => "not",
             OpCode::Lshr => "lshr",
-            OpCode::ArraySetLocal => "array_set_local",
-            OpCode::ArrayPushLocal => "array_push_local",
-            OpCode::MapSetLocal => "map_set_local",
         }
     }
 
@@ -791,9 +770,6 @@ impl OpCode {
             "or" => Some(OpCode::Or),
             "not" => Some(OpCode::Not),
             "lshr" => Some(OpCode::Lshr),
-            "array_set_local" => Some(OpCode::ArraySetLocal),
-            "array_push_local" => Some(OpCode::ArrayPushLocal),
-            "map_set_local" => Some(OpCode::MapSetLocal),
             _ => None,
         }
     }

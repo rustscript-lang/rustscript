@@ -272,13 +272,6 @@ fn lower_block(
                     kind: "unexpected terminal in lowered instruction stream",
                 });
             }
-            OpCode::ArraySetLocal | OpCode::ArrayPushLocal | OpCode::MapSetLocal => {
-                return Err(AotLowerError::InvalidImmediate {
-                    ip,
-                    opcode,
-                    kind: "collection local mutation is unsupported by AOT",
-                });
-            }
         }
 
         ip = next_ip;

@@ -211,62 +211,13 @@ pub(super) fn builtin_array_push_typed_impl(
     mut items: VmArrayHandle,
     value: VmValueOwned,
 ) -> VmArrayHandle {
-    array_push_in_place(&mut items, value);
+    Arc::make_mut(&mut items).push(value);
     items
 }
 
 fn builtin_array_push_shared_impl(mut items: SharedArray, value: AnyValue) -> SharedArray {
-    array_push_in_place(&mut items, value);
+    Arc::make_mut(&mut items).push(value);
     items
-}
-
-fn mutate_shared<T: Clone, R>(value: &mut Arc<T>, mutate: impl FnOnce(&mut T) -> R) -> R {
-    if let Some(unique) = Arc::get_mut(value) {
-        mutate(unique)
-    } else {
-        mutate(Arc::make_mut(value))
-    }
-}
-
-pub(crate) fn array_push_in_place(items: &mut SharedArray, value: Value) {
-    mutate_shared(items, |items| items.push(value));
-}
-
-pub(crate) fn array_set_in_place(
-    items: &mut SharedArray,
-    index: i64,
-    value: Value,
-) -> VmResult<Option<Value>> {
-    if index < 0 {
-        return Err(VmError::HostError(
-            "array index must be non-negative".to_string(),
-        ));
-    }
-    let index = usize::try_from(index)
-        .map_err(|_| VmError::HostError("array index overflow".to_string()))?;
-    if index > items.len() {
-        return Err(VmError::HostError(format!(
-            "array index {index} out of bounds"
-        )));
-    }
-    Ok(mutate_shared(items, |items| {
-        if index == items.len() {
-            items.push(value);
-            None
-        } else {
-            Some(std::mem::replace(&mut items[index], value))
-        }
-    }))
-}
-
-pub(crate) fn map_set_in_place(entries: &mut SharedMap, key: Value, value: Value) -> Option<Value> {
-    mutate_shared(entries, |entries| {
-        if matches!(value, Value::Null) {
-            entries.remove(&key)
-        } else {
-            entries.insert(key, value)
-        }
-    })
 }
 
 pub(super) fn builtin_array_push(args: &mut [Value]) -> VmResult<CallReturn> {
@@ -658,7 +609,23 @@ pub(super) fn builtin_set_array_impl(
     index: i64,
     value: VmValueOwned,
 ) -> VmResult<VmArrayHandle> {
-    let _ = array_set_in_place(&mut items, index, value)?;
+    let items_mut = Arc::make_mut(&mut items);
+    if index < 0 {
+        return Err(VmError::HostError(
+            "array index must be non-negative".to_string(),
+        ));
+    }
+    let index = usize::try_from(index)
+        .map_err(|_| VmError::HostError("array index overflow".to_string()))?;
+    if index < items_mut.len() {
+        items_mut[index] = value;
+    } else if index == items_mut.len() {
+        items_mut.push(value);
+    } else {
+        return Err(VmError::HostError(format!(
+            "array index {index} out of bounds"
+        )));
+    }
     Ok(items)
 }
 
@@ -667,7 +634,23 @@ fn builtin_set_array_shared_impl(
     index: i64,
     value: AnyValue,
 ) -> VmResult<SharedArray> {
-    let _ = array_set_in_place(&mut items, index, value)?;
+    let items_mut = Arc::make_mut(&mut items);
+    if index < 0 {
+        return Err(VmError::HostError(
+            "array index must be non-negative".to_string(),
+        ));
+    }
+    let index = usize::try_from(index)
+        .map_err(|_| VmError::HostError("array index overflow".to_string()))?;
+    if index < items_mut.len() {
+        items_mut[index] = value;
+    } else if index == items_mut.len() {
+        items_mut.push(value);
+    } else {
+        return Err(VmError::HostError(format!(
+            "array index {index} out of bounds"
+        )));
+    }
     Ok(items)
 }
 
@@ -678,7 +661,12 @@ pub(super) fn builtin_set_map_impl(
     key: VmValueOwned,
     value: VmValueOwned,
 ) -> VmMapHandle {
-    let _ = map_set_in_place(&mut entries, key, value);
+    let entries_mut = Arc::make_mut(&mut entries);
+    if matches!(value, Value::Null) {
+        entries_mut.remove(&key);
+    } else {
+        entries_mut.insert(key, value);
+    }
     entries
 }
 
@@ -687,7 +675,12 @@ fn builtin_set_map_shared_impl(
     key: AnyValue,
     value: AnyValue,
 ) -> SharedMap {
-    let _ = map_set_in_place(&mut entries, key, value);
+    let entries_mut = Arc::make_mut(&mut entries);
+    if matches!(value, Value::Null) {
+        entries_mut.remove(&key);
+    } else {
+        entries_mut.insert(key, value);
+    }
     entries
 }
 

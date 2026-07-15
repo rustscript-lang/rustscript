@@ -2,10 +2,9 @@ use std::collections::HashMap;
 
 use vm::{
     ArgInfo, Assembler, BuiltinFunction, BytecodeBuilder, DebugFunction, DebugInfo,
-    DisassembleOptions, HostImport, LineInfo, LocalInfo, OpCode, Program, TypeMap, ValidationError,
-    Value, ValueType, WireError, assemble, builtin_call_index, decode_program, disassemble_program,
-    disassemble_vmbc, disassemble_vmbc_with_options, encode_program, infer_local_count,
-    validate_program,
+    DisassembleOptions, HostImport, LineInfo, LocalInfo, Program, TypeMap, ValidationError, Value,
+    ValueType, WireError, builtin_call_index, decode_program, disassemble_vmbc,
+    disassemble_vmbc_with_options, encode_program, infer_local_count, validate_program,
 };
 
 #[test]
@@ -175,44 +174,6 @@ fn infer_local_count_finds_highest_local_index() {
     let program = Program::new(vec![], bc.finish());
     let locals = infer_local_count(&program).expect("infer should succeed");
     assert_eq!(locals, 8);
-}
-
-#[test]
-fn collection_local_bytecode_roundtrips_and_infers_local_count() {
-    assert_eq!(OpCode::ArraySetLocal as u8, 0x19);
-    assert_eq!(OpCode::ArrayPushLocal as u8, 0x1A);
-    assert_eq!(OpCode::MapSetLocal as u8, 0x1B);
-    assert_eq!(OpCode::ArraySetLocal.operand_len(), 1);
-    assert_eq!(OpCode::ArrayPushLocal.operand_len(), 1);
-    assert_eq!(OpCode::MapSetLocal.operand_len(), 1);
-
-    let mut bc = BytecodeBuilder::new();
-    bc.array_set_local(2);
-    bc.array_push_local(4);
-    bc.map_set_local(7);
-    bc.ret();
-    let code = bc.finish();
-    assert_eq!(code, vec![0x19, 2, 0x1A, 4, 0x1B, 7, 0x01]);
-
-    let program = Program::new(vec![], code.clone());
-    validate_program(&program, 0).expect("collection-local program should validate");
-    assert_eq!(infer_local_count(&program).expect("local inference"), 8);
-    assert_eq!(program.local_count, 8);
-
-    let listing = disassemble_program(&program);
-    assert!(listing.contains("array_set_local 2"));
-    assert!(listing.contains("array_push_local 4"));
-    assert!(listing.contains("map_set_local 7"));
-
-    let encoded = encode_program(&program).expect("encode should succeed");
-    let decoded = decode_program(&encoded).expect("decode should succeed");
-    assert_eq!(decoded.code, code);
-
-    let assembled = assemble(
-        ".local array 2\n.local pushed 4\n.local map 7\narray_set_local array\narray_push_local pushed\nmap_set_local map\nret\n",
-    )
-    .expect("text assembly should succeed");
-    assert_eq!(assembled.code, program.code);
 }
 
 #[test]
