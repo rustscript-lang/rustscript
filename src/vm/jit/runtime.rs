@@ -511,6 +511,7 @@ impl Vm {
                             self.jit.compiled_trace_for_entry(self.ip, self.stack.len())
                         && next_trace_id != current_trace_id
                     {
+                        self.record_jit_link_handoff();
                         current_trace_id = next_trace_id;
                         if let Err(err) = self.ensure_native_trace(
                             current_trace_id,
@@ -554,6 +555,7 @@ impl Vm {
                         if let Some(next_trace_id) = next_trace_id
                             && next_trace_id != current_trace_id
                         {
+                            self.record_jit_link_handoff();
                             current_trace_id = next_trace_id;
                             if let Err(err) = self.ensure_native_trace(
                                 current_trace_id,

@@ -191,7 +191,9 @@ fn try_compile_ssa_trace(
             sparse_restore_exit: restore_sparse_exit_state_entry_address(),
             resume_linked_trace: resume_linked_trace_entry_address(),
         };
-        let allow_exit_link_handoff = !trace.has_yielding_call;
+        // The outer native dispatch loop links trace exits directly. Re-entering it through the
+        // native bridge adds a redundant depth check to every subsequent linked trace.
+        let allow_exit_link_handoff = false;
 
         let mut value_reprs = HashMap::new();
         for block in &ssa.blocks {
