@@ -381,3 +381,55 @@ for (key: string, value: int) in &values {}
         .expect_err("non-string map keys should fail at iterator init");
     assert!(err.to_string().contains("requires string keys"));
 }
+
+#[test]
+fn rustscript_untyped_rebinding_does_not_reuse_stale_map_schema() {
+    let source = r#"
+let values: map<int> = {a: 1};
+let values = {a: "x"};
+for (key: string, value: int) in &values {
+    value;
+}
+"#;
+    let err = match compile_source_with_flavor(source, SourceFlavor::RustScript) {
+        Ok(_) => panic!("untyped rebinding must not retain the old map<int> schema"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("map<T> schema"));
+}
+
+#[test]
+fn rustscript_function_parameter_map_type_is_visible_to_iterators() {
+    let source = r#"
+fn sum(values: map<int>) -> int {
+    let mut total: int = 0;
+    for (key: string, value: int) in &values {
+        total += value;
+    }
+    total
+}
+sum({a: 1, b: 2});
+"#;
+    assert_eq!(
+        run_compiled_source(SourceFlavor::RustScript, source),
+        vec![Value::Int(3)]
+    );
+}
+
+#[test]
+fn rustscript_borrowed_map_iterator_propagates_nested_binding_schema() {
+    let source = r#"
+let groups: map<map<int>> = {first: {a: 1, b: 2}};
+let mut total: int = 0;
+for (group_key: string, group: map<int>) in &groups {
+    for (item_key: string, item: int) in &group {
+        total += item;
+    }
+}
+total;
+"#;
+    assert_eq!(
+        run_compiled_source(SourceFlavor::RustScript, source),
+        vec![Value::Int(3)]
+    );
+}

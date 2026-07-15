@@ -492,7 +492,7 @@ impl Parser {
 
         self.push_active_type_params(&type_params);
         let has_impl = if self.match_kind(&TokenKind::Equal) {
-            let function_impl = self.parse_function_impl_expr(&param_names)?;
+            let function_impl = self.parse_function_impl_expr(&params)?;
             self.expect(
                 &TokenKind::Semicolon,
                 "expected ';' after function definition",
@@ -500,7 +500,7 @@ impl Parser {
             self.function_impls.insert(index, function_impl);
             true
         } else if self.match_kind(&TokenKind::LBrace) {
-            let function_impl = self.parse_function_impl_block(&param_names)?;
+            let function_impl = self.parse_function_impl_block(&params)?;
             self.expect(&TokenKind::RBrace, "expected '}' after function body")?;
             self.function_impls.insert(index, function_impl);
             // Optional trailing semicolon for compatibility.
@@ -528,7 +528,7 @@ impl Parser {
 
     pub(super) fn parse_function_impl_expr(
         &mut self,
-        params: &[String],
+        params: &[crate::compiler::ir::FunctionParam],
     ) -> Result<FunctionImpl, ParseError> {
         self.parse_function_impl(params, |parser| {
             let body_expr_line = parser.current_line_u32();
@@ -750,7 +750,7 @@ impl Parser {
 
     pub(super) fn parse_function_impl_block(
         &mut self,
-        params: &[String],
+        params: &[crate::compiler::ir::FunctionParam],
     ) -> Result<FunctionImpl, ParseError> {
         self.parse_function_impl(params, |parser| {
             let mut body_stmts = Vec::new();
@@ -814,7 +814,7 @@ impl Parser {
 
     pub(super) fn parse_function_impl<F>(
         &mut self,
-        params: &[String],
+        params: &[crate::compiler::ir::FunctionParam],
         parse_body: F,
     ) -> Result<FunctionImpl, ParseError>
     where
@@ -823,17 +823,20 @@ impl Parser {
         let mut param_scope = HashMap::new();
         let mut param_slots = Vec::new();
         for param in params {
-            if param_scope.contains_key(param) {
+            if param_scope.contains_key(&param.name) {
                 return Err(ParseError {
                     span: None,
                     code: None,
                     line: self.current_line(),
-                    message: format!("duplicate function parameter '{param}'"),
+                    message: format!("duplicate function parameter '{}'", param.name),
                 });
             }
             let slot = self.allocate_hidden_local()?;
-            param_scope.insert(param.clone(), slot);
+            param_scope.insert(param.name.clone(), slot);
             param_slots.push(slot);
+            if let Some(schema) = &param.schema {
+                self.local_schemas.insert(slot, schema.clone());
+            }
         }
         self.closure_scopes.push(param_scope);
         self.closure_capture_contexts.push(ClosureCaptureContext {
@@ -924,6 +927,8 @@ impl Parser {
         }
         if let Some(declared_schema) = &declared_schema {
             self.local_schemas.insert(index, declared_schema.clone());
+        } else if !created {
+            self.local_schemas.remove(&index);
         }
         self.apply_let_binding_mutability(index, declared_mutable, created);
         Ok(Stmt::Let {
@@ -1184,6 +1189,12 @@ impl Parser {
         if self.enforce_mutable_bindings {
             self.set_local_slot_mutable(key_slot, false);
             self.set_local_slot_mutable(value_slot, false);
+        }
+        if let Some(schema) = &key_schema {
+            self.local_schemas.insert(key_slot, schema.clone());
+        }
+        if let Some(schema) = &value_schema {
+            self.local_schemas.insert(value_slot, schema.clone());
         }
         let iterator_slot = self.allocate_hidden_local()?;
         let iterator_id = Expr::Int(i64::from(iterator_slot));
