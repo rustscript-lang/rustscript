@@ -215,8 +215,20 @@ pub(crate) fn string_replace_literal_entry_address() -> usize {
     pd_vm_native_string_replace_literal as *const () as usize
 }
 
+pub(crate) fn string_replace_literal_many_entry_address() -> usize {
+    pd_vm_native_string_replace_literal_many as *const () as usize
+}
+
 pub(crate) fn string_lower_ascii_entry_address() -> usize {
     pd_vm_native_string_lower_ascii as *const () as usize
+}
+
+pub(crate) fn type_of_entry_address() -> usize {
+    pd_vm_native_type_of as *const () as usize
+}
+
+pub(crate) fn to_string_entry_address() -> usize {
+    pd_vm_native_to_string as *const () as usize
 }
 
 pub(crate) fn string_split_literal_entry_address() -> usize {
@@ -237,6 +249,10 @@ pub(crate) fn clear_value_slot_entry_address() -> usize {
 
 pub(crate) fn value_eq_entry_address() -> usize {
     pd_vm_native_value_eq as *const () as usize
+}
+
+pub(crate) fn value_len_entry_address() -> usize {
+    pd_vm_native_value_len as *const () as usize
 }
 
 pub(crate) fn write_heap_value_to_slot_entry_address() -> usize {
@@ -474,6 +490,9 @@ pub(crate) extern "C" fn pd_vm_native_string_replace_literal(
     let needle = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(needle_ptr)) };
     let replacement =
         unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(replacement_ptr)) };
+    if !needle.is_empty() && !text.contains(needle.as_str()) {
+        return arc_into_repr_ptr(Arc::clone(&*text));
+    }
     arc_into_repr_ptr(Arc::new(
         crate::builtins::runtime::core::builtin_string_replace_literal_impl(
             text.as_str(),
@@ -483,10 +502,45 @@ pub(crate) extern "C" fn pd_vm_native_string_replace_literal(
     ))
 }
 
+pub(crate) extern "C" fn pd_vm_native_string_replace_literal_many(
+    text_ptr: *mut u8, needles_ptr: *mut u8, replacements_ptr: *mut u8,
+) -> *mut u8 {
+    let text = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(text_ptr)) };
+    let needles = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<Vec<Value>>(needles_ptr)) };
+    let replacements = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<Vec<Value>>(replacements_ptr)) };
+    match crate::builtins::runtime::core::builtin_string_replace_literal_many_impl(
+        text.as_str(), needles.as_slice(), replacements.as_slice(),
+    ) {
+        Ok(value) => arc_into_repr_ptr(Arc::new(value)),
+        Err(error) => { store_bridge_error(error); std::ptr::null_mut() }
+    }
+}
+
 pub(crate) extern "C" fn pd_vm_native_string_lower_ascii(text_ptr: *mut u8) -> *mut u8 {
     let text = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(text_ptr)) };
     arc_into_repr_ptr(Arc::new(
         crate::builtins::runtime::core::builtin_string_lower_ascii_impl(text.as_str()),
+    ))
+}
+
+pub(crate) extern "C" fn pd_vm_native_type_of(value_ptr: *const Value) -> *mut u8 {
+    let name = match unsafe { &*value_ptr } {
+        Value::Null => "null",
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
+        Value::Bool(_) => "bool",
+        Value::String(_) => "string",
+        Value::Bytes(_) => "bytes",
+        Value::Array(_) => "array",
+        Value::Map(_) => "map",
+    };
+    arc_into_repr_ptr(Arc::new(name.to_string()))
+}
+
+pub(crate) extern "C" fn pd_vm_native_to_string(value_ptr: *const Value) -> *mut u8 {
+    let value = unsafe { &*value_ptr };
+    arc_into_repr_ptr(Arc::new(
+        crate::builtins::runtime::core::builtin_to_string_impl(value),
     ))
 }
 
@@ -560,6 +614,31 @@ pub(crate) extern "C" fn pd_vm_native_value_eq(lhs: *const Value, rhs: *const Va
     }
 
     i32::from(unsafe { *lhs == *rhs })
+}
+
+pub(crate) extern "C" fn pd_vm_native_value_len(value: *const Value, out: *mut i64) -> i32 {
+    if value.is_null() || out.is_null() {
+        store_bridge_error(VmError::JitNative(
+            "native value-len helper received null pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    }
+    let len = match unsafe { &*value } {
+        Value::String(value) => value.chars().count(),
+        Value::Bytes(value) => value.len(),
+        Value::Array(value) => value.len(),
+        Value::Map(value) => value.len(),
+        _ => {
+            store_bridge_error(VmError::TypeMismatch("string, bytes, array, or map"));
+            return STATUS_ERROR;
+        }
+    };
+    let Ok(len) = i64::try_from(len) else {
+        store_bridge_error(VmError::IntegerOverflow("len"));
+        return STATUS_ERROR;
+    };
+    unsafe { out.write(len) };
+    STATUS_CONTINUE
 }
 
 pub(crate) extern "C" fn pd_vm_native_write_heap_value_to_slot(

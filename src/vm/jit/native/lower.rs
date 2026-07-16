@@ -26,8 +26,10 @@ use crate::vm::native::{
     shared_string_from_buffer_entry_address, sparse_restore_exit_signature,
     string_binary_transform_signature, string_contains_entry_address, string_contains_signature,
     string_lower_ascii_entry_address, string_replace_literal_entry_address,
+    string_replace_literal_many_entry_address,
     string_replace_signature, string_split_literal_entry_address, string_unary_transform_signature,
-    value_eq_entry_address, value_eq_signature, value_slot_signature,
+    to_string_entry_address, type_of_entry_address, value_eq_entry_address, value_eq_signature,
+    value_len_entry_address, value_len_signature, value_slot_signature,
     write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
 };
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -103,6 +105,7 @@ fn try_compile_ssa_trace(
     let non_yielding_host_call_sig = non_yielding_host_call_signature(pointer_type, call_conv);
     let value_slot_sig = value_slot_signature(pointer_type, call_conv);
     let value_eq_sig = value_eq_signature(pointer_type, call_conv);
+    let value_len_sig = value_len_signature(pointer_type, call_conv);
     let box_heap_value_sig = box_heap_value_signature(pointer_type, call_conv);
     let alloc_buffer_sig = alloc_buffer_signature(pointer_type, call_conv);
     let free_buffer_sig = free_buffer_signature(pointer_type, call_conv);
@@ -158,7 +161,9 @@ fn try_compile_ssa_trace(
             regex_match_ref: b.import_signature(regex_match_sig),
             regex_replace_ref: b.import_signature(regex_replace_sig),
             replace_ref: b.import_signature(string_replace_sig),
-            lower_ascii_ref: b.import_signature(string_lower_sig),
+            lower_ascii_ref: b.import_signature(string_lower_sig.clone()),
+            type_of_ref: b.import_signature(string_lower_sig.clone()),
+            to_string_ref: b.import_signature(string_lower_sig),
             split_literal_ref: b.import_signature(string_split_sig),
         };
         let string_addrs = SsaStringHelperAddrs {
@@ -166,12 +171,16 @@ fn try_compile_ssa_trace(
             regex_match: regex_match_entry_address(),
             regex_replace: regex_replace_entry_address(),
             replace_literal: string_replace_literal_entry_address(),
+            replace_literal_many: string_replace_literal_many_entry_address(),
             lower_ascii: string_lower_ascii_entry_address(),
+            type_of: type_of_entry_address(),
+            to_string: to_string_entry_address(),
             split_literal: string_split_literal_entry_address(),
         };
         let deopt_refs = SsaDeoptHelperRefs {
             clone_value_ref: b.import_signature(clone_value_sig),
             value_eq_ref: b.import_signature(value_eq_sig),
+            value_len_ref: b.import_signature(value_len_sig),
             non_yielding_host_call_ref: b.import_signature(non_yielding_host_call_sig),
             clear_value_slot_ref: b.import_signature(value_slot_sig),
             box_heap_value_ref: b.import_signature(box_heap_value_sig),
@@ -189,6 +198,7 @@ fn try_compile_ssa_trace(
         let deopt_addrs = SsaDeoptHelperAddrs {
             clone_value: clone_value_to_slot_entry_address(),
             value_eq: value_eq_entry_address(),
+            value_len: value_len_entry_address(),
             non_yielding_host_call: non_yielding_host_call_entry_address(),
             clear_value_slot: clear_value_slot_entry_address(),
             box_heap_value: write_heap_value_to_slot_entry_address(),
@@ -437,6 +447,7 @@ struct SsaExitLowering {
 struct SsaDeoptHelperRefs {
     clone_value_ref: cranelift_codegen::ir::SigRef,
     value_eq_ref: cranelift_codegen::ir::SigRef,
+    value_len_ref: cranelift_codegen::ir::SigRef,
     non_yielding_host_call_ref: cranelift_codegen::ir::SigRef,
     clear_value_slot_ref: cranelift_codegen::ir::SigRef,
     box_heap_value_ref: cranelift_codegen::ir::SigRef,
@@ -456,6 +467,7 @@ struct SsaDeoptHelperRefs {
 struct SsaDeoptHelperAddrs {
     clone_value: usize,
     value_eq: usize,
+    value_len: usize,
     non_yielding_host_call: usize,
     clear_value_slot: usize,
     box_heap_value: usize,
@@ -478,6 +490,8 @@ struct SsaStringHelperRefs {
     regex_replace_ref: cranelift_codegen::ir::SigRef,
     replace_ref: cranelift_codegen::ir::SigRef,
     lower_ascii_ref: cranelift_codegen::ir::SigRef,
+    type_of_ref: cranelift_codegen::ir::SigRef,
+    to_string_ref: cranelift_codegen::ir::SigRef,
     split_literal_ref: cranelift_codegen::ir::SigRef,
 }
 
@@ -487,7 +501,10 @@ struct SsaStringHelperAddrs {
     regex_match: usize,
     regex_replace: usize,
     replace_literal: usize,
+    replace_literal_many: usize,
     lower_ascii: usize,
+    type_of: usize,
+    to_string: usize,
     split_literal: usize,
 }
 
@@ -564,6 +581,7 @@ fn ssa_trace_supported(ssa: &SsaTrace) -> bool {
                     | SsaInstKind::UnboxInt { .. }
                     | SsaInstKind::UnboxFloat { .. }
                     | SsaInstKind::UnboxBool { .. }
+                    | SsaInstKind::ValueLen { .. }
                     | SsaInstKind::StringLen { .. }
                     | SsaInstKind::BytesLen { .. }
                     | SsaInstKind::StringSlice { .. }
@@ -575,7 +593,10 @@ fn ssa_trace_supported(ssa: &SsaTrace) -> bool {
                     | SsaInstKind::RegexMatch { .. }
                     | SsaInstKind::RegexReplace { .. }
                     | SsaInstKind::StringReplaceLiteral { .. }
+                    | SsaInstKind::StringReplaceLiteralMany { .. }
                     | SsaInstKind::StringLowerAscii { .. }
+                    | SsaInstKind::TypeOf { .. }
+                    | SsaInstKind::ToString { .. }
                     | SsaInstKind::StringSplitLiteral { .. }
                     | SsaInstKind::StringConcat { .. }
                     | SsaInstKind::BytesConcat { .. }
@@ -856,7 +877,10 @@ fn ssa_inst_requires_owned_value_slot(kind: &SsaInstKind) -> bool {
             | SsaInstKind::StringGet { .. }
             | SsaInstKind::RegexReplace { .. }
             | SsaInstKind::StringReplaceLiteral { .. }
+            | SsaInstKind::StringReplaceLiteralMany { .. }
             | SsaInstKind::StringLowerAscii { .. }
+            | SsaInstKind::TypeOf { .. }
+            | SsaInstKind::ToString { .. }
             | SsaInstKind::StringSplitLiteral { .. }
             | SsaInstKind::BytesFromArrayU8 { .. }
             | SsaInstKind::BytesToArrayU8 { .. }
@@ -1241,6 +1265,34 @@ fn lower_ssa_inst(
 
             b.switch_to_block(cont);
             out
+        }
+        SsaInstKind::ValueLen { value } => {
+            let value = values[value];
+            let out_slot = b.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                std::mem::size_of::<i64>() as u32,
+                std::mem::align_of::<i64>().trailing_zeros() as u8,
+            ));
+            let out = b.ins().stack_addr(pointer_type, out_slot, 0);
+            let helper_ptr = iconst_ptr_from_addr(b, pointer_type, helper_addrs.value_len)?;
+            let call = b.ins().call_indirect(
+                helper_refs.value_len_ref,
+                helper_ptr,
+                &[value, out],
+            );
+            let status = b.inst_results(call)[0];
+            let success = b.create_block();
+            let fail = b.create_block();
+            let ok = b
+                .ins()
+                .icmp_imm(IntCC::Equal, status, i64::from(STATUS_CONTINUE));
+            b.ins().brif(ok, success, &[], fail, &[]);
+
+            b.switch_to_block(fail);
+            jump_with_status(b, exit_block, status);
+
+            b.switch_to_block(success);
+            b.ins().stack_load(types::I64, out_slot, 0)
         }
         SsaInstKind::StringLen { text } => {
             let string_data = ssa_load_heap_data_ptr(b, layout.value, values[text]);
@@ -1781,6 +1833,33 @@ fn lower_ssa_inst(
             ssa_store_heap_ptr_in_value(b, layout.value, out, layout.value.string_tag, out_raw);
             out
         }
+        SsaInstKind::StringReplaceLiteralMany {
+            text,
+            needles,
+            replacements,
+        } => {
+            let text = values[text];
+            let needles = values[needles];
+            let replacements = values[replacements];
+            let out = owned_value_temp_slot_addr(
+                b,
+                pointer_type,
+                owned_value_temps,
+                SsaTempValueSlotKey::Output(output.id),
+            )?;
+            let out_raw = ssa_call_string_replace_literal_many(
+                b,
+                pointer_type,
+                string_refs,
+                string_addrs,
+                text,
+                needles,
+                replacements,
+            )?;
+            clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
+            ssa_store_heap_ptr_in_value(b, layout.value, out, layout.value.string_tag, out_raw);
+            out
+        }
         SsaInstKind::StringReplaceLiteral {
             text,
             needle,
@@ -1818,6 +1897,32 @@ fn lower_ssa_inst(
             )?;
             let out_raw =
                 ssa_call_string_lower_ascii(b, pointer_type, string_refs, string_addrs, text)?;
+            clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
+            ssa_store_heap_ptr_in_value(b, layout.value, out, layout.value.string_tag, out_raw);
+            out
+        }
+        SsaInstKind::TypeOf { value } => {
+            let value = values[value];
+            let out = owned_value_temp_slot_addr(
+                b,
+                pointer_type,
+                owned_value_temps,
+                SsaTempValueSlotKey::Output(output.id),
+            )?;
+            let out_raw = ssa_call_type_of(b, pointer_type, string_refs, string_addrs, value)?;
+            clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
+            ssa_store_heap_ptr_in_value(b, layout.value, out, layout.value.string_tag, out_raw);
+            out
+        }
+        SsaInstKind::ToString { value } => {
+            let value = values[value];
+            let out = owned_value_temp_slot_addr(
+                b,
+                pointer_type,
+                owned_value_temps,
+                SsaTempValueSlotKey::Output(output.id),
+            )?;
+            let out_raw = ssa_call_to_string(b, pointer_type, string_refs, string_addrs, value)?;
             clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
             ssa_store_heap_ptr_in_value(b, layout.value, out, layout.value.string_tag, out_raw);
             out
@@ -3913,6 +4018,24 @@ fn ssa_call_string_replace_literal(
     Ok(b.inst_results(call)[0])
 }
 
+fn ssa_call_string_replace_literal_many(
+    b: &mut FunctionBuilder,
+    pointer_type: cranelift_codegen::ir::Type,
+    string_refs: SsaStringHelperRefs,
+    string_addrs: SsaStringHelperAddrs,
+    text: cranelift_codegen::ir::Value,
+    needles: cranelift_codegen::ir::Value,
+    replacements: cranelift_codegen::ir::Value,
+) -> VmResult<cranelift_codegen::ir::Value> {
+    let helper_ptr = iconst_ptr_from_addr(b, pointer_type, string_addrs.replace_literal_many)?;
+    let call = b.ins().call_indirect(
+        string_refs.replace_ref,
+        helper_ptr,
+        &[text, needles, replacements],
+    );
+    Ok(b.inst_results(call)[0])
+}
+
 fn ssa_call_string_lower_ascii(
     b: &mut FunctionBuilder,
     pointer_type: cranelift_codegen::ir::Type,
@@ -3924,6 +4047,34 @@ fn ssa_call_string_lower_ascii(
     let call = b
         .ins()
         .call_indirect(string_refs.lower_ascii_ref, helper_ptr, &[text]);
+    Ok(b.inst_results(call)[0])
+}
+
+fn ssa_call_type_of(
+    b: &mut FunctionBuilder,
+    pointer_type: cranelift_codegen::ir::Type,
+    string_refs: SsaStringHelperRefs,
+    string_addrs: SsaStringHelperAddrs,
+    value: cranelift_codegen::ir::Value,
+) -> VmResult<cranelift_codegen::ir::Value> {
+    let helper_ptr = iconst_ptr_from_addr(b, pointer_type, string_addrs.type_of)?;
+    let call = b
+        .ins()
+        .call_indirect(string_refs.type_of_ref, helper_ptr, &[value]);
+    Ok(b.inst_results(call)[0])
+}
+
+fn ssa_call_to_string(
+    b: &mut FunctionBuilder,
+    pointer_type: cranelift_codegen::ir::Type,
+    string_refs: SsaStringHelperRefs,
+    string_addrs: SsaStringHelperAddrs,
+    value: cranelift_codegen::ir::Value,
+) -> VmResult<cranelift_codegen::ir::Value> {
+    let helper_ptr = iconst_ptr_from_addr(b, pointer_type, string_addrs.to_string)?;
+    let call = b
+        .ins()
+        .call_indirect(string_refs.to_string_ref, helper_ptr, &[value]);
     Ok(b.inst_results(call)[0])
 }
 
