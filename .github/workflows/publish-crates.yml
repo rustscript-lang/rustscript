@@ -6,6 +6,8 @@ on:
       - 'v*'
       - '[0-9]*'
       - 'yank-pd-host-function-*'
+      - 'unyank-pd-host-function-*'
+      - 'publish-crates-*-host-*'
   workflow_dispatch:
     inputs:
       version:
@@ -55,6 +57,22 @@ jobs:
             host_version="${GITHUB_REF_NAME#yank-pd-host-function-}"
             cargo yank --vers "$host_version" pd-host-function
             exit 0
+          fi
+          if [[ "$GITHUB_REF_NAME" == unyank-pd-host-function-* ]]; then
+            host_version="${GITHUB_REF_NAME#unyank-pd-host-function-}"
+            cargo yank --undo --vers "$host_version" pd-host-function
+            exit 0
+          fi
+          if [[ "$GITHUB_REF_NAME" == publish-crates-*-host-* ]]; then
+            publish_spec="${GITHUB_REF_NAME#publish-crates-}"
+            version="${publish_spec%%-host-*}"
+            host_version="${publish_spec#*-host-}"
+            if [[ -z "$version" || -z "$host_version" || "$version" == "$publish_spec" ]]; then
+              echo "invalid publish recovery tag: $GITHUB_REF_NAME" >&2
+              exit 1
+            fi
+            INPUT_VERSION="$version"
+            INPUT_HOST_VERSION="$host_version"
           fi
           version="${INPUT_VERSION:-${GITHUB_REF_NAME#v}}"
           if [[ -z "$version" ]]; then

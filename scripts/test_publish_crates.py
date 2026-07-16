@@ -7,6 +7,15 @@ from scripts import publish_crates
 
 
 class PublishCratesTests(unittest.TestCase):
+    def test_workflow_supports_unyank_and_explicit_recovery_publish_tags(self) -> None:
+        workflow = (
+            Path(__file__).parents[1] / ".github" / "workflows" / "publish-crates.yml"
+        ).read_text()
+        self.assertIn("'unyank-pd-host-function-*'", workflow)
+        self.assertIn("cargo yank --undo --vers", workflow)
+        self.assertIn("'publish-crates-*-host-*'", workflow)
+        self.assertIn('publish_spec="${GITHUB_REF_NAME#publish-crates-}"', workflow)
+
     def test_package_versions_keep_host_macro_on_compatible_line(self) -> None:
         self.assertEqual(
             publish_crates.package_versions("0.23.1", "0.22.7"),
