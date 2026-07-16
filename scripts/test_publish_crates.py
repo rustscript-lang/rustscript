@@ -16,6 +16,11 @@ class PublishCratesTests(unittest.TestCase):
         self.assertIn("'publish-crates-*-host-*'", workflow)
         self.assertIn('publish_spec="${GITHUB_REF_NAME#publish-crates-}"', workflow)
 
+    def test_publish_script_does_not_force_registry_lock_versions(self) -> None:
+        source = (Path(__file__).parent / "publish_crates.py").read_text()
+        self.assertNotIn("refresh_registry_lock", source)
+        self.assertNotIn("refresh_publish_lock.py", source)
+
     def test_package_versions_keep_host_macro_on_compatible_line(self) -> None:
         self.assertEqual(
             publish_crates.package_versions("0.23.1", "0.22.7"),

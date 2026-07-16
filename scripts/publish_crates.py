@@ -4,7 +4,6 @@ import json
 import os
 import re
 import subprocess
-import sys
 import time
 import tomllib
 import urllib.error
@@ -121,14 +120,6 @@ def crate_exists(package: str, version: str) -> bool:
         raise
 
 
-def refresh_registry_lock(root: Path, package: str, version: str) -> None:
-    subprocess.run(
-        [sys.executable, "scripts/refresh_publish_lock.py", package, version],
-        cwd=root,
-        check=True,
-    )
-
-
 def publish_package(root: Path, package: str, version: str) -> None:
     for attempt in range(1, 19):
         print(f"publishing {package} {version}, attempt {attempt}", flush=True)
@@ -183,8 +174,6 @@ def main() -> None:
         if crate_exists(package, version):
             print(f"{package} {version} already published; skipping", flush=True)
             continue
-        if package == "pd-vm":
-            refresh_registry_lock(root, "pd-host-function", args.host_version)
         publish_package(root, package, version)
 
 
