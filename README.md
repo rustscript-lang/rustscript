@@ -457,6 +457,37 @@ The `call` opcode pops its arguments, dispatches to a builtin or bound host func
 | `Yield` | Retry next `run()` | **Rewound to `call` opcode** | **Args re-pushed** |
 | `Pending(op_id)` | Async result pending | Advanced past `call` | Empty (result injected via `complete_host_op`) |
 
+**Generated `#[pd_host_function]` binding selection:**
+
+Default host functions declared with `#[pd_host_function]` are bound according to their Rust
+signature:
+
+| Signature shape | Generated binding | JIT behavior |
+|---|---|---|
+| Has a `Vm` parameter | `StaticStack` | VM-aware call boundary |
+| Returns `CallOutcome`, `VmResult<CallOutcome>`, or `HostResult<CallOutcome>` | `StaticArgs` | General call boundary; may halt, yield, or become pending |
+| Args-only with a supported ordinary return such as `Value`, `bool`, `String`, `Option<T>`, `VmResult<T>`, or `HostResult<T>` | `StaticNonYieldingArgs` | Eligible to remain inside a native loop trace |
+| Unrecognized return shape | `StaticArgs` | Conservative fallback |
+
+For a simple synchronous host function that always returns one value, prefer an ordinary return type
+(or `VmResult<T>` / `HostResult<T>` when it may fail) instead of wrapping the value in
+`CallOutcome::Return`. The ordinary signature communicates the non-yielding contract to the
+generator and can avoid leaving an eligible native JIT loop trace. Use `CallOutcome` only when the
+function needs `Halt`, `Yield`, `Pending`, or explicit control over the returned value count.
+
+For example:
+
+```rust
+#[pd_host_function(name = "runtime::is_ready")]
+fn runtime_is_ready() -> VmResult<bool> {
+    Ok(true)
+}
+```
+
+This signature selects `StaticNonYieldingArgs`. Changing its return type to
+`VmResult<CallOutcome>` selects the general `StaticArgs` path because the signature no longer proves
+that the function always returns one value synchronously.
+
 **Non-yielding static host calls** — native-trace opt-in:
 
 - `Vm::bind_static_non_yielding_args_function` and
