@@ -1,416 +1,120 @@
-# Implementation Plan: Real Script Call Frames
+# Real Script Call Frames Implementation Plan
+
+**Goal:** Compile every RSS function body once and execute direct calls, function values, closures, recursion, suspension, and Rust invocation through one real-frame model with identical interpreter, Trace JIT, and AOT behavior.
+
+First-class value typing, generic schemas, lifecycle, and retained callback APIs are completed by [function_as_value_plan.md](function_as_value_plan.md). This plan defines the shared bytecode/frame contract they use.
+
+## 1. Freeze the opcode and return contracts
+
+**Target:** Add one opcode and remove context-dependent return semantics.
+
+**Complete:**
+
+- Keep `Call(index: u16, argc: u8)` exclusively for direct builtin/host-import dispatch.
+- Add only `CallValue(argc: u8)` for every RSS function-item/closure invocation and host function used as a value.
+- Define the `CallValue` stack ABI: before execution the stack tail is `callee, arg0, ..., argN`; the opcode removes that segment, enters the selected target, and eventually replaces it with exactly one result (`Null` for unit).
+- Give `Ret` one semantic: complete the active execution frame and transfer its normalized result to that frame's continuation.
+- Represent root execution explicitly as a frame whose continuation is `Halt`; represent nested RSS calls with `ResumeBytecode { return_ip, ... }`; represent Rust/API invocation roots with `ReturnToHost`.
+- Never define `Ret` by checking whether the script-frame stack happens to be empty. Root `Ret` produces `VmStatus::Halted` because its explicit continuation says so.
+- Reuse existing root bytecode ending in `Ret`; no `Halt` or `CallScript` opcode is added.
+- Treat `CallValue` as a cross-cutting bytecode ABI change, with these required edits:
+  - opcode definition/decoding: `src/bytecode.rs` (`OpCode`, `TryFrom<u8>`, operand length, mnemonic, decoded instruction metadata);
+  - assembly: `src/assembler.rs` builders, textual parser, disassembler output, truncation/error tests;
+  - Program/value model: callable prototypes, script-function regions, `Value::Callable`, `ValueType::Callable`, clone/drop/equality/formatting, Program cache hashing;
+  - compiler: `src/compiler/ir.rs`, `codegen.rs`, `pipeline.rs`, typing, lifetime/capture analysis, linker remapping, source/debug metadata;
+  - interpreter/runtime: `src/vm/mod.rs`, `host.rs`, `store.rs`, frame entry/return, suspension/resume, reset/replacement, Rust invocation roots;
+  - Trace JIT: recorder/decoder, trace IR, SSA/liveness/deopt, native lowering, runtime dispatch, cache keys, diagnostics and trace-continuity counters;
+  - AOT: CFG function regions, IR/SSA, native compile/runtime bridges, artifact metadata, dynamic target dispatch and continuation handling;
+  - tooling: VMBC validation, no-std decode/execution, debugger/recording/replay, CLI inspection, REPL state, tests and fixtures.
+- Apply a hard internal format break; no backward decoder, migration, opcode reinterpretation, or compatibility branch is required:
+  - bump VMBC from its current encoding version and accept only the new version;
+  - bump both AOT artifact `VERSION` and native `ABI_VERSION` because Program/VM/native layouts and return control flow change;
+  - bump debugger recording `PDRC` version and remove legacy recording acceptance;
+  - include callable tables, function regions, slot layouts, and the new opcode ABI revision in Program/native trace cache keys so old in-memory entries cannot match;
+  - regenerate internal fixtures/artifacts and make every old format fail with its existing unsupported-version error.
+
+**Acceptance:** `Ret` has one frame-completion rule in the interpreter, Trace IR, AOT IR, debugger, and public invocation API; root halt and nested return are selected only by typed continuation metadata.
+
+## 2. Add Program-owned targets and real frames
+
+**Target:** Separate executable definitions from runtime callable instances without retaining old Programs.
+
+**Complete:**
+
+- Add `Program.script_functions` and `Program.callable_prototypes` containing entry IP, arity, frame-local count, parameter slots, slot-location layout, capture layout, source metadata, and instantiated generic signature.
+- Add `Value::Callable { program_instance, prototype_id, kind, env }`; it stores no `Arc<Program>`.
+- Assign a fresh `ProgramInstanceId` on Program installation/replacement/reset. `CallValue` validates it before prototype lookup and returns `StaleCallable` for old handles.
+- Add an execution-frame stack. Each frame records:
+  - typed continuation (`Halt`, `ResumeBytecode`, or `ReturnToHost`);
+  - prototype/function identity;
+  - frame base and local extent;
+  - operand-stack base;
+  - active callable/environment root;
+  - recursion, fuel/epoch, suspension, and debug state required for exact resume.
+- Resolve logical locals through metadata such as `SlotLocation::Frame(offset)` or `SlotLocation::Capture(cell)`. A logical slot must map to exactly one storage class in each prototype.
+- On `CallValue`, validate value kind, Program instance, arity, and recursion limit; preserve caller state; allocate callee locals; bind arguments/self/environment; then enter the target.
+- On `Ret`, normalize the result, release callee roots/locals, restore the typed continuation, and either resume bytecode, return to Rust, or report halt.
+- Emit root code and every RSS function body once in one code blob, with explicit root/function regions.
+- Validate `Br` and `Brfalse` targets remain inside their current root/function region; cross-function control flow is valid only through `CallValue` and `Ret`.
+
+**Acceptance:** Repeated calls share one body; direct recursion, mutual recursion, nested calls, local isolation, return values, errors, yield/pending, cancellation, and resume preserve exact frame and ownership state.
+
+## 3. Lower every RSS callable path to the shared ABI
+
+**Target:** Remove script-body inlining as a runtime fallback while preserving capture behavior.
+
+**Complete:**
+
+- Record one Program-owned prototype for every function item or closure body and one script-function entry for every emitted RSS body.
+- Initialize capture-free named bindings from Program metadata without a creation opcode.
+- Lower direct or indirect RSS calls by loading the applicable callable value and emitting `CallValue`; keep `Call` only for direct host/builtin imports.
+- Preserve source-order visibility: Program binding initialization must not make a reference before its declaration valid.
+- Bind recursive self-reference through prototype/frame metadata, not a separate opcode.
+- Convert `capture_copies` into environment/slot layouts while preserving `CaptureBindingMode`:
+  - `Copy` receives an independent captured value;
+  - `Borrow`/`BorrowMut` share one cell with the outer frame and aliases;
+  - `Move` transfers the value into the environment and invalidates the source.
+- Give separate closure evaluations separate environments and aliases of one callable the same environment.
+- Seed separately emitted bodies from function-entry typing snapshots instead of caller-time `type_state`.
+- Keep generic substitution in schemas/prototypes and runtime dispatch erased.
+- Allow implementation sequencing internally, but do not mark the feature complete while any RSS function/closure call still depends on inline-body fallback.
+
+**Acceptance:** Named functions, closure expressions, capturing nested functions, returned/stored callables, branch/loop merges, generics, recursion, and escaping environments all use `CallValue` plus real frames.
+
+## 4. Resolve interactions with existing opcodes and native backends
+
+**Target:** Prevent hidden semantic conflicts and keep calls inside native execution.
+
+**Complete:**
+
+- Audit existing opcodes under callable values:
+  - `Call` retains its host-import index namespace and never dispatches RSS prototypes;
+  - `Ldloc`/`Stloc` use the current prototype's unambiguous slot-location map;
+  - `Br`/`Brfalse` cannot cross root/function regions;
+  - `Ldc` cannot deserialize Program-bound callable constants;
+  - `Pop` and `Dup` apply normal callable/environment clone/drop ownership;
+  - `Ceq` compares function items by Program instance/prototype identity and closure aliases by callable/environment identity; separate closure evaluations compare unequal;
+  - arithmetic, bitwise, ordering, and shift opcodes reject callable operands through existing type-error paths.
+- Remove or redesign the current interpreter `Call + Ret` fusion. It may run only when typed continuation/frame semantics, fuel ticks, epoch checks, result normalization, and lifecycle behavior remain identical to unfused execution.
+- Change the current interpreter mapping from unconditional `Ret -> Halted` to frame completion.
+- Change AOT CFG/SSA so `Ret` terminates the current function region and returns to its native continuation; only root continuation reports halt.
+- Change Trace JIT so `CallValue`, callee execution, and `Ret` remain in one compiled trace; recording resumes at the caller continuation after return.
+- Lower dynamic callable target resolution to native dispatch. Target variation, nested calls, captures, errors, and suspension must not produce feature side exits, trace interruption, interpreter handoff, or AOT rejection.
+- Preserve frame bases, locals, operand state, callable/environment roots, fuel/epoch accounting, host-call continuation, and suspension state in all three backends.
 
-## Goal
+**Acceptance:** Opcode behavior is determined by explicit Program/frame metadata, and interpreter, Trace JIT, and AOT produce identical values, errors, ticks, traces, and drops without callable-induced fallback.
 
-Introduce real runtime call frames for script-defined `fn` declarations so a function body is compiled once and invoked many times without duplicating its bytecode at each call site.
+## 5. Complete tooling and verification
 
-This plan is only for real script calls and frames.
+**Target:** Make the new frame model observable, version-safe, and releasable.
 
-Non-goals for this effort:
+**Complete:**
 
-- Exposing callable `Value`s to every RSS expression/container/return position
-- Returning/storing callables in arrays or maps
-- Full escaping closure environments in the first milestone
-- Host-retained UI/event callback APIs
-- Tail-call optimization
+- Update assembler/disassembler, operand decoding, VMBC validation, no-std execution, AOT bundles, REPL replacement, recording/replay, formatter output, and source diagnostics.
+- Add function-region/prototype/frame data to debug info, stack traces, current-frame local inspection, and Rust invocation status.
+- Add focused tests for root `Ret`, nested `Ret`, Rust-root `Ret`, `CallValue` stack shape, stale handles, arity/type errors, region-confined branches, slot-location validation, callable equality, `Pop`/`Dup` lifecycle, and rewritten `Call + Ret` optimization.
+- Add interpreter/JIT/AOT parity tests for direct/dynamic calls, recursion, captures, host calls, errors, yield/pending/resume, cancellation, reset, and exact drop counts.
+- Instrument native tests to assert zero callable-induced side exits, trace breaks, interpreter handoffs, and rejected valid AOT Programs.
+- Run focused suites during implementation, then formatting, workspace tests, Clippy with `-D warnings`, and release builds.
 
-First-class runtime callables, escaping closures, callable lifecycle, generic function values, and Rust-side invocation are specified separately in [function_as_value_plan.md](function_as_value_plan.md). That plan depends on the frame model defined here.
-
-## Current State
-
-Today the compiler and VM behave like this:
-
-- Frontend IR keeps function definitions in `FunctionImpl`, plus `Expr::Call`, `Expr::FunctionRef`, and `Expr::LocalCall`.
-- Codegen inlines any call whose target has a `FunctionImpl`.
-- Final bytecode only emits `OpCode::Call` for builtins and host imports.
-- The VM interprets `OpCode::Call` as builtin/host dispatch only.
-- `OpCode::Ret` always halts the program; there is no intra-program return path.
-- `Program` stores one code blob, one `local_count`, and one import table. It has no script-function table or entry-point metadata.
-- Trace JIT and native AOT assume the same host-only call model.
-
-This means:
-
-- Repeated script calls duplicate the callee body in emitted bytecode.
-- Recursive script functions are impossible under the current lowering.
-- There is no real script stack frame, return address, or frame-local lifetime.
-
-## Recommended End State
-
-### Runtime model
-
-Add real script frames while keeping the semantic opcode surface shared with first-class function values:
-
-- Keep existing `OpCode::Call(index, argc)` for builtin/host import dispatch.
-- Initialize capture-free named callable bindings from Program metadata when the Program instance is installed; this needs no creation opcode.
-- Add only `OpCode::CallValue(argc)` to invoke those values and enter their script frames.
-- Do not add `CallScript`; direct and first-class RSS calls share `CallValue`.
-- Reuse `OpCode::Ret`:
-  - if no script caller exists, halt the program
-  - otherwise pop one script frame, restore the caller frame, and continue at the saved return IP
-- Add a VM-side `CallFrame` stack.
-
-### Program model
-
-Add script-function and callable-prototype tables to `Program`. The callable definitions belong to Program; runtime values only reference them by the active Program instance ID and prototype ID:
-
-```rust
-pub struct ScriptFunction {
-    pub decl_index: u16,
-    pub name: String,
-    pub arity: u8,
-    pub entry_ip: u32,
-    pub frame_local_count: u16,
-    pub param_slots: Vec<u8>,
-}
-
-pub struct Program {
-    // existing fields
-    pub script_functions: Vec<ScriptFunction>,
-    pub callable_prototypes: Vec<CallablePrototype>,
-}
-```
-
-Recommended first version:
-
-- Keep existing local-slot numbering from the compiler.
-- Make `Ldloc`/`Stloc` frame-relative at runtime.
-- For each separately emitted script function, set `frame_local_count` to `max(slot_in_footprint) + 1`.
-- Do not attempt a dense per-function local remap in the first milestone.
-
-That choice keeps the first implementation small because it does not require rewriting the current lifetime/coloring passes, which still operate on one global local-slot space.
-
-### Code layout
-
-Compile the root body first, then append separately emitted script function bodies to the same `Program.code` blob:
-
-1. Root statements
-2. Root `ret`
-3. Function body A
-4. Function `ret`
-5. Function body B
-6. Function `ret`
-7. ...
-
-Execution still starts at `ip = 0`. For each supported capture-free named function, the compiler assigns a hidden callable binding initialized from Program metadata when the Program instance is installed. Appended function bodies are entered only through `CallValue`.
-
-Preserve current source-order semantics: the parser registers a function before parsing its own body, which permits self-recursion, but statements before the declaration cannot use it. The new runtime binding must not hoist a declaration or create a capturing callable when control does not reach the declaration.
-
-## Scope Split
-
-This feature is safest as a staged rollout.
-
-### Phase 1 scope
-
-Support real script frames for direct named functions that do not require runtime capture environments:
-
-- Top-level functions
-- Nested functions with `capture_copies.is_empty()`
-- `LocalCall` sites whose callable is statically known to be one of the above functions
-
-Keep current inline lowering for:
-
-- Closures
-- Capturing nested `fn` declarations
-- Any callable path that still depends on declaration-time capture snapshots
-
-This already delivers the main win: function bodies stop being duplicated in bytecode for the most common direct-call cases.
-
-### Later scope
-
-Extend real frames to capturing nested `fn` declarations by adding declaration environments. That is a second feature, not part of the first milestone.
-
-## Design Details
-
-### 1. Bytecode and metadata
-
-Files:
-
-- `src/bytecode.rs`
-- `src/assembler.rs`
-- `src/vmbc.rs`
-- `src/vm/jit/aot.rs`
-
-Changes:
-
-- Add `ScriptFunction` metadata to `Program`.
-- Add only `OpCode::CallValue(u8)` in the real-frame milestone. Environment construction belongs to the later escaping-closure work and must be selected by capture requirements, not source naming.
-- Keep existing `OpCode::Call(u16, u8)` unchanged for builtin/host imports.
-- Update opcode encoding/decoding and assembler helpers.
-- Update VMBC serialization/deserialization for the new function table.
-- Bump the VMBC wire version.
-- Bump `AOT_VERSION` if AOT bundles persist the expanded `Program` layout.
-
-Recommendation:
-
-- Keep `Program.imports` exactly for host imports.
-- Add a separate `Program.script_functions`.
-- Do not overload the existing import table to carry both concepts.
-
-### 2. VM frame stack
-
-Files:
-
-- `src/vm/mod.rs`
-- `src/vm/host.rs`
-
-Add:
-
-```rust
-struct CallFrame {
-    return_ip: usize,
-    prev_frame_base: usize,
-    prev_locals_len: usize,
-    function_id: u16,
-}
-```
-
-And VM state:
-
-- `frame_base: usize`
-- `call_frames: Vec<CallFrame>`
-- `program_instance: ProgramInstanceId`
-- an optional capture-free callable cache owned by the active VM/Program state
-
-Execution model:
-
-- `Ldloc index` resolves the current logical slot through the frame's slot layout.
-- `Stloc index` stores through the same slot layout.
-- Program installation initializes capture-free named callable bindings with the active `ProgramInstanceId` and prototype IDs.
-- `CallValue argc`:
-  - consume the callable and arguments
-  - reject it with `StaleCallable` unless its Program instance ID equals the active one
-  - resolve the callable prototype, then its target `ScriptFunction`
-  - validate arity against the prototype
-  - save caller frame state
-  - extend `locals` by `frame_local_count`, filled with `Null`
-  - set `frame_base` to the new frame start
-  - move/copy stack args into `param_slots`
-  - retain the callable as the active frame root
-  - bind it to the function's metadata-designated self slot when the body recursively references its own name
-  - jump `ip` to `entry_ip`
-- `Ret`:
-  - if `call_frames` is empty, halt
-  - otherwise truncate locals to `prev_locals_len`, restore `frame_base`, set `ip = return_ip`
-
-Notes:
-
-- This integrates cleanly with the current `Value` stack model.
-- Host/builtin calls still use the current stack-based ABI.
-- Script calls never switch Programs. Replacing/resetting the Program assigns a new `ProgramInstanceId`, clears the callable cache and callback roots, and invalidates all old values.
-- `call_depth()` should be redefined to report total logical call depth, not only host-call nesting.
-
-### 3. Compiler lowering
-
-Files:
-
-- `src/compiler/codegen.rs`
-- `src/compiler/pipeline.rs`
-- `src/compiler/mod.rs`
-
-Add a new compiler path for separately emitted script functions:
-
-- Partition `FunctionImpl`s into:
-  - `runtime_callable`: emit once as a `ScriptFunction`
-  - `inline_only`: keep current behavior temporarily
-- Record one Program-owned callable prototype and hidden binding for each supported capture-free named function; Program installation initializes those bindings.
-- `compile_function_call` becomes:
-  - builtin/host import used directly -> existing `Call`
-  - supported RSS function/local callable -> `Ldloc` callable slot, compile args, `CallValue`
-  - `inline_only` script function -> existing inline path
-- After compiling root statements, emit all `runtime_callable` bodies once and record `entry_ip`.
-- Keep parser declaration visibility source ordered; Program binding initialization must not make an earlier source reference valid.
-
-Important compiler choice:
-
-- The first implementation should keep current slot numbers inside function bodies.
-- Use `collect_function_frame_slots` to compute `frame_local_count`.
-- Do not attempt to renumber locals per function yet.
-
-That avoids touching:
-
-- parser local numbering
-- lifetime availability
-- liveness/coloring
-- most type-inference slot bookkeeping
-
-### 4. Function entry type state
-
-Separate function-body emission cannot depend on caller-time `type_state`.
-
-Files:
-
-- `src/compiler/typing.rs`
-- `src/compiler/typing/context.rs`
-- `src/compiler/typing/collect.rs`
-- `src/compiler/codegen.rs`
-
-Required addition:
-
-- Record a function-entry typing snapshot for each separately emitted script function.
-
-At minimum this snapshot must provide:
-
-- known parameter types
-- optional/schema state for parameter slots
-- callable bindings that are valid at function entry
-
-Reason:
-
-- current codegen uses `type_state` when emitting operand type hints and some type-directed lowering decisions
-- inline codegen gets this state from the caller naturally; separate function emission does not
-
-If a full `LocalTypeState` snapshot per function is too expensive initially, a narrower `FunctionEntryState` is acceptable as long as it seeds all type-directed codegen paths that exist today.
-
-### 5. Capturing nested functions
-
-This is the main semantic trap. Current nested `fn` declarations capture outer locals at declaration time, and inline lowering materializes those capture copies into the flat local space.
-
-Recommendation for the first milestone:
-
-- do not materialize capturing nested `fn` declarations in phase 1
-- keep them inline-only until the environment/slot-layout design in `function_as_value_plan.md` is added
-
-Recommended later design:
-
-- use the shared environment-binding lowering from `function_as_value_plan.md` when a closure expression or nested declaration captures outer state
-- execution snapshots captures into a fresh closure environment
-- calling the resulting value uses the same `CallValue` frame path
-
-That later work is closure-adjacent, even if callables are still not first-class `Value`s.
-
-## Backend Strategy
-
-Interpreter, Trace JIT, and AOT support are one feature scope. Interpreter support may be implemented first during development, but function values are not complete or releasable until both native backends execute the full semantics.
-
-### Trace JIT
-
-Files:
-
-- `src/vm/jit/trace.rs`
-- `src/vm/jit/runtime.rs`
-- `src/vm/jit/native/bridge.rs`
-- `src/vm/jit/native/codegen.rs`
-
-Required implementation:
-
-- Record callable value/environment operations, `CallValue`, script frame entry, callee body operations, and `Ret` in trace IR.
-- Lower callable target resolution and script calls to native dispatch/calls that return to the same compiled trace.
-- Preserve frame bases, locals, operand values, callable/environment roots, fuel/epoch state, and host suspension continuations across native calls.
-- Continue recording after callee return; callable operations must not terminate a trace.
-- Handle dynamic target, arity/type failure, recursion depth, stale Program IDs, and runtime errors through native status/control flow, without interpreter handoff.
-- Add trace assertions proving no function-value opcode produces a feature side exit or trace break.
-
-### Native AOT
-
-Required implementation:
-
-- Add callable prototypes, script frame metadata, capture layouts, and Program instance validation to the AOT bundle.
-- Lower callable creation/environment access, `CallValue`, frame entry/return, recursion, errors, and suspension/resume into AOT IR and native code.
-- Compile or link every reachable script callable target and support dynamic callable dispatch natively.
-- Preserve the same ownership/drop behavior and host-call continuation semantics as the interpreter and Trace JIT.
-- Reject no valid Program and use no interpreter fallback because it contains function values.
-
-## Debugger and tooling
-
-Files:
-
-- `src/debug_info.rs`
-- `src/debugger/mod.rs`
-- `src/bin/pd-vm-run.rs`
-
-Current debug info is flat and local-index based. Real frames need frame-aware introspection.
-
-Recommended additions:
-
-- function entry/range metadata in `DebugInfo`
-- a VM API to inspect the script call stack
-- debugger views that show locals for the current frame, not the entire flat local array
-
-This does not need to block the first executable version, but it should be part of the same effort before calling the feature complete.
-
-## Public API and compatibility
-
-Expected breaking or additive changes:
-
-- `Program` grows a `script_functions` table
-- VMBC version bump
-- possibly AOT version bump
-- `CompiledProgram.functions` should stop meaning "all non-inlined declared functions"
-
-Recommended compiler API cleanup:
-
-- keep `CompiledProgram.functions` for host-visible imports only, or rename it
-- if script function metadata is exposed publicly, return it in a separate field
-
-This avoids breaking CLI/runtime code that currently treats `CompiledProgram.functions` as host bindings to register.
-
-## Rollout Plan
-
-### Milestone 1: metadata and interpreter semantics
-
-- Add Program-owned named callable prototypes/bindings, `CallValue`, `ScriptFunction`, and VM frame stack support
-- Update `Ret` semantics
-- Add direct unit tests for recursive and repeated script calls at the bytecode level
-- Keep compiler unchanged except for a temporary bytecode constructor test path if needed
-
-### Milestone 2: compiler emission for non-capturing functions
-
-- Partition runtime-callable vs inline-only `FunctionImpl`s
-- Emit root code plus appended function bodies
-- Initialize one hidden binding per supported named function and emit `Ldloc` + `CallValue` at RSS call sites
-- Preserve inline lowering for closures and capturing nested functions
-
-### Milestone 3: typing and debug correctness
-
-- Add function-entry type snapshots
-- Restore operand type hints and any type-directed codegen inside separately emitted bodies
-- Make debugger/frame inspection useful again
-
-### Milestone 4: native frame and invocation parity
-
-- Implement `CallValue`, script frame entry/return, recursion, errors, and host suspension in Trace JIT and AOT
-- Keep Trace JIT recording across callable invocation and return with no feature-induced side exit or trace break
-- Add interpreter/JIT/AOT parity tests for values, frame state, lifecycle, and errors
-
-### Milestone 5: capturing nested functions
-
-- Add the shared environment-binding runtime path for every capture-bearing callable
-- Migrate capturing nested `fn` declarations off the inline path
-- Implement the same environment creation/access/drop operations in Trace JIT and AOT before completing the milestone
-
-## Test Matrix
-
-Add tests for:
-
-- repeated direct calls do not duplicate function bytecode bodies
-- direct recursion works
-- mutual recursion works for script-callable functions
-- locals are isolated between caller and callee frames
-- returned values still flow through the existing operand stack
-- host calls inside a script-called function still work
-- host `Yield` and `Pending` inside a script-called function preserve the script call stack correctly
-- inline-only paths still behave exactly as before
-- Trace JIT records through `CallValue`, nested calls, and `Ret` without a feature side exit or trace interruption
-- AOT executes all valid callable targets, captures, recursion, and suspension without rejection or interpreter fallback
-
-## Risks
-
-### Risk 1: capture semantics creep
-
-Trying to support capturing nested functions in the first patch will turn this into a closure-runtime project. Avoid that.
-
-### Risk 2: type-state regressions
-
-Separately emitted function bodies no longer inherit caller context. If function-entry typing is not restored, operand type hints and type-directed lowering will silently degrade.
-
-### Risk 3: debugger confusion
-
-Flat local displays will become misleading once multiple frames exist.
-
-### Risk 4: backend skew
-
-Interpreter-only support would leave the feature incomplete and can create backend skew. Gate completion on matching Trace JIT and AOT execution plus lifecycle tests.
-
-## Recommendation
-
-Implement frames and callable metadata first, then carry every semantic operation through the interpreter, Trace JIT, and AOT in the same feature series. Do not ship a phase that interrupts traces, produces function-value side exits, rejects valid AOT input, or delegates callable execution back to the interpreter.
+**Acceptance:** All RSS callable paths use real frames, `Ret` has no context-dependent bytecode meaning, existing opcodes have explicit callable/frame contracts, and every supported backend passes the same behavior and lifecycle gates.

@@ -24,7 +24,7 @@
 
 - Add Program-owned callable prototypes, script entry points, parameter/local layouts, capture layouts, source metadata, and instantiated generic signatures.
 - Add `Value::Callable { program_instance, prototype_id, kind, env }`; it must not own `Arc<Program>`.
-- Add frame-relative locals, a real `CallFrame` stack, and frame-aware `Ret`.
+- Add frame-relative locals, a real execution-frame stack, and one `Ret` rule: complete the active frame and follow its typed continuation. Root execution uses an explicit `Halt` continuation; nested RSS calls use `ResumeBytecode`; Rust invocation uses `ReturnToHost`. Never infer return meaning from an empty call stack.
 - Add `CallValue(argc)` as the common RSS function-item/closure invocation path; retain existing `Call` for direct host/builtin imports.
 - Initialize capture-free named bindings from Program metadata.
 - Add one shared environment-binding path for every capture-bearing callable. Introduce a dedicated runtime operation only if existing VM operations cannot bind captures.
@@ -71,7 +71,8 @@
 
 **Complete:**
 
-- Update VMBC metadata/versioning and pd-vm-nostd decode/execution.
+- Apply a hard internal format break: bump VMBC, AOT artifact and native ABI, debugger recording, and Program/native trace cache revisions; accept only the new formats, regenerate fixtures, and add no backward decoder or migration path.
+- Audit existing opcode interactions: keep `Call` host-only, constrain branches to one root/function region, resolve `Ldloc`/`Stloc` through one slot-location map, define callable `Ceq` identity and `Pop`/`Dup` lifecycle, reject callable `Ldc` constants, and remove or redesign the current `Call + Ret` fusion.
 - Implement callable creation, environment access, `CallValue`, script frame entry/return, recursion, errors, and suspension/resume completely in both Trace JIT and AOT.
 - Trace JIT must record and compile through callable operations and callee returns. `CallValue`, closure environments, and callable frame transitions must not terminate recording, produce a feature side exit, or hand execution to the interpreter.
 - Lower dynamic callable dispatch to native target resolution/calls that return to the same compiled trace. AOT must emit equivalent callable/frame/environment operations with no rejection or interpreter fallback.
