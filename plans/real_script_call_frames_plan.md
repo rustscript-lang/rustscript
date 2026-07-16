@@ -280,9 +280,7 @@ That later work is closure-adjacent, even if callables are still not first-class
 
 ## Backend Strategy
 
-### Interpreter first
-
-Land the interpreter and compiler support before touching the native backends.
+Interpreter, Trace JIT, and AOT support are one feature scope. Interpreter support may be implemented first during development, but function values are not complete or releasable until both native backends execute the full semantics.
 
 ### Trace JIT
 
@@ -293,29 +291,24 @@ Files:
 - `src/vm/jit/native/bridge.rs`
 - `src/vm/jit/native/codegen.rs`
 
-First cut:
+Required implementation:
 
-- mark `CallValue` as unsupported in trace recording/codegen
-- bail out to the interpreter when a trace would include it
-
-That keeps the feature deliverable without blocking on native frame support.
-
-Later:
-
-- teach `TraceStep` about script calls and returns
-- add frame-stack aware native bridge/runtime handling
+- Record callable value/environment operations, `CallValue`, script frame entry, callee body operations, and `Ret` in trace IR.
+- Lower callable target resolution and script calls to native dispatch/calls that return to the same compiled trace.
+- Preserve frame bases, locals, operand values, callable/environment roots, fuel/epoch state, and host suspension continuations across native calls.
+- Continue recording after callee return; callable operations must not terminate a trace.
+- Handle dynamic target, arity/type failure, recursion depth, stale Program IDs, and runtime errors through native status/control flow, without interpreter handoff.
+- Add trace assertions proving no function-value opcode produces a feature side exit or trace break.
 
 ### Native AOT
 
-First cut:
+Required implementation:
 
-- either reject programs containing `CallValue` for native-only AOT
-- or force interpreter fallback when indirect script calls are present
-
-Later:
-
-- add script frame metadata to the AOT bundle
-- teach generated native code how to enter/leave script frames
+- Add callable prototypes, script frame metadata, capture layouts, and Program instance validation to the AOT bundle.
+- Lower callable creation/environment access, `CallValue`, frame entry/return, recursion, errors, and suspension/resume into AOT IR and native code.
+- Compile or link every reachable script callable target and support dynamic callable dispatch natively.
+- Preserve the same ownership/drop behavior and host-call continuation semantics as the interpreter and Trace JIT.
+- Reject no valid Program and use no interpreter fallback because it contains function values.
 
 ## Debugger and tooling
 
@@ -373,16 +366,17 @@ This avoids breaking CLI/runtime code that currently treats `CompiledProgram.fun
 - Restore operand type hints and any type-directed codegen inside separately emitted bodies
 - Make debugger/frame inspection useful again
 
-### Milestone 4: backend containment
+### Milestone 4: native frame and invocation parity
 
-- Make trace JIT and AOT explicitly reject or side-exit on `CallValue`
-- Add tests to ensure no silent miscompile occurs when JIT/AOT sees it
+- Implement `CallValue`, script frame entry/return, recursion, errors, and host suspension in Trace JIT and AOT
+- Keep Trace JIT recording across callable invocation and return with no feature-induced side exit or trace break
+- Add interpreter/JIT/AOT parity tests for values, frame state, lifecycle, and errors
 
 ### Milestone 5: capturing nested functions
 
 - Add the shared environment-binding runtime path for every capture-bearing callable
 - Migrate capturing nested `fn` declarations off the inline path
-- Revisit closure alignment after nested `fn` semantics are stable
+- Implement the same environment creation/access/drop operations in Trace JIT and AOT before completing the milestone
 
 ## Test Matrix
 
@@ -396,7 +390,8 @@ Add tests for:
 - host calls inside a script-called function still work
 - host `Yield` and `Pending` inside a script-called function preserve the script call stack correctly
 - inline-only paths still behave exactly as before
-- JIT/AOT reject or fall back cleanly when `CallValue` appears
+- Trace JIT records through `CallValue`, nested calls, and `Ret` without a feature side exit or trace interruption
+- AOT executes all valid callable targets, captures, recursion, and suspension without rejection or interpreter fallback
 
 ## Risks
 
@@ -414,16 +409,8 @@ Flat local displays will become misleading once multiple frames exist.
 
 ### Risk 4: backend skew
 
-If interpreter support lands without explicit JIT/AOT rejection, native paths may mis-handle the new opcode.
+Interpreter-only support would leave the feature incomplete and can create backend skew. Gate completion on matching Trace JIT and AOT execution plus lifecycle tests.
 
 ## Recommendation
 
-Implement this as an interpreter-first, non-capturing-function-first change.
-
-That gives the project:
-
-- real script call frames
-- recursive direct function support
-- elimination of bytecode duplication for common direct-call cases
-
-without forcing the much larger "callable as real runtime value" design or full closure environments into the same patch series.
+Implement frames and callable metadata first, then carry every semantic operation through the interpreter, Trace JIT, and AOT in the same feature series. Do not ship a phase that interrupts traces, produces function-value side exits, rejects valid AOT input, or delegates callable execution back to the interpreter.

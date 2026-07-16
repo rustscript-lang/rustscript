@@ -38,8 +38,11 @@
 
 **Complete:**
 
-- Convert current capture-copy metadata into explicit shared environments and capture-cell layouts.
-- Route `Ldloc`/`Stloc` through frame or captured storage; aliases share mutation, while separate closure evaluations receive separate environments.
+- Convert current `CaptureBindingMode::{Copy, Borrow, BorrowMut, Move}` analysis into explicit environment layouts:
+  - `Copy` stores an independent value in the closure environment;
+  - `Borrow` and `BorrowMut` hoist the source local into one shared cell used by the outer frame and every capturing closure, matching C# display-class sharing and Rust reference-capture behavior;
+  - `Move` transfers the value into a closure-owned cell and invalidates the source according to existing move rules.
+- Route `Ldloc`/`Stloc` through frame or captured cells. Aliases of one closure share cells, separate closure evaluations receive separate environments, and outer-frame reads/writes observe borrowed capture updates.
 - Add coarse runtime callable typing and precise parameter/result/capture schemas.
 - Merge compatible callable signatures across branches, matches, and loops; keep exact target identity as inference/optimization metadata only.
 - Support explicit `name::<T>` values, unambiguous contextual resolution, substituted schemas, generic higher-order functions, and erased runtime bodies.
@@ -69,9 +72,11 @@
 **Complete:**
 
 - Update VMBC metadata/versioning and pd-vm-nostd decode/execution.
-- Make Trace JIT/AOT implement, side-exit, fall back, or reject callable operations explicitly.
+- Implement callable creation, environment access, `CallValue`, script frame entry/return, recursion, errors, and suspension/resume completely in both Trace JIT and AOT.
+- Trace JIT must record and compile through callable operations and callee returns. `CallValue`, closure environments, and callable frame transitions must not terminate recording, produce a feature side exit, or hand execution to the interpreter.
+- Lower dynamic callable dispatch to native target resolution/calls that return to the same compiled trace. AOT must emit equivalent callable/frame/environment operations with no rejection or interpreter fallback.
 - Update REPL replacement, debugger frames, stack traces, formatting, recording/replay policy, and diagnostics.
 - Replace old function-value rejection tests only after equivalent positive and focused negative coverage exists.
-- Run focused stage tests, then `cargo fmt --all -- --check`, callable/compiler/type/lifecycle/wire/no-std suites, `cargo test --workspace`, Clippy with `-D warnings`, and the release build.
+- Run focused stage tests, native trace-continuity and AOT parity tests, then `cargo fmt --all -- --check`, callable/compiler/type/lifecycle/wire/no-std suites, `cargo test --workspace`, Clippy with `-D warnings`, and the release build.
 
-**Acceptance:** Interpreter, lifecycle, typing, generics, Rust callbacks, VMBC/no-std, tooling, and native fallback behavior pass the same test matrix.
+**Acceptance:** Interpreter, Trace JIT, and AOT produce identical results and lifecycle behavior. Callable creation, invocation, nested calls, recursion, captures, and returns remain inside native execution without feature-induced side exits, trace interruption, rejection, or interpreter fallback.
