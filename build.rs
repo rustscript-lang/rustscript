@@ -41,6 +41,7 @@ enum WrapperParamKind {
     SliceArgs,
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HostBindingKind {
     StaticStack,
@@ -217,12 +218,11 @@ pub(crate) fn classify_host_binding(function: &ItemFn) -> HostBindingKind {
     ) {
         return HostBindingKind::StaticArgs;
     }
-    if let Some(inner) = sole_type_argument(&return_type, "VmResult")
+    if sole_type_argument(&return_type, "VmResult")
         .or_else(|| sole_type_argument(&return_type, "HostResult"))
+        .is_some_and(|inner| matches!(plain_path_type(&inner).as_deref(), Some("CallOutcome")))
     {
-        if matches!(plain_path_type(&inner).as_deref(), Some("CallOutcome")) {
-            return HostBindingKind::StaticArgs;
-        }
+        return HostBindingKind::StaticArgs;
     }
     if is_supported_ordinary_return_type(&return_type) {
         return HostBindingKind::StaticNonYieldingArgs;
@@ -250,7 +250,7 @@ fn is_supported_ordinary_return_type(ty: &Type) -> bool {
                                 syn::GenericArgument::Type(inner) => Some(inner),
                                 _ => None,
                             })
-                            .is_some_and(|inner| is_supported_ordinary_return_type(inner))
+                            .is_some_and(is_supported_ordinary_return_type)
                     }
                     _ => true,
                 })
