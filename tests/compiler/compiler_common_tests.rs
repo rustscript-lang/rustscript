@@ -578,6 +578,37 @@ fn host_function_registry_caches_static_args_function_pointer_plan_across_vms() 
 }
 
 #[test]
+fn host_function_registry_caches_static_non_yielding_args_function_pointer_plan_across_vms() {
+    let source = include_str!("../../examples/example.rss");
+    let compiled = compile_source(source).expect("compile should succeed");
+
+    let mut registry = HostFunctionRegistry::new();
+    registry.register_static_non_yielding_args("print", 1, |args| {
+        Ok(CallOutcome::Return(args.to_vec().into()))
+    });
+    registry.register_static_non_yielding_args("add_one", 1, static_add_one_args);
+    let plan = registry
+        .prepare_plan(&compiled.program.imports)
+        .expect("plan should build");
+
+    let mut vm1 = Vm::new(compiled.program.clone());
+    registry
+        .bind_vm_with_plan(&mut vm1, &plan)
+        .expect("cached static non-yielding args host binding should succeed");
+    let status1 = vm1.run().expect("vm should run");
+    assert_eq!(status1, VmStatus::Halted);
+    assert_eq!(vm1.stack(), &[Value::Int(6)]);
+
+    let mut vm2 = Vm::new(compiled.program);
+    registry
+        .bind_vm_with_plan(&mut vm2, &plan)
+        .expect("cached static non-yielding args host binding should succeed");
+    let status2 = vm2.run().expect("vm should run");
+    assert_eq!(status2, VmStatus::Halted);
+    assert_eq!(vm2.stack(), &[Value::Int(6)]);
+}
+
+#[test]
 fn break_and_continue_outside_loop_are_rejected() {
     let break_err = match compile_source("break;") {
         Ok(_) => panic!("break outside loop should fail"),

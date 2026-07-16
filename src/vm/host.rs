@@ -105,6 +105,7 @@ enum RegistryEntryKind {
     StackStatic(StaticHostStackFunction),
     ArgsFactory(Arc<HostArgsFactory>),
     ArgsStatic(StaticHostArgsFunction),
+    ArgsStaticNonYielding(StaticHostArgsFunction),
 }
 
 #[derive(Clone)]
@@ -308,6 +309,32 @@ impl HostFunctionRegistry {
         self.invalidate_plan_cache();
     }
 
+    pub fn register_static_non_yielding_args(
+        &mut self,
+        name: impl Into<String>,
+        arity: u8,
+        function: StaticHostArgsFunction,
+    ) {
+        let name = name.into();
+        if let Some(&slot) = self.by_name.get(&name)
+            && let Some(entry) = Arc::make_mut(&mut self.entries).get_mut(slot as usize)
+        {
+            entry.arity = arity;
+            entry.kind = RegistryEntryKind::ArgsStaticNonYielding(function);
+            self.invalidate_plan_cache();
+            return;
+        }
+
+        let entries = Arc::make_mut(&mut self.entries);
+        let slot = entries.len() as u16;
+        entries.push(RegistryEntry {
+            arity,
+            kind: RegistryEntryKind::ArgsStaticNonYielding(function),
+        });
+        Arc::make_mut(&mut self.by_name).insert(name, slot);
+        self.invalidate_plan_cache();
+    }
+
     pub fn bind_vm_cached(&self, vm: &mut Vm) -> VmResult<()> {
         let plan = self.prepare_shared_plan(&vm.program.imports)?;
         self.bind_vm_with_plan(vm, &plan)
@@ -414,6 +441,9 @@ impl HostFunctionRegistry {
                 }
                 RegistryEntryKind::ArgsStatic(function) => {
                     vm.register_static_args_function(*function);
+                }
+                RegistryEntryKind::ArgsStaticNonYielding(function) => {
+                    vm.register_static_non_yielding_args_function(*function);
                 }
             }
         }
