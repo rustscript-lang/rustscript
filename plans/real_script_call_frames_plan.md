@@ -8,11 +8,13 @@ This plan is only for real script calls and frames.
 
 Non-goals for this effort:
 
-- First-class callable `Value`s
-- `call_indirect`-style dynamic dispatch
+- Exposing callable `Value`s to every RSS expression/container/return position
 - Returning/storing callables in arrays or maps
-- Full closure/runtime environment objects in the first milestone
+- Full escaping closure environments in the first milestone
+- Host-retained UI/event callback APIs
 - Tail-call optimization
+
+First-class runtime callables, escaping closures, callable lifecycle, generic function values, and Rust-side invocation are specified separately in [function_as_value_plan.md](function_as_value_plan.md). That plan depends on the frame model defined here.
 
 ## Current State
 
@@ -36,10 +38,12 @@ This means:
 
 ### Runtime model
 
-Add real script frames while keeping host/builtin calls unchanged:
+Add real script frames while keeping the semantic opcode surface shared with first-class function values:
 
-- Keep `OpCode::Call` for builtin/host import dispatch.
-- Add a new `OpCode::CallScript` with operands `(script_function_id: u16, argc: u8)`.
+- Keep existing `OpCode::Call(index, argc)` for builtin/host import dispatch.
+- Initialize capture-free named callable bindings from Program metadata when the Program instance is installed; this needs no creation opcode.
+- Add only `OpCode::CallValue(argc)` to invoke those values and enter their script frames.
+- Do not add `CallScript`; direct and first-class RSS calls share `CallValue`.
 - Reuse `OpCode::Ret`:
   - if no script caller exists, halt the program
   - otherwise pop one script frame, restore the caller frame, and continue at the saved return IP
@@ -47,7 +51,7 @@ Add real script frames while keeping host/builtin calls unchanged:
 
 ### Program model
 
-Add a script-function table to `Program`:
+Add script-function and callable-prototype tables to `Program`. The callable definitions belong to Program; runtime values only reference them by the active Program instance ID and prototype ID:
 
 ```rust
 pub struct ScriptFunction {
@@ -57,6 +61,12 @@ pub struct ScriptFunction {
     pub entry_ip: u32,
     pub frame_local_count: u16,
     pub param_slots: Vec<u8>,
+}
+
+pub struct Program {
+    // existing fields
+    pub script_functions: Vec<ScriptFunction>,
+    pub callable_prototypes: Vec<CallablePrototype>,
 }
 ```
 
@@ -81,7 +91,9 @@ Compile the root body first, then append separately emitted script function bodi
 6. Function `ret`
 7. ...
 
-Execution still starts at `ip = 0`. Appended function bodies are only reachable through `CallScript`.
+Execution still starts at `ip = 0`. For each supported capture-free named function, the compiler assigns a hidden callable binding initialized from Program metadata when the Program instance is installed. Appended function bodies are entered only through `CallValue`.
+
+Preserve current source-order semantics: the parser registers a function before parsing its own body, which permits self-recursion, but statements before the declaration cannot use it. The new runtime binding must not hoist a declaration or create a capturing callable when control does not reach the declaration.
 
 ## Scope Split
 
@@ -121,7 +133,8 @@ Files:
 Changes:
 
 - Add `ScriptFunction` metadata to `Program`.
-- Add `OpCode::CallScript`.
+- Add only `OpCode::CallValue(u8)` in the real-frame milestone. `MakeClosure` belongs to the later escaping-closure work.
+- Keep existing `OpCode::Call(u16, u8)` unchanged for builtin/host imports.
 - Update opcode encoding/decoding and assembler helpers.
 - Update VMBC serialization/deserialization for the new function table.
 - Bump the VMBC wire version.
@@ -155,17 +168,25 @@ And VM state:
 
 - `frame_base: usize`
 - `call_frames: Vec<CallFrame>`
+- `program_instance: ProgramInstanceId`
+- an optional capture-free callable cache owned by the active VM/Program state
 
 Execution model:
 
-- `Ldloc index` reads `locals[frame_base + index]`
-- `Stloc index` writes `locals[frame_base + index]`
-- `CallScript`:
-  - validate arity against `Program.script_functions`
+- `Ldloc index` resolves the current logical slot through the frame's slot layout.
+- `Stloc index` stores through the same slot layout.
+- Program installation initializes capture-free named callable bindings with the active `ProgramInstanceId` and prototype IDs.
+- `CallValue argc`:
+  - consume the callable and arguments
+  - reject it with `StaleCallable` unless its Program instance ID equals the active one
+  - resolve the callable prototype, then its target `ScriptFunction`
+  - validate arity against the prototype
   - save caller frame state
   - extend `locals` by `frame_local_count`, filled with `Null`
   - set `frame_base` to the new frame start
   - move/copy stack args into `param_slots`
+  - retain the callable as the active frame root
+  - bind it to the function's metadata-designated self slot when the body recursively references its own name
   - jump `ip` to `entry_ip`
 - `Ret`:
   - if `call_frames` is empty, halt
@@ -175,6 +196,7 @@ Notes:
 
 - This integrates cleanly with the current `Value` stack model.
 - Host/builtin calls still use the current stack-based ABI.
+- Script calls never switch Programs. Replacing/resetting the Program assigns a new `ProgramInstanceId`, clears the callable cache and callback roots, and invalidates all old values.
 - `call_depth()` should be redefined to report total logical call depth, not only host-call nesting.
 
 ### 3. Compiler lowering
@@ -188,13 +210,15 @@ Files:
 Add a new compiler path for separately emitted script functions:
 
 - Partition `FunctionImpl`s into:
-  - `script_callable`: emit once, invoked by `CallScript`
-  - `inline_only`: keep current behavior
+  - `runtime_callable`: emit once as a `ScriptFunction`
+  - `inline_only`: keep current behavior temporarily
+- Record one Program-owned callable prototype and hidden binding for each supported capture-free named function; Program installation initializes those bindings.
 - `compile_function_call` becomes:
-  - builtin/host import -> `Call`
-  - script function in `script_callable` -> `CallScript`
-  - script function in `inline_only` -> existing inline path
-- After compiling root statements, emit all `script_callable` bodies once and record `entry_ip`
+  - builtin/host import used directly -> existing `Call`
+  - supported RSS function/local callable -> `Ldloc` callable slot, compile args, `CallValue`
+  - `inline_only` script function -> existing inline path
+- After compiling root statements, emit all `runtime_callable` bodies once and record `entry_ip`.
+- Keep parser declaration visibility source ordered; Program binding initialization must not make an earlier source reference valid.
 
 Important compiler choice:
 
@@ -243,14 +267,14 @@ This is the main semantic trap. Current nested `fn` declarations capture outer l
 
 Recommendation for the first milestone:
 
-- do not move capturing `fn` declarations to `CallScript`
-- keep them inline-only until a declaration-environment design is added
+- do not materialize capturing nested `fn` declarations in phase 1
+- keep them inline-only until the environment/slot-layout design in `function_as_value_plan.md` is added
 
 Recommended later design:
 
-- add a per-activation declaration environment table, keyed by function declaration index
-- executing `Stmt::FuncDecl` snapshots the captures into the current activation
-- calling a capturing nested function loads its declaration environment into the callee frame before jumping
+- use `MakeClosure(prototype_id)` from `function_as_value_plan.md` only when executing a capturing nested declaration or evaluating an anonymous function
+- executing `Stmt::FuncDecl` snapshots captures into that fresh closure environment
+- calling the resulting value uses the same `CallValue` frame path
 
 That later work is closure-adjacent, even if callables are still not first-class `Value`s.
 
@@ -271,8 +295,8 @@ Files:
 
 First cut:
 
-- mark `CallScript` as unsupported in trace recording/codegen
-- bail out to the interpreter when a trace would include `CallScript`
+- mark `CallValue` as unsupported in trace recording/codegen
+- bail out to the interpreter when a trace would include it
 
 That keeps the feature deliverable without blocking on native frame support.
 
@@ -285,8 +309,8 @@ Later:
 
 First cut:
 
-- either reject programs containing `CallScript` for native-only AOT
-- or force interpreter fallback when script-call opcodes are present
+- either reject programs containing `CallValue` for native-only AOT
+- or force interpreter fallback when indirect script calls are present
 
 Later:
 
@@ -331,16 +355,16 @@ This avoids breaking CLI/runtime code that currently treats `CompiledProgram.fun
 
 ### Milestone 1: metadata and interpreter semantics
 
-- Add `CallScript`, `ScriptFunction`, and VM frame stack support
+- Add Program-owned named callable prototypes/bindings, `CallValue`, `ScriptFunction`, and VM frame stack support
 - Update `Ret` semantics
 - Add direct unit tests for recursive and repeated script calls at the bytecode level
 - Keep compiler unchanged except for a temporary bytecode constructor test path if needed
 
 ### Milestone 2: compiler emission for non-capturing functions
 
-- Partition script-callable vs inline-only `FunctionImpl`s
+- Partition runtime-callable vs inline-only `FunctionImpl`s
 - Emit root code plus appended function bodies
-- Emit `CallScript` for direct and statically-known local calls to script-callable functions
+- Initialize one hidden binding per supported named function and emit `Ldloc` + `CallValue` at RSS call sites
 - Preserve inline lowering for closures and capturing nested functions
 
 ### Milestone 3: typing and debug correctness
@@ -351,12 +375,12 @@ This avoids breaking CLI/runtime code that currently treats `CompiledProgram.fun
 
 ### Milestone 4: backend containment
 
-- Make trace JIT and AOT explicitly reject or side-exit on `CallScript`
-- Add tests to ensure no silent miscompile occurs when JIT/AOT sees the new opcode
+- Make trace JIT and AOT explicitly reject or side-exit on `CallValue`
+- Add tests to ensure no silent miscompile occurs when JIT/AOT sees it
 
 ### Milestone 5: capturing nested functions
 
-- Add declaration environments
+- Add `MakeClosure` for anonymous functions and capturing nested declarations
 - Migrate capturing nested `fn` declarations off the inline path
 - Revisit closure alignment after nested `fn` semantics are stable
 
@@ -372,7 +396,7 @@ Add tests for:
 - host calls inside a script-called function still work
 - host `Yield` and `Pending` inside a script-called function preserve the script call stack correctly
 - inline-only paths still behave exactly as before
-- JIT/AOT reject or fall back cleanly when `CallScript` appears
+- JIT/AOT reject or fall back cleanly when `CallValue` appears
 
 ## Risks
 
