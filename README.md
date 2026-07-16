@@ -8,7 +8,7 @@ This repo contains the RustScript language implementation, VM/compiler core, sta
 
 - RustScript core: https://github.com/rustscript-lang/rustscript
 - RustScript Playground: https://github.com/rustscript-lang/playground
-- CLR VM: https://github.com/rustscript-lang/rustscript-clr-vm
+- IronRust: https://github.com/rustscript-lang/IronRust
 - Edge runtime and ABI: https://github.com/rustscript-lang/pd-edge
 - Controller: https://github.com/rustscript-lang/pd-controller
 - Compatibility frontends (Lua, JavaScript): https://github.com/rustscript-lang/rustscript-compat-frontends
