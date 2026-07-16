@@ -609,6 +609,36 @@ fn host_function_registry_caches_static_non_yielding_args_function_pointer_plan_
 }
 
 #[test]
+fn host_function_registry_preserves_static_non_yielding_args_contract_in_prepared_plan() {
+    let source = r#"
+        fn yield_now();
+        yield_now();
+    "#;
+    let compiled = compile_source(source).expect("compile should succeed");
+
+    let mut registry = HostFunctionRegistry::new();
+    registry.register_static_non_yielding_args("yield_now", 0, |_args| Ok(CallOutcome::Yield));
+    let plan = registry
+        .prepare_plan(&compiled.program.imports)
+        .expect("plan should build");
+
+    let mut vm = Vm::new(compiled.program);
+    registry
+        .bind_vm_with_plan(&mut vm, &plan)
+        .expect("cached static non-yielding args host binding should succeed");
+
+    let err = vm.run().expect_err("yield should violate the contract");
+    assert!(
+        matches!(
+            err,
+            vm::VmError::HostError(ref detail)
+                if detail.contains("non-yielding host function returned yield")
+        ),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
 fn break_and_continue_outside_loop_are_rejected() {
     let break_err = match compile_source("break;") {
         Ok(_) => panic!("break outside loop should fail"),

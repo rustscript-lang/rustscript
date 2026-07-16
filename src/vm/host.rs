@@ -309,6 +309,11 @@ impl HostFunctionRegistry {
         self.invalidate_plan_cache();
     }
 
+    /// Registers a static args-only host function that always returns one value synchronously.
+    ///
+    /// Returning no value, `Halt`, `Yield`, or `Pending` violates the contract and is reported as
+    /// a host error. When appropriate, the native JIT may keep traces active across the call
+    /// boundary.
     pub fn register_static_non_yielding_args(
         &mut self,
         name: impl Into<String>,
