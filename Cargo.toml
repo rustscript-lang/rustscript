@@ -83,6 +83,7 @@ tokio = { version = "1", features = ["macros", "rt", "time", "sync"] }
 [[test]]
 name = "host_binding_generation_tests"
 path = "tests/host_binding_generation_tests.rs"
+required-features = ["cranelift-jit"]
 
 [build-dependencies]
 syn = { version = "2", features = ["full"] }

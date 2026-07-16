@@ -236,28 +236,49 @@ fn is_supported_ordinary_return_type(ty: &Type) -> bool {
         Type::Paren(paren) => is_supported_ordinary_return_type(&paren.elem),
         Type::Reference(reference) => is_supported_ordinary_return_type(&reference.elem),
         Type::Path(path) => {
-            path.path
-                .segments
-                .last()
-                .is_some_and(|seg| match seg.ident.to_string().as_str() {
-                    "Option" | "VmResult" | "HostResult" => {
-                        let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
-                            return false;
-                        };
-                        args.args
-                            .first()
-                            .and_then(|arg| match arg {
-                                syn::GenericArgument::Type(inner) => Some(inner),
-                                _ => None,
-                            })
-                            .is_some_and(is_supported_ordinary_return_type)
-                    }
-                    _ => true,
-                })
+            let Some(segment) = path.path.segments.last() else {
+                return false;
+            };
+            match segment.ident.to_string().as_str() {
+                "Option" | "VmResult" | "HostResult" => {
+                    sole_type_argument(ty, &segment.ident.to_string())
+                        .is_some_and(|inner| is_supported_ordinary_return_type(&inner))
+                }
+                "Vec" => sole_type_argument(ty, "Vec")
+                    .is_some_and(|inner| is_supported_vec_return_type(&inner)),
+                "Value" | "bool" | "i64" | "u32" | "usize" | "f64" | "String" | "str"
+                | "SharedArray" | "VmBytes" | "SharedBytes" | "VmMap" | "SharedMap"
+                | "NumberValue" => matches!(segment.arguments, syn::PathArguments::None),
+                _ => false,
+            }
         }
         Type::Tuple(tuple) => tuple.elems.is_empty(),
         _ => false,
     }
+}
+
+fn is_supported_vec_return_type(ty: &Type) -> bool {
+    if is_plain_path_type(ty, "Value") {
+        return true;
+    }
+    let Type::Tuple(tuple) = unwrap_surface_type(ty) else {
+        return false;
+    };
+    tuple.elems.len() == 2
+        && tuple
+            .elems
+            .iter()
+            .all(|elem| is_plain_path_type(elem, "Value"))
+}
+
+fn is_plain_path_type(ty: &Type, expected: &str) -> bool {
+    let ty = unwrap_surface_type(ty);
+    let Type::Path(path) = &ty else {
+        return false;
+    };
+    path.path.segments.last().is_some_and(|segment| {
+        segment.ident == expected && matches!(segment.arguments, syn::PathArguments::None)
+    })
 }
 
 fn normalized_return_type(output: &ReturnType) -> Type {
@@ -297,6 +318,9 @@ fn sole_type_argument(ty: &Type, wrapper: &str) -> Option<Type> {
             let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
                 return None;
             };
+            if args.args.len() != 1 {
+                return None;
+            }
             let arg = args.args.first()?;
             match arg {
                 syn::GenericArgument::Type(inner) => Some(inner.clone()),

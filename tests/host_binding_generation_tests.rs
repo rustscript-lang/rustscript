@@ -3,7 +3,7 @@
 mod build_script;
 
 use build_script::{HostBindingKind, classify_host_binding};
-use syn::{ItemFn, parse_quote};
+use syn::parse_quote;
 use vm::{HostFunctionRegistry, JitConfig, JitTraceTerminal, Value, Vm, VmStatus, compile_source};
 
 fn native_jit_supported() -> bool {
@@ -68,6 +68,21 @@ fn classifies_best_effort_host_bindings_from_signatures() {
         parse_quote!(
             fn host() -> HostResult<String> {}
         ),
+        parse_quote!(
+            fn host() -> Value {}
+        ),
+        parse_quote!(
+            fn host() -> Vec<Value> {}
+        ),
+        parse_quote!(
+            fn host() -> Vec<(Value, Value)> {}
+        ),
+        parse_quote!(
+            fn host() -> SharedArray {}
+        ),
+        parse_quote!(
+            fn host() -> NumberValue {}
+        ),
     ] {
         assert_eq!(
             classify_host_binding(&function),
@@ -75,20 +90,34 @@ fn classifies_best_effort_host_bindings_from_signatures() {
         );
     }
 
-    let ambiguous: ItemFn = parse_quote!(
-        fn host() -> impl IntoVmValue {}
-    );
-    assert_eq!(
-        classify_host_binding(&ambiguous),
-        HostBindingKind::StaticArgs
-    );
-    let malformed_result: ItemFn = parse_quote!(
-        fn host() -> VmResult {}
-    );
-    assert_eq!(
-        classify_host_binding(&malformed_result),
-        HostBindingKind::StaticArgs
-    );
+    for unsupported in [
+        parse_quote!(
+            fn host() -> impl IntoVmValue {}
+        ),
+        parse_quote!(
+            fn host() -> VmResult {}
+        ),
+        parse_quote!(
+            fn host() -> Result<bool, HostError> {}
+        ),
+        parse_quote!(
+            fn host() -> CustomReturn {}
+        ),
+        parse_quote!(
+            fn host() -> Vec<bool> {}
+        ),
+        parse_quote!(
+            fn host() -> VmResult<Result<bool, HostError>> {}
+        ),
+        parse_quote!(
+            fn host() -> Option<bool, i64> {}
+        ),
+    ] {
+        assert_eq!(
+            classify_host_binding(&unsupported),
+            HostBindingKind::StaticArgs
+        );
+    }
 }
 
 fn assert_runtime_sleep_loop_uses_native_host_call(bind_cached_registry: bool) {
