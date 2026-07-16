@@ -503,16 +503,25 @@ pub(crate) extern "C" fn pd_vm_native_string_replace_literal(
 }
 
 pub(crate) extern "C" fn pd_vm_native_string_replace_literal_many(
-    text_ptr: *mut u8, needles_ptr: *mut u8, replacements_ptr: *mut u8,
+    text_ptr: *mut u8,
+    needles_ptr: *mut u8,
+    replacements_ptr: *mut u8,
 ) -> *mut u8 {
     let text = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(text_ptr)) };
-    let needles = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<Vec<Value>>(needles_ptr)) };
-    let replacements = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<Vec<Value>>(replacements_ptr)) };
+    let needles =
+        unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<Vec<Value>>(needles_ptr)) };
+    let replacements =
+        unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<Vec<Value>>(replacements_ptr)) };
     match crate::builtins::runtime::core::builtin_string_replace_literal_many_impl(
-        text.as_str(), needles.as_slice(), replacements.as_slice(),
+        text.as_str(),
+        needles.as_slice(),
+        replacements.as_slice(),
     ) {
         Ok(value) => arc_into_repr_ptr(Arc::new(value)),
-        Err(error) => { store_bridge_error(error); std::ptr::null_mut() }
+        Err(error) => {
+            store_bridge_error(error);
+            std::ptr::null_mut()
+        }
     }
 }
 

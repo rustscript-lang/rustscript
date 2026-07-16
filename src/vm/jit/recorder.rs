@@ -1159,11 +1159,10 @@ pub(crate) fn record_trace(
                             || (args.get(1).is_some_and(|arg| {
                                 observed_heap_container_kind(arg.info)
                                     == Some(HeapContainerKind::Array)
-                            })
-                                && args.get(2).is_some_and(|arg| {
-                                    observed_heap_container_kind(arg.info)
-                                        == Some(HeapContainerKind::Array)
-                                })));
+                            }) && args.get(2).is_some_and(|arg| {
+                                observed_heap_container_kind(arg.info)
+                                    == Some(HeapContainerKind::Array)
+                            })));
                     let specialized_kind = if replace_many {
                         Some(SpecializedBuiltinKind::StringReplaceLiteralMany)
                     } else {
@@ -1810,15 +1809,9 @@ fn select_numeric_compare(
     }
     if lhs.repr == SsaValueRepr::I64 && rhs.repr == SsaValueRepr::I64 {
         return match opcode {
-            x if x == OpCode::Ceq as u8 => {
-                Ok(NumericCompareKind::Int(IntCompareKind::Eq))
-            }
-            x if x == OpCode::Clt as u8 => {
-                Ok(NumericCompareKind::Int(IntCompareKind::Lt))
-            }
-            x if x == OpCode::Cgt as u8 => {
-                Ok(NumericCompareKind::Int(IntCompareKind::Gt))
-            }
+            x if x == OpCode::Ceq as u8 => Ok(NumericCompareKind::Int(IntCompareKind::Eq)),
+            x if x == OpCode::Clt as u8 => Ok(NumericCompareKind::Int(IntCompareKind::Lt)),
+            x if x == OpCode::Cgt as u8 => Ok(NumericCompareKind::Int(IntCompareKind::Gt)),
             _ => Err(TraceRecordError::UnsupportedTrace(
                 "SSA recorder expected a numeric comparison opcode".to_string(),
             )),
@@ -1826,15 +1819,9 @@ fn select_numeric_compare(
     }
     if lhs.repr == SsaValueRepr::F64 && rhs.repr == SsaValueRepr::F64 {
         return match opcode {
-            x if x == OpCode::Ceq as u8 => {
-                Ok(NumericCompareKind::Float(FloatCompareKind::Eq))
-            }
-            x if x == OpCode::Clt as u8 => {
-                Ok(NumericCompareKind::Float(FloatCompareKind::Lt))
-            }
-            x if x == OpCode::Cgt as u8 => {
-                Ok(NumericCompareKind::Float(FloatCompareKind::Gt))
-            }
+            x if x == OpCode::Ceq as u8 => Ok(NumericCompareKind::Float(FloatCompareKind::Eq)),
+            x if x == OpCode::Clt as u8 => Ok(NumericCompareKind::Float(FloatCompareKind::Lt)),
+            x if x == OpCode::Cgt as u8 => Ok(NumericCompareKind::Float(FloatCompareKind::Gt)),
             _ => Err(TraceRecordError::UnsupportedTrace(
                 "SSA recorder expected a numeric comparison opcode".to_string(),
             )),
@@ -2866,11 +2853,13 @@ fn analyze_specialized_builtin_call(
             let _ = frame.pop()?;
             let _ = frame.pop()?;
             frame.push(ValueInfo::tagged_typed(ValueType::String));
-            Ok(if matches!(kind, SpecializedBuiltinKind::StringReplaceLiteralMany) {
-                "string_replace_literal_many"
-            } else {
-                "string_replace_literal"
-            })
+            Ok(
+                if matches!(kind, SpecializedBuiltinKind::StringReplaceLiteralMany) {
+                    "string_replace_literal_many"
+                } else {
+                    "string_replace_literal"
+                },
+            )
         }
         SpecializedBuiltinKind::StringLowerAscii => {
             let _ = frame.pop()?;
@@ -2885,11 +2874,13 @@ fn analyze_specialized_builtin_call(
         SpecializedBuiltinKind::ToString | SpecializedBuiltinKind::ToStringIdentity => {
             let _ = frame.pop()?;
             frame.push(ValueInfo::tagged_typed(ValueType::String));
-            Ok(if matches!(kind, SpecializedBuiltinKind::ToStringIdentity) {
-                "to_string_identity"
-            } else {
-                "to_string"
-            })
+            Ok(
+                if matches!(kind, SpecializedBuiltinKind::ToStringIdentity) {
+                    "to_string_identity"
+                } else {
+                    "to_string"
+                },
+            )
         }
         SpecializedBuiltinKind::StringSplitLiteral => {
             let _ = frame.pop()?;
@@ -3306,18 +3297,14 @@ fn emit_specialized_builtin_call(
             Ok(("regex_replace", out))
         }
         SpecializedBuiltinKind::StringReplaceLiteralMany => {
-            let replacements = ensure_heap_ptr(
-                builder, block, ip, frame.pop()?, ValueType::Array,
-            )?;
-            let needles = ensure_heap_ptr(
-                builder, block, ip, frame.pop()?, ValueType::Array,
-            )?;
-            let text = ensure_heap_ptr(
-                builder, block, ip, frame.pop()?, ValueType::String,
-            )?;
+            let replacements = ensure_heap_ptr(builder, block, ip, frame.pop()?, ValueType::Array)?;
+            let needles = ensure_heap_ptr(builder, block, ip, frame.pop()?, ValueType::Array)?;
+            let text = ensure_heap_ptr(builder, block, ip, frame.pop()?, ValueType::String)?;
             let value = builder
                 .append_value_inst(
-                    block, ip, SsaValueRepr::Tagged,
+                    block,
+                    ip,
+                    SsaValueRepr::Tagged,
                     SsaInstKind::StringReplaceLiteralMany {
                         text: text.value.id,
                         needles: needles.value.id,
@@ -3325,7 +3312,8 @@ fn emit_specialized_builtin_call(
                     },
                 )
                 .map(|value| SymbolicValue {
-                    value, info: ValueInfo::tagged_typed(ValueType::String),
+                    value,
+                    info: ValueInfo::tagged_typed(ValueType::String),
                 })
                 .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
             Ok(("string_replace_literal_many", value))

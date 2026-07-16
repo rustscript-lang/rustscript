@@ -4715,7 +4715,10 @@ fn trace_jit_specializes_literal_replace_many() {
     let snapshot = vm.jit_snapshot();
     assert!(
         snapshot.traces.iter().any(|trace| {
-            trace.op_names.iter().any(|name| name == "string_replace_literal_many")
+            trace
+                .op_names
+                .iter()
+                .any(|name| name == "string_replace_literal_many")
         }),
         "expected replace-many SSA specialization, got {}",
         vm.dump_jit_info()

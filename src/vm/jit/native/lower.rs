@@ -26,11 +26,11 @@ use crate::vm::native::{
     shared_string_from_buffer_entry_address, sparse_restore_exit_signature,
     string_binary_transform_signature, string_contains_entry_address, string_contains_signature,
     string_lower_ascii_entry_address, string_replace_literal_entry_address,
-    string_replace_literal_many_entry_address,
-    string_replace_signature, string_split_literal_entry_address, string_unary_transform_signature,
-    to_string_entry_address, type_of_entry_address, value_eq_entry_address, value_eq_signature,
-    value_len_entry_address, value_len_signature, value_slot_signature,
-    write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
+    string_replace_literal_many_entry_address, string_replace_signature,
+    string_split_literal_entry_address, string_unary_transform_signature, to_string_entry_address,
+    type_of_entry_address, value_eq_entry_address, value_eq_signature, value_len_entry_address,
+    value_len_signature, value_slot_signature, write_heap_value_to_slot_entry_address,
+    zero_bytes_entry_address,
 };
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::Ieee64;
@@ -1275,11 +1275,9 @@ fn lower_ssa_inst(
             ));
             let out = b.ins().stack_addr(pointer_type, out_slot, 0);
             let helper_ptr = iconst_ptr_from_addr(b, pointer_type, helper_addrs.value_len)?;
-            let call = b.ins().call_indirect(
-                helper_refs.value_len_ref,
-                helper_ptr,
-                &[value, out],
-            );
+            let call = b
+                .ins()
+                .call_indirect(helper_refs.value_len_ref, helper_ptr, &[value, out]);
             let status = b.inst_results(call)[0];
             let success = b.create_block();
             let fail = b.create_block();

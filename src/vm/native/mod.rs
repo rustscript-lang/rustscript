@@ -22,10 +22,9 @@ pub(crate) use bridge::{
     shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
     store_bridge_error, string_contains_entry_address, string_lower_ascii_entry_address,
     string_replace_literal_entry_address, string_replace_literal_many_entry_address,
-    string_split_literal_entry_address, take_bridge_error,
-    to_string_entry_address, type_of_entry_address, value_eq_entry_address,
-    value_len_entry_address, write_heap_value_to_slot_entry_address,
-    zero_bytes_entry_address,
+    string_split_literal_entry_address, take_bridge_error, to_string_entry_address,
+    type_of_entry_address, value_eq_entry_address, value_len_entry_address,
+    write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
 };
 #[cfg(feature = "cranelift-jit")]
 pub(crate) use codegen::{
