@@ -27,10 +27,10 @@ First-class value typing, generic schemas, lifecycle, and retained callback APIs
   - AOT: CFG function regions, IR/SSA, native compile/runtime bridges, artifact metadata, dynamic target dispatch and continuation handling;
   - tooling: VMBC validation, no-std decode/execution, debugger/recording/replay, CLI inspection, REPL state, tests and fixtures.
 - Apply a hard internal format break; no backward decoder, migration, opcode reinterpretation, or compatibility branch is required:
-  - bump VMBC from its current encoding version and accept only the new version;
-  - bump both AOT artifact `VERSION` and native `ABI_VERSION` because Program/VM/native layouts and return control flow change;
-  - bump debugger recording `PDRC` version and remove legacy recording acceptance;
-  - include callable tables, function regions, slot layouts, and the new opcode ABI revision in Program/native trace cache keys so old in-memory entries cannot match;
+  - bump VMBC `ENCODE_VERSION` from 8 to 9 and accept only version 9;
+  - bump AOT artifact `VERSION` from 2 to 3 and native `ABI_VERSION` from 1 to 2 because Program/VM/native layouts and return control flow change;
+  - bump debugger recording `PDRC` from 2 to 3, accept only version 3, and remove legacy version-1 recording acceptance;
+  - add the bytecode ABI revision to Program/native trace cache keys together with callable tables, function regions, and slot layouts so old in-memory entries cannot match;
   - regenerate internal fixtures/artifacts and make every old format fail with its existing unsupported-version error.
 
 **Acceptance:** `Ret` has one frame-completion rule in the interpreter, Trace IR, AOT IR, debugger, and public invocation API; root halt and nested return are selected only by typed continuation metadata.
