@@ -76,8 +76,15 @@ pub(crate) fn execute_builtin_call(
         BuiltinFunction::MapIterClose => map_iter::close(vm, args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::StringContains => core::builtin_string_contains(args)
             .map(IntoBuiltinCallOutcome::into_builtin_call_outcome),
-        BuiltinFunction::StringReplaceLiteral => core::builtin_string_replace_literal(args)
-            .map(IntoBuiltinCallOutcome::into_builtin_call_outcome),
+        BuiltinFunction::StringReplaceLiteral => {
+            if matches!(args, [Value::String(_), Value::Array(_), Value::Array(_)]) {
+                core::builtin_string_replace_literal_many(args)
+                    .map(IntoBuiltinCallOutcome::into_builtin_call_outcome)
+            } else {
+                core::builtin_string_replace_literal(args)
+                    .map(IntoBuiltinCallOutcome::into_builtin_call_outcome)
+            }
+        }
         BuiltinFunction::StringLowerAscii => core::builtin_string_lower_ascii(args)
             .map(IntoBuiltinCallOutcome::into_builtin_call_outcome),
         BuiltinFunction::StringSplitLiteral => core::builtin_string_split_literal(args)

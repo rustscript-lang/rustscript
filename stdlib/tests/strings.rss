@@ -10,6 +10,10 @@ assert(contains("hello", "ell"));
 assert(contains("hello", "zzz") == false);
 assert(equals(trim("  rustscript\n"), "rustscript"));
 assert(equals(replace("go gopher go", "go", "rs"), "rs rspher rs"));
+assert(equals(
+    string_replace_literal("%27x%20y+z", ["%27", "%20", "+"], ["'", " ", " "]),
+    "'x y z"
+));
 
 let mut parts = split("a,b,c", ",");
 assert(parts.length == 3);
