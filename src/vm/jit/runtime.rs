@@ -147,7 +147,7 @@ fn native_trace_cache_key(
         drop_contract_events_enabled,
         root_ip: trace.root_ip,
         entry_stack_depth: trace.entry_stack_depth,
-        terminal: trace.terminal.clone(),
+        terminal: trace.terminal,
         ssa_text: trace.ssa_text(),
     }
 }
@@ -670,7 +670,7 @@ impl Vm {
         Ok((
             native.entry,
             native.root_ip,
-            native.terminal.clone(),
+            native.terminal,
             native.has_call,
             native.has_yielding_call,
         ))
