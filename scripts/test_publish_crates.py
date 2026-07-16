@@ -50,6 +50,12 @@ class PublishCratesTests(unittest.TestCase):
             self.assertIn('vm = { package = "pd-vm", path = "..", version = "0.23.1" }', nostd_manifest)
             self.assertIn('version = "0.23.1"', alias_manifest)
 
+    def test_yank_command_targets_requested_host_version(self) -> None:
+        self.assertEqual(
+            publish_crates.yank_command("pd-host-function", "0.23.0"),
+            ["cargo", "yank", "--vers", "0.23.0", "pd-host-function"],
+        )
+
     def test_publish_plan_uses_dependency_order_and_per_package_versions(self) -> None:
         self.assertEqual(
             publish_crates.publish_plan("0.23.1", "0.22.7"),

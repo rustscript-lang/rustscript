@@ -15,6 +15,10 @@ on:
         description: 'Compatible pd-host-function version. Defaults to 0.22.7.'
         required: false
         type: string
+      yank_pd_host_function_version:
+        description: 'Optional pd-host-function version to yank before publishing.'
+        required: false
+        type: string
 
 concurrency:
   group: publish-crates-${{ github.ref }}
@@ -43,6 +47,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_HOST_VERSION: ${{ inputs.pd_host_function_version }}
+          INPUT_YANK_HOST_VERSION: ${{ inputs.yank_pd_host_function_version }}
         run: |
           set -euo pipefail
           version="${INPUT_VERSION:-${GITHUB_REF_NAME#v}}"
@@ -50,6 +55,11 @@ jobs:
             echo "version is required" >&2
             exit 1
           fi
-          python3 scripts/publish_crates.py \
-            --version "$version" \
+          args=(
+            --version "$version"
             --host-version "${INPUT_HOST_VERSION:-0.22.7}"
+          )
+          if [[ -n "${INPUT_YANK_HOST_VERSION:-}" ]]; then
+            args+=(--yank-host-version "$INPUT_YANK_HOST_VERSION")
+          fi
+          python3 scripts/publish_crates.py "${args[@]}"

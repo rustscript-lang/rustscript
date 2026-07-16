@@ -28,6 +28,10 @@ def publish_plan(release_version: str, host_version: str) -> list[tuple[str, str
     return [(package, versions[package]) for package in PACKAGE_ORDER]
 
 
+def yank_command(package: str, version: str) -> list[str]:
+    return ["cargo", "yank", "--vers", version, package]
+
+
 def _rewrite_dependency_versions(text: str, versions: dict[str, str]) -> str:
     dependency_re = re.compile(r"^(\s*([A-Za-z0-9_-]+)\s*=\s*\{)(.*)(\}\s*)$")
     output = []
@@ -156,6 +160,7 @@ def main() -> None:
     parser.add_argument("--host-version", default="0.22.7")
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--yank-host-version")
     args = parser.parse_args()
 
     root = args.root.resolve()
@@ -166,6 +171,13 @@ def main() -> None:
         return
     if not os.environ.get("CARGO_REGISTRY_TOKEN"):
         raise SystemExit("CARGO_REGISTRY_TOKEN is required")
+
+    if args.yank_host_version:
+        subprocess.run(
+            yank_command("pd-host-function", args.yank_host_version),
+            cwd=root,
+            check=True,
+        )
 
     for package, version in plan:
         if crate_exists(package, version):
