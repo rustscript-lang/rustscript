@@ -414,10 +414,14 @@ impl SsaInstKind {
                 replacement,
             } => vec![*pattern, *text, *replacement],
             Self::StringReplaceLiteral {
-                text, needle, replacement,
+                text,
+                needle,
+                replacement,
             } => vec![*text, *needle, *replacement],
             Self::StringReplaceLiteralMany {
-                text, needles, replacements,
+                text,
+                needles,
+                replacements,
             } => vec![*text, *needles, *replacements],
             Self::StringLowerAscii { text } => vec![*text],
             Self::TypeOf { value } | Self::ToString { value } => vec![*value],
@@ -1039,10 +1043,18 @@ fn render_inst_kind(kind: &SsaInstKind) -> String {
             text,
             replacement,
         } => format!("regex_replace {pattern}, {text}, {replacement}"),
-        SsaInstKind::StringReplaceLiteral { text, needle, replacement } => {
+        SsaInstKind::StringReplaceLiteral {
+            text,
+            needle,
+            replacement,
+        } => {
             format!("string_replace_literal {text}, {needle}, {replacement}")
         }
-        SsaInstKind::StringReplaceLiteralMany { text, needles, replacements } => {
+        SsaInstKind::StringReplaceLiteralMany {
+            text,
+            needles,
+            replacements,
+        } => {
             format!("string_replace_literal_many {text}, {needles}, {replacements}")
         }
         SsaInstKind::StringLowerAscii { text } => format!("string_lower_ascii {text}"),
