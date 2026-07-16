@@ -47,7 +47,7 @@ fn sleep_duration(millis: i64) -> VmResult<Duration> {
 
 /// Sleeps for the requested milliseconds.
 #[pd_host_function(name = "runtime::sleep")]
-fn runtime_sleep_impl(_vm: &mut Vm, ms: i64) -> VmResult<bool> {
+fn runtime_sleep_impl(ms: i64) -> VmResult<bool> {
     let duration = sleep_duration(ms)?;
     #[cfg(not(target_arch = "wasm32"))]
     std::thread::sleep(duration);
@@ -58,7 +58,7 @@ fn runtime_sleep_impl(_vm: &mut Vm, ms: i64) -> VmResult<bool> {
 
 /// Halts the current VM invocation immediately.
 #[pd_host_function(name = "runtime::exit")]
-fn runtime_exit_impl(_vm: &mut Vm) -> VmResult<CallOutcome> {
+fn runtime_exit_impl() -> VmResult<CallOutcome> {
     Ok(CallOutcome::Halt)
 }
 
@@ -94,11 +94,7 @@ mod tests {
 
     #[test]
     fn runtime_sleep_rejects_negative_milliseconds() {
-        let mut vm = Vm::new(Program::new(
-            Vec::new(),
-            vec![crate::bytecode::OpCode::Ret as u8],
-        ));
-        let err = runtime_sleep_impl(&mut vm, -1).expect_err("negative sleep should fail");
+        let err = runtime_sleep_impl(-1).expect_err("negative sleep should fail");
         assert!(
             err.to_string()
                 .contains("runtime::sleep expects non-negative milliseconds"),
@@ -118,12 +114,8 @@ mod tests {
 
     #[test]
     fn runtime_exit_returns_halt_outcome() {
-        let mut vm = Vm::new(Program::new(
-            Vec::new(),
-            vec![crate::bytecode::OpCode::Ret as u8],
-        ));
         assert_eq!(
-            runtime_exit_impl(&mut vm).expect("runtime::exit should halt"),
+            runtime_exit_impl().expect("runtime::exit should halt"),
             CallOutcome::Halt
         );
     }

@@ -41,6 +41,24 @@ enum WrapperParamKind {
     SliceArgs,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostBindingKind {
+    StaticStack,
+    StaticArgs,
+    StaticNonYieldingArgs,
+}
+
+impl HostBindingKind {
+    pub(crate) fn render_bind_static_call(&self, name: &str, function_name: &str) -> String {
+        let method = match self {
+            Self::StaticStack => "bind_static_stack_function",
+            Self::StaticNonYieldingArgs => "bind_static_non_yielding_args_function",
+            Self::StaticArgs => "bind_static_args_function",
+        };
+        format!("vm.{method}({name:?}, {function_name});")
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CallableDecl {
     rust_ident: String,
@@ -51,6 +69,7 @@ struct CallableDecl {
     return_label: String,
     static_return_type: String,
     wrapper: Option<WrapperDecl>,
+    host_binding_kind: HostBindingKind,
 }
 
 #[derive(Clone, Debug)]
@@ -184,6 +203,110 @@ fn parse_sources(
     out
 }
 
+pub(crate) fn classify_host_binding(function: &ItemFn) -> HostBindingKind {
+    if function.sig.inputs.iter().any(|input| match input {
+        FnArg::Typed(pat_type) => is_vm_context_type(&pat_type.ty),
+        _ => false,
+    }) {
+        return HostBindingKind::StaticStack;
+    }
+    let return_type = normalized_return_type(&function.sig.output);
+    if matches!(
+        plain_path_type(&return_type).as_deref(),
+        Some("CallOutcome")
+    ) {
+        return HostBindingKind::StaticArgs;
+    }
+    if let Some(inner) = sole_type_argument(&return_type, "VmResult")
+        .or_else(|| sole_type_argument(&return_type, "HostResult"))
+    {
+        if matches!(plain_path_type(&inner).as_deref(), Some("CallOutcome")) {
+            return HostBindingKind::StaticArgs;
+        }
+    }
+    if is_supported_ordinary_return_type(&return_type) {
+        return HostBindingKind::StaticNonYieldingArgs;
+    }
+    HostBindingKind::StaticArgs
+}
+
+fn is_supported_ordinary_return_type(ty: &Type) -> bool {
+    match ty {
+        Type::Group(group) => is_supported_ordinary_return_type(&group.elem),
+        Type::Paren(paren) => is_supported_ordinary_return_type(&paren.elem),
+        Type::Reference(reference) => is_supported_ordinary_return_type(&reference.elem),
+        Type::Path(path) => {
+            path.path
+                .segments
+                .last()
+                .is_some_and(|seg| match seg.ident.to_string().as_str() {
+                    "Option" | "VmResult" | "HostResult" => {
+                        let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+                            return false;
+                        };
+                        args.args
+                            .first()
+                            .and_then(|arg| match arg {
+                                syn::GenericArgument::Type(inner) => Some(inner),
+                                _ => None,
+                            })
+                            .is_some_and(|inner| is_supported_ordinary_return_type(inner))
+                    }
+                    _ => true,
+                })
+        }
+        Type::Tuple(tuple) => tuple.elems.is_empty(),
+        _ => false,
+    }
+}
+
+fn normalized_return_type(output: &ReturnType) -> Type {
+    match output {
+        ReturnType::Default => syn::parse_quote!(()),
+        ReturnType::Type(_, ty) => unwrap_surface_type(ty),
+    }
+}
+
+fn unwrap_surface_type(ty: &Type) -> Type {
+    match ty {
+        Type::Group(group) => unwrap_surface_type(&group.elem),
+        Type::Paren(paren) => unwrap_surface_type(&paren.elem),
+        Type::Reference(reference) => unwrap_surface_type(&reference.elem),
+        _ => ty.clone(),
+    }
+}
+
+fn plain_path_type(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Group(group) => plain_path_type(&group.elem),
+        Type::Paren(paren) => plain_path_type(&paren.elem),
+        Type::Reference(reference) => plain_path_type(&reference.elem),
+        Type::Path(path) => path.path.segments.last().map(|seg| seg.ident.to_string()),
+        _ => None,
+    }
+}
+
+fn sole_type_argument(ty: &Type, wrapper: &str) -> Option<Type> {
+    let ty = unwrap_surface_type(ty);
+    match &ty {
+        Type::Path(path) => {
+            let segment = path.path.segments.last()?;
+            if segment.ident != wrapper {
+                return None;
+            }
+            let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+                return None;
+            };
+            let arg = args.args.first()?;
+            match arg {
+                syn::GenericArgument::Type(inner) => Some(inner.clone()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn parse_source_file(path: &Path, spec: &SourceSpec, _order_offset: usize) -> Vec<CallableDecl> {
     let source = fs::read_to_string(path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
@@ -214,6 +337,7 @@ fn parse_source_file(path: &Path, spec: &SourceSpec, _order_offset: usize) -> Ve
             return_label: return_type_label(&function.sig.output),
             static_return_type: static_return_type_label(&function.sig.output),
             wrapper,
+            host_binding_kind: classify_host_binding(function),
         });
     }
     out
@@ -765,7 +889,7 @@ fn render_builtin_runtime_dispatch(
             .as_ref()
             .expect("host wrappers should exist");
         let adapter_name = host_wrapper_adapter_name(callable);
-        if wrapper_uses_vm(wrapper) {
+        if callable.host_binding_kind == HostBindingKind::StaticStack {
             writeln!(
                 &mut out,
                 "fn {adapter_name}(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {{"
@@ -799,14 +923,19 @@ fn render_builtin_runtime_dispatch(
     )
     .unwrap();
     for callable in host_callables {
-        let wrapper = callable
-            .wrapper
-            .as_ref()
-            .expect("host wrappers should exist");
-        if wrapper_uses_vm(wrapper) {
+        if callable.host_binding_kind == HostBindingKind::StaticStack {
             writeln!(
                 &mut out,
                 "    registry.register_static_stack({:?}, {}, {});",
+                callable.name,
+                callable.params.len(),
+                host_wrapper_adapter_name(callable)
+            )
+            .unwrap();
+        } else if callable.host_binding_kind == HostBindingKind::StaticNonYieldingArgs {
+            writeln!(
+                &mut out,
+                "    registry.register_static_non_yielding_args({:?}, {}, {});",
                 callable.name,
                 callable.params.len(),
                 host_wrapper_adapter_name(callable)
@@ -833,28 +962,11 @@ fn render_builtin_runtime_dispatch(
     .unwrap();
     writeln!(&mut out, "    match name {{").unwrap();
     for callable in host_callables {
-        let wrapper = callable
-            .wrapper
-            .as_ref()
-            .expect("host wrappers should exist");
+        let bind_call = callable
+            .host_binding_kind
+            .render_bind_static_call(&callable.name, &host_wrapper_adapter_name(callable));
         writeln!(&mut out, "        {:?} => {{", callable.name).unwrap();
-        if wrapper_uses_vm(wrapper) {
-            writeln!(
-                &mut out,
-                "            vm.bind_static_stack_function({:?}, {});",
-                callable.name,
-                host_wrapper_adapter_name(callable)
-            )
-            .unwrap();
-        } else {
-            writeln!(
-                &mut out,
-                "            vm.bind_static_args_function({:?}, {});",
-                callable.name,
-                host_wrapper_adapter_name(callable)
-            )
-            .unwrap();
-        }
+        writeln!(&mut out, "            {bind_call}").unwrap();
         writeln!(&mut out, "            true").unwrap();
         writeln!(&mut out, "        }}").unwrap();
     }
@@ -1604,13 +1716,6 @@ fn wrapper_name_for_callable(rust_ident: &str) -> String {
 
 fn host_wrapper_adapter_name(callable: &CallableDecl) -> String {
     format!("__pd_host_adapter_{}", callable.rust_ident)
-}
-
-fn wrapper_uses_vm(wrapper: &WrapperDecl) -> bool {
-    wrapper
-        .params
-        .iter()
-        .any(|param| matches!(param, WrapperParamKind::Vm))
 }
 
 fn generated_wrapper_decl(function: &ItemFn) -> WrapperDecl {

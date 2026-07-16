@@ -77,7 +77,12 @@ windows-sys = { version = "0.59", features = ["Win32_System_Diagnostics_Debug", 
 libc = "0.2"
 
 [dev-dependencies]
+syn = { version = "2", features = ["full"] }
 tokio = { version = "1", features = ["macros", "rt", "time", "sync"] }
+
+[[test]]
+name = "host_binding_generation_tests"
+path = "tests/host_binding_generation_tests.rs"
 
 [build-dependencies]
 syn = { version = "2", features = ["full"] }
