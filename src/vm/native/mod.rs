@@ -21,8 +21,11 @@ pub(crate) use bridge::{
     restore_sparse_exit_state_entry_address, shared_array_from_buffer_entry_address,
     shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
     store_bridge_error, string_contains_entry_address, string_lower_ascii_entry_address,
-    string_replace_literal_entry_address, string_split_literal_entry_address, take_bridge_error,
-    value_eq_entry_address, write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
+    string_replace_literal_entry_address, string_replace_literal_many_entry_address,
+    string_split_literal_entry_address, take_bridge_error,
+    to_string_entry_address, type_of_entry_address, value_eq_entry_address,
+    value_len_entry_address, write_heap_value_to_slot_entry_address,
+    zero_bytes_entry_address,
 };
 #[cfg(feature = "cranelift-jit")]
 pub(crate) use codegen::{
@@ -33,7 +36,8 @@ pub(crate) use codegen::{
     non_yielding_host_call_signature, pack_shared_signature, regex_match_signature,
     regex_replace_signature, restore_exit_signature, sparse_restore_exit_signature,
     string_binary_transform_signature, string_contains_signature, string_replace_signature,
-    string_unary_transform_signature, value_eq_signature, value_slot_signature,
+    string_unary_transform_signature, value_eq_signature, value_len_signature,
+    value_slot_signature,
 };
 pub(crate) use exec::{ExecutableBuffer, prepare_for_execution};
 pub(crate) use layout::{

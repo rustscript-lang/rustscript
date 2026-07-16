@@ -2893,7 +2893,12 @@ fn trace_jit_supports_float_and_string_loops_through_ssa() {
     assert_eq!(string_status, VmStatus::Halted);
     assert_eq!(string_vm.stack(), &[Value::string("xxx")]);
     let string_snapshot = string_vm.jit_snapshot();
-    assert_native_ssa_call_boundary_trace(&string_vm, &string_snapshot, "string add loop");
+    assert_native_ssa_specialized_trace(
+        &string_vm,
+        &string_snapshot,
+        "string add loop",
+        &["type_of", "to_string_identity", "string_concat"],
+    );
 }
 
 #[test]
@@ -3085,12 +3090,17 @@ fn trace_jit_supports_string_call_boundary_exits() {
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::string("xxxxxx")]);
     let snapshot = vm.jit_snapshot();
-    assert_native_ssa_call_boundary_trace(&vm, &snapshot, "string concat loop");
+    assert_native_ssa_specialized_trace(
+        &vm,
+        &snapshot,
+        "string concat loop",
+        &["type_of", "to_string_identity", "string_concat"],
+    );
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
     assert!(
         bridge_hits.iter().all(|(_, count)| *count == 0),
-        "string concat loop should not need native helper bridges for call-boundary execution, bridge hits: {bridge_hits:?}\n{}",
+        "string concat loop should not need native helper bridges, bridge hits: {bridge_hits:?}\n{}",
         vm.dump_jit_info()
     );
 }
@@ -4665,6 +4675,142 @@ fn trace_jit_specializes_loop_carried_string_builtins() {
         &snapshot,
         "loop-carried string builtin",
         &["value_eq", "string_contains", "string_replace_literal"],
+    );
+}
+
+#[test]
+fn trace_jit_specializes_literal_replace_many() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        let mut i = 0;
+        let mut out = "";
+        let needles = ["%27", "%20", "+"];
+        let replacements = ["'", " ", " "];
+        while i < 8 {
+            out = string_replace_literal(
+                "%27x%20y+z",
+                &needles,
+                &replacements
+            );
+            i = i + 1;
+        }
+        out == "'x y z";
+    "#;
+    let program = compile_source(source).expect("replace-many fixture should compile");
+    let mut vm = Vm::new_with_jit_config(
+        program.program,
+        JitConfig {
+            enabled: true,
+            hot_loop_threshold: 1,
+            max_trace_len: 512,
+        },
+    );
+    assert_eq!(
+        vm.run().expect("replace-many fixture should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Bool(true)]);
+    let snapshot = vm.jit_snapshot();
+    assert!(
+        snapshot.traces.iter().any(|trace| {
+            trace.op_names.iter().any(|name| name == "string_replace_literal_many")
+        }),
+        "expected replace-many SSA specialization, got {}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
+fn trace_jit_preserves_dynamic_concat_type_guards() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn encode_map(values: map<string>) -> string {
+            let keys = (&values).keys;
+            let mut out = "";
+            for i in 0..keys.length {
+                let key: string = (&keys)[i];
+                out = out + key + "=" + (&values)[key] + "\n";
+            }
+            out
+        }
+        let values: map<string> = { "a": "one", "b": "two" };
+        let mut i = 0;
+        let mut out = "";
+        while i < 8 {
+            out = encode_map(&values);
+            i = i + 1;
+        }
+        string_contains(&out, "a=one");
+    "#;
+    let compiled = compile_source(source).expect("dynamic concat fixture should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    let status = vm.run().unwrap_or_else(|error| {
+        panic!(
+            "dynamic concat fixture failed at ip {} stack={:?}: {error:?}\n{}",
+            vm.ip(),
+            vm.stack(),
+            vm.dump_jit_info(),
+        )
+    });
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Bool(true)]);
+    let snapshot = vm.jit_snapshot();
+    assert!(
+        snapshot.traces.iter().any(|trace| {
+            !trace.has_call
+                && ["type_of", "to_string_identity", "string_concat"]
+                    .iter()
+                    .all(|required| trace.op_names().iter().any(|op| op == required))
+        }),
+        "dynamic concat inner trace should specialize type dispatch without calls:\n{}",
+        vm.dump_jit_info(),
+    );
+}
+
+#[test]
+fn trace_jit_folds_known_type_of_guards_after_map_get() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        let values = { "key": "value", "number": 1 };
+        let keys = ["key", "key"];
+        let mut i = 0;
+        let mut matched = false;
+        while i < 8 {
+            let key = (&keys)[i % 2];
+            matched = type((&values)[key]) == "string";
+            i = i + 1;
+        }
+        matched;
+    "#;
+    let compiled = compile_source(source).expect("known type guard fixture should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    assert_eq!(
+        vm.run().expect("known type guard fixture should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Bool(true)]);
+    let snapshot = vm.jit_snapshot();
+    assert_native_ssa_specialized_trace(
+        &vm,
+        &snapshot,
+        "known type guard after map get",
+        &["map_get", "type_of", "value_eq"],
     );
 }
 

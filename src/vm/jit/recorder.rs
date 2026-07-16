@@ -87,6 +87,7 @@ struct ValueInfo {
     const_float: Option<f64>,
     const_bool: Option<bool>,
     known_type: Option<ValueType>,
+    force_value_eq: bool,
     source_local: Option<u8>,
 }
 
@@ -98,6 +99,7 @@ impl ValueInfo {
             const_float: None,
             const_bool: None,
             known_type: None,
+            force_value_eq: false,
             source_local: None,
         }
     }
@@ -109,6 +111,7 @@ impl ValueInfo {
             const_float: None,
             const_bool: None,
             known_type: Some(known_type),
+            force_value_eq: false,
             source_local: None,
         }
     }
@@ -120,6 +123,7 @@ impl ValueInfo {
             const_float: None,
             const_bool: None,
             known_type: Some(ValueType::Int),
+            force_value_eq: false,
             source_local: None,
         }
     }
@@ -131,6 +135,7 @@ impl ValueInfo {
             const_float: value,
             const_bool: None,
             known_type: Some(ValueType::Float),
+            force_value_eq: false,
             source_local: None,
         }
     }
@@ -142,6 +147,7 @@ impl ValueInfo {
             const_float: None,
             const_bool: value,
             known_type: Some(ValueType::Bool),
+            force_value_eq: false,
             source_local: None,
         }
     }
@@ -153,6 +159,7 @@ impl ValueInfo {
             const_float: None,
             const_bool: None,
             known_type: Some(tag),
+            force_value_eq: false,
             source_local: None,
         }
     }
@@ -168,6 +175,12 @@ impl ValueInfo {
             Value::Array(_) => Self::tagged_typed(ValueType::Array),
             Value::Map(_) => Self::tagged_typed(ValueType::Map),
         }
+    }
+
+    fn type_name() -> Self {
+        let mut info = Self::tagged_typed(ValueType::String);
+        info.force_value_eq = true;
+        info
     }
 
     fn sourced_from(mut self, local: u8) -> Self {
@@ -457,6 +470,7 @@ enum HeapContainerKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SpecializedBuiltinKind {
+    ValueLen,
     StringLen,
     BytesLen,
     StringSlice,
@@ -468,7 +482,12 @@ enum SpecializedBuiltinKind {
     RegexMatch,
     RegexReplace,
     StringReplaceLiteral,
+    StringReplaceLiteralMany,
     StringLowerAscii,
+    TypeOf,
+    TypeOfKnown(ValueType),
+    ToString,
+    ToStringIdentity,
     StringSplitLiteral,
     StringConcat,
     BytesConcat,
@@ -731,6 +750,7 @@ pub(crate) fn record_trace(
                     const_float: None,
                     const_bool: None,
                     known_type: loop_plan.stack_known_types[index],
+                    force_value_eq: false,
                     source_local: None,
                 },
             });
@@ -788,6 +808,7 @@ pub(crate) fn record_trace(
                     const_float: None,
                     const_bool: None,
                     known_type: loop_plan.local_known_types[local],
+                    force_value_eq: false,
                     source_local: None,
                 },
             });
@@ -1133,13 +1154,28 @@ pub(crate) fn record_trace(
                                 .iter()
                                 .all(|arg| arg.info.source_local != Some(local))
                     });
-                    if let Some(kind) = select_specialized_builtin_kind(
-                        program,
-                        ip,
-                        builtin,
-                        args[0].info,
-                        container_was_moved,
-                    ) {
+                    let replace_many = builtin == BuiltinFunction::StringReplaceLiteral
+                        && (operand_types(program, ip).1 == ValueType::Array
+                            || (args.get(1).is_some_and(|arg| {
+                                observed_heap_container_kind(arg.info)
+                                    == Some(HeapContainerKind::Array)
+                            })
+                                && args.get(2).is_some_and(|arg| {
+                                    observed_heap_container_kind(arg.info)
+                                        == Some(HeapContainerKind::Array)
+                                })));
+                    let specialized_kind = if replace_many {
+                        Some(SpecializedBuiltinKind::StringReplaceLiteralMany)
+                    } else {
+                        select_specialized_builtin_kind(
+                            program,
+                            ip,
+                            builtin,
+                            args[0].info,
+                            container_was_moved,
+                        )
+                    };
+                    if let Some(kind) = specialized_kind {
                         let (name, out) = emit_specialized_builtin_call(
                             &mut builder,
                             current_block,
@@ -1532,6 +1568,39 @@ fn select_numeric_binop(
     lhs: ValueInfo,
     rhs: ValueInfo,
 ) -> Result<NumericBinOpKind, TraceRecordError> {
+    if lhs.repr == SsaValueRepr::I64 && rhs.repr == SsaValueRepr::I64 {
+        let kind = match opcode {
+            x if x == OpCode::Add as u8 => IntBinOpKind::Add,
+            x if x == OpCode::Sub as u8 => IntBinOpKind::Sub,
+            x if x == OpCode::Mul as u8 => IntBinOpKind::Mul,
+            x if x == OpCode::Div as u8 => IntBinOpKind::Div,
+            x if x == OpCode::Mod as u8 => IntBinOpKind::Mod,
+            x if x == OpCode::Shl as u8 => IntBinOpKind::Shl,
+            x if x == OpCode::Shr as u8 => IntBinOpKind::Shr,
+            x if x == OpCode::Lshr as u8 => IntBinOpKind::Lshr,
+            _ => {
+                return Err(TraceRecordError::UnsupportedTrace(
+                    "SSA recorder expected a numeric binop opcode".to_string(),
+                ));
+            }
+        };
+        return Ok(NumericBinOpKind::Int(kind));
+    }
+    if lhs.repr == SsaValueRepr::F64 && rhs.repr == SsaValueRepr::F64 {
+        let kind = match opcode {
+            x if x == OpCode::Add as u8 => FloatBinOpKind::Add,
+            x if x == OpCode::Sub as u8 => FloatBinOpKind::Sub,
+            x if x == OpCode::Mul as u8 => FloatBinOpKind::Mul,
+            x if x == OpCode::Div as u8 => FloatBinOpKind::Div,
+            x if x == OpCode::Mod as u8 => FloatBinOpKind::Mod,
+            _ => {
+                return Err(TraceRecordError::UnsupportedTrace(
+                    "SSA recorder expected a numeric binop opcode".to_string(),
+                ));
+            }
+        };
+        return Ok(NumericBinOpKind::Float(kind));
+    }
     let operand_types = operand_types(program, ip);
     let observed_concat = observed_concat_binop_kind(lhs, rhs);
     let int_like = matches!(lhs.repr, SsaValueRepr::I64 | SsaValueRepr::Tagged)
@@ -1734,6 +1803,43 @@ fn select_numeric_compare(
     lhs: ValueInfo,
     rhs: ValueInfo,
 ) -> Result<NumericCompareKind, TraceRecordError> {
+    if lhs.force_value_eq || rhs.force_value_eq {
+        return Err(TraceRecordError::UnsupportedTrace(
+            "SSA recorder requires value equality for known non-numeric operands".to_string(),
+        ));
+    }
+    if lhs.repr == SsaValueRepr::I64 && rhs.repr == SsaValueRepr::I64 {
+        return match opcode {
+            x if x == OpCode::Ceq as u8 => {
+                Ok(NumericCompareKind::Int(IntCompareKind::Eq))
+            }
+            x if x == OpCode::Clt as u8 => {
+                Ok(NumericCompareKind::Int(IntCompareKind::Lt))
+            }
+            x if x == OpCode::Cgt as u8 => {
+                Ok(NumericCompareKind::Int(IntCompareKind::Gt))
+            }
+            _ => Err(TraceRecordError::UnsupportedTrace(
+                "SSA recorder expected a numeric comparison opcode".to_string(),
+            )),
+        };
+    }
+    if lhs.repr == SsaValueRepr::F64 && rhs.repr == SsaValueRepr::F64 {
+        return match opcode {
+            x if x == OpCode::Ceq as u8 => {
+                Ok(NumericCompareKind::Float(FloatCompareKind::Eq))
+            }
+            x if x == OpCode::Clt as u8 => {
+                Ok(NumericCompareKind::Float(FloatCompareKind::Lt))
+            }
+            x if x == OpCode::Cgt as u8 => {
+                Ok(NumericCompareKind::Float(FloatCompareKind::Gt))
+            }
+            _ => Err(TraceRecordError::UnsupportedTrace(
+                "SSA recorder expected a numeric comparison opcode".to_string(),
+            )),
+        };
+    }
     let operand_types = operand_types(program, ip);
     let int_like = matches!(lhs.repr, SsaValueRepr::I64 | SsaValueRepr::Tagged)
         && matches!(rhs.repr, SsaValueRepr::I64 | SsaValueRepr::Tagged);
@@ -2584,6 +2690,19 @@ fn select_specialized_builtin_kind(
         BuiltinFunction::StringLowerAscii => {
             return Some(SpecializedBuiltinKind::StringLowerAscii);
         }
+        BuiltinFunction::TypeOf => {
+            return Some(match container.known_type {
+                Some(value_type) => SpecializedBuiltinKind::TypeOfKnown(value_type),
+                None => SpecializedBuiltinKind::TypeOf,
+            });
+        }
+        BuiltinFunction::ToString => {
+            return Some(if container.known_type == Some(ValueType::String) {
+                SpecializedBuiltinKind::ToStringIdentity
+            } else {
+                SpecializedBuiltinKind::ToString
+            });
+        }
         BuiltinFunction::StringSplitLiteral => {
             return Some(SpecializedBuiltinKind::StringSplitLiteral);
         }
@@ -2602,6 +2721,7 @@ fn select_specialized_builtin_kind(
             | BuiltinFunction::Get
             | BuiltinFunction::Has
             | BuiltinFunction::Concat
+            | BuiltinFunction::StringReplaceLiteral
             | BuiltinFunction::Set
             | BuiltinFunction::ArrayPush
     ) {
@@ -2614,7 +2734,10 @@ fn select_specialized_builtin_kind(
         }
     } else {
         observed_kind
-    }?;
+    };
+    let Some(container_kind) = container_kind else {
+        return (builtin == BuiltinFunction::Len).then_some(SpecializedBuiltinKind::ValueLen);
+    };
 
     match (builtin, container_kind) {
         (BuiltinFunction::Len, HeapContainerKind::String) => {
@@ -2632,9 +2755,7 @@ fn select_specialized_builtin_kind(
         }
         (BuiltinFunction::Get, HeapContainerKind::Bytes) => Some(SpecializedBuiltinKind::BytesGet),
         (BuiltinFunction::Has, HeapContainerKind::Bytes) => Some(SpecializedBuiltinKind::BytesHas),
-        (BuiltinFunction::StringReplaceLiteral, HeapContainerKind::String)
-            if container_was_moved =>
-        {
+        (BuiltinFunction::StringReplaceLiteral, HeapContainerKind::String) => {
             Some(SpecializedBuiltinKind::StringReplaceLiteral)
         }
         (BuiltinFunction::Concat, HeapContainerKind::String) => {
@@ -2673,6 +2794,11 @@ fn analyze_specialized_builtin_call(
     kind: SpecializedBuiltinKind,
 ) -> Result<&'static str, TraceRecordError> {
     match kind {
+        SpecializedBuiltinKind::ValueLen => {
+            let _ = frame.pop()?;
+            frame.push(ValueInfo::int(None));
+            Ok("value_len")
+        }
         SpecializedBuiltinKind::StringLen => {
             let _ = frame.pop()?;
             frame.push(ValueInfo::int(None));
@@ -2734,17 +2860,36 @@ fn analyze_specialized_builtin_call(
             frame.push(ValueInfo::tagged_typed(ValueType::String));
             Ok("regex_replace")
         }
-        SpecializedBuiltinKind::StringReplaceLiteral => {
+        SpecializedBuiltinKind::StringReplaceLiteral
+        | SpecializedBuiltinKind::StringReplaceLiteralMany => {
             let _ = frame.pop()?;
             let _ = frame.pop()?;
             let _ = frame.pop()?;
             frame.push(ValueInfo::tagged_typed(ValueType::String));
-            Ok("string_replace_literal")
+            Ok(if matches!(kind, SpecializedBuiltinKind::StringReplaceLiteralMany) {
+                "string_replace_literal_many"
+            } else {
+                "string_replace_literal"
+            })
         }
         SpecializedBuiltinKind::StringLowerAscii => {
             let _ = frame.pop()?;
             frame.push(ValueInfo::tagged_typed(ValueType::String));
             Ok("string_lower_ascii")
+        }
+        SpecializedBuiltinKind::TypeOf | SpecializedBuiltinKind::TypeOfKnown(_) => {
+            let _ = frame.pop()?;
+            frame.push(ValueInfo::type_name());
+            Ok("type_of")
+        }
+        SpecializedBuiltinKind::ToString | SpecializedBuiltinKind::ToStringIdentity => {
+            let _ = frame.pop()?;
+            frame.push(ValueInfo::tagged_typed(ValueType::String));
+            Ok(if matches!(kind, SpecializedBuiltinKind::ToStringIdentity) {
+                "to_string_identity"
+            } else {
+                "to_string"
+            })
         }
         SpecializedBuiltinKind::StringSplitLiteral => {
             let _ = frame.pop()?;
@@ -2854,6 +2999,24 @@ fn emit_specialized_builtin_call(
     kind: SpecializedBuiltinKind,
 ) -> Result<(&'static str, SymbolicValue), TraceRecordError> {
     match kind {
+        SpecializedBuiltinKind::ValueLen => {
+            let value = frame.pop()?;
+            let out = builder
+                .append_value_inst(
+                    block,
+                    ip,
+                    SsaValueRepr::I64,
+                    SsaInstKind::ValueLen {
+                        value: value.value.id,
+                    },
+                )
+                .map(|value| SymbolicValue {
+                    value,
+                    info: ValueInfo::int(None),
+                })
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+            Ok(("value_len", out))
+        }
         SpecializedBuiltinKind::StringLen => {
             let text = frame.pop()?;
             let text = ensure_heap_ptr(
@@ -3142,6 +3305,31 @@ fn emit_specialized_builtin_call(
                 .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
             Ok(("regex_replace", out))
         }
+        SpecializedBuiltinKind::StringReplaceLiteralMany => {
+            let replacements = ensure_heap_ptr(
+                builder, block, ip, frame.pop()?, ValueType::Array,
+            )?;
+            let needles = ensure_heap_ptr(
+                builder, block, ip, frame.pop()?, ValueType::Array,
+            )?;
+            let text = ensure_heap_ptr(
+                builder, block, ip, frame.pop()?, ValueType::String,
+            )?;
+            let value = builder
+                .append_value_inst(
+                    block, ip, SsaValueRepr::Tagged,
+                    SsaInstKind::StringReplaceLiteralMany {
+                        text: text.value.id,
+                        needles: needles.value.id,
+                        replacements: replacements.value.id,
+                    },
+                )
+                .map(|value| SymbolicValue {
+                    value, info: ValueInfo::tagged_typed(ValueType::String),
+                })
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+            Ok(("string_replace_literal_many", value))
+        }
         SpecializedBuiltinKind::StringReplaceLiteral => {
             let replacement = ensure_heap_ptr(
                 builder,
@@ -3205,6 +3393,70 @@ fn emit_specialized_builtin_call(
                 })
                 .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
             Ok(("string_lower_ascii", out))
+        }
+        SpecializedBuiltinKind::TypeOfKnown(value_type) => {
+            let _ = frame.pop()?;
+            let type_name = match value_type {
+                ValueType::Null => "null",
+                ValueType::Int => "int",
+                ValueType::Float => "float",
+                ValueType::Bool => "bool",
+                ValueType::String => "string",
+                ValueType::Bytes => "bytes",
+                ValueType::Array => "array",
+                ValueType::Map => "map",
+                ValueType::Unknown => {
+                    return Err(TraceRecordError::UnsupportedTrace(
+                        "type_of known specialization received unknown type".to_string(),
+                    ));
+                }
+            };
+            let constant = Value::string(type_name);
+            let info = ValueInfo::type_name();
+            let value = builder
+                .append_value_inst(block, ip, info.repr, SsaInstKind::Constant(constant))
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+            Ok(("type_of", SymbolicValue { value, info }))
+        }
+        SpecializedBuiltinKind::ToStringIdentity => {
+            let value = frame.pop()?;
+            Ok(("to_string_identity", value))
+        }
+        SpecializedBuiltinKind::ToString => {
+            let value = frame.pop()?;
+            let out = builder
+                .append_value_inst(
+                    block,
+                    ip,
+                    SsaValueRepr::Tagged,
+                    SsaInstKind::ToString {
+                        value: value.value.id,
+                    },
+                )
+                .map(|value| SymbolicValue {
+                    value,
+                    info: ValueInfo::tagged_typed(ValueType::String),
+                })
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+            Ok(("to_string", out))
+        }
+        SpecializedBuiltinKind::TypeOf => {
+            let value = frame.pop()?;
+            let out = builder
+                .append_value_inst(
+                    block,
+                    ip,
+                    SsaValueRepr::Tagged,
+                    SsaInstKind::TypeOf {
+                        value: value.value.id,
+                    },
+                )
+                .map(|value| SymbolicValue {
+                    value,
+                    info: ValueInfo::type_name(),
+                })
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+            Ok(("type_of", out))
         }
         SpecializedBuiltinKind::StringSplitLiteral => {
             let delimiter = ensure_heap_ptr(
@@ -3785,6 +4037,9 @@ fn validate_int_operands(
     lhs: ValueInfo,
     rhs: ValueInfo,
 ) -> Result<(), TraceRecordError> {
+    if lhs.repr == SsaValueRepr::I64 && rhs.repr == SsaValueRepr::I64 {
+        return Ok(());
+    }
     let explicit = operand_types(program, ip);
     let has_evidence = lhs.repr == SsaValueRepr::I64
         || rhs.repr == SsaValueRepr::I64
@@ -3820,6 +4075,9 @@ fn validate_int_compare_operands(
     lhs: ValueInfo,
     rhs: ValueInfo,
 ) -> Result<(), TraceRecordError> {
+    if lhs.repr == SsaValueRepr::I64 && rhs.repr == SsaValueRepr::I64 {
+        return Ok(());
+    }
     let explicit = operand_types(program, ip);
     let has_evidence = lhs.repr == SsaValueRepr::I64
         || rhs.repr == SsaValueRepr::I64
@@ -3855,6 +4113,9 @@ fn validate_float_operands(
     lhs: ValueInfo,
     rhs: ValueInfo,
 ) -> Result<(), TraceRecordError> {
+    if lhs.repr == SsaValueRepr::F64 && rhs.repr == SsaValueRepr::F64 {
+        return Ok(());
+    }
     let explicit = operand_types(program, ip);
     let has_evidence = lhs.repr == SsaValueRepr::F64
         || rhs.repr == SsaValueRepr::F64
@@ -4117,6 +4378,7 @@ fn continue_with_frame(
                 const_float: None,
                 const_bool: None,
                 known_type: value.info.known_type,
+                force_value_eq: value.info.force_value_eq,
                 source_local: None,
             },
         });
@@ -4139,6 +4401,7 @@ fn continue_with_frame(
                 const_float: None,
                 const_bool: None,
                 known_type: value.info.known_type,
+                force_value_eq: value.info.force_value_eq,
                 source_local: None,
             },
         });
@@ -4303,6 +4566,49 @@ mod tests {
     fn patch_branch_target(code: &mut [u8], instr_ip: u32, target: u32) {
         let start = instr_ip as usize + 1;
         code[start..start + 4].copy_from_slice(&target.to_le_bytes());
+    }
+
+    #[test]
+    fn unknown_len_container_uses_checked_value_len_specialization() {
+        let program = Program::new(Vec::new(), Vec::new());
+        assert_eq!(
+            select_specialized_builtin_kind(
+                &program,
+                0,
+                BuiltinFunction::Len,
+                ValueInfo::tagged(),
+                false,
+            ),
+            Some(SpecializedBuiltinKind::ValueLen),
+        );
+    }
+
+    #[test]
+    fn unboxed_numeric_compare_ignores_stale_operand_type_hint() {
+        let program = Program::new(Vec::new(), Vec::new()).with_type_map(crate::TypeMap {
+            operand_types: std::collections::HashMap::from([(
+                7,
+                (ValueType::Null, ValueType::Int),
+            )]),
+            ..crate::TypeMap::default()
+        });
+
+        let lhs = ValueInfo::int(None);
+        let rhs = ValueInfo::int(None);
+        assert_eq!(
+            select_numeric_compare(&program, 7, OpCode::Clt as u8, lhs, rhs)
+                .expect("unboxed integer compare should override stale hint"),
+            NumericCompareKind::Int(IntCompareKind::Lt),
+        );
+        validate_int_compare_operands(&program, 7, IntCompareKind::Lt, lhs, rhs)
+            .expect("unboxed integer validator should override stale hint");
+        assert_eq!(
+            select_numeric_binop(&program, 7, OpCode::Add as u8, lhs, rhs)
+                .expect("unboxed integer binop should override stale hint"),
+            NumericBinOpKind::Int(IntBinOpKind::Add),
+        );
+        validate_int_operands(&program, 7, IntBinOpKind::Add, lhs, rhs)
+            .expect("unboxed integer binop validator should override stale hint");
     }
 
     #[test]

@@ -107,6 +107,9 @@ pub(crate) enum SsaInstKind {
         input: SsaValueId,
         tag: ValueType,
     },
+    ValueLen {
+        value: SsaValueId,
+    },
     StringLen {
         text: SsaValueId,
     },
@@ -153,8 +156,19 @@ pub(crate) enum SsaInstKind {
         needle: SsaValueId,
         replacement: SsaValueId,
     },
+    StringReplaceLiteralMany {
+        text: SsaValueId,
+        needles: SsaValueId,
+        replacements: SsaValueId,
+    },
     StringLowerAscii {
         text: SsaValueId,
+    },
+    TypeOf {
+        value: SsaValueId,
+    },
+    ToString {
+        value: SsaValueId,
     },
     StringSplitLiteral {
         text: SsaValueId,
@@ -371,6 +385,7 @@ impl SsaInstKind {
             | Self::UnboxFloat { input }
             | Self::UnboxBool { input }
             | Self::UnboxHeapPtr { input, .. }
+            | Self::ValueLen { value: input }
             | Self::StringLen { text: input }
             | Self::BytesLen { bytes: input }
             | Self::ArrayLen { array: input }
@@ -399,11 +414,13 @@ impl SsaInstKind {
                 replacement,
             } => vec![*pattern, *text, *replacement],
             Self::StringReplaceLiteral {
-                text,
-                needle,
-                replacement,
+                text, needle, replacement,
             } => vec![*text, *needle, *replacement],
+            Self::StringReplaceLiteralMany {
+                text, needles, replacements,
+            } => vec![*text, *needles, *replacements],
             Self::StringLowerAscii { text } => vec![*text],
+            Self::TypeOf { value } | Self::ToString { value } => vec![*value],
             Self::StringSplitLiteral { text, delimiter } => vec![*text, *delimiter],
             Self::StringConcat { lhs, rhs } | Self::BytesConcat { lhs, rhs } => vec![*lhs, *rhs],
             Self::BytesFromArrayU8 { array } => vec![*array],
@@ -995,6 +1012,7 @@ fn render_inst_kind(kind: &SsaInstKind) -> String {
         SsaInstKind::UnboxFloat { input } => format!("unbox_float {input}"),
         SsaInstKind::UnboxBool { input } => format!("unbox_bool {input}"),
         SsaInstKind::UnboxHeapPtr { input, tag } => format!("unbox_ptr {input}, {tag:?}"),
+        SsaInstKind::ValueLen { value } => format!("value_len {value}"),
         SsaInstKind::StringLen { text } => format!("string_len {text}"),
         SsaInstKind::BytesLen { bytes } => format!("bytes_len {bytes}"),
         SsaInstKind::StringSlice {
@@ -1021,12 +1039,15 @@ fn render_inst_kind(kind: &SsaInstKind) -> String {
             text,
             replacement,
         } => format!("regex_replace {pattern}, {text}, {replacement}"),
-        SsaInstKind::StringReplaceLiteral {
-            text,
-            needle,
-            replacement,
-        } => format!("string_replace_literal {text}, {needle}, {replacement}"),
+        SsaInstKind::StringReplaceLiteral { text, needle, replacement } => {
+            format!("string_replace_literal {text}, {needle}, {replacement}")
+        }
+        SsaInstKind::StringReplaceLiteralMany { text, needles, replacements } => {
+            format!("string_replace_literal_many {text}, {needles}, {replacements}")
+        }
         SsaInstKind::StringLowerAscii { text } => format!("string_lower_ascii {text}"),
+        SsaInstKind::TypeOf { value } => format!("type_of {value}"),
+        SsaInstKind::ToString { value } => format!("to_string {value}"),
         SsaInstKind::StringSplitLiteral { text, delimiter } => {
             format!("string_split_literal {text}, {delimiter}")
         }
