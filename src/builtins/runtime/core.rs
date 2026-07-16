@@ -425,7 +425,7 @@ pub(super) fn builtin_type_of_impl(value: VmValueRef<'_>) -> String {
 
 /// Convert a value into a display string.
 #[pd_host_function(name = "__to_string")]
-pub(super) fn builtin_to_string_impl(value: VmValueRef<'_>) -> String {
+pub(crate) fn builtin_to_string_impl(value: VmValueRef<'_>) -> String {
     render_value_for_display(value)
 }
 
@@ -790,6 +790,34 @@ pub(crate) fn builtin_string_replace_literal_impl(
         return text.to_string();
     }
     text.replace(needle, replacement)
+}
+
+/// Apply ordered literal replacements from parallel needle/replacement arrays.
+#[pd_host_function(name = "string_replace_literal")]
+pub(crate) fn builtin_string_replace_literal_many_impl(
+    text: VmStringRef<'_>,
+    needles: VmArrayRef<'_>,
+    replacements: VmArrayRef<'_>,
+) -> VmResult<String> {
+    if needles.len() != replacements.len() {
+        return Err(VmError::HostError(
+            "string_replace_literal array lengths must match".to_string(),
+        ));
+    }
+    let mut out = text.to_string();
+    for (needle, replacement) in needles.iter().zip(replacements.iter()) {
+        let (Value::String(needle), Value::String(replacement)) = (needle, replacement) else {
+            return Err(VmError::TypeMismatch("string arrays"));
+        };
+        if needle.is_empty() || out.contains(needle.as_str()) {
+            out = builtin_string_replace_literal_impl(
+                out.as_str(),
+                needle.as_str(),
+                replacement.as_str(),
+            );
+        }
+    }
+    Ok(out)
 }
 
 /// Lower ASCII `A`-`Z` bytes in `text` while preserving UTF-8.
