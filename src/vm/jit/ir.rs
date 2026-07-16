@@ -139,6 +139,15 @@ pub(crate) enum SsaInstKind {
         text: SsaValueId,
         needle: SsaValueId,
     },
+    RegexMatch {
+        pattern: SsaValueId,
+        text: SsaValueId,
+    },
+    RegexReplace {
+        pattern: SsaValueId,
+        text: SsaValueId,
+        replacement: SsaValueId,
+    },
     StringReplaceLiteral {
         text: SsaValueId,
         needle: SsaValueId,
@@ -331,6 +340,10 @@ pub(crate) enum SsaInstKind {
         lhs: SsaValueId,
         rhs: SsaValueId,
     },
+    ValueCmpEq {
+        lhs: SsaValueId,
+        rhs: SsaValueId,
+    },
     IntCmpLt {
         lhs: SsaValueId,
         rhs: SsaValueId,
@@ -379,6 +392,12 @@ impl SsaInstKind {
             Self::BytesGet { bytes, index } => vec![*bytes, *index],
             Self::BytesHas { bytes, index } => vec![*bytes, *index],
             Self::StringContains { text, needle } => vec![*text, *needle],
+            Self::RegexMatch { pattern, text } => vec![*pattern, *text],
+            Self::RegexReplace {
+                pattern,
+                text,
+                replacement,
+            } => vec![*pattern, *text, *replacement],
             Self::StringReplaceLiteral {
                 text,
                 needle,
@@ -422,6 +441,7 @@ impl SsaInstKind {
             | Self::FloatCmpLt { lhs, rhs }
             | Self::FloatCmpGt { lhs, rhs }
             | Self::IntCmpEq { lhs, rhs }
+            | Self::ValueCmpEq { lhs, rhs }
             | Self::IntCmpLt { lhs, rhs }
             | Self::IntCmpGt { lhs, rhs } => vec![*lhs, *rhs],
             Self::IntAddImm { lhs, .. }
@@ -993,6 +1013,14 @@ fn render_inst_kind(kind: &SsaInstKind) -> String {
         SsaInstKind::StringContains { text, needle } => {
             format!("string_contains {text}, {needle}")
         }
+        SsaInstKind::RegexMatch { pattern, text } => {
+            format!("regex_match {pattern}, {text}")
+        }
+        SsaInstKind::RegexReplace {
+            pattern,
+            text,
+            replacement,
+        } => format!("regex_replace {pattern}, {text}, {replacement}"),
         SsaInstKind::StringReplaceLiteral {
             text,
             needle,
@@ -1057,6 +1085,7 @@ fn render_inst_kind(kind: &SsaInstKind) -> String {
         SsaInstKind::FloatCmpLt { lhs, rhs } => format!("fcmp_lt {lhs}, {rhs}"),
         SsaInstKind::FloatCmpGt { lhs, rhs } => format!("fcmp_gt {lhs}, {rhs}"),
         SsaInstKind::IntCmpEq { lhs, rhs } => format!("icmp_eq {lhs}, {rhs}"),
+        SsaInstKind::ValueCmpEq { lhs, rhs } => format!("value_eq {lhs}, {rhs}"),
         SsaInstKind::IntCmpLt { lhs, rhs } => format!("icmp_lt {lhs}, {rhs}"),
         SsaInstKind::IntCmpLtImm { lhs, imm } => format!("icmp_lt_imm {lhs}, {imm}"),
         SsaInstKind::IntCmpGt { lhs, rhs } => format!("icmp_gt {lhs}, {rhs}"),

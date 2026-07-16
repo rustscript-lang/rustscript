@@ -1230,16 +1230,11 @@ fn trace_jit_preserves_local_move_semantics_across_fuel_yields() {
     );
 
     if native_jit_supported() {
-        let snapshot = vm.jit_snapshot();
         assert!(
-            snapshot
-                .attempts
-                .iter()
-                .any(|attempt| attempt.result.is_err()),
-            "string-equality loop should record an NYI attempt, dump:\n{}",
+            vm.jit_native_exec_count() > 0,
+            "string-equality loop should use native value_eq, dump:\n{}",
             vm.dump_jit_info()
         );
-        assert_eq!(vm.jit_native_exec_count(), 0);
     }
 }
 
@@ -1453,16 +1448,11 @@ fn trace_jit_preserves_local_move_semantics_across_epoch_yields() {
         Some(&Value::Int(50)),
         "move-heavy loop should preserve final result across epoch yields"
     );
-    let snapshot = vm.jit_snapshot();
     assert!(
-        snapshot
-            .attempts
-            .iter()
-            .any(|attempt| attempt.result.is_err()),
-        "string-equality loop should record an NYI attempt, dump:\n{}",
+        vm.jit_native_exec_count() > 0,
+        "string-equality loop should use native value_eq, dump:\n{}",
         vm.dump_jit_info()
     );
-    assert_eq!(vm.jit_native_exec_count(), 0);
 }
 
 #[test]
@@ -4629,4 +4619,93 @@ fn trace_jit_specializes_literal_string_builtins_without_call_boundary() {
         "literal string builtin loop should not use native helper bridges: {bridge_hits:?}\n{}",
         vm.dump_jit_info()
     );
+}
+
+#[test]
+fn trace_jit_specializes_loop_carried_string_builtins() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        let values: [string] = ["abc"];
+        let mut text: string = (&values)[0];
+        let mut i = 0;
+        let mut found = false;
+        let mut same = false;
+        while i < 8 {
+            same = (&text) == "abc";
+            found = string_contains(&text, "a");
+            text = string_replace_literal(text, "x", "x");
+            i = i + 1;
+        }
+        found;
+        same;
+        text;
+    "#;
+    let compiled =
+        compile_source(source).expect("loop-carried string builtin compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    assert_eq!(
+        vm.run()
+            .expect("loop-carried string builtin jit should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(
+        vm.stack(),
+        &[Value::Bool(true), Value::Bool(true), Value::string("abc")]
+    );
+    let snapshot = vm.jit_snapshot();
+    assert_native_ssa_specialized_trace(
+        &vm,
+        &snapshot,
+        "loop-carried string builtin",
+        &["value_eq", "string_contains", "string_replace_literal"],
+    );
+}
+
+#[test]
+fn trace_jit_specializes_regex_builtins_without_call_boundary() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        use re;
+        let mut i = 0;
+        let mut matched = false;
+        let mut replaced = "";
+        while i < 8 {
+            matched = re::match("(?i)^rustscript$", "RustScript");
+            replaced = re::replace("\\s+", "a b", "");
+            i = i + 1;
+        }
+        matched;
+        replaced;
+    "#;
+    let compiled = compile_source(source).expect("regex match compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    assert_eq!(
+        vm.run().expect("regex match jit should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Bool(true), Value::string("ab")]);
+    let snapshot = vm.jit_snapshot();
+    assert_native_ssa_specialized_trace(
+        &vm,
+        &snapshot,
+        "regex builtin loop",
+        &["regex_match", "regex_replace"],
+    );
+    assert_eq!(vm.regex_cache_entry_count(), 2);
+    assert_eq!(vm.regex_cache_compile_count(), 2);
+    assert!(vm.regex_cache_hit_count() >= 14);
 }

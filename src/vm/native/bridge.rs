@@ -203,6 +203,14 @@ pub(crate) fn string_contains_entry_address() -> usize {
     pd_vm_native_string_contains as *const () as usize
 }
 
+pub(crate) fn regex_match_entry_address() -> usize {
+    pd_vm_native_regex_match as *const () as usize
+}
+
+pub(crate) fn regex_replace_entry_address() -> usize {
+    pd_vm_native_regex_replace as *const () as usize
+}
+
 pub(crate) fn string_replace_literal_entry_address() -> usize {
     pd_vm_native_string_replace_literal as *const () as usize
 }
@@ -402,6 +410,59 @@ pub(crate) extern "C" fn pd_vm_native_string_contains(
             needle.as_str(),
         ),
     )
+}
+
+pub(crate) extern "C" fn pd_vm_native_regex_match(
+    vm: *mut Vm,
+    pattern_ptr: *mut u8,
+    text_ptr: *mut u8,
+) -> i32 {
+    let Some(vm_ref) = (unsafe { vm.as_mut() }) else {
+        store_bridge_error(VmError::JitNative(
+            "native regex-match helper received null vm pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    };
+    let pattern = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(pattern_ptr)) };
+    let text = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(text_ptr)) };
+    match crate::builtins::runtime::regex::native_re_match(vm_ref, pattern.as_str(), text.as_str())
+    {
+        Ok(matched) => i32::from(matched),
+        Err(err) => {
+            store_bridge_error(err);
+            STATUS_ERROR
+        }
+    }
+}
+
+pub(crate) extern "C" fn pd_vm_native_regex_replace(
+    vm: *mut Vm,
+    pattern_ptr: *mut u8,
+    text_ptr: *mut u8,
+    replacement_ptr: *mut u8,
+) -> *mut u8 {
+    let Some(vm_ref) = (unsafe { vm.as_mut() }) else {
+        store_bridge_error(VmError::JitNative(
+            "native regex-replace helper received null vm pointer".to_string(),
+        ));
+        return std::ptr::null_mut();
+    };
+    let pattern = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(pattern_ptr)) };
+    let text = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(text_ptr)) };
+    let replacement =
+        unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(replacement_ptr)) };
+    match crate::builtins::runtime::regex::native_re_replace(
+        vm_ref,
+        pattern.as_str(),
+        text.as_str(),
+        replacement.as_str(),
+    ) {
+        Ok(replaced) => arc_into_repr_ptr(Arc::new(replaced)),
+        Err(err) => {
+            store_bridge_error(err);
+            std::ptr::null_mut()
+        }
+    }
 }
 
 pub(crate) extern "C" fn pd_vm_native_string_replace_literal(
