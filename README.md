@@ -457,6 +457,16 @@ The `call` opcode pops its arguments, dispatches to a builtin or bound host func
 | `Yield` | Retry next `run()` | **Rewound to `call` opcode** | **Args re-pushed** |
 | `Pending(op_id)` | Async result pending | Advanced past `call` | Empty (result injected via `complete_host_op`) |
 
+**Non-yielding static host calls** — native-trace opt-in:
+
+- `Vm::bind_static_non_yielding_args_function` and
+  `Vm::register_static_non_yielding_args_function` let the trace JIT keep eligible host calls
+  inside native traces.
+- The function must return exactly one value via `CallOutcome::Return(CallReturn::One(...))`.
+  Returning no value, `Halt`, `Yield`, or `Pending` is a contract violation and produces the same
+  `VmError::HostError` in interpreted and native execution.
+- Use the ordinary static args APIs when the host function may suspend, halt, or return no value.
+
 **`CallOutcome::Yield`** — cooperative "retry me later":
 
 - The VM re-pushes the original args onto the stack and rewinds `self.ip` to the start of the

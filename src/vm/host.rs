@@ -439,6 +439,24 @@ pub(super) enum HostCallExecOutcome {
     Pending(HostOpId),
 }
 
+pub(crate) fn require_non_yielding_host_value(outcome: CallOutcome) -> VmResult<Value> {
+    match outcome {
+        CallOutcome::Return(CallReturn::One(value)) => Ok(value),
+        CallOutcome::Return(CallReturn::None) => Err(VmError::HostError(
+            "non-yielding host function returned no value".to_string(),
+        )),
+        CallOutcome::Halt => Err(VmError::HostError(
+            "non-yielding host function returned halt".to_string(),
+        )),
+        CallOutcome::Yield => Err(VmError::HostError(
+            "non-yielding host function returned yield".to_string(),
+        )),
+        CallOutcome::Pending(_) => Err(VmError::HostError(
+            "non-yielding host function returned pending".to_string(),
+        )),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct WaitingHostOp {
     pub(super) op_id: HostOpId,
@@ -516,9 +534,9 @@ impl Vm {
         index
     }
 
-    /// Registers a static args-only host function that always returns synchronously.
+    /// Registers a static args-only host function that always returns one value synchronously.
     ///
-    /// Violating this contract by returning `Halt`, `Yield`, or `Pending` is a host error.
+    /// Returning no value, `Halt`, `Yield`, or `Pending` violates the contract and is a host error.
     pub fn register_static_non_yielding_args_function(
         &mut self,
         function: StaticHostArgsFunction,
@@ -665,11 +683,11 @@ impl Vm {
         self.resolved_calls_dirty = true;
     }
 
-    /// Binds a static args-only host function that always returns synchronously.
+    /// Binds a static args-only host function that always returns one value synchronously.
     ///
     /// This is equivalent to [`Vm::bind_static_args_function`] except that the VM may keep
-    /// native JIT traces active across the call boundary. Returning `Halt`, `Yield`, or
-    /// `Pending` violates the contract and is reported as a host error.
+    /// native JIT traces active across the call boundary. Returning no value, `Halt`, `Yield`,
+    /// or `Pending` violates the contract and is reported as a host error.
     pub fn bind_static_non_yielding_args_function(
         &mut self,
         name: impl Into<String>,
@@ -1433,9 +1451,9 @@ impl Vm {
                 .get_mut(resolved_index as usize)
                 .ok_or(VmError::InvalidCall(resolved_index))?;
             match function {
-                VmHostFunction::ArgsDynamic(function) => function.call(args),
-                VmHostFunction::ArgsStatic(function)
-                | VmHostFunction::ArgsStaticNonYielding(function) => function(args),
+                VmHostFunction::ArgsDynamic(function) => (function.call(args), false),
+                VmHostFunction::ArgsStatic(function) => (function(args), false),
+                VmHostFunction::ArgsStaticNonYielding(function) => (function(args), true),
                 VmHostFunction::Dynamic(_)
                 | VmHostFunction::Static(_)
                 | VmHostFunction::StackDynamic(_)
@@ -1443,7 +1461,14 @@ impl Vm {
             }
         };
         self.call_depth = self.call_depth.saturating_sub(1);
+        let (outcome, non_yielding) = outcome;
         let outcome = outcome?;
+        if non_yielding {
+            let value = require_non_yielding_host_value(outcome)?;
+            self.stack.truncate(arg_start);
+            self.stack.push(value);
+            return Ok(HostCallExecOutcome::Returned);
+        }
 
         match outcome {
             CallOutcome::Return(values) => {

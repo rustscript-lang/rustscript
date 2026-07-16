@@ -930,23 +930,10 @@ pub(crate) extern "C" fn pd_vm_native_non_yielding_host_call(
     vm.call_depth = vm.call_depth.saturating_add(1);
     let outcome = function(args);
     vm.call_depth = vm.call_depth.saturating_sub(1);
-    match outcome {
-        Ok(CallOutcome::Return(CallReturn::One(value))) => {
+    match outcome.and_then(crate::vm::host::require_non_yielding_host_value) {
+        Ok(value) => {
             unsafe { std::ptr::write(out, value) };
             STATUS_CONTINUE
-        }
-        Ok(CallOutcome::Return(CallReturn::None)) => {
-            store_bridge_error(VmError::HostError(
-                "non-yielding native host call returned no value".to_string(),
-            ));
-            STATUS_ERROR
-        }
-        Ok(CallOutcome::Halt | CallOutcome::Yield | CallOutcome::Pending(_)) => {
-            store_bridge_error(VmError::HostError(
-                "non-yielding native host call violated its synchronous return contract"
-                    .to_string(),
-            ));
-            STATUS_ERROR
         }
         Err(err) => {
             store_bridge_error(err);

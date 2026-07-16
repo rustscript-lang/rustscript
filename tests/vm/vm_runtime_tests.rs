@@ -3,6 +3,45 @@ mod common;
 use common::*;
 use vm::OpCode;
 
+fn non_yielding_returns_none(_: &[Value]) -> Result<CallOutcome, vm::VmError> {
+    Ok(CallOutcome::Return(vm::CallReturn::none()))
+}
+
+fn non_yielding_halts(_: &[Value]) -> Result<CallOutcome, vm::VmError> {
+    Ok(CallOutcome::Halt)
+}
+
+fn non_yielding_yields(_: &[Value]) -> Result<CallOutcome, vm::VmError> {
+    Ok(CallOutcome::Yield)
+}
+
+fn non_yielding_pends(_: &[Value]) -> Result<CallOutcome, vm::VmError> {
+    Ok(CallOutcome::Pending(7))
+}
+
+#[test]
+fn non_yielding_args_contract_is_enforced_before_jit_compilation() {
+    let cases: [(&str, StaticHostArgsFunction); 4] = [
+        ("no value", non_yielding_returns_none),
+        ("halt", non_yielding_halts),
+        ("yield", non_yielding_yields),
+        ("pending", non_yielding_pends),
+    ];
+
+    for (expected, function) in cases {
+        let compiled = compile_source("fn action() -> int; action();")
+            .expect("host call source should compile");
+        let mut vm = Vm::new(compiled.program);
+        vm.bind_static_non_yielding_args_function("action", function);
+
+        let err = vm.run().expect_err("contract violation should fail");
+        assert!(
+            matches!(err, vm::VmError::HostError(ref detail) if detail.contains(expected)),
+            "unexpected error for {expected}: {err:?}"
+        );
+    }
+}
+
 fn builtin_call_index_with_arity(source: &str, argc: u8) -> u16 {
     let compiled = compile_source(source).expect("compile should succeed");
     let mut ip = 0usize;
