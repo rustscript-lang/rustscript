@@ -5,8 +5,8 @@ use crate::vm::{
     CallOutcome, CallReturn, HostCallExecOutcome, NumericValue, Vm, VmError, VmHostFunction,
     VmResult, logical_shr_i64,
 };
+use std::cell::RefCell;
 use std::sync::Arc;
-use std::sync::{Mutex, OnceLock};
 
 pub(crate) const STATUS_CONTINUE: i32 = 0;
 pub(crate) const STATUS_HALTED: i32 = 1;
@@ -72,29 +72,20 @@ impl NativeInterruptSettings {
     }
 }
 
-static GENERIC_BRIDGE_ERROR: OnceLock<Mutex<Option<VmError>>> = OnceLock::new();
-
-fn generic_bridge_error_cell() -> &'static Mutex<Option<VmError>> {
-    GENERIC_BRIDGE_ERROR.get_or_init(|| Mutex::new(None))
+thread_local! {
+    static GENERIC_BRIDGE_ERROR: RefCell<Option<VmError>> = const { RefCell::new(None) };
 }
 
 pub(crate) fn store_bridge_error(error: VmError) {
-    if let Ok(mut guard) = generic_bridge_error_cell().lock() {
-        *guard = Some(error);
-    }
+    GENERIC_BRIDGE_ERROR.with(|slot| *slot.borrow_mut() = Some(error));
 }
 
 pub(crate) fn clear_bridge_error() {
-    if let Ok(mut guard) = generic_bridge_error_cell().lock() {
-        *guard = None;
-    }
+    GENERIC_BRIDGE_ERROR.with(|slot| *slot.borrow_mut() = None);
 }
 
 pub(crate) fn take_bridge_error() -> Option<VmError> {
-    if let Ok(mut guard) = generic_bridge_error_cell().lock() {
-        return guard.take();
-    }
-    None
+    GENERIC_BRIDGE_ERROR.with(|slot| slot.borrow_mut().take())
 }
 
 fn arc_repr_word<T>(value: &Arc<T>) -> usize {
@@ -1161,6 +1152,28 @@ pub(crate) extern "C" fn pd_vm_native_step(vm: *mut Vm, op: i64, a: i64, b: i64,
 mod tests {
     use super::*;
     use std::mem::ManuallyDrop;
+
+    #[test]
+    fn bridge_errors_are_isolated_between_threads() {
+        clear_bridge_error();
+        store_bridge_error(VmError::HostError("main thread".to_string()));
+
+        std::thread::spawn(|| {
+            assert!(take_bridge_error().is_none());
+            store_bridge_error(VmError::HostError("worker thread".to_string()));
+            assert!(matches!(
+                take_bridge_error(),
+                Some(VmError::HostError(detail)) if detail == "worker thread"
+            ));
+        })
+        .join()
+        .expect("worker should finish");
+
+        assert!(matches!(
+            take_bridge_error(),
+            Some(VmError::HostError(detail)) if detail == "main thread"
+        ));
+    }
 
     #[test]
     fn sparse_exit_restore_accepts_null_buffers_for_zero_dirty_locals() {
