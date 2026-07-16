@@ -107,6 +107,10 @@ pub(super) fn builtin_re_match(vm: &mut Vm, pattern: &str, text: &str) -> VmResu
     Ok(regex.is_match(text))
 }
 
+pub(crate) fn native_re_match(vm: &mut Vm, pattern: &str, text: &str) -> VmResult<bool> {
+    builtin_re_match_impl(vm, pattern, text)
+}
+
 /// Returns the first substring matched by a regular expression.
 #[pd_host_function(name = "re::find")]
 pub(super) fn builtin_re_find(vm: &mut Vm, pattern: &str, text: &str) -> VmResult<Option<String>> {
@@ -124,6 +128,15 @@ pub(super) fn builtin_re_replace(
 ) -> VmResult<String> {
     let regex = cached_regex(vm, "re_replace", pattern)?;
     Ok(regex.replace_all(text, replacement).into_owned())
+}
+
+pub(crate) fn native_re_replace(
+    vm: &mut Vm,
+    pattern: &str,
+    text: &str,
+    replacement: &str,
+) -> VmResult<String> {
+    builtin_re_replace_impl(vm, pattern, text, replacement)
 }
 
 /// Splits a string on regular-expression matches.
