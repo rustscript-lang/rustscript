@@ -5,6 +5,7 @@ on:
     tags:
       - 'v*'
       - '[0-9]*'
+      - 'yank-pd-host-function-*'
   workflow_dispatch:
     inputs:
       version:
@@ -50,6 +51,11 @@ jobs:
           INPUT_YANK_HOST_VERSION: ${{ inputs.yank_pd_host_function_version }}
         run: |
           set -euo pipefail
+          if [[ "$GITHUB_REF_NAME" == yank-pd-host-function-* ]]; then
+            host_version="${GITHUB_REF_NAME#yank-pd-host-function-}"
+            cargo yank --vers "$host_version" pd-host-function
+            exit 0
+          fi
           version="${INPUT_VERSION:-${GITHUB_REF_NAME#v}}"
           if [[ -z "$version" ]]; then
             echo "version is required" >&2
