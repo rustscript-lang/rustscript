@@ -133,7 +133,7 @@ Files:
 Changes:
 
 - Add `ScriptFunction` metadata to `Program`.
-- Add only `OpCode::CallValue(u8)` in the real-frame milestone. `MakeClosure` belongs to the later escaping-closure work.
+- Add only `OpCode::CallValue(u8)` in the real-frame milestone. Environment construction belongs to the later escaping-closure work and must be selected by capture requirements, not source naming.
 - Keep existing `OpCode::Call(u16, u8)` unchanged for builtin/host imports.
 - Update opcode encoding/decoding and assembler helpers.
 - Update VMBC serialization/deserialization for the new function table.
@@ -272,8 +272,8 @@ Recommendation for the first milestone:
 
 Recommended later design:
 
-- use `MakeClosure(prototype_id)` from `function_as_value_plan.md` only when executing a capturing nested declaration or evaluating an anonymous function
-- executing `Stmt::FuncDecl` snapshots captures into that fresh closure environment
+- use the shared environment-binding lowering from `function_as_value_plan.md` when a closure expression or nested declaration captures outer state
+- execution snapshots captures into a fresh closure environment
 - calling the resulting value uses the same `CallValue` frame path
 
 That later work is closure-adjacent, even if callables are still not first-class `Value`s.
@@ -380,7 +380,7 @@ This avoids breaking CLI/runtime code that currently treats `CompiledProgram.fun
 
 ### Milestone 5: capturing nested functions
 
-- Add `MakeClosure` for anonymous functions and capturing nested declarations
+- Add the shared environment-binding runtime path for every capture-bearing callable
 - Migrate capturing nested `fn` declarations off the inline path
 - Revisit closure alignment after nested `fn` semantics are stable
 
