@@ -128,6 +128,12 @@ impl JitTrace {
             .filter(|dirty| **dirty)
             .count() as u64
     }
+
+    pub fn terminal_call_exit_ip(&self) -> Option<usize> {
+        (self.op_names.last().map(String::as_str) == Some("call"))
+            .then(|| self.ssa.exits.last().map(|exit| exit.exit_ip))
+            .flatten()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
