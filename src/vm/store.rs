@@ -2,8 +2,8 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::Value;
 use crate::compiler::TypeSchema;
-use crate::{ProgramInstanceId, Value};
 
 use super::{EpochCheckpoint, EpochHandle, FuelCheckpoint, Vm, VmError, VmResult, VmStatus};
 
@@ -32,7 +32,6 @@ pub trait ScriptResult: Sized {
 
 pub struct ScriptCallback<Args = Vec<Value>, Ret = Value> {
     store_id: u64,
-    program_instance: ProgramInstanceId,
     callable: Value,
     schema: Option<TypeSchema>,
     subscribed: Arc<AtomicBool>,
@@ -41,7 +40,6 @@ pub struct ScriptCallback<Args = Vec<Value>, Ret = Value> {
 
 pub struct QueuedScriptInvocation {
     store_id: u64,
-    program_instance: ProgramInstanceId,
     callable: Value,
     args: Vec<Value>,
 }
@@ -50,7 +48,6 @@ impl<Args, Ret> Clone for ScriptCallback<Args, Ret> {
     fn clone(&self) -> Self {
         Self {
             store_id: self.store_id,
-            program_instance: self.program_instance,
             callable: self.callable.clone(),
             schema: self.schema.clone(),
             subscribed: Arc::clone(&self.subscribed),
@@ -102,7 +99,6 @@ where
         }
         Ok(QueuedScriptInvocation {
             store_id: self.store_id,
-            program_instance: self.program_instance,
             callable: self.callable.clone(),
             args: args.into_values(),
         })
@@ -263,12 +259,6 @@ impl<T> Store<T> {
         let Value::Callable(value) = &callable else {
             return Err(VmError::InvalidCallable);
         };
-        if value.program_instance != self.vm.program_instance_id() {
-            return Err(VmError::StaleCallable {
-                expected: self.vm.program_instance_id(),
-                found: value.program_instance,
-            });
-        }
         let prototype = self
             .vm
             .program()
@@ -286,7 +276,6 @@ impl<T> Store<T> {
         }
         Ok(ScriptCallback {
             store_id: self.id,
-            program_instance: value.program_instance,
             callable,
             schema: prototype.schema.clone(),
             subscribed: Arc::new(AtomicBool::new(true)),
@@ -315,12 +304,6 @@ impl<T> Store<T> {
             return Err(VmError::InvalidFrameState(
                 "script callback belongs to another store",
             ));
-        }
-        if invocation.program_instance != self.vm.program_instance_id() {
-            return Err(VmError::StaleCallable {
-                expected: self.vm.program_instance_id(),
-                found: invocation.program_instance,
-            });
         }
         Ok(())
     }

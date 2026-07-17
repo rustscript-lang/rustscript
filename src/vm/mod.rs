@@ -1,6 +1,5 @@
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub(crate) mod aot;
@@ -25,7 +24,7 @@ pub use self::host::{
 };
 use self::host::{HostCallExecOutcome, VmHostFunction, WaitingHostOp};
 pub use crate::bytecode::{
-    CallableTarget, CallableValue, HostImport, OpCode, Program, ProgramInstanceId, Value, ValueType,
+    CallableTarget, CallableValue, HostImport, OpCode, Program, Value, ValueType,
 };
 use crate::bytecode::{StableHasher, hash_value};
 pub use store::{
@@ -79,10 +78,7 @@ pub enum VmError {
     },
     InvalidFrameState(&'static str),
     InvalidCallable,
-    StaleCallable {
-        expected: ProgramInstanceId,
-        found: ProgramInstanceId,
-    },
+
     InvalidCallablePrototype(u32),
     InvalidBranchTarget {
         target: usize,
@@ -144,10 +140,7 @@ impl std::fmt::Display for VmError {
                 write!(f, "invalid execution frame state: {message}")
             }
             VmError::InvalidCallable => write!(f, "callvalue operand is not callable"),
-            VmError::StaleCallable { expected, found } => write!(
-                f,
-                "stale callable program instance: expected {expected}, found {found}"
-            ),
+
             VmError::InvalidCallablePrototype(id) => {
                 write!(f, "invalid callable prototype {id}")
             }
@@ -200,12 +193,7 @@ impl std::error::Error for VmError {}
 
 pub type VmResult<T> = Result<T, VmError>;
 
-static NEXT_PROGRAM_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 const MAX_SCRIPT_CALL_DEPTH: usize = 1024;
-
-fn next_program_instance_id() -> ProgramInstanceId {
-    NEXT_PROGRAM_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VmStatus {
@@ -348,7 +336,6 @@ pub struct Vm {
     resolved_calls: Vec<u16>,
     resolved_calls_dirty: bool,
     call_depth: usize,
-    program_instance: ProgramInstanceId,
     execution_frames: Vec<ExecutionFrame>,
     host_return: Option<Value>,
     queued_callables: VecDeque<QueuedCallable>,
@@ -660,7 +647,6 @@ impl Vm {
             resolved_calls: Vec::new(),
             resolved_calls_dirty: true,
             call_depth: 0,
-            program_instance: next_program_instance_id(),
             execution_frames: vec![ExecutionFrame::root(local_count)],
             host_return: None,
             queued_callables: VecDeque::new(),
@@ -724,7 +710,6 @@ impl Vm {
                 continue;
             };
             *slot = Value::Callable(Arc::new(CallableValue {
-                program_instance: self.program_instance,
                 prototype_id: binding.prototype_id,
                 kind: prototype.kind,
                 env: None,
@@ -863,7 +848,6 @@ impl Vm {
         self.clear_stack_with_drop_contract();
         self.clear_locals_with_drop_contract();
         self.locals.resize(self.program.local_count, Value::Null);
-        self.program_instance = next_program_instance_id();
         self.initialize_root_callable_bindings();
         crate::builtins::runtime::close_all_handles(self);
         self.call_depth = 0;
@@ -1127,7 +1111,6 @@ impl Vm {
             None
         };
         Ok(Value::Callable(Arc::new(CallableValue {
-            program_instance: self.program_instance,
             prototype_id,
             kind: prototype.kind,
             env,
@@ -1145,12 +1128,6 @@ impl Vm {
         let Value::Callable(callable) = callee else {
             return Err(VmError::InvalidCallable);
         };
-        if callable.program_instance != self.program_instance {
-            return Err(VmError::StaleCallable {
-                expected: self.program_instance,
-                found: callable.program_instance,
-            });
-        }
         let prototype = self
             .program
             .callable_prototypes
@@ -1223,7 +1200,6 @@ impl Vm {
                         .get(binding.prototype_id as usize)
                         .ok_or(VmError::InvalidCallablePrototype(binding.prototype_id))?;
                     self.locals[local_base + relative] = Value::Callable(Arc::new(CallableValue {
-                        program_instance: self.program_instance,
                         prototype_id: binding.prototype_id,
                         kind: bound_prototype.kind,
                         env: None,
@@ -2469,23 +2445,12 @@ impl Vm {
         self.call_depth
     }
 
-    pub fn program_instance_id(&self) -> ProgramInstanceId {
-        self.program_instance
-    }
-
     pub fn queue_callable(&mut self, callable: Value, args: Vec<Value>) -> VmResult<()> {
         if self.shutdown {
             return Err(VmError::InvalidFrameState("vm is shut down"));
         }
-        match &callable {
-            Value::Callable(value) if value.program_instance == self.program_instance => {}
-            Value::Callable(value) => {
-                return Err(VmError::StaleCallable {
-                    expected: self.program_instance,
-                    found: value.program_instance,
-                });
-            }
-            _ => return Err(VmError::InvalidCallable),
+        if !matches!(&callable, Value::Callable(_)) {
+            return Err(VmError::InvalidCallable);
         }
         self.queued_callables
             .push_back(QueuedCallable { callable, args });
@@ -2532,7 +2497,6 @@ impl Vm {
         self.host_return = None;
         self.waiting_host_op = None;
         crate::builtins::runtime::close_all_handles(self);
-        self.program_instance = next_program_instance_id();
         self.shutdown = true;
     }
 
@@ -2540,15 +2504,8 @@ impl Vm {
         if self.shutdown {
             return Err(VmError::InvalidFrameState("vm is shut down"));
         }
-        match &callable {
-            Value::Callable(value) if value.program_instance != self.program_instance => {
-                return Err(VmError::StaleCallable {
-                    expected: self.program_instance,
-                    found: value.program_instance,
-                });
-            }
-            Value::Callable(_) => {}
-            _ => return Err(VmError::InvalidCallable),
+        if !matches!(&callable, Value::Callable(_)) {
+            return Err(VmError::InvalidCallable);
         }
         if !self.execution_frames.is_empty() {
             return Err(VmError::InvalidFrameState(

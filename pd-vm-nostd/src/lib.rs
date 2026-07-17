@@ -20,7 +20,7 @@ pub use program::{
     CallablePrototype, CallableTarget, FunctionRegion, HostImport, OpCode, Program,
     RootCallableBinding, ScriptFunction, ValueType,
 };
-pub use value::{CallableEnvironment, CallableKind, CallableValue, ProgramInstanceId, Value};
+pub use value::{CallableEnvironment, CallableKind, CallableValue, Value};
 pub use vm::{Vm, VmResult, VmStatus};
 pub use vmbc::decode_program;
 

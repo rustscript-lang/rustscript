@@ -23,14 +23,14 @@
 **Complete:**
 
 - Add Program-owned callable prototypes, script entry points, parameter/local layouts, capture layouts, source metadata, and instantiated generic signatures.
-- Add `Value::Callable { program_instance, prototype_id, kind, env }`; it must not own `Arc<Program>`.
+- Add Program-owned `Value::Callable { prototype_id, kind, env }`. Callable values follow their Program/Store lifetime and never retain an old `Program`.
 - Add frame-relative locals, a real execution-frame stack, and one `Ret` rule: complete the active frame and follow its typed continuation. Root execution uses an explicit `Halt` continuation; nested RSS calls use `ResumeBytecode`; Rust invocation uses `ReturnToHost`. Never infer return meaning from an empty call stack.
 - Add `CallValue(argc)` as the common RSS function-item/closure invocation path; retain existing `Call` for direct host/builtin imports.
 - Initialize capture-free named bindings from Program metadata.
 - Add one shared environment-binding path for every capture-bearing callable. Introduce a dedicated runtime operation only if existing VM operations cannot bind captures.
-- Validate `ProgramInstanceId` before prototype lookup; replaced/reset Program handles return `StaleCallable`.
+- Keep callable values inside their owning Program/Store. Program replacement and reset invalidate the old callable registry as a lifecycle operation; callable dispatch does not compare stale identities.
 
-**Acceptance:** Named calls, recursion, closure calls, arity failures, stale handles, return values, yield/pending, and resume all use real frames.
+**Acceptance:** Named calls, recursion, closure calls, arity failures, return values, yield/pending, and resume all use real frames.
 
 ## 3. Integrate captures, types, and generics
 
@@ -59,7 +59,7 @@
 - Release environments correctly on clone, overwrite, `Drop`, unwind, collection removal, return, cancellation, and reset; reject ownership cycles until cycle collection exists.
 - On Program replacement, REPL installation, or reuse reset: cancel callback work, remove listeners, clear callable roots/persisted callables, drop the old Program, and invalidate all external old handles.
 - Add Rust APIs to resolve exported RSS functions and invoke function items or closures through one resumable path.
-- Add typed `ScriptCallback<Args, Ret>` with Store identity, Program instance ID, and copied callable schema.
+- Add typed `ScriptCallback<Args, Ret>` with Store ownership and copied callable schema. It follows the Program registry and stores no stale Program identity.
 - Serialize callbacks through the Store queue; define FIFO/coalescing, cross-thread enqueue, unsubscribe, teardown, error, and return-value policies.
 - Verify that the final Rust-held callback releases captures exactly once.
 

@@ -42,7 +42,6 @@ pub struct Vm<C = ()> {
     host_dispatcher: Option<HostDispatcher<C>>,
     context: C,
     fuel: Option<u64>,
-    program_instance: u64,
     frames: Vec<ExecutionFrame>,
 }
 
@@ -86,7 +85,6 @@ impl<C> Vm<C> {
             host_dispatcher,
             context,
             fuel: None,
-            program_instance: 1,
             frames: Vec::new(),
         };
         vm.initialize_root_callables();
@@ -105,7 +103,6 @@ impl<C> Vm<C> {
             let slot = binding.local_slot as usize;
             if let Some(local) = self.locals.get_mut(slot) {
                 *local = Value::Callable(Rc::new(CallableValue {
-                    program_instance: self.program_instance,
                     prototype_id: binding.prototype_id,
                     kind: prototype.kind,
                     env: None,
@@ -136,7 +133,6 @@ impl<C> Vm<C> {
         }
         let env: CallableEnvironment = Rc::new(RefCell::new(captures));
         Ok(Value::Callable(Rc::new(CallableValue {
-            program_instance: self.program_instance,
             prototype_id,
             kind: prototype.kind,
             env: Some(env),
@@ -157,9 +153,6 @@ impl<C> Vm<C> {
             Value::Callable(callable) => callable,
             _ => return Err(VmError::InvalidCallable),
         };
-        if callable.program_instance != self.program_instance {
-            return Err(VmError::StaleCallable);
-        }
         let prototype = self
             .program
             .callable_prototypes()
@@ -215,7 +208,6 @@ impl<C> Vm<C> {
                         if slot < prototype.frame_local_count {
                             self.locals[local_base + slot] =
                                 Value::Callable(Rc::new(CallableValue {
-                                    program_instance: self.program_instance,
                                     prototype_id: binding.prototype_id,
                                     kind: binding_prototype.kind,
                                     env: None,

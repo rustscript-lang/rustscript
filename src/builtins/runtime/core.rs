@@ -912,7 +912,6 @@ mod tests {
     #[test]
     fn callable_map_keys_are_rejected() {
         let callable = Value::Callable(Arc::new(crate::CallableValue {
-            program_instance: 1,
             prototype_id: 0,
             kind: crate::CallableKind::FunctionItem,
             env: None,

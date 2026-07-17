@@ -12,7 +12,6 @@ pub type SharedBytes = Arc<Vec<u8>>;
 pub type SharedArray = Arc<Vec<Value>>;
 pub type SharedMap = Arc<VmMap>;
 pub type SharedCallable = Arc<CallableValue>;
-pub type ProgramInstanceId = u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CallableKind {
@@ -65,7 +64,6 @@ pub struct CallableEnvironment {
 
 #[derive(Clone, Debug)]
 pub struct CallableValue {
-    pub program_instance: ProgramInstanceId,
     pub prototype_id: u32,
     pub kind: CallableKind,
     pub env: Option<Arc<CallableEnvironment>>,
@@ -296,7 +294,6 @@ fn hash_map_key(value: &Value, state: &mut impl Hasher) {
         }
         Value::Callable(callable) => {
             7u8.hash(state);
-            callable.program_instance.hash(state);
             callable.prototype_id.hash(state);
             callable.kind.hash(state);
             callable.env.as_ref().map(Arc::as_ptr).hash(state);
@@ -378,7 +375,6 @@ pub(crate) fn hash_value(value: &Value, state: &mut impl Hasher) {
         }
         Value::Callable(callable) => {
             7u8.hash(state);
-            callable.program_instance.hash(state);
             callable.prototype_id.hash(state);
             callable.kind.hash(state);
             callable.env.as_ref().map(Arc::as_ptr).hash(state);
@@ -503,10 +499,7 @@ impl PartialEq for Value {
 }
 
 fn callable_value_eq(lhs: &CallableValue, rhs: &CallableValue) -> bool {
-    if lhs.program_instance != rhs.program_instance
-        || lhs.prototype_id != rhs.prototype_id
-        || lhs.kind != rhs.kind
-    {
+    if lhs.prototype_id != rhs.prototype_id || lhs.kind != rhs.kind {
         return false;
     }
     match (&lhs.env, &rhs.env) {
