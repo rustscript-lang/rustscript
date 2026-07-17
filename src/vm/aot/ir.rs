@@ -3,11 +3,12 @@ use std::collections::BTreeSet;
 use crate::builtins::BuiltinFunction;
 use crate::vm::{OpCode, Program, ValueType};
 
-use super::cfg::{AotBasicBlock, AotBlockTerminal, AotCfg, AotCfgError, build_cfg};
+use super::cfg::{AotBasicBlock, AotBlockTerminal, AotCfg, AotCfgError, AotCfgRegion, build_cfg};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AotProgram {
     pub(crate) entry_ip: usize,
+    pub(crate) regions: Vec<AotCfgRegion>,
     pub(crate) blocks: Vec<AotIrBlock>,
     pub(crate) resume_ips: Vec<usize>,
 }
@@ -47,7 +48,9 @@ pub(crate) enum AotBytesCodecKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AotInstruction {
     Nop,
-    Ldc { const_index: u32 },
+    Ldc {
+        const_index: u32,
+    },
     Add,
     IAdd,
     FAdd,
@@ -89,9 +92,19 @@ pub(crate) enum AotInstruction {
     FCgt,
     Pop,
     Dup,
-    Ldloc { index: u8 },
-    LdlocOwned { index: u8 },
-    Stloc { index: u8 },
+    Ldloc {
+        index: u8,
+    },
+    LdlocOwned {
+        index: u8,
+    },
+    Stloc {
+        index: u8,
+    },
+    MakeCallable {
+        prototype_id: u32,
+        capture_count: u8,
+    },
     Call(AotCall),
 }
 
@@ -151,6 +164,7 @@ fn lower_from_cfg(program: &Program, cfg: &AotCfg) -> Result<AotProgram, AotLowe
 
     Ok(AotProgram {
         entry_ip: cfg.entry_ip,
+        regions: cfg.regions.clone(),
         blocks,
         resume_ips: resume_ips.into_iter().collect(),
     })
@@ -315,7 +329,43 @@ fn lower_block(
                 }
                 apply_call_provenance(&mut provenance, argc, index);
             }
-            OpCode::CallValue | OpCode::MakeCallable => {
+            OpCode::MakeCallable => {
+                let prototype_id =
+                    read_u32(code, ip + 1).ok_or(AotLowerError::InvalidImmediate {
+                        ip,
+                        opcode,
+                        kind: "callable prototype id",
+                    })?;
+                let prototype = program
+                    .callable_prototypes
+                    .get(prototype_id as usize)
+                    .ok_or(AotLowerError::InvalidImmediate {
+                        ip,
+                        opcode,
+                        kind: "callable prototype id",
+                    })?;
+                let capture_count = u8::try_from(prototype.capture_slots.len()).map_err(|_| {
+                    AotLowerError::InvalidImmediate {
+                        ip,
+                        opcode,
+                        kind: "callable capture count",
+                    }
+                })?;
+                instructions.push(AotInstruction::MakeCallable {
+                    prototype_id,
+                    capture_count,
+                });
+                if let Some(stack) = provenance.as_mut() {
+                    let capture_count = capture_count as usize;
+                    if stack.len() < capture_count {
+                        provenance = None;
+                    } else {
+                        stack.truncate(stack.len() - capture_count);
+                        stack.push(AotStackProvenance::Derived);
+                    }
+                }
+            }
+            OpCode::CallValue => {
                 return Err(AotLowerError::InvalidImmediate {
                     ip,
                     opcode,
@@ -494,6 +544,14 @@ fn is_explicit_terminal_opcode(
             && read_u32(code, ip + 1) == Some(*target_ip as u32)
             && next_ip == *fallthrough_ip),
         AotBlockTerminal::Fallthrough { .. } => Ok(false),
+        AotBlockTerminal::CallValue {
+            argc,
+            call_ip,
+            resume_ip,
+        } => Ok(opcode == OpCode::CallValue
+            && read_u8(code, ip + 1) == Some(*argc)
+            && ip == *call_ip
+            && next_ip == *resume_ip),
         AotBlockTerminal::InterpreterExit { exit_ip } => {
             Ok(matches!(opcode, OpCode::CallValue | OpCode::MakeCallable) && ip == *exit_ip)
         }
@@ -905,6 +963,41 @@ mod tests {
                 AotInstruction::Ldc { const_index: 6 },
                 AotInstruction::BytesCodec(AotBytesCodecKind::ToArrayU8),
             ]
+        );
+    }
+
+    #[test]
+    fn aot_ir_keeps_make_callable_and_call_value_explicit() {
+        let compiled = crate::compile_source_for_repl(
+            r#"
+                let delta = 1;
+                let function = |value| value + delta;
+                function(41);
+            "#,
+        )
+        .expect("closure source should compile");
+        let lowered = lower_program(&compiled.program).expect("lowering should succeed");
+
+        assert_eq!(lowered.regions.len(), 2);
+        assert!(
+            lowered
+                .blocks
+                .iter()
+                .any(
+                    |block| block.instructions.iter().any(|instruction| matches!(
+                        instruction,
+                        AotInstruction::MakeCallable {
+                            prototype_id: 0,
+                            capture_count: 1
+                        }
+                    ))
+                )
+        );
+        assert!(
+            lowered
+                .blocks
+                .iter()
+                .any(|block| matches!(block.terminal, AotBlockTerminal::CallValue { argc: 1, .. }))
         );
     }
 

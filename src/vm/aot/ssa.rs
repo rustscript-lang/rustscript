@@ -1351,6 +1351,12 @@ impl<'a> Builder<'a> {
                         resume_frame,
                     });
                 }
+                if matches!(step.instruction, AotInstruction::MakeCallable { .. }) {
+                    return Ok(ProcessResult::InterpreterBoundary {
+                        ip: step.ip,
+                        frame: frame.clone(),
+                    });
+                }
                 return Err(AotSsaBuildError::UnsupportedInstruction {
                     ip: step.ip,
                     instruction: format!("{:?}", step.instruction),
@@ -1402,6 +1408,10 @@ impl<'a> Builder<'a> {
                     frame: frame.clone(),
                 })
             }
+            AotBlockTerminal::CallValue { call_ip, .. } => Ok(ProcessResult::InterpreterBoundary {
+                ip: *call_ip,
+                frame: frame.clone(),
+            }),
             AotBlockTerminal::Return => Ok(ProcessResult::Return {
                 ip: block
                     .terminal_ip
@@ -1459,6 +1469,7 @@ fn terminal_ip(block: &super::ir::AotIrBlock) -> Option<usize> {
             block.end_ip.checked_sub(5)
         }
         AotBlockTerminal::Fallthrough { .. } | AotBlockTerminal::Stop => None,
+        AotBlockTerminal::CallValue { call_ip, .. } => Some(call_ip),
         AotBlockTerminal::InterpreterExit { exit_ip } => Some(exit_ip),
     }
 }
@@ -1951,7 +1962,7 @@ fn apply_direct_instruction<E: InstEmitter>(
                 _ => None,
             })
         }
-        AotInstruction::Call(_) => Ok(false),
+        AotInstruction::Call(_) | AotInstruction::MakeCallable { .. } => Ok(false),
     }
 }
 
