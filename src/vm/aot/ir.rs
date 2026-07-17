@@ -48,9 +48,7 @@ pub(crate) enum AotBytesCodecKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AotInstruction {
     Nop,
-    Ldc {
-        const_index: u32,
-    },
+    Ldc { const_index: u32 },
     Add,
     IAdd,
     FAdd,
@@ -92,19 +90,9 @@ pub(crate) enum AotInstruction {
     FCgt,
     Pop,
     Dup,
-    Ldloc {
-        index: u8,
-    },
-    LdlocOwned {
-        index: u8,
-    },
-    Stloc {
-        index: u8,
-    },
-    MakeCallable {
-        prototype_id: u32,
-        capture_count: u8,
-    },
+    Ldloc { index: u8 },
+    LdlocOwned { index: u8 },
+    Stloc { index: u8 },
     Call(AotCall),
 }
 
@@ -329,42 +317,7 @@ fn lower_block(
                 }
                 apply_call_provenance(&mut provenance, argc, index);
             }
-            OpCode::MakeCallable => {
-                let prototype_id =
-                    read_u32(code, ip + 1).ok_or(AotLowerError::InvalidImmediate {
-                        ip,
-                        opcode,
-                        kind: "callable prototype id",
-                    })?;
-                let prototype = program
-                    .callable_prototypes
-                    .get(prototype_id as usize)
-                    .ok_or(AotLowerError::InvalidImmediate {
-                        ip,
-                        opcode,
-                        kind: "callable prototype id",
-                    })?;
-                let capture_count = u8::try_from(prototype.capture_slots.len()).map_err(|_| {
-                    AotLowerError::InvalidImmediate {
-                        ip,
-                        opcode,
-                        kind: "callable capture count",
-                    }
-                })?;
-                instructions.push(AotInstruction::MakeCallable {
-                    prototype_id,
-                    capture_count,
-                });
-                if let Some(stack) = provenance.as_mut() {
-                    let capture_count = capture_count as usize;
-                    if stack.len() < capture_count {
-                        provenance = None;
-                    } else {
-                        stack.truncate(stack.len() - capture_count);
-                        stack.push(AotStackProvenance::Derived);
-                    }
-                }
-            }
+
             OpCode::CallValue => {
                 return Err(AotLowerError::InvalidImmediate {
                     ip,
@@ -553,7 +506,7 @@ fn is_explicit_terminal_opcode(
             && ip == *call_ip
             && next_ip == *resume_ip),
         AotBlockTerminal::InterpreterExit { exit_ip } => {
-            Ok(matches!(opcode, OpCode::CallValue | OpCode::MakeCallable) && ip == *exit_ip)
+            Ok(opcode == OpCode::CallValue && ip == *exit_ip)
         }
         AotBlockTerminal::Stop => Ok(false),
     }
@@ -967,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn aot_ir_keeps_make_callable_and_call_value_explicit() {
+    fn aot_ir_uses_existing_call_opcode_for_callable_binding() {
         let compiled = crate::compile_source_for_repl(
             r#"
                 let delta = 1;
@@ -979,20 +932,19 @@ mod tests {
         let lowered = lower_program(&compiled.program).expect("lowering should succeed");
 
         assert_eq!(lowered.regions.len(), 2);
-        assert!(
-            lowered
-                .blocks
-                .iter()
-                .any(
-                    |block| block.instructions.iter().any(|instruction| matches!(
-                        instruction,
-                        AotInstruction::MakeCallable {
-                            prototype_id: 0,
-                            capture_count: 1
-                        }
-                    ))
+        assert!(lowered.blocks.iter().any(|block| {
+            block.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    AotInstruction::Call(AotCall {
+                        index,
+                        argc: 2,
+                        dispatch: AotCallDispatch::Builtin,
+                        ..
+                    }) if *index == BuiltinFunction::BindCallable.call_index()
                 )
-        );
+            })
+        }));
         assert!(
             lowered
                 .blocks

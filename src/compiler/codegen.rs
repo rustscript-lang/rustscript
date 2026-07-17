@@ -1033,9 +1033,6 @@ impl Compiler {
         if function_impl.capture_copies.is_empty() {
             return Ok(());
         }
-        for (source_index, _) in &function_impl.capture_copies {
-            self.emit_copy_ldloc(*source_index)?;
-        }
         let prototype_id = *self
             .function_prototype_ids
             .get(&index)
@@ -1044,7 +1041,13 @@ impl Compiler {
             .function_slots
             .get(&index)
             .ok_or(CompileError::CallableUsedAsValue)?;
-        self.assembler.make_callable(prototype_id);
+        self.emit_bind_callable(
+            prototype_id,
+            function_impl
+                .capture_copies
+                .iter()
+                .map(|(source, _)| *source),
+        )?;
         self.emit_stloc(slot)?;
         Ok(())
     }
@@ -1442,9 +1445,6 @@ impl Compiler {
         closure: &ClosureExpr,
         binding_slot: Option<LocalSlot>,
     ) -> Result<u32, CompileError> {
-        for (source_slot, _) in &closure.capture_copies {
-            self.emit_copy_ldloc(*source_slot)?;
-        }
         let prototype_id = self.callable_prototypes.len() as u32;
         self.callable_prototypes.push(CallablePrototype {
             kind: CallableKind::Closure,
@@ -1467,8 +1467,30 @@ impl Compiler {
             schema: None,
         });
         self.pending_closures.push((prototype_id, closure.clone()));
-        self.assembler.make_callable(prototype_id);
+        self.emit_bind_callable(
+            prototype_id,
+            closure.capture_copies.iter().map(|(source, _)| *source),
+        )?;
         Ok(prototype_id)
+    }
+
+    fn emit_bind_callable(
+        &mut self,
+        prototype_id: u32,
+        capture_slots: impl IntoIterator<Item = LocalSlot>,
+    ) -> Result<(), CompileError> {
+        self.assembler
+            .push_const(Value::Int(i64::from(prototype_id)));
+        self.assembler
+            .call(BuiltinFunction::ArrayNew.call_index(), 0);
+        for source_slot in capture_slots {
+            self.emit_copy_ldloc(source_slot)?;
+            self.assembler
+                .call(BuiltinFunction::ArrayPush.call_index(), 2);
+        }
+        self.assembler
+            .call(BuiltinFunction::BindCallable.call_index(), 2);
+        Ok(())
     }
 
     fn compile_direct_call(&mut self, index: u16, args: &[Expr]) -> Result<(), CompileError> {

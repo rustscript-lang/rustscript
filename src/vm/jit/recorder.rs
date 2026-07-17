@@ -197,11 +197,16 @@ struct AnalysisFrame {
 }
 
 impl AnalysisFrame {
-    fn new(program: &Program, entry_stack_depth: usize, local_count: usize) -> Self {
+    fn new(
+        program: &Program,
+        entry_stack_depth: usize,
+        local_count: usize,
+        entry_local_types: Option<&[ValueType]>,
+    ) -> Self {
         Self {
             stack: vec![ValueInfo::tagged(); entry_stack_depth],
             locals: (0..local_count)
-                .map(|local| entry_local_info(program, local))
+                .map(|local| entry_local_info(program, local, entry_local_types))
                 .collect(),
         }
     }
@@ -231,12 +236,21 @@ impl AnalysisFrame {
     }
 }
 
-fn entry_local_info(program: &Program, local: usize) -> ValueInfo {
-    let known_type = program
-        .type_map
-        .as_ref()
-        .and_then(|type_map| type_map.local_types.get(local))
+fn entry_local_info(
+    program: &Program,
+    local: usize,
+    entry_local_types: Option<&[ValueType]>,
+) -> ValueInfo {
+    let known_type = entry_local_types
+        .and_then(|types| types.get(local))
         .copied()
+        .or_else(|| {
+            program
+                .type_map
+                .as_ref()
+                .and_then(|type_map| type_map.local_types.get(local))
+                .copied()
+        })
         .filter(|ty| *ty != ValueType::Unknown);
     known_type.map_or_else(ValueInfo::tagged, ValueInfo::tagged_typed)
 }
@@ -372,8 +386,10 @@ enum DecodedOp {
         argc: u8,
         yields: bool,
     },
-    InterpreterBoundary {
+    CallValue {
         ip: usize,
+        argc: u8,
+        resume_ip: usize,
     },
 }
 
@@ -388,7 +404,7 @@ impl DecodedOp {
             | Self::Dup { .. }
             | Self::Br { .. }
             | Self::Call { .. }
-            | Self::InterpreterBoundary { .. } => false,
+            | Self::CallValue { .. } => false,
             Self::Stloc { .. }
             | Self::Neg { .. }
             | Self::Not { .. }
@@ -677,13 +693,14 @@ impl<'a> TraceCursor<'a> {
                 }
             }
         } else if opcode == OpCode::CallValue as u8 {
-            let _argc = read_u8(&self.program.code, &mut self.ip)
+            self.recorded_ops += 1;
+            let argc = read_u8(&self.program.code, &mut self.ip)
                 .ok_or(TraceRecordError::InvalidImmediate("callvalue argc"))?;
-            DecodedOp::InterpreterBoundary { ip: instr_ip }
-        } else if opcode == OpCode::MakeCallable as u8 {
-            let _prototype_id = read_u32(&self.program.code, &mut self.ip)
-                .ok_or(TraceRecordError::InvalidImmediate("makecallable prototype"))?;
-            DecodedOp::InterpreterBoundary { ip: instr_ip }
+            DecodedOp::CallValue {
+                ip: instr_ip,
+                argc,
+                resume_ip: self.ip,
+            }
         } else {
             return Err(TraceRecordError::UnsupportedOpcode(opcode));
         };
@@ -705,6 +722,7 @@ pub(crate) fn record_trace(
         root_ip,
         entry_stack_depth,
         program.local_count,
+        None,
         max_trace_len,
         non_yielding_host_imports,
     )
@@ -715,6 +733,7 @@ pub(crate) fn record_trace_with_local_count(
     root_ip: usize,
     entry_stack_depth: usize,
     local_count: usize,
+    entry_local_types: Option<&[ValueType]>,
     max_trace_len: usize,
     non_yielding_host_imports: &[bool],
 ) -> Result<RecordedTrace, TraceRecordError> {
@@ -723,6 +742,7 @@ pub(crate) fn record_trace_with_local_count(
         root_ip,
         entry_stack_depth,
         local_count,
+        entry_local_types,
         max_trace_len,
         non_yielding_host_imports,
     )?;
@@ -747,7 +767,7 @@ pub(crate) fn record_trace_with_local_count(
                 .append_param(entry, SsaValueRepr::Tagged, format!("local{local}"))
                 .map(|value| SymbolicValue {
                     value,
-                    info: entry_local_info(program, local),
+                    info: entry_local_info(program, local, entry_local_types),
                 })
                 .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))
         })
@@ -1166,8 +1186,16 @@ pub(crate) fn record_trace_with_local_count(
                 }
                 cursor.jump_to(target)?;
             }
-            DecodedOp::InterpreterBoundary { ip } => {
-                op_names.push("callable_boundary".to_string());
+
+            DecodedOp::CallValue {
+                ip,
+                argc,
+                resume_ip,
+            } => {
+                if frame.stack.len() < usize::from(argc) + 1 {
+                    return Err(TraceRecordError::StackUnderflow);
+                }
+                op_names.push("call_value".to_string());
                 let exit = builder.add_exit(
                     ip,
                     materialize_stack(&frame.stack),
@@ -1175,9 +1203,19 @@ pub(crate) fn record_trace_with_local_count(
                     frame.dirty_locals.clone(),
                 );
                 builder
-                    .set_terminator(current_block, SsaTerminator::Exit { exit })
+                    .set_terminator(
+                        current_block,
+                        SsaTerminator::CallValue {
+                            argc,
+                            call_ip: ip,
+                            resume_ip,
+                            exit,
+                        },
+                    )
                     .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-                terminal = Some(JitTraceTerminal::BranchExit);
+                has_call = true;
+                has_yielding_call = true;
+                terminal = Some(JitTraceTerminal::CallValue);
                 break;
             }
             DecodedOp::Call {
@@ -1302,11 +1340,12 @@ fn infer_loop_header_plan(
     root_ip: usize,
     entry_stack_depth: usize,
     local_count: usize,
+    entry_local_types: Option<&[ValueType]>,
     max_trace_len: usize,
     non_yielding_host_imports: &[bool],
 ) -> Result<Option<LoopHeaderPlan>, TraceRecordError> {
     let mut cursor = TraceCursor::new(program, root_ip, max_trace_len);
-    let mut frame = AnalysisFrame::new(program, entry_stack_depth, local_count);
+    let mut frame = AnalysisFrame::new(program, entry_stack_depth, local_count, entry_local_types);
     let mut entry_use = vec![EntryUseState::Untouched; local_count];
     let mut local_written = vec![false; local_count];
 
@@ -1471,8 +1510,7 @@ fn infer_loop_header_plan(
                     .unwrap_or(ValueType::Unknown);
                 frame.push(ValueInfo::tagged_typed(return_type));
             }
-            DecodedOp::Call { .. } => return Ok(None),
-            DecodedOp::InterpreterBoundary { .. } => return Ok(None),
+            DecodedOp::Call { .. } | DecodedOp::CallValue { .. } => return Ok(None),
             DecodedOp::Brfalse {
                 target,
                 fallthrough_ip,
@@ -1635,7 +1673,11 @@ fn select_numeric_binop(
         };
         return Ok(NumericBinOpKind::Float(kind));
     }
-    let operand_types = operand_types(program, ip);
+    let static_operand_types = operand_types(program, ip);
+    let operand_types = (
+        lhs.known_type.unwrap_or(static_operand_types.0),
+        rhs.known_type.unwrap_or(static_operand_types.1),
+    );
     let observed_concat = observed_concat_binop_kind(lhs, rhs);
     let int_like = matches!(lhs.repr, SsaValueRepr::I64 | SsaValueRepr::Tagged)
         && matches!(rhs.repr, SsaValueRepr::I64 | SsaValueRepr::Tagged);
@@ -1689,9 +1731,10 @@ fn select_numeric_binop(
             {
                 Ok(NumericBinOpKind::Float(FloatBinOpKind::Add))
             }
-            _ => Err(TraceRecordError::UnsupportedTrace(
-                "SSA recorder requires int- or float-specializable add operands".to_string(),
-            )),
+            _ => Err(TraceRecordError::UnsupportedTrace(format!(
+                "SSA recorder requires int- or float-specializable add operands (types={operand_types:?}, lhs={:?}, rhs={:?})",
+                lhs.repr, rhs.repr
+            ))),
         },
         x if x == OpCode::Sub as u8 => match operand_types {
             (ValueType::Int, ValueType::Int) => Ok(NumericBinOpKind::Int(IntBinOpKind::Sub)),
@@ -4564,20 +4607,20 @@ mod tests {
     }
 
     #[test]
-    fn callable_opcodes_decode_as_explicit_interpreter_boundaries() {
+    fn callable_opcodes_decode_with_explicit_trace_semantics() {
         let mut bytecode = BytecodeBuilder::new();
         bytecode.call_value(2);
-        bytecode.make_callable(7);
         let program = Program::new(Vec::new(), bytecode.finish());
         let mut cursor = TraceCursor::new(&program, 0, 8);
         assert!(matches!(
             cursor.next().expect("callvalue decode"),
-            Some(DecodedOp::InterpreterBoundary { ip: 0 })
+            Some(DecodedOp::CallValue {
+                ip: 0,
+                argc: 2,
+                resume_ip: 2
+            })
         ));
-        assert!(matches!(
-            cursor.next().expect("makecallable decode"),
-            Some(DecodedOp::InterpreterBoundary { ip: 2 })
-        ));
+        assert!(cursor.next().expect("trace end").is_none());
     }
 
     #[test]

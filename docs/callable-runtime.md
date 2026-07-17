@@ -6,7 +6,7 @@ RustScript bytecode format version 9 introduces runtime script call frames and f
 
 - `call <import:u16> <argc:u8>` remains the direct host/builtin operation.
 - `callvalue <argc:u8>` consumes a stack segment in `callee, arg0, ..., argN` order.
-- `makecallable <prototype:u32>` consumes the capture values declared by the prototype and pushes a callable value.
+- callable environments are bound through the internal builtin call path; callable creation adds no bytecode opcode.
 - `ret` completes the active script frame. A nested frame leaves exactly one result at the caller segment base, using `null` when the body produced no value. Root `ret` keeps the historical program-result stack behavior.
 
 VMBC v9 is a hard format boundary. Decoders reject older versions. The stream includes script-function entry ranges, callable prototypes, function regions, and root callable bindings. PDRC recordings and AOT artifacts use their corresponding bumped format/ABI versions and include callable metadata in cache identity.
@@ -36,8 +36,8 @@ PDRC recordings preserve full execution-frame metadata. Callable environments us
 
 ## Optimized backends
 
-Whole-program AOT treats callable creation and invocation as verified interpreter boundaries: live stack/local state is materialized and execution resumes at the boundary opcode. Trace JIT records the same operations as explicit side exits. Script-frame bodies currently execute through the frame-aware interpreter after that boundary; the backend never treats `callvalue` as an ordinary host call.
+Whole-program AOT and Trace JIT use the same builtin call path for environment binding and native frame dispatch for `callvalue`. Script-frame entry and return preserve frame-relative locals and typed continuations.
 
 ## Embedded runtime
 
-`pd-vm-nostd` decodes the same VMBC v9 callable metadata and executes `makecallable`, `callvalue`, recursive frames, captures, and direct host targets using `core` plus `alloc`.
+`pd-vm-nostd` decodes the same VMBC v9 callable metadata and executes callable binding, `callvalue`, recursive frames, captures, and direct host targets using `core` plus `alloc`.

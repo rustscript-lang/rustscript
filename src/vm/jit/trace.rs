@@ -42,8 +42,9 @@ fn native_jit_supported() -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum JitTraceTerminal {
     LoopBack,
-    BranchExit,
     Halt,
+    BranchExit,
+    CallValue,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,6 +251,17 @@ impl TraceJitEngine {
         stack_depth: usize,
         program: &Program,
     ) -> Option<usize> {
+        self.observe_hot_entry_with_local_types(frame_key, ip, stack_depth, None, program)
+    }
+
+    pub(crate) fn observe_hot_entry_with_local_types(
+        &mut self,
+        frame_key: u64,
+        ip: usize,
+        stack_depth: usize,
+        entry_local_types: Option<&[crate::ValueType]>,
+        program: &Program,
+    ) -> Option<usize> {
         if !self.config.enabled || !native_jit_supported() {
             return None;
         }
@@ -280,7 +292,7 @@ impl TraceJitEngine {
         let result = if self.config.hot_loop_threshold == 0 {
             Err(JitNyiReason::HotLoopThresholdZero)
         } else {
-            self.compile_trace(program, key)
+            self.compile_trace(program, key, entry_local_types)
         };
         self.finish_attempt(key, line, result)
     }
@@ -298,6 +310,17 @@ impl TraceJitEngine {
         frame_key: u64,
         ip: usize,
         stack_depth: usize,
+        program: &Program,
+    ) -> Option<usize> {
+        self.observe_exit_entry_with_local_types(frame_key, ip, stack_depth, None, program)
+    }
+
+    pub(crate) fn observe_exit_entry_with_local_types(
+        &mut self,
+        frame_key: u64,
+        ip: usize,
+        stack_depth: usize,
+        entry_local_types: Option<&[crate::ValueType]>,
         program: &Program,
     ) -> Option<usize> {
         if !self.config.enabled || !native_jit_supported() {
@@ -328,7 +351,7 @@ impl TraceJitEngine {
         let result = if self.config.hot_loop_threshold == 0 {
             Err(JitNyiReason::HotLoopThresholdZero)
         } else {
-            self.compile_trace(program, key)
+            self.compile_trace(program, key, entry_local_types)
         };
         self.finish_attempt(key, line, result)
     }
@@ -514,6 +537,7 @@ impl TraceJitEngine {
         &mut self,
         program: &Program,
         key: TraceEntryKey,
+        entry_local_types: Option<&[crate::ValueType]>,
     ) -> Result<usize, JitNyiReason> {
         let local_count = if key.frame_key == ROOT_FRAME_KEY {
             program.local_count
@@ -534,6 +558,7 @@ impl TraceJitEngine {
             key.root_ip,
             key.stack_depth,
             local_count,
+            entry_local_types,
             self.config.max_trace_len,
             &self.non_yielding_host_imports,
         )

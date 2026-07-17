@@ -189,13 +189,12 @@ pub enum OpCode {
     Not = 0x17,
     Lshr = 0x18,
     CallValue = 0x19,
-    MakeCallable = 0x1a,
 }
 
 impl OpCode {
     pub const fn operand_len(self) -> usize {
         match self {
-            Self::Ldc | Self::Br | Self::Brfalse | Self::MakeCallable => 4,
+            Self::Ldc | Self::Br | Self::Brfalse => 4,
             Self::Ldloc | Self::Stloc | Self::CallValue => 1,
             Self::Call => 3,
             _ => 0,
@@ -234,7 +233,6 @@ impl TryFrom<u8> for OpCode {
             0x17 => Ok(Self::Not),
             0x18 => Ok(Self::Lshr),
             0x19 => Ok(Self::CallValue),
-            0x1a => Ok(Self::MakeCallable),
             _ => Err(()),
         }
     }

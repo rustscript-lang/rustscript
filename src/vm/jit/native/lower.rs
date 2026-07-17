@@ -15,22 +15,23 @@ use crate::vm::native::{
     array_set_signature, box_heap_value_signature, checked_add_i32, clear_value_slot_entry_address,
     clone_value_signature, clone_value_to_slot_entry_address, collection_get_signature,
     collection_predicate_signature, copy_bytes_entry_address, copy_bytes_signature,
-    detect_native_stack_layout, entry_signature, frame_state_entry_address, frame_state_signature,
-    free_buffer_signature, jump_with_status, leave_frame_entry_address, leave_frame_signature,
-    map_get_entry_address, map_has_entry_address, map_iter_next_entry_address,
-    map_iter_next_signature, map_iter_take_key_entry_address, map_iter_take_signature,
-    map_iter_take_value_entry_address, map_set_entry_address, map_set_signature,
-    non_yielding_host_call_entry_address, non_yielding_host_call_signature, pack_shared_signature,
-    regex_match_entry_address, regex_match_signature, regex_replace_entry_address,
-    regex_replace_signature, restore_active_sparse_exit_state_entry_address,
-    shared_array_from_buffer_entry_address, shared_bytes_from_buffer_entry_address,
-    shared_string_from_buffer_entry_address, sparse_restore_exit_signature,
-    string_binary_transform_signature, string_contains_entry_address, string_contains_signature,
-    string_lower_ascii_entry_address, string_replace_literal_entry_address,
-    string_replace_signature, string_split_literal_entry_address, string_unary_transform_signature,
-    to_string_entry_address, type_of_entry_address, value_eq_entry_address, value_eq_signature,
-    value_len_entry_address, value_len_signature, value_slot_signature,
-    write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
+    detect_native_stack_layout, enter_call_value_entry_address, enter_call_value_signature,
+    entry_signature, frame_state_entry_address, frame_state_signature, free_buffer_signature,
+    jump_with_status, leave_frame_entry_address, leave_frame_signature, map_get_entry_address,
+    map_has_entry_address, map_iter_next_entry_address, map_iter_next_signature,
+    map_iter_take_key_entry_address, map_iter_take_signature, map_iter_take_value_entry_address,
+    map_set_entry_address, map_set_signature, non_yielding_host_call_entry_address,
+    non_yielding_host_call_signature, pack_shared_signature, regex_match_entry_address,
+    regex_match_signature, regex_replace_entry_address, regex_replace_signature,
+    restore_active_sparse_exit_state_entry_address, shared_array_from_buffer_entry_address,
+    shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
+    sparse_restore_exit_signature, string_binary_transform_signature,
+    string_contains_entry_address, string_contains_signature, string_lower_ascii_entry_address,
+    string_replace_literal_entry_address, string_replace_signature,
+    string_split_literal_entry_address, string_unary_transform_signature, to_string_entry_address,
+    type_of_entry_address, value_eq_entry_address, value_eq_signature, value_len_entry_address,
+    value_len_signature, value_slot_signature, write_heap_value_to_slot_entry_address,
+    zero_bytes_entry_address,
 };
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::Ieee64;
@@ -121,6 +122,8 @@ fn try_compile_ssa_trace(
     let sparse_restore_exit_sig = sparse_restore_exit_signature(pointer_type, call_conv);
     let frame_state_sig = frame_state_signature(pointer_type, call_conv);
     let leave_frame_sig = leave_frame_signature(pointer_type, call_conv);
+    let enter_call_value_sig = enter_call_value_signature(pointer_type, call_conv);
+
     let resume_linked_trace_sig = entry_signature(pointer_type, call_conv);
     let string_contains_sig = string_contains_signature(pointer_type, call_conv);
     let regex_match_sig = regex_match_signature(pointer_type, call_conv);
@@ -196,6 +199,8 @@ fn try_compile_ssa_trace(
             map_set_ref: b.import_signature(map_set_sig),
             sparse_restore_exit_ref: b.import_signature(sparse_restore_exit_sig),
             leave_frame_ref: b.import_signature(leave_frame_sig),
+            enter_call_value_ref: b.import_signature(enter_call_value_sig),
+
             resume_linked_trace_ref: b.import_signature(resume_linked_trace_sig),
         };
         let deopt_addrs = SsaDeoptHelperAddrs {
@@ -215,6 +220,8 @@ fn try_compile_ssa_trace(
             map_set: map_set_entry_address(),
             sparse_restore_exit: restore_active_sparse_exit_state_entry_address(),
             leave_frame: leave_frame_entry_address(),
+            enter_call_value: enter_call_value_entry_address(),
+
             resume_linked_trace: resume_linked_trace_entry_address(),
         };
         // The outer native dispatch loop links trace exits directly. Re-entering it through the
@@ -248,11 +255,27 @@ fn try_compile_ssa_trace(
             block_handles.insert(block.id, handle);
         }
 
+        let call_value_exits = ssa
+            .blocks
+            .iter()
+            .filter_map(|block| match block.terminator.as_ref() {
+                Some(SsaTerminator::CallValue {
+                    argc,
+                    call_ip,
+                    resume_ip,
+                    exit,
+                }) => Some((*exit, (*argc, *call_ip, *resume_ip))),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
         let mut exit_specs = HashMap::new();
         for exit in &ssa.exits {
             let inputs = exit_inputs(exit);
             let trace_exit_block = b.create_block();
             let halted_block = b.create_block();
+            let call_value_block = call_value_exits
+                .contains_key(&exit.id)
+                .then(|| b.create_block());
             for value in &inputs {
                 let Some(repr) = value_reprs.get(value).copied() else {
                     return Ok(None);
@@ -262,12 +285,16 @@ fn try_compile_ssa_trace(
                 };
                 b.append_block_param(trace_exit_block, ty);
                 b.append_block_param(halted_block, ty);
+                if let Some(call_value_block) = call_value_block {
+                    b.append_block_param(call_value_block, ty);
+                }
             }
             exit_specs.insert(
                 exit.id,
                 SsaExitLowering {
                     trace_exit_block,
                     halted_block,
+                    call_value_block,
                     inputs,
                 },
             );
@@ -391,10 +418,24 @@ fn try_compile_ssa_trace(
                 lower_ctx,
                 exit,
                 spec,
-                false,
-                allow_exit_link_handoff,
+                SsaExitAction::TraceExit {
+                    allow_link_handoff: allow_exit_link_handoff,
+                },
             )?;
-            lower_ssa_exit_block(&mut b, lower_ctx, exit, spec, true, false)?;
+            lower_ssa_exit_block(&mut b, lower_ctx, exit, spec, SsaExitAction::Return)?;
+            if let Some((argc, call_ip, resume_ip)) = call_value_exits.get(&exit.id).copied() {
+                lower_ssa_exit_block(
+                    &mut b,
+                    lower_ctx,
+                    exit,
+                    spec,
+                    SsaExitAction::CallValue {
+                        argc,
+                        call_ip,
+                        resume_ip,
+                    },
+                )?;
+            }
         }
 
         b.switch_to_block(exit_block);
@@ -448,7 +489,21 @@ fn try_compile_ssa_trace(
 struct SsaExitLowering {
     trace_exit_block: Block,
     halted_block: Block,
+    call_value_block: Option<Block>,
     inputs: Vec<SsaValueId>,
+}
+
+#[derive(Clone, Copy)]
+enum SsaExitAction {
+    TraceExit {
+        allow_link_handoff: bool,
+    },
+    Return,
+    CallValue {
+        argc: u8,
+        call_ip: usize,
+        resume_ip: usize,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -469,6 +524,8 @@ struct SsaDeoptHelperRefs {
     map_set_ref: cranelift_codegen::ir::SigRef,
     sparse_restore_exit_ref: cranelift_codegen::ir::SigRef,
     leave_frame_ref: cranelift_codegen::ir::SigRef,
+    enter_call_value_ref: cranelift_codegen::ir::SigRef,
+
     resume_linked_trace_ref: cranelift_codegen::ir::SigRef,
 }
 
@@ -490,6 +547,8 @@ struct SsaDeoptHelperAddrs {
     map_set: usize,
     sparse_restore_exit: usize,
     leave_frame: usize,
+    enter_call_value: usize,
+
     resume_linked_trace: usize,
 }
 
@@ -734,6 +793,7 @@ fn allocate_owned_value_temps(
 ) -> VmResult<SsaOwnedValueTemps> {
     let mut ordered = Vec::new();
     let mut slots = HashMap::new();
+
     for block in &ssa.blocks {
         for inst in &block.insts {
             let Some(output) = inst.output else {
@@ -762,6 +822,7 @@ fn allocate_owned_value_temps(
                 ));
                 slots.insert(SsaTempValueSlotKey::HostArgs(output.id), args_slot);
             }
+
             if matches!(
                 inst.kind,
                 SsaInstKind::MapGet { .. } | SsaInstKind::MapHas { .. }
@@ -827,7 +888,9 @@ fn borrowed_array_get_outputs(ssa: &SsaTrace) -> BTreeSet<SsaValueId> {
                     }
                 }
             }
-            SsaTerminator::Exit { .. } | SsaTerminator::Return { .. } => {}
+            SsaTerminator::Exit { .. }
+            | SsaTerminator::Return { .. }
+            | SsaTerminator::CallValue { .. } => {}
         }
     }
     for exit in &ssa.exits {
@@ -1036,7 +1099,9 @@ fn ssa_backedge_targets(
                 push_target(*target);
             }
         }
-        SsaTerminator::Exit { .. } | SsaTerminator::Return { .. } => {}
+        SsaTerminator::Exit { .. }
+        | SsaTerminator::Return { .. }
+        | SsaTerminator::CallValue { .. } => {}
     }
     targets
 }
@@ -3074,6 +3139,25 @@ fn lower_ssa_terminator(
             let args = ssa_block_args(args);
             b.ins().jump(spec.halted_block, &args);
         }
+        SsaTerminator::CallValue { exit, .. } => {
+            let spec = exit_specs.get(exit).ok_or_else(|| {
+                VmError::JitNative("SSA call-value exit lowering missing".to_string())
+            })?;
+            let args = spec
+                .inputs
+                .iter()
+                .map(|value| {
+                    values.get(value).copied().ok_or_else(|| {
+                        VmError::JitNative("SSA call-value exit value missing".to_string())
+                    })
+                })
+                .collect::<VmResult<Vec<_>>>()?;
+            let args = ssa_block_args(args);
+            let call_value_block = spec
+                .call_value_block
+                .ok_or_else(|| VmError::JitNative("SSA call-value block missing".to_string()))?;
+            b.ins().jump(call_value_block, &args);
+        }
     }
     Ok(())
 }
@@ -3147,13 +3231,68 @@ fn ssa_leave_frame_status(
     Ok(b.inst_results(call)[0])
 }
 
+fn ssa_exit_action_status(
+    b: &mut FunctionBuilder,
+    pointer_type: cranelift_codegen::ir::Type,
+    helper_refs: SsaDeoptHelperRefs,
+    helper_addrs: SsaDeoptHelperAddrs,
+    vm_ptr: cranelift_codegen::ir::Value,
+    exit_ip: usize,
+    action: SsaExitAction,
+) -> VmResult<cranelift_codegen::ir::Value> {
+    match action {
+        SsaExitAction::Return => {
+            ssa_leave_frame_status(b, pointer_type, helper_refs, helper_addrs, vm_ptr, exit_ip)
+        }
+        SsaExitAction::CallValue {
+            argc,
+            call_ip,
+            resume_ip,
+        } => {
+            let helper_ptr = iconst_ptr_from_addr(b, pointer_type, helper_addrs.enter_call_value)?;
+            let argc = b.ins().iconst(types::I64, i64::from(argc));
+            let call_ip = b.ins().iconst(
+                types::I64,
+                i64::try_from(call_ip).map_err(|_| {
+                    VmError::JitNative("SSA call-value ip out of range".to_string())
+                })?,
+            );
+            let resume_ip = b.ins().iconst(
+                types::I64,
+                i64::try_from(resume_ip).map_err(|_| {
+                    VmError::JitNative("SSA call-value resume ip out of range".to_string())
+                })?,
+            );
+            let call = b.ins().call_indirect(
+                helper_refs.enter_call_value_ref,
+                helper_ptr,
+                &[vm_ptr, argc, call_ip, resume_ip],
+            );
+            Ok(b.inst_results(call)[0])
+        }
+        SsaExitAction::TraceExit { allow_link_handoff } => {
+            if allow_link_handoff {
+                let helper_ptr =
+                    iconst_ptr_from_addr(b, pointer_type, helper_addrs.resume_linked_trace)?;
+                let call = b.ins().call_indirect(
+                    helper_refs.resume_linked_trace_ref,
+                    helper_ptr,
+                    &[vm_ptr],
+                );
+                Ok(b.inst_results(call)[0])
+            } else {
+                Ok(b.ins().iconst(types::I32, STATUS_TRACE_EXIT as i64))
+            }
+        }
+    }
+}
+
 fn lower_ssa_exit_block(
     b: &mut FunctionBuilder,
     ctx: SsaLowerCtx<'_>,
     exit: &crate::vm::jit::ir::SsaExit,
     spec: &SsaExitLowering,
-    halted: bool,
-    allow_link_handoff: bool,
+    action: SsaExitAction,
 ) -> VmResult<()> {
     let SsaLowerCtx {
         vm_ptr,
@@ -3168,10 +3307,12 @@ fn lower_ssa_exit_block(
         helper_addrs: deopt_addrs,
         ..
     } = ctx;
-    let block = if halted {
-        spec.halted_block
-    } else {
-        spec.trace_exit_block
+    let block = match action {
+        SsaExitAction::TraceExit { .. } => spec.trace_exit_block,
+        SsaExitAction::Return => spec.halted_block,
+        SsaExitAction::CallValue { .. } => spec
+            .call_value_block
+            .ok_or_else(|| VmError::JitNative("SSA call-value exit block missing".to_string()))?,
     };
     b.switch_to_block(block);
     let block_params = b.block_params(block).to_vec();
@@ -3258,25 +3399,15 @@ fn lower_ssa_exit_block(
         );
         b.ins()
             .store(MemFlags::new(), ip_val, vm_ptr, offsets.vm_ip);
-        let status = if halted {
-            ssa_leave_frame_status(
-                b,
-                pointer_type,
-                deopt_refs,
-                deopt_addrs,
-                vm_ptr,
-                exit.exit_ip,
-            )?
-        } else if allow_link_handoff {
-            let helper_ptr =
-                iconst_ptr_from_addr(b, pointer_type, deopt_addrs.resume_linked_trace)?;
-            let call =
-                b.ins()
-                    .call_indirect(deopt_refs.resume_linked_trace_ref, helper_ptr, &[vm_ptr]);
-            b.inst_results(call)[0]
-        } else {
-            b.ins().iconst(types::I32, STATUS_TRACE_EXIT as i64)
-        };
+        let status = ssa_exit_action_status(
+            b,
+            pointer_type,
+            deopt_refs,
+            deopt_addrs,
+            vm_ptr,
+            exit.exit_ip,
+            action,
+        )?;
         jump_with_status(b, exit_block, status);
         return Ok(());
     }
@@ -3360,24 +3491,15 @@ fn lower_ssa_exit_block(
             ip_val,
         ],
     )?;
-    let status = if halted {
-        ssa_leave_frame_status(
-            b,
-            pointer_type,
-            deopt_refs,
-            deopt_addrs,
-            vm_ptr,
-            exit.exit_ip,
-        )?
-    } else if allow_link_handoff {
-        let helper_ptr = iconst_ptr_from_addr(b, pointer_type, deopt_addrs.resume_linked_trace)?;
-        let call = b
-            .ins()
-            .call_indirect(deopt_refs.resume_linked_trace_ref, helper_ptr, &[vm_ptr]);
-        b.inst_results(call)[0]
-    } else {
-        b.ins().iconst(types::I32, STATUS_TRACE_EXIT as i64)
-    };
+    let status = ssa_exit_action_status(
+        b,
+        pointer_type,
+        deopt_refs,
+        deopt_addrs,
+        vm_ptr,
+        exit.exit_ip,
+        action,
+    )?;
     jump_with_status(b, exit_block, status);
     Ok(())
 }

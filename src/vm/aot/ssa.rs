@@ -113,10 +113,7 @@ pub(crate) enum AotSsaInstKind {
     CloneTagged {
         input: AotSsaValueId,
     },
-    MakeCallable {
-        prototype_id: u32,
-        captures: Vec<AotSsaValueId>,
-    },
+
     StringLen {
         text: AotSsaValueId,
     },
@@ -305,7 +302,6 @@ impl AotSsaInstKind {
             | Self::BoolConst(_)
             | Self::ConstSlot { .. } => Vec::new(),
             Self::CloneTagged { input } => vec![*input],
-            Self::MakeCallable { captures, .. } => captures.clone(),
             Self::StringLen { text } => vec![*text],
             Self::BytesLen { bytes } => vec![*bytes],
             Self::StringSlice {
@@ -2034,29 +2030,7 @@ fn apply_direct_instruction<E: InstEmitter>(
                 _ => None,
             })
         }
-        AotInstruction::MakeCallable {
-            prototype_id,
-            capture_count,
-        } => {
-            let capture_count = usize::from(*capture_count);
-            if frame.stack.len() < capture_count {
-                return Err(AotSsaBuildError::StackUnderflow {
-                    ip,
-                    instruction: "makecallable",
-                });
-            }
-            let captures = frame.stack.split_off(frame.stack.len() - capture_count);
-            let value = emitter.emit(
-                ip,
-                AotSsaInstKind::MakeCallable {
-                    prototype_id: *prototype_id,
-                    captures: captures.iter().map(|capture| capture.value.id).collect(),
-                },
-                AotSsaValueRepr::Tagged,
-            );
-            frame.stack.push(FrameValue { value });
-            Ok(true)
-        }
+
         AotInstruction::Call(_) => Ok(false),
     }
 }
@@ -2782,12 +2756,6 @@ mod tests {
         .expect("closure source should compile");
         let ssa = build_aot_ssa(&compiled.program).expect("callable ssa should build");
 
-        assert!(ssa.blocks.iter().any(|block| {
-            block
-                .insts
-                .iter()
-                .any(|inst| matches!(inst.kind, AotSsaInstKind::MakeCallable { .. }))
-        }));
         assert!(
             ssa.blocks.iter().any(|block| {
                 matches!(block.terminator, Some(AotSsaTerminator::CallValue { .. }))

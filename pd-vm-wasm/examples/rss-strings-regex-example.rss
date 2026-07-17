@@ -26,12 +26,20 @@ fn parse_log_line(line) {
     entry
 }
 
+fn is_some_string_equal(actual: string?, expected: string) -> bool {
+    if type(actual) == "string" => {
+        actual == expected
+    } else => {
+        false
+    }
+}
+
 let raw_log = "[INFO] feed/world - 18ms - cache hit\n[WARN] feed/markets - 241ms - cache miss\n[ERROR] feed/culture - 502ms - bad payload id=77";
 let normalized_log: string = string::trim(raw_log);
 
 assert(string::non_empty(normalized_log));
 assert(re::match("(?m)^\\[INFO\\]", normalized_log));
-assert(re::find("feed/[a-z]+", normalized_log) == "feed/world");
+assert(is_some_string_equal(re::find("feed/[a-z]+", normalized_log), "feed/world"));
 
 let lines = re::split("\\n+", normalized_log);
 let first_entry = parse_log_line(lines[0]);
@@ -58,7 +66,7 @@ let rewritten_warn: string = string::replace(warn_message, "cache", "edge-cache"
 let rewritten_route = re::replace("^feed/", warn_route, "rss::");
 let error_words = re::split("\\s+", &error_message);
 let error_word_count = error_words.length;
-let id_groups = re::captures("id=([0-9]+)", error_message);
+let id_groups: [string] = re::captures("id=([0-9]+)", error_message);
 let error_id: string = if id_groups.length == 2 => {
     id_groups[1]
 } else => {

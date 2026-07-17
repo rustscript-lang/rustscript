@@ -74,6 +74,22 @@ pub(crate) fn execute_builtin_call(
             map_iter::take_value(vm, args).map(BuiltinCallOutcome::Return)
         }
         BuiltinFunction::MapIterClose => map_iter::close(vm, args).map(BuiltinCallOutcome::Return),
+        BuiltinFunction::BindCallable => {
+            let prototype_id = match args.first() {
+                Some(Value::Int(value)) => u32::try_from(*value)
+                    .map_err(|_| crate::vm::VmError::InvalidCallablePrototype(u32::MAX))?,
+                _ => return Err(crate::vm::VmError::TypeMismatch("callable prototype id")),
+            };
+            let captures = std::mem::replace(
+                args.get_mut(1)
+                    .ok_or(crate::vm::VmError::TypeMismatch("callable captures"))?,
+                Value::Null,
+            )
+            .into_owned_array()
+            .map_err(|_| crate::vm::VmError::TypeMismatch("callable captures"))?;
+            vm.bind_callable_value(prototype_id, captures)
+                .map(|value| BuiltinCallOutcome::Return(return_one(value)))
+        }
         BuiltinFunction::StringContains => core::builtin_string_contains(args)
             .map(IntoBuiltinCallOutcome::into_builtin_call_outcome),
         BuiltinFunction::StringReplaceLiteral => core::builtin_string_replace_literal(args)

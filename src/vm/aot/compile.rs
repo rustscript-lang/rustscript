@@ -24,12 +24,12 @@ use crate::vm::native::{
     enter_call_value_signature, entry_signature, frame_state_entry_address, frame_state_signature,
     free_buffer_signature, helper_entry_offset, helper_signature,
     init_null_value_slot_entry_address, jump_with_status, leave_frame_entry_address,
-    leave_frame_signature, make_callable_entry_address, make_callable_signature,
-    pack_shared_signature, resolve_offsets, restore_active_exit_state_entry_address,
-    restore_exit_signature, restore_exit_state_entry_address,
-    shared_array_from_buffer_entry_address, shared_bytes_from_buffer_entry_address,
-    shared_string_from_buffer_entry_address, value_eq_entry_address, value_eq_signature,
-    value_slot_signature, write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
+    leave_frame_signature, pack_shared_signature, resolve_offsets,
+    restore_active_exit_state_entry_address, restore_exit_signature,
+    restore_exit_state_entry_address, shared_array_from_buffer_entry_address,
+    shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
+    value_eq_entry_address, value_eq_signature, value_slot_signature,
+    write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
 };
 use crate::vm::{Program, Value, Vm, VmError, VmResult};
 #[cfg(feature = "cranelift-jit")]
@@ -226,7 +226,6 @@ struct AotDeoptHelperRefs {
     frame_state_ref: cranelift_codegen::ir::SigRef,
     enter_call_value_ref: cranelift_codegen::ir::SigRef,
     leave_frame_ref: cranelift_codegen::ir::SigRef,
-    make_callable_ref: cranelift_codegen::ir::SigRef,
     clone_value_ref: cranelift_codegen::ir::SigRef,
     value_eq_ref: cranelift_codegen::ir::SigRef,
     init_null_slot_ref: cranelift_codegen::ir::SigRef,
@@ -244,7 +243,6 @@ struct AotDeoptHelperAddrs {
     frame_state: usize,
     enter_call_value: usize,
     leave_frame: usize,
-    make_callable: usize,
     clone_value: usize,
     value_eq: usize,
     init_null_slot: usize,
@@ -260,14 +258,12 @@ struct AotDeoptHelperAddrs {
 enum AotTempValueSlotKey {
     Output(AotSsaValueId),
     MutationArg(AotSsaValueId, u8),
-    CallableArg(AotSsaValueId, u16),
 }
 
 #[cfg(feature = "cranelift-jit")]
 struct AotOwnedValueTemps {
     ordered: Vec<StackSlot>,
     slots: HashMap<AotTempValueSlotKey, StackSlot>,
-    callable_pointer_buffers: HashMap<AotSsaValueId, StackSlot>,
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -398,7 +394,6 @@ fn compile_ssa(
     let frame_state_sig = frame_state_signature(pointer_type, call_conv);
     let enter_call_value_sig = enter_call_value_signature(pointer_type, call_conv);
     let leave_frame_sig = leave_frame_signature(pointer_type, call_conv);
-    let make_callable_sig = make_callable_signature(pointer_type, call_conv);
     let free_buffer_sig = free_buffer_signature(pointer_type, call_conv);
     let pack_shared_sig = pack_shared_signature(pointer_type, call_conv);
     let copy_bytes_sig = copy_bytes_signature(pointer_type, call_conv);
@@ -429,7 +424,6 @@ fn compile_ssa(
         frame_state: frame_state_entry_address(),
         enter_call_value: enter_call_value_entry_address(),
         leave_frame: leave_frame_entry_address(),
-        make_callable: make_callable_entry_address(),
         clone_value: clone_value_to_slot_entry_address(),
         value_eq: value_eq_entry_address(),
         init_null_slot: init_null_value_slot_entry_address(),
@@ -487,7 +481,6 @@ fn compile_ssa(
             frame_state_ref: b.import_signature(frame_state_sig),
             enter_call_value_ref: b.import_signature(enter_call_value_sig),
             leave_frame_ref: b.import_signature(leave_frame_sig),
-            make_callable_ref: b.import_signature(make_callable_sig),
             clone_value_ref: b.import_signature(clone_value_sig),
             value_eq_ref: b.import_signature(value_eq_sig),
             init_null_slot_ref: b.import_signature(value_slot_sig.clone()),
@@ -943,18 +936,7 @@ fn lower_aot_ssa_inst(
             )?;
             out
         }
-        AotSsaInstKind::MakeCallable {
-            prototype_id,
-            captures,
-        } => aot_lower_make_callable(
-            b,
-            ctx,
-            inst.output.id,
-            *prototype_id,
-            captures,
-            values,
-            value_reprs,
-        )?,
+
         AotSsaInstKind::StringLen { text } => aot_lower_string_len(
             b,
             ctx,
@@ -1344,75 +1326,6 @@ fn aot_ensure_boxed_value_addr(
 }
 
 #[cfg(feature = "cranelift-jit")]
-fn aot_lower_make_callable(
-    b: &mut FunctionBuilder,
-    ctx: AotLowerCtx<'_>,
-    output_id: AotSsaValueId,
-    prototype_id: u32,
-    captures: &[AotSsaValueId],
-    values: &HashMap<AotSsaValueId, cranelift_codegen::ir::Value>,
-    value_reprs: &HashMap<AotSsaValueId, AotSsaValueRepr>,
-) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
-    let out = owned_value_temp_slot_addr(
-        b,
-        ctx.pointer_type,
-        ctx.owned_value_temps,
-        AotTempValueSlotKey::Output(output_id),
-    )?;
-    clear_owned_value_temp_slot(b, ctx.pointer_type, ctx.helper_refs, ctx.helper_addrs, out)?;
-    let captures_ptr = if captures.is_empty() {
-        b.ins().iconst(ctx.pointer_type, 0)
-    } else {
-        let slot = *ctx
-            .owned_value_temps
-            .callable_pointer_buffers
-            .get(&output_id)
-            .ok_or_else(|| {
-                AotCompileError::Codegen("AOT callable pointer buffer missing".to_string())
-            })?;
-        let ptr = b.ins().stack_addr(ctx.pointer_type, slot, 0);
-        for (index, capture) in captures.iter().copied().enumerate() {
-            let capture_addr = aot_ensure_boxed_value_addr(
-                b,
-                ctx,
-                values,
-                value_reprs,
-                capture,
-                AotTempValueSlotKey::CallableArg(
-                    output_id,
-                    u16::try_from(index).map_err(|_| {
-                        AotCompileError::Codegen(
-                            "AOT callable capture index out of range".to_string(),
-                        )
-                    })?,
-                ),
-            )?;
-            let offset = i32::try_from(index * std::mem::size_of::<usize>()).map_err(|_| {
-                AotCompileError::Codegen("AOT callable pointer offset out of range".to_string())
-            })?;
-            b.ins().store(MemFlags::new(), capture_addr, ptr, offset);
-        }
-        ptr
-    };
-    let prototype_id = b.ins().iconst(types::I64, i64::from(prototype_id));
-    let capture_count = b.ins().iconst(
-        types::I64,
-        i64::try_from(captures.len()).map_err(|_| {
-            AotCompileError::Codegen("AOT callable capture count out of range".to_string())
-        })?,
-    );
-    call_status_helper(
-        b,
-        ctx.exit_block,
-        ctx.pointer_type,
-        ctx.helper_refs.make_callable_ref,
-        ctx.helper_addrs.make_callable,
-        &[ctx.vm_ptr, prototype_id, captures_ptr, capture_count, out],
-    )?;
-    Ok(out)
-}
-
-#[cfg(feature = "cranelift-jit")]
 #[allow(clippy::too_many_arguments)]
 fn lower_aot_ssa_terminator(
     b: &mut FunctionBuilder,
@@ -1669,7 +1582,6 @@ fn aot_inst_requires_owned_value_slot(kind: &AotSsaInstKind) -> bool {
     matches!(
         kind,
         AotSsaInstKind::CloneTagged { .. }
-            | AotSsaInstKind::MakeCallable { .. }
             | AotSsaInstKind::StringSlice { .. }
             | AotSsaInstKind::BytesSlice { .. }
             | AotSsaInstKind::StringGet { .. }
@@ -1691,7 +1603,7 @@ fn allocate_owned_value_temps(
 ) -> Result<AotOwnedValueTemps, AotCompileError> {
     let mut ordered = Vec::new();
     let mut slots = HashMap::new();
-    let mut callable_pointer_buffers = HashMap::new();
+
     for block in &ssa.blocks {
         for inst in &block.insts {
             if aot_inst_requires_owned_value_slot(&inst.kind) {
@@ -1713,48 +1625,10 @@ fn allocate_owned_value_temps(
                         );
                     }
                 }
-                if let AotSsaInstKind::MakeCallable { captures, .. } = &inst.kind {
-                    for (index, _) in captures.iter().enumerate() {
-                        let arg_slot = aot_create_value_stack_slot(b, value_size)?;
-                        ordered.push(arg_slot);
-                        slots.insert(
-                            AotTempValueSlotKey::CallableArg(
-                                inst.output.id,
-                                u16::try_from(index).map_err(|_| {
-                                    AotCompileError::Codegen(
-                                        "AOT callable capture index out of range".to_string(),
-                                    )
-                                })?,
-                            ),
-                            arg_slot,
-                        );
-                    }
-                    if !captures.is_empty() {
-                        let pointer_bytes = captures
-                            .len()
-                            .checked_mul(std::mem::size_of::<usize>())
-                            .and_then(|bytes| u32::try_from(bytes).ok())
-                            .ok_or_else(|| {
-                                AotCompileError::Codegen(
-                                    "AOT callable pointer buffer size out of range".to_string(),
-                                )
-                            })?;
-                        let pointer_slot = b.create_sized_stack_slot(StackSlotData::new(
-                            StackSlotKind::ExplicitSlot,
-                            pointer_bytes,
-                            std::mem::align_of::<usize>().trailing_zeros() as u8,
-                        ));
-                        callable_pointer_buffers.insert(inst.output.id, pointer_slot);
-                    }
-                }
             }
         }
     }
-    Ok(AotOwnedValueTemps {
-        ordered,
-        slots,
-        callable_pointer_buffers,
-    })
+    Ok(AotOwnedValueTemps { ordered, slots })
 }
 
 #[cfg(feature = "cranelift-jit")]

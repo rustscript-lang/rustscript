@@ -1,8 +1,11 @@
-use pd_vm_nostd::{Value as EmbeddedValue, WireError, decode_program};
+use pd_vm_nostd::{
+    OpCode as EmbeddedOpCode, Value as EmbeddedValue, Vm as EmbeddedVm,
+    VmStatus as EmbeddedVmStatus, WireError, decode_program,
+};
 use vm::compiler::TypeSchema;
 use vm::{
     HostImport, OpCode, Program, ReplLocalBinding, Value, ValueType, compile_source,
-    compile_source_for_repl_with_locals, encode_program,
+    compile_source_for_repl, compile_source_for_repl_with_locals, encode_program,
 };
 
 fn encoded_scalar_program() -> Vec<u8> {
@@ -103,4 +106,29 @@ fn embedded_decoder_rejects_invalid_magic() {
         decode_program(&bytes),
         Err(WireError::InvalidMagic(_))
     ));
+}
+
+#[test]
+fn embedded_runtime_executes_compiler_generated_capturing_callable() {
+    let compiled = compile_source_for_repl(
+        r#"
+            let base = 40;
+            let add = |value| value + base;
+            add(2);
+        "#,
+    )
+    .expect("capturing callable source should compile");
+    let bytes = encode_program(&compiled.program.with_local_count(compiled.locals))
+        .expect("compiler output should encode");
+    let program = decode_program(&bytes).expect("embedded decoder should accept callable VMBC");
+    let mut runtime = EmbeddedVm::new(program);
+
+    assert_eq!(runtime.run(), Ok(EmbeddedVmStatus::Halted));
+    assert_eq!(runtime.stack(), &[EmbeddedValue::Int(42)]);
+}
+
+#[test]
+fn removed_callable_creation_opcode_is_rejected() {
+    assert!(OpCode::try_from(0x1a).is_err());
+    assert!(EmbeddedOpCode::try_from(0x1a).is_err());
 }

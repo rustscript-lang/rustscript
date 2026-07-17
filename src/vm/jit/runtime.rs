@@ -9,6 +9,7 @@ use super::super::{ExecOutcome, Vm, VmError, VmResult};
 ))]
 use super::JitTrace;
 use super::{JitMetrics, JitTraceTerminal, native};
+use crate::vm::native::ROOT_FRAME_KEY;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 #[cfg(any(
@@ -237,10 +238,16 @@ impl Vm {
                 .jit
                 .compiled_trace_for_entry(frame_key, ip, stack_depth);
             if next_trace_id.is_none() {
+                let entry_local_types =
+                    (frame_key != ROOT_FRAME_KEY).then(|| self.active_local_types());
                 let program = &self.program;
-                next_trace_id = self
-                    .jit
-                    .observe_exit_entry(frame_key, ip, stack_depth, program);
+                next_trace_id = self.jit.observe_exit_entry_with_local_types(
+                    frame_key,
+                    ip,
+                    stack_depth,
+                    entry_local_types.as_deref(),
+                    program,
+                );
             }
             let Some(next_trace_id) = next_trace_id else {
                 return Ok(native::STATUS_LINKED_CONTINUE);
@@ -320,10 +327,16 @@ impl Vm {
                             self.jit
                                 .compiled_trace_for_entry(frame_key, ip, stack_depth);
                         if next_trace_id.is_none() {
+                            let entry_local_types =
+                                (frame_key != ROOT_FRAME_KEY).then(|| self.active_local_types());
                             let program = &self.program;
-                            next_trace_id =
-                                self.jit
-                                    .observe_exit_entry(frame_key, ip, stack_depth, program);
+                            next_trace_id = self.jit.observe_exit_entry_with_local_types(
+                                frame_key,
+                                ip,
+                                stack_depth,
+                                entry_local_types.as_deref(),
+                                program,
+                            );
                         }
                         if let Some(next_trace_id) = next_trace_id
                             && next_trace_id != current_trace_id
@@ -590,9 +603,16 @@ impl Vm {
                                 .compiled_trace_for_entry(frame_key, ip, stack_depth);
                         if next_trace_id.is_none() {
                             next_trace_id = {
+                                let entry_local_types = (frame_key != ROOT_FRAME_KEY)
+                                    .then(|| self.active_local_types());
                                 let program = &self.program;
-                                self.jit
-                                    .observe_exit_entry(frame_key, ip, stack_depth, program)
+                                self.jit.observe_exit_entry_with_local_types(
+                                    frame_key,
+                                    ip,
+                                    stack_depth,
+                                    entry_local_types.as_deref(),
+                                    program,
+                                )
                             };
                         }
                         if let Some(next_trace_id) = next_trace_id
@@ -626,7 +646,56 @@ impl Vm {
                     return Ok(ExecOutcome::Continue);
                 }
                 native::STATUS_HALTED => return Ok(ExecOutcome::Halted),
-                native::STATUS_LINKED_CONTINUE => return Ok(ExecOutcome::Continue),
+                native::STATUS_LINKED_CONTINUE => {
+                    let ip = self.ip;
+                    let frame_key = self.active_frame_key();
+                    let stack_depth = self.active_operand_stack_len();
+                    let mut next_trace_id =
+                        self.jit
+                            .compiled_trace_for_entry(frame_key, ip, stack_depth);
+                    if next_trace_id.is_none() {
+                        next_trace_id = {
+                            let entry_local_types =
+                                (frame_key != ROOT_FRAME_KEY).then(|| self.active_local_types());
+                            let program = &self.program;
+                            self.jit.observe_exit_entry_with_local_types(
+                                frame_key,
+                                ip,
+                                stack_depth,
+                                entry_local_types.as_deref(),
+                                program,
+                            )
+                        };
+                    }
+                    if let Some(next_trace_id) = next_trace_id
+                        && next_trace_id != current_trace_id
+                    {
+                        self.record_jit_link_handoff();
+                        current_trace_id = next_trace_id;
+                        if let Some(state) = self.cached_native_trace_state(
+                            current_trace_id,
+                            native::NativeCompileProfile::Jit,
+                        ) {
+                            (entry, root_ip, terminal, _, has_yielding_call) = state;
+                        } else {
+                            if let Err(err) = self.ensure_native_trace(
+                                current_trace_id,
+                                native::NativeCompileProfile::Jit,
+                            ) {
+                                if should_fallback_to_interpreter(&err) {
+                                    self.record_jit_helper_fallback();
+                                    self.jit.block_trace(current_trace_id);
+                                    return Ok(ExecOutcome::Continue);
+                                }
+                                return Err(err);
+                            }
+                            (entry, root_ip, terminal, _, has_yielding_call) =
+                                self.native_trace_state(current_trace_id)?;
+                        }
+                        continue;
+                    }
+                    return Ok(ExecOutcome::Continue);
+                }
                 native::STATUS_YIELDED => {
                     self.last_yield_reason = Some(super::super::VmYieldReason::Host);
                     return Ok(ExecOutcome::Yielded);
