@@ -4,6 +4,8 @@ mod liveness;
 use super::ParseError;
 use super::ir::{FrontendIr, LocalSlot};
 
+pub(crate) use availability::{closure_capture_binding_mode, function_capture_binding_mode};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct EntryLocalAvailability {
     pub slot: LocalSlot,

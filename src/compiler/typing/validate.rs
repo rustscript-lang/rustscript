@@ -721,6 +721,13 @@ pub(super) fn validate_expr(
                 else_ty,
                 context.is_strict(),
             )?;
+            ensure_compatible_callable_schemas(
+                line_context,
+                source_name,
+                "if/else expression result",
+                context.infer_expr_schema(then_expr, &then_state),
+                context.infer_expr_schema(else_expr, &else_state),
+            )?;
             if then_ty == else_ty || matches!(static_condition, Some(true)) {
                 then_ty
             } else if matches!(static_condition, Some(false)) {
@@ -755,6 +762,7 @@ pub(super) fn validate_expr(
                 context,
             );
             let mut arm_type = None;
+            let mut arm_schema = None;
             for (pattern, arm_expr) in arms {
                 validate_match_pattern(pattern, *value_slot, &nested, line_context, source_name)?;
                 let arm_state = refine_state_for_match_pattern(&nested, pattern, *value_slot);
@@ -766,6 +774,15 @@ pub(super) fn validate_expr(
                     context,
                     strict_function_add_types,
                 )?;
+                let schema = context.infer_expr_schema(arm_expr, &arm_state);
+                ensure_compatible_callable_schemas(
+                    line_context,
+                    source_name,
+                    "match arm result",
+                    arm_schema.clone(),
+                    schema.clone(),
+                )?;
+                arm_schema = arm_schema.or(schema);
                 arm_type = Some(match arm_type {
                     None => ty,
                     Some(current) => {
@@ -789,6 +806,7 @@ pub(super) fn validate_expr(
                 context,
                 strict_function_add_types,
             )?;
+            let default_schema = context.infer_expr_schema(default, &nested);
             if arms.is_empty() {
                 default_ty
             } else {
@@ -800,6 +818,13 @@ pub(super) fn validate_expr(
                     arm_type,
                     default_ty,
                     context.is_strict(),
+                )?;
+                ensure_compatible_callable_schemas(
+                    line_context,
+                    source_name,
+                    "match result",
+                    arm_schema,
+                    default_schema,
                 )?;
                 merge_bound_types(arm_type, default_ty)
             }
@@ -1226,6 +1251,100 @@ fn ensure_compatible_if_else_types(
     })
 }
 
+fn ensure_compatible_callable_schemas(
+    line: Option<u32>,
+    source_name: Option<&str>,
+    context: &str,
+    lhs: Option<TypeSchema>,
+    rhs: Option<TypeSchema>,
+) -> Result<(), CompileError> {
+    let (Some(lhs @ TypeSchema::Callable { .. }), Some(rhs @ TypeSchema::Callable { .. })) =
+        (lhs, rhs)
+    else {
+        return Ok(());
+    };
+    if are_compatible_schemas(&lhs, &rhs) {
+        return Ok(());
+    }
+    Err(CompileError::IfElseBranchTypeMismatch {
+        line,
+        source_name: owned_source_name(source_name),
+        detail: format!(
+            "{context} has incompatible callable schemas: {} vs {}",
+            render_schema_label(&lhs),
+            render_schema_label(&rhs)
+        ),
+    })
+}
+
+fn are_compatible_schemas(lhs: &TypeSchema, rhs: &TypeSchema) -> bool {
+    match (lhs, rhs) {
+        (TypeSchema::Unknown, _) | (_, TypeSchema::Unknown) => true,
+        (TypeSchema::Number, TypeSchema::Int | TypeSchema::Float)
+        | (TypeSchema::Int | TypeSchema::Float, TypeSchema::Number) => true,
+        (TypeSchema::Optional(lhs), TypeSchema::Optional(rhs))
+        | (TypeSchema::Array(lhs), TypeSchema::Array(rhs))
+        | (TypeSchema::Map(lhs), TypeSchema::Map(rhs)) => are_compatible_schemas(lhs, rhs),
+        (TypeSchema::Named(lhs_name, lhs_args), TypeSchema::Named(rhs_name, rhs_args)) => {
+            lhs_name == rhs_name
+                && lhs_args.len() == rhs_args.len()
+                && lhs_args
+                    .iter()
+                    .zip(rhs_args)
+                    .all(|(lhs, rhs)| are_compatible_schemas(lhs, rhs))
+        }
+        (TypeSchema::ArrayTuple(lhs), TypeSchema::ArrayTuple(rhs)) => {
+            lhs.len() == rhs.len()
+                && lhs
+                    .iter()
+                    .zip(rhs)
+                    .all(|(lhs, rhs)| are_compatible_schemas(lhs, rhs))
+        }
+        (
+            TypeSchema::ArrayTupleRest {
+                prefix: lhs_prefix,
+                rest: lhs_rest,
+            },
+            TypeSchema::ArrayTupleRest {
+                prefix: rhs_prefix,
+                rest: rhs_rest,
+            },
+        ) => {
+            lhs_prefix.len() == rhs_prefix.len()
+                && lhs_prefix
+                    .iter()
+                    .zip(rhs_prefix)
+                    .all(|(lhs, rhs)| are_compatible_schemas(lhs, rhs))
+                && are_compatible_schemas(lhs_rest, rhs_rest)
+        }
+        (TypeSchema::Object(lhs), TypeSchema::Object(rhs)) => {
+            lhs.len() == rhs.len()
+                && lhs.iter().all(|(name, lhs)| {
+                    rhs.get(name)
+                        .is_some_and(|rhs| are_compatible_schemas(lhs, rhs))
+                })
+        }
+        (
+            TypeSchema::Callable {
+                params: lhs_params,
+                result: lhs_result,
+            },
+            TypeSchema::Callable {
+                params: rhs_params,
+                result: rhs_result,
+            },
+        ) => {
+            lhs_params.len() == rhs_params.len()
+                && lhs_params
+                    .iter()
+                    .zip(rhs_params)
+                    .all(|(lhs, rhs)| are_compatible_schemas(lhs, rhs))
+                && are_compatible_schemas(lhs_result, rhs_result)
+        }
+        _ => lhs == rhs,
+    }
+}
+
 pub(super) fn validate_branch_state_merge(
     line: Option<u32>,
     source_name: Option<&str>,
@@ -1242,6 +1361,13 @@ pub(super) fn validate_branch_state_merge(
         }
         let left = lhs.get(slot);
         let right = rhs.get(slot);
+        ensure_compatible_callable_schemas(
+            line,
+            source_name,
+            "control-flow local",
+            lhs.schema(slot).cloned(),
+            rhs.schema(slot).cloned(),
+        )?;
         if are_compatible_bound_types_in_mode(left, right, strict) {
             continue;
         }

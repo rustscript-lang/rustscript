@@ -12,12 +12,22 @@ pub type SharedBytes = Arc<Vec<u8>>;
 pub type SharedArray = Arc<Vec<Value>>;
 pub type SharedMap = Arc<VmMap>;
 pub type SharedCallable = Arc<CallableValue>;
+pub type SharedCaptureCell = Arc<std::sync::Mutex<Value>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CallableKind {
     FunctionItem,
     Closure,
     HostFunction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum CaptureBindingMode {
+    Copy = 0,
+    Borrow = 1,
+    BorrowMut = 2,
+    Move = 3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -39,7 +49,9 @@ pub struct CallablePrototype {
     pub arity: u8,
     pub frame_local_count: usize,
     pub parameter_slots: Vec<u16>,
+    pub capture_source_slots: Vec<u16>,
     pub capture_slots: Vec<u16>,
+    pub capture_modes: Vec<CaptureBindingMode>,
     pub self_slot: Option<u16>,
     pub schema: Option<TypeSchema>,
 }
@@ -59,7 +71,7 @@ pub struct RootCallableBinding {
 
 #[derive(Debug)]
 pub struct CallableEnvironment {
-    pub(crate) cells: std::sync::Mutex<Vec<Value>>,
+    pub(crate) cells: std::sync::Mutex<Vec<SharedCaptureCell>>,
 }
 
 #[derive(Clone, Debug)]

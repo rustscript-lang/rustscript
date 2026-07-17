@@ -90,6 +90,15 @@ pub(crate) fn execute_builtin_call(
             vm.bind_callable_value(prototype_id, captures)
                 .map(|value| BuiltinCallOutcome::Return(return_one(value)))
         }
+        BuiltinFunction::DetachLocal => {
+            let slot = match args.first() {
+                Some(Value::Int(value)) => u8::try_from(*value)
+                    .map_err(|_| crate::vm::VmError::TypeMismatch("local slot"))?,
+                _ => return Err(crate::vm::VmError::TypeMismatch("local slot")),
+            };
+            vm.detach_local_with_drop_contract(slot)?;
+            Ok(BuiltinCallOutcome::Return(return_none()))
+        }
         BuiltinFunction::StringContains => core::builtin_string_contains(args)
             .map(IntoBuiltinCallOutcome::into_builtin_call_outcome),
         BuiltinFunction::StringReplaceLiteral => core::builtin_string_replace_literal(args)

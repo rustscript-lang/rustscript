@@ -263,10 +263,22 @@ impl Compiler {
                 arity: function_impl.param_slots.len() as u8,
                 frame_local_count: self.frame_local_count,
                 parameter_slots: function_impl.param_slots.clone(),
+                capture_source_slots: function_impl
+                    .capture_copies
+                    .iter()
+                    .map(|(source, _)| *source)
+                    .collect(),
                 capture_slots: function_impl
                     .capture_copies
                     .iter()
                     .map(|(_, target)| *target)
+                    .collect(),
+                capture_modes: function_impl
+                    .capture_copies
+                    .iter()
+                    .map(|(_, target)| {
+                        super::lifetime::function_capture_binding_mode(function_impl, *target)
+                    })
                     .collect(),
                 self_slot: Some(hidden_slot),
                 schema: decl.map(|decl| TypeSchema::Callable {
@@ -1254,6 +1266,25 @@ impl Compiler {
         index: u16,
         type_args: &[TypeSchema],
     ) -> Result<LocalSlot, CompileError> {
+        if type_args.is_empty()
+            && self
+                .function_decls
+                .get(&index)
+                .is_some_and(|decl| !decl.type_params.is_empty())
+        {
+            let name = self
+                .function_decls
+                .get(&index)
+                .map(|decl| decl.name.as_str())
+                .unwrap_or("<unknown>");
+            return Err(CompileError::CallableArgumentTypeMismatch {
+                line: None,
+                source_name: None,
+                detail: format!(
+                    "generic function value '{name}' requires explicit type arguments or an unambiguous callable context"
+                ),
+            });
+        }
         if !type_args.is_empty()
             && let Some((_, _, slot)) = self
                 .specialized_function_slots
@@ -1289,7 +1320,9 @@ impl Compiler {
             arity,
             frame_local_count: self.frame_local_count,
             parameter_slots: Vec::new(),
+            capture_source_slots: Vec::new(),
             capture_slots: Vec::new(),
+            capture_modes: Vec::new(),
             self_slot: None,
             schema: self.instantiated_callable_schema(index, type_args),
         });
@@ -1457,10 +1490,20 @@ impl Compiler {
                 .map_err(|_| CompileError::CallArityOverflow)?,
             frame_local_count: self.frame_local_count,
             parameter_slots: closure.param_slots.clone(),
+            capture_source_slots: closure
+                .capture_copies
+                .iter()
+                .map(|(source, _)| *source)
+                .collect(),
             capture_slots: closure
                 .capture_copies
                 .iter()
                 .map(|(_, target)| *target)
+                .collect(),
+            capture_modes: closure
+                .capture_copies
+                .iter()
+                .map(|(_, target)| super::lifetime::closure_capture_binding_mode(closure, *target))
                 .collect(),
             self_slot: binding_slot.and_then(|binding_slot| {
                 closure
@@ -1468,7 +1511,13 @@ impl Compiler {
                     .iter()
                     .find_map(|(source, target)| (*source == binding_slot).then_some(*target))
             }),
-            schema: None,
+            schema: binding_slot.and_then(|slot| {
+                self.type_map
+                    .local_schemas
+                    .get(slot as usize)
+                    .cloned()
+                    .flatten()
+            }),
         });
         self.pending_closures.push((prototype_id, closure.clone()));
         self.emit_bind_callable(
@@ -1743,8 +1792,9 @@ impl Compiler {
     fn emit_move_ldloc(&mut self, slot: LocalSlot) -> Result<(), CompileError> {
         let operand = local_slot_operand(slot)?;
         self.assembler.ldloc(operand);
-        self.assembler.push_const(Value::Null);
-        self.assembler.stloc(operand);
+        self.assembler.push_const(Value::Int(i64::from(operand)));
+        self.assembler
+            .call(BuiltinFunction::DetachLocal.call_index(), 1);
         Ok(())
     }
 

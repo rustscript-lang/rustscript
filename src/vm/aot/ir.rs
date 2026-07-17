@@ -430,7 +430,7 @@ fn apply_call_provenance(
     stack.truncate(stack.len() - argc as usize);
     if !matches!(
         BuiltinFunction::from_call_index(call_index),
-        Some(BuiltinFunction::Assert)
+        Some(BuiltinFunction::Assert | BuiltinFunction::DetachLocal)
     ) {
         stack.push(AotStackProvenance::Derived);
     }

@@ -88,6 +88,7 @@ pub enum WireError {
     InvalidTypeMapFlag(u8),
     InvalidDebugFlag(u8),
     InvalidValueType(u8),
+    InvalidCaptureBindingMode(u8),
     InvalidUtf8,
     LengthTooLarge(&'static str, usize),
     SchemaTooDeep,
@@ -108,6 +109,9 @@ impl fmt::Display for WireError {
             Self::InvalidTypeMapFlag(value) => write!(f, "invalid type-map flag: {value}"),
             Self::InvalidDebugFlag(value) => write!(f, "invalid debug flag: {value}"),
             Self::InvalidValueType(value) => write!(f, "invalid value type: {value}"),
+            Self::InvalidCaptureBindingMode(value) => {
+                write!(f, "invalid capture binding mode: {value}")
+            }
             Self::InvalidUtf8 => f.write_str("invalid UTF-8 in VMBC string"),
             Self::LengthTooLarge(field, length) => {
                 write!(f, "{field} length is too large: {length}")

@@ -1623,6 +1623,11 @@ pub(super) fn persistent_capture_slots(
     function_impls: &HashMap<u16, FunctionImpl>,
 ) -> Vec<LocalSlot> {
     let mut slots = BTreeSet::new();
+    collect_persistent_closure_sources_from_stmts(stmts, &mut slots);
+    for function_impl in function_impls.values() {
+        collect_persistent_closure_sources_from_stmts(&function_impl.body_stmts, &mut slots);
+        collect_persistent_closure_sources_from_expr(&function_impl.body_expr, &mut slots);
+    }
     for stmt in stmts {
         let Stmt::FuncDecl {
             index, has_impl, ..
@@ -1636,11 +1641,179 @@ pub(super) fn persistent_capture_slots(
         let Some(function_impl) = function_impls.get(index) else {
             continue;
         };
-        for (_, captured_slot) in &function_impl.capture_copies {
+        for (source_slot, captured_slot) in &function_impl.capture_copies {
             slots.insert(*captured_slot);
+            if matches!(
+                super::availability::function_capture_binding_mode(function_impl, *captured_slot),
+                crate::CaptureBindingMode::Borrow | crate::CaptureBindingMode::BorrowMut
+            ) {
+                slots.insert(*source_slot);
+            }
+        }
+    }
+    for function_impl in function_impls.values() {
+        for (source_slot, captured_slot) in &function_impl.capture_copies {
+            slots.insert(*captured_slot);
+            if matches!(
+                super::availability::function_capture_binding_mode(function_impl, *captured_slot),
+                crate::CaptureBindingMode::Borrow | crate::CaptureBindingMode::BorrowMut
+            ) {
+                slots.insert(*source_slot);
+            }
         }
     }
     slots.into_iter().collect()
+}
+
+fn collect_persistent_closure_sources(
+    closure: &super::super::ir::ClosureExpr,
+    slots: &mut BTreeSet<LocalSlot>,
+) {
+    for (source_slot, captured_slot) in &closure.capture_copies {
+        slots.insert(*captured_slot);
+        if matches!(
+            super::availability::closure_capture_binding_mode(closure, *captured_slot),
+            crate::CaptureBindingMode::Borrow | crate::CaptureBindingMode::BorrowMut
+        ) {
+            slots.insert(*source_slot);
+        }
+    }
+    collect_persistent_closure_sources_from_expr(&closure.body, slots);
+}
+
+fn collect_persistent_closure_sources_from_stmts(stmts: &[Stmt], slots: &mut BTreeSet<LocalSlot>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Noop { .. }
+            | Stmt::FuncDecl { .. }
+            | Stmt::Break { .. }
+            | Stmt::Continue { .. }
+            | Stmt::Drop { .. } => {}
+            Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
+                collect_persistent_closure_sources_from_expr(expr, slots);
+            }
+            Stmt::ClosureLet { closure, .. } => {
+                collect_persistent_closure_sources(closure, slots);
+            }
+            Stmt::IfElse {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                collect_persistent_closure_sources_from_expr(condition, slots);
+                collect_persistent_closure_sources_from_stmts(then_branch, slots);
+                collect_persistent_closure_sources_from_stmts(else_branch, slots);
+            }
+            Stmt::For {
+                init,
+                condition,
+                post,
+                body,
+                ..
+            } => {
+                collect_persistent_closure_sources_from_stmts(
+                    core::slice::from_ref(init.as_ref()),
+                    slots,
+                );
+                collect_persistent_closure_sources_from_expr(condition, slots);
+                collect_persistent_closure_sources_from_stmts(
+                    core::slice::from_ref(post.as_ref()),
+                    slots,
+                );
+                collect_persistent_closure_sources_from_stmts(body, slots);
+            }
+            Stmt::While {
+                condition, body, ..
+            } => {
+                collect_persistent_closure_sources_from_expr(condition, slots);
+                collect_persistent_closure_sources_from_stmts(body, slots);
+            }
+        }
+    }
+}
+
+fn collect_persistent_closure_sources_from_expr(expr: &Expr, slots: &mut BTreeSet<LocalSlot>) {
+    match expr {
+        Expr::Null
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::String(_)
+        | Expr::Bytes(_)
+        | Expr::FunctionRef(..)
+        | Expr::Var(_)
+        | Expr::MoveVar(_)
+        | Expr::MoveField { .. }
+        | Expr::MoveIndex { .. } => {}
+        Expr::OptionalGet { container, key, .. } => {
+            collect_persistent_closure_sources_from_expr(container, slots);
+            collect_persistent_closure_sources_from_expr(key, slots);
+        }
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => {
+            collect_persistent_closure_sources_from_expr(value, slots);
+            collect_persistent_closure_sources_from_expr(fallback, slots);
+        }
+        Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) => {
+            for arg in args {
+                collect_persistent_closure_sources_from_expr(arg, slots);
+            }
+        }
+        Expr::Closure(closure) => collect_persistent_closure_sources(closure, slots),
+        Expr::ClosureCall(closure, args) => {
+            collect_persistent_closure_sources(closure, slots);
+            for arg in args {
+                collect_persistent_closure_sources_from_expr(arg, slots);
+            }
+        }
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::Div(lhs, rhs)
+        | Expr::Mod(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
+        | Expr::Eq(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Gt(lhs, rhs) => {
+            collect_persistent_closure_sources_from_expr(lhs, slots);
+            collect_persistent_closure_sources_from_expr(rhs, slots);
+        }
+        Expr::Neg(value)
+        | Expr::Not(value)
+        | Expr::ToOwned(value)
+        | Expr::Borrow(value)
+        | Expr::BorrowMut(value) => {
+            collect_persistent_closure_sources_from_expr(value, slots);
+        }
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            collect_persistent_closure_sources_from_expr(condition, slots);
+            collect_persistent_closure_sources_from_expr(then_expr, slots);
+            collect_persistent_closure_sources_from_expr(else_expr, slots);
+        }
+        Expr::Match {
+            value,
+            arms,
+            default,
+            ..
+        } => {
+            collect_persistent_closure_sources_from_expr(value, slots);
+            for (_, arm) in arms {
+                collect_persistent_closure_sources_from_expr(arm, slots);
+            }
+            collect_persistent_closure_sources_from_expr(default, slots);
+        }
+        Expr::Block { stmts, expr } => {
+            collect_persistent_closure_sources_from_stmts(stmts, slots);
+            collect_persistent_closure_sources_from_expr(expr, slots);
+        }
+    }
 }
 
 fn remap_slot(index: LocalSlot, mapping: &[LocalSlot]) -> Result<LocalSlot, ParseError> {

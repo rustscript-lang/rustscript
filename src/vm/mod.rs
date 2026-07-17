@@ -291,7 +291,6 @@ pub(crate) struct ExecutionFrame {
     pub(crate) local_base: usize,
     pub(crate) local_count: usize,
     pub(crate) prototype_id: Option<u32>,
-    pub(crate) active_callable: Option<Arc<CallableValue>>,
 }
 
 impl ExecutionFrame {
@@ -302,7 +301,6 @@ impl ExecutionFrame {
             local_base: 0,
             local_count,
             prototype_id: None,
-            active_callable: None,
         }
     }
 }
@@ -328,6 +326,7 @@ pub struct Vm {
     ip: usize,
     stack: Vec<Value>,
     locals: Vec<Value>,
+    capture_cells: HashMap<usize, crate::bytecode::SharedCaptureCell>,
     operand_type_hints: Option<Arc<[PackedOperandTypes]>>,
     decoded_instruction_data: Arc<crate::bytecode::DecodedInstructionData>,
     host_functions: Vec<VmHostFunction>,
@@ -463,7 +462,9 @@ fn compute_program_cache_key(program: &Program) -> u64 {
         prototype.arity.hash(&mut hasher);
         prototype.frame_local_count.hash(&mut hasher);
         prototype.parameter_slots.hash(&mut hasher);
+        prototype.capture_source_slots.hash(&mut hasher);
         prototype.capture_slots.hash(&mut hasher);
+        prototype.capture_modes.hash(&mut hasher);
         prototype.self_slot.hash(&mut hasher);
         match &prototype.schema {
             Some(schema) => {
@@ -639,6 +640,7 @@ impl Vm {
             ip: 0,
             stack: Vec::new(),
             locals: vec![Value::Null; local_count],
+            capture_cells: HashMap::new(),
             operand_type_hints,
             decoded_instruction_data,
             host_functions: Vec::new(),
@@ -846,6 +848,7 @@ impl Vm {
         self.clear_fuel();
         self.clear_epoch_deadline();
         self.clear_stack_with_drop_contract();
+        self.capture_cells.clear();
         self.clear_locals_with_drop_contract();
         self.locals.resize(self.program.local_count, Value::Null);
         self.initialize_root_callable_bindings();
@@ -1020,13 +1023,23 @@ impl Vm {
     #[inline(always)]
     fn load_local_value(&self, index: u8) -> VmResult<Value> {
         let absolute = self.absolute_local_index(index)?;
+        if let Some(cell) = self.capture_cells.get(&absolute) {
+            return cell
+                .lock()
+                .map(|value| value.clone())
+                .map_err(|_| VmError::InvalidFrameState("capture cell lock is poisoned"));
+        }
         Ok(self.locals[absolute].clone())
     }
 
     #[inline(always)]
     pub(super) fn local_numeric_value(&self, index: u8) -> Option<NumericValue> {
         let absolute = self.absolute_local_index(index).ok()?;
-        match self.locals.get(absolute)? {
+        let captured = self
+            .capture_cells
+            .get(&absolute)
+            .and_then(|cell| cell.lock().ok().map(|value| value.clone()));
+        match captured.as_ref().or_else(|| self.locals.get(absolute))? {
             Value::Int(value) => Some(NumericValue::Int(*value)),
             Value::Float(value) => Some(NumericValue::Float(*value)),
             _ => None,
@@ -1077,6 +1090,7 @@ impl Vm {
 impl Drop for Vm {
     fn drop(&mut self) {
         self.clear_stack_with_drop_contract();
+        self.capture_cells.clear();
         self.clear_locals_with_drop_contract();
         crate::builtins::runtime::close_all_handles(self);
     }
@@ -1088,7 +1102,7 @@ impl Vm {
     }
 
     pub(crate) fn bind_callable_value(
-        &self,
+        &mut self,
         prototype_id: u32,
         captures: Vec<Value>,
     ) -> VmResult<Value> {
@@ -1098,14 +1112,54 @@ impl Vm {
             .get(prototype_id as usize)
             .cloned()
             .ok_or(VmError::InvalidCallablePrototype(prototype_id))?;
-        if captures.len() != prototype.capture_slots.len() {
+        if captures.len() != prototype.capture_slots.len()
+            || captures.len() != prototype.capture_modes.len()
+            || captures.len() != prototype.capture_source_slots.len()
+        {
             return Err(VmError::InvalidFrameState(
                 "callable capture layout mismatch",
             ));
         }
-        let env = if prototype.kind == crate::CallableKind::Closure || !captures.is_empty() {
+        let active_base = self.active_local_base();
+        let mut cells = Vec::with_capacity(captures.len());
+        for (((value, source), target), mode) in captures
+            .into_iter()
+            .zip(&prototype.capture_source_slots)
+            .zip(&prototype.capture_slots)
+            .zip(&prototype.capture_modes)
+        {
+            let self_capture = prototype.self_slot == Some(*target);
+            let cell = if !self_capture
+                && matches!(
+                    mode,
+                    crate::CaptureBindingMode::Borrow | crate::CaptureBindingMode::BorrowMut
+                ) {
+                let absolute = active_base
+                    .checked_add(usize::from(*source))
+                    .ok_or(VmError::InvalidFrameState("capture source slot overflow"))?;
+                if absolute >= self.locals.len() {
+                    return Err(VmError::InvalidFrameState(
+                        "capture source exceeds active frame locals",
+                    ));
+                }
+                let cell = self
+                    .capture_cells
+                    .entry(absolute)
+                    .or_insert_with(|| Arc::new(Mutex::new(value)))
+                    .clone();
+                self.locals[absolute] = cell
+                    .lock()
+                    .map_err(|_| VmError::InvalidFrameState("capture cell lock is poisoned"))?
+                    .clone();
+                cell
+            } else {
+                Arc::new(Mutex::new(value))
+            };
+            cells.push(cell);
+        }
+        let env = if prototype.kind == crate::CallableKind::Closure || !cells.is_empty() {
             Some(Arc::new(crate::CallableEnvironment {
-                cells: Mutex::new(captures),
+                cells: Mutex::new(cells),
             }))
         } else {
             None
@@ -1236,7 +1290,16 @@ impl Vm {
                                 "capture slot is outside the script frame",
                             ));
                         }
-                        self.locals[local_base + relative] = cell.clone();
+                        let absolute = local_base + relative;
+                        self.locals[absolute] = cell
+                            .lock()
+                            .map_err(|_| {
+                                VmError::InvalidFrameState("capture cell lock is poisoned")
+                            })?
+                            .clone();
+                        if prototype.self_slot != Some(*slot) {
+                            self.capture_cells.insert(absolute, cell.clone());
+                        }
                     }
                 }
                 if let Some(slot) = prototype.self_slot {
@@ -1255,7 +1318,6 @@ impl Vm {
                     local_base,
                     local_count,
                     prototype_id: Some(callable.prototype_id),
-                    active_callable: Some(callable),
                 });
                 self.call_depth = self.script_frame_depth();
                 self.ip = function.entry_ip as usize;
@@ -1305,36 +1367,10 @@ impl Vm {
         }
         self.call_depth = self.script_frame_depth();
 
-        let mut replaced_capture_values = Vec::new();
-        if let (Some(prototype_id), Some(callable)) =
-            (frame.prototype_id, frame.active_callable.as_ref())
-            && let Some(environment) = callable.env.as_ref()
-            && let Some(prototype) = self.program.callable_prototypes.get(prototype_id as usize)
-        {
-            let mut cells = environment
-                .cells
-                .lock()
-                .map_err(|_| VmError::InvalidFrameState("callable environment lock is poisoned"))?;
-            for (cell, slot) in cells.iter_mut().zip(&prototype.capture_slots) {
-                if prototype.self_slot == Some(*slot) {
-                    continue;
-                }
-                let absolute = frame
-                    .local_base
-                    .checked_add(usize::from(*slot))
-                    .ok_or(VmError::InvalidFrameState("capture slot overflow"))?;
-                let value =
-                    self.locals
-                        .get(absolute)
-                        .cloned()
-                        .ok_or(VmError::InvalidFrameState(
-                            "capture slot exceeds active frame locals",
-                        ))?;
-                replaced_capture_values.push(std::mem::replace(cell, value));
-            }
-        }
-        for value in replaced_capture_values {
-            self.drop_value_with_contract(value);
+        if frame.prototype_id.is_some() {
+            let frame_end = frame.local_base.saturating_add(frame.local_count);
+            self.capture_cells
+                .retain(|absolute, _| *absolute < frame.local_base || *absolute >= frame_end);
         }
 
         if !matches!(frame.continuation, FrameContinuation::Halt) {
@@ -1787,11 +1823,34 @@ impl Vm {
         value: Value,
     ) -> VmResult<()> {
         let absolute = self.absolute_local_index(index)?;
+        if let Some(cell) = self.capture_cells.get(&absolute).cloned() {
+            let previous = {
+                let mut captured = cell
+                    .lock()
+                    .map_err(|_| VmError::InvalidFrameState("capture cell lock is poisoned"))?;
+                std::mem::replace(&mut *captured, value.clone())
+            };
+            self.locals[absolute] = value;
+            self.drop_value_with_contract(previous);
+            return Ok(());
+        }
         let slot = self
             .locals
             .get_mut(absolute)
             .ok_or(VmError::InvalidLocal(index))?;
         let previous = std::mem::replace(slot, value);
+        self.drop_value_with_contract(previous);
+        Ok(())
+    }
+
+    pub(crate) fn detach_local_with_drop_contract(&mut self, index: u8) -> VmResult<()> {
+        let absolute = self.absolute_local_index(index)?;
+        self.capture_cells.remove(&absolute);
+        let slot = self
+            .locals
+            .get_mut(absolute)
+            .ok_or(VmError::InvalidLocal(index))?;
+        let previous = std::mem::replace(slot, Value::Null);
         self.drop_value_with_contract(previous);
         Ok(())
     }
@@ -2491,6 +2550,7 @@ impl Vm {
         self.queued_callables.clear();
         self.draining_queued_callables = false;
         self.clear_stack_with_drop_contract();
+        self.capture_cells.clear();
         self.clear_locals_with_drop_contract();
         self.execution_frames.clear();
         self.call_depth = 0;

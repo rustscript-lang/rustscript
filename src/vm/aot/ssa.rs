@@ -2654,7 +2654,7 @@ fn builtin_runtime_result_count(call_index: u16) -> Option<usize> {
     Some(match builtin {
         // `assert` is typed like a `null`-producing expression in the frontend, but the runtime
         // consumes its arguments and pushes no value on success.
-        BuiltinFunction::Assert => 0,
+        BuiltinFunction::Assert | BuiltinFunction::DetachLocal => 0,
         _ => 1,
     })
 }

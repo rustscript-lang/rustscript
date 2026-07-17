@@ -1576,7 +1576,6 @@ mod tests {
             local_base: 2,
             local_count: 3,
             prototype_id: Some(7),
-            active_callable: None,
         });
         vm.call_depth = 1;
 

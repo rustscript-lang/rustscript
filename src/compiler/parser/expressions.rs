@@ -525,7 +525,9 @@ impl Parser {
                         let index = self.get_local(&name)?;
                         Expr::Var(index)
                     } else if let Some(decl) = self.functions.get(&name).cloned() {
-                        self.validate_named_call_type_args(&decl, &type_args)?;
+                        if !type_args.is_empty() {
+                            self.validate_named_call_type_args(&decl, &type_args)?;
+                        }
                         Expr::FunctionRef(decl.index, type_args)
                     } else if let Some(index) = crate::builtin_call_index(&name) {
                         if !type_args.is_empty() {
@@ -549,6 +551,7 @@ impl Parser {
                     }
                 }
             };
+            self.contextualize_function_call_args(&mut expr)?;
             expr = self.parse_postfix_access(expr)?;
             return Ok(expr);
         }
@@ -1616,6 +1619,241 @@ impl Parser {
         })?;
         let decl = self.define_host_function(host_name, arity)?;
         Ok(Expr::Call(decl.index, type_args, args))
+    }
+
+    pub(super) fn contextualize_function_value(
+        &self,
+        expr: &mut Expr,
+        expected: &TypeSchema,
+    ) -> Result<(), ParseError> {
+        match expr {
+            Expr::FunctionRef(index, type_args) if type_args.is_empty() => {
+                let Some(decl) = self
+                    .functions
+                    .values()
+                    .find(|decl| decl.index == *index)
+                    .cloned()
+                else {
+                    return Ok(());
+                };
+                if decl.type_params.is_empty() {
+                    return Ok(());
+                }
+                let Some(inferred) = Self::infer_contextual_function_type_args(&decl, expected)
+                else {
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line: self.current_line(),
+                        message: format!(
+                            "generic function value '{}' cannot resolve type arguments from the expected callable schema",
+                            decl.name
+                        ),
+                    });
+                };
+                *type_args = inferred;
+            }
+            Expr::IfElse {
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                self.contextualize_function_value(then_expr, expected)?;
+                self.contextualize_function_value(else_expr, expected)?;
+            }
+            Expr::Match { arms, default, .. } => {
+                for (_, arm) in arms {
+                    self.contextualize_function_value(arm, expected)?;
+                }
+                self.contextualize_function_value(default, expected)?;
+            }
+            Expr::Block { expr, .. } => {
+                self.contextualize_function_value(expr, expected)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn contextualize_function_call_args(&self, expr: &mut Expr) -> Result<(), ParseError> {
+        let Expr::Call(index, type_args, args) = expr else {
+            return Ok(());
+        };
+        let Some(decl) = self
+            .functions
+            .values()
+            .find(|decl| decl.index == *index)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        if decl.type_params.len() != type_args.len() {
+            return Ok(());
+        }
+        let bindings = decl
+            .type_params
+            .iter()
+            .cloned()
+            .zip(type_args.iter().cloned())
+            .collect::<HashMap<_, _>>();
+        for (arg, expected) in args.iter_mut().zip(&decl.arg_schemas) {
+            let Some(expected) = expected else {
+                continue;
+            };
+            let expected = Self::substitute_contextual_schema(expected, &bindings);
+            self.contextualize_function_value(arg, &expected)?;
+        }
+        Ok(())
+    }
+
+    fn infer_contextual_function_type_args(
+        decl: &FunctionDecl,
+        expected: &TypeSchema,
+    ) -> Option<Vec<TypeSchema>> {
+        let TypeSchema::Callable { params, result } = expected.clone_inner_if_optional() else {
+            return None;
+        };
+        if params.len() != decl.arg_schemas.len() {
+            return None;
+        }
+        let mut bindings = HashMap::new();
+        for (template, actual) in decl.arg_schemas.iter().zip(&params) {
+            let template = template.as_ref().unwrap_or(&TypeSchema::Unknown);
+            if !Self::unify_contextual_schema(template, actual, &decl.type_params, &mut bindings) {
+                return None;
+            }
+        }
+        let template_result = decl.return_schema.as_ref().unwrap_or(&TypeSchema::Unknown);
+        if !Self::unify_contextual_schema(
+            template_result,
+            result.as_ref(),
+            &decl.type_params,
+            &mut bindings,
+        ) {
+            return None;
+        }
+        decl.type_params
+            .iter()
+            .map(|name| bindings.get(name).cloned())
+            .collect()
+    }
+
+    fn unify_contextual_schema(
+        template: &TypeSchema,
+        actual: &TypeSchema,
+        type_params: &[String],
+        bindings: &mut HashMap<String, TypeSchema>,
+    ) -> bool {
+        if let TypeSchema::GenericParam(name) = template
+            && type_params.contains(name)
+        {
+            if matches!(actual, TypeSchema::Unknown | TypeSchema::GenericParam(_)) {
+                return false;
+            }
+            return bindings.get(name).is_none_or(|bound| bound == actual) && {
+                bindings
+                    .entry(name.clone())
+                    .or_insert_with(|| actual.clone());
+                true
+            };
+        }
+        match (template, actual) {
+            (TypeSchema::Unknown, _) | (_, TypeSchema::Unknown) => true,
+            (TypeSchema::Optional(lhs), TypeSchema::Optional(rhs))
+            | (TypeSchema::Array(lhs), TypeSchema::Array(rhs))
+            | (TypeSchema::Map(lhs), TypeSchema::Map(rhs)) => {
+                Self::unify_contextual_schema(lhs, rhs, type_params, bindings)
+            }
+            (TypeSchema::Named(lhs_name, lhs_args), TypeSchema::Named(rhs_name, rhs_args)) => {
+                lhs_name == rhs_name
+                    && lhs_args.len() == rhs_args.len()
+                    && lhs_args.iter().zip(rhs_args).all(|(lhs, rhs)| {
+                        Self::unify_contextual_schema(lhs, rhs, type_params, bindings)
+                    })
+            }
+            (TypeSchema::ArrayTuple(lhs), TypeSchema::ArrayTuple(rhs)) => {
+                lhs.len() == rhs.len()
+                    && lhs.iter().zip(rhs).all(|(lhs, rhs)| {
+                        Self::unify_contextual_schema(lhs, rhs, type_params, bindings)
+                    })
+            }
+            (
+                TypeSchema::Callable {
+                    params: lhs_params,
+                    result: lhs_result,
+                },
+                TypeSchema::Callable {
+                    params: rhs_params,
+                    result: rhs_result,
+                },
+            ) => {
+                lhs_params.len() == rhs_params.len()
+                    && lhs_params.iter().zip(rhs_params).all(|(lhs, rhs)| {
+                        Self::unify_contextual_schema(lhs, rhs, type_params, bindings)
+                    })
+                    && Self::unify_contextual_schema(lhs_result, rhs_result, type_params, bindings)
+            }
+            _ => template == actual,
+        }
+    }
+
+    fn substitute_contextual_schema(
+        schema: &TypeSchema,
+        bindings: &HashMap<String, TypeSchema>,
+    ) -> TypeSchema {
+        match schema {
+            TypeSchema::GenericParam(name) => bindings
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| schema.clone()),
+            TypeSchema::Optional(inner) => TypeSchema::Optional(Box::new(
+                Self::substitute_contextual_schema(inner, bindings),
+            )),
+            TypeSchema::Named(name, args) => TypeSchema::Named(
+                name.clone(),
+                args.iter()
+                    .map(|arg| Self::substitute_contextual_schema(arg, bindings))
+                    .collect(),
+            ),
+            TypeSchema::Array(inner) => TypeSchema::Array(Box::new(
+                Self::substitute_contextual_schema(inner, bindings),
+            )),
+            TypeSchema::ArrayTuple(items) => TypeSchema::ArrayTuple(
+                items
+                    .iter()
+                    .map(|item| Self::substitute_contextual_schema(item, bindings))
+                    .collect(),
+            ),
+            TypeSchema::ArrayTupleRest { prefix, rest } => TypeSchema::ArrayTupleRest {
+                prefix: prefix
+                    .iter()
+                    .map(|item| Self::substitute_contextual_schema(item, bindings))
+                    .collect(),
+                rest: Box::new(Self::substitute_contextual_schema(rest, bindings)),
+            },
+            TypeSchema::Map(inner) => TypeSchema::Map(Box::new(
+                Self::substitute_contextual_schema(inner, bindings),
+            )),
+            TypeSchema::Object(fields) => TypeSchema::Object(
+                fields
+                    .iter()
+                    .map(|(name, field)| {
+                        (
+                            name.clone(),
+                            Self::substitute_contextual_schema(field, bindings),
+                        )
+                    })
+                    .collect(),
+            ),
+            TypeSchema::Callable { params, result } => TypeSchema::Callable {
+                params: params
+                    .iter()
+                    .map(|param| Self::substitute_contextual_schema(param, bindings))
+                    .collect(),
+                result: Box::new(Self::substitute_contextual_schema(result, bindings)),
+            },
+            _ => schema.clone(),
+        }
     }
 
     fn validate_named_call_type_args(

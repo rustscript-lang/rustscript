@@ -8,7 +8,8 @@ pub type SharedBytes = Rc<Vec<u8>>;
 pub type SharedArray = Rc<Vec<Value>>;
 pub type SharedMap = Rc<Vec<(Value, Value)>>;
 pub type SharedCallable = Rc<CallableValue>;
-pub type CallableEnvironment = Rc<RefCell<Vec<Value>>>;
+pub type SharedCaptureCell = Rc<RefCell<Value>>;
+pub type CallableEnvironment = Rc<Vec<SharedCaptureCell>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CallableKind {

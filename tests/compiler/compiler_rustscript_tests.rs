@@ -2193,6 +2193,86 @@ fn compatible_callable_signatures_merge_across_branches() {
 }
 
 #[test]
+fn incompatible_callable_signatures_are_rejected_across_control_flow() {
+    let cases = [
+        SourceErrorCase {
+            name: "if expression rejects incompatible callable signatures",
+            source: r#"
+                fn map_int(value: int) -> int { value + 1 }
+                fn map_string(value: string) -> string { value + "!" }
+                let choose_int = true;
+                let selected = if choose_int => { map_int } else => { map_string };
+                selected(41);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::IfElseBranchTypeMismatch),
+            expected_contains_all: &["callable"],
+        },
+        SourceErrorCase {
+            name: "match expression rejects incompatible callable signatures",
+            source: r#"
+                fn map_int(value: int) -> int { value + 1 }
+                fn map_string(value: string) -> string { value + "!" }
+                let selected = match 0 {
+                    0 => map_int,
+                    _ => map_string,
+                };
+                selected(41);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::IfElseBranchTypeMismatch),
+            expected_contains_all: &["callable"],
+        },
+        SourceErrorCase {
+            name: "loop merge rejects incompatible callable signatures",
+            source: r#"
+                fn map_int(value: int) -> int { value + 1 }
+                fn map_string(value: string) -> string { value + "!" }
+                let mut selected = map_int;
+                let keep_running = false;
+                while keep_running {
+                    selected = map_string;
+                }
+                selected(41);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::IfElseBranchTypeMismatch),
+            expected_contains_all: &["callable"],
+        },
+    ];
+
+    for case in &cases {
+        expect_source_error_case(case);
+    }
+}
+
+#[test]
+fn bare_generic_function_values_resolve_from_callable_context() {
+    let cases = [
+        rustscript_runtime_case(
+            "bare generic function value resolves from local annotation",
+            r#"
+                fn identity<T>(value: T) -> T { value }
+                let int_identity: fn(int) -> int = identity;
+                int_identity(42);
+            "#,
+            vec![Value::Int(42)],
+        ),
+        rustscript_runtime_case(
+            "bare generic function value resolves from higher order parameter",
+            r#"
+                fn identity<T>(value: T) -> T { value }
+                fn apply<T>(mapper: fn(T) -> T, value: T) -> T { mapper(value) }
+                apply::<int>(identity, 42);
+            "#,
+            vec![Value::Int(42)],
+        ),
+    ];
+
+    run_runtime_cases(&cases);
+}
+
+#[test]
 fn explicit_generic_function_values_use_substituted_callable_schemas() {
     let case = rustscript_runtime_case(
         "explicit generic function values",
@@ -2268,6 +2348,46 @@ fn closure_aliases_share_state_and_factory_evaluations_are_independent() {
             second();
         "#,
         vec![Value::Int(1), Value::Int(2), Value::Int(1)],
+    );
+
+    run_runtime_case(&case);
+}
+
+#[test]
+fn borrowed_capture_shares_outer_mutation_cell() {
+    let case = rustscript_runtime_case(
+        "borrowed capture observes outer writes",
+        r#"
+            let mut base = 1;
+            let read = || &base;
+            base = 2;
+            read();
+            base;
+        "#,
+        vec![Value::Int(2), Value::Int(2)],
+    );
+
+    run_runtime_case(&case);
+}
+
+#[test]
+fn recursive_mutable_capture_updates_one_shared_cell() {
+    let case = rustscript_runtime_case(
+        "recursive mutable capture does not restore stale snapshots",
+        r#"
+            let mut count = 0;
+            let recurse = |depth| if depth == 0 => {
+                count = count + 1;
+                count
+            } else => {
+                count = count + 1;
+                recurse(depth - 1);
+                count
+            };
+            recurse(2);
+            count;
+        "#,
+        vec![Value::Int(3), Value::Int(3)],
     );
 
     run_runtime_case(&case);
