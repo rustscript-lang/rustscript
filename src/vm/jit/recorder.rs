@@ -482,7 +482,6 @@ enum SpecializedBuiltinKind {
     RegexMatch,
     RegexReplace,
     StringReplaceLiteral,
-    StringReplaceLiteralMany,
     StringLowerAscii,
     TypeOf,
     TypeOfKnown(ValueType),
@@ -1154,26 +1153,13 @@ pub(crate) fn record_trace(
                                 .iter()
                                 .all(|arg| arg.info.source_local != Some(local))
                     });
-                    let replace_many = builtin == BuiltinFunction::StringReplaceLiteral
-                        && (operand_types(program, ip).1 == ValueType::Array
-                            || (args.get(1).is_some_and(|arg| {
-                                observed_heap_container_kind(arg.info)
-                                    == Some(HeapContainerKind::Array)
-                            }) && args.get(2).is_some_and(|arg| {
-                                observed_heap_container_kind(arg.info)
-                                    == Some(HeapContainerKind::Array)
-                            })));
-                    let specialized_kind = if replace_many {
-                        Some(SpecializedBuiltinKind::StringReplaceLiteralMany)
-                    } else {
-                        select_specialized_builtin_kind(
-                            program,
-                            ip,
-                            builtin,
-                            args[0].info,
-                            container_was_moved,
-                        )
-                    };
+                    let specialized_kind = select_specialized_builtin_kind(
+                        program,
+                        ip,
+                        builtin,
+                        args[0].info,
+                        container_was_moved,
+                    );
                     if let Some(kind) = specialized_kind {
                         let (name, out) = emit_specialized_builtin_call(
                             &mut builder,
@@ -2847,19 +2833,12 @@ fn analyze_specialized_builtin_call(
             frame.push(ValueInfo::tagged_typed(ValueType::String));
             Ok("regex_replace")
         }
-        SpecializedBuiltinKind::StringReplaceLiteral
-        | SpecializedBuiltinKind::StringReplaceLiteralMany => {
+        SpecializedBuiltinKind::StringReplaceLiteral => {
             let _ = frame.pop()?;
             let _ = frame.pop()?;
             let _ = frame.pop()?;
             frame.push(ValueInfo::tagged_typed(ValueType::String));
-            Ok(
-                if matches!(kind, SpecializedBuiltinKind::StringReplaceLiteralMany) {
-                    "string_replace_literal_many"
-                } else {
-                    "string_replace_literal"
-                },
-            )
+            Ok("string_replace_literal")
         }
         SpecializedBuiltinKind::StringLowerAscii => {
             let _ = frame.pop()?;
@@ -3295,28 +3274,6 @@ fn emit_specialized_builtin_call(
                 })
                 .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
             Ok(("regex_replace", out))
-        }
-        SpecializedBuiltinKind::StringReplaceLiteralMany => {
-            let replacements = ensure_heap_ptr(builder, block, ip, frame.pop()?, ValueType::Array)?;
-            let needles = ensure_heap_ptr(builder, block, ip, frame.pop()?, ValueType::Array)?;
-            let text = ensure_heap_ptr(builder, block, ip, frame.pop()?, ValueType::String)?;
-            let value = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Tagged,
-                    SsaInstKind::StringReplaceLiteralMany {
-                        text: text.value.id,
-                        needles: needles.value.id,
-                        replacements: replacements.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::tagged_typed(ValueType::String),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("string_replace_literal_many", value))
         }
         SpecializedBuiltinKind::StringReplaceLiteral => {
             let replacement = ensure_heap_ptr(

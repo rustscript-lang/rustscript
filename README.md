@@ -761,6 +761,9 @@ frontend/source patterns may still reach a `Bridge/Exit` path even when an SSA i
 | `len(map)` | Bridge/Exit | Inline |
 | `get(map)` | Bridge/Exit | Helper |
 | `has(map)` | Bridge/Exit | Helper |
+| `string_contains`, `string_replace_literal`, `string_lower_ascii`, `string_split_literal` | Bridge/Exit | Helper |
+| `re::match`, `re::replace` | Bridge/Exit | Helper |
+| Dynamic `type`, `to_string`, equality, and `len` | Bridge/Exit | Helper (known `type` / string `to_string` cases are folded) |
 | All other builtins | Bridge/Exit | Bridge/Exit or NYI, depending on trace shape |
 | Host imports | Bridge/Exit | Bridge/Exit or branch-exit trace, never inline |
 

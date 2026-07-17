@@ -4679,53 +4679,6 @@ fn trace_jit_specializes_loop_carried_string_builtins() {
 }
 
 #[test]
-fn trace_jit_specializes_literal_replace_many() {
-    if !native_jit_supported() {
-        return;
-    }
-    let source = r#"
-        let mut i = 0;
-        let mut out = "";
-        let needles = ["%27", "%20", "+"];
-        let replacements = ["'", " ", " "];
-        while i < 8 {
-            out = string_replace_literal(
-                "%27x%20y+z",
-                &needles,
-                &replacements
-            );
-            i = i + 1;
-        }
-        out == "'x y z";
-    "#;
-    let program = compile_source(source).expect("replace-many fixture should compile");
-    let mut vm = Vm::new_with_jit_config(
-        program.program,
-        JitConfig {
-            enabled: true,
-            hot_loop_threshold: 1,
-            max_trace_len: 512,
-        },
-    );
-    assert_eq!(
-        vm.run().expect("replace-many fixture should run"),
-        VmStatus::Halted
-    );
-    assert_eq!(vm.stack(), &[Value::Bool(true)]);
-    let snapshot = vm.jit_snapshot();
-    assert!(
-        snapshot.traces.iter().any(|trace| {
-            trace
-                .op_names
-                .iter()
-                .any(|name| name == "string_replace_literal_many")
-        }),
-        "expected replace-many SSA specialization, got {}",
-        vm.dump_jit_info()
-    );
-}
-
-#[test]
 fn trace_jit_preserves_dynamic_concat_type_guards() {
     if !native_jit_supported() {
         return;
@@ -4857,40 +4810,4 @@ fn trace_jit_specializes_regex_builtins_without_call_boundary() {
     assert_eq!(vm.regex_cache_entry_count(), 2);
     assert_eq!(vm.regex_cache_compile_count(), 2);
     assert!(vm.regex_cache_hit_count() >= 14);
-}
-
-#[test]
-fn trace_jit_propagates_replace_many_length_mismatch() {
-    if !native_jit_supported() {
-        return;
-    }
-    let source = r#"
-        let needles = ["a"];
-        let replacement_sets: [[string]] = [["x"], ["x"], ["x"], ["x"], ["x"], []];
-        let mut replacements: [string] = ["x"];
-        let mut i = 0;
-        let mut out = "";
-        while i < 6 {
-            replacements = (&replacement_sets)[i];
-            out = string_replace_literal("a", &needles, &replacements);
-            i = i + 1;
-        }
-        out;
-    "#;
-    let compiled = compile_source(source).expect("replace-many mismatch fixture should compile");
-    let mut vm = Vm::new_with_jit_config(
-        compiled.program.with_local_count(compiled.locals),
-        JitConfig {
-            enabled: true,
-            hot_loop_threshold: 1,
-            max_trace_len: 512,
-        },
-    );
-    let error = vm
-        .run()
-        .expect_err("replace-many mismatch should propagate its host error");
-    assert_eq!(
-        error.to_string(),
-        "host error: string_replace_literal array lengths must match"
-    );
 }

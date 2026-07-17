@@ -215,10 +215,6 @@ pub(crate) fn string_replace_literal_entry_address() -> usize {
     pd_vm_native_string_replace_literal as *const () as usize
 }
 
-pub(crate) fn string_replace_literal_many_entry_address() -> usize {
-    pd_vm_native_string_replace_literal_many as *const () as usize
-}
-
 pub(crate) fn string_lower_ascii_entry_address() -> usize {
     pd_vm_native_string_lower_ascii as *const () as usize
 }
@@ -500,29 +496,6 @@ pub(crate) extern "C" fn pd_vm_native_string_replace_literal(
             replacement.as_str(),
         ),
     ))
-}
-
-pub(crate) extern "C" fn pd_vm_native_string_replace_literal_many(
-    text_ptr: *mut u8,
-    needles_ptr: *mut u8,
-    replacements_ptr: *mut u8,
-) -> *mut u8 {
-    let text = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(text_ptr)) };
-    let needles =
-        unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<Vec<Value>>(needles_ptr)) };
-    let replacements =
-        unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<Vec<Value>>(replacements_ptr)) };
-    match crate::builtins::runtime::core::builtin_string_replace_literal_many_impl(
-        text.as_str(),
-        needles.as_slice(),
-        replacements.as_slice(),
-    ) {
-        Ok(value) => arc_into_repr_ptr(Arc::new(value)),
-        Err(error) => {
-            store_bridge_error(error);
-            std::ptr::null_mut()
-        }
-    }
 }
 
 pub(crate) extern "C" fn pd_vm_native_string_lower_ascii(text_ptr: *mut u8) -> *mut u8 {

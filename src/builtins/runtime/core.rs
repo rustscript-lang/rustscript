@@ -792,38 +792,6 @@ pub(crate) fn builtin_string_replace_literal_impl(
     text.replace(needle, replacement)
 }
 
-/// Apply literal replacements in order from parallel `needles` and `replacements` arrays.
-///
-/// Each pair uses the same non-overlapping semantics as the scalar overload. Empty needles
-/// leave the current output unchanged. Both arrays must have equal length and contain strings.
-/// A length mismatch or a non-string element returns an error.
-#[pd_host_function(name = "string_replace_literal")]
-pub(crate) fn builtin_string_replace_literal_many_impl(
-    text: VmStringRef<'_>,
-    needles: VmArrayRef<'_>,
-    replacements: VmArrayRef<'_>,
-) -> VmResult<String> {
-    if needles.len() != replacements.len() {
-        return Err(VmError::HostError(
-            "string_replace_literal array lengths must match".to_string(),
-        ));
-    }
-    let mut out = text.to_string();
-    for (needle, replacement) in needles.iter().zip(replacements.iter()) {
-        let (Value::String(needle), Value::String(replacement)) = (needle, replacement) else {
-            return Err(VmError::TypeMismatch("string arrays"));
-        };
-        if needle.is_empty() || out.contains(needle.as_str()) {
-            out = builtin_string_replace_literal_impl(
-                out.as_str(),
-                needle.as_str(),
-                replacement.as_str(),
-            );
-        }
-    }
-    Ok(out)
-}
-
 /// Lower ASCII `A`-`Z` bytes in `text` while preserving UTF-8.
 #[pd_host_function(name = "string_lower_ascii")]
 pub(crate) fn builtin_string_lower_ascii_impl(text: VmStringRef<'_>) -> String {

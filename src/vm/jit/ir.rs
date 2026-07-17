@@ -156,11 +156,6 @@ pub(crate) enum SsaInstKind {
         needle: SsaValueId,
         replacement: SsaValueId,
     },
-    StringReplaceLiteralMany {
-        text: SsaValueId,
-        needles: SsaValueId,
-        replacements: SsaValueId,
-    },
     StringLowerAscii {
         text: SsaValueId,
     },
@@ -418,11 +413,6 @@ impl SsaInstKind {
                 needle,
                 replacement,
             } => vec![*text, *needle, *replacement],
-            Self::StringReplaceLiteralMany {
-                text,
-                needles,
-                replacements,
-            } => vec![*text, *needles, *replacements],
             Self::StringLowerAscii { text } => vec![*text],
             Self::TypeOf { value } | Self::ToString { value } => vec![*value],
             Self::StringSplitLiteral { text, delimiter } => vec![*text, *delimiter],
@@ -1049,13 +1039,6 @@ fn render_inst_kind(kind: &SsaInstKind) -> String {
             replacement,
         } => {
             format!("string_replace_literal {text}, {needle}, {replacement}")
-        }
-        SsaInstKind::StringReplaceLiteralMany {
-            text,
-            needles,
-            replacements,
-        } => {
-            format!("string_replace_literal_many {text}, {needles}, {replacements}")
         }
         SsaInstKind::StringLowerAscii { text } => format!("string_lower_ascii {text}"),
         SsaInstKind::TypeOf { value } => format!("type_of {value}"),
