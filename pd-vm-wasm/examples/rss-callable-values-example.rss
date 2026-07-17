@@ -1,0 +1,166 @@
+// First-class callable values in RustScript.
+// This example covers the supported RSS language surface: named functions,
+// closures, captures, higher-order calls, recursion, containers, identity,
+// builtins, generic function values, and contextual generic inference.
+// Named functions are values and can be aliased, reassigned, and passed around.
+fn add_one(value: int) -> int {
+    value + 1
+}
+
+fn add_two(value: int) -> int {
+    value + 2
+}
+
+fn apply_twice(mapper: fn(int) -> int, value: int) -> int {
+    let once = mapper(value);
+    mapper(once)
+}
+
+let named = add_one;
+assert(named(41) == 42);
+assert(apply_twice(add_one, 40) == 42);
+
+let mut rebound = add_one;
+rebound = add_two;
+assert(rebound(40) == 42);
+
+// Compatible callable signatures merge across control flow.
+let branch_mapper = if true => {
+    add_one
+} else => {
+    add_two
+};
+assert(branch_mapper(41) == 42);
+
+let match_mapper = match 1 {
+    1 => add_one,
+    _ => add_two,
+};
+assert(match_mapper(41) == 42);
+
+// Functions can return named callable values.
+fn get_adder() {
+    add_one
+}
+
+let returned_function = get_adder();
+assert(returned_function(41) == 42);
+
+// Closure literals support zero or more parameters and contextual signatures.
+let answer = 42;
+let read_answer = || answer;
+let double = |value| value * 2;
+let typed_closure: fn(int) -> int = |value| value + 1;
+assert(read_answer() == 42);
+assert(double(21) == 42);
+assert(typed_closure(41) == 42);
+
+// Capture-free and capture-bearing closures can be passed to higher-order code.
+let increment = |value| value + 1;
+assert(apply_twice(increment, 40) == 42);
+
+let delta = 2;
+let captured_add = |value| value + delta;
+assert(captured_add(40) == 42);
+
+// Copy, shared borrow, mutable borrow, and move capture modes remain explicit.
+let copied = "copy";
+let copy_capture = |suffix| copied.copy() + suffix;
+assert(copy_capture("!") == "copy!");
+assert(copied == "copy");
+
+let borrowed = "borrow";
+let borrow_capture = |suffix| &borrowed + suffix;
+assert(borrow_capture("!") == "borrow!");
+assert(borrowed == "borrow");
+
+let mut shared = 1;
+let read_shared = || &shared;
+shared = 42;
+assert(read_shared() == 42);
+
+let mut mut_shared = "mut";
+let mut_borrow_capture = |suffix| &mut mut_shared + suffix;
+assert(mut_borrow_capture("!") == "mut!");
+assert(mut_shared == "mut");
+
+let moved = "move";
+let move_capture = |suffix| moved + suffix;
+assert(move_capture("!") == "move!");
+
+// Escaping closures retain their environment after the factory returns.
+fn make_adder(delta: int) {
+    |value| value + delta
+}
+
+let add_five = make_adder(5);
+assert(add_five(37) == 42);
+
+// Capturing nested functions are closure instances. Aliases share one
+// environment, while separate factory calls allocate independent environments.
+fn make_counter() {
+    let mut count = 0;
+    fn next() {
+        count = count + 1;
+        count
+    }
+    next
+}
+
+let first_counter = make_counter();
+let counter_alias = first_counter;
+let second_counter = make_counter();
+assert(first_counter() == 1);
+assert(counter_alias() == 2);
+assert(second_counter() == 1);
+
+// Closure literals support finite recursion through their self binding.
+let recursive_closure = |value| if value == 0 => {
+    0
+} else => {
+    recursive_closure(value - 1);
+    value
+};
+assert(recursive_closure(5) == 5);
+
+// Callable values can be stored in arrays and maps, then invoked after lookup.
+let callable_array = [add_one, add_two];
+let from_array = callable_array[0];
+assert(from_array(41) == 42);
+
+let callable_map = {mapper: add_two};
+let from_map = callable_map.mapper;
+assert(from_map(40) == 42);
+
+// Callable equality uses function-item identity or closure-environment identity.
+let item_alias = add_one;
+let first_closure = |value| value + 1;
+let second_closure = |value| value + 1;
+assert(item_alias == add_one);
+assert(first_closure == first_closure);
+assert(first_closure != second_closure);
+
+// Builtin host functions are callable values too.
+let length = len;
+assert(length("rss") == 3);
+
+// Generic named functions can become explicit callable values.
+fn identity<T>(value: T) -> T {
+    value
+}
+
+let int_identity = identity:: < int >;
+assert(int_identity(42) == 42);
+
+// A callable annotation can infer the type arguments of a bare generic value.
+let string_identity: fn(string) -> string = identity;
+assert(string_identity("rustscript") == "rustscript");
+
+// Higher-order generic context can infer a bare generic callable argument.
+fn apply<T>(mapper: fn(T) -> T, value: T) -> T {
+    mapper(value)
+}
+
+assert(apply::<int>(identity, 42) == 42);
+
+print("callable values: all assertions passed");
