@@ -3,7 +3,7 @@ use std::task::{Context, Poll};
 use pd_host_function::pd_host_function;
 
 use super::BuiltinResult;
-use crate::vm::{CallReturn, HostOpId, Value, Vm, VmError, VmResult};
+use crate::vm::{CallReturn, HostOpId, Vm, VmError, VmResult};
 
 pub(crate) struct IoState;
 
@@ -12,6 +12,8 @@ impl Default for IoState {
         Self
     }
 }
+
+pub(super) fn cancel_pending_op(_vm: &mut Vm, _op_id: HostOpId) {}
 
 pub(super) fn poll_builtin_io_op(
     _vm: &mut Vm,
