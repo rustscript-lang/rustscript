@@ -448,14 +448,7 @@ pub fn disassemble_program_with_options(program: &Program, options: DisassembleO
                     truncated = true;
                 }
             }
-            x if x == OpCode::MakeCallable as u8 => {
-                if let Some(prototype_id) = read_u32(code, &mut ip) {
-                    instruction.push_str(&format!("makecallable {prototype_id}"));
-                } else {
-                    instruction.push_str("makecallable <truncated>");
-                    truncated = true;
-                }
-            }
+
             x if x == OpCode::Shl as u8 => instruction.push_str("shl"),
             x if x == OpCode::Shr as u8 => instruction.push_str("shr"),
             x if x == OpCode::Lshr as u8 => instruction.push_str("lshr"),
@@ -714,19 +707,7 @@ fn analyze_program(
                     expected_bytes: 1,
                 })?;
             }
-            x if x == OpCode::MakeCallable as u8 => {
-                let prototype_id =
-                    read_u32(code, &mut ip).ok_or(ValidationError::TruncatedOperand {
-                        offset: start,
-                        opcode,
-                        expected_bytes: 4,
-                    })?;
-                if prototype_id as usize >= program.callable_prototypes.len() {
-                    return Err(ValidationError::InvalidCallableMetadata(
-                        "makecallable references an invalid prototype",
-                    ));
-                }
-            }
+
             other => {
                 return Err(ValidationError::InvalidOpcode {
                     offset: start,

@@ -9,6 +9,13 @@ use pd_host_function::pd_host_function;
 use rt_format::{Format, FormatArgument, NoNamedArguments, ParsedFormat, Specifier};
 use std::sync::Arc;
 
+/// Bind a callable prototype to an owned capture array.
+#[allow(dead_code)]
+#[pd_host_function(name = "__bind_callable")]
+fn builtin_bind_callable_metadata(_prototype_id: i64, captures: VmArrayRef<'_>) -> VmArray {
+    captures.to_vec()
+}
+
 /// Return the length of a string, array, or map.
 #[pd_host_function(name = "len")]
 pub(super) fn builtin_len_string_impl(text: VmStringRef<'_>) -> i64 {
@@ -883,13 +890,14 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn map_iterator_builtins_have_unique_reserved_call_indices() {
+    fn internal_builtins_have_unique_reserved_call_indices() {
         let reserved = [
             (BuiltinFunction::MapIterInit, BUILTIN_CALL_BASE - 9),
             (BuiltinFunction::MapIterNext, BUILTIN_CALL_BASE - 10),
             (BuiltinFunction::MapIterTakeKey, BUILTIN_CALL_BASE - 11),
             (BuiltinFunction::MapIterTakeValue, BUILTIN_CALL_BASE - 12),
             (BuiltinFunction::MapIterClose, BUILTIN_CALL_BASE - 13),
+            (BuiltinFunction::BindCallable, BUILTIN_CALL_BASE - 14),
         ];
         for (builtin, index) in reserved {
             assert_eq!(builtin.call_index(), index);

@@ -232,6 +232,7 @@ pub(crate) enum SsaInstKind {
         import: u16,
         args: Vec<SsaValueId>,
     },
+
     IntNeg {
         input: SsaValueId,
     },
@@ -376,6 +377,7 @@ impl SsaInstKind {
         match self {
             Self::Constant(_) => Vec::new(),
             Self::HostCall { args, .. } => args.clone(),
+
             Self::UnboxInt { input }
             | Self::UnboxFloat { input }
             | Self::UnboxBool { input }
@@ -518,6 +520,12 @@ pub(crate) enum SsaTerminator {
         exit: SsaExitId,
     },
     Return {
+        exit: SsaExitId,
+    },
+    CallValue {
+        argc: u8,
+        call_ip: usize,
+        resume_ip: usize,
         exit: SsaExitId,
     },
 }
@@ -907,7 +915,9 @@ fn verify_terminator(
             verify_branch_target(*condition, if_true, scope, block_param_reprs, exit_ids)?;
             verify_branch_target(*condition, if_false, scope, block_param_reprs, exit_ids)
         }
-        SsaTerminator::Exit { exit } | SsaTerminator::Return { exit } => {
+        SsaTerminator::Exit { exit }
+        | SsaTerminator::Return { exit }
+        | SsaTerminator::CallValue { exit, .. } => {
             if !exit_ids.contains(exit) {
                 return Err(SsaVerifyError::UnknownExit(*exit));
             }
@@ -1071,6 +1081,7 @@ fn render_inst_kind(kind: &SsaInstKind) -> String {
         SsaInstKind::HostCall { import, args } => {
             format!("host_call {import}({})", render_value_list(args))
         }
+
         SsaInstKind::IntNeg { input } => format!("ineg {input}"),
         SsaInstKind::IntAdd { lhs, rhs } => format!("iadd {lhs}, {rhs}"),
         SsaInstKind::IntAddImm { lhs, imm } => format!("iadd_imm {lhs}, {imm}"),
@@ -1127,6 +1138,12 @@ fn render_terminator(terminator: &SsaTerminator) -> String {
         ),
         SsaTerminator::Exit { exit } => format!("exit {exit}"),
         SsaTerminator::Return { exit } => format!("return {exit}"),
+        SsaTerminator::CallValue {
+            argc,
+            call_ip,
+            resume_ip,
+            exit,
+        } => format!("call_value argc={argc} call_ip={call_ip} resume_ip={resume_ip} {exit}"),
     }
 }
 

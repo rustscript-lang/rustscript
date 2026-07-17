@@ -772,7 +772,6 @@ pub enum OpCode {
     Not = 0x17,
     Lshr = 0x18,
     CallValue = 0x19,
-    MakeCallable = 0x1a,
 }
 
 impl TryFrom<u8> for OpCode {
@@ -806,7 +805,6 @@ impl TryFrom<u8> for OpCode {
             x if x == Self::Not as u8 => Ok(Self::Not),
             x if x == Self::Lshr as u8 => Ok(Self::Lshr),
             x if x == Self::CallValue as u8 => Ok(Self::CallValue),
-            x if x == Self::MakeCallable as u8 => Ok(Self::MakeCallable),
             _ => Err(()),
         }
     }
@@ -835,7 +833,6 @@ impl OpCode {
             | Self::Not
             | Self::Lshr => 0,
             Self::Ldc | Self::Br | Self::Brfalse => 4,
-            Self::MakeCallable => 4,
             Self::Ldloc | Self::Stloc | Self::CallValue => 1,
             Self::Call => 3,
         }
@@ -869,7 +866,6 @@ impl OpCode {
             OpCode::Not => "not",
             OpCode::Lshr => "lshr",
             Self::CallValue => "callvalue",
-            Self::MakeCallable => "makecallable",
         }
     }
 

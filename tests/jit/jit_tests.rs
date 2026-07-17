@@ -4668,7 +4668,7 @@ fn trace_jit_specializes_loop_carried_string_builtins() {
 }
 
 #[test]
-fn trace_jit_preserves_dynamic_concat_type_guards() {
+fn trace_jit_links_dynamic_concat_callable_graph() {
     if !native_jit_supported() {
         return;
     }
@@ -4711,14 +4711,13 @@ fn trace_jit_preserves_dynamic_concat_type_guards() {
     let snapshot = vm.jit_snapshot();
     assert!(
         snapshot.traces.iter().any(|trace| {
-            !trace.has_call
-                && ["type_of", "to_string_identity", "string_concat"]
-                    .iter()
-                    .all(|required| trace.op_names().iter().any(|op| op == required))
+            trace.terminal == JitTraceTerminal::CallValue && trace.executions >= 8
         }),
-        "dynamic concat inner trace should specialize type dispatch without calls:\n{}",
+        "dynamic concat root trace should link into its callable graph:\n{}",
         vm.dump_jit_info(),
     );
+    assert!(vm.jit_native_link_handoff_count() > 0);
+    assert!(vm.dump_jit_info().contains("interpreter fallbacks: 0"));
 }
 
 #[test]
@@ -4838,4 +4837,243 @@ fn trace_jit_executes_hot_loop_inside_script_callable_frame() {
         "expected a prototype-keyed trace: {}",
         vm.dump_jit_info()
     );
+}
+
+#[test]
+fn trace_jit_executes_call_value_natively_inside_loop() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        let mut i = 0;
+        let mut total = 0;
+        let delta = 3;
+        let add: fn(int) -> int = |value| value + delta;
+        while i < 16 {
+            total = add(total);
+            i = i + 1;
+        }
+        total;
+    "#;
+    let compiled = compile_source(source).expect("callable loop should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(
+        vm.run().expect("callable loop trace should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(48)]);
+    let snapshot = vm.jit_snapshot();
+    assert!(
+        snapshot.traces.iter().any(|trace| {
+            trace.terminal == JitTraceTerminal::CallValue
+                && trace.op_names.iter().any(|name| name == "call_value")
+                && trace.executions > 0
+        }),
+        "expected native callable trace: {}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        vm.jit_native_link_handoff_count() > 0,
+        "expected callable native handoff: {}",
+        vm.dump_jit_info()
+    );
+    assert!(vm.dump_jit_info().contains("interpreter fallbacks: 0"));
+}
+
+#[test]
+fn trace_jit_call_value_waits_and_resumes_host_callable_without_replay() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    struct PendingCallableHost;
+
+    impl HostFunction for PendingCallableHost {
+        fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
+            let value = match args {
+                [Value::Int(value)] => *value,
+                _ => {
+                    return Err(vm::VmError::HostError(
+                        "pending callable expected int".to_string(),
+                    ));
+                }
+            };
+            Ok(CallOutcome::Pending(900 + value as u64))
+        }
+    }
+
+    let source = r#"
+        fn action(value: int) -> int;
+        let function: fn(int) -> int = action;
+        let mut i = 0;
+        let mut total = 0;
+        while i < 2 {
+            total = total + function(i);
+            i = i + 1;
+        }
+        total;
+    "#;
+    let compiled = compile_source(source).expect("pending callable loop should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.register_function(Box::new(PendingCallableHost));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(
+        vm.run().expect("first callable host call should wait"),
+        VmStatus::Waiting(900)
+    );
+    vm.complete_host_op(900, CallReturn::one(Value::Int(10)))
+        .expect("first pending call should complete");
+    assert_eq!(
+        vm.resume().expect("second callable host call should wait"),
+        VmStatus::Waiting(901)
+    );
+    vm.complete_host_op(901, CallReturn::one(Value::Int(20)))
+        .expect("second pending call should complete");
+    assert_eq!(
+        vm.resume().expect("callable host loop should finish"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(30)]);
+    assert!(
+        vm.jit_snapshot().traces.iter().any(|trace| {
+            trace.terminal == JitTraceTerminal::CallValue && trace.executions >= 2
+        })
+    );
+    assert!(vm.dump_jit_info().contains("interpreter fallbacks: 0"));
+}
+
+#[test]
+fn trace_jit_call_value_yields_and_resumes_host_callable_without_losing_frame_state() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn action() -> int;
+        let function: fn() -> int = action;
+        let mut i = 0;
+        let mut total = 0;
+        while i < 2 {
+            total = total + function();
+            i = i + 1;
+        }
+        total;
+    "#;
+    let compiled = compile_source(source).expect("yielding callable loop should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.register_function(Box::new(YieldOnce { yielded: false }));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(
+        vm.run().expect("callable host should yield"),
+        VmStatus::Yielded
+    );
+    assert_eq!(vm.last_yield_reason(), Some(VmYieldReason::Host));
+    assert_eq!(
+        vm.resume().expect("callable host loop should resume"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(84)]);
+    assert!(vm.dump_jit_info().contains("interpreter fallbacks: 0"));
+}
+
+#[test]
+fn trace_jit_links_nested_dynamic_script_callables_without_interpreter_handoff() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn add_one(value: int) -> int { value + 1 }
+        fn add_two(value: int) -> int { value + 2 }
+        fn apply(function: fn(int) -> int, value: int) -> int { function(value) }
+        let mut i = 0;
+        let mut total = 0;
+        while i < 16 {
+            let selected = if i < 8 => { add_one } else => { add_two };
+            total = apply(selected, total);
+            i = i + 1;
+        }
+        total;
+    "#;
+    let compiled = compile_source(source).expect("dynamic callable graph should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(
+        vm.run().expect("dynamic callable graph should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(24)]);
+    let snapshot = vm.jit_snapshot();
+    assert!(
+        snapshot
+            .traces
+            .iter()
+            .any(|trace| trace.frame_key != u64::MAX)
+    );
+    assert!(
+        vm.jit_native_link_handoff_count() > 0,
+        "expected linked callable graph: {}",
+        vm.dump_jit_info()
+    );
+    assert!(vm.dump_jit_info().contains("interpreter fallbacks: 0"));
+}
+
+#[test]
+fn trace_jit_links_finite_mutual_recursion_without_interpreter_handoff() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn even(value: int) -> int {
+            if value == 0 => { 1 } else => { odd(value - 1) }
+        }
+        fn odd(value: int) -> int {
+            if value == 0 => { 0 } else => { even(value - 1) }
+        }
+        let mut i = 0;
+        let mut total = 0;
+        while i < 8 {
+            total = total + even(8);
+            i = i + 1;
+        }
+        total;
+    "#;
+    let compiled = compile_source(source).expect("mutual recursion should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(
+        vm.run().expect("mutual recursion should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(8)]);
+    assert!(
+        vm.jit_native_link_handoff_count() > 0,
+        "expected recursive native handoffs: {}",
+        vm.dump_jit_info()
+    );
+    assert!(vm.dump_jit_info().contains("interpreter fallbacks: 0"));
 }

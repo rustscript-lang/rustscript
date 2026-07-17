@@ -1740,7 +1740,7 @@ mod runtime_tests {
     fn lint_accepts_embedded_parse_stdlib_imports() {
         let source = r#"
             use stdlib::rss::parse as parse;
-            let value = parse::try_parse_int_base("ff", 16);
+            let value: int = parse::parse_int_base_or("ff", 16, 0);
             value == 255;
         "#;
         let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
@@ -1752,15 +1752,7 @@ mod runtime_tests {
             "expected embedded parse stdlib lint to emit warnings only, got {:?}",
             report.diagnostics
         );
-        assert!(
-            report.diagnostics.iter().any(|diagnostic| {
-                diagnostic
-                    .message
-                    .contains("compiler could not determine the type of local 'value'")
-            }),
-            "expected an unknown warning for 'value', got {:?}",
-            report.diagnostics
-        );
+        assert!(report.diagnostics.is_empty());
     }
 
     #[test]
@@ -1787,7 +1779,8 @@ mod runtime_tests {
             use json;
             let matched = re::match("(?i)^rss$", "RSS");
             let payload = json::encode({ ok: matched });
-            let decoded = json::decode(payload);
+            struct Payload { ok: bool }
+            let decoded = json::decode::<Payload>(payload);
             let ok = decoded.ok.copy();
             if ok {
                 print(1);

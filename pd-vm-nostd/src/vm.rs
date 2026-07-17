@@ -125,25 +125,22 @@ impl<C> Vm<C> {
             .ok_or(VmError::InvalidLocal(index))
     }
 
-    fn make_callable(&mut self, prototype_id: u32) -> VmResult<()> {
+    fn bind_callable_value(&self, prototype_id: u32, captures: Vec<Value>) -> VmResult<Value> {
         let prototype = self
             .program
             .callable_prototypes()
             .get(prototype_id as usize)
             .ok_or(VmError::InvalidCallablePrototype(prototype_id))?;
-        let capture_count = prototype.capture_slots.len();
-        if self.stack.len() < capture_count {
-            return Err(VmError::StackUnderflow);
+        if captures.len() != prototype.capture_slots.len() {
+            return Err(VmError::InvalidCallablePrototype(prototype_id));
         }
-        let captures = self.stack.split_off(self.stack.len() - capture_count);
         let env: CallableEnvironment = Rc::new(RefCell::new(captures));
-        self.stack.push(Value::Callable(Rc::new(CallableValue {
+        Ok(Value::Callable(Rc::new(CallableValue {
             program_instance: self.program_instance,
             prototype_id,
             kind: prototype.kind,
             env: Some(env),
-        })));
-        Ok(())
+        })))
     }
 
     fn call_value(&mut self, argc: u8) -> VmResult<()> {
@@ -387,10 +384,7 @@ impl<C> Vm<C> {
                     let arity = self.read_u8()?;
                     self.call_value(arity)?;
                 }
-                OpCode::MakeCallable => {
-                    let prototype_id = self.read_u32()?;
-                    self.make_callable(prototype_id)?;
-                }
+
                 OpCode::Shl => {
                     let rhs = self.pop_shift()?;
                     let lhs = self.pop_int()?;
@@ -533,6 +527,7 @@ impl<C> Vm<C> {
         const ARRAY_PUSH: u16 = BUILTIN_BASE + 4;
         const MAP_NEW: u16 = BUILTIN_BASE + 5;
         const SET: u16 = BUILTIN_BASE + 8;
+        const BIND_CALLABLE: u16 = BUILTIN_BASE - 14;
 
         Some(match index {
             ARRAY_NEW => {
@@ -588,6 +583,35 @@ impl<C> Vm<C> {
                 }
                 self.stack.truncate(start);
                 self.stack.push(Value::Map(entries));
+                Ok(())
+            }
+            BIND_CALLABLE => {
+                if let Err(error) = self.require_builtin_arity("__bind_callable", arity, 2) {
+                    return Some(Err(error));
+                }
+                let start = match self.stack.len().checked_sub(2) {
+                    Some(start) => start,
+                    None => return Some(Err(VmError::StackUnderflow)),
+                };
+                let prototype_id = match self.stack.get(start) {
+                    Some(Value::Int(value)) => match u32::try_from(*value) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return Some(Err(VmError::InvalidCallablePrototype(u32::MAX)));
+                        }
+                    },
+                    _ => return Some(Err(VmError::TypeMismatch("callable prototype id"))),
+                };
+                let captures = match self.stack.get(start + 1).cloned() {
+                    Some(Value::Array(values)) => values.as_ref().clone(),
+                    _ => return Some(Err(VmError::TypeMismatch("callable captures"))),
+                };
+                let callable = match self.bind_callable_value(prototype_id, captures) {
+                    Ok(value) => value,
+                    Err(error) => return Some(Err(error)),
+                };
+                self.stack.truncate(start);
+                self.stack.push(callable);
                 Ok(())
             }
             _ => return None,

@@ -997,6 +997,23 @@ impl Vm {
             .unwrap_or(0)
     }
 
+    pub(super) fn active_local_types(&self) -> Vec<ValueType> {
+        self.locals[self.active_local_base()..]
+            .iter()
+            .map(|value| match value {
+                Value::Null => ValueType::Null,
+                Value::Int(_) => ValueType::Int,
+                Value::Float(_) => ValueType::Float,
+                Value::Bool(_) => ValueType::Bool,
+                Value::String(_) => ValueType::String,
+                Value::Bytes(_) => ValueType::Bytes,
+                Value::Array(_) => ValueType::Array,
+                Value::Map(_) => ValueType::Map,
+                Value::Callable(_) => ValueType::Callable,
+            })
+            .collect()
+    }
+
     fn script_frame_depth(&self) -> usize {
         self.execution_frames
             .iter()
@@ -1086,18 +1103,22 @@ impl Vm {
         self.stack.pop().ok_or(VmError::StackUnderflow)
     }
 
-    fn make_callable(&mut self, prototype_id: u32) -> VmResult<()> {
+    pub(crate) fn bind_callable_value(
+        &self,
+        prototype_id: u32,
+        captures: Vec<Value>,
+    ) -> VmResult<Value> {
         let prototype = self
             .program
             .callable_prototypes
             .get(prototype_id as usize)
             .cloned()
             .ok_or(VmError::InvalidCallablePrototype(prototype_id))?;
-        let capture_count = prototype.capture_slots.len();
-        if self.stack.len() < capture_count {
-            return Err(VmError::StackUnderflow);
+        if captures.len() != prototype.capture_slots.len() {
+            return Err(VmError::InvalidFrameState(
+                "callable capture layout mismatch",
+            ));
         }
-        let captures = self.stack.split_off(self.stack.len() - capture_count);
         let env = if prototype.kind == crate::CallableKind::Closure || !captures.is_empty() {
             Some(Arc::new(crate::CallableEnvironment {
                 cells: Mutex::new(captures),
@@ -1105,13 +1126,12 @@ impl Vm {
         } else {
             None
         };
-        self.stack.push(Value::Callable(Arc::new(CallableValue {
+        Ok(Value::Callable(Arc::new(CallableValue {
             program_instance: self.program_instance,
             prototype_id,
             kind: prototype.kind,
             env,
-        })));
-        Ok(())
+        })))
     }
 
     fn execute_call_value(&mut self, argc: u8) -> VmResult<ExecOutcome> {
@@ -1272,7 +1292,11 @@ impl Vm {
                 match self.execute_host_call(import_index, argc, call_ip)? {
                     HostCallExecOutcome::Returned => Ok(ExecOutcome::Continue),
                     HostCallExecOutcome::Halted => Ok(ExecOutcome::Halted),
-                    HostCallExecOutcome::Yielded => Ok(ExecOutcome::Yielded),
+                    HostCallExecOutcome::Yielded => {
+                        self.stack
+                            .insert(operand_stack_base, Value::Callable(callable));
+                        Ok(ExecOutcome::Yielded)
+                    }
                     HostCallExecOutcome::Pending(op_id) => Ok(ExecOutcome::Waiting(op_id)),
                 }
             }
@@ -1986,10 +2010,17 @@ impl Vm {
             {
                 let frame_key = self.active_frame_key();
                 let stack_depth = self.active_operand_stack_len();
+                let entry_local_types = (frame_key != crate::vm::native::ROOT_FRAME_KEY)
+                    .then(|| self.active_local_types());
                 let trace_id = {
                     let program = &self.program;
-                    self.jit
-                        .observe_hot_entry(frame_key, self.ip, stack_depth, program)
+                    self.jit.observe_hot_entry_with_local_types(
+                        frame_key,
+                        self.ip,
+                        stack_depth,
+                        entry_local_types.as_deref(),
+                        program,
+                    )
                 };
                 if let Some(trace_id) = trace_id {
                     let outcome = match self.execute_jit_entry(trace_id) {
@@ -2382,10 +2413,7 @@ impl Vm {
                     HostCallExecOutcome::Pending(op_id) => return Ok(ExecOutcome::Waiting(op_id)),
                 }
             }
-            x if x == OpCode::MakeCallable as u8 => {
-                let prototype_id = self.read_u32()?;
-                self.make_callable(prototype_id)?;
-            }
+
             x if x == OpCode::CallValue as u8 => {
                 let argc = self.read_u8()?;
                 return self.execute_call_value(argc);

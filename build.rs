@@ -494,7 +494,7 @@ fn render_builtin_catalog(
         .and_then(|value| value.checked_add(1))
         .expect("builtin call base should fit in u16");
     assert!(
-        builtin_call_base >= 14,
+        builtin_call_base >= 15,
         "builtin call base must leave room for reserved special builtins"
     );
 
@@ -665,6 +665,11 @@ fn render_builtin_catalog(
     writeln!(
         &mut out,
         "    (BUILTIN_CALL_BASE - 13, BuiltinFunction::MapIterClose),"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "    (BUILTIN_CALL_BASE - 14, BuiltinFunction::BindCallable),"
     )
     .unwrap();
     writeln!(&mut out, "];").unwrap();
@@ -858,6 +863,11 @@ fn render_builtin_catalog(
     writeln!(
         &mut out,
         "            BuiltinFunction::MapIterClose => BUILTIN_CALL_BASE - 13,"
+    )
+    .unwrap();
+    writeln!(
+        &mut out,
+        "            BuiltinFunction::BindCallable => BUILTIN_CALL_BASE - 14,"
     )
     .unwrap();
     writeln!(
@@ -1492,6 +1502,7 @@ fn appended_builtin_order() -> &'static [&'static str] {
         "__map_iter_take_key",
         "__map_iter_take_value",
         "__map_iter_close",
+        "__bind_callable",
     ]
 }
 
@@ -1518,7 +1529,7 @@ fn required_language_builtin_stubs() -> &'static [&'static str] {
 }
 
 fn required_internal_builtin_stubs() -> &'static [&'static str] {
-    &["__format_template", "__to_string"]
+    &["__format_template", "__to_string", "__bind_callable"]
 }
 
 fn is_language_builtin_stub_name(name: &str) -> bool {
@@ -1662,6 +1673,7 @@ fn main_range_builtin_variants(builtin_variant_order: &[String]) -> Vec<String> 
                     | "MapIterTakeKey"
                     | "MapIterTakeValue"
                     | "MapIterClose"
+                    | "BindCallable"
             )
         })
         .cloned()
