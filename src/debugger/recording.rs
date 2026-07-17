@@ -388,7 +388,10 @@ fn encode_value(
                     })?;
                     write_u32_len(cells.len(), out)?;
                     for cell in cells.iter() {
-                        encode_value(cell, out, context)?;
+                        let value = cell.lock().map_err(|_| {
+                            VmRecordingError::InvalidFormat("poisoned callable capture cell")
+                        })?;
+                        encode_value(&value, out, context)?;
                     }
                 }
             } else {
@@ -464,7 +467,7 @@ fn decode_value(
                     let len = cursor.read_u32()? as usize;
                     let mut cells = Vec::with_capacity(len);
                     for _ in 0..len {
-                        cells.push(decode_value(cursor, context)?);
+                        cells.push(Arc::new(Mutex::new(decode_value(cursor, context)?)));
                     }
                     *environment.cells.lock().map_err(|_| {
                         VmRecordingError::InvalidFormat("poisoned callable environment")
@@ -556,7 +559,7 @@ mod tests {
     #[test]
     fn recording_preserves_callable_environment_aliases() {
         let environment = Arc::new(crate::CallableEnvironment {
-            cells: Mutex::new(vec![Value::Int(7)]),
+            cells: Mutex::new(vec![Arc::new(Mutex::new(Value::Int(7)))]),
         });
         let callable = |prototype_id| {
             Value::Callable(Arc::new(crate::CallableValue {

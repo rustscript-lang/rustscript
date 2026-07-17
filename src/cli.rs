@@ -1100,8 +1100,29 @@ fn repl_locals_moved_by_rebinding(
                 .is_some_and(|value| value == &Value::Null)
                 && program.code.get(ip + 7).copied() == Some(OpCode::Stloc as u8)
                 && program.code.get(ip + 8).copied() == Some(source);
-            if null_store {
+            let detach_local = program
+                .code
+                .get(ip + 2)
+                .copied()
+                .and_then(|byte| OpCode::try_from(byte).ok())
+                .filter(|opcode| *opcode == OpCode::Ldc)
+                .and_then(|_| program.code.get(ip + 3..ip + 7))
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u32::from_le_bytes)
+                .and_then(|index| program.constants.get(index as usize))
+                .is_some_and(|value| value == &Value::Int(i64::from(source)))
+                && program.code.get(ip + 7).copied() == Some(OpCode::Call as u8)
+                && program
+                    .code
+                    .get(ip + 8..ip + 10)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u16::from_le_bytes)
+                    == Some(crate::builtins::BuiltinFunction::DetachLocal.call_index())
+                && program.code.get(ip + 10).copied() == Some(1);
+            if null_store || detach_local {
                 moved.insert(name.clone());
+            }
+            if null_store {
                 move_store_offsets.insert(ip + 7);
             }
         }

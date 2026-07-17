@@ -802,7 +802,9 @@ mod tests {
             arity: 0,
             frame_local_count: 1,
             parameter_slots: Vec::new(),
+            capture_source_slots: Vec::new(),
             capture_slots: Vec::new(),
+            capture_modes: Vec::new(),
             self_slot: None,
             schema: None,
         });

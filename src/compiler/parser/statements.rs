@@ -929,7 +929,10 @@ impl Parser {
         } else {
             None
         };
-        let expr = self.parse_expr()?;
+        let mut expr = self.parse_expr()?;
+        if let Some(expected) = declared_schema.as_ref() {
+            self.contextualize_function_value(&mut expr, expected)?;
+        }
         if expect_terminator {
             self.consume_stmt_terminator("expected ';' after let")?;
         }

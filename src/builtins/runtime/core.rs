@@ -16,6 +16,11 @@ fn builtin_bind_callable_metadata(_prototype_id: i64, captures: VmArrayRef<'_>) 
     captures.to_vec()
 }
 
+/// Detach a moved local slot from any shared capture cell.
+#[allow(dead_code)]
+#[pd_host_function(name = "__detach_local")]
+fn builtin_detach_local_metadata(_slot: i64) {}
+
 /// Return the length of a string, array, or map.
 #[pd_host_function(name = "len")]
 pub(super) fn builtin_len_string_impl(text: VmStringRef<'_>) -> i64 {
@@ -898,6 +903,7 @@ mod tests {
             (BuiltinFunction::MapIterTakeValue, BUILTIN_CALL_BASE - 12),
             (BuiltinFunction::MapIterClose, BUILTIN_CALL_BASE - 13),
             (BuiltinFunction::BindCallable, BUILTIN_CALL_BASE - 14),
+            (BuiltinFunction::DetachLocal, BUILTIN_CALL_BASE - 15),
         ];
         for (builtin, index) in reserved {
             assert_eq!(builtin.call_index(), index);

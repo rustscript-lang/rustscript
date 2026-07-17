@@ -2,8 +2,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::{
-    CallableKind, CallablePrototype, CallableTarget, FunctionRegion, HostImport, Program,
-    RootCallableBinding, ScriptFunction, Value, ValueType, WireError,
+    CallableKind, CallablePrototype, CallableTarget, CaptureBindingMode, FunctionRegion,
+    HostImport, Program, RootCallableBinding, ScriptFunction, Value, ValueType, WireError,
 };
 
 const MAGIC: [u8; 4] = *b"VMBC";
@@ -223,11 +223,37 @@ fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, W
         for _ in 0..parameter_count {
             parameter_slots.push(cursor.read_u16()?);
         }
+        let capture_source_count = cursor.read_u32()? as usize;
+        let mut capture_source_slots = Vec::new();
+        reserve(
+            &mut capture_source_slots,
+            "callable capture sources",
+            capture_source_count,
+        )?;
+        for _ in 0..capture_source_count {
+            capture_source_slots.push(cursor.read_u16()?);
+        }
         let capture_count = cursor.read_u32()? as usize;
         let mut capture_slots = Vec::new();
         reserve(&mut capture_slots, "callable captures", capture_count)?;
         for _ in 0..capture_count {
             capture_slots.push(cursor.read_u16()?);
+        }
+        let capture_mode_count = cursor.read_u32()? as usize;
+        let mut capture_modes = Vec::new();
+        reserve(
+            &mut capture_modes,
+            "callable capture modes",
+            capture_mode_count,
+        )?;
+        for _ in 0..capture_mode_count {
+            capture_modes.push(match cursor.read_u8()? {
+                0 => CaptureBindingMode::Copy,
+                1 => CaptureBindingMode::Borrow,
+                2 => CaptureBindingMode::BorrowMut,
+                3 => CaptureBindingMode::Move,
+                other => return Err(WireError::InvalidCaptureBindingMode(other)),
+            });
         }
         let self_slot = cursor.read_bool()?.then(|| cursor.read_u16()).transpose()?;
         if cursor.read_bool()? {
@@ -239,7 +265,9 @@ fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, W
             arity,
             frame_local_count,
             parameter_slots,
+            capture_source_slots,
             capture_slots,
+            capture_modes,
             self_slot,
         });
     }

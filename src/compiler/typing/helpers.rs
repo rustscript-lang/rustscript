@@ -488,6 +488,7 @@ pub(super) fn validate_stmts(
                     context,
                     strict_function_add_types,
                 )?;
+                let loop_entry = state.clone();
                 try_stabilize_loop_state(state, |iterated| {
                     let _ = validate_expr(
                         condition,
@@ -512,6 +513,14 @@ pub(super) fn validate_stmts(
                         source_name,
                         context,
                         strict_function_add_types,
+                    )?;
+                    validate_branch_state_merge(
+                        Some(*line),
+                        source_name,
+                        &loop_entry,
+                        &loop_entry,
+                        iterated,
+                        context.is_strict(),
                     )
                 })?;
             }
@@ -520,6 +529,7 @@ pub(super) fn validate_stmts(
                 body,
                 line,
             } => {
+                let loop_entry = state.clone();
                 try_stabilize_loop_state(state, |iterated| {
                     let _ = validate_expr(
                         condition,
@@ -536,6 +546,14 @@ pub(super) fn validate_stmts(
                         source_name,
                         context,
                         strict_function_add_types,
+                    )?;
+                    validate_branch_state_merge(
+                        Some(*line),
+                        source_name,
+                        &loop_entry,
+                        &loop_entry,
+                        iterated,
+                        context.is_strict(),
                     )
                 })?;
             }
@@ -1107,12 +1125,9 @@ pub(super) fn bind_expr_result_to_slot(
             .map(|(_, optional)| *optional)
             .unwrap_or(false);
         let optional = context.expr_is_optional(expr, expr_state) || declared_optional;
-        let schema = slot_declared_schema.clone().or_else(|| {
-            expr_state
-                .callable_schema(slot)
-                .cloned()
-                .or_else(|| context.infer_expr_schema(expr, expr_state))
-        });
+        let schema = slot_declared_schema
+            .clone()
+            .or_else(|| context.infer_expr_schema(expr, expr_state));
         let from_declared_schema =
             slot_declared_schema.is_some() || expr_state.has_declared_schema(slot);
         state.bind_callable_with_schema(slot, callable, schema, from_declared_schema, optional);

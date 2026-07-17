@@ -47,7 +47,17 @@ pub fn run_runtime_case_with_bindings(case: &RuntimeCase<'_>, bindings: &[HostBi
     for binding in bindings {
         vm.bind_function(binding.name, (binding.factory)());
     }
-    let status = vm.run().expect("vm should run");
+    let status = vm.run().unwrap_or_else(|error| {
+        panic!(
+            "vm should run for case '{}': {error:?}; ip={}; prototypes={:#?}; frames={:?}; locals={:?}; stack={:?}",
+            case.name,
+            vm.ip(),
+            vm.program().callable_prototypes,
+            vm.execution_frames(),
+            vm.locals(),
+            vm.stack()
+        )
+    });
     assert_eq!(
         status,
         VmStatus::Halted,

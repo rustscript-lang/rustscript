@@ -44,6 +44,15 @@ pub enum CallableTarget {
     HostImport(u16),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CaptureBindingMode {
+    Copy = 0,
+    Borrow = 1,
+    BorrowMut = 2,
+    Move = 3,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScriptFunction {
     pub entry_ip: u32,
@@ -57,7 +66,9 @@ pub struct CallablePrototype {
     pub arity: u8,
     pub frame_local_count: usize,
     pub parameter_slots: Vec<u16>,
+    pub capture_source_slots: Vec<u16>,
     pub capture_slots: Vec<u16>,
+    pub capture_modes: Vec<CaptureBindingMode>,
     pub self_slot: Option<u16>,
 }
 

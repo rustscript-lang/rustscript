@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use crate::builtins::BuiltinFunction;
+use crate::bytecode::CaptureBindingMode;
 
 use super::super::ParseError;
 use super::super::ir::{ClosureExpr, Expr, FrontendIr, FunctionImpl, LocalSlot, Stmt};
@@ -58,14 +59,6 @@ enum MovedFieldKey {
     Index(i64),
     Dynamic,
     Slice,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum CaptureBindingMode {
-    Copy,
-    Borrow,
-    BorrowMut,
-    Move,
 }
 
 impl FlowState {
@@ -156,6 +149,22 @@ pub(super) fn enforce_local_availability(
         ir = allocator.allocate(ir)?;
     }
     Ok(ir)
+}
+
+pub(crate) fn function_capture_binding_mode(
+    function_impl: &FunctionImpl,
+    captured_slot: LocalSlot,
+) -> CaptureBindingMode {
+    AvailabilityAnalyzer::new(0, &[], &HashMap::new(), false)
+        .runtime_function_capture_mode_for_slot(function_impl, captured_slot)
+}
+
+pub(crate) fn closure_capture_binding_mode(
+    closure: &ClosureExpr,
+    captured_slot: LocalSlot,
+) -> CaptureBindingMode {
+    AvailabilityAnalyzer::new(0, &[], &HashMap::new(), false)
+        .runtime_closure_capture_mode_for_slot(closure, captured_slot)
 }
 
 struct AvailabilityAnalyzer {

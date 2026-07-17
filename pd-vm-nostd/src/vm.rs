@@ -1,5 +1,6 @@
 use core::cell::RefCell;
 
+use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec;
@@ -30,7 +31,6 @@ struct ExecutionFrame {
     local_base: usize,
     local_count: usize,
     prototype_id: u32,
-    active_callable: Rc<CallableValue>,
 }
 
 pub struct Vm<C = ()> {
@@ -38,6 +38,7 @@ pub struct Vm<C = ()> {
     ip: usize,
     stack: Vec<Value>,
     locals: Vec<Value>,
+    capture_cells: BTreeMap<usize, Rc<RefCell<Value>>>,
     host_functions: Vec<HostFunction<C>>,
     host_dispatcher: Option<HostDispatcher<C>>,
     context: C,
@@ -81,6 +82,7 @@ impl<C> Vm<C> {
             ip: 0,
             stack: Vec::new(),
             locals: vec![Value::Null; local_count],
+            capture_cells: BTreeMap::new(),
             host_functions,
             host_dispatcher,
             context,
@@ -122,16 +124,50 @@ impl<C> Vm<C> {
             .ok_or(VmError::InvalidLocal(index))
     }
 
-    fn bind_callable_value(&self, prototype_id: u32, captures: Vec<Value>) -> VmResult<Value> {
+    fn bind_callable_value(&mut self, prototype_id: u32, captures: Vec<Value>) -> VmResult<Value> {
         let prototype = self
             .program
             .callable_prototypes()
             .get(prototype_id as usize)
+            .cloned()
             .ok_or(VmError::InvalidCallablePrototype(prototype_id))?;
-        if captures.len() != prototype.capture_slots.len() {
+        if captures.len() != prototype.capture_slots.len()
+            || captures.len() != prototype.capture_source_slots.len()
+            || captures.len() != prototype.capture_modes.len()
+        {
             return Err(VmError::InvalidCallablePrototype(prototype_id));
         }
-        let env: CallableEnvironment = Rc::new(RefCell::new(captures));
+        let active_base = self.active_local_base();
+        let mut cells = Vec::with_capacity(captures.len());
+        for (((value, source), target), mode) in captures
+            .into_iter()
+            .zip(&prototype.capture_source_slots)
+            .zip(&prototype.capture_slots)
+            .zip(&prototype.capture_modes)
+        {
+            let self_capture = prototype.self_slot == Some(*target);
+            let cell = if !self_capture
+                && matches!(
+                    mode,
+                    super::CaptureBindingMode::Borrow | super::CaptureBindingMode::BorrowMut
+                ) {
+                let absolute = active_base.saturating_add(usize::from(*source));
+                if absolute >= self.locals.len() {
+                    return Err(VmError::InvalidCallablePrototype(prototype_id));
+                }
+                let cell = self
+                    .capture_cells
+                    .entry(absolute)
+                    .or_insert_with(|| Rc::new(RefCell::new(value)))
+                    .clone();
+                self.locals[absolute] = cell.borrow().clone();
+                cell
+            } else {
+                Rc::new(RefCell::new(value))
+            };
+            cells.push(cell);
+        }
+        let env: CallableEnvironment = Rc::new(cells);
         Ok(Value::Callable(Rc::new(CallableValue {
             prototype_id,
             kind: prototype.kind,
@@ -228,16 +264,16 @@ impl<C> Vm<C> {
                     self.locals[local_base + slot] = argument;
                 }
                 if let Some(env) = &callable.env {
-                    for (slot, value) in prototype
-                        .capture_slots
-                        .iter()
-                        .zip(env.borrow().iter().cloned())
-                    {
+                    for (slot, cell) in prototype.capture_slots.iter().zip(env.iter()) {
                         let slot = *slot as usize;
                         if slot >= prototype.frame_local_count {
                             return Err(VmError::InvalidCallablePrototype(callable.prototype_id));
                         }
-                        self.locals[local_base + slot] = value;
+                        let absolute = local_base + slot;
+                        self.locals[absolute] = cell.borrow().clone();
+                        if prototype.self_slot != Some(slot as u16) {
+                            self.capture_cells.insert(absolute, cell.clone());
+                        }
                     }
                 }
                 if let Some(slot) = prototype.self_slot {
@@ -253,7 +289,6 @@ impl<C> Vm<C> {
                     local_base,
                     local_count: prototype.frame_local_count,
                     prototype_id: callable.prototype_id,
-                    active_callable: callable,
                 });
                 self.ip = function.entry_ip as usize;
                 Ok(())
@@ -274,26 +309,9 @@ impl<C> Vm<C> {
             Value::Null
         };
         self.stack.truncate(frame.operand_stack_base);
-        if let Some(environment) = frame.active_callable.env.as_ref()
-            && let Some(prototype) = self
-                .program
-                .callable_prototypes()
-                .get(frame.prototype_id as usize)
-        {
-            let mut cells = environment.borrow_mut();
-            for (cell, slot) in cells.iter_mut().zip(&prototype.capture_slots) {
-                if prototype.self_slot == Some(*slot) {
-                    continue;
-                }
-                let absolute = frame.local_base.saturating_add(*slot as usize);
-                let value = self
-                    .locals
-                    .get(absolute)
-                    .cloned()
-                    .ok_or(VmError::InvalidCallablePrototype(frame.prototype_id))?;
-                *cell = value;
-            }
-        }
+        let frame_end = frame.local_base.saturating_add(frame.local_count);
+        self.capture_cells
+            .retain(|absolute, _| *absolute < frame.local_base || *absolute >= frame_end);
         self.locals.truncate(frame.local_base);
         self.ip = frame.return_ip;
         self.stack.push(result);
@@ -358,12 +376,19 @@ impl<C> Vm<C> {
                 OpCode::Ldloc => {
                     let index = self.read_u8()?;
                     let absolute = self.absolute_local(index)?;
-                    self.stack.push(self.locals[absolute].clone());
+                    let value = self.capture_cells.get(&absolute).map_or_else(
+                        || self.locals[absolute].clone(),
+                        |cell| cell.borrow().clone(),
+                    );
+                    self.stack.push(value);
                 }
                 OpCode::Stloc => {
                     let index = self.read_u8()?;
                     let absolute = self.absolute_local(index)?;
                     let value = self.pop()?;
+                    if let Some(cell) = self.capture_cells.get(&absolute) {
+                        *cell.borrow_mut() = value.clone();
+                    }
                     self.locals[absolute] = value;
                 }
 
@@ -520,6 +545,7 @@ impl<C> Vm<C> {
         const MAP_NEW: u16 = BUILTIN_BASE + 5;
         const SET: u16 = BUILTIN_BASE + 8;
         const BIND_CALLABLE: u16 = BUILTIN_BASE - 14;
+        const DETACH_LOCAL: u16 = BUILTIN_BASE - 15;
 
         Some(match index {
             ARRAY_NEW => {
@@ -575,6 +601,30 @@ impl<C> Vm<C> {
                 }
                 self.stack.truncate(start);
                 self.stack.push(Value::Map(entries));
+                Ok(())
+            }
+            DETACH_LOCAL => {
+                if let Err(error) = self.require_builtin_arity("__detach_local", arity, 1) {
+                    return Some(Err(error));
+                }
+                let start = match self.stack.len().checked_sub(1) {
+                    Some(start) => start,
+                    None => return Some(Err(VmError::StackUnderflow)),
+                };
+                let slot = match self.stack.get(start) {
+                    Some(Value::Int(value)) => match u8::try_from(*value) {
+                        Ok(value) => value,
+                        Err(_) => return Some(Err(VmError::TypeMismatch("local slot"))),
+                    },
+                    _ => return Some(Err(VmError::TypeMismatch("local slot"))),
+                };
+                let absolute = match self.absolute_local(slot) {
+                    Ok(value) => value,
+                    Err(error) => return Some(Err(error)),
+                };
+                self.capture_cells.remove(&absolute);
+                self.locals[absolute] = Value::Null;
+                self.stack.truncate(start);
                 Ok(())
             }
             BIND_CALLABLE => {
@@ -743,6 +793,9 @@ impl<C> Vm<C> {
 
     fn store_local(&mut self, index: u8, value: Value) -> VmResult<()> {
         let absolute = self.absolute_local(index)?;
+        if let Some(cell) = self.capture_cells.get(&absolute) {
+            *cell.borrow_mut() = value.clone();
+        }
         self.locals[absolute] = value;
         Ok(())
     }

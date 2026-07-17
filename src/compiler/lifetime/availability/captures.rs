@@ -181,6 +181,47 @@ impl AvailabilityAnalyzer {
         if seen { mode } else { CaptureBindingMode::Move }
     }
 
+    pub(super) fn runtime_function_capture_mode_for_slot(
+        &self,
+        function_impl: &FunctionImpl,
+        captured_slot: LocalSlot,
+    ) -> CaptureBindingMode {
+        let mut mode = CaptureBindingMode::Copy;
+        let mut seen = false;
+        self.capture_mode_for_stmts(
+            &function_impl.body_stmts,
+            captured_slot,
+            CaptureBindingMode::Copy,
+            &mut mode,
+            &mut seen,
+        );
+        self.capture_mode_for_expr(
+            &function_impl.body_expr,
+            captured_slot,
+            CaptureBindingMode::Copy,
+            &mut mode,
+            &mut seen,
+        );
+        if seen { mode } else { CaptureBindingMode::Move }
+    }
+
+    pub(super) fn runtime_closure_capture_mode_for_slot(
+        &self,
+        closure: &ClosureExpr,
+        captured_slot: LocalSlot,
+    ) -> CaptureBindingMode {
+        let mut mode = CaptureBindingMode::Copy;
+        let mut seen = false;
+        self.capture_mode_for_expr(
+            &closure.body,
+            captured_slot,
+            CaptureBindingMode::Copy,
+            &mut mode,
+            &mut seen,
+        );
+        if seen { mode } else { CaptureBindingMode::Move }
+    }
+
     pub(super) fn capture_mode_for_stmts(
         &self,
         stmts: &[Stmt],
@@ -216,7 +257,12 @@ impl AvailabilityAnalyzer {
             Stmt::Let { index, expr, .. } | Stmt::Assign { index, expr, .. } => {
                 if *index == captured_slot {
                     *seen = true;
-                    *mode = (*mode).max(context);
+                    let assignment_mode = if context == CaptureBindingMode::Move {
+                        CaptureBindingMode::Move
+                    } else {
+                        CaptureBindingMode::BorrowMut
+                    };
+                    *mode = (*mode).max(assignment_mode);
                 }
                 self.capture_mode_for_expr(expr, captured_slot, context, mode, seen);
             }

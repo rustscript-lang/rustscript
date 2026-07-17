@@ -71,7 +71,9 @@ fn callvalue_enters_script_frame_and_resumes_caller() {
                 arity: 1,
                 frame_local_count: 1,
                 parameter_slots: vec![0],
+                capture_source_slots: Vec::new(),
                 capture_slots: Vec::new(),
+                capture_modes: Vec::new(),
                 self_slot: None,
                 schema: None,
             }],
@@ -122,7 +124,9 @@ fn host_can_invoke_exported_callable_and_reset_rebinds_program_owned_value() {
                 arity: 1,
                 frame_local_count: 1,
                 parameter_slots: vec![0],
+                capture_source_slots: Vec::new(),
                 capture_slots: Vec::new(),
+                capture_modes: Vec::new(),
                 self_slot: None,
                 schema: None,
             }],
@@ -177,6 +181,27 @@ fn host_can_invoke_exported_callable_and_reset_rebinds_program_owned_value() {
             .expect("reset should rebind the Program-owned function item"),
         Value::Int(2)
     );
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[test]
+fn aot_executes_move_detach_without_stack_contract_mismatch() {
+    let compiled = crate::compile_source_for_repl(
+        r#"
+            let source = "x";
+            let moved = source;
+            moved;
+        "#,
+    )
+    .expect("move source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.compile_aot().expect("aot compilation should succeed");
+    assert_eq!(
+        vm.run().expect("aot execution should halt"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::String(Arc::new("x".to_string()))]);
+    assert!(!vm.aot_interpreter_boundary_hit);
 }
 
 #[cfg(feature = "cranelift-jit")]

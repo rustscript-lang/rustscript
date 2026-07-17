@@ -3,8 +3,8 @@ use std::fmt::Write;
 
 use crate::builtins::BuiltinFunction;
 use crate::bytecode::{
-    CallableKind, CallablePrototype, CallableTarget, FunctionRegion, RootCallableBinding,
-    ScriptFunction, TypeMap, ValueType,
+    CallableKind, CallablePrototype, CallableTarget, CaptureBindingMode, FunctionRegion,
+    RootCallableBinding, ScriptFunction, TypeMap, ValueType,
 };
 use crate::compiler::ir::TypeSchema;
 use crate::debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
@@ -31,6 +31,7 @@ pub enum WireError {
     InvalidTypeMapFlag(u8),
     InvalidDebugFlag(u8),
     InvalidValueType(u8),
+    InvalidCaptureBindingMode(u8),
     InvalidUtf8,
     StringTooLong(usize),
     CodeTooLong(usize),
@@ -53,6 +54,9 @@ impl std::fmt::Display for WireError {
             WireError::InvalidTypeMapFlag(value) => write!(f, "invalid type-map flag: {value}"),
             WireError::InvalidDebugFlag(value) => write!(f, "invalid debug flag: {value}"),
             WireError::InvalidValueType(value) => write!(f, "invalid value type: {value}"),
+            WireError::InvalidCaptureBindingMode(value) => {
+                write!(f, "invalid capture binding mode: {value}")
+            }
             WireError::InvalidUtf8 => write!(f, "invalid utf-8 string"),
             WireError::StringTooLong(len) => write!(f, "string too long: {len}"),
             WireError::CodeTooLong(len) => write!(f, "code too long: {len}"),
@@ -544,9 +548,12 @@ fn validate_callable_metadata(program: &Program) -> Result<(), ValidationError> 
     for prototype in &program.callable_prototypes {
         if matches!(prototype.target, CallableTarget::ScriptFunction(_))
             && prototype.parameter_slots.len() != prototype.arity as usize
+            || prototype.capture_source_slots.len() != prototype.capture_slots.len()
+            || prototype.capture_modes.len() != prototype.capture_slots.len()
             || prototype
                 .parameter_slots
                 .iter()
+                .chain(prototype.capture_source_slots.iter())
                 .chain(prototype.capture_slots.iter())
                 .any(|slot| *slot as usize >= prototype.frame_local_count)
             || prototype
@@ -783,7 +790,16 @@ fn write_callable_metadata(out: &mut Vec<u8>, program: &Program) -> Result<(), W
         out.push(prototype.arity);
         write_u32_count("callable frame locals", prototype.frame_local_count, out)?;
         write_u16_list("callable parameters", &prototype.parameter_slots, out)?;
+        write_u16_list(
+            "callable capture sources",
+            &prototype.capture_source_slots,
+            out,
+        )?;
         write_u16_list("callable captures", &prototype.capture_slots, out)?;
+        write_u32_count("callable capture modes", prototype.capture_modes.len(), out)?;
+        for mode in &prototype.capture_modes {
+            out.push(*mode as u8);
+        }
         match prototype.self_slot {
             Some(slot) => {
                 out.push(1);
@@ -871,7 +887,19 @@ fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, W
         let arity = cursor.read_u8()?;
         let frame_local_count = cursor.read_u32()? as usize;
         let parameter_slots = read_u16_list(cursor)?;
+        let capture_source_slots = read_u16_list(cursor)?;
         let capture_slots = read_u16_list(cursor)?;
+        let capture_mode_count = cursor.read_u32()? as usize;
+        let mut capture_modes = Vec::with_capacity(capture_mode_count);
+        for _ in 0..capture_mode_count {
+            capture_modes.push(match cursor.read_u8()? {
+                0 => CaptureBindingMode::Copy,
+                1 => CaptureBindingMode::Borrow,
+                2 => CaptureBindingMode::BorrowMut,
+                3 => CaptureBindingMode::Move,
+                other => return Err(WireError::InvalidCaptureBindingMode(other)),
+            });
+        }
         let self_slot = match cursor.read_u8()? {
             0 => None,
             1 => Some(cursor.read_u16()?),
@@ -888,7 +916,9 @@ fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, W
             arity,
             frame_local_count,
             parameter_slots,
+            capture_source_slots,
             capture_slots,
+            capture_modes,
             self_slot,
             schema,
         });
