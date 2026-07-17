@@ -674,7 +674,7 @@ The compiler keeps direct host dispatch separate from script callable dispatch.
    - `ret` completes the active typed continuation: root halt, caller resume, or host return.
 
 At runtime, direct `call` uses `Vm::execute_host_call`, while `callvalue` validates the callable's
-Program instance, prototype, schema, arity, and frame layout before dispatch. VMBC v9 carries the
+prototype, schema, arity, and frame layout before dispatch. VMBC v9 carries the
 script-function, prototype, function-region, and root-binding tables. See
 [`docs/callable-runtime.md`](docs/callable-runtime.md) for the bytecode, lifecycle, callback, and
 optimized-backend contracts.

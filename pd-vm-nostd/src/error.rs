@@ -13,7 +13,6 @@ pub enum VmError {
     InvalidLocal(u8),
     InvalidCall(u16),
     InvalidCallable,
-    StaleCallable,
     InvalidCallablePrototype(u32),
     CallStackOverflow,
     InvalidCallArity {
@@ -49,7 +48,6 @@ impl fmt::Display for VmError {
             Self::InvalidLocal(index) => write!(f, "invalid local index: {index}"),
             Self::InvalidCall(index) => write!(f, "invalid call index: {index}"),
             Self::InvalidCallable => f.write_str("callvalue operand is not callable"),
-            Self::StaleCallable => f.write_str("callable belongs to another program instance"),
             Self::InvalidCallablePrototype(index) => {
                 write!(f, "invalid callable prototype: {index}")
             }

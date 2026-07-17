@@ -29,7 +29,7 @@ First-class value typing, generic schemas, lifecycle, and retained callback APIs
 - Apply a hard internal format break; no backward decoder, migration, opcode reinterpretation, or compatibility branch is required:
   - bump VMBC `ENCODE_VERSION` from 8 to 9 and accept only version 9;
   - bump AOT artifact `VERSION` from 2 to 3 and native `ABI_VERSION` from 1 to 2 because Program/VM/native layouts and return control flow change;
-  - bump debugger recording `PDRC` from 2 to 3, accept only version 3, and remove legacy version-1 recording acceptance;
+  - bump debugger recording `PDRC` from 2 to 4, accept only version 4, and reject legacy versions 1 through 3;
   - add the bytecode ABI revision to Program/native trace cache keys together with callable tables, function regions, and slot layouts so old in-memory entries cannot match;
   - regenerate internal fixtures/artifacts and make every old format fail with its existing unsupported-version error.
 
@@ -42,8 +42,8 @@ First-class value typing, generic schemas, lifecycle, and retained callback APIs
 **Complete:**
 
 - Add `Program.script_functions` and `Program.callable_prototypes` containing entry IP, arity, frame-local count, parameter slots, slot-location layout, capture layout, source metadata, and instantiated generic signature.
-- Add `Value::Callable { program_instance, prototype_id, kind, env }`; it stores no `Arc<Program>`.
-- Assign a fresh `ProgramInstanceId` on Program installation/replacement/reset. `CallValue` validates it before prototype lookup and returns `StaleCallable` for old handles.
+- Add Program-owned `Value::Callable { prototype_id, kind, env }`; it stores no `Arc<Program>` and never outlives the owning Program/Store registry.
+- On Program installation/replacement/reset, clear runtime callable values and invalidate external callbacks through the owning Store registry. Callable dispatch does not compare stale identities.
 - Add an execution-frame stack. Each frame records:
   - typed continuation (`Halt`, `ResumeBytecode`, or `ReturnToHost`);
   - prototype/function identity;
@@ -52,7 +52,7 @@ First-class value typing, generic schemas, lifecycle, and retained callback APIs
   - active callable/environment root;
   - recursion, fuel/epoch, suspension, and debug state required for exact resume.
 - Resolve logical locals through metadata such as `SlotLocation::Frame(offset)` or `SlotLocation::Capture(cell)`. A logical slot must map to exactly one storage class in each prototype.
-- On `CallValue`, validate value kind, Program instance, arity, and recursion limit; preserve caller state; allocate callee locals; bind arguments/self/environment; then enter the target.
+- On `CallValue`, validate value kind, prototype, arity, and recursion limit; preserve caller state; allocate callee locals; bind arguments/self/environment; then enter the target.
 - On `Ret`, normalize the result, release callee roots/locals, restore the typed continuation, and either resume bytecode, return to Rust, or report halt.
 - Emit root code and every RSS function body once in one code blob, with explicit root/function regions.
 - Validate `Br` and `Brfalse` targets remain inside their current root/function region; cross-function control flow is valid only through `CallValue` and `Ret`.
@@ -93,7 +93,7 @@ First-class value typing, generic schemas, lifecycle, and retained callback APIs
   - `Br`/`Brfalse` cannot cross root/function regions;
   - `Ldc` cannot deserialize Program-bound callable constants;
   - `Pop` and `Dup` apply normal callable/environment clone/drop ownership;
-  - `Ceq` compares function items by Program instance/prototype identity and closure aliases by callable/environment identity; separate closure evaluations compare unequal;
+  - `Ceq` compares function items by prototype identity inside their owning Program and closure aliases by callable/environment identity; separate closure evaluations compare unequal;
   - arithmetic, bitwise, ordering, and shift opcodes reject callable operands through existing type-error paths.
 - Remove or redesign the current interpreter `Call + Ret` fusion. It may run only when typed continuation/frame semantics, fuel ticks, epoch checks, result normalization, and lifecycle behavior remain identical to unfused execution.
 - Change the current interpreter mapping from unconditional `Ret -> Halted` to frame completion.
@@ -112,7 +112,7 @@ First-class value typing, generic schemas, lifecycle, and retained callback APIs
 
 - Update assembler/disassembler, operand decoding, VMBC validation, no-std execution, AOT bundles, REPL replacement, recording/replay, formatter output, and source diagnostics.
 - Add function-region/prototype/frame data to debug info, stack traces, current-frame local inspection, and Rust invocation status.
-- Add focused tests for root `Ret`, nested `Ret`, Rust-root `Ret`, `CallValue` stack shape, stale handles, arity/type errors, region-confined branches, slot-location validation, callable equality, `Pop`/`Dup` lifecycle, and rewritten `Call + Ret` optimization.
+- Add focused tests for root `Ret`, nested `Ret`, Rust-root `Ret`, `CallValue` stack shape, Program-owned callback invalidation, arity/type errors, region-confined branches, slot-location validation, callable equality, `Pop`/`Dup` lifecycle, and rewritten `Call + Ret` optimization.
 - Add interpreter/JIT/AOT parity tests for direct/dynamic calls, recursion, captures, host calls, errors, yield/pending/resume, cancellation, reset, and exact drop counts.
 - Instrument native tests to assert zero callable-induced side exits, trace breaks, interpreter handoffs, and rejected valid AOT Programs.
 - Run focused suites during implementation, then formatting, workspace tests, Clippy with `-D warnings`, and release builds.

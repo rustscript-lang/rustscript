@@ -102,7 +102,7 @@ impl VmRecording {
 
     pub fn encode(&self) -> Result<Vec<u8>, VmRecordingError> {
         const MAGIC: [u8; 4] = *b"PDRC";
-        const VERSION: u16 = 3;
+        const VERSION: u16 = 4;
 
         let mut out = Vec::new();
         out.extend_from_slice(&MAGIC);
@@ -167,7 +167,7 @@ impl VmRecording {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, VmRecordingError> {
         const MAGIC: [u8; 4] = *b"PDRC";
-        const VERSION: u16 = 3;
+        const VERSION: u16 = 4;
 
         let mut cursor = RecordingCursor::new(bytes);
 
@@ -361,7 +361,6 @@ fn encode_value(
         }
         Value::Callable(callable) => {
             out.push(9);
-            out.extend_from_slice(&callable.program_instance.to_le_bytes());
             out.extend_from_slice(&callable.prototype_id.to_le_bytes());
             out.push(match callable.kind {
                 crate::CallableKind::FunctionItem => 0,
@@ -440,7 +439,6 @@ fn decode_value(
             Ok(Value::map(entries))
         }
         9 => {
-            let program_instance = cursor.read_u64()?;
             let prototype_id = cursor.read_u32()?;
             let kind = match cursor.read_u8()? {
                 0 => crate::CallableKind::FunctionItem,
@@ -482,7 +480,6 @@ fn decode_value(
                 _ => return Err(VmRecordingError::InvalidFormat("invalid callable env flag")),
             };
             Ok(Value::Callable(Arc::new(crate::CallableValue {
-                program_instance,
                 prototype_id,
                 kind,
                 env,
@@ -563,7 +560,6 @@ mod tests {
         });
         let callable = |prototype_id| {
             Value::Callable(Arc::new(crate::CallableValue {
-                program_instance: 11,
                 prototype_id,
                 kind: crate::CallableKind::Closure,
                 env: Some(environment.clone()),
@@ -595,16 +591,16 @@ mod tests {
     }
 
     #[test]
-    fn recording_v3_rejects_legacy_versions() {
+    fn recording_v4_rejects_legacy_versions() {
         let recording = VmRecording {
             program: Program::new(Vec::new(), vec![crate::OpCode::Ret as u8]),
             frames: Vec::new(),
             terminal_status: Some(VmStatus::Halted),
         };
         let bytes = recording.encode().expect("recording should encode");
-        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 3);
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 4);
 
-        for legacy in [1u16, 2u16] {
+        for legacy in [1u16, 2u16, 3u16] {
             let mut legacy_bytes = bytes.clone();
             legacy_bytes[4..6].copy_from_slice(&legacy.to_le_bytes());
             assert!(matches!(

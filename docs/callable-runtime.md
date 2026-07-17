@@ -9,7 +9,7 @@ RustScript bytecode format version 9 introduces runtime script call frames and f
 - callable environments are bound through the internal builtin call path; callable creation adds no bytecode opcode.
 - `ret` completes the active script frame. A nested frame leaves exactly one result at the caller segment base, using `null` when the body produced no value. Root `ret` keeps the historical program-result stack behavior.
 
-VMBC v9 is a hard format boundary. Decoders reject older versions. The stream includes script-function entry ranges, callable prototypes, function regions, and root callable bindings. PDRC recordings and AOT artifacts use their corresponding bumped format/ABI versions and include callable metadata in cache identity.
+VMBC v9 is a hard format boundary. Decoders reject older versions. The stream includes script-function entry ranges, callable prototypes, function regions, and root callable bindings. PDRC v4 recordings and AOT artifacts use their corresponding bumped format/ABI versions and include callable metadata in cache identity.
 
 ## Runtime model
 
@@ -26,11 +26,11 @@ Branches are restricted to the active function region. Validation rejects cross-
 
 ## Callable identity and lifetime
 
-A callable contains the owning program-instance ID, prototype ID, kind, and optional environment. Capture-free function items compare by program/prototype identity. Closures compare by runtime identity. Callable constants are forbidden; functions are initialized from program metadata and closures are materialized at their declaration site.
+A callable contains its prototype ID, kind, and optional environment. The Program/Store owns the callable lifetime. Capture-free function items compare by prototype identity inside that Program; closures compare by runtime environment identity. Callable constants are forbidden; functions are initialized from Program metadata and closures are materialized at their declaration site.
 
-Resetting or replacing the VM program assigns a new program-instance ID. Calling a value from an older instance reports `StaleCallable`.
+Reset clears Program runtime values and rebinds root function items from Program metadata. Program replacement cancels and releases the old Store callback registry before dropping the old Program. Raw callable values are Program-local and are not portable across Program/Store boundaries.
 
-`Vm::invoke_callable` is the synchronous host-entry API for a callable retained after the root program halts. For resumable work, `Vm::start_callable` returns `VmStatus`; after `Yielded` or `Waiting`, continue with `Vm::resume` and read the completed value with `Vm::take_callable_result`. `ScriptCallback::start` and `Store::take_callback_result` expose the same flow for typed callbacks. `Store::script_callback` validates the Store identity, Program instance, arity, and copied callable schema and returns a typed `ScriptCallback<Args, Ret>`. A callback can invoke directly, create a `Send` queued invocation on another thread, unsubscribe all aliases, or enter the Store FIFO through `enqueue_callback`; queue errors propagate and no implicit coalescing occurs. `Vm::shutdown` clears queued work, runtime values and host resources before invalidating every exported callable.
+`Vm::invoke_callable` is the synchronous host-entry API for a callable retained while the current Program is active. For resumable work, `Vm::start_callable` returns `VmStatus`; after `Yielded` or `Waiting`, continue with `Vm::resume` and read the completed value with `Vm::take_callable_result`. `ScriptCallback::start` and `Store::take_callback_result` expose the same flow for typed callbacks. `Store::script_callback` validates Store ownership, arity, and the copied callable schema and returns a typed `ScriptCallback<Args, Ret>` with no stale identity field. A callback can invoke directly, create a `Send` queued invocation on another thread, unsubscribe all aliases, or enter the Store FIFO through `enqueue_callback`; queue errors propagate and no implicit coalescing occurs. `Vm::shutdown` clears queued work, runtime values and host resources before invalidating every exported callback through the Store registry.
 
 PDRC recordings preserve full execution-frame metadata. Callable environments use identity-table encoding, so aliases still share one environment after decode.
 

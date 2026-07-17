@@ -100,7 +100,7 @@ fn callvalue_enters_script_frame_and_resumes_caller() {
 }
 
 #[test]
-fn host_can_invoke_exported_callable_and_reset_makes_it_stale() {
+fn host_can_invoke_exported_callable_and_reset_rebinds_program_owned_value() {
     let mut bc = crate::BytecodeBuilder::new();
     bc.ret();
     let entry = bc.position();
@@ -170,10 +170,13 @@ fn host_can_invoke_exported_callable_and_reset_makes_it_stale() {
     ));
 
     vm.reset_for_reuse();
-    assert!(matches!(
-        vm.invoke_callable(callable, &[Value::Int(1)]),
-        Err(VmError::StaleCallable { .. })
-    ));
+    assert_eq!(vm.run().expect("reset root should halt"), VmStatus::Halted);
+    let rebound = vm.locals()[0].clone();
+    assert_eq!(
+        vm.invoke_callable(rebound, &[Value::Int(1)])
+            .expect("reset should rebind the Program-owned function item"),
+        Value::Int(2)
+    );
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -356,9 +359,6 @@ fn typed_script_callbacks_invoke_queue_unsubscribe_and_invalidate() {
     assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
     let callable = vm.stack().last().cloned().expect("callable result");
     let mut store = crate::Store::from_vm(vm);
-    let stale_callback: crate::ScriptCallback<(i64,), i64> = store
-        .script_callback(callable.clone())
-        .expect("second callback should bind");
     let callback: crate::ScriptCallback<(i64,), i64> = store
         .script_callback(callable.clone())
         .expect("typed callback should bind");
@@ -392,12 +392,6 @@ fn typed_script_callbacks_invoke_queue_unsubscribe_and_invalidate() {
         Err(VmError::InvalidFrameState(
             "script callback is unsubscribed"
         ))
-    ));
-
-    store.vm_mut().reset_for_reuse();
-    assert!(matches!(
-        stale_callback.call(&mut store, (1,)),
-        Err(VmError::StaleCallable { .. })
     ));
 }
 
