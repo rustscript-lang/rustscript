@@ -14,18 +14,20 @@ use std::time::Instant;
 use crate::vm::native::ExecutableBuffer;
 #[cfg(feature = "cranelift-jit")]
 use crate::vm::native::{
-    HeapIntrinsicAddrs, HeapIntrinsicRefs, OP_BUILTIN_CALL, OP_CALL, STATUS_CONTINUE, STATUS_ERROR,
-    alloc_buffer_signature, alloc_byte_buffer_entry_address, alloc_value_buffer_entry_address,
-    aot_call_boundary_interrupt_entry_address, array_push_entry_address, box_heap_value_signature,
-    clear_value_slot_entry_address, clone_value_signature, clone_value_to_slot_entry_address,
-    collection_get_signature, collection_mutation_signature, collection_set_entry_address,
-    copy_bytes_entry_address, copy_bytes_signature, detect_native_stack_layout, entry_signature,
-    free_buffer_signature, helper_entry_offset, helper_signature,
+    HeapIntrinsicAddrs, HeapIntrinsicRefs, NativeFrameState, OP_BUILTIN_CALL, OP_CALL,
+    STATUS_CONTINUE, STATUS_ERROR, alloc_buffer_signature, alloc_byte_buffer_entry_address,
+    alloc_value_buffer_entry_address, aot_call_boundary_interrupt_entry_address,
+    array_push_entry_address, box_heap_value_signature, clear_value_slot_entry_address,
+    clone_value_signature, clone_value_to_slot_entry_address, collection_get_signature,
+    collection_mutation_signature, collection_set_entry_address, copy_bytes_entry_address,
+    copy_bytes_signature, detect_native_stack_layout, entry_signature, frame_state_entry_address,
+    frame_state_signature, free_buffer_signature, helper_entry_offset, helper_signature,
     init_null_value_slot_entry_address, jump_with_status, pack_shared_signature, resolve_offsets,
-    restore_exit_signature, restore_exit_state_entry_address,
-    shared_array_from_buffer_entry_address, shared_bytes_from_buffer_entry_address,
-    shared_string_from_buffer_entry_address, value_eq_entry_address, value_eq_signature,
-    value_slot_signature, write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
+    restore_active_exit_state_entry_address, restore_exit_signature,
+    restore_exit_state_entry_address, shared_array_from_buffer_entry_address,
+    shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
+    value_eq_entry_address, value_eq_signature, value_slot_signature,
+    write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
 };
 use crate::vm::{Program, Value, Vm, VmError, VmResult};
 #[cfg(feature = "cranelift-jit")]
@@ -219,6 +221,7 @@ struct AotDeoptHelperRefs {
     helper_ref: cranelift_codegen::ir::SigRef,
     vm_status_ref: cranelift_codegen::ir::SigRef,
     interrupt_ref: cranelift_codegen::ir::SigRef,
+    frame_state_ref: cranelift_codegen::ir::SigRef,
     clone_value_ref: cranelift_codegen::ir::SigRef,
     value_eq_ref: cranelift_codegen::ir::SigRef,
     init_null_slot_ref: cranelift_codegen::ir::SigRef,
@@ -233,6 +236,7 @@ struct AotDeoptHelperRefs {
 #[derive(Clone, Copy)]
 struct AotDeoptHelperAddrs {
     aot_interrupt: usize,
+    frame_state: usize,
     clone_value: usize,
     value_eq: usize,
     init_null_slot: usize,
@@ -381,6 +385,7 @@ fn compile_ssa(
     let sigs_started = Instant::now();
     let helper_sig = helper_signature(pointer_type, call_conv);
     let alloc_buffer_sig = alloc_buffer_signature(pointer_type, call_conv);
+    let frame_state_sig = frame_state_signature(pointer_type, call_conv);
     let free_buffer_sig = free_buffer_signature(pointer_type, call_conv);
     let pack_shared_sig = pack_shared_signature(pointer_type, call_conv);
     let copy_bytes_sig = copy_bytes_signature(pointer_type, call_conv);
@@ -408,6 +413,7 @@ fn compile_ssa(
     };
     let helper_addrs = AotDeoptHelperAddrs {
         aot_interrupt: aot_call_boundary_interrupt_entry_address(),
+        frame_state: frame_state_entry_address(),
         clone_value: clone_value_to_slot_entry_address(),
         value_eq: value_eq_entry_address(),
         init_null_slot: init_null_value_slot_entry_address(),
@@ -415,7 +421,7 @@ fn compile_ssa(
         box_heap_value: write_heap_value_to_slot_entry_address(),
         array_push: array_push_entry_address(),
         collection_set: collection_set_entry_address(),
-        restore_exit: restore_exit_state_entry_address(),
+        restore_exit: restore_active_exit_state_entry_address(),
     };
     let addr_setup_elapsed = addr_setup_started.elapsed();
 
@@ -462,6 +468,7 @@ fn compile_ssa(
             helper_ref: b.import_signature(helper_sig),
             vm_status_ref: b.import_signature(vm_status_sig),
             interrupt_ref: b.import_signature(interrupt_sig),
+            frame_state_ref: b.import_signature(frame_state_sig),
             clone_value_ref: b.import_signature(clone_value_sig),
             value_eq_ref: b.import_signature(value_eq_sig),
             init_null_slot_ref: b.import_signature(value_slot_sig.clone()),
@@ -558,6 +565,8 @@ fn compile_ssa(
                 pointer_type,
                 layout,
                 offsets,
+                helper_refs,
+                helper_addrs,
                 checkpoint,
             )?;
             b.ins()
@@ -685,6 +694,7 @@ fn compile_ssa(
 }
 
 #[cfg(feature = "cranelift-jit")]
+#[allow(clippy::too_many_arguments)]
 fn load_checkpoint_args(
     b: &mut FunctionBuilder,
     vm_ptr: cranelift_codegen::ir::Value,
@@ -692,8 +702,49 @@ fn load_checkpoint_args(
     pointer_type: cranelift_codegen::ir::Type,
     layout: crate::vm::native::NativeStackLayout,
     offsets: crate::vm::native::ResolvedOffsets,
+    helper_refs: AotDeoptHelperRefs,
+    helper_addrs: AotDeoptHelperAddrs,
     checkpoint: &AotCheckpoint,
 ) -> Result<Vec<cranelift_codegen::ir::Value>, AotCompileError> {
+    let frame_state_size =
+        u32::try_from(std::mem::size_of::<NativeFrameState>()).map_err(|_| {
+            AotCompileError::Codegen("native frame state size out of range".to_string())
+        })?;
+    let frame_state_align = std::mem::align_of::<NativeFrameState>().trailing_zeros() as u8;
+    let frame_state_slot = b.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        frame_state_size,
+        frame_state_align,
+    ));
+    let frame_state_ptr = b.ins().stack_addr(pointer_type, frame_state_slot, 0);
+    call_status_helper(
+        b,
+        exit_block,
+        pointer_type,
+        helper_refs.frame_state_ref,
+        helper_addrs.frame_state,
+        &[vm_ptr, frame_state_ptr],
+    )?;
+    let stack_base_offset =
+        i32::try_from(std::mem::offset_of!(NativeFrameState, operand_stack_base)).map_err(
+            |_| AotCompileError::Codegen("frame stack-base offset out of range".to_string()),
+        )?;
+    let local_base_offset = i32::try_from(std::mem::offset_of!(NativeFrameState, local_base))
+        .map_err(|_| {
+            AotCompileError::Codegen("frame local-base offset out of range".to_string())
+        })?;
+    let stack_base = b.ins().load(
+        pointer_type,
+        MemFlags::new(),
+        frame_state_ptr,
+        stack_base_offset,
+    );
+    let local_base = b.ins().load(
+        pointer_type,
+        MemFlags::new(),
+        frame_state_ptr,
+        local_base_offset,
+    );
     let stack_len = b
         .ins()
         .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_len);
@@ -703,7 +754,8 @@ fn load_checkpoint_args(
             AotCompileError::Codegen("checkpoint stack length out of range".to_string())
         })?,
     );
-    let stack_ok = b.ins().icmp(IntCC::Equal, stack_len, expected_stack_len);
+    let expected_stack_total = b.ins().iadd(stack_base, expected_stack_len);
+    let stack_ok = b.ins().icmp(IntCC::Equal, stack_len, expected_stack_total);
     let stack_match = b.create_block();
     let stack_error = b.ins().iconst(types::I32, STATUS_ERROR as i64);
     b.ins().brif(
@@ -724,7 +776,10 @@ fn load_checkpoint_args(
             AotCompileError::Codegen("checkpoint locals length out of range".to_string())
         })?,
     );
-    let locals_ok = b.ins().icmp(IntCC::Equal, locals_len, expected_locals_len);
+    let expected_locals_total = b.ins().iadd(local_base, expected_locals_len);
+    let locals_ok = b
+        .ins()
+        .icmp(IntCC::Equal, locals_len, expected_locals_total);
     let locals_match = b.create_block();
     let locals_error = b.ins().iconst(types::I32, STATUS_ERROR as i64);
     b.ins().brif(
@@ -742,6 +797,8 @@ fn load_checkpoint_args(
     let locals_ptr = b
         .ins()
         .load(pointer_type, MemFlags::new(), vm_ptr, offsets.locals_ptr);
+    let stack_ptr = ssa_value_addr(b, pointer_type, stack_ptr, stack_base, layout.value.size);
+    let locals_ptr = ssa_value_addr(b, pointer_type, locals_ptr, local_base, layout.value.size);
 
     let mut args = Vec::with_capacity(checkpoint.stack.len() + checkpoint.locals.len());
     for (index, repr) in checkpoint.stack.iter().copied().enumerate() {
