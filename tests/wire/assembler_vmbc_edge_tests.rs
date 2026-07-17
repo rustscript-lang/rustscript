@@ -1,7 +1,9 @@
+use std::sync::Arc;
+
 use vm::{
-    Assembler, AssemblerError, DebugInfo, DisassembleOptions, LineInfo, OpCode, Program,
-    ValidationError, Value, WireError, assemble, compile_source, decode_program,
-    disassemble_program_with_options, encode_program, validate_program,
+    Assembler, AssemblerError, CallableKind, CallableValue, DebugInfo, DisassembleOptions,
+    LineInfo, OpCode, Program, ValidationError, Value, WireError, assemble, compile_source,
+    decode_program, disassemble_program_with_options, encode_program, validate_program,
 };
 
 fn assert_asm_error_contains(source: &str, expected: &str) {
@@ -120,17 +122,26 @@ fn assemble_reports_local_index_overflow() {
 }
 
 #[test]
-fn encode_rejects_array_and_map_constants() {
-    let array_program = Program::new(vec![Value::array(vec![])], vec![OpCode::Ret as u8]);
-    let array_err = encode_program(&array_program).expect_err("array constants should be rejected");
-    assert!(matches!(
-        array_err,
-        WireError::UnsupportedConstantType("array")
-    ));
+fn array_and_map_constants_roundtrip_while_callable_constants_are_rejected() {
+    let constants = vec![Value::array(vec![
+        Value::Int(1),
+        Value::map(vec![(Value::string("key"), Value::Bool(true))]),
+    ])];
+    let program = Program::new(constants.clone(), vec![OpCode::Ret as u8]);
+    let decoded = decode_program(&encode_program(&program).expect("containers should encode"))
+        .expect("containers should decode");
+    assert_eq!(decoded.constants, constants);
 
-    let map_program = Program::new(vec![Value::map(vec![])], vec![OpCode::Ret as u8]);
-    let map_err = encode_program(&map_program).expect_err("map constants should be rejected");
-    assert!(matches!(map_err, WireError::UnsupportedConstantType("map")));
+    let callable = Value::Callable(Arc::new(CallableValue {
+        prototype_id: 0,
+        kind: CallableKind::FunctionItem,
+        env: None,
+    }));
+    let callable_program = Program::new(vec![callable], vec![OpCode::Ret as u8]);
+    assert!(matches!(
+        encode_program(&callable_program),
+        Err(WireError::UnsupportedConstantType("callable"))
+    ));
 }
 
 #[test]

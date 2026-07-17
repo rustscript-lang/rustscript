@@ -11,6 +11,43 @@ const MAGIC: [u8; 4] = *b"VMBC";
 const VERSION_V10: u16 = 10;
 const FLAGS: u16 = 0;
 const MAX_SCHEMA_DEPTH: usize = 64;
+const MAX_CONSTANT_DEPTH: usize = 64;
+
+fn read_constant(cursor: &mut Cursor<'_>, depth: usize) -> Result<Value, WireError> {
+    if depth >= MAX_CONSTANT_DEPTH {
+        return Err(WireError::LengthTooLarge("constant nesting depth", depth));
+    }
+    match cursor.read_u8()? {
+        0 => Ok(Value::Int(cursor.read_i64()?)),
+        1 => Ok(Value::Bool(cursor.read_bool()?)),
+        2 => Ok(Value::string(cursor.read_string()?)),
+        3 => Ok(Value::Float(cursor.read_f64()?)),
+        4 => Ok(Value::Null),
+        5 => Ok(Value::bytes(cursor.read_blob()?.to_vec())),
+        6 => {
+            let count = cursor.read_u32()? as usize;
+            let mut values = Vec::new();
+            reserve(&mut values, "constant array", count)?;
+            for _ in 0..count {
+                values.push(read_constant(cursor, depth + 1)?);
+            }
+            Ok(Value::array(values))
+        }
+        7 => {
+            let count = cursor.read_u32()? as usize;
+            let mut entries = Vec::new();
+            reserve(&mut entries, "constant map", count)?;
+            for _ in 0..count {
+                entries.push((
+                    read_constant(cursor, depth + 1)?,
+                    read_constant(cursor, depth + 1)?,
+                ));
+            }
+            Ok(Value::map(entries))
+        }
+        tag => Err(WireError::InvalidConstantTag(tag)),
+    }
+}
 
 pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     let mut cursor = Cursor::new(bytes);
@@ -32,16 +69,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     let mut constants = Vec::new();
     reserve(&mut constants, "constants", constant_count)?;
     for _ in 0..constant_count {
-        let value = match cursor.read_u8()? {
-            0 => Value::Int(cursor.read_i64()?),
-            1 => Value::Bool(cursor.read_bool()?),
-            2 => Value::string(cursor.read_string()?),
-            3 => Value::Float(cursor.read_f64()?),
-            4 => Value::Null,
-            5 => Value::bytes(cursor.read_blob()?.to_vec()),
-            tag => return Err(WireError::InvalidConstantTag(tag)),
-        };
-        constants.push(value);
+        constants.push(read_constant(&mut cursor, 0)?);
     }
 
     let code = cursor.read_blob()?.to_vec();
