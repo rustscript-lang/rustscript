@@ -132,6 +132,28 @@ fn callvalue_enters_script_frame_and_resumes_caller() {
 }
 
 #[test]
+fn script_call_depth_limit_is_configurable() {
+    let compiled = crate::compile_source_for_repl(
+        "fn recurse(value: int) -> int { recurse(value) } recurse(1);",
+    )
+    .expect("recursive callable should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+
+    assert_eq!(vm.max_script_call_depth(), 1024);
+    assert!(matches!(
+        vm.set_max_script_call_depth(0),
+        Err(VmError::InvalidCallStackLimit(0))
+    ));
+    vm.set_max_script_call_depth(3)
+        .expect("positive call depth should be accepted");
+    assert_eq!(vm.max_script_call_depth(), 3);
+    assert!(matches!(
+        vm.run(),
+        Err(VmError::CallStackOverflow { limit: 3 })
+    ));
+}
+
+#[test]
 fn host_can_invoke_exported_callable_and_reset_rebinds_program_owned_value() {
     let mut bc = crate::BytecodeBuilder::new();
     bc.ret();

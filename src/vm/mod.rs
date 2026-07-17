@@ -92,6 +92,7 @@ pub enum VmError {
     CallStackOverflow {
         limit: usize,
     },
+    InvalidCallStackLimit(usize),
     UnboundImport(String),
     InvalidOpcode(u8),
     BytecodeBounds,
@@ -162,6 +163,12 @@ impl std::fmt::Display for VmError {
             VmError::CallStackOverflow { limit } => {
                 write!(f, "script call stack limit {limit} exceeded")
             }
+            VmError::InvalidCallStackLimit(limit) => {
+                write!(
+                    f,
+                    "invalid script call stack limit {limit}: expected a positive value"
+                )
+            }
             VmError::UnboundImport(name) => write!(f, "unbound host import '{name}'"),
             VmError::InvalidOpcode(opcode) => write!(f, "invalid opcode {opcode}"),
             VmError::BytecodeBounds => write!(f, "bytecode bounds"),
@@ -194,7 +201,7 @@ impl std::error::Error for VmError {}
 
 pub type VmResult<T> = Result<T, VmError>;
 
-const MAX_SCRIPT_CALL_DEPTH: usize = 1024;
+pub const DEFAULT_MAX_SCRIPT_CALL_DEPTH: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VmStatus {
@@ -337,6 +344,7 @@ pub struct Vm {
     resolved_calls: Vec<u16>,
     resolved_calls_dirty: bool,
     call_depth: usize,
+    max_script_call_depth: usize,
     execution_frames: Vec<ExecutionFrame>,
     host_return: Option<Value>,
     queued_callables: VecDeque<QueuedCallable>,
@@ -655,6 +663,7 @@ impl Vm {
             resolved_calls: Vec::new(),
             resolved_calls_dirty: true,
             call_depth: 0,
+            max_script_call_depth: DEFAULT_MAX_SCRIPT_CALL_DEPTH,
             execution_frames: vec![ExecutionFrame::root(local_count)],
             host_return: None,
             queued_callables: VecDeque::new(),
@@ -729,6 +738,23 @@ impl Vm {
             self.owned_callables.push(Arc::downgrade(&callable));
             self.locals[binding.local_slot as usize] = Value::Callable(callable);
         }
+    }
+
+    /// Returns the maximum number of simultaneously active script call frames.
+    pub fn max_script_call_depth(&self) -> usize {
+        self.max_script_call_depth
+    }
+
+    /// Sets the maximum number of simultaneously active script call frames.
+    ///
+    /// The limit must be greater than zero. Existing active frames are not unwound;
+    /// the new limit is checked before the next script frame is entered.
+    pub fn set_max_script_call_depth(&mut self, limit: usize) -> VmResult<()> {
+        if limit == 0 {
+            return Err(VmError::InvalidCallStackLimit(limit));
+        }
+        self.max_script_call_depth = limit;
+        Ok(())
     }
 
     fn ensure_program_cache_key(&mut self) -> u64 {
@@ -1226,9 +1252,9 @@ impl Vm {
 
         match prototype.target {
             CallableTarget::ScriptFunction(function_id) => {
-                if self.call_depth >= MAX_SCRIPT_CALL_DEPTH {
+                if self.call_depth >= self.max_script_call_depth {
                     return Err(VmError::CallStackOverflow {
-                        limit: MAX_SCRIPT_CALL_DEPTH,
+                        limit: self.max_script_call_depth,
                     });
                 }
                 let function = self

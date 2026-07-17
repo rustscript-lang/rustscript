@@ -54,6 +54,7 @@ struct CliConfig {
     jit_dump: bool,
     jit_dump_show_machine_code: bool,
     jit_hot_loop_threshold: Option<u32>,
+    max_call_depth: Option<usize>,
     fuel: Option<u64>,
     epoch_deadline: Option<u64>,
     help: bool,
@@ -83,6 +84,7 @@ impl Default for CliConfig {
             jit_dump: false,
             jit_dump_show_machine_code: true,
             jit_hot_loop_threshold: None,
+            max_call_depth: None,
             fuel: None,
             epoch_deadline: None,
             help: false,
@@ -239,6 +241,10 @@ fn try_new_cli_vm_from_standalone_aot(cli: &CliConfig) -> Result<Option<Vm>, io:
 
 fn apply_runtime_flags(vm: &mut Vm, cli: &CliConfig) -> Result<(), io::Error> {
     vm.set_jit_native_bridge_stats_enabled(cli.jit_dump);
+    if let Some(limit) = cli.max_call_depth {
+        vm.set_max_script_call_depth(limit)
+            .map_err(|err| io::Error::other(render_vm_error(vm, &err)))?;
+    }
     if let Some(interval) = cli.epoch_check_interval {
         vm.set_epoch_check_interval(interval)
             .map_err(|err| io::Error::other(render_vm_error(vm, &err)))?;
@@ -520,6 +526,30 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
                 cfg.fuel = Some(value);
                 index += 2;
             }
+            "--max-call-depth" => {
+                let raw = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --max-call-depth".to_string())?;
+                let value = raw
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid --max-call-depth value '{raw}'"))?;
+                if value == 0 {
+                    return Err("--max-call-depth must be greater than zero".to_string());
+                }
+                cfg.max_call_depth = Some(value);
+                index += 2;
+            }
+            value if value.starts_with("--max-call-depth=") => {
+                let raw = value.trim_start_matches("--max-call-depth=");
+                let value = raw
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid --max-call-depth value '{raw}'"))?;
+                if value == 0 {
+                    return Err("--max-call-depth must be greater than zero".to_string());
+                }
+                cfg.max_call_depth = Some(value);
+                index += 1;
+            }
             "--epoch-deadline" => {
                 let raw = args
                     .get(index + 1)
@@ -623,6 +653,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
             || cfg.tcp_addr.is_some()
             || cfg.jit_dump
             || cfg.jit_hot_loop_threshold.is_some()
+            || cfg.max_call_depth.is_some()
             || cfg.fuel.is_some()
             || cfg.epoch_deadline.is_some()
             || cfg.epoch_check_interval.is_some()
@@ -650,6 +681,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
             || cfg.tcp_addr.is_some()
             || cfg.jit_dump
             || cfg.jit_hot_loop_threshold.is_some()
+            || cfg.max_call_depth.is_some()
             || cfg.fuel.is_some()
             || cfg.epoch_deadline.is_some()
             || cfg.epoch_check_interval.is_some()
@@ -679,6 +711,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
             || cfg.tcp_addr.is_some()
             || cfg.jit_dump
             || cfg.jit_hot_loop_threshold.is_some()
+            || cfg.max_call_depth.is_some()
             || cfg.fuel.is_some()
             || cfg.epoch_deadline.is_some()
             || cfg.epoch_check_interval.is_some()
@@ -733,6 +766,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
             || cfg.tcp_addr.is_some()
             || cfg.jit_dump
             || cfg.jit_hot_loop_threshold.is_some()
+            || cfg.max_call_depth.is_some()
             || cfg.fuel.is_some()
             || cfg.epoch_deadline.is_some()
             || cfg.epoch_check_interval.is_some()
@@ -853,7 +887,7 @@ fn print_usage(binary_name: &str) {
         "  {binary_name} [--jit-hot-loop <n>] [--jit-dump|--dump-jit] [--jit-dump-no-code] [--emit-vmbc <output.vmbc>] [source_path]"
     );
     println!(
-        "  {binary_name} [--fuel <n>|--epoch-deadline <n>] [--epoch-check-interval <n>] [source_path]"
+        "  {binary_name} [--max-call-depth <n>] [--fuel <n>|--epoch-deadline <n>] [--epoch-check-interval <n>] [source_path]"
     );
     println!("  {binary_name} debug [--tcp <addr>] [source_path]");
     println!();
@@ -861,6 +895,9 @@ fn print_usage(binary_name: &str) {
     println!("  -V, --version              Show version with git metadata");
     println!("  -h, --help                 Show this help");
     println!("      --check                In fmt mode, fail if formatting would change the file");
+    println!(
+        "      --max-call-depth <n>   Set the positive script call-frame limit (default: 1024)"
+    );
 }
 
 fn cli_build_features() -> Vec<String> {
@@ -1682,6 +1719,7 @@ mod tests {
         assert!(!cfg.jit_dump);
         assert!(cfg.jit_dump_show_machine_code);
         assert!(cfg.jit_hot_loop_threshold.is_none());
+        assert!(cfg.max_call_depth.is_none());
         assert!(cfg.fuel.is_none());
         assert!(cfg.epoch_deadline.is_none());
         assert!(cfg.source.is_none());
@@ -1816,6 +1854,22 @@ mod tests {
             .expect("parse should succeed");
         assert_eq!(cfg.fuel, Some(123));
         assert_eq!(cfg.source.as_deref(), Some("examples/example.rss"));
+    }
+
+    #[test]
+    fn parse_cli_max_call_depth_flag() {
+        let cfg = parse_cli_args(&[s("--max-call-depth"), s("3"), s("examples/example.rss")])
+            .expect("parse should succeed");
+        assert_eq!(cfg.max_call_depth, Some(3));
+
+        let equals = parse_cli_args(&[s("--max-call-depth=4"), s("examples/example.rss")])
+            .expect("equals form should parse");
+        assert_eq!(equals.max_call_depth, Some(4));
+
+        assert_eq!(
+            parse_cli_args(&[s("--max-call-depth"), s("0"), s("examples/example.rss"),]),
+            Err("--max-call-depth must be greater than zero".to_string())
+        );
     }
 
     #[test]

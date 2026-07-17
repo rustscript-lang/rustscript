@@ -12,6 +12,7 @@ use super::{
 };
 
 pub type VmResult<T> = Result<T, VmError>;
+pub const DEFAULT_MAX_SCRIPT_CALL_DEPTH: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VmStatus {
@@ -43,6 +44,7 @@ pub struct Vm<C = ()> {
     host_dispatcher: Option<HostDispatcher<C>>,
     context: C,
     fuel: Option<u64>,
+    max_script_call_depth: usize,
     frames: Vec<ExecutionFrame>,
 }
 
@@ -87,6 +89,7 @@ impl<C> Vm<C> {
             host_dispatcher,
             context,
             fuel: None,
+            max_script_call_depth: DEFAULT_MAX_SCRIPT_CALL_DEPTH,
             frames: Vec::new(),
         };
         vm.initialize_root_callables();
@@ -176,7 +179,7 @@ impl<C> Vm<C> {
     }
 
     fn call_value(&mut self, argc: u8) -> VmResult<()> {
-        if self.frames.len() >= 1024 {
+        if self.frames.len() >= self.max_script_call_depth {
             return Err(VmError::CallStackOverflow);
         }
         let operand_count = argc as usize + 1;
@@ -522,6 +525,18 @@ impl<C> Vm<C> {
 
     pub fn set_fuel(&mut self, fuel: u64) {
         self.fuel = Some(fuel);
+    }
+
+    pub fn max_script_call_depth(&self) -> usize {
+        self.max_script_call_depth
+    }
+
+    pub fn set_max_script_call_depth(&mut self, limit: usize) -> VmResult<()> {
+        if limit == 0 {
+            return Err(VmError::InvalidCallStackLimit(limit));
+        }
+        self.max_script_call_depth = limit;
+        Ok(())
     }
 
     pub fn clear_fuel(&mut self) {

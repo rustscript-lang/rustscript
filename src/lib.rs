@@ -88,10 +88,10 @@ pub use jit::{
 pub use vm::diagnostics::render_vm_error;
 #[cfg(feature = "runtime")]
 pub use vm::{
-    AotArtifactError, CallOutcome, CallReturn, EpochCheckpoint, EpochHandle, FuelCheckpoint,
-    HostArgsFunction, HostAsyncBridge, HostBindingPlan, HostFunction, HostFunctionRegistry,
-    HostOpId, HostStackFunction, IntoScriptValue, QueuedScriptInvocation, ScriptArgs,
-    ScriptCallback, ScriptResult, StaticHostArgsFunction, StaticHostFunction,
+    AotArtifactError, CallOutcome, CallReturn, DEFAULT_MAX_SCRIPT_CALL_DEPTH, EpochCheckpoint,
+    EpochHandle, FuelCheckpoint, HostArgsFunction, HostAsyncBridge, HostBindingPlan, HostFunction,
+    HostFunctionRegistry, HostOpId, HostStackFunction, IntoScriptValue, QueuedScriptInvocation,
+    ScriptArgs, ScriptCallback, ScriptResult, StaticHostArgsFunction, StaticHostFunction,
     StaticHostStackFunction, Store, Vm, VmError, VmResult, VmStatus, VmYieldReason,
 };
 #[cfg(feature = "runtime")]
