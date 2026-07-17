@@ -113,6 +113,10 @@ pub(crate) enum AotSsaInstKind {
     CloneTagged {
         input: AotSsaValueId,
     },
+    MakeCallable {
+        prototype_id: u32,
+        captures: Vec<AotSsaValueId>,
+    },
     StringLen {
         text: AotSsaValueId,
     },
@@ -301,6 +305,7 @@ impl AotSsaInstKind {
             | Self::BoolConst(_)
             | Self::ConstSlot { .. } => Vec::new(),
             Self::CloneTagged { input } => vec![*input],
+            Self::MakeCallable { captures, .. } => captures.clone(),
             Self::StringLen { text } => vec![*text],
             Self::BytesLen { bytes } => vec![*bytes],
             Self::StringSlice {
@@ -409,6 +414,13 @@ pub(crate) enum AotSsaTerminator {
     },
     CallBoundary {
         call: AotCall,
+        stack: Vec<AotSsaMaterialization>,
+        locals: Vec<AotSsaMaterialization>,
+    },
+    CallValue {
+        argc: u8,
+        call_ip: usize,
+        resume_ip: usize,
         stack: Vec<AotSsaMaterialization>,
         locals: Vec<AotSsaMaterialization>,
     },
@@ -735,6 +747,7 @@ fn verify_terminator(
             verify_jump_target(if_false, block_params, available_values)
         }
         AotSsaTerminator::CallBoundary { stack, locals, .. }
+        | AotSsaTerminator::CallValue { stack, locals, .. }
         | AotSsaTerminator::InterpreterBoundary { stack, locals, .. }
         | AotSsaTerminator::Return { stack, locals, .. } => {
             for materialization in stack.iter().chain(locals.iter()) {
@@ -836,6 +849,13 @@ enum ProcessResult {
         frame: Frame,
         resume_frame: Frame,
     },
+    CallValue {
+        argc: u8,
+        call_ip: usize,
+        resume_ip: usize,
+        frame: Frame,
+        resume_frame: Frame,
+    },
     InterpreterBoundary {
         ip: usize,
         frame: Frame,
@@ -928,6 +948,12 @@ impl<'a> Builder<'a> {
             checkpoint_ips.insert(block.start_ip);
         }
         let mut external_resume_ips = BTreeSet::from([lowered.entry_ip]);
+        for region in &lowered.regions {
+            if region.prototype_id.is_some() {
+                checkpoint_ips.insert(region.start_ip);
+                external_resume_ips.insert(region.start_ip);
+            }
+        }
         for block in &decoded_blocks {
             for step in &block.steps {
                 if let AotInstruction::Call(call) = &step.instruction {
@@ -936,6 +962,15 @@ impl<'a> Builder<'a> {
                     external_resume_ips.insert(call.call_ip);
                     external_resume_ips.insert(call.resume_ip);
                 }
+            }
+            if let AotBlockTerminal::CallValue {
+                call_ip, resume_ip, ..
+            } = block.terminal
+            {
+                checkpoint_ips.insert(call_ip);
+                checkpoint_ips.insert(resume_ip);
+                external_resume_ips.insert(call_ip);
+                external_resume_ips.insert(resume_ip);
             }
         }
         Ok(Self {
@@ -1070,6 +1105,19 @@ impl<'a> Builder<'a> {
                     stack: materialize_values(&frame.stack),
                     locals: materialize_values(&frame.locals),
                 },
+                ProcessResult::CallValue {
+                    argc,
+                    call_ip,
+                    resume_ip,
+                    frame,
+                    resume_frame: _,
+                } => AotSsaTerminator::CallValue {
+                    argc,
+                    call_ip,
+                    resume_ip,
+                    stack: materialize_values(&frame.stack),
+                    locals: materialize_values(&frame.locals),
+                },
                 ProcessResult::InterpreterBoundary { ip, frame } => {
                     AotSsaTerminator::InterpreterBoundary {
                         ip,
@@ -1123,6 +1171,13 @@ impl<'a> Builder<'a> {
         self.incoming_shapes
             .insert(self.lowered.entry_ip, entry_shape.clone());
         let mut queue = VecDeque::from([self.lowered.entry_ip]);
+        for region in &self.lowered.regions {
+            if region.prototype_id.is_some() {
+                self.incoming_shapes
+                    .insert(region.start_ip, entry_shape.clone());
+                queue.push_back(region.start_ip);
+            }
+        }
 
         while let Some(ip) = queue.pop_front() {
             let shape = self
@@ -1154,6 +1209,13 @@ impl<'a> Builder<'a> {
                     call, resume_frame, ..
                 } => {
                     self.merge_shape(call.resume_ip, resume_frame.shape(), &mut queue)?;
+                }
+                ProcessResult::CallValue {
+                    resume_ip,
+                    resume_frame,
+                    ..
+                } => {
+                    self.merge_shape(resume_ip, resume_frame.shape(), &mut queue)?;
                 }
                 ProcessResult::InterpreterBoundary { .. }
                 | ProcessResult::Return { .. }
@@ -1351,12 +1413,6 @@ impl<'a> Builder<'a> {
                         resume_frame,
                     });
                 }
-                if matches!(step.instruction, AotInstruction::MakeCallable { .. }) {
-                    return Ok(ProcessResult::InterpreterBoundary {
-                        ip: step.ip,
-                        frame: frame.clone(),
-                    });
-                }
                 return Err(AotSsaBuildError::UnsupportedInstruction {
                     ip: step.ip,
                     instruction: format!("{:?}", step.instruction),
@@ -1408,10 +1464,26 @@ impl<'a> Builder<'a> {
                     frame: frame.clone(),
                 })
             }
-            AotBlockTerminal::CallValue { call_ip, .. } => Ok(ProcessResult::InterpreterBoundary {
-                ip: *call_ip,
-                frame: frame.clone(),
-            }),
+            AotBlockTerminal::CallValue {
+                argc,
+                call_ip,
+                resume_ip,
+            } => {
+                let mut resume_frame = frame.clone();
+                for _ in 0..=usize::from(*argc) {
+                    resume_frame.pop(*call_ip, "callvalue")?;
+                }
+                resume_frame.stack.push(FrameValue {
+                    value: AotSsaValue::new(AotSsaValueId::new(0), AotSsaValueRepr::Tagged),
+                });
+                Ok(ProcessResult::CallValue {
+                    argc: *argc,
+                    call_ip: *call_ip,
+                    resume_ip: *resume_ip,
+                    frame: frame.clone(),
+                    resume_frame,
+                })
+            }
             AotBlockTerminal::Return => Ok(ProcessResult::Return {
                 ip: block
                     .terminal_ip
@@ -1962,7 +2034,30 @@ fn apply_direct_instruction<E: InstEmitter>(
                 _ => None,
             })
         }
-        AotInstruction::Call(_) | AotInstruction::MakeCallable { .. } => Ok(false),
+        AotInstruction::MakeCallable {
+            prototype_id,
+            capture_count,
+        } => {
+            let capture_count = usize::from(*capture_count);
+            if frame.stack.len() < capture_count {
+                return Err(AotSsaBuildError::StackUnderflow {
+                    ip,
+                    instruction: "makecallable",
+                });
+            }
+            let captures = frame.stack.split_off(frame.stack.len() - capture_count);
+            let value = emitter.emit(
+                ip,
+                AotSsaInstKind::MakeCallable {
+                    prototype_id: *prototype_id,
+                    captures: captures.iter().map(|capture| capture.value.id).collect(),
+                },
+                AotSsaValueRepr::Tagged,
+            );
+            frame.stack.push(FrameValue { value });
+            Ok(true)
+        }
+        AotInstruction::Call(_) => Ok(false),
     }
 }
 
@@ -2673,6 +2768,42 @@ mod tests {
         let ssa = build_aot_ssa(&program).expect("ssa should build");
         assert!(ssa.resume_ips.contains(&(call_ip as usize)));
         assert!(ssa.resume_ips.contains(&(resume_ip as usize)));
+    }
+
+    #[test]
+    fn aot_ssa_keeps_callable_creation_calls_and_returns_native() {
+        let compiled = crate::compile_source_for_repl(
+            r#"
+                let answer = 42;
+                let get_answer = || answer;
+                get_answer();
+            "#,
+        )
+        .expect("closure source should compile");
+        let ssa = build_aot_ssa(&compiled.program).expect("callable ssa should build");
+
+        assert!(ssa.blocks.iter().any(|block| {
+            block
+                .insts
+                .iter()
+                .any(|inst| matches!(inst.kind, AotSsaInstKind::MakeCallable { .. }))
+        }));
+        assert!(
+            ssa.blocks.iter().any(|block| {
+                matches!(block.terminator, Some(AotSsaTerminator::CallValue { .. }))
+            })
+        );
+        assert!(
+            ssa.blocks
+                .iter()
+                .any(|block| { matches!(block.terminator, Some(AotSsaTerminator::Return { .. })) })
+        );
+        assert!(!ssa.blocks.iter().any(|block| {
+            matches!(
+                block.terminator,
+                Some(AotSsaTerminator::InterpreterBoundary { .. })
+            )
+        }));
     }
 
     #[test]

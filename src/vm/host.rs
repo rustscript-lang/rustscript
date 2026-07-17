@@ -1588,7 +1588,19 @@ impl Vm {
     }
 
     pub(super) fn call_resume_ip(&self, call_ip: usize) -> VmResult<usize> {
-        let resume_ip = call_ip.checked_add(4).ok_or(VmError::BytecodeBounds)?;
+        let opcode = self
+            .program
+            .code
+            .get(call_ip)
+            .copied()
+            .ok_or(VmError::BytecodeBounds)
+            .and_then(|raw| OpCode::try_from(raw).map_err(|_| VmError::InvalidOpcode(raw)))?;
+        if !matches!(opcode, OpCode::Call | OpCode::CallValue) {
+            return Err(VmError::InvalidOpcode(opcode as u8));
+        }
+        let resume_ip = call_ip
+            .checked_add(1 + opcode.operand_len())
+            .ok_or(VmError::BytecodeBounds)?;
         if resume_ip > self.program.code.len() {
             return Err(VmError::BytecodeBounds);
         }
