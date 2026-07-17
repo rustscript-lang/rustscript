@@ -85,6 +85,15 @@ fn assemble_supports_string_escapes_and_case_insensitive_bools() {
 }
 
 #[test]
+fn assemble_supports_callvalue_operand() {
+    let program = assemble("callvalue 3\nret\n").expect("assembly should succeed");
+    assert_eq!(
+        program.code,
+        vec![OpCode::CallValue as u8, 3, OpCode::Ret as u8]
+    );
+}
+
+#[test]
 fn assemble_rejects_invalid_string_escapes_and_trailing_text() {
     assert_asm_error_contains(
         r#" .data
@@ -137,8 +146,7 @@ fn decode_rejects_invalid_flag_tag_bool_utf8_and_trailing_bytes() {
     ));
 
     let mut bad_debug_flag = encoded_simple.clone();
-    let last = bad_debug_flag.len() - 1;
-    bad_debug_flag[last] = 9;
+    bad_debug_flag[22] = 9;
     assert!(matches!(
         decode_program(&bad_debug_flag),
         Err(WireError::InvalidDebugFlag(9))

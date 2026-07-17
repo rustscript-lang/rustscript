@@ -358,7 +358,10 @@ pub(super) fn builtin_has(args: &[Value]) -> VmResult<CallReturn> {
             };
             Ok(return_one(present))
         }
-        Value::Map(entries) => Ok(return_one(entries.get(key).is_some())),
+        Value::Map(entries) => {
+            ensure_supported_map_key(key)?;
+            Ok(return_one(entries.get(key).is_some()))
+        }
         _ => Err(VmError::TypeMismatch("bytes/array/map")),
     }
 }
@@ -381,6 +384,7 @@ pub(super) fn builtin_get(args: &[Value]) -> VmResult<CallReturn> {
             })?))
         }
         Value::Map(entries) => {
+            ensure_supported_map_key(key)?;
             Ok(return_one(entries.get(key).cloned().ok_or_else(|| {
                 VmError::HostError("map key not found".to_string())
             })?))
@@ -419,6 +423,7 @@ pub(super) fn builtin_type_of_impl(value: VmValueRef<'_>) -> String {
         Value::Bytes(_) => "bytes",
         Value::Array(_) => "array",
         Value::Map(_) => "map",
+        Value::Callable(_) => "callable",
     }
     .to_string()
 }
@@ -474,6 +479,11 @@ fn render_value_for_display(value: &Value) -> String {
                 .join(", ");
             format!("{{{parts}}}")
         }
+        Value::Callable(callable) => match callable.kind {
+            crate::CallableKind::FunctionItem => format!("<fn#{}>", callable.prototype_id),
+            crate::CallableKind::Closure => format!("<closure#{}>", callable.prototype_id),
+            crate::CallableKind::HostFunction => format!("<host-fn#{}>", callable.prototype_id),
+        },
     }
 }
 
@@ -512,7 +522,7 @@ impl FormatArgument for Value {
             Value::String(_) | Value::Bytes(_) => {
                 matches!(specifier.format, Format::Display | Format::Debug)
             }
-            Value::Array(_) | Value::Map(_) => {
+            Value::Array(_) | Value::Map(_) | Value::Callable(_) => {
                 matches!(specifier.format, Format::Display | Format::Debug)
             }
         }
@@ -525,7 +535,7 @@ impl FormatArgument for Value {
             Value::Float(value) => std::fmt::Display::fmt(value, f),
             Value::Bool(value) => std::fmt::Display::fmt(value, f),
             Value::String(value) => std::fmt::Display::fmt(value.as_str(), f),
-            Value::Bytes(_) | Value::Array(_) | Value::Map(_) => {
+            Value::Bytes(_) | Value::Array(_) | Value::Map(_) | Value::Callable(_) => {
                 f.write_str(render_value_for_display(self).as_str())
             }
         }
@@ -553,6 +563,7 @@ impl FormatArgument for Value {
                 }
                 map.finish()
             }
+            Value::Callable(_) => f.write_str(render_value_for_display(self).as_str()),
         }
     }
 
@@ -690,12 +701,24 @@ pub(crate) fn builtin_set_map_shared_impl(
     entries
 }
 
+fn ensure_supported_map_key(key: &Value) -> VmResult<()> {
+    if matches!(key, Value::Callable(_)) {
+        return Err(VmError::HostError(
+            "callable values are not supported as map keys".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn builtin_set_owned(container: Value, key: Value, value: Value) -> VmResult<Value> {
     match container {
         Value::Array(values) => {
             builtin_set_array_shared_impl(values, key.as_int()?, value).map(Value::Array)
         }
-        Value::Map(entries) => Ok(Value::Map(builtin_set_map_shared_impl(entries, key, value))),
+        Value::Map(entries) => {
+            ensure_supported_map_key(&key)?;
+            Ok(Value::Map(builtin_set_map_shared_impl(entries, key, value)))
+        }
         _ => Err(VmError::TypeMismatch("array/map")),
     }
 }
@@ -876,6 +899,19 @@ mod tests {
         for alias in BUILTIN_CALL_BASE + 89..=BUILTIN_CALL_BASE + 92 {
             assert_eq!(BuiltinFunction::from_call_index(alias), None);
         }
+    }
+
+    #[test]
+    fn callable_map_keys_are_rejected() {
+        let callable = Value::Callable(Arc::new(crate::CallableValue {
+            program_instance: 1,
+            prototype_id: 0,
+            kind: crate::CallableKind::FunctionItem,
+            env: None,
+        }));
+        let err = builtin_set_owned(Value::map(Vec::new()), callable, Value::Int(1))
+            .expect_err("callable map key should fail");
+        assert!(err.to_string().contains("not supported as map keys"));
     }
 
     #[test]

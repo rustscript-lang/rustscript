@@ -12,6 +12,10 @@ pub enum VmError {
     InvalidConstant(u32),
     InvalidLocal(u8),
     InvalidCall(u16),
+    InvalidCallable,
+    StaleCallable,
+    InvalidCallablePrototype(u32),
+    CallStackOverflow,
     InvalidCallArity {
         import: String,
         expected: u8,
@@ -44,6 +48,12 @@ impl fmt::Display for VmError {
             Self::InvalidConstant(index) => write!(f, "invalid constant index: {index}"),
             Self::InvalidLocal(index) => write!(f, "invalid local index: {index}"),
             Self::InvalidCall(index) => write!(f, "invalid call index: {index}"),
+            Self::InvalidCallable => f.write_str("callvalue operand is not callable"),
+            Self::StaleCallable => f.write_str("callable belongs to another program instance"),
+            Self::InvalidCallablePrototype(index) => {
+                write!(f, "invalid callable prototype: {index}")
+            }
+            Self::CallStackOverflow => f.write_str("script call stack overflow"),
             Self::InvalidCallArity {
                 import,
                 expected,

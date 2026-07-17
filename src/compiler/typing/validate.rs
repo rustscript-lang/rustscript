@@ -556,7 +556,7 @@ pub(super) fn validate_expr(
         )?,
         Expr::Var(slot) | Expr::MoveVar(slot) => state.get(*slot),
         Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => state.get(*root),
-        Expr::FunctionRef(_) | Expr::Call(..) | Expr::LocalCall(..) | Expr::Closure(_) => {
+        Expr::FunctionRef(..) | Expr::Call(..) | Expr::LocalCall(..) | Expr::Closure(_) => {
             validate_expr_children(
                 expr,
                 state,
@@ -566,7 +566,6 @@ pub(super) fn validate_expr(
                 strict_function_add_types,
             )?;
             observe_direct_function_call_types(expr, state, line_context, source_name, context)?;
-            validate_callable_value_usage(expr, state, context)?;
             validate_schema_access(expr, state, line_context, source_name, context)?;
             context.validate_call_argument_types(expr, state, line_context, source_name)?;
             context.infer_call_like_expr_type(expr, state)
@@ -827,31 +826,6 @@ pub(super) fn validate_expr(
     })
 }
 
-fn validate_callable_value_usage(
-    expr: &Expr,
-    state: &LocalTypeState,
-    context: &mut TypeContext<'_>,
-) -> Result<(), CompileError> {
-    let Expr::Call(index, _, args) = expr else {
-        return Ok(());
-    };
-    let Some(builtin) = BuiltinFunction::from_call_index(*index) else {
-        return Ok(());
-    };
-    let value_arg = match builtin {
-        BuiltinFunction::ArrayPush if args.len() == 2 => args.get(1),
-        BuiltinFunction::Set if args.len() == 3 => args.get(2),
-        _ => None,
-    };
-    if value_arg
-        .and_then(|value| context.callable_binding_from_expr(value, state))
-        .is_some()
-    {
-        return Err(CompileError::CallableUsedAsValue);
-    }
-    Ok(())
-}
-
 fn validate_expr_children(
     expr: &Expr,
     state: &LocalTypeState,
@@ -880,13 +854,21 @@ fn validate_expr_children(
                     let TypeSchema::Callable { params, .. } = schema else {
                         return None;
                     };
-                    Some(params.iter().cloned().map(Some).collect::<Vec<_>>())
+                    Some(
+                        params
+                            .iter()
+                            .cloned()
+                            .map(|schema| {
+                                (!matches!(schema, TypeSchema::Unknown)).then_some(schema)
+                            })
+                            .collect::<Vec<_>>(),
+                    )
                 });
                 let declared_result_schema = declared_callable.as_ref().and_then(|schema| {
                     let TypeSchema::Callable { result, .. } = schema else {
                         return None;
                     };
-                    Some(result.as_ref())
+                    (!matches!(result.as_ref(), TypeSchema::Unknown)).then_some(result.as_ref())
                 });
                 validate_callable_body(
                     CallableBody {

@@ -332,7 +332,16 @@ impl AvailabilityAnalyzer {
                 expr,
                 line,
             } => {
-                let mut out = self.analyze_expr(expr, &state, *line)?;
+                let mut initializer_state = state.clone();
+                if let Expr::Closure(closure) = expr
+                    && closure
+                        .capture_copies
+                        .iter()
+                        .any(|(source, _)| source == index)
+                {
+                    self.mark_available(&mut initializer_state, *index, *line)?;
+                }
+                let mut out = self.analyze_expr(expr, &initializer_state, *line)?;
                 let mut rewritten_expr = expr.clone();
                 if out.reachable {
                     self.mark_available(&mut out, *index, *line)?;
@@ -647,7 +656,7 @@ impl AvailabilityAnalyzer {
             | Expr::Bool(_)
             | Expr::Bytes(_)
             | Expr::String(_)
-            | Expr::FunctionRef(_) => Ok(state.clone()),
+            | Expr::FunctionRef(..) => Ok(state.clone()),
             Expr::Var(index) => {
                 self.require_available(*index, state, line)?;
                 self.require_local_not_moved(*index, state, line)?;

@@ -12,8 +12,8 @@ use super::super::jit::JitConfig;
 use super::compile::CompiledProgram;
 
 const MAGIC: [u8; 4] = *b"PAT\0";
-const VERSION: u16 = 2;
-const ABI_VERSION: u16 = 1;
+const VERSION: u16 = 3;
+const ABI_VERSION: u16 = 2;
 const FLAGS: u16 = 0;
 
 #[derive(Debug)]
@@ -458,6 +458,7 @@ fn write_value(value: &Value, out: &mut Vec<u8>) -> Result<(), AotArtifactError>
                 out.extend_from_slice(&entry);
             }
         }
+        Value::Callable(_) => return Err(AotArtifactError::InvalidValueType(9)),
     }
     Ok(())
 }
@@ -551,6 +552,7 @@ fn read_value_type(raw: u8) -> Result<ValueType, AotArtifactError> {
         6 => Ok(ValueType::Bytes),
         7 => Ok(ValueType::Array),
         8 => Ok(ValueType::Map),
+        9 => Ok(ValueType::Callable),
         other => Err(AotArtifactError::InvalidValueType(other)),
     }
 }

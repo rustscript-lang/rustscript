@@ -6,8 +6,8 @@ compiler, parser, CLI, debugger, JIT/AOT backends, filesystem support, and opera
 
 ## Runtime surface
 
-- VMBC v8 decoding with type/debug metadata skipped after validation
-- stack and local execution for direct bytecode opcodes
+- VMBC v9 decoding with script-call and callable metadata
+- stack, local, and recursive script-frame execution for direct bytecode opcodes
 - instruction fuel with pause/resume support
 - synchronous named host bindings and dynamic host dispatch
 - `Rc`-backed strings, bytes, arrays, and maps for single-threaded targets

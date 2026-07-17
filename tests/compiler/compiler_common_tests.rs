@@ -250,7 +250,7 @@ fn compiler_rejects_programs_with_more_than_256_simultaneously_live_locals() {
 }
 
 #[test]
-fn compiler_reuses_slots_with_large_programs_that_inline_functions() {
+fn compiler_reuses_slots_with_large_programs_that_call_script_functions() {
     let mut source = String::from("fn id(x) { x }\nlet mut out = 0;\n");
     for idx in 0..400usize {
         source.push_str(&format!("let v{idx} = {idx};\n"));
@@ -1493,6 +1493,6 @@ fn stack_is_clean_after_halt_with_single_result() {
     );
     assert_eq!(vm.stack(), &[Value::Int(8)]);
 }
-// NOTE: function parameter slot cleanup is already covered by
-// `inline_function_call_frame_slots_are_cleared_after_return` in
-// compiler_rustscript_tests.rs (which asserts ALL locals are Null).
+// NOTE: function parameter slot cleanup is covered by
+// `script_function_frame_values_are_released_after_return` in
+// compiler_rustscript_tests.rs.

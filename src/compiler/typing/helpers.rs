@@ -171,6 +171,9 @@ pub(super) fn validate_function_impl(
         .get(&function_index)
         .and_then(|decl| decl.return_schema.as_ref());
     let function_name = context.function_name(function_index).to_string();
+    let returns_callable = context
+        .callable_binding_from_expr(&function_impl.body_expr, &state)
+        .is_some();
     if let Some(schema) = declared_return_schema {
         validate_declared_return_schema(
             &function_name,
@@ -182,12 +185,8 @@ pub(super) fn validate_function_impl(
             Some(function_impl.body_expr_line),
             source_name,
         )?;
-    } else if context
-        .callable_binding_from_expr(&function_impl.body_expr, &state)
-        .is_some()
-    {
-        return Err(CompileError::CallableUsedAsValue);
     } else if context.is_strict()
+        && !returns_callable
         && observed_body_ty == BoundType::Unknown
         && actual_schema.is_none()
     {
@@ -1355,7 +1354,7 @@ pub(super) fn expr_contains_param_add(expr: &Expr, param_slots: &[LocalSlot]) ->
         | Expr::Bool(_)
         | Expr::Bytes(_)
         | Expr::String(_)
-        | Expr::FunctionRef(_)
+        | Expr::FunctionRef(..)
         | Expr::Var(_)
         | Expr::MoveVar(_)
         | Expr::MoveField { .. }
@@ -1430,7 +1429,7 @@ pub(super) fn expr_uses_param(expr: &Expr, param_slots: &[LocalSlot]) -> bool {
         | Expr::Bool(_)
         | Expr::Bytes(_)
         | Expr::String(_)
-        | Expr::FunctionRef(_)
+        | Expr::FunctionRef(..)
         | Expr::MoveField { .. }
         | Expr::MoveIndex { .. } => false,
         Expr::OptionalGet { container, key, .. } => {
@@ -1589,7 +1588,7 @@ pub(super) fn legalize_expr(
             let _ = legalize_expr(fallback, state, context);
             context.infer_expr_type(expr, state)
         }
-        Expr::FunctionRef(_) | Expr::Call(..) | Expr::LocalCall(..) | Expr::Closure(_) => {
+        Expr::FunctionRef(..) | Expr::Call(..) | Expr::LocalCall(..) | Expr::Closure(_) => {
             legalize_expr_children(expr, state, context);
             context.infer_call_like_expr_type(expr, state)
         }
@@ -1852,5 +1851,6 @@ pub(super) fn bound_type_label(ty: BoundType) -> &'static str {
         BoundType::Bytes => "bytes",
         BoundType::Array | BoundType::ArrayOf(_) => "array",
         BoundType::Map | BoundType::MapOf(_) => "map",
+        BoundType::Callable => "callable",
     }
 }

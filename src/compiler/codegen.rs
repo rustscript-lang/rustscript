@@ -1,8 +1,11 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::assembler::Assembler;
 use crate::builtins::BuiltinFunction;
-use crate::{Program, TypeMap, Value, ValueType};
+use crate::{
+    CallableKind, CallablePrototype, CallableTarget, FunctionRegion, Program, RootCallableBinding,
+    ScriptFunction, TypeMap, Value, ValueType,
+};
 
 use super::ir::{
     ClosureExpr, Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern, MatchTypePattern, Stmt,
@@ -20,12 +23,24 @@ pub struct Compiler {
     host_import_return_types: HashMap<u16, typing::BoundType>,
     host_import_signatures: HashMap<u16, typing::HostCallableSignature>,
     call_index_remap: HashMap<u16, u16>,
-    inline_call_stack: Vec<u16>,
+
     callable_bindings: HashMap<LocalSlot, CallableBinding>,
     enable_local_move_semantics: bool,
     typing_mode: TypingMode,
     type_state: typing::LocalTypeState,
     type_map: TypeMap,
+    root_local_count: usize,
+    frame_local_count: usize,
+    function_slots: HashMap<u16, LocalSlot>,
+    specialized_function_slots: Vec<(u16, Vec<TypeSchema>, LocalSlot)>,
+    function_prototype_ids: HashMap<u16, u32>,
+    script_functions: Vec<ScriptFunction>,
+    callable_prototypes: Vec<CallablePrototype>,
+    function_regions: Vec<FunctionRegion>,
+    root_callable_bindings: Vec<RootCallableBinding>,
+    pending_closures: Vec<(u32, ClosureExpr)>,
+    callable_prototype_bindings: HashMap<LocalSlot, u32>,
+    closure_param_hints: HashMap<u32, Vec<(typing::BoundType, Option<TypeSchema>)>>,
 }
 
 struct LoopContext {
@@ -37,14 +52,6 @@ struct LoopContext {
 enum CallableBinding {
     Closure(ClosureExpr),
     Function(u16),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum CaptureBindingMode {
-    Copy,
-    Borrow,
-    BorrowMut,
-    Move,
 }
 
 impl Default for Compiler {
@@ -65,12 +72,24 @@ impl Compiler {
             host_import_return_types: HashMap::new(),
             host_import_signatures: HashMap::new(),
             call_index_remap: HashMap::new(),
-            inline_call_stack: Vec::new(),
+
             callable_bindings: HashMap::new(),
             enable_local_move_semantics: false,
             typing_mode: TypingMode::DynamicHints,
             type_state: typing::LocalTypeState::default(),
             type_map: TypeMap::default(),
+            root_local_count: 0,
+            frame_local_count: 0,
+            function_slots: HashMap::new(),
+            specialized_function_slots: Vec::new(),
+            function_prototype_ids: HashMap::new(),
+            script_functions: Vec::new(),
+            callable_prototypes: Vec::new(),
+            function_regions: Vec::new(),
+            root_callable_bindings: Vec::new(),
+            pending_closures: Vec::new(),
+            callable_prototype_bindings: HashMap::new(),
+            closure_param_hints: HashMap::new(),
         }
     }
 
@@ -97,6 +116,10 @@ impl Compiler {
             last_line,
         );
         Ok(())
+    }
+
+    pub fn set_root_local_count(&mut self, root_local_count: usize) {
+        self.root_local_count = root_local_count;
     }
 
     pub fn set_function_impls(&mut self, function_impls: HashMap<u16, FunctionImpl>) {
@@ -145,15 +168,202 @@ impl Compiler {
     }
 
     pub fn compile_program(mut self, stmts: &[Stmt]) -> Result<Program, CompileError> {
+        let named_functions = self.prepare_named_callables()?;
         self.compile_stmts(stmts)?;
         self.assembler.ret();
+        let root_end = self.assembler.position();
+        if root_end > 0 {
+            self.function_regions.push(FunctionRegion {
+                start_ip: 0,
+                end_ip: root_end,
+                prototype_id: None,
+            });
+        }
+
+        for function_index in named_functions {
+            self.compile_named_function_body(function_index)?;
+        }
+        let mut closure_index = 0usize;
+        while closure_index < self.pending_closures.len() {
+            let (prototype_id, closure) = self.pending_closures[closure_index].clone();
+            self.compile_closure_body(prototype_id, &closure)?;
+            closure_index += 1;
+        }
+        for prototype in &mut self.callable_prototypes {
+            prototype.frame_local_count = self.frame_local_count;
+        }
+
         let mut program = self
             .assembler
             .finish_program()
             .map_err(CompileError::Assembler)?;
         self.type_map.strict_types = self.typing_mode.is_strict();
         program.type_map = Some(self.type_map);
+        program.local_count = self.frame_local_count;
+        program.script_functions = self.script_functions;
+        program.callable_prototypes = self.callable_prototypes;
+        program.function_regions = self.function_regions;
+        program.root_callable_bindings = self.root_callable_bindings;
         Ok(program)
+    }
+
+    fn seed_frame_type_state_from_type_map(&mut self) {
+        for index in 0..self.frame_local_count.min(usize::from(u16::MAX) + 1) {
+            let Ok(slot) = LocalSlot::try_from(index) else {
+                break;
+            };
+            let schema = self.type_map.local_schemas.get(index).cloned().flatten();
+            let ty = schema
+                .as_ref()
+                .map(typing::bound_type_from_schema)
+                .unwrap_or_else(|| {
+                    self.type_map
+                        .local_types
+                        .get(index)
+                        .copied()
+                        .map(typing::BoundType::from)
+                        .unwrap_or(typing::BoundType::Unknown)
+                });
+            self.type_state
+                .set_with_schema_origin(slot, ty, schema, false);
+        }
+    }
+
+    fn prepare_named_callables(&mut self) -> Result<Vec<u16>, CompileError> {
+        let mut indices = self.function_impls.keys().copied().collect::<Vec<_>>();
+        indices.sort_unstable();
+        self.frame_local_count = self
+            .root_local_count
+            .checked_add(indices.len())
+            .ok_or(CompileError::LocalSlotOverflow(LocalSlot::MAX))?;
+        if self.frame_local_count > usize::from(u8::MAX) + 1 {
+            return Err(CompileError::LocalSlotOverflow(LocalSlot::MAX));
+        }
+
+        for (position, function_index) in indices.iter().copied().enumerate() {
+            let hidden_slot = LocalSlot::try_from(self.root_local_count + position)
+                .map_err(|_| CompileError::LocalSlotOverflow(LocalSlot::MAX))?;
+            let prototype_id = self.callable_prototypes.len() as u32;
+            let script_function_id = self.script_functions.len() as u32 + position as u32;
+            let function_impl = self
+                .function_impls
+                .get(&function_index)
+                .expect("function index came from implementation map");
+            let decl = self.function_decls.get(&function_index);
+            self.function_slots.insert(function_index, hidden_slot);
+            self.function_prototype_ids
+                .insert(function_index, prototype_id);
+            self.callable_prototypes.push(CallablePrototype {
+                kind: CallableKind::FunctionItem,
+                target: CallableTarget::ScriptFunction(script_function_id),
+                arity: function_impl.param_slots.len() as u8,
+                frame_local_count: self.frame_local_count,
+                parameter_slots: function_impl.param_slots.clone(),
+                capture_slots: function_impl
+                    .capture_copies
+                    .iter()
+                    .map(|(_, target)| *target)
+                    .collect(),
+                self_slot: Some(hidden_slot),
+                schema: decl.map(|decl| TypeSchema::Callable {
+                    params: decl
+                        .arg_schemas
+                        .iter()
+                        .map(|schema| schema.clone().unwrap_or(TypeSchema::Unknown))
+                        .collect(),
+                    result: Box::new(decl.return_schema.clone().unwrap_or(TypeSchema::Unknown)),
+                }),
+            });
+            if function_impl.capture_copies.is_empty() {
+                self.root_callable_bindings.push(RootCallableBinding {
+                    local_slot: hidden_slot,
+                    prototype_id,
+                });
+            }
+        }
+        Ok(indices)
+    }
+
+    fn compile_named_function_body(&mut self, function_index: u16) -> Result<(), CompileError> {
+        let function_impl = self
+            .function_impls
+            .get(&function_index)
+            .cloned()
+            .expect("prepared function implementation must exist");
+        let prototype_id = self.function_prototype_ids[&function_index];
+        let entry_ip = self.assembler.position();
+        let callable_snapshot = self.callable_bindings.clone();
+        let type_snapshot = self.type_state.clone();
+        let loop_snapshot = std::mem::take(&mut self.loop_stack);
+        self.seed_frame_type_state_from_type_map();
+        if let Some(decl) = self.function_decls.get(&function_index) {
+            for (slot, schema) in function_impl.param_slots.iter().zip(&decl.arg_schemas) {
+                match schema {
+                    Some(schema) => self.type_state.set_with_schema_origin(
+                        *slot,
+                        typing::bound_type_from_schema(schema),
+                        Some(schema.clone()),
+                        true,
+                    ),
+                    None => self.type_state.set_with_schema_origin(
+                        *slot,
+                        typing::BoundType::Unknown,
+                        None,
+                        false,
+                    ),
+                }
+            }
+        }
+        self.compile_stmts(&function_impl.body_stmts)?;
+        self.compile_expr(&function_impl.body_expr)?;
+        self.assembler.ret();
+        self.loop_stack = loop_snapshot;
+        self.callable_bindings = callable_snapshot;
+        self.type_state = type_snapshot;
+        let end_ip = self.assembler.position();
+        self.script_functions
+            .push(ScriptFunction { entry_ip, end_ip });
+        self.function_regions.push(FunctionRegion {
+            start_ip: entry_ip,
+            end_ip,
+            prototype_id: Some(prototype_id),
+        });
+        Ok(())
+    }
+
+    fn compile_closure_body(
+        &mut self,
+        prototype_id: u32,
+        closure: &ClosureExpr,
+    ) -> Result<(), CompileError> {
+        let entry_ip = self.assembler.position();
+        let callable_snapshot = self.callable_bindings.clone();
+        let type_snapshot = self.type_state.clone();
+        let loop_snapshot = std::mem::take(&mut self.loop_stack);
+        self.seed_frame_type_state_from_type_map();
+        if let Some(hints) = self.closure_param_hints.get(&prototype_id).cloned() {
+            for (slot, (ty, schema)) in closure.param_slots.iter().zip(hints) {
+                self.type_state
+                    .set_with_schema_origin(*slot, ty, schema, false);
+            }
+        }
+        self.compile_expr(&closure.body)?;
+        self.assembler.ret();
+        self.loop_stack = loop_snapshot;
+        self.callable_bindings = callable_snapshot;
+        self.type_state = type_snapshot;
+        let end_ip = self.assembler.position();
+        let function_id = self.script_functions.len() as u32;
+        self.script_functions
+            .push(ScriptFunction { entry_ip, end_ip });
+        self.callable_prototypes[prototype_id as usize].target =
+            CallableTarget::ScriptFunction(function_id);
+        self.function_regions.push(FunctionRegion {
+            start_ip: entry_ip,
+            end_ip,
+            prototype_id: Some(prototype_id),
+        });
+        Ok(())
     }
 
     fn compile_stmts(&mut self, stmts: &[Stmt]) -> Result<(), CompileError> {
@@ -183,9 +393,8 @@ impl Compiler {
                 self.assembler.mark_line(*line);
                 self.assign_expr_to_slot(*index, None, expr)?;
             }
-            Stmt::ClosureLet { line, closure } => {
+            Stmt::ClosureLet { line, .. } => {
                 self.assembler.mark_line(*line);
-                self.bind_closure_captures(closure)?;
             }
             Stmt::FuncDecl {
                 index,
@@ -195,7 +404,7 @@ impl Compiler {
             } => {
                 self.assembler.mark_line(*line);
                 if *has_impl {
-                    self.bind_function_decl_captures(*index)?;
+                    self.emit_named_callable_binding(*index)?;
                 }
             }
             Stmt::Expr { expr, line } => {
@@ -423,25 +632,27 @@ impl Compiler {
             } => {
                 self.compile_option_unwrap_or_expr(value, *value_slot, fallback)?;
             }
-            Expr::FunctionRef(_) => {
-                return Err(CompileError::CallableUsedAsValue);
+            Expr::FunctionRef(index, type_args) => {
+                let slot = self.ensure_function_value_slot(*index, type_args)?;
+                self.emit_copy_ldloc(slot)?;
             }
             Expr::Call(index, _, args) => {
                 self.compile_function_call(*index, args)?;
             }
-            Expr::Closure(_) => {
-                return Err(CompileError::CallableUsedAsValue);
+            Expr::Closure(closure) => {
+                let _ = self.emit_closure_callable(closure)?;
             }
             Expr::ClosureCall(closure, args) => {
-                self.compile_inline_closure_call(closure, args)?;
+                let prototype_id = self.emit_closure_callable(closure)?;
+                self.record_closure_param_hints(prototype_id, args);
+                self.compile_callvalue_args(args)?;
             }
             Expr::LocalCall(index, _, args) => {
-                let callable = self
-                    .callable_bindings
-                    .get(index)
-                    .cloned()
-                    .ok_or(CompileError::NonCallableLocal(*index))?;
-                self.compile_callable_call(callable, args)?;
+                if let Some(prototype_id) = self.callable_prototype_bindings.get(index).copied() {
+                    self.record_closure_param_hints(prototype_id, args);
+                }
+                self.emit_copy_ldloc(*index)?;
+                self.compile_callvalue_args(args)?;
             }
             Expr::Add(lhs, rhs) => {
                 let lhs_ty = self.value_type_of_expr(lhs);
@@ -558,15 +769,9 @@ impl Compiler {
                 self.assembler.cgt();
             }
             Expr::Var(index) => {
-                if self.callable_bindings.contains_key(index) {
-                    return Err(CompileError::CallableUsedAsValue);
-                }
                 self.emit_copy_ldloc(*index)?;
             }
             Expr::MoveVar(index) => {
-                if self.callable_bindings.contains_key(index) {
-                    return Err(CompileError::CallableUsedAsValue);
-                }
                 self.emit_move_ldloc(*index)?;
                 self.type_state.set(*index, typing::BoundType::Null);
             }
@@ -821,348 +1026,27 @@ impl Compiler {
         self.compile_expr(&lowered)
     }
 
-    fn bind_closure_captures(&mut self, closure: &ClosureExpr) -> Result<(), CompileError> {
-        let mut seen = HashSet::new();
-        for (source_index, captured_slot) in &closure.capture_copies {
-            if !seen.insert((*source_index, *captured_slot)) {
-                continue;
-            }
-            let capture_mode = self.closure_capture_mode_for_slot(closure, *captured_slot);
-            self.bind_capture_copy(*source_index, *captured_slot, capture_mode)?;
-        }
-        Ok(())
-    }
-
-    fn bind_function_decl_captures(&mut self, index: u16) -> Result<(), CompileError> {
+    fn emit_named_callable_binding(&mut self, index: u16) -> Result<(), CompileError> {
         let Some(function_impl) = self.function_impls.get(&index).cloned() else {
             return Ok(());
         };
-        let mut seen = HashSet::new();
-        for (source_index, captured_slot) in &function_impl.capture_copies {
-            if !seen.insert((*source_index, *captured_slot)) {
-                continue;
-            }
-            let capture_mode = self.function_capture_mode_for_slot(&function_impl, *captured_slot);
-            self.bind_capture_copy(*source_index, *captured_slot, capture_mode)?;
+        if function_impl.capture_copies.is_empty() {
+            return Ok(());
         }
+        for (source_index, _) in &function_impl.capture_copies {
+            self.emit_copy_ldloc(*source_index)?;
+        }
+        let prototype_id = *self
+            .function_prototype_ids
+            .get(&index)
+            .ok_or(CompileError::CallableUsedAsValue)?;
+        let slot = *self
+            .function_slots
+            .get(&index)
+            .ok_or(CompileError::CallableUsedAsValue)?;
+        self.assembler.make_callable(prototype_id);
+        self.emit_stloc(slot)?;
         Ok(())
-    }
-
-    fn bind_capture_copy(
-        &mut self,
-        source_index: LocalSlot,
-        captured_slot: LocalSlot,
-        capture_mode: CaptureBindingMode,
-    ) -> Result<(), CompileError> {
-        let captured_type = self.type_state.get(source_index);
-        if self.enable_local_move_semantics && capture_mode == CaptureBindingMode::Move {
-            self.emit_move_ldloc(source_index)?;
-            self.type_state.set(source_index, typing::BoundType::Null);
-        } else {
-            self.emit_copy_ldloc(source_index)?;
-        }
-        self.emit_stloc(captured_slot)?;
-        self.type_state.set(captured_slot, captured_type);
-        Ok(())
-    }
-
-    fn function_capture_mode_for_slot(
-        &self,
-        function_impl: &FunctionImpl,
-        captured_slot: LocalSlot,
-    ) -> CaptureBindingMode {
-        let mut mode = CaptureBindingMode::Copy;
-        let mut seen = false;
-        self.capture_mode_for_stmts(
-            &function_impl.body_stmts,
-            captured_slot,
-            CaptureBindingMode::Move,
-            &mut mode,
-            &mut seen,
-        );
-        self.capture_mode_for_expr(
-            &function_impl.body_expr,
-            captured_slot,
-            CaptureBindingMode::Move,
-            &mut mode,
-            &mut seen,
-        );
-        if seen { mode } else { CaptureBindingMode::Move }
-    }
-
-    fn closure_capture_mode_for_slot(
-        &self,
-        closure: &ClosureExpr,
-        captured_slot: LocalSlot,
-    ) -> CaptureBindingMode {
-        let mut mode = CaptureBindingMode::Copy;
-        let mut seen = false;
-        self.capture_mode_for_expr(
-            &closure.body,
-            captured_slot,
-            CaptureBindingMode::Move,
-            &mut mode,
-            &mut seen,
-        );
-        if seen { mode } else { CaptureBindingMode::Move }
-    }
-
-    fn capture_mode_for_stmts(
-        &self,
-        stmts: &[Stmt],
-        captured_slot: LocalSlot,
-        context: CaptureBindingMode,
-        mode: &mut CaptureBindingMode,
-        seen: &mut bool,
-    ) {
-        for stmt in stmts {
-            self.capture_mode_for_stmt(stmt, captured_slot, context, mode, seen);
-        }
-    }
-
-    fn capture_mode_for_stmt(
-        &self,
-        stmt: &Stmt,
-        captured_slot: LocalSlot,
-        context: CaptureBindingMode,
-        mode: &mut CaptureBindingMode,
-        seen: &mut bool,
-    ) {
-        match stmt {
-            Stmt::Noop { .. }
-            | Stmt::FuncDecl { .. }
-            | Stmt::Break { .. }
-            | Stmt::Continue { .. } => {}
-            Stmt::Drop { index, .. } => {
-                if *index == captured_slot {
-                    *seen = true;
-                    *mode = (*mode).max(context);
-                }
-            }
-            Stmt::Let { index, expr, .. } | Stmt::Assign { index, expr, .. } => {
-                if *index == captured_slot {
-                    *seen = true;
-                    *mode = (*mode).max(context);
-                }
-                self.capture_mode_for_expr(expr, captured_slot, context, mode, seen);
-            }
-            Stmt::ClosureLet { closure, .. } => {
-                for (nested_source_slot, nested_captured_slot) in &closure.capture_copies {
-                    if *nested_source_slot == captured_slot {
-                        self.capture_mode_for_expr(
-                            &closure.body,
-                            *nested_captured_slot,
-                            CaptureBindingMode::Move,
-                            mode,
-                            seen,
-                        );
-                    }
-                }
-                self.capture_mode_for_expr(&closure.body, captured_slot, context, mode, seen);
-            }
-            Stmt::Expr { expr, .. } => {
-                self.capture_mode_for_expr(expr, captured_slot, context, mode, seen);
-            }
-            Stmt::IfElse {
-                condition,
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                self.capture_mode_for_expr(condition, captured_slot, context, mode, seen);
-                self.capture_mode_for_stmts(then_branch, captured_slot, context, mode, seen);
-                self.capture_mode_for_stmts(else_branch, captured_slot, context, mode, seen);
-            }
-            Stmt::For {
-                init,
-                condition,
-                post,
-                body,
-                ..
-            } => {
-                self.capture_mode_for_stmt(init, captured_slot, context, mode, seen);
-                self.capture_mode_for_expr(condition, captured_slot, context, mode, seen);
-                self.capture_mode_for_stmt(post, captured_slot, context, mode, seen);
-                self.capture_mode_for_stmts(body, captured_slot, context, mode, seen);
-            }
-            Stmt::While {
-                condition, body, ..
-            } => {
-                self.capture_mode_for_expr(condition, captured_slot, context, mode, seen);
-                self.capture_mode_for_stmts(body, captured_slot, context, mode, seen);
-            }
-        }
-    }
-
-    fn capture_mode_for_expr(
-        &self,
-        expr: &Expr,
-        captured_slot: LocalSlot,
-        context: CaptureBindingMode,
-        mode: &mut CaptureBindingMode,
-        seen: &mut bool,
-    ) {
-        match expr {
-            Expr::Null
-            | Expr::Int(_)
-            | Expr::Float(_)
-            | Expr::Bool(_)
-            | Expr::Bytes(_)
-            | Expr::String(_)
-            | Expr::FunctionRef(_) => {}
-            Expr::Var(index) => {
-                if *index == captured_slot {
-                    *seen = true;
-                    *mode = (*mode).max(context);
-                }
-            }
-            Expr::MoveVar(index) => {
-                if *index == captured_slot {
-                    *seen = true;
-                    *mode = CaptureBindingMode::Move;
-                }
-            }
-            Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
-                if *root == captured_slot {
-                    *seen = true;
-                    *mode = CaptureBindingMode::Move;
-                }
-            }
-            Expr::OptionalGet {
-                container,
-                key,
-                container_slot,
-                key_slot,
-            } => {
-                if *container_slot == captured_slot || *key_slot == captured_slot {
-                    *seen = true;
-                    *mode = (*mode).max(context);
-                }
-                self.capture_mode_for_expr(container, captured_slot, context, mode, seen);
-                self.capture_mode_for_expr(key, captured_slot, context, mode, seen);
-            }
-            Expr::OptionUnwrapOr {
-                value,
-                value_slot,
-                fallback,
-            } => {
-                if *value_slot == captured_slot {
-                    *seen = true;
-                    *mode = (*mode).max(context);
-                }
-                self.capture_mode_for_expr(value, captured_slot, context, mode, seen);
-                self.capture_mode_for_expr(fallback, captured_slot, context, mode, seen);
-            }
-            Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) => {
-                for arg in args {
-                    self.capture_mode_for_expr(arg, captured_slot, context, mode, seen);
-                }
-            }
-            Expr::Closure(closure) => {
-                for (nested_source_slot, nested_captured_slot) in &closure.capture_copies {
-                    if *nested_source_slot == captured_slot {
-                        self.capture_mode_for_expr(
-                            &closure.body,
-                            *nested_captured_slot,
-                            CaptureBindingMode::Move,
-                            mode,
-                            seen,
-                        );
-                    }
-                }
-                self.capture_mode_for_expr(&closure.body, captured_slot, context, mode, seen);
-            }
-            Expr::ClosureCall(closure, args) => {
-                for arg in args {
-                    self.capture_mode_for_expr(arg, captured_slot, context, mode, seen);
-                }
-                for (nested_source_slot, nested_captured_slot) in &closure.capture_copies {
-                    if *nested_source_slot == captured_slot {
-                        self.capture_mode_for_expr(
-                            &closure.body,
-                            *nested_captured_slot,
-                            CaptureBindingMode::Move,
-                            mode,
-                            seen,
-                        );
-                    }
-                }
-                self.capture_mode_for_expr(&closure.body, captured_slot, context, mode, seen);
-            }
-            Expr::Add(lhs, rhs)
-            | Expr::Sub(lhs, rhs)
-            | Expr::Mul(lhs, rhs)
-            | Expr::Div(lhs, rhs)
-            | Expr::Mod(lhs, rhs)
-            | Expr::And(lhs, rhs)
-            | Expr::Or(lhs, rhs)
-            | Expr::Eq(lhs, rhs)
-            | Expr::Lt(lhs, rhs)
-            | Expr::Gt(lhs, rhs) => {
-                self.capture_mode_for_expr(lhs, captured_slot, context, mode, seen);
-                self.capture_mode_for_expr(rhs, captured_slot, context, mode, seen);
-            }
-            Expr::Neg(inner) | Expr::Not(inner) => {
-                self.capture_mode_for_expr(inner, captured_slot, context, mode, seen);
-            }
-            Expr::ToOwned(inner) => {
-                self.capture_mode_for_expr(
-                    inner,
-                    captured_slot,
-                    CaptureBindingMode::Copy,
-                    mode,
-                    seen,
-                );
-            }
-            Expr::Borrow(inner) => {
-                self.capture_mode_for_expr(
-                    inner,
-                    captured_slot,
-                    CaptureBindingMode::Borrow,
-                    mode,
-                    seen,
-                );
-            }
-            Expr::BorrowMut(inner) => {
-                self.capture_mode_for_expr(
-                    inner,
-                    captured_slot,
-                    CaptureBindingMode::BorrowMut,
-                    mode,
-                    seen,
-                );
-            }
-            Expr::IfElse {
-                condition,
-                then_expr,
-                else_expr,
-            } => {
-                self.capture_mode_for_expr(condition, captured_slot, context, mode, seen);
-                self.capture_mode_for_expr(then_expr, captured_slot, context, mode, seen);
-                self.capture_mode_for_expr(else_expr, captured_slot, context, mode, seen);
-            }
-            Expr::Match {
-                value_slot,
-                result_slot,
-                value,
-                arms,
-                default,
-            } => {
-                if *value_slot == captured_slot || *result_slot == captured_slot {
-                    *seen = true;
-                    *mode = (*mode).max(context);
-                }
-                self.capture_mode_for_expr(value, captured_slot, context, mode, seen);
-                for (_, arm_expr) in arms {
-                    self.capture_mode_for_expr(arm_expr, captured_slot, context, mode, seen);
-                }
-                self.capture_mode_for_expr(default, captured_slot, context, mode, seen);
-            }
-            Expr::Block { stmts, expr } => {
-                self.capture_mode_for_stmts(stmts, captured_slot, context, mode, seen);
-                self.capture_mode_for_expr(expr, captured_slot, context, mode, seen);
-            }
-        }
     }
 
     fn callable_binding_from_expr(
@@ -1170,11 +1054,8 @@ impl Compiler {
         expr: &Expr,
     ) -> Result<Option<CallableBinding>, CompileError> {
         match expr {
-            Expr::Closure(closure) => {
-                self.bind_closure_captures(closure)?;
-                Ok(Some(CallableBinding::Closure(closure.clone())))
-            }
-            Expr::FunctionRef(index) => Ok(Some(CallableBinding::Function(*index))),
+            Expr::Closure(closure) => Ok(Some(CallableBinding::Closure(closure.clone()))),
+            Expr::FunctionRef(index, _) => Ok(Some(CallableBinding::Function(*index))),
             Expr::Var(index) => Ok(self.callable_bindings.get(index).cloned()),
             _ => Ok(None),
         }
@@ -1192,6 +1073,19 @@ impl Compiler {
                 CallableBinding::Closure(closure) => self.type_state.bind_closure(slot, &closure),
                 CallableBinding::Function(index) => self.type_state.bind_function(slot, index),
             }
+            if let Expr::Closure(closure) = expr {
+                let prototype_id = self.emit_closure_callable_with_self(closure, Some(slot))?;
+                self.callable_prototype_bindings.insert(slot, prototype_id);
+            } else {
+                if let Expr::Var(source) | Expr::MoveVar(source) = expr
+                    && let Some(prototype_id) =
+                        self.callable_prototype_bindings.get(source).copied()
+                {
+                    self.callable_prototype_bindings.insert(slot, prototype_id);
+                }
+                self.compile_expr(expr)?;
+            }
+            self.emit_stloc(slot)?;
             return Ok(());
         }
         let declared_binding = declared_schema.map(TypeSchema::split_optional).or_else(|| {
@@ -1348,70 +1242,233 @@ impl Compiler {
         Ok(())
     }
 
+    fn ensure_function_value_slot(
+        &mut self,
+        index: u16,
+        type_args: &[TypeSchema],
+    ) -> Result<LocalSlot, CompileError> {
+        if !type_args.is_empty()
+            && let Some((_, _, slot)) = self
+                .specialized_function_slots
+                .iter()
+                .find(|(candidate, args, _)| *candidate == index && args == type_args)
+        {
+            return Ok(*slot);
+        }
+        if type_args.is_empty()
+            && let Some(slot) = self.function_slots.get(&index)
+        {
+            return Ok(*slot);
+        }
+        if !type_args.is_empty() && self.function_slots.contains_key(&index) {
+            return self.ensure_specialized_function_slot(index, type_args);
+        }
+
+        let (target_index, arity) = if let Some(builtin) = BuiltinFunction::from_call_index(index) {
+            (index, builtin.arity())
+        } else if let Some(decl) = self.function_decls.get(&index) {
+            (
+                self.call_index_remap.get(&index).copied().unwrap_or(index),
+                decl.args.len() as u8,
+            )
+        } else {
+            return Err(CompileError::CallableUsedAsValue);
+        };
+        let slot = self.allocate_hidden_callable_slot()?;
+        let prototype_id = self.callable_prototypes.len() as u32;
+        self.callable_prototypes.push(CallablePrototype {
+            kind: CallableKind::HostFunction,
+            target: CallableTarget::HostImport(target_index),
+            arity,
+            frame_local_count: self.frame_local_count,
+            parameter_slots: Vec::new(),
+            capture_slots: Vec::new(),
+            self_slot: None,
+            schema: self.instantiated_callable_schema(index, type_args),
+        });
+        self.root_callable_bindings.push(RootCallableBinding {
+            local_slot: slot,
+            prototype_id,
+        });
+        self.function_slots.insert(index, slot);
+        self.function_prototype_ids.insert(index, prototype_id);
+        if type_args.is_empty() {
+            Ok(slot)
+        } else {
+            self.ensure_specialized_function_slot(index, type_args)
+        }
+    }
+
+    fn ensure_specialized_function_slot(
+        &mut self,
+        index: u16,
+        type_args: &[TypeSchema],
+    ) -> Result<LocalSlot, CompileError> {
+        let base_prototype_id = *self
+            .function_prototype_ids
+            .get(&index)
+            .ok_or(CompileError::CallableUsedAsValue)?;
+        if self
+            .function_impls
+            .get(&index)
+            .is_some_and(|function| !function.capture_copies.is_empty())
+        {
+            return self
+                .function_slots
+                .get(&index)
+                .copied()
+                .ok_or(CompileError::CallableUsedAsValue);
+        }
+        let slot = self.allocate_hidden_callable_slot()?;
+        let mut prototype = self.callable_prototypes[base_prototype_id as usize].clone();
+        prototype.schema = self.instantiated_callable_schema(index, type_args);
+        prototype.frame_local_count = self.frame_local_count;
+        let prototype_id = self.callable_prototypes.len() as u32;
+        self.callable_prototypes.push(prototype);
+        self.root_callable_bindings.push(RootCallableBinding {
+            local_slot: slot,
+            prototype_id,
+        });
+        self.specialized_function_slots
+            .push((index, type_args.to_vec(), slot));
+        Ok(slot)
+    }
+
+    fn allocate_hidden_callable_slot(&mut self) -> Result<LocalSlot, CompileError> {
+        let slot = LocalSlot::try_from(self.frame_local_count)
+            .map_err(|_| CompileError::LocalSlotOverflow(LocalSlot::MAX))?;
+        let _ = local_slot_operand(slot)?;
+        self.frame_local_count = self.frame_local_count.saturating_add(1);
+        Ok(slot)
+    }
+
+    fn instantiated_callable_schema(
+        &self,
+        index: u16,
+        type_args: &[TypeSchema],
+    ) -> Option<TypeSchema> {
+        let decl = self.function_decls.get(&index)?;
+        if decl.type_params.len() != type_args.len() {
+            return None;
+        }
+        let bindings = decl
+            .type_params
+            .iter()
+            .cloned()
+            .zip(type_args.iter().cloned())
+            .collect::<HashMap<_, _>>();
+        Some(TypeSchema::Callable {
+            params: decl
+                .arg_schemas
+                .iter()
+                .map(|schema| {
+                    schema
+                        .as_ref()
+                        .map(|schema| substitute_type_schema(schema, &bindings))
+                        .unwrap_or(TypeSchema::Unknown)
+                })
+                .collect(),
+            result: Box::new(
+                decl.return_schema
+                    .as_ref()
+                    .map(|schema| substitute_type_schema(schema, &bindings))
+                    .unwrap_or(TypeSchema::Unknown),
+            ),
+        })
+    }
+
+    fn record_closure_param_hints(&mut self, prototype_id: u32, args: &[Expr]) {
+        let hints = args
+            .iter()
+            .map(|arg| {
+                let schema = typing::infer_expr_schema_with_function_impls_and_imports(
+                    arg,
+                    &self.type_state,
+                    &self.function_impls,
+                    &self.function_decls,
+                    &self.struct_schemas,
+                    &self.host_import_return_types,
+                    &self.host_import_signatures,
+                );
+                let ty = schema
+                    .as_ref()
+                    .map(typing::bound_type_from_schema)
+                    .unwrap_or_else(|| self.infer_bound_type(arg));
+                (ty, schema)
+            })
+            .collect::<Vec<_>>();
+
+        self.closure_param_hints
+            .entry(prototype_id)
+            .and_modify(|existing| {
+                for (index, hint) in hints.iter().enumerate() {
+                    if let Some(existing) = existing.get_mut(index)
+                        && existing.0 == typing::BoundType::Unknown
+                    {
+                        *existing = hint.clone();
+                    }
+                }
+            })
+            .or_insert(hints);
+    }
+
     fn compile_function_call(&mut self, index: u16, args: &[Expr]) -> Result<(), CompileError> {
-        if let Some(function_impl) = self.function_impls.get(&index).cloned() {
-            return self.compile_inline_function_call(index, &function_impl, args);
+        if self.function_impls.contains_key(&index) {
+            let slot = *self
+                .function_slots
+                .get(&index)
+                .ok_or(CompileError::CallableUsedAsValue)?;
+            self.emit_copy_ldloc(slot)?;
+            return self.compile_callvalue_args(args);
         }
         self.compile_direct_call(index, args)
     }
 
-    fn compile_inline_function_call(
-        &mut self,
-        index: u16,
-        function_impl: &FunctionImpl,
-        args: &[Expr],
-    ) -> Result<(), CompileError> {
-        if function_impl.param_slots.len() != args.len() {
-            return Err(CompileError::CallableArityMismatch {
-                expected: function_impl.param_slots.len(),
-                got: args.len(),
-            });
+    fn compile_callvalue_args(&mut self, args: &[Expr]) -> Result<(), CompileError> {
+        for arg in args {
+            self.compile_scalar_expr(arg)?;
         }
-        let frame_slots = collect_function_frame_slots(function_impl);
-        let callable_snapshot = self.callable_bindings.clone();
-        for (arg, slot) in args.iter().zip(function_impl.param_slots.iter()) {
-            self.assign_expr_to_slot(*slot, None, arg)?;
-        }
-        if self.inline_call_stack.contains(&index) {
-            self.callable_bindings = callable_snapshot;
-            return Err(CompileError::InlineFunctionRecursion(format!(
-                "recursive RustScript function call detected for function index {}",
-                index
-            )));
-        }
-        self.inline_call_stack.push(index);
-        let result = (|| -> Result<(), CompileError> {
-            self.compile_stmts(&function_impl.body_stmts)?;
-            self.compile_expr(&function_impl.body_expr)
-        })();
-        self.inline_call_stack.pop();
-        self.callable_bindings = callable_snapshot;
-        result?;
-        self.emit_inline_frame_clears(&frame_slots)?;
+        let argc = u8::try_from(args.len()).map_err(|_| CompileError::CallArityOverflow)?;
+        self.assembler.call_value(argc);
         Ok(())
     }
 
-    fn compile_inline_closure_call(
+    fn emit_closure_callable(&mut self, closure: &ClosureExpr) -> Result<u32, CompileError> {
+        self.emit_closure_callable_with_self(closure, None)
+    }
+
+    fn emit_closure_callable_with_self(
         &mut self,
         closure: &ClosureExpr,
-        args: &[Expr],
-    ) -> Result<(), CompileError> {
-        if closure.param_slots.len() != args.len() {
-            return Err(CompileError::CallableArityMismatch {
-                expected: closure.param_slots.len(),
-                got: args.len(),
-            });
+        binding_slot: Option<LocalSlot>,
+    ) -> Result<u32, CompileError> {
+        for (source_slot, _) in &closure.capture_copies {
+            self.emit_copy_ldloc(*source_slot)?;
         }
-        let frame_slots = collect_closure_frame_slots(closure);
-        let callable_snapshot = self.callable_bindings.clone();
-        for (arg, slot) in args.iter().zip(closure.param_slots.iter()) {
-            self.assign_expr_to_slot(*slot, None, arg)?;
-        }
-        let result = self.compile_expr(&closure.body);
-        self.callable_bindings = callable_snapshot;
-        result?;
-        self.emit_inline_frame_clears(&frame_slots)?;
-        Ok(())
+        let prototype_id = self.callable_prototypes.len() as u32;
+        self.callable_prototypes.push(CallablePrototype {
+            kind: CallableKind::Closure,
+            target: CallableTarget::ScriptFunction(u32::MAX),
+            arity: u8::try_from(closure.param_slots.len())
+                .map_err(|_| CompileError::CallArityOverflow)?,
+            frame_local_count: self.frame_local_count,
+            parameter_slots: closure.param_slots.clone(),
+            capture_slots: closure
+                .capture_copies
+                .iter()
+                .map(|(_, target)| *target)
+                .collect(),
+            self_slot: binding_slot.and_then(|binding_slot| {
+                closure
+                    .capture_copies
+                    .iter()
+                    .find_map(|(source, target)| (*source == binding_slot).then_some(*target))
+            }),
+            schema: None,
+        });
+        self.pending_closures.push((prototype_id, closure.clone()));
+        self.assembler.make_callable(prototype_id);
+        Ok(prototype_id)
     }
 
     fn compile_direct_call(&mut self, index: u16, args: &[Expr]) -> Result<(), CompileError> {
@@ -1432,17 +1489,6 @@ impl Compiler {
         let remapped_index = self.call_index_remap.get(&index).copied().unwrap_or(index);
         self.assembler.call(remapped_index, argc);
         Ok(())
-    }
-
-    fn compile_callable_call(
-        &mut self,
-        callable: CallableBinding,
-        args: &[Expr],
-    ) -> Result<(), CompileError> {
-        match callable {
-            CallableBinding::Closure(closure) => self.compile_inline_closure_call(&closure, args),
-            CallableBinding::Function(index) => self.compile_function_call(index, args),
-        }
     }
 
     fn compile_match_pattern_condition(
@@ -1686,15 +1732,6 @@ impl Compiler {
         Ok(())
     }
 
-    fn emit_inline_frame_clears(&mut self, slots: &[LocalSlot]) -> Result<(), CompileError> {
-        for slot in slots {
-            self.assembler.push_const(Value::Null);
-            self.emit_stloc(*slot)?;
-            self.type_state.set(*slot, typing::BoundType::Null);
-        }
-        Ok(())
-    }
-
     fn compile_string_concat_operand(&mut self, expr: &Expr) -> Result<(), CompileError> {
         if let Some(value) = eval_const_int_expr(expr) {
             self.assembler.push_const(Value::string(value.to_string()));
@@ -1741,219 +1778,62 @@ impl Compiler {
     }
 }
 
+fn substitute_type_schema(
+    schema: &TypeSchema,
+    bindings: &HashMap<String, TypeSchema>,
+) -> TypeSchema {
+    match schema {
+        TypeSchema::GenericParam(name) => bindings
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| schema.clone()),
+        TypeSchema::Optional(inner) => {
+            TypeSchema::Optional(Box::new(substitute_type_schema(inner, bindings)))
+        }
+        TypeSchema::Named(name, args) => TypeSchema::Named(
+            name.clone(),
+            args.iter()
+                .map(|schema| substitute_type_schema(schema, bindings))
+                .collect(),
+        ),
+        TypeSchema::Array(inner) => {
+            TypeSchema::Array(Box::new(substitute_type_schema(inner, bindings)))
+        }
+        TypeSchema::ArrayTuple(items) => TypeSchema::ArrayTuple(
+            items
+                .iter()
+                .map(|schema| substitute_type_schema(schema, bindings))
+                .collect(),
+        ),
+        TypeSchema::ArrayTupleRest { prefix, rest } => TypeSchema::ArrayTupleRest {
+            prefix: prefix
+                .iter()
+                .map(|schema| substitute_type_schema(schema, bindings))
+                .collect(),
+            rest: Box::new(substitute_type_schema(rest, bindings)),
+        },
+        TypeSchema::Map(inner) => {
+            TypeSchema::Map(Box::new(substitute_type_schema(inner, bindings)))
+        }
+        TypeSchema::Object(fields) => TypeSchema::Object(
+            fields
+                .iter()
+                .map(|(name, schema)| (name.clone(), substitute_type_schema(schema, bindings)))
+                .collect(),
+        ),
+        TypeSchema::Callable { params, result } => TypeSchema::Callable {
+            params: params
+                .iter()
+                .map(|schema| substitute_type_schema(schema, bindings))
+                .collect(),
+            result: Box::new(substitute_type_schema(result, bindings)),
+        },
+        _ => schema.clone(),
+    }
+}
+
 fn local_slot_operand(index: LocalSlot) -> Result<u8, CompileError> {
     u8::try_from(index).map_err(|_| CompileError::LocalSlotOverflow(index))
-}
-
-fn collect_function_frame_slots(function_impl: &FunctionImpl) -> Vec<LocalSlot> {
-    let mut slots = BTreeSet::new();
-    for slot in &function_impl.param_slots {
-        slots.insert(*slot);
-    }
-    for stmt in &function_impl.body_stmts {
-        collect_stmt_slot_footprint(stmt, &mut slots);
-    }
-    collect_expr_slot_footprint(&function_impl.body_expr, &mut slots);
-    for (_, captured_slot) in &function_impl.capture_copies {
-        slots.remove(captured_slot);
-    }
-    let mut out = slots.into_iter().collect::<Vec<_>>();
-    out.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
-    out
-}
-
-fn collect_closure_frame_slots(closure: &ClosureExpr) -> Vec<LocalSlot> {
-    let mut slots = BTreeSet::new();
-    for slot in &closure.param_slots {
-        slots.insert(*slot);
-    }
-    collect_expr_slot_footprint(&closure.body, &mut slots);
-    for (_, captured_slot) in &closure.capture_copies {
-        slots.remove(captured_slot);
-    }
-    let mut out = slots.into_iter().collect::<Vec<_>>();
-    out.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
-    out
-}
-
-fn collect_stmt_slot_footprint(stmt: &Stmt, slots: &mut BTreeSet<LocalSlot>) {
-    match stmt {
-        Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
-        Stmt::Drop { index, .. } => {
-            slots.insert(*index);
-        }
-        Stmt::Let { index, expr, .. } | Stmt::Assign { index, expr, .. } => {
-            slots.insert(*index);
-            collect_expr_slot_footprint(expr, slots);
-        }
-        Stmt::ClosureLet { closure, .. } => {
-            for slot in &closure.param_slots {
-                slots.insert(*slot);
-            }
-            for (source_slot, captured_slot) in &closure.capture_copies {
-                slots.insert(*source_slot);
-                slots.insert(*captured_slot);
-            }
-            collect_expr_slot_footprint(&closure.body, slots);
-        }
-        Stmt::Expr { expr, .. } => collect_expr_slot_footprint(expr, slots),
-        Stmt::IfElse {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            collect_expr_slot_footprint(condition, slots);
-            for stmt in then_branch {
-                collect_stmt_slot_footprint(stmt, slots);
-            }
-            for stmt in else_branch {
-                collect_stmt_slot_footprint(stmt, slots);
-            }
-        }
-        Stmt::For {
-            init,
-            condition,
-            post,
-            body,
-            ..
-        } => {
-            collect_stmt_slot_footprint(init, slots);
-            collect_expr_slot_footprint(condition, slots);
-            collect_stmt_slot_footprint(post, slots);
-            for stmt in body {
-                collect_stmt_slot_footprint(stmt, slots);
-            }
-        }
-        Stmt::While {
-            condition, body, ..
-        } => {
-            collect_expr_slot_footprint(condition, slots);
-            for stmt in body {
-                collect_stmt_slot_footprint(stmt, slots);
-            }
-        }
-    }
-}
-
-fn collect_expr_slot_footprint(expr: &Expr, slots: &mut BTreeSet<LocalSlot>) {
-    match expr {
-        Expr::Null
-        | Expr::Int(_)
-        | Expr::Float(_)
-        | Expr::Bool(_)
-        | Expr::Bytes(_)
-        | Expr::String(_)
-        | Expr::FunctionRef(_) => {}
-        Expr::Var(index) | Expr::MoveVar(index) => {
-            slots.insert(*index);
-        }
-        Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
-            slots.insert(*root);
-        }
-        Expr::OptionalGet {
-            container,
-            key,
-            container_slot,
-            key_slot,
-        } => {
-            slots.insert(*container_slot);
-            slots.insert(*key_slot);
-            collect_expr_slot_footprint(container, slots);
-            collect_expr_slot_footprint(key, slots);
-        }
-        Expr::OptionUnwrapOr {
-            value,
-            value_slot,
-            fallback,
-        } => {
-            slots.insert(*value_slot);
-            collect_expr_slot_footprint(value, slots);
-            collect_expr_slot_footprint(fallback, slots);
-        }
-        Expr::Call(_, _, args) => {
-            for arg in args {
-                collect_expr_slot_footprint(arg, slots);
-            }
-        }
-        Expr::LocalCall(index, _, args) => {
-            slots.insert(*index);
-            for arg in args {
-                collect_expr_slot_footprint(arg, slots);
-            }
-        }
-        Expr::Closure(closure) => {
-            for slot in &closure.param_slots {
-                slots.insert(*slot);
-            }
-            for (source_slot, captured_slot) in &closure.capture_copies {
-                slots.insert(*source_slot);
-                slots.insert(*captured_slot);
-            }
-            collect_expr_slot_footprint(&closure.body, slots);
-        }
-        Expr::ClosureCall(closure, args) => {
-            for slot in &closure.param_slots {
-                slots.insert(*slot);
-            }
-            for (source_slot, captured_slot) in &closure.capture_copies {
-                slots.insert(*source_slot);
-                slots.insert(*captured_slot);
-            }
-            for arg in args {
-                collect_expr_slot_footprint(arg, slots);
-            }
-            collect_expr_slot_footprint(&closure.body, slots);
-        }
-        Expr::Add(lhs, rhs)
-        | Expr::Sub(lhs, rhs)
-        | Expr::Mul(lhs, rhs)
-        | Expr::Div(lhs, rhs)
-        | Expr::Mod(lhs, rhs)
-        | Expr::And(lhs, rhs)
-        | Expr::Or(lhs, rhs)
-        | Expr::Eq(lhs, rhs)
-        | Expr::Lt(lhs, rhs)
-        | Expr::Gt(lhs, rhs) => {
-            collect_expr_slot_footprint(lhs, slots);
-            collect_expr_slot_footprint(rhs, slots);
-        }
-        Expr::Neg(inner)
-        | Expr::Not(inner)
-        | Expr::ToOwned(inner)
-        | Expr::Borrow(inner)
-        | Expr::BorrowMut(inner) => collect_expr_slot_footprint(inner, slots),
-        Expr::IfElse {
-            condition,
-            then_expr,
-            else_expr,
-        } => {
-            collect_expr_slot_footprint(condition, slots);
-            collect_expr_slot_footprint(then_expr, slots);
-            collect_expr_slot_footprint(else_expr, slots);
-        }
-        Expr::Match {
-            value_slot,
-            result_slot,
-            value,
-            arms,
-            default,
-        } => {
-            slots.insert(*value_slot);
-            slots.insert(*result_slot);
-            collect_expr_slot_footprint(value, slots);
-            for (_, arm_expr) in arms {
-                collect_expr_slot_footprint(arm_expr, slots);
-            }
-            collect_expr_slot_footprint(default, slots);
-        }
-        Expr::Block { stmts, expr } => {
-            for stmt in stmts {
-                collect_stmt_slot_footprint(stmt, slots);
-            }
-            collect_expr_slot_footprint(expr, slots);
-        }
-    }
 }
 
 fn shift_amount_for_power_of_two(value: i64) -> Option<u32> {

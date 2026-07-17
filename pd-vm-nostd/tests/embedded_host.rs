@@ -41,6 +41,21 @@ fn dispatch_host(
 }
 
 #[test]
+fn script_call_frames_execute_in_embedded_runtime() {
+    let program = compile_embedded(
+        r#"
+            fn inc(x) { x + 1 }
+            fn twice(x) { inc(inc(x)) }
+            twice(40);
+        "#,
+    );
+    let mut vm = EmbeddedVm::new(program);
+
+    assert_eq!(vm.run(), Ok(VmStatus::Halted));
+    assert_eq!(vm.stack(), &[EmbeddedValue::Int(42)]);
+}
+
+#[test]
 fn static_host_binding_mutates_board_context() {
     let program = compile_embedded(
         r#"

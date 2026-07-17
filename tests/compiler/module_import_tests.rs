@@ -221,7 +221,7 @@ fn compile_source_file_rustscript_module_exports_only_pub_functions() {
 }
 
 #[test]
-fn rss_function_definition_is_inlined_without_host_imports() {
+fn rss_function_definition_uses_script_target_without_host_imports() {
     let source = r#"
         fn eq(lhs, rhs) {
             lhs == rhs;

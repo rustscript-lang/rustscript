@@ -519,7 +519,7 @@ fn collect_expr_types(
         | Expr::MoveVar(_)
         | Expr::MoveField { .. }
         | Expr::MoveIndex { .. }
-        | Expr::FunctionRef(_) => {
+        | Expr::FunctionRef(..) => {
             let _ = context.infer_expr_type(expr, state);
         }
         Expr::OptionalGet { container, key, .. } => {

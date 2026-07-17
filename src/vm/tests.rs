@@ -10,6 +10,306 @@ fn native_cache_test_lock() -> &'static Mutex<()> {
 }
 
 #[test]
+fn root_ret_completes_explicit_halt_frame() {
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    assert_eq!(vm.execution_frames.len(), 1);
+    assert_eq!(vm.execution_frames[0].continuation, FrameContinuation::Halt);
+
+    assert_eq!(vm.run().expect("root ret should run"), VmStatus::Halted);
+    assert!(vm.execution_frames.is_empty());
+    assert!(vm.stack().is_empty());
+
+    vm.reset_for_reuse();
+    assert_eq!(vm.execution_frames.len(), 1);
+    assert_eq!(vm.stack(), &[]);
+}
+
+#[test]
+fn callable_operand_type_hint_roundtrips() {
+    let packed = pack_operand_types(ValueType::Callable, ValueType::Callable);
+    assert_eq!(
+        unpack_operand_types(packed),
+        (ValueType::Callable, ValueType::Callable)
+    );
+}
+
+#[test]
+fn callvalue_decodes_its_arity_before_callable_validation() {
+    let mut vm = Vm::new(Program::new(
+        Vec::new(),
+        vec![OpCode::CallValue as u8, 0, OpCode::Ret as u8],
+    ));
+    vm.stack.push(Value::Null);
+    assert!(matches!(vm.run(), Err(VmError::InvalidCallable)));
+    assert_eq!(vm.ip(), 2);
+}
+
+#[test]
+fn callvalue_enters_script_frame_and_resumes_caller() {
+    let mut bc = crate::BytecodeBuilder::new();
+    bc.ldloc(0);
+    bc.ldc(0);
+    bc.call_value(1);
+    bc.ret();
+    let function_entry = bc.position();
+    bc.ldloc(0);
+    bc.ldc(1);
+    bc.add();
+    bc.ret();
+    let function_end = bc.position();
+
+    let program = Program::new(vec![Value::Int(41), Value::Int(1)], bc.finish())
+        .with_local_count(1)
+        .with_callable_metadata(
+            vec![crate::ScriptFunction {
+                entry_ip: function_entry,
+                end_ip: function_end,
+            }],
+            vec![crate::CallablePrototype {
+                kind: crate::CallableKind::FunctionItem,
+                target: crate::CallableTarget::ScriptFunction(0),
+                arity: 1,
+                frame_local_count: 1,
+                parameter_slots: vec![0],
+                capture_slots: Vec::new(),
+                self_slot: None,
+                schema: None,
+            }],
+            vec![
+                crate::FunctionRegion {
+                    start_ip: 0,
+                    end_ip: function_entry,
+                    prototype_id: None,
+                },
+                crate::FunctionRegion {
+                    start_ip: function_entry,
+                    end_ip: function_end,
+                    prototype_id: Some(0),
+                },
+            ],
+            vec![crate::RootCallableBinding {
+                local_slot: 0,
+                prototype_id: 0,
+            }],
+        );
+    let mut vm = Vm::new(program);
+
+    assert_eq!(vm.run().expect("script call should run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+    assert_eq!(vm.call_depth(), 0);
+}
+
+#[test]
+fn host_can_invoke_exported_callable_and_reset_makes_it_stale() {
+    let mut bc = crate::BytecodeBuilder::new();
+    bc.ret();
+    let entry = bc.position();
+    bc.ldloc(0);
+    bc.ldc(0);
+    bc.add();
+    bc.ret();
+    let end = bc.position();
+    let program = Program::new(vec![Value::Int(1)], bc.finish())
+        .with_local_count(1)
+        .with_callable_metadata(
+            vec![crate::ScriptFunction {
+                entry_ip: entry,
+                end_ip: end,
+            }],
+            vec![crate::CallablePrototype {
+                kind: crate::CallableKind::FunctionItem,
+                target: crate::CallableTarget::ScriptFunction(0),
+                arity: 1,
+                frame_local_count: 1,
+                parameter_slots: vec![0],
+                capture_slots: Vec::new(),
+                self_slot: None,
+                schema: None,
+            }],
+            vec![
+                crate::FunctionRegion {
+                    start_ip: 0,
+                    end_ip: entry,
+                    prototype_id: None,
+                },
+                crate::FunctionRegion {
+                    start_ip: entry,
+                    end_ip: end,
+                    prototype_id: Some(0),
+                },
+            ],
+            vec![crate::RootCallableBinding {
+                local_slot: 0,
+                prototype_id: 0,
+            }],
+        );
+    let mut vm = Vm::new(program);
+    let callable = vm.locals()[0].clone();
+    assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
+    assert_eq!(
+        vm.invoke_callable(callable.clone(), &[Value::Int(41)])
+            .expect("host invocation should return"),
+        Value::Int(42)
+    );
+    vm.queue_callable(callable.clone(), vec![Value::Int(1)])
+        .expect("queue first callback");
+    vm.queue_callable(callable.clone(), vec![Value::Int(2)])
+        .expect("queue second callback");
+    assert_eq!(vm.queued_callable_count(), 2);
+    assert_eq!(
+        vm.drain_callable_queue().expect("drain callbacks"),
+        vec![Value::Int(2), Value::Int(3)]
+    );
+    vm.queue_callable(callable.clone(), vec![Value::Int(3)])
+        .expect("queue callback before shutdown");
+    vm.shutdown();
+    assert_eq!(vm.queued_callable_count(), 0);
+    assert!(matches!(
+        vm.invoke_callable(callable.clone(), &[Value::Int(1)]),
+        Err(VmError::InvalidFrameState("vm is shut down"))
+    ));
+
+    vm.reset_for_reuse();
+    assert!(matches!(
+        vm.invoke_callable(callable, &[Value::Int(1)]),
+        Err(VmError::StaleCallable { .. })
+    ));
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[test]
+fn aot_side_exits_at_callable_boundary_with_state_preserved() {
+    let compiled = crate::compile_source_for_repl(
+        r#"
+            fn add_one(value: int) -> int { value + 1 }
+            add_one(41);
+        "#,
+    )
+    .expect("script frame source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.compile_aot().expect("aot compilation should succeed");
+    assert_eq!(
+        vm.run().expect("aot execution should halt"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+    assert!(vm.aot_exec_count() > 0);
+    assert!(vm.aot_interpreter_boundary_hit);
+}
+
+#[test]
+fn typed_script_callbacks_invoke_queue_unsubscribe_and_invalidate() {
+    let compiled = crate::compile_source_for_repl(
+        r#"
+            fn add_one(value: int) -> int { value + 1 }
+            add_one;
+        "#,
+    )
+    .expect("callback source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
+    let callable = vm.stack().last().cloned().expect("callable result");
+    let mut store = crate::Store::from_vm(vm);
+    let stale_callback: crate::ScriptCallback<(i64,), i64> = store
+        .script_callback(callable.clone())
+        .expect("second callback should bind");
+    let callback: crate::ScriptCallback<(i64,), i64> = store
+        .script_callback(callable.clone())
+        .expect("typed callback should bind");
+
+    assert_eq!(callback.call(&mut store, (41,)).expect("direct call"), 42);
+    let queued = callback.prepare((40,)).expect("queued call should prepare");
+    let queued = std::thread::spawn(move || queued)
+        .join()
+        .expect("queued invocation should cross threads");
+    store
+        .enqueue_callback(queued)
+        .expect("queued call should bind to its store");
+    assert_eq!(
+        store.drain_callbacks().expect("queue should drain"),
+        vec![Value::Int(41)]
+    );
+
+    let alias = callback.clone();
+    let wrong_type: crate::ScriptCallback<(bool,), i64> = store
+        .script_callback(callable)
+        .expect("callable arity should bind");
+    assert!(matches!(
+        wrong_type.call(&mut store, (false,)),
+        Err(VmError::TypeMismatch("callable argument schema"))
+    ));
+
+    callback.unsubscribe();
+    assert!(!alias.is_subscribed());
+    assert!(matches!(
+        alias.prepare((1,)),
+        Err(VmError::InvalidFrameState(
+            "script callback is unsubscribed"
+        ))
+    ));
+
+    store.vm_mut().reset_for_reuse();
+    assert!(matches!(
+        stale_callback.call(&mut store, (1,)),
+        Err(VmError::StaleCallable { .. })
+    ));
+}
+
+#[test]
+fn typed_script_callback_can_yield_resume_and_return_to_host() {
+    let compiled = crate::compile_source_for_repl(
+        r#"
+            fn sum_to(limit: int) -> int {
+                let mut index = 0;
+                let mut total = 0;
+                while index < limit {
+                    total = total + index;
+                    index = index + 1;
+                }
+                total;
+            }
+            sum_to;
+        "#,
+    )
+    .expect("callback source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
+    let callable = vm.stack().last().cloned().expect("callable result");
+    let mut store = crate::Store::from_vm(vm);
+    let callback: crate::ScriptCallback<(i64,), i64> = store
+        .script_callback(callable)
+        .expect("typed callback should bind");
+
+    store.set_fuel(4);
+    let mut status = callback
+        .start(&mut store, (100,))
+        .expect("callback should start");
+    assert_eq!(store.vm().call_depth(), 1);
+    let mut yields = 0usize;
+    loop {
+        match status {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => {
+                yields += 1;
+                assert!(yields < 1_000, "callback should make progress");
+                store.recharge(4).expect("fuel recharge should succeed");
+                status = store.resume().expect("callback should resume");
+            }
+            VmStatus::Waiting(_) => panic!("unexpected waiting callback"),
+        }
+    }
+    assert!(yields > 0);
+    assert_eq!(store.vm().call_depth(), 0);
+    assert_eq!(
+        store
+            .take_callback_result::<i64>()
+            .expect("typed callback result")
+            .expect("callback should produce a result"),
+        4_950
+    );
+}
+
+#[test]
 fn vm_instances_share_decoded_instruction_metadata_across_program_clones() {
     let compiled = crate::compile_source(
         r#"

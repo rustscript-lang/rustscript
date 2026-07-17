@@ -720,16 +720,6 @@ fn rustscript_named_function_capture_error_cases_work() {
             expected_kind: SourceErrorKind::Parse,
             expected_contains_all: &["lut", "moved"],
         },
-        SourceErrorCase {
-            name: "named function recursion is still rejected",
-            source: r#"
-                fn recurse(x: int) -> int { recurse(x) }
-                recurse(1);
-            "#,
-            flavor: SourceFlavor::RustScript,
-            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InlineFunctionRecursion),
-            expected_contains_all: &[],
-        },
     ];
 
     for case in &cases {
@@ -756,6 +746,73 @@ fn closure_captures_outer_value_at_definition_time() {
         factory: make_print_builtin,
     }];
     run_runtime_case_with_bindings(&case, &bindings);
+}
+
+#[test]
+fn named_function_recursion_uses_runtime_frames_and_hits_depth_limit() {
+    let compiled = vm::compile_source_for_repl(
+        r#"
+            fn recurse(x: int) -> int { recurse(x) }
+            recurse(1);
+        "#,
+    )
+    .expect("recursive function should compile");
+    assert!(
+        compiled
+            .program
+            .code
+            .contains(&(vm::OpCode::CallValue as u8))
+    );
+    assert_eq!(compiled.program.script_functions.len(), 1);
+
+    let mut runtime = vm::Vm::new(compiled.program.with_local_count(compiled.locals));
+    assert!(matches!(
+        runtime.run(),
+        Err(vm::VmError::CallStackOverflow { limit: 1024 })
+    ));
+}
+
+#[test]
+fn mutual_recursion_resolves_forward_function_declarations() {
+    let case = rustscript_runtime_case(
+        "mutual recursion",
+        r#"
+            fn a(x) { if x == 0 => { 0 } else => { b(x - 1); x } }
+            fn b(x) { if x == 0 => { 0 } else => { a(x - 1); x } }
+            a(4);
+        "#,
+        vec![Value::Int(4)],
+    );
+    run_runtime_case(&case);
+}
+
+#[test]
+fn finite_recursive_closure_unwinds_and_returns() {
+    let case = rustscript_runtime_case(
+        "finite recursive closure",
+        r#"
+            let recurse = |x| if x == 0 => { 0 } else => { recurse(x - 1); x };
+            recurse(5);
+        "#,
+        vec![Value::Int(5)],
+    );
+    run_runtime_case(&case);
+}
+
+#[test]
+fn recursive_closure_uses_self_binding_and_hits_depth_limit() {
+    let compiled = vm::compile_source_for_repl(
+        r#"
+            let recurse = |x| recurse(x);
+            recurse(1);
+        "#,
+    )
+    .expect("recursive closure should compile");
+    let mut runtime = vm::Vm::new(compiled.program.with_local_count(compiled.locals));
+    assert!(matches!(
+        runtime.run(),
+        Err(vm::VmError::CallStackOverflow { .. })
+    ));
 }
 
 #[test]
@@ -984,10 +1041,10 @@ fn rustscript_closure_value_parse_rejection_cases_work() {
 }
 
 #[test]
-fn rustscript_closure_captured_callable_invocation_is_rejected() {
+fn rustscript_closure_captured_callable_invocation_works() {
     let cases = vec![
-        SourceErrorCase {
-            name: "captured function-valued local cannot be invoked from closure body",
+        RuntimeCase {
+            name: "captured function-valued local can be invoked from closure body",
             source: r#"
                 fn add_one(value) {
                     value + 1;
@@ -997,23 +1054,23 @@ fn rustscript_closure_captured_callable_invocation_is_rejected() {
                 apply(41);
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_kind: SourceErrorKind::Compile(CompileErrorKind::NonCallableLocal),
-            expected_contains_all: &[],
+            expected_stack: vec![Value::Int(42)],
+            expected_locals: None,
         },
-        SourceErrorCase {
-            name: "captured closure-valued local cannot be invoked from closure body",
+        RuntimeCase {
+            name: "captured closure-valued local can be invoked from closure body",
             source: r#"
                 let inc = |x| x + 1;
                 let apply = |value| inc(value);
                 apply(41);
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_kind: SourceErrorKind::Compile(CompileErrorKind::NonCallableLocal),
-            expected_contains_all: &[],
+            expected_stack: vec![Value::Int(42)],
+            expected_locals: None,
         },
     ];
     for case in &cases {
-        expect_source_error_case(case);
+        run_runtime_case(case);
     }
 }
 
@@ -1956,7 +2013,7 @@ fn liveness_clears_local_after_function_value_last_use() {
 }
 
 #[test]
-fn inline_function_call_frame_slots_are_cleared_after_return() {
+fn script_function_frame_values_are_released_after_return() {
     let source = r#"
         fn make_pair() {
             let left = "L";
@@ -1973,11 +2030,9 @@ fn inline_function_call_frame_slots_are_cleared_after_return() {
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack().last(), Some(&Value::Int(0)));
-    assert!(
-        vm.locals().iter().all(|value| matches!(value, Value::Null)),
-        "expected all inline call-frame locals to be cleared after return, got {:?}",
-        vm.locals()
-    );
+    assert!(!vm.locals().iter().any(
+        |value| matches!(value, Value::String(text) if matches!(text.as_str(), "L" | "R" | "LR"))
+    ));
 }
 
 #[test]
@@ -1999,35 +2054,118 @@ fn interprocedural_closure_capture_slots_are_cleared_after_last_use() {
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack().last(), Some(&Value::Int(0)));
     assert!(
-        vm.locals().iter().all(|value| matches!(value, Value::Null)),
-        "expected closure capture and call-frame slots to clear after last use, got {:?}",
-        vm.locals()
+        !vm.locals().iter().any(
+            |value| matches!(value, Value::String(text) if matches!(text.as_str(), "!" | "a!"))
+        )
     );
 }
 
 #[test]
-fn rustscript_callable_values_cannot_be_stored_in_arrays() {
-    let case = SourceErrorCase {
-        name: "callable values cannot be stored in arrays",
+fn rustscript_callable_values_can_be_stored_in_arrays() {
+    let case = RuntimeCase {
+        name: "callable values can be stored in arrays",
         source: r#"
-            fn add_one(value) {
+            fn add_one(value: int) -> int {
                 value + 1;
             }
             let func = add_one;
             let values = [func];
-            values.length;
+            let stored = values[0];
+            stored(41);
         "#,
         flavor: SourceFlavor::RustScript,
-        expected_kind: SourceErrorKind::Compile(CompileErrorKind::CallableUsedAsValue),
-        expected_contains_all: &[],
+        expected_stack: vec![Value::Int(42)],
+        expected_locals: None,
     };
-    expect_source_error_case(&case);
+    run_runtime_case(&case);
 }
 
 #[test]
-fn rustscript_callable_values_cannot_be_returned_from_functions() {
-    let case = SourceErrorCase {
-        name: "callable values cannot be returned from functions",
+fn rustscript_callable_values_can_be_stored_in_maps() {
+    let case = RuntimeCase {
+        name: "callable values can be stored in maps",
+        source: r#"
+            fn add_one(value: int) -> int {
+                value + 1;
+            }
+            let values = { f: add_one };
+            let stored = values.f;
+            stored(41);
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_stack: vec![Value::Int(42)],
+        expected_locals: None,
+    };
+    run_runtime_case(&case);
+}
+
+#[test]
+fn builtin_host_functions_can_be_values() {
+    let source = r#"
+        let f = len;
+        f("abc");
+    "#;
+    let path = std::env::temp_dir().join(format!(
+        "rustscript_callable_builtin_{}_{}.rss",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos()
+    ));
+    std::fs::write(&path, source).expect("source should write");
+    let compiled =
+        compile_source_file(path.as_path()).expect("builtin function value should compile");
+    assert!(
+        compiled
+            .program
+            .code
+            .contains(&(vm::OpCode::CallValue as u8))
+    );
+    let mut runtime = Vm::new(compiled.program.with_local_count(compiled.locals));
+    assert_eq!(
+        runtime.run().expect("runtime should halt"),
+        VmStatus::Halted
+    );
+    assert_eq!(runtime.stack(), &[Value::Int(3)]);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn compatible_callable_signatures_merge_across_branches() {
+    let case = rustscript_runtime_case(
+        "compatible callable branch merge",
+        r#"
+            fn add_one(value: int) -> int { value + 1 }
+            fn add_two(value: int) -> int { value + 2 }
+            let selected = if true => { add_one } else => { add_two };
+            selected(40);
+        "#,
+        vec![Value::Int(41)],
+    );
+
+    run_runtime_case(&case);
+}
+
+#[test]
+fn explicit_generic_function_values_use_substituted_callable_schemas() {
+    let case = rustscript_runtime_case(
+        "explicit generic function values",
+        r#"
+            fn identity<T>(value: T) -> T { value }
+            let int_identity = identity::<int>;
+            int_identity(42);
+        "#,
+        vec![Value::Int(42)],
+    );
+
+    run_runtime_case(&case);
+}
+
+#[test]
+fn rustscript_callable_values_can_be_returned_from_functions() {
+    let case = RuntimeCase {
+        name: "callable values can be returned from functions",
         source: r#"
             fn add_one(value: int) -> int {
                 value + 1;
@@ -2035,15 +2173,15 @@ fn rustscript_callable_values_cannot_be_returned_from_functions() {
             fn get_adder() {
                 add_one;
             }
-
             let func = get_adder();
             func(41);
         "#,
+
         flavor: SourceFlavor::RustScript,
-        expected_kind: SourceErrorKind::Compile(CompileErrorKind::CallableUsedAsValue),
-        expected_contains_all: &[],
+        expected_stack: vec![Value::Int(42)],
+        expected_locals: None,
     };
-    expect_source_error_case(&case);
+    run_runtime_case(&case);
 }
 
 #[test]

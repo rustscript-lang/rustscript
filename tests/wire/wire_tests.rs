@@ -55,6 +55,7 @@ fn wire_roundtrip_preserves_constants_and_code() {
     });
 
     let encoded = encode_program(&program).expect("encode should succeed");
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 9);
     let decoded = decode_program(&encoded).expect("decode should succeed");
 
     assert_eq!(decoded.constants, program.constants);
@@ -81,6 +82,13 @@ fn decode_rejects_invalid_magic_version_and_truncation() {
     assert!(matches!(
         decode_program(&bad_version),
         Err(WireError::UnsupportedVersion(99))
+    ));
+
+    let mut old_version = encoded.clone();
+    old_version[4..6].copy_from_slice(&8u16.to_le_bytes());
+    assert!(matches!(
+        decode_program(&old_version),
+        Err(WireError::UnsupportedVersion(8))
     ));
 
     let truncated = &encoded[..encoded.len() - 1];
@@ -135,6 +143,101 @@ fn validate_accepts_known_good_program() {
         None,
     );
     validate_program(&program, 4).expect("program should validate");
+}
+
+#[test]
+fn callable_metadata_roundtrips_vmbc_v9() {
+    let compiled = vm::compile_source_for_repl(
+        r#"
+            fn add_one(value: int) -> int { value + 1 }
+            let closure = |value| add_one(value);
+            closure(41);
+        "#,
+    )
+    .expect("callable source should compile");
+    let encoded = encode_program(&compiled.program).expect("encode callable metadata");
+    let decoded = decode_program(&encoded).expect("decode callable metadata");
+    assert_eq!(decoded.script_functions, compiled.program.script_functions);
+    assert_eq!(
+        decoded.callable_prototypes,
+        compiled.program.callable_prototypes
+    );
+    assert_eq!(decoded.function_regions, compiled.program.function_regions);
+    assert_eq!(
+        decoded.root_callable_bindings,
+        compiled.program.root_callable_bindings
+    );
+    validate_program(&decoded, 0).expect("decoded program should validate");
+}
+
+#[test]
+fn callvalue_roundtrips_validation_and_disassembly() {
+    let mut bc = BytecodeBuilder::new();
+    bc.call_value(2);
+    bc.ret();
+    let program = Program::new(vec![], bc.finish());
+
+    validate_program(&program, 0).expect("callvalue should validate structurally");
+    let bytes = encode_program(&program).expect("callvalue should encode");
+    let decoded = decode_program(&bytes).expect("callvalue should decode");
+    assert_eq!(decoded.code, program.code);
+    assert!(disassemble_vmbc(&bytes).unwrap().contains("callvalue 2"));
+}
+
+#[test]
+fn validate_rejects_truncated_callvalue() {
+    let program = Program::new(vec![], vec![vm::OpCode::CallValue as u8]);
+    assert!(matches!(
+        validate_program(&program, 0),
+        Err(ValidationError::TruncatedOperand {
+            expected_bytes: 1,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn validation_rejects_cross_region_branches() {
+    let mut code = vec![vm::OpCode::Br as u8];
+    code.extend_from_slice(&6u32.to_le_bytes());
+    code.push(vm::OpCode::Ret as u8);
+    code.push(vm::OpCode::Ret as u8);
+    let program = Program::new(Vec::new(), code).with_callable_metadata(
+        vec![vm::ScriptFunction {
+            entry_ip: 6,
+            end_ip: 7,
+        }],
+        vec![vm::CallablePrototype {
+            kind: vm::CallableKind::FunctionItem,
+            target: vm::CallableTarget::ScriptFunction(0),
+            arity: 0,
+            frame_local_count: 0,
+            parameter_slots: Vec::new(),
+            capture_slots: Vec::new(),
+            self_slot: None,
+            schema: None,
+        }],
+        vec![
+            vm::FunctionRegion {
+                start_ip: 0,
+                end_ip: 6,
+                prototype_id: None,
+            },
+            vm::FunctionRegion {
+                start_ip: 6,
+                end_ip: 7,
+                prototype_id: Some(0),
+            },
+        ],
+        Vec::new(),
+    );
+    assert!(matches!(
+        validate_program(&program, 0),
+        Err(ValidationError::InvalidJumpTarget {
+            offset: 0,
+            target: 6
+        })
+    ));
 }
 
 #[test]

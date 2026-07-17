@@ -1395,6 +1395,25 @@ fn lower_aot_ssa_terminator(
             );
             jump_with_status(b, exit_block, status);
         }
+        AotSsaTerminator::InterpreterBoundary { ip, stack, locals } => {
+            materialize_state_to_vm(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                helper_refs,
+                helper_addrs,
+                stack,
+                locals,
+                values,
+                *ip,
+            )?;
+            let status = b
+                .ins()
+                .iconst(types::I32, crate::vm::native::STATUS_TRACE_EXIT as i64);
+            jump_with_status(b, exit_block, status);
+        }
         AotSsaTerminator::Return { ip, stack, locals } => {
             materialize_state_to_vm(
                 b,

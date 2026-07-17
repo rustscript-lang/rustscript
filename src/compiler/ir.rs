@@ -55,10 +55,10 @@ impl TypeSchema {
 
     pub(crate) fn coarse_value_type(&self) -> ValueType {
         match self {
-            TypeSchema::Unknown
-            | TypeSchema::GenericParam(_)
-            | TypeSchema::Number
-            | TypeSchema::Callable { .. } => ValueType::Unknown,
+            TypeSchema::Unknown | TypeSchema::GenericParam(_) | TypeSchema::Number => {
+                ValueType::Unknown
+            }
+            TypeSchema::Callable { .. } => ValueType::Callable,
             TypeSchema::Null => ValueType::Null,
             TypeSchema::Int => ValueType::Int,
             TypeSchema::Float => ValueType::Float,
@@ -185,7 +185,7 @@ pub enum Expr {
     Bool(bool),
     String(String),
     Bytes(Vec<u8>),
-    FunctionRef(u16),
+    FunctionRef(u16, Vec<TypeSchema>),
     OptionalGet {
         container: Box<Expr>,
         key: Box<Expr>,

@@ -283,7 +283,7 @@ impl AvailabilityAnalyzer {
             | Expr::Bool(_)
             | Expr::Bytes(_)
             | Expr::String(_)
-            | Expr::FunctionRef(_) => {}
+            | Expr::FunctionRef(..) => {}
             Expr::Var(index) => {
                 if *index == captured_slot {
                     *seen = true;

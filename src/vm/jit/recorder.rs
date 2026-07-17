@@ -174,6 +174,7 @@ impl ValueInfo {
             Value::Bytes(_) => Self::tagged_typed(ValueType::Bytes),
             Value::Array(_) => Self::tagged_typed(ValueType::Array),
             Value::Map(_) => Self::tagged_typed(ValueType::Map),
+            Value::Callable(_) => Self::tagged_typed(ValueType::Callable),
         }
     }
 
@@ -371,6 +372,9 @@ enum DecodedOp {
         argc: u8,
         yields: bool,
     },
+    InterpreterBoundary {
+        ip: usize,
+    },
 }
 
 impl DecodedOp {
@@ -383,7 +387,8 @@ impl DecodedOp {
             | Self::Pop { .. }
             | Self::Dup { .. }
             | Self::Br { .. }
-            | Self::Call { .. } => false,
+            | Self::Call { .. }
+            | Self::InterpreterBoundary { .. } => false,
             Self::Stloc { .. }
             | Self::Neg { .. }
             | Self::Not { .. }
@@ -671,6 +676,14 @@ impl<'a> TraceCursor<'a> {
                     yields: true,
                 }
             }
+        } else if opcode == OpCode::CallValue as u8 {
+            let _argc = read_u8(&self.program.code, &mut self.ip)
+                .ok_or(TraceRecordError::InvalidImmediate("callvalue argc"))?;
+            DecodedOp::InterpreterBoundary { ip: instr_ip }
+        } else if opcode == OpCode::MakeCallable as u8 {
+            let _prototype_id = read_u32(&self.program.code, &mut self.ip)
+                .ok_or(TraceRecordError::InvalidImmediate("makecallable prototype"))?;
+            DecodedOp::InterpreterBoundary { ip: instr_ip }
         } else {
             return Err(TraceRecordError::UnsupportedOpcode(opcode));
         };
@@ -1133,6 +1146,20 @@ pub(crate) fn record_trace(
                 }
                 cursor.jump_to(target)?;
             }
+            DecodedOp::InterpreterBoundary { ip } => {
+                op_names.push("callable_boundary".to_string());
+                let exit = builder.add_exit(
+                    ip,
+                    materialize_stack(&frame.stack),
+                    materialize_locals(&frame.locals),
+                    frame.dirty_locals.clone(),
+                );
+                builder
+                    .set_terminator(current_block, SsaTerminator::Exit { exit })
+                    .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+                terminal = Some(JitTraceTerminal::BranchExit);
+                break;
+            }
             DecodedOp::Call {
                 ip,
                 index,
@@ -1424,6 +1451,7 @@ fn infer_loop_header_plan(
                 frame.push(ValueInfo::tagged_typed(return_type));
             }
             DecodedOp::Call { .. } => return Ok(None),
+            DecodedOp::InterpreterBoundary { .. } => return Ok(None),
             DecodedOp::Brfalse {
                 target,
                 fallthrough_ip,
@@ -3350,6 +3378,7 @@ fn emit_specialized_builtin_call(
                 ValueType::Bytes => "bytes",
                 ValueType::Array => "array",
                 ValueType::Map => "map",
+                ValueType::Callable => "callable",
                 ValueType::Unknown => {
                     return Err(TraceRecordError::UnsupportedTrace(
                         "type_of known specialization received unknown type".to_string(),
@@ -4511,6 +4540,23 @@ mod tests {
     fn patch_branch_target(code: &mut [u8], instr_ip: u32, target: u32) {
         let start = instr_ip as usize + 1;
         code[start..start + 4].copy_from_slice(&target.to_le_bytes());
+    }
+
+    #[test]
+    fn callable_opcodes_decode_as_explicit_interpreter_boundaries() {
+        let mut bytecode = BytecodeBuilder::new();
+        bytecode.call_value(2);
+        bytecode.make_callable(7);
+        let program = Program::new(Vec::new(), bytecode.finish());
+        let mut cursor = TraceCursor::new(&program, 0, 8);
+        assert!(matches!(
+            cursor.next().expect("callvalue decode"),
+            Some(DecodedOp::InterpreterBoundary { ip: 0 })
+        ));
+        assert!(matches!(
+            cursor.next().expect("makecallable decode"),
+            Some(DecodedOp::InterpreterBoundary { ip: 2 })
+        ));
     }
 
     #[test]

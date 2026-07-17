@@ -4326,7 +4326,7 @@ fn trace_jit_supports_float_comparisons_in_ssa() {
 }
 
 #[test]
-fn trace_jit_executes_loop_with_live_entry_stack() {
+fn trace_jit_skips_nested_loop_with_one_live_operand() {
     if !native_jit_supported() {
         return;
     }
@@ -4354,23 +4354,14 @@ fn trace_jit_executes_loop_with_live_entry_stack() {
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(145)]);
     assert!(
-        vm.jit_native_exec_count() > 0,
-        "a trace with a modeled live entry stack should execute natively, dump:\n{}",
-        vm.dump_jit_info()
-    );
-    assert!(
-        vm.jit_snapshot().traces.iter().any(|trace| {
-            trace.entry_stack_depth == 1
-                && trace.ssa_text().contains("stack0")
-                && trace.ssa_text().contains("loop_stack0")
-        }),
+        vm.jit_snapshot().traces.is_empty(),
         "{}",
         vm.dump_jit_info()
     );
 }
 
 #[test]
-fn trace_jit_executes_loop_with_two_live_entry_values() {
+fn trace_jit_skips_nested_loop_with_two_live_operands() {
     if !native_jit_supported() {
         return;
     }
@@ -4397,19 +4388,15 @@ fn trace_jit_executes_loop_with_two_live_entry_values() {
     let status = vm.run().expect("depth-two entry stack program should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(48)]);
-    assert!(vm.jit_native_exec_count() > 0, "{}", vm.dump_jit_info());
     assert!(
-        vm.jit_snapshot()
-            .traces
-            .iter()
-            .any(|trace| trace.entry_stack_depth >= 2),
+        vm.jit_snapshot().traces.is_empty(),
         "{}",
         vm.dump_jit_info()
     );
 }
 
 #[test]
-fn trace_jit_preserves_heap_values_on_live_entry_stack() {
+fn trace_jit_skips_nested_loop_with_heap_live_operand() {
     if !native_jit_supported() {
         return;
     }
@@ -4443,19 +4430,15 @@ fn trace_jit_preserves_heap_values_on_live_entry_stack() {
             Value::Int(45),
         ])]
     );
-    assert!(vm.jit_native_exec_count() > 0, "{}", vm.dump_jit_info());
     assert!(
-        vm.jit_snapshot()
-            .traces
-            .iter()
-            .any(|trace| trace.entry_stack_depth >= 1),
+        vm.jit_snapshot().traces.is_empty(),
         "{}",
         vm.dump_jit_info()
     );
 }
 
 #[test]
-fn trace_jit_reuses_live_entry_stack_trace_after_reset() {
+fn trace_jit_skips_nested_loop_after_reset() {
     if !native_jit_supported() {
         return;
     }
@@ -4482,12 +4465,12 @@ fn trace_jit_reuses_live_entry_stack_trace_after_reset() {
     assert_eq!(vm.run().expect("first run"), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(145)]);
     let first_native_exec_count = vm.jit_native_exec_count();
-    assert!(first_native_exec_count > 0, "{}", vm.dump_jit_info());
+    assert_eq!(first_native_exec_count, 0, "{}", vm.dump_jit_info());
 
     vm.reset_for_reuse();
     assert_eq!(vm.run().expect("second run"), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(145)]);
-    assert!(vm.jit_native_exec_count() > first_native_exec_count);
+    assert_eq!(vm.jit_native_exec_count(), first_native_exec_count);
 }
 
 #[test]

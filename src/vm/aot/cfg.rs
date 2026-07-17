@@ -34,13 +34,16 @@ pub(crate) enum AotBlockTerminal {
     Fallthrough {
         next_ip: usize,
     },
+    InterpreterExit {
+        exit_ip: usize,
+    },
     Stop,
 }
 
 impl AotBlockTerminal {
     pub(crate) fn successor_ips(&self) -> Vec<usize> {
         match self {
-            Self::Return | Self::Stop => Vec::new(),
+            Self::Return | Self::InterpreterExit { .. } | Self::Stop => Vec::new(),
             Self::Jump { target_ip } => vec![*target_ip],
             Self::ConditionalJump {
                 target_ip,
@@ -98,6 +101,9 @@ fn build_cfg_from_code(code: &[u8]) -> Result<AotCfg, AotCfgError> {
                     target_ip: read_jump_target(code, ip)?,
                     fallthrough_ip: next_ip,
                 }),
+                OpCode::CallValue | OpCode::MakeCallable => {
+                    Some(AotBlockTerminal::InterpreterExit { exit_ip: ip })
+                }
                 _ if next_ip == code.len() => Some(AotBlockTerminal::Stop),
                 _ if Some(next_ip) == next_block_start => {
                     Some(AotBlockTerminal::Fallthrough { next_ip })
@@ -137,6 +143,11 @@ fn collect_block_starts(code: &[u8]) -> Result<Vec<usize>, AotCfgError> {
             }
             OpCode::Brfalse => {
                 starts.insert(read_jump_target(code, ip)?);
+                if next_ip < code.len() {
+                    starts.insert(next_ip);
+                }
+            }
+            OpCode::CallValue | OpCode::MakeCallable => {
                 if next_ip < code.len() {
                     starts.insert(next_ip);
                 }

@@ -511,21 +511,34 @@ impl Parser {
                         Expr::Call(decl.index, type_args, args)
                     }
                 } else {
-                    if !type_args.is_empty() {
-                        return Err(ParseError {
-                            span: Some(self.current_span()),
-                            code: None,
-                            line: self.current_line(),
-                            message: format!(
-                                "explicit type arguments require a direct function call; generic function values are not supported for '{name}'"
-                            ),
-                        });
-                    }
                     if self.has_local_binding(&name) {
+                        if !type_args.is_empty() {
+                            return Err(ParseError {
+                                span: Some(self.current_span()),
+                                code: None,
+                                line: self.current_line(),
+                                message: format!(
+                                    "local callable '{name}' does not accept explicit type arguments"
+                                ),
+                            });
+                        }
                         let index = self.get_local(&name)?;
                         Expr::Var(index)
-                    } else if let Some(decl) = self.functions.get(&name) {
-                        Expr::FunctionRef(decl.index)
+                    } else if let Some(decl) = self.functions.get(&name).cloned() {
+                        self.validate_named_call_type_args(&decl, &type_args)?;
+                        Expr::FunctionRef(decl.index, type_args)
+                    } else if let Some(index) = crate::builtin_call_index(&name) {
+                        if !type_args.is_empty() {
+                            return Err(ParseError {
+                                span: Some(self.current_span()),
+                                code: None,
+                                line: self.current_line(),
+                                message: format!(
+                                    "function '{name}' does not accept explicit type arguments"
+                                ),
+                            });
+                        }
+                        Expr::FunctionRef(index, Vec::new())
                     } else {
                         return Err(ParseError {
                             span: None,

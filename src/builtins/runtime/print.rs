@@ -24,6 +24,11 @@ pub fn format_value(value: &Value) -> String {
                 .join(", ");
             format!("{{{parts}}}")
         }
+        Value::Callable(callable) => match callable.kind {
+            crate::CallableKind::FunctionItem => format!("<fn#{}>", callable.prototype_id),
+            crate::CallableKind::Closure => format!("<closure#{}>", callable.prototype_id),
+            crate::CallableKind::HostFunction => format!("<host-fn#{}>", callable.prototype_id),
+        },
     }
 }
 

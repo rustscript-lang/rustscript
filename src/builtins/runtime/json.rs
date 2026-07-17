@@ -60,6 +60,9 @@ fn vm_to_json_value(value: &Value) -> VmResult<JsonValue> {
             }
             Ok(JsonValue::Object(out))
         }
+        Value::Callable(_) => Err(VmError::HostError(
+            "json_encode does not support callable values".to_string(),
+        )),
     }
 }
 

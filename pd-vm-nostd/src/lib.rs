@@ -16,8 +16,11 @@ mod vmbc;
 
 pub use error::{VmError, WireError};
 pub use host::{HostBinding, HostDispatcher, HostError, HostFunction};
-pub use program::{HostImport, OpCode, Program, ValueType};
-pub use value::Value;
+pub use program::{
+    CallablePrototype, CallableTarget, FunctionRegion, HostImport, OpCode, Program,
+    RootCallableBinding, ScriptFunction, ValueType,
+};
+pub use value::{CallableEnvironment, CallableKind, CallableValue, ProgramInstanceId, Value};
 pub use vm::{Vm, VmResult, VmStatus};
 pub use vmbc::decode_program;
 
