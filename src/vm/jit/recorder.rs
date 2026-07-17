@@ -197,10 +197,10 @@ struct AnalysisFrame {
 }
 
 impl AnalysisFrame {
-    fn new(program: &Program, entry_stack_depth: usize) -> Self {
+    fn new(program: &Program, entry_stack_depth: usize, local_count: usize) -> Self {
         Self {
             stack: vec![ValueInfo::tagged(); entry_stack_depth],
-            locals: (0..program.local_count)
+            locals: (0..local_count)
                 .map(|local| entry_local_info(program, local))
                 .collect(),
         }
@@ -692,6 +692,7 @@ impl<'a> TraceCursor<'a> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn record_trace(
     program: &Program,
     root_ip: usize,
@@ -699,10 +700,29 @@ pub(crate) fn record_trace(
     max_trace_len: usize,
     non_yielding_host_imports: &[bool],
 ) -> Result<RecordedTrace, TraceRecordError> {
+    record_trace_with_local_count(
+        program,
+        root_ip,
+        entry_stack_depth,
+        program.local_count,
+        max_trace_len,
+        non_yielding_host_imports,
+    )
+}
+
+pub(crate) fn record_trace_with_local_count(
+    program: &Program,
+    root_ip: usize,
+    entry_stack_depth: usize,
+    local_count: usize,
+    max_trace_len: usize,
+    non_yielding_host_imports: &[bool],
+) -> Result<RecordedTrace, TraceRecordError> {
     let loop_header_plan = infer_loop_header_plan(
         program,
         root_ip,
         entry_stack_depth,
+        local_count,
         max_trace_len,
         non_yielding_host_imports,
     )?;
@@ -721,7 +741,7 @@ pub(crate) fn record_trace(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let entry_locals = (0..program.local_count)
+    let entry_locals = (0..local_count)
         .map(|local| {
             builder
                 .append_param(entry, SsaValueRepr::Tagged, format!("local{local}"))
@@ -1281,13 +1301,14 @@ fn infer_loop_header_plan(
     program: &Program,
     root_ip: usize,
     entry_stack_depth: usize,
+    local_count: usize,
     max_trace_len: usize,
     non_yielding_host_imports: &[bool],
 ) -> Result<Option<LoopHeaderPlan>, TraceRecordError> {
     let mut cursor = TraceCursor::new(program, root_ip, max_trace_len);
-    let mut frame = AnalysisFrame::new(program, entry_stack_depth);
-    let mut entry_use = vec![EntryUseState::Untouched; program.local_count];
-    let mut local_written = vec![false; program.local_count];
+    let mut frame = AnalysisFrame::new(program, entry_stack_depth, local_count);
+    let mut entry_use = vec![EntryUseState::Untouched; local_count];
+    let mut local_written = vec![false; local_count];
 
     loop {
         let Some(decoded) = cursor.next()? else {

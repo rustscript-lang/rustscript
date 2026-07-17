@@ -4326,7 +4326,7 @@ fn trace_jit_supports_float_comparisons_in_ssa() {
 }
 
 #[test]
-fn trace_jit_skips_nested_loop_with_one_live_operand() {
+fn trace_jit_executes_nested_loop_with_one_live_caller_operand() {
     if !native_jit_supported() {
         return;
     }
@@ -4353,15 +4353,17 @@ fn trace_jit_skips_nested_loop_with_one_live_operand() {
     let status = vm.run().expect("live entry stack program should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(145)]);
+    let snapshot = vm.jit_snapshot();
+    assert!(vm.jit_native_exec_count() > 0, "{}", vm.dump_jit_info());
     assert!(
-        vm.jit_snapshot().traces.is_empty(),
+        snapshot.traces.iter().any(|trace| trace.frame_key == 0),
         "{}",
         vm.dump_jit_info()
     );
 }
 
 #[test]
-fn trace_jit_skips_nested_loop_with_two_live_operands() {
+fn trace_jit_executes_nested_loop_with_two_live_caller_operands() {
     if !native_jit_supported() {
         return;
     }
@@ -4388,15 +4390,17 @@ fn trace_jit_skips_nested_loop_with_two_live_operands() {
     let status = vm.run().expect("depth-two entry stack program should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(48)]);
+    let snapshot = vm.jit_snapshot();
+    assert!(vm.jit_native_exec_count() > 0, "{}", vm.dump_jit_info());
     assert!(
-        vm.jit_snapshot().traces.is_empty(),
+        snapshot.traces.iter().any(|trace| trace.frame_key == 0),
         "{}",
         vm.dump_jit_info()
     );
 }
 
 #[test]
-fn trace_jit_skips_nested_loop_with_heap_live_operand() {
+fn trace_jit_executes_nested_loop_with_heap_caller_operand() {
     if !native_jit_supported() {
         return;
     }
@@ -4430,15 +4434,17 @@ fn trace_jit_skips_nested_loop_with_heap_live_operand() {
             Value::Int(45),
         ])]
     );
+    let snapshot = vm.jit_snapshot();
+    assert!(vm.jit_native_exec_count() > 0, "{}", vm.dump_jit_info());
     assert!(
-        vm.jit_snapshot().traces.is_empty(),
+        snapshot.traces.iter().any(|trace| trace.frame_key == 0),
         "{}",
         vm.dump_jit_info()
     );
 }
 
 #[test]
-fn trace_jit_skips_nested_loop_after_reset() {
+fn trace_jit_reuses_nested_frame_trace_after_reset() {
     if !native_jit_supported() {
         return;
     }
@@ -4465,12 +4471,12 @@ fn trace_jit_skips_nested_loop_after_reset() {
     assert_eq!(vm.run().expect("first run"), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(145)]);
     let first_native_exec_count = vm.jit_native_exec_count();
-    assert_eq!(first_native_exec_count, 0, "{}", vm.dump_jit_info());
+    assert!(first_native_exec_count > 0, "{}", vm.dump_jit_info());
 
     vm.reset_for_reuse();
     assert_eq!(vm.run().expect("second run"), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(145)]);
-    assert_eq!(vm.jit_native_exec_count(), first_native_exec_count);
+    assert!(vm.jit_native_exec_count() > first_native_exec_count);
 }
 
 #[test]
@@ -4793,4 +4799,43 @@ fn trace_jit_specializes_regex_builtins_without_call_boundary() {
     assert_eq!(vm.regex_cache_entry_count(), 2);
     assert_eq!(vm.regex_cache_compile_count(), 2);
     assert!(vm.regex_cache_hit_count() >= 14);
+}
+
+#[test]
+fn trace_jit_executes_hot_loop_inside_script_callable_frame() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn sum_to(limit: int) -> int {
+            let mut i = 0;
+            let mut total = 0;
+            while i < limit {
+                total = total + i;
+                i = i + 1;
+            }
+            total
+        }
+        sum_to(100);
+    "#;
+    let compiled = compile_source(source).expect("nested-frame loop should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(
+        vm.run().expect("nested-frame trace should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(4_950)]);
+    assert!(vm.jit_native_exec_count() > 0);
+    let snapshot = vm.jit_snapshot();
+    assert!(
+        snapshot.traces.iter().any(|trace| trace.frame_key == 0),
+        "expected a prototype-keyed trace: {}",
+        vm.dump_jit_info()
+    );
 }
