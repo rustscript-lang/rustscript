@@ -56,6 +56,27 @@ fn script_call_frames_execute_in_embedded_runtime() {
 }
 
 #[test]
+fn script_call_depth_limit_is_configurable() {
+    let program = compile_embedded(
+        r#"
+            fn recurse(value: int) -> int { recurse(value) }
+            recurse(1);
+        "#,
+    );
+    let mut vm = EmbeddedVm::new(program);
+
+    assert_eq!(vm.max_script_call_depth(), 1024);
+    assert!(matches!(
+        vm.set_max_script_call_depth(0),
+        Err(VmError::InvalidCallStackLimit(0))
+    ));
+    vm.set_max_script_call_depth(3)
+        .expect("positive call depth should be accepted");
+    assert_eq!(vm.max_script_call_depth(), 3);
+    assert_eq!(vm.run(), Err(VmError::CallStackOverflow));
+}
+
+#[test]
 fn static_host_binding_mutates_board_context() {
     let program = compile_embedded(
         r#"

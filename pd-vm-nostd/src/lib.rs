@@ -21,7 +21,7 @@ pub use program::{
     HostImport, OpCode, Program, RootCallableBinding, ScriptFunction, ValueType,
 };
 pub use value::{CallableEnvironment, CallableKind, CallableValue, Value};
-pub use vm::{Vm, VmResult, VmStatus};
+pub use vm::{DEFAULT_MAX_SCRIPT_CALL_DEPTH, Vm, VmResult, VmStatus};
 pub use vmbc::decode_program;
 
 pub(crate) use host::resolve_host_functions;

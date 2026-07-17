@@ -15,6 +15,7 @@ pub enum VmError {
     InvalidCallable,
     InvalidCallablePrototype(u32),
     CallStackOverflow,
+    InvalidCallStackLimit(usize),
     InvalidCallArity {
         import: String,
         expected: u8,
@@ -52,6 +53,12 @@ impl fmt::Display for VmError {
                 write!(f, "invalid callable prototype: {index}")
             }
             Self::CallStackOverflow => f.write_str("script call stack overflow"),
+            Self::InvalidCallStackLimit(limit) => {
+                write!(
+                    f,
+                    "invalid script call stack limit {limit}: expected a positive value"
+                )
+            }
             Self::InvalidCallArity {
                 import,
                 expected,
