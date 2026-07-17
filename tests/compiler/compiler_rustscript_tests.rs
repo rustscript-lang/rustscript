@@ -773,6 +773,51 @@ fn named_function_recursion_uses_runtime_frames_and_hits_depth_limit() {
 }
 
 #[test]
+fn repeated_named_calls_share_one_emitted_body() {
+    let compiled = vm::compile_source_for_repl(
+        r#"
+            fn add_one(value: int) -> int { value + 1 }
+            add_one(1);
+            add_one(2);
+            add_one(3);
+        "#,
+    )
+    .expect("repeated calls should compile");
+
+    assert_eq!(compiled.program.script_functions.len(), 1);
+    assert_eq!(
+        compiled
+            .program
+            .function_regions
+            .iter()
+            .filter(|region| region.prototype_id.is_some())
+            .count(),
+        1
+    );
+    let mut ip = 0usize;
+    let mut callvalue_count = 0usize;
+    while ip < compiled.program.code.len() {
+        let opcode = vm::OpCode::try_from(compiled.program.code[ip])
+            .expect("compiler should emit valid opcodes");
+        if opcode == vm::OpCode::CallValue {
+            callvalue_count += 1;
+        }
+        ip += 1 + opcode.operand_len();
+    }
+    assert_eq!(callvalue_count, 3);
+
+    let mut runtime = vm::Vm::new(compiled.program.with_local_count(compiled.locals));
+    assert_eq!(
+        runtime.run().expect("runtime should halt"),
+        VmStatus::Halted
+    );
+    assert_eq!(
+        runtime.stack(),
+        &[Value::Int(2), Value::Int(3), Value::Int(4)]
+    );
+}
+
+#[test]
 fn mutual_recursion_resolves_forward_function_declarations() {
     let case = rustscript_runtime_case(
         "mutual recursion",
@@ -2179,6 +2224,44 @@ fn rustscript_callable_values_can_be_returned_from_functions() {
 
         flavor: SourceFlavor::RustScript,
         expected_stack: vec![Value::Int(42)],
+        expected_locals: None,
+    };
+    run_runtime_case(&case);
+}
+
+#[test]
+fn escaping_closure_retains_its_environment() {
+    let case = RuntimeCase {
+        name: "escaping closure retains captures after its defining frame returns",
+        source: r#"
+            fn make_adder(delta: int) {
+                |value| value + delta;
+            }
+            let add_one = make_adder(1);
+            add_one(41);
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_stack: vec![Value::Int(42)],
+        expected_locals: None,
+    };
+    run_runtime_case(&case);
+}
+
+#[test]
+fn callable_equality_distinguishes_items_aliases_and_closure_instances() {
+    let case = RuntimeCase {
+        name: "callable equality follows item and environment identity",
+        source: r#"
+            fn add_one(value: int) -> int { value + 1 }
+            let item = add_one;
+            let first = |value| value + 1;
+            let second = |value| value + 1;
+            item == add_one;
+            first == first;
+            first == second;
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_stack: vec![Value::Bool(true), Value::Bool(true), Value::Bool(false)],
         expected_locals: None,
     };
     run_runtime_case(&case);
