@@ -149,7 +149,7 @@ impl HostFunction for YieldThenOne {
 #[test]
 fn jit_handles_yielding_host_calls_without_replaying_extra_returns() {
     let source = r#"
-        fn tick();
+        fn tick() -> int;
         let mut i = 0;
         let mut sum = 0;
         while i < 8 {
@@ -227,7 +227,7 @@ impl HostFunction for PendingOnceThenAddOne {
 #[test]
 fn jit_pending_host_call_waits_and_resumes_without_replay() {
     let source = r#"
-        fn maybe_wait(x);
+        fn maybe_wait(x: int) -> int;
         let mut i = 0;
         let mut sum = 0;
         while i < 5 {

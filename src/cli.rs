@@ -909,6 +909,7 @@ fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
     println!("history: up/down arrows, commands: .help, .quit, .cancel");
     let mut editor = DefaultEditor::new()?;
     let mut session = ReplSession::default();
+    let mut active_store: Option<vm::Store<()>> = None;
     let mut pending_input = String::new();
     loop {
         let prompt = if pending_input.is_empty() {
@@ -977,11 +978,20 @@ fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
                     println!("{}", render_vm_error(&vm, &err));
                     continue;
                 }
+                if let Some(store) = active_store.as_mut() {
+                    store.replace_vm(vm);
+                } else {
+                    active_store = Some(vm::Store::from_vm(vm));
+                }
+                let vm = active_store
+                    .as_mut()
+                    .expect("REPL store must be installed")
+                    .vm_mut();
                 loop {
                     match vm.run() {
                         Ok(VmStatus::Halted) => {
                             sync_repl_session(
-                                &vm,
+                                vm,
                                 &compiled.bindings,
                                 &moved_by_rebinding,
                                 &mut session,
@@ -997,24 +1007,19 @@ fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(VmStatus::Waiting(_op_id)) => {
                             if let Err(err) = vm.wait_for_host_op_blocking() {
                                 sync_repl_session(
-                                    &vm,
+                                    vm,
                                     &compiled.bindings,
                                     &no_repl_moves,
                                     &mut session,
                                 );
-                                println!("{}", render_vm_error(&vm, &err));
+                                println!("{}", render_vm_error(vm, &err));
                                 break;
                             }
                             continue;
                         }
                         Err(err) => {
-                            sync_repl_session(
-                                &vm,
-                                &compiled.bindings,
-                                &no_repl_moves,
-                                &mut session,
-                            );
-                            println!("{}", render_vm_error(&vm, &err));
+                            sync_repl_session(vm, &compiled.bindings, &no_repl_moves, &mut session);
+                            println!("{}", render_vm_error(vm, &err));
                             break;
                         }
                     }
@@ -1138,6 +1143,17 @@ fn repl_locals_moved_by_rebinding(
     moved
 }
 
+fn repl_value_contains_callable(value: &Value) -> bool {
+    match value {
+        Value::Callable(_) => true,
+        Value::Array(values) => values.iter().any(repl_value_contains_callable),
+        Value::Map(values) => values.iter().any(|(key, value)| {
+            repl_value_contains_callable(key) || repl_value_contains_callable(value)
+        }),
+        _ => false,
+    }
+}
+
 fn sync_repl_session(
     vm: &Vm,
     bindings: &[ReplLocalBinding],
@@ -1160,6 +1176,9 @@ fn sync_repl_session(
         let Some(value) = vm.locals().get(index as usize) else {
             continue;
         };
+        if repl_value_contains_callable(value) {
+            continue;
+        }
         let (schema, optional) = repl_local_schema_from_vm(vm, index as usize, value);
         let moved = moved_by_rebinding.contains(&binding.name)
             || (!optional
@@ -1253,6 +1272,11 @@ fn seed_repl_vm_locals(
         return Ok(());
     }
     for (name, local) in locals {
+        if repl_value_contains_callable(&local.value) {
+            return Err(VmError::InvalidFrameState(
+                "repl callable value was invalidated by program replacement",
+            ));
+        }
         let index = {
             let Some(debug) = vm.debug_info() else {
                 return Err(VmError::HostError(
@@ -2086,6 +2110,17 @@ mod tests {
 
         let vm = run_repl_snippet_and_sync(&mut session, "x + 1");
         assert_eq!(vm.stack().last(), Some(&Value::Int(42)));
+    }
+
+    #[test]
+    fn repl_session_invalidates_program_owned_callable_locals() {
+        let mut session = super::ReplSession::default();
+        let _ = run_repl_snippet_and_sync(
+            &mut session,
+            "fn answer() -> int { 42 } let callback = answer; let callbacks = [callback];",
+        );
+        assert!(!session.locals.contains_key("callback"));
+        assert!(!session.locals.contains_key("callbacks"));
     }
 
     #[test]

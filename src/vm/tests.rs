@@ -25,6 +25,36 @@ fn root_ret_completes_explicit_halt_frame() {
 }
 
 #[test]
+fn reset_for_reuse_keeps_host_operation_ids_monotonic() {
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    assert_eq!(vm.allocate_host_op_id(), 1);
+    vm.reset_for_reuse();
+    assert_eq!(vm.allocate_host_op_id(), 2);
+}
+
+#[test]
+fn shared_capture_cell_rejects_callable_ownership_cycle() {
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]).with_local_count(1));
+    let cell = Arc::new(Mutex::new(Value::Null));
+    vm.capture_cells.insert(0, Arc::clone(&cell));
+    let environment = Arc::new(crate::CallableEnvironment {
+        cells: Mutex::new(vec![cell]),
+    });
+    let callable = Value::Callable(Arc::new(crate::CallableValue {
+        prototype_id: 0,
+        kind: crate::CallableKind::Closure,
+        env: Some(environment),
+    }));
+    assert!(matches!(
+        vm.store_local_with_drop_contract(0, callable),
+        Err(VmError::InvalidFrameState(
+            "callable capture ownership cycle is unsupported"
+        ))
+    ));
+    assert_eq!(vm.locals()[0], Value::Null);
+}
+
+#[test]
 fn callable_operand_type_hint_roundtrips() {
     let packed = pack_operand_types(ValueType::Callable, ValueType::Callable);
     assert_eq!(
@@ -402,12 +432,13 @@ fn typed_script_callbacks_invoke_queue_unsubscribe_and_invalidate() {
     );
 
     let alias = callback.clone();
-    let wrong_type: crate::ScriptCallback<(bool,), i64> = store
-        .script_callback(callable)
-        .expect("callable arity should bind");
     assert!(matches!(
-        wrong_type.call(&mut store, (false,)),
-        Err(VmError::TypeMismatch("callable argument schema"))
+        store.script_callback::<(bool,), i64>(callable.clone()),
+        Err(VmError::TypeMismatch("script callback argument schema"))
+    ));
+    assert!(matches!(
+        store.script_callback::<(i64,), bool>(callable.clone()),
+        Err(VmError::TypeMismatch("script callback result schema"))
     ));
 
     callback.unsubscribe();
@@ -418,6 +449,259 @@ fn typed_script_callbacks_invoke_queue_unsubscribe_and_invalidate() {
             "script callback is unsubscribed"
         ))
     ));
+
+    let independently_subscribed: crate::ScriptCallback<(i64,), i64> = store
+        .script_callback(callable)
+        .expect("second callback should bind");
+    let queued_before_unsubscribe = independently_subscribed
+        .prepare((1,))
+        .expect("active callback should prepare");
+    independently_subscribed.unsubscribe();
+    assert!(matches!(
+        store.enqueue_callback(queued_before_unsubscribe),
+        Err(VmError::InvalidFrameState(
+            "script callback is unsubscribed"
+        ))
+    ));
+}
+
+#[test]
+fn callback_unsubscribe_cancels_already_enqueued_work() {
+    let compiled = crate::compile_source_for_repl(
+        r#"
+            fn add_one(value: int) -> int { value + 1 }
+            add_one;
+        "#,
+    )
+    .expect("callback source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
+    let callable = vm.stack().last().cloned().expect("callable result");
+    let mut store = crate::Store::from_vm(vm);
+    let callback: crate::ScriptCallback<(i64,), i64> = store
+        .script_callback(callable)
+        .expect("callback should bind");
+    let queued = callback.prepare((41,)).expect("callback should prepare");
+    store
+        .enqueue_callback(queued)
+        .expect("callback should enqueue");
+    callback.unsubscribe();
+    assert_eq!(
+        store
+            .drain_callbacks()
+            .expect("canceled queue should drain"),
+        Vec::<Value>::new()
+    );
+}
+
+#[test]
+fn store_reset_and_replacement_invalidate_callback_registries() {
+    let compiled = crate::compile_source_for_repl(
+        r#"
+            fn add_one(value: int) -> int { value + 1 }
+            add_one;
+        "#,
+    )
+    .expect("first callback source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    assert_eq!(vm.run().expect("first root should halt"), VmStatus::Halted);
+    let callable = vm.stack().last().cloned().expect("first callable result");
+    let mut store = crate::Store::from_vm(vm);
+    let callback: crate::ScriptCallback<(i64,), i64> = store
+        .script_callback(callable)
+        .expect("first callback should bind");
+    let prepared = callback.prepare((1,)).expect("callback should prepare");
+
+    store.reset_for_reuse();
+    assert!(!callback.is_subscribed());
+    assert!(matches!(
+        store.enqueue_callback(prepared),
+        Err(VmError::InvalidFrameState(
+            "script callback belongs to another store"
+        ))
+    ));
+
+    let replacement = crate::compile_source_for_repl(
+        r#"
+            fn double(value: int) -> int { value * 2 }
+            double;
+        "#,
+    )
+    .expect("replacement callback source should compile");
+    let mut replacement_vm = Vm::new(replacement.program.with_local_count(replacement.locals));
+    assert_eq!(
+        replacement_vm.run().expect("replacement root should halt"),
+        VmStatus::Halted
+    );
+    let replacement_callable = replacement_vm
+        .stack()
+        .last()
+        .cloned()
+        .expect("replacement callable result");
+    store.replace_vm(replacement_vm);
+    let replacement_callback: crate::ScriptCallback<(i64,), i64> = store
+        .script_callback(replacement_callable)
+        .expect("replacement callback should bind");
+    assert_eq!(
+        replacement_callback
+            .call(&mut store, (21,))
+            .expect("replacement callback should run"),
+        42
+    );
+}
+
+#[test]
+fn synchronous_callback_error_unwinds_before_next_invocation() {
+    let compiled = crate::compile_source_for_repl(
+        r#"
+            fn fail() -> int { 1 / 0 }
+            fn answer() -> int { 42 }
+            fail;
+            answer;
+        "#,
+    )
+    .expect("callback error source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
+    let fail_callable = vm.stack()[0].clone();
+    let answer_callable = vm.stack()[1].clone();
+    let mut store = crate::Store::from_vm(vm);
+    let fail: crate::ScriptCallback<(), i64> = store
+        .script_callback(fail_callable)
+        .expect("failing callback should bind");
+    let answer: crate::ScriptCallback<(), i64> = store
+        .script_callback(answer_callable)
+        .expect("answer callback should bind");
+
+    assert!(matches!(
+        fail.call(&mut store, ()),
+        Err(VmError::DivisionByZero)
+    ));
+    assert_eq!(store.vm().call_depth(), 0);
+    assert!(store.vm().execution_frames().is_empty());
+    assert_eq!(
+        answer
+            .call(&mut store, ())
+            .expect("next callback should run without reset"),
+        42
+    );
+}
+
+#[test]
+fn final_script_callback_releases_capture_environment_once() {
+    let compiled = crate::compile_source_for_repl(
+        r#"
+            fn make_callback() {
+                let captured = 42;
+                || captured
+            }
+            make_callback();
+        "#,
+    )
+    .expect("capturing callback source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
+    let callable = vm.stack().last().cloned().expect("capturing callback");
+    let Value::Callable(callable_value) = &callable else {
+        panic!("expected callable value");
+    };
+    let environment = callable_value
+        .env
+        .as_ref()
+        .expect("capturing callback should own an environment");
+    let weak_environment = Arc::downgrade(environment);
+    let mut store = crate::Store::from_vm(vm);
+    let callback: crate::ScriptCallback<(), i64> = store
+        .script_callback(callable.clone())
+        .expect("capturing callback should bind");
+
+    store.vm_mut().shutdown();
+    drop(callable);
+    drop(store);
+    assert!(weak_environment.upgrade().is_some());
+    drop(callback);
+    assert!(weak_environment.upgrade().is_none());
+}
+
+#[test]
+fn store_resolves_only_exported_script_functions_by_name() {
+    let compiled = crate::compile_source_for_repl(
+        r#"
+            pub fn add_one(value: int) -> int { value + 1 }
+            fn private_double(value: int) -> int { value * 2 }
+        "#,
+    )
+    .expect("exported callback source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
+    let mut store = crate::Store::from_vm(vm);
+    let callback: crate::ScriptCallback<(i64,), i64> = store
+        .script_callback_by_name("add_one")
+        .expect("exported callback should resolve");
+    assert_eq!(callback.call(&mut store, (41,)).expect("export call"), 42);
+    assert!(matches!(
+        store.resolve_exported_callable("private_double"),
+        Err(VmError::HostError(_))
+    ));
+}
+
+#[test]
+fn store_rejects_callable_values_from_another_store() {
+    let first =
+        crate::compile_source_for_repl("pub fn value() -> int { 11 }").expect("first store source");
+    let mut first_store =
+        crate::Store::from_vm(Vm::new(first.program.with_local_count(first.locals)));
+    assert_eq!(first_store.run().expect("first root"), VmStatus::Halted);
+    let foreign = first_store
+        .resolve_exported_callable("value")
+        .expect("first export");
+
+    let second = crate::compile_source_for_repl("pub fn value() -> int { 22 }")
+        .expect("second store source");
+    let mut second_store =
+        crate::Store::from_vm(Vm::new(second.program.with_local_count(second.locals)));
+    assert_eq!(second_store.run().expect("second root"), VmStatus::Halted);
+    let injected_slot = u8::try_from(second_store.vm().program().exported_callables[0].local_slot)
+        .expect("test slot fits u8");
+    second_store
+        .vm_mut()
+        .set_local(injected_slot, foreign.clone())
+        .expect("foreign value can be injected into raw VM state");
+    assert!(matches!(
+        second_store.script_callback::<(), i64>(foreign),
+        Err(VmError::InvalidFrameState(
+            "script callable does not belong to this store"
+        ))
+    ));
+}
+
+#[test]
+fn callback_queue_preserves_completed_results_and_remaining_events_after_error() {
+    let compiled = crate::compile_source_for_repl(
+        r#"
+            pub fn first() -> int { 1 }
+            pub fn fail() -> int { 1 / 0 }
+            pub fn third() -> int { 3 }
+        "#,
+    )
+    .expect("queue source");
+    let mut store =
+        crate::Store::from_vm(Vm::new(compiled.program.with_local_count(compiled.locals)));
+    assert_eq!(store.run().expect("queue root"), VmStatus::Halted);
+    let first: crate::ScriptCallback<(), i64> = store.script_callback_by_name("first").unwrap();
+    let fail: crate::ScriptCallback<(), i64> = store.script_callback_by_name("fail").unwrap();
+    let third: crate::ScriptCallback<(), i64> = store.script_callback_by_name("third").unwrap();
+    store.enqueue_callback(first.prepare(()).unwrap()).unwrap();
+    store.enqueue_callback(fail.prepare(()).unwrap()).unwrap();
+    store.enqueue_callback(third.prepare(()).unwrap()).unwrap();
+
+    assert!(matches!(
+        store.drain_callbacks(),
+        Err(VmError::DivisionByZero)
+    ));
+    assert_eq!(store.take_callback_result::<i64>().unwrap(), Some(1));
+    assert_eq!(store.vm().queued_callable_count(), 1);
+    assert_eq!(store.drain_callbacks().unwrap(), vec![Value::Int(3)]);
 }
 
 #[test]

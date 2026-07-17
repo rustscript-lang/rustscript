@@ -2,12 +2,13 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::{
-    CallableKind, CallablePrototype, CallableTarget, CaptureBindingMode, FunctionRegion,
-    HostImport, Program, RootCallableBinding, ScriptFunction, Value, ValueType, WireError,
+    CallableKind, CallablePrototype, CallableTarget, CaptureBindingMode, ExportedCallable,
+    FunctionRegion, HostImport, Program, RootCallableBinding, ScriptFunction, Value, ValueType,
+    WireError,
 };
 
 const MAGIC: [u8; 4] = *b"VMBC";
-const VERSION_V9: u16 = 9;
+const VERSION_V10: u16 = 10;
 const FLAGS: u16 = 0;
 const MAX_SCHEMA_DEPTH: usize = 64;
 
@@ -19,7 +20,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     }
 
     let version = cursor.read_u16()?;
-    if version != VERSION_V9 {
+    if version != VERSION_V10 {
         return Err(WireError::UnsupportedVersion(version));
     }
     let flags = cursor.read_u16()?;
@@ -57,8 +58,13 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
 
     let encoded_local_count = skip_type_map(&mut cursor)?;
     skip_debug_info(&mut cursor)?;
-    let (script_functions, callable_prototypes, function_regions, root_callable_bindings) =
-        read_callable_metadata(&mut cursor)?;
+    let (
+        script_functions,
+        callable_prototypes,
+        function_regions,
+        root_callable_bindings,
+        exported_callables,
+    ) = read_callable_metadata(&mut cursor)?;
     if !cursor.is_empty() {
         return Err(WireError::TrailingBytes);
     }
@@ -73,6 +79,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
         callable_prototypes,
         function_regions,
         root_callable_bindings,
+        exported_callables,
     ))
 }
 
@@ -183,6 +190,7 @@ type CallableMetadata = (
     Vec<CallablePrototype>,
     Vec<FunctionRegion>,
     Vec<RootCallableBinding>,
+    Vec<ExportedCallable>,
 );
 
 fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, WireError> {
@@ -295,7 +303,22 @@ fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, W
             prototype_id: cursor.read_u32()?,
         });
     }
-    Ok((script_functions, prototypes, regions, bindings))
+    let export_count = cursor.read_u32()? as usize;
+    let mut exported_callables = Vec::new();
+    reserve(&mut exported_callables, "exported callables", export_count)?;
+    for _ in 0..export_count {
+        exported_callables.push(ExportedCallable {
+            name: cursor.read_string()?,
+            local_slot: cursor.read_u16()?,
+        });
+    }
+    Ok((
+        script_functions,
+        prototypes,
+        regions,
+        bindings,
+        exported_callables,
+    ))
 }
 
 fn skip_debug_info(cursor: &mut Cursor<'_>) -> Result<(), WireError> {

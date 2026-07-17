@@ -123,6 +123,10 @@ pub(crate) fn execute_builtin_call(
     }
 }
 
+pub(crate) fn cancel_builtin_io_op(vm: &mut Vm, op_id: HostOpId) {
+    io::cancel_pending_op(vm, op_id);
+}
+
 pub(crate) fn poll_builtin_io_op(
     vm: &mut Vm,
     op_id: HostOpId,

@@ -29,9 +29,9 @@ fn encoded_scalar_program() -> Vec<u8> {
 }
 
 #[test]
-fn embedded_decoder_reads_host_generated_v9() {
+fn embedded_decoder_reads_host_generated_v10() {
     let bytes = encoded_scalar_program();
-    let program = decode_program(&bytes).expect("embedded decoder should accept VMBC v9");
+    let program = decode_program(&bytes).expect("embedded decoder should accept VMBC v10");
 
     assert_eq!(
         program.code(),
@@ -62,6 +62,37 @@ fn embedded_decoder_accepts_compiler_type_and_debug_metadata() {
     let program = decode_program(&bytes).expect("embedded decoder should skip std-only metadata");
     assert!(!program.code().is_empty());
     assert_eq!(program.local_count(), compiled.locals);
+}
+
+#[test]
+fn embedded_decoder_preserves_exported_callable_names() {
+    let compiled = compile_source_for_repl("pub fn answer() -> int { 42 }")
+        .expect("exported function should compile");
+    let bytes = encode_program(&compiled.program.with_local_count(compiled.locals))
+        .expect("exported program should encode");
+    let program = decode_program(&bytes).expect("embedded decoder should preserve exports");
+    assert_eq!(program.exported_callables().len(), 1);
+    assert_eq!(program.exported_callables()[0].name, "answer");
+    assert!(
+        program
+            .root_callable_bindings()
+            .iter()
+            .any(|binding| binding.local_slot == program.exported_callables()[0].local_slot)
+    );
+    let mut vm = EmbeddedVm::new(program);
+    assert!(matches!(
+        vm.resolve_exported_callable("answer"),
+        Some(EmbeddedValue::Callable(_))
+    ));
+    assert_eq!(
+        vm.run().expect("embedded root should halt"),
+        EmbeddedVmStatus::Halted
+    );
+    assert!(matches!(
+        vm.resolve_exported_callable("answer"),
+        Some(EmbeddedValue::Callable(_))
+    ));
+    assert_eq!(vm.resolve_exported_callable("missing"), None);
 }
 
 #[test]

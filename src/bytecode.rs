@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::compiler::TypeSchema;
 
-pub const BYTECODE_ABI_VERSION: u16 = 9;
+pub const BYTECODE_ABI_VERSION: u16 = 10;
 
 pub type SharedString = Arc<String>;
 pub type SharedBytes = Arc<Vec<u8>>;
@@ -67,6 +67,12 @@ pub struct FunctionRegion {
 pub struct RootCallableBinding {
     pub local_slot: u16,
     pub prototype_id: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ExportedCallable {
+    pub name: String,
+    pub local_slot: u16,
 }
 
 #[derive(Debug)]
@@ -589,6 +595,7 @@ pub struct Program {
     pub callable_prototypes: Vec<CallablePrototype>,
     pub function_regions: Vec<FunctionRegion>,
     pub root_callable_bindings: Vec<RootCallableBinding>,
+    pub exported_callables: Vec<ExportedCallable>,
     #[allow(dead_code)]
     decoded_instruction_data_cache: Arc<OnceLock<Arc<DecodedInstructionData>>>,
     operand_type_hints_cache: Arc<OnceLock<Option<Arc<[u8]>>>>,
@@ -608,6 +615,7 @@ impl Program {
             callable_prototypes: Vec::new(),
             function_regions: Vec::new(),
             root_callable_bindings: Vec::new(),
+            exported_callables: Vec::new(),
             decoded_instruction_data_cache: Arc::new(OnceLock::new()),
             operand_type_hints_cache: Arc::new(OnceLock::new()),
         }
@@ -630,6 +638,7 @@ impl Program {
             callable_prototypes: Vec::new(),
             function_regions: Vec::new(),
             root_callable_bindings: Vec::new(),
+            exported_callables: Vec::new(),
             decoded_instruction_data_cache: Arc::new(OnceLock::new()),
             operand_type_hints_cache: Arc::new(OnceLock::new()),
         }
@@ -653,6 +662,7 @@ impl Program {
             callable_prototypes: Vec::new(),
             function_regions: Vec::new(),
             root_callable_bindings: Vec::new(),
+            exported_callables: Vec::new(),
             decoded_instruction_data_cache: Arc::new(OnceLock::new()),
             operand_type_hints_cache: Arc::new(OnceLock::new()),
         }
@@ -680,6 +690,11 @@ impl Program {
         self.callable_prototypes = callable_prototypes;
         self.function_regions = function_regions;
         self.root_callable_bindings = root_callable_bindings;
+        self
+    }
+
+    pub fn with_exported_callables(mut self, exported_callables: Vec<ExportedCallable>) -> Self {
+        self.exported_callables = exported_callables;
         self
     }
 

@@ -86,6 +86,12 @@ pub struct RootCallableBinding {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportedCallable {
+    pub name: String,
+    pub local_slot: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostImport {
     pub name: String,
     pub arity: u8,
@@ -102,6 +108,7 @@ pub struct Program {
     callable_prototypes: Vec<CallablePrototype>,
     function_regions: Vec<FunctionRegion>,
     root_callable_bindings: Vec<RootCallableBinding>,
+    exported_callables: Vec<ExportedCallable>,
 }
 
 impl Program {
@@ -116,6 +123,7 @@ impl Program {
             callable_prototypes: Vec::new(),
             function_regions: Vec::new(),
             root_callable_bindings: Vec::new(),
+            exported_callables: Vec::new(),
         }
     }
 
@@ -130,11 +138,29 @@ impl Program {
         callable_prototypes: Vec<CallablePrototype>,
         function_regions: Vec<FunctionRegion>,
         root_callable_bindings: Vec<RootCallableBinding>,
+        exported_callables: Vec<ExportedCallable>,
     ) -> Self {
         self.script_functions = script_functions;
         self.callable_prototypes = callable_prototypes;
         self.function_regions = function_regions;
+        self.local_count = self
+            .local_count
+            .max(
+                root_callable_bindings
+                    .iter()
+                    .map(|binding| binding.local_slot as usize + 1)
+                    .max()
+                    .unwrap_or(0),
+            )
+            .max(
+                exported_callables
+                    .iter()
+                    .map(|exported| exported.local_slot as usize + 1)
+                    .max()
+                    .unwrap_or(0),
+            );
         self.root_callable_bindings = root_callable_bindings;
+        self.exported_callables = exported_callables;
         self
     }
 
@@ -152,6 +178,10 @@ impl Program {
 
     pub fn root_callable_bindings(&self) -> &[RootCallableBinding] {
         &self.root_callable_bindings
+    }
+
+    pub fn exported_callables(&self) -> &[ExportedCallable] {
+        &self.exported_callables
     }
 
     pub fn constants(&self) -> &[Value] {

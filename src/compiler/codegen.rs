@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use crate::assembler::Assembler;
 use crate::builtins::BuiltinFunction;
 use crate::{
-    CallableKind, CallablePrototype, CallableTarget, FunctionRegion, Program, RootCallableBinding,
-    ScriptFunction, TypeMap, Value, ValueType,
+    CallableKind, CallablePrototype, CallableTarget, ExportedCallable, FunctionRegion, Program,
+    RootCallableBinding, ScriptFunction, TypeMap, Value, ValueType,
 };
 
 use super::ir::{
@@ -192,6 +192,21 @@ impl Compiler {
         for prototype in &mut self.callable_prototypes {
             prototype.frame_local_count = self.frame_local_count;
         }
+        let mut exported_callables = self
+            .function_decls
+            .values()
+            .filter(|decl| decl.exported)
+            .filter_map(|decl| {
+                self.function_slots
+                    .get(&decl.index)
+                    .copied()
+                    .map(|local_slot| ExportedCallable {
+                        name: decl.name.clone(),
+                        local_slot,
+                    })
+            })
+            .collect::<Vec<_>>();
+        exported_callables.sort_unstable_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
 
         let mut program = self
             .assembler
@@ -204,6 +219,7 @@ impl Compiler {
         program.callable_prototypes = self.callable_prototypes;
         program.function_regions = self.function_regions;
         program.root_callable_bindings = self.root_callable_bindings;
+        program.exported_callables = exported_callables;
         Ok(program)
     }
 
