@@ -178,7 +178,7 @@ fn host_can_invoke_exported_callable_and_reset_makes_it_stale() {
 
 #[cfg(feature = "cranelift-jit")]
 #[test]
-fn aot_side_exits_at_callable_boundary_with_state_preserved() {
+fn aot_executes_script_callable_frames_without_interpreter_boundary() {
     let compiled = crate::compile_source_for_repl(
         r#"
             fn add_one(value: int) -> int { value + 1 }
@@ -193,8 +193,154 @@ fn aot_side_exits_at_callable_boundary_with_state_preserved() {
         VmStatus::Halted
     );
     assert_eq!(vm.stack(), &[Value::Int(42)]);
-    assert!(vm.aot_exec_count() > 0);
-    assert!(vm.aot_interpreter_boundary_hit);
+    assert!(vm.aot_exec_count() >= 3);
+    assert!(!vm.aot_interpreter_boundary_hit);
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[test]
+fn aot_executes_capturing_closure_without_interpreter_boundary() {
+    let compiled = crate::compile_source_for_repl(
+        r#"
+            let answer = 42;
+            let get_answer = || answer;
+            get_answer();
+        "#,
+    )
+    .expect("closure source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.compile_aot().expect("aot compilation should succeed");
+    assert_eq!(
+        vm.run().expect("aot execution should halt"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+    assert!(vm.aot_exec_count() >= 3);
+    assert!(!vm.aot_interpreter_boundary_hit);
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[test]
+fn aot_executes_builtin_callable_values_without_interpreter_boundary() {
+    let compiled = crate::compile_source_for_repl(
+        r#"
+            let function = len;
+            function("abc");
+        "#,
+    )
+    .expect("builtin callable source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.compile_aot().expect("aot compilation should succeed");
+    assert_eq!(
+        vm.run().expect("aot execution should halt"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(3)]);
+    assert!(!vm.aot_interpreter_boundary_hit);
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[test]
+fn aot_callable_call_resumes_after_fuel_yield_without_interpreter_boundary() {
+    let compiled = crate::compile_source_for_repl(
+        r#"
+            fn add_one(value: int) -> int { value + 1 }
+            add_one(41);
+        "#,
+    )
+    .expect("callable source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.compile_aot().expect("aot compilation should succeed");
+    vm.set_fuel(0);
+    assert_eq!(
+        vm.run().expect("fuel exhaustion should yield"),
+        VmStatus::Yielded
+    );
+    assert_eq!(vm.last_yield_reason(), Some(VmYieldReason::Fuel));
+    vm.set_fuel(100);
+    assert_eq!(
+        vm.resume().expect("aot callable should resume"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+    assert!(!vm.aot_interpreter_boundary_hit);
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[test]
+fn aot_executes_nested_script_callables_without_interpreter_boundary() {
+    let compiled = crate::compile_source_for_repl(
+        r#"
+            fn inc(value: int) -> int { value + 1 }
+            fn twice(value: int) -> int { inc(inc(value)) }
+            twice(40);
+        "#,
+    )
+    .expect("nested callable source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.compile_aot().expect("aot compilation should succeed");
+    assert_eq!(
+        vm.run().expect("nested aot call should halt"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+    assert!(!vm.aot_interpreter_boundary_hit);
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[test]
+fn aot_recursive_script_callable_reports_depth_limit_without_interpreter_boundary() {
+    let compiled = crate::compile_source_for_repl(
+        r#"
+            fn recurse(value: int) -> int { recurse(value) }
+            recurse(1);
+        "#,
+    )
+    .expect("recursive callable source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.compile_aot().expect("aot compilation should succeed");
+    assert!(matches!(
+        vm.run(),
+        Err(VmError::CallStackOverflow { limit: 1024 })
+    ));
+    assert!(!vm.aot_interpreter_boundary_hit);
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[test]
+fn aot_host_callable_value_waits_and_resumes_without_interpreter_boundary() {
+    struct PendingAotHost;
+
+    impl HostFunction for PendingAotHost {
+        fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+            Ok(CallOutcome::Pending(812))
+        }
+    }
+
+    let compiled = crate::compile_source_for_repl(
+        r#"
+            fn action(value: int) -> int;
+            let function = action;
+            function(41);
+        "#,
+    )
+    .expect("host callable source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.register_function(Box::new(PendingAotHost));
+    vm.compile_aot().expect("aot compilation should succeed");
+    assert_eq!(
+        vm.run().expect("pending host callable should wait"),
+        VmStatus::Waiting(812)
+    );
+    assert!(!vm.aot_interpreter_boundary_hit);
+    vm.complete_host_op(812, vec![Value::Int(42)])
+        .expect("host operation should complete");
+    assert_eq!(
+        vm.resume().expect("aot host callable should resume"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+    assert!(!vm.aot_interpreter_boundary_hit);
 }
 
 #[test]

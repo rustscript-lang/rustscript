@@ -2,8 +2,8 @@
 use crate::builtins::BuiltinFunction;
 use crate::bytecode::{Value, ValueType, VmMap};
 use crate::vm::{
-    CallOutcome, CallReturn, FrameContinuation, HostCallExecOutcome, NumericValue, Vm, VmError,
-    VmHostFunction, VmResult, logical_shr_i64,
+    CallOutcome, CallReturn, ExecOutcome, FrameContinuation, HostCallExecOutcome, NumericValue, Vm,
+    VmError, VmHostFunction, VmResult, logical_shr_i64,
 };
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -279,6 +279,18 @@ pub(crate) fn active_stack_base_entry_address() -> usize {
 
 pub(crate) fn frame_state_entry_address() -> usize {
     pd_vm_native_frame_state as *const () as usize
+}
+
+pub(crate) fn enter_call_value_entry_address() -> usize {
+    pd_vm_native_enter_call_value as *const () as usize
+}
+
+pub(crate) fn leave_frame_entry_address() -> usize {
+    pd_vm_native_leave_frame as *const () as usize
+}
+
+pub(crate) fn make_callable_entry_address() -> usize {
+    pd_vm_native_make_callable as *const () as usize
 }
 
 pub(crate) fn active_local_base_entry_address() -> usize {
@@ -779,6 +791,98 @@ pub(crate) extern "C" fn pd_vm_native_frame_state(vm: *mut Vm, out: *mut NativeF
                 frame_depth: vm.call_depth,
                 continuation_kind,
             });
+        }
+        Ok(STATUS_CONTINUE)
+    })
+}
+
+pub(crate) extern "C" fn pd_vm_native_enter_call_value(
+    vm: *mut Vm,
+    argc: i64,
+    call_ip: i64,
+    resume_ip: i64,
+) -> i32 {
+    run_step(vm, "enter_call_value", |vm| {
+        let argc = u8::try_from(argc)
+            .map_err(|_| VmError::InvalidFrameState("native call argc out of range"))?;
+        let call_ip = usize::try_from(call_ip)
+            .map_err(|_| VmError::InvalidFrameState("native call ip out of range"))?;
+        let resume_ip = usize::try_from(resume_ip)
+            .map_err(|_| VmError::InvalidFrameState("native resume ip out of range"))?;
+        if vm.ip != call_ip {
+            vm.jump_to(call_ip)?;
+        }
+        if resume_ip > vm.program.code.len() {
+            return Err(VmError::BytecodeBounds);
+        }
+        vm.ip = resume_ip;
+        match vm.execute_call_value(argc)? {
+            ExecOutcome::Continue => Ok(STATUS_LINKED_CONTINUE),
+            ExecOutcome::Halted => Ok(STATUS_HALTED),
+            ExecOutcome::Yielded => Ok(STATUS_YIELDED),
+            ExecOutcome::Waiting(_) => Ok(STATUS_WAITING),
+        }
+    })
+}
+
+pub(crate) extern "C" fn pd_vm_native_leave_frame(vm: *mut Vm, ret_ip: i64) -> i32 {
+    run_step(vm, "leave_frame", |vm| {
+        let ret_ip = usize::try_from(ret_ip)
+            .map_err(|_| VmError::InvalidFrameState("native ret ip out of range"))?;
+        vm.jump_to(ret_ip)?;
+        match vm.complete_active_frame()? {
+            ExecOutcome::Continue => Ok(STATUS_LINKED_CONTINUE),
+            ExecOutcome::Halted => Ok(STATUS_HALTED),
+            ExecOutcome::Yielded => Ok(STATUS_YIELDED),
+            ExecOutcome::Waiting(_) => Ok(STATUS_WAITING),
+        }
+    })
+}
+
+pub(crate) extern "C" fn pd_vm_native_make_callable(
+    vm: *mut Vm,
+    prototype_id: i64,
+    captures: *const *mut Value,
+    capture_count: i64,
+    out: *mut Value,
+) -> i32 {
+    run_step(vm, "make_callable", |vm| {
+        if out.is_null() {
+            return Err(VmError::InvalidFrameState(
+                "native callable output buffer is null",
+            ));
+        }
+        let prototype_id = u32::try_from(prototype_id)
+            .map_err(|_| VmError::InvalidFrameState("native prototype id out of range"))?;
+        let capture_count = usize::try_from(capture_count)
+            .map_err(|_| VmError::InvalidFrameState("native capture count out of range"))?;
+        if capture_count > 0 && captures.is_null() {
+            return Err(VmError::InvalidFrameState(
+                "native callable capture buffer is null",
+            ));
+        }
+        let stack_base = vm.stack.len();
+        for index in 0..capture_count {
+            let capture = unsafe { captures.add(index).read() };
+            if capture.is_null() {
+                vm.stack.truncate(stack_base);
+                return Err(VmError::InvalidFrameState(
+                    "native callable capture slot is null",
+                ));
+            }
+            vm.stack.push(unsafe { capture.read() });
+            unsafe {
+                capture.write(Value::Null);
+            }
+        }
+        if let Err(err) = vm.make_callable(prototype_id) {
+            vm.stack.truncate(stack_base);
+            return Err(err);
+        }
+        let callable = vm.pop_value()?;
+        vm.stack.truncate(stack_base);
+        unsafe {
+            out.write(callable);
         }
         Ok(STATUS_CONTINUE)
     })
@@ -1488,6 +1592,62 @@ mod tests {
                 Value::Int(50),
             ]
         );
+    }
+
+    #[test]
+    fn native_callable_helpers_create_enter_and_leave_frames() {
+        let compiled = crate::compile_source_for_repl(
+            r#"
+                let delta = 1;
+                let function = |value| value + delta;
+                function(41);
+            "#,
+        )
+        .expect("closure source should compile");
+        let call_ip = compiled
+            .program
+            .code
+            .iter()
+            .position(|byte| *byte == crate::OpCode::CallValue as u8)
+            .expect("callvalue opcode");
+        let resume_ip = call_ip + 2;
+        let prototype = compiled.program.callable_prototypes[0].clone();
+        let function = match prototype.target {
+            crate::CallableTarget::ScriptFunction(function_id) => {
+                compiled.program.script_functions[function_id as usize].clone()
+            }
+            _ => panic!("expected script target"),
+        };
+        let ret_ip = function.end_ip as usize - 1;
+        let mut vm = Vm::new(compiled.program);
+
+        let mut capture = Value::Int(1);
+        let captures = [&mut capture as *mut Value];
+        let mut callable = MaybeUninit::<Value>::uninit();
+        assert_eq!(
+            pd_vm_native_make_callable(&mut vm, 0, captures.as_ptr(), 1, callable.as_mut_ptr(),),
+            STATUS_CONTINUE
+        );
+        assert_eq!(capture, Value::Null);
+        let callable = unsafe { callable.assume_init() };
+        assert!(matches!(callable, Value::Callable(_)));
+
+        vm.stack.extend([callable, Value::Int(41)]);
+        assert_eq!(
+            pd_vm_native_enter_call_value(&mut vm, 1, call_ip as i64, resume_ip as i64,),
+            STATUS_LINKED_CONTINUE
+        );
+        assert_eq!(vm.call_depth, 1);
+        assert_eq!(vm.ip, function.entry_ip as usize);
+
+        vm.stack.push(Value::Int(42));
+        assert_eq!(
+            pd_vm_native_leave_frame(&mut vm, ret_ip as i64),
+            STATUS_LINKED_CONTINUE
+        );
+        assert_eq!(vm.call_depth, 0);
+        assert_eq!(vm.ip, resume_ip);
+        assert_eq!(vm.stack, vec![Value::Int(42)]);
     }
 
     #[test]

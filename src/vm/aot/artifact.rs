@@ -12,8 +12,8 @@ use super::super::jit::JitConfig;
 use super::compile::CompiledProgram;
 
 const MAGIC: [u8; 4] = *b"PAT\0";
-const VERSION: u16 = 4;
-const ABI_VERSION: u16 = 3;
+const VERSION: u16 = 5;
+const ABI_VERSION: u16 = 4;
 const FLAGS: u16 = 0;
 
 #[derive(Debug)]
