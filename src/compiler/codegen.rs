@@ -254,7 +254,11 @@ impl Compiler {
             self.function_prototype_ids
                 .insert(function_index, prototype_id);
             self.callable_prototypes.push(CallablePrototype {
-                kind: CallableKind::FunctionItem,
+                kind: if function_impl.capture_copies.is_empty() {
+                    CallableKind::FunctionItem
+                } else {
+                    CallableKind::Closure
+                },
                 target: CallableTarget::ScriptFunction(script_function_id),
                 arity: function_impl.param_slots.len() as u8,
                 frame_local_count: self.frame_local_count,

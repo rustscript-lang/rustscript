@@ -2248,6 +2248,52 @@ fn escaping_closure_retains_its_environment() {
 }
 
 #[test]
+fn closure_aliases_share_state_and_factory_evaluations_are_independent() {
+    let case = rustscript_runtime_case(
+        "closure aliases share one environment while factory calls allocate distinct environments",
+        r#"
+            fn make_counter() {
+                let mut count = 0;
+                fn next() {
+                    count = count + 1;
+                    count
+                }
+                next
+            }
+            let first = make_counter();
+            let alias = first;
+            let second = make_counter();
+            first();
+            alias();
+            second();
+        "#,
+        vec![Value::Int(1), Value::Int(2), Value::Int(1)],
+    );
+
+    run_runtime_case(&case);
+}
+
+#[test]
+fn capturing_named_functions_use_closure_runtime_kind() {
+    let compiled = vm::compile_source_for_repl(
+        r#"
+            let captured = 42;
+            fn read_captured() { captured }
+            read_captured;
+        "#,
+    )
+    .expect("capturing named function should compile");
+    let prototype = compiled
+        .program
+        .callable_prototypes
+        .iter()
+        .find(|prototype| !prototype.capture_slots.is_empty())
+        .expect("capturing named function should have an environment layout");
+
+    assert_eq!(prototype.kind, vm::CallableKind::Closure);
+}
+
+#[test]
 fn callable_equality_distinguishes_items_aliases_and_closure_instances() {
     let case = RuntimeCase {
         name: "callable equality follows item and environment identity",
