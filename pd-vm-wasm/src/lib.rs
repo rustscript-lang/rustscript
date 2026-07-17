@@ -980,9 +980,13 @@ mod runtime_tests {
         compile_source_with_flavor_and_options,
     };
 
-    fn rss_playground_examples() -> [(&'static str, &'static str); 5] {
+    fn rss_playground_examples() -> [(&'static str, &'static str); 6] {
         [
             ("Demo", include_str!("../examples/rss-complex-example.rss")),
+            (
+                "Callable Values Example",
+                include_str!("../examples/rss-callable-values-example.rss"),
+            ),
             (
                 "IFFT Example",
                 include_str!("../examples/rss-ifft-example.rss"),
