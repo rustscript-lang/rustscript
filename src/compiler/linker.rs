@@ -298,6 +298,7 @@ fn value_type_name(ty: crate::ValueType) -> &'static str {
         crate::ValueType::Bytes => "bytes",
         crate::ValueType::Array => "array",
         crate::ValueType::Map => "map",
+        crate::ValueType::Callable => "callable",
     }
 }
 
@@ -412,7 +413,7 @@ fn remap_expr_indices(
         | Expr::Bool(_)
         | Expr::Bytes(_)
         | Expr::String(_) => {}
-        Expr::FunctionRef(index) => {
+        Expr::FunctionRef(index, _) => {
             if let Some(remapped_index) = function_map.get(index).copied() {
                 *index = remapped_index;
             } else if BuiltinFunction::from_call_index(*index).is_none() {

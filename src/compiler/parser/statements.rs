@@ -453,12 +453,26 @@ impl Parser {
             line: self.current_line(),
             message: "function arity too large".to_string(),
         })?;
-        if self.functions.contains_key(&name) {
+        let predeclared = self.functions.get(&name).cloned().ok_or(ParseError {
+            span: None,
+            code: None,
+            line: self.current_line(),
+            message: format!("function '{name}' was not predeclared"),
+        })?;
+        if self.parsed_function_decls.contains(&predeclared.index) {
             return Err(ParseError {
                 span: None,
                 code: None,
                 line: self.current_line(),
                 message: format!("duplicate function '{name}'"),
+            });
+        }
+        if predeclared.arity != arity || predeclared.type_params.len() != type_params.len() {
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line: self.current_line(),
+                message: format!("function header changed while parsing '{name}'"),
             });
         }
         if self.locals.contains_key(&name) {
@@ -469,13 +483,7 @@ impl Parser {
                 message: format!("name '{name}' already used by a local binding"),
             });
         }
-        let index = self.next_function;
-        self.next_function = self.next_function.checked_add(1).ok_or(ParseError {
-            span: None,
-            code: None,
-            line: self.current_line(),
-            message: "function index overflow".to_string(),
-        })?;
+        let index = predeclared.index;
         let decl = FunctionDecl {
             name: name.clone(),
             arity,
@@ -488,7 +496,19 @@ impl Parser {
             return_type,
         };
         self.functions.insert(name.clone(), decl.clone());
-        self.function_list.push(decl.clone());
+        let current_line = self.current_line();
+        let list_entry = self
+            .function_list
+            .iter_mut()
+            .find(|candidate| candidate.index == index)
+            .ok_or(ParseError {
+                span: None,
+                code: None,
+                line: current_line,
+                message: format!("function list entry missing for '{name}'"),
+            })?;
+        *list_entry = decl.clone();
+        self.parsed_function_decls.insert(index);
 
         self.push_active_type_params(&type_params);
         let has_impl = if self.match_kind(&TokenKind::Equal) {
@@ -886,12 +906,37 @@ impl Parser {
             None
         };
         self.expect(&TokenKind::Equal, "expected '=' after identifier")?;
+        let predeclared_closure_binding = if self.check(&TokenKind::Pipe) {
+            Some(if !self.closure_scopes.is_empty() {
+                if let Some(index) = self
+                    .closure_scopes
+                    .last()
+                    .and_then(|scope| scope.get(&name))
+                    .copied()
+                {
+                    (index, false)
+                } else {
+                    let index = self.allocate_hidden_local()?;
+                    if let Some(scope) = self.closure_scopes.last_mut() {
+                        scope.insert(name.clone(), index);
+                    }
+                    self.named_local_bindings.push((name.clone(), index));
+                    (index, true)
+                }
+            } else {
+                self.get_or_assign_local(&name)?
+            })
+        } else {
+            None
+        };
         let expr = self.parse_expr()?;
         if expect_terminator {
             self.consume_stmt_terminator("expected ';' after let")?;
         }
 
-        let (index, created) = if !self.closure_scopes.is_empty() {
+        let (index, created) = if let Some(predeclared) = predeclared_closure_binding {
+            predeclared
+        } else if !self.closure_scopes.is_empty() {
             if let Some(index) = self
                 .closure_scopes
                 .last()

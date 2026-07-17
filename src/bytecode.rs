@@ -5,10 +5,71 @@ use std::sync::{Arc, OnceLock};
 
 use crate::compiler::TypeSchema;
 
+pub const BYTECODE_ABI_VERSION: u16 = 9;
+
 pub type SharedString = Arc<String>;
 pub type SharedBytes = Arc<Vec<u8>>;
 pub type SharedArray = Arc<Vec<Value>>;
 pub type SharedMap = Arc<VmMap>;
+pub type SharedCallable = Arc<CallableValue>;
+pub type ProgramInstanceId = u64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CallableKind {
+    FunctionItem,
+    Closure,
+    HostFunction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CallableTarget {
+    ScriptFunction(u32),
+    HostImport(u16),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ScriptFunction {
+    pub entry_ip: u32,
+    pub end_ip: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallablePrototype {
+    pub kind: CallableKind,
+    pub target: CallableTarget,
+    pub arity: u8,
+    pub frame_local_count: usize,
+    pub parameter_slots: Vec<u16>,
+    pub capture_slots: Vec<u16>,
+    pub self_slot: Option<u16>,
+    pub schema: Option<TypeSchema>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FunctionRegion {
+    pub start_ip: u32,
+    pub end_ip: u32,
+    pub prototype_id: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RootCallableBinding {
+    pub local_slot: u16,
+    pub prototype_id: u32,
+}
+
+#[derive(Debug)]
+pub struct CallableEnvironment {
+    pub(crate) cells: std::sync::Mutex<Vec<Value>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CallableValue {
+    pub program_instance: ProgramInstanceId,
+    pub prototype_id: u32,
+    pub kind: CallableKind,
+    pub env: Option<Arc<CallableEnvironment>>,
+}
 
 type VmMapStorage = HashMap<MapKey, Value, BuildHasherDefault<StableHasher>>;
 
@@ -233,6 +294,13 @@ fn hash_map_key(value: &Value, state: &mut impl Hasher) {
             6u8.hash(state);
             Arc::as_ptr(entries).hash(state);
         }
+        Value::Callable(callable) => {
+            7u8.hash(state);
+            callable.program_instance.hash(state);
+            callable.prototype_id.hash(state);
+            callable.kind.hash(state);
+            callable.env.as_ref().map(Arc::as_ptr).hash(state);
+        }
     }
 }
 
@@ -248,6 +316,7 @@ fn map_key_eq(lhs: &Value, rhs: &Value) -> bool {
         (Value::Bytes(lhs), Value::Bytes(rhs)) => lhs == rhs,
         (Value::Array(lhs), Value::Array(rhs)) => Arc::ptr_eq(lhs, rhs),
         (Value::Map(lhs), Value::Map(rhs)) => Arc::ptr_eq(lhs, rhs),
+        (Value::Callable(lhs), Value::Callable(rhs)) => callable_value_eq(lhs, rhs),
         _ => false,
     }
 }
@@ -307,6 +376,13 @@ pub(crate) fn hash_value(value: &Value, state: &mut impl Hasher) {
                 entry_hash.hash(state);
             }
         }
+        Value::Callable(callable) => {
+            7u8.hash(state);
+            callable.program_instance.hash(state);
+            callable.prototype_id.hash(state);
+            callable.kind.hash(state);
+            callable.env.as_ref().map(Arc::as_ptr).hash(state);
+        }
     }
 }
 
@@ -328,6 +404,7 @@ pub enum Value {
     Bytes(SharedBytes),
     Array(SharedArray),
     Map(SharedMap),
+    Callable(SharedCallable),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -342,6 +419,7 @@ pub enum ValueType {
     Bytes = 6,
     Array = 7,
     Map = 8,
+    Callable = 9,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -418,8 +496,23 @@ impl PartialEq for Value {
             (Self::Bytes(lhs), Self::Bytes(rhs)) => lhs == rhs,
             (Self::Array(lhs), Self::Array(rhs)) => lhs == rhs,
             (Self::Map(lhs), Self::Map(rhs)) => lhs == rhs,
+            (Self::Callable(lhs), Self::Callable(rhs)) => callable_value_eq(lhs, rhs),
             _ => false,
         }
+    }
+}
+
+fn callable_value_eq(lhs: &CallableValue, rhs: &CallableValue) -> bool {
+    if lhs.program_instance != rhs.program_instance
+        || lhs.prototype_id != rhs.prototype_id
+        || lhs.kind != rhs.kind
+    {
+        return false;
+    }
+    match (&lhs.env, &rhs.env) {
+        (None, None) => true,
+        (Some(lhs), Some(rhs)) => Arc::ptr_eq(lhs, rhs),
+        _ => false,
     }
 }
 
@@ -487,6 +580,10 @@ pub struct Program {
     pub imports: Vec<HostImport>,
     pub debug: Option<crate::debug_info::DebugInfo>,
     pub type_map: Option<TypeMap>,
+    pub script_functions: Vec<ScriptFunction>,
+    pub callable_prototypes: Vec<CallablePrototype>,
+    pub function_regions: Vec<FunctionRegion>,
+    pub root_callable_bindings: Vec<RootCallableBinding>,
     #[allow(dead_code)]
     decoded_instruction_data_cache: Arc<OnceLock<Arc<DecodedInstructionData>>>,
     operand_type_hints_cache: Arc<OnceLock<Option<Arc<[u8]>>>>,
@@ -502,6 +599,10 @@ impl Program {
             imports: Vec::new(),
             debug: None,
             type_map: None,
+            script_functions: Vec::new(),
+            callable_prototypes: Vec::new(),
+            function_regions: Vec::new(),
+            root_callable_bindings: Vec::new(),
             decoded_instruction_data_cache: Arc::new(OnceLock::new()),
             operand_type_hints_cache: Arc::new(OnceLock::new()),
         }
@@ -520,6 +621,10 @@ impl Program {
             imports: Vec::new(),
             debug,
             type_map: None,
+            script_functions: Vec::new(),
+            callable_prototypes: Vec::new(),
+            function_regions: Vec::new(),
+            root_callable_bindings: Vec::new(),
             decoded_instruction_data_cache: Arc::new(OnceLock::new()),
             operand_type_hints_cache: Arc::new(OnceLock::new()),
         }
@@ -539,6 +644,10 @@ impl Program {
             imports,
             debug,
             type_map: None,
+            script_functions: Vec::new(),
+            callable_prototypes: Vec::new(),
+            function_regions: Vec::new(),
+            root_callable_bindings: Vec::new(),
             decoded_instruction_data_cache: Arc::new(OnceLock::new()),
             operand_type_hints_cache: Arc::new(OnceLock::new()),
         }
@@ -552,6 +661,20 @@ impl Program {
     pub fn with_type_map(mut self, type_map: TypeMap) -> Self {
         self.type_map = Some(type_map);
         self.operand_type_hints_cache = Arc::new(OnceLock::new());
+        self
+    }
+
+    pub fn with_callable_metadata(
+        mut self,
+        script_functions: Vec<ScriptFunction>,
+        callable_prototypes: Vec<CallablePrototype>,
+        function_regions: Vec<FunctionRegion>,
+        root_callable_bindings: Vec<RootCallableBinding>,
+    ) -> Self {
+        self.script_functions = script_functions;
+        self.callable_prototypes = callable_prototypes;
+        self.function_regions = function_regions;
+        self.root_callable_bindings = root_callable_bindings;
         self
     }
 
@@ -648,6 +771,8 @@ pub enum OpCode {
     Or = 0x16,
     Not = 0x17,
     Lshr = 0x18,
+    CallValue = 0x19,
+    MakeCallable = 0x1a,
 }
 
 impl TryFrom<u8> for OpCode {
@@ -680,6 +805,8 @@ impl TryFrom<u8> for OpCode {
             x if x == Self::Or as u8 => Ok(Self::Or),
             x if x == Self::Not as u8 => Ok(Self::Not),
             x if x == Self::Lshr as u8 => Ok(Self::Lshr),
+            x if x == Self::CallValue as u8 => Ok(Self::CallValue),
+            x if x == Self::MakeCallable as u8 => Ok(Self::MakeCallable),
             _ => Err(()),
         }
     }
@@ -708,7 +835,8 @@ impl OpCode {
             | Self::Not
             | Self::Lshr => 0,
             Self::Ldc | Self::Br | Self::Brfalse => 4,
-            Self::Ldloc | Self::Stloc => 1,
+            Self::MakeCallable => 4,
+            Self::Ldloc | Self::Stloc | Self::CallValue => 1,
             Self::Call => 3,
         }
     }
@@ -740,6 +868,8 @@ impl OpCode {
             OpCode::Or => "or",
             OpCode::Not => "not",
             OpCode::Lshr => "lshr",
+            Self::CallValue => "callvalue",
+            Self::MakeCallable => "makecallable",
         }
     }
 
@@ -770,6 +900,7 @@ impl OpCode {
             "or" => Some(OpCode::Or),
             "not" => Some(OpCode::Not),
             "lshr" => Some(OpCode::Lshr),
+            "callvalue" => Some(OpCode::CallValue),
             _ => None,
         }
     }

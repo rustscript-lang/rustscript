@@ -437,7 +437,7 @@ impl LivenessRewriter {
             | Expr::Bool(_)
             | Expr::Bytes(_)
             | Expr::String(_)
-            | Expr::FunctionRef(_) => {}
+            | Expr::FunctionRef(..) => {}
             Expr::Var(index) | Expr::MoveVar(index) => self.mark_live(live, *index),
             Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
                 self.mark_live(live, *root)
@@ -736,7 +736,7 @@ impl LivenessRewriter {
             | Expr::Bool(_)
             | Expr::Bytes(_)
             | Expr::String(_)
-            | Expr::FunctionRef(_) => {}
+            | Expr::FunctionRef(..) => {}
             Expr::Var(index) | Expr::MoveVar(index) | Expr::LocalCall(index, _, _) => {
                 self.mark_live(footprint, *index);
             }
@@ -897,7 +897,7 @@ fn expr_contains_local_call(expr: &Expr) -> bool {
         | Expr::Bool(_)
         | Expr::Bytes(_)
         | Expr::String(_)
-        | Expr::FunctionRef(_)
+        | Expr::FunctionRef(..)
         | Expr::Var(_)
         | Expr::MoveVar(_)
         | Expr::MoveField { .. }
@@ -1130,7 +1130,7 @@ impl LocalSlotAllocator {
             | Expr::Bool(_)
             | Expr::Bytes(_)
             | Expr::String(_)
-            | Expr::FunctionRef(_) => {}
+            | Expr::FunctionRef(..) => {}
             Expr::Var(index) | Expr::MoveVar(index) => {
                 self.add_slot_live_edges(*index, &live_during);
             }
@@ -1354,7 +1354,7 @@ impl LocalSlotAllocator {
             | Expr::Bool(_)
             | Expr::Bytes(_)
             | Expr::String(_)
-            | Expr::FunctionRef(_) => {}
+            | Expr::FunctionRef(..) => {}
             Expr::Var(index) | Expr::MoveVar(index) | Expr::LocalCall(index, _, _) => {
                 self.mark_set_slot(set, *index)
             }
@@ -1721,7 +1721,7 @@ fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseE
         | Expr::Bool(_)
         | Expr::Bytes(_)
         | Expr::String(_) => {}
-        Expr::FunctionRef(_) => {}
+        Expr::FunctionRef(..) => {}
         Expr::Call(_, _, args) => {
             for arg in args {
                 remap_expr_slots(arg, mapping)?;

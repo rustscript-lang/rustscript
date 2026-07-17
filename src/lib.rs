@@ -29,7 +29,11 @@ pub use builtins::{
     callable_signatures_for_builtin_namespace_member, default_host_callables, is_builtin_namespace,
     language_builtin_specs, resolve_builtin_namespace_call,
 };
-pub use bytecode::{HostImport, OpCode, Program, TypeMap, Value, ValueType};
+pub use bytecode::{
+    CallableEnvironment, CallableKind, CallablePrototype, CallableTarget, CallableValue,
+    FunctionRegion, HostImport, OpCode, Program, ProgramInstanceId, RootCallableBinding,
+    ScriptFunction, TypeMap, Value, ValueType,
+};
 pub fn builtin_call_index(name: &str) -> Option<u16> {
     use builtins::BuiltinFunction;
 
@@ -86,7 +90,8 @@ pub use vm::diagnostics::render_vm_error;
 pub use vm::{
     AotArtifactError, CallOutcome, CallReturn, EpochCheckpoint, EpochHandle, FuelCheckpoint,
     HostArgsFunction, HostAsyncBridge, HostBindingPlan, HostFunction, HostFunctionRegistry,
-    HostOpId, HostStackFunction, StaticHostArgsFunction, StaticHostFunction,
+    HostOpId, HostStackFunction, IntoScriptValue, QueuedScriptInvocation, ScriptArgs,
+    ScriptCallback, ScriptResult, StaticHostArgsFunction, StaticHostFunction,
     StaticHostStackFunction, Store, Vm, VmError, VmResult, VmStatus, VmYieldReason,
 };
 #[cfg(feature = "runtime")]

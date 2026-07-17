@@ -1144,7 +1144,12 @@ fn lower_ssa_inst(
             b.ins().icmp_imm(IntCC::NotEqual, raw, 0)
         }
         SsaInstKind::Constant(
-            Value::Null | Value::String(_) | Value::Bytes(_) | Value::Array(_) | Value::Map(_),
+            Value::Null
+            | Value::String(_)
+            | Value::Bytes(_)
+            | Value::Array(_)
+            | Value::Map(_)
+            | Value::Callable(_),
         ) => {
             let addr = tagged_constant_addrs
                 .get(&output.id)

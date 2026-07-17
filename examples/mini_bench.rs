@@ -18,6 +18,7 @@ const DEFAULT_RUN_TRIALS: usize = 7;
 const DEFAULT_RSS_VM_COUNT: usize = 256;
 const DEFAULT_HOT_LOOP_INNER: i64 = 40_000;
 const DEFAULT_HOT_LOOP_OUTER: i64 = 8;
+const DEFAULT_CALLBACK_ITERS: usize = 50_000;
 const LOAD_HOST_COUNTS: [usize; 6] = [0, 1, 10, 50, 100, 500];
 
 fn main() {
@@ -34,11 +35,16 @@ fn real_main() -> Result<(), String> {
         println!("{}", sample.to_child_line());
         return Ok(());
     }
+    if config.callback_only {
+        benchmark_retained_callbacks(&config)?;
+        return Ok(());
+    }
 
     print_banner(&config);
     benchmark_compile(&config)?;
     benchmark_load(&config)?;
     benchmark_runtime(&config)?;
+    benchmark_retained_callbacks(&config)?;
     benchmark_rss(&config)?;
     Ok(())
 }
@@ -91,6 +97,8 @@ struct BenchConfig {
     rss_vm_count: usize,
     hot_loop_inner: i64,
     hot_loop_outer: i64,
+    callback_iters: usize,
+    callback_only: bool,
     rss_child_mode: Option<RssMode>,
 }
 
@@ -105,6 +113,8 @@ impl Default for BenchConfig {
             rss_vm_count: DEFAULT_RSS_VM_COUNT,
             hot_loop_inner: DEFAULT_HOT_LOOP_INNER,
             hot_loop_outer: DEFAULT_HOT_LOOP_OUTER,
+            callback_iters: DEFAULT_CALLBACK_ITERS,
+            callback_only: false,
             rss_child_mode: None,
         }
     }
@@ -141,6 +151,10 @@ impl BenchConfig {
                 "--hot-loop-outer" => {
                     config.hot_loop_outer = parse_i64_flag("--hot-loop-outer", args.next())?;
                 }
+                "--callback-iters" => {
+                    config.callback_iters = parse_usize_flag("--callback-iters", args.next())?;
+                }
+                "--callback-only" => config.callback_only = true,
                 "--rss-child" => {
                     let value = args
                         .next()
@@ -164,6 +178,7 @@ impl BenchConfig {
             || config.load_iters == 0
             || config.run_trials == 0
             || config.rss_vm_count == 0
+            || config.callback_iters == 0
         {
             return Err("iteration counts must be >= 1".to_string());
         }
@@ -199,12 +214,14 @@ fn print_help() {
     println!("  --rss-vms <n>");
     println!("  --hot-loop-inner <n>");
     println!("  --hot-loop-outer <n>");
+    println!("  --callback-iters <n>");
+    println!("  --callback-only");
 }
 
 fn print_banner(config: &BenchConfig) {
     println!("pd-vm mini benchmark platform");
     println!(
-        "config: compile_iters={} compile_stress_lines={} load_iters={} load_locals={} run_trials={} rss_vms={} hot_loop_inner={} hot_loop_outer={} native_jit_supported={}",
+        "config: compile_iters={} compile_stress_lines={} load_iters={} load_locals={} run_trials={} rss_vms={} hot_loop_inner={} hot_loop_outer={} callback_iters={} native_jit_supported={}",
         config.compile_iters,
         config.compile_stress_lines,
         config.load_iters,
@@ -213,6 +230,7 @@ fn print_banner(config: &BenchConfig) {
         config.rss_vm_count,
         config.hot_loop_inner,
         config.hot_loop_outer,
+        config.callback_iters,
         native_jit_supported()
     );
     println!();
@@ -318,6 +336,50 @@ fn benchmark_runtime(config: &BenchConfig) -> Result<(), String> {
         &hot_expected,
         config.run_trials,
     )?;
+    println!();
+    Ok(())
+}
+
+fn benchmark_retained_callbacks(config: &BenchConfig) -> Result<(), String> {
+    println!("[callback]");
+    let compiled = compile_source_with_flavor(
+        r#"
+            fn add_one(value: int) -> int { value + 1 }
+            add_one;
+        "#,
+        SourceFlavor::RustScript,
+    )
+    .map_err(|err| format!("callback compile failed: {err}"))?;
+    let mut vm = Vm::new(compiled.program);
+    let status = vm
+        .run()
+        .map_err(|err| format!("callback root run failed: {err}"))?;
+    if status != VmStatus::Halted {
+        return Err(format!("callback root returned {status:?}"));
+    }
+    let callable = vm
+        .stack()
+        .last()
+        .cloned()
+        .ok_or_else(|| "callback root did not return a callable".to_string())?;
+
+    let start = Instant::now();
+    for value in 0..config.callback_iters {
+        let expected = i64::try_from(value).map_err(|_| "callback iteration overflow")? + 1;
+        let result = vm
+            .invoke_callable(callable.clone(), &[Value::Int(expected - 1)])
+            .map_err(|err| format!("callback invocation failed: {err}"))?;
+        if result != Value::Int(expected) {
+            return Err(format!("callback returned {result:?}, expected {expected}"));
+        }
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "  retained         iters={:<10} total_ms={:<10} ns_per_call={:.1}",
+        config.callback_iters,
+        elapsed.as_millis(),
+        elapsed.as_nanos() as f64 / config.callback_iters as f64,
+    );
     println!();
     Ok(())
 }

@@ -315,6 +315,13 @@ fn lower_block(
                 }
                 apply_call_provenance(&mut provenance, argc, index);
             }
+            OpCode::CallValue | OpCode::MakeCallable => {
+                return Err(AotLowerError::InvalidImmediate {
+                    ip,
+                    opcode,
+                    kind: "script callable frame operation requires runtime lowering",
+                });
+            }
             OpCode::Ret | OpCode::Br | OpCode::Brfalse => {
                 return Err(AotLowerError::InvalidImmediate {
                     ip,
@@ -487,6 +494,9 @@ fn is_explicit_terminal_opcode(
             && read_u32(code, ip + 1) == Some(*target_ip as u32)
             && next_ip == *fallthrough_ip),
         AotBlockTerminal::Fallthrough { .. } => Ok(false),
+        AotBlockTerminal::InterpreterExit { exit_ip } => {
+            Ok(matches!(opcode, OpCode::CallValue | OpCode::MakeCallable) && ip == *exit_ip)
+        }
         AotBlockTerminal::Stop => Ok(false),
     }
 }

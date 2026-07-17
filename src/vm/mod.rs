@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub(crate) mod aot;
 pub mod diagnostics;
@@ -23,9 +24,13 @@ pub use self::host::{
     StaticHostStackFunction,
 };
 use self::host::{HostCallExecOutcome, VmHostFunction, WaitingHostOp};
-pub use crate::bytecode::{HostImport, OpCode, Program, Value, ValueType};
+pub use crate::bytecode::{
+    CallableTarget, CallableValue, HostImport, OpCode, Program, ProgramInstanceId, Value, ValueType,
+};
 use crate::bytecode::{StableHasher, hash_value};
-pub use store::Store;
+pub use store::{
+    IntoScriptValue, QueuedScriptInvocation, ScriptArgs, ScriptCallback, ScriptResult, Store,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum NumericValue {
@@ -72,6 +77,24 @@ pub enum VmError {
         expected: u8,
         got: u8,
     },
+    InvalidFrameState(&'static str),
+    InvalidCallable,
+    StaleCallable {
+        expected: ProgramInstanceId,
+        found: ProgramInstanceId,
+    },
+    InvalidCallablePrototype(u32),
+    InvalidBranchTarget {
+        target: usize,
+    },
+    CallableArityMismatch {
+        prototype_id: u32,
+        expected: u8,
+        got: u8,
+    },
+    CallStackOverflow {
+        limit: usize,
+    },
     UnboundImport(String),
     InvalidOpcode(u8),
     BytecodeBounds,
@@ -117,6 +140,34 @@ impl std::fmt::Display for VmError {
                 f,
                 "invalid call arity for import '{import}': expected {expected}, got {got}",
             ),
+            VmError::InvalidFrameState(message) => {
+                write!(f, "invalid execution frame state: {message}")
+            }
+            VmError::InvalidCallable => write!(f, "callvalue operand is not callable"),
+            VmError::StaleCallable { expected, found } => write!(
+                f,
+                "stale callable program instance: expected {expected}, found {found}"
+            ),
+            VmError::InvalidCallablePrototype(id) => {
+                write!(f, "invalid callable prototype {id}")
+            }
+            VmError::InvalidBranchTarget { target } => {
+                write!(
+                    f,
+                    "branch target {target} leaves the active function region"
+                )
+            }
+            VmError::CallableArityMismatch {
+                prototype_id,
+                expected,
+                got,
+            } => write!(
+                f,
+                "invalid call arity for callable {prototype_id}: expected {expected}, got {got}"
+            ),
+            VmError::CallStackOverflow { limit } => {
+                write!(f, "script call stack limit {limit} exceeded")
+            }
             VmError::UnboundImport(name) => write!(f, "unbound host import '{name}'"),
             VmError::InvalidOpcode(opcode) => write!(f, "invalid opcode {opcode}"),
             VmError::BytecodeBounds => write!(f, "bytecode bounds"),
@@ -148,6 +199,13 @@ impl std::fmt::Display for VmError {
 impl std::error::Error for VmError {}
 
 pub type VmResult<T> = Result<T, VmError>;
+
+static NEXT_PROGRAM_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+const MAX_SCRIPT_CALL_DEPTH: usize = 1024;
+
+fn next_program_instance_id() -> ProgramInstanceId {
+    NEXT_PROGRAM_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VmStatus {
@@ -213,6 +271,60 @@ const INT_UNARY_OPERAND_TYPE_HINT: PackedOperandTypes =
 const FLOAT_UNARY_OPERAND_TYPE_HINT: PackedOperandTypes =
     pack_operand_types(ValueType::Float, ValueType::Unknown);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VmFrameContinuation {
+    Halt,
+    ResumeBytecode { return_ip: usize },
+    ReturnToHost,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VmExecutionFrameSnapshot {
+    pub continuation: VmFrameContinuation,
+    pub operand_stack_base: usize,
+    pub local_base: usize,
+    pub local_count: usize,
+    pub prototype_id: Option<u32>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FrameContinuation {
+    Halt,
+    ResumeBytecode { return_ip: usize },
+    ReturnToHost,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct ExecutionFrame {
+    pub(crate) continuation: FrameContinuation,
+    pub(crate) operand_stack_base: usize,
+    pub(crate) local_base: usize,
+    pub(crate) local_count: usize,
+    pub(crate) prototype_id: Option<u32>,
+    pub(crate) active_callable: Option<Arc<CallableValue>>,
+}
+
+impl ExecutionFrame {
+    fn root(local_count: usize) -> Self {
+        Self {
+            continuation: FrameContinuation::Halt,
+            operand_stack_base: 0,
+            local_base: 0,
+            local_count,
+            prototype_id: None,
+            active_callable: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct QueuedCallable {
+    callable: Value,
+    args: Vec<Value>,
+}
+
 pub struct Vm {
     program: Arc<Program>,
     #[allow(dead_code)]
@@ -236,8 +348,15 @@ pub struct Vm {
     resolved_calls: Vec<u16>,
     resolved_calls_dirty: bool,
     call_depth: usize,
+    program_instance: ProgramInstanceId,
+    execution_frames: Vec<ExecutionFrame>,
+    host_return: Option<Value>,
+    queued_callables: VecDeque<QueuedCallable>,
+    draining_queued_callables: bool,
+    shutdown: bool,
     aot_program: Option<aot::CompiledProgram>,
     aot_exec_count: u64,
+    aot_interpreter_boundary_hit: bool,
     jit: jit::TraceJitEngine,
     native_traces: Vec<Option<jit::NativeTrace>>,
     native_trace_exec_count: u64,
@@ -305,6 +424,7 @@ const fn unpack_operand_type(raw: u8) -> ValueType {
         6 => ValueType::Bytes,
         7 => ValueType::Array,
         8 => ValueType::Map,
+        9 => ValueType::Callable,
         _ => ValueType::Unknown,
     }
 }
@@ -338,12 +458,33 @@ pub(crate) fn checked_int_rem(lhs: i64, rhs: i64) -> VmResult<i64> {
 
 fn compute_program_cache_key(program: &Program) -> u64 {
     let mut hasher = StableHasher::default();
+    crate::bytecode::BYTECODE_ABI_VERSION.hash(&mut hasher);
     program.code.hash(&mut hasher);
     program.local_count.hash(&mut hasher);
     for constant in &program.constants {
         hash_value(constant, &mut hasher);
     }
     program.imports.hash(&mut hasher);
+    program.script_functions.hash(&mut hasher);
+    program.function_regions.hash(&mut hasher);
+    program.root_callable_bindings.hash(&mut hasher);
+    program.callable_prototypes.len().hash(&mut hasher);
+    for prototype in &program.callable_prototypes {
+        prototype.kind.hash(&mut hasher);
+        prototype.target.hash(&mut hasher);
+        prototype.arity.hash(&mut hasher);
+        prototype.frame_local_count.hash(&mut hasher);
+        prototype.parameter_slots.hash(&mut hasher);
+        prototype.capture_slots.hash(&mut hasher);
+        prototype.self_slot.hash(&mut hasher);
+        match &prototype.schema {
+            Some(schema) => {
+                1u8.hash(&mut hasher);
+                hash_type_schema(schema, &mut hasher);
+            }
+            None => 0u8.hash(&mut hasher),
+        }
+    }
     hash_type_map(program.type_map.as_ref(), &mut hasher);
     hasher.finish()
 }
@@ -379,6 +520,31 @@ fn hash_local_schemas(schemas: &[Option<crate::compiler::TypeSchema>], state: &m
             }
             None => 0u8.hash(state),
         }
+    }
+}
+
+fn value_matches_type_schema(value: &Value, schema: &crate::compiler::TypeSchema) -> bool {
+    use crate::compiler::TypeSchema;
+
+    match schema {
+        TypeSchema::Unknown | TypeSchema::GenericParam(_) => true,
+        TypeSchema::Null => matches!(value, Value::Null),
+        TypeSchema::Int => matches!(value, Value::Int(_)),
+        TypeSchema::Float => matches!(value, Value::Float(_)),
+        TypeSchema::Number => matches!(value, Value::Int(_) | Value::Float(_)),
+        TypeSchema::Bool => matches!(value, Value::Bool(_)),
+        TypeSchema::String => matches!(value, Value::String(_)),
+        TypeSchema::Bytes => matches!(value, Value::Bytes(_)),
+        TypeSchema::Optional(inner) => {
+            matches!(value, Value::Null) || value_matches_type_schema(value, inner)
+        }
+        TypeSchema::Named(_, _) | TypeSchema::Map(_) | TypeSchema::Object(_) => {
+            matches!(value, Value::Map(_))
+        }
+        TypeSchema::Array(_) | TypeSchema::ArrayTuple(_) | TypeSchema::ArrayTupleRest { .. } => {
+            matches!(value, Value::Array(_))
+        }
+        TypeSchema::Callable { .. } => matches!(value, Value::Callable(_)),
     }
 }
 
@@ -474,7 +640,7 @@ impl Vm {
         let decoded_instruction_data = program.shared_decoded_instruction_data();
         let epoch_handle = EpochHandle::default();
         let epoch_counter_ptr = epoch_handle.as_ptr() as usize;
-        Self {
+        let mut vm = Self {
             program,
             program_constants_ptr: program_constants_ptr as usize,
             program_constants_len,
@@ -493,8 +659,15 @@ impl Vm {
             resolved_calls: Vec::new(),
             resolved_calls_dirty: true,
             call_depth: 0,
+            program_instance: next_program_instance_id(),
+            execution_frames: vec![ExecutionFrame::root(local_count)],
+            host_return: None,
+            queued_callables: VecDeque::new(),
+            draining_queued_callables: false,
+            shutdown: false,
             aot_program: None,
             aot_exec_count: 0,
+            aot_interpreter_boundary_hit: false,
             jit: jit::TraceJitEngine::new(jit_config),
             native_traces: Vec::new(),
             native_trace_exec_count: 0,
@@ -531,6 +704,30 @@ impl Vm {
             generic_builtin_call_count: 0,
             scalar_superinstruction_count: 0,
             local_type_hint_hit_count: 0,
+        };
+        vm.initialize_root_callable_bindings();
+        vm
+    }
+
+    fn initialize_root_callable_bindings(&mut self) {
+        let bindings = self.program.root_callable_bindings.clone();
+        for binding in bindings {
+            let Some(prototype) = self
+                .program
+                .callable_prototypes
+                .get(binding.prototype_id as usize)
+            else {
+                continue;
+            };
+            let Some(slot) = self.locals.get_mut(binding.local_slot as usize) else {
+                continue;
+            };
+            *slot = Value::Callable(Arc::new(CallableValue {
+                program_instance: self.program_instance,
+                prototype_id: binding.prototype_id,
+                kind: prototype.kind,
+                env: None,
+            }));
         }
     }
 
@@ -664,8 +861,19 @@ impl Vm {
         self.clear_epoch_deadline();
         self.clear_stack_with_drop_contract();
         self.clear_locals_with_drop_contract();
+        self.locals.resize(self.program.local_count, Value::Null);
+        self.program_instance = next_program_instance_id();
+        self.initialize_root_callable_bindings();
         crate::builtins::runtime::close_all_handles(self);
         self.call_depth = 0;
+        self.execution_frames.clear();
+        self.execution_frames
+            .push(ExecutionFrame::root(self.program.local_count));
+        self.host_return = None;
+        self.queued_callables.clear();
+        self.draining_queued_callables = false;
+        self.shutdown = false;
+        self.aot_interpreter_boundary_hit = false;
         self.waiting_host_op = None;
         self.next_host_op_id = 1;
         self.io_state = crate::builtins::runtime::IoState::default();
@@ -758,8 +966,42 @@ impl Vm {
     }
 
     #[inline(always)]
+    fn active_local_base(&self) -> usize {
+        self.execution_frames
+            .last()
+            .map(|frame| frame.local_base)
+            .unwrap_or(0)
+    }
+
+    fn script_frame_depth(&self) -> usize {
+        self.execution_frames
+            .iter()
+            .filter(|frame| frame.prototype_id.is_some())
+            .count()
+    }
+
+    #[inline(always)]
+    fn absolute_local_index(&self, index: u8) -> VmResult<usize> {
+        let absolute = self
+            .active_local_base()
+            .checked_add(index as usize)
+            .ok_or(VmError::InvalidLocal(index))?;
+        self.locals
+            .get(absolute)
+            .map(|_| absolute)
+            .ok_or(VmError::InvalidLocal(index))
+    }
+
+    #[inline(always)]
+    fn load_local_value(&self, index: u8) -> VmResult<Value> {
+        let absolute = self.absolute_local_index(index)?;
+        Ok(self.locals[absolute].clone())
+    }
+
+    #[inline(always)]
     pub(super) fn local_numeric_value(&self, index: u8) -> Option<NumericValue> {
-        match self.locals.get(index as usize)? {
+        let absolute = self.absolute_local_index(index).ok()?;
+        match self.locals.get(absolute)? {
             Value::Int(value) => Some(NumericValue::Int(*value)),
             Value::Float(value) => Some(NumericValue::Float(*value)),
             _ => None,
@@ -820,6 +1062,302 @@ impl Vm {
         self.stack.pop().ok_or(VmError::StackUnderflow)
     }
 
+    fn make_callable(&mut self, prototype_id: u32) -> VmResult<()> {
+        let prototype = self
+            .program
+            .callable_prototypes
+            .get(prototype_id as usize)
+            .cloned()
+            .ok_or(VmError::InvalidCallablePrototype(prototype_id))?;
+        let capture_count = prototype.capture_slots.len();
+        if self.stack.len() < capture_count {
+            return Err(VmError::StackUnderflow);
+        }
+        let captures = self.stack.split_off(self.stack.len() - capture_count);
+        let env = if prototype.kind == crate::CallableKind::Closure || !captures.is_empty() {
+            Some(Arc::new(crate::CallableEnvironment {
+                cells: Mutex::new(captures),
+            }))
+        } else {
+            None
+        };
+        self.stack.push(Value::Callable(Arc::new(CallableValue {
+            program_instance: self.program_instance,
+            prototype_id,
+            kind: prototype.kind,
+            env,
+        })));
+        Ok(())
+    }
+
+    fn execute_call_value(&mut self, argc: u8) -> VmResult<ExecOutcome> {
+        let operand_count = argc as usize + 1;
+        if self.stack.len() < operand_count {
+            return Err(VmError::StackUnderflow);
+        }
+        let operand_stack_base = self.stack.len() - operand_count;
+        let mut operands = self.stack.split_off(operand_stack_base);
+        let callee = operands.remove(0);
+        let Value::Callable(callable) = callee else {
+            return Err(VmError::InvalidCallable);
+        };
+        if callable.program_instance != self.program_instance {
+            return Err(VmError::StaleCallable {
+                expected: self.program_instance,
+                found: callable.program_instance,
+            });
+        }
+        let prototype = self
+            .program
+            .callable_prototypes
+            .get(callable.prototype_id as usize)
+            .cloned()
+            .ok_or(VmError::InvalidCallablePrototype(callable.prototype_id))?;
+        if prototype.arity != argc {
+            return Err(VmError::CallableArityMismatch {
+                prototype_id: callable.prototype_id,
+                expected: prototype.arity,
+                got: argc,
+            });
+        }
+        if let Some(crate::compiler::TypeSchema::Callable { params, .. }) = &prototype.schema
+            && (params.len() != operands.len()
+                || !params
+                    .iter()
+                    .zip(&operands)
+                    .all(|(schema, value)| value_matches_type_schema(value, schema)))
+        {
+            return Err(VmError::TypeMismatch("callable argument schema"));
+        }
+
+        match prototype.target {
+            CallableTarget::ScriptFunction(function_id) => {
+                if self.call_depth >= MAX_SCRIPT_CALL_DEPTH {
+                    return Err(VmError::CallStackOverflow {
+                        limit: MAX_SCRIPT_CALL_DEPTH,
+                    });
+                }
+                let function = self
+                    .program
+                    .script_functions
+                    .get(function_id as usize)
+                    .cloned()
+                    .ok_or(VmError::InvalidCallablePrototype(callable.prototype_id))?;
+                if prototype.parameter_slots.len() != operands.len() {
+                    return Err(VmError::CallableArityMismatch {
+                        prototype_id: callable.prototype_id,
+                        expected: prototype.parameter_slots.len() as u8,
+                        got: argc,
+                    });
+                }
+                let inherited_callables = self
+                    .execution_frames
+                    .last()
+                    .map(|frame| {
+                        self.locals[frame.local_base..frame.local_base + frame.local_count]
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, value)| matches!(value, Value::Callable(_)))
+                            .map(|(slot, value)| (slot, value.clone()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let local_base = self.locals.len();
+                let local_count = prototype.frame_local_count;
+                self.locals
+                    .resize(local_base.saturating_add(local_count), Value::Null);
+                for binding in &self.program.root_callable_bindings {
+                    let relative = binding.local_slot as usize;
+                    if relative >= local_count {
+                        return Err(VmError::InvalidFrameState(
+                            "root callable binding is outside the script frame",
+                        ));
+                    }
+                    let bound_prototype = self
+                        .program
+                        .callable_prototypes
+                        .get(binding.prototype_id as usize)
+                        .ok_or(VmError::InvalidCallablePrototype(binding.prototype_id))?;
+                    self.locals[local_base + relative] = Value::Callable(Arc::new(CallableValue {
+                        program_instance: self.program_instance,
+                        prototype_id: binding.prototype_id,
+                        kind: bound_prototype.kind,
+                        env: None,
+                    }));
+                }
+                for (slot, value) in inherited_callables {
+                    if slot < local_count {
+                        self.locals[local_base + slot] = value;
+                    }
+                }
+                for (slot, argument) in prototype.parameter_slots.iter().zip(operands) {
+                    let relative = *slot as usize;
+                    if relative >= local_count {
+                        return Err(VmError::InvalidFrameState(
+                            "parameter slot is outside the script frame",
+                        ));
+                    }
+                    self.locals[local_base + relative] = argument;
+                }
+                if let Some(environment) = &callable.env {
+                    let cells = environment
+                        .cells
+                        .lock()
+                        .map_err(|_| VmError::InvalidFrameState("poisoned callable environment"))?;
+                    if cells.len() != prototype.capture_slots.len() {
+                        return Err(VmError::InvalidFrameState(
+                            "callable environment layout mismatch",
+                        ));
+                    }
+                    for (slot, cell) in prototype.capture_slots.iter().zip(cells.iter()) {
+                        let relative = *slot as usize;
+                        if relative >= local_count {
+                            return Err(VmError::InvalidFrameState(
+                                "capture slot is outside the script frame",
+                            ));
+                        }
+                        self.locals[local_base + relative] = cell.clone();
+                    }
+                }
+                if let Some(slot) = prototype.self_slot {
+                    let relative = slot as usize;
+                    if relative >= local_count {
+                        return Err(VmError::InvalidFrameState(
+                            "self slot is outside the script frame",
+                        ));
+                    }
+                    self.locals[local_base + relative] = Value::Callable(callable.clone());
+                }
+                let return_ip = self.ip;
+                self.execution_frames.push(ExecutionFrame {
+                    continuation: FrameContinuation::ResumeBytecode { return_ip },
+                    operand_stack_base,
+                    local_base,
+                    local_count,
+                    prototype_id: Some(callable.prototype_id),
+                    active_callable: Some(callable),
+                });
+                self.call_depth = self.script_frame_depth();
+                self.ip = function.entry_ip as usize;
+                self.charge_interrupt_tick()?;
+                Ok(ExecOutcome::Continue)
+            }
+            CallableTarget::HostImport(import_index) => {
+                self.stack.extend(operands);
+                let call_ip = self.ip.saturating_sub(2);
+                match self.execute_host_call(import_index, argc, call_ip)? {
+                    HostCallExecOutcome::Returned => Ok(ExecOutcome::Continue),
+                    HostCallExecOutcome::Halted => Ok(ExecOutcome::Halted),
+                    HostCallExecOutcome::Yielded => Ok(ExecOutcome::Yielded),
+                    HostCallExecOutcome::Pending(op_id) => Ok(ExecOutcome::Waiting(op_id)),
+                }
+            }
+        }
+    }
+
+    fn complete_active_frame(&mut self) -> VmResult<ExecOutcome> {
+        let frame = self
+            .execution_frames
+            .pop()
+            .ok_or(VmError::InvalidFrameState("missing active frame"))?;
+        if self.stack.len() < frame.operand_stack_base {
+            return Err(VmError::InvalidFrameState(
+                "operand stack is below the active frame base",
+            ));
+        }
+        if matches!(frame.continuation, FrameContinuation::Halt) {
+            self.call_depth = self.script_frame_depth();
+            return Ok(ExecOutcome::Halted);
+        }
+
+        let result = if self.stack.len() > frame.operand_stack_base {
+            self.stack.pop().expect("stack length checked above")
+        } else {
+            Value::Null
+        };
+        while self.stack.len() > frame.operand_stack_base {
+            let value = self.stack.pop().expect("stack length checked above");
+            self.drop_value_with_contract(value);
+        }
+        self.call_depth = self.script_frame_depth();
+
+        let mut replaced_capture_values = Vec::new();
+        if let (Some(prototype_id), Some(callable)) =
+            (frame.prototype_id, frame.active_callable.as_ref())
+            && let Some(environment) = callable.env.as_ref()
+            && let Some(prototype) = self.program.callable_prototypes.get(prototype_id as usize)
+        {
+            let mut cells = environment
+                .cells
+                .lock()
+                .map_err(|_| VmError::InvalidFrameState("callable environment lock is poisoned"))?;
+            for (cell, slot) in cells.iter_mut().zip(&prototype.capture_slots) {
+                if prototype.self_slot == Some(*slot) {
+                    continue;
+                }
+                let absolute = frame
+                    .local_base
+                    .checked_add(usize::from(*slot))
+                    .ok_or(VmError::InvalidFrameState("capture slot overflow"))?;
+                let value =
+                    self.locals
+                        .get(absolute)
+                        .cloned()
+                        .ok_or(VmError::InvalidFrameState(
+                            "capture slot exceeds active frame locals",
+                        ))?;
+                replaced_capture_values.push(std::mem::replace(cell, value));
+            }
+        }
+        for value in replaced_capture_values {
+            self.drop_value_with_contract(value);
+        }
+
+        if !matches!(frame.continuation, FrameContinuation::Halt) {
+            let frame_end = frame
+                .local_base
+                .checked_add(frame.local_count)
+                .ok_or(VmError::InvalidFrameState("local frame range overflow"))?;
+            if frame_end != self.locals.len() {
+                return Err(VmError::InvalidFrameState(
+                    "active local frame does not end at the local stack tail",
+                ));
+            }
+            let drained = self.locals.drain(frame.local_base..).collect::<Vec<_>>();
+            for value in drained {
+                self.drop_value_with_contract(value);
+            }
+        }
+
+        if let Some(prototype_id) = frame.prototype_id
+            && let Some(crate::compiler::TypeSchema::Callable { result: schema, .. }) = self
+                .program
+                .callable_prototypes
+                .get(prototype_id as usize)
+                .and_then(|prototype| prototype.schema.as_ref())
+            && !value_matches_type_schema(&result, schema)
+        {
+            self.drop_value_with_contract(result);
+            return Err(VmError::TypeMismatch("callable return schema"));
+        }
+
+        match frame.continuation {
+            FrameContinuation::Halt => {
+                self.stack.push(result);
+                Ok(ExecOutcome::Halted)
+            }
+            FrameContinuation::ResumeBytecode { return_ip } => {
+                self.ip = return_ip;
+                self.stack.push(result);
+                Ok(ExecOutcome::Continue)
+            }
+            FrameContinuation::ReturnToHost => {
+                self.host_return = Some(result);
+                Ok(ExecOutcome::Halted)
+            }
+        }
+    }
+
     pub(super) fn can_fuse_call_ret_pattern(&self) -> bool {
         let code = &self.program.code;
         self.ip < code.len() && code[self.ip] == OpCode::Ret as u8
@@ -865,7 +1403,8 @@ impl Vm {
             | Value::Float(_)
             | Value::Bool(_)
             | Value::String(_)
-            | Value::Bytes(_) => {
+            | Value::Bytes(_)
+            | Value::Callable(_) => {
                 self.drop_contract_events = self.drop_contract_events.saturating_add(1);
             }
         }
@@ -1223,9 +1762,10 @@ impl Vm {
         index: u8,
         value: Value,
     ) -> VmResult<()> {
+        let absolute = self.absolute_local_index(index)?;
         let slot = self
             .locals
-            .get_mut(index as usize)
+            .get_mut(absolute)
             .ok_or(VmError::InvalidLocal(index))?;
         let previous = std::mem::replace(slot, value);
         self.drop_value_with_contract(previous);
@@ -1264,6 +1804,23 @@ impl Vm {
     pub(super) fn jump_to(&mut self, target: usize) -> VmResult<()> {
         if target >= self.program.code.len() {
             return Err(VmError::BytecodeBounds);
+        }
+        if !self.program.function_regions.is_empty() {
+            let active_prototype = self
+                .execution_frames
+                .last()
+                .and_then(|frame| frame.prototype_id);
+            let target_prototype = self
+                .program
+                .function_regions
+                .iter()
+                .find(|region| {
+                    region.start_ip as usize <= target && target < region.end_ip as usize
+                })
+                .and_then(|region| region.prototype_id);
+            if active_prototype != target_prototype {
+                return Err(VmError::InvalidBranchTarget { target });
+            }
         }
         self.ip = target;
         Ok(())
@@ -1369,7 +1926,11 @@ impl Vm {
                 active_debugger.on_instruction(self);
             }
 
-            if allow_jit && self.has_aot_program() && !self.drop_contract_events_enabled() {
+            if allow_jit
+                && self.has_aot_program()
+                && !self.aot_interpreter_boundary_hit
+                && !self.drop_contract_events_enabled()
+            {
                 let outcome = match self.execute_aot_entry() {
                     Ok(outcome) => outcome,
                     Err(err) => {
@@ -1395,6 +1956,7 @@ impl Vm {
             }
 
             if allow_jit
+                && self.call_depth == 0
                 && self.jit_config().enabled
                 && self.builtin_overrides.is_empty()
                 && !self.drop_contract_events_enabled()
@@ -1484,9 +2046,10 @@ impl Vm {
         opcode: u8,
         allow_superinstructions: bool,
     ) -> VmResult<ExecOutcome> {
+        let allow_superinstructions = allow_superinstructions && self.call_depth == 0;
         match opcode {
             x if x == OpCode::Nop as u8 => {}
-            x if x == OpCode::Ret as u8 => return Ok(ExecOutcome::Halted),
+            x if x == OpCode::Ret as u8 => return self.complete_active_frame(),
             x if x == OpCode::Ldc as u8 => {
                 let opcode_ip = self.ip - 1;
                 let value = if let Some(value) = self.decoded_ldc_value_at(opcode_ip).cloned() {
@@ -1752,14 +2315,12 @@ impl Vm {
                 } else {
                     self.read_u8()?
                 };
-                if self.try_fuse_scalar_sequence(index, allow_superinstructions)? {
+                if self.call_depth == 0
+                    && self.try_fuse_scalar_sequence(index, allow_superinstructions)?
+                {
                     return Ok(ExecOutcome::Continue);
                 }
-                let value = self
-                    .locals
-                    .get(index as usize)
-                    .cloned()
-                    .ok_or(VmError::InvalidLocal(index))?;
+                let value = self.load_local_value(index)?;
                 self.stack.push(value);
             }
             x if x == OpCode::Stloc as u8 => {
@@ -1785,7 +2346,7 @@ impl Vm {
                                 self.charge_interrupt_tick()?;
                             }
                             self.ip = self.ip.saturating_add(1);
-                            return Ok(ExecOutcome::Halted);
+                            return self.complete_active_frame();
                         }
                     }
                     HostCallExecOutcome::Halted => return Ok(ExecOutcome::Halted),
@@ -1796,13 +2357,27 @@ impl Vm {
                     HostCallExecOutcome::Pending(op_id) => return Ok(ExecOutcome::Waiting(op_id)),
                 }
             }
+            x if x == OpCode::MakeCallable as u8 => {
+                let prototype_id = self.read_u32()?;
+                self.make_callable(prototype_id)?;
+            }
+            x if x == OpCode::CallValue as u8 => {
+                let argc = self.read_u8()?;
+                return self.execute_call_value(argc);
+            }
             other => return Err(VmError::InvalidOpcode(other)),
         }
         Ok(ExecOutcome::Continue)
     }
 
     pub fn resume(&mut self) -> VmResult<VmStatus> {
-        self.run()
+        let allow_jit = !matches!(
+            self.execution_frames
+                .last()
+                .map(|frame| &frame.continuation),
+            Some(FrameContinuation::ReturnToHost)
+        );
+        self.run_internal(None, allow_jit)
     }
 
     pub fn stack(&self) -> &[Value] {
@@ -1839,5 +2414,159 @@ impl Vm {
 
     pub fn call_depth(&self) -> usize {
         self.call_depth
+    }
+
+    pub fn program_instance_id(&self) -> ProgramInstanceId {
+        self.program_instance
+    }
+
+    pub fn queue_callable(&mut self, callable: Value, args: Vec<Value>) -> VmResult<()> {
+        if self.shutdown {
+            return Err(VmError::InvalidFrameState("vm is shut down"));
+        }
+        match &callable {
+            Value::Callable(value) if value.program_instance == self.program_instance => {}
+            Value::Callable(value) => {
+                return Err(VmError::StaleCallable {
+                    expected: self.program_instance,
+                    found: value.program_instance,
+                });
+            }
+            _ => return Err(VmError::InvalidCallable),
+        }
+        self.queued_callables
+            .push_back(QueuedCallable { callable, args });
+        Ok(())
+    }
+
+    pub fn queued_callable_count(&self) -> usize {
+        self.queued_callables.len()
+    }
+
+    pub fn drain_callable_queue(&mut self) -> VmResult<Vec<Value>> {
+        if self.draining_queued_callables {
+            return Err(VmError::InvalidFrameState(
+                "callable queue is already being drained",
+            ));
+        }
+        if !self.execution_frames.is_empty() {
+            return Err(VmError::InvalidFrameState(
+                "queued callables can only run after the root frame halts",
+            ));
+        }
+        self.draining_queued_callables = true;
+        let mut results = Vec::with_capacity(self.queued_callables.len());
+        while let Some(queued) = self.queued_callables.pop_front() {
+            match self.invoke_callable(queued.callable, &queued.args) {
+                Ok(result) => results.push(result),
+                Err(err) => {
+                    self.draining_queued_callables = false;
+                    return Err(err);
+                }
+            }
+        }
+        self.draining_queued_callables = false;
+        Ok(results)
+    }
+
+    pub fn shutdown(&mut self) {
+        self.queued_callables.clear();
+        self.draining_queued_callables = false;
+        self.clear_stack_with_drop_contract();
+        self.clear_locals_with_drop_contract();
+        self.execution_frames.clear();
+        self.call_depth = 0;
+        self.host_return = None;
+        self.waiting_host_op = None;
+        crate::builtins::runtime::close_all_handles(self);
+        self.program_instance = next_program_instance_id();
+        self.shutdown = true;
+    }
+
+    pub fn start_callable(&mut self, callable: Value, args: &[Value]) -> VmResult<VmStatus> {
+        if self.shutdown {
+            return Err(VmError::InvalidFrameState("vm is shut down"));
+        }
+        match &callable {
+            Value::Callable(value) if value.program_instance != self.program_instance => {
+                return Err(VmError::StaleCallable {
+                    expected: self.program_instance,
+                    found: value.program_instance,
+                });
+            }
+            Value::Callable(_) => {}
+            _ => return Err(VmError::InvalidCallable),
+        }
+        if !self.execution_frames.is_empty() {
+            return Err(VmError::InvalidFrameState(
+                "host invocation requires a halted VM",
+            ));
+        }
+        let stack_base = self.stack.len();
+        self.stack.push(callable);
+        self.stack.extend_from_slice(args);
+        self.host_return = None;
+        let frame_count = self.execution_frames.len();
+        let outcome = self.execute_call_value(
+            u8::try_from(args.len())
+                .map_err(|_| VmError::InvalidFrameState("too many arguments"))?,
+        )?;
+        if self.execution_frames.len() == frame_count {
+            let result = match outcome {
+                ExecOutcome::Continue | ExecOutcome::Halted => {
+                    self.stack.pop().unwrap_or(Value::Null)
+                }
+                ExecOutcome::Yielded => {
+                    return Err(VmError::InvalidFrameState(
+                        "direct host callable invocation yielded",
+                    ));
+                }
+                ExecOutcome::Waiting(_) => {
+                    return Err(VmError::InvalidFrameState(
+                        "direct host callable invocation is waiting",
+                    ));
+                }
+            };
+            self.stack.truncate(stack_base);
+            self.host_return = Some(result);
+            return Ok(VmStatus::Halted);
+        }
+        if let Some(frame) = self.execution_frames.last_mut() {
+            frame.continuation = FrameContinuation::ReturnToHost;
+        }
+        self.run_internal(None, false)
+    }
+
+    pub fn invoke_callable(&mut self, callable: Value, args: &[Value]) -> VmResult<Value> {
+        match self.start_callable(callable, args)? {
+            VmStatus::Halted => self.host_return.take().ok_or(VmError::InvalidFrameState(
+                "host invocation completed without a result",
+            )),
+            VmStatus::Yielded => Err(VmError::InvalidFrameState("host invocation yielded")),
+            VmStatus::Waiting(_) => Err(VmError::InvalidFrameState("host invocation is waiting")),
+        }
+    }
+
+    pub fn take_callable_result(&mut self) -> Option<Value> {
+        self.host_return.take()
+    }
+
+    pub fn execution_frames(&self) -> Vec<VmExecutionFrameSnapshot> {
+        self.execution_frames
+            .iter()
+            .map(|frame| VmExecutionFrameSnapshot {
+                continuation: match frame.continuation {
+                    FrameContinuation::Halt => VmFrameContinuation::Halt,
+                    FrameContinuation::ResumeBytecode { return_ip } => {
+                        VmFrameContinuation::ResumeBytecode { return_ip }
+                    }
+                    FrameContinuation::ReturnToHost => VmFrameContinuation::ReturnToHost,
+                },
+                operand_stack_base: frame.operand_stack_base,
+                local_base: frame.local_base,
+                local_count: frame.local_count,
+                prototype_id: frame.prototype_id,
+            })
+            .collect()
     }
 }

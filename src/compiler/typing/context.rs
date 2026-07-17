@@ -768,6 +768,41 @@ impl<'a> TypeContext<'a> {
                 self.infer_expr_schema(inner, state)
             }
             Expr::Var(slot) | Expr::MoveVar(slot) => state.schema(*slot).cloned(),
+            Expr::FunctionRef(index, type_args) => {
+                let decl = self.function_decls.get(index).cloned()?;
+                if decl.type_params.len() != type_args.len() && !type_args.is_empty() {
+                    return None;
+                }
+                if !type_args.is_empty() {
+                    self.push_generic_bindings(&decl.type_params, type_args);
+                }
+                let schema = TypeSchema::Callable {
+                    params: decl
+                        .arg_schemas
+                        .iter()
+                        .map(|schema| {
+                            schema
+                                .as_ref()
+                                .map(|schema| self.resolve_schema(schema))
+                                .unwrap_or(TypeSchema::Unknown)
+                        })
+                        .collect(),
+                    result: Box::new(
+                        decl.return_schema
+                            .as_ref()
+                            .map(|schema| self.resolve_schema(schema))
+                            .unwrap_or(TypeSchema::Unknown),
+                    ),
+                };
+                if !type_args.is_empty() {
+                    self.pop_generic_bindings();
+                }
+                Some(schema)
+            }
+            Expr::Closure(closure) => Some(TypeSchema::Callable {
+                params: vec![TypeSchema::Unknown; closure.param_slots.len()],
+                result: Box::new(TypeSchema::Unknown),
+            }),
             Expr::Call(index, type_args, args) => {
                 if let Some(builtin) = BuiltinFunction::from_call_index(*index) {
                     self.infer_builtin_call_schema(builtin, type_args, args, state)
@@ -887,9 +922,8 @@ impl<'a> TypeContext<'a> {
                     state.get(*root)
                 }
             }
-            Expr::FunctionRef(_) | Expr::Call(..) | Expr::LocalCall(..) | Expr::Closure(_) => {
-                self.infer_call_like_expr_type(expr, state)
-            }
+            Expr::FunctionRef(..) | Expr::Closure(_) => BoundType::Callable,
+            Expr::Call(..) | Expr::LocalCall(..) => self.infer_call_like_expr_type(expr, state),
             Expr::ClosureCall(_, _) => self.infer_call_like_expr_type(expr, state),
             Expr::Add(lhs, rhs)
             | Expr::Sub(lhs, rhs)
@@ -1027,7 +1061,7 @@ impl<'a> TypeContext<'a> {
                     .unwrap_or(BoundType::Unknown),
             },
             Expr::ClosureCall(closure, args) => self.infer_closure_return(closure, args, state),
-            Expr::Closure(_) | Expr::FunctionRef(_) => BoundType::Unknown,
+            Expr::Closure(_) | Expr::FunctionRef(..) => BoundType::Callable,
             _ => BoundType::Unknown,
         }
     }
@@ -2048,7 +2082,7 @@ impl<'a> TypeContext<'a> {
     ) -> Option<InferredCallable> {
         match expr {
             Expr::Closure(closure) => Some(InferredCallable::Closure(closure.clone())),
-            Expr::FunctionRef(index) => Some(InferredCallable::Function(*index)),
+            Expr::FunctionRef(index, _) => Some(InferredCallable::Function(*index)),
             Expr::Var(slot) | Expr::MoveVar(slot) => state.callable(*slot).cloned(),
             _ => None,
         }
@@ -2205,6 +2239,10 @@ fn schema_from_bound_type(ty: BoundType) -> Option<TypeSchema> {
         BoundType::Map | BoundType::MapOf(_) => {
             Some(TypeSchema::Map(Box::new(TypeSchema::Unknown)))
         }
+        BoundType::Callable => Some(TypeSchema::Callable {
+            params: Vec::new(),
+            result: Box::new(TypeSchema::Unknown),
+        }),
     }
 }
 
@@ -2230,7 +2268,7 @@ pub(crate) fn bound_type_from_schema(schema: &TypeSchema) -> BoundType {
         TypeSchema::Bytes => BoundType::Bytes,
         TypeSchema::Optional(inner) => bound_type_from_schema(inner),
         TypeSchema::GenericParam(_) => BoundType::Unknown,
-        TypeSchema::Callable { .. } => BoundType::Unknown,
+        TypeSchema::Callable { .. } => BoundType::Callable,
         TypeSchema::Named(_, _) => BoundType::Map,
         TypeSchema::Array(_) | TypeSchema::ArrayTuple(_) | TypeSchema::ArrayTupleRest { .. } => {
             BoundType::Array

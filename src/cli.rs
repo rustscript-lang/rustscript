@@ -1285,6 +1285,10 @@ fn repl_schema_from_value(value: &Value) -> Option<vm::compiler::TypeSchema> {
         Value::Bytes(_) => Some(TypeSchema::Bytes),
         Value::Array(_) => Some(TypeSchema::Array(Box::new(TypeSchema::Unknown))),
         Value::Map(_) => Some(TypeSchema::Map(Box::new(TypeSchema::Unknown))),
+        Value::Callable(_) => Some(TypeSchema::Callable {
+            params: Vec::new(),
+            result: Box::new(TypeSchema::Unknown),
+        }),
     }
 }
 
@@ -1301,6 +1305,10 @@ fn repl_schema_from_value_type(value_type: vm::ValueType) -> Option<vm::compiler
         vm::ValueType::Bytes => Some(TypeSchema::Bytes),
         vm::ValueType::Array => Some(TypeSchema::Array(Box::new(TypeSchema::Unknown))),
         vm::ValueType::Map => Some(TypeSchema::Map(Box::new(TypeSchema::Unknown))),
+        vm::ValueType::Callable => Some(TypeSchema::Callable {
+            params: Vec::new(),
+            result: Box::new(TypeSchema::Unknown),
+        }),
     }
 }
 
@@ -1477,6 +1485,7 @@ fn format_value(value: &Value) -> String {
                 .join(", ");
             format!("{{{parts}}}")
         }
+        Value::Callable(callable) => format!("<callable#{}>", callable.prototype_id),
     }
 }
 

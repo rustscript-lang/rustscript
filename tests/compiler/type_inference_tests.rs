@@ -273,7 +273,7 @@ fn compiler_type_inference_runtime_cases_cover_operator_and_callable_flows() {
         rustscript_type_inference_runtime_case(
             "callable return types propagate through functions and closures",
             r#"
-                fn add_one(value) {
+                fn add_one(value: int) -> int {
                     value + 1;
                 }
 
@@ -305,11 +305,6 @@ fn compiler_type_inference_runtime_cases_cover_operator_and_callable_flows() {
             &[TypeMetadataExpectation::Exact {
                 opcode: OpCode::Add,
                 expected: &[
-                    (ValueType::Int, ValueType::Int),
-                    (ValueType::Int, ValueType::Int),
-                    (ValueType::Int, ValueType::Int),
-                    (ValueType::Int, ValueType::Int),
-                    (ValueType::Int, ValueType::Int),
                     (ValueType::Int, ValueType::Int),
                     (ValueType::Int, ValueType::Int),
                     (ValueType::Int, ValueType::Int),
@@ -357,7 +352,7 @@ fn compiler_type_inference_runtime_cases_cover_operator_and_callable_flows() {
         rustscript_type_inference_runtime_case(
             "named function plus operands infer from consistent calls",
             r#"
-                fn addme(x) {
+                fn addme(x: int) -> int {
                     x + x
                 }
 

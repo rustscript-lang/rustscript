@@ -515,6 +515,7 @@ pub(crate) extern "C" fn pd_vm_native_type_of(value_ptr: *const Value) -> *mut u
         Value::Bytes(_) => "bytes",
         Value::Array(_) => "array",
         Value::Map(_) => "map",
+        Value::Callable(_) => "callable",
     };
     arc_into_repr_ptr(Arc::new(name.to_string()))
 }

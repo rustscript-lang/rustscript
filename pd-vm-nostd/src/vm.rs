@@ -1,11 +1,13 @@
+use core::cell::RefCell;
+
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use super::{
-    HostBinding, HostDispatcher, HostFunction, OpCode, Program, Value, VmError,
-    resolve_host_functions,
+    CallableEnvironment, CallableTarget, CallableValue, HostBinding, HostDispatcher, HostFunction,
+    OpCode, Program, Value, VmError, resolve_host_functions,
 };
 
 pub type VmResult<T> = Result<T, VmError>;
@@ -21,6 +23,16 @@ enum NumericValue {
     Float(f64),
 }
 
+#[derive(Clone, Debug)]
+struct ExecutionFrame {
+    return_ip: usize,
+    operand_stack_base: usize,
+    local_base: usize,
+    local_count: usize,
+    prototype_id: u32,
+    active_callable: Rc<CallableValue>,
+}
+
 pub struct Vm<C = ()> {
     program: Program,
     ip: usize,
@@ -30,6 +42,8 @@ pub struct Vm<C = ()> {
     host_dispatcher: Option<HostDispatcher<C>>,
     context: C,
     fuel: Option<u64>,
+    program_instance: u64,
+    frames: Vec<ExecutionFrame>,
 }
 
 impl Vm<()> {
@@ -63,7 +77,7 @@ impl<C> Vm<C> {
         host_dispatcher: Option<HostDispatcher<C>>,
     ) -> Self {
         let local_count = program.local_count();
-        Self {
+        let mut vm = Self {
             program,
             ip: 0,
             stack: Vec::new(),
@@ -72,7 +86,229 @@ impl<C> Vm<C> {
             host_dispatcher,
             context,
             fuel: None,
+            program_instance: 1,
+            frames: Vec::new(),
+        };
+        vm.initialize_root_callables();
+        vm
+    }
+
+    fn initialize_root_callables(&mut self) {
+        for binding in self.program.root_callable_bindings() {
+            let Some(prototype) = self
+                .program
+                .callable_prototypes()
+                .get(binding.prototype_id as usize)
+            else {
+                continue;
+            };
+            let slot = binding.local_slot as usize;
+            if let Some(local) = self.locals.get_mut(slot) {
+                *local = Value::Callable(Rc::new(CallableValue {
+                    program_instance: self.program_instance,
+                    prototype_id: binding.prototype_id,
+                    kind: prototype.kind,
+                    env: None,
+                }));
+            }
         }
+    }
+
+    fn active_local_base(&self) -> usize {
+        self.frames.last().map_or(0, |frame| frame.local_base)
+    }
+
+    fn absolute_local(&self, index: u8) -> VmResult<usize> {
+        let absolute = self.active_local_base().saturating_add(index as usize);
+        (absolute < self.locals.len())
+            .then_some(absolute)
+            .ok_or(VmError::InvalidLocal(index))
+    }
+
+    fn make_callable(&mut self, prototype_id: u32) -> VmResult<()> {
+        let prototype = self
+            .program
+            .callable_prototypes()
+            .get(prototype_id as usize)
+            .ok_or(VmError::InvalidCallablePrototype(prototype_id))?;
+        let capture_count = prototype.capture_slots.len();
+        if self.stack.len() < capture_count {
+            return Err(VmError::StackUnderflow);
+        }
+        let captures = self.stack.split_off(self.stack.len() - capture_count);
+        let env: CallableEnvironment = Rc::new(RefCell::new(captures));
+        self.stack.push(Value::Callable(Rc::new(CallableValue {
+            program_instance: self.program_instance,
+            prototype_id,
+            kind: prototype.kind,
+            env: Some(env),
+        })));
+        Ok(())
+    }
+
+    fn call_value(&mut self, argc: u8) -> VmResult<()> {
+        if self.frames.len() >= 1024 {
+            return Err(VmError::CallStackOverflow);
+        }
+        let operand_count = argc as usize + 1;
+        if self.stack.len() < operand_count {
+            return Err(VmError::StackUnderflow);
+        }
+        let stack_base = self.stack.len() - operand_count;
+        let mut operands = self.stack.split_off(stack_base);
+        let callable = match operands.remove(0) {
+            Value::Callable(callable) => callable,
+            _ => return Err(VmError::InvalidCallable),
+        };
+        if callable.program_instance != self.program_instance {
+            return Err(VmError::StaleCallable);
+        }
+        let prototype = self
+            .program
+            .callable_prototypes()
+            .get(callable.prototype_id as usize)
+            .cloned()
+            .ok_or(VmError::InvalidCallablePrototype(callable.prototype_id))?;
+        if prototype.arity != argc || prototype.parameter_slots.len() != operands.len() {
+            return Err(VmError::InvalidCallArity {
+                import: String::from("script callable"),
+                expected: prototype.arity,
+                got: argc,
+            });
+        }
+        match prototype.target {
+            CallableTarget::HostImport(index) => {
+                self.stack.extend(operands);
+                self.call_host(index, argc)
+            }
+            CallableTarget::ScriptFunction(function_id) => {
+                let function = self
+                    .program
+                    .script_functions()
+                    .get(function_id as usize)
+                    .cloned()
+                    .ok_or(VmError::InvalidCallablePrototype(callable.prototype_id))?;
+                let inherited = {
+                    let base = self.active_local_base();
+                    let count = self
+                        .frames
+                        .last()
+                        .map_or(self.locals.len(), |frame| frame.local_count);
+                    self.locals[base..base.saturating_add(count)]
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(slot, value)| match value {
+                            Value::Callable(_) => Some((slot, value.clone())),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let local_base = self.locals.len();
+                self.locals.resize(
+                    local_base.saturating_add(prototype.frame_local_count),
+                    Value::Null,
+                );
+                for binding in self.program.root_callable_bindings() {
+                    if let Some(binding_prototype) = self
+                        .program
+                        .callable_prototypes()
+                        .get(binding.prototype_id as usize)
+                    {
+                        let slot = binding.local_slot as usize;
+                        if slot < prototype.frame_local_count {
+                            self.locals[local_base + slot] =
+                                Value::Callable(Rc::new(CallableValue {
+                                    program_instance: self.program_instance,
+                                    prototype_id: binding.prototype_id,
+                                    kind: binding_prototype.kind,
+                                    env: None,
+                                }));
+                        }
+                    }
+                }
+                for (slot, value) in inherited {
+                    if slot < prototype.frame_local_count {
+                        self.locals[local_base + slot] = value;
+                    }
+                }
+                for (slot, argument) in prototype.parameter_slots.iter().zip(operands) {
+                    let slot = *slot as usize;
+                    if slot >= prototype.frame_local_count {
+                        return Err(VmError::InvalidCallablePrototype(callable.prototype_id));
+                    }
+                    self.locals[local_base + slot] = argument;
+                }
+                if let Some(env) = &callable.env {
+                    for (slot, value) in prototype
+                        .capture_slots
+                        .iter()
+                        .zip(env.borrow().iter().cloned())
+                    {
+                        let slot = *slot as usize;
+                        if slot >= prototype.frame_local_count {
+                            return Err(VmError::InvalidCallablePrototype(callable.prototype_id));
+                        }
+                        self.locals[local_base + slot] = value;
+                    }
+                }
+                if let Some(slot) = prototype.self_slot {
+                    let slot = slot as usize;
+                    if slot >= prototype.frame_local_count {
+                        return Err(VmError::InvalidCallablePrototype(callable.prototype_id));
+                    }
+                    self.locals[local_base + slot] = Value::Callable(callable.clone());
+                }
+                self.frames.push(ExecutionFrame {
+                    return_ip: self.ip,
+                    operand_stack_base: stack_base,
+                    local_base,
+                    local_count: prototype.frame_local_count,
+                    prototype_id: callable.prototype_id,
+                    active_callable: callable,
+                });
+                self.ip = function.entry_ip as usize;
+                Ok(())
+            }
+        }
+    }
+
+    fn return_from_frame(&mut self) -> VmResult<bool> {
+        let Some(frame) = self.frames.pop() else {
+            return Ok(false);
+        };
+        if self.stack.len() < frame.operand_stack_base {
+            return Err(VmError::StackUnderflow);
+        }
+        let result = if self.stack.len() > frame.operand_stack_base {
+            self.stack.pop().unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
+        self.stack.truncate(frame.operand_stack_base);
+        if let Some(environment) = frame.active_callable.env.as_ref()
+            && let Some(prototype) = self
+                .program
+                .callable_prototypes()
+                .get(frame.prototype_id as usize)
+        {
+            let mut cells = environment.borrow_mut();
+            for (cell, slot) in cells.iter_mut().zip(&prototype.capture_slots) {
+                if prototype.self_slot == Some(*slot) {
+                    continue;
+                }
+                let absolute = frame.local_base.saturating_add(*slot as usize);
+                let value = self
+                    .locals
+                    .get(absolute)
+                    .cloned()
+                    .ok_or(VmError::InvalidCallablePrototype(frame.prototype_id))?;
+                *cell = value;
+            }
+        }
+        self.locals.truncate(frame.local_base);
+        self.ip = frame.return_ip;
+        self.stack.push(result);
+        Ok(true)
     }
 
     pub fn run(&mut self) -> VmResult<VmStatus> {
@@ -82,7 +318,11 @@ impl<C> Vm<C> {
             let opcode = OpCode::try_from(raw).map_err(|()| VmError::InvalidOpcode(raw))?;
             match opcode {
                 OpCode::Nop => {}
-                OpCode::Ret => return Ok(VmStatus::Halted),
+                OpCode::Ret => {
+                    if !self.return_from_frame()? {
+                        return Ok(VmStatus::Halted);
+                    }
+                }
                 OpCode::Ldc => {
                     let index = self.read_u32()?;
                     let value = self
@@ -128,22 +368,28 @@ impl<C> Vm<C> {
                 }
                 OpCode::Ldloc => {
                     let index = self.read_u8()?;
-                    let value = self
-                        .locals
-                        .get(usize::from(index))
-                        .cloned()
-                        .ok_or(VmError::InvalidLocal(index))?;
-                    self.stack.push(value);
+                    let absolute = self.absolute_local(index)?;
+                    self.stack.push(self.locals[absolute].clone());
                 }
                 OpCode::Stloc => {
                     let index = self.read_u8()?;
+                    let absolute = self.absolute_local(index)?;
                     let value = self.pop()?;
-                    self.store_local(index, value)?;
+                    self.locals[absolute] = value;
                 }
+
                 OpCode::Call => {
                     let index = self.read_u16()?;
                     let arity = self.read_u8()?;
                     self.call_host(index, arity)?;
+                }
+                OpCode::CallValue => {
+                    let arity = self.read_u8()?;
+                    self.call_value(arity)?;
+                }
+                OpCode::MakeCallable => {
+                    let prototype_id = self.read_u32()?;
+                    self.make_callable(prototype_id)?;
                 }
                 OpCode::Shl => {
                     let rhs = self.pop_shift()?;
@@ -480,11 +726,8 @@ impl<C> Vm<C> {
     }
 
     fn store_local(&mut self, index: u8, value: Value) -> VmResult<()> {
-        let slot = self
-            .locals
-            .get_mut(usize::from(index))
-            .ok_or(VmError::InvalidLocal(index))?;
-        *slot = value;
+        let absolute = self.absolute_local(index)?;
+        self.locals[absolute] = value;
         Ok(())
     }
 
@@ -492,6 +735,21 @@ impl<C> Vm<C> {
         let target_index = target as usize;
         if target_index >= self.program.code().len() {
             return Err(VmError::InvalidJump(target));
+        }
+        if !self.program.function_regions().is_empty() {
+            let expected_prototype = self.frames.last().map(|frame| frame.prototype_id);
+            let target_prototype = self
+                .program
+                .function_regions()
+                .iter()
+                .find(|region| {
+                    region.start_ip as usize <= target_index
+                        && target_index < region.end_ip as usize
+                })
+                .and_then(|region| region.prototype_id);
+            if target_prototype != expected_prototype {
+                return Err(VmError::InvalidJump(target));
+            }
         }
         self.ip = target_index;
         Ok(())

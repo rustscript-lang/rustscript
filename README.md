@@ -341,10 +341,10 @@ Browser playground wasm runtime is provided by sibling crate `pd-vm-wasm` built 
 
 ### `no_std` Embedded Runtime
 
-The sibling crate [`pd-vm-nostd`](pd-vm-nostd) provides the VMBC v8 decoder and compact interpreter
-using only `core` and `alloc`. It supports direct bytecode execution, synchronous host callbacks,
-and instruction fuel while leaving source compilation, CLI, debugger, JIT/AOT, async host
-operations, and operating-system integrations in `pd-vm`.
+The sibling crate [`pd-vm-nostd`](pd-vm-nostd) provides the VMBC v9 decoder and compact interpreter
+using only `core` and `alloc`. It supports direct bytecode execution, script call frames and callable
+values, synchronous host callbacks, and instruction fuel while leaving source compilation, CLI,
+debugger, JIT/AOT, async host operations, and operating-system integrations in `pd-vm`.
 
 RP2040 compile check:
 
@@ -654,38 +654,39 @@ Directives:
 - `.local NAME [INDEX]` defines a named local
 
 
-#### Builtins and Bridged `call` Opcode
+#### Host Calls and Callable Values
 
-The compiler uses one call shape (`Expr::Call` -> `OpCode::Call`) and distinguishes targets by call
-index.
+The compiler keeps direct host dispatch separate from script callable dispatch.
 
 1. Builtin calls (fixed reserved indices)
-   - Builtins use `BuiltinFunction::call_index()`
-   - parser lowering emits these for helpers such as `len`, `get`, `set`, `slice`, `count`,
-     `type_of`, `assert`, and `io::*`/`re::*`/`json::*`/`jit::*`
+   - Builtins use `BuiltinFunction::call_index()`.
+   - Parser lowering emits these for helpers such as `len`, `get`, `set`, `slice`, `count`,
+     `type_of`, `assert`, and `io::*`/`re::*`/`json::*`/`jit::*`.
 2. Runtime host imports (per-program remapped indices)
-   - non-inlined runtime imports are remapped to dense import slots (`call_index_remap`)
-   - emitted as `call <slot>, <argc>`
-   - exposed as `Program.imports` and bound via `HostFunctionRegistry`
-   - `runtime::sleep(ms)` is available as a default host import; native runtimes block for the requested duration and wasm runtimes return `true` immediately
-3. Inlined RustScript function bodies
-   - calls to targets with `FunctionImpl` are inlined (no emitted `call`)
+   - Runtime imports are remapped to dense import slots (`call_index_remap`).
+   - Direct calls are emitted as `call <slot>, <argc>`.
+   - Host functions used as values are Program-owned callable prototypes and execute through
+     `callvalue <argc>`.
+3. RustScript function items and closures
+   - Every script body is emitted once in a function region.
+   - Named functions and closure evaluations produce callable values; script invocation uses
+     `callvalue <argc>` and a real execution frame.
+   - `ret` completes the active typed continuation: root halt, caller resume, or host return.
 
-At runtime, `call` is bridged through `Vm::execute_host_call`:
-
-- builtin call indices dispatch to `vm/builtin_runtime.rs`
-- non-builtin indices dispatch to bound host imports
-- trace-JIT records supported hot paths into SSA and falls back to the interpreter for call-heavy
-  or otherwise unsupported traces, preserving interpreter semantics
+At runtime, direct `call` uses `Vm::execute_host_call`, while `callvalue` validates the callable's
+Program instance, prototype, schema, arity, and frame layout before dispatch. VMBC v9 carries the
+script-function, prototype, function-region, and root-binding tables. See
+[`docs/callable-runtime.md`](docs/callable-runtime.md) for the bytecode, lifecycle, callback, and
+optimized-backend contracts.
 
 #### Current Compiler Subset Limitations
 
 Core compiler/IR:
 
-- callable locals can be passed and called, but callables are not runtime `Value`s
-- callable values cannot currently be stored in arrays/maps or returned from functions
+- callable locals can be passed, returned, called, and stored as array or map values
+- callable values cannot be used as map keys or serialized as constants
 - callable return-type inference propagates through direct named calls, callable locals, closures,
-  and callable parameters when the compiler can still identify the callee
+  and callable parameters when the compiler can identify a compatible signature
 - known `if`/`else` expression results and branch-local merges with incompatible concrete types are
   compile errors
 - RustScript uses explicit nullable schemas such as `int?` and `Profile?`; non-optional declared
@@ -695,8 +696,8 @@ Core compiler/IR:
   that binds `Some(name)`
 - after optional handling, the compiler and wasm lint keep the concrete inner type instead of
   degrading back to `unknown`
-- recursive RustScript function declarations are not supported by current inlining-based lowering
-- function declarations can be nested and implicitly capture outer locals (closure-like snapshot at declaration time)
+- direct and mutual recursion are supported with a 1,024-frame script recursion limit
+- function declarations can be nested and implicitly capture outer locals at declaration time
 - in RustScript move-semantics mode, implicit captures follow expression semantics (`x` may move, `x.copy()` copies, `&x`/`&mut x` capture borrowed views)
 - `match` patterns are limited to int/string/null literals, `None`, `Some(name)`, `_`, and type constructors (`Some(TypeName)`)
 - `break` and `continue` are only valid inside loops

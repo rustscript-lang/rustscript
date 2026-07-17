@@ -171,7 +171,7 @@ pub(super) fn expr_uses_slot(expr: &Expr, slot: LocalSlot) -> bool {
         | Expr::Bool(_)
         | Expr::Bytes(_)
         | Expr::String(_)
-        | Expr::FunctionRef(_) => false,
+        | Expr::FunctionRef(..) => false,
         Expr::Var(index) | Expr::MoveVar(index) => *index == slot,
         Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => *root == slot,
         Expr::OptionalGet {
@@ -375,7 +375,7 @@ pub(super) fn collect_consumed_positions_from_expr(
         | Expr::Bool(_)
         | Expr::Bytes(_)
         | Expr::String(_)
-        | Expr::FunctionRef(_)
+        | Expr::FunctionRef(..)
         | Expr::Var(_) => {}
         Expr::MoveVar(slot) => {
             if let Some(position) = function_impl

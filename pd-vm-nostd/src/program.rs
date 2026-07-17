@@ -15,6 +15,7 @@ pub enum ValueType {
     Bytes = 6,
     Array = 7,
     Map = 8,
+    Callable = 9,
 }
 
 impl TryFrom<u8> for ValueType {
@@ -31,9 +32,46 @@ impl TryFrom<u8> for ValueType {
             6 => Ok(Self::Bytes),
             7 => Ok(Self::Array),
             8 => Ok(Self::Map),
+            9 => Ok(Self::Callable),
             _ => Err(()),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallableTarget {
+    ScriptFunction(u32),
+    HostImport(u16),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptFunction {
+    pub entry_ip: u32,
+    pub end_ip: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallablePrototype {
+    pub kind: super::CallableKind,
+    pub target: CallableTarget,
+    pub arity: u8,
+    pub frame_local_count: usize,
+    pub parameter_slots: Vec<u16>,
+    pub capture_slots: Vec<u16>,
+    pub self_slot: Option<u16>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunctionRegion {
+    pub start_ip: u32,
+    pub end_ip: u32,
+    pub prototype_id: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RootCallableBinding {
+    pub local_slot: u16,
+    pub prototype_id: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,6 +87,10 @@ pub struct Program {
     code: Vec<u8>,
     local_count: usize,
     imports: Vec<HostImport>,
+    script_functions: Vec<ScriptFunction>,
+    callable_prototypes: Vec<CallablePrototype>,
+    function_regions: Vec<FunctionRegion>,
+    root_callable_bindings: Vec<RootCallableBinding>,
 }
 
 impl Program {
@@ -59,12 +101,46 @@ impl Program {
             code,
             local_count,
             imports,
+            script_functions: Vec::new(),
+            callable_prototypes: Vec::new(),
+            function_regions: Vec::new(),
+            root_callable_bindings: Vec::new(),
         }
     }
 
     pub(crate) fn with_local_count(mut self, local_count: usize) -> Self {
-        self.local_count = local_count;
+        self.local_count = self.local_count.max(local_count);
         self
+    }
+
+    pub(crate) fn with_callable_metadata(
+        mut self,
+        script_functions: Vec<ScriptFunction>,
+        callable_prototypes: Vec<CallablePrototype>,
+        function_regions: Vec<FunctionRegion>,
+        root_callable_bindings: Vec<RootCallableBinding>,
+    ) -> Self {
+        self.script_functions = script_functions;
+        self.callable_prototypes = callable_prototypes;
+        self.function_regions = function_regions;
+        self.root_callable_bindings = root_callable_bindings;
+        self
+    }
+
+    pub fn script_functions(&self) -> &[ScriptFunction] {
+        &self.script_functions
+    }
+
+    pub fn callable_prototypes(&self) -> &[CallablePrototype] {
+        &self.callable_prototypes
+    }
+
+    pub fn function_regions(&self) -> &[FunctionRegion] {
+        &self.function_regions
+    }
+
+    pub fn root_callable_bindings(&self) -> &[RootCallableBinding] {
+        &self.root_callable_bindings
     }
 
     pub fn constants(&self) -> &[Value] {
@@ -112,13 +188,15 @@ pub enum OpCode {
     Or = 0x16,
     Not = 0x17,
     Lshr = 0x18,
+    CallValue = 0x19,
+    MakeCallable = 0x1a,
 }
 
 impl OpCode {
     pub const fn operand_len(self) -> usize {
         match self {
-            Self::Ldc | Self::Br | Self::Brfalse => 4,
-            Self::Ldloc | Self::Stloc => 1,
+            Self::Ldc | Self::Br | Self::Brfalse | Self::MakeCallable => 4,
+            Self::Ldloc | Self::Stloc | Self::CallValue => 1,
             Self::Call => 3,
             _ => 0,
         }
@@ -155,6 +233,8 @@ impl TryFrom<u8> for OpCode {
             0x16 => Ok(Self::Or),
             0x17 => Ok(Self::Not),
             0x18 => Ok(Self::Lshr),
+            0x19 => Ok(Self::CallValue),
+            0x1a => Ok(Self::MakeCallable),
             _ => Err(()),
         }
     }

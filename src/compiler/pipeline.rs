@@ -173,7 +173,7 @@ fn record_expr_local_debug_ranges(
         | Expr::Bool(_)
         | Expr::Bytes(_)
         | Expr::String(_)
-        | Expr::FunctionRef(_) => {}
+        | Expr::FunctionRef(..) => {}
         Expr::Var(index) | Expr::MoveVar(index) => {
             note_local_use(ranges, *index, line);
         }
@@ -436,6 +436,7 @@ fn compile_parsed_output_with_entry_locals(
     compiler.set_type_inference(type_info);
     compiler.set_typing_mode(typing_mode);
     compiler.set_source(source);
+    compiler.set_root_local_count(locals);
     compiler.set_function_decls(function_decls);
     compiler.set_function_impls(function_impls);
     compiler.set_struct_schemas(struct_schemas);
@@ -455,7 +456,7 @@ fn compile_parsed_output_with_entry_locals(
     let mut program = compiler
         .compile_program(&stmts)
         .map_err(SourceError::Compile)?;
-    program.local_count = locals;
+    program.local_count = program.local_count.max(locals);
     program.imports = runtime_import_functions
         .iter()
         .map(|func| HostImport {
@@ -464,9 +465,10 @@ fn compile_parsed_output_with_entry_locals(
             return_type: func.return_type,
         })
         .collect();
+    let runtime_locals = program.local_count;
     Ok(CompiledProgram {
         program,
-        locals,
+        locals: runtime_locals,
         functions: visible_runtime_import_functions,
     })
 }
@@ -1021,6 +1023,7 @@ fn value_type_name(value: crate::ValueType) -> &'static str {
         crate::ValueType::Bytes => "bytes",
         crate::ValueType::Array => "array",
         crate::ValueType::Map => "map",
+        crate::ValueType::Callable => "callable",
     }
 }
 

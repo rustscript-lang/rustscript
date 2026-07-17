@@ -102,9 +102,10 @@ impl Vm {
                     self.has_aot_program()
                 )))
             }
-            STATUS_TRACE_EXIT => Err(VmError::JitNative(
-                "whole-program aot returned trace-exit status unexpectedly".to_string(),
-            )),
+            STATUS_TRACE_EXIT => {
+                self.aot_interpreter_boundary_hit = true;
+                Ok(ExecOutcome::Continue)
+            }
             other => Err(VmError::JitNative(format!(
                 "unexpected aot return status {other}"
             ))),

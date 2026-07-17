@@ -412,6 +412,11 @@ pub(crate) enum AotSsaTerminator {
         stack: Vec<AotSsaMaterialization>,
         locals: Vec<AotSsaMaterialization>,
     },
+    InterpreterBoundary {
+        ip: usize,
+        stack: Vec<AotSsaMaterialization>,
+        locals: Vec<AotSsaMaterialization>,
+    },
     Return {
         ip: usize,
         stack: Vec<AotSsaMaterialization>,
@@ -730,6 +735,7 @@ fn verify_terminator(
             verify_jump_target(if_false, block_params, available_values)
         }
         AotSsaTerminator::CallBoundary { stack, locals, .. }
+        | AotSsaTerminator::InterpreterBoundary { stack, locals, .. }
         | AotSsaTerminator::Return { stack, locals, .. } => {
             for materialization in stack.iter().chain(locals.iter()) {
                 verify_materialization(materialization, available_values)?;
@@ -829,6 +835,10 @@ enum ProcessResult {
         call: AotCall,
         frame: Frame,
         resume_frame: Frame,
+    },
+    InterpreterBoundary {
+        ip: usize,
+        frame: Frame,
     },
     Return {
         ip: usize,
@@ -1060,6 +1070,13 @@ impl<'a> Builder<'a> {
                     stack: materialize_values(&frame.stack),
                     locals: materialize_values(&frame.locals),
                 },
+                ProcessResult::InterpreterBoundary { ip, frame } => {
+                    AotSsaTerminator::InterpreterBoundary {
+                        ip,
+                        stack: materialize_values(&frame.stack),
+                        locals: materialize_values(&frame.locals),
+                    }
+                }
                 ProcessResult::Return { ip, frame } => AotSsaTerminator::Return {
                     ip,
                     stack: materialize_values(&frame.stack),
@@ -1138,7 +1155,9 @@ impl<'a> Builder<'a> {
                 } => {
                     self.merge_shape(call.resume_ip, resume_frame.shape(), &mut queue)?;
                 }
-                ProcessResult::Return { .. } | ProcessResult::Stop { .. } => {}
+                ProcessResult::InterpreterBoundary { .. }
+                | ProcessResult::Return { .. }
+                | ProcessResult::Stop { .. } => {}
             }
         }
 
@@ -1377,6 +1396,12 @@ impl<'a> Builder<'a> {
                     frame_after_pop: frame.clone(),
                 })
             }
+            AotBlockTerminal::InterpreterExit { exit_ip } => {
+                Ok(ProcessResult::InterpreterBoundary {
+                    ip: *exit_ip,
+                    frame: frame.clone(),
+                })
+            }
             AotBlockTerminal::Return => Ok(ProcessResult::Return {
                 ip: block
                     .terminal_ip
@@ -1434,6 +1459,7 @@ fn terminal_ip(block: &super::ir::AotIrBlock) -> Option<usize> {
             block.end_ip.checked_sub(5)
         }
         AotBlockTerminal::Fallthrough { .. } | AotBlockTerminal::Stop => None,
+        AotBlockTerminal::InterpreterExit { exit_ip } => Some(exit_ip),
     }
 }
 
@@ -1533,7 +1559,8 @@ fn value_type_repr(ty: ValueType) -> AotSsaValueRepr {
         | ValueType::String
         | ValueType::Bytes
         | ValueType::Array
-        | ValueType::Map => AotSsaValueRepr::Tagged,
+        | ValueType::Map
+        | ValueType::Callable => AotSsaValueRepr::Tagged,
     }
 }
 
@@ -1542,9 +1569,12 @@ fn value_repr_for_constant(value: &Value) -> AotSsaValueRepr {
         Value::Int(_) => AotSsaValueRepr::I64,
         Value::Float(_) => AotSsaValueRepr::F64,
         Value::Bool(_) => AotSsaValueRepr::Bool,
-        Value::Null | Value::String(_) | Value::Bytes(_) | Value::Array(_) | Value::Map(_) => {
-            AotSsaValueRepr::Tagged
-        }
+        Value::Null
+        | Value::String(_)
+        | Value::Bytes(_)
+        | Value::Array(_)
+        | Value::Map(_)
+        | Value::Callable(_) => AotSsaValueRepr::Tagged,
     }
 }
 
@@ -1572,7 +1602,8 @@ fn apply_direct_instruction<E: InstEmitter>(
                 | Value::String(_)
                 | Value::Bytes(_)
                 | Value::Array(_)
-                | Value::Map(_) => AotSsaInstKind::ConstSlot {
+                | Value::Map(_)
+                | Value::Callable(_) => AotSsaInstKind::ConstSlot {
                     index: *const_index,
                 },
             };

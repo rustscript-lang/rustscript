@@ -1,10 +1,13 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::{HostImport, Program, Value, ValueType, WireError};
+use super::{
+    CallableKind, CallablePrototype, CallableTarget, FunctionRegion, HostImport, Program,
+    RootCallableBinding, ScriptFunction, Value, ValueType, WireError,
+};
 
 const MAGIC: [u8; 4] = *b"VMBC";
-const VERSION_V8: u16 = 8;
+const VERSION_V9: u16 = 9;
 const FLAGS: u16 = 0;
 const MAX_SCHEMA_DEPTH: usize = 64;
 
@@ -16,7 +19,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     }
 
     let version = cursor.read_u16()?;
-    if version != VERSION_V8 {
+    if version != VERSION_V9 {
         return Err(WireError::UnsupportedVersion(version));
     }
     let flags = cursor.read_u16()?;
@@ -54,15 +57,23 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
 
     let encoded_local_count = skip_type_map(&mut cursor)?;
     skip_debug_info(&mut cursor)?;
+    let (script_functions, callable_prototypes, function_regions, root_callable_bindings) =
+        read_callable_metadata(&mut cursor)?;
     if !cursor.is_empty() {
         return Err(WireError::TrailingBytes);
     }
 
     let program = Program::new(constants, code, imports);
-    Ok(match encoded_local_count {
+    let program = match encoded_local_count {
         Some(local_count) => program.with_local_count(local_count),
         None => program,
-    })
+    };
+    Ok(program.with_callable_metadata(
+        script_functions,
+        callable_prototypes,
+        function_regions,
+        root_callable_bindings,
+    ))
 }
 
 fn reserve<T>(items: &mut Vec<T>, field: &'static str, count: usize) -> Result<(), WireError> {
@@ -165,6 +176,98 @@ fn skip_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<(), WireError> {
         }
         value => Err(WireError::InvalidValueType(value)),
     }
+}
+
+type CallableMetadata = (
+    Vec<ScriptFunction>,
+    Vec<CallablePrototype>,
+    Vec<FunctionRegion>,
+    Vec<RootCallableBinding>,
+);
+
+fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, WireError> {
+    let function_count = cursor.read_u32()? as usize;
+    let mut script_functions = Vec::new();
+    reserve(&mut script_functions, "script functions", function_count)?;
+    for _ in 0..function_count {
+        script_functions.push(ScriptFunction {
+            entry_ip: cursor.read_u32()?,
+            end_ip: cursor.read_u32()?,
+        });
+    }
+
+    let prototype_count = cursor.read_u32()? as usize;
+    let mut prototypes = Vec::new();
+    reserve(&mut prototypes, "callable prototypes", prototype_count)?;
+    for _ in 0..prototype_count {
+        let kind = match cursor.read_u8()? {
+            0 => CallableKind::FunctionItem,
+            1 => CallableKind::Closure,
+            2 => CallableKind::HostFunction,
+            value => return Err(WireError::InvalidValueType(value)),
+        };
+        let target_tag = cursor.read_u8()?;
+        let target_id = cursor.read_u32()?;
+        let target = match target_tag {
+            0 => CallableTarget::ScriptFunction(target_id),
+            1 => CallableTarget::HostImport(u16::try_from(target_id).map_err(|_| {
+                WireError::LengthTooLarge("host callable target", target_id as usize)
+            })?),
+            value => return Err(WireError::InvalidValueType(value)),
+        };
+        let arity = cursor.read_u8()?;
+        let frame_local_count = cursor.read_u32()? as usize;
+        let parameter_count = cursor.read_u32()? as usize;
+        let mut parameter_slots = Vec::new();
+        reserve(&mut parameter_slots, "callable parameters", parameter_count)?;
+        for _ in 0..parameter_count {
+            parameter_slots.push(cursor.read_u16()?);
+        }
+        let capture_count = cursor.read_u32()? as usize;
+        let mut capture_slots = Vec::new();
+        reserve(&mut capture_slots, "callable captures", capture_count)?;
+        for _ in 0..capture_count {
+            capture_slots.push(cursor.read_u16()?);
+        }
+        let self_slot = cursor.read_bool()?.then(|| cursor.read_u16()).transpose()?;
+        if cursor.read_bool()? {
+            skip_schema(cursor, 0)?;
+        }
+        prototypes.push(CallablePrototype {
+            kind,
+            target,
+            arity,
+            frame_local_count,
+            parameter_slots,
+            capture_slots,
+            self_slot,
+        });
+    }
+
+    let region_count = cursor.read_u32()? as usize;
+    let mut regions = Vec::new();
+    reserve(&mut regions, "function regions", region_count)?;
+    for _ in 0..region_count {
+        let start_ip = cursor.read_u32()?;
+        let end_ip = cursor.read_u32()?;
+        let prototype_id = cursor.read_bool()?.then(|| cursor.read_u32()).transpose()?;
+        regions.push(FunctionRegion {
+            start_ip,
+            end_ip,
+            prototype_id,
+        });
+    }
+
+    let binding_count = cursor.read_u32()? as usize;
+    let mut bindings = Vec::new();
+    reserve(&mut bindings, "root callable bindings", binding_count)?;
+    for _ in 0..binding_count {
+        bindings.push(RootCallableBinding {
+            local_slot: cursor.read_u16()?,
+            prototype_id: cursor.read_u32()?,
+        });
+    }
+    Ok((script_functions, prototypes, regions, bindings))
 }
 
 fn skip_debug_info(cursor: &mut Cursor<'_>) -> Result<(), WireError> {

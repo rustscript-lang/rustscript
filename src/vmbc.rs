@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 
 use crate::builtins::BuiltinFunction;
-use crate::bytecode::{TypeMap, ValueType};
+use crate::bytecode::{
+    CallableKind, CallablePrototype, CallableTarget, FunctionRegion, RootCallableBinding,
+    ScriptFunction, TypeMap, ValueType,
+};
 use crate::compiler::ir::TypeSchema;
 use crate::debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
 use crate::vm::{HostImport, OpCode, Program, Value};
@@ -13,8 +16,8 @@ const VERSION_V3: u16 = 3;
 const VERSION_V4: u16 = 4;
 const VERSION_V5: u16 = 5;
 const VERSION_V6: u16 = 6;
-const VERSION_V8: u16 = 8;
-const ENCODE_VERSION: u16 = VERSION_V8;
+const VERSION_V9: u16 = 9;
+const ENCODE_VERSION: u16 = VERSION_V9;
 const FLAGS: u16 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +98,7 @@ pub enum ValidationError {
         offset: usize,
         target: u32,
     },
+    InvalidCallableMetadata(&'static str),
 }
 
 impl std::fmt::Display for ValidationError {
@@ -131,6 +135,9 @@ impl std::fmt::Display for ValidationError {
                 f,
                 "invalid jump target {target} referenced by instruction at offset {offset}",
             ),
+            ValidationError::InvalidCallableMetadata(message) => {
+                write!(f, "invalid callable metadata: {message}")
+            }
         }
     }
 }
@@ -177,6 +184,9 @@ pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
             Value::Map(_) => {
                 return Err(WireError::UnsupportedConstantType("map"));
             }
+            Value::Callable(_) => {
+                return Err(WireError::UnsupportedConstantType("callable"));
+            }
         }
     }
 
@@ -199,6 +209,7 @@ pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
     if ENCODE_VERSION >= VERSION_V2 {
         write_debug_info(&mut out, program.debug.as_ref())?;
     }
+    write_callable_metadata(&mut out, program)?;
 
     Ok(out)
 }
@@ -212,7 +223,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     }
 
     let version = cursor.read_u16()?;
-    if version != VERSION_V8 {
+    if version != VERSION_V9 {
         return Err(WireError::UnsupportedVersion(version));
     }
 
@@ -274,6 +285,8 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     } else {
         None
     };
+    let (script_functions, callable_prototypes, function_regions, root_callable_bindings) =
+        read_callable_metadata(&mut cursor)?;
 
     if !cursor.is_eof() {
         return Err(WireError::TrailingBytes);
@@ -281,6 +294,10 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
 
     let mut program = Program::with_imports_and_debug(constants, code, imports, debug);
     program.type_map = type_map;
+    program.script_functions = script_functions;
+    program.callable_prototypes = callable_prototypes;
+    program.function_regions = function_regions;
+    program.root_callable_bindings = root_callable_bindings;
     Ok(program)
 }
 
@@ -423,6 +440,22 @@ pub fn disassemble_program_with_options(program: &Program, options: DisassembleO
                     truncated = true;
                 }
             }
+            x if x == OpCode::CallValue as u8 => {
+                if let Some(argc) = read_u8(code, &mut ip) {
+                    instruction.push_str(&format!("callvalue {argc}"));
+                } else {
+                    instruction.push_str("callvalue <truncated>");
+                    truncated = true;
+                }
+            }
+            x if x == OpCode::MakeCallable as u8 => {
+                if let Some(prototype_id) = read_u32(code, &mut ip) {
+                    instruction.push_str(&format!("makecallable {prototype_id}"));
+                } else {
+                    instruction.push_str("makecallable <truncated>");
+                    truncated = true;
+                }
+            }
             x if x == OpCode::Shl as u8 => instruction.push_str("shl"),
             x if x == OpCode::Shr as u8 => instruction.push_str("shr"),
             x if x == OpCode::Lshr as u8 => instruction.push_str("lshr"),
@@ -481,10 +514,91 @@ struct ProgramAnalysis {
     max_local_index: Option<u8>,
 }
 
+fn region_index_for_ip(regions: &[FunctionRegion], ip: usize) -> Option<usize> {
+    regions
+        .iter()
+        .position(|region| (region.start_ip as usize) <= ip && ip < region.end_ip as usize)
+}
+
+fn validate_callable_metadata(program: &Program) -> Result<(), ValidationError> {
+    let code_len = program.code.len();
+    let mut previous_end = 0usize;
+    for region in &program.function_regions {
+        let start = region.start_ip as usize;
+        let end = region.end_ip as usize;
+        if start < previous_end || start >= end || end > code_len {
+            return Err(ValidationError::InvalidCallableMetadata(
+                "function regions overlap or exceed bytecode bounds",
+            ));
+        }
+        if let Some(prototype_id) = region.prototype_id
+            && prototype_id as usize >= program.callable_prototypes.len()
+        {
+            return Err(ValidationError::InvalidCallableMetadata(
+                "function region references an invalid prototype",
+            ));
+        }
+        previous_end = end;
+    }
+    if !program.function_regions.is_empty()
+        && (program.function_regions[0].start_ip != 0 || previous_end != code_len)
+    {
+        return Err(ValidationError::InvalidCallableMetadata(
+            "function regions do not cover the complete bytecode",
+        ));
+    }
+
+    for prototype in &program.callable_prototypes {
+        if matches!(prototype.target, CallableTarget::ScriptFunction(_))
+            && prototype.parameter_slots.len() != prototype.arity as usize
+            || prototype
+                .parameter_slots
+                .iter()
+                .chain(prototype.capture_slots.iter())
+                .any(|slot| *slot as usize >= prototype.frame_local_count)
+            || prototype
+                .self_slot
+                .is_some_and(|slot| slot as usize >= prototype.frame_local_count)
+        {
+            return Err(ValidationError::InvalidCallableMetadata(
+                "callable frame layout is invalid",
+            ));
+        }
+        match prototype.target {
+            CallableTarget::ScriptFunction(id) if id as usize >= program.script_functions.len() => {
+                return Err(ValidationError::InvalidCallableMetadata(
+                    "callable references an invalid script function",
+                ));
+            }
+            CallableTarget::HostImport(id)
+                if id as usize >= program.imports.len()
+                    && BuiltinFunction::from_call_index(id).is_none() =>
+            {
+                return Err(ValidationError::InvalidCallableMetadata(
+                    "callable references an invalid host import",
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    for binding in &program.root_callable_bindings {
+        if binding.local_slot as usize >= program.local_count
+            || binding.prototype_id as usize >= program.callable_prototypes.len()
+        {
+            return Err(ValidationError::InvalidCallableMetadata(
+                "root callable binding is invalid",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn analyze_program(
     program: &Program,
     host_fn_count: Option<u16>,
 ) -> Result<ProgramAnalysis, ValidationError> {
+    validate_callable_metadata(program)?;
     let mut ip = 0usize;
     let mut instruction_starts = HashSet::new();
     let mut jump_targets: Vec<(usize, u32)> = Vec::new();
@@ -593,6 +707,26 @@ fn analyze_program(
                     }
                 }
             }
+            x if x == OpCode::CallValue as u8 => {
+                read_u8(code, &mut ip).ok_or(ValidationError::TruncatedOperand {
+                    offset: start,
+                    opcode,
+                    expected_bytes: 1,
+                })?;
+            }
+            x if x == OpCode::MakeCallable as u8 => {
+                let prototype_id =
+                    read_u32(code, &mut ip).ok_or(ValidationError::TruncatedOperand {
+                        offset: start,
+                        opcode,
+                        expected_bytes: 4,
+                    })?;
+                if prototype_id as usize >= program.callable_prototypes.len() {
+                    return Err(ValidationError::InvalidCallableMetadata(
+                        "makecallable references an invalid prototype",
+                    ));
+                }
+            }
             other => {
                 return Err(ValidationError::InvalidOpcode {
                     offset: start,
@@ -610,9 +744,215 @@ fn analyze_program(
                 target: target as u32,
             });
         }
+        if !program.function_regions.is_empty()
+            && region_index_for_ip(&program.function_regions, *offset)
+                != region_index_for_ip(&program.function_regions, target)
+        {
+            return Err(ValidationError::InvalidJumpTarget {
+                offset: *offset,
+                target: target as u32,
+            });
+        }
+    }
+
+    for function in &program.script_functions {
+        let entry = function.entry_ip as usize;
+        let end = function.end_ip as usize;
+        if !instruction_starts.contains(&entry)
+            || end > code.len()
+            || (end < code.len() && !instruction_starts.contains(&end))
+        {
+            return Err(ValidationError::InvalidCallableMetadata(
+                "script function boundary is not an instruction boundary",
+            ));
+        }
     }
 
     Ok(ProgramAnalysis { max_local_index })
+}
+
+fn write_callable_metadata(out: &mut Vec<u8>, program: &Program) -> Result<(), WireError> {
+    write_u32_count("script functions", program.script_functions.len(), out)?;
+    for function in &program.script_functions {
+        out.extend_from_slice(&function.entry_ip.to_le_bytes());
+        out.extend_from_slice(&function.end_ip.to_le_bytes());
+    }
+
+    write_u32_count(
+        "callable prototypes",
+        program.callable_prototypes.len(),
+        out,
+    )?;
+    for prototype in &program.callable_prototypes {
+        out.push(match prototype.kind {
+            CallableKind::FunctionItem => 0,
+            CallableKind::Closure => 1,
+            CallableKind::HostFunction => 2,
+        });
+        match prototype.target {
+            CallableTarget::ScriptFunction(id) => {
+                out.push(0);
+                out.extend_from_slice(&id.to_le_bytes());
+            }
+            CallableTarget::HostImport(id) => {
+                out.push(1);
+                out.extend_from_slice(&u32::from(id).to_le_bytes());
+            }
+        }
+        out.push(prototype.arity);
+        write_u32_count("callable frame locals", prototype.frame_local_count, out)?;
+        write_u16_list("callable parameters", &prototype.parameter_slots, out)?;
+        write_u16_list("callable captures", &prototype.capture_slots, out)?;
+        match prototype.self_slot {
+            Some(slot) => {
+                out.push(1);
+                out.extend_from_slice(&slot.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+        match &prototype.schema {
+            Some(schema) => {
+                out.push(1);
+                write_schema(schema, out)?;
+            }
+            None => out.push(0),
+        }
+    }
+
+    write_u32_count("function regions", program.function_regions.len(), out)?;
+    for region in &program.function_regions {
+        out.extend_from_slice(&region.start_ip.to_le_bytes());
+        out.extend_from_slice(&region.end_ip.to_le_bytes());
+        match region.prototype_id {
+            Some(id) => {
+                out.push(1);
+                out.extend_from_slice(&id.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+    }
+
+    write_u32_count(
+        "root callable bindings",
+        program.root_callable_bindings.len(),
+        out,
+    )?;
+    for binding in &program.root_callable_bindings {
+        out.extend_from_slice(&binding.local_slot.to_le_bytes());
+        out.extend_from_slice(&binding.prototype_id.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn write_u16_list(field: &'static str, values: &[u16], out: &mut Vec<u8>) -> Result<(), WireError> {
+    write_u32_count(field, values.len(), out)?;
+    for value in values {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(())
+}
+
+type CallableMetadata = (
+    Vec<ScriptFunction>,
+    Vec<CallablePrototype>,
+    Vec<FunctionRegion>,
+    Vec<RootCallableBinding>,
+);
+
+fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, WireError> {
+    let function_count = cursor.read_u32()? as usize;
+    let mut script_functions = Vec::with_capacity(function_count);
+    for _ in 0..function_count {
+        script_functions.push(ScriptFunction {
+            entry_ip: cursor.read_u32()?,
+            end_ip: cursor.read_u32()?,
+        });
+    }
+
+    let prototype_count = cursor.read_u32()? as usize;
+    let mut callable_prototypes = Vec::with_capacity(prototype_count);
+    for _ in 0..prototype_count {
+        let kind = match cursor.read_u8()? {
+            0 => CallableKind::FunctionItem,
+            1 => CallableKind::Closure,
+            2 => CallableKind::HostFunction,
+            other => return Err(WireError::InvalidValueType(other)),
+        };
+        let target_tag = cursor.read_u8()?;
+        let target_id = cursor.read_u32()?;
+        let target = match target_tag {
+            0 => CallableTarget::ScriptFunction(target_id),
+            1 => CallableTarget::HostImport(
+                u16::try_from(target_id).map_err(|_| WireError::InvalidValueType(target_tag))?,
+            ),
+            other => return Err(WireError::InvalidValueType(other)),
+        };
+        let arity = cursor.read_u8()?;
+        let frame_local_count = cursor.read_u32()? as usize;
+        let parameter_slots = read_u16_list(cursor)?;
+        let capture_slots = read_u16_list(cursor)?;
+        let self_slot = match cursor.read_u8()? {
+            0 => None,
+            1 => Some(cursor.read_u16()?),
+            other => return Err(WireError::InvalidBool(other)),
+        };
+        let schema = match cursor.read_u8()? {
+            0 => None,
+            1 => Some(read_schema(cursor)?),
+            other => return Err(WireError::InvalidBool(other)),
+        };
+        callable_prototypes.push(CallablePrototype {
+            kind,
+            target,
+            arity,
+            frame_local_count,
+            parameter_slots,
+            capture_slots,
+            self_slot,
+            schema,
+        });
+    }
+
+    let region_count = cursor.read_u32()? as usize;
+    let mut function_regions = Vec::with_capacity(region_count);
+    for _ in 0..region_count {
+        let start_ip = cursor.read_u32()?;
+        let end_ip = cursor.read_u32()?;
+        let prototype_id = match cursor.read_u8()? {
+            0 => None,
+            1 => Some(cursor.read_u32()?),
+            other => return Err(WireError::InvalidBool(other)),
+        };
+        function_regions.push(FunctionRegion {
+            start_ip,
+            end_ip,
+            prototype_id,
+        });
+    }
+
+    let binding_count = cursor.read_u32()? as usize;
+    let mut root_callable_bindings = Vec::with_capacity(binding_count);
+    for _ in 0..binding_count {
+        root_callable_bindings.push(RootCallableBinding {
+            local_slot: cursor.read_u16()?,
+            prototype_id: cursor.read_u32()?,
+        });
+    }
+    Ok((
+        script_functions,
+        callable_prototypes,
+        function_regions,
+        root_callable_bindings,
+    ))
+}
+
+fn read_u16_list(cursor: &mut Cursor<'_>) -> Result<Vec<u16>, WireError> {
+    let len = cursor.read_u32()? as usize;
+    let mut values = Vec::with_capacity(len);
+    for _ in 0..len {
+        values.push(cursor.read_u16()?);
+    }
+    Ok(values)
 }
 
 fn write_debug_info(out: &mut Vec<u8>, debug: Option<&DebugInfo>) -> Result<(), WireError> {
@@ -819,6 +1159,7 @@ fn read_value_type(raw: u8) -> Result<ValueType, WireError> {
         6 => Ok(ValueType::Bytes),
         7 => Ok(ValueType::Array),
         8 => Ok(ValueType::Map),
+        9 => Ok(ValueType::Callable),
         other => Err(WireError::InvalidValueType(other)),
     }
 }

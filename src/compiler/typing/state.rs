@@ -29,6 +29,7 @@ pub(crate) enum BoundType {
     ArrayOf(Option<SimpleType>),
     Map,
     MapOf(Option<SimpleType>),
+    Callable,
 }
 
 impl BoundType {
@@ -44,6 +45,7 @@ impl BoundType {
             BoundType::Bytes => Some("bytes"),
             BoundType::Array | BoundType::ArrayOf(_) => Some("array"),
             BoundType::Map | BoundType::MapOf(_) => Some("map"),
+            BoundType::Callable => Some("callable"),
         }
     }
 
@@ -84,6 +86,7 @@ impl From<BoundType> for ValueType {
             BoundType::Bytes => ValueType::Bytes,
             BoundType::Array | BoundType::ArrayOf(_) => ValueType::Array,
             BoundType::Map | BoundType::MapOf(_) => ValueType::Map,
+            BoundType::Callable => ValueType::Callable,
         }
     }
 }
@@ -100,6 +103,7 @@ impl From<ValueType> for BoundType {
             ValueType::Bytes => BoundType::Bytes,
             ValueType::Array => BoundType::Array,
             ValueType::Map => BoundType::Map,
+            ValueType::Callable => BoundType::Callable,
         }
     }
 }
@@ -277,7 +281,7 @@ impl LocalTypeState {
     }
 
     pub(super) fn bind_callable(&mut self, slot: LocalSlot, callable: InferredCallable) {
-        self.by_slot.remove(&slot);
+        self.by_slot.insert(slot, BoundType::Callable);
         self.schemas.remove(&slot);
         self.declared_schema_slots.remove(&slot);
         self.optional_slots.remove(&slot);
@@ -292,7 +296,7 @@ impl LocalTypeState {
         from_declared_schema: bool,
         optional: bool,
     ) {
-        self.by_slot.remove(&slot);
+        self.by_slot.insert(slot, BoundType::Callable);
         if let Some(schema) = schema {
             self.schemas.insert(slot, schema);
         } else {

@@ -121,6 +121,7 @@ pub(super) struct Parser {
     functions: HashMap<String, FunctionDecl>,
     function_list: Vec<FunctionDecl>,
     function_impls: HashMap<u16, FunctionImpl>,
+    parsed_function_decls: HashSet<u16>,
     next_function: u16,
     closure_scopes: Vec<HashMap<String, LocalSlot>>,
     closure_capture_contexts: Vec<ClosureCaptureContext>,
@@ -175,6 +176,7 @@ impl Parser {
             functions: HashMap::new(),
             function_list: Vec::new(),
             function_impls: HashMap::new(),
+            parsed_function_decls: HashSet::new(),
             next_function: 0,
             closure_scopes: Vec::new(),
             closure_capture_contexts: Vec::new(),
@@ -221,12 +223,128 @@ impl Parser {
     }
 
     pub(super) fn parse_program(&mut self) -> Result<Vec<Stmt>, ParseError> {
+        self.predeclare_functions()?;
         let mut stmts = Vec::new();
         while !self.check(&TokenKind::Eof) {
             stmts.push(self.parse_stmt()?);
         }
         self.validate_schema_reference_sites()?;
         Ok(stmts)
+    }
+
+    fn predeclare_functions(&mut self) -> Result<(), ParseError> {
+        let mut index = 0usize;
+        while index < self.tokens.len() {
+            match &self.tokens[index].kind {
+                TokenKind::Fn => {
+                    let line = self.tokens[index].line;
+                    let Some(Token {
+                        kind: TokenKind::Ident(name),
+                        ..
+                    }) = self.tokens.get(index + 1)
+                    else {
+                        index += 1;
+                        continue;
+                    };
+                    let name = name.clone();
+                    let exported =
+                        index > 0 && matches!(self.tokens[index - 1].kind, TokenKind::Pub);
+                    let mut cursor = index + 2;
+                    let mut type_params = Vec::new();
+                    if self
+                        .tokens
+                        .get(cursor)
+                        .is_some_and(|token| matches!(token.kind, TokenKind::Less))
+                    {
+                        cursor += 1;
+                        while let Some(token) = self.tokens.get(cursor) {
+                            match &token.kind {
+                                TokenKind::Ident(param) => type_params.push(param.clone()),
+                                TokenKind::Greater => {
+                                    cursor += 1;
+                                    break;
+                                }
+                                _ => {}
+                            }
+                            cursor += 1;
+                        }
+                    }
+                    if !self
+                        .tokens
+                        .get(cursor)
+                        .is_some_and(|token| matches!(token.kind, TokenKind::LParen))
+                    {
+                        index += 1;
+                        continue;
+                    }
+                    cursor += 1;
+                    let mut arity = 0usize;
+                    let mut angle_depth = 0usize;
+                    let mut paren_depth = 1usize;
+                    let mut has_param = false;
+                    while let Some(token) = self.tokens.get(cursor) {
+                        match token.kind {
+                            TokenKind::LParen => paren_depth += 1,
+                            TokenKind::RParen if paren_depth == 1 && angle_depth == 0 => {
+                                if has_param {
+                                    arity += 1;
+                                }
+                                break;
+                            }
+                            TokenKind::RParen => paren_depth = paren_depth.saturating_sub(1),
+                            TokenKind::Less => angle_depth += 1,
+                            TokenKind::Greater => angle_depth = angle_depth.saturating_sub(1),
+                            TokenKind::Comma if paren_depth == 1 && angle_depth == 0 => {
+                                if has_param {
+                                    arity += 1;
+                                    has_param = false;
+                                }
+                            }
+                            _ if paren_depth == 1 && angle_depth == 0 => has_param = true,
+                            _ => {}
+                        }
+                        cursor += 1;
+                    }
+                    if self.functions.contains_key(&name) {
+                        return Err(ParseError {
+                            span: None,
+                            code: None,
+                            line,
+                            message: format!("duplicate function '{name}'"),
+                        });
+                    }
+                    let arity = u8::try_from(arity).map_err(|_| ParseError {
+                        span: None,
+                        code: None,
+                        line,
+                        message: "function arity too large".to_string(),
+                    })?;
+                    let function_index = self.next_function;
+                    self.next_function = self.next_function.checked_add(1).ok_or(ParseError {
+                        span: None,
+                        code: None,
+                        line,
+                        message: "function index overflow".to_string(),
+                    })?;
+                    let decl = FunctionDecl {
+                        name: name.clone(),
+                        arity,
+                        index: function_index,
+                        args: vec![String::new(); usize::from(arity)],
+                        arg_schemas: vec![None; usize::from(arity)],
+                        return_schema: None,
+                        type_params,
+                        exported,
+                        return_type: ValueType::Unknown,
+                    };
+                    self.functions.insert(name, decl.clone());
+                    self.function_list.push(decl);
+                    index = cursor;
+                }
+                _ => index += 1,
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn local_count(&self) -> usize {

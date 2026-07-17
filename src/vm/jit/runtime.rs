@@ -539,6 +539,12 @@ impl Vm {
                 }
                 native::STATUS_TRACE_EXIT => {
                     self.jit_trace_exit_count = self.jit_trace_exit_count.saturating_add(1);
+                    if self.jit.trace_clone(current_trace_id).is_some_and(|trace| {
+                        trace.op_names.last().map(String::as_str) == Some("callable_boundary")
+                    }) {
+                        self.jit.block_trace(current_trace_id);
+                        return Ok(ExecOutcome::Continue);
+                    }
                     // Fast path: if this trace looped back to its own root and cannot yield via host
                     // calls, keep executing in native mode without bouncing through the interpreter.
                     if !has_yielding_call

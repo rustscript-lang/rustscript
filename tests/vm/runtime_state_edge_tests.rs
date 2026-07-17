@@ -256,8 +256,16 @@ fn waiting_host_op_preserves_interprocedural_closure_state_then_clears_on_resume
     assert_eq!(resumed, VmStatus::Halted);
     assert_eq!(vm.stack().last(), Some(&Value::Int(0)));
     assert!(
-        vm.locals().iter().all(|value| matches!(value, Value::Null)),
-        "expected closure and inline call frames to clear after resume, got {:?}",
+        vm.locals().iter().all(|value| {
+            matches!(value, Value::Null)
+                || matches!(
+                    value,
+                    Value::Callable(callable)
+                        if callable.kind == vm::CallableKind::FunctionItem
+                            && callable.env.is_none()
+                )
+        }),
+        "expected closure and transient call-frame state to clear after resume, got {:?}",
         vm.locals()
     );
 }
