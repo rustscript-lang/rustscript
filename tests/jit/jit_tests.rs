@@ -4858,3 +4858,39 @@ fn trace_jit_specializes_regex_builtins_without_call_boundary() {
     assert_eq!(vm.regex_cache_compile_count(), 2);
     assert!(vm.regex_cache_hit_count() >= 14);
 }
+
+#[test]
+fn trace_jit_propagates_replace_many_length_mismatch() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        let needles = ["a"];
+        let replacement_sets: [[string]] = [["x"], ["x"], ["x"], ["x"], ["x"], []];
+        let mut replacements: [string] = ["x"];
+        let mut i = 0;
+        let mut out = "";
+        while i < 6 {
+            replacements = (&replacement_sets)[i];
+            out = string_replace_literal("a", &needles, &replacements);
+            i = i + 1;
+        }
+        out;
+    "#;
+    let compiled = compile_source(source).expect("replace-many mismatch fixture should compile");
+    let mut vm = Vm::new_with_jit_config(
+        compiled.program.with_local_count(compiled.locals),
+        JitConfig {
+            enabled: true,
+            hot_loop_threshold: 1,
+            max_trace_len: 512,
+        },
+    );
+    let error = vm
+        .run()
+        .expect_err("replace-many mismatch should propagate its host error");
+    assert_eq!(
+        error.to_string(),
+        "host error: string_replace_literal array lengths must match"
+    );
+}

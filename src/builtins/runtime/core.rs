@@ -792,7 +792,11 @@ pub(crate) fn builtin_string_replace_literal_impl(
     text.replace(needle, replacement)
 }
 
-/// Apply ordered literal replacements from parallel needle/replacement arrays.
+/// Apply literal replacements in order from parallel `needles` and `replacements` arrays.
+///
+/// Each pair uses the same non-overlapping semantics as the scalar overload. Empty needles
+/// leave the current output unchanged. Both arrays must have equal length and contain strings.
+/// A length mismatch or a non-string element returns an error.
 #[pd_host_function(name = "string_replace_literal")]
 pub(crate) fn builtin_string_replace_literal_many_impl(
     text: VmStringRef<'_>,

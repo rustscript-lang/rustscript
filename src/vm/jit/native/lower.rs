@@ -1839,12 +1839,6 @@ fn lower_ssa_inst(
             let text = values[text];
             let needles = values[needles];
             let replacements = values[replacements];
-            let out = owned_value_temp_slot_addr(
-                b,
-                pointer_type,
-                owned_value_temps,
-                SsaTempValueSlotKey::Output(output.id),
-            )?;
             let out_raw = ssa_call_string_replace_literal_many(
                 b,
                 pointer_type,
@@ -1853,6 +1847,20 @@ fn lower_ssa_inst(
                 text,
                 needles,
                 replacements,
+            )?;
+            let error = b.ins().icmp_imm(IntCC::Equal, out_raw, 0);
+            let failed = b.create_block();
+            let replaced = b.create_block();
+            b.ins().brif(error, failed, &[], replaced, &[]);
+            b.switch_to_block(failed);
+            let status = b.ins().iconst(types::I32, STATUS_ERROR as i64);
+            jump_with_status(b, exit_block, status);
+            b.switch_to_block(replaced);
+            let out = owned_value_temp_slot_addr(
+                b,
+                pointer_type,
+                owned_value_temps,
+                SsaTempValueSlotKey::Output(output.id),
             )?;
             clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
             ssa_store_heap_ptr_in_value(b, layout.value, out, layout.value.string_tag, out_raw);
@@ -3979,6 +3987,7 @@ fn ssa_call_regex_match(
     Ok(b.inst_results(call)[0])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ssa_call_regex_replace(
     b: &mut FunctionBuilder,
     pointer_type: cranelift_codegen::ir::Type,
