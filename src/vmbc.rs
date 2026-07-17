@@ -11,13 +11,7 @@ use crate::debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
 use crate::vm::{HostImport, OpCode, Program, Value};
 
 const MAGIC: [u8; 4] = *b"VMBC";
-const VERSION_V2: u16 = 2;
-const VERSION_V3: u16 = 3;
-const VERSION_V4: u16 = 4;
-const VERSION_V5: u16 = 5;
-const VERSION_V6: u16 = 6;
 const VERSION_V10: u16 = 10;
-const ENCODE_VERSION: u16 = VERSION_V10;
 const FLAGS: u16 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,71 +142,125 @@ impl std::fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
+const MAX_CONSTANT_DEPTH: usize = 64;
+
+fn write_constant(value: &Value, out: &mut Vec<u8>, depth: usize) -> Result<(), WireError> {
+    if depth >= MAX_CONSTANT_DEPTH {
+        return Err(WireError::LengthTooLarge("constant nesting depth", depth));
+    }
+    match value {
+        Value::Int(value) => {
+            out.push(0);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        Value::Bool(value) => {
+            out.push(1);
+            out.push(u8::from(*value));
+        }
+        Value::String(value) => {
+            out.push(2);
+            write_u32_len("constant string", value.len(), out)?;
+            out.extend_from_slice(value.as_bytes());
+        }
+        Value::Float(value) => {
+            out.push(3);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        Value::Null => out.push(4),
+        Value::Bytes(value) => {
+            out.push(5);
+            write_u32_len("constant bytes", value.len(), out)?;
+            out.extend_from_slice(value.as_slice());
+        }
+        Value::Array(values) => {
+            out.push(6);
+            write_u32_count("constant array", values.len(), out)?;
+            for value in values.iter() {
+                write_constant(value, out, depth + 1)?;
+            }
+        }
+        Value::Map(entries) => {
+            out.push(7);
+            write_u32_count("constant map", entries.len(), out)?;
+            for (key, value) in entries.iter() {
+                write_constant(key, out, depth + 1)?;
+                write_constant(value, out, depth + 1)?;
+            }
+        }
+        Value::Callable(_) => return Err(WireError::UnsupportedConstantType("callable")),
+    }
+    Ok(())
+}
+
+fn read_constant(cursor: &mut Cursor<'_>, depth: usize) -> Result<Value, WireError> {
+    if depth >= MAX_CONSTANT_DEPTH {
+        return Err(WireError::LengthTooLarge("constant nesting depth", depth));
+    }
+    match cursor.read_u8()? {
+        0 => Ok(Value::Int(cursor.read_i64()?)),
+        1 => match cursor.read_u8()? {
+            0 => Ok(Value::Bool(false)),
+            1 => Ok(Value::Bool(true)),
+            other => Err(WireError::InvalidBool(other)),
+        },
+        2 => {
+            let len = cursor.read_u32()? as usize;
+            let bytes = cursor.read_exact(len)?;
+            let text = String::from_utf8(bytes.to_vec()).map_err(|_| WireError::InvalidUtf8)?;
+            Ok(Value::string(text))
+        }
+        3 => Ok(Value::Float(cursor.read_f64()?)),
+        4 => Ok(Value::Null),
+        5 => {
+            let len = cursor.read_u32()? as usize;
+            Ok(Value::bytes(cursor.read_exact(len)?.to_vec()))
+        }
+        6 => {
+            let count = cursor.read_u32()? as usize;
+            let mut values = Vec::with_capacity(count);
+            for _ in 0..count {
+                values.push(read_constant(cursor, depth + 1)?);
+            }
+            Ok(Value::array(values))
+        }
+        7 => {
+            let count = cursor.read_u32()? as usize;
+            let mut entries = Vec::with_capacity(count);
+            for _ in 0..count {
+                entries.push((
+                    read_constant(cursor, depth + 1)?,
+                    read_constant(cursor, depth + 1)?,
+                ));
+            }
+            Ok(Value::map(entries))
+        }
+        tag => Err(WireError::InvalidConstantTag(tag)),
+    }
+}
+
 pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&ENCODE_VERSION.to_le_bytes());
+    out.extend_from_slice(&VERSION_V10.to_le_bytes());
     out.extend_from_slice(&FLAGS.to_le_bytes());
     write_u32_count("constants", program.constants.len(), &mut out)?;
 
     for constant in &program.constants {
-        match constant {
-            Value::Null => {
-                out.push(4);
-            }
-            Value::Int(value) => {
-                out.push(0);
-                out.extend_from_slice(&value.to_le_bytes());
-            }
-            Value::Float(value) => {
-                out.push(3);
-                out.extend_from_slice(&value.to_le_bytes());
-            }
-            Value::Bool(value) => {
-                out.push(1);
-                out.push(u8::from(*value));
-            }
-            Value::String(value) => {
-                out.push(2);
-                write_u32_len("constant string", value.len(), &mut out)?;
-                out.extend_from_slice(value.as_bytes());
-            }
-            Value::Bytes(value) => {
-                out.push(5);
-                write_u32_len("constant bytes", value.len(), &mut out)?;
-                out.extend_from_slice(value.as_slice());
-            }
-            Value::Array(_) => {
-                return Err(WireError::UnsupportedConstantType("array"));
-            }
-            Value::Map(_) => {
-                return Err(WireError::UnsupportedConstantType("map"));
-            }
-            Value::Callable(_) => {
-                return Err(WireError::UnsupportedConstantType("callable"));
-            }
-        }
+        write_constant(constant, &mut out, 0)?;
     }
 
     write_u32_len("code", program.code.len(), &mut out)?;
     out.extend_from_slice(&program.code);
 
-    if ENCODE_VERSION >= VERSION_V4 {
-        write_u32_count("imports", program.imports.len(), &mut out)?;
-        for import in &program.imports {
-            write_string("import name", &import.name, &mut out)?;
-            out.push(import.arity);
-            out.push(import.return_type as u8);
-        }
+    write_u32_count("imports", program.imports.len(), &mut out)?;
+    for import in &program.imports {
+        write_string("import name", &import.name, &mut out)?;
+        out.push(import.arity);
+        out.push(import.return_type as u8);
     }
 
-    if ENCODE_VERSION >= VERSION_V6 {
-        write_type_map(&mut out, program.type_map.as_ref())?;
-    }
-
-    if ENCODE_VERSION >= VERSION_V2 {
-        write_debug_info(&mut out, program.debug.as_ref())?;
-    }
+    write_type_map(&mut out, program.type_map.as_ref())?;
+    write_debug_info(&mut out, program.debug.as_ref())?;
     write_callable_metadata(&mut out, program)?;
 
     Ok(out)
@@ -239,33 +287,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     let constant_count = cursor.read_u32()? as usize;
     let mut constants = Vec::with_capacity(constant_count);
     for _ in 0..constant_count {
-        let tag = cursor.read_u8()?;
-        let value = match tag {
-            4 => Value::Null,
-            0 => Value::Int(cursor.read_i64()?),
-            3 => Value::Float(cursor.read_f64()?),
-            1 => {
-                let raw = cursor.read_u8()?;
-                match raw {
-                    0 => Value::Bool(false),
-                    1 => Value::Bool(true),
-                    other => return Err(WireError::InvalidBool(other)),
-                }
-            }
-            2 => {
-                let len = cursor.read_u32()? as usize;
-                let text_bytes = cursor.read_exact(len)?;
-                let text =
-                    String::from_utf8(text_bytes.to_vec()).map_err(|_| WireError::InvalidUtf8)?;
-                Value::string(text)
-            }
-            5 => {
-                let len = cursor.read_u32()? as usize;
-                Value::bytes(cursor.read_exact(len)?.to_vec())
-            }
-            other => return Err(WireError::InvalidConstantTag(other)),
-        };
-        constants.push(value);
+        constants.push(read_constant(&mut cursor, 0)?);
     }
 
     let code_len = cursor.read_u32()? as usize;
@@ -279,16 +301,8 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
             return_type: read_value_type(cursor.read_u8()?)?,
         });
     }
-    let type_map = if version >= VERSION_V6 {
-        read_type_map(&mut cursor)?
-    } else {
-        None
-    };
-    let debug = if version >= VERSION_V2 {
-        read_debug_info(&mut cursor, version)?
-    } else {
-        None
-    };
+    let type_map = read_type_map(&mut cursor)?;
+    let debug = read_debug_info(&mut cursor)?;
     let (
         script_functions,
         callable_prototypes,
@@ -1035,10 +1049,8 @@ fn write_debug_info(out: &mut Vec<u8>, debug: Option<&DebugInfo>) -> Result<(), 
             for local in &debug.locals {
                 write_string("debug local name", &local.name, out)?;
                 out.push(local.index);
-                if ENCODE_VERSION >= VERSION_V5 {
-                    write_optional_u32(local.declared_line, out);
-                    write_optional_u32(local.last_line, out);
-                }
+                write_optional_u32(local.declared_line, out);
+                write_optional_u32(local.last_line, out);
             }
 
             Ok(())
@@ -1046,7 +1058,7 @@ fn write_debug_info(out: &mut Vec<u8>, debug: Option<&DebugInfo>) -> Result<(), 
     }
 }
 
-fn read_debug_info(cursor: &mut Cursor<'_>, version: u16) -> Result<Option<DebugInfo>, WireError> {
+fn read_debug_info(cursor: &mut Cursor<'_>) -> Result<Option<DebugInfo>, WireError> {
     let flag = cursor.read_u8()?;
     match flag {
         0 => Ok(None),
@@ -1081,28 +1093,16 @@ fn read_debug_info(cursor: &mut Cursor<'_>, version: u16) -> Result<Option<Debug
                 functions.push(DebugFunction { name, args });
             }
 
-            let locals = if version >= VERSION_V3 {
-                let local_count = cursor.read_u32()? as usize;
-                let mut locals = Vec::with_capacity(local_count);
-                for _ in 0..local_count {
-                    let name = cursor.read_string()?;
-                    let index = cursor.read_u8()?;
-                    let (declared_line, last_line) = if version >= VERSION_V5 {
-                        (read_optional_u32(cursor)?, read_optional_u32(cursor)?)
-                    } else {
-                        (None, None)
-                    };
-                    locals.push(LocalInfo {
-                        name,
-                        index,
-                        declared_line,
-                        last_line,
-                    });
-                }
-                locals
-            } else {
-                Vec::new()
-            };
+            let local_count = cursor.read_u32()? as usize;
+            let mut locals = Vec::with_capacity(local_count);
+            for _ in 0..local_count {
+                locals.push(LocalInfo {
+                    name: cursor.read_string()?,
+                    index: cursor.read_u8()?,
+                    declared_line: read_optional_u32(cursor)?,
+                    last_line: read_optional_u32(cursor)?,
+                });
+            }
 
             Ok(Some(DebugInfo {
                 source,

@@ -53,6 +53,29 @@ fn embedded_decoder_reads_host_generated_v10() {
 }
 
 #[test]
+fn embedded_decoder_reads_nested_container_constants() {
+    let source = Program::new(
+        vec![Value::array(vec![
+            Value::Int(1),
+            Value::map(vec![(Value::string("key"), Value::Bool(true))]),
+        ])],
+        vec![OpCode::Ret as u8],
+    );
+    let bytes = encode_program(&source).expect("nested constants should encode");
+    let program = decode_program(&bytes).expect("nested constants should decode");
+    assert_eq!(
+        program.constants()[0],
+        EmbeddedValue::array(vec![
+            EmbeddedValue::Int(1),
+            EmbeddedValue::map(vec![(
+                EmbeddedValue::string("key"),
+                EmbeddedValue::Bool(true),
+            )]),
+        ])
+    );
+}
+
+#[test]
 fn embedded_decoder_accepts_compiler_type_and_debug_metadata() {
     let compiled = compile_source("let mut x = 40; x = x + 2; print(x);")
         .expect("RustScript source should compile");

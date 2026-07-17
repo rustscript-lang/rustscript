@@ -102,7 +102,7 @@ impl VmRecording {
 
     pub fn encode(&self) -> Result<Vec<u8>, VmRecordingError> {
         const MAGIC: [u8; 4] = *b"PDRC";
-        const VERSION: u16 = 4;
+        const VERSION: u16 = 5;
 
         let mut out = Vec::new();
         out.extend_from_slice(&MAGIC);
@@ -167,7 +167,7 @@ impl VmRecording {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, VmRecordingError> {
         const MAGIC: [u8; 4] = *b"PDRC";
-        const VERSION: u16 = 4;
+        const VERSION: u16 = 5;
 
         let mut cursor = RecordingCursor::new(bytes);
 
@@ -594,16 +594,16 @@ mod tests {
     }
 
     #[test]
-    fn recording_v4_rejects_legacy_versions() {
+    fn recording_v5_rejects_legacy_versions() {
         let recording = VmRecording {
             program: Program::new(Vec::new(), vec![crate::OpCode::Ret as u8]),
             frames: Vec::new(),
             terminal_status: Some(VmStatus::Halted),
         };
         let bytes = recording.encode().expect("recording should encode");
-        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 4);
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 5);
 
-        for legacy in [1u16, 2u16, 3u16] {
+        for legacy in [1u16, 2u16, 3u16, 4u16] {
             let mut legacy_bytes = bytes.clone();
             legacy_bytes[4..6].copy_from_slice(&legacy.to_le_bytes());
             assert!(matches!(

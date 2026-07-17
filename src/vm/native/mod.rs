@@ -49,7 +49,7 @@ pub(crate) use layout::{
 #[cfg(feature = "cranelift-jit")]
 pub(crate) use offsets::{HeapIntrinsicAddrs, HeapIntrinsicRefs, ResolvedOffsets, resolve_offsets};
 
-pub(crate) const NATIVE_CALLABLE_ABI_VERSION: u16 = 3;
+pub(crate) const NATIVE_CALLABLE_ABI_VERSION: u16 = 4;
 
 #[cfg(feature = "cranelift-jit")]
 pub(crate) fn selected_codegen_backend() -> &'static str {
