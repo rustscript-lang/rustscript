@@ -3,8 +3,8 @@ use std::fmt::Write;
 
 use crate::builtins::BuiltinFunction;
 use crate::bytecode::{
-    CallableKind, CallablePrototype, CallableTarget, CaptureBindingMode, FunctionRegion,
-    RootCallableBinding, ScriptFunction, TypeMap, ValueType,
+    CallableKind, CallablePrototype, CallableTarget, CaptureBindingMode, ExportedCallable,
+    FunctionRegion, RootCallableBinding, ScriptFunction, TypeMap, ValueType,
 };
 use crate::compiler::ir::TypeSchema;
 use crate::debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
@@ -16,8 +16,8 @@ const VERSION_V3: u16 = 3;
 const VERSION_V4: u16 = 4;
 const VERSION_V5: u16 = 5;
 const VERSION_V6: u16 = 6;
-const VERSION_V9: u16 = 9;
-const ENCODE_VERSION: u16 = VERSION_V9;
+const VERSION_V10: u16 = 10;
+const ENCODE_VERSION: u16 = VERSION_V10;
 const FLAGS: u16 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,7 +227,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     }
 
     let version = cursor.read_u16()?;
-    if version != VERSION_V9 {
+    if version != VERSION_V10 {
         return Err(WireError::UnsupportedVersion(version));
     }
 
@@ -289,8 +289,13 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     } else {
         None
     };
-    let (script_functions, callable_prototypes, function_regions, root_callable_bindings) =
-        read_callable_metadata(&mut cursor)?;
+    let (
+        script_functions,
+        callable_prototypes,
+        function_regions,
+        root_callable_bindings,
+        exported_callables,
+    ) = read_callable_metadata(&mut cursor)?;
 
     if !cursor.is_eof() {
         return Err(WireError::TrailingBytes);
@@ -302,6 +307,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     program.callable_prototypes = callable_prototypes;
     program.function_regions = function_regions;
     program.root_callable_bindings = root_callable_bindings;
+    program.exported_callables = exported_callables;
     Ok(program)
 }
 
@@ -591,6 +597,17 @@ fn validate_callable_metadata(program: &Program) -> Result<(), ValidationError> 
             ));
         }
     }
+    let mut export_names = HashSet::new();
+    for exported in &program.exported_callables {
+        if exported.name.is_empty()
+            || exported.local_slot as usize >= program.local_count
+            || !export_names.insert(exported.name.as_str())
+        {
+            return Err(ValidationError::InvalidCallableMetadata(
+                "exported callable metadata is invalid",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -838,6 +855,11 @@ fn write_callable_metadata(out: &mut Vec<u8>, program: &Program) -> Result<(), W
         out.extend_from_slice(&binding.local_slot.to_le_bytes());
         out.extend_from_slice(&binding.prototype_id.to_le_bytes());
     }
+    write_u32_count("exported callables", program.exported_callables.len(), out)?;
+    for exported in &program.exported_callables {
+        write_string("exported callable name", &exported.name, out)?;
+        out.extend_from_slice(&exported.local_slot.to_le_bytes());
+    }
     Ok(())
 }
 
@@ -854,6 +876,7 @@ type CallableMetadata = (
     Vec<CallablePrototype>,
     Vec<FunctionRegion>,
     Vec<RootCallableBinding>,
+    Vec<ExportedCallable>,
 );
 
 fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, WireError> {
@@ -949,11 +972,20 @@ fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, W
             prototype_id: cursor.read_u32()?,
         });
     }
+    let export_count = cursor.read_u32()? as usize;
+    let mut exported_callables = Vec::with_capacity(export_count);
+    for _ in 0..export_count {
+        exported_callables.push(ExportedCallable {
+            name: cursor.read_string()?,
+            local_slot: cursor.read_u16()?,
+        });
+    }
     Ok((
         script_functions,
         callable_prototypes,
         function_regions,
         root_callable_bindings,
+        exported_callables,
     ))
 }
 

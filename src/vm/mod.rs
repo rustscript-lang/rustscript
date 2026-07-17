@@ -1,6 +1,7 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 pub(crate) mod aot;
 pub mod diagnostics;
@@ -309,6 +310,7 @@ impl ExecutionFrame {
 struct QueuedCallable {
     callable: Value,
     args: Vec<Value>,
+    subscription: Option<Arc<AtomicBool>>,
 }
 
 pub struct Vm {
@@ -338,6 +340,9 @@ pub struct Vm {
     execution_frames: Vec<ExecutionFrame>,
     host_return: Option<Value>,
     queued_callables: VecDeque<QueuedCallable>,
+    completed_callable_results: VecDeque<Value>,
+    owned_callables: Vec<Weak<CallableValue>>,
+    callback_registry_flags: Vec<Weak<AtomicBool>>,
     draining_queued_callables: bool,
     shutdown: bool,
     aot_program: Option<aot::CompiledProgram>,
@@ -455,6 +460,7 @@ fn compute_program_cache_key(program: &Program) -> u64 {
     program.script_functions.hash(&mut hasher);
     program.function_regions.hash(&mut hasher);
     program.root_callable_bindings.hash(&mut hasher);
+    program.exported_callables.hash(&mut hasher);
     program.callable_prototypes.len().hash(&mut hasher);
     for prototype in &program.callable_prototypes {
         prototype.kind.hash(&mut hasher);
@@ -652,6 +658,9 @@ impl Vm {
             execution_frames: vec![ExecutionFrame::root(local_count)],
             host_return: None,
             queued_callables: VecDeque::new(),
+            completed_callable_results: VecDeque::new(),
+            owned_callables: Vec::new(),
+            callback_registry_flags: Vec::new(),
             draining_queued_callables: false,
             shutdown: false,
             aot_program: None,
@@ -701,21 +710,24 @@ impl Vm {
     fn initialize_root_callable_bindings(&mut self) {
         let bindings = self.program.root_callable_bindings.clone();
         for binding in bindings {
-            let Some(prototype) = self
+            let Some(kind) = self
                 .program
                 .callable_prototypes
                 .get(binding.prototype_id as usize)
+                .map(|prototype| prototype.kind)
             else {
                 continue;
             };
-            let Some(slot) = self.locals.get_mut(binding.local_slot as usize) else {
+            if binding.local_slot as usize >= self.locals.len() {
                 continue;
-            };
-            *slot = Value::Callable(Arc::new(CallableValue {
+            }
+            let callable = Arc::new(CallableValue {
                 prototype_id: binding.prototype_id,
-                kind: prototype.kind,
+                kind,
                 env: None,
-            }));
+            });
+            self.owned_callables.push(Arc::downgrade(&callable));
+            self.locals[binding.local_slot as usize] = Value::Callable(callable);
         }
     }
 
@@ -841,6 +853,8 @@ impl Vm {
     /// Locals are reset to `Null`, stack is cleared, and instruction pointer is
     /// rewound to the program entry.
     pub fn reset_for_reuse(&mut self) {
+        self.invalidate_callback_registries();
+        self.cancel_waiting_host_op();
         self.ip = 0;
         self.drop_contract_events = 0;
         self.last_yield_reason = None;
@@ -850,6 +864,7 @@ impl Vm {
         self.clear_stack_with_drop_contract();
         self.capture_cells.clear();
         self.clear_locals_with_drop_contract();
+        self.owned_callables.clear();
         self.locals.resize(self.program.local_count, Value::Null);
         self.initialize_root_callable_bindings();
         crate::builtins::runtime::close_all_handles(self);
@@ -859,11 +874,12 @@ impl Vm {
             .push(ExecutionFrame::root(self.program.local_count));
         self.host_return = None;
         self.queued_callables.clear();
+        self.completed_callable_results.clear();
+        self.owned_callables.clear();
         self.draining_queued_callables = false;
         self.shutdown = false;
         self.aot_interpreter_boundary_hit = false;
         self.waiting_host_op = None;
-        self.next_host_op_id = 1;
         self.io_state = crate::builtins::runtime::IoState::default();
         self.map_iterators.clear();
         self.clear_interpreter_metrics();
@@ -1089,6 +1105,7 @@ impl Vm {
 
 impl Drop for Vm {
     fn drop(&mut self) {
+        self.cancel_waiting_host_op();
         self.clear_stack_with_drop_contract();
         self.capture_cells.clear();
         self.clear_locals_with_drop_contract();
@@ -1164,11 +1181,13 @@ impl Vm {
         } else {
             None
         };
-        Ok(Value::Callable(Arc::new(CallableValue {
+        let callable = Arc::new(CallableValue {
             prototype_id,
             kind: prototype.kind,
             env,
-        })))
+        });
+        self.owned_callables.push(Arc::downgrade(&callable));
+        Ok(Value::Callable(callable))
     }
 
     fn execute_call_value(&mut self, argc: u8) -> VmResult<ExecOutcome> {
@@ -1248,16 +1267,19 @@ impl Vm {
                             "root callable binding is outside the script frame",
                         ));
                     }
-                    let bound_prototype = self
+                    let kind = self
                         .program
                         .callable_prototypes
                         .get(binding.prototype_id as usize)
+                        .map(|prototype| prototype.kind)
                         .ok_or(VmError::InvalidCallablePrototype(binding.prototype_id))?;
-                    self.locals[local_base + relative] = Value::Callable(Arc::new(CallableValue {
+                    let callable = Arc::new(CallableValue {
                         prototype_id: binding.prototype_id,
-                        kind: bound_prototype.kind,
+                        kind,
                         env: None,
-                    }));
+                    });
+                    self.owned_callables.push(Arc::downgrade(&callable));
+                    self.locals[local_base + relative] = Value::Callable(callable);
                 }
                 for (slot, value) in inherited_callables {
                     if slot < local_count {
@@ -1824,6 +1846,11 @@ impl Vm {
     ) -> VmResult<()> {
         let absolute = self.absolute_local_index(index)?;
         if let Some(cell) = self.capture_cells.get(&absolute).cloned() {
+            if Self::value_references_capture_cell(&value, &cell, &mut HashSet::new())? {
+                return Err(VmError::InvalidFrameState(
+                    "callable capture ownership cycle is unsupported",
+                ));
+            }
             let previous = {
                 let mut captured = cell
                     .lock()
@@ -1841,6 +1868,57 @@ impl Vm {
         let previous = std::mem::replace(slot, value);
         self.drop_value_with_contract(previous);
         Ok(())
+    }
+
+    fn value_references_capture_cell(
+        value: &Value,
+        target: &crate::bytecode::SharedCaptureCell,
+        visited_cells: &mut HashSet<usize>,
+    ) -> VmResult<bool> {
+        match value {
+            Value::Callable(callable) => {
+                let Some(environment) = callable.env.as_ref() else {
+                    return Ok(false);
+                };
+                let cells = environment.cells.lock().map_err(|_| {
+                    VmError::InvalidFrameState("capture environment lock is poisoned")
+                })?;
+                for cell in cells.iter() {
+                    if Arc::ptr_eq(cell, target) {
+                        return Ok(true);
+                    }
+                    let identity = Arc::as_ptr(cell) as usize;
+                    if visited_cells.insert(identity) {
+                        let captured = cell.lock().map_err(|_| {
+                            VmError::InvalidFrameState("capture cell lock is poisoned")
+                        })?;
+                        if Self::value_references_capture_cell(&captured, target, visited_cells)? {
+                            return Ok(true);
+                        }
+                    }
+                }
+                Ok(false)
+            }
+            Value::Array(values) => {
+                for value in values.iter() {
+                    if Self::value_references_capture_cell(value, target, visited_cells)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Value::Map(values) => {
+                for (key, value) in values.iter() {
+                    if Self::value_references_capture_cell(key, target, visited_cells)?
+                        || Self::value_references_capture_cell(value, target, visited_cells)?
+                    {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
     }
 
     pub(crate) fn detach_local_with_drop_contract(&mut self, index: u8) -> VmResult<()> {
@@ -2496,6 +2574,42 @@ impl Vm {
         self.ip
     }
 
+    pub(super) fn owns_callable(&self, value: &Value) -> bool {
+        let Value::Callable(target) = value else {
+            return false;
+        };
+        self.owned_callables.iter().any(|owned| {
+            owned
+                .upgrade()
+                .is_some_and(|owned| Arc::ptr_eq(&owned, target))
+        })
+    }
+
+    pub fn resolve_exported_callable(&self, name: &str) -> VmResult<Value> {
+        let exported = self
+            .program
+            .exported_callables
+            .iter()
+            .find(|exported| exported.name == name)
+            .ok_or_else(|| {
+                VmError::HostError(format!("unknown exported script function '{name}'"))
+            })?;
+        let value = self
+            .locals
+            .get(exported.local_slot as usize)
+            .cloned()
+            .ok_or(VmError::InvalidLocal(
+                u8::try_from(exported.local_slot).unwrap_or(u8::MAX),
+            ))?;
+        if matches!(value, Value::Callable(_)) {
+            Ok(value)
+        } else {
+            Err(VmError::InvalidFrameState(
+                "exported script function is not initialized",
+            ))
+        }
+    }
+
     pub fn debug_info(&self) -> Option<&crate::debug_info::DebugInfo> {
         self.program.debug.as_ref()
     }
@@ -2505,14 +2619,26 @@ impl Vm {
     }
 
     pub fn queue_callable(&mut self, callable: Value, args: Vec<Value>) -> VmResult<()> {
+        self.queue_callable_with_subscription(callable, args, None)
+    }
+
+    pub(super) fn queue_callable_with_subscription(
+        &mut self,
+        callable: Value,
+        args: Vec<Value>,
+        subscription: Option<Arc<AtomicBool>>,
+    ) -> VmResult<()> {
         if self.shutdown {
             return Err(VmError::InvalidFrameState("vm is shut down"));
         }
         if !matches!(&callable, Value::Callable(_)) {
             return Err(VmError::InvalidCallable);
         }
-        self.queued_callables
-            .push_back(QueuedCallable { callable, args });
+        self.queued_callables.push_back(QueuedCallable {
+            callable,
+            args,
+            subscription,
+        });
         Ok(())
     }
 
@@ -2534,9 +2660,40 @@ impl Vm {
         self.draining_queued_callables = true;
         let mut results = Vec::with_capacity(self.queued_callables.len());
         while let Some(queued) = self.queued_callables.pop_front() {
-            match self.invoke_callable(queued.callable, &queued.args) {
-                Ok(result) => results.push(result),
+            if queued
+                .subscription
+                .as_ref()
+                .is_some_and(|active| !active.load(Ordering::Acquire))
+            {
+                continue;
+            }
+            match self.start_callable(queued.callable, &queued.args) {
+                Ok(VmStatus::Halted) => {
+                    let Some(result) = self.host_return.take() else {
+                        self.completed_callable_results.extend(results);
+                        self.draining_queued_callables = false;
+                        return Err(VmError::InvalidFrameState(
+                            "queued invocation completed without a result",
+                        ));
+                    };
+                    results.push(result);
+                }
+                Ok(VmStatus::Yielded) => {
+                    self.completed_callable_results.extend(results);
+                    self.draining_queued_callables = false;
+                    return Err(VmError::InvalidFrameState(
+                        "queued invocation yielded; resume it before draining again",
+                    ));
+                }
+                Ok(VmStatus::Waiting(_)) => {
+                    self.completed_callable_results.extend(results);
+                    self.draining_queued_callables = false;
+                    return Err(VmError::InvalidFrameState(
+                        "queued invocation is waiting; resume it before draining again",
+                    ));
+                }
                 Err(err) => {
+                    self.completed_callable_results.extend(results);
                     self.draining_queued_callables = false;
                     return Err(err);
                 }
@@ -2547,7 +2704,11 @@ impl Vm {
     }
 
     pub fn shutdown(&mut self) {
+        self.invalidate_callback_registries();
+        self.cancel_waiting_host_op();
         self.queued_callables.clear();
+        self.completed_callable_results.clear();
+        self.owned_callables.clear();
         self.draining_queued_callables = false;
         self.clear_stack_with_drop_contract();
         self.capture_cells.clear();
@@ -2558,6 +2719,20 @@ impl Vm {
         self.waiting_host_op = None;
         crate::builtins::runtime::close_all_handles(self);
         self.shutdown = true;
+    }
+
+    pub(super) fn register_callback_registry(&mut self, active: &Arc<AtomicBool>) {
+        self.callback_registry_flags.push(Arc::downgrade(active));
+    }
+
+    fn invalidate_callback_registries(&mut self) {
+        for active in self
+            .callback_registry_flags
+            .drain(..)
+            .filter_map(|flag| flag.upgrade())
+        {
+            active.store(false, Ordering::Release);
+        }
     }
 
     pub fn start_callable(&mut self, callable: Value, args: &[Value]) -> VmResult<VmStatus> {
@@ -2572,26 +2747,33 @@ impl Vm {
                 "host invocation requires a halted VM",
             ));
         }
+        let argc = u8::try_from(args.len())
+            .map_err(|_| VmError::InvalidFrameState("too many arguments"))?;
         let stack_base = self.stack.len();
+        let frame_count = self.execution_frames.len();
         self.stack.push(callable);
         self.stack.extend_from_slice(args);
         self.host_return = None;
-        let frame_count = self.execution_frames.len();
-        let outcome = self.execute_call_value(
-            u8::try_from(args.len())
-                .map_err(|_| VmError::InvalidFrameState("too many arguments"))?,
-        )?;
+        let outcome = match self.execute_call_value(argc) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.abort_host_invocation(stack_base, frame_count);
+                return Err(error);
+            }
+        };
         if self.execution_frames.len() == frame_count {
             let result = match outcome {
                 ExecOutcome::Continue | ExecOutcome::Halted => {
                     self.stack.pop().unwrap_or(Value::Null)
                 }
                 ExecOutcome::Yielded => {
+                    self.abort_host_invocation(stack_base, frame_count);
                     return Err(VmError::InvalidFrameState(
                         "direct host callable invocation yielded",
                     ));
                 }
                 ExecOutcome::Waiting(_) => {
+                    self.abort_host_invocation(stack_base, frame_count);
                     return Err(VmError::InvalidFrameState(
                         "direct host callable invocation is waiting",
                     ));
@@ -2604,21 +2786,65 @@ impl Vm {
         if let Some(frame) = self.execution_frames.last_mut() {
             frame.continuation = FrameContinuation::ReturnToHost;
         }
-        self.run_internal(None, false)
+        match self.run_internal(None, false) {
+            Ok(status) => Ok(status),
+            Err(error) => {
+                self.abort_host_invocation(stack_base, frame_count);
+                Err(error)
+            }
+        }
     }
 
     pub fn invoke_callable(&mut self, callable: Value, args: &[Value]) -> VmResult<Value> {
+        let stack_base = self.stack.len();
+        let frame_count = self.execution_frames.len();
         match self.start_callable(callable, args)? {
             VmStatus::Halted => self.host_return.take().ok_or(VmError::InvalidFrameState(
                 "host invocation completed without a result",
             )),
-            VmStatus::Yielded => Err(VmError::InvalidFrameState("host invocation yielded")),
-            VmStatus::Waiting(_) => Err(VmError::InvalidFrameState("host invocation is waiting")),
+            VmStatus::Yielded => {
+                self.abort_host_invocation(stack_base, frame_count);
+                Err(VmError::InvalidFrameState("host invocation yielded"))
+            }
+            VmStatus::Waiting(_) => {
+                self.abort_host_invocation(stack_base, frame_count);
+                Err(VmError::InvalidFrameState("host invocation is waiting"))
+            }
         }
     }
 
+    fn abort_host_invocation(&mut self, stack_base: usize, frame_count: usize) {
+        while self.execution_frames.len() > frame_count {
+            let Some(frame) = self.execution_frames.pop() else {
+                break;
+            };
+            let frame_end = frame.local_base.saturating_add(frame.local_count);
+            self.capture_cells
+                .retain(|absolute, _| *absolute < frame.local_base || *absolute >= frame_end);
+            if frame.local_base <= self.locals.len() {
+                let drained = self.locals.drain(frame.local_base..).collect::<Vec<_>>();
+                for value in drained {
+                    self.drop_value_with_contract(value);
+                }
+            }
+        }
+        while self.stack.len() > stack_base {
+            if let Some(value) = self.stack.pop() {
+                self.drop_value_with_contract(value);
+            }
+        }
+        self.call_depth = self.script_frame_depth();
+        self.host_return = None;
+        self.cancel_waiting_host_op();
+        self.last_yield_reason = None;
+        self.map_iterators
+            .truncate(self.call_depth.saturating_add(1));
+    }
+
     pub fn take_callable_result(&mut self) -> Option<Value> {
-        self.host_return.take()
+        self.completed_callable_results
+            .pop_front()
+            .or_else(|| self.host_return.take())
     }
 
     pub fn execution_frames(&self) -> Vec<VmExecutionFrameSnapshot> {

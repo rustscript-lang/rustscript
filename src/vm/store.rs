@@ -1,45 +1,64 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::Value;
 use crate::compiler::TypeSchema;
 
 use super::{EpochCheckpoint, EpochHandle, FuelCheckpoint, Vm, VmError, VmResult, VmStatus};
 
-static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
-
 /// Lightweight Wasmtime-style store wrapper for VM state and host context data.
 pub struct Store<T = ()> {
     vm: Vm,
     data: T,
-    id: u64,
+    callback_registry: CallbackRegistryOwner,
+}
+
+struct CallbackRegistryOwner(Arc<AtomicBool>);
+
+impl Drop for CallbackRegistryOwner {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 pub trait ScriptArgs {
     const ARITY: Option<usize>;
 
     fn into_values(self) -> Vec<Value>;
+
+    fn schemas() -> Option<Vec<TypeSchema>> {
+        None
+    }
 }
 
 pub trait IntoScriptValue {
     fn into_script_value(self) -> Value;
+
+    fn schema() -> Option<TypeSchema> {
+        None
+    }
 }
 
 pub trait ScriptResult: Sized {
     fn from_value(value: Value) -> VmResult<Self>;
+
+    fn schema() -> Option<TypeSchema> {
+        None
+    }
 }
 
 pub struct ScriptCallback<Args = Vec<Value>, Ret = Value> {
-    store_id: u64,
+    registry: Arc<AtomicBool>,
     callable: Value,
     schema: Option<TypeSchema>,
-    subscribed: Arc<AtomicBool>,
+    subscription: Arc<AtomicBool>,
     marker: PhantomData<fn(Args) -> Ret>,
 }
 
 pub struct QueuedScriptInvocation {
-    store_id: u64,
+    registry: Arc<AtomicBool>,
+    subscription: Arc<AtomicBool>,
     callable: Value,
     args: Vec<Value>,
 }
@@ -47,10 +66,10 @@ pub struct QueuedScriptInvocation {
 impl<Args, Ret> Clone for ScriptCallback<Args, Ret> {
     fn clone(&self) -> Self {
         Self {
-            store_id: self.store_id,
+            registry: Arc::clone(&self.registry),
             callable: self.callable.clone(),
             schema: self.schema.clone(),
-            subscribed: Arc::clone(&self.subscribed),
+            subscription: Arc::clone(&self.subscription),
             marker: PhantomData,
         }
     }
@@ -66,11 +85,11 @@ where
     }
 
     pub fn is_subscribed(&self) -> bool {
-        self.subscribed.load(Ordering::Acquire)
+        self.registry.load(Ordering::Acquire) && self.subscription.load(Ordering::Acquire)
     }
 
     pub fn unsubscribe(&self) {
-        self.subscribed.store(false, Ordering::Release);
+        self.subscription.store(false, Ordering::Release);
     }
 
     pub fn call<T>(&self, store: &mut Store<T>, args: Args) -> VmResult<Ret> {
@@ -92,13 +111,19 @@ where
     }
 
     pub fn prepare(&self, args: Args) -> VmResult<QueuedScriptInvocation> {
-        if !self.is_subscribed() {
+        if !self.registry.load(Ordering::Acquire) {
+            return Err(VmError::InvalidFrameState(
+                "script callback registry is invalidated",
+            ));
+        }
+        if !self.subscription.load(Ordering::Acquire) {
             return Err(VmError::InvalidFrameState(
                 "script callback is unsubscribed",
             ));
         }
         Ok(QueuedScriptInvocation {
-            store_id: self.store_id,
+            registry: Arc::clone(&self.registry),
+            subscription: Arc::clone(&self.subscription),
             callable: self.callable.clone(),
             args: args.into_values(),
         })
@@ -110,6 +135,10 @@ impl ScriptArgs for () {
 
     fn into_values(self) -> Vec<Value> {
         Vec::new()
+    }
+
+    fn schemas() -> Option<Vec<TypeSchema>> {
+        Some(Vec::new())
     }
 }
 
@@ -142,6 +171,10 @@ macro_rules! impl_script_args_tuple {
                 let ($($name,)+) = self;
                 vec![$($name.into_script_value(),)+]
             }
+
+            fn schemas() -> Option<Vec<TypeSchema>> {
+                Some(vec![$($name::schema()?),+])
+            }
         }
     };
 }
@@ -161,11 +194,19 @@ impl IntoScriptValue for i64 {
     fn into_script_value(self) -> Value {
         Value::Int(self)
     }
+
+    fn schema() -> Option<TypeSchema> {
+        Some(TypeSchema::Int)
+    }
 }
 
 impl IntoScriptValue for bool {
     fn into_script_value(self) -> Value {
         Value::Bool(self)
+    }
+
+    fn schema() -> Option<TypeSchema> {
+        Some(TypeSchema::Bool)
     }
 }
 
@@ -173,11 +214,19 @@ impl IntoScriptValue for String {
     fn into_script_value(self) -> Value {
         Value::string(self)
     }
+
+    fn schema() -> Option<TypeSchema> {
+        Some(TypeSchema::String)
+    }
 }
 
 impl IntoScriptValue for &str {
     fn into_script_value(self) -> Value {
         Value::string(self)
+    }
+
+    fn schema() -> Option<TypeSchema> {
+        Some(TypeSchema::String)
     }
 }
 
@@ -194,6 +243,10 @@ impl ScriptResult for () {
             _ => Err(VmError::TypeMismatch("null callback result")),
         }
     }
+
+    fn schema() -> Option<TypeSchema> {
+        Some(TypeSchema::Null)
+    }
 }
 
 impl ScriptResult for i64 {
@@ -202,6 +255,10 @@ impl ScriptResult for i64 {
             Value::Int(value) => Ok(value),
             _ => Err(VmError::TypeMismatch("int callback result")),
         }
+    }
+
+    fn schema() -> Option<TypeSchema> {
+        Some(TypeSchema::Int)
     }
 }
 
@@ -212,14 +269,20 @@ impl ScriptResult for bool {
             _ => Err(VmError::TypeMismatch("bool callback result")),
         }
     }
+
+    fn schema() -> Option<TypeSchema> {
+        Some(TypeSchema::Bool)
+    }
 }
 
 impl<T> Store<T> {
-    pub fn new(vm: Vm, data: T) -> Self {
+    pub fn new(mut vm: Vm, data: T) -> Self {
+        let callback_registry = Arc::new(AtomicBool::new(true));
+        vm.register_callback_registry(&callback_registry);
         Self {
             vm,
             data,
-            id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
+            callback_registry: CallbackRegistryOwner(callback_registry),
         }
     }
 
@@ -251,14 +314,41 @@ impl<T> Store<T> {
         self.vm.run()
     }
 
-    pub fn script_callback<Args, Ret>(&self, callable: Value) -> VmResult<ScriptCallback<Args, Ret>>
+    pub fn resolve_exported_callable(&self, name: &str) -> VmResult<Value> {
+        self.vm.resolve_exported_callable(name)
+    }
+
+    pub fn script_callback_by_name<Args, Ret>(
+        &mut self,
+        name: &str,
+    ) -> VmResult<ScriptCallback<Args, Ret>>
     where
         Args: ScriptArgs,
         Ret: ScriptResult,
     {
+        let callable = self.resolve_exported_callable(name)?;
+        self.script_callback(callable)
+    }
+
+    pub fn script_callback<Args, Ret>(
+        &mut self,
+        callable: Value,
+    ) -> VmResult<ScriptCallback<Args, Ret>>
+    where
+        Args: ScriptArgs,
+        Ret: ScriptResult,
+    {
+        if !self.callback_registry.0.load(Ordering::Acquire) {
+            self.install_callback_registry();
+        }
         let Value::Callable(value) = &callable else {
             return Err(VmError::InvalidCallable);
         };
+        if !self.vm.owns_callable(&callable) {
+            return Err(VmError::InvalidFrameState(
+                "script callable does not belong to this store",
+            ));
+        }
         let prototype = self
             .vm
             .program()
@@ -274,18 +364,38 @@ impl<T> Store<T> {
                 got: u8::try_from(arity).unwrap_or(u8::MAX),
             });
         }
+        if let Some(TypeSchema::Callable { params, result }) = prototype.schema.as_ref() {
+            if let Some(args) = Args::schemas()
+                && (args.len() != params.len()
+                    || !args
+                        .iter()
+                        .zip(params)
+                        .all(|(actual, expected)| callback_schema_accepts(expected, actual)))
+            {
+                return Err(VmError::TypeMismatch("script callback argument schema"));
+            }
+            if let Some(actual) = Ret::schema()
+                && !callback_schema_accepts(result, &actual)
+            {
+                return Err(VmError::TypeMismatch("script callback result schema"));
+            }
+        }
         Ok(ScriptCallback {
-            store_id: self.id,
+            registry: Arc::clone(&self.callback_registry.0),
             callable,
             schema: prototype.schema.clone(),
-            subscribed: Arc::new(AtomicBool::new(true)),
+            subscription: Arc::new(AtomicBool::new(true)),
             marker: PhantomData,
         })
     }
 
     pub fn enqueue_callback(&mut self, invocation: QueuedScriptInvocation) -> VmResult<()> {
         self.validate_invocation(&invocation)?;
-        self.vm.queue_callable(invocation.callable, invocation.args)
+        self.vm.queue_callable_with_subscription(
+            invocation.callable,
+            invocation.args,
+            Some(invocation.subscription),
+        )
     }
 
     pub fn drain_callbacks(&mut self) -> VmResult<Vec<Value>> {
@@ -300,12 +410,42 @@ impl<T> Store<T> {
     }
 
     fn validate_invocation(&self, invocation: &QueuedScriptInvocation) -> VmResult<()> {
-        if invocation.store_id != self.id {
+        if !Arc::ptr_eq(&invocation.registry, &self.callback_registry.0) {
             return Err(VmError::InvalidFrameState(
                 "script callback belongs to another store",
             ));
         }
+        if !invocation.registry.load(Ordering::Acquire) {
+            return Err(VmError::InvalidFrameState(
+                "script callback registry is invalidated",
+            ));
+        }
+        if !invocation.subscription.load(Ordering::Acquire) {
+            return Err(VmError::InvalidFrameState(
+                "script callback is unsubscribed",
+            ));
+        }
         Ok(())
+    }
+
+    pub fn reset_for_reuse(&mut self) {
+        self.vm.reset_for_reuse();
+        self.install_callback_registry();
+    }
+
+    pub fn replace_vm(&mut self, mut vm: Vm) {
+        self.callback_registry.0.store(false, Ordering::Release);
+        self.vm.shutdown();
+        let callback_registry = Arc::new(AtomicBool::new(true));
+        vm.register_callback_registry(&callback_registry);
+        self.callback_registry = CallbackRegistryOwner(callback_registry);
+        self.vm = vm;
+    }
+
+    fn install_callback_registry(&mut self) {
+        let callback_registry = Arc::new(AtomicBool::new(true));
+        self.vm.register_callback_registry(&callback_registry);
+        self.callback_registry = CallbackRegistryOwner(callback_registry);
     }
 
     pub fn resume(&mut self) -> VmResult<VmStatus> {
@@ -415,6 +555,10 @@ impl<T> Store<T> {
     pub fn restore_checkpoint(&mut self, checkpoint: FuelCheckpoint) {
         self.vm.restore_checkpoint(checkpoint);
     }
+}
+
+fn callback_schema_accepts(expected: &TypeSchema, actual: &TypeSchema) -> bool {
+    matches!(expected, TypeSchema::Unknown) || expected == actual
 }
 
 impl Store<()> {

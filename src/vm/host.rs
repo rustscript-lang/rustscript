@@ -87,6 +87,8 @@ pub trait HostArgsFunction: Send {
 
 pub trait HostAsyncBridge: Send {
     fn poll_op(&mut self, op_id: HostOpId, cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>>;
+
+    fn cancel_op(&mut self, _op_id: HostOpId) {}
 }
 
 pub type StaticHostFunction = fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>;
@@ -789,10 +791,12 @@ impl Vm {
     }
 
     pub fn set_async_bridge(&mut self, bridge: Box<dyn HostAsyncBridge>) {
+        self.cancel_waiting_host_op();
         self.async_bridge = Some(bridge);
     }
 
     pub fn clear_async_bridge(&mut self) {
+        self.cancel_waiting_host_op();
         self.async_bridge = None;
     }
 
@@ -825,6 +829,22 @@ impl Vm {
 
     pub fn waiting_host_op_id(&self) -> Option<HostOpId> {
         self.waiting_host_op.map(|op| op.op_id)
+    }
+
+    pub(super) fn cancel_waiting_host_op(&mut self) {
+        let Some(waiting) = self.waiting_host_op.take() else {
+            return;
+        };
+        match waiting.source {
+            WaitingHostOpSource::HostBridge => {
+                if let Some(bridge) = self.async_bridge.as_mut() {
+                    bridge.cancel_op(waiting.op_id);
+                }
+            }
+            WaitingHostOpSource::BuiltinIo => {
+                crate::builtins::runtime::cancel_builtin_io_op(self, waiting.op_id);
+            }
+        }
     }
 
     pub fn complete_host_op(

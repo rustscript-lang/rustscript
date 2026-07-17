@@ -386,7 +386,12 @@ impl<C> Vm<C> {
                     let index = self.read_u8()?;
                     let absolute = self.absolute_local(index)?;
                     let value = self.pop()?;
-                    if let Some(cell) = self.capture_cells.get(&absolute) {
+                    if let Some(cell) = self.capture_cells.get(&absolute).cloned() {
+                        if Self::value_references_capture_cell(&value, &cell, &mut Vec::new()) {
+                            return Err(VmError::HostError(
+                                "callable capture ownership cycle is unsupported",
+                            ));
+                        }
                         *cell.borrow_mut() = value.clone();
                     }
                     self.locals[absolute] = value;
@@ -436,8 +441,59 @@ impl<C> Vm<C> {
         }
     }
 
+    fn value_references_capture_cell(
+        value: &Value,
+        target: &Rc<RefCell<Value>>,
+        visited_cells: &mut Vec<usize>,
+    ) -> bool {
+        match value {
+            Value::Callable(callable) => {
+                let Some(environment) = callable.env.as_ref() else {
+                    return false;
+                };
+                for cell in environment.iter() {
+                    if Rc::ptr_eq(cell, target) {
+                        return true;
+                    }
+                    let identity = Rc::as_ptr(cell) as usize;
+                    if !visited_cells.contains(&identity) {
+                        visited_cells.push(identity);
+                        if Self::value_references_capture_cell(
+                            &cell.borrow(),
+                            target,
+                            visited_cells,
+                        ) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            Value::Array(values) => values
+                .iter()
+                .any(|value| Self::value_references_capture_cell(value, target, visited_cells)),
+            Value::Map(values) => values.iter().any(|(key, value)| {
+                Self::value_references_capture_cell(key, target, visited_cells)
+                    || Self::value_references_capture_cell(value, target, visited_cells)
+            }),
+            _ => false,
+        }
+    }
+
     pub fn stack(&self) -> &[Value] {
         &self.stack
+    }
+
+    pub fn resolve_exported_callable(&self, name: &str) -> Option<Value> {
+        let exported = self
+            .program
+            .exported_callables()
+            .iter()
+            .find(|exported| exported.name == name)?;
+        self.locals
+            .get(exported.local_slot as usize)
+            .filter(|value| matches!(value, Value::Callable(_)))
+            .cloned()
     }
 
     pub fn locals(&self) -> &[Value] {

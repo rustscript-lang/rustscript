@@ -88,6 +88,14 @@ impl HostAsyncBridge for TestAsyncBridge {
             .expect("test async ops lock poisoned")
             .poll_op(op_id, cx)
     }
+
+    fn cancel_op(&mut self, op_id: HostOpId) {
+        self.ops
+            .lock()
+            .expect("test async ops lock poisoned")
+            .pending
+            .remove(&op_id);
+    }
 }
 
 struct AsyncAddOneFunction {
@@ -195,6 +203,31 @@ async fn async_host_call_waits_and_resumes_via_tokio_runtime() {
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(vm.stack(), &[Value::Int(42)]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reset_cancels_pending_host_bridge_operation() {
+    let ops = Arc::new(Mutex::new(TestAsyncOps::default()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut vm = Vm::new(build_async_import_program(41));
+    vm.bind_function(
+        "edge::async_add_one",
+        Box::new(AsyncAddOneFunction::new(
+            ops.clone(),
+            calls,
+            Duration::from_secs(60),
+        )),
+    );
+    vm.set_async_bridge(Box::new(TestAsyncBridge::new(ops.clone())));
+
+    assert!(matches!(
+        vm.run().expect("pending call"),
+        VmStatus::Waiting(_)
+    ));
+    assert_eq!(ops.lock().unwrap().pending.len(), 1);
+    vm.reset_for_reuse();
+    assert_eq!(ops.lock().unwrap().pending.len(), 0);
+    assert_eq!(vm.waiting_host_op_id(), None);
 }
 
 #[tokio::test(flavor = "current_thread")]

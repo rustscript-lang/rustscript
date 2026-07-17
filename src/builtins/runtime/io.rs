@@ -39,6 +39,10 @@ struct IoAsyncCompletion {
     result: VmResult<CallReturn>,
 }
 
+pub(super) fn cancel_pending_op(vm: &mut Vm, op_id: HostOpId) {
+    vm.io_state.pending_ops.remove(&op_id);
+}
+
 pub(super) fn poll_builtin_io_op(
     vm: &mut Vm,
     op_id: HostOpId,
