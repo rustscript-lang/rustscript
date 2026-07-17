@@ -910,6 +910,14 @@ mod tests {
             assert_eq!(BuiltinFunction::from_call_index(index), Some(builtin));
         }
         assert_eq!(BUILTIN_CALL_COUNT, 89);
+        for name in ["__bind_callable", "__detach_local"] {
+            assert!(
+                !crate::builtins::language_builtin_specs()
+                    .iter()
+                    .any(|spec| spec.name == name),
+                "internal callable metadata operation must not be language-visible: {name}"
+            );
+        }
         for alias in BUILTIN_CALL_BASE + 89..=BUILTIN_CALL_BASE + 92 {
             assert_eq!(BuiltinFunction::from_call_index(alias), None);
         }
