@@ -967,14 +967,30 @@ impl Vm {
     }
 
     #[inline(always)]
-    fn active_operand_stack_base(&self) -> usize {
+    pub(super) fn active_operand_stack_base(&self) -> usize {
         self.execution_frames
             .last()
             .map(|frame| frame.operand_stack_base)
             .unwrap_or(0)
     }
 
-    fn active_local_base(&self) -> usize {
+    #[inline(always)]
+    pub(super) fn active_operand_stack_len(&self) -> usize {
+        self.stack
+            .len()
+            .saturating_sub(self.active_operand_stack_base())
+    }
+
+    #[inline(always)]
+    pub(super) fn active_frame_key(&self) -> u64 {
+        self.execution_frames
+            .last()
+            .and_then(|frame| frame.prototype_id)
+            .map(u64::from)
+            .unwrap_or(crate::vm::native::ROOT_FRAME_KEY)
+    }
+
+    pub(super) fn active_local_base(&self) -> usize {
         self.execution_frames
             .last()
             .map(|frame| frame.local_base)
@@ -1964,15 +1980,16 @@ impl Vm {
             }
 
             if allow_jit
-                && self.call_depth == 0
                 && self.jit_config().enabled
                 && self.builtin_overrides.is_empty()
                 && !self.drop_contract_events_enabled()
             {
+                let frame_key = self.active_frame_key();
+                let stack_depth = self.active_operand_stack_len();
                 let trace_id = {
                     let program = &self.program;
                     self.jit
-                        .observe_hot_entry(self.ip, self.stack.len(), program)
+                        .observe_hot_entry(frame_key, self.ip, stack_depth, program)
                 };
                 if let Some(trace_id) = trace_id {
                     let outcome = match self.execute_jit_entry(trace_id) {

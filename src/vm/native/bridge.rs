@@ -305,6 +305,10 @@ pub(crate) fn restore_sparse_exit_state_entry_address() -> usize {
     pd_vm_native_restore_sparse_exit_state as *const () as usize
 }
 
+pub(crate) fn restore_active_sparse_exit_state_entry_address() -> usize {
+    pd_vm_native_restore_active_sparse_exit_state as *const () as usize
+}
+
 pub(crate) fn map_has_entry_address() -> usize {
     pd_vm_native_map_has as *const () as usize
 }
@@ -1028,6 +1032,88 @@ pub(crate) extern "C" fn pd_vm_native_restore_sparse_exit_state(
     })
 }
 
+pub(crate) extern "C" fn pd_vm_native_restore_active_sparse_exit_state(
+    vm: *mut Vm,
+    stack_src: *const Value,
+    stack_len: usize,
+    dirty_local_indices: *const u32,
+    dirty_local_values: *const Value,
+    dirty_local_count: usize,
+    ip: usize,
+) -> i32 {
+    run_step(vm, "restore_active_sparse_exit_state", |vm| {
+        if stack_len != 0 && stack_src.is_null() {
+            return Err(VmError::JitNative(
+                "native active sparse exit restore received null stack buffer".to_string(),
+            ));
+        }
+        if dirty_local_count != 0 && dirty_local_indices.is_null() {
+            return Err(VmError::JitNative(
+                "native active sparse exit restore received null local index buffer".to_string(),
+            ));
+        }
+        if dirty_local_count != 0 && dirty_local_values.is_null() {
+            return Err(VmError::JitNative(
+                "native active sparse exit restore received null local value buffer".to_string(),
+            ));
+        }
+
+        let local_count = vm
+            .execution_frames
+            .last()
+            .map(|frame| frame.local_count)
+            .unwrap_or(vm.locals.len());
+        let mut validated_indices = Vec::with_capacity(dirty_local_count);
+        for compact_index in 0..dirty_local_count {
+            let local_index = unsafe { *dirty_local_indices.add(compact_index) };
+            let local_index_usize = usize::try_from(local_index).map_err(|_| {
+                VmError::JitNative(
+                    "native active sparse exit restore local index out of range".to_string(),
+                )
+            })?;
+            if local_index_usize >= local_count {
+                return Err(VmError::JitNative(format!(
+                    "native active sparse exit restore local index {local_index} out of range for {local_count} active locals"
+                )));
+            }
+            let local_index = u8::try_from(local_index).map_err(|_| {
+                VmError::JitNative(
+                    "native active sparse exit restore local index exceeds VM local range"
+                        .to_string(),
+                )
+            })?;
+            if validated_indices.contains(&local_index) {
+                return Err(VmError::JitNative(format!(
+                    "native active sparse exit restore received duplicate local index {local_index}"
+                )));
+            }
+            validated_indices.push(local_index);
+        }
+
+        let stack_base = vm.active_operand_stack_base();
+        if stack_base > vm.stack.len() {
+            return Err(VmError::JitNative(format!(
+                "native active sparse stack base {stack_base} exceeds stack length {}",
+                vm.stack.len()
+            )));
+        }
+        vm.stack.truncate(stack_base);
+        vm.stack.reserve(stack_len);
+        for index in 0..stack_len {
+            let value = unsafe { std::ptr::read(stack_src.add(index)) };
+            vm.stack.push(value);
+        }
+
+        for (compact_index, local_index) in validated_indices.into_iter().enumerate() {
+            let value = unsafe { std::ptr::read(dirty_local_values.add(compact_index)) };
+            vm.store_local_with_drop_contract(local_index, value)?;
+        }
+
+        vm.jump_to(ip)?;
+        Ok(STATUS_CONTINUE)
+    })
+}
+
 pub(crate) extern "C" fn pd_vm_native_map_has(repr_ptr: *mut u8, key: *const Value) -> i32 {
     if repr_ptr.is_null() || key.is_null() {
         store_bridge_error(VmError::JitNative(
@@ -1589,6 +1675,38 @@ mod tests {
                 Value::Int(2),
                 Value::Int(30),
                 Value::Int(40),
+                Value::Int(50),
+            ]
+        );
+
+        let sparse_stack = [Value::Int(77), Value::Int(88)];
+        let dirty_indices = [1_u32];
+        let dirty_values = [Value::Int(44)];
+        assert_eq!(
+            pd_vm_native_restore_active_sparse_exit_state(
+                &mut vm,
+                sparse_stack.as_ptr(),
+                sparse_stack.len(),
+                dirty_indices.as_ptr(),
+                dirty_values.as_ptr(),
+                dirty_indices.len(),
+                0,
+            ),
+            STATUS_CONTINUE
+        );
+        std::mem::forget(sparse_stack);
+        std::mem::forget(dirty_values);
+        assert_eq!(
+            vm.stack,
+            vec![Value::Int(10), Value::Int(77), Value::Int(88)]
+        );
+        assert_eq!(
+            vm.locals,
+            vec![
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(30),
+                Value::Int(44),
                 Value::Int(50),
             ]
         );

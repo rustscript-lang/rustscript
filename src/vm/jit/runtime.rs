@@ -64,6 +64,7 @@ struct NativeTraceCacheKey {
     interrupt_settings: Option<native::NativeInterruptSettings>,
     compile_profile: native::NativeCompileProfile,
     drop_contract_events_enabled: bool,
+    frame_key: u64,
     root_ip: usize,
     entry_stack_depth: usize,
     terminal: JitTraceTerminal,
@@ -145,6 +146,7 @@ fn native_trace_cache_key(
         interrupt_settings,
         compile_profile,
         drop_contract_events_enabled,
+        frame_key: trace.frame_key,
         root_ip: trace.root_ip,
         entry_stack_depth: trace.entry_stack_depth,
         terminal: trace.terminal,
@@ -229,10 +231,16 @@ impl Vm {
         self.jit_trace_exit_count = self.jit_trace_exit_count.saturating_add(1);
         let mut current_trace_id = {
             let ip = self.ip;
-            let mut next_trace_id = self.jit.compiled_trace_for_entry(ip, self.stack.len());
+            let frame_key = self.active_frame_key();
+            let stack_depth = self.active_operand_stack_len();
+            let mut next_trace_id = self
+                .jit
+                .compiled_trace_for_entry(frame_key, ip, stack_depth);
             if next_trace_id.is_none() {
                 let program = &self.program;
-                next_trace_id = self.jit.observe_exit_entry(ip, self.stack.len(), program);
+                next_trace_id = self
+                    .jit
+                    .observe_exit_entry(frame_key, ip, stack_depth, program);
             }
             let Some(next_trace_id) = next_trace_id else {
                 return Ok(native::STATUS_LINKED_CONTINUE);
@@ -263,9 +271,16 @@ impl Vm {
 
             match status {
                 native::STATUS_CONTINUE => {
-                    if !has_yielding_call
-                        && let Some(next_trace_id) =
-                            self.jit.compiled_trace_for_entry(self.ip, self.stack.len())
+                    let next_trace_id = if has_yielding_call {
+                        None
+                    } else {
+                        self.jit.compiled_trace_for_entry(
+                            self.active_frame_key(),
+                            self.ip,
+                            self.active_operand_stack_len(),
+                        )
+                    };
+                    if let Some(next_trace_id) = next_trace_id
                         && next_trace_id != current_trace_id
                     {
                         self.record_jit_link_handoff();
@@ -299,12 +314,16 @@ impl Vm {
                     }
                     if !has_yielding_call {
                         let ip = self.ip;
+                        let frame_key = self.active_frame_key();
+                        let stack_depth = self.active_operand_stack_len();
                         let mut next_trace_id =
-                            self.jit.compiled_trace_for_entry(ip, self.stack.len());
+                            self.jit
+                                .compiled_trace_for_entry(frame_key, ip, stack_depth);
                         if next_trace_id.is_none() {
                             let program = &self.program;
                             next_trace_id =
-                                self.jit.observe_exit_entry(ip, self.stack.len(), program);
+                                self.jit
+                                    .observe_exit_entry(frame_key, ip, stack_depth, program);
                         }
                         if let Some(next_trace_id) = next_trace_id
                             && next_trace_id != current_trace_id
@@ -506,9 +525,16 @@ impl Vm {
 
             match status {
                 native::STATUS_CONTINUE => {
-                    if !has_yielding_call
-                        && let Some(next_trace_id) =
-                            self.jit.compiled_trace_for_entry(self.ip, self.stack.len())
+                    let next_trace_id = if has_yielding_call {
+                        None
+                    } else {
+                        self.jit.compiled_trace_for_entry(
+                            self.active_frame_key(),
+                            self.ip,
+                            self.active_operand_stack_len(),
+                        )
+                    };
+                    if let Some(next_trace_id) = next_trace_id
                         && next_trace_id != current_trace_id
                     {
                         self.record_jit_link_handoff();
@@ -557,12 +583,16 @@ impl Vm {
                     }
                     if !has_yielding_call {
                         let ip = self.ip;
+                        let frame_key = self.active_frame_key();
+                        let stack_depth = self.active_operand_stack_len();
                         let mut next_trace_id =
-                            self.jit.compiled_trace_for_entry(ip, self.stack.len());
+                            self.jit
+                                .compiled_trace_for_entry(frame_key, ip, stack_depth);
                         if next_trace_id.is_none() {
                             next_trace_id = {
                                 let program = &self.program;
-                                self.jit.observe_exit_entry(ip, self.stack.len(), program)
+                                self.jit
+                                    .observe_exit_entry(frame_key, ip, stack_depth, program)
                             };
                         }
                         if let Some(next_trace_id) = next_trace_id

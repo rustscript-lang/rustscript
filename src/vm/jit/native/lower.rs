@@ -8,20 +8,21 @@ use crate::vm::jit::ir::{
     SsaTrace, SsaValueId, SsaValueRepr,
 };
 use crate::vm::native::{
-    ExecutableBuffer, HeapIntrinsicAddrs, HeapIntrinsicRefs, NativeInterruptMode,
-    NativeInterruptSettings, NativeStackLayout, STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED,
-    STATUS_OUT_OF_FUEL, STATUS_TRACE_EXIT, alloc_buffer_signature, alloc_byte_buffer_entry_address,
+    ExecutableBuffer, HeapIntrinsicAddrs, HeapIntrinsicRefs, NativeFrameState, NativeInterruptMode,
+    NativeInterruptSettings, NativeStackLayout, STATUS_CONTINUE, STATUS_ERROR, STATUS_OUT_OF_FUEL,
+    STATUS_TRACE_EXIT, alloc_buffer_signature, alloc_byte_buffer_entry_address,
     alloc_value_buffer_entry_address, array_push_entry_address, array_set_entry_address,
     array_set_signature, box_heap_value_signature, checked_add_i32, clear_value_slot_entry_address,
     clone_value_signature, clone_value_to_slot_entry_address, collection_get_signature,
     collection_predicate_signature, copy_bytes_entry_address, copy_bytes_signature,
-    detect_native_stack_layout, entry_signature, free_buffer_signature, jump_with_status,
+    detect_native_stack_layout, entry_signature, frame_state_entry_address, frame_state_signature,
+    free_buffer_signature, jump_with_status, leave_frame_entry_address, leave_frame_signature,
     map_get_entry_address, map_has_entry_address, map_iter_next_entry_address,
     map_iter_next_signature, map_iter_take_key_entry_address, map_iter_take_signature,
     map_iter_take_value_entry_address, map_set_entry_address, map_set_signature,
     non_yielding_host_call_entry_address, non_yielding_host_call_signature, pack_shared_signature,
     regex_match_entry_address, regex_match_signature, regex_replace_entry_address,
-    regex_replace_signature, restore_sparse_exit_state_entry_address,
+    regex_replace_signature, restore_active_sparse_exit_state_entry_address,
     shared_array_from_buffer_entry_address, shared_bytes_from_buffer_entry_address,
     shared_string_from_buffer_entry_address, sparse_restore_exit_signature,
     string_binary_transform_signature, string_contains_entry_address, string_contains_signature,
@@ -118,6 +119,8 @@ fn try_compile_ssa_trace(
     let array_set_sig = array_set_signature(pointer_type, call_conv);
     let map_set_sig = map_set_signature(pointer_type, call_conv);
     let sparse_restore_exit_sig = sparse_restore_exit_signature(pointer_type, call_conv);
+    let frame_state_sig = frame_state_signature(pointer_type, call_conv);
+    let leave_frame_sig = leave_frame_signature(pointer_type, call_conv);
     let resume_linked_trace_sig = entry_signature(pointer_type, call_conv);
     let string_contains_sig = string_contains_signature(pointer_type, call_conv);
     let regex_match_sig = regex_match_signature(pointer_type, call_conv);
@@ -175,6 +178,7 @@ fn try_compile_ssa_trace(
             to_string: to_string_entry_address(),
             split_literal: string_split_literal_entry_address(),
         };
+        let frame_state_ref = b.import_signature(frame_state_sig);
         let deopt_refs = SsaDeoptHelperRefs {
             clone_value_ref: b.import_signature(clone_value_sig),
             value_eq_ref: b.import_signature(value_eq_sig),
@@ -191,6 +195,7 @@ fn try_compile_ssa_trace(
             array_set_ref: b.import_signature(array_set_sig),
             map_set_ref: b.import_signature(map_set_sig),
             sparse_restore_exit_ref: b.import_signature(sparse_restore_exit_sig),
+            leave_frame_ref: b.import_signature(leave_frame_sig),
             resume_linked_trace_ref: b.import_signature(resume_linked_trace_sig),
         };
         let deopt_addrs = SsaDeoptHelperAddrs {
@@ -208,7 +213,8 @@ fn try_compile_ssa_trace(
             array_push: array_push_entry_address(),
             array_set: array_set_entry_address(),
             map_set: map_set_entry_address(),
-            sparse_restore_exit: restore_sparse_exit_state_entry_address(),
+            sparse_restore_exit: restore_active_sparse_exit_state_entry_address(),
+            leave_frame: leave_frame_entry_address(),
             resume_linked_trace: resume_linked_trace_entry_address(),
         };
         // The outer native dispatch loop links trace exits directly. Re-entering it through the
@@ -270,8 +276,31 @@ fn try_compile_ssa_trace(
         b.switch_to_block(entry_block);
         b.append_block_params_for_function_params(entry_block);
         let vm_ptr = b.block_params(entry_block)[0];
+        let entry_local_count = ssa
+            .blocks
+            .get(ssa.entry.index())
+            .and_then(|block| block.params.len().checked_sub(ssa.entry_stack_depth))
+            .ok_or_else(|| {
+                VmError::JitNative(
+                    "SSA entry stack depth exceeds entry parameter count".to_string(),
+                )
+            })?;
+        let (active_stack_base, active_local_base) = emit_frame_state_entry_guard(
+            &mut b,
+            vm_ptr,
+            exit_block,
+            pointer_type,
+            offsets,
+            frame_state_ref,
+            frame_state_entry_address(),
+            trace.frame_key,
+            ssa.entry_stack_depth,
+            entry_local_count,
+        )?;
         let lower_ctx = SsaLowerCtx {
             vm_ptr,
+            active_stack_base,
+            active_local_base,
             exit_block,
             pointer_type,
             layout,
@@ -295,19 +324,6 @@ fn try_compile_ssa_trace(
         );
         b.ins()
             .store(MemFlags::new(), root_ip, vm_ptr, offsets.vm_ip);
-        emit_entry_stack_depth_guard(
-            &mut b,
-            vm_ptr,
-            exit_block,
-            pointer_type,
-            offsets,
-            ssa.entry_stack_depth,
-        )?;
-
-        let entry_ssa_block = ssa
-            .blocks
-            .get(ssa.entry.index())
-            .ok_or_else(|| VmError::JitNative("SSA entry block missing".to_string()))?;
         let entry_handle = *block_handles
             .get(&ssa.entry)
             .ok_or_else(|| VmError::JitNative("SSA entry block handle missing".to_string()))?;
@@ -317,16 +333,10 @@ fn try_compile_ssa_trace(
             pointer_type,
             layout,
             offsets,
+            active_stack_base,
+            active_local_base,
             ssa.entry_stack_depth,
-            entry_ssa_block
-                .params
-                .len()
-                .checked_sub(ssa.entry_stack_depth)
-                .ok_or_else(|| {
-                    VmError::JitNative(
-                        "SSA entry stack depth exceeds entry parameter count".to_string(),
-                    )
-                })?,
+            entry_local_count,
         )?;
         init_owned_value_temps(&mut b, pointer_type, layout.value, &owned_value_temps)?;
         let entry_args = ssa_block_args(entry_args);
@@ -458,6 +468,7 @@ struct SsaDeoptHelperRefs {
     array_set_ref: cranelift_codegen::ir::SigRef,
     map_set_ref: cranelift_codegen::ir::SigRef,
     sparse_restore_exit_ref: cranelift_codegen::ir::SigRef,
+    leave_frame_ref: cranelift_codegen::ir::SigRef,
     resume_linked_trace_ref: cranelift_codegen::ir::SigRef,
 }
 
@@ -478,6 +489,7 @@ struct SsaDeoptHelperAddrs {
     array_set: usize,
     map_set: usize,
     sparse_restore_exit: usize,
+    leave_frame: usize,
     resume_linked_trace: usize,
 }
 
@@ -522,6 +534,8 @@ struct SsaOwnedValueTemps {
 #[derive(Clone, Copy)]
 struct SsaLowerCtx<'a> {
     vm_ptr: cranelift_codegen::ir::Value,
+    active_stack_base: cranelift_codegen::ir::Value,
+    active_local_base: cranelift_codegen::ir::Value,
     exit_block: Block,
     pointer_type: cranelift_codegen::ir::Type,
     layout: crate::vm::native::NativeStackLayout,
@@ -1027,21 +1041,38 @@ fn ssa_backedge_targets(
     targets
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_entry_args(
     b: &mut FunctionBuilder,
     vm_ptr: cranelift_codegen::ir::Value,
     pointer_type: cranelift_codegen::ir::Type,
     layout: crate::vm::native::NativeStackLayout,
     offsets: ResolvedOffsets,
+    active_stack_base: cranelift_codegen::ir::Value,
+    active_local_base: cranelift_codegen::ir::Value,
     stack_depth: usize,
     local_count: usize,
 ) -> VmResult<Vec<cranelift_codegen::ir::Value>> {
     let stack_ptr = b
         .ins()
         .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_ptr);
+    let stack_ptr = ssa_value_addr(
+        b,
+        pointer_type,
+        stack_ptr,
+        active_stack_base,
+        layout.value.size,
+    );
     let locals_ptr = b
         .ins()
         .load(pointer_type, MemFlags::new(), vm_ptr, offsets.locals_ptr);
+    let locals_ptr = ssa_value_addr(
+        b,
+        pointer_type,
+        locals_ptr,
+        active_local_base,
+        layout.value.size,
+    );
     let mut args = Vec::with_capacity(stack_depth + local_count);
     for stack_index in 0..stack_depth {
         let index = b.ins().iconst(
@@ -1074,33 +1105,122 @@ fn build_entry_args(
     Ok(args)
 }
 
-fn emit_entry_stack_depth_guard(
+#[allow(clippy::too_many_arguments)]
+fn emit_frame_state_entry_guard(
     b: &mut FunctionBuilder,
     vm_ptr: cranelift_codegen::ir::Value,
     exit_block: Block,
     pointer_type: cranelift_codegen::ir::Type,
     offsets: ResolvedOffsets,
-    expected_depth: usize,
-) -> VmResult<()> {
-    let actual_depth = b
-        .ins()
-        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_len);
-    let expected_depth = b.ins().iconst(
+    frame_state_ref: cranelift_codegen::ir::SigRef,
+    frame_state_addr: usize,
+    expected_frame_key: u64,
+    expected_stack_depth: usize,
+    expected_local_count: usize,
+) -> VmResult<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value)> {
+    let frame_state_size = u32::try_from(std::mem::size_of::<NativeFrameState>())
+        .map_err(|_| VmError::JitNative("native frame state size out of range".to_string()))?;
+    let frame_state_align = std::mem::align_of::<NativeFrameState>().trailing_zeros() as u8;
+    let frame_state_slot = b.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        frame_state_size,
+        frame_state_align,
+    ));
+    let frame_state_ptr = b.ins().stack_addr(pointer_type, frame_state_slot, 0);
+    ssa_call_status_helper(
+        b,
+        exit_block,
         pointer_type,
-        i64::try_from(expected_depth)
-            .map_err(|_| VmError::JitNative("SSA entry stack depth out of range".to_string()))?,
+        frame_state_ref,
+        frame_state_addr,
+        &[vm_ptr, frame_state_ptr],
+    )?;
+
+    let frame_key_offset = i32::try_from(std::mem::offset_of!(NativeFrameState, frame_key))
+        .map_err(|_| VmError::JitNative("native frame key offset out of range".to_string()))?;
+    let stack_base_offset =
+        i32::try_from(std::mem::offset_of!(NativeFrameState, operand_stack_base)).map_err(
+            |_| VmError::JitNative("native frame stack-base offset out of range".to_string()),
+        )?;
+    let local_base_offset = i32::try_from(std::mem::offset_of!(NativeFrameState, local_base))
+        .map_err(|_| {
+            VmError::JitNative("native frame local-base offset out of range".to_string())
+        })?;
+    let frame_key = b.ins().load(
+        types::I64,
+        MemFlags::new(),
+        frame_state_ptr,
+        frame_key_offset,
     );
-    let matches = b.ins().icmp(IntCC::Equal, actual_depth, expected_depth);
-    let matched = b.create_block();
+    let active_stack_base = b.ins().load(
+        pointer_type,
+        MemFlags::new(),
+        frame_state_ptr,
+        stack_base_offset,
+    );
+    let active_local_base = b.ins().load(
+        pointer_type,
+        MemFlags::new(),
+        frame_state_ptr,
+        local_base_offset,
+    );
+
+    let expected_frame_key = b.ins().iconst(types::I64, expected_frame_key as i64);
+    let frame_matches = b.ins().icmp(IntCC::Equal, frame_key, expected_frame_key);
+    let frame_match = b.create_block();
     let mismatch = b.create_block();
-    b.ins().brif(matches, matched, &[], mismatch, &[]);
+    b.ins().brif(frame_matches, frame_match, &[], mismatch, &[]);
 
     b.switch_to_block(mismatch);
     let status = b.ins().iconst(types::I32, STATUS_CONTINUE as i64);
     jump_with_status(b, exit_block, status);
 
-    b.switch_to_block(matched);
-    Ok(())
+    b.switch_to_block(frame_match);
+    let actual_stack_len = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.stack_len);
+    let expected_stack_depth = b.ins().iconst(
+        pointer_type,
+        i64::try_from(expected_stack_depth)
+            .map_err(|_| VmError::JitNative("SSA entry stack depth out of range".to_string()))?,
+    );
+    let expected_stack_len = b.ins().iadd(active_stack_base, expected_stack_depth);
+    let stack_matches = b
+        .ins()
+        .icmp(IntCC::Equal, actual_stack_len, expected_stack_len);
+    let stack_match = b.create_block();
+    let stack_mismatch = b.create_block();
+    b.ins()
+        .brif(stack_matches, stack_match, &[], stack_mismatch, &[]);
+
+    b.switch_to_block(stack_mismatch);
+    let status = b.ins().iconst(types::I32, STATUS_CONTINUE as i64);
+    jump_with_status(b, exit_block, status);
+
+    b.switch_to_block(stack_match);
+    let actual_local_len = b
+        .ins()
+        .load(pointer_type, MemFlags::new(), vm_ptr, offsets.locals_len);
+    let expected_local_count = b.ins().iconst(
+        pointer_type,
+        i64::try_from(expected_local_count)
+            .map_err(|_| VmError::JitNative("SSA entry local count out of range".to_string()))?,
+    );
+    let expected_local_len = b.ins().iadd(active_local_base, expected_local_count);
+    let locals_match = b
+        .ins()
+        .icmp(IntCC::Equal, actual_local_len, expected_local_len);
+    let locals_matched = b.create_block();
+    let locals_mismatch = b.create_block();
+    b.ins()
+        .brif(locals_match, locals_matched, &[], locals_mismatch, &[]);
+
+    b.switch_to_block(locals_mismatch);
+    let status = b.ins().iconst(types::I32, STATUS_CONTINUE as i64);
+    jump_with_status(b, exit_block, status);
+
+    b.switch_to_block(locals_matched);
+    Ok((active_stack_base, active_local_base))
 }
 
 fn ssa_block_args(values: impl IntoIterator<Item = cranelift_codegen::ir::Value>) -> Vec<BlockArg> {
@@ -3007,6 +3127,26 @@ fn ssa_branch_target_block(
     }
 }
 
+fn ssa_leave_frame_status(
+    b: &mut FunctionBuilder,
+    pointer_type: cranelift_codegen::ir::Type,
+    helper_refs: SsaDeoptHelperRefs,
+    helper_addrs: SsaDeoptHelperAddrs,
+    vm_ptr: cranelift_codegen::ir::Value,
+    ret_ip: usize,
+) -> VmResult<cranelift_codegen::ir::Value> {
+    let helper_ptr = iconst_ptr_from_addr(b, pointer_type, helper_addrs.leave_frame)?;
+    let ret_ip = b.ins().iconst(
+        types::I64,
+        i64::try_from(ret_ip)
+            .map_err(|_| VmError::JitNative("SSA return ip out of range".to_string()))?,
+    );
+    let call = b
+        .ins()
+        .call_indirect(helper_refs.leave_frame_ref, helper_ptr, &[vm_ptr, ret_ip]);
+    Ok(b.inst_results(call)[0])
+}
+
 fn lower_ssa_exit_block(
     b: &mut FunctionBuilder,
     ctx: SsaLowerCtx<'_>,
@@ -3017,6 +3157,7 @@ fn lower_ssa_exit_block(
 ) -> VmResult<()> {
     let SsaLowerCtx {
         vm_ptr,
+        active_local_base,
         exit_block,
         pointer_type,
         layout,
@@ -3077,6 +3218,13 @@ fn lower_ssa_exit_block(
         let vm_locals_ptr = b
             .ins()
             .load(pointer_type, MemFlags::new(), vm_ptr, offsets.locals_ptr);
+        let vm_locals_ptr = ssa_value_addr(
+            b,
+            pointer_type,
+            vm_locals_ptr,
+            active_local_base,
+            layout.value.size,
+        );
         for (local_index, materialization) in
             exit.locals
                 .iter()
@@ -3111,7 +3259,14 @@ fn lower_ssa_exit_block(
         b.ins()
             .store(MemFlags::new(), ip_val, vm_ptr, offsets.vm_ip);
         let status = if halted {
-            b.ins().iconst(types::I32, STATUS_HALTED as i64)
+            ssa_leave_frame_status(
+                b,
+                pointer_type,
+                deopt_refs,
+                deopt_addrs,
+                vm_ptr,
+                exit.exit_ip,
+            )?
         } else if allow_link_handoff {
             let helper_ptr =
                 iconst_ptr_from_addr(b, pointer_type, deopt_addrs.resume_linked_trace)?;
@@ -3206,7 +3361,14 @@ fn lower_ssa_exit_block(
         ],
     )?;
     let status = if halted {
-        b.ins().iconst(types::I32, STATUS_HALTED as i64)
+        ssa_leave_frame_status(
+            b,
+            pointer_type,
+            deopt_refs,
+            deopt_addrs,
+            vm_ptr,
+            exit.exit_ip,
+        )?
     } else if allow_link_handoff {
         let helper_ptr = iconst_ptr_from_addr(b, pointer_type, deopt_addrs.resume_linked_trace)?;
         let call = b
@@ -4108,6 +4270,7 @@ struct ResolvedOffsets {
     stack_ptr: i32,
     stack_len: i32,
     locals_ptr: i32,
+    locals_len: i32,
     vm_ip: i32,
     fuel_remaining: i32,
     fuel_ops_until_check: i32,
@@ -4319,11 +4482,17 @@ fn resolve_offsets(layout: NativeStackLayout) -> VmResult<ResolvedOffsets> {
         layout.stack_vec.ptr_offset,
         "locals ptr offset overflow",
     )?;
+    let locals_len = checked_add_i32(
+        layout.vm_locals_offset,
+        layout.stack_vec.len_offset,
+        "locals len offset overflow",
+    )?;
 
     Ok(ResolvedOffsets {
         stack_ptr,
         stack_len,
         locals_ptr,
+        locals_len,
         vm_ip: layout.vm_ip_offset,
         fuel_remaining: layout.vm_fuel_remaining_offset,
         fuel_ops_until_check: layout.vm_fuel_ops_until_check_offset,

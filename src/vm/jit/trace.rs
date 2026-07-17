@@ -1,14 +1,16 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::debug_info::DebugInfo;
+use crate::vm::native::ROOT_FRAME_KEY;
 use crate::vm::{OpCode, Program};
 
 use super::ir::SsaTrace;
 use super::liveness::{boxed_load_site_count, boxed_store_site_count};
-use super::recorder::{RecordedTrace, TraceRecordError, record_trace};
+use super::recorder::{RecordedTrace, TraceRecordError, record_trace_with_local_count};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct TraceEntryKey {
+    pub(crate) frame_key: u64,
     pub(crate) root_ip: usize,
     pub(crate) stack_depth: usize,
 }
@@ -84,6 +86,7 @@ impl JitNyiReason {
 #[derive(Clone, Debug, PartialEq)]
 pub struct JitTrace {
     pub id: usize,
+    pub frame_key: u64,
     pub root_ip: usize,
     pub entry_stack_depth: usize,
     pub start_line: Option<u32>,
@@ -138,6 +141,7 @@ impl JitTrace {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JitAttempt {
+    pub frame_key: u64,
     pub root_ip: usize,
     pub entry_stack_depth: usize,
     pub line: Option<u32>,
@@ -179,7 +183,7 @@ pub struct JitNyiDoc {
 pub struct TraceJitEngine {
     config: JitConfig,
     hot_counts: HashMap<TraceEntryKey, u32>,
-    compiled_by_ip: Vec<Vec<(usize, usize)>>,
+    compiled_by_ip: Vec<Vec<(u64, usize, usize)>>,
     blocked_entries: HashSet<TraceEntryKey>,
     loop_headers: Option<Vec<bool>>,
     non_yielding_host_imports: Vec<bool>,
@@ -236,11 +240,12 @@ impl TraceJitEngine {
     }
 
     pub fn observe_hot_ip(&mut self, ip: usize, program: &Program) -> Option<usize> {
-        self.observe_hot_entry(ip, 0, program)
+        self.observe_hot_entry(ROOT_FRAME_KEY, ip, 0, program)
     }
 
     pub(crate) fn observe_hot_entry(
         &mut self,
+        frame_key: u64,
         ip: usize,
         stack_depth: usize,
         program: &Program,
@@ -249,6 +254,7 @@ impl TraceJitEngine {
             return None;
         }
         let key = TraceEntryKey {
+            frame_key,
             root_ip: ip,
             stack_depth,
         };
@@ -284,11 +290,12 @@ impl TraceJitEngine {
     }
 
     pub fn observe_exit_ip(&mut self, ip: usize, program: &Program) -> Option<usize> {
-        self.observe_exit_entry(ip, 0, program)
+        self.observe_exit_entry(ROOT_FRAME_KEY, ip, 0, program)
     }
 
     pub(crate) fn observe_exit_entry(
         &mut self,
+        frame_key: u64,
         ip: usize,
         stack_depth: usize,
         program: &Program,
@@ -297,6 +304,7 @@ impl TraceJitEngine {
             return None;
         }
         let key = TraceEntryKey {
+            frame_key,
             root_ip: ip,
             stack_depth,
         };
@@ -332,11 +340,17 @@ impl TraceJitEngine {
     }
 
     pub fn compiled_trace_for_ip(&self, ip: usize) -> Option<usize> {
-        self.compiled_trace_for_entry(ip, 0)
+        self.compiled_trace_for_entry(ROOT_FRAME_KEY, ip, 0)
     }
 
-    pub(crate) fn compiled_trace_for_entry(&self, ip: usize, stack_depth: usize) -> Option<usize> {
+    pub(crate) fn compiled_trace_for_entry(
+        &self,
+        frame_key: u64,
+        ip: usize,
+        stack_depth: usize,
+    ) -> Option<usize> {
         self.compiled_trace_for_key(TraceEntryKey {
+            frame_key,
             root_ip: ip,
             stack_depth,
         })
@@ -351,6 +365,7 @@ impl TraceJitEngine {
     pub(crate) fn block_trace(&mut self, trace_id: usize) {
         if let Some(trace) = self.traces.get(trace_id) {
             let key = TraceEntryKey {
+                frame_key: trace.frame_key,
                 root_ip: trace.root_ip,
                 stack_depth: trace.entry_stack_depth,
             };
@@ -472,6 +487,7 @@ impl TraceJitEngine {
         match result {
             Ok(trace_id) => {
                 self.attempts.push(JitAttempt {
+                    frame_key: key.frame_key,
                     root_ip: key.root_ip,
                     entry_stack_depth: key.stack_depth,
                     line,
@@ -482,6 +498,7 @@ impl TraceJitEngine {
             }
             Err(reason) => {
                 self.attempts.push(JitAttempt {
+                    frame_key: key.frame_key,
                     root_ip: key.root_ip,
                     entry_stack_depth: key.stack_depth,
                     line,
@@ -498,10 +515,25 @@ impl TraceJitEngine {
         program: &Program,
         key: TraceEntryKey,
     ) -> Result<usize, JitNyiReason> {
-        let recorded = record_trace(
+        let local_count = if key.frame_key == ROOT_FRAME_KEY {
+            program.local_count
+        } else {
+            program
+                .callable_prototypes
+                .get(key.frame_key as usize)
+                .map(|prototype| prototype.frame_local_count)
+                .ok_or_else(|| {
+                    JitNyiReason::UnsupportedTrace(format!(
+                        "unknown callable prototype frame key {}",
+                        key.frame_key
+                    ))
+                })?
+        };
+        let recorded = record_trace_with_local_count(
             program,
             key.root_ip,
             key.stack_depth,
+            local_count,
             self.config.max_trace_len,
             &self.non_yielding_host_imports,
         )
@@ -518,12 +550,12 @@ impl TraceJitEngine {
 
     #[inline(always)]
     fn compiled_trace_for_key(&self, key: TraceEntryKey) -> Option<usize> {
-        self.compiled_by_ip
-            .get(key.root_ip)?
-            .iter()
-            .find_map(|(stack_depth, trace_id)| {
-                (*stack_depth == key.stack_depth).then_some(*trace_id)
-            })
+        self.compiled_by_ip.get(key.root_ip)?.iter().find_map(
+            |(frame_key, stack_depth, trace_id)| {
+                (*frame_key == key.frame_key && *stack_depth == key.stack_depth)
+                    .then_some(*trace_id)
+            },
+        )
     }
 
     fn insert_compiled_trace(&mut self, key: TraceEntryKey, trace_id: usize) {
@@ -531,13 +563,14 @@ impl TraceJitEngine {
             self.compiled_by_ip.resize_with(key.root_ip + 1, Vec::new);
         }
         let entries = &mut self.compiled_by_ip[key.root_ip];
-        if let Some((_, existing_trace_id)) = entries
-            .iter_mut()
-            .find(|(stack_depth, _)| *stack_depth == key.stack_depth)
+        if let Some((_, _, existing_trace_id)) =
+            entries.iter_mut().find(|(frame_key, stack_depth, _)| {
+                *frame_key == key.frame_key && *stack_depth == key.stack_depth
+            })
         {
             *existing_trace_id = trace_id;
         } else {
-            entries.push((key.stack_depth, trace_id));
+            entries.push((key.frame_key, key.stack_depth, trace_id));
         }
     }
 
@@ -545,10 +578,9 @@ impl TraceJitEngine {
         let Some(entries) = self.compiled_by_ip.get_mut(key.root_ip) else {
             return;
         };
-        if let Some(index) = entries
-            .iter()
-            .position(|(stack_depth, _)| *stack_depth == key.stack_depth)
-        {
+        if let Some(index) = entries.iter().position(|(frame_key, stack_depth, _)| {
+            *frame_key == key.frame_key && *stack_depth == key.stack_depth
+        }) {
             entries.swap_remove(index);
         }
     }
@@ -589,6 +621,7 @@ fn build_jit_trace(
 ) -> JitTrace {
     JitTrace {
         id,
+        frame_key: key.frame_key,
         root_ip: key.root_ip,
         entry_stack_depth: key.stack_depth,
         start_line,
@@ -703,7 +736,9 @@ fn nyi_reference() -> Vec<JitNyiDoc> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BytecodeBuilder, Value};
+    use crate::{
+        BytecodeBuilder, CallableKind, CallablePrototype, CallableTarget, ScriptFunction, Value,
+    };
 
     #[test]
     fn scan_loop_headers_finds_backward_targets() {
@@ -717,5 +752,57 @@ mod tests {
         let headers = scan_loop_headers(&program);
         assert!(headers[root_ip as usize]);
         assert!(!headers[branch_ip as usize]);
+    }
+
+    #[test]
+    fn trace_entry_cache_separates_root_and_script_frames() {
+        if !native_jit_supported() {
+            return;
+        }
+        let mut bc = BytecodeBuilder::new();
+        let root_ip = bc.position();
+        bc.ldloc(0);
+        bc.ldc(0);
+        bc.add();
+        bc.stloc(0);
+        bc.br(root_ip);
+        let mut program = Program::new(vec![Value::Int(1)], bc.finish()).with_local_count(4);
+        program.script_functions.push(ScriptFunction {
+            entry_ip: root_ip,
+            end_ip: program.code.len() as u32,
+        });
+        program.callable_prototypes.push(CallablePrototype {
+            kind: CallableKind::FunctionItem,
+            target: CallableTarget::ScriptFunction(0),
+            arity: 0,
+            frame_local_count: 1,
+            parameter_slots: Vec::new(),
+            capture_slots: Vec::new(),
+            self_slot: None,
+            schema: None,
+        });
+        let mut engine = TraceJitEngine::new(JitConfig {
+            enabled: true,
+            hot_loop_threshold: 1,
+            max_trace_len: 64,
+        });
+
+        let root_trace = engine
+            .observe_hot_entry(ROOT_FRAME_KEY, root_ip as usize, 0, &program)
+            .expect("root trace should compile");
+        let frame_trace = engine
+            .observe_hot_entry(0, root_ip as usize, 0, &program)
+            .expect("script-frame trace should compile separately");
+        assert_ne!(root_trace, frame_trace);
+        assert_eq!(engine.traces[root_trace].ssa.blocks[0].params.len(), 4);
+        assert_eq!(engine.traces[frame_trace].ssa.blocks[0].params.len(), 1);
+        assert_eq!(
+            engine.compiled_trace_for_entry(ROOT_FRAME_KEY, root_ip as usize, 0),
+            Some(root_trace)
+        );
+        assert_eq!(
+            engine.compiled_trace_for_entry(0, root_ip as usize, 0),
+            Some(frame_trace)
+        );
     }
 }

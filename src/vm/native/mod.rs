@@ -20,12 +20,13 @@ pub(crate) use bridge::{
     map_get_entry_address, map_has_entry_address, map_iter_next_entry_address,
     map_iter_take_key_entry_address, map_iter_take_value_entry_address, map_set_entry_address,
     non_yielding_host_call_entry_address, regex_match_entry_address, regex_replace_entry_address,
-    restore_active_exit_state_entry_address, restore_exit_state_entry_address,
-    restore_sparse_exit_state_entry_address, shared_array_from_buffer_entry_address,
-    shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
-    store_bridge_error, string_contains_entry_address, string_lower_ascii_entry_address,
-    string_replace_literal_entry_address, string_split_literal_entry_address, take_bridge_error,
-    to_string_entry_address, type_of_entry_address, value_eq_entry_address,
+    restore_active_exit_state_entry_address, restore_active_sparse_exit_state_entry_address,
+    restore_exit_state_entry_address, restore_sparse_exit_state_entry_address,
+    shared_array_from_buffer_entry_address, shared_bytes_from_buffer_entry_address,
+    shared_string_from_buffer_entry_address, store_bridge_error, string_contains_entry_address,
+    string_lower_ascii_entry_address, string_replace_literal_entry_address,
+    string_split_literal_entry_address, take_bridge_error, to_string_entry_address,
+    type_of_entry_address, value_eq_entry_address,
     value_len_entry_address, write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
 };
 #[cfg(feature = "cranelift-jit")]
@@ -48,7 +49,7 @@ pub(crate) use layout::{
 #[cfg(feature = "cranelift-jit")]
 pub(crate) use offsets::{HeapIntrinsicAddrs, HeapIntrinsicRefs, ResolvedOffsets, resolve_offsets};
 
-pub(crate) const NATIVE_CALLABLE_ABI_VERSION: u16 = 2;
+pub(crate) const NATIVE_CALLABLE_ABI_VERSION: u16 = 3;
 
 #[cfg(feature = "cranelift-jit")]
 pub(crate) fn selected_codegen_backend() -> &'static str {
