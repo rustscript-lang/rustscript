@@ -2,8 +2,8 @@
 use crate::builtins::BuiltinFunction;
 use crate::bytecode::{Value, ValueType, VmMap};
 use crate::vm::{
-    CallOutcome, CallReturn, HostCallExecOutcome, NumericValue, Vm, VmError, VmHostFunction,
-    VmResult, logical_shr_i64,
+    CallOutcome, CallReturn, FrameContinuation, HostCallExecOutcome, NumericValue, Vm, VmError,
+    VmHostFunction, VmResult, logical_shr_i64,
 };
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -16,6 +16,20 @@ pub(crate) const STATUS_WAITING: i32 = 4;
 pub(crate) const STATUS_OUT_OF_FUEL: i32 = 5;
 pub(crate) const STATUS_LINKED_CONTINUE: i32 = 6;
 pub(crate) const STATUS_ERROR: i32 = -1;
+
+pub(crate) const ROOT_FRAME_KEY: u64 = u64::MAX;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NativeFrameState {
+    pub(crate) frame_key: u64,
+    pub(crate) operand_stack_base: usize,
+    pub(crate) active_stack_len: usize,
+    pub(crate) local_base: usize,
+    pub(crate) local_count: usize,
+    pub(crate) frame_depth: usize,
+    pub(crate) continuation_kind: u8,
+}
 
 pub(crate) const OP_LDC: i64 = 1;
 pub(crate) const OP_ADD: i64 = 2;
@@ -257,6 +271,22 @@ pub(crate) fn write_heap_value_to_slot_entry_address() -> usize {
 
 pub(crate) fn restore_exit_state_entry_address() -> usize {
     pd_vm_native_restore_exit_state as *const () as usize
+}
+
+pub(crate) fn active_stack_base_entry_address() -> usize {
+    pd_vm_native_active_stack_base as *const () as usize
+}
+
+pub(crate) fn frame_state_entry_address() -> usize {
+    pd_vm_native_frame_state as *const () as usize
+}
+
+pub(crate) fn active_local_base_entry_address() -> usize {
+    pd_vm_native_active_local_base as *const () as usize
+}
+
+pub(crate) fn restore_active_exit_state_entry_address() -> usize {
+    pd_vm_native_restore_active_exit_state as *const () as usize
 }
 
 pub(crate) fn restore_sparse_exit_state_entry_address() -> usize {
@@ -700,6 +730,120 @@ pub(crate) extern "C" fn pd_vm_native_restore_exit_state(
         for index in 0..locals_len {
             let local_index = u8::try_from(index).map_err(|_| {
                 VmError::JitNative("native exit restore local index out of range".to_string())
+            })?;
+            let value = unsafe { std::ptr::read(locals_src.add(index)) };
+            vm.store_local_with_drop_contract(local_index, value)?;
+        }
+
+        vm.jump_to(ip)?;
+        Ok(STATUS_CONTINUE)
+    })
+}
+
+pub(crate) extern "C" fn pd_vm_native_frame_state(vm: *mut Vm, out: *mut NativeFrameState) -> i32 {
+    run_step(vm, "frame_state", |vm| {
+        if out.is_null() {
+            return Err(VmError::JitNative(
+                "native frame-state helper received null output".to_string(),
+            ));
+        }
+        let frame = vm.execution_frames.last();
+        let operand_stack_base = frame.map(|frame| frame.operand_stack_base).unwrap_or(0);
+        let local_base = frame.map(|frame| frame.local_base).unwrap_or(0);
+        let local_count = frame
+            .map(|frame| frame.local_count)
+            .unwrap_or(vm.locals.len());
+        let active_stack_len = vm
+            .stack
+            .len()
+            .checked_sub(operand_stack_base)
+            .ok_or_else(|| {
+                VmError::JitNative("native frame-state stack base exceeds stack length".to_string())
+            })?;
+        let frame_key = frame
+            .and_then(|frame| frame.prototype_id)
+            .map(u64::from)
+            .unwrap_or(ROOT_FRAME_KEY);
+        let continuation_kind = match frame.map(|frame| &frame.continuation) {
+            Some(FrameContinuation::Halt) | None => 0,
+            Some(FrameContinuation::ResumeBytecode { .. }) => 1,
+            Some(FrameContinuation::ReturnToHost) => 2,
+        };
+        unsafe {
+            out.write(NativeFrameState {
+                frame_key,
+                operand_stack_base,
+                active_stack_len,
+                local_base,
+                local_count,
+                frame_depth: vm.call_depth,
+                continuation_kind,
+            });
+        }
+        Ok(STATUS_CONTINUE)
+    })
+}
+
+pub(crate) extern "C" fn pd_vm_native_active_stack_base(vm: *const Vm) -> usize {
+    unsafe { vm.as_ref() }
+        .map(Vm::active_operand_stack_base)
+        .unwrap_or(0)
+}
+
+pub(crate) extern "C" fn pd_vm_native_active_local_base(vm: *const Vm) -> usize {
+    unsafe { vm.as_ref() }
+        .map(Vm::active_local_base)
+        .unwrap_or(0)
+}
+
+pub(crate) extern "C" fn pd_vm_native_restore_active_exit_state(
+    vm: *mut Vm,
+    stack_src: *const Value,
+    stack_len: usize,
+    locals_src: *const Value,
+    locals_len: usize,
+    ip: usize,
+) -> i32 {
+    run_step(vm, "restore_active_exit_state", |vm| {
+        let stack_base = vm.active_operand_stack_base();
+        let local_base = vm.active_local_base();
+        let expected_locals_len = local_base
+            .checked_add(locals_len)
+            .ok_or_else(|| VmError::JitNative("native active local length overflow".to_string()))?;
+        if expected_locals_len != vm.locals.len() {
+            return Err(VmError::JitNative(format!(
+                "native active exit restore locals length mismatch: expected {}, got {}",
+                vm.locals.len(),
+                expected_locals_len
+            )));
+        }
+        if stack_base > vm.stack.len() {
+            return Err(VmError::JitNative(format!(
+                "native active stack base {stack_base} exceeds stack length {}",
+                vm.stack.len()
+            )));
+        }
+        if stack_len != 0 && stack_src.is_null() {
+            return Err(VmError::JitNative(
+                "native active exit restore received null stack buffer".to_string(),
+            ));
+        }
+        if locals_len != 0 && locals_src.is_null() {
+            return Err(VmError::JitNative(
+                "native active exit restore received null locals buffer".to_string(),
+            ));
+        }
+
+        vm.stack.truncate(stack_base);
+        vm.stack.reserve(stack_len);
+        for index in 0..stack_len {
+            let value = unsafe { std::ptr::read(stack_src.add(index)) };
+            vm.stack.push(value);
+        }
+
+        for index in 0..locals_len {
+            let local_index = u8::try_from(index).map_err(|_| {
+                VmError::JitNative("native active local index out of range".to_string())
             })?;
             let value = unsafe { std::ptr::read(locals_src.add(index)) };
             vm.store_local_with_drop_contract(local_index, value)?;
@@ -1274,7 +1418,77 @@ pub(crate) extern "C" fn pd_vm_native_step(vm: *mut Vm, op: i64, a: i64, b: i64,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem::ManuallyDrop;
+    use std::mem::{ManuallyDrop, MaybeUninit};
+
+    #[test]
+    fn native_frame_state_and_active_restore_are_frame_relative() {
+        let program =
+            crate::Program::new(Vec::new(), vec![crate::OpCode::Ret as u8]).with_local_count(2);
+        let mut vm = Vm::new(program);
+        vm.stack = vec![Value::Int(10), Value::Int(20)];
+        vm.locals = vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4),
+            Value::Int(5),
+        ];
+        vm.execution_frames.push(crate::vm::ExecutionFrame {
+            continuation: FrameContinuation::ResumeBytecode { return_ip: 0 },
+            operand_stack_base: 1,
+            local_base: 2,
+            local_count: 3,
+            prototype_id: Some(7),
+            active_callable: None,
+        });
+        vm.call_depth = 1;
+
+        let mut state = MaybeUninit::<NativeFrameState>::uninit();
+        assert_eq!(
+            pd_vm_native_frame_state(&mut vm, state.as_mut_ptr()),
+            STATUS_CONTINUE
+        );
+        let state = unsafe { state.assume_init() };
+        assert_eq!(
+            state,
+            NativeFrameState {
+                frame_key: 7,
+                operand_stack_base: 1,
+                active_stack_len: 1,
+                local_base: 2,
+                local_count: 3,
+                frame_depth: 1,
+                continuation_kind: 1,
+            }
+        );
+
+        let stack = [Value::Int(99)];
+        let locals = [Value::Int(30), Value::Int(40), Value::Int(50)];
+        assert_eq!(
+            pd_vm_native_restore_active_exit_state(
+                &mut vm,
+                stack.as_ptr(),
+                stack.len(),
+                locals.as_ptr(),
+                locals.len(),
+                0,
+            ),
+            STATUS_CONTINUE
+        );
+        std::mem::forget(stack);
+        std::mem::forget(locals);
+        assert_eq!(vm.stack, vec![Value::Int(10), Value::Int(99)]);
+        assert_eq!(
+            vm.locals,
+            vec![
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(30),
+                Value::Int(40),
+                Value::Int(50),
+            ]
+        );
+    }
 
     #[test]
     fn bridge_errors_are_isolated_between_threads() {

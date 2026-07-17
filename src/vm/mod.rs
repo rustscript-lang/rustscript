@@ -459,6 +459,7 @@ pub(crate) fn checked_int_rem(lhs: i64, rhs: i64) -> VmResult<i64> {
 fn compute_program_cache_key(program: &Program) -> u64 {
     let mut hasher = StableHasher::default();
     crate::bytecode::BYTECODE_ABI_VERSION.hash(&mut hasher);
+    native::NATIVE_CALLABLE_ABI_VERSION.hash(&mut hasher);
     program.code.hash(&mut hasher);
     program.local_count.hash(&mut hasher);
     for constant in &program.constants {
@@ -966,6 +967,13 @@ impl Vm {
     }
 
     #[inline(always)]
+    fn active_operand_stack_base(&self) -> usize {
+        self.execution_frames
+            .last()
+            .map(|frame| frame.operand_stack_base)
+            .unwrap_or(0)
+    }
+
     fn active_local_base(&self) -> usize {
         self.execution_frames
             .last()

@@ -256,6 +256,61 @@ fn typed_script_callbacks_invoke_queue_unsubscribe_and_invalidate() {
 }
 
 #[test]
+fn typed_script_callback_can_wait_resume_and_return_to_host() {
+    struct PendingCallbackHost;
+
+    impl HostFunction for PendingCallbackHost {
+        fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+            Ok(CallOutcome::Pending(811))
+        }
+    }
+
+    let compiled = crate::compile_source_for_repl(
+        r#"
+            fn wait();
+            fn callback() -> int {
+                wait();
+                42;
+            }
+            callback;
+        "#,
+    )
+    .expect("callback source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.register_function(Box::new(PendingCallbackHost));
+    assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
+    let callable = vm.stack().last().cloned().expect("callable result");
+    let mut store = crate::Store::from_vm(vm);
+    let callback: crate::ScriptCallback<(), i64> = store
+        .script_callback(callable)
+        .expect("typed callback should bind");
+
+    assert_eq!(
+        callback
+            .start(&mut store, ())
+            .expect("callback should start"),
+        VmStatus::Waiting(811)
+    );
+    assert_eq!(store.vm().call_depth(), 1);
+    store
+        .vm_mut()
+        .complete_host_op(811, Vec::new())
+        .expect("host completion should succeed");
+    assert_eq!(
+        store.resume().expect("callback should resume"),
+        VmStatus::Halted
+    );
+    assert_eq!(store.vm().call_depth(), 0);
+    assert_eq!(
+        store
+            .take_callback_result::<i64>()
+            .expect("typed callback result")
+            .expect("callback should produce a result"),
+        42
+    );
+}
+
+#[test]
 fn typed_script_callback_can_yield_resume_and_return_to_host() {
     let compiled = crate::compile_source_for_repl(
         r#"
