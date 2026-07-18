@@ -2323,6 +2323,61 @@ fn trace_jit_region_links_hot_same_frame_side_exit() {
 }
 
 #[test]
+fn trace_jit_region_cycle_propagates_disjoint_dirty_locals() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn branch_counts(limit) {
+            let mut i = 0;
+            let mut even = 0;
+            let mut odd = 0;
+            while i < limit {
+                if i % 2 == 0 {
+                    even = even + 1;
+                } else {
+                    odd = odd + 1;
+                }
+                i = i + 1;
+            }
+            even * 10000 + odd
+        }
+        branch_counts(4096);
+    "#;
+    let compiled = compile_source(source).expect("disjoint dirty region compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(
+        vm.run().expect("first disjoint dirty region run"),
+        VmStatus::Halted
+    );
+    assert_eq!(
+        vm.stack(),
+        &[Value::Int(20_482_048)],
+        "{}",
+        vm.dump_jit_info()
+    );
+    assert_eq!(vm.jit_native_region_count(), 1, "{}", vm.dump_jit_info());
+
+    vm.reset_for_reuse();
+    assert_eq!(
+        vm.run().expect("second disjoint dirty region run"),
+        VmStatus::Halted
+    );
+    assert_eq!(
+        vm.stack(),
+        &[Value::Int(20_482_048)],
+        "{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
 fn trace_jit_region_republishes_after_native_settings_change() {
     if !native_jit_supported() {
         return;
