@@ -1277,11 +1277,17 @@ pub(crate) fn record_trace_with_local_count(
                         .get(usize::from(index))
                         .map(|import| import.return_type)
                         .unwrap_or(ValueType::Unknown);
+                    let (return_repr, return_info) = match return_type {
+                        ValueType::Int => (SsaValueRepr::I64, ValueInfo::int(None)),
+                        ValueType::Float => (SsaValueRepr::F64, ValueInfo::float(None)),
+                        ValueType::Bool => (SsaValueRepr::Bool, ValueInfo::bool(None)),
+                        _ => (SsaValueRepr::Tagged, ValueInfo::tagged_typed(return_type)),
+                    };
                     let value = builder
                         .append_value_inst(
                             current_block,
                             ip,
-                            SsaValueRepr::Tagged,
+                            return_repr,
                             SsaInstKind::HostCall {
                                 import: index,
                                 args,
@@ -1290,7 +1296,7 @@ pub(crate) fn record_trace_with_local_count(
                         .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
                     frame.push(SymbolicValue {
                         value,
-                        info: ValueInfo::tagged_typed(return_type),
+                        info: return_info,
                     });
                     has_call = true;
                     op_names.push("host_call".to_string());
@@ -1508,7 +1514,12 @@ fn infer_loop_header_plan(
                     .get(usize::from(index))
                     .map(|import| import.return_type)
                     .unwrap_or(ValueType::Unknown);
-                frame.push(ValueInfo::tagged_typed(return_type));
+                frame.push(match return_type {
+                    ValueType::Int => ValueInfo::int(None),
+                    ValueType::Float => ValueInfo::float(None),
+                    ValueType::Bool => ValueInfo::bool(None),
+                    _ => ValueInfo::tagged_typed(return_type),
+                });
             }
             DecodedOp::Call { .. } | DecodedOp::CallValue { .. } => return Ok(None),
             DecodedOp::Brfalse {
