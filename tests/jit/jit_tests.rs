@@ -2184,14 +2184,14 @@ fn trace_jit_reports_exact_parent_exit_profiles() {
         return;
     }
     let source = r#"
+        fn choose(i) {
+            if i % 2 == 0 => { 3 } else => { 5 }
+        }
+
         let mut i = 0;
         let mut total = 0;
         while i < 64 {
-            if i % 2 == 0 {
-                total = total + 3;
-            } else {
-                total = total + 5;
-            }
+            total = total + choose(i);
             i = i + 1;
         }
         total;
@@ -2221,6 +2221,13 @@ fn trace_jit_reports_exact_parent_exit_profiles() {
         assert!(profile.exit_id < parent.ssa_exit_count() as u32);
         assert!(profile.executions > 0);
     }
+    assert!(
+        snapshot.exit_profiles.iter().any(|profile| {
+            snapshot.traces[profile.parent_trace_id].frame_key != u64::MAX && profile.executions > 1
+        }),
+        "expected a repeated exact exit inside a callable frame:\n{}",
+        vm.dump_jit_info()
+    );
 }
 
 #[test]
