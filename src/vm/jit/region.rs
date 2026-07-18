@@ -11,6 +11,7 @@ use super::ir::{
 use super::trace::TraceExitKey;
 
 #[derive(Clone, Debug)]
+#[cfg_attr(not(feature = "cranelift-jit"), allow(dead_code))]
 pub(crate) struct FusedRegionLink {
     pub(crate) exit: SsaExitId,
     pub(crate) child_entry: SsaBlockId,
@@ -20,6 +21,7 @@ pub(crate) struct FusedRegionLink {
 #[derive(Clone, Debug)]
 pub(crate) struct FusedRegion {
     pub(crate) trace: JitTrace,
+    #[cfg_attr(not(feature = "cranelift-jit"), allow(dead_code))]
     pub(crate) links: Vec<FusedRegionLink>,
     pub(crate) exit_keys: HashMap<u32, TraceExitKey>,
 }
