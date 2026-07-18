@@ -2291,11 +2291,18 @@ fn trace_jit_region_links_hot_same_frame_side_exit() {
     assert_eq!(vm.run().expect("first region run"), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(1_024)]);
     let first_handoffs = vm.jit_native_link_handoff_count();
+    let first_native_execs = vm.jit_native_exec_count();
+    let first_region_entries = vm.jit_native_region_entry_count();
+    let first_internal_edges = vm.jit_native_internal_region_edge_count();
+    let first_fallbacks = vm.jit_helper_fallback_count();
     assert!(
         first_handoffs > 0,
         "expected warmup to cross native trace boundaries:\n{}",
         vm.dump_jit_info()
     );
+    assert_eq!(vm.jit_native_region_count(), 1, "{}", vm.dump_jit_info());
+    assert!(first_region_entries > 0, "{}", vm.dump_jit_info());
+    assert!(first_internal_edges > 0, "{}", vm.dump_jit_info());
 
     vm.reset_for_reuse();
     assert_eq!(vm.run().expect("second region run"), VmStatus::Halted);
@@ -2305,10 +2312,93 @@ fn trace_jit_region_links_hot_same_frame_side_exit() {
         .jit_native_link_handoff_count()
         .saturating_sub(first_handoffs);
     assert!(
-        second_run_handoffs <= 130,
-        "expected one-way same-frame region fusion to halve external handoffs, second_run_handoffs={second_run_handoffs}:\n{}",
+        second_run_handoffs <= 2,
+        "expected cyclic same-frame region fusion to bound external handoffs, second_run_handoffs={second_run_handoffs}:\n{}",
         vm.dump_jit_info()
     );
+    assert!(vm.jit_native_exec_count() > first_native_execs);
+    assert!(vm.jit_native_region_entry_count() > first_region_entries);
+    assert!(vm.jit_native_internal_region_edge_count() > first_internal_edges);
+    assert_eq!(vm.jit_helper_fallback_count(), first_fallbacks);
+}
+
+#[test]
+fn trace_jit_region_republishes_after_native_settings_change() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        let mut i = 0;
+        let mut total = 0;
+        while i < 256 {
+            if i % 2 == 0 {
+                total = total + 3;
+            } else {
+                total = total + 5;
+            }
+            i = i + 1;
+        }
+        total;
+    "#;
+    let compiled = compile_source(source).expect("region fixture should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 256,
+    });
+    vm.set_fuel_check_interval(64).unwrap();
+    vm.set_fuel(1_000_000);
+
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.jit_native_region_count(), 1, "{}", vm.dump_jit_info());
+    let first_edges = vm.jit_native_internal_region_edge_count();
+
+    vm.reset_for_reuse();
+    vm.set_fuel_check_interval(1).unwrap();
+    vm.set_fuel(1_000_000);
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(1_024)]);
+    assert_eq!(vm.jit_native_region_count(), 1, "{}", vm.dump_jit_info());
+    assert!(vm.jit_native_internal_region_edge_count() > first_edges);
+}
+
+#[test]
+fn trace_jit_region_invalidation_releases_owner_and_can_republish() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        let mut i = 0;
+        let mut total = 0;
+        while i < 256 {
+            if i % 2 == 0 {
+                total = total + 3;
+            } else {
+                total = total + 5;
+            }
+            i = i + 1;
+        }
+        total;
+    "#;
+    let compiled = compile_source(source).expect("region fixture should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 256,
+    });
+
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.jit_native_region_count(), 1, "{}", vm.dump_jit_info());
+
+    vm.set_drop_contract_events_enabled(true);
+    assert_eq!(vm.jit_native_region_count(), 0);
+    vm.set_drop_contract_events_enabled(false);
+    vm.reset_for_reuse();
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(1_024)]);
+    assert_eq!(vm.jit_native_region_count(), 1, "{}", vm.dump_jit_info());
 }
 
 #[test]
@@ -2494,9 +2584,9 @@ fn trace_jit_supports_array_len_get_has_in_ssa() {
 
     let status = vm.run().expect("array trace vm should run");
     assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(60)]);
-
     let dump = vm.dump_jit_info();
+    assert_eq!(vm.stack(), &[Value::Int(60)], "{dump}");
+
     let snapshot = vm.jit_snapshot();
     assert!(
         vm.jit_native_exec_count() > 0,
@@ -4977,7 +5067,7 @@ fn trace_jit_executes_hot_loop_inside_script_callable_frame() {
 }
 
 #[test]
-fn trace_jit_backs_off_exit_heavy_script_callable_frame() {
+fn trace_jit_region_cycles_without_external_handoffs() {
     if !native_jit_supported() {
         return;
     }
@@ -5011,26 +5101,33 @@ fn trace_jit_backs_off_exit_heavy_script_callable_frame() {
     );
     assert_eq!(vm.stack(), &[Value::Int(-2_048)]);
     let first_native_execs = vm.jit_native_exec_count();
+    let first_region_entries = vm.jit_native_region_entry_count();
+    let first_internal_edges = vm.jit_native_internal_region_edge_count();
+    let first_handoffs = vm.jit_native_link_handoff_count();
+    let first_fallbacks = vm.jit_helper_fallback_count();
+    assert_eq!(vm.jit_native_region_count(), 1, "{}", vm.dump_jit_info());
     assert!(first_native_execs > 0);
-    assert!(
-        first_native_execs < 1_024,
-        "exit-heavy callable traces should back off: {}",
-        vm.dump_jit_info()
-    );
+    assert!(first_region_entries > 0, "{}", vm.dump_jit_info());
+    assert!(first_internal_edges > 0, "{}", vm.dump_jit_info());
 
     vm.reset_for_reuse();
     assert_eq!(
-        vm.run().expect("blocked callable loop should run again"),
+        vm.run().expect("linked callable loop should run again"),
         VmStatus::Halted
     );
     assert_eq!(vm.stack(), &[Value::Int(-2_048)]);
+    let second_handoffs = vm
+        .jit_native_link_handoff_count()
+        .saturating_sub(first_handoffs);
     assert!(
-        vm.jit_native_exec_count()
-            .saturating_sub(first_native_execs)
-            < 64,
-        "blocked callable traces should stay in the interpreter: {}",
+        second_handoffs <= 2,
+        "callable cycle should remain in one native region, second_handoffs={second_handoffs}: {}",
         vm.dump_jit_info()
     );
+    assert!(vm.jit_native_exec_count() > first_native_execs);
+    assert!(vm.jit_native_region_entry_count() > first_region_entries);
+    assert!(vm.jit_native_internal_region_edge_count() > first_internal_edges);
+    assert_eq!(vm.jit_helper_fallback_count(), first_fallbacks);
 }
 
 #[test]

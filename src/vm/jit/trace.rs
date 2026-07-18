@@ -287,7 +287,7 @@ pub struct JitNyiDoc {
 const CALLABLE_SIDE_EXIT_BACKOFF_THRESHOLD: u32 = 64;
 const REGION_EXIT_HOT_THRESHOLD: u64 = 2;
 const MAX_REGION_MEMBERS: usize = 2;
-const MAX_REGION_LINKS: usize = 1;
+const MAX_REGION_LINKS: usize = 2;
 
 pub struct TraceJitEngine {
     config: JitConfig,
@@ -448,7 +448,7 @@ impl TraceJitEngine {
         child_trace_id: usize,
     ) -> Option<RegionCandidate> {
         if MAX_REGION_MEMBERS != 2
-            || MAX_REGION_LINKS != 1
+            || MAX_REGION_LINKS != 2
             || self.published_region.is_some()
             || self.failed_region_exits.contains(&key)
             || !self.region_exit_is_hot(key)
@@ -457,9 +457,7 @@ impl TraceJitEngine {
         }
         let parent = self.traces.get(key.parent_trace_id)?;
         let child = self.traces.get(child_trace_id)?;
-        if parent.frame_key != ROOT_FRAME_KEY {
-            return None;
-        }
+
         let region_ops = parent.op_names.len().checked_add(child.op_names.len());
         if region_ops.is_none_or(|ops| ops > self.config.max_trace_len) {
             self.failed_region_exits.insert(key);
@@ -513,7 +511,7 @@ impl TraceJitEngine {
         self.published_region
     }
 
-    fn invalidate_regions(&mut self) {
+    pub(crate) fn invalidate_regions(&mut self) {
         self.region_generation = self.region_generation.wrapping_add(1);
         self.published_region = None;
         self.failed_region_exits.clear();

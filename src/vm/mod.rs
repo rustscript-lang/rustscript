@@ -359,6 +359,8 @@ pub struct Vm {
     jit: jit::TraceJitEngine,
     native_traces: Vec<Option<jit::NativeTrace>>,
     native_trace_exec_count: u64,
+    jit_native_region_entry_count: u64,
+    jit_native_region_edge_count: u64,
     jit_trace_exit_count: u64,
     jit_native_loop_back_count: u64,
     jit_native_link_handoff_count: u64,
@@ -678,6 +680,8 @@ impl Vm {
             jit: jit::TraceJitEngine::new(jit_config),
             native_traces: Vec::new(),
             native_trace_exec_count: 0,
+            jit_native_region_entry_count: 0,
+            jit_native_region_edge_count: 0,
             jit_trace_exit_count: 0,
             jit_native_loop_back_count: 0,
             jit_native_link_handoff_count: 0,
@@ -1094,6 +1098,7 @@ impl Vm {
 
     pub fn set_drop_contract_events_enabled(&mut self, enabled: bool) {
         if self.drop_contract_events_enabled != enabled {
+            self.disconnect_native_regions();
             self.native_traces.clear();
         }
         self.drop_contract_events_enabled = enabled;

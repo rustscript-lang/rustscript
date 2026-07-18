@@ -53,7 +53,7 @@ pub(super) fn compile_native_trace(
 ) -> VmResult<Box<CompiledTrace>> {
     Ok(Box::new(lower::compile_trace(
         trace,
-        None,
+        &[],
         interrupt_settings,
         profile,
         drop_contract_events_enabled,
@@ -81,7 +81,7 @@ pub(super) fn compile_native_region(
 ) -> VmResult<Box<CompiledTrace>> {
     Ok(Box::new(lower::compile_trace(
         &region.trace,
-        Some(&region.link),
+        &region.links,
         interrupt_settings,
         profile,
         drop_contract_events_enabled,

@@ -20,7 +20,7 @@ pub(crate) struct FusedRegionLink {
 #[derive(Clone, Debug)]
 pub(crate) struct FusedRegion {
     pub(crate) trace: JitTrace,
-    pub(crate) link: FusedRegionLink,
+    pub(crate) links: Vec<FusedRegionLink>,
     pub(crate) exit_keys: HashMap<u32, TraceExitKey>,
 }
 
@@ -28,6 +28,7 @@ pub(crate) fn fuse_two_trace_region(
     parent: &JitTrace,
     child: &JitTrace,
     import: &SideTraceImport,
+    back_import: Option<&SideTraceImport>,
 ) -> VmResult<FusedRegion> {
     let value_offset = parent
         .ssa
@@ -111,13 +112,26 @@ pub(crate) fn fuse_two_trace_region(
         );
     }
 
+    let mut links = vec![FusedRegionLink {
+        exit: import.parent_exit,
+        child_entry,
+        args: import.args.clone(),
+    }];
+    if let Some(back_import) = back_import {
+        let mut args = back_import.args.clone();
+        for materialization in &mut args {
+            offset_materialization(materialization, value_offset)?;
+        }
+        links.push(FusedRegionLink {
+            exit: offset_exit_id(back_import.parent_exit, exit_offset)?,
+            child_entry: parent.ssa.entry,
+            args,
+        });
+    }
+
     Ok(FusedRegion {
         trace,
-        link: FusedRegionLink {
-            exit: import.parent_exit,
-            child_entry,
-            args: import.args.clone(),
-        },
+        links,
         exit_keys,
     })
 }
@@ -508,13 +522,25 @@ mod tests {
             args: Vec::new(),
         };
 
-        let region = fuse_two_trace_region(&parent, &child, &import).unwrap();
+        let back_import = SideTraceImport {
+            parent_exit: child_exit,
+            stack_depth: 0,
+            local_count: 0,
+            dirty_locals: Vec::new(),
+            args: Vec::new(),
+        };
+
+        let region = fuse_two_trace_region(&parent, &child, &import, Some(&back_import)).unwrap();
 
         assert_eq!(region.trace.ssa.blocks.len(), 2);
         assert_eq!(region.trace.ssa.exits.len(), 2);
-        assert_eq!(region.link.exit, parent_exit);
-        assert_eq!(region.link.child_entry, SsaBlockId::new(1));
-        assert!(region.link.args.is_empty());
+        assert_eq!(region.links.len(), 2);
+        assert_eq!(region.links[0].exit, parent_exit);
+        assert_eq!(region.links[0].child_entry, SsaBlockId::new(1));
+        assert!(region.links[0].args.is_empty());
+        assert_eq!(region.links[1].exit, SsaExitId::new(1));
+        assert_eq!(region.links[1].child_entry, parent.ssa.entry);
+        assert!(region.links[1].args.is_empty());
         assert_eq!(
             region.exit_keys.get(&parent_exit.raw()),
             Some(&TraceExitKey {
