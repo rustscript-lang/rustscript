@@ -1,5 +1,6 @@
 use super::super::super::{Value, VmError, VmResult};
 use super::super::JitTrace;
+use super::super::region::FusedRegionLink;
 use super::super::runtime::resume_linked_trace_entry_address;
 use super::{NativeCompileProfile, TraceLoweringKind};
 use crate::vm::jit::deopt::exit_inputs;
@@ -80,6 +81,7 @@ impl TraceKeepAlive {
 fn try_compile_ssa_trace(
     trace: &JitTrace,
     ssa: &SsaTrace,
+    internal_link: Option<&FusedRegionLink>,
     interrupt_settings: Option<NativeInterruptSettings>,
     profile: NativeCompileProfile,
     drop_contract_events_enabled: bool,
@@ -242,6 +244,9 @@ fn try_compile_ssa_trace(
         let borrowed_array_gets = borrowed_array_get_outputs(ssa);
         let owned_value_temps =
             allocate_owned_value_temps(&mut b, ssa, layout.value.size, &borrowed_array_gets)?;
+        let internal_link_slots = internal_link
+            .map(|link| allocate_internal_link_slots(&mut b, link, layout.value.size))
+            .transpose()?;
 
         let mut block_handles = HashMap::new();
         for block in &ssa.blocks {
@@ -406,6 +411,7 @@ fn try_compile_ssa_trace(
                 &values,
                 &block_handles,
                 &exit_specs,
+                internal_link.zip(internal_link_slots.as_deref()),
             )?;
         }
 
@@ -3059,13 +3065,104 @@ fn lower_ssa_inst(
     Ok(())
 }
 
+fn allocate_internal_link_slots(
+    b: &mut FunctionBuilder,
+    link: &FusedRegionLink,
+    value_size: i32,
+) -> VmResult<Vec<Option<StackSlot>>> {
+    link.args
+        .iter()
+        .map(|materialization| match materialization {
+            SsaMaterialization::Value(_) => Ok(None),
+            SsaMaterialization::BoxInt(_)
+            | SsaMaterialization::BoxFloat(_)
+            | SsaMaterialization::BoxBool(_) => {
+                ssa_create_value_stack_slot(b, value_size).map(Some)
+            }
+            SsaMaterialization::BoxHeapPtr { .. } => Err(VmError::JitNative(
+                "fused SSA link does not support heap ownership transfer".to_string(),
+            )),
+        })
+        .collect()
+}
+
+fn lower_internal_link_args(
+    b: &mut FunctionBuilder,
+    ctx: SsaLowerCtx<'_>,
+    link: &FusedRegionLink,
+    slots: &[Option<StackSlot>],
+    values: &HashMap<SsaValueId, cranelift_codegen::ir::Value>,
+) -> VmResult<Vec<cranelift_codegen::ir::Value>> {
+    if slots.len() != link.args.len() {
+        return Err(VmError::JitNative(
+            "fused SSA link slot count mismatch".to_string(),
+        ));
+    }
+    link.args
+        .iter()
+        .zip(slots)
+        .map(|(materialization, slot)| match materialization {
+            SsaMaterialization::Value(value) => values
+                .get(value)
+                .copied()
+                .ok_or_else(|| VmError::JitNative("fused SSA link value missing".to_string())),
+            SsaMaterialization::BoxInt(value) => {
+                let src = *values.get(value).ok_or_else(|| {
+                    VmError::JitNative("fused SSA link int value missing".to_string())
+                })?;
+                let addr = b.ins().stack_addr(
+                    ctx.pointer_type,
+                    slot.ok_or_else(|| {
+                        VmError::JitNative("fused SSA link int slot missing".to_string())
+                    })?,
+                    0,
+                );
+                ssa_store_int_in_value(b, ctx.layout.value, addr, src);
+                Ok(addr)
+            }
+            SsaMaterialization::BoxFloat(value) => {
+                let src = *values.get(value).ok_or_else(|| {
+                    VmError::JitNative("fused SSA link float value missing".to_string())
+                })?;
+                let addr = b.ins().stack_addr(
+                    ctx.pointer_type,
+                    slot.ok_or_else(|| {
+                        VmError::JitNative("fused SSA link float slot missing".to_string())
+                    })?,
+                    0,
+                );
+                ssa_store_float_in_value(b, ctx.layout.value, addr, src);
+                Ok(addr)
+            }
+            SsaMaterialization::BoxBool(value) => {
+                let src = *values.get(value).ok_or_else(|| {
+                    VmError::JitNative("fused SSA link bool value missing".to_string())
+                })?;
+                let addr = b.ins().stack_addr(
+                    ctx.pointer_type,
+                    slot.ok_or_else(|| {
+                        VmError::JitNative("fused SSA link bool slot missing".to_string())
+                    })?,
+                    0,
+                );
+                ssa_store_bool_in_value(b, ctx.layout.value, addr, src);
+                Ok(addr)
+            }
+            SsaMaterialization::BoxHeapPtr { .. } => Err(VmError::JitNative(
+                "fused SSA link does not support heap ownership transfer".to_string(),
+            )),
+        })
+        .collect()
+}
+
 fn lower_ssa_terminator(
     b: &mut FunctionBuilder,
-    _ctx: SsaLowerCtx<'_>,
+    ctx: SsaLowerCtx<'_>,
     terminator: &SsaTerminator,
     values: &HashMap<SsaValueId, cranelift_codegen::ir::Value>,
     block_handles: &HashMap<crate::vm::jit::ir::SsaBlockId, Block>,
     exit_specs: &HashMap<SsaExitId, SsaExitLowering>,
+    internal_link: Option<(&FusedRegionLink, &[Option<StackSlot>])>,
 ) -> VmResult<()> {
     match terminator {
         SsaTerminator::Jump { target, args } => {
@@ -3092,10 +3189,24 @@ fn lower_ssa_terminator(
             let condition = *values
                 .get(condition)
                 .ok_or_else(|| VmError::JitNative("SSA branch condition missing".to_string()))?;
-            let true_target =
-                ssa_branch_target_block(if_true, values, block_handles, exit_specs, false)?;
-            let false_target =
-                ssa_branch_target_block(if_false, values, block_handles, exit_specs, false)?;
+            let true_target = ssa_branch_target_block(
+                b,
+                ctx,
+                if_true,
+                values,
+                block_handles,
+                exit_specs,
+                internal_link,
+            )?;
+            let false_target = ssa_branch_target_block(
+                b,
+                ctx,
+                if_false,
+                values,
+                block_handles,
+                exit_specs,
+                internal_link,
+            )?;
             let true_args = ssa_block_args(true_target.1);
             let false_args = ssa_block_args(false_target.1);
             b.ins().brif(
@@ -3107,6 +3218,15 @@ fn lower_ssa_terminator(
             );
         }
         SsaTerminator::Exit { exit } => {
+            if let Some((link, slots)) = internal_link.filter(|(link, _)| link.exit == *exit) {
+                let handle = *block_handles.get(&link.child_entry).ok_or_else(|| {
+                    VmError::JitNative("fused SSA child entry block missing".to_string())
+                })?;
+                let args = lower_internal_link_args(b, ctx, link, slots, values)?;
+                let args = ssa_block_args(args);
+                b.ins().jump(handle, &args);
+                return Ok(());
+            }
             let spec = exit_specs
                 .get(exit)
                 .ok_or_else(|| VmError::JitNative("SSA exit lowering missing".to_string()))?;
@@ -3163,11 +3283,13 @@ fn lower_ssa_terminator(
 }
 
 fn ssa_branch_target_block(
+    b: &mut FunctionBuilder,
+    ctx: SsaLowerCtx<'_>,
     target: &SsaBranchTarget,
     values: &HashMap<SsaValueId, cranelift_codegen::ir::Value>,
     block_handles: &HashMap<crate::vm::jit::ir::SsaBlockId, Block>,
     exit_specs: &HashMap<SsaExitId, SsaExitLowering>,
-    halted: bool,
+    internal_link: Option<(&FusedRegionLink, &[Option<StackSlot>])>,
 ) -> VmResult<(Block, Vec<cranelift_codegen::ir::Value>)> {
     match target {
         SsaBranchTarget::Block { target, args } => {
@@ -3186,6 +3308,13 @@ fn ssa_branch_target_block(
             Ok((handle, lowered_args))
         }
         SsaBranchTarget::Exit(exit) => {
+            if let Some((link, slots)) = internal_link.filter(|(link, _)| link.exit == *exit) {
+                let handle = *block_handles.get(&link.child_entry).ok_or_else(|| {
+                    VmError::JitNative("fused SSA child entry block missing".to_string())
+                })?;
+                let args = lower_internal_link_args(b, ctx, link, slots, values)?;
+                return Ok((handle, args));
+            }
             let spec = exit_specs.get(exit).ok_or_else(|| {
                 VmError::JitNative("SSA branch exit lowering missing".to_string())
             })?;
@@ -3199,14 +3328,7 @@ fn ssa_branch_target_block(
                         .ok_or_else(|| VmError::JitNative("SSA exit arg missing".to_string()))
                 })
                 .collect::<VmResult<Vec<_>>>()?;
-            Ok((
-                if halted {
-                    spec.halted_block
-                } else {
-                    spec.trace_exit_block
-                },
-                lowered_args,
-            ))
+            Ok((spec.trace_exit_block, lowered_args))
         }
     }
 }
@@ -4634,6 +4756,7 @@ fn resolve_offsets(layout: NativeStackLayout) -> VmResult<ResolvedOffsets> {
 
 pub(crate) fn compile_trace(
     trace: &JitTrace,
+    internal_link: Option<&FusedRegionLink>,
     interrupt_settings: Option<NativeInterruptSettings>,
     profile: NativeCompileProfile,
     drop_contract_events_enabled: bool,
@@ -4645,6 +4768,7 @@ pub(crate) fn compile_trace(
     try_compile_ssa_trace(
         trace,
         &trace.ssa,
+        internal_link,
         interrupt_settings,
         profile,
         drop_contract_events_enabled,
