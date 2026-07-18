@@ -912,6 +912,67 @@ mod tests {
     }
 
     #[test]
+    fn callable_frame_backoff_clears_on_jit_invalidation() {
+        if !native_jit_supported() {
+            return;
+        }
+        let mut bc = BytecodeBuilder::new();
+        let root_ip = bc.position();
+        bc.ldloc(0);
+        bc.ldc(0);
+        bc.add();
+        bc.stloc(0);
+        bc.br(root_ip);
+        let mut program = Program::new(vec![Value::Int(1)], bc.finish()).with_local_count(1);
+        program.script_functions.push(ScriptFunction {
+            entry_ip: root_ip,
+            end_ip: program.code.len() as u32,
+        });
+        program.callable_prototypes.push(CallablePrototype {
+            kind: CallableKind::FunctionItem,
+            target: CallableTarget::ScriptFunction(0),
+            arity: 0,
+            frame_local_count: 1,
+            parameter_slots: Vec::new(),
+            capture_source_slots: Vec::new(),
+            capture_slots: Vec::new(),
+            capture_modes: Vec::new(),
+            self_slot: None,
+            schema: None,
+        });
+        let config = JitConfig {
+            enabled: true,
+            hot_loop_threshold: 1,
+            max_trace_len: 64,
+        };
+        let mut engine = TraceJitEngine::new(config);
+
+        let trace_id = engine
+            .observe_hot_entry(0, root_ip as usize, 0, &program)
+            .expect("script-frame trace should compile");
+        for _ in 0..CALLABLE_SIDE_EXIT_BACKOFF_THRESHOLD {
+            engine.record_native_side_exit(trace_id);
+        }
+        engine.block_callable_frame(trace_id);
+        assert!(engine.callable_frame_is_blocked(0));
+
+        engine.set_config(config);
+        assert!(!engine.callable_frame_is_blocked(0));
+
+        let trace_id = engine
+            .observe_hot_entry(0, root_ip as usize, 0, &program)
+            .expect("script-frame trace should recompile after config invalidation");
+        for _ in 0..CALLABLE_SIDE_EXIT_BACKOFF_THRESHOLD {
+            engine.record_native_side_exit(trace_id);
+        }
+        engine.block_callable_frame(trace_id);
+        assert!(engine.callable_frame_is_blocked(0));
+
+        assert!(engine.set_non_yielding_host_imports(vec![true]));
+        assert!(!engine.callable_frame_is_blocked(0));
+    }
+
+    #[test]
     fn trace_entry_cache_separates_root_and_script_frames() {
         if !native_jit_supported() {
             return;
