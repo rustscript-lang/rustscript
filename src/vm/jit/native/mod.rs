@@ -188,14 +188,47 @@ pub(super) fn compile_native_region(
 #[cfg(test)]
 mod tests {
     use super::lower::{
-        compile_system_tail_wrapper, compile_tail_side_link_body, compile_tail_status_body,
+        compile_system_owned_tail_wrapper, compile_system_tail_wrapper,
+        compile_tail_owned_clear_body, compile_tail_owned_side_link_body,
+        compile_tail_side_link_body, compile_tail_status_body,
     };
     use super::{
         InheritedStateAbiClass, NativeSideLinkSlot, SideEntryOwnership,
         classify_side_entry_materialization, classify_side_entry_repr, selected_codegen_backend,
     };
-    use crate::ValueType;
     use crate::vm::jit::ir::{SsaMaterialization, SsaValueId, SsaValueRepr};
+    use crate::{Value, ValueType};
+    use std::sync::Arc;
+
+    #[cfg(target_os = "linux")]
+    fn assert_executable_mapping_is_not_writable(entry: *const u8) {
+        let address = entry as usize;
+        let maps = std::fs::read_to_string("/proc/self/maps").expect("process maps should read");
+        let mapping = maps
+            .lines()
+            .find(|line| {
+                let Some((range, _)) = line.split_once(' ') else {
+                    return false;
+                };
+                let Some((start, end)) = range.split_once('-') else {
+                    return false;
+                };
+                let Ok(start) = usize::from_str_radix(start, 16) else {
+                    return false;
+                };
+                let Ok(end) = usize::from_str_radix(end, 16) else {
+                    return false;
+                };
+                start <= address && address < end
+            })
+            .expect("entry mapping should exist");
+        let permissions = mapping
+            .split_whitespace()
+            .nth(1)
+            .expect("mapping permissions should exist");
+        assert!(permissions.contains('x'), "{mapping}");
+        assert!(!permissions.contains('w'), "{mapping}");
+    }
 
     #[test]
     fn side_entry_abi_classifies_scalar_pointer_tagged_borrowed_and_owned_values() {
@@ -252,6 +285,8 @@ mod tests {
             .expect("tail root should compile");
         let wrapper =
             compile_system_tail_wrapper(root.entry()).expect("system wrapper should compile");
+        #[cfg(target_os = "linux")]
+        assert_executable_mapping_is_not_writable(wrapper.entry());
         assert!(child.code_len() > 0);
         assert!(root.code_len() > 0);
         assert!(wrapper.code_len() > 0);
@@ -269,6 +304,53 @@ mod tests {
         slot.clear();
         assert!(slot.target().is_null());
         assert_eq!(unsafe { entry(std::ptr::null_mut()) }, DEOPT_STATUS);
+    }
+
+    #[cfg(feature = "cranelift-jit")]
+    #[test]
+    fn trace_jit_side_entry_transfers_owned_values_once() {
+        if selected_codegen_backend() != "native" {
+            return;
+        }
+        const DEOPT_STATUS: i32 = 29;
+        const CHILD_STATUS: i32 = 31;
+        let slot = Box::new(NativeSideLinkSlot::new());
+        let child =
+            compile_tail_owned_clear_body(CHILD_STATUS).expect("owned child should compile");
+        let root = compile_tail_owned_side_link_body(slot.address() as usize, DEOPT_STATUS)
+            .expect("owned root should compile");
+        let wrapper = compile_system_owned_tail_wrapper(root.entry())
+            .expect("owned system wrapper should compile");
+        let entry = unsafe {
+            std::mem::transmute::<*const u8, unsafe extern "C" fn(*mut crate::Vm, *mut Value) -> i32>(
+                wrapper.entry(),
+            )
+        };
+        let backing = Arc::new("owned".to_string());
+        let mut owned = Value::String(backing.clone());
+        assert_eq!(Arc::strong_count(&backing), 2);
+
+        assert_eq!(
+            unsafe { entry(std::ptr::null_mut(), &mut owned) },
+            DEOPT_STATUS
+        );
+        assert!(matches!(owned, Value::String(_)));
+        assert_eq!(Arc::strong_count(&backing), 2);
+
+        slot.publish(child.entry());
+        assert_eq!(
+            unsafe { entry(std::ptr::null_mut(), &mut owned) },
+            CHILD_STATUS
+        );
+        assert!(matches!(owned, Value::Null));
+        assert_eq!(Arc::strong_count(&backing), 1);
+
+        assert_eq!(
+            unsafe { entry(std::ptr::null_mut(), &mut owned) },
+            CHILD_STATUS
+        );
+        assert!(matches!(owned, Value::Null));
+        assert_eq!(Arc::strong_count(&backing), 1);
     }
 
     #[test]
