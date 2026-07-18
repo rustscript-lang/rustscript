@@ -145,6 +145,69 @@ Interpretation:
 - Stage 4 remains in the expected post-fast-path regime where interpreter and JIT are close enough
   that specialized-trace coverage, not simple wall-clock ordering, is the stable regression guard
 
+## Validation Rerun (2026-07-18)
+
+This rerun preserves the 2026-03-21 results above and compares the plan-validation revision with
+the tested revision on the same machine:
+
+- plan-validation baseline: `4dff448b23585e1bec33b913aad781dcdc326fd1`
+- tested revision (checked-out `master` at benchmark time): `73fb7879907297d47d059d4da646f129600d3d62`
+- toolchain: `rustc 1.94.1 (e408947bf 2026-03-25)`
+- main affinity: CPU 3; cross-check affinity: CPU 11
+- baseline and current used independent debug and release target directories
+- rename-aware comparison found only formatting/repository-layout changes in the perf harness;
+  iteration counts, warmups, expected values, and measurement logic remain equivalent
+- all 178 captured benchmark invocations passed their correctness assertions; array/map runs also
+  retained the expected `jit_traces=5` and `jit_traces=6` coverage
+
+The exact plan commands were run first. The debug host/proc-macro timings were strongly bimodal on
+this VM and did not reproduce the historical absolute `0.9-1.2 us/call` host range for either
+revision. Supplementary release A/B runs therefore used alternating endpoint order and a second CPU.
+The collection benchmarks were repeated in release mode with the original Cranelift JIT feature.
+
+Same-machine A/B signals:
+
+| Measurement | Baseline | Current | Change | Confidence |
+|---|---:|---:|---:|---|
+| host `0arg` family, CPU 11 median-ratio geometric mean | - | - | `+50.0%` | regression signal; bimodal samples overlap |
+| host `1arg` family, CPU 11 median-ratio geometric mean | - | - | `+24.3%` | regression signal; ABI variants are mixed |
+| proc-macro family, CPU 11 median-ratio geometric mean | - | - | `+14.2%` | no aggregate improvement; bimodal samples overlap |
+| no-host tight-loop interpreter median | `209 ms` | `214 ms` | `+2.4%` | close |
+| array interpreter, cross-core low-latency sample | `16.54 ms` | `18.79 ms` | `+13.6%` | modest regression signal |
+| array JIT, cross-core low-latency sample | `20.21 ms` | `21.20 ms` | `+4.9%` | close |
+| map interpreter, cross-core low-latency sample | `18.34 ms` | `18.72 ms` | `+2.1%` | close |
+| map JIT, CPU 3 low-latency sample | `22.29 ms` | `56.32 ms` | `+152.7%` | inconclusive across CPUs |
+| array JIT trace count | `5` | `5` | unchanged | structural coverage retained |
+| map JIT trace count | `6` | `6` | unchanged | structural coverage retained |
+
+The historical collection values remain reproducible by the baseline revision on the current
+machine:
+
+| Measurement | 2026-03-21 document value | 2026-07-18 baseline rerun |
+|---|---:|---:|
+| array interpreter | `15.747 ms` | `16.543 ms` |
+| array JIT | `16.425 ms` | `20.213 ms` |
+| map interpreter | `19.582 ms` | `18.340 ms` |
+| map JIT | `20.165 ms` | `22.285 ms` |
+
+Interpretation:
+
+- tested revision `73fb787` does not demonstrate a broad call-overhead improvement over `4dff448`
+- the host result is call-path-specific rather than a general interpreter-loop shift: the no-host
+  tight-loop control moved only `+2.4%`
+- dynamic `Args*` and `Stack*` `1arg` variants improved in the CPU 11 median comparison, while
+  static, legacy, and most `0arg` variants produced the aggregate host regression signal
+- proc-macro heap-argument paths show no repeatable aggregate gain
+- array/map interpreter paths remain close to baseline, with array showing a modest slowdown signal
+- map JIT retained six traces and passed all specialized-op coverage assertions; CPU 3 did not recover
+  the baseline low-latency cluster, but the large delta did not reproduce consistently on CPU 11, so
+  the wall-clock result remains inconclusive rather than a confirmed regression
+- performance counters were unavailable because `perf_event_paranoid=4`; confirming any noisy CPU
+  regression requires a same-frequency cluster across both endpoints, at least 15 alternating rounds,
+  or a repeatable commit boundary from an isolated bisection
+- `7a151fc` added typed builtin fast-path checks and counters to the interpreter `Call` path after the
+  plan baseline; it is a profiling candidate, not an established causal commit
+
 ## Non-Goals
 
 - redesigning RustScript source-level function semantics
