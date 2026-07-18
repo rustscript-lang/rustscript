@@ -41,6 +41,15 @@ type NativeTraceEntry = unsafe extern "C" fn(*mut Vm) -> i32;
 )))]
 type NativeTraceEntry = fn(*mut Vm) -> i32;
 
+type NativeTraceState = (
+    NativeTraceEntry,
+    usize,
+    JitTraceTerminal,
+    bool,
+    bool,
+    Option<Arc<HashMap<u32, TraceExitKey>>>,
+);
+
 pub(crate) struct NativeTrace {
     _keepalive: Arc<Mutex<native::TraceKeepAlive>>,
     entry: NativeTraceEntry,
@@ -53,6 +62,21 @@ pub(crate) struct NativeTrace {
     interrupt_settings: Option<native::NativeInterruptSettings>,
     compile_profile: native::NativeCompileProfile,
     drop_contract_events_enabled: bool,
+    region: Option<NativeRegion>,
+}
+
+struct NativeRegion {
+    _keepalive: Arc<Mutex<native::TraceKeepAlive>>,
+    entry: NativeTraceEntry,
+    code: Arc<[u8]>,
+    terminal: JitTraceTerminal,
+    has_call: bool,
+    has_yielding_call: bool,
+    lowering_kind: native::TraceLoweringKind,
+    generation: u64,
+    key: TraceExitKey,
+    child_trace_id: usize,
+    exit_keys: Arc<HashMap<u32, TraceExitKey>>,
 }
 
 #[cfg(any(
@@ -269,7 +293,7 @@ impl Vm {
             return Err(err);
         }
 
-        let (mut entry, mut root_ip, mut terminal, _, mut has_yielding_call) =
+        let (mut entry, mut root_ip, mut terminal, _, mut has_yielding_call, mut exit_keys) =
             self.native_trace_state(current_trace_id)?;
 
         loop {
@@ -277,13 +301,24 @@ impl Vm {
             let status = unsafe { entry(self as *mut Vm) };
             self.native_trace_exec_count = self.native_trace_exec_count.saturating_add(1);
             self.jit.mark_trace_executed(current_trace_id);
+            let mut trace_exit_key = None;
             let status = if let Some(exit_id) = native::decode_jit_trace_exit_status(status) {
-                self.jit
-                    .record_trace_exit(TraceExitKey {
+                let key = if let Some(region_exit_keys) = &exit_keys {
+                    *region_exit_keys.get(&exit_id).ok_or_else(|| {
+                        VmError::JitNative(format!(
+                            "fused native region returned impossible exit id {exit_id}"
+                        ))
+                    })?
+                } else {
+                    TraceExitKey {
                         parent_trace_id: current_trace_id,
                         exit_id: SsaExitId::new(exit_id),
-                    })
+                    }
+                };
+                self.jit
+                    .record_trace_exit(key)
                     .map_err(|err| VmError::JitNative(err.message()))?;
+                trace_exit_key = Some(key);
                 native::STATUS_TRACE_EXIT
             } else {
                 status
@@ -316,7 +351,7 @@ impl Vm {
                             }
                             return Err(err);
                         }
-                        (entry, root_ip, terminal, _, has_yielding_call) =
+                        (entry, root_ip, terminal, _, has_yielding_call, exit_keys) =
                             self.native_trace_state(current_trace_id)?;
                         continue;
                     }
@@ -360,6 +395,9 @@ impl Vm {
                         if let Some(next_trace_id) = next_trace_id
                             && next_trace_id != current_trace_id
                         {
+                            if let Some(key) = trace_exit_key {
+                                self.maybe_publish_native_region(key, next_trace_id);
+                            }
                             self.record_jit_link_handoff();
                             current_trace_id = next_trace_id;
                             if let Err(err) = self.ensure_native_trace(
@@ -373,7 +411,7 @@ impl Vm {
                                 }
                                 return Err(err);
                             }
-                            (entry, root_ip, terminal, _, has_yielding_call) =
+                            (entry, root_ip, terminal, _, has_yielding_call, exit_keys) =
                                 self.native_trace_state(current_trace_id)?;
                             continue;
                         }
@@ -405,6 +443,81 @@ impl Vm {
                 self.fuel_check_interval,
             )),
         }
+    }
+
+    #[cfg(any(
+        all(
+            target_arch = "x86_64",
+            any(target_os = "windows", all(unix, not(target_os = "macos")))
+        ),
+        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+    ))]
+    fn maybe_publish_native_region(&mut self, key: TraceExitKey, child_trace_id: usize) {
+        let Some(candidate) = self.jit.region_candidate(key, child_trace_id) else {
+            return;
+        };
+        if candidate.generation != self.jit.region_generation() {
+            return;
+        }
+        let Some(parent) = self.jit.trace_clone(key.parent_trace_id) else {
+            self.jit.record_region_compile_failure(&candidate);
+            return;
+        };
+        let Some(child) = self.jit.trace_clone(child_trace_id) else {
+            self.jit.record_region_compile_failure(&candidate);
+            return;
+        };
+        let fused = match super::region::fuse_two_trace_region(&parent, &child, &candidate.import) {
+            Ok(fused) => fused,
+            Err(_) => {
+                self.jit.record_region_compile_failure(&candidate);
+                return;
+            }
+        };
+        let interrupt_settings = self.active_native_interrupt_settings();
+        let compile_profile = native::NativeCompileProfile::Jit;
+        let drop_contract_events_enabled = self.drop_contract_events_enabled();
+        let compiled = match native::compile_native_region(
+            &fused,
+            interrupt_settings,
+            compile_profile,
+            drop_contract_events_enabled,
+        ) {
+            Ok(compiled) => compiled,
+            Err(_) => {
+                self.jit.record_region_compile_failure(&candidate);
+                return;
+            }
+        };
+        let entry = unsafe { std::mem::transmute::<*const u8, NativeTraceEntry>(compiled.entry) };
+        let lowering_kind = compiled.lowering_kind;
+        let code = Arc::<[u8]>::from(compiled.code.into_boxed_slice());
+        let keepalive = Arc::new(Mutex::new(compiled.keepalive));
+        let region = NativeRegion {
+            _keepalive: keepalive,
+            entry,
+            code,
+            terminal: fused.trace.terminal,
+            has_call: fused.trace.has_call,
+            has_yielding_call: fused.trace.has_yielding_call,
+            lowering_kind,
+            generation: candidate.generation,
+            key,
+            child_trace_id,
+            exit_keys: Arc::new(fused.exit_keys),
+        };
+        let Some(parent_native) = self
+            .native_traces
+            .get_mut(key.parent_trace_id)
+            .and_then(Option::as_mut)
+        else {
+            self.jit.record_region_compile_failure(&candidate);
+            return;
+        };
+        if !self.jit.publish_region(&candidate) {
+            return;
+        }
+        parent_native.region = Some(region);
     }
 
     pub fn set_jit_config(&mut self, config: super::JitConfig) {
@@ -495,6 +608,21 @@ impl Vm {
                     }
                     out.push('\n');
                 }
+                if let Some(region) = &native.region {
+                    out.push_str(&format!(
+                        "    region entry=0x{:X} code_bytes={} lowering={}\n",
+                        region.entry as usize,
+                        region.code.len(),
+                        region.lowering_kind.as_str()
+                    ));
+                    if include_machine_code {
+                        out.push_str("      code:");
+                        for byte in region.code.iter() {
+                            out.push_str(&format!(" {:02X}", byte));
+                        }
+                        out.push('\n');
+                    }
+                }
             }
         }
         out
@@ -551,20 +679,31 @@ impl Vm {
             }
             return Err(err);
         }
-        let (mut entry, mut root_ip, mut terminal, _, mut has_yielding_call) =
+        let (mut entry, mut root_ip, mut terminal, _, mut has_yielding_call, mut exit_keys) =
             self.native_trace_state(current_trace_id)?;
         native::clear_bridge_error();
         loop {
             let status = unsafe { entry(self as *mut Vm) };
             self.native_trace_exec_count = self.native_trace_exec_count.saturating_add(1);
             self.jit.mark_trace_executed(current_trace_id);
+            let mut trace_exit_key = None;
             let status = if let Some(exit_id) = native::decode_jit_trace_exit_status(status) {
-                self.jit
-                    .record_trace_exit(TraceExitKey {
+                let key = if let Some(region_exit_keys) = &exit_keys {
+                    *region_exit_keys.get(&exit_id).ok_or_else(|| {
+                        VmError::JitNative(format!(
+                            "fused native region returned impossible exit id {exit_id}"
+                        ))
+                    })?
+                } else {
+                    TraceExitKey {
                         parent_trace_id: current_trace_id,
                         exit_id: SsaExitId::new(exit_id),
-                    })
+                    }
+                };
+                self.jit
+                    .record_trace_exit(key)
                     .map_err(|err| VmError::JitNative(err.message()))?;
+                trace_exit_key = Some(key);
                 native::STATUS_TRACE_EXIT
             } else {
                 status
@@ -590,7 +729,7 @@ impl Vm {
                             current_trace_id,
                             native::NativeCompileProfile::Jit,
                         ) {
-                            (entry, root_ip, terminal, _, has_yielding_call) = state;
+                            (entry, root_ip, terminal, _, has_yielding_call, exit_keys) = state;
                         } else {
                             if let Err(err) = self.ensure_native_trace(
                                 current_trace_id,
@@ -603,7 +742,7 @@ impl Vm {
                                 }
                                 return Err(err);
                             }
-                            (entry, root_ip, terminal, _, has_yielding_call) =
+                            (entry, root_ip, terminal, _, has_yielding_call, exit_keys) =
                                 self.native_trace_state(current_trace_id)?;
                         }
                         continue;
@@ -658,13 +797,16 @@ impl Vm {
                         if let Some(next_trace_id) = next_trace_id
                             && next_trace_id != current_trace_id
                         {
+                            if let Some(key) = trace_exit_key {
+                                self.maybe_publish_native_region(key, next_trace_id);
+                            }
                             self.record_jit_link_handoff();
                             current_trace_id = next_trace_id;
                             if let Some(state) = self.cached_native_trace_state(
                                 current_trace_id,
                                 native::NativeCompileProfile::Jit,
                             ) {
-                                (entry, root_ip, terminal, _, has_yielding_call) = state;
+                                (entry, root_ip, terminal, _, has_yielding_call, exit_keys) = state;
                             } else {
                                 if let Err(err) = self.ensure_native_trace(
                                     current_trace_id,
@@ -677,7 +819,7 @@ impl Vm {
                                     }
                                     return Err(err);
                                 }
-                                (entry, root_ip, terminal, _, has_yielding_call) =
+                                (entry, root_ip, terminal, _, has_yielding_call, exit_keys) =
                                     self.native_trace_state(current_trace_id)?;
                             }
                             continue;
@@ -716,7 +858,7 @@ impl Vm {
                             current_trace_id,
                             native::NativeCompileProfile::Jit,
                         ) {
-                            (entry, root_ip, terminal, _, has_yielding_call) = state;
+                            (entry, root_ip, terminal, _, has_yielding_call, exit_keys) = state;
                         } else {
                             if let Err(err) = self.ensure_native_trace(
                                 current_trace_id,
@@ -729,7 +871,7 @@ impl Vm {
                                 }
                                 return Err(err);
                             }
-                            (entry, root_ip, terminal, _, has_yielding_call) =
+                            (entry, root_ip, terminal, _, has_yielding_call, exit_keys) =
                                 self.native_trace_state(current_trace_id)?;
                         }
                         continue;
@@ -801,10 +943,7 @@ impl Vm {
         ),
         all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
     ))]
-    fn native_trace_state(
-        &self,
-        trace_id: usize,
-    ) -> VmResult<(NativeTraceEntry, usize, JitTraceTerminal, bool, bool)> {
+    fn native_trace_state(&self, trace_id: usize) -> VmResult<NativeTraceState> {
         let native = self
             .native_traces
             .get(trace_id)
@@ -812,12 +951,30 @@ impl Vm {
             .ok_or_else(|| {
                 VmError::JitNative(format!("native trace entry for id {} missing", trace_id))
             })?;
+        if let Some(region) = native.region.as_ref().filter(|region| {
+            self.jit.published_region().is_some_and(|published| {
+                published.generation == region.generation
+                    && published.key == region.key
+                    && published.child_trace_id == region.child_trace_id
+                    && published.key.parent_trace_id == trace_id
+            })
+        }) {
+            return Ok((
+                region.entry,
+                native.root_ip,
+                region.terminal,
+                region.has_call,
+                region.has_yielding_call,
+                Some(Arc::clone(&region.exit_keys)),
+            ));
+        }
         Ok((
             native.entry,
             native.root_ip,
             native.terminal,
             native.has_call,
             native.has_yielding_call,
+            None,
         ))
     }
 
@@ -833,18 +990,13 @@ impl Vm {
         &self,
         trace_id: usize,
         compile_profile: native::NativeCompileProfile,
-    ) -> Option<(NativeTraceEntry, usize, JitTraceTerminal, bool, bool)> {
+    ) -> Option<NativeTraceState> {
         let native = self.native_traces.get(trace_id)?.as_ref()?;
         (native.interrupt_settings == self.active_native_interrupt_settings()
             && compile_profile_satisfies(native.compile_profile, compile_profile)
             && native.drop_contract_events_enabled == self.drop_contract_events_enabled)
-            .then_some((
-                native.entry,
-                native.root_ip,
-                native.terminal,
-                native.has_call,
-                native.has_yielding_call,
-            ))
+            .then(|| self.native_trace_state(trace_id).ok())
+            .flatten()
     }
 
     #[cfg(any(
@@ -924,6 +1076,7 @@ impl Vm {
                 interrupt_settings,
                 compile_profile: cached.compile_profile,
                 drop_contract_events_enabled,
+                region: None,
             });
             return Ok(());
         }
@@ -966,6 +1119,7 @@ impl Vm {
             interrupt_settings,
             compile_profile,
             drop_contract_events_enabled,
+            region: None,
         });
         Ok(())
     }

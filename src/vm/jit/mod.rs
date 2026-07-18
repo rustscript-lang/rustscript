@@ -3,6 +3,7 @@ pub(crate) mod ir;
 pub(crate) mod liveness;
 pub(crate) mod native;
 pub(crate) mod recorder;
+pub(crate) mod region;
 pub(crate) mod runtime;
 pub(crate) mod trace;
 

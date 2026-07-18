@@ -10,6 +10,10 @@ impl SsaValueId {
     pub(crate) fn new(raw: u32) -> Self {
         Self(raw)
     }
+
+    pub(crate) fn raw(self) -> u32 {
+        self.0
+    }
 }
 
 impl fmt::Display for SsaValueId {

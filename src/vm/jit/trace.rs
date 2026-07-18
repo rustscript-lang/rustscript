@@ -22,6 +22,21 @@ pub(crate) struct TraceExitKey {
     pub(crate) exit_id: SsaExitId,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RegionCandidate {
+    pub(crate) generation: u64,
+    pub(crate) key: TraceExitKey,
+    pub(crate) child_trace_id: usize,
+    pub(crate) import: SideTraceImport,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PublishedRegion {
+    pub(crate) generation: u64,
+    pub(crate) key: TraceExitKey,
+    pub(crate) child_trace_id: usize,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TraceExitProfile {
     pub(crate) executions: u64,
@@ -270,6 +285,9 @@ pub struct JitNyiDoc {
 }
 
 const CALLABLE_SIDE_EXIT_BACKOFF_THRESHOLD: u32 = 64;
+const REGION_EXIT_HOT_THRESHOLD: u64 = 2;
+const MAX_REGION_MEMBERS: usize = 2;
+const MAX_REGION_LINKS: usize = 1;
 
 pub struct TraceJitEngine {
     config: JitConfig,
@@ -280,6 +298,9 @@ pub struct TraceJitEngine {
     non_yielding_host_imports: Vec<bool>,
     traces: Vec<JitTrace>,
     trace_exit_profiles: HashMap<TraceExitKey, TraceExitProfile>,
+    region_generation: u64,
+    published_region: Option<PublishedRegion>,
+    failed_region_exits: HashSet<TraceExitKey>,
     callable_side_exit_streaks: Vec<u32>,
     blocked_callable_frames: Vec<bool>,
     attempts: Vec<JitAttempt>,
@@ -302,6 +323,9 @@ impl TraceJitEngine {
             non_yielding_host_imports: Vec::new(),
             traces: Vec::new(),
             trace_exit_profiles: HashMap::new(),
+            region_generation: 0,
+            published_region: None,
+            failed_region_exits: HashSet::new(),
             callable_side_exit_streaks: Vec::new(),
             blocked_callable_frames: Vec::new(),
             attempts: Vec::new(),
@@ -313,6 +337,7 @@ impl TraceJitEngine {
     }
 
     pub fn set_config(&mut self, config: JitConfig) {
+        self.invalidate_regions();
         self.config = config;
         self.hot_counts.clear();
         self.compiled_by_ip.clear();
@@ -329,6 +354,7 @@ impl TraceJitEngine {
         if self.non_yielding_host_imports == imports {
             return false;
         }
+        self.invalidate_regions();
         self.non_yielding_host_imports = imports;
         self.hot_counts.clear();
         self.compiled_by_ip.clear();
@@ -406,7 +432,93 @@ impl TraceJitEngine {
         self.traces.get(trace_id).cloned()
     }
 
-    #[allow(dead_code)]
+    pub(crate) fn region_generation(&self) -> u64 {
+        self.region_generation
+    }
+
+    fn region_exit_is_hot(&self, key: TraceExitKey) -> bool {
+        self.trace_exit_profiles
+            .get(&key)
+            .is_some_and(|profile| profile.executions >= REGION_EXIT_HOT_THRESHOLD)
+    }
+
+    pub(crate) fn region_candidate(
+        &mut self,
+        key: TraceExitKey,
+        child_trace_id: usize,
+    ) -> Option<RegionCandidate> {
+        if MAX_REGION_MEMBERS != 2
+            || MAX_REGION_LINKS != 1
+            || self.published_region.is_some()
+            || self.failed_region_exits.contains(&key)
+            || !self.region_exit_is_hot(key)
+        {
+            return None;
+        }
+        let parent = self.traces.get(key.parent_trace_id)?;
+        let child = self.traces.get(child_trace_id)?;
+        if parent.frame_key != ROOT_FRAME_KEY {
+            return None;
+        }
+        let region_ops = parent.op_names.len().checked_add(child.op_names.len());
+        if region_ops.is_none_or(|ops| ops > self.config.max_trace_len) {
+            self.failed_region_exits.insert(key);
+            return None;
+        }
+        let import = match self.side_trace_import(key.parent_trace_id, key.exit_id, child_trace_id)
+        {
+            Ok(import) => import,
+            Err(_) => {
+                self.failed_region_exits.insert(key);
+                return None;
+            }
+        };
+        Some(RegionCandidate {
+            generation: self.region_generation,
+            key,
+            child_trace_id,
+            import,
+        })
+    }
+
+    pub(crate) fn publish_region(&mut self, candidate: &RegionCandidate) -> bool {
+        if candidate.generation != self.region_generation || self.published_region.is_some() {
+            return false;
+        }
+        let Ok(import) = self.side_trace_import(
+            candidate.key.parent_trace_id,
+            candidate.key.exit_id,
+            candidate.child_trace_id,
+        ) else {
+            return false;
+        };
+        if import != candidate.import {
+            return false;
+        }
+        self.published_region = Some(PublishedRegion {
+            generation: candidate.generation,
+            key: candidate.key,
+            child_trace_id: candidate.child_trace_id,
+        });
+        true
+    }
+
+    pub(crate) fn record_region_compile_failure(&mut self, candidate: &RegionCandidate) {
+        if candidate.generation == self.region_generation {
+            self.failed_region_exits.insert(candidate.key);
+        }
+    }
+
+    pub(crate) fn published_region(&self) -> Option<PublishedRegion> {
+        self.published_region
+    }
+
+    fn invalidate_regions(&mut self) {
+        self.region_generation = self.region_generation.wrapping_add(1);
+        self.published_region = None;
+        self.failed_region_exits.clear();
+    }
+
     pub(crate) fn side_trace_import(
         &self,
         parent_trace_id: usize,
@@ -621,6 +733,7 @@ impl TraceJitEngine {
             self.block_trace(trace_id);
             return;
         }
+        self.invalidate_regions();
         let Ok(frame_index) = usize::try_from(frame_key) else {
             self.block_trace(trace_id);
             return;
@@ -636,6 +749,7 @@ impl TraceJitEngine {
     }
 
     pub(crate) fn block_trace(&mut self, trace_id: usize) {
+        self.invalidate_regions();
         if let Some(trace) = self.traces.get(trace_id) {
             let key = TraceEntryKey {
                 frame_key: trace.frame_key,
@@ -1359,6 +1473,26 @@ mod tests {
                 SsaMaterialization::BoxBool(bool_local.id),
             ]
         );
+    }
+
+    #[test]
+    fn region_publication_rejects_stale_trace_generation() {
+        let (mut engine, parent_exit) =
+            tagged_side_trace_pair(ROOT_FRAME_KEY, ROOT_FRAME_KEY, false, false);
+        let key = TraceExitKey {
+            parent_trace_id: 0,
+            exit_id: parent_exit,
+        };
+        engine.record_trace_exit(key).unwrap();
+        engine.record_trace_exit(key).unwrap();
+        let candidate = engine
+            .region_candidate(key, 1)
+            .expect("same-frame candidate");
+
+        engine.set_config(*engine.config());
+
+        assert!(!engine.publish_region(&candidate));
+        assert!(engine.published_region().is_none());
     }
 
     #[test]
