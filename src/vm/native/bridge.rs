@@ -359,6 +359,14 @@ pub(crate) fn non_yielding_host_call_entry_address() -> usize {
     pd_vm_native_non_yielding_host_call as *const () as usize
 }
 
+pub(crate) fn non_yielding_scalar_host_call_entry_address() -> usize {
+    pd_vm_native_non_yielding_scalar_host_call as *const () as usize
+}
+
+pub(crate) fn non_yielding_i64_host_call_entry_address() -> usize {
+    pd_vm_native_non_yielding_i64_host_call as *const () as usize
+}
+
 pub(crate) fn helper_entry_offset() -> i32 {
     i32::try_from(std::mem::offset_of!(Vm, native_helper_fn))
         .expect("Vm::native_helper_fn offset must fit i32")
@@ -1344,6 +1352,110 @@ pub(crate) extern "C" fn pd_vm_native_non_yielding_host_call(
             unsafe { std::ptr::write(out, value) };
             STATUS_CONTINUE
         }
+        Err(err) => {
+            store_bridge_error(err);
+            STATUS_ERROR
+        }
+    }
+}
+
+fn call_non_yielding_host_value(vm: &mut Vm, import: usize, args: &[Value]) -> VmResult<Value> {
+    let resolved = *vm
+        .resolved_calls
+        .get(import)
+        .ok_or(VmError::InvalidCall(import as u16))?;
+    let function = match vm.host_functions.get(usize::from(resolved)) {
+        Some(VmHostFunction::ArgsStaticNonYielding(function)) => *function,
+        _ => {
+            return Err(VmError::JitNative(
+                "native host-call binding changed after trace compilation".to_string(),
+            ));
+        }
+    };
+    vm.call_depth = vm.call_depth.saturating_add(1);
+    let outcome = function(args);
+    vm.call_depth = vm.call_depth.saturating_sub(1);
+    outcome.and_then(crate::vm::host::require_non_yielding_host_value)
+}
+
+fn store_scalar_host_result(value: Value, return_type: i64, out: *mut u64) -> VmResult<()> {
+    let bits = match (return_type, value) {
+        (tag, Value::Int(value)) if tag == ValueType::Int as i64 => value as u64,
+        (tag, Value::Float(value)) if tag == ValueType::Float as i64 => value.to_bits(),
+        (tag, Value::Bool(value)) if tag == ValueType::Bool as i64 => u64::from(value),
+        (tag, _) if tag == ValueType::Int as i64 => return Err(VmError::TypeMismatch("int")),
+        (tag, _) if tag == ValueType::Float as i64 => {
+            return Err(VmError::TypeMismatch("float"));
+        }
+        (tag, _) if tag == ValueType::Bool as i64 => return Err(VmError::TypeMismatch("bool")),
+        _ => {
+            return Err(VmError::JitNative(
+                "native scalar host-call return type is unsupported".to_string(),
+            ));
+        }
+    };
+    unsafe { out.write(bits) };
+    Ok(())
+}
+
+pub(crate) extern "C" fn pd_vm_native_non_yielding_scalar_host_call(
+    vm: *mut Vm,
+    import: usize,
+    args: *const Value,
+    argc: usize,
+    return_type: i64,
+    out: *mut u64,
+) -> i32 {
+    let Some(vm) = (unsafe { vm.as_mut() }) else {
+        store_bridge_error(VmError::JitNative(
+            "native scalar host-call helper received null vm pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    };
+    if out.is_null() || (argc != 0 && args.is_null()) || argc > u8::MAX as usize {
+        store_bridge_error(VmError::JitNative(
+            "native scalar host-call helper received invalid storage".to_string(),
+        ));
+        return STATUS_ERROR;
+    }
+    let args = unsafe { std::slice::from_raw_parts(args, argc) };
+    match call_non_yielding_host_value(vm, import, args)
+        .and_then(|value| store_scalar_host_result(value, return_type, out))
+    {
+        Ok(()) => STATUS_CONTINUE,
+        Err(err) => {
+            store_bridge_error(err);
+            STATUS_ERROR
+        }
+    }
+}
+
+pub(crate) extern "C" fn pd_vm_native_non_yielding_i64_host_call(
+    vm: *mut Vm,
+    import: usize,
+    arg0: i64,
+    arg1: i64,
+    argc: usize,
+    return_type: i64,
+    out: *mut u64,
+) -> i32 {
+    let Some(vm) = (unsafe { vm.as_mut() }) else {
+        store_bridge_error(VmError::JitNative(
+            "native i64 host-call helper received null vm pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    };
+    if out.is_null() || argc > 2 {
+        store_bridge_error(VmError::JitNative(
+            "native i64 host-call helper received invalid storage".to_string(),
+        ));
+        return STATUS_ERROR;
+    }
+    let storage = [Value::Int(arg0), Value::Int(arg1)];
+    match call_non_yielding_host_value(vm, import, &storage[..argc])
+        .and_then(|value| store_scalar_host_result(value, return_type, out))
+    {
+        Ok(()) => STATUS_CONTINUE,
         Err(err) => {
             store_bridge_error(err);
             STATUS_ERROR

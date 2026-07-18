@@ -1735,6 +1735,105 @@ fn increment_non_yielding(args: &[Value]) -> Result<CallOutcome, vm::VmError> {
     Ok(CallOutcome::Return(CallReturn::one(Value::Int(value + 1))))
 }
 
+fn less_non_yielding(args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+    let [Value::Int(lhs), Value::Int(rhs)] = args else {
+        return Err(vm::VmError::TypeMismatch("two ints"));
+    };
+    Ok(CallOutcome::Return(CallReturn::one(Value::Bool(lhs < rhs))))
+}
+
+fn string_len_non_yielding(args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+    let [Value::String(value)] = args else {
+        return Err(vm::VmError::TypeMismatch("string"));
+    };
+    Ok(CallOutcome::Return(CallReturn::one(Value::Int(
+        value.len() as i64,
+    ))))
+}
+
+#[test]
+fn trace_jit_passes_tagged_host_args_to_scalar_return() {
+    if !native_jit_supported() {
+        return;
+    }
+    let compiled = compile_source(
+        r#"
+            fn string_len(value: string) -> int;
+            let mut i = 0;
+            while i < 100 {
+                i = i + string_len("x");
+            }
+            i;
+        "#,
+    )
+    .expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    vm.bind_static_non_yielding_args_function("string_len", string_len_non_yielding);
+
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(100)]);
+    assert!(
+        vm.jit_snapshot().traces.iter().any(|trace| {
+            trace
+                .ssa_text()
+                .lines()
+                .any(|line| line.contains(":i64 = host_call"))
+        }),
+        "tagged argument host call should return an SSA scalar:\n{}",
+        vm.dump_jit_info()
+    );
+    assert!(vm.jit_native_exec_count() > 0);
+}
+
+#[test]
+fn trace_jit_passes_i64_host_args_and_bool_return_as_scalars() {
+    if !native_jit_supported() {
+        return;
+    }
+    let compiled = compile_source(
+        r#"
+            fn less(lhs: int, rhs: int) -> bool;
+            let mut i = 0;
+            let mut matched = 0;
+            while i < 100 {
+                if less(i, 50) {
+                    matched = matched + 1;
+                }
+                i = i + 1;
+            }
+            matched;
+        "#,
+    )
+    .expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    vm.bind_static_non_yielding_args_function("less", less_non_yielding);
+
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(50)]);
+    let snapshot = vm.jit_snapshot();
+    assert!(
+        snapshot.traces.iter().any(|trace| {
+            trace
+                .ssa_text()
+                .lines()
+                .any(|line| line.contains(":bool = host_call"))
+        }),
+        "bool host return should remain an SSA scalar:\n{}",
+        vm.dump_jit_info()
+    );
+    assert!(vm.jit_native_exec_count() > 0);
+}
+
 #[test]
 fn trace_jit_keeps_non_yielding_static_args_calls_inside_loop_trace() {
     if !native_jit_supported() {
@@ -1768,14 +1867,34 @@ fn trace_jit_keeps_non_yielding_static_args_calls_inside_loop_trace() {
     assert_eq!(status.unwrap(), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(100)]);
     let snapshot = vm.jit_snapshot();
-    assert!(
-        snapshot.traces.iter().any(|trace| {
+    let host_trace = snapshot
+        .traces
+        .iter()
+        .find(|trace| {
             trace.terminal == JitTraceTerminal::LoopBack
                 && trace.op_names().iter().any(|op| op == "host_call")
                 && trace.ssa_text().contains("host_call")
-        }),
-        "non-yielding call should remain inside a loop-back trace, dump:\n{}",
-        vm.dump_jit_info()
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "non-yielding call should remain inside a loop-back trace, dump:\n{}",
+                vm.dump_jit_info()
+            )
+        });
+    let host_ssa = host_trace.ssa_text();
+    assert!(
+        host_ssa
+            .lines()
+            .any(|line| line.contains(":i64 = host_call")),
+        "typed host return should remain an unboxed SSA scalar:\n{host_ssa}"
+    );
+    let host_result_tail = host_ssa
+        .split_once("host_call")
+        .map(|(_, tail)| tail)
+        .expect("host-call SSA line should exist");
+    assert!(
+        !host_result_tail.contains("unbox_int"),
+        "typed host result should not pass through tagged return storage:\n{host_ssa}"
     );
     assert!(vm.jit_native_exec_count() > 0);
 }
