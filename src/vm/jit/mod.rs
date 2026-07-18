@@ -8,6 +8,6 @@ pub(crate) mod trace;
 
 pub(crate) use runtime::NativeTrace;
 pub use trace::{
-    JitAttempt, JitConfig, JitMetrics, JitNyiDoc, JitNyiReason, JitSnapshot, JitTrace,
-    JitTraceTerminal, TraceJitEngine,
+    JitAttempt, JitConfig, JitExitProfile, JitMetrics, JitNyiDoc, JitNyiReason, JitSnapshot,
+    JitTrace, JitTraceTerminal, TraceJitEngine,
 };

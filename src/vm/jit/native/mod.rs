@@ -6,7 +6,7 @@ use super::super::super::VmResult;
 pub(crate) use crate::vm::native::{
     NativeInterruptSettings, STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED, STATUS_LINKED_CONTINUE,
     STATUS_OUT_OF_FUEL, STATUS_TRACE_EXIT, STATUS_WAITING, STATUS_YIELDED, clear_bridge_error,
-    selected_codegen_backend, store_bridge_error, take_bridge_error,
+    decode_jit_trace_exit_status, selected_codegen_backend, store_bridge_error, take_bridge_error,
 };
 
 #[cfg(feature = "cranelift-jit")]

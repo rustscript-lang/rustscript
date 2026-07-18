@@ -2179,6 +2179,51 @@ fn trace_jit_links_between_nested_loop_native_traces() {
 }
 
 #[test]
+fn trace_jit_reports_exact_parent_exit_profiles() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        let mut i = 0;
+        let mut total = 0;
+        while i < 64 {
+            if i % 2 == 0 {
+                total = total + 3;
+            } else {
+                total = total + 5;
+            }
+            i = i + 1;
+        }
+        total;
+    "#;
+    let compiled = compile_source(source).expect("branch profile fixture should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 256,
+    });
+
+    assert_eq!(
+        vm.run().expect("branch profile fixture should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(256)]);
+
+    let snapshot = vm.jit_snapshot();
+    assert!(
+        !snapshot.exit_profiles.is_empty(),
+        "expected exact parent-exit profiles:\n{}",
+        vm.dump_jit_info()
+    );
+    for profile in &snapshot.exit_profiles {
+        let parent = &snapshot.traces[profile.parent_trace_id];
+        assert!(profile.exit_id < parent.ssa_exit_count() as u32);
+        assert!(profile.executions > 0);
+    }
+}
+
+#[test]
 fn trace_jit_restores_tagged_heap_locals_on_ssa_exit() {
     if !native_jit_supported() {
         return;
