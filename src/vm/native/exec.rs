@@ -25,7 +25,10 @@ impl ExecutableBuffer {
                 std::ptr::copy_nonoverlapping(code.as_ptr(), ptr, code.len());
             });
             flush_instruction_cache(ptr, code.len());
-            prepare_for_execution();
+            if let Err(err) = protect_executable_buffer(ptr, code.len()) {
+                free_executable(ptr, code.len());
+                return Err(err);
+            }
         }
 
         Ok(Self {
@@ -67,7 +70,7 @@ impl Drop for ExecutableBuffer {
 #[cfg(windows)]
 unsafe fn alloc_executable(len: usize) -> VmResult<*mut u8> {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc,
+        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
     };
 
     let ptr = unsafe {
@@ -75,7 +78,7 @@ unsafe fn alloc_executable(len: usize) -> VmResult<*mut u8> {
             std::ptr::null_mut(),
             len,
             MEM_COMMIT | MEM_RESERVE,
-            PAGE_EXECUTE_READWRITE,
+            PAGE_READWRITE,
         )
     } as *mut u8;
     if ptr.is_null() {
@@ -104,11 +107,15 @@ unsafe fn flush_instruction_cache(ptr: *mut u8, len: usize) {
 
 #[cfg(unix)]
 unsafe fn alloc_executable(len: usize) -> VmResult<*mut u8> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let prot = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let prot = libc::PROT_READ | libc::PROT_WRITE;
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
             len,
-            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            prot,
             libc::MAP_PRIVATE | map_anon_flag() | map_jit_flag(),
             -1,
             0,
@@ -171,6 +178,38 @@ const fn map_jit_flag() -> i32 {
 #[cfg(not(all(unix, target_os = "macos", target_arch = "aarch64")))]
 const fn map_jit_flag() -> i32 {
     0
+}
+
+#[cfg(all(unix, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) unsafe fn protect_executable_buffer(_ptr: *mut u8, _len: usize) -> VmResult<()> {
+    if unsafe { libc::pthread_jit_write_protect_supported_np() } != 0 {
+        unsafe { libc::pthread_jit_write_protect_np(1) };
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(all(target_os = "macos", target_arch = "aarch64"))))]
+pub(crate) unsafe fn protect_executable_buffer(ptr: *mut u8, len: usize) -> VmResult<()> {
+    if unsafe { libc::mprotect(ptr.cast(), len, libc::PROT_READ | libc::PROT_EXEC) } != 0 {
+        return Err(VmError::JitNative(format!(
+            "mprotect failed for executable trace buffer: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) unsafe fn protect_executable_buffer(ptr: *mut u8, len: usize) -> VmResult<()> {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READ, VirtualProtect};
+
+    let mut previous = 0;
+    if unsafe { VirtualProtect(ptr.cast(), len, PAGE_EXECUTE_READ, &mut previous) } == 0 {
+        return Err(VmError::JitNative(
+            "VirtualProtect failed for executable trace buffer".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(all(unix, target_os = "macos", target_arch = "aarch64"))]

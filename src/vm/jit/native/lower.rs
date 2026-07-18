@@ -222,6 +222,122 @@ pub(crate) fn compile_system_tail_wrapper(root_entry: *const u8) -> VmResult<Com
     )
 }
 
+fn tail_owned_entry_signature(pointer_type: cranelift_codegen::ir::Type) -> Signature {
+    let mut signature = tail_entry_signature(pointer_type);
+    signature.params.push(AbiParam::new(pointer_type));
+    signature
+}
+
+fn system_owned_entry_signature(
+    pointer_type: cranelift_codegen::ir::Type,
+    call_conv: CallConv,
+) -> Signature {
+    let mut signature = entry_signature(pointer_type, call_conv);
+    signature.params.push(AbiParam::new(pointer_type));
+    signature
+}
+
+pub(crate) fn compile_tail_owned_side_link_body(
+    slot_address: usize,
+    deopt_status: i32,
+) -> VmResult<CompiledTailFunction> {
+    compile_standalone_native_function(
+        "pd_vm_tail_owned_side_link",
+        |pointer_type, _| tail_owned_entry_signature(pointer_type),
+        move |builder, pointer_type, _| {
+            let entry = builder.create_block();
+            let deopt = builder.create_block();
+            let linked = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+            let vm_ptr = builder.block_params(entry)[0];
+            let owned_slot = builder.block_params(entry)[1];
+            let slot_address = iconst_ptr_from_addr(builder, pointer_type, slot_address)?;
+            let target = builder
+                .ins()
+                .load(pointer_type, MemFlags::new(), slot_address, 0);
+            let is_null = builder.ins().icmp_imm(IntCC::Equal, target, 0);
+            builder.ins().brif(is_null, deopt, &[], linked, &[]);
+
+            builder.switch_to_block(deopt);
+            let status = builder.ins().iconst(types::I32, i64::from(deopt_status));
+            builder.ins().return_(&[status]);
+
+            builder.switch_to_block(linked);
+            let signature = builder.import_signature(tail_owned_entry_signature(pointer_type));
+            builder
+                .ins()
+                .return_call_indirect(signature, target, &[vm_ptr, owned_slot]);
+            Ok(())
+        },
+    )
+}
+
+pub(crate) fn compile_tail_owned_clear_body(success_status: i32) -> VmResult<CompiledTailFunction> {
+    compile_standalone_native_function(
+        "pd_vm_tail_owned_clear",
+        |pointer_type, _| tail_owned_entry_signature(pointer_type),
+        move |builder, pointer_type, call_conv| {
+            let entry = builder.create_block();
+            let success = builder.create_block();
+            let failure = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.append_block_param(failure, types::I32);
+            builder.switch_to_block(entry);
+            let owned_slot = builder.block_params(entry)[1];
+            let helper =
+                iconst_ptr_from_addr(builder, pointer_type, clear_value_slot_entry_address())?;
+            let helper_signature =
+                builder.import_signature(value_slot_signature(pointer_type, call_conv));
+            let call = builder
+                .ins()
+                .call_indirect(helper_signature, helper, &[owned_slot]);
+            let helper_status = builder.inst_results(call)[0];
+            let succeeded =
+                builder
+                    .ins()
+                    .icmp_imm(IntCC::Equal, helper_status, i64::from(STATUS_CONTINUE));
+            builder
+                .ins()
+                .brif(succeeded, success, &[], failure, &[helper_status.into()]);
+
+            builder.switch_to_block(success);
+            let status = builder.ins().iconst(types::I32, i64::from(success_status));
+            builder.ins().return_(&[status]);
+
+            builder.switch_to_block(failure);
+            let status = builder.block_params(failure)[0];
+            builder.ins().return_(&[status]);
+            Ok(())
+        },
+    )
+}
+
+pub(crate) fn compile_system_owned_tail_wrapper(
+    root_entry: *const u8,
+) -> VmResult<CompiledTailFunction> {
+    let root_entry = root_entry as usize;
+    compile_standalone_native_function(
+        "pd_vm_tail_owned_wrapper",
+        system_owned_entry_signature,
+        move |builder, pointer_type, _| {
+            let entry = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+            let vm_ptr = builder.block_params(entry)[0];
+            let owned_slot = builder.block_params(entry)[1];
+            let root_entry = iconst_ptr_from_addr(builder, pointer_type, root_entry)?;
+            let signature = builder.import_signature(tail_owned_entry_signature(pointer_type));
+            let call = builder
+                .ins()
+                .call_indirect(signature, root_entry, &[vm_ptr, owned_slot]);
+            let status = builder.inst_results(call)[0];
+            builder.ins().return_(&[status]);
+            Ok(())
+        },
+    )
+}
+
 fn try_compile_ssa_trace(
     trace: &JitTrace,
     ssa: &SsaTrace,
