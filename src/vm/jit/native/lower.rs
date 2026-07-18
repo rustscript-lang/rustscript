@@ -81,7 +81,7 @@ impl TraceKeepAlive {
 fn try_compile_ssa_trace(
     trace: &JitTrace,
     ssa: &SsaTrace,
-    internal_link: Option<&FusedRegionLink>,
+    internal_links: &[FusedRegionLink],
     interrupt_settings: Option<NativeInterruptSettings>,
     profile: NativeCompileProfile,
     drop_contract_events_enabled: bool,
@@ -244,9 +244,10 @@ fn try_compile_ssa_trace(
         let borrowed_array_gets = borrowed_array_get_outputs(ssa);
         let owned_value_temps =
             allocate_owned_value_temps(&mut b, ssa, layout.value.size, &borrowed_array_gets)?;
-        let internal_link_slots = internal_link
+        let internal_link_slots = internal_links
+            .iter()
             .map(|link| allocate_internal_link_slots(&mut b, link, layout.value.size))
-            .transpose()?;
+            .collect::<VmResult<Vec<_>>>()?;
 
         let mut block_handles = HashMap::new();
         for block in &ssa.blocks {
@@ -411,7 +412,10 @@ fn try_compile_ssa_trace(
                 &values,
                 &block_handles,
                 &exit_specs,
-                internal_link.zip(internal_link_slots.as_deref()),
+                InternalRegionLinks {
+                    links: internal_links,
+                    slots: &internal_link_slots,
+                },
             )?;
         }
 
@@ -594,6 +598,22 @@ enum SsaTempValueSlotKey {
 struct SsaOwnedValueTemps {
     ordered: Vec<StackSlot>,
     slots: HashMap<SsaTempValueSlotKey, StackSlot>,
+}
+
+#[derive(Clone, Copy)]
+struct InternalRegionLinks<'a> {
+    links: &'a [FusedRegionLink],
+    slots: &'a [Vec<Option<StackSlot>>],
+}
+
+impl<'a> InternalRegionLinks<'a> {
+    fn find(self, exit: SsaExitId) -> Option<(&'a FusedRegionLink, &'a [Option<StackSlot>])> {
+        self.links
+            .iter()
+            .zip(self.slots)
+            .find(|(link, _)| link.exit == exit)
+            .map(|(link, slots)| (link, slots.as_slice()))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3162,7 +3182,7 @@ fn lower_ssa_terminator(
     values: &HashMap<SsaValueId, cranelift_codegen::ir::Value>,
     block_handles: &HashMap<crate::vm::jit::ir::SsaBlockId, Block>,
     exit_specs: &HashMap<SsaExitId, SsaExitLowering>,
-    internal_link: Option<(&FusedRegionLink, &[Option<StackSlot>])>,
+    internal_links: InternalRegionLinks<'_>,
 ) -> VmResult<()> {
     match terminator {
         SsaTerminator::Jump { target, args } => {
@@ -3196,7 +3216,7 @@ fn lower_ssa_terminator(
                 values,
                 block_handles,
                 exit_specs,
-                internal_link,
+                internal_links,
             )?;
             let false_target = ssa_branch_target_block(
                 b,
@@ -3205,7 +3225,7 @@ fn lower_ssa_terminator(
                 values,
                 block_handles,
                 exit_specs,
-                internal_link,
+                internal_links,
             )?;
             let true_args = ssa_block_args(true_target.1);
             let false_args = ssa_block_args(false_target.1);
@@ -3218,11 +3238,12 @@ fn lower_ssa_terminator(
             );
         }
         SsaTerminator::Exit { exit } => {
-            if let Some((link, slots)) = internal_link.filter(|(link, _)| link.exit == *exit) {
+            if let Some((link, slots)) = internal_links.find(*exit) {
                 let handle = *block_handles.get(&link.child_entry).ok_or_else(|| {
                     VmError::JitNative("fused SSA child entry block missing".to_string())
                 })?;
                 let args = lower_internal_link_args(b, ctx, link, slots, values)?;
+                increment_native_region_edge_count(b, ctx);
                 let args = ssa_block_args(args);
                 b.ins().jump(handle, &args);
                 return Ok(());
@@ -3289,7 +3310,7 @@ fn ssa_branch_target_block(
     values: &HashMap<SsaValueId, cranelift_codegen::ir::Value>,
     block_handles: &HashMap<crate::vm::jit::ir::SsaBlockId, Block>,
     exit_specs: &HashMap<SsaExitId, SsaExitLowering>,
-    internal_link: Option<(&FusedRegionLink, &[Option<StackSlot>])>,
+    internal_links: InternalRegionLinks<'_>,
 ) -> VmResult<(Block, Vec<cranelift_codegen::ir::Value>)> {
     match target {
         SsaBranchTarget::Block { target, args } => {
@@ -3308,11 +3329,12 @@ fn ssa_branch_target_block(
             Ok((handle, lowered_args))
         }
         SsaBranchTarget::Exit(exit) => {
-            if let Some((link, slots)) = internal_link.filter(|(link, _)| link.exit == *exit) {
+            if let Some((link, slots)) = internal_links.find(*exit) {
                 let handle = *block_handles.get(&link.child_entry).ok_or_else(|| {
                     VmError::JitNative("fused SSA child entry block missing".to_string())
                 })?;
                 let args = lower_internal_link_args(b, ctx, link, slots, values)?;
+                increment_native_region_edge_count(b, ctx);
                 return Ok((handle, args));
             }
             let spec = exit_specs.get(exit).ok_or_else(|| {
@@ -3331,6 +3353,22 @@ fn ssa_branch_target_block(
             Ok((spec.trace_exit_block, lowered_args))
         }
     }
+}
+
+fn increment_native_region_edge_count(b: &mut FunctionBuilder, ctx: SsaLowerCtx<'_>) {
+    let count = b.ins().load(
+        types::I64,
+        MemFlags::new(),
+        ctx.vm_ptr,
+        ctx.offsets.jit_native_region_edge_count,
+    );
+    let next = b.ins().iadd_imm(count, 1);
+    b.ins().store(
+        MemFlags::new(),
+        next,
+        ctx.vm_ptr,
+        ctx.offsets.jit_native_region_edge_count,
+    );
 }
 
 fn ssa_leave_frame_status(
@@ -4529,6 +4567,7 @@ struct ResolvedOffsets {
     fuel_ops_until_check: i32,
     epoch_deadline: i32,
     epoch_counter_ptr: i32,
+    jit_native_region_edge_count: i32,
 }
 
 fn emit_interrupt_tick_inline(
@@ -4751,12 +4790,13 @@ fn resolve_offsets(layout: NativeStackLayout) -> VmResult<ResolvedOffsets> {
         fuel_ops_until_check: layout.vm_fuel_ops_until_check_offset,
         epoch_deadline: layout.vm_epoch_deadline_offset,
         epoch_counter_ptr: layout.vm_epoch_counter_ptr_offset,
+        jit_native_region_edge_count: layout.vm_jit_native_region_edge_count_offset,
     })
 }
 
 pub(crate) fn compile_trace(
     trace: &JitTrace,
-    internal_link: Option<&FusedRegionLink>,
+    internal_links: &[FusedRegionLink],
     interrupt_settings: Option<NativeInterruptSettings>,
     profile: NativeCompileProfile,
     drop_contract_events_enabled: bool,
@@ -4768,7 +4808,7 @@ pub(crate) fn compile_trace(
     try_compile_ssa_trace(
         trace,
         &trace.ssa,
-        internal_link,
+        internal_links,
         interrupt_settings,
         profile,
         drop_contract_events_enabled,

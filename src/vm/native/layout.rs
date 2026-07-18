@@ -48,6 +48,7 @@ pub(crate) struct NativeStackLayout {
     pub(crate) vm_fuel_ops_until_check_offset: i32,
     pub(crate) vm_epoch_deadline_offset: i32,
     pub(crate) vm_epoch_counter_ptr_offset: i32,
+    pub(crate) vm_jit_native_region_edge_count_offset: i32,
     pub(crate) stack_vec: VecLayout,
     pub(crate) map: MapLayout,
     pub(crate) value: ValueLayout,
@@ -86,6 +87,10 @@ fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
         std::mem::offset_of!(Vm, epoch_counter_ptr),
         "Vm::epoch_counter_ptr offset",
     )?;
+    let vm_jit_native_region_edge_count_offset = usize_to_i32(
+        std::mem::offset_of!(Vm, jit_native_region_edge_count),
+        "Vm::jit_native_region_edge_count offset",
+    )?;
     let stack_vec = detect_vec_layout()?;
     let map = detect_map_layout()?;
     let value = detect_value_layout()?;
@@ -98,6 +103,7 @@ fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
         vm_fuel_ops_until_check_offset,
         vm_epoch_deadline_offset,
         vm_epoch_counter_ptr_offset,
+        vm_jit_native_region_edge_count_offset,
         stack_vec,
         map,
         value,

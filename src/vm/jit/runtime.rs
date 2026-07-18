@@ -48,7 +48,19 @@ type NativeTraceState = (
     bool,
     bool,
     Option<Arc<HashMap<u32, TraceExitKey>>>,
+    bool,
 );
+
+fn scalar_cycle_import(import: &super::deopt::SideTraceImport) -> bool {
+    import.args.iter().all(|arg| {
+        matches!(
+            arg,
+            super::ir::SsaMaterialization::BoxInt(_)
+                | super::ir::SsaMaterialization::BoxFloat(_)
+                | super::ir::SsaMaterialization::BoxBool(_)
+        )
+    })
+}
 
 pub(crate) struct NativeTrace {
     _keepalive: Arc<Mutex<native::TraceKeepAlive>>,
@@ -287,19 +299,30 @@ impl Vm {
         {
             if should_fallback_to_interpreter(&err) {
                 self.record_jit_helper_fallback();
-                self.jit.block_trace(current_trace_id);
+                self.block_jit_trace(current_trace_id);
                 return Ok(native::STATUS_LINKED_CONTINUE);
             }
             return Err(err);
         }
 
-        let (mut entry, mut root_ip, mut terminal, _, mut has_yielding_call, mut exit_keys) =
-            self.native_trace_state(current_trace_id)?;
+        let (
+            mut entry,
+            mut root_ip,
+            mut terminal,
+            _,
+            mut has_yielding_call,
+            mut exit_keys,
+            mut is_region,
+        ) = self.native_trace_state(current_trace_id)?;
 
         loop {
             native::clear_bridge_error();
             let status = unsafe { entry(self as *mut Vm) };
             self.native_trace_exec_count = self.native_trace_exec_count.saturating_add(1);
+            if is_region {
+                self.jit_native_region_entry_count =
+                    self.jit_native_region_entry_count.saturating_add(1);
+            }
             self.jit.mark_trace_executed(current_trace_id);
             let mut trace_exit_key = None;
             let status = if let Some(exit_id) = native::decode_jit_trace_exit_status(status) {
@@ -346,13 +369,20 @@ impl Vm {
                         ) {
                             if should_fallback_to_interpreter(&err) {
                                 self.record_jit_helper_fallback();
-                                self.jit.block_trace(current_trace_id);
+                                self.block_jit_trace(current_trace_id);
                                 return Ok(native::STATUS_LINKED_CONTINUE);
                             }
                             return Err(err);
                         }
-                        (entry, root_ip, terminal, _, has_yielding_call, exit_keys) =
-                            self.native_trace_state(current_trace_id)?;
+                        (
+                            entry,
+                            root_ip,
+                            terminal,
+                            _,
+                            has_yielding_call,
+                            exit_keys,
+                            is_region,
+                        ) = self.native_trace_state(current_trace_id)?;
                         continue;
                     }
                     return Ok(native::STATUS_LINKED_CONTINUE);
@@ -369,7 +399,7 @@ impl Vm {
                         continue;
                     }
                     if self.jit.record_native_side_exit(current_trace_id) {
-                        self.jit.block_callable_frame(current_trace_id);
+                        self.block_jit_callable_frame(current_trace_id);
                         return Ok(native::STATUS_LINKED_CONTINUE);
                     }
                     if !has_yielding_call {
@@ -406,13 +436,20 @@ impl Vm {
                             ) {
                                 if should_fallback_to_interpreter(&err) {
                                     self.record_jit_helper_fallback();
-                                    self.jit.block_trace(current_trace_id);
+                                    self.block_jit_trace(current_trace_id);
                                     return Ok(native::STATUS_LINKED_CONTINUE);
                                 }
                                 return Err(err);
                             }
-                            (entry, root_ip, terminal, _, has_yielding_call, exit_keys) =
-                                self.native_trace_state(current_trace_id)?;
+                            (
+                                entry,
+                                root_ip,
+                                terminal,
+                                _,
+                                has_yielding_call,
+                                exit_keys,
+                                is_region,
+                            ) = self.native_trace_state(current_trace_id)?;
                             continue;
                         }
                     }
@@ -467,7 +504,27 @@ impl Vm {
             self.jit.record_region_compile_failure(&candidate);
             return;
         };
-        let fused = match super::region::fuse_two_trace_region(&parent, &child, &candidate.import) {
+        let back_import = scalar_cycle_import(&candidate.import)
+            .then(|| {
+                child
+                    .ssa
+                    .exits
+                    .iter()
+                    .filter(|exit| exit.exit_ip == parent.root_ip)
+                    .find_map(|exit| {
+                        self.jit
+                            .side_trace_import(child.id, exit.id, parent.id)
+                            .ok()
+                    })
+            })
+            .flatten()
+            .filter(scalar_cycle_import);
+        let fused = match super::region::fuse_two_trace_region(
+            &parent,
+            &child,
+            &candidate.import,
+            back_import.as_ref(),
+        ) {
             Ok(fused) => fused,
             Err(_) => {
                 self.jit.record_region_compile_failure(&candidate);
@@ -520,12 +577,35 @@ impl Vm {
         parent_native.region = Some(region);
     }
 
+    fn clear_native_region_owners(&mut self) {
+        for native in self.native_traces.iter_mut().flatten() {
+            native.region = None;
+        }
+    }
+
+    pub(crate) fn disconnect_native_regions(&mut self) {
+        self.jit.invalidate_regions();
+        self.clear_native_region_owners();
+    }
+
+    fn block_jit_trace(&mut self, trace_id: usize) {
+        self.jit.block_trace(trace_id);
+        self.clear_native_region_owners();
+    }
+
+    fn block_jit_callable_frame(&mut self, trace_id: usize) {
+        self.jit.block_callable_frame(trace_id);
+        self.clear_native_region_owners();
+    }
+
     pub fn set_jit_config(&mut self, config: super::JitConfig) {
         if config.enabled {
             self.ensure_program_cache_key();
         }
         self.native_traces.clear();
         self.native_trace_exec_count = 0;
+        self.jit_native_region_entry_count = 0;
+        self.jit_native_region_edge_count = 0;
         self.jit_trace_exit_count = 0;
         self.jit_native_loop_back_count = 0;
         self.jit_native_link_handoff_count = 0;
@@ -565,6 +645,14 @@ impl Vm {
         out.push_str(&format!(
             "  native trace handoffs: {}\n",
             self.jit_native_link_handoff_count
+        ));
+        out.push_str(&format!(
+            "  native region entries: {}\n",
+            self.jit_native_region_entry_count
+        ));
+        out.push_str(&format!(
+            "  native internal region edges: {}\n",
+            self.jit_native_region_edge_count
         ));
         if self.jit_native_bridge_stats_enabled {
             let mut bridge_entries: Vec<(&'static str, u64)> = self
@@ -641,7 +729,7 @@ impl Vm {
                 Ok(outcome) => Ok(outcome),
                 Err(err) if should_fallback_to_interpreter(&err) => {
                     self.record_jit_helper_fallback();
-                    self.jit.block_trace(trace_id);
+                    self.block_jit_trace(trace_id);
                     Ok(ExecOutcome::Continue)
                 }
                 Err(err) => Err(err),
@@ -674,17 +762,28 @@ impl Vm {
         {
             if should_fallback_to_interpreter(&err) {
                 self.record_jit_helper_fallback();
-                self.jit.block_trace(current_trace_id);
+                self.block_jit_trace(current_trace_id);
                 return Ok(ExecOutcome::Continue);
             }
             return Err(err);
         }
-        let (mut entry, mut root_ip, mut terminal, _, mut has_yielding_call, mut exit_keys) =
-            self.native_trace_state(current_trace_id)?;
+        let (
+            mut entry,
+            mut root_ip,
+            mut terminal,
+            _,
+            mut has_yielding_call,
+            mut exit_keys,
+            mut is_region,
+        ) = self.native_trace_state(current_trace_id)?;
         native::clear_bridge_error();
         loop {
             let status = unsafe { entry(self as *mut Vm) };
             self.native_trace_exec_count = self.native_trace_exec_count.saturating_add(1);
+            if is_region {
+                self.jit_native_region_entry_count =
+                    self.jit_native_region_entry_count.saturating_add(1);
+            }
             self.jit.mark_trace_executed(current_trace_id);
             let mut trace_exit_key = None;
             let status = if let Some(exit_id) = native::decode_jit_trace_exit_status(status) {
@@ -729,7 +828,15 @@ impl Vm {
                             current_trace_id,
                             native::NativeCompileProfile::Jit,
                         ) {
-                            (entry, root_ip, terminal, _, has_yielding_call, exit_keys) = state;
+                            (
+                                entry,
+                                root_ip,
+                                terminal,
+                                _,
+                                has_yielding_call,
+                                exit_keys,
+                                is_region,
+                            ) = state;
                         } else {
                             if let Err(err) = self.ensure_native_trace(
                                 current_trace_id,
@@ -737,13 +844,20 @@ impl Vm {
                             ) {
                                 if should_fallback_to_interpreter(&err) {
                                     self.record_jit_helper_fallback();
-                                    self.jit.block_trace(current_trace_id);
+                                    self.block_jit_trace(current_trace_id);
                                     return Ok(ExecOutcome::Continue);
                                 }
                                 return Err(err);
                             }
-                            (entry, root_ip, terminal, _, has_yielding_call, exit_keys) =
-                                self.native_trace_state(current_trace_id)?;
+                            (
+                                entry,
+                                root_ip,
+                                terminal,
+                                _,
+                                has_yielding_call,
+                                exit_keys,
+                                is_region,
+                            ) = self.native_trace_state(current_trace_id)?;
                         }
                         continue;
                     }
@@ -754,7 +868,7 @@ impl Vm {
                     if self.jit.trace_clone(current_trace_id).is_some_and(|trace| {
                         trace.op_names.last().map(String::as_str) == Some("callable_boundary")
                     }) {
-                        self.jit.block_trace(current_trace_id);
+                        self.block_jit_trace(current_trace_id);
                         return Ok(ExecOutcome::Continue);
                     }
                     // Fast path: if this trace looped back to its own root and cannot yield via host
@@ -769,7 +883,7 @@ impl Vm {
                         continue;
                     }
                     if self.jit.record_native_side_exit(current_trace_id) {
-                        self.jit.block_callable_frame(current_trace_id);
+                        self.block_jit_callable_frame(current_trace_id);
                         return Ok(ExecOutcome::Continue);
                     }
                     if !has_yielding_call {
@@ -806,7 +920,15 @@ impl Vm {
                                 current_trace_id,
                                 native::NativeCompileProfile::Jit,
                             ) {
-                                (entry, root_ip, terminal, _, has_yielding_call, exit_keys) = state;
+                                (
+                                    entry,
+                                    root_ip,
+                                    terminal,
+                                    _,
+                                    has_yielding_call,
+                                    exit_keys,
+                                    is_region,
+                                ) = state;
                             } else {
                                 if let Err(err) = self.ensure_native_trace(
                                     current_trace_id,
@@ -814,13 +936,20 @@ impl Vm {
                                 ) {
                                     if should_fallback_to_interpreter(&err) {
                                         self.record_jit_helper_fallback();
-                                        self.jit.block_trace(current_trace_id);
+                                        self.block_jit_trace(current_trace_id);
                                         return Ok(ExecOutcome::Continue);
                                     }
                                     return Err(err);
                                 }
-                                (entry, root_ip, terminal, _, has_yielding_call, exit_keys) =
-                                    self.native_trace_state(current_trace_id)?;
+                                (
+                                    entry,
+                                    root_ip,
+                                    terminal,
+                                    _,
+                                    has_yielding_call,
+                                    exit_keys,
+                                    is_region,
+                                ) = self.native_trace_state(current_trace_id)?;
                             }
                             continue;
                         }
@@ -858,7 +987,15 @@ impl Vm {
                             current_trace_id,
                             native::NativeCompileProfile::Jit,
                         ) {
-                            (entry, root_ip, terminal, _, has_yielding_call, exit_keys) = state;
+                            (
+                                entry,
+                                root_ip,
+                                terminal,
+                                _,
+                                has_yielding_call,
+                                exit_keys,
+                                is_region,
+                            ) = state;
                         } else {
                             if let Err(err) = self.ensure_native_trace(
                                 current_trace_id,
@@ -866,13 +1003,20 @@ impl Vm {
                             ) {
                                 if should_fallback_to_interpreter(&err) {
                                     self.record_jit_helper_fallback();
-                                    self.jit.block_trace(current_trace_id);
+                                    self.block_jit_trace(current_trace_id);
                                     return Ok(ExecOutcome::Continue);
                                 }
                                 return Err(err);
                             }
-                            (entry, root_ip, terminal, _, has_yielding_call, exit_keys) =
-                                self.native_trace_state(current_trace_id)?;
+                            (
+                                entry,
+                                root_ip,
+                                terminal,
+                                _,
+                                has_yielding_call,
+                                exit_keys,
+                                is_region,
+                            ) = self.native_trace_state(current_trace_id)?;
                         }
                         continue;
                     }
@@ -966,6 +1110,7 @@ impl Vm {
                 region.has_call,
                 region.has_yielding_call,
                 Some(Arc::clone(&region.exit_keys)),
+                true,
             ));
         }
         Ok((
@@ -975,6 +1120,7 @@ impl Vm {
             native.has_call,
             native.has_yielding_call,
             None,
+            false,
         ))
     }
 
@@ -1034,6 +1180,14 @@ impl Vm {
             && native.drop_contract_events_enabled == self.drop_contract_events_enabled()
         {
             return Ok(());
+        }
+        if self
+            .native_traces
+            .get(trace_id)
+            .and_then(Option::as_ref)
+            .is_some_and(|native| native.region.is_some())
+        {
+            self.disconnect_native_regions();
         }
         if let Some(slot) = self.native_traces.get_mut(trace_id) {
             *slot = None;
@@ -1132,6 +1286,26 @@ impl Vm {
         self.native_trace_exec_count
     }
 
+    pub fn jit_native_region_count(&self) -> usize {
+        self.native_traces
+            .iter()
+            .flatten()
+            .filter(|native| native.region.is_some())
+            .count()
+    }
+
+    pub fn jit_native_region_entry_count(&self) -> u64 {
+        self.jit_native_region_entry_count
+    }
+
+    pub fn jit_native_internal_region_edge_count(&self) -> u64 {
+        self.jit_native_region_edge_count
+    }
+
+    pub fn jit_helper_fallback_count(&self) -> u64 {
+        self.jit_helper_fallback_count
+    }
+
     pub fn jit_native_link_handoff_count(&self) -> u64 {
         self.jit_native_link_handoff_count
     }
@@ -1185,4 +1359,37 @@ pub(crate) fn clear_native_trace_cache_for_tests() {
 ))]
 pub(crate) fn native_trace_cache_snapshot_for_tests() -> (Option<u64>, usize) {
     with_native_trace_cache(|cache| (cache.active_program_key, cache.entries.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vm::jit::deopt::SideTraceImport;
+    use crate::vm::jit::ir::{SsaMaterialization, SsaValueId};
+
+    fn import_with(arg: SsaMaterialization) -> SideTraceImport {
+        SideTraceImport {
+            parent_exit: SsaExitId::new(0),
+            stack_depth: 1,
+            local_count: 0,
+            dirty_locals: Vec::new(),
+            args: vec![arg],
+        }
+    }
+
+    #[test]
+    fn scalar_cycle_import_rejects_tagged_and_heap_materializations() {
+        assert!(scalar_cycle_import(&import_with(
+            SsaMaterialization::BoxInt(SsaValueId::new(0))
+        )));
+        assert!(!scalar_cycle_import(&import_with(
+            SsaMaterialization::Value(SsaValueId::new(0))
+        )));
+        assert!(!scalar_cycle_import(&import_with(
+            SsaMaterialization::BoxHeapPtr {
+                value: SsaValueId::new(0),
+                tag: crate::ValueType::Array,
+            }
+        )));
+    }
 }
