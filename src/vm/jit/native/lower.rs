@@ -242,7 +242,7 @@ pub(crate) fn compile_tail_trace_dispatcher(
     compile_standalone_native_function(
         "pd_vm_tail_trace_dispatch",
         |pointer_type, _| tail_entry_signature(pointer_type),
-        move |builder, pointer_type, default_call_conv| {
+        move |builder, pointer_type, _default_call_conv| {
             let entry = builder.create_block();
             let return_status = builder.create_block();
             builder.append_block_params_for_function_params(entry);
@@ -256,8 +256,7 @@ pub(crate) fn compile_tail_trace_dispatcher(
                 .ins()
                 .store(MemFlags::new(), trace_id, vm_ptr, active_trace_offset);
             let trace_entry = iconst_ptr_from_addr(builder, pointer_type, trace_entry)?;
-            let trace_signature =
-                builder.import_signature(entry_signature(pointer_type, default_call_conv));
+            let trace_signature = builder.import_signature(tail_entry_signature(pointer_type));
             let call = builder
                 .ins()
                 .call_indirect(trace_signature, trace_entry, &[vm_ptr]);
