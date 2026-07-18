@@ -61,13 +61,21 @@ pub(crate) fn fuse_two_trace_region(
             .collect::<VmResult<Vec<_>>>()?,
     );
     let mut exits = parent.ssa.exits.clone();
+    if let Some(back_import) = back_import {
+        for exit in &mut exits {
+            merge_dirty_locals(&mut exit.dirty_locals, &back_import.dirty_locals);
+        }
+    }
     exits.extend(
         child
             .ssa
             .exits
             .iter()
             .cloned()
-            .map(|exit| offset_exit(exit, value_offset, exit_offset))
+            .map(|mut exit| {
+                merge_dirty_locals(&mut exit.dirty_locals, &import.dirty_locals);
+                offset_exit(exit, value_offset, exit_offset)
+            })
             .collect::<VmResult<Vec<_>>>()?,
     );
 
@@ -134,6 +142,15 @@ pub(crate) fn fuse_two_trace_region(
         links,
         exit_keys,
     })
+}
+
+fn merge_dirty_locals(target: &mut Vec<bool>, incoming: &[bool]) {
+    if target.len() < incoming.len() {
+        target.resize(incoming.len(), false);
+    }
+    for (target, incoming) in target.iter_mut().zip(incoming) {
+        *target |= *incoming;
+    }
 }
 
 fn offset_block(
