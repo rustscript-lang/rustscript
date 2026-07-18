@@ -1133,18 +1133,11 @@ impl Vm {
                     if let Some(next_trace_id) = next_trace_id
                         && next_trace_id != current_trace_id
                     {
-                        let same_frame = self
-                            .jit
-                            .trace_clone(current_trace_id)
-                            .zip(self.jit.trace_clone(next_trace_id))
-                            .is_some_and(|(parent, child)| parent.frame_key == child.frame_key);
-                        if same_frame {
-                            self.publish_native_direct_slot(
-                                current_trace_id,
-                                native::LINKED_CONTINUE_SLOT_ID,
-                                next_trace_id,
-                            )?;
-                        }
+                        self.publish_native_direct_slot(
+                            current_trace_id,
+                            native::LINKED_CONTINUE_SLOT_ID,
+                            next_trace_id,
+                        )?;
                         self.record_jit_link_handoff();
                         current_trace_id = next_trace_id;
                         if let Some(state) = self.cached_native_trace_state(
@@ -1379,7 +1372,7 @@ impl Vm {
         if let Some(cached) = cached {
             let dispatcher = native::compile_native_trace_dispatcher(
                 trace_id,
-                cached.entry as *const u8,
+                cached.tail_entry as *const u8,
                 &trace,
             )?;
             let entry =
@@ -1450,7 +1443,8 @@ impl Vm {
             }
             cache.entries.insert(key, cached);
         });
-        let dispatcher = native::compile_native_trace_dispatcher(trace_id, compiled.entry, &trace)?;
+        let dispatcher =
+            native::compile_native_trace_dispatcher(trace_id, compiled.tail_entry, &trace)?;
         let entry = unsafe { std::mem::transmute::<*const u8, NativeTraceEntry>(dispatcher.entry) };
         let tail_entry =
             unsafe { std::mem::transmute::<*const u8, NativeTraceEntry>(dispatcher.tail_entry) };
