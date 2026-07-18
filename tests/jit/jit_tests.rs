@@ -2464,6 +2464,57 @@ fn trace_jit_region_preserves_owned_value_drop_contract() {
 }
 
 #[test]
+fn trace_jit_region_progress_prevents_callable_frame_backoff() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn run(limit, payload) {
+            let mut i = 0;
+            let mut total = 0;
+            while i < limit {
+                if i % 2 == 0 {
+                    total = total + 3;
+                } else {
+                    total = total + 5;
+                }
+                i = i + 1;
+            }
+            total + payload[0]
+        }
+        run(256, [1]);
+    "#;
+    let compiled = compile_source(source).expect("region progress fixture should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 256,
+    });
+
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(1_025)]);
+    assert_eq!(vm.jit_native_region_count(), 1, "{}", vm.dump_jit_info());
+    let first_execs = vm.jit_native_exec_count();
+    let first_edges = vm.jit_native_internal_region_edge_count();
+
+    vm.reset_for_reuse();
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(1_025)]);
+    assert!(
+        vm.jit_native_exec_count() > first_execs,
+        "{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        vm.jit_native_internal_region_edge_count() > first_edges,
+        "{}",
+        vm.dump_jit_info()
+    );
+    assert_eq!(vm.jit_native_region_count(), 1, "{}", vm.dump_jit_info());
+}
+
+#[test]
 fn trace_jit_region_respects_fuel_and_epoch_interrupts() {
     if !native_jit_supported() {
         return;

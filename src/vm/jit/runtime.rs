@@ -321,11 +321,15 @@ impl Vm {
 
         loop {
             native::clear_bridge_error();
+            let region_edges_before = self.jit_native_region_edge_count;
             let status = unsafe { entry(self as *mut Vm) };
             self.native_trace_exec_count = self.native_trace_exec_count.saturating_add(1);
             if is_region {
                 self.jit_native_region_entry_count =
                     self.jit_native_region_entry_count.saturating_add(1);
+                if self.jit_native_region_edge_count > region_edges_before {
+                    self.jit.record_native_region_progress(current_trace_id);
+                }
             }
             self.jit.mark_trace_executed(current_trace_id);
             let mut trace_exit_key = None;
@@ -823,11 +827,15 @@ impl Vm {
         ) = self.native_trace_state(current_trace_id)?;
         native::clear_bridge_error();
         loop {
+            let region_edges_before = self.jit_native_region_edge_count;
             let status = unsafe { entry(self as *mut Vm) };
             self.native_trace_exec_count = self.native_trace_exec_count.saturating_add(1);
             if is_region {
                 self.jit_native_region_entry_count =
                     self.jit_native_region_entry_count.saturating_add(1);
+                if self.jit_native_region_edge_count > region_edges_before {
+                    self.jit.record_native_region_progress(current_trace_id);
+                }
             }
             self.jit.mark_trace_executed(current_trace_id);
             let mut trace_exit_key = None;
