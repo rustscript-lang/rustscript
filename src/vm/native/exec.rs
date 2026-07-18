@@ -182,9 +182,12 @@ const fn map_jit_flag() -> i32 {
 
 #[cfg(all(unix, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) unsafe fn protect_executable_buffer(_ptr: *mut u8, _len: usize) -> VmResult<()> {
-    if unsafe { libc::pthread_jit_write_protect_supported_np() } != 0 {
-        unsafe { libc::pthread_jit_write_protect_np(1) };
+    if unsafe { libc::pthread_jit_write_protect_supported_np() } == 0 {
+        return Err(VmError::JitNative(
+            "macOS JIT write protection is unavailable".to_string(),
+        ));
     }
+    unsafe { libc::pthread_jit_write_protect_np(1) };
     Ok(())
 }
 

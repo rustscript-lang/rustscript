@@ -189,7 +189,7 @@ pub(crate) fn compile_tail_side_link_body(
             let slot_address = iconst_ptr_from_addr(builder, pointer_type, slot_address)?;
             let target = builder
                 .ins()
-                .load(pointer_type, MemFlags::new(), slot_address, 0);
+                .atomic_load(pointer_type, MemFlags::new(), slot_address);
             let is_null = builder.ins().icmp_imm(IntCC::Equal, target, 0);
             builder.ins().brif(is_null, deopt, &[], linked, &[]);
 
@@ -279,7 +279,7 @@ pub(crate) fn compile_tail_trace_dispatcher(
                 let slot_address = iconst_ptr_from_addr(builder, pointer_type, slot_address)?;
                 let target = builder
                     .ins()
-                    .load(pointer_type, MemFlags::new(), slot_address, 0);
+                    .atomic_load(pointer_type, MemFlags::new(), slot_address);
                 let is_null = builder.ins().icmp_imm(IntCC::Equal, target, 0);
                 builder
                     .ins()
@@ -344,7 +344,7 @@ pub(crate) fn compile_tail_owned_side_link_body(
             let slot_address = iconst_ptr_from_addr(builder, pointer_type, slot_address)?;
             let target = builder
                 .ins()
-                .load(pointer_type, MemFlags::new(), slot_address, 0);
+                .atomic_load(pointer_type, MemFlags::new(), slot_address);
             let is_null = builder.ins().icmp_imm(IntCC::Equal, target, 0);
             builder.ins().brif(is_null, deopt, &[], linked, &[]);
 

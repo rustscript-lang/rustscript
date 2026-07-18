@@ -66,18 +66,19 @@ pub(crate) fn classify_side_entry_repr(
 
 pub(crate) fn classify_side_entry_materialization(
     materialization: &SsaMaterialization,
-) -> InheritedStateAbiClass {
+    defining_repr: Option<SsaValueRepr>,
+) -> Option<InheritedStateAbiClass> {
     match materialization {
         SsaMaterialization::Value(_) => {
-            InheritedStateAbiClass::Tagged(SideEntryOwnership::Borrowed)
+            defining_repr.map(|repr| classify_side_entry_repr(repr, SideEntryOwnership::Borrowed))
         }
-        SsaMaterialization::BoxInt(_) => InheritedStateAbiClass::ScalarInt,
-        SsaMaterialization::BoxFloat(_) => InheritedStateAbiClass::ScalarFloat,
-        SsaMaterialization::BoxBool(_) => InheritedStateAbiClass::ScalarBool,
-        SsaMaterialization::BoxHeapPtr { tag, .. } => InheritedStateAbiClass::HeapPointer {
+        SsaMaterialization::BoxInt(_) => Some(InheritedStateAbiClass::ScalarInt),
+        SsaMaterialization::BoxFloat(_) => Some(InheritedStateAbiClass::ScalarFloat),
+        SsaMaterialization::BoxBool(_) => Some(InheritedStateAbiClass::ScalarBool),
+        SsaMaterialization::BoxHeapPtr { tag, .. } => Some(InheritedStateAbiClass::HeapPointer {
             tag: *tag,
             ownership: SideEntryOwnership::Owned,
-        },
+        }),
     }
 }
 
@@ -104,7 +105,7 @@ impl NativeSideLinkSlot {
         self.entry.store(std::ptr::null_mut(), Ordering::Release);
     }
 
-    pub(crate) fn address(&self) -> *mut *mut u8 {
+    pub(crate) fn address(self: &Arc<Self>) -> *mut *mut u8 {
         self.entry.as_ptr()
     }
 }
@@ -296,30 +297,54 @@ mod tests {
     fn side_entry_abi_classifies_scalar_pointer_tagged_borrowed_and_owned_values() {
         let value = SsaValueId::new(7);
         assert_eq!(
-            classify_side_entry_materialization(&SsaMaterialization::BoxInt(value)),
-            InheritedStateAbiClass::ScalarInt
+            classify_side_entry_materialization(&SsaMaterialization::BoxInt(value), None),
+            Some(InheritedStateAbiClass::ScalarInt)
         );
         assert_eq!(
-            classify_side_entry_materialization(&SsaMaterialization::BoxFloat(value)),
-            InheritedStateAbiClass::ScalarFloat
+            classify_side_entry_materialization(&SsaMaterialization::BoxFloat(value), None),
+            Some(InheritedStateAbiClass::ScalarFloat)
         );
         assert_eq!(
-            classify_side_entry_materialization(&SsaMaterialization::BoxBool(value)),
-            InheritedStateAbiClass::ScalarBool
+            classify_side_entry_materialization(&SsaMaterialization::BoxBool(value), None),
+            Some(InheritedStateAbiClass::ScalarBool)
+        );
+        for (repr, expected) in [
+            (SsaValueRepr::I64, InheritedStateAbiClass::ScalarInt),
+            (SsaValueRepr::F64, InheritedStateAbiClass::ScalarFloat),
+            (SsaValueRepr::Bool, InheritedStateAbiClass::ScalarBool),
+            (
+                SsaValueRepr::HeapPtr(ValueType::Array),
+                InheritedStateAbiClass::HeapPointer {
+                    tag: ValueType::Array,
+                    ownership: SideEntryOwnership::Borrowed,
+                },
+            ),
+            (
+                SsaValueRepr::Tagged,
+                InheritedStateAbiClass::Tagged(SideEntryOwnership::Borrowed),
+            ),
+        ] {
+            assert_eq!(
+                classify_side_entry_materialization(&SsaMaterialization::Value(value), Some(repr),),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            classify_side_entry_materialization(&SsaMaterialization::Value(value), None),
+            None
         );
         assert_eq!(
-            classify_side_entry_materialization(&SsaMaterialization::Value(value)),
-            InheritedStateAbiClass::Tagged(SideEntryOwnership::Borrowed)
-        );
-        assert_eq!(
-            classify_side_entry_materialization(&SsaMaterialization::BoxHeapPtr {
-                value,
-                tag: ValueType::String,
-            }),
-            InheritedStateAbiClass::HeapPointer {
+            classify_side_entry_materialization(
+                &SsaMaterialization::BoxHeapPtr {
+                    value,
+                    tag: ValueType::String,
+                },
+                None,
+            ),
+            Some(InheritedStateAbiClass::HeapPointer {
                 tag: ValueType::String,
                 ownership: SideEntryOwnership::Owned,
-            }
+            })
         );
         assert_eq!(
             classify_side_entry_repr(
@@ -341,7 +366,7 @@ mod tests {
         }
         const DEOPT_STATUS: i32 = 17;
         const CHILD_STATUS: i32 = 23;
-        let slot = Box::new(NativeSideLinkSlot::new());
+        let slot = Arc::new(NativeSideLinkSlot::new());
         let child = compile_tail_status_body(CHILD_STATUS).expect("tail child should compile");
         let root = compile_tail_side_link_body(slot.address() as usize, DEOPT_STATUS)
             .expect("tail root should compile");
@@ -376,7 +401,7 @@ mod tests {
         }
         const DEOPT_STATUS: i32 = 29;
         const CHILD_STATUS: i32 = 31;
-        let slot = Box::new(NativeSideLinkSlot::new());
+        let slot = Arc::new(NativeSideLinkSlot::new());
         let child =
             compile_tail_owned_clear_body(CHILD_STATUS).expect("owned child should compile");
         let root = compile_tail_owned_side_link_body(slot.address() as usize, DEOPT_STATUS)
