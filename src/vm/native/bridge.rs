@@ -16,6 +16,16 @@ pub(crate) const STATUS_WAITING: i32 = 4;
 pub(crate) const STATUS_OUT_OF_FUEL: i32 = 5;
 pub(crate) const STATUS_LINKED_CONTINUE: i32 = 6;
 pub(crate) const STATUS_ERROR: i32 = -1;
+pub(crate) const STATUS_JIT_TRACE_EXIT_BASE: i32 = 0x100;
+
+pub(crate) fn encode_jit_trace_exit_status(exit_id: u32) -> Option<i32> {
+    STATUS_JIT_TRACE_EXIT_BASE.checked_add(i32::try_from(exit_id).ok()?)
+}
+
+pub(crate) fn decode_jit_trace_exit_status(status: i32) -> Option<u32> {
+    let encoded = status.checked_sub(STATUS_JIT_TRACE_EXIT_BASE)?;
+    u32::try_from(encoded).ok()
+}
 
 pub(crate) const ROOT_FRAME_KEY: u64 = u64::MAX;
 
@@ -1556,6 +1566,21 @@ pub(crate) extern "C" fn pd_vm_native_step(vm: *mut Vm, op: i64, a: i64, b: i64,
 mod tests {
     use super::*;
     use std::mem::{ManuallyDrop, MaybeUninit};
+
+    #[test]
+    fn jit_trace_exit_status_round_trips_exit_ids_without_status_collisions() {
+        for exit_id in [0, 1, 7, 255, 65_535] {
+            let status = encode_jit_trace_exit_status(exit_id).unwrap();
+            assert_eq!(decode_jit_trace_exit_status(status), Some(exit_id));
+            assert_ne!(status, STATUS_TRACE_EXIT);
+            assert_ne!(status, STATUS_YIELDED);
+            assert_ne!(status, STATUS_WAITING);
+            assert_ne!(status, STATUS_OUT_OF_FUEL);
+            assert_ne!(status, STATUS_LINKED_CONTINUE);
+        }
+        assert_eq!(decode_jit_trace_exit_status(STATUS_TRACE_EXIT), None);
+        assert_eq!(decode_jit_trace_exit_status(STATUS_ERROR), None);
+    }
 
     #[test]
     fn native_frame_state_and_active_restore_are_frame_relative() {

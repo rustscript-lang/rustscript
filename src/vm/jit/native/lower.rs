@@ -3237,13 +3237,18 @@ fn ssa_exit_action_status(
     helper_refs: SsaDeoptHelperRefs,
     helper_addrs: SsaDeoptHelperAddrs,
     vm_ptr: cranelift_codegen::ir::Value,
-    exit_ip: usize,
+    exit: &crate::vm::jit::ir::SsaExit,
     action: SsaExitAction,
 ) -> VmResult<cranelift_codegen::ir::Value> {
     match action {
-        SsaExitAction::Return => {
-            ssa_leave_frame_status(b, pointer_type, helper_refs, helper_addrs, vm_ptr, exit_ip)
-        }
+        SsaExitAction::Return => ssa_leave_frame_status(
+            b,
+            pointer_type,
+            helper_refs,
+            helper_addrs,
+            vm_ptr,
+            exit.exit_ip,
+        ),
         SsaExitAction::CallValue {
             argc,
             call_ip,
@@ -3281,7 +3286,11 @@ fn ssa_exit_action_status(
                 );
                 Ok(b.inst_results(call)[0])
             } else {
-                Ok(b.ins().iconst(types::I32, STATUS_TRACE_EXIT as i64))
+                let status = crate::vm::native::encode_jit_trace_exit_status(exit.id.raw())
+                    .ok_or_else(|| {
+                        VmError::JitNative("SSA exit id exceeds native status range".to_string())
+                    })?;
+                Ok(b.ins().iconst(types::I32, i64::from(status)))
             }
         }
     }
@@ -3405,7 +3414,7 @@ fn lower_ssa_exit_block(
             deopt_refs,
             deopt_addrs,
             vm_ptr,
-            exit.exit_ip,
+            exit,
             action,
         )?;
         jump_with_status(b, exit_block, status);
@@ -3497,7 +3506,7 @@ fn lower_ssa_exit_block(
         deopt_refs,
         deopt_addrs,
         vm_ptr,
-        exit.exit_ip,
+        exit,
         action,
     )?;
     jump_with_status(b, exit_block, status);

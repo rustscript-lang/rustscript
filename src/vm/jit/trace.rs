@@ -4,7 +4,7 @@ use crate::debug_info::DebugInfo;
 use crate::vm::native::ROOT_FRAME_KEY;
 use crate::vm::{OpCode, Program};
 
-use super::ir::SsaTrace;
+use super::ir::{SsaExitId, SsaTrace};
 use super::liveness::{boxed_load_site_count, boxed_store_site_count};
 use super::recorder::{RecordedTrace, TraceRecordError, record_trace_with_local_count};
 
@@ -13,6 +13,17 @@ pub(crate) struct TraceEntryKey {
     pub(crate) frame_key: u64,
     pub(crate) root_ip: usize,
     pub(crate) stack_depth: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct TraceExitKey {
+    pub(crate) parent_trace_id: usize,
+    pub(crate) exit_id: SsaExitId,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TraceExitProfile {
+    pub(crate) executions: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,11 +176,19 @@ impl JitMetrics {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JitExitProfile {
+    pub parent_trace_id: usize,
+    pub exit_id: u32,
+    pub executions: u64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct JitSnapshot {
     pub arch: &'static str,
     pub config: JitConfig,
     pub traces: Vec<JitTrace>,
+    pub exit_profiles: Vec<JitExitProfile>,
     pub attempts: Vec<JitAttempt>,
     pub metrics: JitMetrics,
     pub nyi_reference: Vec<JitNyiDoc>,
@@ -191,6 +210,7 @@ pub struct TraceJitEngine {
     loop_headers: Option<Vec<bool>>,
     non_yielding_host_imports: Vec<bool>,
     traces: Vec<JitTrace>,
+    trace_exit_profiles: HashMap<TraceExitKey, TraceExitProfile>,
     callable_side_exit_streaks: Vec<u32>,
     blocked_callable_frames: Vec<bool>,
     attempts: Vec<JitAttempt>,
@@ -212,6 +232,7 @@ impl TraceJitEngine {
             loop_headers: None,
             non_yielding_host_imports: Vec::new(),
             traces: Vec::new(),
+            trace_exit_profiles: HashMap::new(),
             callable_side_exit_streaks: Vec::new(),
             blocked_callable_frames: Vec::new(),
             attempts: Vec::new(),
@@ -229,6 +250,7 @@ impl TraceJitEngine {
         self.blocked_entries.clear();
         self.loop_headers = None;
         self.traces.clear();
+        self.trace_exit_profiles.clear();
         self.callable_side_exit_streaks.clear();
         self.blocked_callable_frames.clear();
         self.attempts.clear();
@@ -244,6 +266,7 @@ impl TraceJitEngine {
         self.blocked_entries.clear();
         self.loop_headers = None;
         self.traces.clear();
+        self.trace_exit_profiles.clear();
         self.callable_side_exit_streaks.clear();
         self.blocked_callable_frames.clear();
         self.attempts.clear();
@@ -401,6 +424,16 @@ impl TraceJitEngine {
         }
     }
 
+    pub(crate) fn record_trace_exit(&mut self, key: TraceExitKey) {
+        let profile = self.trace_exit_profiles.entry(key).or_default();
+        profile.executions = profile.executions.saturating_add(1);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn trace_exit_profile(&self, key: TraceExitKey) -> Option<&TraceExitProfile> {
+        self.trace_exit_profiles.get(&key)
+    }
+
     pub(crate) fn record_native_side_exit(&mut self, trace_id: usize) -> bool {
         if self
             .traces
@@ -468,10 +501,21 @@ impl TraceJitEngine {
     }
 
     pub fn snapshot(&self, runtime_metrics: JitMetrics) -> JitSnapshot {
+        let mut exit_profiles = self
+            .trace_exit_profiles
+            .iter()
+            .map(|(key, profile)| JitExitProfile {
+                parent_trace_id: key.parent_trace_id,
+                exit_id: key.exit_id.raw(),
+                executions: profile.executions,
+            })
+            .collect::<Vec<_>>();
+        exit_profiles.sort_by_key(|profile| (profile.parent_trace_id, profile.exit_id));
         JitSnapshot {
             arch: std::env::consts::ARCH,
             config: self.config,
             traces: self.traces.clone(),
+            exit_profiles,
             attempts: self.attempts.clone(),
             metrics: self.aggregate_metrics(runtime_metrics),
             nyi_reference: nyi_reference(),
@@ -490,6 +534,10 @@ impl TraceJitEngine {
         ));
         out.push_str(&format!("  max_trace_len: {}\n", self.config.max_trace_len));
         out.push_str(&format!("  compiled traces: {}\n", self.traces.len()));
+        out.push_str(&format!(
+            "  profiled trace exits: {}\n",
+            self.trace_exit_profiles.len()
+        ));
         out.push_str(&format!("  compile attempts: {}\n", self.attempts.len()));
         out.push_str(&format!(
             "  boxed value sites: loads={} stores={}\n",
@@ -832,9 +880,35 @@ fn nyi_reference() -> Vec<JitNyiDoc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm::jit::ir::SsaExitId;
     use crate::{
         BytecodeBuilder, CallableKind, CallablePrototype, CallableTarget, ScriptFunction, Value,
     };
+
+    #[test]
+    fn trace_exit_profiles_are_keyed_by_parent_and_exit() {
+        let mut engine = TraceJitEngine::new(JitConfig {
+            enabled: true,
+            hot_loop_threshold: 1,
+            max_trace_len: 64,
+        });
+        let first = TraceExitKey {
+            parent_trace_id: 3,
+            exit_id: SsaExitId::new(0),
+        };
+        let second = TraceExitKey {
+            parent_trace_id: 3,
+            exit_id: SsaExitId::new(1),
+        };
+
+        engine.record_trace_exit(first);
+        engine.record_trace_exit(first);
+        engine.record_trace_exit(second);
+
+        assert_eq!(engine.trace_exit_profile(first).unwrap().executions, 2);
+        assert_eq!(engine.trace_exit_profile(second).unwrap().executions, 1);
+        assert_ne!(first, second);
+    }
 
     #[test]
     fn scan_loop_headers_finds_backward_targets() {

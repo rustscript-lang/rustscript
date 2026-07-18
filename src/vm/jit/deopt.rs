@@ -1,5 +1,7 @@
 #![allow(dead_code)]
-use super::ir::{SsaExit, SsaMaterialization, SsaValue, SsaValueId, SsaValueRepr};
+use super::ir::{
+    SsaExit, SsaExitId, SsaMaterialization, SsaTrace, SsaValue, SsaValueId, SsaValueRepr,
+};
 
 pub(crate) fn materialize_ssa_values(
     values: impl IntoIterator<Item = SsaValue>,
@@ -40,4 +42,209 @@ pub(crate) fn exit_inputs(exit: &SsaExit) -> Vec<SsaValueId> {
         }
     }
     out
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SideTraceImport {
+    pub(crate) parent_exit: SsaExitId,
+    pub(crate) stack_depth: usize,
+    pub(crate) local_count: usize,
+    pub(crate) args: Vec<SsaMaterialization>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SideTraceImportError {
+    UnknownParentExit(SsaExitId),
+    ExitIpMismatch { parent: usize, child: usize },
+    StackDepthMismatch { parent: usize, child: usize },
+    LocalCountMismatch { parent: usize, child: usize },
+    InvalidChildEntry,
+}
+
+pub(crate) fn side_trace_import(
+    parent: &SsaTrace,
+    parent_exit: SsaExitId,
+    child: &SsaTrace,
+) -> Result<SideTraceImport, SideTraceImportError> {
+    let exit = parent
+        .exits
+        .iter()
+        .find(|exit| exit.id == parent_exit)
+        .ok_or(SideTraceImportError::UnknownParentExit(parent_exit))?;
+    if exit.exit_ip != child.root_ip {
+        return Err(SideTraceImportError::ExitIpMismatch {
+            parent: exit.exit_ip,
+            child: child.root_ip,
+        });
+    }
+    if exit.stack.len() != child.entry_stack_depth {
+        return Err(SideTraceImportError::StackDepthMismatch {
+            parent: exit.stack.len(),
+            child: child.entry_stack_depth,
+        });
+    }
+    let child_entry = child
+        .blocks
+        .get(child.entry.index())
+        .ok_or(SideTraceImportError::InvalidChildEntry)?;
+    let child_local_count = child_entry
+        .params
+        .len()
+        .checked_sub(child.entry_stack_depth)
+        .ok_or(SideTraceImportError::InvalidChildEntry)?;
+    if exit.locals.len() != child_local_count {
+        return Err(SideTraceImportError::LocalCountMismatch {
+            parent: exit.locals.len(),
+            child: child_local_count,
+        });
+    }
+
+    Ok(SideTraceImport {
+        parent_exit,
+        stack_depth: exit.stack.len(),
+        local_count: exit.locals.len(),
+        args: exit.stack.iter().chain(&exit.locals).cloned().collect(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vm::jit::ir::{SsaTerminator, SsaTraceBuilder, SsaValueRepr};
+
+    #[test]
+    fn side_trace_import_maps_parent_stack_then_locals_to_child_entry() {
+        let mut parent = SsaTraceBuilder::new(0, 1);
+        let parent_entry = parent.entry();
+        let stack = parent
+            .append_param(parent_entry, SsaValueRepr::Tagged, "stack0".to_string())
+            .unwrap();
+        let local = parent
+            .append_param(parent_entry, SsaValueRepr::I64, "local0".to_string())
+            .unwrap();
+        let exit_id = parent.add_exit(
+            12,
+            vec![SsaMaterialization::Value(stack.id)],
+            vec![SsaMaterialization::BoxInt(local.id)],
+            vec![true],
+        );
+        parent
+            .set_terminator(parent_entry, SsaTerminator::Exit { exit: exit_id })
+            .unwrap();
+        let parent = parent.finish();
+
+        let mut child = SsaTraceBuilder::new(12, 1);
+        let child_entry = child.entry();
+        child
+            .append_param(child_entry, SsaValueRepr::Tagged, "stack0".to_string())
+            .unwrap();
+        child
+            .append_param(child_entry, SsaValueRepr::Tagged, "local0".to_string())
+            .unwrap();
+        let child_exit = child.add_exit(13, Vec::new(), Vec::new(), Vec::new());
+        child
+            .set_terminator(child_entry, SsaTerminator::Exit { exit: child_exit })
+            .unwrap();
+        let child = child.finish();
+
+        let import = side_trace_import(&parent, exit_id, &child).unwrap();
+
+        assert_eq!(import.parent_exit, exit_id);
+        assert_eq!(import.stack_depth, 1);
+        assert_eq!(import.local_count, 1);
+        assert_eq!(
+            import.args,
+            vec![
+                SsaMaterialization::Value(stack.id),
+                SsaMaterialization::BoxInt(local.id),
+            ]
+        );
+    }
+
+    #[test]
+    fn side_trace_import_rejects_mismatched_exit_ip() {
+        let mut parent = SsaTraceBuilder::new(0, 0);
+        let parent_entry = parent.entry();
+        let exit_id = parent.add_exit(12, Vec::new(), Vec::new(), Vec::new());
+        parent
+            .set_terminator(parent_entry, SsaTerminator::Exit { exit: exit_id })
+            .unwrap();
+        let parent = parent.finish();
+
+        let mut child = SsaTraceBuilder::new(13, 0);
+        let child_entry = child.entry();
+        let child_exit = child.add_exit(14, Vec::new(), Vec::new(), Vec::new());
+        child
+            .set_terminator(child_entry, SsaTerminator::Exit { exit: child_exit })
+            .unwrap();
+        let child = child.finish();
+
+        assert_eq!(
+            side_trace_import(&parent, exit_id, &child),
+            Err(SideTraceImportError::ExitIpMismatch {
+                parent: 12,
+                child: 13,
+            })
+        );
+    }
+
+    #[test]
+    fn side_trace_import_rejects_mismatched_stack_depth() {
+        let mut parent = SsaTraceBuilder::new(0, 0);
+        let parent_entry = parent.entry();
+        let exit_id = parent.add_exit(12, Vec::new(), Vec::new(), Vec::new());
+        parent
+            .set_terminator(parent_entry, SsaTerminator::Exit { exit: exit_id })
+            .unwrap();
+        let parent = parent.finish();
+
+        let mut child = SsaTraceBuilder::new(12, 1);
+        let child_entry = child.entry();
+        child
+            .append_param(child_entry, SsaValueRepr::Tagged, "stack0".to_string())
+            .unwrap();
+        let child_exit = child.add_exit(13, Vec::new(), Vec::new(), Vec::new());
+        child
+            .set_terminator(child_entry, SsaTerminator::Exit { exit: child_exit })
+            .unwrap();
+        let child = child.finish();
+
+        assert_eq!(
+            side_trace_import(&parent, exit_id, &child),
+            Err(SideTraceImportError::StackDepthMismatch {
+                parent: 0,
+                child: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn side_trace_import_rejects_mismatched_local_count() {
+        let mut parent = SsaTraceBuilder::new(0, 0);
+        let parent_entry = parent.entry();
+        let exit_id = parent.add_exit(12, Vec::new(), Vec::new(), Vec::new());
+        parent
+            .set_terminator(parent_entry, SsaTerminator::Exit { exit: exit_id })
+            .unwrap();
+        let parent = parent.finish();
+
+        let mut child = SsaTraceBuilder::new(12, 0);
+        let child_entry = child.entry();
+        child
+            .append_param(child_entry, SsaValueRepr::Tagged, "local0".to_string())
+            .unwrap();
+        let child_exit = child.add_exit(13, Vec::new(), Vec::new(), Vec::new());
+        child
+            .set_terminator(child_entry, SsaTerminator::Exit { exit: child_exit })
+            .unwrap();
+        let child = child.finish();
+
+        assert_eq!(
+            side_trace_import(&parent, exit_id, &child),
+            Err(SideTraceImportError::LocalCountMismatch {
+                parent: 0,
+                child: 1,
+            })
+        );
+    }
 }

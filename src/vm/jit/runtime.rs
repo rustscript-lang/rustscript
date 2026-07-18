@@ -8,6 +8,8 @@ use super::super::{ExecOutcome, Vm, VmError, VmResult};
     all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
 ))]
 use super::JitTrace;
+use super::ir::SsaExitId;
+use super::trace::TraceExitKey;
 use super::{JitMetrics, JitTraceTerminal, native};
 use crate::vm::native::ROOT_FRAME_KEY;
 use std::collections::HashMap;
@@ -275,6 +277,15 @@ impl Vm {
             let status = unsafe { entry(self as *mut Vm) };
             self.native_trace_exec_count = self.native_trace_exec_count.saturating_add(1);
             self.jit.mark_trace_executed(current_trace_id);
+            let status = if let Some(exit_id) = native::decode_jit_trace_exit_status(status) {
+                self.jit.record_trace_exit(TraceExitKey {
+                    parent_trace_id: current_trace_id,
+                    exit_id: SsaExitId::new(exit_id),
+                });
+                native::STATUS_TRACE_EXIT
+            } else {
+                status
+            };
 
             match status {
                 native::STATUS_CONTINUE => {
@@ -541,6 +552,15 @@ impl Vm {
             let status = unsafe { entry(self as *mut Vm) };
             self.native_trace_exec_count = self.native_trace_exec_count.saturating_add(1);
             self.jit.mark_trace_executed(current_trace_id);
+            let status = if let Some(exit_id) = native::decode_jit_trace_exit_status(status) {
+                self.jit.record_trace_exit(TraceExitKey {
+                    parent_trace_id: current_trace_id,
+                    exit_id: SsaExitId::new(exit_id),
+                });
+                native::STATUS_TRACE_EXIT
+            } else {
+                status
+            };
 
             match status {
                 native::STATUS_CONTINUE => {
