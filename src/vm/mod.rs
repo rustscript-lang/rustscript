@@ -922,6 +922,7 @@ impl Vm {
         self.waiting_host_op = None;
         self.io_state = crate::builtins::runtime::IoState::default();
         self.map_iterators.clear();
+        self.jit.reset_runtime_backoff();
         self.clear_interpreter_metrics();
     }
 

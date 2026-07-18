@@ -716,6 +716,31 @@ impl TraceJitEngine {
         self.record_native_loop_back(trace_id);
     }
 
+    pub(crate) fn reset_runtime_backoff(&mut self) {
+        self.callable_side_exit_streaks.fill(0);
+        self.blocked_callable_frames.fill(false);
+        self.compiled_by_ip.clear();
+        let entries = self
+            .traces
+            .iter()
+            .enumerate()
+            .map(|(trace_id, trace)| {
+                (
+                    TraceEntryKey {
+                        frame_key: trace.frame_key,
+                        root_ip: trace.root_ip,
+                        stack_depth: trace.entry_stack_depth,
+                    },
+                    trace_id,
+                )
+            })
+            .filter(|(key, _)| !self.blocked_entries.contains(key))
+            .collect::<Vec<_>>();
+        for (key, trace_id) in entries {
+            self.insert_compiled_trace(key, trace_id);
+        }
+    }
+
     pub(crate) fn callable_frame_is_blocked(&self, frame_key: u64) -> bool {
         if frame_key == ROOT_FRAME_KEY {
             return false;
@@ -1716,6 +1741,18 @@ mod tests {
         let trace_id = engine
             .observe_hot_entry(0, root_ip as usize, 0, &program)
             .expect("script-frame trace should compile");
+        for _ in 0..CALLABLE_SIDE_EXIT_BACKOFF_THRESHOLD {
+            engine.record_native_side_exit(trace_id);
+        }
+        engine.block_callable_frame(trace_id);
+        assert!(engine.callable_frame_is_blocked(0));
+
+        engine.reset_runtime_backoff();
+        assert!(!engine.callable_frame_is_blocked(0));
+        assert_eq!(
+            engine.compiled_trace_for_entry(0, root_ip as usize, 0),
+            Some(trace_id)
+        );
         for _ in 0..CALLABLE_SIDE_EXIT_BACKOFF_THRESHOLD {
             engine.record_native_side_exit(trace_id);
         }
