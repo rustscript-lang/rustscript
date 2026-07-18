@@ -11,9 +11,9 @@ separate costs in dependency order:
 4. lower the hottest builtin projection calls into direct interpreter fast paths instead of paying
    full generic `Call` dispatch
 
-The intent is not to redesign ordinary RustScript function calls. Those are already compiled
-inline today in [`src/compiler/codegen.rs`](../src/compiler/codegen.rs), so the main
-runtime tax is on builtin and host dispatch.
+The first four stages did not redesign ordinary RustScript function calls. Current script functions
+use real callable frames and dynamic calls route through `CallValue`. The native trace-graph
+follow-up preserves those semantics and targets the remaining trace-boundary overhead.
 
 ## Current Snapshot (2026-03-20 Baseline)
 
@@ -254,10 +254,295 @@ Post-fix CPU 11 A/B, four alternating runs:
 | fixed JIT | `530.3 ms` | `485.3-551.0 ms` |
 
 The fixed JIT is `71.7%` faster than the pre-fix master JIT and is within `+3.9%` of the same-run
-interpreter median. It remains `6.54x` slower than the old `0.23.1` JIT because `0.23.1` inlined
-direct named function calls, while real script call frames intentionally route them through
-`CallValue`. Restoring that older speed requires a separate compiler direct-call inlining design;
-the VM mitigation prevents pathological slowdown without changing callable semantics.
+interpreter median. It remains `6.54x` slower than the old `0.23.1` JIT. The old compiler flattened
+direct named calls, while the current runtime preserves real callable frames and routes dynamic
+calls through `CallValue`. Source-level direct-call flattening is retained only as a historical
+performance reference. The follow-up design must preserve callable semantics and remove native
+trace-boundary overhead inside the JIT.
+
+### Follow-up native trace graph plan (2026-07-18)
+
+#### Research basis
+
+LuaJIT v2.1 was used as the architectural reference for the remaining gap:
+
+- hot loops become root traces; the default `hotloop` threshold is `56`
+- a repeatedly taken guard exit starts a side trace at the default `hotexit=10`
+- the side trace is initialized by replaying the parent exit snapshot
+- `lj_asm_patchexit()` redirects the parent guard to the side-trace machine-code entry
+- the side-trace head inherits parent register and spill state instead of reconstructing the full
+  interpreter state
+- Lua calls and returns can be recorded in one trace; the call target is guarded by closure or
+  prototype identity, while frame state remains represented in trace slots and snapshots
+- actual interpreter restoration is reserved for an unlinked exit, failed guard path, error, or
+  other true deoptimization
+- compile failures are managed per exit with `tryside` and `maxside` limits instead of disabling an
+  entire callable prototype after one frequent branch pattern
+
+A local LuaJIT experiment with a tight loop, a Lua comparator call, and a two-way branch produced
+one root trace and two side traces:
+
+```text
+[TRACE 1 lj-tight-loop.lua:8 loop]
+[TRACE 2 (1/5) lj-tight-loop.lua:2 -> 1]
+[TRACE 3 (1/3) lj-tight-loop.lua:7 -> 1]
+```
+
+The root recording contained `CALL`, `FUNCF`, comparator bytecode, `RET1`, and `FORL`. Both hot side
+traces linked back to the root trace without interpreter dispatch.
+
+RustScript currently performs a materially different transition for every linked trace:
+
+1. materialize dirty locals and update `Vm.ip`
+2. call `resume_linked_trace`
+3. look up the next entry in Rust by `(frame_key, ip, stack_depth)`
+4. invoke the next native function
+5. call `pd_vm_native_frame_state()` again at callable-frame entry
+
+The unbacked callable JIT produced roughly `359k-392k` native executions per sort run. The three
+CPU 11 diagnostic runs amortized to `4.2-7.3 us` per native boundary plus trace body, with a
+`6.6 us` median. Removing a single frame helper cannot close the gap while these boundaries remain.
+
+#### Shared correctness constraints
+
+Both directions below must preserve these invariants:
+
+- source-level function values, closures, recursion, captures, and dynamic call targets keep their
+  existing semantics
+- a linked native edge cannot bypass a yield, wait, fuel, epoch, error, or debugger boundary
+- values transferred across a linked edge retain the existing drop contract exactly once
+- an unlinked or invalidated edge uses the existing deoptimization path and reconstructs the same
+  `Vm.stack`, `Vm.locals`, `Vm.ip`, and active frame
+- linked code must not keep stale callable, trace, executable-buffer, or captured-value identity
+- trace invalidation disconnects incoming edges before executable memory or constants are released
+- initial rollout links only traces with the same `frame_key`, stack depth, and non-yielding status
+- root and callable traces retain independent entry keys and debug metadata
+- interruption checks remain reachable in native loops after edges are linked
+
+#### Direction 1: fuse a hot trace region into one Cranelift function
+
+**Objective:** Compile a root trace and its hot same-frame side traces as one native control-flow
+region so linked edges pass SSA values directly between Cranelift blocks.
+
+**Why first:** This removes the dominant handoff without introducing a cross-buffer ABI, writable
+machine-code patching, or a tail-call convention. It also provides the parent-exit lineage and
+snapshot-import model that Direction 2 needs later.
+
+**Target architecture:**
+
+- identify links by `TraceExitKey { parent_trace_id, exit_id }`, not only the destination
+  `(frame_key, ip, stack_depth)`
+- count and compile hot exits independently
+- represent a region as one root trace plus a bounded set of side traces
+- import each side trace from the exact parent `SsaExit` materializations
+- map the parent exit's live locals and operand values to child block parameters
+- lower a linked parent guard to an intra-function Cranelift branch
+- keep scalar and pointer values in SSA form across the edge
+- retain the original deopt block for every unlinked outgoing edge
+- run the callable frame-state entry guard once at the external region entry; internal side-trace
+  blocks do not call it again
+- recompile and atomically replace a region entry when a newly hot side trace is admitted
+- cap region growth by trace count, IR instruction count, machine-code size, and compile latency
+
+**Primary files:**
+
+- `src/vm/jit/trace.rs`
+  - add parent-exit hotness, link state, compile-attempt state, and region membership
+- `src/vm/jit/ir.rs`
+  - add region-level block/value identity and parent-snapshot import metadata
+- `src/vm/jit/deopt.rs`
+  - expose exact parent-exit materializations for child import
+- `src/vm/jit/native/lower.rs`
+  - lower multiple SSA traces into one Cranelift function and branch directly across linked edges
+- `src/vm/jit/native/mod.rs`
+  - represent a compiled region and its entry/keepalive state
+- `src/vm/jit/runtime.rs`
+  - install region replacements and leave Rust dispatch only for unlinked exits
+- `tests/jit/jit_tests.rs`
+  - add structural, callable-frame, deopt, interruption, and ownership tests
+- `tests/jit/perf_tests.rs`
+  - add region-link characterization counters
+
+**Implementation milestones:**
+
+1. **Add parent-exit identity and counters.**
+   - RED: a branch-heavy callable workload must report repeated executions of one exact parent exit.
+   - GREEN: record per-exit executions without changing dispatch.
+   - Keep the existing frame backoff active during this milestone.
+
+2. **Create side-trace snapshot import IR.**
+   - RED: importing a child from a parent exit must preserve scalar, tagged, stack, and dirty-local
+     materializations.
+   - GREEN: build child entry parameters from `SsaExit` values and verify the combined IR.
+   - Reject cross-frame, yielding, mismatched-depth, and unsupported ownership edges.
+
+3. **Lower a two-trace region.**
+   - RED: a hot alternating branch must still increment Rust linked-handoff counters after warmup.
+   - GREEN: compile parent and one child in the same Cranelift function; the linked edge becomes an
+     internal branch and no longer increments the handoff counter.
+   - Preserve the original parent deopt block until the replacement region is installed.
+
+4. **Support cycles and several side traces.**
+   - RED: a parent-to-child-to-parent loop must require repeated external native entries.
+   - GREEN: map the cycle to Cranelift blocks and PHI-style block parameters with no host-stack
+     growth.
+   - Add deterministic region-size limits and refuse an edge before partial installation.
+
+5. **Install and invalidate regions safely.**
+   - RED: JIT config changes, host-import changes, trace blocking, and callable replacement must not
+     leave an incoming edge pointing at old code.
+   - GREEN: publish a complete replacement region, switch the cached entry, then retire the prior
+     keepalive after all references are disconnected.
+
+6. **Retire prototype-wide backoff for successfully linked exits.**
+   - Keep backoff for unsupported or repeatedly failing exits.
+   - Move compile attempts and blacklist state to `TraceExitKey`.
+   - A successful region edge clears its failure streak and cannot block unrelated exits in the
+     same callable frame.
+
+7. **Run the sort performance gate.**
+   - use CPU 11 with four alternating Criterion runs
+   - compare current interpreter, region JIT, and crates.io `0.23.1`
+   - record native executions, external exits, internal region edges, Rust handoffs, helper calls,
+     trace count, region count, IR size, machine-code size, and compile time
+
+**Required tests:**
+
+- `trace_jit_region_links_hot_same_frame_side_exit`
+- `trace_jit_region_cycles_without_external_handoffs`
+- `trace_jit_region_unlinked_exit_restores_callable_frame`
+- `trace_jit_region_preserves_owned_value_drop_contract`
+- `trace_jit_region_respects_fuel_and_epoch_interrupts`
+- `trace_jit_region_invalidation_disconnects_old_entries`
+- `trace_jit_region_rejects_cross_frame_or_yielding_edges`
+
+**Acceptance criteria:**
+
+- all existing workspace tests and clippy remain clean
+- fused edges perform no Rust lookup, frame-state helper call, or `Vm.locals` materialization
+- the branch-heavy callable integration test shows internal region-edge activity and bounded external
+  handoffs on its second run
+- `script-bench-rs` preserves sorted output and native coverage
+- the sort JIT median is at most `2x` the `0.23.1` JIT median on the same CPU and at least `50%`
+  below the same-run interpreter median
+- if the performance gate is missed, record a helper/edge/call breakdown before widening the region
+  or starting Direction 2
+
+#### Direction 2: independent side traces with machine-level links
+
+**Objective:** Keep side traces in independent executable buffers while linking parent exits to
+child entries without Rust dispatch or full VM-state reconstruction.
+
+**When to use:** Start after Direction 1 has validated parent-exit lineage and snapshot import, and
+only if region recompilation, code duplication, or region-size limits prevent adequate coverage.
+
+**Target architecture:**
+
+- each hot parent exit owns a stable link slot outside executable memory
+- the parent guard loads the link slot and transfers control to the child when populated
+- a zero or invalidated slot follows the original deopt path
+- side traces are compiled from one exact parent snapshot and have one inherited-state ABI
+- a generated system-ABI wrapper enters the trace graph
+- linked trace bodies use Cranelift's tail-call convention and `return_call_indirect` so graph cycles
+  do not grow the host stack
+- scalar values cross the side-entry ABI unboxed
+- tagged and owned values use an ABI-safe carrier with explicit move/borrow ownership; pointers to a
+  parent function's temporary stack slots cannot survive a tail transfer
+- child code can tail-link to the root or another compatible side trace
+- link publication uses release ordering; execution loads use acquire ordering
+- invalidation clears incoming link slots before releasing child code and constants
+- executable pages remain write-protected after publication; mutable link slots avoid runtime
+  machine-code rewriting and preserve current W^X behavior
+
+**Cranelift constraints discovered during research:**
+
+- the current dependency is `cranelift-codegen 0.129.1`
+- `return_call_indirect` is available
+- only `CallConv::Tail` reports tail-call support; the current default platform convention does not
+- current traces are compiled independently and copied into separate `ExecutableBuffer` mappings
+- current `ExecutableBuffer` exposes no runtime patch API
+- a system-ABI wrapper plus tail-call trace bodies and data link slots is therefore preferred over
+  editing executable bytes
+
+**Primary files:**
+
+- all Direction 1 trace-lineage, snapshot, and test surfaces
+- `src/vm/jit/native/lower.rs`
+  - add side-entry signatures, tail transfers, and link-slot loads
+- `src/vm/jit/native/mod.rs`
+  - model root wrappers, tail-call bodies, link slots, and keepalive dependencies
+- `src/vm/native/exec.rs`
+  - retain W^X mappings; add patch support only if data slots prove insufficient
+- `src/vm/jit/runtime.rs`
+  - publish/unpublish links and service only unlinked deoptimizations
+
+**Implementation milestones:**
+
+1. **Define and verify inherited-state ABI classes.**
+   - classify scalar, pointer, tagged, borrowed, and owned values
+   - prove exact ownership transfer and deopt reconstruction for every class
+   - reject unsupported signatures before native code is published
+
+2. **Build a root wrapper and one tail-linked child.**
+   - system ABI enters the wrapper
+   - wrapper calls the `CallConv::Tail` root body
+   - root uses `return_call_indirect` for the populated side link
+   - test the zero-slot deopt path and populated-slot direct path
+
+3. **Add cyclic graph linking.**
+   - parent, child, and root may tail-link without host-stack growth
+   - run millions of transitions under a stack-depth probe
+   - ensure interruption and error exits return through the wrapper correctly
+
+4. **Add link lifetime and invalidation.**
+   - track incoming links for each compiled trace
+   - clear all incoming slots before code retirement
+   - prevent ABA reuse with generation identity or non-reused link objects
+   - keep child constants and executable memory alive while any slot can reach them
+
+5. **Replace runtime dispatch for compatible edges.**
+   - keep Rust dispatch for cold, unsupported, yielding, cross-frame, and invalidated exits
+   - collect separate direct-link and fallback-handoff counters
+
+6. **Run the same correctness and performance gates as Direction 1.**
+   - compare direct-linked side traces with fused regions on identical trace graphs
+   - prefer the simpler fused region unless independent traces provide a measured compile-time,
+     code-size, or coverage advantage
+
+**Required tests:**
+
+- `trace_jit_side_link_slot_switches_between_deopt_and_child`
+- `trace_jit_tail_link_cycle_has_bounded_host_stack`
+- `trace_jit_side_entry_transfers_owned_values_once`
+- `trace_jit_side_link_invalidation_clears_incoming_slots`
+- `trace_jit_side_link_generation_prevents_stale_entry_reuse`
+- `trace_jit_side_link_respects_callable_frame_and_interrupt_boundaries`
+
+**Acceptance criteria:**
+
+- compatible linked exits execute with no Rust dispatcher or callable frame-state helper
+- graph cycles show bounded host-stack use
+- no executable page is writable while reachable for execution
+- clearing a link immediately restores the existing deopt behavior
+- owned and captured values retain exact release behavior under linking and invalidation
+- performance is no worse than Direction 1 on the sort workload; any added complexity must be
+  justified by measured region compile-time, code-size, or coverage gains
+
+#### Direction selection and shared rollout
+
+Direction 1 is the implementation default. Direction 2 is a continuation path, not a parallel first
+implementation. The following components must be designed for reuse by both:
+
+- `TraceExitKey` and per-exit hotness/attempt/blacklist state
+- parent snapshot import and inherited-value classification
+- linked-edge counters and diagnostics
+- deopt equivalence tests
+- callable-frame, ownership, interruption, and invalidation test fixtures
+- region/side-trace size and compile-time telemetry
+
+Source compiler direct-call flattening is not part of either direction. A later call-tracing phase may
+record guarded `CallValue -> callee -> return` paths into the native trace graph while preserving real
+frames in snapshots.
 
 Verification:
 
@@ -268,8 +553,8 @@ Verification:
 
 ## Non-Goals
 
-- redesigning RustScript source-level function semantics
-- introducing general closure values or call frames as part of this work
+- changing RustScript source-level function, closure, capture, or recursion semantics
+- restoring source-compiler function flattening or removing real callable frames
 - removing `Arc` from the VM value model
 - broad AOT architecture work beyond the minimal compatibility needed for the hot builtin lowering
 - changing user-visible RSS syntax as part of this plan
