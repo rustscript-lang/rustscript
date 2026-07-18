@@ -19,6 +19,23 @@ fn non_yielding_pends(_: &[Value]) -> Result<CallOutcome, vm::VmError> {
     Ok(CallOutcome::Pending(7))
 }
 
+fn non_yielding_returns_bool(_: &[Value]) -> Result<CallOutcome, vm::VmError> {
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::Bool(true))))
+}
+
+#[test]
+fn non_yielding_args_return_type_contract_is_enforced_before_jit_compilation() {
+    let compiled =
+        compile_source("fn action() -> int; action();").expect("host call source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.bind_static_non_yielding_args_function("action", non_yielding_returns_bool);
+
+    assert!(matches!(
+        vm.run().expect_err("return type mismatch should fail"),
+        vm::VmError::TypeMismatch("int")
+    ));
+}
+
 #[test]
 fn non_yielding_args_contract_is_enforced_before_jit_compilation() {
     let cases: [(&str, StaticHostArgsFunction); 4] = [

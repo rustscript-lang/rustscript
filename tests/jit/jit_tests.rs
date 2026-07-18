@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{cell::Cell, sync::Arc};
 
 use vm::{
     BytecodeBuilder, CallOutcome, CallReturn, HostFunction, JitConfig, JitTraceTerminal, OpCode,
@@ -1749,6 +1749,113 @@ fn string_len_non_yielding(args: &[Value]) -> Result<CallOutcome, vm::VmError> {
     Ok(CallOutcome::Return(CallReturn::one(Value::Int(
         value.len() as i64,
     ))))
+}
+
+fn mixed_float_non_yielding(args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+    let [
+        Value::Int(integer),
+        Value::Float(float),
+        Value::Bool(boolean),
+    ] = args
+    else {
+        return Err(vm::VmError::TypeMismatch("int, float, bool"));
+    };
+    Ok(CallOutcome::Return(CallReturn::one(Value::Float(
+        *integer as f64 + float + if *boolean { 1.0 } else { 0.0 },
+    ))))
+}
+
+thread_local! {
+    static UNSTABLE_HOST_RETURN_COUNT: Cell<u32> = const { Cell::new(0) };
+}
+
+fn unstable_return_non_yielding(_: &[Value]) -> Result<CallOutcome, vm::VmError> {
+    let call = UNSTABLE_HOST_RETURN_COUNT.with(|count| {
+        let call = count.get();
+        count.set(call.saturating_add(1));
+        call
+    });
+    let value = if call < 8 {
+        Value::Int(1)
+    } else {
+        Value::Bool(false)
+    };
+    Ok(CallOutcome::Return(CallReturn::one(value)))
+}
+
+#[test]
+fn trace_jit_enforces_scalar_host_return_contract_after_dirty_local_write() {
+    if !native_jit_supported() {
+        return;
+    }
+    UNSTABLE_HOST_RETURN_COUNT.with(|count| count.set(0));
+    let compiled = compile_source(
+        r#"
+            fn unstable() -> int;
+            let mut dirty = 0;
+            while dirty < 100 {
+                dirty = dirty + 1;
+                dirty = dirty + unstable();
+            }
+            dirty;
+        "#,
+    )
+    .expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    vm.bind_static_non_yielding_args_function("unstable", unstable_return_non_yielding);
+
+    assert!(matches!(vm.run(), Err(vm::VmError::TypeMismatch("int"))));
+    assert!(
+        vm.jit_native_exec_count() > 0,
+        "return mismatch should occur after native execution:\n{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
+fn trace_jit_passes_mixed_host_args_and_float_return_as_scalars() {
+    if !native_jit_supported() {
+        return;
+    }
+    let compiled = compile_source(
+        r#"
+            fn mixed(integer: int, float: float, boolean: bool) -> float;
+            let mut i = 0;
+            let mut total = 0.0;
+            while i < 100 {
+                total = total + mixed(i, 0.5, true);
+                i = i + 1;
+            }
+            total;
+        "#,
+    )
+    .expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    vm.bind_static_non_yielding_args_function("mixed", mixed_float_non_yielding);
+
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Float(5_100.0)]);
+    assert!(
+        vm.jit_snapshot().traces.iter().any(|trace| {
+            trace
+                .ssa_text()
+                .lines()
+                .any(|line| line.contains(":f64 = host_call"))
+        }),
+        "mixed host arguments should return an SSA float:\n{}",
+        vm.dump_jit_info()
+    );
+    assert!(vm.jit_native_exec_count() > 0);
 }
 
 #[test]

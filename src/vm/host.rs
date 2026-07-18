@@ -494,6 +494,41 @@ pub(crate) fn require_non_yielding_host_value(outcome: CallOutcome) -> VmResult<
     }
 }
 
+pub(crate) fn validate_non_yielding_host_value(
+    value: Value,
+    expected: Option<ValueType>,
+) -> VmResult<Value> {
+    let valid = matches!(
+        (expected, &value),
+        (None | Some(ValueType::Unknown), _)
+            | (Some(ValueType::Null), Value::Null)
+            | (Some(ValueType::Int), Value::Int(_))
+            | (Some(ValueType::Float), Value::Float(_))
+            | (Some(ValueType::Bool), Value::Bool(_))
+            | (Some(ValueType::String), Value::String(_))
+            | (Some(ValueType::Bytes), Value::Bytes(_))
+            | (Some(ValueType::Array), Value::Array(_))
+            | (Some(ValueType::Map), Value::Map(_))
+            | (Some(ValueType::Callable), Value::Callable(_))
+    );
+    if valid {
+        return Ok(value);
+    }
+    let expected = match expected.expect("known expected host return type") {
+        ValueType::Unknown => unreachable!(),
+        ValueType::Null => "null",
+        ValueType::Int => "int",
+        ValueType::Float => "float",
+        ValueType::Bool => "bool",
+        ValueType::String => "string",
+        ValueType::Bytes => "bytes",
+        ValueType::Array => "array",
+        ValueType::Map => "map",
+        ValueType::Callable => "callable",
+    };
+    Err(VmError::TypeMismatch(expected))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct WaitingHostOp {
     pub(super) op_id: HostOpId,
@@ -723,8 +758,9 @@ impl Vm {
     /// Binds a static args-only host function that always returns one value synchronously.
     ///
     /// This is equivalent to [`Vm::bind_static_args_function`] except that the VM may keep
-    /// native JIT traces active across the call boundary. Returning no value, `Halt`, `Yield`,
-    /// or `Pending` violates the contract and is reported as a host error.
+    /// native JIT traces active across the call boundary. The returned [`Value`] must match the
+    /// return type declared by the corresponding host import. Returning a different type, no
+    /// value, `Halt`, `Yield`, or `Pending` violates the contract and is reported as a host error.
     pub fn bind_static_non_yielding_args_function(
         &mut self,
         name: impl Into<String>,
@@ -948,9 +984,19 @@ impl Vm {
             return self.execute_builtin_call_from_stack(builtin, argc, call_ip);
         }
 
+        let expected_return_type = self
+            .program
+            .imports
+            .get(usize::from(index))
+            .map(|import| import.return_type);
         let resolved_index = self.resolve_call_target(index, argc_u8)?;
         if self.bound_host_function_uses_args_slice(resolved_index)? {
-            self.execute_bound_args_host_function(resolved_index, argc, call_ip)
+            self.execute_bound_args_host_function(
+                resolved_index,
+                argc,
+                call_ip,
+                expected_return_type,
+            )
         } else if self.bound_host_function_uses_stack_borrow(resolved_index)? {
             self.execute_bound_stack_host_function(resolved_index, argc, call_ip)
         } else {
@@ -975,7 +1021,7 @@ impl Vm {
             })?;
         let argc = argc_u8 as usize;
         if self.bound_host_function_uses_args_slice(resolved_index)? {
-            self.execute_bound_args_host_function(resolved_index, argc, call_ip)
+            self.execute_bound_args_host_function(resolved_index, argc, call_ip, None)
         } else if self.bound_host_function_uses_stack_borrow(resolved_index)? {
             self.execute_bound_stack_host_function(resolved_index, argc, call_ip)
         } else {
@@ -1492,6 +1538,7 @@ impl Vm {
         resolved_index: u16,
         argc: usize,
         call_ip: usize,
+        expected_return_type: Option<ValueType>,
     ) -> VmResult<HostCallExecOutcome> {
         let arg_start = self
             .stack
@@ -1520,6 +1567,7 @@ impl Vm {
         let outcome = outcome?;
         if non_yielding {
             let value = require_non_yielding_host_value(outcome)?;
+            let value = validate_non_yielding_host_value(value, expected_return_type)?;
             self.stack.truncate(arg_start);
             self.stack.push(value);
             return Ok(HostCallExecOutcome::Returned);
