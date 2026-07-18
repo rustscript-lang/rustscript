@@ -37,9 +37,10 @@ use crate::vm::native::{
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::Ieee64;
 use cranelift_codegen::ir::{
-    Block, BlockArg, InstBuilder, MemFlags, StackSlot, StackSlotData, StackSlotKind, types,
+    AbiParam, Block, BlockArg, InstBuilder, MemFlags, Signature, StackSlot, StackSlotData,
+    StackSlotKind, types,
 };
-use cranelift_codegen::isa::OwnedTargetIsa;
+use cranelift_codegen::isa::{CallConv, OwnedTargetIsa};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
@@ -50,6 +51,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static CRANELIFT_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 static CRANELIFT_JIT_ISA: OnceLock<Result<OwnedTargetIsa, String>> = OnceLock::new();
+static CRANELIFT_TAIL_ISA: OnceLock<Result<OwnedTargetIsa, String>> = OnceLock::new();
 
 type TaggedConstants = (Box<[Value]>, HashMap<SsaValueId, usize>);
 
@@ -76,6 +78,148 @@ impl TraceKeepAlive {
     fn entry(&self) -> *const u8 {
         self.exec.entry()
     }
+}
+
+pub(crate) struct CompiledTailFunction {
+    entry: *const u8,
+    _keepalive: TraceKeepAlive,
+    code: Vec<u8>,
+}
+
+impl CompiledTailFunction {
+    pub(crate) fn entry(&self) -> *const u8 {
+        self.entry
+    }
+
+    pub(crate) fn code_len(&self) -> usize {
+        self.code.len()
+    }
+}
+
+fn tail_entry_signature(pointer_type: cranelift_codegen::ir::Type) -> Signature {
+    let mut signature = Signature::new(CallConv::Tail);
+    signature.params.push(AbiParam::new(pointer_type));
+    signature.returns.push(AbiParam::new(types::I32));
+    signature
+}
+
+fn compile_standalone_native_function(
+    prefix: &str,
+    signature: impl FnOnce(cranelift_codegen::ir::Type, CallConv) -> Signature,
+    lower: impl FnOnce(&mut FunctionBuilder<'_>, cranelift_codegen::ir::Type, CallConv) -> VmResult<()>,
+) -> VmResult<CompiledTailFunction> {
+    let isa = native_tail_isa()?;
+    let jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+    let mut module = JITModule::new(jit_builder);
+    let pointer_type = module.target_config().pointer_type();
+    let default_call_conv = module.target_config().default_call_conv;
+    let mut ctx = module.make_context();
+    ctx.func.signature = signature(pointer_type, default_call_conv);
+    let function_id = CRANELIFT_TRACE_ID.fetch_add(1, Ordering::Relaxed);
+    let function_name = format!("{prefix}_{function_id}");
+    let func_id = module
+        .declare_function(&function_name, Linkage::Local, &ctx.func.signature)
+        .map_err(|err| VmError::JitNative(format!("declare {prefix} failed: {err}")))?;
+    {
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+        lower(&mut builder, pointer_type, default_call_conv)?;
+        builder.seal_all_blocks();
+        builder.finalize();
+    }
+    module
+        .define_function(func_id, &mut ctx)
+        .map_err(|err| VmError::JitNative(format!("define {prefix} failed: {err}")))?;
+    let code_len = ctx
+        .compiled_code()
+        .ok_or_else(|| VmError::JitNative(format!("{prefix} produced no machine code")))?
+        .code_buffer()
+        .len();
+    module.clear_context(&mut ctx);
+    module
+        .finalize_definitions()
+        .map_err(|err| VmError::JitNative(format!("finalize {prefix} failed: {err}")))?;
+    let module_entry = module.get_finalized_function(func_id);
+    let code = unsafe { std::slice::from_raw_parts(module_entry, code_len).to_vec() };
+    let keepalive = TraceKeepAlive::from_code(&code, Box::new([]))?;
+    let entry = keepalive.entry();
+    Ok(CompiledTailFunction {
+        entry,
+        _keepalive: keepalive,
+        code,
+    })
+}
+
+pub(crate) fn compile_tail_status_body(status: i32) -> VmResult<CompiledTailFunction> {
+    compile_standalone_native_function(
+        "pd_vm_tail_status",
+        |pointer_type, _| tail_entry_signature(pointer_type),
+        move |builder, _, _| {
+            let entry = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+            let status = builder.ins().iconst(types::I32, i64::from(status));
+            builder.ins().return_(&[status]);
+            Ok(())
+        },
+    )
+}
+
+pub(crate) fn compile_tail_side_link_body(
+    slot_address: usize,
+    deopt_status: i32,
+) -> VmResult<CompiledTailFunction> {
+    compile_standalone_native_function(
+        "pd_vm_tail_side_link",
+        |pointer_type, _| tail_entry_signature(pointer_type),
+        move |builder, pointer_type, _| {
+            let entry = builder.create_block();
+            let deopt = builder.create_block();
+            let linked = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+            let vm_ptr = builder.block_params(entry)[0];
+            let slot_address = iconst_ptr_from_addr(builder, pointer_type, slot_address)?;
+            let target = builder
+                .ins()
+                .load(pointer_type, MemFlags::new(), slot_address, 0);
+            let is_null = builder.ins().icmp_imm(IntCC::Equal, target, 0);
+            builder.ins().brif(is_null, deopt, &[], linked, &[]);
+
+            builder.switch_to_block(deopt);
+            let status = builder.ins().iconst(types::I32, i64::from(deopt_status));
+            builder.ins().return_(&[status]);
+
+            builder.switch_to_block(linked);
+            let signature = builder.import_signature(tail_entry_signature(pointer_type));
+            builder
+                .ins()
+                .return_call_indirect(signature, target, &[vm_ptr]);
+            Ok(())
+        },
+    )
+}
+
+pub(crate) fn compile_system_tail_wrapper(root_entry: *const u8) -> VmResult<CompiledTailFunction> {
+    let root_entry = root_entry as usize;
+    compile_standalone_native_function(
+        "pd_vm_tail_wrapper",
+        entry_signature,
+        move |builder, pointer_type, _| {
+            let entry = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+            let vm_ptr = builder.block_params(entry)[0];
+            let root_entry = iconst_ptr_from_addr(builder, pointer_type, root_entry)?;
+            let signature = builder.import_signature(tail_entry_signature(pointer_type));
+            let call = builder
+                .ins()
+                .call_indirect(signature, root_entry, &[vm_ptr]);
+            let status = builder.inst_results(call)[0];
+            builder.ins().return_(&[status]);
+            Ok(())
+        },
+    )
 }
 
 fn try_compile_ssa_trace(
@@ -4948,6 +5092,24 @@ pub(crate) fn compile_trace(
             trace.id, trace.root_ip
         ))
     })
+}
+
+fn native_tail_isa() -> VmResult<OwnedTargetIsa> {
+    let cached = CRANELIFT_TAIL_ISA.get_or_init(|| {
+        let mut flag_builder = settings::builder();
+        flag_builder
+            .set("opt_level", "speed")
+            .map_err(|err| format!("failed to set cranelift opt_level: {err}"))?;
+        flag_builder
+            .set("preserve_frame_pointers", "true")
+            .map_err(|err| format!("failed to preserve tail-call frame pointers: {err}"))?;
+        let isa_builder = cranelift_native::builder()
+            .map_err(|err| format!("failed to build native tail ISA: {err}"))?;
+        isa_builder
+            .finish(settings::Flags::new(flag_builder))
+            .map_err(|err| format!("failed to finalize cranelift tail ISA: {err}"))
+    });
+    cached.clone().map_err(VmError::JitNative)
 }
 
 fn native_isa(profile: NativeCompileProfile) -> VmResult<OwnedTargetIsa> {

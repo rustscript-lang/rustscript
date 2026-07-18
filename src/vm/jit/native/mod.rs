@@ -2,6 +2,9 @@
 #[cfg(not(feature = "cranelift-jit"))]
 use super::super::super::VmError;
 use super::super::super::VmResult;
+use super::ir::{SsaMaterialization, SsaValueRepr};
+use crate::ValueType;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 pub(crate) use crate::vm::native::{
     NativeInterruptSettings, STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED, STATUS_LINKED_CONTINUE,
@@ -27,6 +30,88 @@ impl TraceLoweringKind {
         match self {
             Self::Ssa => "ssa",
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SideEntryOwnership {
+    Borrowed,
+    Owned,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InheritedStateAbiClass {
+    ScalarInt,
+    ScalarFloat,
+    ScalarBool,
+    HeapPointer {
+        tag: ValueType,
+        ownership: SideEntryOwnership,
+    },
+    Tagged(SideEntryOwnership),
+}
+
+pub(crate) fn classify_side_entry_repr(
+    repr: SsaValueRepr,
+    ownership: SideEntryOwnership,
+) -> InheritedStateAbiClass {
+    match repr {
+        SsaValueRepr::I64 => InheritedStateAbiClass::ScalarInt,
+        SsaValueRepr::F64 => InheritedStateAbiClass::ScalarFloat,
+        SsaValueRepr::Bool => InheritedStateAbiClass::ScalarBool,
+        SsaValueRepr::HeapPtr(tag) => InheritedStateAbiClass::HeapPointer { tag, ownership },
+        SsaValueRepr::Tagged => InheritedStateAbiClass::Tagged(ownership),
+    }
+}
+
+pub(crate) fn classify_side_entry_materialization(
+    materialization: &SsaMaterialization,
+) -> InheritedStateAbiClass {
+    match materialization {
+        SsaMaterialization::Value(_) => {
+            InheritedStateAbiClass::Tagged(SideEntryOwnership::Borrowed)
+        }
+        SsaMaterialization::BoxInt(_) => InheritedStateAbiClass::ScalarInt,
+        SsaMaterialization::BoxFloat(_) => InheritedStateAbiClass::ScalarFloat,
+        SsaMaterialization::BoxBool(_) => InheritedStateAbiClass::ScalarBool,
+        SsaMaterialization::BoxHeapPtr { tag, .. } => InheritedStateAbiClass::HeapPointer {
+            tag: *tag,
+            ownership: SideEntryOwnership::Owned,
+        },
+    }
+}
+
+pub(crate) struct NativeSideLinkSlot {
+    entry: AtomicPtr<u8>,
+}
+
+impl NativeSideLinkSlot {
+    pub(crate) const fn new() -> Self {
+        Self {
+            entry: AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+
+    pub(crate) fn target(&self) -> *mut u8 {
+        self.entry.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn publish(&self, entry: *const u8) {
+        self.entry.store(entry.cast_mut(), Ordering::Release);
+    }
+
+    pub(crate) fn clear(&self) {
+        self.entry.store(std::ptr::null_mut(), Ordering::Release);
+    }
+
+    pub(crate) fn address(&self) -> *mut *mut u8 {
+        self.entry.as_ptr()
+    }
+}
+
+impl Default for NativeSideLinkSlot {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -102,7 +187,89 @@ pub(super) fn compile_native_region(
 
 #[cfg(test)]
 mod tests {
-    use super::selected_codegen_backend;
+    use super::lower::{
+        compile_system_tail_wrapper, compile_tail_side_link_body, compile_tail_status_body,
+    };
+    use super::{
+        InheritedStateAbiClass, NativeSideLinkSlot, SideEntryOwnership,
+        classify_side_entry_materialization, classify_side_entry_repr, selected_codegen_backend,
+    };
+    use crate::ValueType;
+    use crate::vm::jit::ir::{SsaMaterialization, SsaValueId, SsaValueRepr};
+
+    #[test]
+    fn side_entry_abi_classifies_scalar_pointer_tagged_borrowed_and_owned_values() {
+        let value = SsaValueId::new(7);
+        assert_eq!(
+            classify_side_entry_materialization(&SsaMaterialization::BoxInt(value)),
+            InheritedStateAbiClass::ScalarInt
+        );
+        assert_eq!(
+            classify_side_entry_materialization(&SsaMaterialization::BoxFloat(value)),
+            InheritedStateAbiClass::ScalarFloat
+        );
+        assert_eq!(
+            classify_side_entry_materialization(&SsaMaterialization::BoxBool(value)),
+            InheritedStateAbiClass::ScalarBool
+        );
+        assert_eq!(
+            classify_side_entry_materialization(&SsaMaterialization::Value(value)),
+            InheritedStateAbiClass::Tagged(SideEntryOwnership::Borrowed)
+        );
+        assert_eq!(
+            classify_side_entry_materialization(&SsaMaterialization::BoxHeapPtr {
+                value,
+                tag: ValueType::String,
+            }),
+            InheritedStateAbiClass::HeapPointer {
+                tag: ValueType::String,
+                ownership: SideEntryOwnership::Owned,
+            }
+        );
+        assert_eq!(
+            classify_side_entry_repr(
+                SsaValueRepr::HeapPtr(ValueType::Array),
+                SideEntryOwnership::Borrowed,
+            ),
+            InheritedStateAbiClass::HeapPointer {
+                tag: ValueType::Array,
+                ownership: SideEntryOwnership::Borrowed,
+            }
+        );
+    }
+
+    #[cfg(feature = "cranelift-jit")]
+    #[test]
+    fn trace_jit_side_link_slot_switches_between_deopt_and_child() {
+        if selected_codegen_backend() != "native" {
+            return;
+        }
+        const DEOPT_STATUS: i32 = 17;
+        const CHILD_STATUS: i32 = 23;
+        let slot = Box::new(NativeSideLinkSlot::new());
+        let child = compile_tail_status_body(CHILD_STATUS).expect("tail child should compile");
+        let root = compile_tail_side_link_body(slot.address() as usize, DEOPT_STATUS)
+            .expect("tail root should compile");
+        let wrapper =
+            compile_system_tail_wrapper(root.entry()).expect("system wrapper should compile");
+        assert!(child.code_len() > 0);
+        assert!(root.code_len() > 0);
+        assert!(wrapper.code_len() > 0);
+        let entry = unsafe {
+            std::mem::transmute::<*const u8, unsafe extern "C" fn(*mut crate::Vm) -> i32>(
+                wrapper.entry(),
+            )
+        };
+
+        assert!(slot.target().is_null());
+        assert_eq!(unsafe { entry(std::ptr::null_mut()) }, DEOPT_STATUS);
+        slot.publish(child.entry());
+        assert_eq!(slot.target().cast_const(), child.entry());
+        assert_eq!(unsafe { entry(std::ptr::null_mut()) }, CHILD_STATUS);
+        slot.clear();
+        assert!(slot.target().is_null());
+        assert_eq!(unsafe { entry(std::ptr::null_mut()) }, DEOPT_STATUS);
+    }
 
     #[test]
     fn selected_backend_is_native() {
