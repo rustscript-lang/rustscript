@@ -23,6 +23,8 @@ use std::sync::{Arc, Mutex};
 ))]
 use std::{cell::RefCell, thread_local};
 
+const NATIVE_DIRECT_ESCAPE_REGION_THRESHOLD: u16 = 8;
+
 #[cfg(any(
     all(
         target_arch = "x86_64",
@@ -326,6 +328,7 @@ impl Vm {
         loop {
             native::clear_bridge_error();
             let region_edges_before = self.jit_native_region_edge_count;
+            let direct_links_before = self.jit_native_direct_link_count;
             let status = unsafe { entry(self as *mut Vm) };
             self.native_trace_exec_count = self.native_trace_exec_count.saturating_add(1);
             if !is_region
@@ -341,6 +344,7 @@ impl Vm {
                 exit_keys = state.5;
                 is_region = state.6;
             }
+            self.record_native_direct_escape(status, direct_links_before);
             if is_region {
                 self.jit_native_region_entry_count =
                     self.jit_native_region_entry_count.saturating_add(1);
@@ -521,12 +525,33 @@ impl Vm {
         }
     }
 
+    fn record_native_direct_escape(&mut self, status: i32, direct_links_before: u64) {
+        if !self.jit_native_direct_links_enabled
+            || self.jit_native_direct_region_fallback
+            || self.jit_native_direct_link_count == direct_links_before
+        {
+            return;
+        }
+        let escaped = status == native::STATUS_LINKED_CONTINUE
+            || crate::vm::native::decode_jit_trace_exit_status(status).is_some();
+        if !escaped {
+            return;
+        }
+        self.jit_native_direct_escape_streak =
+            self.jit_native_direct_escape_streak.saturating_add(1);
+        if self.jit_native_direct_escape_streak < NATIVE_DIRECT_ESCAPE_REGION_THRESHOLD {
+            return;
+        }
+        self.clear_native_direct_links();
+        self.jit_native_direct_region_fallback = true;
+    }
+
     fn publish_native_direct_link(
         &mut self,
         key: TraceExitKey,
         child_trace_id: usize,
     ) -> VmResult<()> {
-        if !self.jit_native_direct_links_enabled {
+        if !self.jit_native_direct_links_enabled || self.jit_native_direct_region_fallback {
             return Ok(());
         }
         self.publish_native_direct_slot(key.parent_trace_id, key.exit_id.raw(), child_trace_id)
@@ -568,7 +593,7 @@ impl Vm {
         all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
     ))]
     fn maybe_publish_native_region(&mut self, key: TraceExitKey, child_trace_id: usize) {
-        if self.jit_native_direct_links_enabled {
+        if self.jit_native_direct_links_enabled && !self.jit_native_direct_region_fallback {
             return;
         }
         let Some(candidate) = self.jit.region_candidate(key, child_trace_id) else {
@@ -695,6 +720,8 @@ impl Vm {
         self.jit_native_region_edge_count = 0;
         self.jit_native_direct_link_count = 0;
         self.jit_native_active_direct_trace_id = usize::MAX;
+        self.jit_native_direct_escape_streak = 0;
+        self.jit_native_direct_region_fallback = false;
         self.jit_native_compile_time_ns = 0;
         self.jit_native_region_compile_time_ns = 0;
         self.jit_trace_exit_count = 0;
@@ -908,6 +935,7 @@ impl Vm {
         native::clear_bridge_error();
         loop {
             let region_edges_before = self.jit_native_region_edge_count;
+            let direct_links_before = self.jit_native_direct_link_count;
             let status = unsafe { entry(self as *mut Vm) };
             self.native_trace_exec_count = self.native_trace_exec_count.saturating_add(1);
             if !is_region
@@ -923,6 +951,7 @@ impl Vm {
                 exit_keys = state.5;
                 is_region = state.6;
             }
+            self.record_native_direct_escape(status, direct_links_before);
             if is_region {
                 self.jit_native_region_entry_count =
                     self.jit_native_region_entry_count.saturating_add(1);
@@ -1498,6 +1527,8 @@ impl Vm {
         self.jit_native_direct_links_enabled = enabled;
         self.jit_native_direct_link_count = 0;
         self.jit_native_active_direct_trace_id = usize::MAX;
+        self.jit_native_direct_escape_streak = 0;
+        self.jit_native_direct_region_fallback = false;
     }
 
     pub fn jit_native_region_count(&self) -> usize {
