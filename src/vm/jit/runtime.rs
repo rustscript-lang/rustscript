@@ -62,6 +62,10 @@ fn scalar_cycle_import(import: &super::deopt::SideTraceImport) -> bool {
     })
 }
 
+fn elapsed_ns(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
 pub(crate) struct NativeTrace {
     _keepalive: Arc<Mutex<native::TraceKeepAlive>>,
     entry: NativeTraceEntry,
@@ -534,12 +538,17 @@ impl Vm {
         let interrupt_settings = self.active_native_interrupt_settings();
         let compile_profile = native::NativeCompileProfile::Jit;
         let drop_contract_events_enabled = self.drop_contract_events_enabled();
-        let compiled = match native::compile_native_region(
+        let compile_started = std::time::Instant::now();
+        let compile_result = native::compile_native_region(
             &fused,
             interrupt_settings,
             compile_profile,
             drop_contract_events_enabled,
-        ) {
+        );
+        self.jit_native_region_compile_time_ns = self
+            .jit_native_region_compile_time_ns
+            .saturating_add(elapsed_ns(compile_started));
+        let compiled = match compile_result {
             Ok(compiled) => compiled,
             Err(_) => {
                 self.jit.record_region_compile_failure(&candidate);
@@ -606,6 +615,8 @@ impl Vm {
         self.native_trace_exec_count = 0;
         self.jit_native_region_entry_count = 0;
         self.jit_native_region_edge_count = 0;
+        self.jit_native_compile_time_ns = 0;
+        self.jit_native_region_compile_time_ns = 0;
         self.jit_trace_exit_count = 0;
         self.jit_native_loop_back_count = 0;
         self.jit_native_link_handoff_count = 0;
@@ -624,6 +635,31 @@ impl Vm {
 
     pub fn jit_exit_profiles(&self) -> Vec<super::JitExitProfile> {
         self.jit.exit_profiles()
+    }
+
+    pub fn jit_native_code_bytes(&self) -> usize {
+        self.native_traces
+            .iter()
+            .flatten()
+            .map(|native| native.code.len())
+            .sum()
+    }
+
+    pub fn jit_native_region_code_bytes(&self) -> usize {
+        self.native_traces
+            .iter()
+            .flatten()
+            .filter_map(|native| native.region.as_ref())
+            .map(|region| region.code.len())
+            .sum()
+    }
+
+    pub fn jit_native_compile_time_ns(&self) -> u64 {
+        self.jit_native_compile_time_ns
+    }
+
+    pub fn jit_native_region_compile_time_ns(&self) -> u64 {
+        self.jit_native_region_compile_time_ns
     }
 
     pub fn dump_jit_info(&self) -> String {
@@ -653,6 +689,15 @@ impl Vm {
         out.push_str(&format!(
             "  native internal region edges: {}\n",
             self.jit_native_region_edge_count
+        ));
+        out.push_str(&format!(
+            "  native compile time: {} ns (regions={} ns)\n",
+            self.jit_native_compile_time_ns, self.jit_native_region_compile_time_ns
+        ));
+        out.push_str(&format!(
+            "  native code bytes: {} (regions={})\n",
+            self.jit_native_code_bytes(),
+            self.jit_native_region_code_bytes()
         ));
         if self.jit_native_bridge_stats_enabled {
             let mut bridge_entries: Vec<(&'static str, u64)> = self
@@ -1235,12 +1280,17 @@ impl Vm {
             return Ok(());
         }
 
-        let compiled = native::compile_native_trace(
+        let compile_started = std::time::Instant::now();
+        let compile_result = native::compile_native_trace(
             &trace,
             interrupt_settings,
             compile_profile,
             drop_contract_events_enabled,
-        )?;
+        );
+        self.jit_native_compile_time_ns = self
+            .jit_native_compile_time_ns
+            .saturating_add(elapsed_ns(compile_started));
+        let compiled = compile_result?;
         let entry = unsafe { std::mem::transmute::<*const u8, NativeTraceEntry>(compiled.entry) };
         let code = Arc::<[u8]>::from(compiled.code.into_boxed_slice());
         let keepalive = Arc::new(Mutex::new(compiled.keepalive));

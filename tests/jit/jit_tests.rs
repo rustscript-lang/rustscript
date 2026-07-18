@@ -2531,6 +2531,51 @@ fn trace_jit_region_respects_fuel_and_epoch_interrupts() {
 }
 
 #[test]
+fn trace_jit_region_reports_compile_and_code_telemetry() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        let mut i = 0;
+        let mut total = 0;
+        while i < 128 {
+            if i % 2 == 0 {
+                total = total + 3;
+            } else {
+                total = total + 5;
+            }
+            i = i + 1;
+        }
+        total;
+    "#;
+    let compiled = compile_source(source).expect("region telemetry fixture should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 256,
+    });
+
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert!(vm.jit_native_code_bytes() > 0, "{}", vm.dump_jit_info());
+    assert!(
+        vm.jit_native_region_code_bytes() > 0,
+        "{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        vm.jit_native_compile_time_ns() > 0,
+        "{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        vm.jit_native_region_compile_time_ns() > 0,
+        "{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
 fn trace_jit_region_republishes_after_native_settings_change() {
     if !native_jit_supported() {
         return;
