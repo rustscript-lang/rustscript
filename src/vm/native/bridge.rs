@@ -1330,24 +1330,13 @@ pub(crate) extern "C" fn pd_vm_native_non_yielding_host_call(
         ));
         return STATUS_ERROR;
     }
-    let Some(&resolved) = vm.resolved_calls.get(import) else {
-        store_bridge_error(VmError::InvalidCall(import as u16));
-        return STATUS_ERROR;
-    };
-    let Some(VmHostFunction::ArgsStaticNonYielding(function)) =
-        vm.host_functions.get(usize::from(resolved))
-    else {
-        store_bridge_error(VmError::JitNative(
-            "native host-call binding changed after trace compilation".to_string(),
-        ));
-        return STATUS_ERROR;
-    };
-
     let args = unsafe { std::slice::from_raw_parts(args, argc) };
-    vm.call_depth = vm.call_depth.saturating_add(1);
-    let outcome = function(args);
-    vm.call_depth = vm.call_depth.saturating_sub(1);
-    match outcome.and_then(crate::vm::host::require_non_yielding_host_value) {
+    let expected_return_type = vm
+        .program
+        .imports
+        .get(import)
+        .map(|host_import| host_import.return_type);
+    match call_non_yielding_host_value(vm, import, args, expected_return_type) {
         Ok(value) => {
             unsafe { std::ptr::write(out, value) };
             STATUS_CONTINUE
@@ -1359,7 +1348,12 @@ pub(crate) extern "C" fn pd_vm_native_non_yielding_host_call(
     }
 }
 
-fn call_non_yielding_host_value(vm: &mut Vm, import: usize, args: &[Value]) -> VmResult<Value> {
+fn call_non_yielding_host_value(
+    vm: &mut Vm,
+    import: usize,
+    args: &[Value],
+    expected_return_type: Option<ValueType>,
+) -> VmResult<Value> {
     let resolved = *vm
         .resolved_calls
         .get(import)
@@ -1375,7 +1369,25 @@ fn call_non_yielding_host_value(vm: &mut Vm, import: usize, args: &[Value]) -> V
     vm.call_depth = vm.call_depth.saturating_add(1);
     let outcome = function(args);
     vm.call_depth = vm.call_depth.saturating_sub(1);
-    outcome.and_then(crate::vm::host::require_non_yielding_host_value)
+    outcome
+        .and_then(crate::vm::host::require_non_yielding_host_value)
+        .and_then(|value| {
+            crate::vm::host::validate_non_yielding_host_value(value, expected_return_type)
+        })
+}
+
+fn scalar_host_return_type(return_type: i64) -> VmResult<ValueType> {
+    if return_type == ValueType::Int as i64 {
+        Ok(ValueType::Int)
+    } else if return_type == ValueType::Float as i64 {
+        Ok(ValueType::Float)
+    } else if return_type == ValueType::Bool as i64 {
+        Ok(ValueType::Bool)
+    } else {
+        Err(VmError::JitNative(
+            "native scalar host-call return type is unsupported".to_string(),
+        ))
+    }
 }
 
 fn store_scalar_host_result(value: Value, return_type: i64, out: *mut u64) -> VmResult<()> {
@@ -1419,7 +1431,8 @@ pub(crate) extern "C" fn pd_vm_native_non_yielding_scalar_host_call(
         return STATUS_ERROR;
     }
     let args = unsafe { std::slice::from_raw_parts(args, argc) };
-    match call_non_yielding_host_value(vm, import, args)
+    match scalar_host_return_type(return_type)
+        .and_then(|expected| call_non_yielding_host_value(vm, import, args, Some(expected)))
         .and_then(|value| store_scalar_host_result(value, return_type, out))
     {
         Ok(()) => STATUS_CONTINUE,
@@ -1452,7 +1465,10 @@ pub(crate) extern "C" fn pd_vm_native_non_yielding_i64_host_call(
         return STATUS_ERROR;
     }
     let storage = [Value::Int(arg0), Value::Int(arg1)];
-    match call_non_yielding_host_value(vm, import, &storage[..argc])
+    match scalar_host_return_type(return_type)
+        .and_then(|expected| {
+            call_non_yielding_host_value(vm, import, &storage[..argc], Some(expected))
+        })
         .and_then(|value| store_scalar_host_result(value, return_type, out))
     {
         Ok(()) => STATUS_CONTINUE,
