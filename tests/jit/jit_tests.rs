@@ -2263,6 +2263,55 @@ fn trace_jit_reports_exact_parent_exit_profiles() {
 }
 
 #[test]
+fn trace_jit_region_links_hot_same_frame_side_exit() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn choose(i: int) -> int {
+            if i % 2 == 0 => { 3 } else => { 5 }
+        }
+
+        let mut i = 0;
+        let mut total = 0;
+        while i < 256 {
+            total = total + choose(i);
+            i = i + 1;
+        }
+        total;
+    "#;
+    let compiled = compile_source(source).expect("region fixture should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 256,
+    });
+
+    assert_eq!(vm.run().expect("first region run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(1_024)]);
+    let first_handoffs = vm.jit_native_link_handoff_count();
+    assert!(
+        first_handoffs > 0,
+        "expected warmup to cross native trace boundaries:\n{}",
+        vm.dump_jit_info()
+    );
+
+    vm.reset_for_reuse();
+    assert_eq!(vm.run().expect("second region run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(1_024)]);
+
+    let second_run_handoffs = vm
+        .jit_native_link_handoff_count()
+        .saturating_sub(first_handoffs);
+    assert!(
+        second_run_handoffs <= 2,
+        "expected bounded external handoffs after region installation, second_run_handoffs={second_run_handoffs}:\n{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
 fn trace_jit_restores_tagged_heap_locals_on_ssa_exit() {
     if !native_jit_supported() {
         return;
