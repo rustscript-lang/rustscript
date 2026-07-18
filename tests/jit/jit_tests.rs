@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use vm::{
     BytecodeBuilder, CallOutcome, CallReturn, HostFunction, JitConfig, JitTraceTerminal, OpCode,
     Program, Value, ValueType, Vm, VmStatus, VmYieldReason, builtin_call_index, compile_source,
@@ -2375,6 +2377,157 @@ fn trace_jit_region_cycle_propagates_disjoint_dirty_locals() {
         "{}",
         vm.dump_jit_info()
     );
+}
+
+#[test]
+fn trace_jit_region_unlinked_exit_restores_callable_frame() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn probe(limit, stop) {
+            let mut i = 0;
+            let mut total = 0;
+            while i < limit {
+                if i == stop {
+                    break;
+                }
+                if i % 2 == 0 {
+                    total = total + 3;
+                } else {
+                    total = total + 5;
+                }
+                i = i + 1;
+            }
+            total * 1000 + i
+        }
+        probe(257, 50) + 1;
+    "#;
+    let compiled = compile_source(source).expect("unlinked callable exit fixture should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(200_051)], "{}", vm.dump_jit_info());
+    assert_eq!(vm.jit_native_region_count(), 1, "{}", vm.dump_jit_info());
+    assert!(vm.jit_native_internal_region_edge_count() > 0);
+    assert_eq!(vm.jit_helper_fallback_count(), 0, "{}", vm.dump_jit_info());
+}
+
+#[test]
+fn trace_jit_region_preserves_owned_value_drop_contract() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        let payload = ["owned"];
+        let mut i = 0;
+        let mut total = 0;
+        while i < 50 {
+            if i % 2 == 0 {
+                total = total + 3;
+            } else {
+                total = total + 5;
+            }
+            i = i + 1;
+        }
+        [payload, total];
+    "#;
+    let compiled = compile_source(source).expect("owned region fixture should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 256,
+    });
+
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    let Value::Array(output) = &vm.stack()[0] else {
+        panic!("expected owned array output: {}", vm.dump_jit_info());
+    };
+    let output = Arc::clone(output);
+    assert_eq!(output.as_slice()[1], Value::Int(200));
+    assert_eq!(vm.jit_native_region_count(), 1, "{}", vm.dump_jit_info());
+    assert!(vm.jit_native_internal_region_edge_count() > 0);
+    assert_eq!(Arc::strong_count(&output), 2);
+
+    vm.set_drop_contract_events_enabled(true);
+    assert_eq!(vm.jit_native_region_count(), 0);
+    vm.reset_for_reuse();
+    assert_eq!(Arc::strong_count(&output), 1);
+    drop(vm);
+    assert_eq!(Arc::strong_count(&output), 1);
+}
+
+#[test]
+fn trace_jit_region_respects_fuel_and_epoch_interrupts() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        let mut i = 0;
+        let mut total = 0;
+        while i < 256 {
+            if i % 2 == 0 {
+                total = total + 3;
+            } else {
+                total = total + 5;
+            }
+            i = i + 1;
+        }
+        total;
+    "#;
+    let compiled = compile_source(source).expect("region interrupt fixture should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 256,
+    });
+
+    vm.set_fuel_check_interval(1).unwrap();
+    vm.set_fuel(1_000_000);
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.jit_native_region_count(), 1, "{}", vm.dump_jit_info());
+
+    vm.reset_for_reuse();
+    vm.set_fuel(8);
+    let mut fuel_yields = 0_u64;
+    loop {
+        match vm.run().expect("fuel region run should make progress") {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => {
+                fuel_yields = fuel_yields.saturating_add(1);
+                assert_eq!(vm.last_yield_reason(), Some(VmYieldReason::Fuel));
+                assert!(fuel_yields < 1_024, "{}", vm.dump_jit_info());
+                vm.recharge_fuel(16).unwrap();
+            }
+            VmStatus::Waiting(op_id) => panic!("unexpected host wait {op_id}"),
+        }
+    }
+    assert!(fuel_yields > 0);
+    assert_eq!(vm.stack(), &[Value::Int(1_024)]);
+    assert_eq!(vm.jit_native_region_count(), 1, "{}", vm.dump_jit_info());
+
+    vm.clear_fuel();
+    vm.reset_for_reuse();
+    vm.set_epoch_check_interval(1).unwrap();
+    vm.set_epoch_deadline(1_000_000).unwrap();
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.jit_native_region_count(), 1, "{}", vm.dump_jit_info());
+
+    vm.reset_for_reuse();
+    vm.set_epoch_deadline(0).unwrap();
+    assert_eq!(vm.run().unwrap(), VmStatus::Yielded);
+    assert_eq!(vm.last_yield_reason(), Some(VmYieldReason::Epoch));
+    vm.clear_epoch_deadline();
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(1_024)]);
+    assert_eq!(vm.jit_native_region_count(), 1, "{}", vm.dump_jit_info());
 }
 
 #[test]
