@@ -314,9 +314,9 @@ impl HostFunctionRegistry {
     /// Registers a static args-only host function that always returns one value synchronously.
     ///
     /// The returned [`Value`] must match the return type declared by the corresponding host
-    /// import. Returning a different type, no value, `Halt`, `Yield`, or `Pending` violates the
-    /// contract and is reported as a host error. When appropriate, the native JIT may keep traces
-    /// active across the call boundary.
+    /// import. Returning a different type is reported as [`VmError::TypeMismatch`]. Returning no
+    /// value, `Halt`, `Yield`, or `Pending` violates the contract and is reported as a host error.
+    /// When appropriate, the native JIT may keep traces active across the call boundary.
     pub fn register_static_non_yielding_args(
         &mut self,
         name: impl Into<String>,
@@ -610,8 +610,9 @@ impl Vm {
     /// Registers a static args-only host function that always returns one value synchronously.
     ///
     /// When used to resolve a declared host import, the returned [`Value`] must match that
-    /// import's return type. Returning a different type, no value, `Halt`, `Yield`, or `Pending`
-    /// violates the contract and is a host error.
+    /// import's return type. Returning a different type is reported as
+    /// [`VmError::TypeMismatch`]. Returning no value, `Halt`, `Yield`, or `Pending` violates the
+    /// contract and is a host error.
     pub fn register_static_non_yielding_args_function(
         &mut self,
         function: StaticHostArgsFunction,
