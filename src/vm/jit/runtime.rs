@@ -68,7 +68,10 @@ fn elapsed_ns(started: std::time::Instant) -> u64 {
 
 pub(crate) struct NativeTrace {
     _keepalive: Arc<Mutex<native::TraceKeepAlive>>,
+    _direct_keepalives: Vec<Arc<Mutex<native::TraceKeepAlive>>>,
     entry: NativeTraceEntry,
+    tail_entry: NativeTraceEntry,
+    direct_slots: Arc<HashMap<u32, Arc<native::NativeSideLinkSlot>>>,
     pub(super) code: Arc<[u8]>,
     root_ip: usize,
     terminal: JitTraceTerminal,
@@ -124,6 +127,7 @@ struct NativeTraceCacheKey {
 #[derive(Clone)]
 struct NativeTraceCacheEntry {
     entry: NativeTraceEntry,
+    tail_entry: NativeTraceEntry,
     keepalive: Arc<Mutex<native::TraceKeepAlive>>,
     code: Arc<[u8]>,
     lowering_kind: native::TraceLoweringKind,
@@ -324,6 +328,19 @@ impl Vm {
             let region_edges_before = self.jit_native_region_edge_count;
             let status = unsafe { entry(self as *mut Vm) };
             self.native_trace_exec_count = self.native_trace_exec_count.saturating_add(1);
+            if !is_region
+                && self.jit_native_active_direct_trace_id != usize::MAX
+                && self.jit_native_active_direct_trace_id != current_trace_id
+            {
+                current_trace_id = self.jit_native_active_direct_trace_id;
+                let state = self.native_trace_state(current_trace_id)?;
+                entry = state.0;
+                root_ip = state.1;
+                terminal = state.2;
+                has_yielding_call = state.4;
+                exit_keys = state.5;
+                is_region = state.6;
+            }
             if is_region {
                 self.jit_native_region_entry_count =
                     self.jit_native_region_entry_count.saturating_add(1);
@@ -369,6 +386,11 @@ impl Vm {
                     if let Some(next_trace_id) = next_trace_id
                         && next_trace_id != current_trace_id
                     {
+                        self.publish_native_direct_slot(
+                            current_trace_id,
+                            native::CONTINUE_SLOT_ID,
+                            next_trace_id,
+                        )?;
                         self.record_jit_link_handoff();
                         current_trace_id = next_trace_id;
                         if let Err(err) = self.ensure_native_trace(
@@ -434,6 +456,7 @@ impl Vm {
                             && next_trace_id != current_trace_id
                         {
                             if let Some(key) = trace_exit_key {
+                                self.publish_native_direct_link(key, next_trace_id)?;
                                 self.maybe_publish_native_region(key, next_trace_id);
                             }
                             self.record_jit_link_handoff();
@@ -490,6 +513,53 @@ impl Vm {
         }
     }
 
+    fn clear_native_direct_links(&self) {
+        for native in self.native_traces.iter().flatten() {
+            for slot in native.direct_slots.values() {
+                slot.clear();
+            }
+        }
+    }
+
+    fn publish_native_direct_link(
+        &mut self,
+        key: TraceExitKey,
+        child_trace_id: usize,
+    ) -> VmResult<()> {
+        if !self.jit_native_direct_links_enabled {
+            return Ok(());
+        }
+        self.publish_native_direct_slot(key.parent_trace_id, key.exit_id.raw(), child_trace_id)
+    }
+
+    fn publish_native_direct_slot(
+        &mut self,
+        parent_trace_id: usize,
+        slot_id: u32,
+        child_trace_id: usize,
+    ) -> VmResult<()> {
+        self.ensure_native_trace(child_trace_id, native::NativeCompileProfile::Jit)?;
+        let child_entry = self
+            .native_traces
+            .get(child_trace_id)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                VmError::JitNative("direct-link child native trace missing".to_string())
+            })?
+            .tail_entry as *const u8;
+        let Some(slot) = self
+            .native_traces
+            .get(parent_trace_id)
+            .and_then(Option::as_ref)
+            .and_then(|native| native.direct_slots.get(&slot_id))
+            .cloned()
+        else {
+            return Ok(());
+        };
+        slot.publish(child_entry);
+        Ok(())
+    }
+
     #[cfg(any(
         all(
             target_arch = "x86_64",
@@ -498,6 +568,9 @@ impl Vm {
         all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
     ))]
     fn maybe_publish_native_region(&mut self, key: TraceExitKey, child_trace_id: usize) {
+        if self.jit_native_direct_links_enabled {
+            return;
+        }
         let Some(candidate) = self.jit.region_candidate(key, child_trace_id) else {
             return;
         };
@@ -615,10 +688,13 @@ impl Vm {
         if config.enabled {
             self.ensure_program_cache_key();
         }
+        self.clear_native_direct_links();
         self.native_traces.clear();
         self.native_trace_exec_count = 0;
         self.jit_native_region_entry_count = 0;
         self.jit_native_region_edge_count = 0;
+        self.jit_native_direct_link_count = 0;
+        self.jit_native_active_direct_trace_id = usize::MAX;
         self.jit_native_compile_time_ns = 0;
         self.jit_native_region_compile_time_ns = 0;
         self.jit_trace_exit_count = 0;
@@ -693,6 +769,10 @@ impl Vm {
         out.push_str(&format!(
             "  native internal region edges: {}\n",
             self.jit_native_region_edge_count
+        ));
+        out.push_str(&format!(
+            "  native direct side links: {}\n",
+            self.jit_native_direct_link_count
         ));
         out.push_str(&format!(
             "  native compile time: {} ns (regions={} ns)\n",
@@ -830,6 +910,19 @@ impl Vm {
             let region_edges_before = self.jit_native_region_edge_count;
             let status = unsafe { entry(self as *mut Vm) };
             self.native_trace_exec_count = self.native_trace_exec_count.saturating_add(1);
+            if !is_region
+                && self.jit_native_active_direct_trace_id != usize::MAX
+                && self.jit_native_active_direct_trace_id != current_trace_id
+            {
+                current_trace_id = self.jit_native_active_direct_trace_id;
+                let state = self.native_trace_state(current_trace_id)?;
+                entry = state.0;
+                root_ip = state.1;
+                terminal = state.2;
+                has_yielding_call = state.4;
+                exit_keys = state.5;
+                is_region = state.6;
+            }
             if is_region {
                 self.jit_native_region_entry_count =
                     self.jit_native_region_entry_count.saturating_add(1);
@@ -875,6 +968,11 @@ impl Vm {
                     if let Some(next_trace_id) = next_trace_id
                         && next_trace_id != current_trace_id
                     {
+                        self.publish_native_direct_slot(
+                            current_trace_id,
+                            native::CONTINUE_SLOT_ID,
+                            next_trace_id,
+                        )?;
                         self.record_jit_link_handoff();
                         current_trace_id = next_trace_id;
                         if let Some(state) = self.cached_native_trace_state(
@@ -965,6 +1063,7 @@ impl Vm {
                             && next_trace_id != current_trace_id
                         {
                             if let Some(key) = trace_exit_key {
+                                self.publish_native_direct_link(key, next_trace_id)?;
                                 self.maybe_publish_native_region(key, next_trace_id);
                             }
                             self.record_jit_link_handoff();
@@ -1034,6 +1133,18 @@ impl Vm {
                     if let Some(next_trace_id) = next_trace_id
                         && next_trace_id != current_trace_id
                     {
+                        let same_frame = self
+                            .jit
+                            .trace_clone(current_trace_id)
+                            .zip(self.jit.trace_clone(next_trace_id))
+                            .is_some_and(|(parent, child)| parent.frame_key == child.frame_key);
+                        if same_frame {
+                            self.publish_native_direct_slot(
+                                current_trace_id,
+                                native::LINKED_CONTINUE_SLOT_ID,
+                                next_trace_id,
+                            )?;
+                        }
                         self.record_jit_link_handoff();
                         current_trace_id = next_trace_id;
                         if let Some(state) = self.cached_native_trace_state(
@@ -1242,6 +1353,7 @@ impl Vm {
         {
             self.disconnect_native_regions();
         }
+        self.clear_native_direct_links();
         if let Some(slot) = self.native_traces.get_mut(trace_id) {
             *slot = None;
         }
@@ -1262,19 +1374,36 @@ impl Vm {
                 cache.entries.clear();
                 cache.active_program_key = Some(program_cache_key);
             }
-            if let Some(cached) = cache.entries.get(&key).cloned() {
-                return Some(cached);
-            }
-            None
+            cache.entries.get(&key).cloned()
         });
         if let Some(cached) = cached {
+            let dispatcher = native::compile_native_trace_dispatcher(
+                trace_id,
+                cached.entry as *const u8,
+                &trace,
+            )?;
+            let entry =
+                unsafe { std::mem::transmute::<*const u8, NativeTraceEntry>(dispatcher.entry) };
+            let tail_entry = unsafe {
+                std::mem::transmute::<*const u8, NativeTraceEntry>(dispatcher.tail_entry)
+            };
+            let direct_keepalives = dispatcher
+                .keepalives
+                .into_iter()
+                .map(|keepalive| Arc::new(Mutex::new(keepalive)))
+                .collect();
+            let mut code = cached.code.to_vec();
+            code.extend_from_slice(&dispatcher.code);
             if self.native_traces.len() <= trace_id {
                 self.native_traces.resize_with(trace_id + 1, || None);
             }
             self.native_traces[trace_id] = Some(NativeTrace {
                 _keepalive: cached.keepalive,
-                entry: cached.entry,
-                code: cached.code,
+                _direct_keepalives: direct_keepalives,
+                entry,
+                tail_entry,
+                direct_slots: Arc::new(dispatcher.slots),
+                code: Arc::from(code.into_boxed_slice()),
                 root_ip: trace.root_ip,
                 terminal: trace.terminal,
                 has_call: trace.has_call,
@@ -1299,14 +1428,19 @@ impl Vm {
             .jit_native_compile_time_ns
             .saturating_add(elapsed_ns(compile_started));
         let compiled = compile_result?;
-        let entry = unsafe { std::mem::transmute::<*const u8, NativeTraceEntry>(compiled.entry) };
-        let code = Arc::<[u8]>::from(compiled.code.into_boxed_slice());
+        let lowering_kind = compiled.lowering_kind;
+        let base_entry =
+            unsafe { std::mem::transmute::<*const u8, NativeTraceEntry>(compiled.entry) };
+        let base_tail_entry =
+            unsafe { std::mem::transmute::<*const u8, NativeTraceEntry>(compiled.tail_entry) };
         let keepalive = Arc::new(Mutex::new(compiled.keepalive));
+        let base_code = Arc::<[u8]>::from(compiled.code.clone().into_boxed_slice());
         let cached = NativeTraceCacheEntry {
-            entry,
+            entry: base_entry,
+            tail_entry: base_tail_entry,
             keepalive: Arc::clone(&keepalive),
-            code: Arc::clone(&code),
-            lowering_kind: compiled.lowering_kind,
+            code: Arc::clone(&base_code),
+            lowering_kind,
             compile_profile,
         };
         with_native_trace_cache(|cache| {
@@ -1316,18 +1450,34 @@ impl Vm {
             }
             cache.entries.insert(key, cached);
         });
+        let dispatcher = native::compile_native_trace_dispatcher(trace_id, compiled.entry, &trace)?;
+        let entry = unsafe { std::mem::transmute::<*const u8, NativeTraceEntry>(dispatcher.entry) };
+        let tail_entry =
+            unsafe { std::mem::transmute::<*const u8, NativeTraceEntry>(dispatcher.tail_entry) };
+        let direct_keepalives = dispatcher
+            .keepalives
+            .into_iter()
+            .map(|keepalive| Arc::new(Mutex::new(keepalive)))
+            .collect();
+        let direct_slots = Arc::new(dispatcher.slots);
+        let mut code = compiled.code;
+        code.extend_from_slice(&dispatcher.code);
+        let code = Arc::<[u8]>::from(code.into_boxed_slice());
         if self.native_traces.len() <= trace_id {
             self.native_traces.resize_with(trace_id + 1, || None);
         }
         self.native_traces[trace_id] = Some(NativeTrace {
             _keepalive: keepalive,
+            _direct_keepalives: direct_keepalives,
             entry,
+            tail_entry,
+            direct_slots,
             code,
             root_ip: trace.root_ip,
             terminal: trace.terminal,
             has_call: trace.has_call,
             has_yielding_call: trace.has_yielding_call,
-            lowering_kind: compiled.lowering_kind,
+            lowering_kind,
             interrupt_settings,
             compile_profile,
             drop_contract_events_enabled,
@@ -1344,6 +1494,18 @@ impl Vm {
         self.native_trace_exec_count
     }
 
+    pub fn set_jit_native_direct_links_enabled(&mut self, enabled: bool) {
+        if self.jit_native_direct_links_enabled == enabled {
+            return;
+        }
+        self.clear_native_direct_links();
+        self.disconnect_native_regions();
+        self.native_traces.clear();
+        self.jit_native_direct_links_enabled = enabled;
+        self.jit_native_direct_link_count = 0;
+        self.jit_native_active_direct_trace_id = usize::MAX;
+    }
+
     pub fn jit_native_region_count(&self) -> usize {
         self.native_traces
             .iter()
@@ -1358,6 +1520,19 @@ impl Vm {
 
     pub fn jit_native_internal_region_edge_count(&self) -> u64 {
         self.jit_native_region_edge_count
+    }
+
+    pub fn jit_native_direct_link_count(&self) -> u64 {
+        self.jit_native_direct_link_count
+    }
+
+    pub fn jit_native_active_direct_link_slot_count(&self) -> usize {
+        self.native_traces
+            .iter()
+            .flatten()
+            .flat_map(|native| native.direct_slots.values())
+            .filter(|slot| !slot.target().is_null())
+            .count()
     }
 
     pub fn jit_helper_fallback_count(&self) -> u64 {
