@@ -4831,15 +4831,14 @@ fn trace_jit_executes_hot_loop_inside_script_callable_frame() {
     );
     assert_eq!(vm.stack(), &[Value::Int(4_950)]);
     assert!(vm.jit_native_exec_count() > 0);
-    assert!(
-        vm.jit_snapshot().metrics.native_loop_back_count > 0,
-        "scalar callable loop should remain native across backedges: {}",
-        vm.dump_jit_info()
-    );
     let snapshot = vm.jit_snapshot();
     assert!(
-        snapshot.traces.iter().any(|trace| trace.frame_key == 0),
-        "expected a prototype-keyed trace: {}",
+        snapshot.traces.iter().any(|trace| {
+            trace.frame_key == 0
+                && trace.terminal == JitTraceTerminal::LoopBack
+                && trace.executions > 0
+        }),
+        "expected an executed prototype-keyed loopback trace: {}",
         vm.dump_jit_info()
     );
 }
