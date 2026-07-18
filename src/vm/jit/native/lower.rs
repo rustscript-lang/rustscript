@@ -282,6 +282,9 @@ fn try_compile_ssa_trace(
             let call_value_block = call_value_exits
                 .contains_key(&exit.id)
                 .then(|| b.create_block());
+            let interrupt_block = (interrupt_settings.is_some()
+                && internal_links.iter().any(|link| link.exit == exit.id))
+            .then(|| b.create_block());
             for value in &inputs {
                 let Some(repr) = value_reprs.get(value).copied() else {
                     return Ok(None);
@@ -294,6 +297,9 @@ fn try_compile_ssa_trace(
                 if let Some(call_value_block) = call_value_block {
                     b.append_block_param(call_value_block, ty);
                 }
+                if let Some(interrupt_block) = interrupt_block {
+                    b.append_block_param(interrupt_block, ty);
+                }
             }
             exit_specs.insert(
                 exit.id,
@@ -301,6 +307,7 @@ fn try_compile_ssa_trace(
                     trace_exit_block,
                     halted_block,
                     call_value_block,
+                    interrupt_block,
                     inputs,
                 },
             );
@@ -330,6 +337,8 @@ fn try_compile_ssa_trace(
             ssa.entry_stack_depth,
             entry_local_count,
         )?;
+        let interrupt_ops_to_advance = u32::try_from(trace.op_names.len().max(1))
+            .map_err(|_| VmError::JitNative("trace op count exceeds u32".to_string()))?;
         let lower_ctx = SsaLowerCtx {
             vm_ptr,
             active_stack_base,
@@ -349,6 +358,8 @@ fn try_compile_ssa_trace(
             borrowed_array_gets: &borrowed_array_gets,
             value_reprs: &value_reprs,
             tagged_constant_addrs: &tagged_constant_addrs,
+            interrupt_settings,
+            interrupt_ops_to_advance,
         };
         let root_ip = b.ins().iconst(
             pointer_type,
@@ -376,8 +387,6 @@ fn try_compile_ssa_trace(
         b.ins().jump(entry_handle, &entry_args);
 
         let charge_blocks = ssa_interrupt_charge_blocks(ssa);
-        let ops_to_advance = u32::try_from(trace.op_names.len().max(1))
-            .map_err(|_| VmError::JitNative("trace op count exceeds u32".to_string()))?;
         for block in &ssa.blocks {
             let handle = *block_handles
                 .get(&block.id)
@@ -388,7 +397,8 @@ fn try_compile_ssa_trace(
             for (param, lowered) in block.params.iter().zip(block_params.iter().copied()) {
                 values.insert(param.value.id, lowered);
             }
-            if charge_blocks.contains(&block.id)
+            if internal_links.is_empty()
+                && charge_blocks.contains(&block.id)
                 && let Some(settings) = interrupt_settings
             {
                 emit_interrupt_tick_inline(
@@ -396,7 +406,7 @@ fn try_compile_ssa_trace(
                     vm_ptr,
                     exit_block,
                     offsets,
-                    ops_to_advance,
+                    lower_ctx.interrupt_ops_to_advance,
                     settings,
                 );
             }
@@ -445,6 +455,9 @@ fn try_compile_ssa_trace(
                         resume_ip,
                     },
                 )?;
+            }
+            if spec.interrupt_block.is_some() {
+                lower_ssa_exit_block(&mut b, lower_ctx, exit, spec, SsaExitAction::InterruptYield)?;
             }
         }
 
@@ -500,6 +513,7 @@ struct SsaExitLowering {
     trace_exit_block: Block,
     halted_block: Block,
     call_value_block: Option<Block>,
+    interrupt_block: Option<Block>,
     inputs: Vec<SsaValueId>,
 }
 
@@ -514,6 +528,7 @@ enum SsaExitAction {
         call_ip: usize,
         resume_ip: usize,
     },
+    InterruptYield,
 }
 
 #[derive(Clone, Copy)]
@@ -636,6 +651,8 @@ struct SsaLowerCtx<'a> {
     borrowed_array_gets: &'a BTreeSet<SsaValueId>,
     value_reprs: &'a HashMap<SsaValueId, SsaValueRepr>,
     tagged_constant_addrs: &'a HashMap<SsaValueId, usize>,
+    interrupt_settings: Option<NativeInterruptSettings>,
+    interrupt_ops_to_advance: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -3209,7 +3226,7 @@ fn lower_ssa_terminator(
             let condition = *values
                 .get(condition)
                 .ok_or_else(|| VmError::JitNative("SSA branch condition missing".to_string()))?;
-            let true_target = ssa_branch_target_block(
+            let (true_block, true_args, true_pending) = ssa_branch_target_block(
                 b,
                 ctx,
                 if_true,
@@ -3218,7 +3235,7 @@ fn lower_ssa_terminator(
                 exit_specs,
                 internal_links,
             )?;
-            let false_target = ssa_branch_target_block(
+            let (false_block, false_args, false_pending) = ssa_branch_target_block(
                 b,
                 ctx,
                 if_false,
@@ -3227,25 +3244,42 @@ fn lower_ssa_terminator(
                 exit_specs,
                 internal_links,
             )?;
-            let true_args = ssa_block_args(true_target.1);
-            let false_args = ssa_block_args(false_target.1);
-            b.ins().brif(
-                condition,
-                true_target.0,
-                &true_args,
-                false_target.0,
-                &false_args,
-            );
+            let true_args = ssa_block_args(true_args);
+            let false_args = ssa_block_args(false_args);
+            b.ins()
+                .brif(condition, true_block, &true_args, false_block, &false_args);
+            if let Some(pending) = true_pending {
+                lower_pending_internal_link_gate(b, ctx, pending);
+            }
+            if let Some(pending) = false_pending {
+                lower_pending_internal_link_gate(b, ctx, pending);
+            }
         }
         SsaTerminator::Exit { exit } => {
             if let Some((link, slots)) = internal_links.find(*exit) {
                 let handle = *block_handles.get(&link.child_entry).ok_or_else(|| {
                     VmError::JitNative("fused SSA child entry block missing".to_string())
                 })?;
-                let args = lower_internal_link_args(b, ctx, link, slots, values)?;
-                increment_native_region_edge_count(b, ctx);
+                let child_args = lower_internal_link_args(b, ctx, link, slots, values)?;
+                let spec = exit_specs.get(exit).ok_or_else(|| {
+                    VmError::JitNative("SSA internal exit lowering missing".to_string())
+                })?;
+                let restore_args = spec
+                    .inputs
+                    .iter()
+                    .map(|value| {
+                        values.get(value).copied().ok_or_else(|| {
+                            VmError::JitNative("SSA internal restore arg missing".to_string())
+                        })
+                    })
+                    .collect::<VmResult<Vec<_>>>()?;
+                let (target, args, pending) =
+                    lower_internal_link_target(b, ctx, handle, child_args, spec, restore_args)?;
                 let args = ssa_block_args(args);
-                b.ins().jump(handle, &args);
+                b.ins().jump(target, &args);
+                if let Some(pending) = pending {
+                    lower_pending_internal_link_gate(b, ctx, pending);
+                }
                 return Ok(());
             }
             let spec = exit_specs
@@ -3311,7 +3345,11 @@ fn ssa_branch_target_block(
     block_handles: &HashMap<crate::vm::jit::ir::SsaBlockId, Block>,
     exit_specs: &HashMap<SsaExitId, SsaExitLowering>,
     internal_links: InternalRegionLinks<'_>,
-) -> VmResult<(Block, Vec<cranelift_codegen::ir::Value>)> {
+) -> VmResult<(
+    Block,
+    Vec<cranelift_codegen::ir::Value>,
+    Option<PendingInternalLinkGate>,
+)> {
     match target {
         SsaBranchTarget::Block { target, args } => {
             let handle = *block_handles
@@ -3326,16 +3364,29 @@ fn ssa_branch_target_block(
                         .ok_or_else(|| VmError::JitNative("SSA branch arg missing".to_string()))
                 })
                 .collect::<VmResult<Vec<_>>>()?;
-            Ok((handle, lowered_args))
+            Ok((handle, lowered_args, None))
         }
         SsaBranchTarget::Exit(exit) => {
             if let Some((link, slots)) = internal_links.find(*exit) {
                 let handle = *block_handles.get(&link.child_entry).ok_or_else(|| {
                     VmError::JitNative("fused SSA child entry block missing".to_string())
                 })?;
-                let args = lower_internal_link_args(b, ctx, link, slots, values)?;
-                increment_native_region_edge_count(b, ctx);
-                return Ok((handle, args));
+                let child_args = lower_internal_link_args(b, ctx, link, slots, values)?;
+                let spec = exit_specs.get(exit).ok_or_else(|| {
+                    VmError::JitNative("SSA internal branch exit lowering missing".to_string())
+                })?;
+                let restore_args = spec
+                    .inputs
+                    .iter()
+                    .map(|value| {
+                        values.get(value).copied().ok_or_else(|| {
+                            VmError::JitNative(
+                                "SSA internal branch restore arg missing".to_string(),
+                            )
+                        })
+                    })
+                    .collect::<VmResult<Vec<_>>>()?;
+                return lower_internal_link_target(b, ctx, handle, child_args, spec, restore_args);
             }
             let spec = exit_specs.get(exit).ok_or_else(|| {
                 VmError::JitNative("SSA branch exit lowering missing".to_string())
@@ -3350,9 +3401,83 @@ fn ssa_branch_target_block(
                         .ok_or_else(|| VmError::JitNative("SSA exit arg missing".to_string()))
                 })
                 .collect::<VmResult<Vec<_>>>()?;
-            Ok((spec.trace_exit_block, lowered_args))
+            Ok((spec.trace_exit_block, lowered_args, None))
         }
     }
+}
+
+struct PendingInternalLinkGate {
+    gate_block: Block,
+    child_handle: Block,
+    child_arg_count: usize,
+    interrupt_block: Block,
+}
+
+fn lower_internal_link_target(
+    b: &mut FunctionBuilder,
+    ctx: SsaLowerCtx<'_>,
+    child_handle: Block,
+    child_args: Vec<cranelift_codegen::ir::Value>,
+    exit_spec: &SsaExitLowering,
+    restore_args: Vec<cranelift_codegen::ir::Value>,
+) -> VmResult<(
+    Block,
+    Vec<cranelift_codegen::ir::Value>,
+    Option<PendingInternalLinkGate>,
+)> {
+    let Some(_settings) = ctx.interrupt_settings else {
+        increment_native_region_edge_count(b, ctx);
+        return Ok((child_handle, child_args, None));
+    };
+    let gate_block = b.create_block();
+    for value in child_args.iter().chain(&restore_args) {
+        b.append_block_param(gate_block, b.func.dfg.value_type(*value));
+    }
+    let child_arg_count = child_args.len();
+    let mut gate_args = child_args;
+    gate_args.extend(restore_args);
+    let interrupt_block = exit_spec
+        .interrupt_block
+        .ok_or_else(|| VmError::JitNative("SSA internal interrupt block missing".to_string()))?;
+    Ok((
+        gate_block,
+        gate_args,
+        Some(PendingInternalLinkGate {
+            gate_block,
+            child_handle,
+            child_arg_count,
+            interrupt_block,
+        }),
+    ))
+}
+
+fn lower_pending_internal_link_gate(
+    b: &mut FunctionBuilder,
+    ctx: SsaLowerCtx<'_>,
+    pending: PendingInternalLinkGate,
+) {
+    let settings = ctx
+        .interrupt_settings
+        .expect("pending internal link gate requires interrupt settings");
+    b.switch_to_block(pending.gate_block);
+    let gate_params = b.block_params(pending.gate_block).to_vec();
+    let interrupt_status_block = b.create_block();
+    b.append_block_param(interrupt_status_block, types::I32);
+    emit_interrupt_tick_inline(
+        b,
+        ctx.vm_ptr,
+        interrupt_status_block,
+        ctx.offsets,
+        ctx.interrupt_ops_to_advance,
+        settings,
+    );
+    increment_native_region_edge_count(b, ctx);
+    let child_params = ssa_block_args(gate_params[..pending.child_arg_count].to_vec());
+    b.ins().jump(pending.child_handle, &child_params);
+
+    b.switch_to_block(interrupt_status_block);
+    let restore_params = ssa_block_args(gate_params[pending.child_arg_count..].to_vec());
+    b.ins().jump(pending.interrupt_block, &restore_params);
 }
 
 fn increment_native_region_edge_count(b: &mut FunctionBuilder, ctx: SsaLowerCtx<'_>) {
@@ -3401,6 +3526,7 @@ fn ssa_exit_action_status(
     action: SsaExitAction,
 ) -> VmResult<cranelift_codegen::ir::Value> {
     match action {
+        SsaExitAction::InterruptYield => Ok(b.ins().iconst(types::I32, STATUS_OUT_OF_FUEL as i64)),
         SsaExitAction::Return => ssa_leave_frame_status(
             b,
             pointer_type,
@@ -3482,6 +3608,9 @@ fn lower_ssa_exit_block(
         SsaExitAction::CallValue { .. } => spec
             .call_value_block
             .ok_or_else(|| VmError::JitNative("SSA call-value exit block missing".to_string()))?,
+        SsaExitAction::InterruptYield => spec
+            .interrupt_block
+            .ok_or_else(|| VmError::JitNative("SSA interrupt exit block missing".to_string()))?,
     };
     b.switch_to_block(block);
     let block_params = b.block_params(block).to_vec();
