@@ -4,7 +4,8 @@ use crate::debug_info::DebugInfo;
 use crate::vm::native::ROOT_FRAME_KEY;
 use crate::vm::{OpCode, Program};
 
-use super::ir::{SsaExitId, SsaTrace};
+use super::deopt::{SideTraceImport, SideTraceImportError};
+use super::ir::{SsaExitId, SsaMaterialization, SsaTrace, SsaValueId, SsaValueRepr};
 use super::liveness::{boxed_load_site_count, boxed_store_site_count};
 use super::recorder::{RecordedTrace, TraceRecordError, record_trace_with_local_count};
 
@@ -24,6 +25,58 @@ pub(crate) struct TraceExitKey {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TraceExitProfile {
     pub(crate) executions: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TraceExitRecordError {
+    UnknownParentTrace(usize),
+    UnknownExit {
+        parent_trace_id: usize,
+        exit_id: SsaExitId,
+        exit_count: usize,
+    },
+}
+
+impl TraceExitRecordError {
+    pub(crate) fn message(self) -> String {
+        match self {
+            Self::UnknownParentTrace(parent_trace_id) => {
+                format!("native trace exit parent trace {parent_trace_id} does not exist")
+            }
+            Self::UnknownExit {
+                parent_trace_id,
+                exit_id,
+                exit_count,
+            } => format!(
+                "native trace {parent_trace_id} returned impossible exit id {} (parent has {exit_count} exits)",
+                exit_id.raw()
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum SideTraceAdmissionError {
+    UnknownParentTrace(usize),
+    UnknownChildTrace(usize),
+    SameTrace(usize),
+    CrossFrame {
+        parent_frame_key: u64,
+        child_frame_key: u64,
+    },
+    YieldingTrace(usize),
+    Import(SideTraceImportError),
+    UnknownParentValue(SsaValueId),
+    ReprMismatch {
+        index: usize,
+        parent: SsaValueRepr,
+        child: SsaValueRepr,
+    },
+    UnsupportedHeapOwnership {
+        index: usize,
+        value: SsaValueId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +101,23 @@ fn native_jit_supported() -> bool {
         && (cfg!(target_os = "windows") || (cfg!(unix) && !cfg!(target_os = "macos"))))
         || (cfg!(target_arch = "aarch64")
             && (cfg!(target_os = "linux") || cfg!(target_os = "macos")))
+}
+
+#[allow(dead_code)]
+fn ssa_value_repr(trace: &SsaTrace, value: SsaValueId) -> Option<SsaValueRepr> {
+    trace.blocks.iter().find_map(|block| {
+        block
+            .params
+            .iter()
+            .find_map(|param| (param.value.id == value).then_some(param.value.repr))
+            .or_else(|| {
+                block.insts.iter().find_map(|inst| {
+                    inst.output
+                        .filter(|output| output.id == value)
+                        .map(|output| output.repr)
+                })
+            })
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -188,7 +258,6 @@ pub struct JitSnapshot {
     pub arch: &'static str,
     pub config: JitConfig,
     pub traces: Vec<JitTrace>,
-    pub exit_profiles: Vec<JitExitProfile>,
     pub attempts: Vec<JitAttempt>,
     pub metrics: JitMetrics,
     pub nyi_reference: Vec<JitNyiDoc>,
@@ -337,6 +406,69 @@ impl TraceJitEngine {
         self.traces.get(trace_id).cloned()
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn side_trace_import(
+        &self,
+        parent_trace_id: usize,
+        parent_exit_id: SsaExitId,
+        child_trace_id: usize,
+    ) -> Result<SideTraceImport, SideTraceAdmissionError> {
+        let parent = self
+            .traces
+            .get(parent_trace_id)
+            .ok_or(SideTraceAdmissionError::UnknownParentTrace(parent_trace_id))?;
+        let child = self
+            .traces
+            .get(child_trace_id)
+            .ok_or(SideTraceAdmissionError::UnknownChildTrace(child_trace_id))?;
+        if parent_trace_id == child_trace_id {
+            return Err(SideTraceAdmissionError::SameTrace(parent_trace_id));
+        }
+        if parent.frame_key != child.frame_key {
+            return Err(SideTraceAdmissionError::CrossFrame {
+                parent_frame_key: parent.frame_key,
+                child_frame_key: child.frame_key,
+            });
+        }
+        if parent.has_yielding_call {
+            return Err(SideTraceAdmissionError::YieldingTrace(parent_trace_id));
+        }
+        if child.has_yielding_call {
+            return Err(SideTraceAdmissionError::YieldingTrace(child_trace_id));
+        }
+        let import = super::deopt::side_trace_import(&parent.ssa, parent_exit_id, &child.ssa)
+            .map_err(SideTraceAdmissionError::Import)?;
+        let child_entry = child.ssa.blocks.get(child.ssa.entry.index()).ok_or(
+            SideTraceAdmissionError::Import(SideTraceImportError::InvalidChildEntry),
+        )?;
+        for (index, (materialization, child_param)) in
+            import.args.iter().zip(&child_entry.params).enumerate()
+        {
+            let parent_repr = match materialization {
+                SsaMaterialization::Value(value) => ssa_value_repr(&parent.ssa, *value)
+                    .ok_or(SideTraceAdmissionError::UnknownParentValue(*value))?,
+                SsaMaterialization::BoxInt(_)
+                | SsaMaterialization::BoxFloat(_)
+                | SsaMaterialization::BoxBool(_) => SsaValueRepr::Tagged,
+                SsaMaterialization::BoxHeapPtr { value, .. } => {
+                    return Err(SideTraceAdmissionError::UnsupportedHeapOwnership {
+                        index,
+                        value: *value,
+                    });
+                }
+            };
+            let child_repr = child_param.value.repr;
+            if parent_repr != child_repr {
+                return Err(SideTraceAdmissionError::ReprMismatch {
+                    index,
+                    parent: parent_repr,
+                    child: child_repr,
+                });
+            }
+        }
+        Ok(import)
+    }
+
     pub fn observe_exit_ip(&mut self, ip: usize, program: &Program) -> Option<usize> {
         self.observe_exit_entry(ROOT_FRAME_KEY, ip, 0, program)
     }
@@ -424,9 +556,24 @@ impl TraceJitEngine {
         }
     }
 
-    pub(crate) fn record_trace_exit(&mut self, key: TraceExitKey) {
+    pub(crate) fn record_trace_exit(
+        &mut self,
+        key: TraceExitKey,
+    ) -> Result<(), TraceExitRecordError> {
+        let trace = self.traces.get(key.parent_trace_id).ok_or(
+            TraceExitRecordError::UnknownParentTrace(key.parent_trace_id),
+        )?;
+        let exit_count = trace.ssa.exits.len();
+        if !trace.ssa.exits.iter().any(|exit| exit.id == key.exit_id) {
+            return Err(TraceExitRecordError::UnknownExit {
+                parent_trace_id: key.parent_trace_id,
+                exit_id: key.exit_id,
+                exit_count,
+            });
+        }
         let profile = self.trace_exit_profiles.entry(key).or_default();
         profile.executions = profile.executions.saturating_add(1);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -500,8 +647,8 @@ impl TraceJitEngine {
         }
     }
 
-    pub fn snapshot(&self, runtime_metrics: JitMetrics) -> JitSnapshot {
-        let mut exit_profiles = self
+    pub fn exit_profiles(&self) -> Vec<JitExitProfile> {
+        let mut profiles = self
             .trace_exit_profiles
             .iter()
             .map(|(key, profile)| JitExitProfile {
@@ -510,12 +657,15 @@ impl TraceJitEngine {
                 executions: profile.executions,
             })
             .collect::<Vec<_>>();
-        exit_profiles.sort_by_key(|profile| (profile.parent_trace_id, profile.exit_id));
+        profiles.sort_by_key(|profile| (profile.parent_trace_id, profile.exit_id));
+        profiles
+    }
+
+    pub fn snapshot(&self, runtime_metrics: JitMetrics) -> JitSnapshot {
         JitSnapshot {
             arch: std::env::consts::ARCH,
             config: self.config,
             traces: self.traces.clone(),
-            exit_profiles,
             attempts: self.attempts.clone(),
             metrics: self.aggregate_metrics(runtime_metrics),
             nyi_reference: nyi_reference(),
@@ -880,10 +1030,336 @@ fn nyi_reference() -> Vec<JitNyiDoc> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::jit::ir::SsaExitId;
+    use crate::vm::jit::ir::{
+        SsaExitId, SsaMaterialization, SsaTerminator, SsaTrace, SsaTraceBuilder, SsaValueRepr,
+    };
     use crate::{
         BytecodeBuilder, CallableKind, CallablePrototype, CallableTarget, ScriptFunction, Value,
+        ValueType,
     };
+
+    fn test_trace(id: usize, frame_key: u64, has_yielding_call: bool, ssa: SsaTrace) -> JitTrace {
+        JitTrace {
+            id,
+            frame_key,
+            root_ip: ssa.root_ip,
+            entry_stack_depth: ssa.entry_stack_depth,
+            start_line: None,
+            has_call: false,
+            has_yielding_call,
+            op_names: Vec::new(),
+            terminal: JitTraceTerminal::BranchExit,
+            executions: 0,
+            ssa,
+        }
+    }
+
+    fn tagged_side_trace_pair(
+        parent_frame_key: u64,
+        child_frame_key: u64,
+        parent_yields: bool,
+        child_yields: bool,
+    ) -> (TraceJitEngine, SsaExitId) {
+        let mut parent = SsaTraceBuilder::new(0, 1);
+        let parent_entry = parent.entry();
+        let stack = parent
+            .append_param(parent_entry, SsaValueRepr::Tagged, "stack0")
+            .unwrap();
+        let parent_exit = parent.add_exit(
+            12,
+            vec![SsaMaterialization::Value(stack.id)],
+            Vec::new(),
+            Vec::new(),
+        );
+        parent
+            .set_terminator(parent_entry, SsaTerminator::Exit { exit: parent_exit })
+            .unwrap();
+
+        let mut child = SsaTraceBuilder::new(12, 1);
+        let child_entry = child.entry();
+        child
+            .append_param(child_entry, SsaValueRepr::Tagged, "stack0")
+            .unwrap();
+        let child_exit = child.add_exit(13, Vec::new(), Vec::new(), Vec::new());
+        child
+            .set_terminator(child_entry, SsaTerminator::Exit { exit: child_exit })
+            .unwrap();
+
+        let mut engine = TraceJitEngine::new(JitConfig::default());
+        engine.traces.push(test_trace(
+            0,
+            parent_frame_key,
+            parent_yields,
+            parent.finish(),
+        ));
+        engine
+            .traces
+            .push(test_trace(1, child_frame_key, child_yields, child.finish()));
+        (engine, parent_exit)
+    }
+
+    #[test]
+    fn side_trace_admission_rejects_unknown_and_same_trace_ids() {
+        let (engine, parent_exit) = tagged_side_trace_pair(7, 7, false, false);
+
+        assert_eq!(
+            engine.side_trace_import(9, parent_exit, 1),
+            Err(SideTraceAdmissionError::UnknownParentTrace(9))
+        );
+        assert_eq!(
+            engine.side_trace_import(0, parent_exit, 9),
+            Err(SideTraceAdmissionError::UnknownChildTrace(9))
+        );
+        assert_eq!(
+            engine.side_trace_import(0, SsaExitId::new(99), 1),
+            Err(SideTraceAdmissionError::Import(
+                SideTraceImportError::UnknownParentExit(SsaExitId::new(99))
+            ))
+        );
+        assert_eq!(
+            engine.side_trace_import(0, parent_exit, 0),
+            Err(SideTraceAdmissionError::SameTrace(0))
+        );
+    }
+
+    #[test]
+    fn side_trace_admission_rejects_exit_entry_shape_mismatch() {
+        let (mut engine, parent_exit) = tagged_side_trace_pair(7, 7, false, false);
+        engine.traces[1].ssa.root_ip = 13;
+
+        assert_eq!(
+            engine.side_trace_import(0, parent_exit, 1),
+            Err(SideTraceAdmissionError::Import(
+                SideTraceImportError::ExitIpMismatch {
+                    parent: 12,
+                    child: 13,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn side_trace_admission_rejects_repr_mismatch_at_any_entry_param() {
+        let mut parent = SsaTraceBuilder::new(0, 1);
+        let parent_entry = parent.entry();
+        let stack = parent
+            .append_param(parent_entry, SsaValueRepr::Tagged, "stack0")
+            .unwrap();
+        let local = parent
+            .append_param(parent_entry, SsaValueRepr::I64, "local0")
+            .unwrap();
+        let parent_exit = parent.add_exit(
+            12,
+            vec![SsaMaterialization::Value(stack.id)],
+            vec![SsaMaterialization::BoxInt(local.id)],
+            vec![true],
+        );
+        parent
+            .set_terminator(parent_entry, SsaTerminator::Exit { exit: parent_exit })
+            .unwrap();
+
+        let mut child = SsaTraceBuilder::new(12, 1);
+        let child_entry = child.entry();
+        child
+            .append_param(child_entry, SsaValueRepr::Tagged, "stack0")
+            .unwrap();
+        child
+            .append_param(child_entry, SsaValueRepr::I64, "local0")
+            .unwrap();
+        let child_exit = child.add_exit(13, Vec::new(), Vec::new(), Vec::new());
+        child
+            .set_terminator(child_entry, SsaTerminator::Exit { exit: child_exit })
+            .unwrap();
+
+        let mut engine = TraceJitEngine::new(JitConfig::default());
+        engine.traces.push(test_trace(0, 7, false, parent.finish()));
+        engine.traces.push(test_trace(1, 7, false, child.finish()));
+
+        assert_eq!(
+            engine.side_trace_import(0, parent_exit, 1),
+            Err(SideTraceAdmissionError::ReprMismatch {
+                index: 1,
+                parent: SsaValueRepr::Tagged,
+                child: SsaValueRepr::I64,
+            })
+        );
+    }
+
+    #[test]
+    fn side_trace_admission_uses_defining_repr_for_value_materialization() {
+        let mut parent = SsaTraceBuilder::new(0, 1);
+        let parent_entry = parent.entry();
+        let value = parent
+            .append_param(parent_entry, SsaValueRepr::I64, "stack0")
+            .unwrap();
+        let parent_exit = parent.add_exit(
+            12,
+            vec![SsaMaterialization::Value(value.id)],
+            Vec::new(),
+            Vec::new(),
+        );
+        parent
+            .set_terminator(parent_entry, SsaTerminator::Exit { exit: parent_exit })
+            .unwrap();
+
+        let mut child = SsaTraceBuilder::new(12, 1);
+        let child_entry = child.entry();
+        child
+            .append_param(child_entry, SsaValueRepr::Tagged, "stack0")
+            .unwrap();
+        let child_exit = child.add_exit(13, Vec::new(), Vec::new(), Vec::new());
+        child
+            .set_terminator(child_entry, SsaTerminator::Exit { exit: child_exit })
+            .unwrap();
+
+        let mut engine = TraceJitEngine::new(JitConfig::default());
+        engine.traces.push(test_trace(0, 7, false, parent.finish()));
+        engine.traces.push(test_trace(1, 7, false, child.finish()));
+
+        assert_eq!(
+            engine.side_trace_import(0, parent_exit, 1),
+            Err(SideTraceAdmissionError::ReprMismatch {
+                index: 0,
+                parent: SsaValueRepr::I64,
+                child: SsaValueRepr::Tagged,
+            })
+        );
+    }
+
+    #[test]
+    fn side_trace_admission_rejects_box_heap_ptr_ownership() {
+        let mut parent = SsaTraceBuilder::new(0, 1);
+        let parent_entry = parent.entry();
+        let heap = parent
+            .append_param(
+                parent_entry,
+                SsaValueRepr::HeapPtr(ValueType::String),
+                "stack0",
+            )
+            .unwrap();
+        let parent_exit = parent.add_exit(
+            12,
+            vec![SsaMaterialization::BoxHeapPtr {
+                value: heap.id,
+                tag: ValueType::String,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        parent
+            .set_terminator(parent_entry, SsaTerminator::Exit { exit: parent_exit })
+            .unwrap();
+
+        let mut child = SsaTraceBuilder::new(12, 1);
+        let child_entry = child.entry();
+        child
+            .append_param(child_entry, SsaValueRepr::Tagged, "stack0")
+            .unwrap();
+        let child_exit = child.add_exit(13, Vec::new(), Vec::new(), Vec::new());
+        child
+            .set_terminator(child_entry, SsaTerminator::Exit { exit: child_exit })
+            .unwrap();
+
+        let mut engine = TraceJitEngine::new(JitConfig::default());
+        engine.traces.push(test_trace(0, 7, false, parent.finish()));
+        engine.traces.push(test_trace(1, 7, false, child.finish()));
+
+        assert_eq!(
+            engine.side_trace_import(0, parent_exit, 1),
+            Err(SideTraceAdmissionError::UnsupportedHeapOwnership {
+                index: 0,
+                value: heap.id,
+            })
+        );
+    }
+
+    #[test]
+    fn side_trace_admission_rejects_yielding_parent_or_child() {
+        for (parent_yields, child_yields, yielding_trace_id) in [(true, false, 0), (false, true, 1)]
+        {
+            let (engine, parent_exit) = tagged_side_trace_pair(7, 7, parent_yields, child_yields);
+            assert_eq!(
+                engine.side_trace_import(0, parent_exit, 1),
+                Err(SideTraceAdmissionError::YieldingTrace(yielding_trace_id))
+            );
+        }
+    }
+
+    #[test]
+    fn side_trace_admission_rejects_cross_frame_traces() {
+        let (engine, parent_exit) = tagged_side_trace_pair(7, 8, false, false);
+
+        assert_eq!(
+            engine.side_trace_import(0, parent_exit, 1),
+            Err(SideTraceAdmissionError::CrossFrame {
+                parent_frame_key: 7,
+                child_frame_key: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn side_trace_admission_returns_validated_import_for_same_frame_traces() {
+        let mut parent = SsaTraceBuilder::new(0, 1);
+        let parent_entry = parent.entry();
+        let stack = parent
+            .append_param(parent_entry, SsaValueRepr::Tagged, "stack0")
+            .unwrap();
+        let int_local = parent
+            .append_param(parent_entry, SsaValueRepr::I64, "local0")
+            .unwrap();
+        let float_local = parent
+            .append_param(parent_entry, SsaValueRepr::F64, "local1")
+            .unwrap();
+        let bool_local = parent
+            .append_param(parent_entry, SsaValueRepr::Bool, "local2")
+            .unwrap();
+        let parent_exit = parent.add_exit(
+            12,
+            vec![SsaMaterialization::Value(stack.id)],
+            vec![
+                SsaMaterialization::BoxInt(int_local.id),
+                SsaMaterialization::BoxFloat(float_local.id),
+                SsaMaterialization::BoxBool(bool_local.id),
+            ],
+            vec![true, false, true],
+        );
+        parent
+            .set_terminator(parent_entry, SsaTerminator::Exit { exit: parent_exit })
+            .unwrap();
+
+        let mut child = SsaTraceBuilder::new(12, 1);
+        let child_entry = child.entry();
+        for label in ["stack0", "local0", "local1", "local2"] {
+            child
+                .append_param(child_entry, SsaValueRepr::Tagged, label)
+                .unwrap();
+        }
+        let child_exit = child.add_exit(13, Vec::new(), Vec::new(), Vec::new());
+        child
+            .set_terminator(child_entry, SsaTerminator::Exit { exit: child_exit })
+            .unwrap();
+
+        let mut engine = TraceJitEngine::new(JitConfig::default());
+        engine.traces.push(test_trace(0, 7, false, parent.finish()));
+        engine.traces.push(test_trace(1, 7, false, child.finish()));
+
+        let import = engine.side_trace_import(0, parent_exit, 1).unwrap();
+
+        assert_eq!(import.parent_exit, parent_exit);
+        assert_eq!(import.stack_depth, 1);
+        assert_eq!(import.local_count, 3);
+        assert_eq!(import.dirty_locals, vec![true, false, true]);
+        assert_eq!(
+            import.args,
+            vec![
+                SsaMaterialization::Value(stack.id),
+                SsaMaterialization::BoxInt(int_local.id),
+                SsaMaterialization::BoxFloat(float_local.id),
+                SsaMaterialization::BoxBool(bool_local.id),
+            ]
+        );
+    }
 
     #[test]
     fn trace_exit_profiles_are_keyed_by_parent_and_exit() {
@@ -892,22 +1368,98 @@ mod tests {
             hot_loop_threshold: 1,
             max_trace_len: 64,
         });
+        let mut ssa = SsaTraceBuilder::new(0, 0);
+        let entry = ssa.entry();
+        let first_exit = ssa.add_exit(1, Vec::new(), Vec::new(), Vec::new());
+        let second_exit = ssa.add_exit(2, Vec::new(), Vec::new(), Vec::new());
+        ssa.set_terminator(entry, SsaTerminator::Exit { exit: first_exit })
+            .unwrap();
+        engine.traces.push(JitTrace {
+            id: 0,
+            frame_key: ROOT_FRAME_KEY,
+            root_ip: 0,
+            entry_stack_depth: 0,
+            start_line: None,
+            has_call: false,
+            has_yielding_call: false,
+            op_names: Vec::new(),
+            terminal: JitTraceTerminal::BranchExit,
+            executions: 0,
+            ssa: ssa.finish(),
+        });
         let first = TraceExitKey {
-            parent_trace_id: 3,
-            exit_id: SsaExitId::new(0),
+            parent_trace_id: 0,
+            exit_id: first_exit,
         };
         let second = TraceExitKey {
-            parent_trace_id: 3,
-            exit_id: SsaExitId::new(1),
+            parent_trace_id: 0,
+            exit_id: second_exit,
         };
 
-        engine.record_trace_exit(first);
-        engine.record_trace_exit(first);
-        engine.record_trace_exit(second);
+        engine.record_trace_exit(first).unwrap();
+        engine.record_trace_exit(first).unwrap();
+        engine.record_trace_exit(second).unwrap();
 
         assert_eq!(engine.trace_exit_profile(first).unwrap().executions, 2);
         assert_eq!(engine.trace_exit_profile(second).unwrap().executions, 1);
         assert_ne!(first, second);
+        assert_eq!(
+            engine.exit_profiles(),
+            vec![
+                JitExitProfile {
+                    parent_trace_id: 0,
+                    exit_id: first_exit.raw(),
+                    executions: 2,
+                },
+                JitExitProfile {
+                    parent_trace_id: 0,
+                    exit_id: second_exit.raw(),
+                    executions: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn trace_exit_profiles_reject_exit_missing_from_parent_trace() {
+        let mut engine = TraceJitEngine::new(JitConfig {
+            enabled: true,
+            hot_loop_threshold: 1,
+            max_trace_len: 64,
+        });
+        let mut ssa = SsaTraceBuilder::new(0, 0);
+        let entry = ssa.entry();
+        let exit_id = ssa.add_exit(1, Vec::new(), Vec::new(), Vec::new());
+        ssa.set_terminator(entry, SsaTerminator::Exit { exit: exit_id })
+            .unwrap();
+        engine.traces.push(JitTrace {
+            id: 0,
+            frame_key: ROOT_FRAME_KEY,
+            root_ip: 0,
+            entry_stack_depth: 0,
+            start_line: None,
+            has_call: false,
+            has_yielding_call: false,
+            op_names: Vec::new(),
+            terminal: JitTraceTerminal::BranchExit,
+            executions: 0,
+            ssa: ssa.finish(),
+        });
+
+        assert_eq!(
+            engine
+                .record_trace_exit(TraceExitKey {
+                    parent_trace_id: 0,
+                    exit_id: SsaExitId::new(1),
+                })
+                .unwrap_err(),
+            TraceExitRecordError::UnknownExit {
+                parent_trace_id: 0,
+                exit_id: SsaExitId::new(1),
+                exit_count: 1,
+            }
+        );
+        assert!(engine.trace_exit_profiles.is_empty());
     }
 
     #[test]

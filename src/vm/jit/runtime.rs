@@ -278,10 +278,12 @@ impl Vm {
             self.native_trace_exec_count = self.native_trace_exec_count.saturating_add(1);
             self.jit.mark_trace_executed(current_trace_id);
             let status = if let Some(exit_id) = native::decode_jit_trace_exit_status(status) {
-                self.jit.record_trace_exit(TraceExitKey {
-                    parent_trace_id: current_trace_id,
-                    exit_id: SsaExitId::new(exit_id),
-                });
+                self.jit
+                    .record_trace_exit(TraceExitKey {
+                        parent_trace_id: current_trace_id,
+                        exit_id: SsaExitId::new(exit_id),
+                    })
+                    .map_err(|err| VmError::JitNative(err.message()))?;
                 native::STATUS_TRACE_EXIT
             } else {
                 status
@@ -427,6 +429,10 @@ impl Vm {
         self.jit.snapshot(self.jit_runtime_metrics())
     }
 
+    pub fn jit_exit_profiles(&self) -> Vec<super::JitExitProfile> {
+        self.jit.exit_profiles()
+    }
+
     pub fn dump_jit_info(&self) -> String {
         self.dump_jit_info_with_machine_code(true)
     }
@@ -553,10 +559,12 @@ impl Vm {
             self.native_trace_exec_count = self.native_trace_exec_count.saturating_add(1);
             self.jit.mark_trace_executed(current_trace_id);
             let status = if let Some(exit_id) = native::decode_jit_trace_exit_status(status) {
-                self.jit.record_trace_exit(TraceExitKey {
-                    parent_trace_id: current_trace_id,
-                    exit_id: SsaExitId::new(exit_id),
-                });
+                self.jit
+                    .record_trace_exit(TraceExitKey {
+                        parent_trace_id: current_trace_id,
+                        exit_id: SsaExitId::new(exit_id),
+                    })
+                    .map_err(|err| VmError::JitNative(err.message()))?;
                 native::STATUS_TRACE_EXIT
             } else {
                 status

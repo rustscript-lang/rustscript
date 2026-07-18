@@ -17,14 +17,18 @@ pub(crate) const STATUS_OUT_OF_FUEL: i32 = 5;
 pub(crate) const STATUS_LINKED_CONTINUE: i32 = 6;
 pub(crate) const STATUS_ERROR: i32 = -1;
 pub(crate) const STATUS_JIT_TRACE_EXIT_BASE: i32 = 0x100;
+pub(crate) const STATUS_JIT_TRACE_EXIT_MAX_ID: u32 = u16::MAX as u32;
+pub(crate) const STATUS_JIT_TRACE_EXIT_MAX: i32 =
+    STATUS_JIT_TRACE_EXIT_BASE + STATUS_JIT_TRACE_EXIT_MAX_ID as i32;
 
 pub(crate) fn encode_jit_trace_exit_status(exit_id: u32) -> Option<i32> {
-    STATUS_JIT_TRACE_EXIT_BASE.checked_add(i32::try_from(exit_id).ok()?)
+    (exit_id <= STATUS_JIT_TRACE_EXIT_MAX_ID).then(|| STATUS_JIT_TRACE_EXIT_BASE + exit_id as i32)
 }
 
 pub(crate) fn decode_jit_trace_exit_status(status: i32) -> Option<u32> {
-    let encoded = status.checked_sub(STATUS_JIT_TRACE_EXIT_BASE)?;
-    u32::try_from(encoded).ok()
+    (STATUS_JIT_TRACE_EXIT_BASE..=STATUS_JIT_TRACE_EXIT_MAX)
+        .contains(&status)
+        .then(|| (status - STATUS_JIT_TRACE_EXIT_BASE) as u32)
 }
 
 pub(crate) const ROOT_FRAME_KEY: u64 = u64::MAX;
@@ -1568,8 +1572,8 @@ mod tests {
     use std::mem::{ManuallyDrop, MaybeUninit};
 
     #[test]
-    fn jit_trace_exit_status_round_trips_exit_ids_without_status_collisions() {
-        for exit_id in [0, 1, 7, 255, 65_535] {
+    fn jit_trace_exit_status_round_trips_reserved_range_boundaries() {
+        for exit_id in [0, 1, 7, 255, STATUS_JIT_TRACE_EXIT_MAX_ID] {
             let status = encode_jit_trace_exit_status(exit_id).unwrap();
             assert_eq!(decode_jit_trace_exit_status(status), Some(exit_id));
             assert_ne!(status, STATUS_TRACE_EXIT);
@@ -1578,8 +1582,17 @@ mod tests {
             assert_ne!(status, STATUS_OUT_OF_FUEL);
             assert_ne!(status, STATUS_LINKED_CONTINUE);
         }
+        assert_eq!(
+            encode_jit_trace_exit_status(STATUS_JIT_TRACE_EXIT_MAX_ID + 1),
+            None
+        );
         assert_eq!(decode_jit_trace_exit_status(STATUS_TRACE_EXIT), None);
         assert_eq!(decode_jit_trace_exit_status(STATUS_ERROR), None);
+        assert_eq!(
+            decode_jit_trace_exit_status(STATUS_JIT_TRACE_EXIT_MAX + 1),
+            None
+        );
+        assert_eq!(decode_jit_trace_exit_status(i32::MAX), None);
     }
 
     #[test]

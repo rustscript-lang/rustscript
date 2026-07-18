@@ -11,6 +11,20 @@ fn native_jit_supported() -> bool {
             && (cfg!(target_os = "linux") || cfg!(target_os = "macos")))
 }
 
+#[test]
+fn jit_snapshot_literal_preserves_public_source_shape() {
+    let snapshot = vm::jit::JitSnapshot {
+        arch: "test",
+        config: JitConfig::default(),
+        traces: Vec::new(),
+        attempts: Vec::new(),
+        metrics: vm::jit::JitMetrics::default(),
+        nyi_reference: Vec::new(),
+    };
+
+    assert!(snapshot.traces.is_empty());
+}
+
 fn any_trace_op(snapshot: &vm::jit::JitSnapshot, op: &str) -> bool {
     snapshot
         .traces
@@ -2185,7 +2199,14 @@ fn trace_jit_reports_exact_parent_exit_profiles() {
     }
     let source = r#"
         fn choose(i) {
-            if i % 2 == 0 => { 3 } else => { 5 }
+            let mut result = 7;
+            if i % 2 == 0 {
+                result = 3;
+            }
+            if i % 3 == 1 {
+                result = 5;
+            }
+            result
         }
 
         let mut i = 0;
@@ -2208,24 +2229,35 @@ fn trace_jit_reports_exact_parent_exit_profiles() {
         vm.run().expect("branch profile fixture should run"),
         VmStatus::Halted
     );
-    assert_eq!(vm.stack(), &[Value::Int(256)]);
+    assert_eq!(vm.stack(), &[Value::Int(318)]);
 
     let snapshot = vm.jit_snapshot();
+    let exit_profiles = vm.jit_exit_profiles();
     assert!(
-        !snapshot.exit_profiles.is_empty(),
+        !exit_profiles.is_empty(),
         "expected exact parent-exit profiles:\n{}",
         vm.dump_jit_info()
     );
-    for profile in &snapshot.exit_profiles {
+    for profile in &exit_profiles {
         let parent = &snapshot.traces[profile.parent_trace_id];
         assert!(profile.exit_id < parent.ssa_exit_count() as u32);
         assert!(profile.executions > 0);
     }
     assert!(
-        snapshot.exit_profiles.iter().any(|profile| {
-            snapshot.traces[profile.parent_trace_id].frame_key != u64::MAX && profile.executions > 1
-        }),
-        "expected a repeated exact exit inside a callable frame:\n{}",
+        snapshot
+            .traces
+            .iter()
+            .enumerate()
+            .filter(|(_, trace)| trace.frame_key != u64::MAX)
+            .any(|(parent_trace_id, _)| {
+                let parent_profiles = exit_profiles
+                    .iter()
+                    .filter(|profile| profile.parent_trace_id == parent_trace_id)
+                    .collect::<Vec<_>>();
+                parent_profiles.len() >= 2
+                    && parent_profiles.iter().any(|profile| profile.executions > 1)
+            }),
+        "expected two distinct exits and one repeated exact exit under a callable parent:\n{}",
         vm.dump_jit_info()
     );
 }
