@@ -4831,10 +4831,72 @@ fn trace_jit_executes_hot_loop_inside_script_callable_frame() {
     );
     assert_eq!(vm.stack(), &[Value::Int(4_950)]);
     assert!(vm.jit_native_exec_count() > 0);
+    assert!(
+        vm.jit_snapshot().metrics.native_loop_back_count > 0,
+        "scalar callable loop should remain native across backedges: {}",
+        vm.dump_jit_info()
+    );
     let snapshot = vm.jit_snapshot();
     assert!(
         snapshot.traces.iter().any(|trace| trace.frame_key == 0),
         "expected a prototype-keyed trace: {}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
+fn trace_jit_backs_off_exit_heavy_script_callable_frame() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn alternating_sum(limit: int) -> int {
+            let mut i = 0;
+            let mut total = 0;
+            while i < limit {
+                if i % 2 == 0 {
+                    total = total + i;
+                } else {
+                    total = total - i;
+                }
+                i = i + 1;
+            }
+            total
+        }
+        alternating_sum(4096);
+    "#;
+    let compiled = compile_source(source).expect("exit-heavy callable loop should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(
+        vm.run().expect("exit-heavy callable loop should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(-2_048)]);
+    let first_native_execs = vm.jit_native_exec_count();
+    assert!(first_native_execs > 0);
+    assert!(
+        first_native_execs < 1_024,
+        "exit-heavy callable traces should back off: {}",
+        vm.dump_jit_info()
+    );
+
+    vm.reset_for_reuse();
+    assert_eq!(
+        vm.run().expect("blocked callable loop should run again"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(-2_048)]);
+    assert!(
+        vm.jit_native_exec_count()
+            .saturating_sub(first_native_execs)
+            < 64,
+        "blocked callable traces should stay in the interpreter: {}",
         vm.dump_jit_info()
     );
 }

@@ -181,6 +181,8 @@ pub struct JitNyiDoc {
     pub reason: &'static str,
 }
 
+const CALLABLE_SIDE_EXIT_BACKOFF_THRESHOLD: u32 = 64;
+
 pub struct TraceJitEngine {
     config: JitConfig,
     hot_counts: HashMap<TraceEntryKey, u32>,
@@ -189,6 +191,8 @@ pub struct TraceJitEngine {
     loop_headers: Option<Vec<bool>>,
     non_yielding_host_imports: Vec<bool>,
     traces: Vec<JitTrace>,
+    callable_side_exit_streaks: Vec<u32>,
+    blocked_callable_frames: Vec<bool>,
     attempts: Vec<JitAttempt>,
 }
 
@@ -208,6 +212,8 @@ impl TraceJitEngine {
             loop_headers: None,
             non_yielding_host_imports: Vec::new(),
             traces: Vec::new(),
+            callable_side_exit_streaks: Vec::new(),
+            blocked_callable_frames: Vec::new(),
             attempts: Vec::new(),
         }
     }
@@ -223,6 +229,8 @@ impl TraceJitEngine {
         self.blocked_entries.clear();
         self.loop_headers = None;
         self.traces.clear();
+        self.callable_side_exit_streaks.clear();
+        self.blocked_callable_frames.clear();
         self.attempts.clear();
     }
 
@@ -236,6 +244,8 @@ impl TraceJitEngine {
         self.blocked_entries.clear();
         self.loop_headers = None;
         self.traces.clear();
+        self.callable_side_exit_streaks.clear();
+        self.blocked_callable_frames.clear();
         self.attempts.clear();
         true
     }
@@ -262,7 +272,10 @@ impl TraceJitEngine {
         entry_local_types: Option<&[crate::ValueType]>,
         program: &Program,
     ) -> Option<usize> {
-        if !self.config.enabled || !native_jit_supported() {
+        if !self.config.enabled
+            || !native_jit_supported()
+            || self.callable_frame_is_blocked(frame_key)
+        {
             return None;
         }
         let key = TraceEntryKey {
@@ -323,7 +336,10 @@ impl TraceJitEngine {
         entry_local_types: Option<&[crate::ValueType]>,
         program: &Program,
     ) -> Option<usize> {
-        if !self.config.enabled || !native_jit_supported() {
+        if !self.config.enabled
+            || !native_jit_supported()
+            || self.callable_frame_is_blocked(frame_key)
+        {
             return None;
         }
         let key = TraceEntryKey {
@@ -383,6 +399,60 @@ impl TraceJitEngine {
         if let Some(trace) = self.traces.get_mut(trace_id) {
             trace.executions = trace.executions.saturating_add(1);
         }
+    }
+
+    pub(crate) fn record_native_side_exit(&mut self, trace_id: usize) -> bool {
+        if self
+            .traces
+            .get(trace_id)
+            .is_none_or(|trace| trace.frame_key == ROOT_FRAME_KEY)
+        {
+            return false;
+        }
+        let Some(streak) = self.callable_side_exit_streaks.get_mut(trace_id) else {
+            return false;
+        };
+        *streak = streak.saturating_add(1);
+        *streak >= CALLABLE_SIDE_EXIT_BACKOFF_THRESHOLD
+    }
+
+    pub(crate) fn record_native_loop_back(&mut self, trace_id: usize) {
+        if let Some(streak) = self.callable_side_exit_streaks.get_mut(trace_id) {
+            *streak = 0;
+        }
+    }
+
+    pub(crate) fn callable_frame_is_blocked(&self, frame_key: u64) -> bool {
+        if frame_key == ROOT_FRAME_KEY {
+            return false;
+        }
+        usize::try_from(frame_key)
+            .ok()
+            .and_then(|index| self.blocked_callable_frames.get(index))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn block_callable_frame(&mut self, trace_id: usize) {
+        let Some(frame_key) = self.traces.get(trace_id).map(|trace| trace.frame_key) else {
+            return;
+        };
+        if frame_key == ROOT_FRAME_KEY {
+            self.block_trace(trace_id);
+            return;
+        }
+        let Ok(frame_index) = usize::try_from(frame_key) else {
+            self.block_trace(trace_id);
+            return;
+        };
+        if self.blocked_callable_frames.len() <= frame_index {
+            self.blocked_callable_frames.resize(frame_index + 1, false);
+        }
+        self.blocked_callable_frames[frame_index] = true;
+        for entries in &mut self.compiled_by_ip {
+            entries.retain(|(entry_frame_key, _, _)| *entry_frame_key != frame_key);
+        }
+        self.hot_counts.retain(|key, _| key.frame_key != frame_key);
     }
 
     pub(crate) fn block_trace(&mut self, trace_id: usize) {
@@ -570,6 +640,7 @@ impl TraceJitEngine {
             .and_then(|debug| debug.line_for_offset(key.root_ip));
         let trace = build_jit_trace(id, key, start_line, recorded);
         self.traces.push(trace);
+        self.callable_side_exit_streaks.push(0);
         Ok(id)
     }
 
@@ -777,6 +848,67 @@ mod tests {
         let headers = scan_loop_headers(&program);
         assert!(headers[root_ip as usize]);
         assert!(!headers[branch_ip as usize]);
+    }
+
+    #[test]
+    fn callable_side_exit_backoff_resets_on_native_loopback() {
+        if !native_jit_supported() {
+            return;
+        }
+        let mut bc = BytecodeBuilder::new();
+        let root_ip = bc.position();
+        bc.ldloc(0);
+        bc.ldc(0);
+        bc.add();
+        bc.stloc(0);
+        bc.br(root_ip);
+        let mut program = Program::new(vec![Value::Int(1)], bc.finish()).with_local_count(1);
+        program.script_functions.push(ScriptFunction {
+            entry_ip: root_ip,
+            end_ip: program.code.len() as u32,
+        });
+        program.callable_prototypes.push(CallablePrototype {
+            kind: CallableKind::FunctionItem,
+            target: CallableTarget::ScriptFunction(0),
+            arity: 0,
+            frame_local_count: 1,
+            parameter_slots: Vec::new(),
+            capture_source_slots: Vec::new(),
+            capture_slots: Vec::new(),
+            capture_modes: Vec::new(),
+            self_slot: None,
+            schema: None,
+        });
+        let mut engine = TraceJitEngine::new(JitConfig {
+            enabled: true,
+            hot_loop_threshold: 1,
+            max_trace_len: 64,
+        });
+        let trace_id = engine
+            .observe_hot_entry(0, root_ip as usize, 0, &program)
+            .expect("script-frame trace should compile");
+
+        for _ in 1..CALLABLE_SIDE_EXIT_BACKOFF_THRESHOLD {
+            assert!(!engine.record_native_side_exit(trace_id));
+        }
+        engine.record_native_loop_back(trace_id);
+        for _ in 1..CALLABLE_SIDE_EXIT_BACKOFF_THRESHOLD {
+            assert!(!engine.record_native_side_exit(trace_id));
+        }
+        assert!(engine.record_native_side_exit(trace_id));
+        engine.block_callable_frame(trace_id);
+        assert!(engine.callable_frame_is_blocked(0));
+        assert_eq!(
+            engine.compiled_trace_for_entry(0, root_ip as usize, 0),
+            None
+        );
+
+        let root_trace_id = engine
+            .observe_hot_entry(ROOT_FRAME_KEY, root_ip as usize, 0, &program)
+            .expect("root trace should compile");
+        for _ in 0..CALLABLE_SIDE_EXIT_BACKOFF_THRESHOLD * 2 {
+            assert!(!engine.record_native_side_exit(root_trace_id));
+        }
     }
 
     #[test]
