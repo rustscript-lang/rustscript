@@ -49,6 +49,7 @@ pub(crate) struct SideTraceImport {
     pub(crate) parent_exit: SsaExitId,
     pub(crate) stack_depth: usize,
     pub(crate) local_count: usize,
+    pub(crate) dirty_locals: Vec<bool>,
     pub(crate) args: Vec<SsaMaterialization>,
 }
 
@@ -103,6 +104,7 @@ pub(crate) fn side_trace_import(
         parent_exit,
         stack_depth: exit.stack.len(),
         local_count: exit.locals.len(),
+        dirty_locals: exit.dirty_locals.clone(),
         args: exit.stack.iter().chain(&exit.locals).cloned().collect(),
     })
 }
@@ -152,6 +154,7 @@ mod tests {
         assert_eq!(import.parent_exit, exit_id);
         assert_eq!(import.stack_depth, 1);
         assert_eq!(import.local_count, 1);
+        assert_eq!(import.dirty_locals, vec![true]);
         assert_eq!(
             import.args,
             vec![
