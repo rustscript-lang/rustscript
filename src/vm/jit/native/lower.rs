@@ -57,6 +57,7 @@ type TaggedConstants = (Box<[Value]>, HashMap<SsaValueId, usize>);
 
 pub(crate) struct CompiledTrace {
     pub(crate) entry: *const u8,
+    pub(crate) tail_entry: *const u8,
     pub(crate) keepalive: TraceKeepAlive,
     pub(crate) code: Vec<u8>,
     pub(crate) lowering_kind: TraceLoweringKind,
@@ -65,6 +66,7 @@ pub(crate) struct CompiledTrace {
 pub(crate) struct TraceKeepAlive {
     exec: ExecutableBuffer,
     _tagged_constants: Box<[Value]>,
+    dependencies: Vec<TraceKeepAlive>,
 }
 
 impl TraceKeepAlive {
@@ -72,6 +74,7 @@ impl TraceKeepAlive {
         Ok(Self {
             exec: ExecutableBuffer::new(code)?,
             _tagged_constants: tagged_constants,
+            dependencies: Vec::new(),
         })
     }
 
@@ -93,6 +96,10 @@ impl CompiledTailFunction {
 
     pub(crate) fn code_len(&self) -> usize {
         self.code.len()
+    }
+
+    pub(crate) fn into_parts(self) -> (*const u8, TraceKeepAlive, Vec<u8>) {
+        (self.entry, self._keepalive, self.code)
     }
 }
 
@@ -222,6 +229,89 @@ pub(crate) fn compile_system_tail_wrapper(root_entry: *const u8) -> VmResult<Com
     )
 }
 
+pub(crate) fn compile_tail_trace_dispatcher(
+    trace_entry: *const u8,
+    trace_id: usize,
+    links: &[(i32, usize)],
+) -> VmResult<CompiledTailFunction> {
+    let trace_entry = trace_entry as usize;
+    let links = links.to_vec();
+    let direct_link_offset = detect_native_stack_layout()?.vm_jit_native_direct_link_count_offset;
+    let active_trace_offset =
+        detect_native_stack_layout()?.vm_jit_native_active_direct_trace_id_offset;
+    compile_standalone_native_function(
+        "pd_vm_tail_trace_dispatch",
+        |pointer_type, _| tail_entry_signature(pointer_type),
+        move |builder, pointer_type, default_call_conv| {
+            let entry = builder.create_block();
+            let return_status = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.append_block_param(return_status, types::I32);
+            builder.switch_to_block(entry);
+            let vm_ptr = builder.block_params(entry)[0];
+            let trace_id = i64::try_from(trace_id)
+                .map_err(|_| VmError::JitNative("native trace id exceeds i64".to_string()))?;
+            let trace_id = builder.ins().iconst(pointer_type, trace_id);
+            builder
+                .ins()
+                .store(MemFlags::new(), trace_id, vm_ptr, active_trace_offset);
+            let trace_entry = iconst_ptr_from_addr(builder, pointer_type, trace_entry)?;
+            let trace_signature =
+                builder.import_signature(entry_signature(pointer_type, default_call_conv));
+            let call = builder
+                .ins()
+                .call_indirect(trace_signature, trace_entry, &[vm_ptr]);
+            let status = builder.inst_results(call)[0];
+
+            for (linked_status, slot_address) in links {
+                let slot_check = builder.create_block();
+                let next = builder.create_block();
+                let linked = builder.create_block();
+                builder.append_block_param(next, types::I32);
+                let matches =
+                    builder
+                        .ins()
+                        .icmp_imm(IntCC::Equal, status, i64::from(linked_status));
+                builder
+                    .ins()
+                    .brif(matches, slot_check, &[], next, &[status.into()]);
+
+                builder.switch_to_block(slot_check);
+                let slot_address = iconst_ptr_from_addr(builder, pointer_type, slot_address)?;
+                let target = builder
+                    .ins()
+                    .load(pointer_type, MemFlags::new(), slot_address, 0);
+                let is_null = builder.ins().icmp_imm(IntCC::Equal, target, 0);
+                builder
+                    .ins()
+                    .brif(is_null, return_status, &[status.into()], linked, &[]);
+
+                builder.switch_to_block(linked);
+                let direct_count =
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::new(), vm_ptr, direct_link_offset);
+                let direct_count = builder.ins().iadd_imm(direct_count, 1);
+                builder
+                    .ins()
+                    .store(MemFlags::new(), direct_count, vm_ptr, direct_link_offset);
+                let tail_signature = builder.import_signature(tail_entry_signature(pointer_type));
+                builder
+                    .ins()
+                    .return_call_indirect(tail_signature, target, &[vm_ptr]);
+
+                builder.switch_to_block(next);
+            }
+
+            builder.ins().jump(return_status, &[status.into()]);
+            builder.switch_to_block(return_status);
+            let status = builder.block_params(return_status)[0];
+            builder.ins().return_(&[status]);
+            Ok(())
+        },
+    )
+}
+
 fn tail_owned_entry_signature(pointer_type: cranelift_codegen::ir::Type) -> Signature {
     let mut signature = tail_entry_signature(pointer_type);
     signature.params.push(AbiParam::new(pointer_type));
@@ -343,7 +433,7 @@ fn try_compile_ssa_trace(
     ssa: &SsaTrace,
     internal_links: &[FusedRegionLink],
     interrupt_settings: Option<NativeInterruptSettings>,
-    profile: NativeCompileProfile,
+    _profile: NativeCompileProfile,
     drop_contract_events_enabled: bool,
 ) -> VmResult<Option<CompiledTrace>> {
     if drop_contract_events_enabled {
@@ -355,7 +445,7 @@ fn try_compile_ssa_trace(
 
     let layout = detect_native_stack_layout()?;
     let offsets = resolve_offsets(layout)?;
-    let isa = native_isa(profile)?;
+    let isa = native_tail_isa()?;
 
     let jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     let mut module = JITModule::new(jit_builder);
@@ -363,7 +453,7 @@ fn try_compile_ssa_trace(
     let call_conv = module.target_config().default_call_conv;
 
     let mut ctx = module.make_context();
-    ctx.func.signature = entry_signature(pointer_type, call_conv);
+    ctx.func.signature = tail_entry_signature(pointer_type);
     let clone_value_sig = clone_value_signature(pointer_type, call_conv);
     let non_yielding_host_call_sig = non_yielding_host_call_signature(pointer_type, call_conv);
     let value_slot_sig = value_slot_signature(pointer_type, call_conv);
@@ -762,6 +852,7 @@ fn try_compile_ssa_trace(
 
     Ok(Some(CompiledTrace {
         entry,
+        tail_entry: entry,
         keepalive,
         code,
         lowering_kind: TraceLoweringKind::Ssa,
@@ -5194,7 +5285,7 @@ pub(crate) fn compile_trace(
         return Err(VmError::InvalidFuelCheckInterval(0));
     }
 
-    try_compile_ssa_trace(
+    let body = try_compile_ssa_trace(
         trace,
         &trace.ssa,
         internal_links,
@@ -5207,6 +5298,19 @@ pub(crate) fn compile_trace(
             "SSA native lowering does not support trace {} at root_ip {}",
             trace.id, trace.root_ip
         ))
+    })?;
+    let tail_entry = body.tail_entry;
+    let lowering_kind = body.lowering_kind;
+    let mut code = body.code;
+    let mut wrapper = compile_system_tail_wrapper(tail_entry)?;
+    code.extend_from_slice(&wrapper.code);
+    wrapper._keepalive.dependencies.push(body.keepalive);
+    Ok(CompiledTrace {
+        entry: wrapper.entry,
+        tail_entry,
+        keepalive: wrapper._keepalive,
+        code,
+        lowering_kind,
     })
 }
 

@@ -2265,6 +2265,216 @@ fn trace_jit_reports_exact_parent_exit_profiles() {
 }
 
 #[test]
+fn trace_jit_direct_side_link_bypasses_rust_dispatch() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        let mut i = 0;
+        let mut total = 0;
+        while i < 4096 {
+            if i % 2 == 0 {
+                total = total + 3;
+            } else {
+                total = total + 5;
+            }
+            i = i + 1;
+        }
+        total;
+    "#;
+    let compiled = compile_source(source).expect("direct side-link fixture should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_native_direct_links_enabled(true);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 256,
+    });
+
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(16_384)]);
+    let first_direct_links = vm.jit_native_direct_link_count();
+    let first_handoffs = vm.jit_native_link_handoff_count();
+    assert!(first_direct_links > 4_000, "{}", vm.dump_jit_info());
+    assert_eq!(vm.jit_native_region_count(), 0, "{}", vm.dump_jit_info());
+
+    vm.reset_for_reuse();
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(16_384)]);
+    assert!(
+        vm.jit_native_direct_link_count() - first_direct_links > 4_000,
+        "{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        vm.jit_native_link_handoff_count() - first_handoffs <= 2,
+        "{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
+fn trace_jit_tail_link_cycle_has_bounded_host_stack() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        let mut i = 0;
+        let mut total = 0;
+        while i < 1000000 {
+            if i % 2 == 0 {
+                total = total + 3;
+            } else {
+                total = total + 5;
+            }
+            i = i + 1;
+        }
+        total;
+    "#;
+    let compiled = compile_source(source).expect("tail-link cycle fixture should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_native_direct_links_enabled(true);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 256,
+    });
+
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(4_000_000)]);
+    assert!(
+        vm.jit_native_direct_link_count() > 999_000,
+        "{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        vm.jit_native_link_handoff_count() <= 4,
+        "{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
+fn trace_jit_side_link_invalidation_clears_incoming_slots() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        let mut i = 0;
+        let mut total = 0;
+        while i < 4096 {
+            if i % 2 == 0 { total = total + 3; } else { total = total + 5; }
+            i = i + 1;
+        }
+        total;
+    "#;
+    let compiled = compile_source(source).expect("side-link invalidation fixture should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_native_direct_links_enabled(true);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 256,
+    });
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert!(vm.jit_native_active_direct_link_slot_count() > 0);
+
+    vm.set_jit_native_direct_links_enabled(false);
+    assert_eq!(vm.jit_native_active_direct_link_slot_count(), 0);
+    assert_eq!(vm.jit_native_trace_count(), 0);
+}
+
+#[test]
+fn trace_jit_side_link_generation_prevents_stale_entry_reuse() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        let mut i = 0;
+        let mut total = 0;
+        while i < 4096 {
+            if i % 2 == 0 { total = total + 3; } else { total = total + 5; }
+            i = i + 1;
+        }
+        total;
+    "#;
+    let compiled = compile_source(source).expect("side-link generation fixture should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_native_direct_links_enabled(true);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 256,
+    });
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert!(vm.jit_native_active_direct_link_slot_count() > 0);
+
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 257,
+    });
+    assert_eq!(vm.jit_native_active_direct_link_slot_count(), 0);
+    assert_eq!(vm.jit_native_direct_link_count(), 0);
+    vm.reset_for_reuse();
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(16_384)]);
+    assert!(vm.jit_native_direct_link_count() > 4_000);
+    assert!(vm.jit_native_active_direct_link_slot_count() > 0);
+}
+
+#[test]
+fn trace_jit_side_link_respects_callable_frame_and_interrupt_boundaries() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn run(limit) {
+            let mut i = 0;
+            let mut total = 0;
+            while i < limit {
+                if i % 2 == 0 { total = total + 3; } else { total = total + 5; }
+                i = i + 1;
+            }
+            total
+        }
+        run(4096);
+    "#;
+    let compiled = compile_source(source).expect("direct boundary fixture should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_direct_links_enabled(true);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 256,
+    });
+    vm.set_fuel_check_interval(1).unwrap();
+    vm.set_fuel(1_000_000);
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(16_384)]);
+    assert!(vm.jit_native_direct_link_count() > 4_000);
+
+    vm.reset_for_reuse();
+    vm.set_fuel(8);
+    let mut fuel_yields = 0_u64;
+    loop {
+        match vm.run().expect("direct-link fuel run should make progress") {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => {
+                fuel_yields = fuel_yields.saturating_add(1);
+                assert_eq!(vm.last_yield_reason(), Some(VmYieldReason::Fuel));
+                assert!(fuel_yields < 4_096, "{}", vm.dump_jit_info());
+                vm.recharge_fuel(128).unwrap();
+            }
+            VmStatus::Waiting(op_id) => panic!("unexpected host wait {op_id}"),
+        }
+    }
+    assert_eq!(vm.stack(), &[Value::Int(16_384)]);
+    assert!(fuel_yields > 0);
+    assert!(vm.jit_native_direct_link_count() > 4_000);
+}
+
+#[test]
 fn trace_jit_region_links_hot_same_frame_side_exit() {
     if !native_jit_supported() {
         return;
@@ -5432,6 +5642,89 @@ fn trace_jit_region_cycles_without_external_handoffs() {
     assert!(vm.jit_native_region_entry_count() > first_region_entries);
     assert!(vm.jit_native_internal_region_edge_count() > first_internal_edges);
     assert_eq!(vm.jit_helper_fallback_count(), first_fallbacks);
+}
+
+#[test]
+fn trace_jit_direct_links_cross_frame_call_and_return_edges() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        let mut i = 0;
+        let mut total = 0;
+        let delta = 3;
+        let add: fn(int) -> int = |value| value + delta;
+        while i < 4096 {
+            total = add(total);
+            i = i + 1;
+        }
+        total;
+    "#;
+    let compiled = compile_source(source).expect("direct callable loop should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_direct_links_enabled(true);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(12_288)]);
+    let first_direct = vm.jit_native_direct_link_count();
+    let first_handoffs = vm.jit_native_link_handoff_count();
+
+    vm.reset_for_reuse();
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(12_288)]);
+    let direct_delta = vm.jit_native_direct_link_count() - first_direct;
+    let handoff_delta = vm.jit_native_link_handoff_count() - first_handoffs;
+    assert!(direct_delta > 12_000, "{}", vm.dump_jit_info());
+    assert!(handoff_delta <= 3, "{}", vm.dump_jit_info());
+    assert_eq!(vm.jit_native_region_count(), 0);
+}
+
+#[test]
+fn trace_jit_direct_link_slots_clear_and_republish_after_mode_toggle() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        let mut i = 0;
+        let mut total = 0;
+        while i < 512 {
+            if i % 2 == 0 { total = total + 3; } else { total = total + 5; }
+            i = i + 1;
+        }
+        total;
+    "#;
+    let compiled = compile_source(source).unwrap();
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_direct_links_enabled(true);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(2_048)]);
+    assert!(vm.jit_native_direct_link_count() > 500);
+
+    vm.set_jit_native_direct_links_enabled(false);
+    vm.reset_for_reuse();
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(2_048)]);
+    assert_eq!(vm.jit_native_direct_link_count(), 0);
+
+    vm.set_jit_native_direct_links_enabled(true);
+    vm.reset_for_reuse();
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(2_048)]);
+    assert!(
+        vm.jit_native_direct_link_count() > 500,
+        "{}",
+        vm.dump_jit_info()
+    );
 }
 
 #[test]

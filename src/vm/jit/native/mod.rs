@@ -1,9 +1,9 @@
 #![allow(dead_code)]
-#[cfg(not(feature = "cranelift-jit"))]
-use super::super::super::VmError;
-use super::super::super::VmResult;
+use super::super::super::{VmError, VmResult};
 use super::ir::{SsaMaterialization, SsaValueRepr};
 use crate::ValueType;
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 pub(crate) use crate::vm::native::{
@@ -115,6 +115,67 @@ impl Default for NativeSideLinkSlot {
     }
 }
 
+pub(crate) const LINKED_CONTINUE_SLOT_ID: u32 = u32::MAX;
+pub(crate) const CONTINUE_SLOT_ID: u32 = u32::MAX - 1;
+
+pub(crate) struct CompiledTraceDispatcher {
+    pub(crate) entry: *const u8,
+    pub(crate) tail_entry: *const u8,
+    pub(crate) keepalives: Vec<TraceKeepAlive>,
+    pub(crate) code: Vec<u8>,
+    pub(crate) slots: HashMap<u32, Arc<NativeSideLinkSlot>>,
+}
+
+#[cfg(feature = "cranelift-jit")]
+pub(crate) fn compile_native_trace_dispatcher(
+    trace_id: usize,
+    trace_entry: *const u8,
+    trace: &super::JitTrace,
+) -> VmResult<CompiledTraceDispatcher> {
+    let mut slots = HashMap::new();
+    let mut descriptors = Vec::with_capacity(trace.ssa.exits.len());
+    for exit in &trace.ssa.exits {
+        let status =
+            crate::vm::native::encode_jit_trace_exit_status(exit.id.raw()).ok_or_else(|| {
+                VmError::JitNative("SSA exit id exceeds native status range".to_string())
+            })?;
+        let slot = Arc::new(NativeSideLinkSlot::new());
+        descriptors.push((status, slot.address() as usize));
+        slots.insert(exit.id.raw(), slot);
+    }
+    let slot = Arc::new(NativeSideLinkSlot::new());
+    descriptors.push((STATUS_LINKED_CONTINUE, slot.address() as usize));
+    slots.insert(LINKED_CONTINUE_SLOT_ID, slot);
+    let slot = Arc::new(NativeSideLinkSlot::new());
+    descriptors.push((STATUS_CONTINUE, slot.address() as usize));
+    slots.insert(CONTINUE_SLOT_ID, slot);
+    let dispatcher = lower::compile_tail_trace_dispatcher(trace_entry, trace_id, &descriptors)?;
+    let tail_entry = dispatcher.entry();
+    let wrapper = lower::compile_system_tail_wrapper(tail_entry)?;
+    let (tail_entry, dispatcher_keepalive, dispatcher_code) = dispatcher.into_parts();
+    let (entry, wrapper_keepalive, wrapper_code) = wrapper.into_parts();
+    let mut code = dispatcher_code;
+    code.extend_from_slice(&wrapper_code);
+    Ok(CompiledTraceDispatcher {
+        entry,
+        tail_entry,
+        keepalives: vec![dispatcher_keepalive, wrapper_keepalive],
+        code,
+        slots,
+    })
+}
+
+#[cfg(not(feature = "cranelift-jit"))]
+pub(crate) fn compile_native_trace_dispatcher(
+    _trace_id: usize,
+    _trace_entry: *const u8,
+    _trace: &super::JitTrace,
+) -> VmResult<CompiledTraceDispatcher> {
+    Err(VmError::JitNative(
+        "native JIT backend is disabled (feature 'cranelift-jit' is not enabled)".to_string(),
+    ))
+}
+
 #[cfg(feature = "cranelift-jit")]
 pub(crate) use lower::{CompiledTrace, TraceKeepAlive};
 
@@ -124,6 +185,7 @@ pub(crate) struct TraceKeepAlive;
 #[cfg(not(feature = "cranelift-jit"))]
 pub(crate) struct CompiledTrace {
     pub entry: *const u8,
+    pub tail_entry: *const u8,
     pub code: Vec<u8>,
     pub keepalive: TraceKeepAlive,
     pub lowering_kind: TraceLoweringKind,
