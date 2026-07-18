@@ -712,6 +712,10 @@ impl TraceJitEngine {
         }
     }
 
+    pub(crate) fn record_native_region_progress(&mut self, trace_id: usize) {
+        self.record_native_loop_back(trace_id);
+    }
+
     pub(crate) fn callable_frame_is_blocked(&self, frame_key: u64) -> bool {
         if frame_key == ROOT_FRAME_KEY {
             return false;
@@ -1609,7 +1613,7 @@ mod tests {
     }
 
     #[test]
-    fn callable_side_exit_backoff_resets_on_native_loopback() {
+    fn callable_side_exit_backoff_resets_on_native_progress() {
         if !native_jit_supported() {
             return;
         }
@@ -1650,6 +1654,10 @@ mod tests {
             assert!(!engine.record_native_side_exit(trace_id));
         }
         engine.record_native_loop_back(trace_id);
+        for _ in 1..CALLABLE_SIDE_EXIT_BACKOFF_THRESHOLD {
+            assert!(!engine.record_native_side_exit(trace_id));
+        }
+        engine.record_native_region_progress(trace_id);
         for _ in 1..CALLABLE_SIDE_EXIT_BACKOFF_THRESHOLD {
             assert!(!engine.record_native_side_exit(trace_id));
         }
