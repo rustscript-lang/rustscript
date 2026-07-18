@@ -2148,10 +2148,12 @@ impl Vm {
                 && !self.drop_contract_events_enabled()
             {
                 let frame_key = self.active_frame_key();
-                let stack_depth = self.active_operand_stack_len();
-                let entry_local_types = (frame_key != crate::vm::native::ROOT_FRAME_KEY)
-                    .then(|| self.active_local_types());
-                let trace_id = {
+                let trace_id = if self.jit.callable_frame_is_blocked(frame_key) {
+                    None
+                } else {
+                    let stack_depth = self.active_operand_stack_len();
+                    let entry_local_types = (frame_key != crate::vm::native::ROOT_FRAME_KEY)
+                        .then(|| self.active_local_types());
                     let program = &self.program;
                     self.jit.observe_hot_entry_with_local_types(
                         frame_key,

@@ -208,6 +208,64 @@ Interpretation:
 - `7a151fc` added typed builtin fast-path checks and counters to the interpreter `Call` path after the
   plan baseline; it is a profiling candidate, not an established causal commit
 
+### `script-bench-rs` callable-frame regression and mitigation (2026-07-18)
+
+A separate same-machine rerun used `/mnt/TEMP/workspace/script-bench-rs` at
+`6fd2a61f0a2164c40f841d585ac7dbae55362b15` and its `Sort Rust objects` workload over 10,000
+Rust-backed objects. The baseline used crates.io `pd-vm 0.23.1`; the candidate used the RustScript
+working tree based on `2e5399c` with the benchmark dependency redirected by path in an isolated
+export. The benchmark repository itself was not modified or pushed.
+
+The initial CPU 11 result, four alternating Criterion runs with `sample_size=10`, was:
+
+| Mode | `0.23.1` median | `master` median before fix | Change |
+|---|---:|---:|---:|
+| interpreter | `330.6 ms` | `536.6 ms` | `+62.3%` |
+| JIT | `81.1 ms` | `1875.6 ms` | `+2212.4%` / `23.1x` slower |
+
+CPU 3 reproduced the JIT delta at `23.3x`, so the result was not a scheduler-frequency artifact.
+Native-trace assertions passed on both endpoints.
+
+Bisection and trace diagnostics found:
+
+- first large JIT regression: `df6a0ff feat(jit): trace inside script callable frames`
+- all hot sort traces ran in prototype frame `0`
+- one reused pre-fix run produced about `352k` native executions, `352k` exits, `0` native
+  loopbacks, and `332k` linked handoffs
+- trace shape and execution counts were close to `0.23.1`; the regression came from repeatedly
+  entering and leaving frame-relative native traces that performed no sustained native loopback
+- after a trace was blocked, the interpreter still eagerly built `active_local_types()` before the
+  engine could reject the frame, keeping the JIT-enabled fallback path materially slower
+
+The mitigation is callable-frame adaptive backoff:
+
+- count consecutive non-loopback native side exits for callable-frame traces
+- reset the streak after a successful native loopback
+- after 64 consecutive side exits, block the complete callable prototype frame and remove its
+  compiled entry mappings
+- check the blocked-frame bitmap before constructing frame-local type vectors
+- root traces remain eligible, and scalar callable loops with native loopbacks remain native
+
+Post-fix CPU 11 A/B, four alternating runs:
+
+| Mode | Median | Range |
+|---|---:|---:|
+| current interpreter | `510.6 ms` | `490.6-537.0 ms` |
+| fixed JIT | `530.3 ms` | `485.3-551.0 ms` |
+
+The fixed JIT is `71.7%` faster than the pre-fix master JIT and is within `+3.9%` of the same-run
+interpreter median. It remains `6.54x` slower than the old `0.23.1` JIT because `0.23.1` inlined
+direct named function calls, while real script call frames intentionally route them through
+`CallValue`. Restoring that older speed requires a separate compiler direct-call inlining design;
+the VM mitigation prevents pathological slowdown without changing callable semantics.
+
+Verification:
+
+- focused trace-engine and callable-frame regression tests passed
+- complete `jit_tests`: `101 passed`, `0 failed`, `11 ignored`
+- `cargo test --workspace --lib --tests` passed
+- `cargo clippy --workspace --lib --tests -- -D warnings` passed
+
 ## Non-Goals
 
 - redesigning RustScript source-level function semantics

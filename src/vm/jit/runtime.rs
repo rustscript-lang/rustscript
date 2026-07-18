@@ -237,7 +237,7 @@ impl Vm {
             let mut next_trace_id = self
                 .jit
                 .compiled_trace_for_entry(frame_key, ip, stack_depth);
-            if next_trace_id.is_none() {
+            if next_trace_id.is_none() && !self.jit.callable_frame_is_blocked(frame_key) {
                 let entry_local_types =
                     (frame_key != ROOT_FRAME_KEY).then(|| self.active_local_types());
                 let program = &self.program;
@@ -315,9 +315,14 @@ impl Vm {
                         && terminal == JitTraceTerminal::LoopBack
                         && self.ip == root_ip
                     {
+                        self.jit.record_native_loop_back(current_trace_id);
                         self.jit_native_loop_back_count =
                             self.jit_native_loop_back_count.saturating_add(1);
                         continue;
+                    }
+                    if self.jit.record_native_side_exit(current_trace_id) {
+                        self.jit.block_callable_frame(current_trace_id);
+                        return Ok(native::STATUS_LINKED_CONTINUE);
                     }
                     if !has_yielding_call {
                         let ip = self.ip;
@@ -326,7 +331,8 @@ impl Vm {
                         let mut next_trace_id =
                             self.jit
                                 .compiled_trace_for_entry(frame_key, ip, stack_depth);
-                        if next_trace_id.is_none() {
+                        if next_trace_id.is_none() && !self.jit.callable_frame_is_blocked(frame_key)
+                        {
                             let entry_local_types =
                                 (frame_key != ROOT_FRAME_KEY).then(|| self.active_local_types());
                             let program = &self.program;
@@ -590,9 +596,14 @@ impl Vm {
                         && terminal == JitTraceTerminal::LoopBack
                         && self.ip == root_ip
                     {
+                        self.jit.record_native_loop_back(current_trace_id);
                         self.jit_native_loop_back_count =
                             self.jit_native_loop_back_count.saturating_add(1);
                         continue;
+                    }
+                    if self.jit.record_native_side_exit(current_trace_id) {
+                        self.jit.block_callable_frame(current_trace_id);
+                        return Ok(ExecOutcome::Continue);
                     }
                     if !has_yielding_call {
                         let ip = self.ip;
@@ -601,7 +612,8 @@ impl Vm {
                         let mut next_trace_id =
                             self.jit
                                 .compiled_trace_for_entry(frame_key, ip, stack_depth);
-                        if next_trace_id.is_none() {
+                        if next_trace_id.is_none() && !self.jit.callable_frame_is_blocked(frame_key)
+                        {
                             next_trace_id = {
                                 let entry_local_types = (frame_key != ROOT_FRAME_KEY)
                                     .then(|| self.active_local_types());
@@ -653,7 +665,7 @@ impl Vm {
                     let mut next_trace_id =
                         self.jit
                             .compiled_trace_for_entry(frame_key, ip, stack_depth);
-                    if next_trace_id.is_none() {
+                    if next_trace_id.is_none() && !self.jit.callable_frame_is_blocked(frame_key) {
                         next_trace_id = {
                             let entry_local_types =
                                 (frame_key != ROOT_FRAME_KEY).then(|| self.active_local_types());
