@@ -6326,6 +6326,35 @@ fn trace_jit_executes_call_value_natively_inside_loop() {
 }
 
 #[test]
+fn interpreter_superinstructions_use_script_frame_local_base() {
+    let source = r#"
+        fn count() -> int {
+            let mut i = 0;
+            while i < 100 {
+                i = i + 1;
+            }
+            i
+        }
+        count();
+    "#;
+    let compiled =
+        compile_source(source).expect("script-frame superinstruction source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: false,
+        ..JitConfig::default()
+    });
+
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(100)]);
+    assert!(
+        vm.interpreter_metrics_snapshot()
+            .scalar_superinstruction_count
+            > 0
+    );
+}
+
+#[test]
 fn trace_jit_inlines_static_leaf_in_root_loop() {
     if !native_jit_supported() {
         return;
