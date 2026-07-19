@@ -48,11 +48,14 @@ pub(crate) fn classify_static_inline_candidate(
         return Err(InlineRejectReason::NonRootCaller);
     }
     let source_local = source_local.ok_or(InlineRejectReason::UnknownTarget)?;
-    let binding = program
+    let mut bindings = program
         .root_callable_bindings
         .iter()
-        .find(|binding| binding.local_slot == u16::from(source_local))
-        .ok_or(InlineRejectReason::UnknownTarget)?;
+        .filter(|binding| binding.local_slot == u16::from(source_local));
+    let binding = bindings.next().ok_or(InlineRejectReason::UnknownTarget)?;
+    if bindings.next().is_some() {
+        return Err(InlineRejectReason::PolymorphicTarget);
+    }
     if caller_prototype_id == Some(binding.prototype_id) {
         return Err(InlineRejectReason::Recursive);
     }
