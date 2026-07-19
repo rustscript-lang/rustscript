@@ -1,5 +1,6 @@
-use std::fmt;
+use std::{fmt, sync::Arc};
 
+use crate::CallableValue;
 use crate::builtins::BuiltinFunction;
 use crate::vm::{OpCode, Program, Value, ValueType, checked_int_div};
 
@@ -1245,6 +1246,55 @@ pub(crate) fn record_trace_with_local_count(
                 if inline_frame.is_none()
                     && let Ok(candidate) = candidate
                 {
+                    let prototype = &program.callable_prototypes[candidate.prototype_id as usize];
+                    let expected_callable = builder
+                        .append_value_inst(
+                            current_block,
+                            ip,
+                            SsaValueRepr::Tagged,
+                            SsaInstKind::Constant(Value::Callable(Arc::new(CallableValue {
+                                prototype_id: candidate.prototype_id,
+                                kind: prototype.kind,
+                                env: None,
+                            }))),
+                        )
+                        .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+                    let callable_matches = builder
+                        .append_value_inst(
+                            current_block,
+                            ip,
+                            SsaValueRepr::Bool,
+                            SsaInstKind::ValueCmpEq {
+                                lhs: callable.value.id,
+                                rhs: expected_callable.id,
+                            },
+                        )
+                        .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+                    let identity_exit =
+                        add_symbolic_exit(&mut builder, ip, &frame, inline_frame.as_ref());
+                    let (guarded_block, guarded_frame, guard_args) = continue_with_inline_frame(
+                        &mut builder,
+                        &frame,
+                        &mut inline_frame,
+                        "inline_callable_identity",
+                    )?;
+                    builder
+                        .set_terminator(
+                            current_block,
+                            SsaTerminator::BranchBool {
+                                condition: callable_matches.id,
+                                if_true: SsaBranchTarget::Block {
+                                    target: guarded_block,
+                                    args: guard_args,
+                                },
+                                if_false: SsaBranchTarget::Exit(identity_exit),
+                            },
+                        )
+                        .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+                    current_block = guarded_block;
+                    frame = guarded_frame;
+                    op_names.push("inline_callable_identity_guard".to_string());
+
                     let operand_base = frame.stack.len() - usize::from(argc) - 1;
                     let mut operands = frame.stack.split_off(operand_base);
                     let _callable = operands.remove(0);
