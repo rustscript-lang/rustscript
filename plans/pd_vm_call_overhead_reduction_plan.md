@@ -587,10 +587,11 @@ frames in snapshots.
 
 Verification:
 
-- focused trace-engine and callable-frame regression tests passed
-- complete `jit_tests`: `101 passed`, `0 failed`, `11 ignored`
-- `cargo test --workspace --lib --tests` passed
-- `cargo clippy --workspace --lib --tests -- -D warnings` passed
+- focused trace-engine, callable-frame, and stale-continuation regression tests passed
+- complete `jit_tests`: `128 passed`, `0 failed`, `11 ignored`
+- `RUSTFLAGS="-Dwarnings" cargo clippy --workspace --all-targets --all-features` passed
+- `cargo test --workspace` passed
+- GitHub CI passed on Ubuntu, macOS, and Windows
 
 ## Non-Goals
 
