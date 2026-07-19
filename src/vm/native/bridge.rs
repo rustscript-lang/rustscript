@@ -1186,6 +1186,7 @@ pub(crate) extern "C" fn pd_vm_native_restore_active_sparse_exit_state(
 
         if vm.capture_cells.is_empty() {
             let local_base = vm.active_local_base();
+            let count_drop_events = vm.drop_contract_events_enabled;
             for compact_index in 0..dirty_local_count {
                 let local_index = unsafe { *dirty_local_indices.add(compact_index) } as usize;
                 debug_assert!(local_index < 256);
@@ -1194,7 +1195,9 @@ pub(crate) extern "C" fn pd_vm_native_restore_active_sparse_exit_state(
                 let value = unsafe { std::ptr::read(dirty_local_values.add(compact_index)) };
                 let slot = unsafe { vm.locals.get_unchecked_mut(absolute) };
                 let previous = std::mem::replace(slot, value);
-                vm.drop_value_with_contract(previous);
+                if count_drop_events {
+                    vm.count_value_drop_contract(&previous);
+                }
             }
         } else {
             for compact_index in 0..dirty_local_count {
