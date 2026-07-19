@@ -629,7 +629,7 @@ impl TraceJitEngine {
         stack_depth: usize,
         program: &Program,
     ) -> Option<usize> {
-        self.observe_exit_entry_with_local_types(frame_key, ip, stack_depth, None, program)
+        self.observe_exit_entry_with_local_types(frame_key, ip, stack_depth, None, None, program)
     }
 
     pub(crate) fn observe_exit_entry_with_local_types(
@@ -638,9 +638,9 @@ impl TraceJitEngine {
         ip: usize,
         stack_depth: usize,
         entry_local_types: Option<&[crate::ValueType]>,
+        entry_callable_prototypes: Option<&[Option<u32>]>,
         program: &Program,
     ) -> Option<usize> {
-        let entry_callable_prototypes = None;
         if !self.config.enabled
             || !native_jit_supported()
             || self.callable_frame_is_blocked(frame_key)

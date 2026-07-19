@@ -1338,16 +1338,16 @@ pub(crate) fn record_trace_with_local_count(
                     max_trace_len.saturating_sub(cursor.recorded_ops),
                 )
                 .and_then(|candidate| {
-                    if let Some(prototypes) = entry_callable_prototypes {
-                        let source_local = callable
-                            .info
-                            .source_local
-                            .ok_or(InlineRejectReason::UnknownTarget)?;
-                        if prototypes.get(usize::from(source_local)).copied().flatten()
-                            != Some(candidate.prototype_id)
-                        {
-                            return Err(InlineRejectReason::PolymorphicTarget);
-                        }
+                    let prototypes = entry_callable_prototypes
+                        .ok_or(InlineRejectReason::UnknownTarget)?;
+                    let source_local = callable
+                        .info
+                        .source_local
+                        .ok_or(InlineRejectReason::UnknownTarget)?;
+                    if prototypes.get(usize::from(source_local)).copied().flatten()
+                        != Some(candidate.prototype_id)
+                    {
+                        return Err(InlineRejectReason::PolymorphicTarget);
                     }
                     let prototype = &program.callable_prototypes[candidate.prototype_id as usize];
                     let argument_start = frame.stack.len() - usize::from(argc);
@@ -5378,7 +5378,23 @@ mod tests {
                 }],
             );
 
-        let recorded = record_trace(&program, root_ip as usize, 0, 64, &[]).unwrap();
+        let unproven = record_trace(&program, root_ip as usize, 0, 64, &[]).unwrap();
+        assert_eq!(unproven.terminal, JitTraceTerminal::CallValue);
+        assert!(!unproven.op_names.iter().any(|name| name == "inline_call:0"));
+
+        let callable_prototypes = [Some(0), None];
+        let recorded = record_trace_with_local_count(
+            &program,
+            crate::vm::native::ROOT_FRAME_KEY,
+            root_ip as usize,
+            0,
+            program.local_count,
+            None,
+            Some(&callable_prototypes),
+            64,
+            &[],
+        )
+        .unwrap();
         assert_eq!(recorded.terminal, JitTraceTerminal::LoopBack);
         assert!(recorded.op_names.iter().any(|name| name == "inline_call:0"));
         assert!(recorded.op_names.iter().any(|name| name == "inline_ret"));
