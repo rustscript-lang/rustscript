@@ -562,8 +562,9 @@ inherited-state candidate (point estimates, milliseconds):
 
 The candidate/base median ratio is `1.866x`, satisfying the `<=2x` sort gate. The candidate median
 is `67.95%` below the pre-inherited-state `419.614 ms` median. Correct sorted output and native
-execution assertions passed in every Criterion run. Raw logs are retained under
-`/tmp/inherited-state-results/final-ab-{base,candidate}-*.log` for this validation session.
+execution assertions passed in every Criterion run. Raw logs were captured under
+`/tmp/inherited-state-results/final-ab-{base,candidate}-*.log` during validation; they are temporary
+session artifacts and are not part of the repository.
 
 #### Direction selection and shared rollout
 
