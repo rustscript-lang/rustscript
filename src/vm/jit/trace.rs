@@ -5,6 +5,10 @@ use crate::vm::native::ROOT_FRAME_KEY;
 use crate::vm::{OpCode, Program};
 
 use super::deopt::{SideTraceImport, SideTraceImportError};
+use super::inline::{
+    CallSiteKey, CallSiteProfile, JitCallSiteProfile, call_site_metric_summary, call_site_profiles,
+    observe_script_call_target,
+};
 use super::ir::{SsaExitId, SsaMaterialization, SsaTrace, SsaValueId, SsaValueRepr};
 use super::liveness::{boxed_load_site_count, boxed_store_site_count};
 use super::recorder::{RecordedTrace, TraceRecordError, record_trace_with_local_count};
@@ -253,6 +257,9 @@ pub struct JitMetrics {
     pub native_loop_back_count: u64,
     pub helper_fallback_count: u64,
     pub native_trace_exec_count: u64,
+    pub script_call_observations: u64,
+    pub monomorphic_call_sites: u64,
+    pub polymorphic_call_sites: u64,
 }
 
 impl JitMetrics {
@@ -298,6 +305,7 @@ pub struct TraceJitEngine {
     non_yielding_host_imports: Vec<bool>,
     traces: Vec<JitTrace>,
     trace_exit_profiles: HashMap<TraceExitKey, TraceExitProfile>,
+    call_site_profiles: HashMap<CallSiteKey, CallSiteProfile>,
     region_generation: u64,
     published_region: Option<PublishedRegion>,
     failed_region_exits: HashSet<TraceExitKey>,
@@ -323,6 +331,7 @@ impl TraceJitEngine {
             non_yielding_host_imports: Vec::new(),
             traces: Vec::new(),
             trace_exit_profiles: HashMap::new(),
+            call_site_profiles: HashMap::new(),
             region_generation: 0,
             published_region: None,
             failed_region_exits: HashSet::new(),
@@ -336,6 +345,30 @@ impl TraceJitEngine {
         &self.config
     }
 
+    pub(crate) fn observe_script_call_target(
+        &mut self,
+        caller_frame_key: u64,
+        call_ip: usize,
+        prototype_id: u32,
+    ) {
+        observe_script_call_target(
+            &mut self.call_site_profiles,
+            CallSiteKey {
+                caller_frame_key,
+                call_ip,
+            },
+            prototype_id,
+        );
+    }
+
+    pub fn call_site_profiles(&self) -> Vec<JitCallSiteProfile> {
+        call_site_profiles(&self.call_site_profiles)
+    }
+
+    pub(crate) fn clear_call_site_profiles(&mut self) {
+        self.call_site_profiles.clear();
+    }
+
     pub fn set_config(&mut self, config: JitConfig) {
         self.invalidate_regions();
         self.config = config;
@@ -345,6 +378,7 @@ impl TraceJitEngine {
         self.loop_headers = None;
         self.traces.clear();
         self.trace_exit_profiles.clear();
+        self.call_site_profiles.clear();
         self.callable_side_exit_streaks.clear();
         self.blocked_callable_frames.clear();
         self.attempts.clear();
@@ -362,6 +396,7 @@ impl TraceJitEngine {
         self.loop_headers = None;
         self.traces.clear();
         self.trace_exit_profiles.clear();
+        self.call_site_profiles.clear();
         self.callable_side_exit_streaks.clear();
         self.blocked_callable_frames.clear();
         self.attempts.clear();
@@ -831,6 +866,12 @@ impl TraceJitEngine {
         ));
         out.push_str(&format!("  compile attempts: {}\n", self.attempts.len()));
         out.push_str(&format!(
+            "  script calls: observations={} monomorphic_sites={} polymorphic_sites={}\n",
+            metrics.script_call_observations,
+            metrics.monomorphic_call_sites,
+            metrics.polymorphic_call_sites
+        ));
+        out.push_str(&format!(
             "  boxed value sites: loads={} stores={}\n",
             metrics.boxed_load_site_count, metrics.boxed_store_site_count
         ));
@@ -1032,6 +1073,11 @@ impl TraceJitEngine {
     }
 
     fn aggregate_metrics(&self, mut runtime_metrics: JitMetrics) -> JitMetrics {
+        let (observations, monomorphic, polymorphic) =
+            call_site_metric_summary(&self.call_site_profiles);
+        runtime_metrics.script_call_observations = observations;
+        runtime_metrics.monomorphic_call_sites = monomorphic;
+        runtime_metrics.polymorphic_call_sites = polymorphic;
         for trace in &self.traces {
             runtime_metrics.boxed_load_site_count = runtime_metrics
                 .boxed_load_site_count
@@ -1178,6 +1224,88 @@ mod tests {
         BytecodeBuilder, CallableKind, CallablePrototype, CallableTarget, ScriptFunction, Value,
         ValueType,
     };
+
+    #[test]
+    fn call_site_profiles_distinguish_caller_frames_and_target_changes() {
+        let mut engine = TraceJitEngine::new(JitConfig::default());
+
+        engine.observe_script_call_target(7, 41, 2);
+        engine.observe_script_call_target(7, 41, 2);
+        engine.observe_script_call_target(8, 41, 3);
+        engine.observe_script_call_target(7, 41, 4);
+
+        assert_eq!(
+            engine.call_site_profiles(),
+            vec![
+                JitCallSiteProfile {
+                    caller_frame_key: 7,
+                    call_ip: 41,
+                    prototype_id: 2,
+                    observations: 3,
+                    mismatches: 1,
+                    monomorphic: false,
+                },
+                JitCallSiteProfile {
+                    caller_frame_key: 8,
+                    call_ip: 41,
+                    prototype_id: 3,
+                    observations: 1,
+                    mismatches: 0,
+                    monomorphic: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn call_site_profiles_clear_when_engine_config_changes() {
+        let mut engine = TraceJitEngine::new(JitConfig::default());
+        engine.observe_script_call_target(7, 41, 2);
+
+        engine.set_config(JitConfig {
+            enabled: false,
+            ..JitConfig::default()
+        });
+
+        assert!(engine.call_site_profiles().is_empty());
+    }
+
+    #[test]
+    fn call_site_profiles_clear_when_host_import_capabilities_change() {
+        let mut engine = TraceJitEngine::new(JitConfig::default());
+        engine.observe_script_call_target(7, 41, 2);
+
+        assert!(engine.set_non_yielding_host_imports(vec![true]));
+
+        assert!(engine.call_site_profiles().is_empty());
+    }
+
+    #[test]
+    fn call_site_metrics_count_observations_and_site_classes() {
+        let mut engine = TraceJitEngine::new(JitConfig::default());
+        engine.observe_script_call_target(7, 41, 2);
+        engine.observe_script_call_target(7, 41, 2);
+        engine.observe_script_call_target(8, 41, 3);
+        engine.observe_script_call_target(7, 41, 4);
+
+        let metrics = engine.snapshot(JitMetrics::default()).metrics;
+        assert_eq!(metrics.script_call_observations, 4);
+        assert_eq!(metrics.monomorphic_call_sites, 1);
+        assert_eq!(metrics.polymorphic_call_sites, 1);
+    }
+
+    #[test]
+    fn jit_dump_reports_call_site_profile_metrics() {
+        let mut engine = TraceJitEngine::new(JitConfig::default());
+        engine.observe_script_call_target(7, 41, 2);
+        engine.observe_script_call_target(7, 41, 4);
+
+        let dump = engine.dump_text(None, JitMetrics::default());
+        assert!(
+            dump.contains("script calls: observations=2 monomorphic_sites=0 polymorphic_sites=1"),
+            "dump:\n{dump}"
+        );
+    }
 
     fn test_trace(id: usize, frame_key: u64, has_yielding_call: bool, ssa: SsaTrace) -> JitTrace {
         JitTrace {

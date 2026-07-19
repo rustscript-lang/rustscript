@@ -9,8 +9,8 @@ pub mod debugger;
 #[cfg(feature = "runtime")]
 pub mod jit {
     pub use crate::vm::jit::{
-        JitAttempt, JitConfig, JitExitProfile, JitMetrics, JitNyiDoc, JitNyiReason, JitSnapshot,
-        JitTrace, JitTraceTerminal, TraceJitEngine,
+        JitAttempt, JitCallSiteProfile, JitConfig, JitExitProfile, JitMetrics, JitNyiDoc,
+        JitNyiReason, JitSnapshot, JitTrace, JitTraceTerminal, TraceJitEngine,
     };
 }
 #[cfg(feature = "cli")]
@@ -81,8 +81,8 @@ pub use debugger::{
 };
 #[cfg(feature = "runtime")]
 pub use jit::{
-    JitAttempt, JitConfig, JitExitProfile, JitMetrics, JitNyiDoc, JitNyiReason, JitSnapshot,
-    JitTrace, JitTraceTerminal, TraceJitEngine,
+    JitAttempt, JitCallSiteProfile, JitConfig, JitExitProfile, JitMetrics, JitNyiDoc, JitNyiReason,
+    JitSnapshot, JitTrace, JitTraceTerminal, TraceJitEngine,
 };
 #[cfg(feature = "runtime")]
 pub use vm::diagnostics::render_vm_error;

@@ -929,7 +929,7 @@ fn native_enter_call_value(
         return Err(VmError::BytecodeBounds);
     }
     vm.ip = resume_ip;
-    let status = match vm.execute_call_value(argc)? {
+    let status = match vm.execute_call_value(argc, Some(call_ip))? {
         ExecOutcome::Continue => STATUS_LINKED_CONTINUE,
         ExecOutcome::Halted => STATUS_HALTED,
         ExecOutcome::Yielded => STATUS_YIELDED,

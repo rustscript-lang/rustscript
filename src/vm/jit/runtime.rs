@@ -783,6 +783,10 @@ impl Vm {
         self.jit.exit_profiles()
     }
 
+    pub fn jit_call_site_profiles(&self) -> Vec<super::JitCallSiteProfile> {
+        self.jit.call_site_profiles()
+    }
+
     pub fn jit_native_code_bytes(&self) -> usize {
         self.native_traces
             .iter()
@@ -1634,6 +1638,9 @@ impl Vm {
             native_loop_back_count: self.jit_native_loop_back_count,
             helper_fallback_count: self.jit_helper_fallback_count,
             native_trace_exec_count: self.native_trace_exec_count,
+            script_call_observations: 0,
+            monomorphic_call_sites: 0,
+            polymorphic_call_sites: 0,
         }
     }
 

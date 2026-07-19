@@ -929,6 +929,7 @@ impl Vm {
         self.io_state = crate::builtins::runtime::IoState::default();
         self.map_iterators.clear();
         self.jit.reset_runtime_backoff();
+        self.jit.clear_call_site_profiles();
         self.clear_interpreter_metrics();
     }
 
@@ -1238,7 +1239,11 @@ impl Vm {
         Ok(Value::Callable(callable))
     }
 
-    fn execute_call_value(&mut self, argc: u8) -> VmResult<ExecOutcome> {
+    fn execute_call_value(
+        &mut self,
+        argc: u8,
+        call_site_ip: Option<usize>,
+    ) -> VmResult<ExecOutcome> {
         let operand_count = argc as usize + 1;
         if self.stack.len() < operand_count {
             return Err(VmError::StackUnderflow);
@@ -1274,6 +1279,13 @@ impl Vm {
 
         match prototype.target {
             CallableTarget::ScriptFunction(function_id) => {
+                if let Some(call_ip) = call_site_ip {
+                    self.jit.observe_script_call_target(
+                        self.active_frame_key(),
+                        call_ip,
+                        callable.prototype_id,
+                    );
+                }
                 if self.call_depth >= self.max_script_call_depth {
                     return Err(VmError::CallStackOverflow {
                         limit: self.max_script_call_depth,
@@ -2578,8 +2590,9 @@ impl Vm {
             }
 
             x if x == OpCode::CallValue as u8 => {
+                let call_ip = self.ip.saturating_sub(1);
                 let argc = self.read_u8()?;
-                return self.execute_call_value(argc);
+                return self.execute_call_value(argc, Some(call_ip));
             }
             other => return Err(VmError::InvalidOpcode(other)),
         }
@@ -2804,7 +2817,7 @@ impl Vm {
         self.stack.push(callable);
         self.stack.extend_from_slice(args);
         self.host_return = None;
-        let outcome = match self.execute_call_value(argc) {
+        let outcome = match self.execute_call_value(argc, None) {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.abort_host_invocation(stack_base, frame_count);
