@@ -67,7 +67,13 @@ pub(crate) fn classify_static_inline_candidate(
     {
         return Err(InlineRejectReason::CapturedCallable);
     }
-    if prototype.arity != argc || prototype.parameter_slots.len() != usize::from(argc) {
+    if prototype.arity != argc
+        || prototype.parameter_slots.len() != usize::from(argc)
+        || prototype
+            .parameter_slots
+            .iter()
+            .any(|slot| usize::from(*slot) >= prototype.frame_local_count)
+    {
         return Err(InlineRejectReason::ArityMismatch);
     }
     let CallableTarget::ScriptFunction(function_id) = prototype.target else {

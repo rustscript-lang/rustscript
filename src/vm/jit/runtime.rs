@@ -1641,6 +1641,9 @@ impl Vm {
             script_call_observations: 0,
             monomorphic_call_sites: 0,
             polymorphic_call_sites: 0,
+            inline_attempts: 0,
+            inline_successes: 0,
+            inline_rejections: 0,
         }
     }
 

@@ -5,10 +5,10 @@ use crate::vm::{OpCode, Program, Value, ValueType, checked_int_div};
 
 use super::JitTraceTerminal;
 use super::deopt::materialize_ssa_values;
-use super::inline::classify_static_inline_candidate;
+use super::inline::{InlineCandidate, classify_static_inline_candidate};
 use super::ir::{
     SsaBranchTarget, SsaInstKind, SsaMaterialization, SsaTerminator, SsaTrace, SsaTraceBuilder,
-    SsaValue, SsaValueRepr,
+    SsaValue, SsaValueRepr, VirtualFrameSnapshot,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -267,6 +267,14 @@ struct SymbolicFrame {
     stack: Vec<SymbolicValue>,
     locals: Vec<SymbolicValue>,
     dirty_locals: Vec<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct InlineRecorderFrame {
+    candidate: InlineCandidate,
+    call_ip: usize,
+    return_ip: usize,
+    caller: SymbolicFrame,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -745,6 +753,7 @@ pub(crate) fn record_trace_with_local_count(
 ) -> Result<RecordedTrace, TraceRecordError> {
     let loop_header_plan = infer_loop_header_plan(
         program,
+        caller_frame_key,
         root_ip,
         entry_stack_depth,
         local_count,
@@ -896,6 +905,7 @@ pub(crate) fn record_trace_with_local_count(
     let mut has_call = false;
     let mut has_yielding_call = false;
     let mut has_useful_native_computation = false;
+    let mut inline_frame: Option<InlineRecorderFrame> = None;
 
     loop {
         let Some(decoded) = cursor.next()? else {
@@ -906,13 +916,33 @@ pub(crate) fn record_trace_with_local_count(
         match decoded {
             DecodedOp::Nop { .. } => op_names.push("nop".to_string()),
             DecodedOp::Ret { ip } => {
+                if let Some(inlined) = inline_frame.take() {
+                    let result = match frame.stack.pop() {
+                        Some(result) => result,
+                        None => {
+                            let value = builder
+                                .append_value_inst(
+                                    current_block,
+                                    ip,
+                                    SsaValueRepr::Tagged,
+                                    SsaInstKind::Constant(Value::Null),
+                                )
+                                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+                            SymbolicValue {
+                                value,
+                                info: ValueInfo::tagged_typed(ValueType::Null),
+                            }
+                        }
+                    };
+                    op_names.push("inline_ret".to_string());
+                    frame = inlined.caller;
+                    frame.push(result);
+                    cursor.jump_to(inlined.return_ip)?;
+                    has_useful_native_computation = true;
+                    continue;
+                }
                 op_names.push("ret".to_string());
-                let exit = builder.add_exit(
-                    ip,
-                    materialize_stack(&frame.stack),
-                    materialize_locals(&frame.locals),
-                    frame.dirty_locals.clone(),
-                );
+                let exit = add_symbolic_exit(&mut builder, ip, &frame, inline_frame.as_ref());
                 builder
                     .set_terminator(current_block, SsaTerminator::Return { exit })
                     .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
@@ -1041,11 +1071,11 @@ pub(crate) fn record_trace_with_local_count(
                             got: frame.stack.len(),
                         });
                     }
-                    let exit = builder.add_exit(
+                    let exit = add_symbolic_exit(
+                        &mut builder,
                         fallthrough_ip,
-                        materialize_stack(&frame.stack),
-                        materialize_locals(&frame.locals),
-                        frame.dirty_locals.clone(),
+                        &frame,
+                        inline_frame.as_ref(),
                     );
                     builder
                         .set_terminator(
@@ -1069,14 +1099,18 @@ pub(crate) fn record_trace_with_local_count(
 
                 if condition.info.const_bool == Some(false) {
                     op_names.push("guard_true".to_string());
-                    let exit = builder.add_exit(
+                    let exit = add_symbolic_exit(
+                        &mut builder,
                         fallthrough_ip,
-                        materialize_stack(&frame.stack),
-                        materialize_locals(&frame.locals),
-                        frame.dirty_locals.clone(),
+                        &frame,
+                        inline_frame.as_ref(),
                     );
-                    let (next_block, next_frame, args) =
-                        continue_with_frame(&mut builder, &frame, "guard")?;
+                    let (next_block, next_frame, args) = continue_with_inline_frame(
+                        &mut builder,
+                        &frame,
+                        &mut inline_frame,
+                        "guard",
+                    )?;
                     builder
                         .set_terminator(
                             current_block,
@@ -1099,14 +1133,18 @@ pub(crate) fn record_trace_with_local_count(
 
                 if prefer_join_path {
                     op_names.push("guard_true".to_string());
-                    let exit = builder.add_exit(
+                    let exit = add_symbolic_exit(
+                        &mut builder,
                         fallthrough_ip,
-                        materialize_stack(&frame.stack),
-                        materialize_locals(&frame.locals),
-                        frame.dirty_locals.clone(),
+                        &frame,
+                        inline_frame.as_ref(),
                     );
-                    let (next_block, next_frame, args) =
-                        continue_with_frame(&mut builder, &frame, "guard")?;
+                    let (next_block, next_frame, args) = continue_with_inline_frame(
+                        &mut builder,
+                        &frame,
+                        &mut inline_frame,
+                        "guard",
+                    )?;
                     builder
                         .set_terminator(
                             current_block,
@@ -1128,14 +1166,9 @@ pub(crate) fn record_trace_with_local_count(
                 }
 
                 op_names.push("guard_false".to_string());
-                let exit = builder.add_exit(
-                    target,
-                    materialize_stack(&frame.stack),
-                    materialize_locals(&frame.locals),
-                    frame.dirty_locals.clone(),
-                );
+                let exit = add_symbolic_exit(&mut builder, target, &frame, inline_frame.as_ref());
                 let (next_block, next_frame, args) =
-                    continue_with_frame(&mut builder, &frame, "guard")?;
+                    continue_with_inline_frame(&mut builder, &frame, &mut inline_frame, "guard")?;
                 builder
                     .set_terminator(
                         current_block,
@@ -1178,12 +1211,8 @@ pub(crate) fn record_trace_with_local_count(
                 }
                 if target < cursor.ip() {
                     op_names.push("jump_ip".to_string());
-                    let exit = builder.add_exit(
-                        target,
-                        materialize_stack(&frame.stack),
-                        materialize_locals(&frame.locals),
-                        frame.dirty_locals.clone(),
-                    );
+                    let exit =
+                        add_symbolic_exit(&mut builder, target, &frame, inline_frame.as_ref());
                     builder
                         .set_terminator(current_block, SsaTerminator::Exit { exit })
                         .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
@@ -1204,7 +1233,7 @@ pub(crate) fn record_trace_with_local_count(
                 let callable = frame.stack[frame.stack.len() - usize::from(argc) - 1];
                 let caller_prototype_id = (caller_frame_key != crate::vm::native::ROOT_FRAME_KEY)
                     .then_some(caller_frame_key as u32);
-                let _ = classify_static_inline_candidate(
+                let candidate = classify_static_inline_candidate(
                     program,
                     caller_frame_key,
                     caller_prototype_id,
@@ -1212,13 +1241,71 @@ pub(crate) fn record_trace_with_local_count(
                     argc,
                     max_trace_len.saturating_sub(cursor.recorded_ops),
                 );
+                let inline_reject_reason = candidate.as_ref().err().copied();
+                if inline_frame.is_none()
+                    && let Ok(candidate) = candidate
+                {
+                    let operand_base = frame.stack.len() - usize::from(argc) - 1;
+                    let mut operands = frame.stack.split_off(operand_base);
+                    let _callable = operands.remove(0);
+                    let prototype = &program.callable_prototypes[candidate.prototype_id as usize];
+                    let null = builder
+                        .append_value_inst(
+                            current_block,
+                            ip,
+                            SsaValueRepr::Tagged,
+                            SsaInstKind::Constant(Value::Null),
+                        )
+                        .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+                    let null = SymbolicValue {
+                        value: null,
+                        info: ValueInfo::tagged_typed(ValueType::Null),
+                    };
+                    let mut callee_locals = vec![null; prototype.frame_local_count];
+                    for binding in &program.root_callable_bindings {
+                        let slot = usize::from(binding.local_slot);
+                        if slot < callee_locals.len() && slot < frame.locals.len() {
+                            callee_locals[slot] = frame.locals[slot];
+                        }
+                    }
+                    for (slot, mut argument) in candidate.parameter_slots.iter().zip(operands) {
+                        if argument.info.repr == SsaValueRepr::Tagged {
+                            let cloned = builder
+                                .append_value_inst(
+                                    current_block,
+                                    ip,
+                                    SsaValueRepr::Tagged,
+                                    SsaInstKind::CloneTagged {
+                                        input: argument.value.id,
+                                    },
+                                )
+                                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+                            argument.value = cloned;
+                        }
+                        callee_locals[usize::from(*slot)] = argument;
+                    }
+                    op_names.push(format!("inline_call:{}", candidate.prototype_id));
+                    let caller = std::mem::replace(
+                        &mut frame,
+                        SymbolicFrame::new(Vec::new(), callee_locals),
+                    );
+                    inline_frame = Some(InlineRecorderFrame {
+                        candidate: candidate.clone(),
+                        call_ip: ip,
+                        return_ip: resume_ip,
+                        caller,
+                    });
+                    cursor.jump_to(candidate.entry_ip)?;
+                    has_call = true;
+                    continue;
+                }
+                if let Some(reason) = inline_reject_reason {
+                    op_names.push(format!("inline_reject:{reason:?}"));
+                } else if inline_frame.is_some() {
+                    op_names.push("inline_reject:NestedCallable".to_string());
+                }
                 op_names.push("call_value".to_string());
-                let exit = builder.add_exit(
-                    ip,
-                    materialize_stack(&frame.stack),
-                    materialize_locals(&frame.locals),
-                    frame.dirty_locals.clone(),
-                );
+                let exit = add_symbolic_exit(&mut builder, ip, &frame, inline_frame.as_ref());
                 builder
                     .set_terminator(
                         current_block,
@@ -1341,12 +1428,7 @@ pub(crate) fn record_trace_with_local_count(
                 has_call = true;
                 has_yielding_call |= yields;
                 op_names.push("call".to_string());
-                let exit = builder.add_exit(
-                    ip,
-                    materialize_stack(&frame.stack),
-                    materialize_locals(&frame.locals),
-                    frame.dirty_locals.clone(),
-                );
+                let exit = add_symbolic_exit(&mut builder, ip, &frame, inline_frame.as_ref());
                 builder
                     .set_terminator(current_block, SsaTerminator::Exit { exit })
                     .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
@@ -1371,8 +1453,10 @@ pub(crate) fn record_trace_with_local_count(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn infer_loop_header_plan(
     program: &Program,
+    caller_frame_key: u64,
     root_ip: usize,
     entry_stack_depth: usize,
     local_count: usize,
@@ -1384,6 +1468,7 @@ fn infer_loop_header_plan(
     let mut frame = AnalysisFrame::new(program, entry_stack_depth, local_count, entry_local_types);
     let mut entry_use = vec![EntryUseState::Untouched; local_count];
     let mut local_written = vec![false; local_count];
+    let mut inline_frame: Option<(AnalysisFrame, usize)> = None;
 
     loop {
         let Some(decoded) = cursor.next()? else {
@@ -1392,7 +1477,18 @@ fn infer_loop_header_plan(
 
         match decoded {
             DecodedOp::Nop { .. } => {}
-            DecodedOp::Ret { .. } => return Ok(None),
+            DecodedOp::Ret { .. } => {
+                let Some((mut caller, return_ip)) = inline_frame.take() else {
+                    return Ok(None);
+                };
+                let result = frame
+                    .stack
+                    .pop()
+                    .unwrap_or_else(|| ValueInfo::tagged_typed(ValueType::Null));
+                caller.push(result);
+                frame = caller;
+                cursor.jump_to(return_ip)?;
+            }
             DecodedOp::Ldc { index, .. } => {
                 let constant = program.constants.get(index as usize).ok_or_else(|| {
                     TraceRecordError::UnsupportedTrace(format!(
@@ -1402,7 +1498,8 @@ fn infer_loop_header_plan(
                 frame.push(ValueInfo::from_constant(constant));
             }
             DecodedOp::Ldloc { index, .. } => {
-                if let Some(state) = entry_use.get_mut(index as usize)
+                if inline_frame.is_none()
+                    && let Some(state) = entry_use.get_mut(index as usize)
                     && matches!(*state, EntryUseState::Untouched)
                 {
                     *state = EntryUseState::ReadBeforeWrite;
@@ -1410,10 +1507,13 @@ fn infer_loop_header_plan(
                 frame.push(frame.local(index)?.sourced_from(index))
             }
             DecodedOp::Stloc { index, .. } => {
-                if let Some(written) = local_written.get_mut(index as usize) {
+                if inline_frame.is_none()
+                    && let Some(written) = local_written.get_mut(index as usize)
+                {
                     *written = true;
                 }
-                if let Some(state) = entry_use.get_mut(index as usize)
+                if inline_frame.is_none()
+                    && let Some(state) = entry_use.get_mut(index as usize)
                     && matches!(*state, EntryUseState::Untouched)
                 {
                     *state = EntryUseState::WrittenBeforeRead;
@@ -1558,7 +1658,51 @@ fn infer_loop_header_plan(
                     _ => ValueInfo::tagged_typed(return_type),
                 });
             }
-            DecodedOp::Call { .. } | DecodedOp::CallValue { .. } => return Ok(None),
+            DecodedOp::CallValue {
+                argc, resume_ip, ..
+            } => {
+                if inline_frame.is_some() || frame.stack.len() < usize::from(argc) + 1 {
+                    return Ok(None);
+                }
+                let callable = frame.stack[frame.stack.len() - usize::from(argc) - 1];
+                let caller_prototype_id = (caller_frame_key != crate::vm::native::ROOT_FRAME_KEY)
+                    .then_some(caller_frame_key as u32);
+                let Ok(candidate) = classify_static_inline_candidate(
+                    program,
+                    caller_frame_key,
+                    caller_prototype_id,
+                    callable.source_local,
+                    argc,
+                    max_trace_len.saturating_sub(cursor.recorded_ops),
+                ) else {
+                    return Ok(None);
+                };
+                let prototype = &program.callable_prototypes[candidate.prototype_id as usize];
+                let operand_base = frame.stack.len() - usize::from(argc) - 1;
+                let mut operands = frame.stack.split_off(operand_base);
+                let _callable = operands.remove(0);
+                let null = ValueInfo::tagged_typed(ValueType::Null);
+                let mut callee_locals = vec![null; prototype.frame_local_count];
+                for binding in &program.root_callable_bindings {
+                    let slot = usize::from(binding.local_slot);
+                    if slot < callee_locals.len() && slot < frame.locals.len() {
+                        callee_locals[slot] = frame.locals[slot];
+                    }
+                }
+                for (slot, argument) in candidate.parameter_slots.iter().zip(operands) {
+                    callee_locals[usize::from(*slot)] = argument;
+                }
+                let caller = std::mem::replace(
+                    &mut frame,
+                    AnalysisFrame {
+                        stack: Vec::new(),
+                        locals: callee_locals,
+                    },
+                );
+                inline_frame = Some((caller, resume_ip));
+                cursor.jump_to(candidate.entry_ip)?;
+            }
+            DecodedOp::Call { .. } => return Ok(None),
             DecodedOp::Brfalse {
                 target,
                 fallthrough_ip,
@@ -4473,6 +4617,48 @@ fn load_constant(
     Ok(SymbolicValue { value, info })
 }
 
+fn continue_with_inline_frame(
+    builder: &mut SsaTraceBuilder,
+    frame: &SymbolicFrame,
+    inline_frame: &mut Option<InlineRecorderFrame>,
+    label_prefix: &str,
+) -> Result<
+    (
+        super::ir::SsaBlockId,
+        SymbolicFrame,
+        Vec<super::ir::SsaValueId>,
+    ),
+    TraceRecordError,
+> {
+    let Some(inlined) = inline_frame.as_mut() else {
+        return continue_with_frame(builder, frame, label_prefix);
+    };
+    let callee_stack_len = frame.stack.len();
+    let callee_local_len = frame.locals.len();
+    let combined = SymbolicFrame {
+        stack: frame
+            .stack
+            .iter()
+            .chain(&inlined.caller.stack)
+            .copied()
+            .collect(),
+        locals: frame
+            .locals
+            .iter()
+            .chain(&inlined.caller.locals)
+            .copied()
+            .collect(),
+        dirty_locals: Vec::new(),
+    };
+    let (block, mut next, args) = continue_with_frame(builder, &combined, label_prefix)?;
+    let caller_stack = next.stack.split_off(callee_stack_len);
+    let caller_locals = next.locals.split_off(callee_local_len);
+    inlined.caller.stack = caller_stack;
+    inlined.caller.locals = caller_locals;
+    next.dirty_locals = frame.dirty_locals.clone();
+    Ok((block, next, args))
+}
+
 fn continue_with_frame(
     builder: &mut SsaTraceBuilder,
     frame: &SymbolicFrame,
@@ -4556,6 +4742,37 @@ fn materialize_stack(stack: &[SymbolicValue]) -> Vec<SsaMaterialization> {
 
 fn materialize_locals(locals: &[SymbolicValue]) -> Vec<SsaMaterialization> {
     materialize_ssa_values(locals.iter().map(|value| value.value))
+}
+
+fn add_symbolic_exit(
+    builder: &mut SsaTraceBuilder,
+    exit_ip: usize,
+    frame: &SymbolicFrame,
+    inline_frame: Option<&InlineRecorderFrame>,
+) -> super::ir::SsaExitId {
+    let Some(inline_frame) = inline_frame else {
+        return builder.add_exit(
+            exit_ip,
+            materialize_stack(&frame.stack),
+            materialize_locals(&frame.locals),
+            frame.dirty_locals.clone(),
+        );
+    };
+    builder.add_exit_with_virtual_frames(
+        inline_frame.call_ip,
+        materialize_stack(&inline_frame.caller.stack),
+        materialize_locals(&inline_frame.caller.locals),
+        inline_frame.caller.dirty_locals.clone(),
+        vec![VirtualFrameSnapshot {
+            prototype_id: inline_frame.candidate.prototype_id,
+            call_ip: inline_frame.call_ip,
+            return_ip: inline_frame.return_ip,
+            resume_ip: exit_ip,
+            operand_stack: materialize_stack(&frame.stack),
+            locals: materialize_locals(&frame.locals),
+            dirty_locals: frame.dirty_locals.clone(),
+        }],
+    )
 }
 
 fn build_loop_header_plan(
@@ -4693,7 +4910,10 @@ fn read_u32(code: &[u8], ip: &mut usize) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BytecodeBuilder, Value};
+    use crate::{
+        BytecodeBuilder, CallableKind, CallablePrototype, CallableTarget, FunctionRegion,
+        RootCallableBinding, ScriptFunction, Value,
+    };
 
     fn patch_branch_target(code: &mut [u8], instr_ip: u32, target: u32) {
         let start = instr_ip as usize + 1;
@@ -4956,5 +5176,65 @@ mod tests {
             recorded.ssa.blocks[2].terminator,
             Some(SsaTerminator::Jump { .. })
         ));
+    }
+
+    #[test]
+    fn inline_static_leaf_records_call_and_return_inside_root_loop() {
+        let mut bc = BytecodeBuilder::new();
+        let root_ip = bc.position();
+        bc.ldloc(0);
+        bc.ldc(0);
+        bc.call_value(1);
+        bc.pop();
+        bc.br(root_ip);
+        let function_entry = bc.position();
+        bc.ldloc(1);
+        bc.ldc(0);
+        bc.add();
+        bc.ret();
+        let function_end = bc.position();
+
+        let program = Program::new(vec![Value::Int(1)], bc.finish())
+            .with_local_count(2)
+            .with_callable_metadata(
+                vec![ScriptFunction {
+                    entry_ip: function_entry,
+                    end_ip: function_end,
+                }],
+                vec![CallablePrototype {
+                    kind: CallableKind::FunctionItem,
+                    target: CallableTarget::ScriptFunction(0),
+                    arity: 1,
+                    frame_local_count: 2,
+                    parameter_slots: vec![1],
+                    capture_source_slots: Vec::new(),
+                    capture_slots: Vec::new(),
+                    capture_modes: Vec::new(),
+                    self_slot: None,
+                    schema: None,
+                }],
+                vec![FunctionRegion {
+                    start_ip: function_entry,
+                    end_ip: function_end,
+                    prototype_id: Some(0),
+                }],
+                vec![RootCallableBinding {
+                    local_slot: 0,
+                    prototype_id: 0,
+                }],
+            );
+
+        let recorded = record_trace(&program, root_ip as usize, 0, 64, &[]).unwrap();
+        assert_eq!(recorded.terminal, JitTraceTerminal::LoopBack);
+        assert!(recorded.op_names.iter().any(|name| name == "inline_call:0"));
+        assert!(recorded.op_names.iter().any(|name| name == "inline_ret"));
+        assert!(!recorded.op_names.iter().any(|name| name == "call_value"));
+        assert!(
+            recorded
+                .ssa
+                .blocks
+                .iter()
+                .all(|block| !matches!(block.terminator, Some(SsaTerminator::CallValue { .. })))
+        );
     }
 }

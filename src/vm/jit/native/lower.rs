@@ -27,7 +27,8 @@ use crate::vm::native::{
     non_yielding_i64_host_call_signature, non_yielding_scalar_host_call_entry_address,
     non_yielding_scalar_host_call_signature, pack_shared_signature, regex_match_entry_address,
     regex_match_signature, regex_replace_entry_address, regex_replace_signature,
-    restore_active_sparse_exit_state_entry_address, shared_array_from_buffer_entry_address,
+    restore_active_sparse_exit_state_entry_address, restore_virtual_frame_entry_address,
+    restore_virtual_frame_signature, shared_array_from_buffer_entry_address,
     shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
     sparse_restore_exit_signature, string_binary_transform_signature,
     string_contains_entry_address, string_contains_signature, string_lower_ascii_entry_address,
@@ -602,6 +603,7 @@ fn try_compile_ssa_trace(
     let array_set_sig = array_set_signature(pointer_type, call_conv);
     let map_set_sig = map_set_signature(pointer_type, call_conv);
     let sparse_restore_exit_sig = sparse_restore_exit_signature(pointer_type, call_conv);
+    let restore_virtual_frame_sig = restore_virtual_frame_signature(pointer_type, call_conv);
     let frame_state_sig = frame_state_signature(pointer_type, call_conv);
     let leave_frame_sig = leave_frame_inherited_signature(pointer_type, call_conv);
     let enter_call_value_sig = enter_call_value_inherited_signature(pointer_type, call_conv);
@@ -683,6 +685,7 @@ fn try_compile_ssa_trace(
             array_set_ref: b.import_signature(array_set_sig),
             map_set_ref: b.import_signature(map_set_sig),
             sparse_restore_exit_ref: b.import_signature(sparse_restore_exit_sig),
+            restore_virtual_frame_ref: b.import_signature(restore_virtual_frame_sig),
             leave_frame_ref: b.import_signature(leave_frame_sig),
             enter_call_value_ref: b.import_signature(enter_call_value_sig),
 
@@ -706,6 +709,7 @@ fn try_compile_ssa_trace(
             array_set: array_set_entry_address(),
             map_set: map_set_entry_address(),
             sparse_restore_exit: restore_active_sparse_exit_state_entry_address(),
+            restore_virtual_frame: restore_virtual_frame_entry_address(),
             leave_frame: leave_frame_inherited_entry_address(),
             enter_call_value: enter_call_value_inherited_entry_address(),
 
@@ -1165,6 +1169,7 @@ struct SsaDeoptHelperRefs {
     array_set_ref: cranelift_codegen::ir::SigRef,
     map_set_ref: cranelift_codegen::ir::SigRef,
     sparse_restore_exit_ref: cranelift_codegen::ir::SigRef,
+    restore_virtual_frame_ref: cranelift_codegen::ir::SigRef,
     leave_frame_ref: cranelift_codegen::ir::SigRef,
     enter_call_value_ref: cranelift_codegen::ir::SigRef,
 
@@ -1190,6 +1195,7 @@ struct SsaDeoptHelperAddrs {
     array_set: usize,
     map_set: usize,
     sparse_restore_exit: usize,
+    restore_virtual_frame: usize,
     leave_frame: usize,
     enter_call_value: usize,
 
@@ -1312,6 +1318,7 @@ fn ssa_trace_supported(ssa: &SsaTrace) -> bool {
             if !matches!(
                 inst.kind,
                 SsaInstKind::Constant(_)
+                    | SsaInstKind::CloneTagged { .. }
                     | SsaInstKind::UnboxHeapPtr { .. }
                     | SsaInstKind::UnboxInt { .. }
                     | SsaInstKind::UnboxFloat { .. }
@@ -1663,7 +1670,8 @@ fn borrowed_array_get_outputs(ssa: &SsaTrace) -> BTreeSet<SsaValueId> {
 fn ssa_inst_requires_owned_value_slot(kind: &SsaInstKind) -> bool {
     matches!(
         kind,
-        SsaInstKind::ArrayGet { .. }
+        SsaInstKind::CloneTagged { .. }
+            | SsaInstKind::ArrayGet { .. }
             | SsaInstKind::ArraySet { .. }
             | SsaInstKind::ArrayPush { .. }
             | SsaInstKind::MapGet { .. }
@@ -2104,6 +2112,28 @@ fn lower_ssa_inst(
                     VmError::JitNative("SSA tagged constant lowering address missing".to_string())
                 })?;
             iconst_ptr_from_addr(b, pointer_type, addr)?
+        }
+        SsaInstKind::CloneTagged { input } => {
+            if value_reprs.get(input) != Some(&SsaValueRepr::Tagged) {
+                return Err(VmError::JitNative(
+                    "SSA clone-tagged input must be tagged".to_string(),
+                ));
+            }
+            let out = owned_value_temp_slot_addr(
+                b,
+                pointer_type,
+                owned_value_temps,
+                SsaTempValueSlotKey::Output(output.id),
+            )?;
+            ssa_call_status_helper(
+                b,
+                exit_block,
+                pointer_type,
+                helper_refs.clone_value_ref,
+                helper_addrs.clone_value,
+                &[out, values[input]],
+            )?;
+            out
         }
         SsaInstKind::UnboxInt { input } => {
             let input = *values
@@ -4675,7 +4705,8 @@ fn lower_ssa_exit_block(
     };
 
     let mut moved_owned_values = BTreeSet::new();
-    let inline_owned_restore = entry_stack_depth == 0
+    let inline_owned_restore = exit.virtual_frames.is_empty()
+        && entry_stack_depth == 0
         && exit.stack.is_empty()
         && exit
             .locals
@@ -4838,7 +4869,8 @@ fn lower_ssa_exit_block(
             ip_val,
         ],
     )?;
-    if matches!(action, SsaExitAction::TraceExit { .. }) {
+    restore_virtual_frames(b, materialize_ctx, vm_ptr, &exit.virtual_frames)?;
+    if matches!(action, SsaExitAction::TraceExit { .. }) && exit.virtual_frames.is_empty() {
         write_inherited_state_packet(b, ctx, exit)?;
     }
     let status = ssa_exit_action_status(
@@ -4853,6 +4885,88 @@ fn lower_ssa_exit_block(
     )?;
     jump_with_status(b, exit_block, status);
     Ok(())
+}
+
+fn restore_virtual_frames(
+    b: &mut FunctionBuilder,
+    materialize_ctx: SsaMaterializeCtx<'_>,
+    vm_ptr: cranelift_codegen::ir::Value,
+    frames: &[crate::vm::jit::ir::VirtualFrameSnapshot],
+) -> VmResult<()> {
+    let pointer_type = materialize_ctx.pointer_type;
+    let value_size = materialize_ctx.value_layout.size;
+    let null_ptr = b.ins().iconst(pointer_type, 0);
+    for frame in frames {
+        let stack_ptr =
+            ssa_alloc_value_buffer(b, pointer_type, frame.operand_stack.len(), value_size)?;
+        for (index, materialization) in frame.operand_stack.iter().enumerate() {
+            let dst = ssa_value_buffer_slot_addr(
+                b,
+                pointer_type,
+                stack_ptr,
+                index,
+                value_size,
+                "virtual stack",
+            )?;
+            ssa_materialize_slot(b, materialize_ctx, materialization, dst, "virtual stack")?;
+        }
+        let locals_ptr = ssa_alloc_value_buffer(b, pointer_type, frame.locals.len(), value_size)?;
+        for (index, materialization) in frame.locals.iter().enumerate() {
+            let dst = ssa_value_buffer_slot_addr(
+                b,
+                pointer_type,
+                locals_ptr,
+                index,
+                value_size,
+                "virtual local",
+            )?;
+            ssa_materialize_slot(b, materialize_ctx, materialization, dst, "virtual local")?;
+        }
+        let prototype_id = b.ins().iconst(types::I32, i64::from(frame.prototype_id));
+        let call_ip = iconst_usize(b, pointer_type, frame.call_ip, "virtual call ip")?;
+        let return_ip = iconst_usize(b, pointer_type, frame.return_ip, "virtual return ip")?;
+        let resume_ip = iconst_usize(b, pointer_type, frame.resume_ip, "virtual resume ip")?;
+        let stack_len = iconst_usize(
+            b,
+            pointer_type,
+            frame.operand_stack.len(),
+            "virtual stack length",
+        )?;
+        let locals_len =
+            iconst_usize(b, pointer_type, frame.locals.len(), "virtual locals length")?;
+        ssa_call_status_helper(
+            b,
+            materialize_ctx.exit_block,
+            pointer_type,
+            materialize_ctx.deopt_refs.restore_virtual_frame_ref,
+            materialize_ctx.deopt_addrs.restore_virtual_frame,
+            &[
+                vm_ptr,
+                prototype_id,
+                call_ip,
+                return_ip,
+                resume_ip,
+                stack_ptr.unwrap_or(null_ptr),
+                stack_len,
+                locals_ptr.unwrap_or(null_ptr),
+                locals_len,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn iconst_usize(
+    b: &mut FunctionBuilder,
+    pointer_type: cranelift_codegen::ir::Type,
+    value: usize,
+    label: &'static str,
+) -> VmResult<cranelift_codegen::ir::Value> {
+    Ok(b.ins().iconst(
+        pointer_type,
+        i64::try_from(value)
+            .map_err(|_| VmError::JitNative(format!("SSA {label} out of range")))?,
+    ))
 }
 
 fn ssa_materialize_slot(

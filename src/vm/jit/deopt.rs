@@ -42,12 +42,7 @@ pub(crate) fn exit_inputs(exit: &SsaExit) -> Vec<SsaValueId> {
         }
     }
     for frame in &exit.virtual_frames {
-        let dirty_locals = frame
-            .locals
-            .iter()
-            .zip(&frame.dirty_locals)
-            .filter_map(|(materialization, dirty)| dirty.then_some(materialization));
-        for materialization in frame.operand_stack.iter().chain(dirty_locals) {
+        for materialization in frame.operand_stack.iter().chain(&frame.locals) {
             let value = match materialization {
                 SsaMaterialization::Value(value)
                 | SsaMaterialization::BoxInt(value)
@@ -78,6 +73,7 @@ pub(crate) enum SideTraceImportError {
     ExitIpMismatch { parent: usize, child: usize },
     StackDepthMismatch { parent: usize, child: usize },
     LocalCountMismatch { parent: usize, child: usize },
+    VirtualFramesUnsupported { count: usize },
     InvalidChildEntry,
 }
 
@@ -91,6 +87,11 @@ pub(crate) fn side_trace_import(
         .iter()
         .find(|exit| exit.id == parent_exit)
         .ok_or(SideTraceImportError::UnknownParentExit(parent_exit))?;
+    if !exit.virtual_frames.is_empty() {
+        return Err(SideTraceImportError::VirtualFramesUnsupported {
+            count: exit.virtual_frames.len(),
+        });
+    }
     if exit.exit_ip != child.root_ip {
         return Err(SideTraceImportError::ExitIpMismatch {
             parent: exit.exit_ip,

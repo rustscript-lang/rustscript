@@ -260,6 +260,9 @@ pub struct JitMetrics {
     pub script_call_observations: u64,
     pub monomorphic_call_sites: u64,
     pub polymorphic_call_sites: u64,
+    pub inline_attempts: u64,
+    pub inline_successes: u64,
+    pub inline_rejections: u64,
 }
 
 impl JitMetrics {
@@ -872,6 +875,23 @@ impl TraceJitEngine {
             metrics.polymorphic_call_sites
         ));
         out.push_str(&format!(
+            "  inline: attempts={} successes={} rejections={}\n",
+            metrics.inline_attempts, metrics.inline_successes, metrics.inline_rejections
+        ));
+        let mut inline_reject_reasons = std::collections::BTreeMap::<&str, u64>::new();
+        for reason in self.traces.iter().flat_map(|trace| {
+            trace
+                .op_names
+                .iter()
+                .filter_map(|op| op.strip_prefix("inline_reject:"))
+        }) {
+            let count = inline_reject_reasons.entry(reason).or_default();
+            *count = count.saturating_add(1);
+        }
+        for (reason, count) in inline_reject_reasons {
+            out.push_str(&format!("    reject {reason}: {count}\n"));
+        }
+        out.push_str(&format!(
             "  boxed value sites: loads={} stores={}\n",
             metrics.boxed_load_site_count, metrics.boxed_store_site_count
         ));
@@ -1080,6 +1100,19 @@ impl TraceJitEngine {
         runtime_metrics.monomorphic_call_sites = monomorphic;
         runtime_metrics.polymorphic_call_sites = polymorphic;
         for trace in &self.traces {
+            for op in &trace.op_names {
+                if op.starts_with("inline_call:") {
+                    runtime_metrics.inline_attempts =
+                        runtime_metrics.inline_attempts.saturating_add(1);
+                    runtime_metrics.inline_successes =
+                        runtime_metrics.inline_successes.saturating_add(1);
+                } else if op.starts_with("inline_reject:") {
+                    runtime_metrics.inline_attempts =
+                        runtime_metrics.inline_attempts.saturating_add(1);
+                    runtime_metrics.inline_rejections =
+                        runtime_metrics.inline_rejections.saturating_add(1);
+                }
+            }
             runtime_metrics.boxed_load_site_count = runtime_metrics
                 .boxed_load_site_count
                 .saturating_add(boxed_load_site_count(&trace.ssa));
