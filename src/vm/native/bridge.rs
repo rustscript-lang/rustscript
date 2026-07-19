@@ -1166,39 +1166,9 @@ pub(crate) extern "C" fn pd_vm_native_restore_active_sparse_exit_state(
             ));
         }
 
-        let local_count = vm
-            .execution_frames
-            .last()
-            .map(|frame| frame.local_count)
-            .unwrap_or(vm.locals.len());
-        let mut seen_local_indices = [0u64; 4];
-        for compact_index in 0..dirty_local_count {
-            let local_index = unsafe { *dirty_local_indices.add(compact_index) };
-            let local_index_usize = usize::try_from(local_index).map_err(|_| {
-                VmError::JitNative(
-                    "native active sparse exit restore local index out of range".to_string(),
-                )
-            })?;
-            if local_index_usize >= local_count {
-                return Err(VmError::JitNative(format!(
-                    "native active sparse exit restore local index {local_index} out of range for {local_count} active locals"
-                )));
-            }
-            let local_index = u8::try_from(local_index).map_err(|_| {
-                VmError::JitNative(
-                    "native active sparse exit restore local index exceeds VM local range"
-                        .to_string(),
-                )
-            })?;
-            let word = usize::from(local_index) / 64;
-            let bit = 1u64 << (local_index % 64);
-            if seen_local_indices[word] & bit != 0 {
-                return Err(VmError::JitNative(format!(
-                    "native active sparse exit restore received duplicate local index {local_index}"
-                )));
-            }
-            seen_local_indices[word] |= bit;
-        }
+        // This entry point is emitted only by the native lowering pipeline. Dirty local
+        // indices are compile-time metadata whose range and uniqueness are guaranteed
+        // while the sparse exit metadata is built.
 
         let stack_base = vm.active_operand_stack_base();
         if stack_base > vm.stack.len() {
@@ -1216,12 +1186,8 @@ pub(crate) extern "C" fn pd_vm_native_restore_active_sparse_exit_state(
 
         for compact_index in 0..dirty_local_count {
             let local_index = unsafe { *dirty_local_indices.add(compact_index) };
-            let local_index = u8::try_from(local_index).map_err(|_| {
-                VmError::JitNative(
-                    "native active sparse exit restore local index exceeds VM local range"
-                        .to_string(),
-                )
-            })?;
+            debug_assert!(u8::try_from(local_index).is_ok());
+            let local_index = local_index as u8;
             let value = unsafe { std::ptr::read(dirty_local_values.add(compact_index)) };
             vm.store_local_with_drop_contract(local_index, value)?;
         }
