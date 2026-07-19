@@ -1338,8 +1338,8 @@ pub(crate) fn record_trace_with_local_count(
                     max_trace_len.saturating_sub(cursor.recorded_ops),
                 )
                 .and_then(|candidate| {
-                    let prototypes = entry_callable_prototypes
-                        .ok_or(InlineRejectReason::UnknownTarget)?;
+                    let prototypes =
+                        entry_callable_prototypes.ok_or(InlineRejectReason::UnknownTarget)?;
                     let source_local = callable
                         .info
                         .source_local

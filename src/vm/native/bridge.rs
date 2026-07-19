@@ -962,8 +962,13 @@ fn native_enter_call_value(
         ExecOutcome::Yielded => STATUS_YIELDED,
         ExecOutcome::Waiting(_) => STATUS_WAITING,
     };
-    if status == STATUS_LINKED_CONTINUE && !inherited_state.is_null() {
-        write_inherited_state_packet(vm, inherited_state)?;
+    if status == STATUS_LINKED_CONTINUE {
+        if vm.active_frame_has_shared_capture_cells() {
+            return Ok(STATUS_CONTINUE);
+        }
+        if !inherited_state.is_null() {
+            write_inherited_state_packet(vm, inherited_state)?;
+        }
     }
     Ok(status)
 }
@@ -1001,8 +1006,13 @@ fn native_leave_frame(vm: &mut Vm, ret_ip: i64, inherited_state: *mut u8) -> VmR
         ExecOutcome::Yielded => STATUS_YIELDED,
         ExecOutcome::Waiting(_) => STATUS_WAITING,
     };
-    if status == STATUS_LINKED_CONTINUE && !inherited_state.is_null() {
-        write_inherited_state_packet(vm, inherited_state)?;
+    if status == STATUS_LINKED_CONTINUE {
+        if vm.active_frame_has_shared_capture_cells() {
+            return Ok(STATUS_CONTINUE);
+        }
+        if !inherited_state.is_null() {
+            write_inherited_state_packet(vm, inherited_state)?;
+        }
     }
     Ok(status)
 }

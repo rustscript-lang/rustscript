@@ -278,6 +278,17 @@ pub(crate) extern "C" fn pd_vm_native_resume_linked_trace(vm: *mut Vm) -> i32 {
 }
 
 impl Vm {
+    fn compiled_trace_for_active_entry(&self) -> Option<usize> {
+        if self.active_frame_has_shared_capture_cells() {
+            return None;
+        }
+        self.jit.compiled_trace_for_entry(
+            self.active_frame_key(),
+            self.ip,
+            self.active_operand_stack_len(),
+        )
+    }
+
     #[cfg(any(
         all(
             target_arch = "x86_64",
@@ -291,10 +302,11 @@ impl Vm {
             let ip = self.ip;
             let frame_key = self.active_frame_key();
             let stack_depth = self.active_operand_stack_len();
-            let mut next_trace_id = self
-                .jit
-                .compiled_trace_for_entry(frame_key, ip, stack_depth);
-            if next_trace_id.is_none() && !self.jit.callable_frame_is_blocked(frame_key) {
+            let mut next_trace_id = self.compiled_trace_for_active_entry();
+            if next_trace_id.is_none()
+                && !self.active_frame_has_shared_capture_cells()
+                && !self.jit.callable_frame_is_blocked(frame_key)
+            {
                 let entry_local_types =
                     (frame_key != ROOT_FRAME_KEY).then(|| self.active_local_types());
                 let entry_callable_prototypes = self.active_local_callable_prototypes();
@@ -392,11 +404,7 @@ impl Vm {
                     let next_trace_id = if has_yielding_call {
                         None
                     } else {
-                        self.jit.compiled_trace_for_entry(
-                            self.active_frame_key(),
-                            self.ip,
-                            self.active_operand_stack_len(),
-                        )
+                        self.compiled_trace_for_active_entry()
                     };
                     if let Some(next_trace_id) = next_trace_id
                         && next_trace_id != current_trace_id
@@ -449,19 +457,16 @@ impl Vm {
                         self.block_jit_callable_frame(current_trace_id);
                         return Ok(native::STATUS_LINKED_CONTINUE);
                     }
-                    if !has_yielding_call {
+                    if !has_yielding_call && !self.active_frame_has_shared_capture_cells() {
                         let ip = self.ip;
                         let frame_key = self.active_frame_key();
                         let stack_depth = self.active_operand_stack_len();
-                        let mut next_trace_id =
-                            self.jit
-                                .compiled_trace_for_entry(frame_key, ip, stack_depth);
+                        let mut next_trace_id = self.compiled_trace_for_active_entry();
                         if next_trace_id.is_none() && !self.jit.callable_frame_is_blocked(frame_key)
                         {
                             let entry_local_types =
                                 (frame_key != ROOT_FRAME_KEY).then(|| self.active_local_types());
-                            let entry_callable_prototypes =
-                                self.active_local_callable_prototypes();
+                            let entry_callable_prototypes = self.active_local_callable_prototypes();
                             let program = &self.program;
                             next_trace_id = self.jit.observe_exit_entry_with_local_types(
                                 frame_key,
@@ -1036,11 +1041,7 @@ impl Vm {
                     let next_trace_id = if has_yielding_call {
                         None
                     } else {
-                        self.jit.compiled_trace_for_entry(
-                            self.active_frame_key(),
-                            self.ip,
-                            self.active_operand_stack_len(),
-                        )
+                        self.compiled_trace_for_active_entry()
                     };
                     if let Some(next_trace_id) = next_trace_id
                         && next_trace_id != current_trace_id
@@ -1116,13 +1117,11 @@ impl Vm {
                         self.block_jit_callable_frame(current_trace_id);
                         return Ok(ExecOutcome::Continue);
                     }
-                    if !has_yielding_call {
+                    if !has_yielding_call && !self.active_frame_has_shared_capture_cells() {
                         let ip = self.ip;
                         let frame_key = self.active_frame_key();
                         let stack_depth = self.active_operand_stack_len();
-                        let mut next_trace_id =
-                            self.jit
-                                .compiled_trace_for_entry(frame_key, ip, stack_depth);
+                        let mut next_trace_id = self.compiled_trace_for_active_entry();
                         if next_trace_id.is_none() && !self.jit.callable_frame_is_blocked(frame_key)
                         {
                             next_trace_id = {
@@ -1192,18 +1191,18 @@ impl Vm {
                 }
                 native::STATUS_HALTED => return Ok(ExecOutcome::Halted),
                 native::STATUS_LINKED_CONTINUE => {
+                    if self.active_frame_has_shared_capture_cells() {
+                        return Ok(ExecOutcome::Continue);
+                    }
                     let ip = self.ip;
                     let frame_key = self.active_frame_key();
                     let stack_depth = self.active_operand_stack_len();
-                    let mut next_trace_id =
-                        self.jit
-                            .compiled_trace_for_entry(frame_key, ip, stack_depth);
+                    let mut next_trace_id = self.compiled_trace_for_active_entry();
                     if next_trace_id.is_none() && !self.jit.callable_frame_is_blocked(frame_key) {
                         next_trace_id = {
                             let entry_local_types =
                                 (frame_key != ROOT_FRAME_KEY).then(|| self.active_local_types());
-                            let entry_callable_prototypes =
-                                self.active_local_callable_prototypes();
+                            let entry_callable_prototypes = self.active_local_callable_prototypes();
                             let program = &self.program;
                             self.jit.observe_exit_entry_with_local_types(
                                 frame_key,
@@ -1569,14 +1568,10 @@ impl Vm {
     }
 
     pub(crate) fn jit_native_inherited_target(&self) -> usize {
-        if !self.jit_native_direct_links_enabled {
+        if !self.jit_native_direct_links_enabled || self.active_frame_has_shared_capture_cells() {
             return 0;
         }
-        let Some(trace_id) = self.jit.compiled_trace_for_entry(
-            self.active_frame_key(),
-            self.ip,
-            self.active_operand_stack_len(),
-        ) else {
+        let Some(trace_id) = self.compiled_trace_for_active_entry() else {
             return 0;
         };
         self.native_traces
