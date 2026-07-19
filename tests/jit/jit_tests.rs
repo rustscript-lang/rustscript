@@ -3343,6 +3343,63 @@ fn trace_jit_restores_tagged_heap_locals_on_ssa_exit() {
 }
 
 #[test]
+fn trace_jit_snapshots_borrowed_tagged_locals_before_exit_writes() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.stloc(0);
+    bc.ldc(1);
+    bc.stloc(1);
+    bc.ldc(2);
+    bc.stloc(2);
+    let root_ip = bc.position();
+    bc.ldloc(2);
+    bc.ldc(4);
+    bc.clt();
+    let guard_ip = bc.position();
+    bc.brfalse(0);
+    bc.ldloc(0);
+    bc.ldloc(1);
+    bc.stloc(0);
+    bc.stloc(1);
+    bc.ldloc(2);
+    bc.ldc(3);
+    bc.add();
+    bc.stloc(2);
+    bc.br(root_ip);
+    let exit_ip = bc.position();
+    bc.ldloc(1);
+    bc.ret();
+
+    let mut code = bc.finish();
+    patch_branch_target(&mut code, guard_ip, exit_ip);
+    let program = Program::new(
+        vec![
+            Value::string("left"),
+            Value::string("right"),
+            Value::Int(0),
+            Value::Int(1),
+            Value::Int(5),
+        ],
+        code,
+    )
+    .with_local_count(3);
+    let mut vm = Vm::new(program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(vm.run().expect("vm should run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("left")]);
+    assert!(vm.jit_native_exec_count() > 0, "{}", vm.dump_jit_info());
+}
+
+#[test]
 fn trace_jit_restores_array_and_map_locals_on_ssa_exit() {
     if !native_jit_supported() {
         return;
