@@ -6499,6 +6499,55 @@ fn trace_jit_guards_static_inline_callable_identity() {
 }
 
 #[test]
+fn trace_jit_invalidates_native_inline_after_callable_local_replacement() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn add_one(value: int) -> int { value + 1 }
+        fn add_ten(value: int) -> int { value + 10 }
+        let mut i = 0;
+        let mut total = 0;
+        while i < 100 {
+            total = add_one(total);
+            i = i + 1;
+        }
+        total;
+    "#;
+    let compiled = compile_source(source).expect("callable invalidation source should compile");
+    let bindings = compiled.program.root_callable_bindings.clone();
+    let replaced_slot = bindings.first().expect("add_one binding").local_slot;
+    let replacement_id = bindings.get(1).expect("add_ten binding").prototype_id;
+    let replacement_kind = compiled.program.callable_prototypes[replacement_id as usize].kind;
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(vm.run().expect("initial inline run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(100)]);
+    assert!(vm.jit_native_trace_count() > 0, "{}", vm.dump_jit_info());
+
+    vm.reset_for_reuse();
+    vm.set_local(
+        u8::try_from(replaced_slot).expect("root callable slot should fit u8"),
+        Value::Callable(Arc::new(vm::CallableValue {
+            prototype_id: replacement_id,
+            kind: replacement_kind,
+            env: None,
+        })),
+    )
+    .expect("callable replacement should succeed");
+    assert_eq!(vm.jit_native_trace_count(), 0);
+
+    assert_eq!(vm.run().expect("replacement inline run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(1_000)]);
+    assert!(vm.jit_native_exec_count() > 0, "{}", vm.dump_jit_info());
+}
+
+#[test]
 fn trace_jit_preserves_inline_callable_argument_schema_checks() {
     if !native_jit_supported() {
         return;
