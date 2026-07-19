@@ -60,7 +60,9 @@ pub(crate) const INHERITED_STATE_FRAME_KEY_OFFSET: i32 = 8;
 pub(crate) const INHERITED_STATE_STACK_BASE_OFFSET: i32 = 16;
 pub(crate) const INHERITED_STATE_LOCAL_BASE_OFFSET: i32 = 24;
 pub(crate) const INHERITED_STATE_DYNAMIC_TARGET_OFFSET: i32 = 32;
-pub(crate) const INHERITED_STATE_VALUES_OFFSET: i32 = 40;
+pub(crate) const INHERITED_STATE_TARGET_IP_OFFSET: i32 = 40;
+pub(crate) const INHERITED_STATE_VALUE_COUNT_OFFSET: i32 = 48;
+pub(crate) const INHERITED_STATE_VALUES_OFFSET: i32 = 56;
 
 #[cfg(feature = "cranelift-jit")]
 pub(crate) fn selected_codegen_backend() -> &'static str {

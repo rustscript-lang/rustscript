@@ -1203,11 +1203,6 @@ impl Vm {
                     if let Some(next_trace_id) = next_trace_id
                         && next_trace_id != current_trace_id
                     {
-                        self.publish_native_direct_slot(
-                            current_trace_id,
-                            native::LINKED_CONTINUE_SLOT_ID,
-                            next_trace_id,
-                        )?;
                         self.record_jit_link_handoff();
                         current_trace_id = next_trace_id;
                         if let Some(state) = self.cached_native_trace_state(

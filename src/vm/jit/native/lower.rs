@@ -62,7 +62,9 @@ const INHERITED_STATE_FRAME_KEY_OFFSET: i32 = 8;
 const INHERITED_STATE_STACK_BASE_OFFSET: i32 = 16;
 const INHERITED_STATE_LOCAL_BASE_OFFSET: i32 = 24;
 const INHERITED_STATE_DYNAMIC_TARGET_OFFSET: i32 = 32;
-const INHERITED_STATE_VALUES_OFFSET: i32 = 40;
+const INHERITED_STATE_TARGET_IP_OFFSET: i32 = 40;
+const INHERITED_STATE_VALUE_COUNT_OFFSET: i32 = 48;
+const INHERITED_STATE_VALUES_OFFSET: i32 = 56;
 
 type TaggedConstants = (Box<[Value]>, HashMap<SsaValueId, usize>);
 
@@ -260,7 +262,7 @@ pub(crate) fn compile_system_inherited_tail_wrapper(
             let vm_ptr = builder.block_params(entry)[0];
             let pointer_bytes = pointer_type.bits() / 8;
             let packet_bytes = pointer_bytes
-                .checked_mul((MAX_INHERITED_ENTRY_VALUES + 5) as u32)
+                .checked_mul((MAX_INHERITED_ENTRY_VALUES + 7) as u32)
                 .ok_or_else(|| {
                     VmError::JitNative("native inherited-state packet is too large".to_string())
                 })?;
@@ -359,7 +361,7 @@ pub(crate) fn compile_tail_trace_dispatcher(
             let dynamic_target_is_null = builder.ins().icmp_imm(IntCC::Equal, dynamic_target, 0);
             builder.ins().brif(
                 dynamic_target_is_null,
-                static_dispatch,
+                return_status,
                 &[status.into()],
                 dynamic_linked,
                 &[],
@@ -858,8 +860,40 @@ fn try_compile_ssa_trace(
             let frame_matches = b
                 .ins()
                 .icmp(IntCC::Equal, inherited_frame_key, expected_frame_key);
+            let inherited_target_ip = b.ins().load(
+                pointer_type,
+                MemFlags::new(),
+                inherited_state_ptr,
+                INHERITED_STATE_TARGET_IP_OFFSET,
+            );
+            let expected_target_ip = b.ins().iconst(
+                pointer_type,
+                i64::try_from(trace.root_ip).map_err(|_| {
+                    VmError::JitNative("SSA inherited target ip exceeds i64".to_string())
+                })?,
+            );
+            let target_matches =
+                b.ins()
+                    .icmp(IntCC::Equal, inherited_target_ip, expected_target_ip);
+            let inherited_value_count = b.ins().load(
+                pointer_type,
+                MemFlags::new(),
+                inherited_state_ptr,
+                INHERITED_STATE_VALUE_COUNT_OFFSET,
+            );
+            let expected_value_count = b.ins().iconst(
+                pointer_type,
+                i64::try_from(entry_ssa_block.params.len()).map_err(|_| {
+                    VmError::JitNative("SSA inherited value count exceeds i64".to_string())
+                })?,
+            );
+            let value_count_matches =
+                b.ins()
+                    .icmp(IntCC::Equal, inherited_value_count, expected_value_count);
+            let metadata_matches = b.ins().band(frame_matches, target_matches);
+            let metadata_matches = b.ins().band(metadata_matches, value_count_matches);
             b.ins()
-                .brif(frame_matches, inherited_entry, &[], normal_entry, &[]);
+                .brif(metadata_matches, inherited_entry, &[], normal_entry, &[]);
 
             b.switch_to_block(inherited_entry);
             let active_stack_base = b.ins().load(
@@ -4471,6 +4505,28 @@ fn write_inherited_state_packet(
         ctx.active_local_base,
         ctx.inherited_state_ptr,
         INHERITED_STATE_LOCAL_BASE_OFFSET,
+    );
+    let target_ip = b.ins().iconst(
+        ctx.pointer_type,
+        i64::try_from(exit.exit_ip)
+            .map_err(|_| VmError::JitNative("SSA inherited target ip exceeds i64".to_string()))?,
+    );
+    b.ins().store(
+        MemFlags::new(),
+        target_ip,
+        ctx.inherited_state_ptr,
+        INHERITED_STATE_TARGET_IP_OFFSET,
+    );
+    let value_count = b.ins().iconst(
+        ctx.pointer_type,
+        i64::try_from(entry_value_count)
+            .map_err(|_| VmError::JitNative("SSA inherited value count exceeds i64".to_string()))?,
+    );
+    b.ins().store(
+        MemFlags::new(),
+        value_count,
+        ctx.inherited_state_ptr,
+        INHERITED_STATE_VALUE_COUNT_OFFSET,
     );
     let stack_ptr = b.ins().load(
         ctx.pointer_type,

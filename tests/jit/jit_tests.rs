@@ -6191,6 +6191,41 @@ fn trace_jit_direct_links_cross_frame_call_and_return_edges() {
 }
 
 #[test]
+fn trace_jit_missing_dynamic_return_target_never_uses_stale_static_continuation() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        let add: fn(int) -> int = |value| value + 1;
+        let mut i = 0;
+        let mut total = 0;
+        while i < 256 {
+            total = add(total);
+            total = total + 10;
+            i = i + 1;
+        }
+        total = add(total);
+        total = total + 100;
+        total;
+    "#;
+    let compiled = compile_source(source).expect("multiple continuation sites should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_direct_links_enabled(true);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(2_917)]);
+
+    vm.reset_for_reuse();
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(2_917)]);
+}
+
+#[test]
 fn trace_jit_direct_link_slots_clear_and_republish_after_mode_toggle() {
     if !native_jit_supported() {
         return;
@@ -6383,6 +6418,37 @@ fn trace_jit_call_value_yields_and_resumes_host_callable_without_losing_frame_st
     );
     assert_eq!(vm.stack(), &[Value::Int(84)]);
     assert!(vm.dump_jit_info().contains("interpreter fallbacks: 0"));
+}
+
+#[test]
+fn trace_jit_missing_dynamic_return_target_does_not_use_stale_static_slot() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn inc(x: int) -> int { x + 1 }
+        let mut i = 0;
+        let mut value = 0;
+        while i < 32 {
+            value = inc(value);
+            i = i + 1;
+        }
+        value = inc(value) + 100;
+        value;
+    "#;
+    let compiled = compile_source(source).expect("stale return target fixture should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_direct_links_enabled(true);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 256,
+    });
+    assert_eq!(
+        vm.run().expect("stale return target fixture should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(133)]);
 }
 
 #[test]

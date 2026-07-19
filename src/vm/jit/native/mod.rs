@@ -116,7 +116,6 @@ impl Default for NativeSideLinkSlot {
     }
 }
 
-pub(crate) const LINKED_CONTINUE_SLOT_ID: u32 = u32::MAX;
 pub(crate) const CONTINUE_SLOT_ID: u32 = u32::MAX - 1;
 
 pub(crate) struct CompiledTraceDispatcher {
@@ -144,9 +143,6 @@ pub(crate) fn compile_native_trace_dispatcher(
         descriptors.push((status, slot.address() as usize));
         slots.insert(exit.id.raw(), slot);
     }
-    let slot = Arc::new(NativeSideLinkSlot::new());
-    descriptors.push((STATUS_LINKED_CONTINUE, slot.address() as usize));
-    slots.insert(LINKED_CONTINUE_SLOT_ID, slot);
     let slot = Arc::new(NativeSideLinkSlot::new());
     descriptors.push((STATUS_CONTINUE, slot.address() as usize));
     slots.insert(CONTINUE_SLOT_ID, slot);

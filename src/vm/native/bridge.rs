@@ -821,7 +821,8 @@ fn write_inherited_state_packet(vm: &Vm, packet: *mut u8) -> VmResult<()> {
     use super::{
         INHERITED_STATE_ACTIVE_OFFSET, INHERITED_STATE_DYNAMIC_TARGET_OFFSET,
         INHERITED_STATE_FRAME_KEY_OFFSET, INHERITED_STATE_LOCAL_BASE_OFFSET,
-        INHERITED_STATE_STACK_BASE_OFFSET, INHERITED_STATE_VALUES_OFFSET,
+        INHERITED_STATE_STACK_BASE_OFFSET, INHERITED_STATE_TARGET_IP_OFFSET,
+        INHERITED_STATE_VALUE_COUNT_OFFSET, INHERITED_STATE_VALUES_OFFSET,
         MAX_INHERITED_ENTRY_VALUES,
     };
 
@@ -861,6 +862,14 @@ fn write_inherited_state_packet(vm: &Vm, packet: *mut u8) -> VmResult<()> {
             .add(INHERITED_STATE_LOCAL_BASE_OFFSET as usize)
             .cast::<usize>()
             .write(state.local_base);
+        packet
+            .add(INHERITED_STATE_TARGET_IP_OFFSET as usize)
+            .cast::<usize>()
+            .write(vm.ip);
+        packet
+            .add(INHERITED_STATE_VALUE_COUNT_OFFSET as usize)
+            .cast::<usize>()
+            .write(value_count);
         let values = packet
             .add(INHERITED_STATE_VALUES_OFFSET as usize)
             .cast::<*const Value>();
