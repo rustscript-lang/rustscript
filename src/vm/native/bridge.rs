@@ -1171,6 +1171,7 @@ pub(crate) extern "C" fn pd_vm_native_restore_active_sparse_exit_state(
             .last()
             .map(|frame| frame.local_count)
             .unwrap_or(vm.locals.len());
+        let mut seen_local_indices = [0u64; 4];
         for compact_index in 0..dirty_local_count {
             let local_index = unsafe { *dirty_local_indices.add(compact_index) };
             let local_index_usize = usize::try_from(local_index).map_err(|_| {
@@ -1183,19 +1184,20 @@ pub(crate) extern "C" fn pd_vm_native_restore_active_sparse_exit_state(
                     "native active sparse exit restore local index {local_index} out of range for {local_count} active locals"
                 )));
             }
-            u8::try_from(local_index).map_err(|_| {
+            let local_index = u8::try_from(local_index).map_err(|_| {
                 VmError::JitNative(
                     "native active sparse exit restore local index exceeds VM local range"
                         .to_string(),
                 )
             })?;
-            for prior_index in 0..compact_index {
-                if unsafe { *dirty_local_indices.add(prior_index) } == local_index {
-                    return Err(VmError::JitNative(format!(
-                        "native active sparse exit restore received duplicate local index {local_index}"
-                    )));
-                }
+            let word = usize::from(local_index) / 64;
+            let bit = 1u64 << (local_index % 64);
+            if seen_local_indices[word] & bit != 0 {
+                return Err(VmError::JitNative(format!(
+                    "native active sparse exit restore received duplicate local index {local_index}"
+                )));
             }
+            seen_local_indices[word] |= bit;
         }
 
         let stack_base = vm.active_operand_stack_base();
@@ -1224,7 +1226,10 @@ pub(crate) extern "C" fn pd_vm_native_restore_active_sparse_exit_state(
             vm.store_local_with_drop_contract(local_index, value)?;
         }
 
-        vm.jump_to(ip)?;
+        if ip >= vm.program.code.len() {
+            return Err(VmError::InvalidBranchTarget { target: ip });
+        }
+        vm.ip = ip;
         Ok(STATUS_CONTINUE)
     })
 }
@@ -1316,6 +1321,8 @@ pub(crate) extern "C" fn pd_vm_native_restore_virtual_frame(
             local_count: locals_len,
             prototype_id: Some(prototype_id),
         });
+        vm.active_local_base_cache = local_base;
+        vm.active_operand_stack_base_cache = operand_stack_base;
         vm.call_depth = vm.script_frame_depth();
         vm.ip = resume_ip;
         Ok(STATUS_CONTINUE)
@@ -2082,6 +2089,8 @@ mod tests {
             local_count: 3,
             prototype_id: Some(7),
         });
+        vm.active_local_base_cache = 2;
+        vm.active_operand_stack_base_cache = 1;
         vm.call_depth = 1;
 
         let mut state = MaybeUninit::<NativeFrameState>::uninit();

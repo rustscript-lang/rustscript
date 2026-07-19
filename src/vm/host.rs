@@ -994,6 +994,20 @@ impl Vm {
             .get(usize::from(index))
             .map(|import| import.return_type);
         let resolved_index = self.resolve_call_target(index, argc_u8)?;
+        if let Some(function) =
+            self.host_functions
+                .get(resolved_index as usize)
+                .and_then(|function| match function {
+                    VmHostFunction::ArgsStaticNonYielding(function) => Some(*function),
+                    _ => None,
+                })
+        {
+            return self.execute_static_non_yielding_args_host_function(
+                function,
+                argc,
+                expected_return_type,
+            );
+        }
         if self.bound_host_function_uses_args_slice(resolved_index)? {
             self.execute_bound_args_host_function(
                 resolved_index,
@@ -1535,6 +1549,28 @@ impl Vm {
             function,
             VmHostFunction::StackDynamic(_) | VmHostFunction::StackStatic(_)
         ))
+    }
+
+    #[inline(always)]
+    fn execute_static_non_yielding_args_host_function(
+        &mut self,
+        function: StaticHostArgsFunction,
+        argc: usize,
+        expected_return_type: Option<ValueType>,
+    ) -> VmResult<HostCallExecOutcome> {
+        let arg_start = self
+            .stack
+            .len()
+            .checked_sub(argc)
+            .ok_or(VmError::StackUnderflow)?;
+        self.call_depth += 1;
+        let outcome = function(&self.stack[arg_start..]);
+        self.call_depth = self.call_depth.saturating_sub(1);
+        let value = require_non_yielding_host_value(outcome?)?;
+        let value = validate_non_yielding_host_value(value, expected_return_type)?;
+        self.stack.truncate(arg_start);
+        self.stack.push(value);
+        Ok(HostCallExecOutcome::Returned)
     }
 
     pub(super) fn execute_bound_args_host_function(

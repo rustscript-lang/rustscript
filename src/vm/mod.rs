@@ -346,6 +346,8 @@ pub struct Vm {
     call_depth: usize,
     max_script_call_depth: usize,
     execution_frames: Vec<ExecutionFrame>,
+    active_local_base_cache: usize,
+    active_operand_stack_base_cache: usize,
     host_return: Option<Value>,
     queued_callables: VecDeque<QueuedCallable>,
     completed_callable_results: VecDeque<Value>,
@@ -675,6 +677,8 @@ impl Vm {
             call_depth: 0,
             max_script_call_depth: DEFAULT_MAX_SCRIPT_CALL_DEPTH,
             execution_frames: vec![ExecutionFrame::root(local_count)],
+            active_local_base_cache: 0,
+            active_operand_stack_base_cache: 0,
             host_return: None,
             queued_callables: VecDeque::new(),
             completed_callable_results: VecDeque::new(),
@@ -918,6 +922,8 @@ impl Vm {
         self.execution_frames.clear();
         self.execution_frames
             .push(ExecutionFrame::root(self.program.local_count));
+        self.active_local_base_cache = 0;
+        self.active_operand_stack_base_cache = 0;
         self.host_return = None;
         self.queued_callables.clear();
         self.completed_callable_results.clear();
@@ -1019,10 +1025,7 @@ impl Vm {
 
     #[inline(always)]
     pub(super) fn active_operand_stack_base(&self) -> usize {
-        self.execution_frames
-            .last()
-            .map(|frame| frame.operand_stack_base)
-            .unwrap_or(0)
+        self.active_operand_stack_base_cache
     }
 
     #[inline(always)]
@@ -1043,10 +1046,7 @@ impl Vm {
 
     #[inline(always)]
     pub(super) fn active_local_base(&self) -> usize {
-        self.execution_frames
-            .last()
-            .map(|frame| frame.local_base)
-            .unwrap_or(0)
+        self.active_local_base_cache
     }
 
     pub(super) fn active_local_types(&self) -> Vec<ValueType> {
@@ -1091,13 +1091,22 @@ impl Vm {
         if self.capture_cells.is_empty() {
             return Ok(self.locals[absolute].clone());
         }
+        self.load_local_value_with_captures(absolute, index)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn load_local_value_with_captures(&self, absolute: usize, index: u8) -> VmResult<Value> {
         if let Some(cell) = self.capture_cells.get(&absolute) {
             return cell
                 .lock()
                 .map(|value| value.clone())
                 .map_err(|_| VmError::InvalidFrameState("capture cell lock is poisoned"));
         }
-        Ok(self.locals[absolute].clone())
+        self.locals
+            .get(absolute)
+            .cloned()
+            .ok_or(VmError::InvalidLocal(index))
     }
 
     #[inline(always)]
@@ -1110,6 +1119,12 @@ impl Vm {
                 _ => None,
             };
         }
+        self.local_numeric_value_with_captures(absolute)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn local_numeric_value_with_captures(&self, absolute: usize) -> Option<NumericValue> {
         let captured = self
             .capture_cells
             .get(&absolute)
@@ -1412,6 +1427,8 @@ impl Vm {
                     local_count,
                     prototype_id: Some(callable.prototype_id),
                 });
+                self.active_local_base_cache = local_base;
+                self.active_operand_stack_base_cache = operand_stack_base;
                 self.call_depth = self.script_frame_depth();
                 self.ip = function.entry_ip as usize;
                 self.charge_interrupt_tick()?;
@@ -1439,6 +1456,16 @@ impl Vm {
             .execution_frames
             .pop()
             .ok_or(VmError::InvalidFrameState("missing active frame"))?;
+        self.active_local_base_cache = self
+            .execution_frames
+            .last()
+            .map(|frame| frame.local_base)
+            .unwrap_or(0);
+        self.active_operand_stack_base_cache = self
+            .execution_frames
+            .last()
+            .map(|frame| frame.operand_stack_base)
+            .unwrap_or(0);
         if self.stack.len() < frame.operand_stack_base {
             return Err(VmError::InvalidFrameState(
                 "operand stack is below the active frame base",
@@ -1935,6 +1962,17 @@ impl Vm {
             self.drop_value_with_contract(previous);
             return Ok(());
         }
+        self.store_local_with_captures(absolute, index, value)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn store_local_with_captures(
+        &mut self,
+        absolute: usize,
+        index: u8,
+        value: Value,
+    ) -> VmResult<()> {
         if let Some(cell) = self.capture_cells.get(&absolute).cloned() {
             if Self::value_references_capture_cell(&value, &cell, &mut HashSet::new())? {
                 return Err(VmError::InvalidFrameState(
@@ -2172,6 +2210,39 @@ impl Vm {
         result
     }
 
+    fn run_fast_interpreter(&mut self, allow_jit: bool) -> VmResult<Option<VmStatus>> {
+        loop {
+            if self.ip >= self.program.code.len() {
+                return Err(VmError::BytecodeBounds);
+            }
+            let opcode = self.read_u8()?;
+            let outcome = self.execute_interpreter_instruction(opcode, true)?;
+            match outcome {
+                ExecOutcome::Continue => {}
+                ExecOutcome::Halted => {
+                    self.last_yield_reason = None;
+                    return Ok(Some(VmStatus::Halted));
+                }
+                ExecOutcome::Yielded => {
+                    if self.last_yield_reason.is_none() {
+                        self.last_yield_reason = Some(VmYieldReason::Host);
+                    }
+                    return Ok(Some(VmStatus::Yielded));
+                }
+                ExecOutcome::Waiting(op_id) => {
+                    self.last_yield_reason = None;
+                    return Ok(Some(VmStatus::Waiting(op_id)));
+                }
+            }
+            if (opcode == OpCode::Call as u8 || opcode == OpCode::CallValue as u8)
+                && (self.interruption_enabled()
+                    || (allow_jit && (self.jit_config().enabled || self.has_aot_program())))
+            {
+                return Ok(None);
+            }
+        }
+    }
+
     fn run_internal_impl(
         &mut self,
         mut debugger: Option<&mut crate::debugger::Debugger>,
@@ -2186,6 +2257,16 @@ impl Vm {
             return Ok(status);
         }
         self.last_yield_reason = None;
+        if self.epoch_rearm_pending {
+            self.rearm_epoch_after_yield_if_needed();
+        }
+        if debugger.is_none()
+            && !self.interruption_enabled()
+            && (!allow_jit || (!self.jit_config().enabled && !self.has_aot_program()))
+            && let Some(status) = self.run_fast_interpreter(allow_jit)?
+        {
+            return Ok(status);
+        }
 
         loop {
             if self.epoch_rearm_pending {
@@ -2320,6 +2401,7 @@ impl Vm {
         }
     }
 
+    #[inline(always)]
     pub(super) fn execute_interpreter_instruction(
         &mut self,
         opcode: u8,
@@ -2563,7 +2645,11 @@ impl Vm {
                 } else {
                     self.read_u32()? as usize
                 };
-                self.jump_to(target)?;
+                if self.decoded_jump_target_is_valid_at(opcode_ip) {
+                    self.ip = target;
+                } else {
+                    self.jump_to(target)?;
+                }
             }
             x if x == OpCode::Brfalse as u8 => {
                 let opcode_ip = self.ip - 1;
@@ -2575,7 +2661,11 @@ impl Vm {
                 };
                 let condition = self.pop_bool()?;
                 if !condition {
-                    self.jump_to(target)?;
+                    if self.decoded_jump_target_is_valid_at(opcode_ip) {
+                        self.ip = target;
+                    } else {
+                        self.jump_to(target)?;
+                    }
                 }
             }
             x if x == OpCode::Pop as u8 => {
@@ -2822,6 +2912,8 @@ impl Vm {
         self.capture_cells.clear();
         self.clear_locals_with_drop_contract();
         self.execution_frames.clear();
+        self.active_local_base_cache = 0;
+        self.active_operand_stack_base_cache = 0;
         self.call_depth = 0;
         self.host_return = None;
         self.waiting_host_op = None;
@@ -2936,6 +3028,16 @@ impl Vm {
                 }
             }
         }
+        self.active_local_base_cache = self
+            .execution_frames
+            .last()
+            .map(|frame| frame.local_base)
+            .unwrap_or(0);
+        self.active_operand_stack_base_cache = self
+            .execution_frames
+            .last()
+            .map(|frame| frame.operand_stack_base)
+            .unwrap_or(0);
         while self.stack.len() > stack_base {
             if let Some(value) = self.stack.pop() {
                 self.drop_value_with_contract(value);
