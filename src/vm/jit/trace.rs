@@ -417,7 +417,7 @@ impl TraceJitEngine {
         stack_depth: usize,
         program: &Program,
     ) -> Option<usize> {
-        self.observe_hot_entry_with_local_types(frame_key, ip, stack_depth, None, program)
+        self.observe_hot_entry_with_local_types(frame_key, ip, stack_depth, None, None, program)
     }
 
     pub(crate) fn observe_hot_entry_with_local_types(
@@ -426,6 +426,7 @@ impl TraceJitEngine {
         ip: usize,
         stack_depth: usize,
         entry_local_types: Option<&[crate::ValueType]>,
+        entry_callable_prototypes: Option<&[Option<u32>]>,
         program: &Program,
     ) -> Option<usize> {
         if !self.config.enabled
@@ -461,7 +462,7 @@ impl TraceJitEngine {
         let result = if self.config.hot_loop_threshold == 0 {
             Err(JitNyiReason::HotLoopThresholdZero)
         } else {
-            self.compile_trace(program, key, entry_local_types)
+            self.compile_trace(program, key, entry_local_types, entry_callable_prototypes)
         };
         self.finish_attempt(key, line, result)
     }
@@ -639,6 +640,7 @@ impl TraceJitEngine {
         entry_local_types: Option<&[crate::ValueType]>,
         program: &Program,
     ) -> Option<usize> {
+        let entry_callable_prototypes = None;
         if !self.config.enabled
             || !native_jit_supported()
             || self.callable_frame_is_blocked(frame_key)
@@ -670,7 +672,7 @@ impl TraceJitEngine {
         let result = if self.config.hot_loop_threshold == 0 {
             Err(JitNyiReason::HotLoopThresholdZero)
         } else {
-            self.compile_trace(program, key, entry_local_types)
+            self.compile_trace(program, key, entry_local_types, entry_callable_prototypes)
         };
         self.finish_attempt(key, line, result)
     }
@@ -1008,6 +1010,7 @@ impl TraceJitEngine {
         program: &Program,
         key: TraceEntryKey,
         entry_local_types: Option<&[crate::ValueType]>,
+        entry_callable_prototypes: Option<&[Option<u32>]>,
     ) -> Result<usize, JitNyiReason> {
         let local_count = if key.frame_key == ROOT_FRAME_KEY {
             program.local_count
@@ -1030,6 +1033,7 @@ impl TraceJitEngine {
             key.stack_depth,
             local_count,
             entry_local_types,
+            entry_callable_prototypes,
             self.config.max_trace_len,
             &self.non_yielding_host_imports,
         )

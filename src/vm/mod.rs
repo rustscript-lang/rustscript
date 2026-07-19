@@ -2317,12 +2317,24 @@ impl Vm {
                     let stack_depth = self.active_operand_stack_len();
                     let entry_local_types = (frame_key != crate::vm::native::ROOT_FRAME_KEY)
                         .then(|| self.active_local_types());
+                    let entry_callable_prototypes =
+                        (frame_key == crate::vm::native::ROOT_FRAME_KEY).then(|| {
+                            self.locals
+                                .iter()
+                                .take(self.program.local_count)
+                                .map(|value| match value {
+                                    Value::Callable(callable) => Some(callable.prototype_id),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                        });
                     let program = &self.program;
                     self.jit.observe_hot_entry_with_local_types(
                         frame_key,
                         self.ip,
                         stack_depth,
                         entry_local_types.as_deref(),
+                        entry_callable_prototypes.as_deref(),
                         program,
                     )
                 };
@@ -2753,7 +2765,10 @@ impl Vm {
     }
 
     pub fn set_local(&mut self, index: u8, value: Value) -> VmResult<()> {
-        self.store_local_with_drop_contract(index, value)
+        self.store_local_with_drop_contract(index, value)?;
+        let config = *self.jit.config();
+        self.jit.set_config(config);
+        Ok(())
     }
 
     pub fn program(&self) -> &Program {
