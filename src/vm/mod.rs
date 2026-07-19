@@ -336,6 +336,7 @@ pub struct Vm {
     stack: Vec<Value>,
     locals: Vec<Value>,
     capture_cells: HashMap<usize, crate::bytecode::SharedCaptureCell>,
+    shared_capture_slots: HashSet<usize>,
     operand_type_hints: Option<Arc<[PackedOperandTypes]>>,
     decoded_instruction_data: Arc<crate::bytecode::DecodedInstructionData>,
     host_functions: Vec<VmHostFunction>,
@@ -667,6 +668,7 @@ impl Vm {
             stack: Vec::new(),
             locals: vec![Value::Null; local_count],
             capture_cells: HashMap::new(),
+            shared_capture_slots: HashSet::new(),
             operand_type_hints,
             decoded_instruction_data,
             host_functions: Vec::new(),
@@ -913,6 +915,7 @@ impl Vm {
         self.clear_epoch_deadline();
         self.clear_stack_with_drop_contract();
         self.capture_cells.clear();
+        self.shared_capture_slots.clear();
         self.clear_locals_with_drop_contract();
         self.owned_callables.clear();
         self.locals.resize(self.program.local_count, Value::Null);
@@ -1088,34 +1091,16 @@ impl Vm {
     }
 
     pub(super) fn active_frame_has_shared_capture_cells(&self) -> bool {
-        if self.capture_cells.is_empty() {
+        if self.shared_capture_slots.is_empty() {
             return false;
         }
         let Some(frame) = self.execution_frames.last() else {
             return false;
         };
         let base = frame.local_base;
-        if let Some(prototype_id) = frame.prototype_id {
-            let Some(prototype) = self.program.callable_prototypes.get(prototype_id as usize)
-            else {
-                return true;
-            };
-            return prototype
-                .capture_slots
-                .iter()
-                .zip(&prototype.capture_modes)
-                .any(|(slot, mode)| {
-                    matches!(
-                        mode,
-                        crate::CaptureBindingMode::Borrow | crate::CaptureBindingMode::BorrowMut
-                    ) && self
-                        .capture_cells
-                        .contains_key(&base.saturating_add(usize::from(*slot)))
-                });
-        }
         let end = base.saturating_add(frame.local_count);
-        self.capture_cells
-            .keys()
+        self.shared_capture_slots
+            .iter()
             .any(|absolute| base <= *absolute && *absolute < end)
     }
 
@@ -1236,6 +1221,7 @@ impl Drop for Vm {
         self.cancel_waiting_host_op();
         self.clear_stack_with_drop_contract();
         self.capture_cells.clear();
+        self.shared_capture_slots.clear();
         self.clear_locals_with_drop_contract();
         crate::builtins::runtime::close_all_handles(self);
     }
@@ -1292,6 +1278,7 @@ impl Vm {
                     .entry(absolute)
                     .or_insert_with(|| Arc::new(Mutex::new(value)))
                     .clone();
+                self.shared_capture_slots.insert(absolute);
                 self.locals[absolute] = cell
                     .lock()
                     .map_err(|_| VmError::InvalidFrameState("capture cell lock is poisoned"))?
@@ -1444,7 +1431,12 @@ impl Vm {
                             "callable environment layout mismatch",
                         ));
                     }
-                    for (slot, cell) in prototype.capture_slots.iter().zip(cells.iter()) {
+                    for ((slot, mode), cell) in prototype
+                        .capture_slots
+                        .iter()
+                        .zip(&prototype.capture_modes)
+                        .zip(cells.iter())
+                    {
                         let relative = *slot as usize;
                         if relative >= local_count {
                             return Err(VmError::InvalidFrameState(
@@ -1460,6 +1452,13 @@ impl Vm {
                             .clone();
                         if prototype.self_slot != Some(*slot) {
                             self.capture_cells.insert(absolute, cell.clone());
+                            if matches!(
+                                mode,
+                                crate::CaptureBindingMode::Borrow
+                                    | crate::CaptureBindingMode::BorrowMut
+                            ) {
+                                self.shared_capture_slots.insert(absolute);
+                            }
                         }
                     }
                 }
@@ -1544,6 +1543,8 @@ impl Vm {
             let frame_end = frame.local_base.saturating_add(frame.local_count);
             self.capture_cells
                 .retain(|absolute, _| *absolute < frame.local_base || *absolute >= frame_end);
+            self.shared_capture_slots
+                .retain(|absolute| *absolute < frame.local_base || *absolute >= frame_end);
         }
 
         if !matches!(frame.continuation, FrameContinuation::Halt) {
@@ -2969,6 +2970,7 @@ impl Vm {
         self.draining_queued_callables = false;
         self.clear_stack_with_drop_contract();
         self.capture_cells.clear();
+        self.shared_capture_slots.clear();
         self.clear_locals_with_drop_contract();
         self.execution_frames.clear();
         self.active_local_base_cache = 0;
@@ -3080,6 +3082,8 @@ impl Vm {
             let frame_end = frame.local_base.saturating_add(frame.local_count);
             self.capture_cells
                 .retain(|absolute, _| *absolute < frame.local_base || *absolute >= frame_end);
+            self.shared_capture_slots
+                .retain(|absolute| *absolute < frame.local_base || *absolute >= frame_end);
             if frame.local_base <= self.locals.len() {
                 let drained = self.locals.drain(frame.local_base..).collect::<Vec<_>>();
                 for value in drained {
