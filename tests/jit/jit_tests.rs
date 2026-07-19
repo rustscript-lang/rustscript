@@ -6593,6 +6593,53 @@ fn trace_jit_skips_frames_with_shared_capture_cells() {
 }
 
 #[test]
+fn trace_jit_skips_callable_frame_with_nested_shared_capture() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn outer(limit: int) -> int {
+            let mut count = 0;
+            let recurse = |depth| if depth == 0 => {
+                count = count + 1;
+                count
+            } else => {
+                recurse(depth - 1);
+                count
+            };
+            let mut i = 0;
+            let mut total = 0;
+            while i < limit {
+                total = total + recurse(0) + count;
+                i = i + 1;
+            }
+            total
+        }
+        outer(100);
+    "#;
+    let compiled = compile_source(source).expect("nested shared capture source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(
+        vm.run().expect("nested shared capture run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(10_100)], "{}", vm.dump_jit_info());
+    assert_eq!(vm.jit_native_exec_count(), 0, "{}", vm.dump_jit_info());
+    assert_eq!(
+        vm.jit_native_active_direct_link_slot_count(),
+        0,
+        "{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
 fn trace_jit_native_return_does_not_link_into_shared_capture_caller() {
     if !native_jit_supported() {
         return;
