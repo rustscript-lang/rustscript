@@ -27,16 +27,16 @@ use crate::vm::native::{
     non_yielding_i64_host_call_signature, non_yielding_scalar_host_call_entry_address,
     non_yielding_scalar_host_call_signature, pack_shared_signature, regex_match_entry_address,
     regex_match_signature, regex_replace_entry_address, regex_replace_signature,
-    restore_active_sparse_exit_state_entry_address, restore_virtual_frame_entry_address,
-    restore_virtual_frame_signature, shared_array_from_buffer_entry_address,
-    shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
-    sparse_restore_exit_signature, string_binary_transform_signature,
-    string_contains_entry_address, string_contains_signature, string_lower_ascii_entry_address,
-    string_replace_literal_entry_address, string_replace_signature,
-    string_split_literal_entry_address, string_unary_transform_signature, to_string_entry_address,
-    type_of_entry_address, value_eq_entry_address, value_eq_signature, value_len_entry_address,
-    value_len_signature, value_slot_signature, write_heap_value_to_slot_entry_address,
-    zero_bytes_entry_address,
+    replace_value_in_slot_entry_address, restore_active_sparse_exit_state_entry_address,
+    restore_virtual_frame_entry_address, restore_virtual_frame_signature,
+    shared_array_from_buffer_entry_address, shared_bytes_from_buffer_entry_address,
+    shared_string_from_buffer_entry_address, sparse_restore_exit_signature,
+    string_binary_transform_signature, string_contains_entry_address, string_contains_signature,
+    string_lower_ascii_entry_address, string_replace_literal_entry_address,
+    string_replace_signature, string_split_literal_entry_address, string_unary_transform_signature,
+    to_string_entry_address, type_of_entry_address, value_eq_entry_address, value_eq_signature,
+    value_len_entry_address, value_len_signature, value_slot_signature,
+    write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
 };
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::Ieee64;
@@ -667,7 +667,8 @@ fn try_compile_ssa_trace(
         };
         let frame_state_ref = b.import_signature(frame_state_sig);
         let deopt_refs = SsaDeoptHelperRefs {
-            clone_value_ref: b.import_signature(clone_value_sig),
+            clone_value_ref: b.import_signature(clone_value_sig.clone()),
+            replace_value_ref: b.import_signature(clone_value_sig),
             value_eq_ref: b.import_signature(value_eq_sig),
             value_len_ref: b.import_signature(value_len_sig),
             non_yielding_host_call_ref: b.import_signature(non_yielding_host_call_sig),
@@ -693,6 +694,7 @@ fn try_compile_ssa_trace(
         };
         let deopt_addrs = SsaDeoptHelperAddrs {
             clone_value: clone_value_to_slot_entry_address(),
+            replace_value: replace_value_in_slot_entry_address(),
             value_eq: value_eq_entry_address(),
             value_len: value_len_entry_address(),
             non_yielding_host_call: non_yielding_host_call_entry_address(),
@@ -1104,6 +1106,7 @@ enum SsaExitAction {
 #[derive(Clone, Copy)]
 struct SsaDeoptHelperRefs {
     clone_value_ref: cranelift_codegen::ir::SigRef,
+    replace_value_ref: cranelift_codegen::ir::SigRef,
     value_eq_ref: cranelift_codegen::ir::SigRef,
     value_len_ref: cranelift_codegen::ir::SigRef,
     non_yielding_host_call_ref: cranelift_codegen::ir::SigRef,
@@ -1130,6 +1133,7 @@ struct SsaDeoptHelperRefs {
 #[derive(Clone, Copy)]
 struct SsaDeoptHelperAddrs {
     clone_value: usize,
+    replace_value: usize,
     value_eq: usize,
     value_len: usize,
     non_yielding_host_call: usize,
@@ -2080,8 +2084,8 @@ fn lower_ssa_inst(
                 b,
                 exit_block,
                 pointer_type,
-                helper_refs.clone_value_ref,
-                helper_addrs.clone_value,
+                helper_refs.replace_value_ref,
+                helper_addrs.replace_value,
                 &[out, values[input]],
             )?;
             out
@@ -4701,6 +4705,27 @@ fn lower_ssa_exit_block(
             active_local_base,
             layout.value.size,
         );
+        let mut cloned_local_addrs = HashMap::new();
+        for (local_index, materialization) in
+            exit.locals
+                .iter()
+                .enumerate()
+                .filter_map(|(local_index, materialization)| {
+                    exit.dirty_locals[local_index].then_some((local_index, materialization))
+                })
+        {
+            let clone_before_clear = match materialization {
+                SsaMaterialization::BoxHeapPtr { .. } => true,
+                SsaMaterialization::Value(value) => !moved_owned_values.contains(value),
+                _ => false,
+            };
+            if clone_before_clear {
+                let temp_slot = ssa_create_value_stack_slot(b, layout.value.size)?;
+                let temp_addr = b.ins().stack_addr(pointer_type, temp_slot, 0);
+                ssa_materialize_slot(b, materialize_ctx, materialization, temp_addr, "local")?;
+                cloned_local_addrs.insert(local_index, temp_addr);
+            }
+        }
         for (local_index, materialization) in
             exit.locals
                 .iter()
@@ -4716,15 +4741,7 @@ fn lower_ssa_exit_block(
                 })?,
             );
             let dst_addr = ssa_value_addr(b, pointer_type, vm_locals_ptr, index, layout.value.size);
-            let clone_before_clear = match materialization {
-                SsaMaterialization::BoxHeapPtr { .. } => true,
-                SsaMaterialization::Value(value) => !moved_owned_values.contains(value),
-                _ => false,
-            };
-            if clone_before_clear {
-                let temp_slot = ssa_create_value_stack_slot(b, layout.value.size)?;
-                let temp_addr = b.ins().stack_addr(pointer_type, temp_slot, 0);
-                ssa_materialize_slot(b, materialize_ctx, materialization, temp_addr, "local")?;
+            if let Some(temp_addr) = cloned_local_addrs.get(&local_index).copied() {
                 clear_owned_value_temp_slot(b, pointer_type, deopt_refs, deopt_addrs, dst_addr)?;
                 ssa_copy_value_bytes(b, temp_addr, dst_addr, layout.value.size);
                 ssa_store_tag(b, layout.value, temp_addr, layout.value.null_tag);

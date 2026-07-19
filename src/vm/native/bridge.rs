@@ -264,6 +264,10 @@ pub(crate) fn clone_value_to_slot_entry_address() -> usize {
     pd_vm_native_clone_value_to_slot as *const () as usize
 }
 
+pub(crate) fn replace_value_in_slot_entry_address() -> usize {
+    pd_vm_native_replace_value_in_slot as *const () as usize
+}
+
 pub(crate) fn init_null_value_slot_entry_address() -> usize {
     pd_vm_native_init_null_value_slot as *const () as usize
 }
@@ -632,6 +636,25 @@ pub(crate) extern "C" fn pd_vm_native_clone_value_to_slot(
 
     unsafe {
         std::ptr::write(dst, (*src).clone());
+    }
+    STATUS_CONTINUE
+}
+
+pub(crate) extern "C" fn pd_vm_native_replace_value_in_slot(
+    dst: *mut Value,
+    src: *const Value,
+) -> i32 {
+    if dst.is_null() || src.is_null() {
+        store_bridge_error(VmError::JitNative(
+            "native replace-value helper received null slot pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    }
+
+    unsafe {
+        let replacement = (*src).clone();
+        let previous = std::ptr::replace(dst, replacement);
+        drop(previous);
     }
     STATUS_CONTINUE
 }
@@ -2420,5 +2443,18 @@ mod tests {
         assert_eq!(result.get(&Value::Int(1)), Some(&Value::Int(10)));
         assert_eq!(result.get(&Value::Int(2)), Some(&Value::Int(20)));
         assert!(!Arc::ptr_eq(&result, &alias));
+    }
+
+    #[test]
+    fn replace_value_slot_clones_before_dropping_an_aliasing_destination() {
+        let shared = Arc::new(vec![Value::Int(1)]);
+        let mut slot = Value::Array(shared.clone());
+        let slot_ptr = &mut slot as *mut Value;
+
+        let status = pd_vm_native_replace_value_in_slot(slot_ptr, slot_ptr);
+
+        assert_eq!(status, STATUS_CONTINUE);
+        assert_eq!(Arc::strong_count(&shared), 2);
+        assert!(matches!(slot, Value::Array(_)));
     }
 }
