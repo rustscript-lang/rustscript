@@ -1184,12 +1184,26 @@ pub(crate) extern "C" fn pd_vm_native_restore_active_sparse_exit_state(
             vm.stack.push(value);
         }
 
-        for compact_index in 0..dirty_local_count {
-            let local_index = unsafe { *dirty_local_indices.add(compact_index) };
-            debug_assert!(u8::try_from(local_index).is_ok());
-            let local_index = local_index as u8;
-            let value = unsafe { std::ptr::read(dirty_local_values.add(compact_index)) };
-            vm.store_local_with_drop_contract(local_index, value)?;
+        if vm.capture_cells.is_empty() {
+            let local_base = vm.active_local_base();
+            for compact_index in 0..dirty_local_count {
+                let local_index = unsafe { *dirty_local_indices.add(compact_index) } as usize;
+                debug_assert!(local_index < 256);
+                let absolute = local_base + local_index;
+                debug_assert!(absolute < vm.locals.len());
+                let value = unsafe { std::ptr::read(dirty_local_values.add(compact_index)) };
+                let slot = unsafe { vm.locals.get_unchecked_mut(absolute) };
+                let previous = std::mem::replace(slot, value);
+                vm.drop_value_with_contract(previous);
+            }
+        } else {
+            for compact_index in 0..dirty_local_count {
+                let local_index = unsafe { *dirty_local_indices.add(compact_index) };
+                debug_assert!(u8::try_from(local_index).is_ok());
+                let local_index = local_index as u8;
+                let value = unsafe { std::ptr::read(dirty_local_values.add(compact_index)) };
+                vm.store_local_with_drop_contract(local_index, value)?;
+            }
         }
 
         if ip >= vm.program.code.len() {
