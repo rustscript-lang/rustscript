@@ -1087,6 +1087,38 @@ impl Vm {
         Some(prototypes)
     }
 
+    pub(super) fn active_frame_has_shared_capture_cells(&self) -> bool {
+        if self.capture_cells.is_empty() {
+            return false;
+        }
+        let Some(frame) = self.execution_frames.last() else {
+            return false;
+        };
+        let base = frame.local_base;
+        if let Some(prototype_id) = frame.prototype_id {
+            let Some(prototype) = self.program.callable_prototypes.get(prototype_id as usize)
+            else {
+                return true;
+            };
+            return prototype
+                .capture_slots
+                .iter()
+                .zip(&prototype.capture_modes)
+                .any(|(slot, mode)| {
+                    matches!(
+                        mode,
+                        crate::CaptureBindingMode::Borrow | crate::CaptureBindingMode::BorrowMut
+                    ) && self
+                        .capture_cells
+                        .contains_key(&base.saturating_add(usize::from(*slot)))
+                });
+        }
+        let end = base.saturating_add(frame.local_count);
+        self.capture_cells
+            .keys()
+            .any(|absolute| base <= *absolute && *absolute < end)
+    }
+
     fn script_frame_depth(&self) -> usize {
         self.execution_frames
             .iter()
@@ -2330,6 +2362,7 @@ impl Vm {
                 && self.jit_config().enabled
                 && self.builtin_overrides.is_empty()
                 && !self.drop_contract_events_enabled()
+                && !self.active_frame_has_shared_capture_cells()
             {
                 let frame_key = self.active_frame_key();
                 let trace_id = if self.jit.callable_frame_is_blocked(frame_key) {
@@ -2338,8 +2371,7 @@ impl Vm {
                     let stack_depth = self.active_operand_stack_len();
                     let entry_local_types = (frame_key != crate::vm::native::ROOT_FRAME_KEY)
                         .then(|| self.active_local_types());
-                    let entry_callable_prototypes =
-                        self.active_local_callable_prototypes();
+                    let entry_callable_prototypes = self.active_local_callable_prototypes();
                     let program = &self.program;
                     self.jit.observe_hot_entry_with_local_types(
                         frame_key,

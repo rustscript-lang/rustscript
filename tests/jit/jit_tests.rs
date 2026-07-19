@@ -6548,6 +6548,92 @@ fn trace_jit_invalidates_native_inline_after_callable_local_replacement() {
 }
 
 #[test]
+fn trace_jit_skips_frames_with_shared_capture_cells() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        let mut count = 0;
+        let recurse = |depth| if depth == 0 => {
+            count = count + 1;
+            count
+        } else => {
+            recurse(depth - 1);
+            count
+        };
+        let mut i = 0;
+        let mut total = 0;
+        while i < 100 {
+            total = total + recurse(0) + count;
+            i = i + 1;
+        }
+        total;
+    "#;
+    let compiled =
+        compile_source(source).expect("shared capture continuation source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(
+        vm.run().expect("shared capture continuation run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(10_100)], "{}", vm.dump_jit_info());
+    assert_eq!(vm.jit_native_exec_count(), 0, "{}", vm.dump_jit_info());
+    assert_eq!(
+        vm.jit_native_active_direct_link_slot_count(),
+        0,
+        "{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
+fn trace_jit_native_return_does_not_link_into_shared_capture_caller() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        let mut shared = 40;
+        let capture = || &shared;
+        shared = 41;
+        fn work() {
+            let mut i = 0;
+            while i < 100 {
+                i = i + 1;
+            }
+            2
+        }
+        let before = capture();
+        let result = work();
+        before + shared + result;
+    "#;
+    let compiled = compile_source(source).expect("captured caller source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(vm.run().expect("captured caller run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(84)], "{}", vm.dump_jit_info());
+    assert!(vm.jit_native_exec_count() > 0, "{}", vm.dump_jit_info());
+    assert!(
+        vm.jit_snapshot()
+            .traces
+            .iter()
+            .all(|trace| trace.frame_key != u64::MAX),
+        "root frame with shared captures must remain interpreted: {}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
 fn trace_jit_preserves_inline_callable_argument_schema_checks() {
     if !native_jit_supported() {
         return;
