@@ -205,7 +205,7 @@ fn remap_inst_inputs(
         }};
     }
     match kind {
-        SsaInstKind::Constant(_) => {}
+        SsaInstKind::Constant(_) | SsaInstKind::ArrayNew => {}
         SsaInstKind::HostCall { args, .. } => {
             for arg in args {
                 one!(arg);
@@ -227,6 +227,7 @@ fn remap_inst_inputs(
         | SsaInstKind::TypeOf { value: input }
         | SsaInstKind::ToString { value: input }
         | SsaInstKind::BytesFromArrayU8 { array: input }
+        | SsaInstKind::BytesToUtf8Ascii { bytes: input }
         | SsaInstKind::BytesToArrayU8 { bytes: input }
         | SsaInstKind::MapIterNext { slot: input }
         | SsaInstKind::MapIterTakeKey { slot: input }

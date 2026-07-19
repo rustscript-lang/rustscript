@@ -231,6 +231,17 @@ pub(crate) fn resume_linked_trace_entry_address() -> usize {
     pd_vm_native_resume_linked_trace as *const () as usize
 }
 
+#[cfg(not(any(
+    all(
+        target_arch = "x86_64",
+        any(target_os = "windows", all(unix, not(target_os = "macos")))
+    ),
+    all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+)))]
+pub(crate) fn resume_linked_trace_entry_address() -> usize {
+    0
+}
+
 #[cfg(any(
     all(
         target_arch = "x86_64",
@@ -549,6 +560,13 @@ impl Vm {
         self.publish_native_direct_slot(key.parent_trace_id, key.exit_id.raw(), child_trace_id)
     }
 
+    #[cfg(any(
+        all(
+            target_arch = "x86_64",
+            any(target_os = "windows", all(unix, not(target_os = "macos")))
+        ),
+        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+    ))]
     fn publish_native_direct_slot(
         &mut self,
         parent_trace_id: usize,
@@ -587,6 +605,22 @@ impl Vm {
             return Ok(());
         };
         slot.publish(child_entry);
+        Ok(())
+    }
+
+    #[cfg(not(any(
+        all(
+            target_arch = "x86_64",
+            any(target_os = "windows", all(unix, not(target_os = "macos")))
+        ),
+        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+    )))]
+    fn publish_native_direct_slot(
+        &mut self,
+        _parent_trace_id: usize,
+        _slot_id: u32,
+        _child_trace_id: usize,
+    ) -> VmResult<()> {
         Ok(())
     }
 
