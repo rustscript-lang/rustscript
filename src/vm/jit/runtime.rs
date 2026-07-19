@@ -23,8 +23,6 @@ use std::sync::{Arc, Mutex};
 ))]
 use std::{cell::RefCell, thread_local};
 
-const NATIVE_DIRECT_ESCAPE_REGION_THRESHOLD: u16 = 8;
-
 #[cfg(any(
     all(
         target_arch = "x86_64",
@@ -432,7 +430,9 @@ impl Vm {
                             self.jit_native_loop_back_count.saturating_add(1);
                         continue;
                     }
-                    if self.jit.record_native_side_exit(current_trace_id) {
+                    if self.jit.record_native_side_exit(current_trace_id)
+                        && !self.jit_native_direct_links_enabled
+                    {
                         self.block_jit_callable_frame(current_trace_id);
                         return Ok(native::STATUS_LINKED_CONTINUE);
                     }
@@ -525,25 +525,17 @@ impl Vm {
         }
     }
 
-    fn record_native_direct_escape(&mut self, status: i32, direct_links_before: u64) {
+    fn record_native_direct_escape(&mut self, _status: i32, direct_links_before: u64) {
         if !self.jit_native_direct_links_enabled
-            || self.jit_native_direct_region_fallback
             || self.jit_native_direct_link_count == direct_links_before
         {
             return;
         }
-        let escaped = status == native::STATUS_LINKED_CONTINUE
-            || crate::vm::native::decode_jit_trace_exit_status(status).is_some();
-        if !escaped {
-            return;
+        self.jit_native_direct_escape_streak = 0;
+        if self.jit_native_active_direct_trace_id != usize::MAX {
+            self.jit
+                .record_native_loop_back(self.jit_native_active_direct_trace_id);
         }
-        self.jit_native_direct_escape_streak =
-            self.jit_native_direct_escape_streak.saturating_add(1);
-        if self.jit_native_direct_escape_streak < NATIVE_DIRECT_ESCAPE_REGION_THRESHOLD {
-            return;
-        }
-        self.clear_native_direct_links();
-        self.jit_native_direct_region_fallback = true;
     }
 
     fn publish_native_direct_link(
@@ -563,6 +555,19 @@ impl Vm {
         slot_id: u32,
         child_trace_id: usize,
     ) -> VmResult<()> {
+        if !self.jit_native_direct_cross_frame_enabled {
+            let parent_frame_key = self
+                .jit
+                .trace_clone(parent_trace_id)
+                .map(|trace| trace.frame_key);
+            let child_frame_key = self
+                .jit
+                .trace_clone(child_trace_id)
+                .map(|trace| trace.frame_key);
+            if parent_frame_key != child_frame_key {
+                return Ok(());
+            }
+        }
         self.ensure_native_trace(child_trace_id, native::NativeCompileProfile::Jit)?;
         let child_entry = self
             .native_traces
@@ -1062,7 +1067,9 @@ impl Vm {
                             self.jit_native_loop_back_count.saturating_add(1);
                         continue;
                     }
-                    if self.jit.record_native_side_exit(current_trace_id) {
+                    if self.jit.record_native_side_exit(current_trace_id)
+                        && !self.jit_native_direct_links_enabled
+                    {
                         self.block_jit_callable_frame(current_trace_id);
                         return Ok(ExecOutcome::Continue);
                     }
@@ -1517,14 +1524,36 @@ impl Vm {
         self.native_trace_exec_count
     }
 
+    pub(crate) fn jit_native_inherited_target(&self) -> usize {
+        if !self.jit_native_direct_links_enabled {
+            return 0;
+        }
+        let Some(trace_id) = self.jit.compiled_trace_for_entry(
+            self.active_frame_key(),
+            self.ip,
+            self.active_operand_stack_len(),
+        ) else {
+            return 0;
+        };
+        self.native_traces
+            .get(trace_id)
+            .and_then(Option::as_ref)
+            .map(|native| native.tail_entry as usize)
+            .unwrap_or(0)
+    }
+
     pub fn set_jit_native_direct_links_enabled(&mut self, enabled: bool) {
-        if self.jit_native_direct_links_enabled == enabled {
+        let cross_frame_enabled = enabled;
+        if self.jit_native_direct_links_enabled == enabled
+            && self.jit_native_direct_cross_frame_enabled == cross_frame_enabled
+        {
             return;
         }
         self.clear_native_direct_links();
         self.disconnect_native_regions();
         self.native_traces.clear();
         self.jit_native_direct_links_enabled = enabled;
+        self.jit_native_direct_cross_frame_enabled = cross_frame_enabled;
         self.jit_native_direct_link_count = 0;
         self.jit_native_active_direct_trace_id = usize::MAX;
         self.jit_native_direct_escape_streak = 0;

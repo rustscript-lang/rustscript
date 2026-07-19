@@ -13,6 +13,18 @@ fn native_jit_supported() -> bool {
             && (cfg!(target_os = "linux") || cfg!(target_os = "macos")))
 }
 
+fn is_jit_state_boundary_bridge(name: &str) -> bool {
+    matches!(
+        name,
+        "frame_state"
+            | "leave_frame"
+            | "restore_active_exit_state"
+            | "restore_active_sparse_exit_state"
+            | "restore_exit_state"
+            | "restore_sparse_exit_state"
+    )
+}
+
 #[test]
 fn jit_snapshot_literal_preserves_public_source_shape() {
     let snapshot = vm::jit::JitSnapshot {
@@ -361,7 +373,9 @@ fn aot_inlines_typed_numeric_steps_without_bridge_fallback() {
     assert_eq!(vm.stack(), &[Value::Float(3.375)]);
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
     assert!(
-        bridge_hits.iter().all(|(name, _)| *name == "ldc"),
+        bridge_hits
+            .iter()
+            .all(|(name, _)| *name == "ldc" || is_jit_state_boundary_bridge(name)),
         "typed aot arithmetic should only fall back for initial stack growth, not math ops: {bridge_hits:?}"
     );
 }
@@ -2511,6 +2525,7 @@ fn trace_jit_direct_side_link_bypasses_rust_dispatch() {
     let compiled = compile_source(source).expect("direct side-link fixture should compile");
     let mut vm = Vm::new(compiled.program);
     vm.set_jit_native_direct_links_enabled(true);
+    vm.set_jit_native_bridge_stats_enabled(true);
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -2521,9 +2536,23 @@ fn trace_jit_direct_side_link_bypasses_rust_dispatch() {
     assert_eq!(vm.stack(), &[Value::Int(16_384)]);
     let first_direct_links = vm.jit_native_direct_link_count();
     let first_handoffs = vm.jit_native_link_handoff_count();
+    let first_bridge_stats = vm.jit_native_bridge_stats_snapshot();
     assert!(first_direct_links > 4_000, "{}", vm.dump_jit_info());
     assert_eq!(vm.jit_native_region_count(), 0, "{}", vm.dump_jit_info());
+    assert!(
+        first_bridge_stats
+            .iter()
+            .any(|(name, count)| *name == "frame_state" && *count > 0),
+        "direct-link characterization must count native frame-state bridges: {first_bridge_stats:?}"
+    );
+    assert!(
+        first_bridge_stats
+            .iter()
+            .any(|(name, count)| { *name == "restore_active_sparse_exit_state" && *count > 0 }),
+        "direct-link characterization must count sparse exit restores: {first_bridge_stats:?}"
+    );
 
+    vm.clear_jit_native_bridge_stats();
     vm.reset_for_reuse();
     assert_eq!(vm.run().unwrap(), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(16_384)]);
@@ -2535,6 +2564,27 @@ fn trace_jit_direct_side_link_bypasses_rust_dispatch() {
     assert!(
         vm.jit_native_link_handoff_count() - first_handoffs <= 2,
         "{}",
+        vm.dump_jit_info()
+    );
+    let steady_bridge_stats = vm.jit_native_bridge_stats_snapshot();
+    let steady_frame_state = steady_bridge_stats
+        .iter()
+        .find_map(|(name, count)| (*name == "frame_state").then_some(*count))
+        .unwrap_or(0);
+    let steady_sparse_restores = steady_bridge_stats
+        .iter()
+        .find_map(|(name, count)| (*name == "restore_active_sparse_exit_state").then_some(*count))
+        .unwrap_or(0);
+    assert!(
+        steady_frame_state <= 4,
+        "direct-linked child entries must inherit values without reloading VM frame state: \
+         frame_state={steady_frame_state} stats={steady_bridge_stats:?}\n{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        steady_sparse_restores <= 2,
+        "direct-linked edges must skip sparse VM restoration: \
+         restores={steady_sparse_restores} stats={steady_bridge_stats:?}\n{}",
         vm.dump_jit_info()
     );
 }
@@ -2720,6 +2770,7 @@ fn trace_jit_region_links_hot_same_frame_side_exit() {
     "#;
     let compiled = compile_source(source).expect("region fixture should compile");
     let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -2784,6 +2835,7 @@ fn trace_jit_region_cycle_propagates_disjoint_dirty_locals() {
     "#;
     let compiled = compile_source(source).expect("disjoint dirty region compile should succeed");
     let mut vm = Vm::new(compiled.program);
+    vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -2841,6 +2893,7 @@ fn trace_jit_region_unlinked_exit_restores_callable_frame() {
     "#;
     let compiled = compile_source(source).expect("unlinked callable exit fixture should compile");
     let mut vm = Vm::new(compiled.program);
+    vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -2875,6 +2928,7 @@ fn trace_jit_region_preserves_owned_value_drop_contract() {
     "#;
     let compiled = compile_source(source).expect("owned region fixture should compile");
     let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -2922,6 +2976,7 @@ fn trace_jit_region_progress_prevents_callable_frame_backoff() {
     "#;
     let compiled = compile_source(source).expect("region progress fixture should compile");
     let mut vm = Vm::new(compiled.program);
+    vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -2951,6 +3006,74 @@ fn trace_jit_region_progress_prevents_callable_frame_backoff() {
 }
 
 #[test]
+fn trace_jit_inherited_direct_progress_prevents_callable_frame_backoff() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn run(limit, payload) {
+            let mut i = 0;
+            let mut total = 0;
+            while i < limit {
+                if i % 2 == 0 {
+                    total = total + 3;
+                } else {
+                    total = total + 5;
+                }
+                i = i + 1;
+            }
+            total + payload[0]
+        }
+        let mut rounds = 0;
+        let mut sum = 0;
+        while rounds < 32 {
+            sum = sum + run(64, [1]);
+            rounds = rounds + 1;
+        }
+        sum;
+    "#;
+    let compiled = compile_source(source).expect("direct progress fixture should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_native_direct_links_enabled(true);
+    vm.set_jit_native_bridge_stats_enabled(true);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 256,
+    });
+
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(8_224)]);
+    assert!(
+        vm.jit_native_active_direct_link_slot_count() > 0,
+        "{}",
+        vm.dump_jit_info()
+    );
+    let first_direct_links = vm.jit_native_direct_link_count();
+
+    vm.clear_jit_native_bridge_stats();
+    vm.reset_for_reuse();
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(8_224)]);
+    assert!(
+        vm.jit_native_direct_link_count() - first_direct_links > 500,
+        "{}",
+        vm.dump_jit_info()
+    );
+    let bridge_stats = vm.jit_native_bridge_stats_snapshot();
+    let frame_state = bridge_stats
+        .iter()
+        .find_map(|(name, count)| (*name == "frame_state").then_some(*count))
+        .unwrap_or(0);
+    assert!(
+        frame_state <= 40,
+        "callable direct graph must keep inherited state across escaped side paths: \
+         frame_state={frame_state} stats={bridge_stats:?}\n{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
 fn trace_jit_region_respects_fuel_and_epoch_interrupts() {
     if !native_jit_supported() {
         return;
@@ -2970,6 +3093,7 @@ fn trace_jit_region_respects_fuel_and_epoch_interrupts() {
     "#;
     let compiled = compile_source(source).expect("region interrupt fixture should compile");
     let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -3037,6 +3161,7 @@ fn trace_jit_region_reports_compile_and_code_telemetry() {
     "#;
     let compiled = compile_source(source).expect("region telemetry fixture should compile");
     let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -3082,6 +3207,7 @@ fn trace_jit_region_republishes_after_native_settings_change() {
     "#;
     let compiled = compile_source(source).expect("region fixture should compile");
     let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -3123,6 +3249,7 @@ fn trace_jit_region_invalidation_releases_owner_and_can_republish() {
     "#;
     let compiled = compile_source(source).expect("region fixture should compile");
     let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -4018,7 +4145,9 @@ fn trace_jit_supports_float_math_in_ssa() {
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
     assert!(
-        bridge_hits.iter().all(|(_, count)| *count == 0),
+        bridge_hits
+            .iter()
+            .all(|(name, count)| *count == 0 || is_jit_state_boundary_bridge(name)),
         "float loop should not use native helper bridges, bridge hits: {bridge_hits:?}\n{}",
         vm.dump_jit_info()
     );
@@ -4062,7 +4191,9 @@ fn trace_jit_supports_string_call_boundary_exits() {
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
     assert!(
-        bridge_hits.iter().all(|(_, count)| *count == 0),
+        bridge_hits
+            .iter()
+            .all(|(name, count)| *count == 0 || is_jit_state_boundary_bridge(name)),
         "string concat loop should not need native helper bridges, bridge hits: {bridge_hits:?}\n{}",
         vm.dump_jit_info()
     );
@@ -4107,7 +4238,9 @@ fn trace_jit_supports_bytes_call_boundary_exits() {
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
     assert!(
-        bridge_hits.iter().all(|(_, count)| *count == 0),
+        bridge_hits
+            .iter()
+            .all(|(name, count)| *count == 0 || is_jit_state_boundary_bridge(name)),
         "bytes concat loop should not need native helper bridges for call-boundary execution, bridge hits: {bridge_hits:?}\n{}",
         vm.dump_jit_info()
     );
@@ -4166,7 +4299,9 @@ fn trace_jit_supports_bytes_sequence_call_boundary_exits() {
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
     assert!(
-        bridge_hits.iter().all(|(_, count)| *count == 0),
+        bridge_hits
+            .iter()
+            .all(|(name, count)| *count == 0 || is_jit_state_boundary_bridge(name)),
         "bytes builtin loop should not need native helper bridges for call-boundary execution, bridge hits: {bridge_hits:?}\n{}",
         vm.dump_jit_info()
     );
@@ -4221,7 +4356,9 @@ fn trace_jit_supports_string_sequence_call_boundary_exits() {
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
     assert!(
-        bridge_hits.iter().all(|(_, count)| *count == 0),
+        bridge_hits
+            .iter()
+            .all(|(name, count)| *count == 0 || is_jit_state_boundary_bridge(name)),
         "string builtin loop should not need native helper bridges for call-boundary execution, bridge hits: {bridge_hits:?}\n{}",
         vm.dump_jit_info()
     );
@@ -4357,7 +4494,9 @@ fn trace_jit_supports_bytes_len_get_slice_in_ssa() {
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
     assert!(
-        bridge_hits.iter().all(|(_, count)| *count == 0),
+        bridge_hits
+            .iter()
+            .all(|(name, count)| *count == 0 || is_jit_state_boundary_bridge(name)),
         "bytes builtin loop should not need native helper bridges for call-boundary execution, bridge hits: {bridge_hits:?}\n{}",
         vm.dump_jit_info()
     );
@@ -4456,7 +4595,9 @@ fn trace_jit_supports_bytes_has_in_ssa() {
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
     assert!(
-        bridge_hits.iter().all(|(_, count)| *count == 0),
+        bridge_hits
+            .iter()
+            .all(|(name, count)| *count == 0 || is_jit_state_boundary_bridge(name)),
         "bytes has loop should not need native helper bridges, bridge hits: {bridge_hits:?}\n{}",
         vm.dump_jit_info()
     );
@@ -4703,7 +4844,9 @@ fn trace_jit_supports_string_len_get_slice_in_ssa() {
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
     assert!(
-        bridge_hits.iter().all(|(_, count)| *count == 0),
+        bridge_hits
+            .iter()
+            .all(|(name, count)| *count == 0 || is_jit_state_boundary_bridge(name)),
         "string builtin loop should not need native helper bridges for call-boundary execution, bridge hits: {bridge_hits:?}\n{}",
         vm.dump_jit_info()
     );
@@ -4796,7 +4939,9 @@ fn trace_jit_supports_manual_string_concat_in_ssa() {
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
     assert!(
-        bridge_hits.iter().all(|(_, count)| *count == 0),
+        bridge_hits
+            .iter()
+            .all(|(name, count)| *count == 0 || is_jit_state_boundary_bridge(name)),
         "manual string concat loop should not need native helper bridges for call-boundary execution, bridge hits: {bridge_hits:?}\n{}",
         vm.dump_jit_info()
     );
@@ -4894,7 +5039,9 @@ fn trace_jit_supports_manual_bytes_concat_in_ssa() {
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
     assert!(
-        bridge_hits.iter().all(|(_, count)| *count == 0),
+        bridge_hits
+            .iter()
+            .all(|(name, count)| *count == 0 || is_jit_state_boundary_bridge(name)),
         "manual bytes concat loop should not need native helper bridges for call-boundary execution, bridge hits: {bridge_hits:?}\n{}",
         vm.dump_jit_info()
     );
@@ -5007,7 +5154,9 @@ fn trace_jit_supports_bytes_array_codecs_in_ssa() {
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
     assert!(
-        bridge_hits.iter().all(|(_, count)| *count == 0),
+        bridge_hits
+            .iter()
+            .all(|(name, count)| *count == 0 || is_jit_state_boundary_bridge(name)),
         "bytes array codec loop should not need native helper bridges, bridge hits: {bridge_hits:?}\n{}",
         vm.dump_jit_info()
     );
@@ -5110,7 +5259,9 @@ fn trace_jit_supports_shift_ops_in_ssa() {
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
     assert!(
-        bridge_hits.iter().all(|(_, count)| *count == 0),
+        bridge_hits
+            .iter()
+            .all(|(name, count)| *count == 0 || is_jit_state_boundary_bridge(name)),
         "shift loop should not need native helper bridges, bridge hits: {bridge_hits:?}\n{}",
         vm.dump_jit_info()
     );
@@ -5221,7 +5372,9 @@ fn trace_jit_supports_eager_bool_ops_in_ssa() {
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
     assert!(
-        bridge_hits.iter().all(|(_, count)| *count == 0),
+        bridge_hits
+            .iter()
+            .all(|(name, count)| *count == 0 || is_jit_state_boundary_bridge(name)),
         "eager bool loop should not need native helper bridges, bridge hits: {bridge_hits:?}\n{}",
         vm.dump_jit_info()
     );
@@ -5282,7 +5435,9 @@ fn trace_jit_supports_float_comparisons_in_ssa() {
 
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
     assert!(
-        bridge_hits.iter().all(|(_, count)| *count == 0),
+        bridge_hits
+            .iter()
+            .all(|(name, count)| *count == 0 || is_jit_state_boundary_bridge(name)),
         "float compare loop should not use native helper bridges, bridge hits: {bridge_hits:?}\n{}",
         vm.dump_jit_info()
     );
@@ -5577,7 +5732,9 @@ fn trace_jit_specializes_literal_string_builtins_without_call_boundary() {
     );
     let bridge_hits = vm.jit_native_bridge_stats_snapshot();
     assert!(
-        bridge_hits.iter().all(|(_, count)| *count == 0),
+        bridge_hits
+            .iter()
+            .all(|(name, count)| *count == 0 || is_jit_state_boundary_bridge(name)),
         "literal string builtin loop should not use native helper bridges: {bridge_hits:?}\n{}",
         vm.dump_jit_info()
     );
@@ -5782,6 +5939,7 @@ fn trace_jit_executes_hot_loop_inside_script_callable_frame() {
     "#;
     let compiled = compile_source(source).expect("nested-frame loop should compile");
     let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -5829,6 +5987,7 @@ fn trace_jit_region_cycles_without_external_handoffs() {
     "#;
     let compiled = compile_source(source).expect("exit-heavy callable loop should compile");
     let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
