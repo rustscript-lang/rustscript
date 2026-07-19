@@ -105,6 +105,10 @@ pub(crate) enum SsaInstKind {
     CloneTagged {
         input: SsaValueId,
     },
+    ValueIsType {
+        input: SsaValueId,
+        tag: ValueType,
+    },
     UnboxInt {
         input: SsaValueId,
     },
@@ -394,6 +398,7 @@ impl SsaInstKind {
             Self::HostCall { args, .. } => args.clone(),
 
             Self::CloneTagged { input }
+            | Self::ValueIsType { input, .. }
             | Self::UnboxInt { input }
             | Self::UnboxFloat { input }
             | Self::UnboxBool { input }
@@ -1121,6 +1126,9 @@ fn render_inst_kind(kind: &SsaInstKind) -> String {
     match kind {
         SsaInstKind::Constant(value) => format!("const {value:?}"),
         SsaInstKind::CloneTagged { input } => format!("clone_tagged {input}"),
+        SsaInstKind::ValueIsType { input, tag } => {
+            format!("value_is_type {input}, {tag:?}")
+        }
         SsaInstKind::UnboxInt { input } => format!("unbox_int {input}"),
         SsaInstKind::UnboxFloat { input } => format!("unbox_float {input}"),
         SsaInstKind::UnboxBool { input } => format!("unbox_bool {input}"),

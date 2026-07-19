@@ -2,14 +2,15 @@ use std::{fmt, sync::Arc};
 
 use crate::CallableValue;
 use crate::builtins::BuiltinFunction;
+use crate::compiler::TypeSchema;
 use crate::vm::{OpCode, Program, Value, ValueType, checked_int_div};
 
 use super::JitTraceTerminal;
 use super::deopt::materialize_ssa_values;
-use super::inline::{InlineCandidate, classify_static_inline_candidate};
+use super::inline::{InlineCandidate, InlineRejectReason, classify_static_inline_candidate};
 use super::ir::{
     SsaBranchTarget, SsaInstKind, SsaMaterialization, SsaTerminator, SsaTrace, SsaTraceBuilder,
-    SsaValue, SsaValueRepr, VirtualFrameSnapshot,
+    SsaValue, SsaValueId, SsaValueRepr, VirtualFrameSnapshot,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -261,6 +262,99 @@ fn entry_local_info(
 struct SymbolicValue {
     value: SsaValue,
     info: ValueInfo,
+}
+
+fn inline_schema_guard_type(schema: &TypeSchema) -> Option<Option<ValueType>> {
+    match schema {
+        TypeSchema::Unknown | TypeSchema::GenericParam(_) => Some(None),
+        TypeSchema::Int => Some(Some(ValueType::Int)),
+        TypeSchema::Float => Some(Some(ValueType::Float)),
+        TypeSchema::Bool => Some(Some(ValueType::Bool)),
+        TypeSchema::String => Some(Some(ValueType::String)),
+        TypeSchema::Bytes => Some(Some(ValueType::Bytes)),
+        TypeSchema::Named(_, _) | TypeSchema::Map(_) | TypeSchema::Object(_) => {
+            Some(Some(ValueType::Map))
+        }
+        TypeSchema::Array(_) | TypeSchema::ArrayTuple(_) | TypeSchema::ArrayTupleRest { .. } => {
+            Some(Some(ValueType::Array))
+        }
+        TypeSchema::Null
+        | TypeSchema::Number
+        | TypeSchema::Optional(_)
+        | TypeSchema::Callable { .. } => None,
+    }
+}
+
+fn inline_argument_schemas_supported(
+    arguments: &[SymbolicValue],
+    schema: Option<&TypeSchema>,
+) -> bool {
+    let Some(TypeSchema::Callable { params, .. }) = schema else {
+        return schema.is_none();
+    };
+    params.len() == arguments.len()
+        && params.iter().zip(arguments).all(|(schema, argument)| {
+            let Some(guard_type) = inline_schema_guard_type(schema) else {
+                return false;
+            };
+            match (guard_type, argument.info.repr) {
+                (None, _) | (Some(_), SsaValueRepr::Tagged) => true,
+                (Some(ValueType::Int), SsaValueRepr::I64)
+                | (Some(ValueType::Float), SsaValueRepr::F64)
+                | (Some(ValueType::Bool), SsaValueRepr::Bool) => true,
+                (Some(expected), SsaValueRepr::HeapPtr(actual)) => expected == actual,
+                _ => false,
+            }
+        })
+}
+
+fn append_inline_argument_schema_guards(
+    builder: &mut SsaTraceBuilder,
+    block: super::ir::SsaBlockId,
+    ip: usize,
+    arguments: &[SymbolicValue],
+    schema: Option<&TypeSchema>,
+) -> Result<Option<SsaValueId>, TraceRecordError> {
+    let Some(TypeSchema::Callable { params, .. }) = schema else {
+        return Ok(None);
+    };
+    let mut guard = None;
+    for (schema, argument) in params.iter().zip(arguments) {
+        let Some(Some(expected)) = inline_schema_guard_type(schema) else {
+            continue;
+        };
+        if argument.info.repr != SsaValueRepr::Tagged {
+            continue;
+        }
+        let predicate = builder
+            .append_value_inst(
+                block,
+                ip,
+                SsaValueRepr::Bool,
+                SsaInstKind::ValueIsType {
+                    input: argument.value.id,
+                    tag: expected,
+                },
+            )
+            .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+        guard = Some(if let Some(previous) = guard {
+            builder
+                .append_value_inst(
+                    block,
+                    ip,
+                    SsaValueRepr::Bool,
+                    SsaInstKind::BoolAnd {
+                        lhs: previous,
+                        rhs: predicate.id,
+                    },
+                )
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?
+                .id
+        } else {
+            predicate.id
+        });
+    }
+    Ok(guard)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1241,12 +1335,30 @@ pub(crate) fn record_trace_with_local_count(
                     callable.info.source_local,
                     argc,
                     max_trace_len.saturating_sub(cursor.recorded_ops),
-                );
+                )
+                .and_then(|candidate| {
+                    let prototype = &program.callable_prototypes[candidate.prototype_id as usize];
+                    let argument_start = frame.stack.len() - usize::from(argc);
+                    inline_argument_schemas_supported(
+                        &frame.stack[argument_start..],
+                        prototype.schema.as_ref(),
+                    )
+                    .then_some(candidate)
+                    .ok_or(InlineRejectReason::SchemaUnproven)
+                });
                 let inline_reject_reason = candidate.as_ref().err().copied();
                 if inline_frame.is_none()
                     && let Ok(candidate) = candidate
                 {
                     let prototype = &program.callable_prototypes[candidate.prototype_id as usize];
+                    let argument_start = frame.stack.len() - usize::from(argc);
+                    let schema_guard = append_inline_argument_schema_guards(
+                        &mut builder,
+                        current_block,
+                        ip,
+                        &frame.stack[argument_start..],
+                        prototype.schema.as_ref(),
+                    )?;
                     let expected_callable = builder
                         .append_value_inst(
                             current_block,
@@ -1270,6 +1382,22 @@ pub(crate) fn record_trace_with_local_count(
                             },
                         )
                         .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+                    let inline_guard = if let Some(schema_guard) = schema_guard {
+                        builder
+                            .append_value_inst(
+                                current_block,
+                                ip,
+                                SsaValueRepr::Bool,
+                                SsaInstKind::BoolAnd {
+                                    lhs: schema_guard,
+                                    rhs: callable_matches.id,
+                                },
+                            )
+                            .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?
+                            .id
+                    } else {
+                        callable_matches.id
+                    };
                     let identity_exit =
                         add_symbolic_exit(&mut builder, ip, &frame, inline_frame.as_ref());
                     let (guarded_block, guarded_frame, guard_args) = continue_with_inline_frame(
@@ -1282,7 +1410,7 @@ pub(crate) fn record_trace_with_local_count(
                         .set_terminator(
                             current_block,
                             SsaTerminator::BranchBool {
-                                condition: callable_matches.id,
+                                condition: inline_guard,
                                 if_true: SsaBranchTarget::Block {
                                     target: guarded_block,
                                     args: guard_args,

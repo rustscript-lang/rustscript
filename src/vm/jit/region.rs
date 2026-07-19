@@ -212,6 +212,7 @@ fn remap_inst_inputs(
             }
         }
         SsaInstKind::CloneTagged { input }
+        | SsaInstKind::ValueIsType { input, .. }
         | SsaInstKind::UnboxInt { input }
         | SsaInstKind::UnboxFloat { input }
         | SsaInstKind::UnboxBool { input }

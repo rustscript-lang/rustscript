@@ -16,6 +16,7 @@ pub(crate) enum InlineRejectReason {
     HostTarget,
     CapturedCallable,
     ArityMismatch,
+    SchemaUnproven,
     Recursive,
     NestedScriptCall,
     YieldingCall,
