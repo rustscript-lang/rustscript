@@ -258,7 +258,7 @@ pub(crate) fn compile_system_inherited_tail_wrapper(
             builder.append_block_params_for_function_params(entry);
             builder.switch_to_block(entry);
             let vm_ptr = builder.block_params(entry)[0];
-            let pointer_bytes = u32::from(pointer_type.bits()) / 8;
+            let pointer_bytes = pointer_type.bits() / 8;
             let packet_bytes = pointer_bytes
                 .checked_mul((MAX_INHERITED_ENTRY_VALUES + 5) as u32)
                 .ok_or_else(|| {
@@ -4251,6 +4251,7 @@ fn ssa_leave_frame_status(
     Ok(b.inst_results(call)[0])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ssa_exit_action_status(
     b: &mut FunctionBuilder,
     pointer_type: cranelift_codegen::ir::Type,
