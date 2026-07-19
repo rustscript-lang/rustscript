@@ -5,6 +5,7 @@ use crate::vm::{OpCode, Program, Value, ValueType, checked_int_div};
 
 use super::JitTraceTerminal;
 use super::deopt::materialize_ssa_values;
+use super::inline::classify_static_inline_candidate;
 use super::ir::{
     SsaBranchTarget, SsaInstKind, SsaMaterialization, SsaTerminator, SsaTrace, SsaTraceBuilder,
     SsaValue, SsaValueRepr,
@@ -721,6 +722,7 @@ pub(crate) fn record_trace(
 ) -> Result<RecordedTrace, TraceRecordError> {
     record_trace_with_local_count(
         program,
+        crate::vm::native::ROOT_FRAME_KEY,
         root_ip,
         entry_stack_depth,
         program.local_count,
@@ -730,8 +732,10 @@ pub(crate) fn record_trace(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_trace_with_local_count(
     program: &Program,
+    caller_frame_key: u64,
     root_ip: usize,
     entry_stack_depth: usize,
     local_count: usize,
@@ -1197,6 +1201,17 @@ pub(crate) fn record_trace_with_local_count(
                 if frame.stack.len() < usize::from(argc) + 1 {
                     return Err(TraceRecordError::StackUnderflow);
                 }
+                let callable = frame.stack[frame.stack.len() - usize::from(argc) - 1];
+                let caller_prototype_id = (caller_frame_key != crate::vm::native::ROOT_FRAME_KEY)
+                    .then_some(caller_frame_key as u32);
+                let _ = classify_static_inline_candidate(
+                    program,
+                    caller_frame_key,
+                    caller_prototype_id,
+                    callable.info.source_local,
+                    argc,
+                    max_trace_len.saturating_sub(cursor.recorded_ops),
+                );
                 op_names.push("call_value".to_string());
                 let exit = builder.add_exit(
                     ip,

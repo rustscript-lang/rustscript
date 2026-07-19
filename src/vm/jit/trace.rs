@@ -1005,6 +1005,7 @@ impl TraceJitEngine {
         };
         let recorded = record_trace_with_local_count(
             program,
+            key.frame_key,
             key.root_ip,
             key.stack_depth,
             local_count,
