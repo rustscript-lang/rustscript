@@ -836,7 +836,6 @@ fn try_compile_ssa_trace(
 
         let normal_entry = b.create_block();
         if entry_ssa_block.params.len() <= MAX_INHERITED_ENTRY_VALUES {
-            let inherited_candidate = b.create_block();
             let inherited_entry = b.create_block();
             let active = b.ins().load(
                 pointer_type,
@@ -845,59 +844,11 @@ fn try_compile_ssa_trace(
                 INHERITED_STATE_ACTIVE_OFFSET,
             );
             let has_inherited_state = b.ins().icmp_imm(IntCC::NotEqual, active, 0);
-            b.ins().brif(
-                has_inherited_state,
-                inherited_candidate,
-                &[],
-                normal_entry,
-                &[],
-            );
-
-            b.switch_to_block(inherited_candidate);
-            let inherited_frame_key = b.ins().load(
-                pointer_type,
-                MemFlags::new(),
-                inherited_state_ptr,
-                INHERITED_STATE_FRAME_KEY_OFFSET,
-            );
-            let expected_frame_key = b.ins().iconst(pointer_type, trace.frame_key as i64);
-            let frame_matches = b
-                .ins()
-                .icmp(IntCC::Equal, inherited_frame_key, expected_frame_key);
-            let inherited_target_ip = b.ins().load(
-                pointer_type,
-                MemFlags::new(),
-                inherited_state_ptr,
-                INHERITED_STATE_TARGET_IP_OFFSET,
-            );
-            let expected_target_ip = b.ins().iconst(
-                pointer_type,
-                i64::try_from(trace.root_ip).map_err(|_| {
-                    VmError::JitNative("SSA inherited target ip exceeds i64".to_string())
-                })?,
-            );
-            let target_matches =
-                b.ins()
-                    .icmp(IntCC::Equal, inherited_target_ip, expected_target_ip);
-            let inherited_value_count = b.ins().load(
-                pointer_type,
-                MemFlags::new(),
-                inherited_state_ptr,
-                INHERITED_STATE_VALUE_COUNT_OFFSET,
-            );
-            let expected_value_count = b.ins().iconst(
-                pointer_type,
-                i64::try_from(entry_ssa_block.params.len()).map_err(|_| {
-                    VmError::JitNative("SSA inherited value count exceeds i64".to_string())
-                })?,
-            );
-            let value_count_matches =
-                b.ins()
-                    .icmp(IntCC::Equal, inherited_value_count, expected_value_count);
-            let metadata_matches = b.ins().band(frame_matches, target_matches);
-            let metadata_matches = b.ins().band(metadata_matches, value_count_matches);
+            // Active inherited packets are created only by admitted native links. Link
+            // publication already validates frame, target, and entry shape, and invalidation
+            // clears the slot before the packet can be reused.
             b.ins()
-                .brif(metadata_matches, inherited_entry, &[], normal_entry, &[]);
+                .brif(has_inherited_state, inherited_entry, &[], normal_entry, &[]);
 
             b.switch_to_block(inherited_entry);
             let active_stack_base = b.ins().load(
