@@ -1066,6 +1066,27 @@ impl Vm {
             .collect()
     }
 
+    pub(super) fn active_local_callable_prototypes(&self) -> Option<Vec<Option<u32>>> {
+        let base = self.active_local_base();
+        let mut prototypes = Vec::with_capacity(self.locals.len().saturating_sub(base));
+        for (offset, value) in self.locals[base..].iter().enumerate() {
+            let prototype_id = if let Some(cell) = self.capture_cells.get(&(base + offset)) {
+                let value = cell.lock().ok()?;
+                match &*value {
+                    Value::Callable(callable) => Some(callable.prototype_id),
+                    _ => None,
+                }
+            } else {
+                match value {
+                    Value::Callable(callable) => Some(callable.prototype_id),
+                    _ => None,
+                }
+            };
+            prototypes.push(prototype_id);
+        }
+        Some(prototypes)
+    }
+
     fn script_frame_depth(&self) -> usize {
         self.execution_frames
             .iter()
@@ -2318,16 +2339,7 @@ impl Vm {
                     let entry_local_types = (frame_key != crate::vm::native::ROOT_FRAME_KEY)
                         .then(|| self.active_local_types());
                     let entry_callable_prototypes =
-                        (frame_key == crate::vm::native::ROOT_FRAME_KEY).then(|| {
-                            self.locals
-                                .iter()
-                                .take(self.program.local_count)
-                                .map(|value| match value {
-                                    Value::Callable(callable) => Some(callable.prototype_id),
-                                    _ => None,
-                                })
-                                .collect::<Vec<_>>()
-                        });
+                        self.active_local_callable_prototypes();
                     let program = &self.program;
                     self.jit.observe_hot_entry_with_local_types(
                         frame_key,

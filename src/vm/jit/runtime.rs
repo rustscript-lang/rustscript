@@ -297,12 +297,14 @@ impl Vm {
             if next_trace_id.is_none() && !self.jit.callable_frame_is_blocked(frame_key) {
                 let entry_local_types =
                     (frame_key != ROOT_FRAME_KEY).then(|| self.active_local_types());
+                let entry_callable_prototypes = self.active_local_callable_prototypes();
                 let program = &self.program;
                 next_trace_id = self.jit.observe_exit_entry_with_local_types(
                     frame_key,
                     ip,
                     stack_depth,
                     entry_local_types.as_deref(),
+                    entry_callable_prototypes.as_deref(),
                     program,
                 );
             }
@@ -458,12 +460,15 @@ impl Vm {
                         {
                             let entry_local_types =
                                 (frame_key != ROOT_FRAME_KEY).then(|| self.active_local_types());
+                            let entry_callable_prototypes =
+                                self.active_local_callable_prototypes();
                             let program = &self.program;
                             next_trace_id = self.jit.observe_exit_entry_with_local_types(
                                 frame_key,
                                 ip,
                                 stack_depth,
                                 entry_local_types.as_deref(),
+                                entry_callable_prototypes.as_deref(),
                                 program,
                             );
                         }
@@ -1123,12 +1128,15 @@ impl Vm {
                             next_trace_id = {
                                 let entry_local_types = (frame_key != ROOT_FRAME_KEY)
                                     .then(|| self.active_local_types());
+                                let entry_callable_prototypes =
+                                    self.active_local_callable_prototypes();
                                 let program = &self.program;
                                 self.jit.observe_exit_entry_with_local_types(
                                     frame_key,
                                     ip,
                                     stack_depth,
                                     entry_local_types.as_deref(),
+                                    entry_callable_prototypes.as_deref(),
                                     program,
                                 )
                             };
@@ -1194,12 +1202,15 @@ impl Vm {
                         next_trace_id = {
                             let entry_local_types =
                                 (frame_key != ROOT_FRAME_KEY).then(|| self.active_local_types());
+                            let entry_callable_prototypes =
+                                self.active_local_callable_prototypes();
                             let program = &self.program;
                             self.jit.observe_exit_entry_with_local_types(
                                 frame_key,
                                 ip,
                                 stack_depth,
                                 entry_local_types.as_deref(),
+                                entry_callable_prototypes.as_deref(),
                                 program,
                             )
                         };
