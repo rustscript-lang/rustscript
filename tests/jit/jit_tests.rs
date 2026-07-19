@@ -5163,6 +5163,127 @@ fn trace_jit_supports_bytes_array_codecs_in_ssa() {
 }
 
 #[test]
+fn trace_jit_specializes_ascii_bytes_to_utf8_in_ssa() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let from_call =
+        builtin_call_index("bytes::from_array_u8").expect("bytes::from_array_u8 should exist");
+    let utf8_call = builtin_call_index("bytes::to_utf8").expect("bytes::to_utf8 should exist");
+    let mut bc = BytecodeBuilder::new();
+    for (constant, local) in [(0, 0), (1, 1), (2, 2), (3, 3)] {
+        bc.ldc(constant);
+        bc.stloc(local);
+    }
+    let root_ip = bc.position();
+    bc.ldloc(3);
+    bc.ldc(4);
+    let clt_ip = bc.position();
+    bc.clt();
+    let guard_ip = bc.position();
+    bc.brfalse(0);
+    bc.ldloc(0);
+    let from_ip = bc.position();
+    bc.call(from_call, 1);
+    bc.stloc(1);
+    bc.ldloc(1);
+    let utf8_ip = bc.position();
+    bc.call(utf8_call, 1);
+    bc.stloc(2);
+    bc.ldloc(3);
+    bc.ldc(5);
+    let add_ip = bc.position();
+    bc.add();
+    bc.stloc(3);
+    bc.br(root_ip);
+    let exit_ip = bc.position();
+    bc.ldloc(2);
+    bc.ret();
+
+    let mut code = bc.finish();
+    patch_branch_target(&mut code, guard_ip, exit_ip);
+    let program = Program::new(
+        vec![
+            Value::array(vec![Value::Int(97), Value::Int(98), Value::Int(99)]),
+            Value::bytes(vec![]),
+            Value::string(""),
+            Value::Int(0),
+            Value::Int(64),
+            Value::Int(1),
+        ],
+        code,
+    )
+    .with_local_count(4);
+    let program = force_local_types(
+        program,
+        &[
+            (0, ValueType::Array),
+            (1, ValueType::Bytes),
+            (2, ValueType::String),
+            (3, ValueType::Int),
+        ],
+    );
+    let program = force_operand_types(
+        program,
+        &[
+            (clt_ip as usize, (ValueType::Int, ValueType::Int)),
+            (from_ip as usize, (ValueType::Array, ValueType::Unknown)),
+            (utf8_ip as usize, (ValueType::Bytes, ValueType::Unknown)),
+            (add_ip as usize, (ValueType::Int, ValueType::Int)),
+        ],
+    );
+    let mut vm = Vm::new(program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("abc")]);
+    assert_native_ssa_specialized_trace(
+        &vm,
+        &vm.jit_snapshot(),
+        "ASCII bytes::to_utf8 loop",
+        &["bytes_from_array_u8", "bytes_to_utf8_ascii"],
+    );
+}
+
+#[test]
+fn trace_jit_specializes_empty_array_construction_in_ssa() {
+    if !native_jit_supported() {
+        return;
+    }
+    let compiled = compile_source(
+        r#"
+            let mut i = 0;
+            let mut total = 0;
+            while i < 64 {
+                let values: [int] = [];
+                total = total + values.length;
+                i = i + 1;
+            }
+            total;
+        "#,
+    )
+    .expect("array construction fixture should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(0)]);
+    assert_native_ssa_specialized_trace(
+        &vm,
+        &vm.jit_snapshot(),
+        "empty array construction loop",
+        &["array_new"],
+    );
+}
+
+#[test]
 fn trace_jit_supports_shift_ops_in_ssa() {
     if !native_jit_supported() {
         return;

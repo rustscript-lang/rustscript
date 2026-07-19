@@ -512,7 +512,9 @@ enum SpecializedBuiltinKind {
     StringConcat,
     BytesConcat,
     BytesFromArrayU8,
+    BytesToUtf8Ascii,
     BytesToArrayU8,
+    ArrayNew,
     ArrayLen,
     ArrayGet,
     ArrayHas,
@@ -1225,6 +1227,19 @@ pub(crate) fn record_trace_with_local_count(
                 argc,
                 yields,
             } => {
+                if builtin == Some(BuiltinFunction::ArrayNew) && argc == 0 {
+                    let (name, out) = emit_specialized_builtin_call(
+                        &mut builder,
+                        current_block,
+                        ip,
+                        &mut frame,
+                        SpecializedBuiltinKind::ArrayNew,
+                    )?;
+                    op_names.push(name.to_string());
+                    frame.push(out);
+                    has_useful_native_computation = true;
+                    continue;
+                }
                 if let Some(builtin) = builtin
                     && argc > 0
                 {
@@ -1477,6 +1492,13 @@ fn infer_loop_header_plan(
                 ..
             } => {
                 if argc == 0 {
+                    if builtin == BuiltinFunction::ArrayNew {
+                        let _ = analyze_specialized_builtin_call(
+                            &mut frame,
+                            SpecializedBuiltinKind::ArrayNew,
+                        )?;
+                        continue;
+                    }
                     return Ok(None);
                 }
                 let args = call_arg_slice(&frame.stack, usize::from(argc))?;
@@ -2782,6 +2804,9 @@ fn select_specialized_builtin_kind(
         BuiltinFunction::StringSplitLiteral => {
             return Some(SpecializedBuiltinKind::StringSplitLiteral);
         }
+        BuiltinFunction::BytesToUtf8 => {
+            return Some(SpecializedBuiltinKind::BytesToUtf8Ascii);
+        }
         BuiltinFunction::MapIterNext => return Some(SpecializedBuiltinKind::MapIterNext),
         BuiltinFunction::MapIterTakeKey => return Some(SpecializedBuiltinKind::MapIterTakeKey),
         BuiltinFunction::MapIterTakeValue => {
@@ -2987,10 +3012,19 @@ fn analyze_specialized_builtin_call(
             frame.push(ValueInfo::tagged_typed(ValueType::Bytes));
             Ok("bytes_from_array_u8")
         }
+        SpecializedBuiltinKind::BytesToUtf8Ascii => {
+            let _ = frame.pop()?;
+            frame.push(ValueInfo::tagged_typed(ValueType::String));
+            Ok("bytes_to_utf8_ascii")
+        }
         SpecializedBuiltinKind::BytesToArrayU8 => {
             let _ = frame.pop()?;
             frame.push(ValueInfo::tagged_typed(ValueType::Array));
             Ok("bytes_to_array_u8")
+        }
+        SpecializedBuiltinKind::ArrayNew => {
+            frame.push(ValueInfo::tagged_typed(ValueType::Array));
+            Ok("array_new")
         }
         SpecializedBuiltinKind::ArrayLen => {
             let _ = frame.pop()?;
@@ -3573,6 +3607,30 @@ fn emit_specialized_builtin_call(
                 .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
             Ok(("bytes_from_array_u8", out))
         }
+        SpecializedBuiltinKind::BytesToUtf8Ascii => {
+            let bytes = ensure_heap_ptr(
+                builder,
+                block,
+                ip,
+                frame.pop()?,
+                HeapContainerKind::Bytes.value_type(),
+            )?;
+            let out = builder
+                .append_value_inst(
+                    block,
+                    ip,
+                    SsaValueRepr::Tagged,
+                    SsaInstKind::BytesToUtf8Ascii {
+                        bytes: bytes.value.id,
+                    },
+                )
+                .map(|value| SymbolicValue {
+                    value,
+                    info: ValueInfo::tagged_typed(ValueType::String),
+                })
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+            Ok(("bytes_to_utf8_ascii", out))
+        }
         SpecializedBuiltinKind::BytesToArrayU8 => {
             let bytes = ensure_heap_ptr(
                 builder,
@@ -3596,6 +3654,16 @@ fn emit_specialized_builtin_call(
                 })
                 .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
             Ok(("bytes_to_array_u8", out))
+        }
+        SpecializedBuiltinKind::ArrayNew => {
+            let out = builder
+                .append_value_inst(block, ip, SsaValueRepr::Tagged, SsaInstKind::ArrayNew)
+                .map(|value| SymbolicValue {
+                    value,
+                    info: ValueInfo::tagged_typed(ValueType::Array),
+                })
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+            Ok(("array_new", out))
         }
         SpecializedBuiltinKind::ArrayLen => {
             let array = frame.pop()?;

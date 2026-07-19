@@ -1301,7 +1301,9 @@ fn ssa_trace_supported(ssa: &SsaTrace) -> bool {
                     | SsaInstKind::StringConcat { .. }
                     | SsaInstKind::BytesConcat { .. }
                     | SsaInstKind::BytesFromArrayU8 { .. }
+                    | SsaInstKind::BytesToUtf8Ascii { .. }
                     | SsaInstKind::BytesToArrayU8 { .. }
+                    | SsaInstKind::ArrayNew
                     | SsaInstKind::ArrayLen { .. }
                     | SsaInstKind::ArrayGet { .. }
                     | SsaInstKind::ArrayHas { .. }
@@ -1644,7 +1646,9 @@ fn ssa_inst_requires_owned_value_slot(kind: &SsaInstKind) -> bool {
             | SsaInstKind::ToString { .. }
             | SsaInstKind::StringSplitLiteral { .. }
             | SsaInstKind::BytesFromArrayU8 { .. }
+            | SsaInstKind::BytesToUtf8Ascii { .. }
             | SsaInstKind::BytesToArrayU8 { .. }
+            | SsaInstKind::ArrayNew
             | SsaInstKind::StringConcat { .. }
             | SsaInstKind::BytesConcat { .. }
             | SsaInstKind::HostCall { .. }
@@ -2980,6 +2984,92 @@ fn lower_ssa_inst(
             b.switch_to_block(cont);
             out
         }
+        SsaInstKind::BytesToUtf8Ascii { bytes } => {
+            let bytes = values[bytes];
+            let bytes_data = ssa_load_heap_data_ptr(b, layout.value, bytes);
+            let bytes_ptr = b.ins().load(
+                pointer_type,
+                MemFlags::new(),
+                bytes_data,
+                layout.stack_vec.ptr_offset,
+            );
+            let bytes_len = b.ins().load(
+                pointer_type,
+                MemFlags::new(),
+                bytes_data,
+                layout.stack_vec.len_offset,
+            );
+            let out = owned_value_temp_slot_addr(
+                b,
+                pointer_type,
+                owned_value_temps,
+                SsaTempValueSlotKey::Output(output.id),
+            )?;
+            let validate_loop = b.create_block();
+            let validate_step = b.create_block();
+            let finish = b.create_block();
+            let fail = b.create_block();
+            let cont = b.create_block();
+            b.append_block_param(validate_loop, pointer_type);
+
+            let zero = b.ins().iconst(pointer_type, 0);
+            b.ins().jump(validate_loop, &[BlockArg::Value(zero)]);
+
+            b.switch_to_block(validate_loop);
+            let index = b.block_params(validate_loop)[0];
+            let done = b
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, index, bytes_len);
+            b.ins().brif(done, finish, &[], validate_step, &[]);
+
+            b.switch_to_block(validate_step);
+            let byte_addr = b.ins().iadd(bytes_ptr, index);
+            let byte = b.ins().load(types::I8, MemFlags::new(), byte_addr, 0);
+            let is_ascii = b.ins().icmp_imm(IntCC::UnsignedLessThan, byte, 128);
+            let validate_next = b.create_block();
+            b.ins().brif(is_ascii, validate_next, &[], fail, &[]);
+
+            b.switch_to_block(validate_next);
+            let next_index = b.ins().iadd_imm(index, 1);
+            b.ins().jump(validate_loop, &[BlockArg::Value(next_index)]);
+
+            b.switch_to_block(finish);
+            let out_ptr = ssa_call_alloc_buffer(
+                b,
+                pointer_type,
+                heap_refs,
+                heap_addrs,
+                heap_addrs.alloc_byte_buffer,
+                bytes_len,
+            )?;
+            ssa_call_copy_bytes(
+                b,
+                pointer_type,
+                heap_refs,
+                heap_addrs,
+                out_ptr,
+                bytes_ptr,
+                bytes_len,
+            )?;
+            let out_raw = ssa_call_pack_shared(
+                b,
+                pointer_type,
+                heap_refs,
+                heap_addrs.pack_string,
+                out_ptr,
+                bytes_len,
+                bytes_len,
+            )?;
+            clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
+            ssa_store_heap_ptr_in_value(b, layout.value, out, layout.value.string_tag, out_raw);
+            b.ins().jump(cont, &[]);
+
+            b.switch_to_block(fail);
+            ssa_emit_trace_exit_status(b, vm_ptr, exit_block, pointer_type, offsets, inst.ip)?;
+
+            b.switch_to_block(cont);
+            out
+        }
         SsaInstKind::BytesToArrayU8 { bytes } => {
             let bytes = values[bytes];
             let bytes_data = ssa_load_heap_data_ptr(b, layout.value, bytes);
@@ -3065,6 +3155,35 @@ fn lower_ssa_inst(
             ssa_emit_trace_exit_status(b, vm_ptr, exit_block, pointer_type, offsets, inst.ip)?;
 
             b.switch_to_block(cont);
+            out
+        }
+        SsaInstKind::ArrayNew => {
+            let out = owned_value_temp_slot_addr(
+                b,
+                pointer_type,
+                owned_value_temps,
+                SsaTempValueSlotKey::Output(output.id),
+            )?;
+            let zero = b.ins().iconst(pointer_type, 0);
+            let out_ptr = ssa_call_alloc_buffer(
+                b,
+                pointer_type,
+                heap_refs,
+                heap_addrs,
+                heap_addrs.alloc_value_buffer,
+                zero,
+            )?;
+            let out_raw = ssa_call_pack_shared(
+                b,
+                pointer_type,
+                heap_refs,
+                heap_addrs.pack_array,
+                out_ptr,
+                zero,
+                zero,
+            )?;
+            clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
+            ssa_store_heap_ptr_in_value(b, layout.value, out, layout.value.array_tag, out_raw);
             out
         }
         SsaInstKind::ArrayLen { array } => {
@@ -4507,7 +4626,7 @@ fn lower_ssa_exit_block(
                             .contains_key(&SsaTempValueSlotKey::Output(*value))
                             && moved_owned_values.insert(*value)
                     }
-                    SsaMaterialization::BoxHeapPtr { .. } => true,
+                    SsaMaterialization::BoxHeapPtr { .. } => false,
                 }
             });
     if inline_owned_restore {

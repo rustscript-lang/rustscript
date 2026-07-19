@@ -188,9 +188,13 @@ pub(crate) enum SsaInstKind {
     BytesFromArrayU8 {
         array: SsaValueId,
     },
+    BytesToUtf8Ascii {
+        bytes: SsaValueId,
+    },
     BytesToArrayU8 {
         bytes: SsaValueId,
     },
+    ArrayNew,
     ArrayLen {
         array: SsaValueId,
     },
@@ -428,7 +432,8 @@ impl SsaInstKind {
             Self::StringSplitLiteral { text, delimiter } => vec![*text, *delimiter],
             Self::StringConcat { lhs, rhs } | Self::BytesConcat { lhs, rhs } => vec![*lhs, *rhs],
             Self::BytesFromArrayU8 { array } => vec![*array],
-            Self::BytesToArrayU8 { bytes } => vec![*bytes],
+            Self::BytesToUtf8Ascii { bytes } | Self::BytesToArrayU8 { bytes } => vec![*bytes],
+            Self::ArrayNew => Vec::new(),
             Self::ArrayGet { array, index } => vec![*array, *index],
             Self::ArrayHas { array, index } => vec![*array, *index],
             Self::ArraySet {
@@ -1067,7 +1072,9 @@ fn render_inst_kind(kind: &SsaInstKind) -> String {
         SsaInstKind::StringConcat { lhs, rhs } => format!("string_concat {lhs}, {rhs}"),
         SsaInstKind::BytesConcat { lhs, rhs } => format!("bytes_concat {lhs}, {rhs}"),
         SsaInstKind::BytesFromArrayU8 { array } => format!("bytes_from_array_u8 {array}"),
+        SsaInstKind::BytesToUtf8Ascii { bytes } => format!("bytes_to_utf8_ascii {bytes}"),
         SsaInstKind::BytesToArrayU8 { bytes } => format!("bytes_to_array_u8 {bytes}"),
+        SsaInstKind::ArrayNew => "array_new".to_string(),
         SsaInstKind::ArrayLen { array } => format!("array_len {array}"),
         SsaInstKind::ArrayGet { array, index } => format!("array_get {array}, {index}"),
         SsaInstKind::ArrayHas { array, index } => format!("array_has {array}, {index}"),
