@@ -179,6 +179,11 @@ fn offset_exit(mut exit: SsaExit, value_offset: u32, exit_offset: u32) -> VmResu
     for materialization in exit.stack.iter_mut().chain(&mut exit.locals) {
         offset_materialization(materialization, value_offset)?;
     }
+    for frame in &mut exit.virtual_frames {
+        for materialization in frame.operand_stack.iter_mut().chain(&mut frame.locals) {
+            offset_materialization(materialization, value_offset)?;
+        }
+    }
     Ok(exit)
 }
 
@@ -506,7 +511,7 @@ fn offset_exit_id(exit: SsaExitId, offset: u32) -> VmResult<SsaExitId> {
 mod tests {
     use super::*;
     use crate::vm::jit::JitTraceTerminal;
-    use crate::vm::jit::ir::{SsaTerminator, SsaTraceBuilder};
+    use crate::vm::jit::ir::{SsaTerminator, SsaTraceBuilder, VirtualFrameSnapshot};
 
     fn test_trace(id: usize, root_ip: usize, exit_ip: usize) -> (JitTrace, SsaExitId) {
         let mut ssa = SsaTraceBuilder::new(root_ip, 0);
@@ -530,6 +535,43 @@ mod tests {
             },
             exit,
         )
+    }
+
+    #[test]
+    fn offset_exit_remaps_virtual_frame_materializations() {
+        let exit = SsaExit {
+            id: SsaExitId::new(0),
+            exit_ip: 42,
+            stack: vec![SsaMaterialization::Value(SsaValueId::new(1))],
+            locals: vec![SsaMaterialization::BoxInt(SsaValueId::new(2))],
+            dirty_locals: vec![true],
+            virtual_frames: vec![VirtualFrameSnapshot {
+                prototype_id: 3,
+                call_ip: 7,
+                return_ip: 9,
+                resume_ip: 11,
+                operand_stack: vec![SsaMaterialization::Value(SsaValueId::new(3))],
+                locals: vec![SsaMaterialization::BoxHeapPtr {
+                    value: SsaValueId::new(4),
+                    tag: crate::ValueType::Array,
+                }],
+                dirty_locals: vec![true],
+            }],
+        };
+
+        let remapped = offset_exit(exit, 10, 2).expect("exit remap should succeed");
+        assert_eq!(remapped.id, SsaExitId::new(2));
+        assert_eq!(
+            remapped.virtual_frames[0].operand_stack,
+            vec![SsaMaterialization::Value(SsaValueId::new(13))]
+        );
+        assert_eq!(
+            remapped.virtual_frames[0].locals,
+            vec![SsaMaterialization::BoxHeapPtr {
+                value: SsaValueId::new(14),
+                tag: crate::ValueType::Array,
+            }]
+        );
     }
 
     #[test]
