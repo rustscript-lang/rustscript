@@ -1274,6 +1274,7 @@ fn ssa_trace_supported(ssa: &SsaTrace) -> bool {
                 inst.kind,
                 SsaInstKind::Constant(_)
                     | SsaInstKind::CloneTagged { .. }
+                    | SsaInstKind::ValueIsType { .. }
                     | SsaInstKind::UnboxHeapPtr { .. }
                     | SsaInstKind::UnboxInt { .. }
                     | SsaInstKind::UnboxFloat { .. }
@@ -2089,6 +2090,29 @@ fn lower_ssa_inst(
                 &[out, values[input]],
             )?;
             out
+        }
+        SsaInstKind::ValueIsType { input, tag } => {
+            let input = *values.get(input).ok_or_else(|| {
+                VmError::JitNative("SSA type predicate input missing".to_string())
+            })?;
+            let expected_tag = match tag {
+                ValueType::Null => layout.value.null_tag,
+                ValueType::Int => layout.value.int_tag,
+                ValueType::Float => layout.value.float_tag,
+                ValueType::Bool => layout.value.bool_tag,
+                ValueType::String => layout.value.string_tag,
+                ValueType::Bytes => layout.value.bytes_tag,
+                ValueType::Array => layout.value.array_tag,
+                ValueType::Map => layout.value.map_tag,
+                ValueType::Callable | ValueType::Unknown => {
+                    return Err(VmError::JitNative(format!(
+                        "unsupported SSA type predicate tag {tag:?}"
+                    )));
+                }
+            };
+            let actual_tag = ssa_load_tag_i32(b, layout.value, input);
+            b.ins()
+                .icmp_imm(IntCC::Equal, actual_tag, i64::from(expected_tag))
         }
         SsaInstKind::UnboxInt { input } => {
             let input = *values

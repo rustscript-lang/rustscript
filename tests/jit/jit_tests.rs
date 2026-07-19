@@ -6499,6 +6499,60 @@ fn trace_jit_guards_static_inline_callable_identity() {
 }
 
 #[test]
+fn trace_jit_preserves_inline_callable_argument_schema_checks() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn ignore(value: int) -> int { 1 }
+        let mut i = 0;
+        let value: int = 7;
+        while i < 100 {
+            i = i + ignore(value);
+        }
+        i;
+    "#;
+    let compiled = compile_source(source).expect("callable schema source should compile");
+    let value_slot = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("debug metadata")
+        .locals
+        .iter()
+        .find(|local| local.name == "value")
+        .expect("value local")
+        .index;
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_fuel_check_interval(1).expect("fuel interval");
+    vm.set_fuel(1);
+    loop {
+        assert_eq!(
+            vm.run().expect("initialization step should run"),
+            VmStatus::Yielded
+        );
+        if vm.locals().get(value_slot as usize) == Some(&Value::Int(7)) {
+            break;
+        }
+        vm.recharge_fuel(1).expect("fuel recharge");
+    }
+    vm.set_local(value_slot, Value::Bool(true))
+        .expect("dynamic value replacement should succeed");
+    vm.clear_fuel();
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    let error = vm.run().expect_err("invalid callable argument must fail");
+    assert!(
+        matches!(error, vm::VmError::TypeMismatch("callable argument schema")),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
 fn trace_jit_inlines_array_swap_leaf() {
     if !native_jit_supported() {
         return;
