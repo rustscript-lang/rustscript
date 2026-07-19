@@ -4726,7 +4726,7 @@ fn lower_ssa_exit_block(
                             .contains_key(&SsaTempValueSlotKey::Output(*value))
                             && moved_owned_values.insert(*value)
                     }
-                    SsaMaterialization::BoxHeapPtr { .. } => false,
+                    SsaMaterialization::BoxHeapPtr { .. } => true,
                 }
             });
     if inline_owned_restore {
@@ -4755,15 +4755,24 @@ fn lower_ssa_exit_block(
                 })?,
             );
             let dst_addr = ssa_value_addr(b, pointer_type, vm_locals_ptr, index, layout.value.size);
-            clear_owned_value_temp_slot(b, pointer_type, deopt_refs, deopt_addrs, dst_addr)?;
-            if let SsaMaterialization::Value(value) = materialization {
-                let src = *exit_values.get(value).ok_or_else(|| {
-                    VmError::JitNative("SSA exit tagged local value missing".to_string())
-                })?;
-                ssa_copy_value_bytes(b, src, dst_addr, layout.value.size);
-                ssa_store_tag(b, layout.value, src, layout.value.null_tag);
+            if matches!(materialization, SsaMaterialization::BoxHeapPtr { .. }) {
+                let temp_slot = ssa_create_value_stack_slot(b, layout.value.size)?;
+                let temp_addr = b.ins().stack_addr(pointer_type, temp_slot, 0);
+                ssa_materialize_slot(b, materialize_ctx, materialization, temp_addr, "local")?;
+                clear_owned_value_temp_slot(b, pointer_type, deopt_refs, deopt_addrs, dst_addr)?;
+                ssa_copy_value_bytes(b, temp_addr, dst_addr, layout.value.size);
+                ssa_store_tag(b, layout.value, temp_addr, layout.value.null_tag);
             } else {
-                ssa_materialize_slot(b, materialize_ctx, materialization, dst_addr, "local")?;
+                clear_owned_value_temp_slot(b, pointer_type, deopt_refs, deopt_addrs, dst_addr)?;
+                if let SsaMaterialization::Value(value) = materialization {
+                    let src = *exit_values.get(value).ok_or_else(|| {
+                        VmError::JitNative("SSA exit tagged local value missing".to_string())
+                    })?;
+                    ssa_copy_value_bytes(b, src, dst_addr, layout.value.size);
+                    ssa_store_tag(b, layout.value, src, layout.value.null_tag);
+                } else {
+                    ssa_materialize_slot(b, materialize_ctx, materialization, dst_addr, "local")?;
+                }
             }
         }
         let ip_val = b.ins().iconst(
