@@ -6298,6 +6298,13 @@ fn trace_jit_executes_call_value_natively_inside_loop() {
     );
     assert_eq!(vm.stack(), &[Value::Int(48)]);
     let snapshot = vm.jit_snapshot();
+    assert_eq!(snapshot.metrics.script_call_observations, 16);
+    assert_eq!(snapshot.metrics.monomorphic_call_sites, 1);
+    assert_eq!(snapshot.metrics.polymorphic_call_sites, 0);
+    let call_sites = vm.jit_call_site_profiles();
+    assert_eq!(call_sites.len(), 1, "{}", vm.dump_jit_info());
+    assert_eq!(call_sites[0].observations, 16);
+    assert!(call_sites[0].monomorphic);
     assert!(
         snapshot.traces.iter().any(|trace| {
             trace.terminal == JitTraceTerminal::CallValue
@@ -6313,6 +6320,35 @@ fn trace_jit_executes_call_value_natively_inside_loop() {
         vm.dump_jit_info()
     );
     assert!(vm.dump_jit_info().contains("interpreter fallbacks: 0"));
+}
+
+#[test]
+fn trace_jit_call_site_profiles_clear_on_vm_reuse() {
+    let source = r#"
+        fn add_one(value: int) -> int { value + 1 }
+        let mut i = 0;
+        while i < 3 {
+            i = add_one(i);
+        }
+        i;
+    "#;
+    let compiled = compile_source(source).expect("call-site profile source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: false,
+        hot_loop_threshold: 64,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(vm.run().expect("first profile run"), VmStatus::Halted);
+    assert_eq!(vm.jit_snapshot().metrics.script_call_observations, 3);
+
+    vm.reset_for_reuse();
+
+    assert_eq!(vm.jit_snapshot().metrics.script_call_observations, 0);
+    assert!(vm.jit_call_site_profiles().is_empty());
+    assert_eq!(vm.run().expect("second profile run"), VmStatus::Halted);
+    assert_eq!(vm.jit_snapshot().metrics.script_call_observations, 3);
 }
 
 #[test]
