@@ -2490,7 +2490,9 @@ fn trace_jit_reports_exact_parent_exit_profiles() {
             .traces
             .iter()
             .enumerate()
-            .filter(|(_, trace)| trace.frame_key != u64::MAX)
+            .filter(|(_, trace)| {
+                trace.frame_key != u64::MAX || trace.ssa_text().contains("virtual_frame")
+            })
             .any(|(parent_trace_id, _)| {
                 let parent_profiles = exit_profiles
                     .iter()
@@ -6301,6 +6303,7 @@ fn trace_jit_executes_call_value_natively_inside_loop() {
     assert_eq!(snapshot.metrics.script_call_observations, 16);
     assert_eq!(snapshot.metrics.monomorphic_call_sites, 1);
     assert_eq!(snapshot.metrics.polymorphic_call_sites, 0);
+    assert!(snapshot.metrics.inline_rejections > 0);
     let call_sites = vm.jit_call_site_profiles();
     assert_eq!(call_sites.len(), 1, "{}", vm.dump_jit_info());
     assert_eq!(call_sites[0].observations, 16);
@@ -6320,6 +6323,150 @@ fn trace_jit_executes_call_value_natively_inside_loop() {
         vm.dump_jit_info()
     );
     assert!(vm.dump_jit_info().contains("interpreter fallbacks: 0"));
+}
+
+#[test]
+fn trace_jit_inlines_static_leaf_in_root_loop() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn add_one(value: int) -> int { value + 1 }
+        let mut i = 0;
+        while i < 100 {
+            i = add_one(i);
+        }
+        i;
+    "#;
+    let compiled = compile_source(source).expect("static leaf loop should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(
+        vm.run().expect("static leaf loop should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(100)]);
+    let snapshot = vm.jit_snapshot();
+    assert!(snapshot.metrics.inline_successes > 0);
+    assert!(
+        snapshot.traces.iter().any(|trace| {
+            trace.terminal == JitTraceTerminal::LoopBack
+                && trace.op_names.iter().any(|name| name == "inline_call:0")
+                && trace.op_names.iter().any(|name| name == "inline_ret")
+                && trace.executions > 0
+        }),
+        "expected static leaf inline trace: {}",
+        vm.dump_jit_info()
+    );
+    assert!(!any_trace_op(&snapshot, "call_value"));
+    assert!(vm.dump_jit_info().contains("interpreter fallbacks: 0"));
+}
+
+#[test]
+fn trace_jit_inlines_array_swap_leaf() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn swap(values: [int], left: int, right: int) -> int {
+            let temporary = values[left];
+            values[left] = values[right];
+            values[right] = temporary;
+            temporary
+        }
+        let values: [int] = [1, 2];
+        let mut i = 0;
+        while i < 100 {
+            i = i + swap(values, 0, 1) * 0 + 1;
+        }
+        values[0] * 10 + values[1];
+    "#;
+    let compiled = compile_source(source).expect("array swap inline source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    let status = vm
+        .run()
+        .unwrap_or_else(|error| panic!("{error:?}\n{}", vm.dump_jit_info()));
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(12)], "{}", vm.dump_jit_info());
+    let snapshot = vm.jit_snapshot();
+    assert!(
+        any_trace_op(&snapshot, "inline_call:0"),
+        "{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        any_trace_op(&snapshot, "array_get"),
+        "{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        any_trace_op(&snapshot, "array_set"),
+        "{}",
+        vm.dump_jit_info()
+    );
+    assert!(!any_trace_op(&snapshot, "call_value"));
+}
+
+#[test]
+fn trace_jit_inline_guard_exit_restores_callee() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn classify(value: int) -> int {
+            let mut out = 1;
+            if value < 2 {
+                out = 2;
+            }
+            out
+        }
+        let mut i = 0;
+        let mut result = 0;
+        while i < 4 {
+            result = classify(i);
+            i = i + 1;
+        }
+        result;
+    "#;
+    let compiled = compile_source(source).expect("guarded inline source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_bridge_stats_enabled(true);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    let result = vm.run();
+    assert_eq!(
+        result.unwrap_or_else(|error| panic!("{error:?}\n{}", vm.dump_jit_info())),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(1)]);
+    assert!(
+        any_trace_op(&vm.jit_snapshot(), "inline_call:0"),
+        "{}",
+        vm.dump_jit_info()
+    );
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    assert!(
+        bridge_hits
+            .iter()
+            .any(|(name, hits)| *name == "restore_virtual_frame" && *hits > 0),
+        "expected virtual frame restore: {}",
+        vm.dump_jit_info()
+    );
 }
 
 #[test]

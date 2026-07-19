@@ -102,6 +102,9 @@ pub(crate) struct SsaBlockParam {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum SsaInstKind {
     Constant(Value),
+    CloneTagged {
+        input: SsaValueId,
+    },
     UnboxInt {
         input: SsaValueId,
     },
@@ -390,7 +393,8 @@ impl SsaInstKind {
             Self::Constant(_) => Vec::new(),
             Self::HostCall { args, .. } => args.clone(),
 
-            Self::UnboxInt { input }
+            Self::CloneTagged { input }
+            | Self::UnboxInt { input }
             | Self::UnboxFloat { input }
             | Self::UnboxBool { input }
             | Self::UnboxHeapPtr { input, .. }
@@ -760,6 +764,18 @@ impl SsaTrace {
             let _ = writeln!(&mut out, "  stack=[{}]", stack);
             let _ = writeln!(&mut out, "  locals=[{}]", locals);
             let _ = writeln!(&mut out, "  dirty_locals=[{}]", dirty_locals);
+            for (index, frame) in exit.virtual_frames.iter().enumerate() {
+                let _ = writeln!(
+                    &mut out,
+                    "  virtual_frame{index}=prototype{} call_ip={} return_ip={} resume_ip={} stack={} locals={}",
+                    frame.prototype_id,
+                    frame.call_ip,
+                    frame.return_ip,
+                    frame.resume_ip,
+                    frame.operand_stack.len(),
+                    frame.locals.len(),
+                );
+            }
         }
         out
     }
@@ -1104,6 +1120,7 @@ fn verify_materialization(
 fn render_inst_kind(kind: &SsaInstKind) -> String {
     match kind {
         SsaInstKind::Constant(value) => format!("const {value:?}"),
+        SsaInstKind::CloneTagged { input } => format!("clone_tagged {input}"),
         SsaInstKind::UnboxInt { input } => format!("unbox_int {input}"),
         SsaInstKind::UnboxFloat { input } => format!("unbox_float {input}"),
         SsaInstKind::UnboxBool { input } => format!("unbox_bool {input}"),
