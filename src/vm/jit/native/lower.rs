@@ -4478,6 +4478,19 @@ fn write_inherited_state_packet(
     ctx: SsaLowerCtx<'_>,
     exit: &crate::vm::jit::ir::SsaExit,
 ) -> VmResult<()> {
+    let inactive = b.ins().iconst(ctx.pointer_type, 0);
+    b.ins().store(
+        MemFlags::new(),
+        inactive,
+        ctx.inherited_state_ptr,
+        INHERITED_STATE_ACTIVE_OFFSET,
+    );
+    b.ins().store(
+        MemFlags::new(),
+        inactive,
+        ctx.inherited_state_ptr,
+        INHERITED_STATE_DYNAMIC_TARGET_OFFSET,
+    );
     let entry_value_count = exit
         .stack
         .len()
