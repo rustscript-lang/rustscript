@@ -501,12 +501,24 @@ pub(crate) enum SsaMaterialization {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VirtualFrameSnapshot {
+    pub(crate) prototype_id: u32,
+    pub(crate) call_ip: usize,
+    pub(crate) return_ip: usize,
+    pub(crate) resume_ip: usize,
+    pub(crate) operand_stack: Vec<SsaMaterialization>,
+    pub(crate) locals: Vec<SsaMaterialization>,
+    pub(crate) dirty_locals: Vec<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SsaExit {
     pub(crate) id: SsaExitId,
     pub(crate) exit_ip: usize,
     pub(crate) stack: Vec<SsaMaterialization>,
     pub(crate) locals: Vec<SsaMaterialization>,
     pub(crate) dirty_locals: Vec<bool>,
+    pub(crate) virtual_frames: Vec<VirtualFrameSnapshot>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -652,6 +664,41 @@ impl SsaTrace {
             for materialization in exit.stack.iter().chain(exit.locals.iter()) {
                 verify_materialization(materialization, &value_reprs)?;
             }
+            let mut outer_resume_ip = None;
+            for (frame_index, frame) in exit.virtual_frames.iter().enumerate() {
+                if frame.dirty_locals.len() != frame.locals.len() {
+                    return Err(SsaVerifyError::VirtualFrameDirtyLocalLengthMismatch {
+                        exit: exit.id,
+                        frame: frame_index,
+                        locals: frame.locals.len(),
+                        dirty_locals: frame.dirty_locals.len(),
+                    });
+                }
+                if frame.call_ip >= frame.return_ip {
+                    return Err(SsaVerifyError::InvalidVirtualFrameContinuation {
+                        exit: exit.id,
+                        frame: frame_index,
+                        call_ip: frame.call_ip,
+                        return_ip: frame.return_ip,
+                    });
+                }
+                if outer_resume_ip.is_some_and(|resume_ip| resume_ip != frame.call_ip) {
+                    return Err(SsaVerifyError::InvalidVirtualFrameOrder {
+                        exit: exit.id,
+                        frame: frame_index,
+                    });
+                }
+                for materialization in frame.operand_stack.iter().chain(&frame.locals) {
+                    if matches!(materialization, SsaMaterialization::BoxHeapPtr { .. }) {
+                        return Err(SsaVerifyError::UnsupportedVirtualFrameOwnership {
+                            exit: exit.id,
+                            frame: frame_index,
+                        });
+                    }
+                    verify_materialization(materialization, &value_reprs)?;
+                }
+                outer_resume_ip = Some(frame.resume_ip);
+            }
         }
 
         Ok(())
@@ -756,6 +803,26 @@ pub(crate) enum SsaVerifyError {
         locals: usize,
         dirty_locals: usize,
     },
+    VirtualFrameDirtyLocalLengthMismatch {
+        exit: SsaExitId,
+        frame: usize,
+        locals: usize,
+        dirty_locals: usize,
+    },
+    InvalidVirtualFrameContinuation {
+        exit: SsaExitId,
+        frame: usize,
+        call_ip: usize,
+        return_ip: usize,
+    },
+    InvalidVirtualFrameOrder {
+        exit: SsaExitId,
+        frame: usize,
+    },
+    UnsupportedVirtualFrameOwnership {
+        exit: SsaExitId,
+        frame: usize,
+    },
 }
 
 pub(crate) struct SsaTraceBuilder {
@@ -843,6 +910,17 @@ impl SsaTraceBuilder {
         locals: Vec<SsaMaterialization>,
         dirty_locals: Vec<bool>,
     ) -> SsaExitId {
+        self.add_exit_with_virtual_frames(exit_ip, stack, locals, dirty_locals, Vec::new())
+    }
+
+    pub(crate) fn add_exit_with_virtual_frames(
+        &mut self,
+        exit_ip: usize,
+        stack: Vec<SsaMaterialization>,
+        locals: Vec<SsaMaterialization>,
+        dirty_locals: Vec<bool>,
+        virtual_frames: Vec<VirtualFrameSnapshot>,
+    ) -> SsaExitId {
         let id = SsaExitId::new(self.trace.exits.len() as u32);
         self.trace.exits.push(SsaExit {
             id,
@@ -850,6 +928,7 @@ impl SsaTraceBuilder {
             stack,
             locals,
             dirty_locals,
+            virtual_frames,
         });
         id
     }
@@ -1318,6 +1397,125 @@ mod tests {
                 locals: 1,
                 dirty_locals: 0,
             })
+        );
+    }
+
+    fn trace_with_virtual_frame(frame: VirtualFrameSnapshot) -> (SsaTrace, SsaExitId) {
+        let mut builder = SsaTraceBuilder::new(1, 0);
+        let entry = builder.entry();
+        let exit = builder.add_exit_with_virtual_frames(
+            20,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![frame],
+        );
+        builder
+            .set_terminator(entry, SsaTerminator::Exit { exit })
+            .unwrap();
+        (builder.finish(), exit)
+    }
+
+    #[test]
+    fn verifier_accepts_scalar_virtual_frame_snapshot() {
+        let mut builder = SsaTraceBuilder::new(1, 0);
+        let entry = builder.entry();
+        let local = builder
+            .append_param(entry, SsaValueRepr::I64, "inline_local")
+            .unwrap();
+        let exit = builder.add_exit_with_virtual_frames(
+            20,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![VirtualFrameSnapshot {
+                prototype_id: 3,
+                call_ip: 10,
+                return_ip: 12,
+                resume_ip: 20,
+                operand_stack: Vec::new(),
+                locals: vec![SsaMaterialization::BoxInt(local.id)],
+                dirty_locals: vec![true],
+            }],
+        );
+        builder
+            .set_terminator(entry, SsaTerminator::Exit { exit })
+            .unwrap();
+        assert_eq!(builder.finish().verify(), Ok(()));
+    }
+
+    #[test]
+    fn verifier_rejects_malformed_virtual_frame_metadata() {
+        let (trace, exit) = trace_with_virtual_frame(VirtualFrameSnapshot {
+            prototype_id: 3,
+            call_ip: 12,
+            return_ip: 12,
+            resume_ip: 20,
+            operand_stack: Vec::new(),
+            locals: Vec::new(),
+            dirty_locals: Vec::new(),
+        });
+        assert_eq!(
+            trace.verify(),
+            Err(SsaVerifyError::InvalidVirtualFrameContinuation {
+                exit,
+                frame: 0,
+                call_ip: 12,
+                return_ip: 12,
+            })
+        );
+
+        let (trace, exit) = trace_with_virtual_frame(VirtualFrameSnapshot {
+            prototype_id: 3,
+            call_ip: 10,
+            return_ip: 12,
+            resume_ip: 20,
+            operand_stack: Vec::new(),
+            locals: Vec::new(),
+            dirty_locals: vec![true],
+        });
+        assert_eq!(
+            trace.verify(),
+            Err(SsaVerifyError::VirtualFrameDirtyLocalLengthMismatch {
+                exit,
+                frame: 0,
+                locals: 0,
+                dirty_locals: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn verifier_rejects_heap_pointer_transfer_in_virtual_frame() {
+        let mut builder = SsaTraceBuilder::new(1, 0);
+        let entry = builder.entry();
+        let value = builder
+            .append_param(entry, SsaValueRepr::HeapPtr(ValueType::Array), "array")
+            .unwrap();
+        let exit = builder.add_exit_with_virtual_frames(
+            20,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![VirtualFrameSnapshot {
+                prototype_id: 3,
+                call_ip: 10,
+                return_ip: 12,
+                resume_ip: 20,
+                operand_stack: Vec::new(),
+                locals: vec![SsaMaterialization::BoxHeapPtr {
+                    value: value.id,
+                    tag: ValueType::Array,
+                }],
+                dirty_locals: vec![true],
+            }],
+        );
+        builder
+            .set_terminator(entry, SsaTerminator::Exit { exit })
+            .unwrap();
+        assert_eq!(
+            builder.finish().verify(),
+            Err(SsaVerifyError::UnsupportedVirtualFrameOwnership { exit, frame: 0 })
         );
     }
 }

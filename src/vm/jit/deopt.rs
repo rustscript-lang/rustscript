@@ -41,6 +41,25 @@ pub(crate) fn exit_inputs(exit: &SsaExit) -> Vec<SsaValueId> {
             out.push(value);
         }
     }
+    for frame in &exit.virtual_frames {
+        let dirty_locals = frame
+            .locals
+            .iter()
+            .zip(&frame.dirty_locals)
+            .filter_map(|(materialization, dirty)| dirty.then_some(materialization));
+        for materialization in frame.operand_stack.iter().chain(dirty_locals) {
+            let value = match materialization {
+                SsaMaterialization::Value(value)
+                | SsaMaterialization::BoxInt(value)
+                | SsaMaterialization::BoxFloat(value)
+                | SsaMaterialization::BoxBool(value) => *value,
+                SsaMaterialization::BoxHeapPtr { value, .. } => *value,
+            };
+            if !out.contains(&value) {
+                out.push(value);
+            }
+        }
+    }
     out
 }
 
@@ -248,6 +267,49 @@ mod tests {
                 parent: 0,
                 child: 1,
             })
+        );
+    }
+
+    #[test]
+    fn exit_inputs_include_virtual_frame_values_once_in_frame_order() {
+        use crate::vm::jit::ir::VirtualFrameSnapshot;
+
+        let mut builder = SsaTraceBuilder::new(0, 0);
+        let entry = builder.entry();
+        let caller = builder
+            .append_param(entry, SsaValueRepr::Tagged, "caller")
+            .unwrap();
+        let callee_stack = builder
+            .append_param(entry, SsaValueRepr::I64, "callee_stack")
+            .unwrap();
+        let callee_local = builder
+            .append_param(entry, SsaValueRepr::Bool, "callee_local")
+            .unwrap();
+        let exit_id = builder.add_exit_with_virtual_frames(
+            20,
+            vec![SsaMaterialization::Value(caller.id)],
+            Vec::new(),
+            Vec::new(),
+            vec![VirtualFrameSnapshot {
+                prototype_id: 1,
+                call_ip: 10,
+                return_ip: 12,
+                resume_ip: 20,
+                operand_stack: vec![SsaMaterialization::BoxInt(callee_stack.id)],
+                locals: vec![
+                    SsaMaterialization::Value(caller.id),
+                    SsaMaterialization::BoxBool(callee_local.id),
+                ],
+                dirty_locals: vec![true, true],
+            }],
+        );
+        builder
+            .set_terminator(entry, SsaTerminator::Exit { exit: exit_id })
+            .unwrap();
+        let trace = builder.finish();
+        assert_eq!(
+            exit_inputs(&trace.exits[0]),
+            vec![caller.id, callee_stack.id, callee_local.id]
         );
     }
 }

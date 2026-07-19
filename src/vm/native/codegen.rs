@@ -432,6 +432,22 @@ pub(crate) fn sparse_restore_exit_signature(
 }
 
 #[cfg(feature = "cranelift-jit")]
+#[allow(dead_code)]
+pub(crate) fn restore_virtual_frame_signature(
+    pointer_type: cranelift_codegen::ir::Type,
+    call_conv: cranelift_codegen::isa::CallConv,
+) -> Signature {
+    let mut sig = Signature::new(call_conv);
+    sig.params.push(AbiParam::new(pointer_type));
+    sig.params.push(AbiParam::new(types::I32));
+    for _ in 0..7 {
+        sig.params.push(AbiParam::new(pointer_type));
+    }
+    sig.returns.push(AbiParam::new(types::I32));
+    sig
+}
+
+#[cfg(feature = "cranelift-jit")]
 pub(crate) fn entry_signature(
     pointer_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,

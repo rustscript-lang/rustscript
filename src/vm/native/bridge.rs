@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 use crate::builtins::BuiltinFunction;
-use crate::bytecode::{Value, ValueType, VmMap};
+use crate::bytecode::{CallableKind, CallableTarget, Value, ValueType, VmMap};
 use crate::vm::{
-    CallOutcome, CallReturn, ExecOutcome, FrameContinuation, HostCallExecOutcome, NumericValue, Vm,
-    VmError, VmHostFunction, VmResult, logical_shr_i64,
+    CallOutcome, CallReturn, ExecOutcome, ExecutionFrame, FrameContinuation, HostCallExecOutcome,
+    NumericValue, Vm, VmError, VmHostFunction, VmResult, logical_shr_i64,
 };
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -326,6 +326,10 @@ pub(crate) fn restore_sparse_exit_state_entry_address() -> usize {
 
 pub(crate) fn restore_active_sparse_exit_state_entry_address() -> usize {
     pd_vm_native_restore_active_sparse_exit_state as *const () as usize
+}
+
+pub(crate) fn restore_virtual_frame_entry_address() -> usize {
+    pd_vm_native_restore_virtual_frame as *const () as usize
 }
 
 pub(crate) fn map_has_entry_address() -> usize {
@@ -1218,6 +1222,99 @@ pub(crate) extern "C" fn pd_vm_native_restore_active_sparse_exit_state(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) extern "C" fn pd_vm_native_restore_virtual_frame(
+    vm: *mut Vm,
+    prototype_id: u32,
+    call_ip: usize,
+    return_ip: usize,
+    resume_ip: usize,
+    stack_src: *const Value,
+    stack_len: usize,
+    locals_src: *const Value,
+    locals_len: usize,
+) -> i32 {
+    run_step(vm, "restore_virtual_frame", |vm| {
+        if stack_len != 0 && stack_src.is_null() {
+            return Err(VmError::JitNative(
+                "virtual frame restore received null stack buffer".to_string(),
+            ));
+        }
+        if locals_len != 0 && locals_src.is_null() {
+            return Err(VmError::JitNative(
+                "virtual frame restore received null locals buffer".to_string(),
+            ));
+        }
+        if vm.call_depth >= vm.max_script_call_depth {
+            return Err(VmError::CallStackOverflow {
+                limit: vm.max_script_call_depth,
+            });
+        }
+        let prototype = vm
+            .program
+            .callable_prototypes
+            .get(prototype_id as usize)
+            .ok_or(VmError::InvalidCallablePrototype(prototype_id))?;
+        if prototype.kind != CallableKind::FunctionItem
+            || !prototype.capture_slots.is_empty()
+            || !prototype.capture_source_slots.is_empty()
+            || !prototype.capture_modes.is_empty()
+        {
+            return Err(VmError::InvalidFrameState(
+                "virtual frame prototype is not an environment-free function item",
+            ));
+        }
+        let CallableTarget::ScriptFunction(function_id) = prototype.target else {
+            return Err(VmError::InvalidFrameState(
+                "virtual frame prototype is not a script function",
+            ));
+        };
+        let function = vm
+            .program
+            .script_functions
+            .get(function_id as usize)
+            .ok_or(VmError::InvalidCallablePrototype(prototype_id))?;
+        if locals_len != prototype.frame_local_count {
+            return Err(VmError::InvalidFrameState(
+                "virtual frame local count does not match prototype",
+            ));
+        }
+        if call_ip.saturating_add(2) != return_ip
+            || vm.program.code.get(call_ip).copied() != Some(crate::OpCode::CallValue as u8)
+            || return_ip > vm.program.code.len()
+            || resume_ip < function.entry_ip as usize
+            || resume_ip >= function.end_ip as usize
+        {
+            return Err(VmError::InvalidFrameState(
+                "virtual frame continuation metadata is invalid",
+            ));
+        }
+
+        let operand_stack_base = vm.stack.len();
+        let local_base = vm.locals.len();
+        vm.stack.reserve(stack_len);
+        vm.locals.reserve(locals_len);
+        for index in 0..stack_len {
+            vm.stack
+                .push(unsafe { std::ptr::read(stack_src.add(index)) });
+        }
+        for index in 0..locals_len {
+            vm.locals
+                .push(unsafe { std::ptr::read(locals_src.add(index)) });
+        }
+        vm.execution_frames.push(ExecutionFrame {
+            continuation: FrameContinuation::ResumeBytecode { return_ip },
+            operand_stack_base,
+            local_base,
+            local_count: locals_len,
+            prototype_id: Some(prototype_id),
+        });
+        vm.call_depth = vm.script_frame_depth();
+        vm.ip = resume_ip;
+        Ok(STATUS_CONTINUE)
+    })
+}
+
 pub(crate) extern "C" fn pd_vm_native_map_has(repr_ptr: *mut u8, key: *const Value) -> i32 {
     if repr_ptr.is_null() || key.is_null() {
         store_bridge_error(VmError::JitNative(
@@ -1832,7 +1929,107 @@ pub(crate) extern "C" fn pd_vm_native_step(vm: *mut Vm, op: i64, a: i64, b: i64,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{CallablePrototype, FunctionRegion, Program, RootCallableBinding, ScriptFunction};
     use std::mem::{ManuallyDrop, MaybeUninit};
+
+    fn virtual_frame_program() -> Program {
+        Program::new(
+            Vec::new(),
+            vec![crate::OpCode::CallValue as u8, 0, crate::OpCode::Ret as u8],
+        )
+        .with_callable_metadata(
+            vec![ScriptFunction {
+                entry_ip: 2,
+                end_ip: 3,
+            }],
+            vec![CallablePrototype {
+                kind: CallableKind::FunctionItem,
+                target: CallableTarget::ScriptFunction(0),
+                arity: 0,
+                frame_local_count: 1,
+                parameter_slots: Vec::new(),
+                capture_source_slots: Vec::new(),
+                capture_slots: Vec::new(),
+                capture_modes: Vec::new(),
+                self_slot: None,
+                schema: None,
+            }],
+            vec![FunctionRegion {
+                start_ip: 2,
+                end_ip: 3,
+                prototype_id: Some(0),
+            }],
+            vec![RootCallableBinding {
+                local_slot: 0,
+                prototype_id: 0,
+            }],
+        )
+    }
+
+    #[test]
+    fn virtual_frame_restore_is_atomic_for_invalid_metadata() {
+        let mut vm = Vm::new(virtual_frame_program());
+        let locals = [Value::Int(7)];
+        let before = (
+            vm.ip,
+            vm.stack.len(),
+            vm.locals.len(),
+            vm.execution_frames.len(),
+            vm.call_depth,
+        );
+        let status = pd_vm_native_restore_virtual_frame(
+            &mut vm,
+            99,
+            0,
+            2,
+            2,
+            std::ptr::null(),
+            0,
+            locals.as_ptr(),
+            locals.len(),
+        );
+        assert_eq!(status, STATUS_ERROR);
+        assert_eq!(
+            before,
+            (
+                vm.ip,
+                vm.stack.len(),
+                vm.locals.len(),
+                vm.execution_frames.len(),
+                vm.call_depth,
+            )
+        );
+        let _ = take_bridge_error();
+    }
+
+    #[test]
+    fn virtual_frame_restore_builds_script_frame_from_materialized_values() {
+        let mut vm = Vm::new(virtual_frame_program());
+        let mut locals = ManuallyDrop::new(vec![Value::Int(7)]);
+        let status = pd_vm_native_restore_virtual_frame(
+            &mut vm,
+            0,
+            0,
+            2,
+            2,
+            std::ptr::null(),
+            0,
+            locals.as_mut_ptr(),
+            locals.len(),
+        );
+        assert_eq!(status, STATUS_CONTINUE);
+        assert_eq!(vm.ip, 2);
+        assert_eq!(vm.call_depth, 1);
+        assert_eq!(vm.execution_frames.len(), 2);
+        assert_eq!(vm.locals.last(), Some(&Value::Int(7)));
+        let frame = vm.execution_frames.last().unwrap();
+        assert_eq!(frame.prototype_id, Some(0));
+        assert_eq!(frame.local_count, 1);
+        assert_eq!(
+            frame.continuation,
+            FrameContinuation::ResumeBytecode { return_ip: 2 }
+        );
+    }
 
     #[test]
     fn jit_trace_exit_status_round_trips_reserved_range_boundaries() {
