@@ -1447,7 +1447,7 @@ fn build_host_call_latency_source(name: &str, arity: u8, calls: i64) -> String {
     match arity {
         0 => format!(
             r#"
-            fn {name}();
+            fn {name}() -> int;
             let mut i = 0;
             let mut sum = 0;
             while i < {calls} {{
@@ -1459,7 +1459,7 @@ fn build_host_call_latency_source(name: &str, arity: u8, calls: i64) -> String {
         ),
         1 => format!(
             r#"
-            fn {name}(x);
+            fn {name}(x) -> int;
             let mut i = 0;
             let mut sum = 0;
             while i < {calls} {{
