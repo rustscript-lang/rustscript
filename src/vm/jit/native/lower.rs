@@ -4704,6 +4704,12 @@ fn lower_ssa_exit_block(
         deopt_addrs,
     };
 
+    let mut tagged_local_counts = HashMap::<SsaValueId, usize>::new();
+    for (materialization, dirty) in exit.locals.iter().zip(&exit.dirty_locals) {
+        if *dirty && let SsaMaterialization::Value(value) = materialization {
+            *tagged_local_counts.entry(*value).or_default() += 1;
+        }
+    }
     let mut moved_owned_values = BTreeSet::new();
     let inline_owned_restore = exit.virtual_frames.is_empty()
         && entry_stack_depth == 0
@@ -4721,10 +4727,14 @@ fn lower_ssa_exit_block(
                     | SsaMaterialization::BoxBool(_)
                     | SsaMaterialization::BoxFloat(_) => true,
                     SsaMaterialization::Value(value) => {
-                        owned_value_temps
-                            .slots
-                            .contains_key(&SsaTempValueSlotKey::Output(*value))
-                            && moved_owned_values.insert(*value)
+                        if tagged_local_counts.get(value) == Some(&1)
+                            && owned_value_temps
+                                .slots
+                                .contains_key(&SsaTempValueSlotKey::Output(*value))
+                        {
+                            moved_owned_values.insert(*value);
+                        }
+                        true
                     }
                     SsaMaterialization::BoxHeapPtr { .. } => true,
                 }
@@ -4755,7 +4765,12 @@ fn lower_ssa_exit_block(
                 })?,
             );
             let dst_addr = ssa_value_addr(b, pointer_type, vm_locals_ptr, index, layout.value.size);
-            if matches!(materialization, SsaMaterialization::BoxHeapPtr { .. }) {
+            let clone_before_clear = match materialization {
+                SsaMaterialization::BoxHeapPtr { .. } => true,
+                SsaMaterialization::Value(value) => !moved_owned_values.contains(value),
+                _ => false,
+            };
+            if clone_before_clear {
                 let temp_slot = ssa_create_value_stack_slot(b, layout.value.size)?;
                 let temp_addr = b.ins().stack_addr(pointer_type, temp_slot, 0);
                 ssa_materialize_slot(b, materialize_ctx, materialization, temp_addr, "local")?;
