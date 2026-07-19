@@ -16,9 +16,10 @@ use crate::vm::native::{
     array_set_signature, box_heap_value_signature, checked_add_i32, clear_value_slot_entry_address,
     clone_value_signature, clone_value_to_slot_entry_address, collection_get_signature,
     collection_predicate_signature, copy_bytes_entry_address, copy_bytes_signature,
-    detect_native_stack_layout, enter_call_value_entry_address, enter_call_value_signature,
-    entry_signature, frame_state_entry_address, frame_state_signature, free_buffer_signature,
-    jump_with_status, leave_frame_entry_address, leave_frame_signature, map_get_entry_address,
+    detect_native_stack_layout, enter_call_value_inherited_entry_address,
+    enter_call_value_inherited_signature, entry_signature, frame_state_entry_address,
+    frame_state_signature, free_buffer_signature, jump_with_status,
+    leave_frame_inherited_entry_address, leave_frame_inherited_signature, map_get_entry_address,
     map_has_entry_address, map_iter_next_entry_address, map_iter_next_signature,
     map_iter_take_key_entry_address, map_iter_take_signature, map_iter_take_value_entry_address,
     map_set_entry_address, map_set_signature, non_yielding_host_call_entry_address,
@@ -54,6 +55,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static CRANELIFT_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 static CRANELIFT_JIT_ISA: OnceLock<Result<OwnedTargetIsa, String>> = OnceLock::new();
 static CRANELIFT_TAIL_ISA: OnceLock<Result<OwnedTargetIsa, String>> = OnceLock::new();
+
+const MAX_INHERITED_ENTRY_VALUES: usize = 256;
+const INHERITED_STATE_ACTIVE_OFFSET: i32 = 0;
+const INHERITED_STATE_FRAME_KEY_OFFSET: i32 = 8;
+const INHERITED_STATE_STACK_BASE_OFFSET: i32 = 16;
+const INHERITED_STATE_LOCAL_BASE_OFFSET: i32 = 24;
+const INHERITED_STATE_DYNAMIC_TARGET_OFFSET: i32 = 32;
+const INHERITED_STATE_VALUES_OFFSET: i32 = 40;
 
 type TaggedConstants = (Box<[Value]>, HashMap<SsaValueId, usize>);
 
@@ -109,6 +118,12 @@ fn tail_entry_signature(pointer_type: cranelift_codegen::ir::Type) -> Signature 
     let mut signature = Signature::new(CallConv::Tail);
     signature.params.push(AbiParam::new(pointer_type));
     signature.returns.push(AbiParam::new(types::I32));
+    signature
+}
+
+fn inherited_tail_entry_signature(pointer_type: cranelift_codegen::ir::Type) -> Signature {
+    let mut signature = tail_entry_signature(pointer_type);
+    signature.params.push(AbiParam::new(pointer_type));
     signature
 }
 
@@ -231,6 +246,55 @@ pub(crate) fn compile_system_tail_wrapper(root_entry: *const u8) -> VmResult<Com
     )
 }
 
+pub(crate) fn compile_system_inherited_tail_wrapper(
+    root_entry: *const u8,
+) -> VmResult<CompiledTailFunction> {
+    let root_entry = root_entry as usize;
+    compile_standalone_native_function(
+        "pd_vm_inherited_tail_wrapper",
+        entry_signature,
+        move |builder, pointer_type, _| {
+            let entry = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+            let vm_ptr = builder.block_params(entry)[0];
+            let pointer_bytes = u32::from(pointer_type.bits()) / 8;
+            let packet_bytes = pointer_bytes
+                .checked_mul((MAX_INHERITED_ENTRY_VALUES + 5) as u32)
+                .ok_or_else(|| {
+                    VmError::JitNative("native inherited-state packet is too large".to_string())
+                })?;
+            let packet = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                packet_bytes,
+                pointer_bytes.trailing_zeros() as u8,
+            ));
+            let packet_ptr = builder.ins().stack_addr(pointer_type, packet, 0);
+            let inactive = builder.ins().iconst(pointer_type, 0);
+            builder.ins().store(
+                MemFlags::new(),
+                inactive,
+                packet_ptr,
+                INHERITED_STATE_ACTIVE_OFFSET,
+            );
+            builder.ins().store(
+                MemFlags::new(),
+                inactive,
+                packet_ptr,
+                INHERITED_STATE_DYNAMIC_TARGET_OFFSET,
+            );
+            let root_entry = iconst_ptr_from_addr(builder, pointer_type, root_entry)?;
+            let signature = builder.import_signature(inherited_tail_entry_signature(pointer_type));
+            let call = builder
+                .ins()
+                .call_indirect(signature, root_entry, &[vm_ptr, packet_ptr]);
+            let status = builder.inst_results(call)[0];
+            builder.ins().return_(&[status]);
+            Ok(())
+        },
+    )
+}
+
 pub(crate) fn compile_tail_trace_dispatcher(
     trace_entry: *const u8,
     trace_id: usize,
@@ -243,7 +307,7 @@ pub(crate) fn compile_tail_trace_dispatcher(
         detect_native_stack_layout()?.vm_jit_native_active_direct_trace_id_offset;
     compile_standalone_native_function(
         "pd_vm_tail_trace_dispatch",
-        |pointer_type, _| tail_entry_signature(pointer_type),
+        |pointer_type, _| inherited_tail_entry_signature(pointer_type),
         move |builder, pointer_type, _default_call_conv| {
             let entry = builder.create_block();
             let return_status = builder.create_block();
@@ -251,6 +315,7 @@ pub(crate) fn compile_tail_trace_dispatcher(
             builder.append_block_param(return_status, types::I32);
             builder.switch_to_block(entry);
             let vm_ptr = builder.block_params(entry)[0];
+            let inherited_state_ptr = builder.block_params(entry)[1];
             let trace_id = i64::try_from(trace_id)
                 .map_err(|_| VmError::JitNative("native trace id exceeds i64".to_string()))?;
             let trace_id = builder.ins().iconst(pointer_type, trace_id);
@@ -258,12 +323,67 @@ pub(crate) fn compile_tail_trace_dispatcher(
                 .ins()
                 .store(MemFlags::new(), trace_id, vm_ptr, active_trace_offset);
             let trace_entry = iconst_ptr_from_addr(builder, pointer_type, trace_entry)?;
-            let trace_signature = builder.import_signature(tail_entry_signature(pointer_type));
-            let call = builder
-                .ins()
-                .call_indirect(trace_signature, trace_entry, &[vm_ptr]);
+            let trace_signature =
+                builder.import_signature(inherited_tail_entry_signature(pointer_type));
+            let call = builder.ins().call_indirect(
+                trace_signature,
+                trace_entry,
+                &[vm_ptr, inherited_state_ptr],
+            );
             let status = builder.inst_results(call)[0];
 
+            let static_dispatch = builder.create_block();
+            let dynamic_check = builder.create_block();
+            let dynamic_linked = builder.create_block();
+            builder.append_block_param(static_dispatch, types::I32);
+            let is_linked_continue = builder.ins().icmp_imm(
+                IntCC::Equal,
+                status,
+                i64::from(crate::vm::native::STATUS_LINKED_CONTINUE),
+            );
+            builder.ins().brif(
+                is_linked_continue,
+                dynamic_check,
+                &[],
+                static_dispatch,
+                &[status.into()],
+            );
+
+            builder.switch_to_block(dynamic_check);
+            let dynamic_target = builder.ins().load(
+                pointer_type,
+                MemFlags::new(),
+                inherited_state_ptr,
+                INHERITED_STATE_DYNAMIC_TARGET_OFFSET,
+            );
+            let dynamic_target_is_null = builder.ins().icmp_imm(IntCC::Equal, dynamic_target, 0);
+            builder.ins().brif(
+                dynamic_target_is_null,
+                static_dispatch,
+                &[status.into()],
+                dynamic_linked,
+                &[],
+            );
+
+            builder.switch_to_block(dynamic_linked);
+            let direct_count =
+                builder
+                    .ins()
+                    .load(types::I64, MemFlags::new(), vm_ptr, direct_link_offset);
+            let direct_count = builder.ins().iadd_imm(direct_count, 1);
+            builder
+                .ins()
+                .store(MemFlags::new(), direct_count, vm_ptr, direct_link_offset);
+            let dynamic_tail_signature =
+                builder.import_signature(inherited_tail_entry_signature(pointer_type));
+            builder.ins().return_call_indirect(
+                dynamic_tail_signature,
+                dynamic_target,
+                &[vm_ptr, inherited_state_ptr],
+            );
+
+            builder.switch_to_block(static_dispatch);
+            let status = builder.block_params(static_dispatch)[0];
             for (linked_status, slot_address) in links {
                 let slot_check = builder.create_block();
                 let next = builder.create_block();
@@ -296,10 +416,13 @@ pub(crate) fn compile_tail_trace_dispatcher(
                 builder
                     .ins()
                     .store(MemFlags::new(), direct_count, vm_ptr, direct_link_offset);
-                let tail_signature = builder.import_signature(tail_entry_signature(pointer_type));
-                builder
-                    .ins()
-                    .return_call_indirect(tail_signature, target, &[vm_ptr]);
+                let tail_signature =
+                    builder.import_signature(inherited_tail_entry_signature(pointer_type));
+                builder.ins().return_call_indirect(
+                    tail_signature,
+                    target,
+                    &[vm_ptr, inherited_state_ptr],
+                );
 
                 builder.switch_to_block(next);
             }
@@ -454,7 +577,7 @@ fn try_compile_ssa_trace(
     let call_conv = module.target_config().default_call_conv;
 
     let mut ctx = module.make_context();
-    ctx.func.signature = tail_entry_signature(pointer_type);
+    ctx.func.signature = inherited_tail_entry_signature(pointer_type);
     let clone_value_sig = clone_value_signature(pointer_type, call_conv);
     let non_yielding_host_call_sig = non_yielding_host_call_signature(pointer_type, call_conv);
     let non_yielding_scalar_host_call_sig =
@@ -478,8 +601,8 @@ fn try_compile_ssa_trace(
     let map_set_sig = map_set_signature(pointer_type, call_conv);
     let sparse_restore_exit_sig = sparse_restore_exit_signature(pointer_type, call_conv);
     let frame_state_sig = frame_state_signature(pointer_type, call_conv);
-    let leave_frame_sig = leave_frame_signature(pointer_type, call_conv);
-    let enter_call_value_sig = enter_call_value_signature(pointer_type, call_conv);
+    let leave_frame_sig = leave_frame_inherited_signature(pointer_type, call_conv);
+    let enter_call_value_sig = enter_call_value_inherited_signature(pointer_type, call_conv);
 
     let resume_linked_trace_sig = entry_signature(pointer_type, call_conv);
     let string_contains_sig = string_contains_signature(pointer_type, call_conv);
@@ -581,8 +704,8 @@ fn try_compile_ssa_trace(
             array_set: array_set_entry_address(),
             map_set: map_set_entry_address(),
             sparse_restore_exit: restore_active_sparse_exit_state_entry_address(),
-            leave_frame: leave_frame_entry_address(),
-            enter_call_value: enter_call_value_entry_address(),
+            leave_frame: leave_frame_inherited_entry_address(),
+            enter_call_value: enter_call_value_inherited_entry_address(),
 
             resume_linked_trace: resume_linked_trace_entry_address(),
         };
@@ -681,15 +804,97 @@ fn try_compile_ssa_trace(
         b.switch_to_block(entry_block);
         b.append_block_params_for_function_params(entry_block);
         let vm_ptr = b.block_params(entry_block)[0];
-        let entry_local_count = ssa
+        let inherited_state_ptr = b.block_params(entry_block)[1];
+        let entry_ssa_block = ssa
             .blocks
             .get(ssa.entry.index())
-            .and_then(|block| block.params.len().checked_sub(ssa.entry_stack_depth))
+            .ok_or_else(|| VmError::JitNative("SSA entry block is missing".to_string()))?;
+        let entry_local_count = entry_ssa_block
+            .params
+            .len()
+            .checked_sub(ssa.entry_stack_depth)
             .ok_or_else(|| {
                 VmError::JitNative(
                     "SSA entry stack depth exceeds entry parameter count".to_string(),
                 )
             })?;
+        let entry_ready = b.create_block();
+        b.append_block_param(entry_ready, pointer_type);
+        b.append_block_param(entry_ready, pointer_type);
+        for param in &entry_ssa_block.params {
+            let ty = ssa_type(pointer_type, param.value.repr).ok_or_else(|| {
+                VmError::JitNative("SSA inherited entry parameter type is unsupported".to_string())
+            })?;
+            b.append_block_param(entry_ready, ty);
+        }
+
+        let normal_entry = b.create_block();
+        if entry_ssa_block.params.len() <= MAX_INHERITED_ENTRY_VALUES {
+            let inherited_candidate = b.create_block();
+            let inherited_entry = b.create_block();
+            let active = b.ins().load(
+                pointer_type,
+                MemFlags::new(),
+                inherited_state_ptr,
+                INHERITED_STATE_ACTIVE_OFFSET,
+            );
+            let has_inherited_state = b.ins().icmp_imm(IntCC::NotEqual, active, 0);
+            b.ins().brif(
+                has_inherited_state,
+                inherited_candidate,
+                &[],
+                normal_entry,
+                &[],
+            );
+
+            b.switch_to_block(inherited_candidate);
+            let inherited_frame_key = b.ins().load(
+                pointer_type,
+                MemFlags::new(),
+                inherited_state_ptr,
+                INHERITED_STATE_FRAME_KEY_OFFSET,
+            );
+            let expected_frame_key = b.ins().iconst(pointer_type, trace.frame_key as i64);
+            let frame_matches = b
+                .ins()
+                .icmp(IntCC::Equal, inherited_frame_key, expected_frame_key);
+            b.ins()
+                .brif(frame_matches, inherited_entry, &[], normal_entry, &[]);
+
+            b.switch_to_block(inherited_entry);
+            let active_stack_base = b.ins().load(
+                pointer_type,
+                MemFlags::new(),
+                inherited_state_ptr,
+                INHERITED_STATE_STACK_BASE_OFFSET,
+            );
+            let active_local_base = b.ins().load(
+                pointer_type,
+                MemFlags::new(),
+                inherited_state_ptr,
+                INHERITED_STATE_LOCAL_BASE_OFFSET,
+            );
+            let inherited_args = build_inherited_entry_args(
+                &mut b,
+                inherited_state_ptr,
+                pointer_type,
+                entry_ssa_block.params.len(),
+            )?;
+            let inactive = b.ins().iconst(pointer_type, 0);
+            b.ins().store(
+                MemFlags::new(),
+                inactive,
+                inherited_state_ptr,
+                INHERITED_STATE_ACTIVE_OFFSET,
+            );
+            let mut ready_args = vec![active_stack_base.into(), active_local_base.into()];
+            ready_args.extend(ssa_block_args(inherited_args));
+            b.ins().jump(entry_ready, &ready_args);
+        } else {
+            b.ins().jump(normal_entry, &[]);
+        }
+
+        b.switch_to_block(normal_entry);
         let (active_stack_base, active_local_base) = emit_frame_state_entry_guard(
             &mut b,
             vm_ptr,
@@ -702,10 +907,31 @@ fn try_compile_ssa_trace(
             ssa.entry_stack_depth,
             entry_local_count,
         )?;
+        let normal_args = build_entry_args(
+            &mut b,
+            vm_ptr,
+            pointer_type,
+            layout,
+            offsets,
+            active_stack_base,
+            active_local_base,
+            ssa.entry_stack_depth,
+            entry_local_count,
+        )?;
+        let mut ready_args = vec![active_stack_base.into(), active_local_base.into()];
+        ready_args.extend(ssa_block_args(normal_args));
+        b.ins().jump(entry_ready, &ready_args);
+
+        b.switch_to_block(entry_ready);
+        let ready_params = b.block_params(entry_ready).to_vec();
+        let active_stack_base = ready_params[0];
+        let active_local_base = ready_params[1];
         let interrupt_ops_to_advance = u32::try_from(trace.op_names.len().max(1))
             .map_err(|_| VmError::JitNative("trace op count exceeds u32".to_string()))?;
         let lower_ctx = SsaLowerCtx {
             vm_ptr,
+            inherited_state_ptr,
+            frame_key: trace.frame_key,
             active_stack_base,
             active_local_base,
             exit_block,
@@ -736,19 +962,8 @@ fn try_compile_ssa_trace(
         let entry_handle = *block_handles
             .get(&ssa.entry)
             .ok_or_else(|| VmError::JitNative("SSA entry block handle missing".to_string()))?;
-        let entry_args = build_entry_args(
-            &mut b,
-            vm_ptr,
-            pointer_type,
-            layout,
-            offsets,
-            active_stack_base,
-            active_local_base,
-            ssa.entry_stack_depth,
-            entry_local_count,
-        )?;
         init_owned_value_temps(&mut b, pointer_type, layout.value, &owned_value_temps)?;
-        let entry_args = ssa_block_args(entry_args);
+        let entry_args = ssa_block_args(ready_params[2..].to_vec());
         b.ins().jump(entry_handle, &entry_args);
 
         let charge_blocks = ssa_interrupt_charge_blocks(ssa);
@@ -1005,6 +1220,8 @@ impl<'a> InternalRegionLinks<'a> {
 #[derive(Clone, Copy)]
 struct SsaLowerCtx<'a> {
     vm_ptr: cranelift_codegen::ir::Value,
+    inherited_state_ptr: cranelift_codegen::ir::Value,
+    frame_key: u64,
     active_stack_base: cranelift_codegen::ir::Value,
     active_local_base: cranelift_codegen::ir::Value,
     exit_block: Block,
@@ -1576,6 +1793,40 @@ fn ssa_backedge_targets(
         | SsaTerminator::CallValue { .. } => {}
     }
     targets
+}
+
+fn build_inherited_entry_args(
+    b: &mut FunctionBuilder,
+    inherited_state_ptr: cranelift_codegen::ir::Value,
+    pointer_type: cranelift_codegen::ir::Type,
+    entry_value_count: usize,
+) -> VmResult<Vec<cranelift_codegen::ir::Value>> {
+    if entry_value_count > MAX_INHERITED_ENTRY_VALUES {
+        return Err(VmError::JitNative(
+            "SSA inherited entry value count exceeds packet capacity".to_string(),
+        ));
+    }
+    (0..entry_value_count)
+        .map(|index| {
+            let byte_offset = index
+                .checked_mul(std::mem::size_of::<usize>())
+                .and_then(|offset| {
+                    usize::try_from(INHERITED_STATE_VALUES_OFFSET)
+                        .ok()
+                        .and_then(|base| base.checked_add(offset))
+                })
+                .and_then(|offset| i32::try_from(offset).ok())
+                .ok_or_else(|| {
+                    VmError::JitNative("SSA inherited entry packet offset exceeds i32".to_string())
+                })?;
+            Ok(b.ins().load(
+                pointer_type,
+                MemFlags::new(),
+                inherited_state_ptr,
+                byte_offset,
+            ))
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3983,6 +4234,7 @@ fn ssa_leave_frame_status(
     helper_refs: SsaDeoptHelperRefs,
     helper_addrs: SsaDeoptHelperAddrs,
     vm_ptr: cranelift_codegen::ir::Value,
+    inherited_state_ptr: cranelift_codegen::ir::Value,
     ret_ip: usize,
 ) -> VmResult<cranelift_codegen::ir::Value> {
     let helper_ptr = iconst_ptr_from_addr(b, pointer_type, helper_addrs.leave_frame)?;
@@ -3991,9 +4243,11 @@ fn ssa_leave_frame_status(
         i64::try_from(ret_ip)
             .map_err(|_| VmError::JitNative("SSA return ip out of range".to_string()))?,
     );
-    let call = b
-        .ins()
-        .call_indirect(helper_refs.leave_frame_ref, helper_ptr, &[vm_ptr, ret_ip]);
+    let call = b.ins().call_indirect(
+        helper_refs.leave_frame_ref,
+        helper_ptr,
+        &[vm_ptr, ret_ip, inherited_state_ptr],
+    );
     Ok(b.inst_results(call)[0])
 }
 
@@ -4003,6 +4257,7 @@ fn ssa_exit_action_status(
     helper_refs: SsaDeoptHelperRefs,
     helper_addrs: SsaDeoptHelperAddrs,
     vm_ptr: cranelift_codegen::ir::Value,
+    inherited_state_ptr: cranelift_codegen::ir::Value,
     exit: &crate::vm::jit::ir::SsaExit,
     action: SsaExitAction,
 ) -> VmResult<cranelift_codegen::ir::Value> {
@@ -4014,6 +4269,7 @@ fn ssa_exit_action_status(
             helper_refs,
             helper_addrs,
             vm_ptr,
+            inherited_state_ptr,
             exit.exit_ip,
         ),
         SsaExitAction::CallValue {
@@ -4038,7 +4294,7 @@ fn ssa_exit_action_status(
             let call = b.ins().call_indirect(
                 helper_refs.enter_call_value_ref,
                 helper_ptr,
-                &[vm_ptr, argc, call_ip, resume_ip],
+                &[vm_ptr, argc, call_ip, resume_ip, inherited_state_ptr],
             );
             Ok(b.inst_results(call)[0])
         }
@@ -4063,6 +4319,124 @@ fn ssa_exit_action_status(
     }
 }
 
+fn write_inherited_state_packet(
+    b: &mut FunctionBuilder,
+    ctx: SsaLowerCtx<'_>,
+    exit: &crate::vm::jit::ir::SsaExit,
+) -> VmResult<()> {
+    let entry_value_count = exit
+        .stack
+        .len()
+        .checked_add(exit.locals.len())
+        .ok_or_else(|| VmError::JitNative("SSA inherited exit value count overflow".to_string()))?;
+    if entry_value_count > MAX_INHERITED_ENTRY_VALUES {
+        return Ok(());
+    }
+
+    let frame_key = b.ins().iconst(ctx.pointer_type, ctx.frame_key as i64);
+    b.ins().store(
+        MemFlags::new(),
+        frame_key,
+        ctx.inherited_state_ptr,
+        INHERITED_STATE_FRAME_KEY_OFFSET,
+    );
+    b.ins().store(
+        MemFlags::new(),
+        ctx.active_stack_base,
+        ctx.inherited_state_ptr,
+        INHERITED_STATE_STACK_BASE_OFFSET,
+    );
+    b.ins().store(
+        MemFlags::new(),
+        ctx.active_local_base,
+        ctx.inherited_state_ptr,
+        INHERITED_STATE_LOCAL_BASE_OFFSET,
+    );
+    let stack_ptr = b.ins().load(
+        ctx.pointer_type,
+        MemFlags::new(),
+        ctx.vm_ptr,
+        ctx.offsets.stack_ptr,
+    );
+    let stack_base_ptr = ssa_value_addr(
+        b,
+        ctx.pointer_type,
+        stack_ptr,
+        ctx.active_stack_base,
+        ctx.layout.value.size,
+    );
+    let locals_ptr = b.ins().load(
+        ctx.pointer_type,
+        MemFlags::new(),
+        ctx.vm_ptr,
+        ctx.offsets.locals_ptr,
+    );
+    let locals_base_ptr = ssa_value_addr(
+        b,
+        ctx.pointer_type,
+        locals_ptr,
+        ctx.active_local_base,
+        ctx.layout.value.size,
+    );
+    for index in 0..entry_value_count {
+        let value_addr = if index < exit.stack.len() {
+            let stack_index = b.ins().iconst(
+                ctx.pointer_type,
+                i64::try_from(index).map_err(|_| {
+                    VmError::JitNative("SSA inherited stack index exceeds i64".to_string())
+                })?,
+            );
+            ssa_value_addr(
+                b,
+                ctx.pointer_type,
+                stack_base_ptr,
+                stack_index,
+                ctx.layout.value.size,
+            )
+        } else {
+            let local_index = index - exit.stack.len();
+            let local_index = b.ins().iconst(
+                ctx.pointer_type,
+                i64::try_from(local_index).map_err(|_| {
+                    VmError::JitNative("SSA inherited local index exceeds i64".to_string())
+                })?,
+            );
+            ssa_value_addr(
+                b,
+                ctx.pointer_type,
+                locals_base_ptr,
+                local_index,
+                ctx.layout.value.size,
+            )
+        };
+        let packet_offset = index
+            .checked_mul(std::mem::size_of::<usize>())
+            .and_then(|offset| {
+                usize::try_from(INHERITED_STATE_VALUES_OFFSET)
+                    .ok()
+                    .and_then(|base| base.checked_add(offset))
+            })
+            .and_then(|offset| i32::try_from(offset).ok())
+            .ok_or_else(|| {
+                VmError::JitNative("SSA inherited packet offset exceeds i32".to_string())
+            })?;
+        b.ins().store(
+            MemFlags::new(),
+            value_addr,
+            ctx.inherited_state_ptr,
+            packet_offset,
+        );
+    }
+    let active = b.ins().iconst(ctx.pointer_type, 1);
+    b.ins().store(
+        MemFlags::new(),
+        active,
+        ctx.inherited_state_ptr,
+        INHERITED_STATE_ACTIVE_OFFSET,
+    );
+    Ok(())
+}
+
 fn lower_ssa_exit_block(
     b: &mut FunctionBuilder,
     ctx: SsaLowerCtx<'_>,
@@ -4072,6 +4446,7 @@ fn lower_ssa_exit_block(
 ) -> VmResult<()> {
     let SsaLowerCtx {
         vm_ptr,
+        inherited_state_ptr,
         active_local_base,
         exit_block,
         pointer_type,
@@ -4131,7 +4506,7 @@ fn lower_ssa_exit_block(
                             .contains_key(&SsaTempValueSlotKey::Output(*value))
                             && moved_owned_values.insert(*value)
                     }
-                    SsaMaterialization::BoxHeapPtr { .. } => false,
+                    SsaMaterialization::BoxHeapPtr { .. } => true,
                 }
             });
     if inline_owned_restore {
@@ -4178,12 +4553,16 @@ fn lower_ssa_exit_block(
         );
         b.ins()
             .store(MemFlags::new(), ip_val, vm_ptr, offsets.vm_ip);
+        if matches!(action, SsaExitAction::TraceExit { .. }) {
+            write_inherited_state_packet(b, ctx, exit)?;
+        }
         let status = ssa_exit_action_status(
             b,
             pointer_type,
             deopt_refs,
             deopt_addrs,
             vm_ptr,
+            inherited_state_ptr,
             exit,
             action,
         )?;
@@ -4270,12 +4649,16 @@ fn lower_ssa_exit_block(
             ip_val,
         ],
     )?;
+    if matches!(action, SsaExitAction::TraceExit { .. }) {
+        write_inherited_state_packet(b, ctx, exit)?;
+    }
     let status = ssa_exit_action_status(
         b,
         pointer_type,
         deopt_refs,
         deopt_addrs,
         vm_ptr,
+        inherited_state_ptr,
         exit,
         action,
     )?;
@@ -5432,7 +5815,7 @@ pub(crate) fn compile_trace(
     let tail_entry = body.tail_entry;
     let lowering_kind = body.lowering_kind;
     let mut code = body.code;
-    let mut wrapper = compile_system_tail_wrapper(tail_entry)?;
+    let mut wrapper = compile_system_inherited_tail_wrapper(tail_entry)?;
     code.extend_from_slice(&wrapper.code);
     wrapper._keepalive.dependencies.push(body.keepalive);
     Ok(CompiledTrace {

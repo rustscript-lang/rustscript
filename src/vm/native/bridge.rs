@@ -135,7 +135,7 @@ unsafe fn arc_from_repr_ptr<T>(ptr: *mut u8) -> Arc<T> {
     unsafe { std::mem::transmute_copy(&ptr) }
 }
 
-fn run_step<F>(vm: *mut Vm, helper_name: &str, f: F) -> i32
+fn run_step<F>(vm: *mut Vm, helper_name: &'static str, f: F) -> i32
 where
     F: FnOnce(&mut Vm) -> VmResult<i32>,
 {
@@ -146,6 +146,7 @@ where
         return STATUS_ERROR;
     };
 
+    vm_ref.record_native_bridge_hit(helper_name);
     match f(vm_ref) {
         Ok(status) => status,
         Err(err) => {
@@ -299,8 +300,16 @@ pub(crate) fn enter_call_value_entry_address() -> usize {
     pd_vm_native_enter_call_value as *const () as usize
 }
 
+pub(crate) fn enter_call_value_inherited_entry_address() -> usize {
+    pd_vm_native_enter_call_value_inherited as *const () as usize
+}
+
 pub(crate) fn leave_frame_entry_address() -> usize {
     pd_vm_native_leave_frame as *const () as usize
+}
+
+pub(crate) fn leave_frame_inherited_entry_address() -> usize {
+    pd_vm_native_leave_frame_inherited as *const () as usize
 }
 
 pub(crate) fn active_local_base_entry_address() -> usize {
@@ -774,6 +783,109 @@ pub(crate) extern "C" fn pd_vm_native_restore_exit_state(
     })
 }
 
+fn native_frame_state(vm: &Vm) -> VmResult<NativeFrameState> {
+    let frame = vm.execution_frames.last();
+    let operand_stack_base = frame.map(|frame| frame.operand_stack_base).unwrap_or(0);
+    let local_base = frame.map(|frame| frame.local_base).unwrap_or(0);
+    let local_count = frame
+        .map(|frame| frame.local_count)
+        .unwrap_or(vm.locals.len());
+    let active_stack_len = vm
+        .stack
+        .len()
+        .checked_sub(operand_stack_base)
+        .ok_or_else(|| {
+            VmError::JitNative("native frame-state stack base exceeds stack length".to_string())
+        })?;
+    let frame_key = frame
+        .and_then(|frame| frame.prototype_id)
+        .map(u64::from)
+        .unwrap_or(ROOT_FRAME_KEY);
+    let continuation_kind = match frame.map(|frame| &frame.continuation) {
+        Some(FrameContinuation::Halt) | None => 0,
+        Some(FrameContinuation::ResumeBytecode { .. }) => 1,
+        Some(FrameContinuation::ReturnToHost) => 2,
+    };
+    Ok(NativeFrameState {
+        frame_key,
+        operand_stack_base,
+        active_stack_len,
+        local_base,
+        local_count,
+        frame_depth: vm.call_depth,
+        continuation_kind,
+    })
+}
+
+fn write_inherited_state_packet(vm: &Vm, packet: *mut u8) -> VmResult<()> {
+    use super::{
+        INHERITED_STATE_ACTIVE_OFFSET, INHERITED_STATE_DYNAMIC_TARGET_OFFSET,
+        INHERITED_STATE_FRAME_KEY_OFFSET, INHERITED_STATE_LOCAL_BASE_OFFSET,
+        INHERITED_STATE_STACK_BASE_OFFSET, INHERITED_STATE_VALUES_OFFSET,
+        MAX_INHERITED_ENTRY_VALUES,
+    };
+
+    if packet.is_null() {
+        return Err(VmError::JitNative(
+            "native inherited-state packet pointer is null".to_string(),
+        ));
+    }
+    let state = native_frame_state(vm)?;
+    let value_count = state
+        .active_stack_len
+        .checked_add(state.local_count)
+        .ok_or_else(|| VmError::JitNative("native inherited value count overflow".to_string()))?;
+    unsafe {
+        packet
+            .add(INHERITED_STATE_ACTIVE_OFFSET as usize)
+            .cast::<usize>()
+            .write(0);
+        packet
+            .add(INHERITED_STATE_DYNAMIC_TARGET_OFFSET as usize)
+            .cast::<usize>()
+            .write(0);
+    }
+    if value_count > MAX_INHERITED_ENTRY_VALUES {
+        return Ok(());
+    }
+    unsafe {
+        packet
+            .add(INHERITED_STATE_FRAME_KEY_OFFSET as usize)
+            .cast::<u64>()
+            .write(state.frame_key);
+        packet
+            .add(INHERITED_STATE_STACK_BASE_OFFSET as usize)
+            .cast::<usize>()
+            .write(state.operand_stack_base);
+        packet
+            .add(INHERITED_STATE_LOCAL_BASE_OFFSET as usize)
+            .cast::<usize>()
+            .write(state.local_base);
+        let values = packet
+            .add(INHERITED_STATE_VALUES_OFFSET as usize)
+            .cast::<*const Value>();
+        let stack = vm.stack.as_ptr().add(state.operand_stack_base);
+        for index in 0..state.active_stack_len {
+            values.add(index).write(stack.add(index));
+        }
+        let locals = vm.locals.as_ptr().add(state.local_base);
+        for index in 0..state.local_count {
+            values
+                .add(state.active_stack_len + index)
+                .write(locals.add(index));
+        }
+        packet
+            .add(INHERITED_STATE_DYNAMIC_TARGET_OFFSET as usize)
+            .cast::<usize>()
+            .write(vm.jit_native_inherited_target());
+        packet
+            .add(INHERITED_STATE_ACTIVE_OFFSET as usize)
+            .cast::<usize>()
+            .write(1);
+    }
+    Ok(())
+}
+
 pub(crate) extern "C" fn pd_vm_native_frame_state(vm: *mut Vm, out: *mut NativeFrameState) -> i32 {
     run_step(vm, "frame_state", |vm| {
         if out.is_null() {
@@ -781,41 +893,43 @@ pub(crate) extern "C" fn pd_vm_native_frame_state(vm: *mut Vm, out: *mut NativeF
                 "native frame-state helper received null output".to_string(),
             ));
         }
-        let frame = vm.execution_frames.last();
-        let operand_stack_base = frame.map(|frame| frame.operand_stack_base).unwrap_or(0);
-        let local_base = frame.map(|frame| frame.local_base).unwrap_or(0);
-        let local_count = frame
-            .map(|frame| frame.local_count)
-            .unwrap_or(vm.locals.len());
-        let active_stack_len = vm
-            .stack
-            .len()
-            .checked_sub(operand_stack_base)
-            .ok_or_else(|| {
-                VmError::JitNative("native frame-state stack base exceeds stack length".to_string())
-            })?;
-        let frame_key = frame
-            .and_then(|frame| frame.prototype_id)
-            .map(u64::from)
-            .unwrap_or(ROOT_FRAME_KEY);
-        let continuation_kind = match frame.map(|frame| &frame.continuation) {
-            Some(FrameContinuation::Halt) | None => 0,
-            Some(FrameContinuation::ResumeBytecode { .. }) => 1,
-            Some(FrameContinuation::ReturnToHost) => 2,
-        };
         unsafe {
-            out.write(NativeFrameState {
-                frame_key,
-                operand_stack_base,
-                active_stack_len,
-                local_base,
-                local_count,
-                frame_depth: vm.call_depth,
-                continuation_kind,
-            });
+            out.write(native_frame_state(vm)?);
         }
         Ok(STATUS_CONTINUE)
     })
+}
+
+fn native_enter_call_value(
+    vm: &mut Vm,
+    argc: i64,
+    call_ip: i64,
+    resume_ip: i64,
+    inherited_state: *mut u8,
+) -> VmResult<i32> {
+    let argc = u8::try_from(argc)
+        .map_err(|_| VmError::InvalidFrameState("native call argc out of range"))?;
+    let call_ip = usize::try_from(call_ip)
+        .map_err(|_| VmError::InvalidFrameState("native call ip out of range"))?;
+    let resume_ip = usize::try_from(resume_ip)
+        .map_err(|_| VmError::InvalidFrameState("native resume ip out of range"))?;
+    if vm.ip != call_ip {
+        vm.jump_to(call_ip)?;
+    }
+    if resume_ip > vm.program.code.len() {
+        return Err(VmError::BytecodeBounds);
+    }
+    vm.ip = resume_ip;
+    let status = match vm.execute_call_value(argc)? {
+        ExecOutcome::Continue => STATUS_LINKED_CONTINUE,
+        ExecOutcome::Halted => STATUS_HALTED,
+        ExecOutcome::Yielded => STATUS_YIELDED,
+        ExecOutcome::Waiting(_) => STATUS_WAITING,
+    };
+    if status == STATUS_LINKED_CONTINUE && !inherited_state.is_null() {
+        write_inherited_state_packet(vm, inherited_state)?;
+    }
+    Ok(status)
 }
 
 pub(crate) extern "C" fn pd_vm_native_enter_call_value(
@@ -825,39 +939,51 @@ pub(crate) extern "C" fn pd_vm_native_enter_call_value(
     resume_ip: i64,
 ) -> i32 {
     run_step(vm, "enter_call_value", |vm| {
-        let argc = u8::try_from(argc)
-            .map_err(|_| VmError::InvalidFrameState("native call argc out of range"))?;
-        let call_ip = usize::try_from(call_ip)
-            .map_err(|_| VmError::InvalidFrameState("native call ip out of range"))?;
-        let resume_ip = usize::try_from(resume_ip)
-            .map_err(|_| VmError::InvalidFrameState("native resume ip out of range"))?;
-        if vm.ip != call_ip {
-            vm.jump_to(call_ip)?;
-        }
-        if resume_ip > vm.program.code.len() {
-            return Err(VmError::BytecodeBounds);
-        }
-        vm.ip = resume_ip;
-        match vm.execute_call_value(argc)? {
-            ExecOutcome::Continue => Ok(STATUS_LINKED_CONTINUE),
-            ExecOutcome::Halted => Ok(STATUS_HALTED),
-            ExecOutcome::Yielded => Ok(STATUS_YIELDED),
-            ExecOutcome::Waiting(_) => Ok(STATUS_WAITING),
-        }
+        native_enter_call_value(vm, argc, call_ip, resume_ip, std::ptr::null_mut())
     })
+}
+
+pub(crate) extern "C" fn pd_vm_native_enter_call_value_inherited(
+    vm: *mut Vm,
+    argc: i64,
+    call_ip: i64,
+    resume_ip: i64,
+    inherited_state: *mut u8,
+) -> i32 {
+    run_step(vm, "enter_call_value", |vm| {
+        native_enter_call_value(vm, argc, call_ip, resume_ip, inherited_state)
+    })
+}
+
+fn native_leave_frame(vm: &mut Vm, ret_ip: i64, inherited_state: *mut u8) -> VmResult<i32> {
+    let ret_ip = usize::try_from(ret_ip)
+        .map_err(|_| VmError::InvalidFrameState("native ret ip out of range"))?;
+    vm.jump_to(ret_ip)?;
+    let status = match vm.complete_active_frame()? {
+        ExecOutcome::Continue => STATUS_LINKED_CONTINUE,
+        ExecOutcome::Halted => STATUS_HALTED,
+        ExecOutcome::Yielded => STATUS_YIELDED,
+        ExecOutcome::Waiting(_) => STATUS_WAITING,
+    };
+    if status == STATUS_LINKED_CONTINUE && !inherited_state.is_null() {
+        write_inherited_state_packet(vm, inherited_state)?;
+    }
+    Ok(status)
 }
 
 pub(crate) extern "C" fn pd_vm_native_leave_frame(vm: *mut Vm, ret_ip: i64) -> i32 {
     run_step(vm, "leave_frame", |vm| {
-        let ret_ip = usize::try_from(ret_ip)
-            .map_err(|_| VmError::InvalidFrameState("native ret ip out of range"))?;
-        vm.jump_to(ret_ip)?;
-        match vm.complete_active_frame()? {
-            ExecOutcome::Continue => Ok(STATUS_LINKED_CONTINUE),
-            ExecOutcome::Halted => Ok(STATUS_HALTED),
-            ExecOutcome::Yielded => Ok(STATUS_YIELDED),
-            ExecOutcome::Waiting(_) => Ok(STATUS_WAITING),
-        }
+        native_leave_frame(vm, ret_ip, std::ptr::null_mut())
+    })
+}
+
+pub(crate) extern "C" fn pd_vm_native_leave_frame_inherited(
+    vm: *mut Vm,
+    ret_ip: i64,
+    inherited_state: *mut u8,
+) -> i32 {
+    run_step(vm, "leave_frame", |vm| {
+        native_leave_frame(vm, ret_ip, inherited_state)
     })
 }
 

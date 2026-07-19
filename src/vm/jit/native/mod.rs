@@ -152,7 +152,7 @@ pub(crate) fn compile_native_trace_dispatcher(
     slots.insert(CONTINUE_SLOT_ID, slot);
     let dispatcher = lower::compile_tail_trace_dispatcher(trace_entry, trace_id, &descriptors)?;
     let tail_entry = dispatcher.entry();
-    let wrapper = lower::compile_system_tail_wrapper(tail_entry)?;
+    let wrapper = lower::compile_system_inherited_tail_wrapper(tail_entry)?;
     let (tail_entry, dispatcher_keepalive, dispatcher_code) = dispatcher.into_parts();
     let (entry, wrapper_keepalive, wrapper_code) = wrapper.into_parts();
     let mut code = dispatcher_code;

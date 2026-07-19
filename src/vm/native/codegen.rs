@@ -51,6 +51,16 @@ pub(crate) fn enter_call_value_signature(
 }
 
 #[cfg(feature = "cranelift-jit")]
+pub(crate) fn enter_call_value_inherited_signature(
+    pointer_type: cranelift_codegen::ir::Type,
+    call_conv: cranelift_codegen::isa::CallConv,
+) -> Signature {
+    let mut sig = enter_call_value_signature(pointer_type, call_conv);
+    sig.params.push(AbiParam::new(pointer_type));
+    sig
+}
+
+#[cfg(feature = "cranelift-jit")]
 pub(crate) fn leave_frame_signature(
     pointer_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,
@@ -59,6 +69,16 @@ pub(crate) fn leave_frame_signature(
     sig.params.push(AbiParam::new(pointer_type));
     sig.params.push(AbiParam::new(types::I64));
     sig.returns.push(AbiParam::new(types::I32));
+    sig
+}
+
+#[cfg(feature = "cranelift-jit")]
+pub(crate) fn leave_frame_inherited_signature(
+    pointer_type: cranelift_codegen::ir::Type,
+    call_conv: cranelift_codegen::isa::CallConv,
+) -> Signature {
+    let mut sig = leave_frame_signature(pointer_type, call_conv);
+    sig.params.push(AbiParam::new(pointer_type));
     sig
 }
 
