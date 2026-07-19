@@ -528,10 +528,50 @@ only if region recompilation, code duplication, or region-size limits prevent ad
 - performance is no worse than Direction 1 on the sort workload; any added complexity must be
   justified by measured region compile-time, code-size, or coverage gains
 
+**Implemented inherited-state checkpoint (2026-07-19):**
+
+- independent trace dispatchers now use a two-argument tail ABI `(vm, inherited_state)` beneath a
+  one-argument system-ABI wrapper
+- the wrapper owns a bounded packet containing frame identity, active stack/local bases, canonical
+  stack/local `Value` addresses, and a dynamic cross-frame continuation target
+- same-frame linked exits restore their classified state once, publish packet addresses, and tail to
+  the child without a child `frame_state` bridge call
+- native `CallValue` and return transitions populate the same packet after changing frames; the
+  dispatcher may tail to the already-compiled trace selected for the resulting active frame
+- frame-key validation rejects stale or incompatible packets and falls back to the original guarded
+  VM reconstruction path
+- default direct publication is enabled for same-frame edges; static cross-frame slots remain
+  opt-in, while call/return transitions use the frame-derived dynamic target to avoid polymorphic
+  continuation corruption
+- direct progress no longer activates callable-wide backoff or the old global region fallback;
+  unsupported, cold, yielding, invalidated, and missing-target paths still return to Rust
+- focused direct-cycle telemetry requires at most four steady-state `frame_state` bridge hits; the
+  escaped callable fixture retains bounded bridge reloads and all direct-link lifetime, generation,
+  interruption, ownership, and stack-depth tests remain active
+
+CPU 11 four-round alternating Criterion gate, frozen crates.io `pd-vm 0.23.1` binary versus the
+inherited-state candidate (point estimates, milliseconds):
+
+| Round | `0.23.1` | inherited-state candidate |
+|---:|---:|---:|
+| 1 | `61.289` | `132.890` |
+| 2 | `82.893` | `188.570` |
+| 3 | `88.002` | `118.330` |
+| 4 | `46.631` | `136.100` |
+| median | `72.091` | `134.495` |
+
+The candidate/base median ratio is `1.866x`, satisfying the `<=2x` sort gate. The candidate median
+is `67.95%` below the pre-inherited-state `419.614 ms` median. Correct sorted output and native
+execution assertions passed in every Criterion run. Raw logs are retained under
+`/tmp/inherited-state-results/final-ab-{base,candidate}-*.log` for this validation session.
+
 #### Direction selection and shared rollout
 
-Direction 1 is the implementation default. Direction 2 is a continuation path, not a parallel first
-implementation. The following components must be designed for reuse by both:
+Direction 1 remains the fused-region fallback and comparison baseline. Direction 2 is now the default
+same-frame linking mode after satisfying the shared correctness and performance gates; static
+cross-frame slots stay opt-in, while frame-derived dynamic call/return targets use the same packet
+without making a polymorphic continuation slot global. The following components remain shared by
+both directions:
 
 - `TraceExitKey` and per-exit hotness/attempt/blacklist state
 - parent snapshot import and inherited-value classification
