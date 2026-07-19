@@ -2767,7 +2767,7 @@ impl Vm {
     pub fn set_local(&mut self, index: u8, value: Value) -> VmResult<()> {
         self.store_local_with_drop_contract(index, value)?;
         let config = *self.jit.config();
-        self.jit.set_config(config);
+        self.set_jit_config(config);
         Ok(())
     }
 
