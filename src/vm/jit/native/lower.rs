@@ -59,13 +59,9 @@ static CRANELIFT_TAIL_ISA: OnceLock<Result<OwnedTargetIsa, String>> = OnceLock::
 
 const MAX_INHERITED_ENTRY_VALUES: usize = 256;
 const INHERITED_STATE_ACTIVE_OFFSET: i32 = 0;
-const INHERITED_STATE_FRAME_KEY_OFFSET: i32 = 8;
 const INHERITED_STATE_STACK_BASE_OFFSET: i32 = 16;
 const INHERITED_STATE_LOCAL_BASE_OFFSET: i32 = 24;
 const INHERITED_STATE_DYNAMIC_TARGET_OFFSET: i32 = 32;
-const INHERITED_STATE_TARGET_IP_OFFSET: i32 = 40;
-const INHERITED_STATE_VALUE_COUNT_OFFSET: i32 = 48;
-const INHERITED_STATE_VALUES_OFFSET: i32 = 56;
 
 type TaggedConstants = (Box<[Value]>, HashMap<SsaValueId, usize>);
 
@@ -865,11 +861,16 @@ fn try_compile_ssa_trace(
                 inherited_state_ptr,
                 INHERITED_STATE_LOCAL_BASE_OFFSET,
             );
-            let inherited_args = build_inherited_entry_args(
+            let inherited_args = build_entry_args(
                 &mut b,
-                inherited_state_ptr,
+                vm_ptr,
                 pointer_type,
-                entry_ssa_block.params.len(),
+                layout,
+                offsets,
+                active_stack_base,
+                active_local_base,
+                ssa.entry_stack_depth,
+                entry_local_count,
             )?;
             let inactive = b.ins().iconst(pointer_type, 0);
             b.ins().store(
@@ -1795,40 +1796,6 @@ fn ssa_backedge_targets(
         | SsaTerminator::CallValue { .. } => {}
     }
     targets
-}
-
-fn build_inherited_entry_args(
-    b: &mut FunctionBuilder,
-    inherited_state_ptr: cranelift_codegen::ir::Value,
-    pointer_type: cranelift_codegen::ir::Type,
-    entry_value_count: usize,
-) -> VmResult<Vec<cranelift_codegen::ir::Value>> {
-    if entry_value_count > MAX_INHERITED_ENTRY_VALUES {
-        return Err(VmError::JitNative(
-            "SSA inherited entry value count exceeds packet capacity".to_string(),
-        ));
-    }
-    (0..entry_value_count)
-        .map(|index| {
-            let byte_offset = index
-                .checked_mul(std::mem::size_of::<usize>())
-                .and_then(|offset| {
-                    usize::try_from(INHERITED_STATE_VALUES_OFFSET)
-                        .ok()
-                        .and_then(|base| base.checked_add(offset))
-                })
-                .and_then(|offset| i32::try_from(offset).ok())
-                .ok_or_else(|| {
-                    VmError::JitNative("SSA inherited entry packet offset exceeds i32".to_string())
-                })?;
-            Ok(b.ins().load(
-                pointer_type,
-                MemFlags::new(),
-                inherited_state_ptr,
-                byte_offset,
-            ))
-        })
-        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4487,19 +4454,6 @@ fn write_inherited_state_packet(
     ctx: SsaLowerCtx<'_>,
     exit: &crate::vm::jit::ir::SsaExit,
 ) -> VmResult<()> {
-    let inactive = b.ins().iconst(ctx.pointer_type, 0);
-    b.ins().store(
-        MemFlags::new(),
-        inactive,
-        ctx.inherited_state_ptr,
-        INHERITED_STATE_ACTIVE_OFFSET,
-    );
-    b.ins().store(
-        MemFlags::new(),
-        inactive,
-        ctx.inherited_state_ptr,
-        INHERITED_STATE_DYNAMIC_TARGET_OFFSET,
-    );
     let entry_value_count = exit
         .stack
         .len()
@@ -4509,13 +4463,6 @@ fn write_inherited_state_packet(
         return Ok(());
     }
 
-    let frame_key = b.ins().iconst(ctx.pointer_type, ctx.frame_key as i64);
-    b.ins().store(
-        MemFlags::new(),
-        frame_key,
-        ctx.inherited_state_ptr,
-        INHERITED_STATE_FRAME_KEY_OFFSET,
-    );
     b.ins().store(
         MemFlags::new(),
         ctx.active_stack_base,
@@ -4528,103 +4475,6 @@ fn write_inherited_state_packet(
         ctx.inherited_state_ptr,
         INHERITED_STATE_LOCAL_BASE_OFFSET,
     );
-    let target_ip = b.ins().iconst(
-        ctx.pointer_type,
-        i64::try_from(exit.exit_ip)
-            .map_err(|_| VmError::JitNative("SSA inherited target ip exceeds i64".to_string()))?,
-    );
-    b.ins().store(
-        MemFlags::new(),
-        target_ip,
-        ctx.inherited_state_ptr,
-        INHERITED_STATE_TARGET_IP_OFFSET,
-    );
-    let value_count = b.ins().iconst(
-        ctx.pointer_type,
-        i64::try_from(entry_value_count)
-            .map_err(|_| VmError::JitNative("SSA inherited value count exceeds i64".to_string()))?,
-    );
-    b.ins().store(
-        MemFlags::new(),
-        value_count,
-        ctx.inherited_state_ptr,
-        INHERITED_STATE_VALUE_COUNT_OFFSET,
-    );
-    let stack_ptr = b.ins().load(
-        ctx.pointer_type,
-        MemFlags::new(),
-        ctx.vm_ptr,
-        ctx.offsets.stack_ptr,
-    );
-    let stack_base_ptr = ssa_value_addr(
-        b,
-        ctx.pointer_type,
-        stack_ptr,
-        ctx.active_stack_base,
-        ctx.layout.value.size,
-    );
-    let locals_ptr = b.ins().load(
-        ctx.pointer_type,
-        MemFlags::new(),
-        ctx.vm_ptr,
-        ctx.offsets.locals_ptr,
-    );
-    let locals_base_ptr = ssa_value_addr(
-        b,
-        ctx.pointer_type,
-        locals_ptr,
-        ctx.active_local_base,
-        ctx.layout.value.size,
-    );
-    for index in 0..entry_value_count {
-        let value_addr = if index < exit.stack.len() {
-            let stack_index = b.ins().iconst(
-                ctx.pointer_type,
-                i64::try_from(index).map_err(|_| {
-                    VmError::JitNative("SSA inherited stack index exceeds i64".to_string())
-                })?,
-            );
-            ssa_value_addr(
-                b,
-                ctx.pointer_type,
-                stack_base_ptr,
-                stack_index,
-                ctx.layout.value.size,
-            )
-        } else {
-            let local_index = index - exit.stack.len();
-            let local_index = b.ins().iconst(
-                ctx.pointer_type,
-                i64::try_from(local_index).map_err(|_| {
-                    VmError::JitNative("SSA inherited local index exceeds i64".to_string())
-                })?,
-            );
-            ssa_value_addr(
-                b,
-                ctx.pointer_type,
-                locals_base_ptr,
-                local_index,
-                ctx.layout.value.size,
-            )
-        };
-        let packet_offset = index
-            .checked_mul(std::mem::size_of::<usize>())
-            .and_then(|offset| {
-                usize::try_from(INHERITED_STATE_VALUES_OFFSET)
-                    .ok()
-                    .and_then(|base| base.checked_add(offset))
-            })
-            .and_then(|offset| i32::try_from(offset).ok())
-            .ok_or_else(|| {
-                VmError::JitNative("SSA inherited packet offset exceeds i32".to_string())
-            })?;
-        b.ins().store(
-            MemFlags::new(),
-            value_addr,
-            ctx.inherited_state_ptr,
-            packet_offset,
-        );
-    }
     let active = b.ins().iconst(ctx.pointer_type, 1);
     b.ins().store(
         MemFlags::new(),
