@@ -1000,7 +1000,10 @@ impl LocalSlotAllocator {
 
     pub(super) fn allocate(mut self, mut ir: FrontendIr) -> Result<FrontendIr, ParseError> {
         let persistent_slots = persistent_capture_slots(&ir.stmts, &ir.function_impls);
-        let live_out = self.liveness.empty_set();
+        let mut live_out = self.liveness.empty_set();
+        for slot in &persistent_slots {
+            self.liveness.mark_live(&mut live_out, *slot);
+        }
         let _ = self.collect_block(&ir.stmts, &live_out)?;
         for function_impl in ir.function_impls.values() {
             let live_after = self.liveness.function_body_live_out(

@@ -2715,6 +2715,58 @@ fn compile_source_file_rustscript_imported_function_capture_binds_once() {
 }
 
 #[test]
+fn compile_source_file_imported_capture_survives_later_root_slot_compaction() {
+    let unique = format!(
+        "vm_rss_import_capture_compaction_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos()
+    );
+    let root = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&root).expect("temp module root should be created");
+
+    let module_path = root.join("module.rss");
+    let main_path = root.join("main.rss");
+    std::fs::write(
+        &module_path,
+        r#"
+        let lookup = [7];
+        pub fn read() -> int { (&lookup)[0] }
+    "#,
+    )
+    .expect("module source should write");
+    std::fs::write(
+        &main_path,
+        r#"
+        use self::module as m;
+        let overwrite0 = "a";
+        let overwrite1 = "b";
+        let overwrite2 = "c";
+        let overwrite3 = "d";
+        let overwrite4 = "e";
+        let overwrite5 = "f";
+        let overwrite6 = "g";
+        let overwrite7 = "h";
+        let overwrite8 = "i";
+        m::read();
+    "#,
+    )
+    .expect("main source should write");
+
+    let compiled = compile_source_file(main_path.as_path()).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(7)]);
+
+    let _ = std::fs::remove_file(main_path);
+    let _ = std::fs::remove_file(module_path);
+    let _ = std::fs::remove_dir(root);
+}
+
+#[test]
 fn compile_source_file_rustscript_imported_borrow_capture_survives_nested_calls() {
     let unique = format!(
         "vm_rss_import_direct_capture_test_{}_{}",

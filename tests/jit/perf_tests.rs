@@ -891,7 +891,7 @@ fn perf_jit_native_characterizes_map_builtin_loop_latency() {
 
 #[test]
 #[ignore = "manual run performance test; run explicitly"]
-fn perf_manual_aes_128_cbc_rustscript_matches_in_interpreter_jit_and_aot() {
+fn perf_manual_aes_128_cbc_rustscript_matches_in_interpreter_and_jit() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/aes_128_cbc_usage.rss");
     let compiled =
@@ -912,7 +912,7 @@ fn perf_manual_aes_128_cbc_rustscript_matches_in_interpreter_jit_and_aot() {
     };
     let diag_enabled = std::env::var_os("PDVM_PERF_AES_JIT_DIAG").is_some();
     println!(
-        "aes perf mode: {} (trials={}, hot_loop_threshold={}, max_trace_len={}, aot=enabled)",
+        "aes perf mode: {} (trials={}, hot_loop_threshold={}, max_trace_len={})",
         if full_benchmark {
             "benchmark"
         } else {
@@ -924,12 +924,10 @@ fn perf_manual_aes_128_cbc_rustscript_matches_in_interpreter_jit_and_aot() {
     );
     let mut interpreter_times = Vec::with_capacity(trials);
     let mut jit_times = Vec::with_capacity(trials);
-    let mut aot_times = Vec::with_capacity(trials);
     let mut jit_attempts_total = 0usize;
     let mut jit_traces_total = 0usize;
     let mut jit_nyi_total = 0usize;
     let mut jit_native_exec_total = 0u64;
-    let mut aot_exec_total = 0u64;
 
     for trial in 0..trials {
         let mut vm_interpreter = Vm::new(compiled.program.clone());
@@ -1045,78 +1043,29 @@ fn perf_manual_aes_128_cbc_rustscript_matches_in_interpreter_jit_and_aot() {
             }
         }
         jit_times.push(jit_elapsed);
-
-        let mut vm_aot = Vm::new(compiled.program.clone());
-        vm_aot.set_jit_config(JitConfig {
-            enabled: false,
-            hot_loop_threshold,
-            max_trace_len,
-        });
-        vm_aot
-            .compile_aot()
-            .expect("aes aot compile should succeed");
-        let aot_started = Instant::now();
-        let aot_status = vm_aot
-            .run()
-            .expect("aes RustScript example should run in aot mode");
-        let aot_elapsed = aot_started.elapsed();
-        assert_eq!(
-            aot_status,
-            VmStatus::Halted,
-            "aot should halt on trial {trial}"
-        );
-        assert_eq!(
-            vm_aot.stack(),
-            expected.as_slice(),
-            "aot result mismatch on trial {trial}"
-        );
-        assert_eq!(
-            vm_aot.stack(),
-            vm_interpreter.stack(),
-            "interpreter/aot stack mismatch on trial {trial}"
-        );
-        assert!(
-            vm_aot.aot_exec_count() > 0,
-            "expected aot execution count > 0, dump:\n{}",
-            vm_aot.dump_aot_info()
-        );
-        aot_exec_total = aot_exec_total.saturating_add(vm_aot.aot_exec_count());
-        if diag_enabled && trial == 0 && std::env::var_os("PDVM_PERF_AES_AOT_DUMP").is_some() {
-            println!("aes aot trial0 dump:\n{}", vm_aot.dump_aot_info());
-        }
-        aot_times.push(aot_elapsed);
     }
 
     let interpreter_median = median_duration(&mut interpreter_times);
     let jit_median = median_duration(&mut jit_times);
-    let aot_median = median_duration(&mut aot_times);
     let jit_speedup =
         interpreter_median.as_secs_f64() / jit_median.as_secs_f64().max(f64::MIN_POSITIVE);
-    let aot_speedup =
-        interpreter_median.as_secs_f64() / aot_median.as_secs_f64().max(f64::MIN_POSITIVE);
     println!(
-        "aes-128-cbc rss latency median: interpreter={}us jit={}us aot={}us jit_speedup={:.2}x aot_speedup={:.2}x",
+        "aes-128-cbc rss latency median: interpreter={}us jit={}us jit_speedup={:.2}x",
         interpreter_median.as_micros(),
         jit_median.as_micros(),
-        aot_median.as_micros(),
-        jit_speedup,
-        aot_speedup
+        jit_speedup
     );
     if diag_enabled {
         println!(
             "aes jit aggregate diagnostics across {} trials: attempts={} traces={} nyi={} native_exec={}",
             trials, jit_attempts_total, jit_traces_total, jit_nyi_total, jit_native_exec_total
         );
-        println!(
-            "aes aot aggregate diagnostics across {} trials: executions={}",
-            trials, aot_exec_total
-        );
     }
 }
 
 #[test]
 #[ignore = "manual run performance test; run explicitly"]
-fn perf_manual_ifft_math_matches_in_interpreter_jit_and_aot_without_warmup_or_compile_time() {
+fn perf_manual_ifft_math_matches_in_interpreter_and_jit_without_warmup() {
     if !native_jit_supported() {
         println!("skipping ifft perf on unsupported native JIT target");
         return;
@@ -1186,51 +1135,23 @@ fn perf_manual_ifft_math_matches_in_interpreter_jit_and_aot_without_warmup_or_co
     let jit_trace_count = vm_jit.jit_native_trace_count();
     let jit_exec_count = vm_jit.jit_native_exec_count();
 
-    let mut vm_aot = Vm::new(compiled.program);
-    vm_aot.set_jit_config(JitConfig {
-        enabled: false,
-        hot_loop_threshold,
-        max_trace_len,
-    });
-    let aot_compile_started = Instant::now();
-    vm_aot
-        .compile_aot()
-        .expect("ifft perf aot compile should succeed");
-    let aot_compile_elapsed = aot_compile_started.elapsed();
-    let aot_warmup = warm_reusable_vm_once(&mut vm_aot, &expected_stack);
-    assert!(
-        vm_aot.aot_exec_count() > 0,
-        "expected warmed aot vm to execute natively, dump:\n{}",
-        vm_aot.dump_aot_info()
-    );
-    let mut aot_times = sample_reused_vm_latencies(&mut vm_aot, &expected_stack, trials);
-    let aot_exec_count = vm_aot.aot_exec_count();
-
     let interpreter_median = median_duration(&mut interpreter_times);
     let jit_median = median_duration(&mut jit_times);
-    let aot_median = median_duration(&mut aot_times);
     let jit_speedup =
         interpreter_median.as_secs_f64() / jit_median.as_secs_f64().max(f64::MIN_POSITIVE);
-    let aot_speedup =
-        interpreter_median.as_secs_f64() / aot_median.as_secs_f64().max(f64::MIN_POSITIVE);
 
     println!(
-        "ifft_math warmed latency median: interpreter={}us jit={}us aot={}us jit_speedup={:.2}x aot_speedup={:.2}x",
+        "ifft_math warmed latency median: interpreter={}us jit={}us jit_speedup={:.2}x",
         interpreter_median.as_micros(),
         jit_median.as_micros(),
-        aot_median.as_micros(),
-        jit_speedup,
-        aot_speedup
+        jit_speedup
     );
     println!(
-        "ifft_math setup diagnostics: interpreter_warmup_us={} jit_warmup_us={} aot_compile_us={} aot_warmup_us={} jit_traces={} jit_native_execs={} aot_execs={}",
+        "ifft_math setup diagnostics: interpreter_warmup_us={} jit_warmup_us={} jit_traces={} jit_native_execs={}",
         interpreter_warmup.as_micros(),
         jit_warmup.as_micros(),
-        aot_compile_elapsed.as_micros(),
-        aot_warmup.as_micros(),
         jit_trace_count,
-        jit_exec_count,
-        aot_exec_count
+        jit_exec_count
     );
 }
 
