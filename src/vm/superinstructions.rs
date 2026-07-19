@@ -27,10 +27,15 @@ impl ScalarValue {
 
 impl Vm {
     #[inline(always)]
-    fn local_scalar_value_with_hint(&mut self, index: u8) -> Option<ScalarValue> {
+    fn local_scalar_value_with_hint(
+        &mut self,
+        local_base: usize,
+        index: u8,
+    ) -> Option<ScalarValue> {
+        let absolute = local_base.checked_add(index as usize)?;
         match self.local_type_hint(index) {
             ValueType::Int => {
-                let value = match self.locals.get(index as usize)? {
+                let value = match self.locals.get(absolute)? {
                     Value::Int(value) => *value,
                     _ => return None,
                 };
@@ -38,7 +43,7 @@ impl Vm {
                 Some(ScalarValue::Int(value))
             }
             ValueType::Float => {
-                let value = match self.locals.get(index as usize)? {
+                let value = match self.locals.get(absolute)? {
                     Value::Float(value) => *value,
                     _ => return None,
                 };
@@ -69,6 +74,15 @@ impl Vm {
     }
 
     #[inline(always)]
+    pub(super) fn decoded_jump_target_is_valid_at(&self, opcode_ip: usize) -> bool {
+        self.decoded_instruction_data
+            .valid_jump_targets
+            .get(opcode_ip)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    #[inline(always)]
     pub(super) fn decoded_local_index_at(&self, opcode_ip: usize) -> Option<u8> {
         self.decoded_instruction_data
             .local_indices
@@ -85,7 +99,8 @@ impl Vm {
         if !allow_superinstructions {
             return Ok(false);
         }
-        let Some(initial) = self.local_scalar_value_with_hint(src) else {
+        let local_base = self.active_local_base();
+        let Some(initial) = self.local_scalar_value_with_hint(local_base, src) else {
             return Ok(false);
         };
         let mut cursor = self.ip;
@@ -120,7 +135,7 @@ impl Vm {
                     let Some(index) = self.decoded_local_index_at(cursor) else {
                         return Ok(false);
                     };
-                    let Some(value) = self.local_scalar_value_with_hint(index) else {
+                    let Some(value) = self.local_scalar_value_with_hint(local_base, index) else {
                         return Ok(false);
                     };
                     if stack_len == stack.len() {
@@ -211,7 +226,13 @@ impl Vm {
                         .take()
                         .expect("result scalar should exist")
                         .into_value();
-                    self.store_local_with_drop_contract(dst, value)?;
+                    let absolute =
+                        local_base
+                            .checked_add(dst as usize)
+                            .ok_or(VmError::InvalidFrameState(
+                                "superinstruction local index overflow",
+                            ))?;
+                    self.store_local_absolute_with_drop_contract(absolute, dst, value)?;
                     self.record_scalar_superinstruction();
                     self.ip = cursor + 2;
                     return Ok(true);
@@ -220,10 +241,12 @@ impl Vm {
                     if stack_len != 2 {
                         return Ok(false);
                     }
-                    if self.program.code.get(cursor + 1).copied() != Some(OpCode::Brfalse as u8) {
+                    let jump_opcode_ip = cursor + 1;
+                    if self.program.code.get(jump_opcode_ip).copied() != Some(OpCode::Brfalse as u8)
+                    {
                         return Ok(false);
                     }
-                    let Some(target) = self.decoded_jump_target_at(cursor + 1) else {
+                    let Some(target) = self.decoded_jump_target_at(jump_opcode_ip) else {
                         return Ok(false);
                     };
                     let rhs = stack[stack_len - 1]
@@ -253,7 +276,11 @@ impl Vm {
                     };
                     self.ip = cursor + 6;
                     if !condition {
-                        self.jump_to(target)?;
+                        if self.decoded_jump_target_is_valid_at(jump_opcode_ip) {
+                            self.ip = target;
+                        } else {
+                            self.jump_to(target)?;
+                        }
                     }
                     self.record_scalar_superinstruction();
                     return Ok(true);

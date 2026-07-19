@@ -1171,7 +1171,6 @@ pub(crate) extern "C" fn pd_vm_native_restore_active_sparse_exit_state(
             .last()
             .map(|frame| frame.local_count)
             .unwrap_or(vm.locals.len());
-        let mut validated_indices = Vec::with_capacity(dirty_local_count);
         for compact_index in 0..dirty_local_count {
             let local_index = unsafe { *dirty_local_indices.add(compact_index) };
             let local_index_usize = usize::try_from(local_index).map_err(|_| {
@@ -1184,18 +1183,19 @@ pub(crate) extern "C" fn pd_vm_native_restore_active_sparse_exit_state(
                     "native active sparse exit restore local index {local_index} out of range for {local_count} active locals"
                 )));
             }
-            let local_index = u8::try_from(local_index).map_err(|_| {
+            u8::try_from(local_index).map_err(|_| {
                 VmError::JitNative(
                     "native active sparse exit restore local index exceeds VM local range"
                         .to_string(),
                 )
             })?;
-            if validated_indices.contains(&local_index) {
-                return Err(VmError::JitNative(format!(
-                    "native active sparse exit restore received duplicate local index {local_index}"
-                )));
+            for prior_index in 0..compact_index {
+                if unsafe { *dirty_local_indices.add(prior_index) } == local_index {
+                    return Err(VmError::JitNative(format!(
+                        "native active sparse exit restore received duplicate local index {local_index}"
+                    )));
+                }
             }
-            validated_indices.push(local_index);
         }
 
         let stack_base = vm.active_operand_stack_base();
@@ -1212,7 +1212,14 @@ pub(crate) extern "C" fn pd_vm_native_restore_active_sparse_exit_state(
             vm.stack.push(value);
         }
 
-        for (compact_index, local_index) in validated_indices.into_iter().enumerate() {
+        for compact_index in 0..dirty_local_count {
+            let local_index = unsafe { *dirty_local_indices.add(compact_index) };
+            let local_index = u8::try_from(local_index).map_err(|_| {
+                VmError::JitNative(
+                    "native active sparse exit restore local index exceeds VM local range"
+                        .to_string(),
+                )
+            })?;
             let value = unsafe { std::ptr::read(dirty_local_values.add(compact_index)) };
             vm.store_local_with_drop_contract(local_index, value)?;
         }

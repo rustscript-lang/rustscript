@@ -539,6 +539,7 @@ pub struct HostImport {
 pub(crate) struct DecodedInstructionData {
     pub(crate) ldc_values: Box<[Option<Value>]>,
     pub(crate) jump_targets: Box<[Option<usize>]>,
+    pub(crate) valid_jump_targets: Box<[bool]>,
     pub(crate) local_indices: Box<[Option<u8>]>,
 }
 
@@ -546,6 +547,7 @@ impl DecodedInstructionData {
     fn build(program: &Program) -> Self {
         let mut ldc_values = vec![None; program.code.len()];
         let mut jump_targets = vec![None; program.code.len()];
+        let mut valid_jump_targets = vec![false; program.code.len()];
         let mut local_indices = vec![None; program.code.len()];
         let mut ip = 0usize;
         while ip < program.code.len() {
@@ -562,8 +564,32 @@ impl DecodedInstructionData {
                     }
                 }
                 OpCode::Br | OpCode::Brfalse => {
-                    if let Some(target) = read_u32_at(&program.code, ip + 1) {
-                        jump_targets[ip] = Some(target as usize);
+                    if let Some(target) =
+                        read_u32_at(&program.code, ip + 1).map(|target| target as usize)
+                    {
+                        jump_targets[ip] = Some(target);
+                        if target >= program.code.len() {
+                            ip = ip.saturating_add(1 + opcode.operand_len());
+                            continue;
+                        }
+                        let source_owner = program
+                            .function_regions
+                            .iter()
+                            .find(|region| {
+                                region.start_ip as usize <= ip && ip < region.end_ip as usize
+                            })
+                            .and_then(|region| region.prototype_id);
+                        let target_owner = program
+                            .function_regions
+                            .iter()
+                            .find(|region| {
+                                region.start_ip as usize <= target
+                                    && target < region.end_ip as usize
+                            })
+                            .and_then(|region| region.prototype_id);
+                        if source_owner == target_owner {
+                            valid_jump_targets[ip] = true;
+                        }
                     }
                 }
                 OpCode::Ldloc | OpCode::Stloc => {
@@ -578,6 +604,7 @@ impl DecodedInstructionData {
         Self {
             ldc_values: ldc_values.into_boxed_slice(),
             jump_targets: jump_targets.into_boxed_slice(),
+            valid_jump_targets: valid_jump_targets.into_boxed_slice(),
             local_indices: local_indices.into_boxed_slice(),
         }
     }

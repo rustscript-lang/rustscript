@@ -1041,6 +1041,7 @@ impl Vm {
             .unwrap_or(crate::vm::native::ROOT_FRAME_KEY)
     }
 
+    #[inline(always)]
     pub(super) fn active_local_base(&self) -> usize {
         self.execution_frames
             .last()
@@ -1087,6 +1088,9 @@ impl Vm {
     #[inline(always)]
     fn load_local_value(&self, index: u8) -> VmResult<Value> {
         let absolute = self.absolute_local_index(index)?;
+        if self.capture_cells.is_empty() {
+            return Ok(self.locals[absolute].clone());
+        }
         if let Some(cell) = self.capture_cells.get(&absolute) {
             return cell
                 .lock()
@@ -1099,6 +1103,13 @@ impl Vm {
     #[inline(always)]
     pub(super) fn local_numeric_value(&self, index: u8) -> Option<NumericValue> {
         let absolute = self.absolute_local_index(index).ok()?;
+        if self.capture_cells.is_empty() {
+            return match self.locals.get(absolute)? {
+                Value::Int(value) => Some(NumericValue::Int(*value)),
+                Value::Float(value) => Some(NumericValue::Float(*value)),
+                _ => None,
+            };
+        }
         let captured = self
             .capture_cells
             .get(&absolute)
@@ -1905,6 +1916,25 @@ impl Vm {
         value: Value,
     ) -> VmResult<()> {
         let absolute = self.absolute_local_index(index)?;
+        self.store_local_absolute_with_drop_contract(absolute, index, value)
+    }
+
+    #[inline(always)]
+    pub(super) fn store_local_absolute_with_drop_contract(
+        &mut self,
+        absolute: usize,
+        index: u8,
+        value: Value,
+    ) -> VmResult<()> {
+        if self.capture_cells.is_empty() {
+            let slot = self
+                .locals
+                .get_mut(absolute)
+                .ok_or(VmError::InvalidLocal(index))?;
+            let previous = std::mem::replace(slot, value);
+            self.drop_value_with_contract(previous);
+            return Ok(());
+        }
         if let Some(cell) = self.capture_cells.get(&absolute).cloned() {
             if Self::value_references_capture_cell(&value, &cell, &mut HashSet::new())? {
                 return Err(VmError::InvalidFrameState(
@@ -2031,15 +2061,33 @@ impl Vm {
                 .execution_frames
                 .last()
                 .and_then(|frame| frame.prototype_id);
-            let target_prototype = self
-                .program
-                .function_regions
-                .iter()
-                .find(|region| {
-                    region.start_ip as usize <= target && target < region.end_ip as usize
-                })
-                .and_then(|region| region.prototype_id);
-            if active_prototype != target_prototype {
+            let target_is_valid = if let Some(prototype_id) = active_prototype
+                && !self.has_aot_program()
+            {
+                self.program
+                    .callable_prototypes
+                    .get(prototype_id as usize)
+                    .and_then(|prototype| match prototype.target {
+                        CallableTarget::ScriptFunction(function_id) => {
+                            self.program.script_functions.get(function_id as usize)
+                        }
+                        CallableTarget::HostImport(_) => None,
+                    })
+                    .is_some_and(|function| {
+                        function.entry_ip as usize <= target && target < function.end_ip as usize
+                    })
+            } else {
+                let target_prototype = self
+                    .program
+                    .function_regions
+                    .iter()
+                    .find(|region| {
+                        region.start_ip as usize <= target && target < region.end_ip as usize
+                    })
+                    .and_then(|region| region.prototype_id);
+                active_prototype == target_prototype
+            };
+            if !target_is_valid {
                 return Err(VmError::InvalidBranchTarget { target });
             }
         }
@@ -2277,7 +2325,6 @@ impl Vm {
         opcode: u8,
         allow_superinstructions: bool,
     ) -> VmResult<ExecOutcome> {
-        let allow_superinstructions = allow_superinstructions && self.call_depth == 0;
         match opcode {
             x if x == OpCode::Nop as u8 => {}
             x if x == OpCode::Ret as u8 => return self.complete_active_frame(),
@@ -2546,9 +2593,7 @@ impl Vm {
                 } else {
                     self.read_u8()?
                 };
-                if self.call_depth == 0
-                    && self.try_fuse_scalar_sequence(index, allow_superinstructions)?
-                {
+                if self.try_fuse_scalar_sequence(index, allow_superinstructions)? {
                     return Ok(ExecOutcome::Continue);
                 }
                 let value = self.load_local_value(index)?;
