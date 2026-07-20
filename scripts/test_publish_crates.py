@@ -16,10 +16,40 @@ class PublishCratesTests(unittest.TestCase):
         self.assertIn("'publish-crates-*-host-*'", workflow)
         self.assertIn('publish_spec="${GITHUB_REF_NAME#publish-crates-}"', workflow)
 
-    def test_publish_script_does_not_force_registry_lock_versions(self) -> None:
-        source = (Path(__file__).parent / "publish_crates.py").read_text()
-        self.assertNotIn("refresh_registry_lock", source)
-        self.assertNotIn("refresh_publish_lock.py", source)
+    def test_compatible_registry_lock_versions_only_selects_same_compatibility_line(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            lock_path = Path(directory) / "Cargo.lock"
+            lock_path.write_text(
+                """version = 4
+
+[[package]]
+name = "pd-host-function"
+version = "0.22.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "old"
+
+[[package]]
+name = "pd-host-function"
+version = "0.21.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "older-line"
+
+[[package]]
+name = "pd-host-function"
+version = "0.22.7"
+"""
+            )
+
+            self.assertEqual(
+                publish_crates.compatible_registry_lock_versions(
+                    lock_path,
+                    "pd-host-function",
+                    "0.22.7",
+                ),
+                ["0.22.2"],
+            )
 
     def test_package_versions_keep_host_macro_on_compatible_line(self) -> None:
         self.assertEqual(
