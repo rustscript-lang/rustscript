@@ -6412,6 +6412,38 @@ fn interpreter_superinstructions_use_script_frame_local_base() {
 }
 
 #[test]
+fn interpreter_superinstructions_read_nested_shared_capture_cells() {
+    let source = r#"
+        fn outer() -> int {
+            let mut count = 0;
+            fn set_count() -> int {
+                count = 5;
+                count
+            }
+            set_count();
+            count = count + 1;
+            count
+        }
+        outer();
+    "#;
+    let compiled =
+        compile_source(source).expect("shared-capture superinstruction source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: false,
+        ..JitConfig::default()
+    });
+
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(6)]);
+    assert!(
+        vm.interpreter_metrics_snapshot()
+            .scalar_superinstruction_count
+            > 0
+    );
+}
+
+#[test]
 fn trace_jit_inlines_static_leaf_in_root_loop() {
     if !native_jit_supported() {
         return;
