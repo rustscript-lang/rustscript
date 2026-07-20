@@ -5,38 +5,39 @@ use super::super::runtime::resume_linked_trace_entry_address;
 use super::{NativeCompileProfile, TraceLoweringKind};
 use crate::vm::jit::deopt::exit_inputs;
 use crate::vm::jit::ir::{
-    SsaBlockId, SsaBranchTarget, SsaExitId, SsaInstKind, SsaMaterialization, SsaTerminator,
-    SsaTrace, SsaValueId, SsaValueRepr,
+    SsaBlockId, SsaBranchTarget, SsaExitId, SsaInst, SsaInstKind, SsaMaterialization,
+    SsaTerminator, SsaTrace, SsaValueId, SsaValueRepr,
 };
 use crate::vm::native::{
     ExecutableBuffer, HeapIntrinsicAddrs, HeapIntrinsicRefs, NativeFrameState, NativeInterruptMode,
     NativeInterruptSettings, NativeStackLayout, STATUS_CONTINUE, STATUS_ERROR, STATUS_OUT_OF_FUEL,
     STATUS_TRACE_EXIT, alloc_buffer_signature, alloc_byte_buffer_entry_address,
     alloc_value_buffer_entry_address, array_push_entry_address, array_set_entry_address,
-    array_set_signature, box_heap_value_signature, checked_add_i32, clear_value_slot_entry_address,
-    clone_value_signature, clone_value_to_slot_entry_address, collection_get_signature,
-    collection_predicate_signature, copy_bytes_entry_address, copy_bytes_signature,
-    detect_native_stack_layout, enter_call_value_inherited_entry_address,
-    enter_call_value_inherited_signature, entry_signature, frame_state_entry_address,
-    frame_state_signature, free_buffer_signature, jump_with_status,
-    leave_frame_inherited_entry_address, leave_frame_inherited_signature, map_get_entry_address,
-    map_has_entry_address, map_iter_next_entry_address, map_iter_next_signature,
-    map_iter_take_key_entry_address, map_iter_take_signature, map_iter_take_value_entry_address,
-    map_set_entry_address, map_set_signature, non_yielding_host_call_entry_address,
-    non_yielding_host_call_signature, non_yielding_i64_host_call_entry_address,
-    non_yielding_i64_host_call_signature, non_yielding_scalar_host_call_entry_address,
-    non_yielding_scalar_host_call_signature, pack_shared_signature, regex_match_entry_address,
-    regex_match_signature, regex_replace_entry_address, regex_replace_signature,
-    replace_value_in_slot_entry_address, restore_active_sparse_exit_state_entry_address,
-    restore_virtual_frame_entry_address, restore_virtual_frame_signature,
-    shared_array_from_buffer_entry_address, shared_bytes_from_buffer_entry_address,
-    shared_string_from_buffer_entry_address, sparse_restore_exit_signature,
-    string_binary_transform_signature, string_contains_entry_address, string_contains_signature,
-    string_lower_ascii_entry_address, string_replace_literal_entry_address,
-    string_replace_signature, string_split_literal_entry_address, string_unary_transform_signature,
-    to_string_entry_address, type_of_entry_address, value_eq_entry_address, value_eq_signature,
-    value_len_entry_address, value_len_signature, value_slot_signature,
-    write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
+    array_set_signature, box_heap_value_signature, checked_add_i32,
+    clear_bridge_error_entry_address, clear_value_slot_entry_address, clone_value_signature,
+    clone_value_to_slot_entry_address, collection_get_signature, collection_predicate_signature,
+    copy_bytes_entry_address, copy_bytes_signature, detect_native_stack_layout,
+    enter_call_value_inherited_entry_address, enter_call_value_inherited_signature,
+    entry_signature, frame_state_entry_address, frame_state_signature, free_buffer_signature,
+    jump_with_status, leave_frame_inherited_entry_address, leave_frame_inherited_signature,
+    map_get_entry_address, map_has_entry_address, map_iter_next_entry_address,
+    map_iter_next_signature, map_iter_take_key_entry_address, map_iter_take_signature,
+    map_iter_take_value_entry_address, map_set_entry_address, map_set_signature,
+    non_yielding_host_call_entry_address, non_yielding_host_call_signature,
+    non_yielding_i64_host_call_entry_address, non_yielding_i64_host_call_signature,
+    non_yielding_scalar_host_call_entry_address, non_yielding_scalar_host_call_signature,
+    pack_shared_signature, regex_match_entry_address, regex_match_signature,
+    regex_replace_entry_address, regex_replace_signature, replace_value_in_slot_entry_address,
+    restore_active_sparse_exit_state_entry_address, restore_virtual_frame_entry_address,
+    restore_virtual_frame_signature, shared_array_from_buffer_entry_address,
+    shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
+    sparse_restore_exit_signature, string_binary_transform_signature,
+    string_contains_entry_address, string_contains_signature, string_lower_ascii_entry_address,
+    string_replace_literal_entry_address, string_replace_signature,
+    string_split_literal_entry_address, string_unary_transform_signature, to_string_entry_address,
+    type_of_entry_address, value_eq_entry_address, value_eq_signature, value_len_entry_address,
+    value_len_signature, value_slot_signature, write_heap_value_to_slot_entry_address,
+    zero_bytes_entry_address,
 };
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::Ieee64;
@@ -598,6 +599,7 @@ fn try_compile_ssa_trace(
     let array_push_sig = collection_get_signature(pointer_type, call_conv);
     let array_set_sig = array_set_signature(pointer_type, call_conv);
     let map_set_sig = map_set_signature(pointer_type, call_conv);
+    let clear_bridge_error_sig = Signature::new(call_conv);
     let sparse_restore_exit_sig = sparse_restore_exit_signature(pointer_type, call_conv);
     let restore_virtual_frame_sig = restore_virtual_frame_signature(pointer_type, call_conv);
     let frame_state_sig = frame_state_signature(pointer_type, call_conv);
@@ -672,6 +674,7 @@ fn try_compile_ssa_trace(
                 .import_signature(non_yielding_scalar_host_call_sig),
             non_yielding_i64_host_call_ref: b.import_signature(non_yielding_i64_host_call_sig),
             clear_value_slot_ref: b.import_signature(value_slot_sig),
+            clear_bridge_error_ref: b.import_signature(clear_bridge_error_sig),
             box_heap_value_ref: b.import_signature(box_heap_value_sig),
             map_has_ref: b.import_signature(map_has_sig),
             map_get_ref: b.import_signature(map_get_sig),
@@ -697,6 +700,7 @@ fn try_compile_ssa_trace(
             non_yielding_scalar_host_call: non_yielding_scalar_host_call_entry_address(),
             non_yielding_i64_host_call: non_yielding_i64_host_call_entry_address(),
             clear_value_slot: clear_value_slot_entry_address(),
+            clear_bridge_error: clear_bridge_error_entry_address(),
             box_heap_value: write_heap_value_to_slot_entry_address(),
             map_has: map_has_entry_address(),
             map_get: map_get_entry_address(),
@@ -1115,6 +1119,7 @@ struct SsaDeoptHelperRefs {
     non_yielding_scalar_host_call_ref: cranelift_codegen::ir::SigRef,
     non_yielding_i64_host_call_ref: cranelift_codegen::ir::SigRef,
     clear_value_slot_ref: cranelift_codegen::ir::SigRef,
+    clear_bridge_error_ref: cranelift_codegen::ir::SigRef,
     box_heap_value_ref: cranelift_codegen::ir::SigRef,
     map_has_ref: cranelift_codegen::ir::SigRef,
     map_get_ref: cranelift_codegen::ir::SigRef,
@@ -1142,6 +1147,7 @@ struct SsaDeoptHelperAddrs {
     non_yielding_scalar_host_call: usize,
     non_yielding_i64_host_call: usize,
     clear_value_slot: usize,
+    clear_bridge_error: usize,
     box_heap_value: usize,
     map_has: usize,
     map_get: usize,
@@ -2211,7 +2217,7 @@ fn lower_ssa_inst(
             b.ins().brif(ok, success, &[], fail, &[]);
 
             b.switch_to_block(fail);
-            jump_with_status(b, exit_block, status);
+            ssa_emit_helper_failure_exit(b, ctx, inst, values, status)?;
 
             b.switch_to_block(success);
             b.ins().stack_load(types::I64, out_slot, 0)
@@ -2715,7 +2721,7 @@ fn lower_ssa_inst(
             b.ins().brif(error, failed, &[], matched, &[]);
             b.switch_to_block(failed);
             let status = b.ins().iconst(types::I32, STATUS_ERROR as i64);
-            jump_with_status(b, exit_block, status);
+            ssa_emit_helper_failure_exit(b, ctx, inst, values, status)?;
             b.switch_to_block(matched);
             b.ins().icmp_imm(IntCC::NotEqual, raw, 0)
         }
@@ -2743,7 +2749,7 @@ fn lower_ssa_inst(
             b.ins().brif(error, failed, &[], replaced, &[]);
             b.switch_to_block(failed);
             let status = b.ins().iconst(types::I32, STATUS_ERROR as i64);
-            jump_with_status(b, exit_block, status);
+            ssa_emit_helper_failure_exit(b, ctx, inst, values, status)?;
             b.switch_to_block(replaced);
             let out = owned_value_temp_slot_addr(
                 b,
@@ -3344,7 +3350,7 @@ fn lower_ssa_inst(
             b.ins().brif(is_error, fail, &[], cont, &[]);
 
             b.switch_to_block(fail);
-            jump_with_status(b, exit_block, status);
+            ssa_emit_helper_failure_exit(b, ctx, inst, values, status)?;
 
             b.switch_to_block(cont);
             out
@@ -3392,7 +3398,7 @@ fn lower_ssa_inst(
             b.ins().brif(is_error, fail, &[], cont, &[]);
 
             b.switch_to_block(fail);
-            jump_with_status(b, exit_block, status);
+            ssa_emit_helper_failure_exit(b, ctx, inst, values, status)?;
 
             b.switch_to_block(cont);
             out
@@ -3464,7 +3470,7 @@ fn lower_ssa_inst(
                 .brif(is_status_error, error_block, &[], miss_block, &[]);
 
             b.switch_to_block(error_block);
-            jump_with_status(b, exit_block, status);
+            ssa_emit_helper_failure_exit(b, ctx, inst, values, status)?;
 
             b.switch_to_block(miss_block);
             ssa_emit_failure_exit(b, ctx, inst.failure_exit, inst.ip, values)?;
@@ -3509,7 +3515,7 @@ fn lower_ssa_inst(
             b.ins().brif(is_error, fail, &[], cont, &[]);
 
             b.switch_to_block(fail);
-            jump_with_status(b, exit_block, status);
+            ssa_emit_helper_failure_exit(b, ctx, inst, values, status)?;
 
             b.switch_to_block(cont);
             b.ins().icmp_imm(IntCC::NotEqual, status, 0)
@@ -3529,7 +3535,7 @@ fn lower_ssa_inst(
                 .icmp_imm(IntCC::Equal, status, i64::from(STATUS_ERROR));
             b.ins().brif(is_error, fail, &[], cont, &[]);
             b.switch_to_block(fail);
-            jump_with_status(b, exit_block, status);
+            ssa_emit_helper_failure_exit(b, ctx, inst, values, status)?;
             b.switch_to_block(cont);
             b.ins().icmp_imm(IntCC::NotEqual, status, 0)
         }
@@ -3563,7 +3569,7 @@ fn lower_ssa_inst(
                 .icmp_imm(IntCC::Equal, status, i64::from(STATUS_ERROR));
             b.ins().brif(is_error, fail, &[], cont, &[]);
             b.switch_to_block(fail);
-            jump_with_status(b, exit_block, status);
+            ssa_emit_helper_failure_exit(b, ctx, inst, values, status)?;
             b.switch_to_block(cont);
             out
         }
@@ -3631,7 +3637,7 @@ fn lower_ssa_inst(
             b.ins().brif(is_error, fail, &[], cont, &[]);
 
             b.switch_to_block(fail);
-            jump_with_status(b, exit_block, status);
+            ssa_emit_helper_failure_exit(b, ctx, inst, values, status)?;
 
             b.switch_to_block(cont);
             out
@@ -5701,6 +5707,24 @@ fn ssa_utf8_char_width(
     let tail = b.ins().select(lt_f0, three, four);
     let wide = b.ins().select(lt_e0, two, tail);
     b.ins().select(lt_80, one, wide)
+}
+
+fn ssa_emit_helper_failure_exit(
+    b: &mut FunctionBuilder,
+    ctx: SsaLowerCtx<'_>,
+    inst: &SsaInst,
+    values: &HashMap<SsaValueId, cranelift_codegen::ir::Value>,
+    status: cranelift_codegen::ir::Value,
+) -> VmResult<()> {
+    if inst.failure_exit.is_some() {
+        let helper_ptr =
+            iconst_ptr_from_addr(b, ctx.pointer_type, ctx.helper_addrs.clear_bridge_error)?;
+        b.ins()
+            .call_indirect(ctx.helper_refs.clear_bridge_error_ref, helper_ptr, &[]);
+        return ssa_emit_failure_exit(b, ctx, inst.failure_exit, inst.ip, values);
+    }
+    jump_with_status(b, ctx.exit_block, status);
+    Ok(())
 }
 
 fn ssa_emit_failure_exit(

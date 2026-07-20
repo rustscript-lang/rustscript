@@ -6930,9 +6930,20 @@ fn trace_jit_preserves_inline_callable_return_schema_checks() {
         "unexpected error: {error:?}\n{}",
         vm.dump_jit_info()
     );
+    let snapshot = vm.jit_snapshot();
     assert!(
-        any_trace_op(&vm.jit_snapshot(), "inline_call:0"),
+        any_trace_op(&snapshot, "inline_call:0"),
         "{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        !any_trace_op(&snapshot, "inline_return_schema_guard"),
+        "synthetic return guards must not advance bytecode interruption accounting: {}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        !any_trace_op(&snapshot, "inline_callable_schema_guard"),
+        "synthetic argument guards must not advance bytecode interruption accounting: {}",
         vm.dump_jit_info()
     );
 }
@@ -6986,6 +6997,54 @@ fn trace_jit_inlines_array_swap_leaf() {
         vm.dump_jit_info()
     );
     assert!(!any_trace_op(&snapshot, "call_value"));
+}
+
+#[test]
+fn trace_jit_inline_array_set_failure_restores_callee_frame() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn write(values: [int], index: int) -> int {
+            values[index] = 99;
+            values[0]
+        }
+        let values: [int] = [10, 20];
+        let mut i = 0;
+        let mut sink = 0;
+        while i < 100 {
+            sink = write(values, i);
+            i = i + 1;
+        }
+        i + sink * 0;
+    "#;
+    let compiled = compile_source(source).expect("inline array-set failure source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    let error = vm
+        .run()
+        .expect_err("out-of-range inline array set must fail");
+    assert!(
+        matches!(error, vm::VmError::HostError(ref message) if message == "array index 3 out of bounds"),
+        "unexpected error: {error:?}\n{}",
+        vm.dump_jit_info()
+    );
+    let snapshot = vm.jit_snapshot();
+    assert!(
+        any_trace_op(&snapshot, "inline_call:0"),
+        "{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        any_trace_op(&snapshot, "array_set"),
+        "{}",
+        vm.dump_jit_info()
+    );
 }
 
 #[test]

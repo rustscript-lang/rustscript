@@ -713,7 +713,7 @@ pub(crate) fn builtin_set_map_shared_impl(
     entries
 }
 
-fn ensure_supported_map_key(key: &Value) -> VmResult<()> {
+pub(crate) fn ensure_supported_map_key(key: &Value) -> VmResult<()> {
     if matches!(key, Value::Callable(_)) {
         return Err(VmError::HostError(
             "callable values are not supported as map keys".to_string(),
