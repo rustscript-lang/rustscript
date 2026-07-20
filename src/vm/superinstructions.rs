@@ -27,33 +27,20 @@ impl ScalarValue {
 
 impl Vm {
     #[inline(always)]
-    fn local_scalar_value_with_hint(
-        &mut self,
-        local_base: usize,
-        index: u8,
-    ) -> Option<ScalarValue> {
-        let absolute = local_base.checked_add(index as usize)?;
-        match self.local_type_hint(index) {
-            ValueType::Int => {
-                let value = match self.locals.get(absolute)? {
-                    Value::Int(value) => *value,
-                    _ => return None,
-                };
+    fn local_scalar_value_with_hint(&mut self, index: u8) -> Option<ScalarValue> {
+        let value = self.local_numeric_value(index)?;
+        match (self.local_type_hint(index), value) {
+            (ValueType::Int, NumericValue::Int(value)) => {
                 self.record_local_type_hint_hit();
                 Some(ScalarValue::Int(value))
             }
-            ValueType::Float => {
-                let value = match self.locals.get(absolute)? {
-                    Value::Float(value) => *value,
-                    _ => return None,
-                };
+            (ValueType::Float, NumericValue::Float(value)) => {
                 self.record_local_type_hint_hit();
                 Some(ScalarValue::Float(value))
             }
-            _ => self.local_numeric_value(index).map(|value| match value {
-                NumericValue::Int(value) => ScalarValue::Int(value),
-                NumericValue::Float(value) => ScalarValue::Float(value),
-            }),
+            (ValueType::Int | ValueType::Float, _) => None,
+            (_, NumericValue::Int(value)) => Some(ScalarValue::Int(value)),
+            (_, NumericValue::Float(value)) => Some(ScalarValue::Float(value)),
         }
     }
 
@@ -100,7 +87,7 @@ impl Vm {
             return Ok(false);
         }
         let local_base = self.active_local_base();
-        let Some(initial) = self.local_scalar_value_with_hint(local_base, src) else {
+        let Some(initial) = self.local_scalar_value_with_hint(src) else {
             return Ok(false);
         };
         let mut cursor = self.ip;
@@ -135,7 +122,7 @@ impl Vm {
                     let Some(index) = self.decoded_local_index_at(cursor) else {
                         return Ok(false);
                     };
-                    let Some(value) = self.local_scalar_value_with_hint(local_base, index) else {
+                    let Some(value) = self.local_scalar_value_with_hint(index) else {
                         return Ok(false);
                     };
                     if stack_len == stack.len() {
