@@ -27,6 +27,59 @@ def publish_plan(release_version: str, host_version: str) -> list[tuple[str, str
     return [(package, versions[package]) for package in PACKAGE_ORDER]
 
 
+def _compatibility_line(version: str) -> tuple[int, ...]:
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version)
+    if not match:
+        raise ValueError(f"unsupported package version: {version}")
+    major, minor, _patch = map(int, match.groups())
+    return (major,) if major else (major, minor)
+
+
+def compatible_registry_lock_versions(
+    lock_path: Path,
+    package: str,
+    target_version: str,
+) -> list[str]:
+    if not lock_path.exists():
+        return []
+    target_line = _compatibility_line(target_version)
+    lock = tomllib.loads(lock_path.read_text())
+    versions = {
+        entry["version"]
+        for entry in lock.get("package", [])
+        if entry.get("name") == package
+        and str(entry.get("source", "")).startswith("registry+")
+        and entry.get("version") != target_version
+        and _compatibility_line(entry["version"]) == target_line
+    }
+    return sorted(versions, key=lambda version: tuple(map(int, version.split("."))))
+
+
+def refresh_compatible_registry_lock(
+    root: Path,
+    package: str,
+    target_version: str,
+) -> None:
+    lock_path = root / "Cargo.lock"
+    while stale_versions := compatible_registry_lock_versions(
+        lock_path,
+        package,
+        target_version,
+    ):
+        subprocess.run(
+            [
+                "cargo",
+                "update",
+                "-p",
+                f"{package}@{stale_versions[0]}",
+                "--precise",
+                target_version,
+            ],
+            cwd=root,
+            check=True,
+        )
+
+
 def yank_command(package: str, version: str) -> list[str]:
     return ["cargo", "yank", "--vers", version, package]
 
@@ -156,6 +209,7 @@ def main() -> None:
 
     root = args.root.resolve()
     rewrite_manifests(root, args.version, args.host_version)
+    refresh_compatible_registry_lock(root, "pd-host-function", args.host_version)
     plan = publish_plan(args.version, args.host_version)
     print(json.dumps({"publish_plan": plan}))
     if args.prepare_only:
