@@ -4390,12 +4390,13 @@ fn emit_spec_driven_builtin(
     }
 
     // Build the typed SsaInstKind from the popped values.
-    let (inst_kind, out_info) = match kind {
+    let (inst_kind, out_info, emitted_name) = match kind {
         SpecializedBuiltinKind::StringLen => (
             SsaInstKind::StringLen {
                 text: popped[0].value.id,
             },
             ValueInfo::int(None),
+            spec.name,
         ),
         SpecializedBuiltinKind::RegexMatch => (
             SsaInstKind::RegexMatch {
@@ -4403,6 +4404,7 @@ fn emit_spec_driven_builtin(
                 text: popped[0].value.id,
             },
             ValueInfo::bool(None),
+            spec.name,
         ),
         SpecializedBuiltinKind::ArraySet => {
             let value = &popped[0];
@@ -4432,7 +4434,11 @@ fn emit_spec_driven_builtin(
                     value: value.value.id,
                 }
             };
-            (ssa_kind, ValueInfo::tagged_typed(ValueType::Array))
+            (
+                ssa_kind,
+                ValueInfo::tagged_typed(ValueType::Array),
+                if is_append { "array_push" } else { spec.name },
+            )
         }
         _ => unreachable!("non-pilot builtin in spec-driven emit"),
     };
@@ -4445,16 +4451,7 @@ fn emit_spec_driven_builtin(
         })
         .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
 
-    let name = if matches!(kind, SpecializedBuiltinKind::ArraySet)
-        && matches!(
-            builder.defining_inst(out.value.id).map(|inst| &inst.kind),
-            Some(SsaInstKind::ArrayPush { .. })
-        ) {
-        "array_push"
-    } else {
-        spec.name
-    };
-    Ok((name, out))
+    Ok((emitted_name, out))
 }
 
 fn ensure_entry_repr(
