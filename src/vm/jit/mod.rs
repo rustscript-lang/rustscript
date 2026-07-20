@@ -1,3 +1,4 @@
+pub(crate) mod builtin_spec;
 pub(crate) mod deopt;
 pub(crate) mod inline;
 pub(crate) mod ir;
