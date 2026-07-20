@@ -5,6 +5,7 @@ use crate::compiler::TypeSchema;
 use crate::vm::{OpCode, Program, Value, ValueType, checked_int_div};
 
 use super::JitTraceTerminal;
+use super::builtin_spec::{self, InputRepr, OutputKind};
 use super::deopt::materialize_ssa_values;
 use super::inline::{InlineCandidate, InlineRejectReason, classify_static_inline_candidate};
 use super::ir::{
@@ -680,7 +681,7 @@ enum HeapContainerKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SpecializedBuiltinKind {
+pub(crate) enum SpecializedBuiltinKind {
     ValueLen,
     StringLen,
     BytesLen,
@@ -3373,16 +3374,30 @@ fn analyze_specialized_builtin_call(
     frame: &mut AnalysisFrame,
     kind: SpecializedBuiltinKind,
 ) -> Result<&'static str, TraceRecordError> {
+    // Spec-driven fast path for pilot builtins.
+    if let Some(spec) = builtin_spec::pilot_spec_for(kind) {
+        for _ in 0..spec.arity {
+            let _ = frame.pop()?;
+        }
+        let info = match spec.output {
+            OutputKind::Int => ValueInfo::int(None),
+            OutputKind::Bool => ValueInfo::bool(None),
+            OutputKind::Tagged(vt) => ValueInfo::tagged_typed(vt),
+            OutputKind::TaggedUnknown => ValueInfo::tagged(),
+        };
+        frame.push(info);
+        return Ok(spec.name);
+    }
     match kind {
         SpecializedBuiltinKind::ValueLen => {
             let _ = frame.pop()?;
             frame.push(ValueInfo::int(None));
             Ok("value_len")
         }
-        SpecializedBuiltinKind::StringLen => {
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::int(None));
-            Ok("string_len")
+        SpecializedBuiltinKind::StringLen
+        | SpecializedBuiltinKind::RegexMatch
+        | SpecializedBuiltinKind::ArraySet => {
+            unreachable!("pilot builtins are handled by the spec-driven path")
         }
         SpecializedBuiltinKind::BytesLen => {
             let _ = frame.pop()?;
@@ -3426,12 +3441,6 @@ fn analyze_specialized_builtin_call(
             let _ = frame.pop()?;
             frame.push(ValueInfo::bool(None));
             Ok("string_contains")
-        }
-        SpecializedBuiltinKind::RegexMatch => {
-            let _ = frame.pop()?;
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::bool(None));
-            Ok("regex_match")
         }
         SpecializedBuiltinKind::RegexReplace => {
             let _ = frame.pop()?;
@@ -3522,13 +3531,6 @@ fn analyze_specialized_builtin_call(
             frame.push(ValueInfo::bool(None));
             Ok("array_has")
         }
-        SpecializedBuiltinKind::ArraySet => {
-            let _ = frame.pop()?;
-            let _ = frame.pop()?;
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::tagged_typed(ValueType::Array));
-            Ok("array_set")
-        }
         SpecializedBuiltinKind::ArrayPush => {
             let _ = frame.pop()?;
             let _ = frame.pop()?;
@@ -3584,6 +3586,10 @@ fn emit_specialized_builtin_call(
     frame: &mut SymbolicFrame,
     kind: SpecializedBuiltinKind,
 ) -> Result<(&'static str, SymbolicValue), TraceRecordError> {
+    // Spec-driven fast path for pilot builtins.
+    if let Some(spec) = builtin_spec::pilot_spec_for(kind) {
+        return emit_spec_driven_builtin(builder, block, ip, frame, kind, spec);
+    }
     match kind {
         SpecializedBuiltinKind::ValueLen => {
             let value = frame.pop()?;
@@ -3603,30 +3609,10 @@ fn emit_specialized_builtin_call(
                 .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
             Ok(("value_len", out))
         }
-        SpecializedBuiltinKind::StringLen => {
-            let text = frame.pop()?;
-            let text = ensure_heap_ptr(
-                builder,
-                block,
-                ip,
-                text,
-                HeapContainerKind::String.value_type(),
-            )?;
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::I64,
-                    SsaInstKind::StringLen {
-                        text: text.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::int(None),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("string_len", out))
+        SpecializedBuiltinKind::StringLen
+        | SpecializedBuiltinKind::RegexMatch
+        | SpecializedBuiltinKind::ArraySet => {
+            unreachable!("pilot builtins are handled by the spec-driven path")
         }
         SpecializedBuiltinKind::BytesLen => {
             let bytes = frame.pop()?;
@@ -3818,38 +3804,6 @@ fn emit_specialized_builtin_call(
                 })
                 .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
             Ok(("string_contains", out))
-        }
-        SpecializedBuiltinKind::RegexMatch => {
-            let text = ensure_heap_ptr(
-                builder,
-                block,
-                ip,
-                frame.pop()?,
-                HeapContainerKind::String.value_type(),
-            )?;
-            let pattern = ensure_heap_ptr(
-                builder,
-                block,
-                ip,
-                frame.pop()?,
-                HeapContainerKind::String.value_type(),
-            )?;
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Bool,
-                    SsaInstKind::RegexMatch {
-                        pattern: pattern.value.id,
-                        text: text.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::bool(None),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("regex_match", out))
         }
         SpecializedBuiltinKind::RegexReplace => {
             let replacement = ensure_heap_ptr(
@@ -4225,48 +4179,6 @@ fn emit_specialized_builtin_call(
                 .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
             Ok(("array_has", out))
         }
-        SpecializedBuiltinKind::ArraySet => {
-            let value = frame.pop()?;
-            let index = ensure_int(builder, block, ip, frame.pop()?)?;
-            let array = frame.pop()?;
-            if array.info.repr != SsaValueRepr::Tagged {
-                return Err(TraceRecordError::TypeMismatch {
-                    expected: "owned tagged array",
-                    actual: array.info.repr,
-                });
-            }
-            let is_append = matches!(
-                builder.defining_inst(index.value.id).map(|inst| &inst.kind),
-                Some(SsaInstKind::ArrayLen { array: array_ptr })
-                    if matches!(
-                        builder.defining_inst(*array_ptr).map(|inst| &inst.kind),
-                        Some(SsaInstKind::UnboxHeapPtr {
-                            input,
-                            tag: ValueType::Array,
-                        }) if *input == array.value.id
-                    )
-            );
-            let kind = if is_append {
-                SsaInstKind::ArrayPush {
-                    array: array.value.id,
-                    value: value.value.id,
-                }
-            } else {
-                SsaInstKind::ArraySet {
-                    array: array.value.id,
-                    index: index.value.id,
-                    value: value.value.id,
-                }
-            };
-            let out = builder
-                .append_value_inst(block, ip, SsaValueRepr::Tagged, kind)
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::tagged_typed(ValueType::Array),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok((if is_append { "array_push" } else { "array_set" }, out))
-        }
         SpecializedBuiltinKind::ArrayPush => {
             let value = frame.pop()?;
             let array = frame.pop()?;
@@ -4438,6 +4350,111 @@ fn emit_specialized_builtin_call(
             Ok(("map_iter_take_value", out))
         }
     }
+}
+
+/// Spec-driven emit path for pilot builtins.
+///
+/// Reads the declarative `BuiltinSpec` to pop inputs in order, apply
+/// representation constraints, and emit the typed `SsaInstKind`.
+/// Semantic special cases (e.g. ArraySet→ArrayPush append detection)
+/// remain as explicit typed logic within this function.
+fn emit_spec_driven_builtin(
+    builder: &mut SsaTraceBuilder,
+    block: super::ir::SsaBlockId,
+    ip: usize,
+    frame: &mut SymbolicFrame,
+    kind: SpecializedBuiltinKind,
+    spec: &builtin_spec::BuiltinSpec,
+) -> Result<(&'static str, SymbolicValue), TraceRecordError> {
+    // Pop and constrain inputs in spec order (reverse of push order).
+    let mut popped: Vec<SymbolicValue> = Vec::with_capacity(spec.arity);
+    for input_repr in spec.inputs {
+        let raw = frame.pop()?;
+        let constrained = match input_repr {
+            InputRepr::Int => ensure_int(builder, block, ip, raw)?,
+            InputRepr::HeapPtr(heap_kind) => {
+                ensure_heap_ptr(builder, block, ip, raw, heap_kind.value_type())?
+            }
+            InputRepr::Tagged => {
+                if raw.info.repr != SsaValueRepr::Tagged {
+                    return Err(TraceRecordError::TypeMismatch {
+                        expected: "owned tagged",
+                        actual: raw.info.repr,
+                    });
+                }
+                raw
+            }
+            InputRepr::Any => raw,
+        };
+        popped.push(constrained);
+    }
+
+    // Build the typed SsaInstKind from the popped values.
+    let (inst_kind, out_info) = match kind {
+        SpecializedBuiltinKind::StringLen => (
+            SsaInstKind::StringLen {
+                text: popped[0].value.id,
+            },
+            ValueInfo::int(None),
+        ),
+        SpecializedBuiltinKind::RegexMatch => (
+            SsaInstKind::RegexMatch {
+                pattern: popped[1].value.id,
+                text: popped[0].value.id,
+            },
+            ValueInfo::bool(None),
+        ),
+        SpecializedBuiltinKind::ArraySet => {
+            let value = &popped[0];
+            let index = &popped[1];
+            let array = &popped[2];
+            // Append-pattern detection: index == array.len() → ArrayPush.
+            let is_append = matches!(
+                builder.defining_inst(index.value.id).map(|inst| &inst.kind),
+                Some(SsaInstKind::ArrayLen { array: array_ptr })
+                    if matches!(
+                        builder.defining_inst(*array_ptr).map(|inst| &inst.kind),
+                        Some(SsaInstKind::UnboxHeapPtr {
+                            input,
+                            tag: ValueType::Array,
+                        }) if *input == array.value.id
+                    )
+            );
+            let ssa_kind = if is_append {
+                SsaInstKind::ArrayPush {
+                    array: array.value.id,
+                    value: value.value.id,
+                }
+            } else {
+                SsaInstKind::ArraySet {
+                    array: array.value.id,
+                    index: index.value.id,
+                    value: value.value.id,
+                }
+            };
+            (ssa_kind, ValueInfo::tagged_typed(ValueType::Array))
+        }
+        _ => unreachable!("non-pilot builtin in spec-driven emit"),
+    };
+
+    let out = builder
+        .append_value_inst(block, ip, spec.output.repr(), inst_kind)
+        .map(|value| SymbolicValue {
+            value,
+            info: out_info,
+        })
+        .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+
+    let name = if matches!(kind, SpecializedBuiltinKind::ArraySet)
+        && matches!(
+            builder.defining_inst(out.value.id).map(|inst| &inst.kind),
+            Some(SsaInstKind::ArrayPush { .. })
+        ) {
+        "array_push"
+    } else {
+        spec.name
+    };
+    Ok((name, out))
 }
 
 fn ensure_entry_repr(
