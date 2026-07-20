@@ -941,6 +941,7 @@ fn try_compile_ssa_trace(
             borrowed_array_gets: &borrowed_array_gets,
             value_reprs: &value_reprs,
             tagged_constant_addrs: &tagged_constant_addrs,
+            exit_specs: &exit_specs,
             interrupt_settings,
             interrupt_ops_to_advance,
         };
@@ -1235,6 +1236,7 @@ struct SsaLowerCtx<'a> {
     borrowed_array_gets: &'a BTreeSet<SsaValueId>,
     value_reprs: &'a HashMap<SsaValueId, SsaValueRepr>,
     tagged_constant_addrs: &'a HashMap<SsaValueId, usize>,
+    exit_specs: &'a HashMap<SsaExitId, SsaExitLowering>,
     interrupt_settings: Option<NativeInterruptSettings>,
     interrupt_ops_to_advance: u32,
 }
@@ -1262,6 +1264,7 @@ struct SsaBoxCtx {
 struct SsaConcatOp {
     output_id: SsaValueId,
     ip: usize,
+    failure_exit: Option<SsaExitId>,
     lhs: cranelift_codegen::ir::Value,
     rhs: cranelift_codegen::ir::Value,
     result_tag: u32,
@@ -1995,7 +1998,6 @@ fn lower_ssa_inst(
         exit_block,
         pointer_type,
         layout,
-        offsets,
         heap_refs,
         heap_addrs,
         string_refs,
@@ -2104,7 +2106,7 @@ fn lower_ssa_inst(
             b.ins().jump(cont, &[]);
 
             b.switch_to_block(fail);
-            ssa_emit_trace_exit_status(b, vm_ptr, exit_block, pointer_type, offsets, inst.ip)?;
+            ssa_emit_failure_exit(b, ctx, inst.failure_exit, inst.ip, values)?;
 
             b.switch_to_block(cont);
             out
@@ -2132,7 +2134,7 @@ fn lower_ssa_inst(
             b.ins().jump(cont, &[]);
 
             b.switch_to_block(fail);
-            ssa_emit_trace_exit_status(b, vm_ptr, exit_block, pointer_type, offsets, inst.ip)?;
+            ssa_emit_failure_exit(b, ctx, inst.failure_exit, inst.ip, values)?;
 
             b.switch_to_block(cont);
             out
@@ -2161,7 +2163,7 @@ fn lower_ssa_inst(
             b.ins().jump(cont, &[]);
 
             b.switch_to_block(fail);
-            ssa_emit_trace_exit_status(b, vm_ptr, exit_block, pointer_type, offsets, inst.ip)?;
+            ssa_emit_failure_exit(b, ctx, inst.failure_exit, inst.ip, values)?;
 
             b.switch_to_block(cont);
             out
@@ -2183,7 +2185,7 @@ fn lower_ssa_inst(
             b.ins().jump(cont, &[]);
 
             b.switch_to_block(fail);
-            ssa_emit_trace_exit_status(b, vm_ptr, exit_block, pointer_type, offsets, inst.ip)?;
+            ssa_emit_failure_exit(b, ctx, inst.failure_exit, inst.ip, values)?;
 
             b.switch_to_block(cont);
             out
@@ -2637,7 +2639,7 @@ fn lower_ssa_inst(
             );
 
             b.switch_to_block(fail);
-            ssa_emit_trace_exit_status(b, vm_ptr, exit_block, pointer_type, offsets, inst.ip)?;
+            ssa_emit_failure_exit(b, ctx, inst.failure_exit, inst.ip, values)?;
 
             b.switch_to_block(cont);
             out
@@ -2671,7 +2673,7 @@ fn lower_ssa_inst(
             b.ins().jump(cont, &[]);
 
             b.switch_to_block(fail);
-            ssa_emit_trace_exit_status(b, vm_ptr, exit_block, pointer_type, offsets, inst.ip)?;
+            ssa_emit_failure_exit(b, ctx, inst.failure_exit, inst.ip, values)?;
 
             b.switch_to_block(cont);
             out
@@ -2844,9 +2846,11 @@ fn lower_ssa_inst(
         SsaInstKind::StringConcat { lhs, rhs } => ssa_inline_concat(
             b,
             ctx,
+            values,
             SsaConcatOp {
                 output_id: output.id,
                 ip: inst.ip,
+                failure_exit: inst.failure_exit,
                 lhs: values[lhs],
                 rhs: values[rhs],
                 result_tag: layout.value.string_tag,
@@ -2856,9 +2860,11 @@ fn lower_ssa_inst(
         SsaInstKind::BytesConcat { lhs, rhs } => ssa_inline_concat(
             b,
             ctx,
+            values,
             SsaConcatOp {
                 output_id: output.id,
                 ip: inst.ip,
+                failure_exit: inst.failure_exit,
                 lhs: values[lhs],
                 rhs: values[rhs],
                 result_tag: layout.value.bytes_tag,
@@ -2989,7 +2995,7 @@ fn lower_ssa_inst(
             b.ins().jump(cont, &[]);
 
             b.switch_to_block(fail);
-            ssa_emit_trace_exit_status(b, vm_ptr, exit_block, pointer_type, offsets, inst.ip)?;
+            ssa_emit_failure_exit(b, ctx, inst.failure_exit, inst.ip, values)?;
 
             b.switch_to_block(cont);
             out
@@ -3075,7 +3081,7 @@ fn lower_ssa_inst(
             b.ins().jump(cont, &[]);
 
             b.switch_to_block(fail);
-            ssa_emit_trace_exit_status(b, vm_ptr, exit_block, pointer_type, offsets, inst.ip)?;
+            ssa_emit_failure_exit(b, ctx, inst.failure_exit, inst.ip, values)?;
 
             b.switch_to_block(cont);
             out
@@ -3162,7 +3168,7 @@ fn lower_ssa_inst(
             b.ins().jump(cont, &[]);
 
             b.switch_to_block(fail);
-            ssa_emit_trace_exit_status(b, vm_ptr, exit_block, pointer_type, offsets, inst.ip)?;
+            ssa_emit_failure_exit(b, ctx, inst.failure_exit, inst.ip, values)?;
 
             b.switch_to_block(cont);
             out
@@ -3269,7 +3275,7 @@ fn lower_ssa_inst(
             b.ins().jump(done, &[]);
 
             b.switch_to_block(fail);
-            ssa_emit_trace_exit_status(b, vm_ptr, exit_block, pointer_type, offsets, inst.ip)?;
+            ssa_emit_failure_exit(b, ctx, inst.failure_exit, inst.ip, values)?;
 
             b.switch_to_block(done);
             out
@@ -3461,7 +3467,7 @@ fn lower_ssa_inst(
             jump_with_status(b, exit_block, status);
 
             b.switch_to_block(miss_block);
-            ssa_emit_trace_exit_status(b, vm_ptr, exit_block, pointer_type, offsets, inst.ip)?;
+            ssa_emit_failure_exit(b, ctx, inst.failure_exit, inst.ip, values)?;
 
             b.switch_to_block(cont);
             out
@@ -3771,7 +3777,7 @@ fn lower_ssa_inst(
             b.ins().jump(cont, &[]);
 
             b.switch_to_block(fail);
-            ssa_emit_trace_exit_status(b, vm_ptr, exit_block, pointer_type, offsets, inst.ip)?;
+            ssa_emit_failure_exit(b, ctx, inst.failure_exit, inst.ip, values)?;
 
             b.switch_to_block(cont);
             out
@@ -3807,7 +3813,7 @@ fn lower_ssa_inst(
             b.ins().jump(cont, &[]);
 
             b.switch_to_block(fail);
-            ssa_emit_trace_exit_status(b, vm_ptr, exit_block, pointer_type, offsets, inst.ip)?;
+            ssa_emit_failure_exit(b, ctx, inst.failure_exit, inst.ip, values)?;
 
             b.switch_to_block(cont);
             out
@@ -3840,7 +3846,7 @@ fn lower_ssa_inst(
             b.ins().jump(cont, &[]);
 
             b.switch_to_block(fail);
-            ssa_emit_trace_exit_status(b, vm_ptr, exit_block, pointer_type, offsets, inst.ip)?;
+            ssa_emit_failure_exit(b, ctx, inst.failure_exit, inst.ip, values)?;
 
             b.switch_to_block(cont);
             out
@@ -3868,7 +3874,7 @@ fn lower_ssa_inst(
             b.ins().jump(cont, &[]);
 
             b.switch_to_block(fail);
-            ssa_emit_trace_exit_status(b, vm_ptr, exit_block, pointer_type, offsets, inst.ip)?;
+            ssa_emit_failure_exit(b, ctx, inst.failure_exit, inst.ip, values)?;
 
             b.switch_to_block(cont);
             out
@@ -3896,7 +3902,7 @@ fn lower_ssa_inst(
             b.ins().jump(cont, &[]);
 
             b.switch_to_block(fail);
-            ssa_emit_trace_exit_status(b, vm_ptr, exit_block, pointer_type, offsets, inst.ip)?;
+            ssa_emit_failure_exit(b, ctx, inst.failure_exit, inst.ip, values)?;
 
             b.switch_to_block(cont);
             out
@@ -5098,14 +5104,12 @@ fn ssa_index_in_range(
 fn ssa_inline_concat(
     b: &mut FunctionBuilder,
     ctx: SsaLowerCtx<'_>,
+    values: &HashMap<SsaValueId, cranelift_codegen::ir::Value>,
     op: SsaConcatOp,
 ) -> VmResult<cranelift_codegen::ir::Value> {
     let SsaLowerCtx {
-        vm_ptr,
-        exit_block,
         pointer_type,
         layout,
-        offsets,
         heap_refs,
         heap_addrs,
         helper_refs,
@@ -5116,6 +5120,7 @@ fn ssa_inline_concat(
     let SsaConcatOp {
         output_id,
         ip,
+        failure_exit,
         lhs,
         rhs,
         result_tag,
@@ -5213,7 +5218,7 @@ fn ssa_inline_concat(
     b.ins().jump(cont, &[]);
 
     b.switch_to_block(fail);
-    ssa_emit_trace_exit_status(b, vm_ptr, exit_block, pointer_type, offsets, ip)?;
+    ssa_emit_failure_exit(b, ctx, failure_exit, ip, values)?;
 
     b.switch_to_block(cont);
     Ok(out)
@@ -5696,6 +5701,49 @@ fn ssa_utf8_char_width(
     let tail = b.ins().select(lt_f0, three, four);
     let wide = b.ins().select(lt_e0, two, tail);
     b.ins().select(lt_80, one, wide)
+}
+
+fn ssa_emit_failure_exit(
+    b: &mut FunctionBuilder,
+    ctx: SsaLowerCtx<'_>,
+    failure_exit: Option<SsaExitId>,
+    ip: usize,
+    values: &HashMap<SsaValueId, cranelift_codegen::ir::Value>,
+) -> VmResult<()> {
+    if let Some(failure_exit) = failure_exit {
+        let spec = ctx.exit_specs.get(&failure_exit).ok_or_else(|| {
+            VmError::JitNative(format!(
+                "SSA instruction failure exit {} lowering missing",
+                failure_exit.raw()
+            ))
+        })?;
+        let args = spec
+            .inputs
+            .iter()
+            .map(|value| {
+                values
+                    .get(value)
+                    .copied()
+                    .map(BlockArg::Value)
+                    .ok_or_else(|| {
+                        VmError::JitNative(format!(
+                            "SSA instruction failure exit input {} missing",
+                            value.raw()
+                        ))
+                    })
+            })
+            .collect::<VmResult<Vec<_>>>()?;
+        b.ins().jump(spec.trace_exit_block, &args);
+        return Ok(());
+    }
+    ssa_emit_trace_exit_status(
+        b,
+        ctx.vm_ptr,
+        ctx.exit_block,
+        ctx.pointer_type,
+        ctx.offsets,
+        ip,
+    )
 }
 
 fn ssa_emit_trace_exit_status(

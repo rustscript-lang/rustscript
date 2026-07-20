@@ -193,6 +193,7 @@ pub struct JitTrace {
     pub start_line: Option<u32>,
     pub has_call: bool,
     pub has_yielding_call: bool,
+    pub(crate) entry_callable_guards: Vec<(u8, u32)>,
     pub op_names: Vec<String>,
     pub terminal: JitTraceTerminal,
     pub executions: u64,
@@ -440,7 +441,9 @@ impl TraceJitEngine {
             root_ip: ip,
             stack_depth,
         };
-        if let Some(trace_id) = self.compiled_trace_for_key(key) {
+        if let Some(trace_id) =
+            self.compiled_trace_for_key_matching_callables(key, entry_callable_prototypes)
+        {
             return Some(trace_id);
         }
         if !self.is_loop_header(program, ip)
@@ -652,7 +655,9 @@ impl TraceJitEngine {
             root_ip: ip,
             stack_depth,
         };
-        if let Some(trace_id) = self.compiled_trace_for_key(key) {
+        if let Some(trace_id) =
+            self.compiled_trace_for_key_matching_callables(key, entry_callable_prototypes)
+        {
             return Some(trace_id);
         }
         if !self.blocked_entries.is_empty() && self.blocked_entries.contains(&key) {
@@ -697,6 +702,40 @@ impl TraceJitEngine {
             frame_key,
             root_ip: ip,
             stack_depth,
+        })
+    }
+
+    pub(crate) fn compiled_trace_for_entry_with_callables(
+        &self,
+        frame_key: u64,
+        ip: usize,
+        stack_depth: usize,
+        entry_callable_prototypes: Option<&[Option<u32>]>,
+    ) -> Option<usize> {
+        self.compiled_trace_for_key_matching_callables(
+            TraceEntryKey {
+                frame_key,
+                root_ip: ip,
+                stack_depth,
+            },
+            entry_callable_prototypes,
+        )
+    }
+
+    pub(crate) fn trace_has_entry_callable_guards(&self, trace_id: usize) -> bool {
+        self.traces
+            .get(trace_id)
+            .is_some_and(|trace| !trace.entry_callable_guards.is_empty())
+    }
+
+    pub(crate) fn trace_exit_is_instruction_failure(&self, key: TraceExitKey) -> bool {
+        self.traces.get(key.parent_trace_id).is_some_and(|trace| {
+            trace
+                .ssa
+                .blocks
+                .iter()
+                .flat_map(|block| &block.insts)
+                .any(|inst| inst.failure_exit == Some(key.exit_id))
         })
     }
 
@@ -1059,6 +1098,32 @@ impl TraceJitEngine {
         )
     }
 
+    fn compiled_trace_for_key_matching_callables(
+        &self,
+        key: TraceEntryKey,
+        entry_callable_prototypes: Option<&[Option<u32>]>,
+    ) -> Option<usize> {
+        self.compiled_by_ip.get(key.root_ip)?.iter().find_map(
+            |(frame_key, stack_depth, trace_id)| {
+                if *frame_key != key.frame_key || *stack_depth != key.stack_depth {
+                    return None;
+                }
+                let trace = self.traces.get(*trace_id)?;
+                trace
+                    .entry_callable_guards
+                    .iter()
+                    .all(|(local, prototype_id)| {
+                        entry_callable_prototypes
+                            .and_then(|prototypes| prototypes.get(usize::from(*local)))
+                            .copied()
+                            .flatten()
+                            == Some(*prototype_id)
+                    })
+                    .then_some(*trace_id)
+            },
+        )
+    }
+
     fn insert_compiled_trace(&mut self, key: TraceEntryKey, trace_id: usize) {
         if self.compiled_by_ip.len() <= key.root_ip {
             self.compiled_by_ip.resize_with(key.root_ip + 1, Vec::new);
@@ -1146,6 +1211,7 @@ fn build_jit_trace(
         start_line,
         has_call: recorded.has_call,
         has_yielding_call: recorded.has_yielding_call,
+        entry_callable_guards: recorded.entry_callable_guards,
         op_names: recorded.op_names,
         terminal: recorded.terminal,
         executions: 0,
@@ -1259,8 +1325,8 @@ mod tests {
         SsaExitId, SsaMaterialization, SsaTerminator, SsaTrace, SsaTraceBuilder, SsaValueRepr,
     };
     use crate::{
-        BytecodeBuilder, CallableKind, CallablePrototype, CallableTarget, ScriptFunction, Value,
-        ValueType,
+        BytecodeBuilder, CallableKind, CallablePrototype, CallableTarget, FunctionRegion,
+        RootCallableBinding, ScriptFunction, Value, ValueType,
     };
 
     #[test]
@@ -1354,6 +1420,7 @@ mod tests {
             start_line: None,
             has_call: false,
             has_yielding_call,
+            entry_callable_guards: Vec::new(),
             op_names: Vec::new(),
             terminal: JitTraceTerminal::BranchExit,
             executions: 0,
@@ -1709,6 +1776,7 @@ mod tests {
             start_line: None,
             has_call: false,
             has_yielding_call: false,
+            entry_callable_guards: Vec::new(),
             op_names: Vec::new(),
             terminal: JitTraceTerminal::BranchExit,
             executions: 0,
@@ -1767,6 +1835,7 @@ mod tests {
             start_line: None,
             has_call: false,
             has_yielding_call: false,
+            entry_callable_guards: Vec::new(),
             op_names: Vec::new(),
             terminal: JitTraceTerminal::BranchExit,
             executions: 0,
@@ -1787,6 +1856,123 @@ mod tests {
             }
         );
         assert!(engine.trace_exit_profiles.is_empty());
+    }
+
+    #[test]
+    fn cached_inline_trace_requires_matching_entry_callable_prototype() {
+        if !native_jit_supported() {
+            return;
+        }
+        let mut bc = BytecodeBuilder::new();
+        let root_ip = bc.position();
+        bc.ldloc(0);
+        bc.call_value(0);
+        bc.pop();
+        bc.br(root_ip);
+        let first_entry = bc.position();
+        bc.ldc(0);
+        bc.ret();
+        let first_end = bc.position();
+        let second_entry = bc.position();
+        bc.ldc(1);
+        bc.ret();
+        let second_end = bc.position();
+        let program = Program::new(vec![Value::Int(1), Value::Int(2)], bc.finish())
+            .with_local_count(1)
+            .with_callable_metadata(
+                vec![
+                    ScriptFunction {
+                        entry_ip: first_entry,
+                        end_ip: first_end,
+                    },
+                    ScriptFunction {
+                        entry_ip: second_entry,
+                        end_ip: second_end,
+                    },
+                ],
+                vec![
+                    CallablePrototype {
+                        kind: CallableKind::FunctionItem,
+                        target: CallableTarget::ScriptFunction(0),
+                        arity: 0,
+                        frame_local_count: 1,
+                        parameter_slots: Vec::new(),
+                        capture_source_slots: Vec::new(),
+                        capture_slots: Vec::new(),
+                        capture_modes: Vec::new(),
+                        self_slot: None,
+                        schema: None,
+                    },
+                    CallablePrototype {
+                        kind: CallableKind::FunctionItem,
+                        target: CallableTarget::ScriptFunction(1),
+                        arity: 0,
+                        frame_local_count: 1,
+                        parameter_slots: Vec::new(),
+                        capture_source_slots: Vec::new(),
+                        capture_slots: Vec::new(),
+                        capture_modes: Vec::new(),
+                        self_slot: None,
+                        schema: None,
+                    },
+                ],
+                vec![
+                    FunctionRegion {
+                        start_ip: first_entry,
+                        end_ip: first_end,
+                        prototype_id: Some(0),
+                    },
+                    FunctionRegion {
+                        start_ip: second_entry,
+                        end_ip: second_end,
+                        prototype_id: Some(1),
+                    },
+                ],
+                vec![RootCallableBinding {
+                    local_slot: 0,
+                    prototype_id: 0,
+                }],
+            );
+        let mut engine = TraceJitEngine::new(JitConfig {
+            enabled: true,
+            hot_loop_threshold: 1,
+            max_trace_len: 64,
+        });
+
+        let first = engine
+            .observe_hot_entry_with_local_types(
+                ROOT_FRAME_KEY,
+                root_ip as usize,
+                0,
+                None,
+                Some(&[Some(0)]),
+                &program,
+            )
+            .expect("first inline trace");
+        assert!(
+            engine.traces[first]
+                .op_names
+                .iter()
+                .any(|name| name == "inline_call:0")
+        );
+
+        let replacement = engine
+            .observe_hot_entry_with_local_types(
+                ROOT_FRAME_KEY,
+                root_ip as usize,
+                0,
+                None,
+                Some(&[Some(1)]),
+                &program,
+            )
+            .expect("replacement trace");
+        assert_ne!(replacement, first);
+        assert!(
+            !engine.traces[replacement]
+                .op_names
+                .iter()
+                .any(|name| name == "inline_call:0")
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ use super::ir::{
 pub(crate) struct RecordedTrace {
     pub(crate) has_call: bool,
     pub(crate) has_yielding_call: bool,
+    pub(crate) entry_callable_guards: Vec<(u8, u32)>,
     pub(crate) op_names: Vec<String>,
     pub(crate) ssa: SsaTrace,
     pub(crate) terminal: JitTraceTerminal,
@@ -187,7 +188,9 @@ impl ValueInfo {
     }
 
     fn sourced_from(mut self, local: u8) -> Self {
-        self.source_local = Some(local);
+        if self.source_local.is_none() {
+            self.source_local = Some(local);
+        }
         self
     }
 }
@@ -277,10 +280,8 @@ fn inline_schema_guard_type(schema: &TypeSchema) -> Option<Option<ValueType>> {
         TypeSchema::Array(_) | TypeSchema::ArrayTuple(_) | TypeSchema::ArrayTupleRest { .. } => {
             Some(Some(ValueType::Array))
         }
-        TypeSchema::Null
-        | TypeSchema::Number
-        | TypeSchema::Optional(_)
-        | TypeSchema::Callable { .. } => None,
+        TypeSchema::Null => Some(Some(ValueType::Null)),
+        TypeSchema::Number | TypeSchema::Optional(_) | TypeSchema::Callable { .. } => None,
     }
 }
 
@@ -288,10 +289,11 @@ fn inline_argument_schemas_supported(
     arguments: &[SymbolicValue],
     schema: Option<&TypeSchema>,
 ) -> bool {
-    let Some(TypeSchema::Callable { params, .. }) = schema else {
+    let Some(TypeSchema::Callable { params, result }) = schema else {
         return schema.is_none();
     };
-    params.len() == arguments.len()
+    inline_schema_guard_type(result).is_some()
+        && params.len() == arguments.len()
         && params.iter().zip(arguments).all(|(schema, argument)| {
             let Some(guard_type) = inline_schema_guard_type(schema) else {
                 return false;
@@ -354,6 +356,58 @@ fn append_inline_argument_schema_guards(
         });
     }
     Ok(guard)
+}
+
+fn append_inline_result_schema_guard(
+    builder: &mut SsaTraceBuilder,
+    block: super::ir::SsaBlockId,
+    ip: usize,
+    result: SymbolicValue,
+    schema: Option<&TypeSchema>,
+) -> Result<Option<SsaValueId>, TraceRecordError> {
+    let Some(TypeSchema::Callable { result: schema, .. }) = schema else {
+        return Ok(None);
+    };
+    let Some(guard_type) = inline_schema_guard_type(schema) else {
+        return Err(TraceRecordError::UnsupportedTrace(
+            "inline callable return schema is not guardable".to_string(),
+        ));
+    };
+    let Some(expected) = guard_type else {
+        return Ok(None);
+    };
+    let statically_matches = match result.info.repr {
+        SsaValueRepr::I64 => expected == ValueType::Int,
+        SsaValueRepr::F64 => expected == ValueType::Float,
+        SsaValueRepr::Bool => expected == ValueType::Bool,
+        SsaValueRepr::HeapPtr(actual) => expected == actual,
+        SsaValueRepr::Tagged => {
+            let predicate = builder
+                .append_value_inst(
+                    block,
+                    ip,
+                    SsaValueRepr::Bool,
+                    SsaInstKind::ValueIsType {
+                        input: result.value.id,
+                        tag: expected,
+                    },
+                )
+                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+            return Ok(Some(predicate.id));
+        }
+    };
+    if statically_matches {
+        return Ok(None);
+    }
+    let predicate = builder
+        .append_value_inst(
+            block,
+            ip,
+            SsaValueRepr::Bool,
+            SsaInstKind::Constant(Value::Bool(false)),
+        )
+        .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+    Ok(Some(predicate.id))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -497,6 +551,39 @@ enum DecodedOp {
 }
 
 impl DecodedOp {
+    fn ip(self) -> usize {
+        match self {
+            Self::Nop { ip }
+            | Self::Ret { ip }
+            | Self::Ldc { ip, .. }
+            | Self::Ldloc { ip, .. }
+            | Self::Stloc { ip, .. }
+            | Self::Pop { ip }
+            | Self::Dup { ip }
+            | Self::Neg { ip }
+            | Self::Not { ip }
+            | Self::BinOp { ip, .. }
+            | Self::Compare { ip, .. }
+            | Self::Brfalse { ip, .. }
+            | Self::Br { ip, .. }
+            | Self::Call { ip, .. }
+            | Self::CallValue { ip, .. } => ip,
+        }
+    }
+
+    fn may_need_inline_failure_exit(self) -> bool {
+        matches!(
+            self,
+            Self::Ret { .. }
+                | Self::Neg { .. }
+                | Self::Not { .. }
+                | Self::BinOp { .. }
+                | Self::Compare { .. }
+                | Self::Brfalse { .. }
+                | Self::Call { .. }
+        )
+    }
+
     fn is_useful_native_computation(self) -> bool {
         match self {
             Self::Nop { .. }
@@ -1001,6 +1088,7 @@ pub(crate) fn record_trace_with_local_count(
     let mut has_call = false;
     let mut has_yielding_call = false;
     let mut has_useful_native_computation = false;
+    let mut entry_callable_guards = Vec::new();
     let mut inline_frame: Option<InlineRecorderFrame> = None;
 
     loop {
@@ -1008,28 +1096,81 @@ pub(crate) fn record_trace_with_local_count(
             break;
         };
         let is_useful_native_computation = decoded.is_useful_native_computation();
+        let instruction_failure_exit = if decoded.may_need_inline_failure_exit() {
+            inline_frame
+                .as_ref()
+                .map(|inlined| add_symbolic_exit(&mut builder, decoded.ip(), &frame, Some(inlined)))
+        } else {
+            None
+        };
+        builder.set_current_failure_exit(instruction_failure_exit);
 
         match decoded {
             DecodedOp::Nop { .. } => op_names.push("nop".to_string()),
             DecodedOp::Ret { ip } => {
-                if let Some(inlined) = inline_frame.take() {
-                    let result = match frame.stack.pop() {
-                        Some(result) => result,
-                        None => {
-                            let value = builder
-                                .append_value_inst(
-                                    current_block,
-                                    ip,
-                                    SsaValueRepr::Tagged,
-                                    SsaInstKind::Constant(Value::Null),
-                                )
-                                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-                            SymbolicValue {
-                                value,
-                                info: ValueInfo::tagged_typed(ValueType::Null),
-                            }
-                        }
-                    };
+                if inline_frame.is_some() {
+                    if frame.stack.is_empty() {
+                        let value = builder
+                            .append_value_inst(
+                                current_block,
+                                ip,
+                                SsaValueRepr::Tagged,
+                                SsaInstKind::Constant(Value::Null),
+                            )
+                            .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+                        frame.push(SymbolicValue {
+                            value,
+                            info: ValueInfo::tagged_typed(ValueType::Null),
+                        });
+                    }
+                    let result = *frame.stack.last().expect("inline result ensured above");
+                    let prototype_id = inline_frame
+                        .as_ref()
+                        .expect("inline frame checked above")
+                        .candidate
+                        .prototype_id;
+                    let return_guard = append_inline_result_schema_guard(
+                        &mut builder,
+                        current_block,
+                        ip,
+                        result,
+                        program.callable_prototypes[prototype_id as usize]
+                            .schema
+                            .as_ref(),
+                    )?;
+                    if let Some(condition) = return_guard {
+                        let failure_exit = instruction_failure_exit.ok_or_else(|| {
+                            TraceRecordError::InvalidIr(
+                                "inline return schema guard is missing its virtual-frame exit"
+                                    .to_string(),
+                            )
+                        })?;
+                        let (guarded_block, guarded_frame, guarded_args) =
+                            continue_with_inline_frame(
+                                &mut builder,
+                                &frame,
+                                &mut inline_frame,
+                                "inline_return_schema",
+                            )?;
+                        builder
+                            .set_terminator(
+                                current_block,
+                                SsaTerminator::BranchBool {
+                                    condition,
+                                    if_true: super::ir::SsaBranchTarget::Block {
+                                        target: guarded_block,
+                                        args: guarded_args,
+                                    },
+                                    if_false: super::ir::SsaBranchTarget::Exit(failure_exit),
+                                },
+                            )
+                            .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+                        current_block = guarded_block;
+                        frame = guarded_frame;
+                        op_names.push("inline_return_schema_guard".to_string());
+                    }
+                    let inlined = inline_frame.take().expect("inline frame checked above");
+                    let result = frame.pop()?;
                     op_names.push("inline_ret".to_string());
                     frame = inlined.caller;
                     frame.push(result);
@@ -1362,6 +1503,17 @@ pub(crate) fn record_trace_with_local_count(
                 if inline_frame.is_none()
                     && let Ok(candidate) = candidate
                 {
+                    let source_local =
+                        callable
+                            .info
+                            .source_local
+                            .ok_or(TraceRecordError::UnsupportedTrace(
+                                "inline candidate lost callable source local".to_string(),
+                            ))?;
+                    let entry_guard = (source_local, candidate.prototype_id);
+                    if !entry_callable_guards.contains(&entry_guard) {
+                        entry_callable_guards.push(entry_guard);
+                    }
                     let prototype = &program.callable_prototypes[candidate.prototype_id as usize];
                     let argument_start = frame.stack.len() - usize::from(argc);
                     let schema_guard = append_inline_argument_schema_guards(
@@ -1594,6 +1746,21 @@ pub(crate) fn record_trace_with_local_count(
     }
 
     let terminal = terminal.ok_or(TraceRecordError::MissingTerminal)?;
+    if loop_header_plan.is_some()
+        && entry_callable_guards.iter().any(|(local, _)| {
+            let local = usize::from(*local);
+            frame.dirty_locals.get(local).copied().unwrap_or(false)
+                || inline_frame
+                    .as_ref()
+                    .and_then(|inlined| inlined.caller.dirty_locals.get(local))
+                    .copied()
+                    .unwrap_or(false)
+        })
+    {
+        return Err(TraceRecordError::UnsupportedTrace(
+            "inline callable source local is mutated by the native loop".to_string(),
+        ));
+    }
     let ssa = builder.finish();
     ssa.verify()
         .map_err(|err| TraceRecordError::InvalidIr(format!("{err:?}")))?;
@@ -1601,6 +1768,7 @@ pub(crate) fn record_trace_with_local_count(
     Ok(RecordedTrace {
         has_call,
         has_yielding_call,
+        entry_callable_guards,
         op_names,
         ssa,
         terminal,
@@ -5330,6 +5498,205 @@ mod tests {
             recorded.ssa.blocks[2].terminator,
             Some(SsaTerminator::Jump { .. })
         ));
+    }
+
+    #[test]
+    fn inline_static_leaf_rejects_loop_that_mutates_guarded_callable_source() {
+        let mut bc = BytecodeBuilder::new();
+        let root_ip = bc.position();
+        bc.ldloc(0);
+        bc.call_value(0);
+        bc.pop();
+        bc.ldloc(1);
+        bc.stloc(0);
+        bc.br(root_ip);
+        let first_entry = bc.position();
+        bc.ldc(0);
+        bc.ret();
+        let first_end = bc.position();
+        let second_entry = bc.position();
+        bc.ldc(1);
+        bc.ret();
+        let second_end = bc.position();
+        let program = Program::new(vec![Value::Int(1), Value::Int(2)], bc.finish())
+            .with_local_count(2)
+            .with_callable_metadata(
+                vec![
+                    ScriptFunction {
+                        entry_ip: first_entry,
+                        end_ip: first_end,
+                    },
+                    ScriptFunction {
+                        entry_ip: second_entry,
+                        end_ip: second_end,
+                    },
+                ],
+                vec![
+                    CallablePrototype {
+                        kind: CallableKind::FunctionItem,
+                        target: CallableTarget::ScriptFunction(0),
+                        arity: 0,
+                        frame_local_count: 1,
+                        parameter_slots: Vec::new(),
+                        capture_source_slots: Vec::new(),
+                        capture_slots: Vec::new(),
+                        capture_modes: Vec::new(),
+                        self_slot: None,
+                        schema: None,
+                    },
+                    CallablePrototype {
+                        kind: CallableKind::FunctionItem,
+                        target: CallableTarget::ScriptFunction(1),
+                        arity: 0,
+                        frame_local_count: 1,
+                        parameter_slots: Vec::new(),
+                        capture_source_slots: Vec::new(),
+                        capture_slots: Vec::new(),
+                        capture_modes: Vec::new(),
+                        self_slot: None,
+                        schema: None,
+                    },
+                ],
+                vec![
+                    FunctionRegion {
+                        start_ip: first_entry,
+                        end_ip: first_end,
+                        prototype_id: Some(0),
+                    },
+                    FunctionRegion {
+                        start_ip: second_entry,
+                        end_ip: second_end,
+                        prototype_id: Some(1),
+                    },
+                ],
+                vec![
+                    RootCallableBinding {
+                        local_slot: 0,
+                        prototype_id: 0,
+                    },
+                    RootCallableBinding {
+                        local_slot: 1,
+                        prototype_id: 1,
+                    },
+                ],
+            );
+
+        let error = record_trace_with_local_count(
+            &program,
+            crate::vm::native::ROOT_FRAME_KEY,
+            root_ip as usize,
+            0,
+            2,
+            None,
+            Some(&[Some(0), Some(1)]),
+            64,
+            &[],
+        )
+        .expect_err("mutated callable source must reject native loop");
+        assert!(
+            matches!(error, TraceRecordError::UnsupportedTrace(ref reason) if reason.contains("callable source local")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn inline_static_leaf_tracks_callable_source_across_local_copy() {
+        let mut bc = BytecodeBuilder::new();
+        let root_ip = bc.position();
+        bc.ldloc(1);
+        bc.stloc(0);
+        bc.ldloc(0);
+        bc.call_value(0);
+        bc.pop();
+        bc.br(root_ip);
+        let first_entry = bc.position();
+        bc.ldc(0);
+        bc.ret();
+        let first_end = bc.position();
+        let second_entry = bc.position();
+        bc.ldc(1);
+        bc.ret();
+        let second_end = bc.position();
+
+        let program = Program::new(vec![Value::Int(1), Value::Int(2)], bc.finish())
+            .with_local_count(2)
+            .with_callable_metadata(
+                vec![
+                    ScriptFunction {
+                        entry_ip: first_entry,
+                        end_ip: first_end,
+                    },
+                    ScriptFunction {
+                        entry_ip: second_entry,
+                        end_ip: second_end,
+                    },
+                ],
+                vec![
+                    CallablePrototype {
+                        kind: CallableKind::FunctionItem,
+                        target: CallableTarget::ScriptFunction(0),
+                        arity: 0,
+                        frame_local_count: 2,
+                        parameter_slots: Vec::new(),
+                        capture_source_slots: Vec::new(),
+                        capture_slots: Vec::new(),
+                        capture_modes: Vec::new(),
+                        self_slot: None,
+                        schema: None,
+                    },
+                    CallablePrototype {
+                        kind: CallableKind::FunctionItem,
+                        target: CallableTarget::ScriptFunction(1),
+                        arity: 0,
+                        frame_local_count: 2,
+                        parameter_slots: Vec::new(),
+                        capture_source_slots: Vec::new(),
+                        capture_slots: Vec::new(),
+                        capture_modes: Vec::new(),
+                        self_slot: None,
+                        schema: None,
+                    },
+                ],
+                vec![
+                    FunctionRegion {
+                        start_ip: first_entry,
+                        end_ip: first_end,
+                        prototype_id: Some(0),
+                    },
+                    FunctionRegion {
+                        start_ip: second_entry,
+                        end_ip: second_end,
+                        prototype_id: Some(1),
+                    },
+                ],
+                vec![
+                    RootCallableBinding {
+                        local_slot: 0,
+                        prototype_id: 0,
+                    },
+                    RootCallableBinding {
+                        local_slot: 1,
+                        prototype_id: 1,
+                    },
+                ],
+            );
+        let callable_prototypes = [Some(0), Some(1)];
+
+        let recorded = record_trace_with_local_count(
+            &program,
+            crate::vm::native::ROOT_FRAME_KEY,
+            root_ip as usize,
+            0,
+            program.local_count,
+            None,
+            Some(&callable_prototypes),
+            64,
+            &[],
+        )
+        .expect("copied callable trace");
+
+        assert!(recorded.op_names.iter().any(|name| name == "inline_call:1"));
+        assert!(!recorded.op_names.iter().any(|name| name == "inline_call:0"));
     }
 
     #[test]
