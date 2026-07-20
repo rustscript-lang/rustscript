@@ -1167,7 +1167,6 @@ pub(crate) fn record_trace_with_local_count(
                             .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
                         current_block = guarded_block;
                         frame = guarded_frame;
-                        op_names.push("inline_return_schema_guard".to_string());
                     }
                     let inlined = inline_frame.take().expect("inline frame checked above");
                     let result = frame.pop()?;
@@ -1548,7 +1547,6 @@ pub(crate) fn record_trace_with_local_count(
                             .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
                         current_block = guarded_block;
                         frame = guarded_frame;
-                        op_names.push("inline_callable_schema_guard".to_string());
                     }
 
                     let operand_base = frame.stack.len() - usize::from(argc) - 1;

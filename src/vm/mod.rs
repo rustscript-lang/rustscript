@@ -635,6 +635,17 @@ fn hash_type_schema(schema: &crate::compiler::TypeSchema, state: &mut impl Hashe
     }
 }
 
+fn inline_compatible_callable_prototype(value: &Value) -> Option<u32> {
+    match value {
+        Value::Callable(callable)
+            if callable.kind == crate::CallableKind::FunctionItem && callable.env.is_none() =>
+        {
+            Some(callable.prototype_id)
+        }
+        _ => None,
+    }
+}
+
 impl Vm {
     pub fn new(program: Program) -> Self {
         Self::new_shared_with_jit_config(Arc::new(program), jit::JitConfig::default())
@@ -1075,15 +1086,9 @@ impl Vm {
         for (offset, value) in self.locals[base..].iter().enumerate() {
             let prototype_id = if let Some(cell) = self.capture_cells.get(&(base + offset)) {
                 let value = cell.lock().ok()?;
-                match &*value {
-                    Value::Callable(callable) => Some(callable.prototype_id),
-                    _ => None,
-                }
+                inline_compatible_callable_prototype(&value)
             } else {
-                match value {
-                    Value::Callable(callable) => Some(callable.prototype_id),
-                    _ => None,
-                }
+                inline_compatible_callable_prototype(value)
             };
             prototypes.push(prototype_id);
         }

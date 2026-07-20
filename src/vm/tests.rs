@@ -55,6 +55,46 @@ fn shared_capture_cell_rejects_callable_ownership_cycle() {
 }
 
 #[test]
+fn inline_callable_identity_requires_capture_free_function_item_state() {
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]).with_local_count(1));
+    let malformed_environment = Arc::new(crate::CallableEnvironment {
+        cells: Mutex::new(vec![Arc::new(Mutex::new(Value::Int(7)))]),
+    });
+    vm.set_local(
+        0,
+        Value::Callable(Arc::new(crate::CallableValue {
+            prototype_id: 42,
+            kind: crate::CallableKind::FunctionItem,
+            env: Some(malformed_environment),
+        })),
+    )
+    .expect("install malformed callable");
+    assert_eq!(vm.active_local_callable_prototypes(), Some(vec![None]));
+
+    vm.set_local(
+        0,
+        Value::Callable(Arc::new(crate::CallableValue {
+            prototype_id: 42,
+            kind: crate::CallableKind::Closure,
+            env: None,
+        })),
+    )
+    .expect("install closure-shaped callable");
+    assert_eq!(vm.active_local_callable_prototypes(), Some(vec![None]));
+
+    vm.set_local(
+        0,
+        Value::Callable(Arc::new(crate::CallableValue {
+            prototype_id: 42,
+            kind: crate::CallableKind::FunctionItem,
+            env: None,
+        })),
+    )
+    .expect("install inline-compatible callable");
+    assert_eq!(vm.active_local_callable_prototypes(), Some(vec![Some(42)]));
+}
+
+#[test]
 fn callable_operand_type_hint_roundtrips() {
     let packed = pack_operand_types(ValueType::Callable, ValueType::Callable);
     assert_eq!(

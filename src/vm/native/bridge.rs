@@ -112,6 +112,10 @@ pub(crate) fn clear_bridge_error() {
     GENERIC_BRIDGE_ERROR.with(|slot| *slot.borrow_mut() = None);
 }
 
+pub(crate) extern "C" fn pd_vm_native_clear_bridge_error() {
+    clear_bridge_error();
+}
+
 pub(crate) fn take_bridge_error() -> Option<VmError> {
     GENERIC_BRIDGE_ERROR.with(|slot| slot.borrow_mut().take())
 }
@@ -274,6 +278,10 @@ pub(crate) fn init_null_value_slot_entry_address() -> usize {
 
 pub(crate) fn clear_value_slot_entry_address() -> usize {
     pd_vm_native_clear_value_slot as *const () as usize
+}
+
+pub(crate) fn clear_bridge_error_entry_address() -> usize {
+    pd_vm_native_clear_bridge_error as *const () as usize
 }
 
 pub(crate) fn value_eq_entry_address() -> usize {
@@ -1353,8 +1361,13 @@ pub(crate) extern "C" fn pd_vm_native_map_has(repr_ptr: *mut u8, key: *const Val
         return STATUS_ERROR;
     }
 
+    let key = unsafe { &*key };
+    if let Err(err) = crate::builtins::runtime::core::ensure_supported_map_key(key) {
+        store_bridge_error(err);
+        return STATUS_ERROR;
+    }
     let entries = unsafe { arc_from_repr_ptr::<VmMap>(repr_ptr) };
-    let present = entries.get(unsafe { &*key }).is_some();
+    let present = entries.get(key).is_some();
     std::mem::forget(entries);
     i32::from(present)
 }
@@ -1371,8 +1384,13 @@ pub(crate) extern "C" fn pd_vm_native_map_get(
         return STATUS_ERROR;
     }
 
+    let key = unsafe { &*key };
+    if let Err(err) = crate::builtins::runtime::core::ensure_supported_map_key(key) {
+        store_bridge_error(err);
+        return STATUS_ERROR;
+    }
     let entries = unsafe { arc_from_repr_ptr::<VmMap>(repr_ptr) };
-    let Some(value) = entries.get(unsafe { &*key }) else {
+    let Some(value) = entries.get(key) else {
         std::mem::forget(entries);
         return 0;
     };
@@ -1482,26 +1500,50 @@ pub(crate) extern "C" fn pd_vm_native_array_set(
         return STATUS_ERROR;
     }
 
-    let array = unsafe { std::ptr::replace(array, Value::Null) };
-    let value = unsafe { (&*value).clone() };
-    let result = match array {
+    let validated_index = match unsafe { &*array } {
         Value::Array(values) => {
-            crate::builtins::runtime::core::builtin_set_array_shared_impl(values, index, value)
-                .map(Value::Array)
+            if index < 0 {
+                store_bridge_error(VmError::HostError(
+                    "array index must be non-negative".to_string(),
+                ));
+                return STATUS_ERROR;
+            }
+            let Ok(index) = usize::try_from(index) else {
+                store_bridge_error(VmError::HostError("array index overflow".to_string()));
+                return STATUS_ERROR;
+            };
+            if index > values.len() {
+                store_bridge_error(VmError::HostError(format!(
+                    "array index {index} out of bounds"
+                )));
+                return STATUS_ERROR;
+            }
+            index
         }
-        _ => Err(VmError::TypeMismatch("array")),
+        _ => {
+            store_bridge_error(VmError::TypeMismatch("array"));
+            return STATUS_ERROR;
+        }
     };
-    match result {
-        Ok(result) => {
-            let previous = unsafe { std::ptr::replace(dst, result) };
-            drop(previous);
-            STATUS_CONTINUE
+
+    let value = unsafe { (&*value).clone() };
+    let mut values = match unsafe { std::ptr::replace(array, Value::Null) } {
+        Value::Array(values) => values,
+        other => {
+            unsafe { std::ptr::write(array, other) };
+            store_bridge_error(VmError::TypeMismatch("array"));
+            return STATUS_ERROR;
         }
-        Err(err) => {
-            store_bridge_error(err);
-            STATUS_ERROR
-        }
+    };
+    let values_mut = Arc::make_mut(&mut values);
+    if validated_index == values_mut.len() {
+        values_mut.push(value);
+    } else {
+        values_mut[validated_index] = value;
     }
+    let previous = unsafe { std::ptr::replace(dst, Value::Array(values)) };
+    drop(previous);
+    STATUS_CONTINUE
 }
 
 pub(crate) extern "C" fn pd_vm_native_map_set(
@@ -1517,26 +1559,30 @@ pub(crate) extern "C" fn pd_vm_native_map_set(
         return STATUS_ERROR;
     }
 
-    let map = unsafe { std::ptr::replace(map, Value::Null) };
+    if !matches!(unsafe { &*map }, Value::Map(_)) {
+        store_bridge_error(VmError::TypeMismatch("map"));
+        return STATUS_ERROR;
+    }
     let key = unsafe { (&*key).clone() };
     let value = unsafe { (&*value).clone() };
-    let result = match map {
-        Value::Map(entries) => Ok(Value::Map(
-            crate::builtins::runtime::core::builtin_set_map_shared_impl(entries, key, value),
-        )),
-        _ => Err(VmError::TypeMismatch("map")),
-    };
-    match result {
-        Ok(result) => {
-            let previous = unsafe { std::ptr::replace(dst, result) };
-            drop(previous);
-            STATUS_CONTINUE
-        }
-        Err(err) => {
-            store_bridge_error(err);
-            STATUS_ERROR
-        }
+    if let Err(err) = crate::builtins::runtime::core::ensure_supported_map_key(&key) {
+        store_bridge_error(err);
+        return STATUS_ERROR;
     }
+    let entries = match unsafe { std::ptr::replace(map, Value::Null) } {
+        Value::Map(entries) => entries,
+        other => {
+            unsafe { std::ptr::write(map, other) };
+            store_bridge_error(VmError::TypeMismatch("map"));
+            return STATUS_ERROR;
+        }
+    };
+    let result = Value::Map(crate::builtins::runtime::core::builtin_set_map_shared_impl(
+        entries, key, value,
+    ));
+    let previous = unsafe { std::ptr::replace(dst, result) };
+    drop(previous);
+    STATUS_CONTINUE
 }
 
 pub(crate) extern "C" fn pd_vm_native_array_push(
@@ -1551,25 +1597,24 @@ pub(crate) extern "C" fn pd_vm_native_array_push(
         return STATUS_ERROR;
     }
 
-    let array = unsafe { std::ptr::replace(array, Value::Null) };
-    let value = unsafe { (&*value).clone() };
-    let result = match array {
-        Value::Array(values) => Ok(Value::Array(
-            crate::builtins::runtime::core::builtin_array_push_shared_impl(values, value),
-        )),
-        _ => Err(VmError::TypeMismatch("array")),
-    };
-    match result {
-        Ok(result) => {
-            let previous = unsafe { std::ptr::replace(dst, result) };
-            drop(previous);
-            STATUS_CONTINUE
-        }
-        Err(err) => {
-            store_bridge_error(err);
-            STATUS_ERROR
-        }
+    if !matches!(unsafe { &*array }, Value::Array(_)) {
+        store_bridge_error(VmError::TypeMismatch("array"));
+        return STATUS_ERROR;
     }
+    let value = unsafe { (&*value).clone() };
+    let values = match unsafe { std::ptr::replace(array, Value::Null) } {
+        Value::Array(values) => values,
+        other => {
+            unsafe { std::ptr::write(array, other) };
+            store_bridge_error(VmError::TypeMismatch("array"));
+            return STATUS_ERROR;
+        }
+    };
+    let result =
+        Value::Array(crate::builtins::runtime::core::builtin_array_push_shared_impl(values, value));
+    let previous = unsafe { std::ptr::replace(dst, result) };
+    drop(previous);
+    STATUS_CONTINUE
 }
 
 pub(crate) extern "C" fn pd_vm_native_non_yielding_host_call(
@@ -2413,6 +2458,45 @@ mod tests {
     }
 
     #[test]
+    fn typed_array_set_failure_preserves_owned_input() {
+        clear_bridge_error();
+        let shared = Arc::new(vec![Value::Int(10), Value::Int(20)]);
+        let mut input = Value::Array(shared.clone());
+        let replacement = Value::Int(99);
+        let mut output = Value::Null;
+
+        let status = pd_vm_native_array_set(&mut output, &mut input, 3, &replacement);
+
+        assert_eq!(status, STATUS_ERROR);
+        assert_eq!(input, Value::Array(shared));
+        assert_eq!(output, Value::Null);
+        assert!(matches!(
+            take_bridge_error(),
+            Some(VmError::HostError(message)) if message == "array index 3 out of bounds"
+        ));
+    }
+
+    #[test]
+    fn typed_array_set_clones_aliasing_value_before_transfer() {
+        let shared = Arc::new(vec![Value::Int(10)]);
+        let mut input = Value::Array(shared.clone());
+        let input_ptr = &mut input as *mut Value;
+        let mut output = Value::Null;
+
+        let status = pd_vm_native_array_set(&mut output, input_ptr, 0, input_ptr);
+
+        assert_eq!(status, STATUS_CONTINUE);
+        assert_eq!(input, Value::Null);
+        let Value::Array(result) = output else {
+            panic!("expected array result");
+        };
+        let Value::Array(nested) = &result[0] else {
+            panic!("expected aliased array value");
+        };
+        assert!(Arc::ptr_eq(nested, &shared));
+    }
+
+    #[test]
     fn typed_array_push_detaches_shared_input() {
         let shared = Arc::new(vec![Value::Int(10)]);
         let alias = shared.clone();
@@ -2430,6 +2514,26 @@ mod tests {
         };
         assert_eq!(result.as_slice(), &[Value::Int(10), Value::Int(20)]);
         assert!(!Arc::ptr_eq(&result, &alias));
+    }
+
+    #[test]
+    fn typed_array_push_clones_aliasing_value_before_transfer() {
+        let shared = Arc::new(vec![Value::Int(10)]);
+        let mut input = Value::Array(shared.clone());
+        let input_ptr = &mut input as *mut Value;
+        let mut output = Value::Null;
+
+        let status = pd_vm_native_array_push(&mut output, input_ptr, input_ptr);
+
+        assert_eq!(status, STATUS_CONTINUE);
+        assert_eq!(input, Value::Null);
+        let Value::Array(result) = output else {
+            panic!("expected array result");
+        };
+        let Value::Array(nested) = &result[1] else {
+            panic!("expected aliased array value");
+        };
+        assert!(Arc::ptr_eq(nested, &shared));
     }
 
     #[test]
@@ -2453,6 +2557,106 @@ mod tests {
         assert_eq!(result.get(&Value::Int(1)), Some(&Value::Int(10)));
         assert_eq!(result.get(&Value::Int(2)), Some(&Value::Int(20)));
         assert!(!Arc::ptr_eq(&result, &alias));
+    }
+
+    #[test]
+    fn typed_map_lookup_rejects_callable_key() {
+        clear_bridge_error();
+        let entries = Arc::new(VmMap::default());
+        let repr_ptr = arc_repr_word(&entries) as *mut u8;
+        let callable = Value::Callable(Arc::new(crate::CallableValue {
+            prototype_id: 0,
+            kind: CallableKind::FunctionItem,
+            env: None,
+        }));
+        let mut output = Value::Null;
+
+        assert_eq!(pd_vm_native_map_has(repr_ptr, &callable), STATUS_ERROR);
+        assert!(matches!(
+            take_bridge_error(),
+            Some(VmError::HostError(message))
+                if message == "callable values are not supported as map keys"
+        ));
+
+        assert_eq!(
+            pd_vm_native_map_get(&mut output, repr_ptr, &callable),
+            STATUS_ERROR
+        );
+        assert_eq!(output, Value::Null);
+        assert!(matches!(
+            take_bridge_error(),
+            Some(VmError::HostError(message))
+                if message == "callable values are not supported as map keys"
+        ));
+        assert_eq!(Arc::strong_count(&entries), 1);
+    }
+
+    #[test]
+    fn typed_map_set_rejects_callable_key_without_consuming_input() {
+        clear_bridge_error();
+        let shared = Arc::new(VmMap::default());
+        let mut input = Value::Map(shared.clone());
+        let callable = Value::Callable(Arc::new(crate::CallableValue {
+            prototype_id: 0,
+            kind: CallableKind::FunctionItem,
+            env: None,
+        }));
+        let value = Value::Int(1);
+        let mut output = Value::Null;
+
+        let status = pd_vm_native_map_set(&mut output, &mut input, &callable, &value);
+
+        assert_eq!(status, STATUS_ERROR);
+        assert_eq!(input, Value::Map(shared));
+        assert_eq!(output, Value::Null);
+        assert!(matches!(
+            take_bridge_error(),
+            Some(VmError::HostError(message))
+                if message == "callable values are not supported as map keys"
+        ));
+    }
+
+    #[test]
+    fn typed_map_set_clones_aliasing_key_before_transfer() {
+        let shared = Arc::new(VmMap::default());
+        let mut input = Value::Map(shared.clone());
+        let input_ptr = &mut input as *mut Value;
+        let value = Value::Int(7);
+        let mut output = Value::Null;
+
+        let status = pd_vm_native_map_set(&mut output, input_ptr, input_ptr, &value);
+
+        assert_eq!(status, STATUS_CONTINUE);
+        assert_eq!(input, Value::Null);
+        let Value::Map(result) = output else {
+            panic!("expected map result");
+        };
+        let Some((Value::Map(key), stored)) = result.iter().next() else {
+            panic!("expected aliased map key");
+        };
+        assert!(Arc::ptr_eq(key, &shared));
+        assert_eq!(stored, &value);
+    }
+
+    #[test]
+    fn typed_map_set_clones_aliasing_value_before_transfer() {
+        let shared = Arc::new(VmMap::default());
+        let mut input = Value::Map(shared.clone());
+        let input_ptr = &mut input as *mut Value;
+        let key = Value::Int(1);
+        let mut output = Value::Null;
+
+        let status = pd_vm_native_map_set(&mut output, input_ptr, &key, input_ptr);
+
+        assert_eq!(status, STATUS_CONTINUE);
+        assert_eq!(input, Value::Null);
+        let Value::Map(result) = output else {
+            panic!("expected map result");
+        };
+        let Some(Value::Map(nested)) = result.get(&key) else {
+            panic!("expected aliased map value");
+        };
+        assert!(Arc::ptr_eq(nested, &shared));
     }
 
     #[test]
