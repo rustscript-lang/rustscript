@@ -282,10 +282,12 @@ impl Vm {
         if self.active_frame_has_shared_capture_cells() {
             return None;
         }
-        self.jit.compiled_trace_for_entry(
+        let entry_callable_prototypes = self.active_local_callable_prototypes();
+        self.jit.compiled_trace_for_entry_with_callables(
             self.active_frame_key(),
             self.ip,
             self.active_operand_stack_len(),
+            entry_callable_prototypes.as_deref(),
         )
     }
 
@@ -377,6 +379,7 @@ impl Vm {
             }
             self.jit.mark_trace_executed(current_trace_id);
             let mut trace_exit_key = None;
+            let mut instruction_failure_exit = false;
             let status = if let Some(exit_id) = native::decode_jit_trace_exit_status(status) {
                 let key = if let Some(region_exit_keys) = &exit_keys {
                     *region_exit_keys.get(&exit_id).ok_or_else(|| {
@@ -390,6 +393,7 @@ impl Vm {
                         exit_id: SsaExitId::new(exit_id),
                     }
                 };
+                instruction_failure_exit = self.jit.trace_exit_is_instruction_failure(key);
                 self.jit
                     .record_trace_exit(key)
                     .map_err(|err| VmError::JitNative(err.message()))?;
@@ -442,6 +446,9 @@ impl Vm {
                 }
                 native::STATUS_TRACE_EXIT => {
                     self.jit_trace_exit_count = self.jit_trace_exit_count.saturating_add(1);
+                    if instruction_failure_exit {
+                        return Ok(native::STATUS_LINKED_CONTINUE);
+                    }
                     if !has_yielding_call
                         && terminal == JitTraceTerminal::LoopBack
                         && self.ip == root_ip
@@ -583,6 +590,9 @@ impl Vm {
         slot_id: u32,
         child_trace_id: usize,
     ) -> VmResult<()> {
+        if self.jit.trace_has_entry_callable_guards(child_trace_id) {
+            return Ok(());
+        }
         if !self.jit_native_direct_cross_frame_enabled {
             let parent_frame_key = self
                 .jit
@@ -643,6 +653,13 @@ impl Vm {
     ))]
     fn maybe_publish_native_region(&mut self, key: TraceExitKey, child_trace_id: usize) {
         if self.jit_native_direct_links_enabled && !self.jit_native_direct_region_fallback {
+            return;
+        }
+        if self
+            .jit
+            .trace_has_entry_callable_guards(key.parent_trace_id)
+            || self.jit.trace_has_entry_callable_guards(child_trace_id)
+        {
             return;
         }
         let Some(candidate) = self.jit.region_candidate(key, child_trace_id) else {
@@ -1014,6 +1031,7 @@ impl Vm {
             }
             self.jit.mark_trace_executed(current_trace_id);
             let mut trace_exit_key = None;
+            let mut instruction_failure_exit = false;
             let status = if let Some(exit_id) = native::decode_jit_trace_exit_status(status) {
                 let key = if let Some(region_exit_keys) = &exit_keys {
                     *region_exit_keys.get(&exit_id).ok_or_else(|| {
@@ -1027,6 +1045,7 @@ impl Vm {
                         exit_id: SsaExitId::new(exit_id),
                     }
                 };
+                instruction_failure_exit = self.jit.trace_exit_is_instruction_failure(key);
                 self.jit
                     .record_trace_exit(key)
                     .map_err(|err| VmError::JitNative(err.message()))?;
@@ -1094,6 +1113,9 @@ impl Vm {
                 }
                 native::STATUS_TRACE_EXIT => {
                     self.jit_trace_exit_count = self.jit_trace_exit_count.saturating_add(1);
+                    if instruction_failure_exit {
+                        return Ok(ExecOutcome::Continue);
+                    }
                     if self.jit.trace_clone(current_trace_id).is_some_and(|trace| {
                         trace.op_names.last().map(String::as_str) == Some("callable_boundary")
                     }) {

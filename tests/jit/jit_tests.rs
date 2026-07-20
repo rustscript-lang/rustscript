@@ -6767,6 +6767,177 @@ fn trace_jit_preserves_inline_callable_argument_schema_checks() {
 }
 
 #[test]
+fn trace_jit_inline_instruction_failure_restores_callee_frame() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn get(values: [int], index: int) -> int { values[index] }
+        let values: [int] = [10, 20];
+        let mut i = 0;
+        let mut sink = 0;
+        while i < 100 {
+            sink = get(values, i);
+            i = i + 1;
+        }
+        i + sink * 0;
+    "#;
+    let compiled = compile_source(source).expect("inline failure source should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    let error = vm
+        .run()
+        .expect_err("out-of-range inline array get must fail");
+    assert!(
+        matches!(error, vm::VmError::HostError(ref message) if message == "array index 2 out of bounds"),
+        "unexpected error: {error:?}\n{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        any_trace_op(&vm.jit_snapshot(), "inline_call:0"),
+        "{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
+fn trace_jit_inline_unbox_failure_matches_interpreter_error() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn add_one(values: [int]) -> int { values[0] + 1 }
+        let values: [int] = [7];
+        let mut i = 0;
+        let mut sink = 0;
+        while i < 100 {
+            sink = add_one(values);
+            i = i + 1;
+        }
+        i + sink * 0;
+    "#;
+    let compiled = compile_source(source).expect("inline unbox failure source should compile");
+    let values_slot = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("debug metadata")
+        .locals
+        .iter()
+        .find(|local| local.name == "values")
+        .expect("values local")
+        .index;
+    let local_count = compiled.locals;
+    let prepare = |program: Program| {
+        let mut vm = Vm::new(program.with_local_count(local_count));
+        vm.set_fuel_check_interval(1).expect("fuel interval");
+        vm.set_fuel(1);
+        loop {
+            assert_eq!(
+                vm.run().expect("initialization step should run"),
+                VmStatus::Yielded
+            );
+            if vm.locals().get(values_slot as usize) == Some(&Value::array(vec![Value::Int(7)])) {
+                break;
+            }
+            vm.recharge_fuel(1).expect("fuel recharge");
+        }
+        vm.set_local(values_slot, Value::array(vec![Value::Bool(true)]))
+            .expect("dynamic array replacement should succeed");
+        vm.clear_fuel();
+        vm
+    };
+
+    let mut interpreted = prepare(compiled.program.clone());
+    let expected = interpreted
+        .run()
+        .expect_err("interpreter must reject the invalid array element");
+    let mut vm = prepare(compiled.program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    let actual = vm
+        .run()
+        .expect_err("inline unbox failure must return the interpreter error");
+    assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+    assert!(
+        any_trace_op(&vm.jit_snapshot(), "inline_call:0"),
+        "{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
+fn trace_jit_preserves_inline_callable_return_schema_checks() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        fn first(values: [int]) -> int { values[0] }
+        let values: [int] = [7];
+        let mut i = 0;
+        let mut sink = 0;
+        while i < 100 {
+            sink = first(values);
+            i = i + 1;
+        }
+        i + sink * 0;
+    "#;
+    let compiled = compile_source(source).expect("return schema source should compile");
+    let values_slot = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("debug metadata")
+        .locals
+        .iter()
+        .find(|local| local.name == "values")
+        .expect("values local")
+        .index;
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_fuel_check_interval(1).expect("fuel interval");
+    vm.set_fuel(1);
+    loop {
+        assert_eq!(
+            vm.run().expect("initialization step should run"),
+            VmStatus::Yielded
+        );
+        if vm.locals().get(values_slot as usize) == Some(&Value::array(vec![Value::Int(7)])) {
+            break;
+        }
+        vm.recharge_fuel(1).expect("fuel recharge");
+    }
+    vm.set_local(values_slot, Value::array(vec![Value::Bool(true)]))
+        .expect("dynamic array replacement should succeed");
+    vm.clear_fuel();
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    let error = vm.run().expect_err("invalid inline result must fail");
+    assert!(
+        matches!(error, vm::VmError::TypeMismatch("callable return schema")),
+        "unexpected error: {error:?}\n{}",
+        vm.dump_jit_info()
+    );
+    assert!(
+        any_trace_op(&vm.jit_snapshot(), "inline_call:0"),
+        "{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
 fn trace_jit_inlines_array_swap_leaf() {
     if !native_jit_supported() {
         return;

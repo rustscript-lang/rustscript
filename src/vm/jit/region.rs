@@ -166,7 +166,7 @@ fn offset_block(
         param.value.id = offset_value_id(param.value.id, value_offset)?;
     }
     for inst in &mut block.insts {
-        offset_inst(inst, value_offset)?;
+        offset_inst(inst, value_offset, exit_offset)?;
     }
     if let Some(terminator) = &mut block.terminator {
         offset_terminator(terminator, value_offset, block_offset, exit_offset)?;
@@ -187,9 +187,12 @@ fn offset_exit(mut exit: SsaExit, value_offset: u32, exit_offset: u32) -> VmResu
     Ok(exit)
 }
 
-fn offset_inst(inst: &mut SsaInst, value_offset: u32) -> VmResult<()> {
+fn offset_inst(inst: &mut SsaInst, value_offset: u32, exit_offset: u32) -> VmResult<()> {
     if let Some(output) = &mut inst.output {
         output.id = offset_value_id(output.id, value_offset)?;
+    }
+    if let Some(failure_exit) = &mut inst.failure_exit {
+        *failure_exit = offset_exit_id(*failure_exit, exit_offset)?;
     }
     remap_inst_inputs(&mut inst.kind, |value| offset_value_id(value, value_offset))
 }
@@ -528,6 +531,7 @@ mod tests {
                 start_line: None,
                 has_call: false,
                 has_yielding_call: false,
+                entry_callable_guards: Vec::new(),
                 op_names: vec![format!("trace{id}")],
                 terminal: JitTraceTerminal::BranchExit,
                 executions: 0,
@@ -535,6 +539,23 @@ mod tests {
             },
             exit,
         )
+    }
+
+    #[test]
+    fn offset_inst_remaps_failure_exit() {
+        let mut inst = SsaInst {
+            ip: 7,
+            output: Some(crate::vm::jit::ir::SsaValue {
+                id: SsaValueId::new(1),
+                repr: crate::vm::jit::ir::SsaValueRepr::I64,
+            }),
+            failure_exit: Some(SsaExitId::new(0)),
+            kind: SsaInstKind::Constant(crate::Value::Int(1)),
+        };
+
+        offset_inst(&mut inst, 10, 2).expect("instruction remap should succeed");
+        assert_eq!(inst.output.expect("output").id, SsaValueId::new(11));
+        assert_eq!(inst.failure_exit, Some(SsaExitId::new(2)));
     }
 
     #[test]

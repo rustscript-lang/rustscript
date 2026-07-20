@@ -497,6 +497,7 @@ impl SsaInstKind {
 pub(crate) struct SsaInst {
     pub(crate) ip: usize,
     pub(crate) output: Option<SsaValue>,
+    pub(crate) failure_exit: Option<SsaExitId>,
     pub(crate) kind: SsaInstKind,
 }
 
@@ -638,6 +639,11 @@ impl SsaTrace {
                 scope.insert(param.value.id, param.value.repr);
             }
             for inst in &block.insts {
+                if let Some(failure_exit) = inst.failure_exit
+                    && !exit_ids.contains(&failure_exit)
+                {
+                    return Err(SsaVerifyError::UnknownExit(failure_exit));
+                }
                 for input in inst.kind.inputs() {
                     if !scope.contains_key(&input) {
                         return Err(SsaVerifyError::UseBeforeDef {
@@ -849,6 +855,7 @@ pub(crate) enum SsaVerifyError {
 pub(crate) struct SsaTraceBuilder {
     trace: SsaTrace,
     next_value: u32,
+    current_failure_exit: Option<SsaExitId>,
 }
 
 impl SsaTraceBuilder {
@@ -868,6 +875,7 @@ impl SsaTraceBuilder {
                 exits: Vec::new(),
             },
             next_value: 0,
+            current_failure_exit: None,
         }
     }
 
@@ -916,12 +924,18 @@ impl SsaTraceBuilder {
         kind: SsaInstKind,
     ) -> VmResult<SsaValue> {
         let output = self.alloc_value(repr);
+        let failure_exit = self.current_failure_exit;
         self.block_mut(block)?.insts.push(SsaInst {
             ip,
             output: Some(output),
+            failure_exit,
             kind,
         });
         Ok(output)
+    }
+
+    pub(crate) fn set_current_failure_exit(&mut self, exit: Option<SsaExitId>) {
+        self.current_failure_exit = exit;
     }
 
     pub(crate) fn add_exit(
