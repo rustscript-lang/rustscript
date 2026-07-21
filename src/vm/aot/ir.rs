@@ -54,8 +54,10 @@ pub(crate) enum AotInstruction {
     FAdd,
     Concat(AotConcatKind),
     Len(AotTextBytesKind),
+    ArrayLen,
     Slice(AotTextBytesKind),
     Get(AotTextBytesKind),
+    ArrayGet,
     HasBytes,
     BytesCodec(AotBytesCodecKind),
     ArraySet,
@@ -584,6 +586,7 @@ fn typed_builtin_instruction(
         BuiltinFunction::Len => match lhs {
             ValueType::String => Some(AotInstruction::Len(AotTextBytesKind::String)),
             ValueType::Bytes => Some(AotInstruction::Len(AotTextBytesKind::Bytes)),
+            ValueType::Array => Some(AotInstruction::ArrayLen),
             _ => None,
         },
         BuiltinFunction::Slice => match lhs {
@@ -594,6 +597,7 @@ fn typed_builtin_instruction(
         BuiltinFunction::Get => match lhs {
             ValueType::String => Some(AotInstruction::Get(AotTextBytesKind::String)),
             ValueType::Bytes => Some(AotInstruction::Get(AotTextBytesKind::Bytes)),
+            ValueType::Array => Some(AotInstruction::ArrayGet),
             _ => None,
         },
         BuiltinFunction::Has if lhs == ValueType::Bytes => Some(AotInstruction::HasBytes),

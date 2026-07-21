@@ -124,6 +124,9 @@ pub(crate) enum AotSsaInstKind {
     BytesLen {
         bytes: AotSsaValueId,
     },
+    ArrayLen {
+        array: AotSsaValueId,
+    },
     StringSlice {
         text: AotSsaValueId,
         start: AotSsaValueId,
@@ -140,6 +143,10 @@ pub(crate) enum AotSsaInstKind {
     },
     BytesGet {
         bytes: AotSsaValueId,
+        index: AotSsaValueId,
+    },
+    ArrayGet {
+        array: AotSsaValueId,
         index: AotSsaValueId,
     },
     BytesHas {
@@ -309,6 +316,7 @@ impl AotSsaInstKind {
             Self::HostCall { args, .. } => args.clone(),
             Self::StringLen { text } => vec![*text],
             Self::BytesLen { bytes } => vec![*bytes],
+            Self::ArrayLen { array } => vec![*array],
             Self::StringSlice {
                 text,
                 start,
@@ -321,6 +329,7 @@ impl AotSsaInstKind {
             } => vec![*bytes, *start, *length],
             Self::StringGet { text, index } => vec![*text, *index],
             Self::BytesGet { bytes, index } => vec![*bytes, *index],
+            Self::ArrayGet { array, index } => vec![*array, *index],
             Self::BytesHas { bytes, index } => vec![*bytes, *index],
             Self::StringConcat { lhs, rhs } | Self::BytesConcat { lhs, rhs } => vec![*lhs, *rhs],
             Self::BytesFromArrayU8 { array } => vec![*array],
@@ -1828,6 +1837,14 @@ fn apply_direct_instruction<E: InstEmitter>(
             AotSsaValueRepr::I64,
             |bytes| AotSsaInstKind::BytesLen { bytes },
         ),
+        AotInstruction::ArrayLen => emit_tagged_unary(
+            frame,
+            emitter,
+            ip,
+            "array_len",
+            AotSsaValueRepr::I64,
+            |array| AotSsaInstKind::ArrayLen { array },
+        ),
         AotInstruction::Concat(AotConcatKind::String) => {
             emit_tagged_binary(frame, emitter, ip, "string_concat", |lhs, rhs| {
                 AotSsaInstKind::StringConcat { lhs, rhs }
@@ -1875,6 +1892,14 @@ fn apply_direct_instruction<E: InstEmitter>(
             "bytes_get",
             AotSsaValueRepr::I64,
             |bytes, index| AotSsaInstKind::BytesGet { bytes, index },
+        ),
+        AotInstruction::ArrayGet => emit_tagged_binary_with_int_rhs(
+            frame,
+            emitter,
+            ip,
+            "array_get",
+            AotSsaValueRepr::Tagged,
+            |array, index| AotSsaInstKind::ArrayGet { array, index },
         ),
         AotInstruction::HasBytes => emit_tagged_binary_with_int_rhs(
             frame,

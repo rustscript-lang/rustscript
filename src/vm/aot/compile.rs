@@ -327,6 +327,15 @@ struct AotBytesIndexOp {
 
 #[cfg(feature = "cranelift-jit")]
 #[derive(Clone, Copy)]
+struct AotArrayIndexOp {
+    output_id: AotSsaValueId,
+    ip: usize,
+    array: cranelift_codegen::ir::Value,
+    index: cranelift_codegen::ir::Value,
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[derive(Clone, Copy)]
 struct AotStringGetOp {
     output_id: AotSsaValueId,
     ip: usize,
@@ -996,6 +1005,14 @@ fn lower_aot_ssa_inst(
                 value: values[bytes],
             },
         )?,
+        AotSsaInstKind::ArrayLen { array } => aot_lower_array_len(
+            b,
+            ctx,
+            AotTaggedValueOp {
+                ip: inst.ip,
+                value: values[array],
+            },
+        )?,
         AotSsaInstKind::StringSlice {
             text,
             start,
@@ -1042,6 +1059,16 @@ fn lower_aot_ssa_inst(
             AotBytesIndexOp {
                 ip: inst.ip,
                 bytes: values[bytes],
+                index: values[index],
+            },
+        )?,
+        AotSsaInstKind::ArrayGet { array, index } => aot_lower_array_get(
+            b,
+            ctx,
+            AotArrayIndexOp {
+                output_id: inst.output.id,
+                ip: inst.ip,
+                array: values[array],
                 index: values[index],
             },
         )?,
@@ -1807,6 +1834,7 @@ fn aot_inst_requires_owned_value_slot(kind: &AotSsaInstKind) -> bool {
             | AotSsaInstKind::StringSlice { .. }
             | AotSsaInstKind::BytesSlice { .. }
             | AotSsaInstKind::StringGet { .. }
+            | AotSsaInstKind::ArrayGet { .. }
             | AotSsaInstKind::StringConcat { .. }
             | AotSsaInstKind::BytesConcat { .. }
             | AotSsaInstKind::BytesFromArrayU8 { .. }
@@ -2351,6 +2379,102 @@ fn aot_lower_bytes_has(
         layout.stack_vec.len_offset,
     );
     Ok(ssa_index_in_range(b, index, len))
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn aot_lower_array_len(
+    b: &mut FunctionBuilder,
+    ctx: AotLowerCtx<'_>,
+    operand: AotTaggedValueOp,
+) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let AotLowerCtx {
+        pointer_type,
+        layout,
+        ..
+    } = ctx;
+    let array_raw = aot_load_checked_heap_ptr(b, ctx, operand, layout.value.array_tag)?;
+    let vec_ptr = ssa_load_heap_data_ptr(b, layout.value, array_raw);
+    Ok(b.ins().load(
+        pointer_type,
+        MemFlags::new(),
+        vec_ptr,
+        layout.stack_vec.len_offset,
+    ))
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn aot_lower_array_get(
+    b: &mut FunctionBuilder,
+    ctx: AotLowerCtx<'_>,
+    op: AotArrayIndexOp,
+) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let AotLowerCtx {
+        vm_ptr,
+        exit_block,
+        pointer_type,
+        layout,
+        offsets,
+        helper_refs,
+        helper_addrs,
+        owned_value_temps,
+        ..
+    } = ctx;
+    let AotArrayIndexOp {
+        output_id,
+        ip,
+        array,
+        index,
+    } = op;
+    let array_raw = aot_load_checked_heap_ptr(
+        b,
+        ctx,
+        AotTaggedValueOp { ip, value: array },
+        layout.value.array_tag,
+    )?;
+    let vec_ptr = ssa_load_heap_data_ptr(b, layout.value, array_raw);
+    let len = b.ins().load(
+        pointer_type,
+        MemFlags::new(),
+        vec_ptr,
+        layout.stack_vec.len_offset,
+    );
+    let in_range = ssa_index_in_range(b, index, len);
+    let ok = b.create_block();
+    let fail = b.create_block();
+    let cont = b.create_block();
+    b.append_block_param(cont, pointer_type);
+    b.ins().brif(in_range, ok, &[], fail, &[]);
+
+    b.switch_to_block(ok);
+    let data_ptr = b.ins().load(
+        pointer_type,
+        MemFlags::new(),
+        vec_ptr,
+        layout.stack_vec.ptr_offset,
+    );
+    let element_addr = ssa_value_addr(b, pointer_type, data_ptr, index, layout.value.size);
+    let out = owned_value_temp_slot_addr(
+        b,
+        pointer_type,
+        owned_value_temps,
+        AotTempValueSlotKey::Output(output_id),
+    )?;
+    clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
+    call_status_helper(
+        b,
+        exit_block,
+        pointer_type,
+        helper_refs.clone_value_ref,
+        helper_addrs.clone_value,
+        &[out, element_addr],
+    )?;
+    b.ins().jump(cont, &[BlockArg::Value(out)]);
+
+    b.switch_to_block(fail);
+    aot_emit_error_status(b, vm_ptr, exit_block, pointer_type, offsets, ip)?;
+
+    b.switch_to_block(cont);
+    Ok(b.block_params(cont)[0])
 }
 
 #[cfg(feature = "cranelift-jit")]
