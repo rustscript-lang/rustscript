@@ -2438,13 +2438,19 @@ fn emit_tagged_binary_with_int_rhs<E: InstEmitter>(
 ) -> Result<bool, AotSsaBuildError> {
     let rhs = frame.pop(ip, instruction)?;
     let lhs = frame.pop(ip, instruction)?;
-    if lhs.value.repr != AotSsaValueRepr::Tagged || rhs.value.repr != AotSsaValueRepr::I64 {
+    if lhs.value.repr != AotSsaValueRepr::Tagged
+        || !matches!(
+            rhs.value.repr,
+            AotSsaValueRepr::I64 | AotSsaValueRepr::Tagged
+        )
+    {
         frame.stack.push(lhs);
         frame.stack.push(rhs);
         return Ok(false);
     }
+    let rhs = coerce_numeric_to_int(emitter, ip, rhs.value);
     frame.stack.push(FrameValue {
-        value: emitter.emit(ip, build(lhs.value.id, rhs.value.id), output_repr),
+        value: emitter.emit(ip, build(lhs.value.id, rhs.id), output_repr),
     });
     Ok(true)
 }

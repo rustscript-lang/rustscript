@@ -502,6 +502,62 @@ fn aot_inlines_array_len_and_get_without_builtin_boundary() {
 }
 
 #[test]
+fn aot_inlines_array_get_result_used_as_next_array_index() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let get_call = builtin_call_index("get").expect("get builtin should exist");
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.stloc(0);
+    bc.ldc(1);
+    bc.stloc(1);
+
+    bc.ldloc(0);
+    bc.ldloc(1);
+    bc.ldc(2);
+    let index_get_ip = bc.position();
+    bc.call(get_call, 2);
+    let value_get_ip = bc.position();
+    bc.call(get_call, 2);
+    bc.ret();
+
+    let program = Program::new(
+        vec![
+            Value::array(vec![Value::Int(100), Value::Int(200), Value::Int(300)]),
+            Value::array(vec![Value::Int(2)]),
+            Value::Int(0),
+        ],
+        bc.finish(),
+    )
+    .with_local_count(2);
+    let program = force_local_types(program, &[(0, ValueType::Array), (1, ValueType::Array)]);
+    let program = force_operand_types(
+        program,
+        &[
+            (index_get_ip as usize, (ValueType::Array, ValueType::Int)),
+            (value_get_ip as usize, (ValueType::Array, ValueType::Int)),
+        ],
+    );
+    let mut vm = Vm::new(program);
+    vm.set_jit_native_bridge_stats_enabled(true);
+    install_aot(&mut vm);
+
+    assert_eq!(vm.run().expect("aot vm should run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(300)]);
+    assert!(vm.aot_exec_count() > 0, "aot should execute natively");
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    assert_eq!(
+        bridge_hits
+            .iter()
+            .find_map(|(name, count)| (*name == "get").then_some(*count)),
+        None,
+        "Array get should not cross the builtin bridge: {bridge_hits:?}"
+    );
+}
+
+#[test]
 fn aot_inlines_same_local_map_set_in_loop() {
     if !native_jit_supported() {
         return;
