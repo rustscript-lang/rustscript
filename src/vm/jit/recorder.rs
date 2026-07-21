@@ -3274,11 +3274,11 @@ fn select_specialized_builtin_kind(
             });
         }
         BuiltinFunction::ToString => {
-            return Some(if container.known_type == Some(ValueType::String) {
-                SpecializedBuiltinKind::ToStringIdentity
-            } else {
-                SpecializedBuiltinKind::ToString
-            });
+            return match (container.known_type, container.repr) {
+                (Some(ValueType::String), _) => Some(SpecializedBuiltinKind::ToStringIdentity),
+                (_, SsaValueRepr::Tagged) => Some(SpecializedBuiltinKind::ToString),
+                _ => None,
+            };
         }
         BuiltinFunction::StringSplitLiteral => {
             return Some(SpecializedBuiltinKind::StringSplitLiteral);
@@ -5269,6 +5269,38 @@ mod tests {
                 false,
             ),
             Some(SpecializedBuiltinKind::ValueLen),
+        );
+    }
+
+    #[test]
+    fn scalar_to_string_stays_on_general_call_path() {
+        let program = Program::new(Vec::new(), Vec::new());
+        for info in [
+            ValueInfo::int(None),
+            ValueInfo::float(None),
+            ValueInfo::bool(None),
+        ] {
+            assert_eq!(
+                select_specialized_builtin_kind(
+                    &program,
+                    0,
+                    BuiltinFunction::ToString,
+                    info,
+                    false,
+                ),
+                None,
+                "unboxed scalar to_string needs a tagged Value slot"
+            );
+        }
+        assert_eq!(
+            select_specialized_builtin_kind(
+                &program,
+                0,
+                BuiltinFunction::ToString,
+                ValueInfo::tagged(),
+                false,
+            ),
+            Some(SpecializedBuiltinKind::ToString)
         );
     }
 

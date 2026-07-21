@@ -6101,6 +6101,43 @@ fn trace_jit_specializes_regex_builtins_without_call_boundary() {
 }
 
 #[test]
+fn trace_jit_scalar_to_string_uses_safe_call_boundary() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        let mut i = 0;
+        let mut rendered = "";
+        while i < 16 {
+            rendered = i + "";
+            i = i + 1;
+        }
+        rendered;
+    "#;
+    let compiled = compile_source(source).expect("scalar to_string loop should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_direct_links_enabled(false);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(
+        vm.run().expect("scalar to_string JIT should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::string("15")]);
+    let snapshot = vm.jit_snapshot();
+    assert!(vm.jit_native_exec_count() > 0, "{}", vm.dump_jit_info());
+    assert!(
+        !snapshot.traces.is_empty(),
+        "scalar to_string should leave surrounding loop traceable:\n{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
 fn trace_jit_executes_hot_loop_inside_script_callable_frame() {
     if !native_jit_supported() {
         return;
