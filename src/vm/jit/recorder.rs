@@ -3399,40 +3399,20 @@ fn analyze_specialized_builtin_call(
         | SpecializedBuiltinKind::MapLen
         | SpecializedBuiltinKind::TypeOf
         | SpecializedBuiltinKind::StringContains
-        | SpecializedBuiltinKind::ArrayHas => {
+        | SpecializedBuiltinKind::ArrayHas
+        | SpecializedBuiltinKind::StringSlice
+        | SpecializedBuiltinKind::BytesSlice
+        | SpecializedBuiltinKind::StringGet
+        | SpecializedBuiltinKind::BytesGet
+        | SpecializedBuiltinKind::BytesHas
+        | SpecializedBuiltinKind::StringReplaceLiteral
+        | SpecializedBuiltinKind::StringLowerAscii
+        | SpecializedBuiltinKind::StringSplitLiteral
+        | SpecializedBuiltinKind::BytesFromArrayU8
+        | SpecializedBuiltinKind::BytesToUtf8Ascii
+        | SpecializedBuiltinKind::BytesToArrayU8
+        | SpecializedBuiltinKind::ToString => {
             unreachable!("spec-covered builtins are handled by the spec-driven path")
-        }
-        SpecializedBuiltinKind::StringSlice => {
-            let _ = frame.pop()?;
-            let _ = frame.pop()?;
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::tagged_typed(ValueType::String));
-            Ok("string_slice")
-        }
-        SpecializedBuiltinKind::BytesSlice => {
-            let _ = frame.pop()?;
-            let _ = frame.pop()?;
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::tagged_typed(ValueType::Bytes));
-            Ok("bytes_slice")
-        }
-        SpecializedBuiltinKind::StringGet => {
-            let _ = frame.pop()?;
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::tagged_typed(ValueType::String));
-            Ok("string_get")
-        }
-        SpecializedBuiltinKind::BytesGet => {
-            let _ = frame.pop()?;
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::int(None));
-            Ok("bytes_get")
-        }
-        SpecializedBuiltinKind::BytesHas => {
-            let _ = frame.pop()?;
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::bool(None));
-            Ok("bytes_has")
         }
         SpecializedBuiltinKind::RegexReplace => {
             let _ = frame.pop()?;
@@ -3441,24 +3421,12 @@ fn analyze_specialized_builtin_call(
             frame.push(ValueInfo::tagged_typed(ValueType::String));
             Ok("regex_replace")
         }
-        SpecializedBuiltinKind::StringReplaceLiteral => {
-            let _ = frame.pop()?;
-            let _ = frame.pop()?;
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::tagged_typed(ValueType::String));
-            Ok("string_replace_literal")
-        }
-        SpecializedBuiltinKind::StringLowerAscii => {
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::tagged_typed(ValueType::String));
-            Ok("string_lower_ascii")
-        }
         SpecializedBuiltinKind::TypeOfKnown(_) => {
             let _ = frame.pop()?;
             frame.push(ValueInfo::type_name());
             Ok("type_of")
         }
-        SpecializedBuiltinKind::ToString | SpecializedBuiltinKind::ToStringIdentity => {
+        SpecializedBuiltinKind::ToStringIdentity => {
             let _ = frame.pop()?;
             frame.push(ValueInfo::tagged_typed(ValueType::String));
             Ok(
@@ -3468,12 +3436,6 @@ fn analyze_specialized_builtin_call(
                     "to_string"
                 },
             )
-        }
-        SpecializedBuiltinKind::StringSplitLiteral => {
-            let _ = frame.pop()?;
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::tagged_typed(ValueType::Array));
-            Ok("string_split_literal")
         }
         SpecializedBuiltinKind::StringConcat => {
             let _ = frame.pop()?;
@@ -3486,21 +3448,6 @@ fn analyze_specialized_builtin_call(
             let _ = frame.pop()?;
             frame.push(ValueInfo::tagged_typed(ValueType::Bytes));
             Ok("bytes_concat")
-        }
-        SpecializedBuiltinKind::BytesFromArrayU8 => {
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::tagged_typed(ValueType::Bytes));
-            Ok("bytes_from_array_u8")
-        }
-        SpecializedBuiltinKind::BytesToUtf8Ascii => {
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::tagged_typed(ValueType::String));
-            Ok("bytes_to_utf8_ascii")
-        }
-        SpecializedBuiltinKind::BytesToArrayU8 => {
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::tagged_typed(ValueType::Array));
-            Ok("bytes_to_array_u8")
         }
         SpecializedBuiltinKind::ArrayNew => {
             frame.push(ValueInfo::tagged_typed(ValueType::Array));
@@ -3576,142 +3523,20 @@ fn emit_specialized_builtin_call(
         | SpecializedBuiltinKind::MapLen
         | SpecializedBuiltinKind::TypeOf
         | SpecializedBuiltinKind::StringContains
-        | SpecializedBuiltinKind::ArrayHas => {
+        | SpecializedBuiltinKind::ArrayHas
+        | SpecializedBuiltinKind::StringSlice
+        | SpecializedBuiltinKind::BytesSlice
+        | SpecializedBuiltinKind::StringGet
+        | SpecializedBuiltinKind::BytesGet
+        | SpecializedBuiltinKind::BytesHas
+        | SpecializedBuiltinKind::StringReplaceLiteral
+        | SpecializedBuiltinKind::StringLowerAscii
+        | SpecializedBuiltinKind::StringSplitLiteral
+        | SpecializedBuiltinKind::BytesFromArrayU8
+        | SpecializedBuiltinKind::BytesToUtf8Ascii
+        | SpecializedBuiltinKind::BytesToArrayU8
+        | SpecializedBuiltinKind::ToString => {
             unreachable!("spec-covered builtins are handled by the spec-driven path")
-        }
-        SpecializedBuiltinKind::StringSlice => {
-            let length = ensure_int(builder, block, ip, frame.pop()?)?;
-            let start = ensure_int(builder, block, ip, frame.pop()?)?;
-            let text = ensure_heap_ptr(
-                builder,
-                block,
-                ip,
-                frame.pop()?,
-                HeapContainerKind::String.value_type(),
-            )?;
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Tagged,
-                    SsaInstKind::StringSlice {
-                        text: text.value.id,
-                        start: start.value.id,
-                        length: length.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::tagged_typed(ValueType::String),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("string_slice", out))
-        }
-        SpecializedBuiltinKind::BytesSlice => {
-            let length = ensure_int(builder, block, ip, frame.pop()?)?;
-            let start = ensure_int(builder, block, ip, frame.pop()?)?;
-            let bytes = ensure_heap_ptr(
-                builder,
-                block,
-                ip,
-                frame.pop()?,
-                HeapContainerKind::Bytes.value_type(),
-            )?;
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Tagged,
-                    SsaInstKind::BytesSlice {
-                        bytes: bytes.value.id,
-                        start: start.value.id,
-                        length: length.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::tagged_typed(ValueType::Bytes),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("bytes_slice", out))
-        }
-        SpecializedBuiltinKind::StringGet => {
-            let index = ensure_int(builder, block, ip, frame.pop()?)?;
-            let text = ensure_heap_ptr(
-                builder,
-                block,
-                ip,
-                frame.pop()?,
-                HeapContainerKind::String.value_type(),
-            )?;
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Tagged,
-                    SsaInstKind::StringGet {
-                        text: text.value.id,
-                        index: index.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::tagged_typed(ValueType::String),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("string_get", out))
-        }
-        SpecializedBuiltinKind::BytesGet => {
-            let index = ensure_int(builder, block, ip, frame.pop()?)?;
-            let bytes = ensure_heap_ptr(
-                builder,
-                block,
-                ip,
-                frame.pop()?,
-                HeapContainerKind::Bytes.value_type(),
-            )?;
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::I64,
-                    SsaInstKind::BytesGet {
-                        bytes: bytes.value.id,
-                        index: index.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::int(None),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("bytes_get", out))
-        }
-        SpecializedBuiltinKind::BytesHas => {
-            let index = ensure_int(builder, block, ip, frame.pop()?)?;
-            let bytes = ensure_heap_ptr(
-                builder,
-                block,
-                ip,
-                frame.pop()?,
-                HeapContainerKind::Bytes.value_type(),
-            )?;
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Bool,
-                    SsaInstKind::BytesHas {
-                        bytes: bytes.value.id,
-                        index: index.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::bool(None),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("bytes_has", out))
         }
         SpecializedBuiltinKind::RegexReplace => {
             let replacement = ensure_heap_ptr(
@@ -3753,70 +3578,6 @@ fn emit_specialized_builtin_call(
                 .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
             Ok(("regex_replace", out))
         }
-        SpecializedBuiltinKind::StringReplaceLiteral => {
-            let replacement = ensure_heap_ptr(
-                builder,
-                block,
-                ip,
-                frame.pop()?,
-                HeapContainerKind::String.value_type(),
-            )?;
-            let needle = ensure_heap_ptr(
-                builder,
-                block,
-                ip,
-                frame.pop()?,
-                HeapContainerKind::String.value_type(),
-            )?;
-            let text = ensure_heap_ptr(
-                builder,
-                block,
-                ip,
-                frame.pop()?,
-                HeapContainerKind::String.value_type(),
-            )?;
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Tagged,
-                    SsaInstKind::StringReplaceLiteral {
-                        text: text.value.id,
-                        needle: needle.value.id,
-                        replacement: replacement.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::tagged_typed(ValueType::String),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("string_replace_literal", out))
-        }
-        SpecializedBuiltinKind::StringLowerAscii => {
-            let text = ensure_heap_ptr(
-                builder,
-                block,
-                ip,
-                frame.pop()?,
-                HeapContainerKind::String.value_type(),
-            )?;
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Tagged,
-                    SsaInstKind::StringLowerAscii {
-                        text: text.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::tagged_typed(ValueType::String),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("string_lower_ascii", out))
-        }
         SpecializedBuiltinKind::TypeOfKnown(value_type) => {
             let _ = frame.pop()?;
             let type_name = match value_type {
@@ -3846,56 +3607,6 @@ fn emit_specialized_builtin_call(
             let value = frame.pop()?;
             Ok(("to_string_identity", value))
         }
-        SpecializedBuiltinKind::ToString => {
-            let value = frame.pop()?;
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Tagged,
-                    SsaInstKind::ToString {
-                        value: value.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::tagged_typed(ValueType::String),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("to_string", out))
-        }
-        SpecializedBuiltinKind::StringSplitLiteral => {
-            let delimiter = ensure_heap_ptr(
-                builder,
-                block,
-                ip,
-                frame.pop()?,
-                HeapContainerKind::String.value_type(),
-            )?;
-            let text = ensure_heap_ptr(
-                builder,
-                block,
-                ip,
-                frame.pop()?,
-                HeapContainerKind::String.value_type(),
-            )?;
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Tagged,
-                    SsaInstKind::StringSplitLiteral {
-                        text: text.value.id,
-                        delimiter: delimiter.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::tagged_typed(ValueType::Array),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("string_split_literal", out))
-        }
         SpecializedBuiltinKind::StringConcat => {
             let rhs = frame.pop()?;
             let lhs = frame.pop()?;
@@ -3905,78 +3616,6 @@ fn emit_specialized_builtin_call(
             let rhs = frame.pop()?;
             let lhs = frame.pop()?;
             emit_concat_binop(builder, block, ip, ConcatBinOpKind::Bytes, lhs, rhs)
-        }
-        SpecializedBuiltinKind::BytesFromArrayU8 => {
-            let array = ensure_heap_ptr(
-                builder,
-                block,
-                ip,
-                frame.pop()?,
-                HeapContainerKind::Array.value_type(),
-            )?;
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Tagged,
-                    SsaInstKind::BytesFromArrayU8 {
-                        array: array.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::tagged_typed(ValueType::Bytes),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("bytes_from_array_u8", out))
-        }
-        SpecializedBuiltinKind::BytesToUtf8Ascii => {
-            let bytes = ensure_heap_ptr(
-                builder,
-                block,
-                ip,
-                frame.pop()?,
-                HeapContainerKind::Bytes.value_type(),
-            )?;
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Tagged,
-                    SsaInstKind::BytesToUtf8Ascii {
-                        bytes: bytes.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::tagged_typed(ValueType::String),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("bytes_to_utf8_ascii", out))
-        }
-        SpecializedBuiltinKind::BytesToArrayU8 => {
-            let bytes = ensure_heap_ptr(
-                builder,
-                block,
-                ip,
-                frame.pop()?,
-                HeapContainerKind::Bytes.value_type(),
-            )?;
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Tagged,
-                    SsaInstKind::BytesToArrayU8 {
-                        bytes: bytes.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::tagged_typed(ValueType::Array),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("bytes_to_array_u8", out))
         }
         SpecializedBuiltinKind::ArrayNew => {
             let out = builder
@@ -4274,6 +3913,100 @@ fn emit_spec_driven_builtin(
                 index: popped[0].value.id,
             },
             ValueInfo::bool(None),
+            spec.name,
+        ),
+        SpecializedBuiltinKind::StringSlice => (
+            SsaInstKind::StringSlice {
+                text: popped[2].value.id,
+                start: popped[1].value.id,
+                length: popped[0].value.id,
+            },
+            ValueInfo::tagged_typed(ValueType::String),
+            spec.name,
+        ),
+        SpecializedBuiltinKind::BytesSlice => (
+            SsaInstKind::BytesSlice {
+                bytes: popped[2].value.id,
+                start: popped[1].value.id,
+                length: popped[0].value.id,
+            },
+            ValueInfo::tagged_typed(ValueType::Bytes),
+            spec.name,
+        ),
+        SpecializedBuiltinKind::StringGet => (
+            SsaInstKind::StringGet {
+                text: popped[1].value.id,
+                index: popped[0].value.id,
+            },
+            ValueInfo::tagged_typed(ValueType::String),
+            spec.name,
+        ),
+        SpecializedBuiltinKind::BytesGet => (
+            SsaInstKind::BytesGet {
+                bytes: popped[1].value.id,
+                index: popped[0].value.id,
+            },
+            ValueInfo::int(None),
+            spec.name,
+        ),
+        SpecializedBuiltinKind::BytesHas => (
+            SsaInstKind::BytesHas {
+                bytes: popped[1].value.id,
+                index: popped[0].value.id,
+            },
+            ValueInfo::bool(None),
+            spec.name,
+        ),
+        SpecializedBuiltinKind::StringReplaceLiteral => (
+            SsaInstKind::StringReplaceLiteral {
+                text: popped[2].value.id,
+                needle: popped[1].value.id,
+                replacement: popped[0].value.id,
+            },
+            ValueInfo::tagged_typed(ValueType::String),
+            spec.name,
+        ),
+        SpecializedBuiltinKind::StringLowerAscii => (
+            SsaInstKind::StringLowerAscii {
+                text: popped[0].value.id,
+            },
+            ValueInfo::tagged_typed(ValueType::String),
+            spec.name,
+        ),
+        SpecializedBuiltinKind::StringSplitLiteral => (
+            SsaInstKind::StringSplitLiteral {
+                text: popped[1].value.id,
+                delimiter: popped[0].value.id,
+            },
+            ValueInfo::tagged_typed(ValueType::Array),
+            spec.name,
+        ),
+        SpecializedBuiltinKind::BytesFromArrayU8 => (
+            SsaInstKind::BytesFromArrayU8 {
+                array: popped[0].value.id,
+            },
+            ValueInfo::tagged_typed(ValueType::Bytes),
+            spec.name,
+        ),
+        SpecializedBuiltinKind::BytesToUtf8Ascii => (
+            SsaInstKind::BytesToUtf8Ascii {
+                bytes: popped[0].value.id,
+            },
+            ValueInfo::tagged_typed(ValueType::String),
+            spec.name,
+        ),
+        SpecializedBuiltinKind::BytesToArrayU8 => (
+            SsaInstKind::BytesToArrayU8 {
+                bytes: popped[0].value.id,
+            },
+            ValueInfo::tagged_typed(ValueType::Array),
+            spec.name,
+        ),
+        SpecializedBuiltinKind::ToString => (
+            SsaInstKind::ToString {
+                value: popped[0].value.id,
+            },
+            ValueInfo::tagged_typed(ValueType::String),
             spec.name,
         ),
         SpecializedBuiltinKind::ArraySet => {
