@@ -502,6 +502,41 @@ fn aot_inlines_array_len_and_get_without_builtin_boundary() {
 }
 
 #[test]
+fn aot_inlines_array_literal_new_and_push_without_builtin_boundary() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        let values = [1, 2, 3, 4];
+        values[3];
+    "#;
+    let compiled = compile_source(source).expect("array literal aot compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_bridge_stats_enabled(true);
+    install_aot(&mut vm);
+
+    assert_eq!(vm.run().expect("aot vm should run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(4)]);
+    assert!(vm.aot_exec_count() > 0, "aot should execute natively");
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    assert_eq!(
+        bridge_hits
+            .iter()
+            .find_map(|(name, count)| (*name == "array_new").then_some(*count)),
+        None,
+        "ArrayNew should not cross the builtin bridge: {bridge_hits:?}"
+    );
+    assert_eq!(
+        bridge_hits
+            .iter()
+            .find_map(|(name, count)| (*name == "array_push").then_some(*count)),
+        None,
+        "ArrayPush should not cross the builtin bridge: {bridge_hits:?}"
+    );
+}
+
+#[test]
 fn aot_inlines_array_get_result_used_as_next_array_index() {
     if !native_jit_supported() {
         return;
@@ -2041,6 +2076,75 @@ fn aot_lowers_non_yielding_host_call_with_tagged_result() {
         !bridge_hits.iter().any(|(name, _)| *name == "call"),
         "tagged-result non-yielding host call should lower directly in AOT: {bridge_hits:?}"
     );
+}
+
+#[test]
+fn aot_coerces_typed_array_gets_for_non_yielding_host_call_args() {
+    if !native_jit_supported() {
+        return;
+    }
+    let compiled = compile_source(
+        r#"
+            fn less(lhs: int, rhs: int) -> bool;
+            let values: int[] = [3, 1, 2];
+            let mut i = 0;
+            let mut count = 0;
+            while i < values.length {
+                if less(values[i].copy(), 3) {
+                    count = count + 1;
+                }
+                i = i + 1;
+            }
+            count;
+        "#,
+    )
+    .expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_bridge_stats_enabled(true);
+    vm.bind_static_non_yielding_args_function("less", less_non_yielding);
+    install_aot(&mut vm);
+
+    assert_eq!(vm.run().expect("aot vm should run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(2)]);
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    assert!(
+        !bridge_hits.iter().any(|(name, _)| *name == "call"),
+        "typed array-get host args should stay in direct AOT host-call lowering: {bridge_hits:?}"
+    );
+}
+
+#[test]
+fn aot_moves_delayed_array_mutation_through_loop_carried_output() {
+    if !native_jit_supported() {
+        return;
+    }
+    let compiled = compile_source(
+        r#"
+            let mut values: int[] = [];
+            for i in 0..16 {
+                values[values.length] = i;
+            }
+            let mut i = 1;
+            while i < values.length {
+                values[i - 1] = values[i].copy();
+                i = i + 1;
+            }
+            values;
+        "#,
+    )
+    .expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_bridge_stats_enabled(true);
+    install_aot(&mut vm);
+
+    assert_eq!(vm.run().expect("aot vm should run"), VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[Value::array(
+            (1..16).chain(std::iter::once(15)).map(Value::Int).collect()
+        )]
+    );
+    assert!(vm.aot_exec_count() > 0, "aot should execute natively");
 }
 
 #[test]

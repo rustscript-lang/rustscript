@@ -3,7 +3,7 @@ use std::fmt;
 use std::sync::Arc;
 
 #[cfg(feature = "cranelift-jit")]
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 #[cfg(feature = "cranelift-jit")]
 use std::sync::OnceLock;
 #[cfg(feature = "cranelift-jit")]
@@ -17,21 +17,22 @@ use crate::vm::native::{
     HeapIntrinsicAddrs, HeapIntrinsicRefs, NativeFrameState, OP_BUILTIN_CALL, OP_CALL,
     STATUS_CONTINUE, STATUS_ERROR, alloc_buffer_signature, alloc_byte_buffer_entry_address,
     alloc_value_buffer_entry_address, aot_call_boundary_interrupt_entry_address,
-    array_push_entry_address, box_heap_value_signature, clear_value_slot_entry_address,
-    clone_value_signature, clone_value_to_slot_entry_address, collection_get_signature,
-    collection_mutation_signature, collection_set_entry_address, copy_bytes_entry_address,
-    copy_bytes_signature, detect_native_stack_layout, enter_call_value_entry_address,
-    enter_call_value_signature, entry_signature, frame_state_entry_address, frame_state_signature,
-    free_buffer_signature, helper_entry_offset, helper_signature,
-    init_null_value_slot_entry_address, jump_with_status, leave_frame_entry_address,
-    leave_frame_signature, non_yielding_host_call_entry_address, non_yielding_host_call_signature,
-    non_yielding_i64_host_call_entry_address, non_yielding_i64_host_call_signature,
-    non_yielding_scalar_host_call_entry_address, non_yielding_scalar_host_call_signature,
-    pack_shared_signature, resolve_offsets, restore_active_exit_state_entry_address,
-    restore_exit_signature, restore_exit_state_entry_address,
-    shared_array_from_buffer_entry_address, shared_bytes_from_buffer_entry_address,
-    shared_string_from_buffer_entry_address, value_eq_entry_address, value_eq_signature,
-    value_slot_signature, write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
+    array_push_entry_address, array_set_entry_address, array_set_signature,
+    box_heap_value_signature, clear_value_slot_entry_address, clone_value_signature,
+    clone_value_to_slot_entry_address, collection_get_signature, collection_mutation_signature,
+    collection_set_entry_address, copy_bytes_entry_address, copy_bytes_signature,
+    detect_native_stack_layout, enter_call_value_entry_address, enter_call_value_signature,
+    entry_signature, frame_state_entry_address, frame_state_signature, free_buffer_signature,
+    helper_entry_offset, helper_signature, init_null_value_slot_entry_address, jump_with_status,
+    leave_frame_entry_address, leave_frame_signature, non_yielding_host_call_entry_address,
+    non_yielding_host_call_signature, non_yielding_i64_host_call_entry_address,
+    non_yielding_i64_host_call_signature, non_yielding_scalar_host_call_entry_address,
+    non_yielding_scalar_host_call_signature, pack_shared_signature, resolve_offsets,
+    restore_active_exit_state_entry_address, restore_exit_signature,
+    restore_exit_state_entry_address, shared_array_from_buffer_entry_address,
+    shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
+    value_eq_entry_address, value_eq_signature, value_slot_signature,
+    write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
 };
 use crate::vm::{Program, Value, ValueType, Vm, VmError, VmResult};
 #[cfg(feature = "cranelift-jit")]
@@ -57,8 +58,8 @@ use cranelift_module::{Linkage, Module};
 
 use super::ir::{AotCallDispatch, AotLowerError};
 use super::ssa::{
-    AotCheckpoint, AotSsaBuildError, AotSsaInstKind, AotSsaJumpTarget, AotSsaMaterialization,
-    AotSsaProgram, AotSsaTerminator, AotSsaValueId, AotSsaValueRepr,
+    AotCheckpoint, AotSsaBlockId, AotSsaBuildError, AotSsaInstKind, AotSsaJumpTarget,
+    AotSsaMaterialization, AotSsaProgram, AotSsaTerminator, AotSsaValueId, AotSsaValueRepr,
     build_aot_ssa_with_non_yielding_host_imports,
 };
 
@@ -247,6 +248,7 @@ struct AotDeoptHelperRefs {
     init_null_slot_ref: cranelift_codegen::ir::SigRef,
     clear_value_slot_ref: cranelift_codegen::ir::SigRef,
     box_heap_value_ref: cranelift_codegen::ir::SigRef,
+    array_set_ref: cranelift_codegen::ir::SigRef,
     array_push_ref: cranelift_codegen::ir::SigRef,
     collection_set_ref: cranelift_codegen::ir::SigRef,
     restore_exit_ref: cranelift_codegen::ir::SigRef,
@@ -267,6 +269,7 @@ struct AotDeoptHelperAddrs {
     init_null_slot: usize,
     clear_value_slot: usize,
     box_heap_value: usize,
+    array_set: usize,
     array_push: usize,
     collection_set: usize,
     restore_exit: usize,
@@ -332,6 +335,7 @@ struct AotArrayIndexOp {
     ip: usize,
     array: cranelift_codegen::ir::Value,
     index: cranelift_codegen::ir::Value,
+    borrow_output: bool,
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -361,6 +365,7 @@ struct AotMutationOp {
     container: AotSsaValueId,
     first_arg: AotSsaValueId,
     second_arg: Option<AotSsaValueId>,
+    map_set: bool,
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -438,6 +443,7 @@ fn compile_ssa(
         non_yielding_i64_host_call_signature(pointer_type, call_conv);
     let value_slot_sig = value_slot_signature(pointer_type, call_conv);
     let box_heap_sig = box_heap_value_signature(pointer_type, call_conv);
+    let array_set_sig = array_set_signature(pointer_type, call_conv);
     let array_push_sig = collection_get_signature(pointer_type, call_conv);
     let collection_set_sig = collection_mutation_signature(pointer_type, call_conv);
     let restore_exit_sig = restore_exit_signature(pointer_type, call_conv);
@@ -467,6 +473,7 @@ fn compile_ssa(
         init_null_slot: init_null_value_slot_entry_address(),
         clear_value_slot: clear_value_slot_entry_address(),
         box_heap_value: write_heap_value_to_slot_entry_address(),
+        array_set: array_set_entry_address(),
         array_push: array_push_entry_address(),
         collection_set: collection_set_entry_address(),
         restore_exit: restore_active_exit_state_entry_address(),
@@ -528,6 +535,7 @@ fn compile_ssa(
             init_null_slot_ref: b.import_signature(value_slot_sig.clone()),
             clear_value_slot_ref: b.import_signature(value_slot_sig),
             box_heap_value_ref: b.import_signature(box_heap_sig),
+            array_set_ref: b.import_signature(array_set_sig),
             array_push_ref: b.import_signature(array_push_sig),
             collection_set_ref: b.import_signature(collection_set_sig),
             restore_exit_ref: b.import_signature(restore_exit_sig),
@@ -566,6 +574,7 @@ fn compile_ssa(
             }
         }
         let owned_value_temps = allocate_owned_value_temps(&mut b, ssa, layout.value.size)?;
+        let borrowed_array_gets = borrowed_array_get_outputs(ssa);
 
         b.switch_to_block(entry_block);
         b.append_block_params_for_function_params(entry_block);
@@ -639,7 +648,14 @@ fn compile_ssa(
                 values.insert(param.value.id, lowered);
             }
             for inst in &block.insts {
-                let lowered = lower_aot_ssa_inst(&mut b, lower_ctx, inst, &values, &value_reprs)?;
+                let lowered = lower_aot_ssa_inst(
+                    &mut b,
+                    lower_ctx,
+                    inst,
+                    &values,
+                    &value_reprs,
+                    &borrowed_array_gets,
+                )?;
                 values.insert(inst.output.id, lowered);
             }
             lower_aot_ssa_terminator(
@@ -928,12 +944,117 @@ fn load_aot_checkpoint_value(
 }
 
 #[cfg(feature = "cranelift-jit")]
+fn borrowed_array_get_outputs(ssa: &AotSsaProgram) -> BTreeSet<AotSsaValueId> {
+    let mut instruction_uses: HashMap<AotSsaValueId, Vec<(AotSsaBlockId, usize, bool)>> =
+        HashMap::new();
+    let mut non_instruction_uses = BTreeSet::new();
+
+    for block in &ssa.blocks {
+        for (index, inst) in block.insts.iter().enumerate() {
+            for input in inst.kind.inputs() {
+                let borrows_input = match &inst.kind {
+                    AotSsaInstKind::TaggedToInt { .. }
+                    | AotSsaInstKind::TaggedNumberToFloat { .. } => true,
+                    AotSsaInstKind::HostCall { .. } => true,
+                    AotSsaInstKind::ArraySet { value, .. }
+                    | AotSsaInstKind::ArrayPush { value, .. } => *value == input,
+                    AotSsaInstKind::MapSet { key, value, .. } => *key == input || *value == input,
+                    _ => false,
+                };
+                instruction_uses
+                    .entry(input)
+                    .or_default()
+                    .push((block.id, index, borrows_input));
+            }
+        }
+        if let Some(terminator) = &block.terminator {
+            non_instruction_uses.extend(aot_terminator_inputs(terminator));
+        }
+    }
+
+    let mut borrowed = BTreeSet::new();
+    for block in &ssa.blocks {
+        for (definition_index, inst) in block.insts.iter().enumerate() {
+            let output = inst.output.id;
+            if !matches!(inst.kind, AotSsaInstKind::ArrayGet { .. })
+                || non_instruction_uses.contains(&output)
+            {
+                continue;
+            }
+            let Some([(use_block, use_index, true)]) =
+                instruction_uses.get(&output).map(Vec::as_slice)
+            else {
+                continue;
+            };
+            if *use_block != block.id || *use_index <= definition_index {
+                continue;
+            }
+            let borrow_stays_valid =
+                block.insts[definition_index + 1..*use_index]
+                    .iter()
+                    .all(|between| {
+                        !matches!(
+                            between.kind,
+                            AotSsaInstKind::ArraySet { .. }
+                                | AotSsaInstKind::ArrayPush { .. }
+                                | AotSsaInstKind::MapSet { .. }
+                                | AotSsaInstKind::HostCall { .. }
+                        )
+                    });
+            if borrow_stays_valid {
+                borrowed.insert(output);
+            }
+        }
+    }
+    borrowed
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn aot_terminator_inputs(terminator: &AotSsaTerminator) -> Vec<AotSsaValueId> {
+    let mut inputs = Vec::new();
+    match terminator {
+        AotSsaTerminator::Jump(target) => inputs.extend(target.args.iter().copied()),
+        AotSsaTerminator::BranchBool {
+            condition,
+            if_true,
+            if_false,
+        } => {
+            inputs.push(*condition);
+            inputs.extend(if_true.args.iter().copied());
+            inputs.extend(if_false.args.iter().copied());
+        }
+        AotSsaTerminator::CallBoundary { stack, locals, .. }
+        | AotSsaTerminator::CallValue { stack, locals, .. }
+        | AotSsaTerminator::InterpreterBoundary { stack, locals, .. }
+        | AotSsaTerminator::Return { stack, locals, .. } => {
+            for materialization in stack.iter().chain(locals.iter()) {
+                inputs.extend(aot_materialization_inputs(materialization));
+            }
+        }
+        AotSsaTerminator::Stop { .. } => {}
+    }
+    inputs
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn aot_materialization_inputs(materialization: &AotSsaMaterialization) -> Vec<AotSsaValueId> {
+    match materialization {
+        AotSsaMaterialization::Value(value)
+        | AotSsaMaterialization::BoxInt(value)
+        | AotSsaMaterialization::BoxFloat(value)
+        | AotSsaMaterialization::BoxBool(value)
+        | AotSsaMaterialization::BoxHeapPtr { value, .. } => vec![*value],
+    }
+}
+
+#[cfg(feature = "cranelift-jit")]
 fn lower_aot_ssa_inst(
     b: &mut FunctionBuilder,
     ctx: AotLowerCtx<'_>,
     inst: &super::ssa::AotSsaInst,
     values: &HashMap<AotSsaValueId, cranelift_codegen::ir::Value>,
     value_reprs: &HashMap<AotSsaValueId, AotSsaValueRepr>,
+    borrowed_array_gets: &BTreeSet<AotSsaValueId>,
 ) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
     let AotLowerCtx {
         vm_ptr,
@@ -1070,8 +1191,10 @@ fn lower_aot_ssa_inst(
                 ip: inst.ip,
                 array: values[array],
                 index: values[index],
+                borrow_output: borrowed_array_gets.contains(&inst.output.id),
             },
         )?,
+        AotSsaInstKind::ArrayNew => aot_lower_array_new(b, ctx, inst.output.id)?,
         AotSsaInstKind::BytesHas { bytes, index } => aot_lower_bytes_has(
             b,
             ctx,
@@ -1135,6 +1258,7 @@ fn lower_aot_ssa_inst(
                 container: *array,
                 first_arg: *index,
                 second_arg: Some(*value),
+                map_set: false,
             },
             values,
             value_reprs,
@@ -1147,6 +1271,7 @@ fn lower_aot_ssa_inst(
                 container: *map,
                 first_arg: *key,
                 second_arg: Some(*value),
+                map_set: true,
             },
             values,
             value_reprs,
@@ -1159,6 +1284,7 @@ fn lower_aot_ssa_inst(
                 container: *array,
                 first_arg: *value,
                 second_arg: None,
+                map_set: false,
             },
             values,
             value_reprs,
@@ -1484,15 +1610,13 @@ fn aot_lower_mutation(
         ctx.owned_value_temps,
         AotTempValueSlotKey::Output(op.output_id),
     )?;
-    clear_owned_value_temp_slot(b, ctx.pointer_type, ctx.helper_refs, ctx.helper_addrs, out)?;
-    let first_addr = aot_ensure_boxed_value_addr(
-        b,
-        ctx,
-        values,
-        value_reprs,
-        op.first_arg,
-        AotTempValueSlotKey::MutationArg(op.output_id, 0),
-    )?;
+    let container = values[&op.container];
+    // Mutation helpers replace the destination slot themselves. Keeping the
+    // output slot live until the helper runs preserves loop-carried in-place
+    // updates where the block parameter and output temp are the same runtime
+    // slot; clearing it here would null the container before the helper reads
+    // it. If the output holds an older owner, the helper drops it after the
+    // new collection is written.
     let (helper_ref, helper_addr, args) = if let Some(second_arg) = op.second_arg {
         let second_addr = aot_ensure_boxed_value_addr(
             b,
@@ -1502,16 +1626,45 @@ fn aot_lower_mutation(
             second_arg,
             AotTempValueSlotKey::MutationArg(op.output_id, 1),
         )?;
-        (
-            ctx.helper_refs.collection_set_ref,
-            ctx.helper_addrs.collection_set,
-            vec![out, values[&op.container], first_addr, second_addr],
-        )
+        if op.map_set {
+            let first_addr = aot_ensure_boxed_value_addr(
+                b,
+                ctx,
+                values,
+                value_reprs,
+                op.first_arg,
+                AotTempValueSlotKey::MutationArg(op.output_id, 0),
+            )?;
+            (
+                ctx.helper_refs.collection_set_ref,
+                ctx.helper_addrs.collection_set,
+                vec![out, container, first_addr, second_addr],
+            )
+        } else {
+            if value_reprs.get(&op.first_arg) != Some(&AotSsaValueRepr::I64) {
+                return Err(AotCompileError::Codegen(
+                    "AOT array-set index must be lowered as i64".to_string(),
+                ));
+            }
+            (
+                ctx.helper_refs.array_set_ref,
+                ctx.helper_addrs.array_set,
+                vec![out, container, values[&op.first_arg], second_addr],
+            )
+        }
     } else {
+        let first_addr = aot_ensure_boxed_value_addr(
+            b,
+            ctx,
+            values,
+            value_reprs,
+            op.first_arg,
+            AotTempValueSlotKey::MutationArg(op.output_id, 0),
+        )?;
         (
             ctx.helper_refs.array_push_ref,
             ctx.helper_addrs.array_push,
-            vec![out, values[&op.container], first_addr],
+            vec![out, container, first_addr],
         )
     };
     let helper_ptr = iconst_ptr_from_addr(b, ctx.pointer_type, helper_addr)?;
@@ -1831,6 +1984,7 @@ fn aot_inst_requires_owned_value_slot(kind: &AotSsaInstKind) -> bool {
         kind,
         AotSsaInstKind::CloneTagged { .. }
             | AotSsaInstKind::HostCall { .. }
+            | AotSsaInstKind::ArrayNew
             | AotSsaInstKind::StringSlice { .. }
             | AotSsaInstKind::BytesSlice { .. }
             | AotSsaInstKind::StringGet { .. }
@@ -2403,6 +2557,47 @@ fn aot_lower_array_len(
 }
 
 #[cfg(feature = "cranelift-jit")]
+fn aot_lower_array_new(
+    b: &mut FunctionBuilder,
+    ctx: AotLowerCtx<'_>,
+    output_id: AotSsaValueId,
+) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let out = owned_value_temp_slot_addr(
+        b,
+        ctx.pointer_type,
+        ctx.owned_value_temps,
+        AotTempValueSlotKey::Output(output_id),
+    )?;
+    let zero = b.ins().iconst(ctx.pointer_type, 0);
+    let out_ptr = ssa_call_alloc_buffer(
+        b,
+        ctx.pointer_type,
+        ctx.heap_refs,
+        ctx.heap_addrs,
+        ctx.heap_addrs.alloc_value_buffer,
+        zero,
+    )?;
+    let out_raw = ssa_call_pack_shared(
+        b,
+        ctx.pointer_type,
+        ctx.heap_refs,
+        ctx.heap_addrs.pack_array,
+        out_ptr,
+        zero,
+        zero,
+    )?;
+    clear_owned_value_temp_slot(b, ctx.pointer_type, ctx.helper_refs, ctx.helper_addrs, out)?;
+    ssa_store_heap_ptr_in_value(
+        b,
+        ctx.layout.value,
+        out,
+        ctx.layout.value.array_tag,
+        out_raw,
+    );
+    Ok(out)
+}
+
+#[cfg(feature = "cranelift-jit")]
 fn aot_lower_array_get(
     b: &mut FunctionBuilder,
     ctx: AotLowerCtx<'_>,
@@ -2424,6 +2619,7 @@ fn aot_lower_array_get(
         ip,
         array,
         index,
+        borrow_output,
     } = op;
     let array_raw = aot_load_checked_heap_ptr(
         b,
@@ -2453,21 +2649,42 @@ fn aot_lower_array_get(
         layout.stack_vec.ptr_offset,
     );
     let element_addr = ssa_value_addr(b, pointer_type, data_ptr, index, layout.value.size);
-    let out = owned_value_temp_slot_addr(
-        b,
-        pointer_type,
-        owned_value_temps,
-        AotTempValueSlotKey::Output(output_id),
-    )?;
-    clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
-    call_status_helper(
-        b,
-        exit_block,
-        pointer_type,
-        helper_refs.clone_value_ref,
-        helper_addrs.clone_value,
-        &[out, element_addr],
-    )?;
+    let out = if borrow_output {
+        element_addr
+    } else {
+        let out = owned_value_temp_slot_addr(
+            b,
+            pointer_type,
+            owned_value_temps,
+            AotTempValueSlotKey::Output(output_id),
+        )?;
+        let tag = ssa_load_tag_i32(b, layout.value, element_addr);
+        let scalar = ssa_is_scalar_tag(b, layout.value, tag);
+        let fast = b.create_block();
+        let slow = b.create_block();
+        let clone_done = b.create_block();
+        b.ins().brif(scalar, fast, &[], slow, &[]);
+
+        b.switch_to_block(fast);
+        clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
+        ssa_copy_value_bytes(b, element_addr, out, layout.value.size);
+        b.ins().jump(clone_done, &[]);
+
+        b.switch_to_block(slow);
+        clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
+        call_status_helper(
+            b,
+            exit_block,
+            pointer_type,
+            helper_refs.clone_value_ref,
+            helper_addrs.clone_value,
+            &[out, element_addr],
+        )?;
+        b.ins().jump(clone_done, &[]);
+
+        b.switch_to_block(clone_done);
+        out
+    };
     b.ins().jump(cont, &[BlockArg::Value(out)]);
 
     b.switch_to_block(fail);
@@ -3968,6 +4185,54 @@ fn ssa_load_tag_i32(
     match layout.tag_size {
         1 | 2 => b.ins().uextend(types::I32, raw),
         _ => raw,
+    }
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn ssa_is_scalar_tag(
+    b: &mut FunctionBuilder,
+    layout: crate::vm::native::ValueLayout,
+    tag: cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    let is_null = b
+        .ins()
+        .icmp_imm(IntCC::Equal, tag, i64::from(layout.null_tag));
+    let is_int = b
+        .ins()
+        .icmp_imm(IntCC::Equal, tag, i64::from(layout.int_tag));
+    let is_float = b
+        .ins()
+        .icmp_imm(IntCC::Equal, tag, i64::from(layout.float_tag));
+    let is_bool = b
+        .ins()
+        .icmp_imm(IntCC::Equal, tag, i64::from(layout.bool_tag));
+    let scalar_a = b.ins().bor(is_null, is_int);
+    let scalar_b = b.ins().bor(is_float, is_bool);
+    b.ins().bor(scalar_a, scalar_b)
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn ssa_copy_value_bytes(
+    b: &mut FunctionBuilder,
+    src_addr: cranelift_codegen::ir::Value,
+    dst_addr: cranelift_codegen::ir::Value,
+    size: i32,
+) {
+    let mut offset = 0i32;
+    while offset + 8 <= size {
+        let chunk = b.ins().load(types::I64, MemFlags::new(), src_addr, offset);
+        b.ins().store(MemFlags::new(), chunk, dst_addr, offset);
+        offset += 8;
+    }
+    if offset + 4 <= size {
+        let chunk = b.ins().load(types::I32, MemFlags::new(), src_addr, offset);
+        b.ins().store(MemFlags::new(), chunk, dst_addr, offset);
+        offset += 4;
+    }
+    while offset < size {
+        let chunk = b.ins().load(types::I8, MemFlags::new(), src_addr, offset);
+        b.ins().store(MemFlags::new(), chunk, dst_addr, offset);
+        offset += 1;
     }
 }
 

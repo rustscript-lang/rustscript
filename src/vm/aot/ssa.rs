@@ -127,6 +127,7 @@ pub(crate) enum AotSsaInstKind {
     ArrayLen {
         array: AotSsaValueId,
     },
+    ArrayNew,
     StringSlice {
         text: AotSsaValueId,
         start: AotSsaValueId,
@@ -306,12 +307,13 @@ pub(crate) enum AotSsaInstKind {
 }
 
 impl AotSsaInstKind {
-    fn inputs(&self) -> Vec<AotSsaValueId> {
+    pub(crate) fn inputs(&self) -> Vec<AotSsaValueId> {
         match self {
             Self::IntConst(_)
             | Self::FloatConst(_)
             | Self::BoolConst(_)
-            | Self::ConstSlot { .. } => Vec::new(),
+            | Self::ConstSlot { .. }
+            | Self::ArrayNew => Vec::new(),
             Self::CloneTagged { input } => vec![*input],
             Self::HostCall { args, .. } => args.clone(),
             Self::StringLen { text } => vec![*text],
@@ -1744,15 +1746,11 @@ fn apply_direct_instruction<E: InstEmitter>(
             if value.value.repr != AotSsaValueRepr::Tagged {
                 return Ok(false);
             }
-            frame.stack.push(FrameValue {
-                value: emitter.emit(
-                    ip,
-                    AotSsaInstKind::CloneTagged {
-                        input: value.value.id,
-                    },
-                    AotSsaValueRepr::Tagged,
-                ),
-            });
+            // The IR only emits LdlocOwned for compiler delayed-move
+            // collection mutations whose source local is cleared before the
+            // mutation result is rebound. Forward the owner through SSA rather
+            // than cloning it; the native mutation helper consumes the slot.
+            frame.stack.push(value);
             Ok(true)
         }
         AotInstruction::Stloc { index } => {
@@ -1845,6 +1843,12 @@ fn apply_direct_instruction<E: InstEmitter>(
             AotSsaValueRepr::I64,
             |array| AotSsaInstKind::ArrayLen { array },
         ),
+        AotInstruction::ArrayNew => {
+            frame.stack.push(FrameValue {
+                value: emitter.emit(ip, AotSsaInstKind::ArrayNew, AotSsaValueRepr::Tagged),
+            });
+            Ok(true)
+        }
         AotInstruction::Concat(AotConcatKind::String) => {
             emit_tagged_binary(frame, emitter, ip, "string_concat", |lhs, rhs| {
                 AotSsaInstKind::StringConcat { lhs, rhs }
@@ -2119,6 +2123,7 @@ fn emit_non_yielding_host_call<E: InstEmitter>(
         args.push(frame.pop(ip, "host_call")?);
     }
     args.reverse();
+    coerce_host_args_from_operand_types(program, emitter, ip, call, &mut args);
     let arg_reprs = args.iter().map(|arg| arg.value.repr).collect::<Vec<_>>();
     let result_reprs = call_result_reprs(program, direct_host_result_counts, call, &arg_reprs);
     let [result_repr] = result_reprs.as_slice() else {
@@ -2138,6 +2143,21 @@ fn emit_non_yielding_host_call<E: InstEmitter>(
         ),
     });
     Ok(true)
+}
+
+fn coerce_host_args_from_operand_types<E: InstEmitter>(
+    program: &Program,
+    emitter: &mut E,
+    ip: usize,
+    call: &AotCall,
+    args: &mut [FrameValue],
+) {
+    let (lhs, rhs) = operand_types_at(program, call.call_ip);
+    for (index, expected) in [lhs, rhs].into_iter().enumerate().take(args.len()) {
+        let expected_repr = value_type_repr(expected);
+        let value = args[index].value;
+        args[index].value = coerce_value_for_local(emitter, ip, value, expected_repr);
+    }
 }
 
 fn emit_collection_set<E: InstEmitter>(
@@ -2162,9 +2182,19 @@ fn emit_collection_set<E: InstEmitter>(
             value: value.value.id,
         }
     } else {
+        if !matches!(
+            key.value.repr,
+            AotSsaValueRepr::I64 | AotSsaValueRepr::Tagged
+        ) {
+            frame.stack.push(container);
+            frame.stack.push(key);
+            frame.stack.push(value);
+            return Ok(false);
+        }
+        let index = coerce_numeric_to_int(emitter, ip, key.value);
         AotSsaInstKind::ArraySet {
             array: container.value.id,
-            index: key.value.id,
+            index: index.id,
             value: value.value.id,
         }
     };
@@ -2668,6 +2698,26 @@ fn is_numeric_repr(repr: AotSsaValueRepr) -> bool {
         repr,
         AotSsaValueRepr::I64 | AotSsaValueRepr::F64 | AotSsaValueRepr::Tagged
     )
+}
+
+fn coerce_value_for_local<E: InstEmitter>(
+    emitter: &mut E,
+    ip: usize,
+    value: AotSsaValue,
+    expected_repr: AotSsaValueRepr,
+) -> AotSsaValue {
+    if value.repr == expected_repr {
+        return value;
+    }
+    match (value.repr, expected_repr) {
+        (AotSsaValueRepr::Tagged, AotSsaValueRepr::I64) => {
+            coerce_numeric_to_int(emitter, ip, value)
+        }
+        (AotSsaValueRepr::Tagged, AotSsaValueRepr::F64) => {
+            coerce_numeric_to_float(emitter, ip, value)
+        }
+        _ => value,
+    }
 }
 
 fn coerce_numeric_to_int<E: InstEmitter>(

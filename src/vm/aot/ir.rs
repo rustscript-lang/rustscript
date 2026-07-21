@@ -55,6 +55,7 @@ pub(crate) enum AotInstruction {
     Concat(AotConcatKind),
     Len(AotTextBytesKind),
     ArrayLen,
+    ArrayNew,
     Slice(AotTextBytesKind),
     Get(AotTextBytesKind),
     ArrayGet,
@@ -583,6 +584,8 @@ fn typed_builtin_instruction(
         .unwrap_or((ValueType::Unknown, ValueType::Unknown));
 
     match builtin {
+        BuiltinFunction::ArrayNew => Some(AotInstruction::ArrayNew),
+        BuiltinFunction::ArrayPush if lhs == ValueType::Array => Some(AotInstruction::ArrayPush),
         BuiltinFunction::Len => match lhs {
             ValueType::String => Some(AotInstruction::Len(AotTextBytesKind::String)),
             ValueType::Bytes => Some(AotInstruction::Len(AotTextBytesKind::Bytes)),
