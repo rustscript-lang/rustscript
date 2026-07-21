@@ -1,4 +1,5 @@
 use super::compile::{CompiledProgram, compile_program};
+use crate::vm::host::VmHostFunction;
 use crate::vm::native::{
     STATUS_CONTINUE, STATUS_ERROR, STATUS_HALTED, STATUS_LINKED_CONTINUE, STATUS_OUT_OF_FUEL,
     STATUS_TRACE_EXIT, STATUS_WAITING, STATUS_YIELDED, clear_bridge_error,
@@ -8,7 +9,21 @@ use crate::vm::{ExecOutcome, Vm, VmError, VmResult};
 
 impl Vm {
     pub fn compile_aot(&mut self) -> VmResult<()> {
-        self.aot_program = Some(compile_program(self.program())?);
+        self.ensure_call_bindings()?;
+        let non_yielding_host_imports = self
+            .resolved_calls
+            .iter()
+            .map(|&slot| {
+                matches!(
+                    self.host_functions.get(usize::from(slot)),
+                    Some(VmHostFunction::ArgsStaticNonYielding(_))
+                )
+            })
+            .collect::<Vec<_>>();
+        self.aot_program = Some(compile_program(
+            self.program(),
+            non_yielding_host_imports.as_slice(),
+        )?);
         self.aot_exec_count = 0;
         Ok(())
     }

@@ -113,6 +113,10 @@ pub(crate) enum AotSsaInstKind {
     CloneTagged {
         input: AotSsaValueId,
     },
+    HostCall {
+        import: u16,
+        args: Vec<AotSsaValueId>,
+    },
 
     StringLen {
         text: AotSsaValueId,
@@ -302,6 +306,7 @@ impl AotSsaInstKind {
             | Self::BoolConst(_)
             | Self::ConstSlot { .. } => Vec::new(),
             Self::CloneTagged { input } => vec![*input],
+            Self::HostCall { args, .. } => args.clone(),
             Self::StringLen { text } => vec![*text],
             Self::BytesLen { bytes } => vec![*bytes],
             Self::StringSlice {
@@ -911,6 +916,7 @@ struct Builder<'a> {
     external_resume_ips: BTreeSet<usize>,
     incoming_shapes: HashMap<usize, FrameShape>,
     direct_host_result_counts: HashMap<usize, usize>,
+    non_yielding_host_imports: Vec<bool>,
     next_fake_value: u32,
 }
 
@@ -918,6 +924,7 @@ impl<'a> Builder<'a> {
     fn new(
         program: &'a Program,
         direct_host_result_counts: HashMap<usize, usize>,
+        non_yielding_host_imports: &[bool],
     ) -> Result<Self, AotSsaBuildError> {
         let lowered = lower_program(program)?;
         let decoded_blocks = decode_blocks(program, &lowered)?;
@@ -953,6 +960,9 @@ impl<'a> Builder<'a> {
         for block in &decoded_blocks {
             for step in &block.steps {
                 if let AotInstruction::Call(call) = &step.instruction {
+                    if call_is_direct_non_yielding_host(call, non_yielding_host_imports) {
+                        continue;
+                    }
                     checkpoint_ips.insert(call.call_ip);
                     checkpoint_ips.insert(call.resume_ip);
                     external_resume_ips.insert(call.call_ip);
@@ -980,6 +990,7 @@ impl<'a> Builder<'a> {
             external_resume_ips,
             incoming_shapes: HashMap::new(),
             direct_host_result_counts,
+            non_yielding_host_imports: non_yielding_host_imports.to_vec(),
             next_fake_value: 1,
         })
     }
@@ -1320,9 +1331,16 @@ fn merge_value_repr(lhs: AotSsaValueRepr, rhs: AotSsaValueRepr) -> AotSsaValueRe
 }
 
 pub(crate) fn build_aot_ssa(program: &Program) -> Result<AotSsaProgram, AotSsaBuildError> {
+    build_aot_ssa_with_non_yielding_host_imports(program, &[])
+}
+
+pub(crate) fn build_aot_ssa_with_non_yielding_host_imports(
+    program: &Program,
+    non_yielding_host_imports: &[bool],
+) -> Result<AotSsaProgram, AotSsaBuildError> {
     let ambiguous_calls = collect_ambiguous_direct_host_calls(program)?;
     if ambiguous_calls.is_empty() {
-        return Builder::new(program, HashMap::new())?.build();
+        return Builder::new(program, HashMap::new(), non_yielding_host_imports)?.build();
     }
 
     let mut first_error = None;
@@ -1337,7 +1355,13 @@ pub(crate) fn build_aot_ssa(program: &Program) -> Result<AotSsaProgram, AotSsaBu
             let result_count = if (mask >> index) & 1 == 0 { 1 } else { 0 };
             direct_host_result_counts.insert(call_ip, result_count);
         }
-        match Builder::new(program, direct_host_result_counts)?.build() {
+        match Builder::new(
+            program,
+            direct_host_result_counts,
+            non_yielding_host_imports,
+        )?
+        .build()
+        {
             Ok(ssa) => return Ok(ssa),
             Err(err) => {
                 if first_error.is_none() {
@@ -1390,6 +1414,7 @@ impl<'a> Builder<'a> {
             if !apply_direct_instruction(
                 self.program,
                 &self.direct_host_result_counts,
+                &self.non_yielding_host_imports,
                 frame,
                 emitter,
                 step,
@@ -1659,7 +1684,8 @@ fn value_repr_for_constant(value: &Value) -> AotSsaValueRepr {
 
 fn apply_direct_instruction<E: InstEmitter>(
     program: &Program,
-    _direct_host_result_counts: &HashMap<usize, usize>,
+    direct_host_result_counts: &HashMap<usize, usize>,
+    non_yielding_host_imports: &[bool],
     frame: &mut Frame,
     emitter: &mut E,
     step: &DecodedStep,
@@ -2031,8 +2057,62 @@ fn apply_direct_instruction<E: InstEmitter>(
             })
         }
 
-        AotInstruction::Call(_) => Ok(false),
+        AotInstruction::Call(call) => emit_non_yielding_host_call(
+            program,
+            direct_host_result_counts,
+            non_yielding_host_imports,
+            frame,
+            emitter,
+            ip,
+            call,
+        ),
     }
+}
+
+fn call_is_direct_non_yielding_host(call: &AotCall, non_yielding_host_imports: &[bool]) -> bool {
+    call.dispatch == AotCallDispatch::HostImport
+        && non_yielding_host_imports
+            .get(call.index as usize)
+            .copied()
+            .unwrap_or(false)
+}
+
+fn emit_non_yielding_host_call<E: InstEmitter>(
+    program: &Program,
+    direct_host_result_counts: &HashMap<usize, usize>,
+    non_yielding_host_imports: &[bool],
+    frame: &mut Frame,
+    emitter: &mut E,
+    ip: usize,
+    call: &AotCall,
+) -> Result<bool, AotSsaBuildError> {
+    if !call_is_direct_non_yielding_host(call, non_yielding_host_imports) {
+        return Ok(false);
+    }
+    let mut args = Vec::with_capacity(call.argc as usize);
+    for _ in 0..call.argc {
+        args.push(frame.pop(ip, "host_call")?);
+    }
+    args.reverse();
+    let arg_reprs = args.iter().map(|arg| arg.value.repr).collect::<Vec<_>>();
+    let result_reprs = call_result_reprs(program, direct_host_result_counts, call, &arg_reprs);
+    let [result_repr] = result_reprs.as_slice() else {
+        for arg in args {
+            frame.stack.push(arg);
+        }
+        return Ok(false);
+    };
+    frame.stack.push(FrameValue {
+        value: emitter.emit(
+            ip,
+            AotSsaInstKind::HostCall {
+                import: call.index,
+                args: args.into_iter().map(|arg| arg.value.id).collect(),
+            },
+            *result_repr,
+        ),
+    });
+    Ok(true)
 }
 
 fn emit_collection_set<E: InstEmitter>(

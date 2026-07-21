@@ -1797,6 +1797,108 @@ fn unstable_return_non_yielding(_: &[Value]) -> Result<CallOutcome, vm::VmError>
     Ok(CallOutcome::Return(CallReturn::one(value)))
 }
 
+fn label_non_yielding(args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+    let [Value::Int(value)] = args else {
+        return Err(vm::VmError::TypeMismatch("int"));
+    };
+    Ok(CallOutcome::Return(CallReturn::one(Value::string(
+        format!("{value};"),
+    ))))
+}
+
+#[test]
+fn aot_lowers_non_yielding_static_args_host_call_without_call_boundary() {
+    if !native_jit_supported() {
+        return;
+    }
+    let compiled = compile_source(
+        r#"
+            fn increment(value: int) -> int;
+            let mut i = 0;
+            while i < 100 {
+                i = increment(i);
+            }
+            i;
+        "#,
+    )
+    .expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_bridge_stats_enabled(true);
+    vm.bind_static_non_yielding_args_function("increment", increment_non_yielding);
+    install_aot(&mut vm);
+
+    assert_eq!(vm.run().expect("aot vm should run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(100)]);
+    assert!(vm.aot_exec_count() > 0, "aot should execute natively");
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    assert!(
+        !bridge_hits.iter().any(|(name, _)| *name == "call"),
+        "non-yielding host call should lower directly in AOT: {bridge_hits:?}"
+    );
+}
+
+#[test]
+fn aot_lowers_non_yielding_host_call_with_tagged_args_to_scalar_result() {
+    if !native_jit_supported() {
+        return;
+    }
+    let compiled = compile_source(
+        r#"
+            fn string_len(value: string) -> int;
+            let mut i = 0;
+            while i < 100 {
+                i = i + string_len("x");
+            }
+            i;
+        "#,
+    )
+    .expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_bridge_stats_enabled(true);
+    vm.bind_static_non_yielding_args_function("string_len", string_len_non_yielding);
+    install_aot(&mut vm);
+
+    assert_eq!(vm.run().expect("aot vm should run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(100)]);
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    assert!(
+        !bridge_hits.iter().any(|(name, _)| *name == "call"),
+        "tagged-arg non-yielding host call should lower directly in AOT: {bridge_hits:?}"
+    );
+}
+
+#[test]
+fn aot_lowers_non_yielding_host_call_with_tagged_result() {
+    if !native_jit_supported() {
+        return;
+    }
+    let compiled = compile_source(
+        r#"
+            fn label(value: int) -> string;
+            let mut i = 0;
+            let mut out = "";
+            while i < 4 {
+                out = out + label(i);
+                i = i + 1;
+            }
+            out;
+        "#,
+    )
+    .expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_jit_native_bridge_stats_enabled(true);
+    vm.bind_static_non_yielding_args_function("label", label_non_yielding);
+    install_aot(&mut vm);
+
+    assert_eq!(vm.run().expect("aot vm should run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("0;1;2;3;")]);
+    let bridge_hits = vm.jit_native_bridge_stats_snapshot();
+    assert!(
+        !bridge_hits.iter().any(|(name, _)| *name == "call"),
+        "tagged-result non-yielding host call should lower directly in AOT: {bridge_hits:?}"
+    );
+}
+
 #[test]
 fn trace_jit_enforces_scalar_host_return_contract_after_dirty_local_write() {
     if !native_jit_supported() {

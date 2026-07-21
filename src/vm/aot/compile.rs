@@ -24,14 +24,16 @@ use crate::vm::native::{
     enter_call_value_signature, entry_signature, frame_state_entry_address, frame_state_signature,
     free_buffer_signature, helper_entry_offset, helper_signature,
     init_null_value_slot_entry_address, jump_with_status, leave_frame_entry_address,
-    leave_frame_signature, pack_shared_signature, resolve_offsets,
-    restore_active_exit_state_entry_address, restore_exit_signature,
-    restore_exit_state_entry_address, shared_array_from_buffer_entry_address,
-    shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
-    value_eq_entry_address, value_eq_signature, value_slot_signature,
-    write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
+    leave_frame_signature, non_yielding_host_call_entry_address, non_yielding_host_call_signature,
+    non_yielding_i64_host_call_entry_address, non_yielding_i64_host_call_signature,
+    non_yielding_scalar_host_call_entry_address, non_yielding_scalar_host_call_signature,
+    pack_shared_signature, resolve_offsets, restore_active_exit_state_entry_address,
+    restore_exit_signature, restore_exit_state_entry_address,
+    shared_array_from_buffer_entry_address, shared_bytes_from_buffer_entry_address,
+    shared_string_from_buffer_entry_address, value_eq_entry_address, value_eq_signature,
+    value_slot_signature, write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
 };
-use crate::vm::{Program, Value, Vm, VmError, VmResult};
+use crate::vm::{Program, Value, ValueType, Vm, VmError, VmResult};
 #[cfg(feature = "cranelift-jit")]
 use cranelift_codegen::ir::condcodes::IntCC;
 #[cfg(feature = "cranelift-jit")]
@@ -56,7 +58,8 @@ use cranelift_module::{Linkage, Module};
 use super::ir::{AotCallDispatch, AotLowerError};
 use super::ssa::{
     AotCheckpoint, AotSsaBuildError, AotSsaInstKind, AotSsaJumpTarget, AotSsaMaterialization,
-    AotSsaProgram, AotSsaTerminator, AotSsaValueId, AotSsaValueRepr, build_aot_ssa,
+    AotSsaProgram, AotSsaTerminator, AotSsaValueId, AotSsaValueRepr,
+    build_aot_ssa_with_non_yielding_host_imports,
 };
 
 #[cfg(any(
@@ -152,15 +155,22 @@ static CRANELIFT_AOT_ID: AtomicU64 = AtomicU64::new(1);
 #[cfg(feature = "cranelift-jit")]
 static CRANELIFT_AOT_ISA: OnceLock<Result<OwnedTargetIsa, String>> = OnceLock::new();
 
-pub(crate) fn compile_program(program: &Program) -> VmResult<CompiledProgram> {
-    compile_program_inner(program).map_err(|err| VmError::JitNative(err.to_string()))
+pub(crate) fn compile_program(
+    program: &Program,
+    non_yielding_host_imports: &[bool],
+) -> VmResult<CompiledProgram> {
+    compile_program_inner(program, non_yielding_host_imports)
+        .map_err(|err| VmError::JitNative(err.to_string()))
 }
 
 #[cfg(feature = "cranelift-jit")]
-fn compile_program_inner(program: &Program) -> Result<CompiledProgram, AotCompileError> {
+fn compile_program_inner(
+    program: &Program,
+    non_yielding_host_imports: &[bool],
+) -> Result<CompiledProgram, AotCompileError> {
     let trace_enabled = std::env::var_os("PDVM_TRACE_AOT_COMPILE").is_some();
     let build_started = Instant::now();
-    let ssa = build_aot_ssa(program)?;
+    let ssa = build_aot_ssa_with_non_yielding_host_imports(program, non_yielding_host_imports)?;
     let build_elapsed = build_started.elapsed();
     if trace_enabled {
         let total_insts = ssa
@@ -210,7 +220,10 @@ fn compile_program_inner(program: &Program) -> Result<CompiledProgram, AotCompil
 }
 
 #[cfg(not(feature = "cranelift-jit"))]
-fn compile_program_inner(_program: &Program) -> Result<CompiledProgram, AotCompileError> {
+fn compile_program_inner(
+    _program: &Program,
+    _non_yielding_host_imports: &[bool],
+) -> Result<CompiledProgram, AotCompileError> {
     Err(AotCompileError::Codegen(
         "whole-program AOT backend is disabled (feature 'cranelift-jit' is not enabled)"
             .to_string(),
@@ -228,6 +241,9 @@ struct AotDeoptHelperRefs {
     leave_frame_ref: cranelift_codegen::ir::SigRef,
     clone_value_ref: cranelift_codegen::ir::SigRef,
     value_eq_ref: cranelift_codegen::ir::SigRef,
+    non_yielding_host_call_ref: cranelift_codegen::ir::SigRef,
+    non_yielding_scalar_host_call_ref: cranelift_codegen::ir::SigRef,
+    non_yielding_i64_host_call_ref: cranelift_codegen::ir::SigRef,
     init_null_slot_ref: cranelift_codegen::ir::SigRef,
     clear_value_slot_ref: cranelift_codegen::ir::SigRef,
     box_heap_value_ref: cranelift_codegen::ir::SigRef,
@@ -245,6 +261,9 @@ struct AotDeoptHelperAddrs {
     leave_frame: usize,
     clone_value: usize,
     value_eq: usize,
+    non_yielding_host_call: usize,
+    non_yielding_scalar_host_call: usize,
+    non_yielding_i64_host_call: usize,
     init_null_slot: usize,
     clear_value_slot: usize,
     box_heap_value: usize,
@@ -258,6 +277,8 @@ struct AotDeoptHelperAddrs {
 enum AotTempValueSlotKey {
     Output(AotSsaValueId),
     MutationArg(AotSsaValueId, u8),
+    HostArgs(AotSsaValueId),
+    HostScalarResult(AotSsaValueId),
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -401,6 +422,11 @@ fn compile_ssa(
     let interrupt_sig = entry_signature(pointer_type, call_conv);
     let clone_value_sig = clone_value_signature(pointer_type, call_conv);
     let value_eq_sig = value_eq_signature(pointer_type, call_conv);
+    let non_yielding_host_call_sig = non_yielding_host_call_signature(pointer_type, call_conv);
+    let non_yielding_scalar_host_call_sig =
+        non_yielding_scalar_host_call_signature(pointer_type, call_conv);
+    let non_yielding_i64_host_call_sig =
+        non_yielding_i64_host_call_signature(pointer_type, call_conv);
     let value_slot_sig = value_slot_signature(pointer_type, call_conv);
     let box_heap_sig = box_heap_value_signature(pointer_type, call_conv);
     let array_push_sig = collection_get_signature(pointer_type, call_conv);
@@ -426,6 +452,9 @@ fn compile_ssa(
         leave_frame: leave_frame_entry_address(),
         clone_value: clone_value_to_slot_entry_address(),
         value_eq: value_eq_entry_address(),
+        non_yielding_host_call: non_yielding_host_call_entry_address(),
+        non_yielding_scalar_host_call: non_yielding_scalar_host_call_entry_address(),
+        non_yielding_i64_host_call: non_yielding_i64_host_call_entry_address(),
         init_null_slot: init_null_value_slot_entry_address(),
         clear_value_slot: clear_value_slot_entry_address(),
         box_heap_value: write_heap_value_to_slot_entry_address(),
@@ -483,6 +512,10 @@ fn compile_ssa(
             leave_frame_ref: b.import_signature(leave_frame_sig),
             clone_value_ref: b.import_signature(clone_value_sig),
             value_eq_ref: b.import_signature(value_eq_sig),
+            non_yielding_host_call_ref: b.import_signature(non_yielding_host_call_sig),
+            non_yielding_scalar_host_call_ref: b
+                .import_signature(non_yielding_scalar_host_call_sig),
+            non_yielding_i64_host_call_ref: b.import_signature(non_yielding_i64_host_call_sig),
             init_null_slot_ref: b.import_signature(value_slot_sig.clone()),
             clear_value_slot_ref: b.import_signature(value_slot_sig),
             box_heap_value_ref: b.import_signature(box_heap_sig),
@@ -936,6 +969,16 @@ fn lower_aot_ssa_inst(
             )?;
             out
         }
+        AotSsaInstKind::HostCall { import, args } => aot_lower_host_call(
+            b,
+            ctx,
+            inst.output.id,
+            inst.output.repr,
+            *import,
+            args,
+            values,
+            value_reprs,
+        )?,
 
         AotSsaInstKind::StringLen { text } => aot_lower_string_len(
             b,
@@ -1220,6 +1263,184 @@ fn lower_aot_ssa_inst(
         ),
     };
     Ok(value)
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[allow(clippy::too_many_arguments)]
+fn aot_lower_host_call(
+    b: &mut FunctionBuilder,
+    ctx: AotLowerCtx<'_>,
+    output_id: AotSsaValueId,
+    output_repr: AotSsaValueRepr,
+    import: u16,
+    args: &[AotSsaValueId],
+    values: &HashMap<AotSsaValueId, cranelift_codegen::ir::Value>,
+    value_reprs: &HashMap<AotSsaValueId, AotSsaValueRepr>,
+) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let scalar_result = (output_repr != AotSsaValueRepr::Tagged)
+        .then(|| {
+            owned_value_temp_slot_addr(
+                b,
+                ctx.pointer_type,
+                ctx.owned_value_temps,
+                AotTempValueSlotKey::HostScalarResult(output_id),
+            )
+        })
+        .transpose()?;
+    let import_value = b.ins().iconst(ctx.pointer_type, i64::from(import));
+    let argc = b.ins().iconst(
+        ctx.pointer_type,
+        i64::try_from(args.len()).map_err(|_| {
+            AotCompileError::Codegen("AOT host-call argument count out of range".to_string())
+        })?,
+    );
+
+    if let Some(out) = scalar_result
+        && aot_host_call_has_direct_i64_args_from_map(args, value_reprs)
+    {
+        let zero = b.ins().iconst(types::I64, 0);
+        let arg0 = args.first().map_or(zero, |arg| values[arg]);
+        let arg1 = args.get(1).map_or(zero, |arg| values[arg]);
+        let return_type = b
+            .ins()
+            .iconst(types::I64, aot_scalar_host_return_type(output_repr)? as i64);
+        call_status_helper(
+            b,
+            ctx.exit_block,
+            ctx.pointer_type,
+            ctx.helper_refs.non_yielding_i64_host_call_ref,
+            ctx.helper_addrs.non_yielding_i64_host_call,
+            &[ctx.vm_ptr, import_value, arg0, arg1, argc, return_type, out],
+        )?;
+        return aot_load_scalar_host_result(b, output_repr, out);
+    }
+
+    let arg_values = owned_value_temp_slot_addr(
+        b,
+        ctx.pointer_type,
+        ctx.owned_value_temps,
+        AotTempValueSlotKey::HostArgs(output_id),
+    )?;
+    for (index, arg) in args.iter().copied().enumerate() {
+        let repr = *value_reprs.get(&arg).ok_or_else(|| {
+            AotCompileError::Codegen("AOT host-call argument representation missing".to_string())
+        })?;
+        let value = values[&arg];
+        let index_value = b.ins().iconst(
+            ctx.pointer_type,
+            i64::try_from(index).map_err(|_| {
+                AotCompileError::Codegen("AOT host-call argument index out of range".to_string())
+            })?,
+        );
+        let addr = ssa_value_addr(
+            b,
+            ctx.pointer_type,
+            arg_values,
+            index_value,
+            ctx.layout.value.size,
+        );
+        match repr {
+            AotSsaValueRepr::Tagged => {
+                let len = b
+                    .ins()
+                    .iconst(ctx.pointer_type, i64::from(ctx.layout.value.size));
+                ssa_call_copy_bytes(
+                    b,
+                    ctx.pointer_type,
+                    ctx.heap_refs,
+                    ctx.heap_addrs,
+                    addr,
+                    value,
+                    len,
+                )?;
+            }
+            AotSsaValueRepr::I64 => ssa_store_int_in_value(b, ctx.layout.value, addr, value),
+            AotSsaValueRepr::F64 => ssa_store_float_in_value(b, ctx.layout.value, addr, value),
+            AotSsaValueRepr::Bool => ssa_store_bool_in_value(b, ctx.layout.value, addr, value),
+            AotSsaValueRepr::HeapPtr(tag) => {
+                let tag = aot_heap_tag(ctx.layout.value, tag)?;
+                ssa_store_heap_ptr_in_value(b, ctx.layout.value, addr, tag, value);
+            }
+        }
+    }
+
+    if let Some(out) = scalar_result {
+        let return_type = b.ins().iconst(
+            ctx.pointer_type,
+            aot_scalar_host_return_type(output_repr)? as i64,
+        );
+        call_status_helper(
+            b,
+            ctx.exit_block,
+            ctx.pointer_type,
+            ctx.helper_refs.non_yielding_scalar_host_call_ref,
+            ctx.helper_addrs.non_yielding_scalar_host_call,
+            &[ctx.vm_ptr, import_value, arg_values, argc, return_type, out],
+        )?;
+        aot_load_scalar_host_result(b, output_repr, out)
+    } else {
+        let out = owned_value_temp_slot_addr(
+            b,
+            ctx.pointer_type,
+            ctx.owned_value_temps,
+            AotTempValueSlotKey::Output(output_id),
+        )?;
+        clear_owned_value_temp_slot(b, ctx.pointer_type, ctx.helper_refs, ctx.helper_addrs, out)?;
+        call_status_helper(
+            b,
+            ctx.exit_block,
+            ctx.pointer_type,
+            ctx.helper_refs.non_yielding_host_call_ref,
+            ctx.helper_addrs.non_yielding_host_call,
+            &[ctx.vm_ptr, import_value, arg_values, argc, out],
+        )?;
+        Ok(out)
+    }
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn aot_scalar_host_return_type(repr: AotSsaValueRepr) -> Result<ValueType, AotCompileError> {
+    match repr {
+        AotSsaValueRepr::I64 => Ok(ValueType::Int),
+        AotSsaValueRepr::F64 => Ok(ValueType::Float),
+        AotSsaValueRepr::Bool => Ok(ValueType::Bool),
+        _ => Err(AotCompileError::Codegen(
+            "AOT scalar host-call result representation is unsupported".to_string(),
+        )),
+    }
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn aot_heap_tag(
+    layout: crate::vm::native::ValueLayout,
+    value_type: ValueType,
+) -> Result<u32, AotCompileError> {
+    match value_type {
+        ValueType::String => Ok(layout.string_tag),
+        ValueType::Bytes => Ok(layout.bytes_tag),
+        ValueType::Array => Ok(layout.array_tag),
+        ValueType::Map => Ok(layout.map_tag),
+        _ => Err(AotCompileError::Codegen(
+            "AOT heap pointer representation is unsupported".to_string(),
+        )),
+    }
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn aot_load_scalar_host_result(
+    b: &mut FunctionBuilder,
+    repr: AotSsaValueRepr,
+    slot: cranelift_codegen::ir::Value,
+) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let raw = b.ins().load(types::I64, MemFlags::new(), slot, 0);
+    match repr {
+        AotSsaValueRepr::I64 => Ok(raw),
+        AotSsaValueRepr::F64 => Ok(b.ins().bitcast(types::F64, MemFlags::new(), raw)),
+        AotSsaValueRepr::Bool => Ok(b.ins().ireduce(types::I8, raw)),
+        _ => Err(AotCompileError::Codegen(
+            "AOT scalar host-call result representation is unsupported".to_string(),
+        )),
+    }
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -1582,6 +1803,7 @@ fn aot_inst_requires_owned_value_slot(kind: &AotSsaInstKind) -> bool {
     matches!(
         kind,
         AotSsaInstKind::CloneTagged { .. }
+            | AotSsaInstKind::HostCall { .. }
             | AotSsaInstKind::StringSlice { .. }
             | AotSsaInstKind::BytesSlice { .. }
             | AotSsaInstKind::StringGet { .. }
@@ -1596,6 +1818,35 @@ fn aot_inst_requires_owned_value_slot(kind: &AotSsaInstKind) -> bool {
 }
 
 #[cfg(feature = "cranelift-jit")]
+fn aot_host_call_has_direct_i64_args(args: &[AotSsaValueId], ssa: &AotSsaProgram) -> bool {
+    args.len() <= 2
+        && args.iter().all(|arg| {
+            ssa.blocks
+                .iter()
+                .flat_map(|block| {
+                    block
+                        .params
+                        .iter()
+                        .map(|param| param.value)
+                        .chain(block.insts.iter().map(|inst| inst.output))
+                })
+                .find(|value| value.id == *arg)
+                .is_some_and(|value| value.repr == AotSsaValueRepr::I64)
+        })
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn aot_host_call_has_direct_i64_args_from_map(
+    args: &[AotSsaValueId],
+    value_reprs: &HashMap<AotSsaValueId, AotSsaValueRepr>,
+) -> bool {
+    args.len() <= 2
+        && args
+            .iter()
+            .all(|arg| value_reprs.get(arg) == Some(&AotSsaValueRepr::I64))
+}
+
+#[cfg(feature = "cranelift-jit")]
 fn allocate_owned_value_temps(
     b: &mut FunctionBuilder,
     ssa: &AotSsaProgram,
@@ -1606,7 +1857,9 @@ fn allocate_owned_value_temps(
 
     for block in &ssa.blocks {
         for inst in &block.insts {
-            if aot_inst_requires_owned_value_slot(&inst.kind) {
+            let scalar_host_call = matches!(inst.kind, AotSsaInstKind::HostCall { .. })
+                && inst.output.repr != AotSsaValueRepr::Tagged;
+            if aot_inst_requires_owned_value_slot(&inst.kind) && !scalar_host_call {
                 let slot = aot_create_value_stack_slot(b, value_size)?;
                 ordered.push(slot);
                 slots.insert(AotTempValueSlotKey::Output(inst.output.id), slot);
@@ -1624,6 +1877,37 @@ fn allocate_owned_value_temps(
                             arg_slot,
                         );
                     }
+                }
+            }
+            if let AotSsaInstKind::HostCall { args, .. } = &inst.kind {
+                if scalar_host_call {
+                    let scalar_slot = b.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        std::mem::size_of::<u64>() as u32,
+                        std::mem::align_of::<u64>().trailing_zeros() as u8,
+                    ));
+                    slots.insert(
+                        AotTempValueSlotKey::HostScalarResult(inst.output.id),
+                        scalar_slot,
+                    );
+                }
+                if !(scalar_host_call && aot_host_call_has_direct_i64_args(args, ssa)) {
+                    let arg_bytes = usize::try_from(value_size)
+                        .ok()
+                        .and_then(|value_size| value_size.checked_mul(args.len().max(1)))
+                        .and_then(|bytes| u32::try_from(bytes).ok())
+                        .ok_or_else(|| {
+                            AotCompileError::Codegen(
+                                "AOT host-call argument storage too large".to_string(),
+                            )
+                        })?;
+                    let align_shift = std::mem::align_of::<Value>().trailing_zeros() as u8;
+                    let args_slot = b.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        arg_bytes,
+                        align_shift,
+                    ));
+                    slots.insert(AotTempValueSlotKey::HostArgs(inst.output.id), args_slot);
                 }
             }
         }
