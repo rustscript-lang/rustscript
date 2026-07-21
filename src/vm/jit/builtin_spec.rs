@@ -223,6 +223,152 @@ pub(crate) const ARRAY_HAS_SPEC: BuiltinSpec = BuiltinSpec {
     needs_failure_exit: false,
 };
 
+// ── Family 2: string/bytes pure transformations ─────────────────────
+
+/// `string.slice(start, length)` — pure transformation.
+pub(crate) const STRING_SLICE_SPEC: BuiltinSpec = BuiltinSpec {
+    name: "string_slice",
+    arity: 3,
+    inputs: &[
+        InputRepr::Int,                            // length (popped third)
+        InputRepr::Int,                            // start (popped second)
+        InputRepr::HeapPtr(HeapInputKind::String), // text (popped first)
+    ],
+    output: OutputKind::Tagged(ValueType::String),
+    effect: BuiltinEffect::Pure,
+    needs_failure_exit: false,
+};
+
+/// `bytes.slice(start, length)` — pure transformation.
+pub(crate) const BYTES_SLICE_SPEC: BuiltinSpec = BuiltinSpec {
+    name: "bytes_slice",
+    arity: 3,
+    inputs: &[
+        InputRepr::Int,                           // length (popped third)
+        InputRepr::Int,                           // start (popped second)
+        InputRepr::HeapPtr(HeapInputKind::Bytes), // bytes (popped first)
+    ],
+    output: OutputKind::Tagged(ValueType::Bytes),
+    effect: BuiltinEffect::Pure,
+    needs_failure_exit: false,
+};
+
+/// `string.get(index)` — pure read, string result.
+pub(crate) const STRING_GET_SPEC: BuiltinSpec = BuiltinSpec {
+    name: "string_get",
+    arity: 2,
+    inputs: &[
+        InputRepr::Int,                            // index (popped second)
+        InputRepr::HeapPtr(HeapInputKind::String), // text (popped first)
+    ],
+    output: OutputKind::Tagged(ValueType::String),
+    effect: BuiltinEffect::Pure,
+    needs_failure_exit: false,
+};
+
+/// `bytes.get(index)` — pure read, int result.
+pub(crate) const BYTES_GET_SPEC: BuiltinSpec = BuiltinSpec {
+    name: "bytes_get",
+    arity: 2,
+    inputs: &[
+        InputRepr::Int,                           // index (popped second)
+        InputRepr::HeapPtr(HeapInputKind::Bytes), // bytes (popped first)
+    ],
+    output: OutputKind::Int,
+    effect: BuiltinEffect::Pure,
+    needs_failure_exit: false,
+};
+
+/// `bytes.has(index)` — pure read, bool result.
+pub(crate) const BYTES_HAS_SPEC: BuiltinSpec = BuiltinSpec {
+    name: "bytes_has",
+    arity: 2,
+    inputs: &[
+        InputRepr::Int,                           // index (popped second)
+        InputRepr::HeapPtr(HeapInputKind::Bytes), // bytes (popped first)
+    ],
+    output: OutputKind::Bool,
+    effect: BuiltinEffect::Pure,
+    needs_failure_exit: false,
+};
+
+/// `string.replace_literal(needle, replacement)` — pure transformation.
+pub(crate) const STRING_REPLACE_LITERAL_SPEC: BuiltinSpec = BuiltinSpec {
+    name: "string_replace_literal",
+    arity: 3,
+    inputs: &[
+        InputRepr::HeapPtr(HeapInputKind::String), // replacement (popped third)
+        InputRepr::HeapPtr(HeapInputKind::String), // needle (popped second)
+        InputRepr::HeapPtr(HeapInputKind::String), // text (popped first)
+    ],
+    output: OutputKind::Tagged(ValueType::String),
+    effect: BuiltinEffect::Pure,
+    needs_failure_exit: false,
+};
+
+/// `string.lower_ascii()` — pure transformation.
+pub(crate) const STRING_LOWER_ASCII_SPEC: BuiltinSpec = BuiltinSpec {
+    name: "string_lower_ascii",
+    arity: 1,
+    inputs: &[InputRepr::HeapPtr(HeapInputKind::String)],
+    output: OutputKind::Tagged(ValueType::String),
+    effect: BuiltinEffect::Pure,
+    needs_failure_exit: false,
+};
+
+/// `string.split_literal(delimiter)` — pure transformation, array result.
+pub(crate) const STRING_SPLIT_LITERAL_SPEC: BuiltinSpec = BuiltinSpec {
+    name: "string_split_literal",
+    arity: 2,
+    inputs: &[
+        InputRepr::HeapPtr(HeapInputKind::String), // delimiter (popped second)
+        InputRepr::HeapPtr(HeapInputKind::String), // text (popped first)
+    ],
+    output: OutputKind::Tagged(ValueType::Array),
+    effect: BuiltinEffect::Pure,
+    needs_failure_exit: false,
+};
+
+/// `bytes.from_array_u8(array)` — pure transformation.
+pub(crate) const BYTES_FROM_ARRAY_U8_SPEC: BuiltinSpec = BuiltinSpec {
+    name: "bytes_from_array_u8",
+    arity: 1,
+    inputs: &[InputRepr::HeapPtr(HeapInputKind::Array)],
+    output: OutputKind::Tagged(ValueType::Bytes),
+    effect: BuiltinEffect::Pure,
+    needs_failure_exit: false,
+};
+
+/// `bytes.to_utf8_ascii()` — pure transformation.
+pub(crate) const BYTES_TO_UTF8_ASCII_SPEC: BuiltinSpec = BuiltinSpec {
+    name: "bytes_to_utf8_ascii",
+    arity: 1,
+    inputs: &[InputRepr::HeapPtr(HeapInputKind::Bytes)],
+    output: OutputKind::Tagged(ValueType::String),
+    effect: BuiltinEffect::Pure,
+    needs_failure_exit: false,
+};
+
+/// `bytes.to_array_u8()` — pure transformation.
+pub(crate) const BYTES_TO_ARRAY_U8_SPEC: BuiltinSpec = BuiltinSpec {
+    name: "bytes_to_array_u8",
+    arity: 1,
+    inputs: &[InputRepr::HeapPtr(HeapInputKind::Bytes)],
+    output: OutputKind::Tagged(ValueType::Array),
+    effect: BuiltinEffect::Pure,
+    needs_failure_exit: false,
+};
+
+/// `to_string(value)` — pure transformation.
+pub(crate) const TO_STRING_SPEC: BuiltinSpec = BuiltinSpec {
+    name: "to_string",
+    arity: 1,
+    inputs: &[InputRepr::Any],
+    output: OutputKind::Tagged(ValueType::String),
+    effect: BuiltinEffect::Pure,
+    needs_failure_exit: false,
+};
+
 /// Look up the spec for a specialized builtin kind, if one exists.
 ///
 /// Returns `None` for builtins not yet covered by the spec-driven
@@ -241,6 +387,26 @@ pub(crate) fn spec_for(
         super::recorder::SpecializedBuiltinKind::TypeOf => Some(&TYPE_OF_SPEC),
         super::recorder::SpecializedBuiltinKind::StringContains => Some(&STRING_CONTAINS_SPEC),
         super::recorder::SpecializedBuiltinKind::ArrayHas => Some(&ARRAY_HAS_SPEC),
+        super::recorder::SpecializedBuiltinKind::StringSlice => Some(&STRING_SLICE_SPEC),
+        super::recorder::SpecializedBuiltinKind::BytesSlice => Some(&BYTES_SLICE_SPEC),
+        super::recorder::SpecializedBuiltinKind::StringGet => Some(&STRING_GET_SPEC),
+        super::recorder::SpecializedBuiltinKind::BytesGet => Some(&BYTES_GET_SPEC),
+        super::recorder::SpecializedBuiltinKind::BytesHas => Some(&BYTES_HAS_SPEC),
+        super::recorder::SpecializedBuiltinKind::StringReplaceLiteral => {
+            Some(&STRING_REPLACE_LITERAL_SPEC)
+        }
+        super::recorder::SpecializedBuiltinKind::StringLowerAscii => Some(&STRING_LOWER_ASCII_SPEC),
+        super::recorder::SpecializedBuiltinKind::StringSplitLiteral => {
+            Some(&STRING_SPLIT_LITERAL_SPEC)
+        }
+        super::recorder::SpecializedBuiltinKind::BytesFromArrayU8 => {
+            Some(&BYTES_FROM_ARRAY_U8_SPEC)
+        }
+        super::recorder::SpecializedBuiltinKind::BytesToUtf8Ascii => {
+            Some(&BYTES_TO_UTF8_ASCII_SPEC)
+        }
+        super::recorder::SpecializedBuiltinKind::BytesToArrayU8 => Some(&BYTES_TO_ARRAY_U8_SPEC),
+        super::recorder::SpecializedBuiltinKind::ToString => Some(&TO_STRING_SPEC),
         _ => None,
     }
 }
