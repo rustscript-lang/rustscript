@@ -369,6 +369,22 @@ pub(crate) const TO_STRING_SPEC: BuiltinSpec = BuiltinSpec {
     needs_failure_exit: false,
 };
 
+// ── Family 3: regex fallible ────────────────────────────────────────
+
+/// `re_replace(pattern, text, replacement)` — fallible helper.
+pub(crate) const REGEX_REPLACE_SPEC: BuiltinSpec = BuiltinSpec {
+    name: "regex_replace",
+    arity: 3,
+    inputs: &[
+        InputRepr::HeapPtr(HeapInputKind::String), // replacement (popped third)
+        InputRepr::HeapPtr(HeapInputKind::String), // text (popped second)
+        InputRepr::HeapPtr(HeapInputKind::String), // pattern (popped first)
+    ],
+    output: OutputKind::Tagged(ValueType::String),
+    effect: BuiltinEffect::FallibleHelper,
+    needs_failure_exit: true,
+};
+
 /// Look up the spec for a specialized builtin kind, if one exists.
 ///
 /// Returns `None` for builtins not yet covered by the spec-driven
@@ -407,6 +423,7 @@ pub(crate) fn spec_for(
         }
         super::recorder::SpecializedBuiltinKind::BytesToArrayU8 => Some(&BYTES_TO_ARRAY_U8_SPEC),
         super::recorder::SpecializedBuiltinKind::ToString => Some(&TO_STRING_SPEC),
+        super::recorder::SpecializedBuiltinKind::RegexReplace => Some(&REGEX_REPLACE_SPEC),
         _ => None,
     }
 }

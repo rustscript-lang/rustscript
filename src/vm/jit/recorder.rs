@@ -3411,15 +3411,9 @@ fn analyze_specialized_builtin_call(
         | SpecializedBuiltinKind::BytesFromArrayU8
         | SpecializedBuiltinKind::BytesToUtf8Ascii
         | SpecializedBuiltinKind::BytesToArrayU8
-        | SpecializedBuiltinKind::ToString => {
+        | SpecializedBuiltinKind::ToString
+        | SpecializedBuiltinKind::RegexReplace => {
             unreachable!("spec-covered builtins are handled by the spec-driven path")
-        }
-        SpecializedBuiltinKind::RegexReplace => {
-            let _ = frame.pop()?;
-            let _ = frame.pop()?;
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::tagged_typed(ValueType::String));
-            Ok("regex_replace")
         }
         SpecializedBuiltinKind::TypeOfKnown(_) => {
             let _ = frame.pop()?;
@@ -3535,48 +3529,9 @@ fn emit_specialized_builtin_call(
         | SpecializedBuiltinKind::BytesFromArrayU8
         | SpecializedBuiltinKind::BytesToUtf8Ascii
         | SpecializedBuiltinKind::BytesToArrayU8
-        | SpecializedBuiltinKind::ToString => {
+        | SpecializedBuiltinKind::ToString
+        | SpecializedBuiltinKind::RegexReplace => {
             unreachable!("spec-covered builtins are handled by the spec-driven path")
-        }
-        SpecializedBuiltinKind::RegexReplace => {
-            let replacement = ensure_heap_ptr(
-                builder,
-                block,
-                ip,
-                frame.pop()?,
-                HeapContainerKind::String.value_type(),
-            )?;
-            let text = ensure_heap_ptr(
-                builder,
-                block,
-                ip,
-                frame.pop()?,
-                HeapContainerKind::String.value_type(),
-            )?;
-            let pattern = ensure_heap_ptr(
-                builder,
-                block,
-                ip,
-                frame.pop()?,
-                HeapContainerKind::String.value_type(),
-            )?;
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Tagged,
-                    SsaInstKind::RegexReplace {
-                        pattern: pattern.value.id,
-                        text: text.value.id,
-                        replacement: replacement.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::tagged_typed(ValueType::String),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("regex_replace", out))
         }
         SpecializedBuiltinKind::TypeOfKnown(value_type) => {
             let _ = frame.pop()?;
@@ -4005,6 +3960,15 @@ fn emit_spec_driven_builtin(
         SpecializedBuiltinKind::ToString => (
             SsaInstKind::ToString {
                 value: popped[0].value.id,
+            },
+            ValueInfo::tagged_typed(ValueType::String),
+            spec.name,
+        ),
+        SpecializedBuiltinKind::RegexReplace => (
+            SsaInstKind::RegexReplace {
+                pattern: popped[2].value.id,
+                text: popped[1].value.id,
+                replacement: popped[0].value.id,
             },
             ValueInfo::tagged_typed(ValueType::String),
             spec.name,
