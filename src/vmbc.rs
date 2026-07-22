@@ -322,6 +322,26 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     program.function_regions = function_regions;
     program.root_callable_bindings = root_callable_bindings;
     program.exported_callables = exported_callables;
+    let type_map_local_count = program
+        .type_map
+        .as_ref()
+        .map_or(0, |type_map| type_map.local_types.len());
+    let callable_local_count = program
+        .root_callable_bindings
+        .iter()
+        .map(|binding| binding.local_slot as usize + 1)
+        .chain(
+            program
+                .exported_callables
+                .iter()
+                .map(|exported| exported.local_slot as usize + 1),
+        )
+        .max()
+        .unwrap_or(0);
+    program.local_count = program
+        .local_count
+        .max(type_map_local_count)
+        .max(callable_local_count);
     Ok(program)
 }
 
