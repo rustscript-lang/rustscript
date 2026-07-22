@@ -11,7 +11,9 @@ use super::inline::{
 };
 use super::ir::{SsaExitId, SsaMaterialization, SsaTrace, SsaValueId, SsaValueRepr};
 use super::liveness::{boxed_load_site_count, boxed_store_site_count};
-use super::recorder::{RecordedTrace, TraceRecordError, record_trace_with_local_count};
+use super::recorder::{
+    RecordedTrace, TraceRecordError, WIDE_FRAME_REASON, record_trace_with_local_count,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct TraceEntryKey {
@@ -1031,6 +1033,12 @@ impl TraceJitEngine {
                 Some(trace_id)
             }
             Err(reason) => {
+                if matches!(
+                    &reason,
+                    JitNyiReason::UnsupportedTrace(detail) if detail == WIDE_FRAME_REASON
+                ) {
+                    self.config.enabled = false;
+                }
                 self.attempts.push(JitAttempt {
                     frame_key: key.frame_key,
                     root_ip: key.root_ip,
@@ -1856,6 +1864,32 @@ mod tests {
             }
         );
         assert!(engine.trace_exit_profiles.is_empty());
+    }
+
+    #[test]
+    fn wide_frame_rejection_disables_subsequent_trace_polling() {
+        let mut bc = BytecodeBuilder::new();
+        bc.ldloc(0);
+        bc.ldc(0);
+        bc.add();
+        bc.stloc(0);
+        bc.br(0);
+        let program = Program::new(vec![Value::Int(1)], bc.finish()).with_local_count(80);
+        let mut engine = TraceJitEngine::new(JitConfig {
+            enabled: true,
+            hot_loop_threshold: 1,
+            max_trace_len: 32,
+        });
+
+        assert_eq!(
+            engine.observe_hot_entry(ROOT_FRAME_KEY, 0, 0, &program),
+            None
+        );
+        assert_eq!(
+            engine.observe_hot_entry(ROOT_FRAME_KEY, 0, 0, &program),
+            None
+        );
+        assert!(!engine.config.enabled);
     }
 
     #[test]

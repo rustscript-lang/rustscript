@@ -4051,6 +4051,42 @@ fn trace_jit_supports_float_and_string_loops_through_ssa() {
 }
 
 #[test]
+fn trace_jit_boxes_scalar_before_native_to_string_helper() {
+    if !native_jit_supported() {
+        return;
+    }
+
+    let source = r#"
+        let mut i = 0;
+        let mut out = "";
+        while i < 4 {
+            out = i + "";
+            i = i + 1;
+        }
+        out;
+    "#;
+    let compiled = compile_source(source).expect("scalar to_string fixture should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    let status = vm.run().expect("scalar to_string fixture should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("3")]);
+    assert!(
+        vm.jit_snapshot()
+            .traces
+            .iter()
+            .any(|trace| trace.op_names().iter().any(|op| op == "to_string")),
+        "expected native to_string trace, dump:\n{}",
+        vm.dump_jit_info()
+    );
+}
+
+#[test]
 fn trace_jit_supports_bytes_heavy_call_boundary_exits_without_fallback() {
     if !native_jit_supported() {
         return;

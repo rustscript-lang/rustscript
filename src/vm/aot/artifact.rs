@@ -13,7 +13,8 @@ use super::compile::CompiledProgram;
 const MAGIC: [u8; 4] = *b"PAT\0";
 const VERSION: u16 = 6;
 const ABI_VERSION: u16 = 5;
-const FLAGS: u16 = 0;
+const FLAG_INTERPRETER_BOUNDARY_ONLY: u16 = 1;
+const SUPPORTED_FLAGS: u16 = FLAG_INTERPRETER_BOUNDARY_ONLY;
 
 #[derive(Debug)]
 pub enum AotArtifactError {
@@ -129,10 +130,12 @@ impl Vm {
     pub fn load_aot_artifact(&mut self, bytes: &[u8]) -> Result<(), AotArtifactError> {
         let expected_program_hash = self.ensure_program_cache_key();
         let decoded = decode_artifact(bytes, Some(expected_program_hash))?;
-        self.aot_program = Some(CompiledProgram::from_code(
-            decoded.code,
-            decoded.resume_ips,
-        )?);
+        let compiled = if decoded.interpreter_boundary_only {
+            CompiledProgram::from_interpreter_boundary_code(decoded.code, decoded.resume_ips)?
+        } else {
+            CompiledProgram::from_code(decoded.code, decoded.resume_ips)?
+        };
+        self.aot_program = Some(compiled);
         self.aot_exec_count = 0;
         Ok(())
     }
@@ -151,10 +154,12 @@ impl Vm {
     ) -> Result<Self, AotArtifactError> {
         let decoded = decode_artifact(bytes, None)?;
         let mut vm = Vm::new_with_jit_config(decoded.program, jit_config);
-        vm.aot_program = Some(CompiledProgram::from_code(
-            decoded.code,
-            decoded.resume_ips,
-        )?);
+        let compiled = if decoded.interpreter_boundary_only {
+            CompiledProgram::from_interpreter_boundary_code(decoded.code, decoded.resume_ips)?
+        } else {
+            CompiledProgram::from_code(decoded.code, decoded.resume_ips)?
+        };
+        vm.aot_program = Some(compiled);
         vm.aot_exec_count = 0;
         Ok(vm)
     }
@@ -172,6 +177,7 @@ struct DecodedArtifact {
     program: Program,
     code: Vec<u8>,
     resume_ips: Vec<usize>,
+    interpreter_boundary_only: bool,
 }
 
 fn encode_artifact(
@@ -183,7 +189,12 @@ fn encode_artifact(
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
     out.extend_from_slice(&ABI_VERSION.to_le_bytes());
-    out.extend_from_slice(&FLAGS.to_le_bytes());
+    let flags = if aot_program.interpreter_boundary_only {
+        FLAG_INTERPRETER_BOUNDARY_ONLY
+    } else {
+        0
+    };
+    out.extend_from_slice(&flags.to_le_bytes());
     out.push(u8::try_from(std::mem::size_of::<usize>()).expect("pointer width fits u8"));
 
     write_string("arch", std::env::consts::ARCH, &mut out)?;
@@ -244,9 +255,10 @@ fn decode_artifact(
     }
 
     let flags = cursor.read_u16()?;
-    if flags != FLAGS {
+    if flags & !SUPPORTED_FLAGS != 0 {
         return Err(AotArtifactError::UnsupportedFlags(flags));
     }
+    let interpreter_boundary_only = flags & FLAG_INTERPRETER_BOUNDARY_ONLY != 0;
 
     let pointer_width = cursor.read_u8()?;
     validate_runtime_field(
@@ -324,6 +336,7 @@ fn decode_artifact(
         program,
         code,
         resume_ips,
+        interpreter_boundary_only,
     })
 }
 
@@ -426,6 +439,41 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::*;
     use crate::{BytecodeBuilder, Program, Value, ValueType, VmStatus};
+
+    #[test]
+    fn aot_artifact_preserves_interpreter_boundary_mode() {
+        let mut bc = BytecodeBuilder::new();
+        bc.ret();
+        let mut vm = Vm::new(Program::new(Vec::new(), bc.finish()));
+        vm.compile_aot().expect("aot compile should succeed");
+        vm.aot_program
+            .as_mut()
+            .expect("compiled program")
+            .interpreter_boundary_only = true;
+
+        let encoded = vm
+            .encode_aot_artifact()
+            .expect("artifact encode should succeed");
+        assert_eq!(
+            u16::from_le_bytes([encoded[8], encoded[9]]),
+            FLAG_INTERPRETER_BOUNDARY_ONLY
+        );
+        let standalone = Vm::new_from_aot_artifact_with_jit_config(
+            &encoded,
+            JitConfig {
+                enabled: false,
+                ..JitConfig::default()
+            },
+        )
+        .expect("boundary artifact should load");
+        assert!(
+            standalone
+                .aot_program
+                .as_ref()
+                .expect("loaded aot program")
+                .interpreter_boundary_only
+        );
+    }
 
     #[test]
     fn aot_artifact_decode_rejects_invalid_magic_and_trailing_bytes() {

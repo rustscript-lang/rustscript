@@ -15,16 +15,16 @@ use crate::vm::native::ExecutableBuffer;
 #[cfg(feature = "cranelift-jit")]
 use crate::vm::native::{
     HeapIntrinsicAddrs, HeapIntrinsicRefs, NativeFrameState, OP_BUILTIN_CALL, OP_CALL,
-    STATUS_CONTINUE, STATUS_ERROR, alloc_buffer_signature, alloc_byte_buffer_entry_address,
-    alloc_value_buffer_entry_address, aot_call_boundary_interrupt_entry_address,
-    array_push_entry_address, box_heap_value_signature, clear_value_slot_entry_address,
-    clone_value_signature, clone_value_to_slot_entry_address, collection_get_signature,
-    collection_mutation_signature, collection_set_entry_address, copy_bytes_entry_address,
-    copy_bytes_signature, detect_native_stack_layout, enter_call_value_entry_address,
-    enter_call_value_signature, entry_signature, frame_state_entry_address, frame_state_signature,
-    free_buffer_signature, helper_entry_offset, helper_signature,
-    init_null_value_slot_entry_address, jump_with_status, leave_frame_entry_address,
-    leave_frame_signature, pack_shared_signature, resolve_offsets,
+    STATUS_CONTINUE, STATUS_ERROR, STATUS_TRACE_EXIT, alloc_buffer_signature,
+    alloc_byte_buffer_entry_address, alloc_value_buffer_entry_address,
+    aot_call_boundary_interrupt_entry_address, array_push_entry_address, box_heap_value_signature,
+    clear_value_slot_entry_address, clone_value_signature, clone_value_to_slot_entry_address,
+    collection_get_signature, collection_mutation_signature, collection_set_entry_address,
+    copy_bytes_entry_address, copy_bytes_signature, detect_native_stack_layout,
+    enter_call_value_entry_address, enter_call_value_signature, entry_signature,
+    frame_state_entry_address, frame_state_signature, free_buffer_signature, helper_entry_offset,
+    helper_signature, init_null_value_slot_entry_address, jump_with_status,
+    leave_frame_entry_address, leave_frame_signature, pack_shared_signature, resolve_offsets,
     restore_active_exit_state_entry_address, restore_exit_signature,
     restore_exit_state_entry_address, shared_array_from_buffer_entry_address,
     shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
@@ -82,6 +82,7 @@ pub(crate) struct CompiledProgram {
     pub(crate) entry: NativeProgramEntry,
     pub(crate) code: Arc<[u8]>,
     pub(crate) resume_ips: Arc<[usize]>,
+    pub(crate) interpreter_boundary_only: bool,
 }
 
 struct ProgramKeepAlive {
@@ -102,6 +103,21 @@ impl ProgramKeepAlive {
 
 impl CompiledProgram {
     pub(crate) fn from_code(code: Vec<u8>, resume_ips: Vec<usize>) -> VmResult<Self> {
+        Self::from_code_with_boundary_mode(code, resume_ips, false)
+    }
+
+    pub(crate) fn from_interpreter_boundary_code(
+        code: Vec<u8>,
+        resume_ips: Vec<usize>,
+    ) -> VmResult<Self> {
+        Self::from_code_with_boundary_mode(code, resume_ips, true)
+    }
+
+    fn from_code_with_boundary_mode(
+        code: Vec<u8>,
+        resume_ips: Vec<usize>,
+        interpreter_boundary_only: bool,
+    ) -> VmResult<Self> {
         let keepalive = ProgramKeepAlive::from_code(&code)?;
         let entry =
             unsafe { std::mem::transmute::<*const u8, NativeProgramEntry>(keepalive.entry()) };
@@ -110,6 +126,7 @@ impl CompiledProgram {
             entry,
             code: Arc::<[u8]>::from(code.into_boxed_slice()),
             resume_ips: Arc::<[usize]>::from(resume_ips.into_boxed_slice()),
+            interpreter_boundary_only,
         })
     }
 
@@ -206,7 +223,64 @@ fn compile_program_inner(program: &Program) -> Result<CompiledProgram, AotCompil
             build_elapsed.as_micros(),
         );
     }
-    compile_ssa(program, &ssa, trace_enabled)
+    match compile_ssa(program, &ssa, trace_enabled) {
+        Ok(compiled) => Ok(compiled),
+        Err(AotCompileError::Codegen(message))
+            if message.contains("Code for function is too large") =>
+        {
+            compile_interpreter_boundary_program()
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn compile_interpreter_boundary_program() -> Result<CompiledProgram, AotCompileError> {
+    let isa = native_isa()?;
+    let jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+    let mut module = JITModule::new(jit_builder);
+    let pointer_type = module.target_config().pointer_type();
+    let call_conv = module.target_config().default_call_conv;
+    let mut ctx = module.make_context();
+    ctx.func.signature = entry_signature(pointer_type, call_conv);
+    let id = CRANELIFT_AOT_ID.fetch_add(1, Ordering::Relaxed);
+    let name = format!("pd_vm_aot_interpreter_boundary_{id}");
+    let func_id = module
+        .declare_function(&name, Linkage::Local, &ctx.func.signature)
+        .map_err(|err| {
+            AotCompileError::Codegen(format!("declare aot interpreter boundary failed: {err}"))
+        })?;
+    {
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        let status = b.ins().iconst(types::I32, STATUS_TRACE_EXIT as i64);
+        b.ins().return_(&[status]);
+        b.seal_all_blocks();
+        b.finalize();
+    }
+    module.define_function(func_id, &mut ctx).map_err(|err| {
+        AotCompileError::Codegen(format!("define aot interpreter boundary failed: {err}"))
+    })?;
+    let code_len = ctx
+        .compiled_code()
+        .ok_or_else(|| {
+            AotCompileError::Codegen(
+                "aot interpreter boundary produced no machine code".to_string(),
+            )
+        })?
+        .code_buffer()
+        .len();
+    module.clear_context(&mut ctx);
+    module.finalize_definitions().map_err(|err| {
+        AotCompileError::Codegen(format!("finalize aot interpreter boundary failed: {err}"))
+    })?;
+    let entry = module.get_finalized_function(func_id);
+    let code = unsafe { std::slice::from_raw_parts(entry, code_len).to_vec() };
+    CompiledProgram::from_interpreter_boundary_code(code, vec![0])
+        .map_err(|err| AotCompileError::Codegen(err.to_string()))
 }
 
 #[cfg(not(feature = "cranelift-jit"))]

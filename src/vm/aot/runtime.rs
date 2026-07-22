@@ -45,7 +45,14 @@ impl Vm {
         ));
         out.push_str(&format!("  aot executions: {}\n", self.aot_exec_count));
         out.push_str(&format!("  code_bytes={}\n", program.code.len()));
-        out.push_str("  lowering=ssa\n");
+        out.push_str(&format!(
+            "  lowering={}\n",
+            if program.interpreter_boundary_only {
+                "interpreter-boundary"
+            } else {
+                "ssa"
+            }
+        ));
         out.push_str(&format!("  resume ips: {}\n", format_resume_ips(program)));
         out
     }

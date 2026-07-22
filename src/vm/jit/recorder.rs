@@ -13,6 +13,10 @@ use super::ir::{
     SsaValue, SsaValueId, SsaValueRepr, VirtualFrameSnapshot,
 };
 
+pub(super) const MAX_PROFITABLE_FRAME_LOCALS: usize = 64;
+pub(super) const WIDE_FRAME_REASON: &str =
+    "trace frame has too many locals for profitable native execution";
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RecordedTrace {
     pub(crate) has_call: bool,
@@ -935,6 +939,11 @@ pub(crate) fn record_trace_with_local_count(
     max_trace_len: usize,
     non_yielding_host_imports: &[bool],
 ) -> Result<RecordedTrace, TraceRecordError> {
+    if local_count > MAX_PROFITABLE_FRAME_LOCALS {
+        return Err(TraceRecordError::UnsupportedTrace(
+            WIDE_FRAME_REASON.to_string(),
+        ));
+    }
     let loop_header_plan = infer_loop_header_plan(
         program,
         caller_frame_key,
@@ -4820,6 +4829,25 @@ mod tests {
         );
         validate_int_operands(&program, 7, IntBinOpKind::Add, lhs, rhs)
             .expect("unboxed integer binop validator should override stale hint");
+    }
+
+    #[test]
+    fn rejects_wide_frames_before_building_native_trace_state() {
+        let mut bc = BytecodeBuilder::new();
+        bc.ldloc(0);
+        bc.ldc(0);
+        bc.add();
+        bc.stloc(0);
+        bc.ret();
+        let program = Program::new(vec![Value::Int(1)], bc.finish()).with_local_count(80);
+
+        let error =
+            record_trace(&program, 0, 0, 32, &[]).expect_err("wide frame should be rejected");
+        assert!(matches!(
+            error,
+            TraceRecordError::UnsupportedTrace(detail)
+                if detail == "trace frame has too many locals for profitable native execution"
+        ));
     }
 
     #[test]

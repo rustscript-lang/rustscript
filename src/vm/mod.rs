@@ -944,7 +944,10 @@ impl Vm {
         self.owned_callables.clear();
         self.draining_queued_callables = false;
         self.shutdown = false;
-        self.aot_interpreter_boundary_hit = false;
+        self.aot_interpreter_boundary_hit = self
+            .aot_program
+            .as_ref()
+            .is_some_and(|program| program.interpreter_boundary_only);
         self.waiting_host_op = None;
         self.io_state = crate::builtins::runtime::IoState::default();
         self.map_iterators.clear();
@@ -2321,7 +2324,9 @@ impl Vm {
         }
         if debugger.is_none()
             && !self.interruption_enabled()
-            && (!allow_jit || (!self.jit_config().enabled && !self.has_aot_program()))
+            && (!allow_jit
+                || (!self.jit_config().enabled
+                    && (!self.has_aot_program() || self.aot_interpreter_boundary_hit)))
             && let Some(status) = self.run_fast_interpreter(allow_jit)?
         {
             return Ok(status);
@@ -2362,6 +2367,15 @@ impl Vm {
                     return Ok(status);
                 }
                 continue;
+            }
+
+            if self.aot_interpreter_boundary_hit
+                && debugger.is_none()
+                && !self.interruption_enabled()
+                && !self.jit_config().enabled
+                && let Some(status) = self.run_fast_interpreter(false)?
+            {
+                return Ok(status);
             }
 
             if allow_jit

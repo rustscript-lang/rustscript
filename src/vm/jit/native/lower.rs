@@ -2803,27 +2803,60 @@ fn lower_ssa_inst(
             out
         }
         SsaInstKind::TypeOf { value } => {
-            let value = values[value];
+            let input = values[value];
+            let input_repr = *value_reprs.get(value).ok_or_else(|| {
+                VmError::JitNative("SSA type_of input representation missing".to_string())
+            })?;
             let out = owned_value_temp_slot_addr(
                 b,
                 pointer_type,
                 owned_value_temps,
                 SsaTempValueSlotKey::Output(output.id),
             )?;
-            let out_raw = ssa_call_type_of(b, pointer_type, string_refs, string_addrs, value)?;
+            let input_addr = ssa_ensure_boxed_value_addr(
+                b,
+                SsaBoxCtx {
+                    exit_block,
+                    pointer_type,
+                    value_layout: layout.value,
+                    helper_refs,
+                    helper_addrs,
+                },
+                Some(out),
+                input_repr,
+                input,
+            )?;
+            let out_raw = ssa_call_type_of(b, pointer_type, string_refs, string_addrs, input_addr)?;
             clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
             ssa_store_heap_ptr_in_value(b, layout.value, out, layout.value.string_tag, out_raw);
             out
         }
         SsaInstKind::ToString { value } => {
-            let value = values[value];
+            let input = values[value];
+            let input_repr = *value_reprs.get(value).ok_or_else(|| {
+                VmError::JitNative("SSA to_string input representation missing".to_string())
+            })?;
             let out = owned_value_temp_slot_addr(
                 b,
                 pointer_type,
                 owned_value_temps,
                 SsaTempValueSlotKey::Output(output.id),
             )?;
-            let out_raw = ssa_call_to_string(b, pointer_type, string_refs, string_addrs, value)?;
+            let input_addr = ssa_ensure_boxed_value_addr(
+                b,
+                SsaBoxCtx {
+                    exit_block,
+                    pointer_type,
+                    value_layout: layout.value,
+                    helper_refs,
+                    helper_addrs,
+                },
+                Some(out),
+                input_repr,
+                input,
+            )?;
+            let out_raw =
+                ssa_call_to_string(b, pointer_type, string_refs, string_addrs, input_addr)?;
             clear_owned_value_temp_slot(b, pointer_type, helper_refs, helper_addrs, out)?;
             ssa_store_heap_ptr_in_value(b, layout.value, out, layout.value.string_tag, out_raw);
             out
