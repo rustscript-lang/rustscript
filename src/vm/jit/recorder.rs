@@ -3221,6 +3221,7 @@ fn emit_float_compare(
 }
 
 impl HeapContainerKind {
+    #[allow(dead_code)] // Used by ensure_owned_heap_ptr and future families.
     fn value_type(self) -> ValueType {
         match self {
             Self::String => ValueType::String,
@@ -3412,7 +3413,10 @@ fn analyze_specialized_builtin_call(
         | SpecializedBuiltinKind::BytesToUtf8Ascii
         | SpecializedBuiltinKind::BytesToArrayU8
         | SpecializedBuiltinKind::ToString
-        | SpecializedBuiltinKind::RegexReplace => {
+        | SpecializedBuiltinKind::RegexReplace
+        | SpecializedBuiltinKind::ArrayGet
+        | SpecializedBuiltinKind::MapGet
+        | SpecializedBuiltinKind::MapHas => {
             unreachable!("spec-covered builtins are handled by the spec-driven path")
         }
         SpecializedBuiltinKind::TypeOfKnown(_) => {
@@ -3447,29 +3451,11 @@ fn analyze_specialized_builtin_call(
             frame.push(ValueInfo::tagged_typed(ValueType::Array));
             Ok("array_new")
         }
-        SpecializedBuiltinKind::ArrayGet => {
-            let _ = frame.pop()?;
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::tagged());
-            Ok("array_get")
-        }
         SpecializedBuiltinKind::ArrayPush => {
             let _ = frame.pop()?;
             let _ = frame.pop()?;
             frame.push(ValueInfo::tagged_typed(ValueType::Array));
             Ok("array_push")
-        }
-        SpecializedBuiltinKind::MapGet => {
-            let _ = frame.pop()?;
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::tagged());
-            Ok("map_get")
-        }
-        SpecializedBuiltinKind::MapHas => {
-            let _ = frame.pop()?;
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::bool(None));
-            Ok("map_has")
         }
         SpecializedBuiltinKind::MapSet => {
             let _ = frame.pop()?;
@@ -3530,7 +3516,10 @@ fn emit_specialized_builtin_call(
         | SpecializedBuiltinKind::BytesToUtf8Ascii
         | SpecializedBuiltinKind::BytesToArrayU8
         | SpecializedBuiltinKind::ToString
-        | SpecializedBuiltinKind::RegexReplace => {
+        | SpecializedBuiltinKind::RegexReplace
+        | SpecializedBuiltinKind::ArrayGet
+        | SpecializedBuiltinKind::MapGet
+        | SpecializedBuiltinKind::MapHas => {
             unreachable!("spec-covered builtins are handled by the spec-driven path")
         }
         SpecializedBuiltinKind::TypeOfKnown(value_type) => {
@@ -3582,34 +3571,6 @@ fn emit_specialized_builtin_call(
                 .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
             Ok(("array_new", out))
         }
-        SpecializedBuiltinKind::ArrayGet => {
-            let index = frame.pop()?;
-            let array = frame.pop()?;
-            let array = ensure_heap_ptr(
-                builder,
-                block,
-                ip,
-                array,
-                HeapContainerKind::Array.value_type(),
-            )?;
-            let index = ensure_int(builder, block, ip, index)?;
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Tagged,
-                    SsaInstKind::ArrayGet {
-                        array: array.value.id,
-                        index: index.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::tagged(),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("array_get", out))
-        }
         SpecializedBuiltinKind::ArrayPush => {
             let value = frame.pop()?;
             let array = frame.pop()?;
@@ -3635,50 +3596,6 @@ fn emit_specialized_builtin_call(
                 })
                 .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
             Ok(("array_push", out))
-        }
-        SpecializedBuiltinKind::MapGet => {
-            let key = frame.pop()?;
-            let map = frame.pop()?;
-            let map =
-                ensure_heap_ptr(builder, block, ip, map, HeapContainerKind::Map.value_type())?;
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Tagged,
-                    SsaInstKind::MapGet {
-                        map: map.value.id,
-                        key: key.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::tagged(),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("map_get", out))
-        }
-        SpecializedBuiltinKind::MapHas => {
-            let key = frame.pop()?;
-            let map = frame.pop()?;
-            let map =
-                ensure_heap_ptr(builder, block, ip, map, HeapContainerKind::Map.value_type())?;
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Bool,
-                    SsaInstKind::MapHas {
-                        map: map.value.id,
-                        key: key.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::bool(None),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("map_has", out))
         }
         SpecializedBuiltinKind::MapSet => {
             let value = frame.pop()?;
@@ -3971,6 +3888,30 @@ fn emit_spec_driven_builtin(
                 replacement: popped[0].value.id,
             },
             ValueInfo::tagged_typed(ValueType::String),
+            spec.name,
+        ),
+        SpecializedBuiltinKind::ArrayGet => (
+            SsaInstKind::ArrayGet {
+                array: popped[1].value.id,
+                index: popped[0].value.id,
+            },
+            ValueInfo::tagged(),
+            spec.name,
+        ),
+        SpecializedBuiltinKind::MapGet => (
+            SsaInstKind::MapGet {
+                map: popped[1].value.id,
+                key: popped[0].value.id,
+            },
+            ValueInfo::tagged(),
+            spec.name,
+        ),
+        SpecializedBuiltinKind::MapHas => (
+            SsaInstKind::MapHas {
+                map: popped[1].value.id,
+                key: popped[0].value.id,
+            },
+            ValueInfo::bool(None),
             spec.name,
         ),
         SpecializedBuiltinKind::ArraySet => {
