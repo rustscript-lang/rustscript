@@ -168,6 +168,15 @@ impl From<AotSsaBuildError> for AotCompileError {
 static CRANELIFT_AOT_ID: AtomicU64 = AtomicU64::new(1);
 #[cfg(feature = "cranelift-jit")]
 static CRANELIFT_AOT_ISA: OnceLock<Result<OwnedTargetIsa, String>> = OnceLock::new();
+#[cfg(feature = "cranelift-jit")]
+// regalloc2 stores virtual-register indices in 21 bits. Keep enough room for
+// instruction results and checkpoint loaders after allocating block params.
+const MAX_MONOLITHIC_AOT_BLOCK_PARAMS: usize = 1_000_000;
+
+#[cfg(feature = "cranelift-jit")]
+fn exceeds_monolithic_aot_block_param_budget(total_block_params: usize) -> bool {
+    total_block_params > MAX_MONOLITHIC_AOT_BLOCK_PARAMS
+}
 
 pub(crate) fn compile_program(program: &Program) -> VmResult<CompiledProgram> {
     compile_program_inner(program).map_err(|err| VmError::JitNative(err.to_string()))
@@ -179,6 +188,11 @@ fn compile_program_inner(program: &Program) -> Result<CompiledProgram, AotCompil
     let build_started = Instant::now();
     let ssa = build_aot_ssa(program)?;
     let build_elapsed = build_started.elapsed();
+    let total_block_params = ssa
+        .blocks
+        .iter()
+        .map(|block| block.params.len())
+        .sum::<usize>();
     if trace_enabled {
         let total_insts = ssa
             .blocks
@@ -186,11 +200,6 @@ fn compile_program_inner(program: &Program) -> Result<CompiledProgram, AotCompil
             .map(|block| block.insts.len())
             .sum::<usize>();
         let external_checkpoints = ssa.checkpoints.iter().filter(|cp| cp.external).count();
-        let total_block_params = ssa
-            .blocks
-            .iter()
-            .map(|block| block.params.len())
-            .sum::<usize>();
         let max_block_params = ssa
             .blocks
             .iter()
@@ -223,6 +232,15 @@ fn compile_program_inner(program: &Program) -> Result<CompiledProgram, AotCompil
             build_elapsed.as_micros(),
         );
     }
+    if exceeds_monolithic_aot_block_param_budget(total_block_params) {
+        if trace_enabled {
+            eprintln!(
+                "aot trace: lowering=interpreter-boundary reason=block-param-budget block_params_total={} budget={}",
+                total_block_params, MAX_MONOLITHIC_AOT_BLOCK_PARAMS,
+            );
+        }
+        return compile_interpreter_boundary_program();
+    }
     match compile_ssa(program, &ssa, trace_enabled) {
         Ok(compiled) => Ok(compiled),
         Err(AotCompileError::Codegen(message))
@@ -231,6 +249,21 @@ fn compile_program_inner(program: &Program) -> Result<CompiledProgram, AotCompil
             compile_interpreter_boundary_program()
         }
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(all(test, feature = "cranelift-jit"))]
+mod boundary_budget_tests {
+    use super::{MAX_MONOLITHIC_AOT_BLOCK_PARAMS, exceeds_monolithic_aot_block_param_budget};
+
+    #[test]
+    fn oversized_aot_ssa_crosses_the_monolithic_block_param_budget() {
+        assert!(!exceeds_monolithic_aot_block_param_budget(
+            MAX_MONOLITHIC_AOT_BLOCK_PARAMS
+        ));
+        assert!(exceeds_monolithic_aot_block_param_budget(
+            MAX_MONOLITHIC_AOT_BLOCK_PARAMS + 1
+        ));
     }
 }
 
