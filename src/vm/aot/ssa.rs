@@ -1169,8 +1169,10 @@ impl<'a> Builder<'a> {
         let mut queue = VecDeque::from([self.lowered.entry_ip]);
         for region in &self.lowered.regions {
             if region.prototype_id.is_some() {
-                self.incoming_shapes
-                    .insert(region.start_ip, entry_shape.clone());
+                self.incoming_shapes.insert(
+                    region.start_ip,
+                    function_region_entry_shape(self.program, region.prototype_id, &entry_shape),
+                );
                 queue.push_back(region.start_ip);
             }
         }
@@ -1317,6 +1319,30 @@ fn merge_value_repr(lhs: AotSsaValueRepr, rhs: AotSsaValueRepr) -> AotSsaValueRe
     } else {
         AotSsaValueRepr::Tagged
     }
+}
+
+fn function_region_entry_shape(
+    program: &Program,
+    prototype_id: Option<u32>,
+    root_shape: &FrameShape,
+) -> FrameShape {
+    let mut shape = root_shape.clone();
+    let Some(prototype_id) = prototype_id else {
+        return shape;
+    };
+    let Some(prototype) = program.callable_prototypes.get(prototype_id as usize) else {
+        return shape;
+    };
+    let Some(crate::compiler::TypeSchema::Callable { params, .. }) = prototype.schema.as_ref()
+    else {
+        return shape;
+    };
+    for (slot, schema) in prototype.parameter_slots.iter().zip(params.iter()) {
+        if let Some(repr) = shape.locals.get_mut(*slot as usize) {
+            *repr = value_type_repr(schema.coarse_value_type());
+        }
+    }
+    shape
 }
 
 pub(crate) fn build_aot_ssa(program: &Program) -> Result<AotSsaProgram, AotSsaBuildError> {
@@ -1469,8 +1495,9 @@ impl<'a> Builder<'a> {
                 for _ in 0..=usize::from(*argc) {
                     resume_frame.pop(*call_ip, "callvalue")?;
                 }
+                let return_repr = value_type_repr(operand_types_at(self.program, *call_ip).1);
                 resume_frame.stack.push(FrameValue {
-                    value: AotSsaValue::new(AotSsaValueId::new(0), AotSsaValueRepr::Tagged),
+                    value: AotSsaValue::new(AotSsaValueId::new(0), return_repr),
                 });
                 Ok(ProcessResult::CallValue {
                     argc: *argc,
@@ -2003,6 +2030,36 @@ fn apply_direct_instruction<E: InstEmitter>(
                         },
                     };
                     Some(tagged_kind)
+                }
+                (AotSsaValueRepr::Tagged, AotSsaValueRepr::I64)
+                    if operand_types_at(program, ip) == (ValueType::Int, ValueType::Int) =>
+                {
+                    let lhs_int = emitter.emit(
+                        ip,
+                        AotSsaInstKind::TaggedToInt {
+                            input: lhs.value.id,
+                        },
+                        AotSsaValueRepr::I64,
+                    );
+                    Some(AotSsaInstKind::IntCmpEq {
+                        lhs: lhs_int.id,
+                        rhs: rhs.value.id,
+                    })
+                }
+                (AotSsaValueRepr::I64, AotSsaValueRepr::Tagged)
+                    if operand_types_at(program, ip) == (ValueType::Int, ValueType::Int) =>
+                {
+                    let rhs_int = emitter.emit(
+                        ip,
+                        AotSsaInstKind::TaggedToInt {
+                            input: rhs.value.id,
+                        },
+                        AotSsaValueRepr::I64,
+                    );
+                    Some(AotSsaInstKind::IntCmpEq {
+                        lhs: lhs.value.id,
+                        rhs: rhs_int.id,
+                    })
                 }
                 _ => None,
             };

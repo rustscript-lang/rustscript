@@ -677,14 +677,15 @@ impl Compiler {
             Expr::ClosureCall(closure, args) => {
                 let prototype_id = self.emit_closure_callable(closure)?;
                 self.record_closure_param_hints(prototype_id, args);
-                self.compile_callvalue_args(args)?;
+                self.compile_callvalue_args(args, ValueType::Unknown)?;
             }
             Expr::LocalCall(index, _, args) => {
                 if let Some(prototype_id) = self.callable_prototype_bindings.get(index).copied() {
                     self.record_closure_param_hints(prototype_id, args);
                 }
+                let return_type = self.callable_local_return_type(*index);
                 self.emit_copy_ldloc(*index)?;
-                self.compile_callvalue_args(args)?;
+                self.compile_callvalue_args(args, return_type)?;
             }
             Expr::Add(lhs, rhs) => {
                 let lhs_ty = self.value_type_of_expr(lhs);
@@ -1474,17 +1475,29 @@ impl Compiler {
                 .function_slots
                 .get(&index)
                 .ok_or(CompileError::CallableUsedAsValue)?;
+            let return_type = self
+                .function_decls
+                .get(&index)
+                .map(|decl| decl.return_type)
+                .unwrap_or(ValueType::Unknown);
             self.emit_copy_ldloc(slot)?;
-            return self.compile_callvalue_args(args);
+            return self.compile_callvalue_args(args, return_type);
         }
         self.compile_direct_call(index, args)
     }
 
-    fn compile_callvalue_args(&mut self, args: &[Expr]) -> Result<(), CompileError> {
+    fn compile_callvalue_args(
+        &mut self,
+        args: &[Expr],
+        return_type: ValueType,
+    ) -> Result<(), CompileError> {
         for arg in args {
             self.compile_scalar_expr(arg)?;
         }
         let argc = u8::try_from(args.len()).map_err(|_| CompileError::CallArityOverflow)?;
+        if return_type != ValueType::Unknown {
+            self.record_operand_types(ValueType::Callable, return_type);
+        }
         self.assembler.call_value(argc);
         Ok(())
     }
@@ -1761,6 +1774,18 @@ impl Compiler {
 
     fn value_type_of_expr(&self, expr: &Expr) -> ValueType {
         ValueType::from(self.infer_bound_type(expr))
+    }
+
+    fn callable_local_return_type(&self, slot: LocalSlot) -> ValueType {
+        match self
+            .type_map
+            .local_schemas
+            .get(slot as usize)
+            .and_then(|schema| schema.as_ref())
+        {
+            Some(TypeSchema::Callable { result, .. }) => result.coarse_value_type(),
+            _ => ValueType::Unknown,
+        }
     }
 
     fn record_operand_types(&mut self, lhs: ValueType, rhs: ValueType) {
