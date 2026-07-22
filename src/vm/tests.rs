@@ -319,6 +319,47 @@ fn aot_executes_script_callable_frames_without_interpreter_boundary() {
 
 #[cfg(feature = "cranelift-jit")]
 #[test]
+fn aot_executes_typed_script_callable_parameter_equality_without_interpreter_boundary() {
+    let compiled = crate::compile_source(
+        r#"
+            fn is_zero(value: int) -> bool { value == 0 }
+            is_zero(0);
+        "#,
+    )
+    .expect("typed equality source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.compile_aot().expect("aot compilation should succeed");
+    assert_eq!(
+        vm.run().expect("aot execution should halt"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Bool(true)]);
+    assert!(!vm.aot_interpreter_boundary_hit);
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[test]
+fn aot_executes_script_callable_bool_return_in_branch_without_interpreter_boundary() {
+    let compiled = crate::compile_source(
+        r#"
+            fn is_zero(value: int) -> bool { value == 0 }
+            let selected = if is_zero(0) => { 1 } else => { 2 };
+            selected;
+        "#,
+    )
+    .expect("typed branch source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.compile_aot().expect("aot compilation should succeed");
+    assert_eq!(
+        vm.run().expect("aot execution should halt"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(1)]);
+    assert!(!vm.aot_interpreter_boundary_hit);
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[test]
 fn aot_executes_capturing_closure_without_interpreter_boundary() {
     let compiled = crate::compile_source_for_repl(
         r#"
