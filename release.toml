@@ -1,0 +1,8 @@
+allow-branch = ["master"]
+publish = true
+shared-version = true
+consolidate-commits = true
+pre-release-commit-message = "release: {{version}}"
+tag-name = "{{version}}"
+pre-release-hook = ["python3", "scripts/verify_publish_order.py", "pd-host-function", "pd-vm", "pd-vm-nostd", "rustscript"]
+no-confirm = true

@@ -385,6 +385,47 @@ pub(crate) const REGEX_REPLACE_SPEC: BuiltinSpec = BuiltinSpec {
     needs_failure_exit: true,
 };
 
+// ── Family 4: array/map queries ─────────────────────────────────────
+
+/// `array.get(index)` — pure read, unknown tagged result.
+pub(crate) const ARRAY_GET_SPEC: BuiltinSpec = BuiltinSpec {
+    name: "array_get",
+    arity: 2,
+    inputs: &[
+        InputRepr::Int,                           // index (popped second)
+        InputRepr::HeapPtr(HeapInputKind::Array), // array (popped first)
+    ],
+    output: OutputKind::TaggedUnknown,
+    effect: BuiltinEffect::Pure,
+    needs_failure_exit: false,
+};
+
+/// `map.get(key)` — pure read, unknown tagged result.
+pub(crate) const MAP_GET_SPEC: BuiltinSpec = BuiltinSpec {
+    name: "map_get",
+    arity: 2,
+    inputs: &[
+        InputRepr::Any,                         // key (popped second)
+        InputRepr::HeapPtr(HeapInputKind::Map), // map (popped first)
+    ],
+    output: OutputKind::TaggedUnknown,
+    effect: BuiltinEffect::Pure,
+    needs_failure_exit: false,
+};
+
+/// `map.has(key)` — pure read, bool result.
+pub(crate) const MAP_HAS_SPEC: BuiltinSpec = BuiltinSpec {
+    name: "map_has",
+    arity: 2,
+    inputs: &[
+        InputRepr::Any,                         // key (popped second)
+        InputRepr::HeapPtr(HeapInputKind::Map), // map (popped first)
+    ],
+    output: OutputKind::Bool,
+    effect: BuiltinEffect::Pure,
+    needs_failure_exit: false,
+};
+
 /// Look up the spec for a specialized builtin kind, if one exists.
 ///
 /// Returns `None` for builtins not yet covered by the spec-driven
@@ -424,6 +465,9 @@ pub(crate) fn spec_for(
         super::recorder::SpecializedBuiltinKind::BytesToArrayU8 => Some(&BYTES_TO_ARRAY_U8_SPEC),
         super::recorder::SpecializedBuiltinKind::ToString => Some(&TO_STRING_SPEC),
         super::recorder::SpecializedBuiltinKind::RegexReplace => Some(&REGEX_REPLACE_SPEC),
+        super::recorder::SpecializedBuiltinKind::ArrayGet => Some(&ARRAY_GET_SPEC),
+        super::recorder::SpecializedBuiltinKind::MapGet => Some(&MAP_GET_SPEC),
+        super::recorder::SpecializedBuiltinKind::MapHas => Some(&MAP_HAS_SPEC),
         _ => None,
     }
 }
