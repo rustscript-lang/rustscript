@@ -66,6 +66,25 @@ fn wire_roundtrip_preserves_constants_and_code() {
 }
 
 #[test]
+fn wire_roundtrip_recovers_locals_reserved_by_type_metadata() {
+    let local_count = 8;
+    let program = Program::new(Vec::new(), vec![vm::OpCode::Ret as u8])
+        .with_local_count(local_count)
+        .with_type_map(TypeMap {
+            strict_types: true,
+            local_types: vec![ValueType::Unknown; local_count],
+            local_schemas: vec![None; local_count],
+            callable_slots: vec![false; local_count],
+            optional_slots: vec![false; local_count],
+            operand_types: HashMap::new(),
+        });
+
+    let encoded = encode_program(&program).expect("encode reserved locals");
+    let decoded = decode_program(&encoded).expect("decode reserved locals");
+    assert_eq!(decoded.local_count, local_count);
+}
+
+#[test]
 fn decode_rejects_invalid_magic_version_and_truncation() {
     let program = Program::new(vec![Value::Int(7)], vec![0x01]);
     let encoded = encode_program(&program).expect("encode should succeed");
