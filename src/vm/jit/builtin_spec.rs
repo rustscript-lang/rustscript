@@ -96,11 +96,16 @@ pub(crate) struct BuiltinSpec {
     /// Output type.
     pub(crate) output: OutputKind,
     /// Effect classification.
-    #[allow(dead_code)] // Read by future lowering/registry generation.
     pub(crate) effect: BuiltinEffect,
     /// Whether the builtin requires a failure exit on helper error.
-    #[allow(dead_code)] // Read by future lowering/registry generation.
     pub(crate) needs_failure_exit: bool,
+}
+
+impl BuiltinSpec {
+    /// Whether this builtin is a pure read-only operation with no side effects.
+    pub(crate) fn is_pure(&self) -> bool {
+        matches!(self.effect, BuiltinEffect::Pure)
+    }
 }
 
 /// `string.len()` — pure read, scalar result.
@@ -438,7 +443,7 @@ pub(crate) const ARRAY_PUSH_SPEC: BuiltinSpec = BuiltinSpec {
     ],
     output: OutputKind::Tagged(ValueType::Array),
     effect: BuiltinEffect::OwnedMutation,
-    needs_failure_exit: false,
+    needs_failure_exit: true,
 };
 
 /// `map.set(key, value)` — owned mutation, returns the mutated map.
@@ -452,7 +457,7 @@ pub(crate) const MAP_SET_SPEC: BuiltinSpec = BuiltinSpec {
     ],
     output: OutputKind::Tagged(ValueType::Map),
     effect: BuiltinEffect::OwnedMutation,
-    needs_failure_exit: false,
+    needs_failure_exit: true,
 };
 
 // ── Family 6: map iterators ─────────────────────────────────────────
