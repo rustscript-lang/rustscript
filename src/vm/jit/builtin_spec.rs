@@ -426,6 +426,67 @@ pub(crate) const MAP_HAS_SPEC: BuiltinSpec = BuiltinSpec {
     needs_failure_exit: false,
 };
 
+// ── Family 5: array/map mutations ───────────────────────────────────
+
+/// `array.push(value)` — owned mutation, returns the mutated array.
+pub(crate) const ARRAY_PUSH_SPEC: BuiltinSpec = BuiltinSpec {
+    name: "array_push",
+    arity: 2,
+    inputs: &[
+        InputRepr::Any,    // value (popped second)
+        InputRepr::Tagged, // array (popped first, must be owned Tagged)
+    ],
+    output: OutputKind::Tagged(ValueType::Array),
+    effect: BuiltinEffect::OwnedMutation,
+    needs_failure_exit: false,
+};
+
+/// `map.set(key, value)` — owned mutation, returns the mutated map.
+pub(crate) const MAP_SET_SPEC: BuiltinSpec = BuiltinSpec {
+    name: "map_set",
+    arity: 3,
+    inputs: &[
+        InputRepr::Any,    // value (popped third)
+        InputRepr::Any,    // key (popped second)
+        InputRepr::Tagged, // map (popped first, must be owned Tagged)
+    ],
+    output: OutputKind::Tagged(ValueType::Map),
+    effect: BuiltinEffect::OwnedMutation,
+    needs_failure_exit: false,
+};
+
+// ── Family 6: map iterators ─────────────────────────────────────────
+
+/// `map_iter_next(slot)` — advance iterator, bool result.
+pub(crate) const MAP_ITER_NEXT_SPEC: BuiltinSpec = BuiltinSpec {
+    name: "map_iter_next",
+    arity: 1,
+    inputs: &[InputRepr::Int], // slot
+    output: OutputKind::Bool,
+    effect: BuiltinEffect::Pure,
+    needs_failure_exit: false,
+};
+
+/// `map_iter_take_key(slot)` — take current key, tagged result.
+pub(crate) const MAP_ITER_TAKE_KEY_SPEC: BuiltinSpec = BuiltinSpec {
+    name: "map_iter_take_key",
+    arity: 1,
+    inputs: &[InputRepr::Int], // slot
+    output: OutputKind::TaggedUnknown,
+    effect: BuiltinEffect::Pure,
+    needs_failure_exit: false,
+};
+
+/// `map_iter_take_value(slot)` — take current value, tagged result.
+pub(crate) const MAP_ITER_TAKE_VALUE_SPEC: BuiltinSpec = BuiltinSpec {
+    name: "map_iter_take_value",
+    arity: 1,
+    inputs: &[InputRepr::Int], // slot
+    output: OutputKind::TaggedUnknown,
+    effect: BuiltinEffect::Pure,
+    needs_failure_exit: false,
+};
+
 /// Look up the spec for a specialized builtin kind, if one exists.
 ///
 /// Returns `None` for builtins not yet covered by the spec-driven
@@ -468,6 +529,13 @@ pub(crate) fn spec_for(
         super::recorder::SpecializedBuiltinKind::ArrayGet => Some(&ARRAY_GET_SPEC),
         super::recorder::SpecializedBuiltinKind::MapGet => Some(&MAP_GET_SPEC),
         super::recorder::SpecializedBuiltinKind::MapHas => Some(&MAP_HAS_SPEC),
+        super::recorder::SpecializedBuiltinKind::ArrayPush => Some(&ARRAY_PUSH_SPEC),
+        super::recorder::SpecializedBuiltinKind::MapSet => Some(&MAP_SET_SPEC),
+        super::recorder::SpecializedBuiltinKind::MapIterNext => Some(&MAP_ITER_NEXT_SPEC),
+        super::recorder::SpecializedBuiltinKind::MapIterTakeKey => Some(&MAP_ITER_TAKE_KEY_SPEC),
+        super::recorder::SpecializedBuiltinKind::MapIterTakeValue => {
+            Some(&MAP_ITER_TAKE_VALUE_SPEC)
+        }
         _ => None,
     }
 }
