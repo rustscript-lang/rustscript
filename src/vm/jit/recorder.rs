@@ -3425,7 +3425,12 @@ fn analyze_specialized_builtin_call(
         | SpecializedBuiltinKind::RegexReplace
         | SpecializedBuiltinKind::ArrayGet
         | SpecializedBuiltinKind::MapGet
-        | SpecializedBuiltinKind::MapHas => {
+        | SpecializedBuiltinKind::MapHas
+        | SpecializedBuiltinKind::ArrayPush
+        | SpecializedBuiltinKind::MapSet
+        | SpecializedBuiltinKind::MapIterNext
+        | SpecializedBuiltinKind::MapIterTakeKey
+        | SpecializedBuiltinKind::MapIterTakeValue => {
             unreachable!("spec-covered builtins are handled by the spec-driven path")
         }
         SpecializedBuiltinKind::TypeOfKnown(_) => {
@@ -3459,34 +3464,6 @@ fn analyze_specialized_builtin_call(
         SpecializedBuiltinKind::ArrayNew => {
             frame.push(ValueInfo::tagged_typed(ValueType::Array));
             Ok("array_new")
-        }
-        SpecializedBuiltinKind::ArrayPush => {
-            let _ = frame.pop()?;
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::tagged_typed(ValueType::Array));
-            Ok("array_push")
-        }
-        SpecializedBuiltinKind::MapSet => {
-            let _ = frame.pop()?;
-            let _ = frame.pop()?;
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::tagged_typed(ValueType::Map));
-            Ok("map_set")
-        }
-        SpecializedBuiltinKind::MapIterNext => {
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::bool(None));
-            Ok("map_iter_next")
-        }
-        SpecializedBuiltinKind::MapIterTakeKey => {
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::tagged());
-            Ok("map_iter_take_key")
-        }
-        SpecializedBuiltinKind::MapIterTakeValue => {
-            let _ = frame.pop()?;
-            frame.push(ValueInfo::tagged());
-            Ok("map_iter_take_value")
         }
     }
 }
@@ -3528,7 +3505,12 @@ fn emit_specialized_builtin_call(
         | SpecializedBuiltinKind::RegexReplace
         | SpecializedBuiltinKind::ArrayGet
         | SpecializedBuiltinKind::MapGet
-        | SpecializedBuiltinKind::MapHas => {
+        | SpecializedBuiltinKind::MapHas
+        | SpecializedBuiltinKind::ArrayPush
+        | SpecializedBuiltinKind::MapSet
+        | SpecializedBuiltinKind::MapIterNext
+        | SpecializedBuiltinKind::MapIterTakeKey
+        | SpecializedBuiltinKind::MapIterTakeValue => {
             unreachable!("spec-covered builtins are handled by the spec-driven path")
         }
         SpecializedBuiltinKind::TypeOfKnown(value_type) => {
@@ -3579,114 +3561,6 @@ fn emit_specialized_builtin_call(
                 })
                 .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
             Ok(("array_new", out))
-        }
-        SpecializedBuiltinKind::ArrayPush => {
-            let value = frame.pop()?;
-            let array = frame.pop()?;
-            if array.info.repr != SsaValueRepr::Tagged {
-                return Err(TraceRecordError::TypeMismatch {
-                    expected: "owned tagged array",
-                    actual: array.info.repr,
-                });
-            }
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Tagged,
-                    SsaInstKind::ArrayPush {
-                        array: array.value.id,
-                        value: value.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::tagged_typed(ValueType::Array),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("array_push", out))
-        }
-        SpecializedBuiltinKind::MapSet => {
-            let value = frame.pop()?;
-            let key = frame.pop()?;
-            let map = frame.pop()?;
-            if map.info.repr != SsaValueRepr::Tagged {
-                return Err(TraceRecordError::TypeMismatch {
-                    expected: "owned tagged map",
-                    actual: map.info.repr,
-                });
-            }
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Tagged,
-                    SsaInstKind::MapSet {
-                        map: map.value.id,
-                        key: key.value.id,
-                        value: value.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::tagged_typed(ValueType::Map),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("map_set", out))
-        }
-        SpecializedBuiltinKind::MapIterNext => {
-            let slot = ensure_int(builder, block, ip, frame.pop()?)?;
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Bool,
-                    SsaInstKind::MapIterNext {
-                        slot: slot.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::bool(None),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("map_iter_next", out))
-        }
-        SpecializedBuiltinKind::MapIterTakeKey => {
-            let slot = ensure_int(builder, block, ip, frame.pop()?)?;
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Tagged,
-                    SsaInstKind::MapIterTakeKey {
-                        slot: slot.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::tagged(),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("map_iter_take_key", out))
-        }
-        SpecializedBuiltinKind::MapIterTakeValue => {
-            let slot = ensure_int(builder, block, ip, frame.pop()?)?;
-            let out = builder
-                .append_value_inst(
-                    block,
-                    ip,
-                    SsaValueRepr::Tagged,
-                    SsaInstKind::MapIterTakeValue {
-                        slot: slot.value.id,
-                    },
-                )
-                .map(|value| SymbolicValue {
-                    value,
-                    info: ValueInfo::tagged(),
-                })
-                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-            Ok(("map_iter_take_value", out))
         }
     }
 }
@@ -3921,6 +3795,44 @@ fn emit_spec_driven_builtin(
                 key: popped[0].value.id,
             },
             ValueInfo::bool(None),
+            spec.name,
+        ),
+        SpecializedBuiltinKind::ArrayPush => (
+            SsaInstKind::ArrayPush {
+                array: popped[1].value.id,
+                value: popped[0].value.id,
+            },
+            ValueInfo::tagged_typed(ValueType::Array),
+            spec.name,
+        ),
+        SpecializedBuiltinKind::MapSet => (
+            SsaInstKind::MapSet {
+                map: popped[2].value.id,
+                key: popped[1].value.id,
+                value: popped[0].value.id,
+            },
+            ValueInfo::tagged_typed(ValueType::Map),
+            spec.name,
+        ),
+        SpecializedBuiltinKind::MapIterNext => (
+            SsaInstKind::MapIterNext {
+                slot: popped[0].value.id,
+            },
+            ValueInfo::bool(None),
+            spec.name,
+        ),
+        SpecializedBuiltinKind::MapIterTakeKey => (
+            SsaInstKind::MapIterTakeKey {
+                slot: popped[0].value.id,
+            },
+            ValueInfo::tagged(),
+            spec.name,
+        ),
+        SpecializedBuiltinKind::MapIterTakeValue => (
+            SsaInstKind::MapIterTakeValue {
+                slot: popped[0].value.id,
+            },
+            ValueInfo::tagged(),
             spec.name,
         ),
         SpecializedBuiltinKind::ArraySet => {
