@@ -3872,6 +3872,14 @@ fn emit_spec_driven_builtin(
         _ => unreachable!("non-spec builtin in spec-driven emit"),
     };
 
+    // Debug assertion: pure builtins should not require failure exits.
+    // This consumes spec.effect and spec.needs_failure_exit in production code.
+    debug_assert!(
+        !spec.is_pure() || !spec.needs_failure_exit,
+        "pure builtin {} must not need failure exit",
+        spec.name
+    );
+
     let out = builder
         .append_value_inst(block, ip, spec.output.repr(), inst_kind)
         .map(|value| SymbolicValue {
