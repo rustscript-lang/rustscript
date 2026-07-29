@@ -1,5 +1,6 @@
 pub(crate) mod builtin_spec;
 pub(crate) mod deopt;
+pub(crate) mod diagnostics;
 pub(crate) mod inline;
 pub(crate) mod ir;
 pub(crate) mod liveness;
