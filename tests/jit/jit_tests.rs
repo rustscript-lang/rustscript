@@ -1144,6 +1144,56 @@ fn trace_jit_compiles_hot_loop_and_is_dumpable() {
 }
 
 #[test]
+fn trace_jit_diagnostics_preserve_public_snapshot_and_machine_code_toggle() {
+    let source = r#"
+        let mut i = 0;
+        while i < 20 {
+            i = i + 1;
+        }
+        i;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(JitConfig {
+        enabled: native_jit_supported(),
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+
+    assert_eq!(vm.run().expect("vm should run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(20)]);
+
+    let snapshot = vm.jit_snapshot();
+    let dump_without_machine_code = vm.dump_jit_info_with_machine_code(false);
+    let dump_with_machine_code = vm.dump_jit_info_with_machine_code(true);
+
+    assert_eq!(
+        snapshot.metrics.native_trace_exec_count,
+        vm.jit_native_exec_count(),
+        "snapshot metrics must retain the public native execution count"
+    );
+    assert!(
+        dump_without_machine_code.contains("native codegen backend:"),
+        "diagnostics dump must retain its public native backend line"
+    );
+    assert!(
+        !dump_without_machine_code.contains("    code:"),
+        "machine-code-disabled diagnostics dump must omit machine code"
+    );
+    if native_jit_supported() {
+        assert!(
+            !snapshot.traces.is_empty(),
+            "expected a compiled trace, dump:\n{dump_with_machine_code}"
+        );
+        assert!(
+            dump_with_machine_code.contains("    code:"),
+            "machine-code-enabled diagnostics dump must include native machine code"
+        );
+    }
+}
+
+#[test]
 fn trace_jit_native_path_honors_fuel_metering() {
     let source = r#"
         let mut i = 0;

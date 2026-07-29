@@ -10,7 +10,7 @@ use super::super::{ExecOutcome, Vm, VmError, VmResult};
 use super::JitTrace;
 use super::ir::SsaExitId;
 use super::trace::TraceExitKey;
-use super::{JitMetrics, JitTraceTerminal, native};
+use super::{JitTraceTerminal, native};
 use crate::vm::native::ROOT_FRAME_KEY;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -69,7 +69,7 @@ fn elapsed_ns(started: std::time::Instant) -> u64 {
 pub(crate) struct NativeTrace {
     _keepalive: Arc<Mutex<native::TraceKeepAlive>>,
     _direct_keepalives: Vec<Arc<Mutex<native::TraceKeepAlive>>>,
-    entry: NativeTraceEntry,
+    pub(super) entry: NativeTraceEntry,
     tail_entry: NativeTraceEntry,
     direct_slots: Arc<HashMap<u32, Arc<native::NativeSideLinkSlot>>>,
     pub(super) code: Arc<[u8]>,
@@ -77,21 +77,21 @@ pub(crate) struct NativeTrace {
     terminal: JitTraceTerminal,
     has_call: bool,
     has_yielding_call: bool,
-    lowering_kind: native::TraceLoweringKind,
+    pub(super) lowering_kind: native::TraceLoweringKind,
     interrupt_settings: Option<native::NativeInterruptSettings>,
     compile_profile: native::NativeCompileProfile,
     drop_contract_events_enabled: bool,
-    region: Option<NativeRegion>,
+    pub(super) region: Option<NativeRegion>,
 }
 
-struct NativeRegion {
+pub(super) struct NativeRegion {
     _keepalive: Arc<Mutex<native::TraceKeepAlive>>,
-    entry: NativeTraceEntry,
-    code: Arc<[u8]>,
+    pub(super) entry: NativeTraceEntry,
+    pub(super) code: Arc<[u8]>,
     terminal: JitTraceTerminal,
     has_call: bool,
     has_yielding_call: bool,
-    lowering_kind: native::TraceLoweringKind,
+    pub(super) lowering_kind: native::TraceLoweringKind,
     generation: u64,
     key: TraceExitKey,
     child_trace_id: usize,
@@ -803,7 +803,7 @@ impl Vm {
     }
 
     pub fn jit_snapshot(&self) -> super::JitSnapshot {
-        self.jit.snapshot(self.jit_runtime_metrics())
+        self.jit_diagnostics_snapshot()
     }
 
     pub fn jit_exit_profiles(&self) -> Vec<super::JitExitProfile> {
@@ -844,102 +844,7 @@ impl Vm {
     }
 
     pub fn dump_jit_info_with_machine_code(&self, include_machine_code: bool) -> String {
-        let mut out = self
-            .jit
-            .dump_text(self.program.debug.as_ref(), self.jit_runtime_metrics());
-        out.push_str(&format!(
-            "  native codegen backend: {}\n",
-            native::selected_codegen_backend()
-        ));
-        out.push_str(&format!(
-            "  native trace executions: {}\n",
-            self.native_trace_exec_count
-        ));
-        out.push_str(&format!(
-            "  native trace handoffs: {}\n",
-            self.jit_native_link_handoff_count
-        ));
-        out.push_str(&format!(
-            "  native region entries: {}\n",
-            self.jit_native_region_entry_count
-        ));
-        out.push_str(&format!(
-            "  native internal region edges: {}\n",
-            self.jit_native_region_edge_count
-        ));
-        out.push_str(&format!(
-            "  native direct side links: {}\n",
-            self.jit_native_direct_link_count
-        ));
-        out.push_str(&format!(
-            "  native compile time: {} ns (regions={} ns)\n",
-            self.jit_native_compile_time_ns, self.jit_native_region_compile_time_ns
-        ));
-        out.push_str(&format!(
-            "  native code bytes: {} (regions={})\n",
-            self.jit_native_code_bytes(),
-            self.jit_native_region_code_bytes()
-        ));
-        if self.jit_native_bridge_stats_enabled {
-            let mut bridge_entries: Vec<(&'static str, u64)> = self
-                .jit_native_bridge_counts
-                .iter()
-                .map(|(name, count)| (*name, *count))
-                .collect();
-            bridge_entries.sort_unstable_by_key(|(name, _)| *name);
-            let total_bridge_hits = bridge_entries
-                .iter()
-                .fold(0u64, |acc, (_, count)| acc.saturating_add(*count));
-            out.push_str(&format!(
-                "  native bridge hits: {} (helpers={})\n",
-                total_bridge_hits,
-                bridge_entries.len()
-            ));
-            for (name, count) in bridge_entries {
-                out.push_str(&format!("    bridge {}: {}\n", name, count));
-            }
-        }
-        let native_trace_count = self.native_traces.iter().flatten().count();
-        if native_trace_count == 0 {
-            out.push_str("  native traces: 0\n");
-            return out;
-        }
-
-        out.push_str(&format!("  native traces: {}\n", native_trace_count));
-        for (id, native) in self.native_traces.iter().enumerate() {
-            if let Some(native) = native {
-                out.push_str(&format!(
-                    "  native trace#{} entry=0x{:X} code_bytes={} lowering={}\n",
-                    id,
-                    native.entry as usize,
-                    native.code.len(),
-                    native.lowering_kind.as_str()
-                ));
-                if include_machine_code {
-                    out.push_str("    code:");
-                    for byte in native.code.iter() {
-                        out.push_str(&format!(" {:02X}", byte));
-                    }
-                    out.push('\n');
-                }
-                if let Some(region) = &native.region {
-                    out.push_str(&format!(
-                        "    region entry=0x{:X} code_bytes={} lowering={}\n",
-                        region.entry as usize,
-                        region.code.len(),
-                        region.lowering_kind.as_str()
-                    ));
-                    if include_machine_code {
-                        out.push_str("      code:");
-                        for byte in region.code.iter() {
-                            out.push_str(&format!(" {:02X}", byte));
-                        }
-                        out.push('\n');
-                    }
-                }
-            }
-        }
-        out
+        self.jit_diagnostics_dump(include_machine_code)
     }
 
     pub(in crate::vm) fn execute_jit_entry(&mut self, trace_id: usize) -> VmResult<ExecOutcome> {
@@ -1656,23 +1561,6 @@ impl Vm {
 
     pub fn jit_native_link_handoff_count(&self) -> u64 {
         self.jit_native_link_handoff_count
-    }
-
-    fn jit_runtime_metrics(&self) -> JitMetrics {
-        JitMetrics {
-            boxed_load_site_count: 0,
-            boxed_store_site_count: 0,
-            trace_exit_count: self.jit_trace_exit_count,
-            native_loop_back_count: self.jit_native_loop_back_count,
-            helper_fallback_count: self.jit_helper_fallback_count,
-            native_trace_exec_count: self.native_trace_exec_count,
-            script_call_observations: 0,
-            monomorphic_call_sites: 0,
-            polymorphic_call_sites: 0,
-            inline_attempts: 0,
-            inline_successes: 0,
-            inline_rejections: 0,
-        }
     }
 
     fn record_jit_helper_fallback(&mut self) {
