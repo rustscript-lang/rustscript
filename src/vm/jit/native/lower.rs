@@ -189,13 +189,16 @@ pub(crate) fn compile_tail_status_body(status: i32) -> VmResult<CompiledTailFunc
     )
 }
 
-pub(crate) fn compile_tail_side_link_body(
+fn compile_tail_side_link_body_with_abi(
+    prefix: &str,
     slot_address: usize,
     deopt_status: i32,
+    abi: TailCallAbi,
 ) -> VmResult<CompiledTailFunction> {
+    debug_assert!(matches!(abi, TailCallAbi::Plain | TailCallAbi::Owned));
     compile_standalone_native_function(
-        "pd_vm_tail_side_link",
-        |pointer_type, _| tail_entry_signature(pointer_type),
+        prefix,
+        move |pointer_type, _| abi.tail_signature(pointer_type),
         move |builder, pointer_type, _| {
             let entry = builder.create_block();
             let deopt = builder.create_block();
@@ -203,6 +206,13 @@ pub(crate) fn compile_tail_side_link_body(
             builder.append_block_params_for_function_params(entry);
             builder.switch_to_block(entry);
             let vm_ptr = builder.block_params(entry)[0];
+            let args = match abi {
+                TailCallAbi::Plain => vec![vm_ptr],
+                TailCallAbi::Owned => vec![vm_ptr, builder.block_params(entry)[1]],
+                TailCallAbi::Inherited => {
+                    unreachable!("inherited packets use the trace dispatcher")
+                }
+            };
             let slot_address = iconst_ptr_from_addr(builder, pointer_type, slot_address)?;
             let target = builder
                 .ins()
@@ -215,83 +225,130 @@ pub(crate) fn compile_tail_side_link_body(
             builder.ins().return_(&[status]);
 
             builder.switch_to_block(linked);
-            let signature = builder.import_signature(tail_entry_signature(pointer_type));
-            builder
-                .ins()
-                .return_call_indirect(signature, target, &[vm_ptr]);
+            let signature = builder.import_signature(abi.tail_signature(pointer_type));
+            builder.ins().return_call_indirect(signature, target, &args);
+            Ok(())
+        },
+    )
+}
+
+pub(crate) fn compile_tail_side_link_body(
+    slot_address: usize,
+    deopt_status: i32,
+) -> VmResult<CompiledTailFunction> {
+    compile_tail_side_link_body_with_abi(
+        "pd_vm_tail_side_link",
+        slot_address,
+        deopt_status,
+        TailCallAbi::Plain,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum TailCallAbi {
+    Plain,
+    Inherited,
+    Owned,
+}
+
+impl TailCallAbi {
+    fn system_signature(
+        self,
+        pointer_type: cranelift_codegen::ir::Type,
+        call_conv: CallConv,
+    ) -> Signature {
+        match self {
+            Self::Plain | Self::Inherited => entry_signature(pointer_type, call_conv),
+            Self::Owned => system_owned_entry_signature(pointer_type, call_conv),
+        }
+    }
+
+    fn tail_signature(self, pointer_type: cranelift_codegen::ir::Type) -> Signature {
+        match self {
+            Self::Plain => tail_entry_signature(pointer_type),
+            Self::Inherited => inherited_tail_entry_signature(pointer_type),
+            Self::Owned => tail_owned_entry_signature(pointer_type),
+        }
+    }
+}
+
+fn create_inherited_state_packet(
+    builder: &mut FunctionBuilder<'_>,
+    pointer_type: cranelift_codegen::ir::Type,
+) -> VmResult<cranelift_codegen::ir::Value> {
+    let pointer_bytes = pointer_type.bits() / 8;
+    let packet_bytes = pointer_bytes
+        .checked_mul((MAX_INHERITED_ENTRY_VALUES + 7) as u32)
+        .ok_or_else(|| {
+            VmError::JitNative("native inherited-state packet is too large".to_string())
+        })?;
+    let packet = builder.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        packet_bytes,
+        pointer_bytes.trailing_zeros() as u8,
+    ));
+    let packet_ptr = builder.ins().stack_addr(pointer_type, packet, 0);
+    let inactive = builder.ins().iconst(pointer_type, 0);
+    builder.ins().store(
+        MemFlags::new(),
+        inactive,
+        packet_ptr,
+        INHERITED_STATE_ACTIVE_OFFSET,
+    );
+    builder.ins().store(
+        MemFlags::new(),
+        inactive,
+        packet_ptr,
+        INHERITED_STATE_DYNAMIC_TARGET_OFFSET,
+    );
+    Ok(packet_ptr)
+}
+
+fn compile_system_tail_wrapper_with_abi(
+    prefix: &str,
+    root_entry: *const u8,
+    abi: TailCallAbi,
+) -> VmResult<CompiledTailFunction> {
+    let root_entry = root_entry as usize;
+    compile_standalone_native_function(
+        prefix,
+        move |pointer_type, call_conv| abi.system_signature(pointer_type, call_conv),
+        move |builder, pointer_type, _| {
+            let entry = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+            let vm_ptr = builder.block_params(entry)[0];
+            let args = match abi {
+                TailCallAbi::Plain => vec![vm_ptr],
+                TailCallAbi::Inherited => {
+                    vec![
+                        vm_ptr,
+                        create_inherited_state_packet(builder, pointer_type)?,
+                    ]
+                }
+                TailCallAbi::Owned => vec![vm_ptr, builder.block_params(entry)[1]],
+            };
+            let root_entry = iconst_ptr_from_addr(builder, pointer_type, root_entry)?;
+            let signature = builder.import_signature(abi.tail_signature(pointer_type));
+            let call = builder.ins().call_indirect(signature, root_entry, &args);
+            let status = builder.inst_results(call)[0];
+            builder.ins().return_(&[status]);
             Ok(())
         },
     )
 }
 
 pub(crate) fn compile_system_tail_wrapper(root_entry: *const u8) -> VmResult<CompiledTailFunction> {
-    let root_entry = root_entry as usize;
-    compile_standalone_native_function(
-        "pd_vm_tail_wrapper",
-        entry_signature,
-        move |builder, pointer_type, _| {
-            let entry = builder.create_block();
-            builder.append_block_params_for_function_params(entry);
-            builder.switch_to_block(entry);
-            let vm_ptr = builder.block_params(entry)[0];
-            let root_entry = iconst_ptr_from_addr(builder, pointer_type, root_entry)?;
-            let signature = builder.import_signature(tail_entry_signature(pointer_type));
-            let call = builder
-                .ins()
-                .call_indirect(signature, root_entry, &[vm_ptr]);
-            let status = builder.inst_results(call)[0];
-            builder.ins().return_(&[status]);
-            Ok(())
-        },
-    )
+    compile_system_tail_wrapper_with_abi("pd_vm_tail_wrapper", root_entry, TailCallAbi::Plain)
 }
 
 pub(crate) fn compile_system_inherited_tail_wrapper(
     root_entry: *const u8,
 ) -> VmResult<CompiledTailFunction> {
-    let root_entry = root_entry as usize;
-    compile_standalone_native_function(
+    compile_system_tail_wrapper_with_abi(
         "pd_vm_inherited_tail_wrapper",
-        entry_signature,
-        move |builder, pointer_type, _| {
-            let entry = builder.create_block();
-            builder.append_block_params_for_function_params(entry);
-            builder.switch_to_block(entry);
-            let vm_ptr = builder.block_params(entry)[0];
-            let pointer_bytes = pointer_type.bits() / 8;
-            let packet_bytes = pointer_bytes
-                .checked_mul((MAX_INHERITED_ENTRY_VALUES + 7) as u32)
-                .ok_or_else(|| {
-                    VmError::JitNative("native inherited-state packet is too large".to_string())
-                })?;
-            let packet = builder.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                packet_bytes,
-                pointer_bytes.trailing_zeros() as u8,
-            ));
-            let packet_ptr = builder.ins().stack_addr(pointer_type, packet, 0);
-            let inactive = builder.ins().iconst(pointer_type, 0);
-            builder.ins().store(
-                MemFlags::new(),
-                inactive,
-                packet_ptr,
-                INHERITED_STATE_ACTIVE_OFFSET,
-            );
-            builder.ins().store(
-                MemFlags::new(),
-                inactive,
-                packet_ptr,
-                INHERITED_STATE_DYNAMIC_TARGET_OFFSET,
-            );
-            let root_entry = iconst_ptr_from_addr(builder, pointer_type, root_entry)?;
-            let signature = builder.import_signature(inherited_tail_entry_signature(pointer_type));
-            let call = builder
-                .ins()
-                .call_indirect(signature, root_entry, &[vm_ptr, packet_ptr]);
-            let status = builder.inst_results(call)[0];
-            builder.ins().return_(&[status]);
-            Ok(())
-        },
+        root_entry,
+        TailCallAbi::Inherited,
     )
 }
 
@@ -455,35 +512,11 @@ pub(crate) fn compile_tail_owned_side_link_body(
     slot_address: usize,
     deopt_status: i32,
 ) -> VmResult<CompiledTailFunction> {
-    compile_standalone_native_function(
+    compile_tail_side_link_body_with_abi(
         "pd_vm_tail_owned_side_link",
-        |pointer_type, _| tail_owned_entry_signature(pointer_type),
-        move |builder, pointer_type, _| {
-            let entry = builder.create_block();
-            let deopt = builder.create_block();
-            let linked = builder.create_block();
-            builder.append_block_params_for_function_params(entry);
-            builder.switch_to_block(entry);
-            let vm_ptr = builder.block_params(entry)[0];
-            let owned_slot = builder.block_params(entry)[1];
-            let slot_address = iconst_ptr_from_addr(builder, pointer_type, slot_address)?;
-            let target = builder
-                .ins()
-                .atomic_load(pointer_type, MemFlags::new(), slot_address);
-            let is_null = builder.ins().icmp_imm(IntCC::Equal, target, 0);
-            builder.ins().brif(is_null, deopt, &[], linked, &[]);
-
-            builder.switch_to_block(deopt);
-            let status = builder.ins().iconst(types::I32, i64::from(deopt_status));
-            builder.ins().return_(&[status]);
-
-            builder.switch_to_block(linked);
-            let signature = builder.import_signature(tail_owned_entry_signature(pointer_type));
-            builder
-                .ins()
-                .return_call_indirect(signature, target, &[vm_ptr, owned_slot]);
-            Ok(())
-        },
+        slot_address,
+        deopt_status,
+        TailCallAbi::Owned,
     )
 }
 
@@ -530,26 +563,7 @@ pub(crate) fn compile_tail_owned_clear_body(success_status: i32) -> VmResult<Com
 pub(crate) fn compile_system_owned_tail_wrapper(
     root_entry: *const u8,
 ) -> VmResult<CompiledTailFunction> {
-    let root_entry = root_entry as usize;
-    compile_standalone_native_function(
-        "pd_vm_tail_owned_wrapper",
-        system_owned_entry_signature,
-        move |builder, pointer_type, _| {
-            let entry = builder.create_block();
-            builder.append_block_params_for_function_params(entry);
-            builder.switch_to_block(entry);
-            let vm_ptr = builder.block_params(entry)[0];
-            let owned_slot = builder.block_params(entry)[1];
-            let root_entry = iconst_ptr_from_addr(builder, pointer_type, root_entry)?;
-            let signature = builder.import_signature(tail_owned_entry_signature(pointer_type));
-            let call = builder
-                .ins()
-                .call_indirect(signature, root_entry, &[vm_ptr, owned_slot]);
-            let status = builder.inst_results(call)[0];
-            builder.ins().return_(&[status]);
-            Ok(())
-        },
-    )
+    compile_system_tail_wrapper_with_abi("pd_vm_tail_owned_wrapper", root_entry, TailCallAbi::Owned)
 }
 
 fn try_compile_ssa_trace(
