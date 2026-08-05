@@ -352,7 +352,7 @@ fn type_label(ty: &Type) -> Result<String, Error> {
                     let inner_label = type_label(inner)?;
                     Ok(format!("{inner_label} | null"))
                 }
-                "VmResult" | "BuiltinResult" | "HostResult" => {
+                "VmResult" | "BuiltinResult" | "HostResult" | "HostCallResult" => {
                     let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
                         return Err(Error::new_spanned(
                             &segment.arguments,
@@ -470,5 +470,27 @@ fn uses_taken_extractor(ty: &Type) -> bool {
             )
         }),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_pd_host_function;
+    use syn::{ItemFn, Meta, Token, parse_quote, punctuated::Punctuated};
+
+    #[test]
+    fn accepts_host_call_result_from_the_function_signature() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "test::suspend");
+        let item: ItemFn = parse_quote! {
+            /// Returns a value after a host operation completes.
+            #[pd_host_function(name = "test::suspend")]
+            fn suspend() -> VmResult<HostCallResult<Value>> {
+                todo!()
+            }
+        };
+
+        let expanded = expand_pd_host_function(attr, item)
+            .expect("HostCallResult should be accepted from the return signature");
+        assert!(expanded.to_string().contains("HostCallResult"));
     }
 }
