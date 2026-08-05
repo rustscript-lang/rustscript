@@ -579,7 +579,9 @@ fn schema_is_fully_known(schema: &TypeSchema) -> bool {
         | TypeSchema::GenericParam(_) => true,
         TypeSchema::Optional(inner) => schema_is_fully_known(inner),
         TypeSchema::Named(_, type_args) => type_args.iter().all(schema_is_fully_known),
-        TypeSchema::Array(item) | TypeSchema::Map(item) => schema_is_fully_known(item),
+        TypeSchema::Array(item) | TypeSchema::Map(item) => {
+            matches!(item.as_ref(), TypeSchema::Unknown) || schema_is_fully_known(item)
+        }
         TypeSchema::ArrayTuple(items) => items.iter().all(schema_is_fully_known),
         TypeSchema::ArrayTupleRest { prefix, rest } => {
             prefix.iter().all(schema_is_fully_known) && schema_is_fully_known(rest)
