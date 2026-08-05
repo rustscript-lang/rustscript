@@ -67,7 +67,7 @@ Run the narrow host/JIT tests. Expected: generated code still selects `bind_stat
 Add `HostBindingKind::{StaticStack, StaticArgs, StaticNonYieldingArgs}` in `build.rs`. Classify in this order:
 
 1. any `Vm` parameter → `StaticStack`;
-2. normalized `CallOutcome`, including `VmResult<CallOutcome>` and `HostResult<CallOutcome>` → `StaticArgs`;
+2. normalized `CallOutcome`, including `VmResult<CallOutcome>` → `StaticArgs`;
 3. all other valid args-only returns → `StaticNonYieldingArgs`.
 
 Use that one classification in generated registry and direct VM binding code. The non-yielding branches must emit `register_static_non_yielding_args` and `bind_static_non_yielding_args_function`.

@@ -43,10 +43,17 @@ pub struct CallableSignature {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostExecution {
+    Sync,
+    MaySuspend,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CallableDef {
     pub name: &'static str,
     pub docs: &'static str,
     pub signature: CallableSignature,
+    pub host_execution: HostExecution,
 }
 
 #[allow(dead_code)]

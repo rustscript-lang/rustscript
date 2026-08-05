@@ -25,9 +25,10 @@ mod typed;
 use io_wasm as io;
 
 pub(crate) use io::IoState;
+pub use typed::HostCallResult;
 use typed::{
-    AnyValue, BuiltinResult, IntoBuiltinCallOutcome, IntoHostCallOutcome, NumberValue,
-    UnknownValue, VmArray, VmBytes, VmMap, arg, borrow_arg, return_none, return_one, take_arg,
+    AnyValue, IntoBuiltinCallOutcome, IntoHostCallOutcome, NumberValue, UnknownValue, VmArray,
+    VmBytes, VmMap, arg, borrow_arg, return_none, return_one, take_arg,
 };
 
 pub(crate) enum BuiltinCallOutcome {

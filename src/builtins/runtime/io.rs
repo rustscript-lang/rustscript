@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 use futures_channel::oneshot;
 use pd_host_function::pd_host_function;
 
-use super::BuiltinResult;
+use super::HostCallResult;
 use crate::vm::{CallReturn, HostOpId, Value, Vm, VmError, VmResult};
 
 pub(crate) struct IoState {
@@ -87,7 +87,11 @@ pub(super) fn close_all_handles(vm: &mut Vm) {
 
 /// Opens a file handle for runtime I/O.
 #[pd_host_function(name = "io::open")]
-pub(super) fn builtin_io_open(vm: &mut Vm, path: &str, mode: &str) -> VmResult<BuiltinResult<i64>> {
+pub(super) fn builtin_io_open(
+    vm: &mut Vm,
+    path: &str,
+    mode: &str,
+) -> VmResult<HostCallResult<i64>> {
     let reserved_id = io_reserve_handle_id(vm);
     let path = path.to_string();
     let mode = mode.to_string();
@@ -133,7 +137,7 @@ pub(super) fn builtin_io_open(vm: &mut Vm, path: &str, mode: &str) -> VmResult<B
             },
         }
     })?;
-    Ok(BuiltinResult::Pending(op_id))
+    Ok(HostCallResult::Pending(op_id))
 }
 
 /// Starts a child process and returns a process-backed handle.
@@ -142,7 +146,7 @@ pub(super) fn builtin_io_popen(
     vm: &mut Vm,
     command: &str,
     mode: &str,
-) -> VmResult<BuiltinResult<i64>> {
+) -> VmResult<HostCallResult<i64>> {
     if mode != "r" && mode != "w" {
         return Err(VmError::HostError(format!(
             "unsupported io_popen mode '{mode}', expected r or w"
@@ -191,12 +195,12 @@ pub(super) fn builtin_io_popen(
             result: Ok(CallReturn::one(Value::Int(reserved_id))),
         }
     })?;
-    Ok(BuiltinResult::Pending(op_id))
+    Ok(HostCallResult::Pending(op_id))
 }
 
 /// Reads all remaining text from an I/O handle.
 #[pd_host_function(name = "io::read_all")]
-pub(super) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<BuiltinResult<String>> {
+pub(super) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<HostCallResult<String>> {
     let handle = io_take_handle(vm, handle_id)?;
     let op_id = schedule_io_task(vm, move || {
         let mut handle = handle;
@@ -232,12 +236,15 @@ pub(super) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<Built
             result,
         }
     })?;
-    Ok(BuiltinResult::Pending(op_id))
+    Ok(HostCallResult::Pending(op_id))
 }
 
 /// Reads a single line of text from an I/O handle.
 #[pd_host_function(name = "io::read_line")]
-pub(super) fn builtin_io_read_line(vm: &mut Vm, handle_id: i64) -> VmResult<BuiltinResult<String>> {
+pub(super) fn builtin_io_read_line(
+    vm: &mut Vm,
+    handle_id: i64,
+) -> VmResult<HostCallResult<String>> {
     let handle = io_take_handle(vm, handle_id)?;
     let op_id = schedule_io_task(vm, move || {
         let mut handle = handle;
@@ -268,7 +275,7 @@ pub(super) fn builtin_io_read_line(vm: &mut Vm, handle_id: i64) -> VmResult<Buil
             result,
         }
     })?;
-    Ok(BuiltinResult::Pending(op_id))
+    Ok(HostCallResult::Pending(op_id))
 }
 
 /// Writes text to an I/O handle.
@@ -277,7 +284,7 @@ pub(super) fn builtin_io_write(
     vm: &mut Vm,
     handle_id: i64,
     text: &str,
-) -> VmResult<BuiltinResult<i64>> {
+) -> VmResult<HostCallResult<i64>> {
     let bytes = text.as_bytes().to_vec();
     let handle = io_take_handle(vm, handle_id)?;
     let op_id = schedule_io_task(vm, move || {
@@ -313,12 +320,12 @@ pub(super) fn builtin_io_write(
             result,
         }
     })?;
-    Ok(BuiltinResult::Pending(op_id))
+    Ok(HostCallResult::Pending(op_id))
 }
 
 /// Flushes buffered output for an I/O handle.
 #[pd_host_function(name = "io::flush")]
-pub(super) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<BuiltinResult<bool>> {
+pub(super) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<HostCallResult<bool>> {
     let handle = io_take_handle(vm, handle_id)?;
     let op_id = schedule_io_task(vm, move || {
         let mut handle = handle;
@@ -351,23 +358,23 @@ pub(super) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<BuiltinR
             result,
         }
     })?;
-    Ok(BuiltinResult::Pending(op_id))
+    Ok(HostCallResult::Pending(op_id))
 }
 
 /// Closes an I/O handle.
 #[pd_host_function(name = "io::close")]
-pub(super) fn builtin_io_close(vm: &mut Vm, handle_id: i64) -> VmResult<BuiltinResult<bool>> {
+pub(super) fn builtin_io_close(vm: &mut Vm, handle_id: i64) -> VmResult<HostCallResult<bool>> {
     let handle = io_take_handle(vm, handle_id)?;
     let op_id = schedule_io_task(vm, move || IoAsyncCompletion {
         restored_handle: None,
         result: close_io_handle(handle).map(|_| CallReturn::one(Value::Bool(true))),
     })?;
-    Ok(BuiltinResult::Pending(op_id))
+    Ok(HostCallResult::Pending(op_id))
 }
 
 /// Returns whether a file system path exists.
 #[pd_host_function(name = "io::exists")]
-pub(super) fn builtin_io_exists(vm: &mut Vm, path: &str) -> VmResult<BuiltinResult<bool>> {
+pub(super) fn builtin_io_exists(vm: &mut Vm, path: &str) -> VmResult<HostCallResult<bool>> {
     let path = path.to_string();
     let op_id = schedule_io_task(vm, move || IoAsyncCompletion {
         restored_handle: None,
@@ -375,7 +382,7 @@ pub(super) fn builtin_io_exists(vm: &mut Vm, path: &str) -> VmResult<BuiltinResu
             std::path::Path::new(path.as_str()).exists(),
         ))),
     })?;
-    Ok(BuiltinResult::Pending(op_id))
+    Ok(HostCallResult::Pending(op_id))
 }
 
 fn spawn_shell_command(command: &str, mode: &str) -> VmResult<Child> {

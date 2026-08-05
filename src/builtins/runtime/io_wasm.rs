@@ -2,7 +2,7 @@ use std::task::{Context, Poll};
 
 use pd_host_function::pd_host_function;
 
-use super::BuiltinResult;
+use super::HostCallResult;
 use crate::vm::{CallReturn, HostOpId, Value, Vm, VmError, VmResult};
 
 pub(crate) struct IoState;
@@ -31,7 +31,7 @@ pub(super) fn builtin_io_open(
     _vm: &mut Vm,
     _path: &str,
     _mode: &str,
-) -> VmResult<BuiltinResult<i64>> {
+) -> VmResult<HostCallResult<i64>> {
     Err(VmError::HostError(
         "io::open is unsupported on wasm32 runtime".to_string(),
     ))
@@ -43,7 +43,7 @@ pub(super) fn builtin_io_popen(
     _vm: &mut Vm,
     _command: &str,
     _mode: &str,
-) -> VmResult<BuiltinResult<i64>> {
+) -> VmResult<HostCallResult<i64>> {
     Err(VmError::HostError(
         "io::popen is unsupported on wasm32 runtime".to_string(),
     ))
@@ -54,7 +54,7 @@ pub(super) fn builtin_io_popen(
 pub(super) fn builtin_io_read_all(
     _vm: &mut Vm,
     _handle_id: i64,
-) -> VmResult<BuiltinResult<String>> {
+) -> VmResult<HostCallResult<String>> {
     Err(VmError::HostError(
         "io::read_all is unsupported on wasm32 runtime".to_string(),
     ))
@@ -65,7 +65,7 @@ pub(super) fn builtin_io_read_all(
 pub(super) fn builtin_io_read_line(
     _vm: &mut Vm,
     _handle_id: i64,
-) -> VmResult<BuiltinResult<String>> {
+) -> VmResult<HostCallResult<String>> {
     Err(VmError::HostError(
         "io::read_line is unsupported on wasm32 runtime".to_string(),
     ))
@@ -77,7 +77,7 @@ pub(super) fn builtin_io_write(
     _vm: &mut Vm,
     _handle_id: i64,
     _text: &str,
-) -> VmResult<BuiltinResult<i64>> {
+) -> VmResult<HostCallResult<i64>> {
     Err(VmError::HostError(
         "io::write is unsupported on wasm32 runtime".to_string(),
     ))
@@ -85,7 +85,7 @@ pub(super) fn builtin_io_write(
 
 /// Flushes buffered output for an I/O handle.
 #[pd_host_function(name = "io::flush")]
-pub(super) fn builtin_io_flush(_vm: &mut Vm, _handle_id: i64) -> VmResult<BuiltinResult<bool>> {
+pub(super) fn builtin_io_flush(_vm: &mut Vm, _handle_id: i64) -> VmResult<HostCallResult<bool>> {
     Err(VmError::HostError(
         "io::flush is unsupported on wasm32 runtime".to_string(),
     ))
@@ -93,7 +93,7 @@ pub(super) fn builtin_io_flush(_vm: &mut Vm, _handle_id: i64) -> VmResult<Builti
 
 /// Closes an I/O handle.
 #[pd_host_function(name = "io::close")]
-pub(super) fn builtin_io_close(_vm: &mut Vm, _handle_id: i64) -> VmResult<BuiltinResult<bool>> {
+pub(super) fn builtin_io_close(_vm: &mut Vm, _handle_id: i64) -> VmResult<HostCallResult<bool>> {
     Err(VmError::HostError(
         "io::close is unsupported on wasm32 runtime".to_string(),
     ))
@@ -101,7 +101,7 @@ pub(super) fn builtin_io_close(_vm: &mut Vm, _handle_id: i64) -> VmResult<Builti
 
 /// Returns whether a file system path exists.
 #[pd_host_function(name = "io::exists")]
-pub(super) fn builtin_io_exists(_vm: &mut Vm, _path: &str) -> VmResult<BuiltinResult<bool>> {
+pub(super) fn builtin_io_exists(_vm: &mut Vm, _path: &str) -> VmResult<HostCallResult<bool>> {
     Err(VmError::HostError(
         "io::exists is unsupported on wasm32 runtime".to_string(),
     ))
