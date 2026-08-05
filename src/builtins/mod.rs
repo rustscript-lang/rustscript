@@ -5,7 +5,9 @@ mod metadata;
 #[cfg(feature = "runtime")]
 pub(crate) mod runtime;
 
-pub use self::metadata::{CallableDef, CallableParam, CallableParamType, CallableSignature};
+pub use self::metadata::{
+    CallableDef, CallableParam, CallableParamType, CallableSignature, HostExecution,
+};
 use crate::ValueType;
 #[cfg(feature = "runtime")]
 pub(crate) use crate::vm::{HostFunctionRegistry, Value, Vm, VmResult};

@@ -53,6 +53,16 @@ fn parse_name_arg(args: &Punctuated<Meta, Token![,]>) -> Result<LitStr, Error> {
             "expected #[pd_host_function(name = \"...\")]",
         ));
     };
+    if args.len() != 1 {
+        let extra = args
+            .iter()
+            .nth(1)
+            .expect("a non-empty attribute with more than one argument has an extra argument");
+        return Err(Error::new_spanned(
+            extra,
+            "#[pd_host_function] only supports name = \"...\"",
+        ));
+    }
     if !name_value.path.is_ident("name") {
         return Err(Error::new_spanned(
             &name_value.path,
@@ -267,10 +277,7 @@ fn unwrap_vm_result_type(ty: &Type) -> Result<Option<Type>, Error> {
             let Some(segment) = path.path.segments.last() else {
                 return Ok(None);
             };
-            if !matches!(
-                segment.ident.to_string().as_str(),
-                "VmResult" | "HostResult"
-            ) {
+            if segment.ident != "VmResult" {
                 return Ok(None);
             }
             let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
@@ -352,7 +359,7 @@ fn type_label(ty: &Type) -> Result<String, Error> {
                     let inner_label = type_label(inner)?;
                     Ok(format!("{inner_label} | null"))
                 }
-                "VmResult" | "BuiltinResult" | "HostResult" => {
+                "VmResult" | "HostCallResult" => {
                     let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
                         return Err(Error::new_spanned(
                             &segment.arguments,
@@ -470,5 +477,60 @@ fn uses_taken_extractor(ty: &Type) -> bool {
             )
         }),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_pd_host_function;
+    use syn::{ItemFn, Meta, Token, parse_quote, punctuated::Punctuated};
+
+    #[test]
+    fn accepts_host_call_result_from_the_function_signature() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "test::suspend");
+        let item: ItemFn = parse_quote! {
+            /// Returns a value after a host operation completes.
+            #[pd_host_function(name = "test::suspend")]
+            fn suspend() -> VmResult<HostCallResult<Value>> {
+                todo!()
+            }
+        };
+
+        let expanded = expand_pd_host_function(attr, item)
+            .expect("HostCallResult should be accepted from the return signature");
+        assert!(expanded.to_string().contains("HostCallResult"));
+    }
+
+    #[test]
+    fn rejects_host_result_compatibility_wrapper() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "test::legacy");
+        let item: ItemFn = parse_quote! {
+            /// Legacy result wrapper must be rejected.
+            #[pd_host_function(name = "test::legacy")]
+            fn legacy() -> HostResult<Value> {
+                todo!()
+            }
+        };
+
+        let error = expand_pd_host_function(attr, item)
+            .expect_err("HostResult must not be accepted as a return wrapper");
+        assert!(error.to_string().contains("unsupported callable type"));
+    }
+
+    #[test]
+    fn rejects_async_attribute_instead_of_treating_it_as_a_host_contract() {
+        let attr: Punctuated<Meta, Token![,]> =
+            parse_quote!(name = "test::suspend", r#async = true);
+        let item: ItemFn = parse_quote! {
+            /// Returns a value after a host operation completes.
+            #[pd_host_function(name = "test::suspend")]
+            fn suspend() -> VmResult<HostCallResult<Value>> {
+                todo!()
+            }
+        };
+
+        let error = expand_pd_host_function(attr, item)
+            .expect_err("the pd-host-function macro must not accept an async attribute");
+        assert!(error.to_string().contains("only supports name"));
     }
 }

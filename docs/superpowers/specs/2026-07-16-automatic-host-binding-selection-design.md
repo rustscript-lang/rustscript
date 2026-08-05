@@ -13,10 +13,10 @@ This change covers `#[pd_host_function]` implementations discovered by the RustS
 Introduce one shared build-time classification with these ordered rules:
 
 1. A function with a `Vm` context parameter uses `StaticStack`.
-2. An args-only function whose normalized return type is `CallOutcome`, including `VmResult<CallOutcome>` and `HostResult<CallOutcome>`, uses `StaticArgs`.
+2. An args-only function whose normalized return type is `CallOutcome`, including `VmResult<CallOutcome>`, uses `StaticArgs`.
 3. Every other valid args-only annotated function uses `StaticNonYieldingArgs`.
 
-The third rule is safe because the generated wrapper converts all supported ordinary outputs through `IntoVmValue` into exactly one `Value`. This includes implicit `()`, explicit `()`, and `Option<T>`, which become `Value::Null` when appropriate. `VmResult<T>` and `HostResult<T>` may still return an error; successful calls return exactly one value synchronously.
+The third rule is safe because the generated wrapper converts all supported ordinary outputs through `IntoVmValue` into exactly one `Value`. This includes implicit `()`, explicit `()`, and `Option<T>`, which become `Value::Null` when appropriate. `VmResult<T>` may still return an error; successful calls return exactly one value synchronously.
 
 `CallOutcome` stays on the general static args ABI because it can represent no return value, halt, yield, or pending work. Any signature that cannot be classified safely falls back to the general compatible static binding.
 

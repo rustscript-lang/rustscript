@@ -22,11 +22,13 @@ pub mod vmbc;
 
 pub use assembler::{AsmParseError, Assembler, AssemblerError, BytecodeBuilder, assemble};
 #[cfg(feature = "runtime")]
+pub use builtins::runtime::HostCallResult;
+#[cfg(feature = "runtime")]
 pub use builtins::runtime::print::{PrintHostFunction, PrintlnHostFunction, format_value};
 pub use builtins::{
     BUILTIN_CATALOG, BuiltinFunction, BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec,
-    CallableDef, CallableParam, CallableParamType, CallableSignature, LanguageBuiltinSpec,
-    builtin_namespace_specs, callable_signatures_for_builtin_namespace_member,
+    CallableDef, CallableParam, CallableParamType, CallableSignature, HostExecution,
+    LanguageBuiltinSpec, builtin_namespace_specs, callable_signatures_for_builtin_namespace_member,
     default_host_callables, is_builtin_namespace, language_builtin_specs,
     resolve_builtin_namespace_call,
 };

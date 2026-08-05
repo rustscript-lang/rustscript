@@ -49,6 +49,12 @@ pub(crate) enum HostBindingKind {
     StaticNonYieldingArgs,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostExecutionKind {
+    Sync,
+    MaySuspend,
+}
+
 impl HostBindingKind {
     pub(crate) fn render_bind_static_call(&self, name: &str, function_name: &str) -> String {
         let method = match self {
@@ -108,6 +114,7 @@ struct CallableDecl {
     static_return_type: String,
     wrapper: Option<WrapperDecl>,
     host_binding_kind: HostBindingKind,
+    host_execution: HostExecutionKind,
 }
 
 #[derive(Clone, Debug)]
@@ -261,7 +268,6 @@ pub(crate) fn classify_host_binding(function: &ItemFn) -> HostBindingKind {
         return HostBindingKind::StaticArgs;
     }
     if sole_type_argument(&return_type, "VmResult")
-        .or_else(|| sole_type_argument(&return_type, "HostResult"))
         .is_some_and(|inner| matches!(plain_path_type(&inner).as_deref(), Some("CallOutcome")))
     {
         return HostBindingKind::StaticArgs;
@@ -270,6 +276,22 @@ pub(crate) fn classify_host_binding(function: &ItemFn) -> HostBindingKind {
         return HostBindingKind::StaticNonYieldingArgs;
     }
     HostBindingKind::StaticArgs
+}
+
+pub(crate) fn infer_host_execution(function: &ItemFn) -> HostExecutionKind {
+    let return_type = normalized_return_type(&function.sig.output);
+    if contains_host_call_result(&return_type) {
+        HostExecutionKind::MaySuspend
+    } else {
+        HostExecutionKind::Sync
+    }
+}
+
+fn contains_host_call_result(ty: &Type) -> bool {
+    if sole_type_argument(ty, "HostCallResult").is_some() {
+        return true;
+    }
+    sole_type_argument(ty, "VmResult").is_some_and(|inner| contains_host_call_result(&inner))
 }
 
 fn is_supported_ordinary_return_type(ty: &Type) -> bool {
@@ -282,10 +304,8 @@ fn is_supported_ordinary_return_type(ty: &Type) -> bool {
                 return false;
             };
             match segment.ident.to_string().as_str() {
-                "Option" | "VmResult" | "HostResult" => {
-                    sole_type_argument(ty, &segment.ident.to_string())
-                        .is_some_and(|inner| is_supported_ordinary_return_type(&inner))
-                }
+                "Option" | "VmResult" => sole_type_argument(ty, &segment.ident.to_string())
+                    .is_some_and(|inner| is_supported_ordinary_return_type(&inner)),
                 "Vec" => sole_type_argument(ty, "Vec")
                     .is_some_and(|inner| is_supported_vec_return_type(&inner)),
                 "Value" | "bool" | "i64" | "u32" | "usize" | "f64" | "String" | "str"
@@ -404,6 +424,7 @@ fn parse_source_file(path: &Path, spec: &SourceSpec, _order_offset: usize) -> Ve
             static_return_type: static_return_type_label(&function.sig.output),
             wrapper,
             host_binding_kind: classify_host_binding(function),
+            host_execution: infer_host_execution(function),
         });
     }
     out
@@ -1145,9 +1166,13 @@ fn render_callable_consts(callables: &[&CallableDecl]) -> String {
         .unwrap();
         writeln!(
             &mut out,
-            "#[allow(dead_code)]\nconst {base}_DEF: CallableDef = CallableDef {{ name: {:?}, docs: {:?}, signature: {base}_SIGNATURE }};",
+            "#[allow(dead_code)]\nconst {base}_DEF: CallableDef = CallableDef {{ name: {:?}, docs: {:?}, signature: {base}_SIGNATURE, host_execution: HostExecution::{} }};",
             callable.name,
-            callable.docs
+            callable.docs,
+            match callable.host_execution {
+                HostExecutionKind::Sync => "Sync",
+                HostExecutionKind::MaySuspend => "MaySuspend",
+            }
         )
         .unwrap();
         writeln!(&mut out).unwrap();
@@ -1997,7 +2022,7 @@ fn type_label(ty: &Type) -> String {
                     };
                     format!("{} | null", type_label(inner))
                 }
-                "VmResult" | "BuiltinResult" | "HostResult" => {
+                "VmResult" | "HostCallResult" => {
                     let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
                         panic!("{ident}<T> requires one generic argument");
                     };
