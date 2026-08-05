@@ -53,6 +53,16 @@ fn parse_name_arg(args: &Punctuated<Meta, Token![,]>) -> Result<LitStr, Error> {
             "expected #[pd_host_function(name = \"...\")]",
         ));
     };
+    if args.len() != 1 {
+        let extra = args
+            .iter()
+            .nth(1)
+            .expect("a non-empty attribute with more than one argument has an extra argument");
+        return Err(Error::new_spanned(
+            extra,
+            "#[pd_host_function] only supports name = \"...\"",
+        ));
+    }
     if !name_value.path.is_ident("name") {
         return Err(Error::new_spanned(
             &name_value.path,
@@ -492,5 +502,22 @@ mod tests {
         let expanded = expand_pd_host_function(attr, item)
             .expect("HostCallResult should be accepted from the return signature");
         assert!(expanded.to_string().contains("HostCallResult"));
+    }
+
+    #[test]
+    fn rejects_async_attribute_instead_of_treating_it_as_a_host_contract() {
+        let attr: Punctuated<Meta, Token![,]> =
+            parse_quote!(name = "test::suspend", r#async = true);
+        let item: ItemFn = parse_quote! {
+            /// Returns a value after a host operation completes.
+            #[pd_host_function(name = "test::suspend")]
+            fn suspend() -> VmResult<HostCallResult<Value>> {
+                todo!()
+            }
+        };
+
+        let error = expand_pd_host_function(attr, item)
+            .expect_err("the pd-host-function macro must not accept an async attribute");
+        assert!(error.to_string().contains("only supports name"));
     }
 }
