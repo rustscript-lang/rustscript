@@ -2,7 +2,9 @@
 #[path = "../build.rs"]
 mod build_script;
 
-use build_script::{HostBindingKind, classify_host_binding};
+use build_script::{
+    HostBindingKind, HostExecutionKind, classify_host_binding, infer_host_execution,
+};
 use syn::parse_quote;
 use vm::{HostFunctionRegistry, JitConfig, JitTraceTerminal, Value, Vm, VmStatus, compile_source};
 
@@ -118,6 +120,35 @@ fn classifies_best_effort_host_bindings_from_signatures() {
             HostBindingKind::StaticArgs
         );
     }
+}
+
+#[test]
+fn infers_host_suspension_from_the_return_signature() {
+    for function in [
+        parse_quote!(
+            fn host() -> HostCallResult<Value> {}
+        ),
+        parse_quote!(
+            fn host() -> VmResult<HostCallResult<Value>> {}
+        ),
+        parse_quote!(
+            fn host() -> HostResult<HostCallResult<Value>> {}
+        ),
+    ] {
+        assert_eq!(
+            infer_host_execution(&function),
+            HostExecutionKind::MaySuspend
+        );
+        assert_eq!(
+            classify_host_binding(&function),
+            HostBindingKind::StaticArgs
+        );
+    }
+
+    let synchronous = parse_quote!(
+        fn host() -> VmResult<Value> {}
+    );
+    assert_eq!(infer_host_execution(&synchronous), HostExecutionKind::Sync);
 }
 
 fn assert_runtime_sleep_loop_uses_native_host_call(bind_cached_registry: bool) {

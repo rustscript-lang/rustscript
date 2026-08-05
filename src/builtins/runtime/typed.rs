@@ -35,6 +35,12 @@ impl NumberValue {
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub enum HostCallResult<T> {
+    Return(T),
+    Pending(HostOpId),
+}
+
 pub(super) fn missing_arg(label: &str) -> VmError {
     VmError::HostError(format!("missing argument: {label}"))
 }
@@ -475,6 +481,18 @@ impl IntoHostCallOutcome for CallOutcome {
     }
 }
 
+impl<T> IntoHostCallOutcome for HostCallResult<T>
+where
+    T: IntoVmValue,
+{
+    fn into_host_call_outcome(self) -> CallOutcome {
+        match self {
+            Self::Return(value) => value.into_host_call_outcome(),
+            Self::Pending(op_id) => CallOutcome::Pending(op_id),
+        }
+    }
+}
+
 impl<T> IntoHostCallOutcome for T
 where
     T: IntoVmValue,
@@ -486,7 +504,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Value, arg};
+    use super::{HostCallResult, IntoHostCallOutcome, Value, arg};
+    use crate::vm::{CallOutcome, CallReturn};
 
     #[test]
     fn optional_arg_decodes_missing_as_none() {
@@ -510,5 +529,17 @@ mod tests {
         let value =
             arg::<Option<&str>>(&args, 0, "label").expect("present optional arg should decode");
         assert_eq!(value, Some("hello"));
+    }
+
+    #[test]
+    fn host_call_result_converts_return_and_pending_variants() {
+        assert_eq!(
+            HostCallResult::Return(true).into_host_call_outcome(),
+            CallOutcome::Return(CallReturn::one(Value::Bool(true)))
+        );
+        assert_eq!(
+            HostCallResult::<Value>::Pending(17).into_host_call_outcome(),
+            CallOutcome::Pending(17)
+        );
     }
 }
