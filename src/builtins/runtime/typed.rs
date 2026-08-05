@@ -465,7 +465,19 @@ where
 {
     fn into_builtin_call_outcome(self) -> BuiltinCallOutcome {
         match self {
-            Self::Return(value) => value.into_builtin_call_outcome(),
+            Self::Return(value) => BuiltinCallOutcome::Return(return_one(value)),
+            Self::Pending(op_id) => BuiltinCallOutcome::Pending(op_id),
+        }
+    }
+}
+
+impl<T> IntoBuiltinCallOutcome for HostCallResult<T>
+where
+    T: IntoVmValue,
+{
+    fn into_builtin_call_outcome(self) -> BuiltinCallOutcome {
+        match self {
+            Self::Return(value) => BuiltinCallOutcome::Return(return_one(value)),
             Self::Pending(op_id) => BuiltinCallOutcome::Pending(op_id),
         }
     }

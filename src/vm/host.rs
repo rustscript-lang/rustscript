@@ -851,6 +851,18 @@ impl Vm {
         self.runtime_print_sink = None;
     }
 
+    pub fn configure_http(&mut self, config: crate::builtins::runtime::HttpConfig) {
+        self.http_state.configure(config);
+    }
+
+    pub fn clear_http_configuration(&mut self) {
+        self.http_state.clear_configuration();
+    }
+
+    pub fn http_is_configured(&self) -> bool {
+        self.http_state.is_configured()
+    }
+
     pub(crate) fn write_runtime_print(&mut self, rendered: String) -> VmResult<()> {
         let Some(sink) = self.runtime_print_sink.as_mut() else {
             return Err(VmError::HostError(
@@ -1520,7 +1532,7 @@ impl Vm {
                 saved_stack.append(&mut host_stack);
                 self.stack = saved_stack;
                 let resume_ip = self.call_resume_ip(call_ip)?;
-                self.set_waiting_host_op(op_id, WaitingHostOpSource::HostBridge)?;
+                self.set_waiting_host_op(op_id, self.pending_host_op_source(op_id))?;
                 self.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
             }
@@ -1630,7 +1642,7 @@ impl Vm {
             CallOutcome::Pending(op_id) => {
                 self.stack.truncate(arg_start);
                 let resume_ip = self.call_resume_ip(call_ip)?;
-                self.set_waiting_host_op(op_id, WaitingHostOpSource::HostBridge)?;
+                self.set_waiting_host_op(op_id, self.pending_host_op_source(op_id))?;
                 self.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
             }
@@ -1688,7 +1700,7 @@ impl Vm {
             CallOutcome::Pending(op_id) => {
                 self.stack.truncate(arg_start);
                 let resume_ip = self.call_resume_ip(call_ip)?;
-                self.set_waiting_host_op(op_id, WaitingHostOpSource::HostBridge)?;
+                self.set_waiting_host_op(op_id, self.pending_host_op_source(op_id))?;
                 self.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
             }
@@ -1713,6 +1725,14 @@ impl Vm {
             return Err(VmError::BytecodeBounds);
         }
         Ok(resume_ip)
+    }
+
+    fn pending_host_op_source(&self, op_id: HostOpId) -> WaitingHostOpSource {
+        if crate::builtins::runtime::is_builtin_io_op(self, op_id) {
+            WaitingHostOpSource::BuiltinIo
+        } else {
+            WaitingHostOpSource::HostBridge
+        }
     }
 
     pub(super) fn set_waiting_host_op(

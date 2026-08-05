@@ -43,6 +43,10 @@ pub(super) fn cancel_pending_op(vm: &mut Vm, op_id: HostOpId) {
     vm.io_state.pending_ops.remove(&op_id);
 }
 
+pub(super) fn has_pending_op(vm: &Vm, op_id: HostOpId) -> bool {
+    vm.io_state.pending_ops.contains_key(&op_id)
+}
+
 pub(super) fn poll_builtin_io_op(
     vm: &mut Vm,
     op_id: HostOpId,

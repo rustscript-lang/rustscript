@@ -24,6 +24,8 @@ pub use assembler::{AsmParseError, Assembler, AssemblerError, BytecodeBuilder, a
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::HostCallResult;
 #[cfg(feature = "runtime")]
+pub use builtins::runtime::HttpConfig;
+#[cfg(feature = "runtime")]
 pub use builtins::runtime::print::{PrintHostFunction, PrintlnHostFunction, format_value};
 pub use builtins::{
     BuiltinFunction, BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec, CallableDef, CallableParam,
@@ -35,7 +37,7 @@ pub use builtins::{
 pub use bytecode::{
     CallableEnvironment, CallableKind, CallablePrototype, CallableTarget, CallableValue,
     CaptureBindingMode, ExportedCallable, FunctionRegion, HostImport, OpCode, Program,
-    RootCallableBinding, ScriptFunction, TypeMap, Value, ValueType,
+    RootCallableBinding, ScriptFunction, TypeMap, Value, ValueType, VmMap,
 };
 pub fn builtin_call_index(name: &str) -> Option<u16> {
     use builtins::BuiltinFunction;
