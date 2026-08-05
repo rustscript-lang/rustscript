@@ -1,7 +1,9 @@
 use std::task::{Context, Poll};
 
 #[cfg(feature = "http-client")]
-use std::io::Read;
+use futures_util::StreamExt;
+#[cfg(feature = "http-client")]
+use futures_util::future::{AbortHandle, Abortable};
 
 use pd_host_function::pd_host_function;
 
@@ -49,8 +51,7 @@ pub(crate) struct HttpState {
     config: Option<HttpConfig>,
     pending_ops:
         std::collections::HashMap<HostOpId, futures_channel::oneshot::Receiver<HttpCompletion>>,
-    cancel_flags:
-        std::collections::HashMap<HostOpId, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    abort_handles: std::collections::HashMap<HostOpId, AbortHandle>,
 }
 
 #[cfg(not(feature = "http-client"))]
@@ -63,7 +64,7 @@ impl Default for HttpState {
             return Self {
                 config: None,
                 pending_ops: std::collections::HashMap::new(),
-                cancel_flags: std::collections::HashMap::new(),
+                abort_handles: std::collections::HashMap::new(),
             };
         }
 
@@ -106,20 +107,29 @@ impl HttpState {
         config: HttpConfig,
         request: HttpRequest,
     ) -> VmResult<HostOpId> {
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicBool;
-
         let (sender, receiver) = futures_channel::oneshot::channel();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let worker_cancelled = Arc::clone(&cancelled);
+        let (abort_handle, abort_registration) = AbortHandle::new_pair();
         let thread_name = format!("rustscript-http-{op_id}");
         std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                let result = if worker_cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                    Err(VmError::HostError("HTTP request was cancelled".to_string()))
-                } else {
-                    execute_request(&config, &request, &worker_cancelled)
+                let result = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(async move {
+                        match Abortable::new(execute_request(&config, &request), abort_registration)
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => {
+                                Err(VmError::HostError("HTTP request was cancelled".to_string()))
+                            }
+                        }
+                    }),
+                    Err(error) => Err(VmError::HostError(format!(
+                        "failed to create HTTP runtime: {error}"
+                    ))),
                 };
                 let _ = sender.send(HttpCompletion { result });
             })
@@ -127,7 +137,7 @@ impl HttpState {
                 VmError::HostError(format!("failed to start HTTP request: {error}"))
             })?;
         self.pending_ops.insert(op_id, receiver);
-        self.cancel_flags.insert(op_id, cancelled);
+        self.abort_handles.insert(op_id, abort_handle);
         Ok(op_id)
     }
 
@@ -138,18 +148,17 @@ impl HttpState {
 
     #[cfg(feature = "http-client")]
     fn cancel_pending_op(&mut self, op_id: HostOpId) {
-        if let Some(flag) = self.cancel_flags.remove(&op_id) {
-            flag.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(handle) = self.abort_handles.remove(&op_id) {
+            handle.abort();
         }
         self.pending_ops.remove(&op_id);
     }
 
     #[cfg(feature = "http-client")]
     fn cancel_all(&mut self) {
-        for flag in self.cancel_flags.values() {
-            flag.store(true, std::sync::atomic::Ordering::Release);
+        for handle in self.abort_handles.drain().map(|(_, handle)| handle) {
+            handle.abort();
         }
-        self.cancel_flags.clear();
         self.pending_ops.clear();
     }
 
@@ -171,12 +180,12 @@ impl HttpState {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(completion)) => {
                 self.pending_ops.remove(&op_id);
-                self.cancel_flags.remove(&op_id);
+                self.abort_handles.remove(&op_id);
                 Poll::Ready(completion.result)
             }
             Poll::Ready(Err(_)) => {
                 self.pending_ops.remove(&op_id);
-                self.cancel_flags.remove(&op_id);
+                self.abort_handles.remove(&op_id);
                 Poll::Ready(Err(VmError::HostError(format!(
                     "HTTP op {op_id} was cancelled",
                 ))))
@@ -210,7 +219,6 @@ pub(super) fn builtin_http_client_request(
             .clone()
             .ok_or_else(|| VmError::HostError("HTTP host is not configured".to_string()))?;
         let request = parse_request(request, &config)?;
-        validate_url(&config, &request.url)?;
         let op_id = vm.allocate_host_op_id();
         let op_id = vm.http_state.schedule(op_id, config, request)?;
         Ok(HostCallResult::Pending(op_id))
@@ -356,7 +364,7 @@ fn map_string(map: &VmMap, key: &str) -> VmResult<String> {
 }
 
 #[cfg(feature = "http-client")]
-fn validate_url(config: &HttpConfig, url: &url::Url) -> VmResult<()> {
+fn validate_url(config: &HttpConfig, url: &url::Url) -> VmResult<Option<std::net::SocketAddr>> {
     let scheme = url.scheme().to_ascii_lowercase();
     if !config
         .allowed_schemes
@@ -382,29 +390,39 @@ fn validate_url(config: &HttpConfig, url: &url::Url) -> VmResult<()> {
     let port = url
         .port_or_known_default()
         .ok_or_else(|| VmError::HostError("HTTP URL has no known port".to_string()))?;
-    if !config.allowed_ports.is_empty() && !config.allowed_ports.contains(&port) {
+    if !config.allowed_ports.contains(&port) {
         return Err(VmError::HostError(format!(
             "HTTP target port {port} is not allowed",
         )));
     }
-    if !config.allow_private_ips {
-        let host_ip = host.parse::<std::net::IpAddr>().ok();
-        if host_ip.is_some_and(is_restricted_ip) {
-            return Err(VmError::HostError(
-                "HTTP target resolves to a restricted IP".to_string(),
-            ));
-        }
-        use std::net::ToSocketAddrs;
-        let addresses = (host, port)
-            .to_socket_addrs()
-            .map_err(|error| VmError::HostError(format!("HTTP host resolution failed: {error}")))?;
-        if addresses.map(|address| address.ip()).any(is_restricted_ip) {
-            return Err(VmError::HostError(
-                "HTTP target resolves to a restricted IP".to_string(),
-            ));
-        }
+    if config.allow_private_ips {
+        return Ok(None);
     }
-    Ok(())
+
+    if let Some(host_ip) = host.parse::<std::net::IpAddr>().ok() {
+        if is_restricted_ip(host_ip) {
+            return Err(VmError::HostError(
+                "HTTP target resolves to a restricted IP".to_string(),
+            ));
+        }
+        return Ok(None);
+    }
+
+    use std::net::ToSocketAddrs;
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| VmError::HostError(format!("HTTP host resolution failed: {error}")))?
+        .collect::<Vec<_>>();
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|address| is_restricted_ip(address.ip()))
+    {
+        return Err(VmError::HostError(
+            "HTTP target resolves to a restricted IP".to_string(),
+        ));
+    }
+    Ok(addresses.first().copied())
 }
 
 #[cfg(feature = "http-client")]
@@ -419,6 +437,9 @@ fn is_restricted_ip(ip: std::net::IpAddr) -> bool {
                 || ip.is_multicast()
         }
         std::net::IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_restricted_ip(std::net::IpAddr::V4(mapped));
+            }
             ip.is_loopback()
                 || ip.is_unique_local()
                 || ip.is_unicast_link_local()
@@ -429,28 +450,28 @@ fn is_restricted_ip(ip: std::net::IpAddr) -> bool {
 }
 
 #[cfg(feature = "http-client")]
-fn execute_request(
-    config: &HttpConfig,
-    request: &HttpRequest,
-    cancelled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> VmResult<CallReturn> {
-    let client = reqwest::blocking::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .connect_timeout(config.connect_timeout)
-        .timeout(config.request_timeout)
-        .build()
-        .map_err(|error| VmError::HostError(format!("HTTP client setup failed: {error}")))?;
+async fn execute_request(config: &HttpConfig, request: &HttpRequest) -> VmResult<CallReturn> {
+    let deadline = std::time::Instant::now() + config.request_timeout;
     let mut method = request.method.clone();
     let mut url = request.url.clone();
     let mut body = request.body.clone();
     let mut headers = request.headers.clone();
 
     for redirect_index in 0..=config.max_redirects {
-        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(VmError::HostError("HTTP request was cancelled".to_string()));
+        let resolved_address = validate_url(config, &url)?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| VmError::HostError("HTTP URL has no host".to_string()))?;
+        let mut client_builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .connect_timeout(config.connect_timeout);
+        if let Some(address) = resolved_address {
+            client_builder = client_builder.resolve(host, address);
         }
-        validate_url(config, &url)?;
+        let client = client_builder
+            .build()
+            .map_err(|error| VmError::HostError(format!("HTTP client setup failed: {error}")))?;
         let origin = request.url.origin();
         let mut builder = client.request(method.clone(), url.clone());
         for (name, value) in &headers {
@@ -459,8 +480,13 @@ fn execute_request(
         if let Some(body) = &body {
             builder = builder.body(body.clone());
         }
-        let mut response = builder
-            .send()
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(VmError::HostError("HTTP request timed out".to_string()));
+        }
+        let response = tokio::time::timeout(remaining, builder.send())
+            .await
+            .map_err(|_| VmError::HostError("HTTP request timed out".to_string()))?
             .map_err(|error| VmError::HostError(format!("HTTP request failed: {error}")))?;
         if response.status().is_redirection() {
             if redirect_index == config.max_redirects {
@@ -473,11 +499,11 @@ fn execute_request(
                 .get(reqwest::header::LOCATION)
                 .ok_or_else(|| VmError::HostError("HTTP redirect has no location".to_string()))?
                 .to_str()
-                .map_err(|_| VmError::HostError("HTTP redirect location is invalid".to_string()))?;
+                .map_err(|_| VmError::HostError("HTTP redirect location is invalid".to_string()))?
+                .to_string();
             let next_url = url
-                .join(location)
+                .join(&location)
                 .map_err(|error| VmError::HostError(format!("invalid HTTP redirect: {error}")))?;
-            validate_url(config, &next_url)?;
             if next_url.origin() != origin {
                 headers.retain(|(name, _)| {
                     name != reqwest::header::AUTHORIZATION && name != reqwest::header::COOKIE
@@ -496,31 +522,45 @@ fn execute_request(
             continue;
         }
 
-        let mut bytes = Vec::new();
-        let mut limited_response =
-            (&mut response).take(config.max_response_body_bytes.saturating_add(1) as u64);
-        limited_response
-            .read_to_end(&mut bytes)
-            .map_err(|error| VmError::HostError(format!("HTTP response read failed: {error}")))?;
-        if bytes.len() > config.max_response_body_bytes {
-            return Err(VmError::HostError(
-                "HTTP response body exceeds limit".to_string(),
-            ));
-        }
         let response_headers = response
             .headers()
             .iter()
-            .filter_map(|(name, value)| {
-                value
+            .map(|(name, value)| {
+                let value = value
                     .to_str()
-                    .ok()
-                    .map(|value| (Value::string(name.as_str()), Value::string(value)))
+                    .map(Value::string)
+                    .unwrap_or_else(|_| Value::bytes(value.as_bytes().to_vec()));
+                (Value::string(name.as_str()), value)
             })
             .collect::<Vec<_>>();
+        let status = response.status();
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(VmError::HostError(
+                    "HTTP response read timed out".to_string(),
+                ));
+            }
+            tokio::time::timeout(remaining, stream.next())
+                .await
+                .map_err(|_| VmError::HostError("HTTP response read timed out".to_string()))?
+        } {
+            let chunk = chunk.map_err(|error| {
+                VmError::HostError(format!("HTTP response read failed: {error}"))
+            })?;
+            if bytes.len().saturating_add(chunk.len()) > config.max_response_body_bytes {
+                return Err(VmError::HostError(
+                    "HTTP response body exceeds limit".to_string(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
         let response_map = VmMap::from_entries(vec![
             (
                 Value::string("status"),
-                Value::Int(i64::from(response.status().as_u16())),
+                Value::Int(i64::from(status.as_u16())),
             ),
             (
                 Value::string("headers"),
@@ -541,13 +581,36 @@ fn execute_request(
 
 #[cfg(test)]
 mod tests {
-    use super::HttpConfig;
+    use super::{HttpConfig, is_restricted_ip, validate_url};
 
     #[test]
     fn default_http_policy_denies_all_hosts() {
         let config = HttpConfig::default();
         assert_eq!(config.allowed_schemes, ["https"]);
         assert!(config.allowed_hosts.is_empty());
+        assert!(config.allowed_ports.is_empty());
         assert!(!config.allow_private_ips);
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn empty_port_allowlist_rejects_explicit_and_default_ports() {
+        let config = HttpConfig {
+            allowed_schemes: vec!["https".to_string()],
+            allowed_hosts: vec!["example.com".to_string()],
+            ..HttpConfig::default()
+        };
+        let explicit = "https://example.com:443/".parse().expect("valid URL");
+        let default_port = "https://example.com/".parse().expect("valid URL");
+        assert!(validate_url(&config, &explicit).is_err());
+        assert!(validate_url(&config, &default_port).is_err());
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn ipv4_mapped_ipv6_loopback_is_restricted() {
+        assert!(is_restricted_ip(
+            "::ffff:127.0.0.1".parse().expect("valid IP")
+        ));
     }
 }

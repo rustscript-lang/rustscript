@@ -27,7 +27,7 @@ name = "vm"
 [features]
 default = ["runtime", "cli", "cranelift-jit"]
 runtime = []
-http-client = ["dep:reqwest", "dep:url"]
+http-client = ["dep:reqwest", "dep:url", "dep:tokio", "dep:futures-util"]
 edge-abi = [
     "dep:edge_abi",
     "edge_abi/console",
@@ -61,8 +61,10 @@ cranelift-jit = { version = "0.129.1", optional = true }
 cranelift-module = { version = "0.129.1", optional = true }
 cranelift-native = { version = "0.129.1", optional = true }
 pd-host-function = { path = "./pd-host-function", version = "0.1.0" }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"], optional = true }
 url = { version = "2", optional = true }
+futures-util = { version = "0.3", optional = true }
+tokio = { version = "1", features = ["rt", "net", "time"], optional = true }
 edge_abi = { package = "pd-edge-abi", version = "0.1.1", default-features = false, optional = true }
 futures-channel = "0.3"
 paste = "1"

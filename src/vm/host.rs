@@ -137,7 +137,7 @@ impl Default for HostFunctionRegistry {
 }
 
 impl HostFunctionRegistry {
-    fn empty() -> Self {
+    pub fn empty() -> Self {
         Self {
             entries: Arc::new(Vec::new()),
             by_name: Arc::new(HashMap::new()),
@@ -456,6 +456,7 @@ impl HostFunctionRegistry {
             }
         }
         vm.install_resolved_calls(plan.resolved_calls.clone())?;
+        vm.set_default_host_fallback_enabled(false);
         Ok(())
     }
 }
@@ -863,6 +864,19 @@ impl Vm {
         self.http_state.is_configured()
     }
 
+    /// Enables or disables implicit binding of built-in host functions.
+    ///
+    /// Disabling this makes the VM use only explicitly registered host functions. The default
+    /// remains enabled for backwards compatibility until a registry is bound.
+    pub fn set_default_host_fallback_enabled(&mut self, enabled: bool) {
+        self.allow_default_host_fallback = enabled;
+        self.resolved_calls_dirty = true;
+    }
+
+    pub fn default_host_fallback_enabled(&self) -> bool {
+        self.allow_default_host_fallback
+    }
+
     pub(crate) fn write_runtime_print(&mut self, rendered: String) -> VmResult<()> {
         let Some(sink) = self.runtime_print_sink.as_mut() else {
             return Err(VmError::HostError(
@@ -883,7 +897,7 @@ impl Vm {
         self.waiting_host_op.map(|op| op.op_id)
     }
 
-    pub(super) fn cancel_waiting_host_op(&mut self) {
+    pub fn cancel_waiting_host_op(&mut self) {
         let Some(waiting) = self.waiting_host_op.take() else {
             return;
         };
@@ -952,6 +966,35 @@ impl Vm {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         loop {
+            match self.poll_waiting_host_op(&mut cx) {
+                Poll::Ready(result) => return result,
+                Poll::Pending => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        return Err(VmError::HostError(
+                            "blocking host-op wait is unsupported on wasm32 runtime".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn wait_for_host_op_blocking_with_cancel<F>(&mut self, mut should_cancel: F) -> VmResult<()>
+    where
+        F: FnMut() -> bool,
+    {
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            if should_cancel() {
+                self.cancel_waiting_host_op();
+                return Err(VmError::HostError("host operation cancelled".to_string()));
+            }
             match self.poll_waiting_host_op(&mut cx) {
                 Poll::Ready(result) => return result,
                 Poll::Pending => {
@@ -1797,7 +1840,10 @@ impl Vm {
             return Ok(());
         }
 
-        if self.host_function_symbols.is_empty() && self.host_functions.is_empty() {
+        if self.allow_default_host_fallback
+            && self.host_function_symbols.is_empty()
+            && self.host_functions.is_empty()
+        {
             let import_names = self
                 .program
                 .imports
@@ -1823,7 +1869,9 @@ impl Vm {
 
             let bound = if let Some(bound) = self.host_function_symbols.get(&import.name).copied() {
                 bound
-            } else if crate::builtins::runtime::bind_default_host_function(self, &import.name) {
+            } else if self.allow_default_host_fallback
+                && crate::builtins::runtime::bind_default_host_function(self, &import.name)
+            {
                 self.host_function_symbols
                     .get(&import.name)
                     .copied()
