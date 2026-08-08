@@ -5,13 +5,33 @@ use syn::{
     punctuated::Punctuated,
 };
 
+mod edge;
+
 #[proc_macro_attribute]
 pub fn pd_host_function(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr with Punctuated::<Meta, Token![,]>::parse_terminated);
-    match expand_pd_host_function(args, parse_macro_input!(item as ItemFn)) {
+    let item = parse_macro_input!(item as ItemFn);
+    let result = if uses_edge_host_contract(&args, &item) {
+        edge::expand_scoped_pd_host_function(args, item)
+    } else {
+        expand_pd_host_function(args, item)
+    };
+    match result {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }
+}
+
+fn uses_edge_host_contract(args: &Punctuated<Meta, Token![,]>, item: &ItemFn) -> bool {
+    if item.sig.asyncness.is_some() {
+        return true;
+    }
+
+    args.iter().any(|meta| match meta {
+        Meta::NameValue(name_value) if name_value.path.is_ident("scope") => true,
+        Meta::List(list) if list.path.is_ident("bind") => true,
+        _ => false,
+    })
 }
 
 fn expand_pd_host_function(
@@ -53,6 +73,16 @@ fn parse_name_arg(args: &Punctuated<Meta, Token![,]>) -> Result<LitStr, Error> {
             "expected #[pd_host_function(name = \"...\")]",
         ));
     };
+    if args.len() != 1 {
+        let extra = args
+            .iter()
+            .nth(1)
+            .expect("a non-empty attribute with more than one argument has an extra argument");
+        return Err(Error::new_spanned(
+            extra,
+            "#[pd_host_function] only supports name = \"...\"",
+        ));
+    }
     if !name_value.path.is_ident("name") {
         return Err(Error::new_spanned(
             &name_value.path,
@@ -352,7 +382,7 @@ fn type_label(ty: &Type) -> Result<String, Error> {
                     let inner_label = type_label(inner)?;
                     Ok(format!("{inner_label} | null"))
                 }
-                "VmResult" | "BuiltinResult" | "HostResult" => {
+                "VmResult" | "BuiltinResult" | "HostResult" | "HostCallResult" => {
                     let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
                         return Err(Error::new_spanned(
                             &segment.arguments,
@@ -470,5 +500,49 @@ fn uses_taken_extractor(ty: &Type) -> bool {
             )
         }),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{expand_pd_host_function, uses_edge_host_contract};
+    use syn::{ItemFn, Meta, Token, parse_quote, punctuated::Punctuated};
+
+    #[test]
+    fn accepts_host_call_result_from_the_function_signature() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "test::suspend");
+        let item: ItemFn = parse_quote! {
+            /// Returns a value after a host operation completes.
+            #[pd_host_function(name = "test::suspend")]
+            fn suspend() -> VmResult<HostCallResult<Value>> {
+                todo!()
+            }
+        };
+
+        let expanded = expand_pd_host_function(attr, item)
+            .expect("HostCallResult should be accepted from the return signature");
+        assert!(expanded.to_string().contains("HostCallResult"));
+    }
+
+    #[test]
+    fn native_async_signature_selects_edge_contract() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "test::async_call");
+        let item: ItemFn = parse_quote! {
+            async fn async_call() -> VmResult<HostCallResult<Value>> {
+                todo!()
+            }
+        };
+        assert!(uses_edge_host_contract(&attr, &item));
+    }
+
+    #[test]
+    fn name_expression_alone_does_not_select_edge_contract() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = NAME_PATH);
+        let item: ItemFn = parse_quote! {
+            fn sync_call() -> VmResult<HostCallResult<Value>> {
+                todo!()
+            }
+        };
+        assert!(!uses_edge_host_contract(&attr, &item));
     }
 }

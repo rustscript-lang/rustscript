@@ -22,17 +22,22 @@ pub mod vmbc;
 
 pub use assembler::{AsmParseError, Assembler, AssemblerError, BytecodeBuilder, assemble};
 #[cfg(feature = "runtime")]
+pub use builtins::runtime::HostCallResult;
+#[cfg(feature = "runtime")]
+pub use builtins::runtime::HttpConfig;
+#[cfg(feature = "runtime")]
 pub use builtins::runtime::print::{PrintHostFunction, PrintlnHostFunction, format_value};
 pub use builtins::{
     BuiltinFunction, BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec, CallableDef, CallableParam,
-    CallableParamType, CallableSignature, LanguageBuiltinSpec, builtin_namespace_specs,
-    callable_signatures_for_builtin_namespace_member, default_host_callables, is_builtin_namespace,
-    language_builtin_specs, resolve_builtin_namespace_call,
+    CallableParamType, CallableSignature, HostExecution, LanguageBuiltinSpec,
+    builtin_namespace_specs, callable_signatures_for_builtin_namespace_member,
+    default_host_callables, is_builtin_namespace, language_builtin_specs,
+    resolve_builtin_namespace_call,
 };
 pub use bytecode::{
     CallableEnvironment, CallableKind, CallablePrototype, CallableTarget, CallableValue,
     CaptureBindingMode, ExportedCallable, FunctionRegion, HostImport, OpCode, Program,
-    RootCallableBinding, ScriptFunction, TypeMap, Value, ValueType,
+    RootCallableBinding, ScriptFunction, TypeMap, Value, ValueType, VmMap,
 };
 pub fn builtin_call_index(name: &str) -> Option<u16> {
     use builtins::BuiltinFunction;
