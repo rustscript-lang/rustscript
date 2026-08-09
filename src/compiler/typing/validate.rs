@@ -556,7 +556,13 @@ pub(super) fn validate_expr(
         )?,
         Expr::Var(slot) | Expr::MoveVar(slot) => state.get(*slot),
         Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => state.get(*root),
-        Expr::FunctionRef(..) | Expr::Call(..) | Expr::LocalCall(..) | Expr::Closure(_) => {
+        Expr::FunctionRef(..)
+        | Expr::ModuleFunctionRef(..)
+        | Expr::UnresolvedFunctionRef { .. }
+        | Expr::Call(..)
+        | Expr::ModuleCall(..)
+        | Expr::LocalCall(..)
+        | Expr::Closure(_) => {
             validate_expr_children(
                 expr,
                 state,

@@ -1,5 +1,14 @@
 # Semantic Module System Implementation Plan
 
+**Status (2026-08-09):** Milestones 1-7 complete, committed in b3ef8a7.
+The semantic module graph is the sole file-module path: `rewrite.rs` and
+`line_map.rs` are deleted, the synthetic imported-function prelude is gone,
+and module sources are parsed verbatim with implicit-extern fallback and
+resolved by `SymbolId` in the source loader (see
+`src/compiler/source_loader.rs` module docs). Verification: `compiler_tests`
+(215 tests incl. `semantic_module_m6_tests`), workspace all-features tests,
+fmt, clippy (no new warnings), and `git diff --check` are green.
+
 **Goal:** Replace textual import rewriting and synthetic declarations with a semantic module graph and symbol resolution model.
 
 **Architecture:** Parse imports as syntax, assign every source a `ModuleId` and `SourceId`, resolve declarations to `SymbolId`, and link by resolved identity. Module namespaces, visibility, private helpers, and diagnostics become first-class compiler data instead of rewritten text and parallel metadata arrays.

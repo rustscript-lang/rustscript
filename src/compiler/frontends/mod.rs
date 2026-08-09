@@ -21,10 +21,61 @@ pub(super) fn parse_source(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<FrontendIr, ParseError> {
+    parse_source_with_source_id(source, flavor, options, 0)
+}
+
+/// Parse `source` and attribute every produced span to `original_source_id`.
+///
+/// The id belongs to the compilation-wide [`SourceMap`] built by the source
+/// loader, whose ids are the semantic module graph's
+/// [`SourceId`](crate::compiler::modules::SourceId) space. Spans produced by
+/// this parse (including the error span on failure) therefore stay owned by
+/// the module's source after unit merge. The default id `0` preserves the
+/// legacy single-source behavior for entry points that build their own map.
+pub(super) fn parse_source_with_source_id(
+    source: &str,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+    original_source_id: u32,
+) -> Result<FrontendIr, ParseError> {
+    parse_source_with_source_id_and_externs(source, flavor, options, original_source_id, false)
+}
+
+/// Parse one module's source for the source loader (module mode).
+///
+/// Module-mode parses enable the parser's implicit-extern fallback so that
+/// calls to imported module functions and module namespace members parse
+/// before the loader resolves them by [`SymbolId`](crate::compiler::modules::SymbolId).
+/// The produced IR carries the implicit-extern names on
+/// [`FrontendIr::implicit_extern_names`] so the loader keeps those synthetic
+/// declarations out of module declaration/export tables.
+pub(super) fn parse_module_source_with_source_id(
+    source: &str,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+    original_source_id: u32,
+) -> Result<FrontendIr, ParseError> {
+    parse_source_with_source_id_and_externs(source, flavor, options, original_source_id, true)
+}
+
+fn parse_source_with_source_id_and_externs(
+    source: &str,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+    original_source_id: u32,
+    allow_implicit_externs: bool,
+) -> Result<FrontendIr, ParseError> {
     match flavor {
         SourceFlavor::RustScript => {
             let lowered = rustscript::lower(source)?;
-            parse_lowered_with_mapping(source, lowered, false, false, true)
+            parse_lowered_with_mapping(
+                source,
+                lowered,
+                allow_implicit_externs,
+                false,
+                true,
+                original_source_id,
+            )
         }
         SourceFlavor::JavaScript | SourceFlavor::Lua => {
             let Some(plugin) = options.source_plugin_for_flavor(flavor) else {
@@ -60,6 +111,7 @@ pub fn parse_source_with_dialect(
         options.allow_implicit_externs,
         options.allow_implicit_semicolons,
         options.enforce_mutable_bindings,
+        options.import_scan_mode,
         dialect,
     )
 }
@@ -86,6 +138,7 @@ fn parse_with_parser(
     allow_implicit_externs: bool,
     allow_implicit_semicolons: bool,
     enforce_mutable_bindings: bool,
+    import_scan_mode: bool,
     dialect: &'static dyn ParserDialect,
 ) -> Result<FrontendIr, ParseError> {
     let mut parser = Parser::new(
@@ -94,6 +147,7 @@ fn parse_with_parser(
         allow_implicit_externs,
         allow_implicit_semicolons,
         enforce_mutable_bindings,
+        import_scan_mode,
         dialect,
     )?;
     let stmts = parser.parse_program()?;
@@ -107,6 +161,8 @@ fn parse_with_parser(
         function_impls: parser.function_impls(),
         stmt_sources: Vec::new(),
         function_sources: HashMap::new(),
+        use_declarations: parser.use_declarations(),
+        implicit_extern_names: parser.implicit_extern_names(),
     })
 }
 
@@ -142,6 +198,8 @@ fn parse_repl_with_parser(
             function_impls: parser.function_impls(),
             stmt_sources: Vec::new(),
             function_sources: HashMap::new(),
+            use_declarations: parser.use_declarations(),
+            implicit_extern_names: parser.implicit_extern_names(),
         },
         bindings,
     })
@@ -153,9 +211,10 @@ fn parse_lowered_with_mapping(
     allow_implicit_externs: bool,
     allow_implicit_semicolons: bool,
     enforce_mutable_bindings: bool,
+    original_source_id: u32,
 ) -> Result<FrontendIr, ParseError> {
     let mut source_map = SourceMap::new();
-    let original_source_id = source_map.add_source("<source>", original_source.to_string());
+    source_map.add_source_at(original_source_id, "<source>", original_source.to_string());
     let lowered_source_id = source_map.add_source("<lowered>", lowered.text.clone());
 
     match parse_with_parser(
@@ -164,6 +223,7 @@ fn parse_lowered_with_mapping(
         allow_implicit_externs,
         allow_implicit_semicolons,
         enforce_mutable_bindings,
+        false,
         rustscript::parser_dialect(),
     ) {
         Ok(mut ir) => {

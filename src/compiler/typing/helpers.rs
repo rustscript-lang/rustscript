@@ -1370,6 +1370,8 @@ pub(super) fn expr_contains_param_add(expr: &Expr, param_slots: &[LocalSlot]) ->
         | Expr::Bytes(_)
         | Expr::String(_)
         | Expr::FunctionRef(..)
+        | Expr::ModuleFunctionRef(..)
+        | Expr::UnresolvedFunctionRef { .. }
         | Expr::Var(_)
         | Expr::MoveVar(_)
         | Expr::MoveField { .. }
@@ -1384,7 +1386,7 @@ pub(super) fn expr_contains_param_add(expr: &Expr, param_slots: &[LocalSlot]) ->
             expr_contains_param_add(value, param_slots)
                 || expr_contains_param_add(fallback, param_slots)
         }
-        Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) => args
+        Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) | Expr::ModuleCall(_, _, args) => args
             .iter()
             .any(|arg| expr_contains_param_add(arg, param_slots)),
         Expr::ClosureCall(closure, args) => {
@@ -1445,6 +1447,8 @@ pub(super) fn expr_uses_param(expr: &Expr, param_slots: &[LocalSlot]) -> bool {
         | Expr::Bytes(_)
         | Expr::String(_)
         | Expr::FunctionRef(..)
+        | Expr::ModuleFunctionRef(..)
+        | Expr::UnresolvedFunctionRef { .. }
         | Expr::MoveField { .. }
         | Expr::MoveIndex { .. } => false,
         Expr::OptionalGet { container, key, .. } => {
@@ -1453,7 +1457,7 @@ pub(super) fn expr_uses_param(expr: &Expr, param_slots: &[LocalSlot]) -> bool {
         Expr::OptionUnwrapOr {
             value, fallback, ..
         } => expr_uses_param(value, param_slots) || expr_uses_param(fallback, param_slots),
-        Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) => {
+        Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) | Expr::ModuleCall(_, _, args) => {
             args.iter().any(|arg| expr_uses_param(arg, param_slots))
         }
         Expr::ClosureCall(closure, args) => {
@@ -1603,7 +1607,13 @@ pub(super) fn legalize_expr(
             let _ = legalize_expr(fallback, state, context);
             context.infer_expr_type(expr, state)
         }
-        Expr::FunctionRef(..) | Expr::Call(..) | Expr::LocalCall(..) | Expr::Closure(_) => {
+        Expr::FunctionRef(..)
+        | Expr::ModuleFunctionRef(..)
+        | Expr::UnresolvedFunctionRef { .. }
+        | Expr::Call(..)
+        | Expr::ModuleCall(..)
+        | Expr::LocalCall(..)
+        | Expr::Closure(_) => {
             legalize_expr_children(expr, state, context);
             context.infer_call_like_expr_type(expr, state)
         }
@@ -1707,6 +1717,11 @@ pub(super) fn legalize_expr_children(
             }
             if let Some(builtin) = BuiltinFunction::from_call_index(*index) {
                 fold_builtin_call(expr, builtin, state);
+            }
+        }
+        Expr::ModuleCall(_, _, args) => {
+            for arg in args.iter_mut() {
+                let _ = legalize_expr(arg, state, context);
             }
         }
         Expr::LocalCall(_, _, args) => {
