@@ -66,6 +66,43 @@ impl HostBindingKind {
     }
 }
 
+/// Documented call-index blocks shared by builtins and host imports.
+///
+/// Must match the block table in `src/builtins/catalog.rs`.
+pub(crate) const ORDINARY_BLOCK_START: u16 = 0xFFA2;
+pub(crate) const SPECIAL_CALL_BLOCK_START: u16 = 0xFF90;
+pub(crate) const SPECIAL_CALL_BLOCK_END: u16 = 0xFFA1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CatalogClass {
+    Ordinary,
+    Internal,
+    Special,
+}
+
+impl CatalogClass {
+    fn parse(value: &str) -> Self {
+        match value {
+            "Ordinary" => Self::Ordinary,
+            "Internal" => Self::Internal,
+            "Special" => Self::Special,
+            other => panic!(
+                "unknown builtin catalog class {other:?} (expected Ordinary, Internal, or Special)"
+            ),
+        }
+    }
+}
+
+/// One explicit static builtin ID from `src/builtins/catalog.rs`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CatalogEntry {
+    pub(crate) id: u16,
+    pub(crate) source_name: String,
+    pub(crate) variant: String,
+    pub(crate) class: CatalogClass,
+    pub(crate) feature_gate: String,
+}
+
 #[derive(Clone, Debug)]
 struct CallableDecl {
     rust_ident: String,
@@ -108,6 +145,10 @@ fn main() {
     println!("cargo:rerun-if-changed={}", namespace_manifest.display());
     let namespaces = parse_namespace_manifest(&namespace_manifest);
 
+    let catalog_path = manifest_dir.join("src").join("builtins").join("catalog.rs");
+    println!("cargo:rerun-if-changed={}", catalog_path.display());
+    let catalog = parse_catalog(&catalog_path);
+
     let host_sources = [
         SourceSpec {
             path: "src/builtins/runtime/host.rs".to_string(),
@@ -145,6 +186,7 @@ fn main() {
             &host_callables,
             &builtin_callables,
             &metadata_callables,
+            &catalog,
         ),
     );
     write_generated_file(
@@ -400,6 +442,183 @@ fn parse_source_file(path: &Path, spec: &SourceSpec, _order_offset: usize) -> Ve
     out
 }
 
+/// Parse the authoritative static builtin ID catalog (`src/builtins/catalog.rs`).
+///
+/// Each entry is one line:
+///
+/// ```text
+/// builtin_id!(0xXXXX, "source_name", RustVariant, Class, feature_gate);
+/// ```
+///
+/// Fails on malformed lines, duplicate IDs, duplicate source names, or
+/// duplicate Rust variants. Class and gate values are validated here; block
+/// membership and callable coverage are validated by
+/// [`validate_catalog_contract`].
+fn parse_catalog(path: &Path) -> Vec<CatalogEntry> {
+    let source = fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+    parse_catalog_source(&source, &path.display().to_string())
+}
+
+pub(crate) fn parse_catalog_source(source: &str, display: &str) -> Vec<CatalogEntry> {
+    let mut entries = Vec::new();
+    let mut seen_ids = HashSet::new();
+    let mut seen_names = HashSet::new();
+    let mut seen_variants = HashSet::new();
+    for (line_index, raw_line) in source.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        let line_number = line_index + 1;
+        let Some(rest) = line.strip_prefix("builtin_id!(") else {
+            panic!("{display}:{line_number}: unexpected line in builtin catalog: {line:?}");
+        };
+        let rest = rest.strip_suffix(");").unwrap_or_else(|| {
+            panic!("{display}:{line_number}: catalog entry must end with ');': {line:?}")
+        });
+        let parts = rest.split(',').map(str::trim).collect::<Vec<_>>();
+        if parts.len() != 5 {
+            panic!(
+                "{display}:{line_number}: catalog entry needs 5 fields \
+                 (id, source_name, RustVariant, Class, feature_gate): {line:?}"
+            );
+        }
+        let id = u16::from_str_radix(parts[0].trim_start_matches("0x"), 16).unwrap_or_else(|err| {
+            panic!("{display}:{line_number}: invalid builtin id {parts:?}: {err}")
+        });
+        let source_name = strip_quoted(parts[1]).unwrap_or_else(|| {
+            panic!("{display}:{line_number}: expected quoted source name: {line:?}")
+        });
+        let variant = parts[2].to_string();
+        let class = CatalogClass::parse(parts[3]);
+        let feature_gate = parts[4].to_string();
+        if feature_gate != "none" {
+            panic!(
+                "{display}:{line_number}: unsupported feature gate {feature_gate:?}; \
+                 only 'none' is defined today"
+            );
+        }
+        if !seen_ids.insert(id) {
+            panic!("{display}:{line_number}: duplicate builtin id 0x{id:04X}");
+        }
+        if !seen_names.insert(source_name.clone()) {
+            panic!("{display}:{line_number}: duplicate builtin source name {source_name:?}");
+        }
+        if !seen_variants.insert(variant.clone()) {
+            panic!("{display}:{line_number}: duplicate builtin variant {variant}");
+        }
+        entries.push(CatalogEntry {
+            id,
+            source_name,
+            variant,
+            class,
+            feature_gate,
+        });
+    }
+    entries
+}
+
+fn strip_quoted(value: &str) -> Option<String> {
+    value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .map(str::to_string)
+}
+
+/// Validate the static builtin ID contract against the discovered callables.
+///
+/// Fails the build when:
+/// - a runtime callable has no explicit catalog ID, or a catalog entry has no
+///   runtime callable (typos and missing IDs);
+/// - a catalog variant does not match the derived variant for its source name;
+/// - a class disagrees with the dispatch classification (ordinary vs
+///   special-call) or with the `__` internal-name prefix;
+/// - an ID falls outside its documented block.
+pub(crate) fn validate_catalog_contract(
+    entries: &[CatalogEntry],
+    discovered_names: &HashSet<String>,
+    special_variants: &HashSet<String>,
+) {
+    let catalog_names = entries
+        .iter()
+        .map(|entry| entry.source_name.as_str())
+        .collect::<HashSet<_>>();
+    let discovered = discovered_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    if catalog_names != discovered {
+        let mut missing = discovered.difference(&catalog_names).collect::<Vec<_>>();
+        missing.sort_unstable();
+        let mut extra = catalog_names.difference(&discovered).collect::<Vec<_>>();
+        extra.sort_unstable();
+        panic!(
+            "builtin catalog does not match discovered callables: \
+             missing explicit IDs for {missing:?}, catalog entries without callables {extra:?}"
+        );
+    }
+    for entry in entries {
+        let expected_variant = builtin_variant_name(&entry.source_name);
+        if expected_variant != entry.variant {
+            panic!(
+                "catalog variant mismatch for '{}': derived {expected_variant}, catalog {}",
+                entry.source_name, entry.variant
+            );
+        }
+        let is_special_call = special_variants.contains(&entry.variant);
+        match entry.class {
+            CatalogClass::Ordinary => {
+                if is_special_call {
+                    panic!(
+                        "catalog entry '{}' is class Ordinary but dispatches as a special-call builtin",
+                        entry.source_name
+                    );
+                }
+                if entry.id < ORDINARY_BLOCK_START {
+                    panic!(
+                        "ordinary builtin '{}' id 0x{:04X} falls outside the ordinary block \
+                         0x{ORDINARY_BLOCK_START:04X}..=0xFFFF",
+                        entry.source_name, entry.id
+                    );
+                }
+            }
+            CatalogClass::Internal | CatalogClass::Special => {
+                if !is_special_call {
+                    panic!(
+                        "catalog entry '{}' is class {:?} but is not a special-call builtin",
+                        entry.source_name, entry.class
+                    );
+                }
+                if !(SPECIAL_CALL_BLOCK_START..=SPECIAL_CALL_BLOCK_END).contains(&entry.id) {
+                    panic!(
+                        "special-call builtin '{}' id 0x{:04X} falls outside the special-call block \
+                         0x{SPECIAL_CALL_BLOCK_START:04X}..=0x{SPECIAL_CALL_BLOCK_END:04X}",
+                        entry.source_name, entry.id
+                    );
+                }
+            }
+        }
+        let is_internal_name = entry.source_name.starts_with("__");
+        match entry.class {
+            CatalogClass::Internal if !is_internal_name => {
+                panic!(
+                    "catalog entry '{}' is class Internal but its source name has no '__' prefix",
+                    entry.source_name
+                );
+            }
+            CatalogClass::Special if is_internal_name => {
+                panic!(
+                    "catalog entry '{}' has an internal '__' source name but is class Special; \
+                     use Internal",
+                    entry.source_name
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 fn parse_namespace_manifest(path: &Path) -> Vec<NamespaceDecl> {
     let source = fs::read_to_string(path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
@@ -500,6 +719,7 @@ fn render_builtin_catalog(
     host_callables: &[CallableDecl],
     builtin_callables: &[CallableDecl],
     metadata_callables: &[CallableDecl],
+    catalog: &[CatalogEntry],
 ) -> String {
     let language_group_input = metadata_callables
         .iter()
@@ -515,21 +735,21 @@ fn render_builtin_catalog(
     let host_groups = stable_groups(&host_group_input, |callable| callable.name.clone());
     let (builtin_variant_order, actual_builtin_by_variant) =
         ordered_actual_builtin_variants(namespaces, builtin_callables, metadata_callables);
-    let builtin_call_count = u16::try_from(
-        builtin_variant_order
-            .len()
-            .checked_sub(appended_builtin_order().len())
-            .expect("appended builtin count should fit catalog"),
-    )
-    .expect("builtin function count should fit in u16");
-    let builtin_call_base = u16::MAX
-        .checked_sub(builtin_call_count)
-        .and_then(|value| value.checked_add(1))
-        .expect("builtin call base should fit in u16");
-    assert!(
-        builtin_call_base >= 15,
-        "builtin call base must leave room for reserved special builtins"
-    );
+    let discovered_names = builtin_callables
+        .iter()
+        .chain(metadata_callables.iter())
+        .map(|callable| callable.name.clone())
+        .collect::<HashSet<_>>();
+    let special_variants = special_builtin_order()
+        .iter()
+        .chain(appended_builtin_order())
+        .map(|name| builtin_variant_name(name))
+        .collect::<HashSet<_>>();
+    validate_catalog_contract(catalog, &discovered_names, &special_variants);
+    let catalog_id_by_variant = catalog
+        .iter()
+        .map(|entry| (entry.variant.clone(), entry.id))
+        .collect::<HashMap<_, _>>();
 
     let namespace_member_group_input = builtin_callables
         .iter()
@@ -565,25 +785,13 @@ fn render_builtin_catalog(
     .unwrap();
     writeln!(&mut out, "#[repr(u16)]").unwrap();
     writeln!(&mut out, "pub enum BuiltinFunction {{").unwrap();
-    for (index, variant) in builtin_variant_order.iter().enumerate() {
-        if index == 0 {
-            writeln!(&mut out, "    {variant} = 0,").unwrap();
-        } else {
-            writeln!(&mut out, "    {variant},").unwrap();
-        }
+    for variant in &builtin_variant_order {
+        let id = catalog_id_by_variant
+            .get(variant)
+            .unwrap_or_else(|| panic!("missing static id for builtin variant '{variant}'"));
+        writeln!(&mut out, "    {variant} = 0x{id:04X},").unwrap();
     }
     writeln!(&mut out, "}}").unwrap();
-    writeln!(&mut out).unwrap();
-
-    writeln!(
-        &mut out,
-        "const MAIN_RANGE_BUILTINS: &[BuiltinFunction] = &["
-    )
-    .unwrap();
-    for variant in main_range_builtin_variants(&builtin_variant_order) {
-        writeln!(&mut out, "    BuiltinFunction::{variant},").unwrap();
-    }
-    writeln!(&mut out, "];").unwrap();
     writeln!(&mut out).unwrap();
 
     for group in &language_groups {
@@ -621,95 +829,17 @@ fn render_builtin_catalog(
 
     writeln!(
         &mut out,
-        "pub(crate) const BUILTIN_CALL_BASE: u16 = 0x{builtin_call_base:04X};"
+        "/// Every VM-visible builtin in catalog order; the enum discriminants are the static IDs."
     )
     .unwrap();
     writeln!(
         &mut out,
-        "pub(crate) const BUILTIN_CALL_COUNT: u16 = MAIN_RANGE_BUILTINS.len() as u16;"
+        "pub const BUILTIN_CATALOG: &[BuiltinFunction] = &["
     )
     .unwrap();
-    writeln!(&mut out).unwrap();
-    writeln!(
-        &mut out,
-        "const SPECIAL_CALL_BUILTINS: &[(u16, BuiltinFunction)] = &["
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "    (BUILTIN_CALL_BASE - 4, BuiltinFunction::FormatTemplate),"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "    (BUILTIN_CALL_BASE - 3, BuiltinFunction::ToString),"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "    (BUILTIN_CALL_BASE - 2, BuiltinFunction::TypeOf),"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "    (BUILTIN_CALL_BASE - 1, BuiltinFunction::Assert),"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "    (BUILTIN_CALL_BASE - 7, BuiltinFunction::StringContains),"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "    (BUILTIN_CALL_BASE - 6, BuiltinFunction::StringReplaceLiteral),"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "    (BUILTIN_CALL_BASE - 5, BuiltinFunction::StringLowerAscii),"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "    (BUILTIN_CALL_BASE - 8, BuiltinFunction::StringSplitLiteral),"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "    (BUILTIN_CALL_BASE - 9, BuiltinFunction::MapIterInit),"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "    (BUILTIN_CALL_BASE - 10, BuiltinFunction::MapIterNext),"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "    (BUILTIN_CALL_BASE - 11, BuiltinFunction::MapIterTakeKey),"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "    (BUILTIN_CALL_BASE - 12, BuiltinFunction::MapIterTakeValue),"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "    (BUILTIN_CALL_BASE - 13, BuiltinFunction::MapIterClose),"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "    (BUILTIN_CALL_BASE - 14, BuiltinFunction::BindCallable),"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "    (BUILTIN_CALL_BASE - 15, BuiltinFunction::DetachLocal),"
-    )
-    .unwrap();
+    for variant in &builtin_variant_order {
+        writeln!(&mut out, "    BuiltinFunction::{variant},").unwrap();
+    }
     writeln!(&mut out, "];").unwrap();
     writeln!(&mut out).unwrap();
 
@@ -836,89 +966,31 @@ fn render_builtin_catalog(
     writeln!(&mut out, "        resolve_namespaced_builtin(name)").unwrap();
     writeln!(&mut out, "    }}").unwrap();
     writeln!(&mut out).unwrap();
-    writeln!(&mut out, "    pub fn call_index(self) -> u16 {{").unwrap();
-    writeln!(&mut out, "        match self {{").unwrap();
     writeln!(
         &mut out,
-        "            BuiltinFunction::FormatTemplate => BUILTIN_CALL_BASE - 4,"
+        "    pub fn from_source_name(name: &str) -> Option<Self> {{"
     )
     .unwrap();
-    writeln!(
-        &mut out,
-        "            BuiltinFunction::ToString => BUILTIN_CALL_BASE - 3,"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "            BuiltinFunction::TypeOf => BUILTIN_CALL_BASE - 2,"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "            BuiltinFunction::Assert => BUILTIN_CALL_BASE - 1,"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "            BuiltinFunction::StringContains => BUILTIN_CALL_BASE - 7,"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "            BuiltinFunction::StringReplaceLiteral => BUILTIN_CALL_BASE - 6,"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "            BuiltinFunction::StringLowerAscii => BUILTIN_CALL_BASE - 5,"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "            BuiltinFunction::StringSplitLiteral => BUILTIN_CALL_BASE - 8,"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "            BuiltinFunction::MapIterInit => BUILTIN_CALL_BASE - 9,"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "            BuiltinFunction::MapIterNext => BUILTIN_CALL_BASE - 10,"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "            BuiltinFunction::MapIterTakeKey => BUILTIN_CALL_BASE - 11,"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "            BuiltinFunction::MapIterTakeValue => BUILTIN_CALL_BASE - 12,"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "            BuiltinFunction::MapIterClose => BUILTIN_CALL_BASE - 13,"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "            BuiltinFunction::BindCallable => BUILTIN_CALL_BASE - 14,"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "            BuiltinFunction::DetachLocal => BUILTIN_CALL_BASE - 15,"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "            _ => BUILTIN_CALL_BASE + self as u16,"
-    )
-    .unwrap();
+    writeln!(&mut out, "        match name {{").unwrap();
+    for entry in catalog {
+        writeln!(
+            &mut out,
+            "            {:?} => Some(Self::{}),",
+            entry.source_name, entry.variant
+        )
+        .unwrap();
+    }
+    writeln!(&mut out, "            _ => None,").unwrap();
     writeln!(&mut out, "        }}").unwrap();
+    writeln!(&mut out, "    }}").unwrap();
+    writeln!(&mut out).unwrap();
+    writeln!(&mut out, "    pub fn call_index(self) -> u16 {{").unwrap();
+    writeln!(
+        &mut out,
+        "        // The enum is #[repr(u16)] with explicit static ID discriminants."
+    )
+    .unwrap();
+    writeln!(&mut out, "        self as u16").unwrap();
     writeln!(&mut out, "    }}").unwrap();
     writeln!(&mut out).unwrap();
     writeln!(
@@ -926,28 +998,15 @@ fn render_builtin_catalog(
         "    pub(crate) fn from_call_index(index: u16) -> Option<Self> {{"
     )
     .unwrap();
-    writeln!(
-        &mut out,
-        "        if let Some((_, builtin)) = SPECIAL_CALL_BUILTINS.iter().find(|(call_index, _)| *call_index == index) {{"
-    )
-    .unwrap();
-    writeln!(&mut out, "            return Some(*builtin);").unwrap();
+    writeln!(&mut out, "        match index {{").unwrap();
+    for variant in &builtin_variant_order {
+        let id = catalog_id_by_variant
+            .get(variant)
+            .unwrap_or_else(|| panic!("missing static id for builtin variant '{variant}'"));
+        writeln!(&mut out, "            0x{id:04X} => Some(Self::{variant}),").unwrap();
+    }
+    writeln!(&mut out, "            _ => None,").unwrap();
     writeln!(&mut out, "        }}").unwrap();
-    writeln!(
-        &mut out,
-        "        let offset = index.checked_sub(BUILTIN_CALL_BASE)?;"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "        if offset >= BUILTIN_CALL_COUNT {{ return None; }}"
-    )
-    .unwrap();
-    writeln!(
-        &mut out,
-        "        MAIN_RANGE_BUILTINS.get(offset as usize).copied()"
-    )
-    .unwrap();
     writeln!(&mut out, "    }}").unwrap();
     writeln!(&mut out, "}}").unwrap();
 
@@ -1346,7 +1405,7 @@ fn render_builtin_name_method(
     builtin_variant_order: &[String],
     actual_builtin_by_variant: &HashMap<String, Vec<&CallableDecl>>,
 ) {
-    writeln!(out, "    pub(crate) fn name(self) -> &'static str {{").unwrap();
+    writeln!(out, "    pub fn name(self) -> &'static str {{").unwrap();
     writeln!(out, "        match self {{").unwrap();
     for variant in builtin_variant_order {
         let internal_name = builtin_internal_name(variant, actual_builtin_by_variant);
@@ -1663,7 +1722,7 @@ fn namespace_root(name: &str) -> Option<&str> {
     name.split_once("::").map(|(root, _)| root)
 }
 
-fn builtin_variant_name(name: &str) -> String {
+pub(crate) fn builtin_variant_name(name: &str) -> String {
     match name {
         "type" => "TypeOf".to_string(),
         "__to_string" => "ToString".to_string(),
@@ -1705,33 +1764,6 @@ fn variant_segment(segment: &str) -> String {
             out
         }
     }
-}
-
-fn main_range_builtin_variants(builtin_variant_order: &[String]) -> Vec<String> {
-    builtin_variant_order
-        .iter()
-        .filter(|variant| {
-            !matches!(
-                variant.as_str(),
-                "FormatTemplate"
-                    | "ToString"
-                    | "TypeOf"
-                    | "Assert"
-                    | "StringContains"
-                    | "StringReplaceLiteral"
-                    | "StringLowerAscii"
-                    | "StringSplitLiteral"
-                    | "MapIterInit"
-                    | "MapIterNext"
-                    | "MapIterTakeKey"
-                    | "MapIterTakeValue"
-                    | "MapIterClose"
-                    | "BindCallable"
-                    | "DetachLocal"
-            )
-        })
-        .cloned()
-        .collect()
 }
 
 fn namespace_member_target_variant(name: &str) -> String {

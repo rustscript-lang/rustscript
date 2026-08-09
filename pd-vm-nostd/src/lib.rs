@@ -8,6 +8,7 @@
 extern crate alloc;
 
 mod error;
+mod generated_builtin_ids;
 mod host;
 mod program;
 mod value;

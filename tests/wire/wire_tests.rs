@@ -55,7 +55,7 @@ fn wire_roundtrip_preserves_constants_and_code() {
     });
 
     let encoded = encode_program(&program).expect("encode should succeed");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 10);
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 11);
     let decoded = decode_program(&encoded).expect("decode should succeed");
 
     assert_eq!(decoded.constants, program.constants);
@@ -108,6 +108,13 @@ fn decode_rejects_invalid_magic_version_and_truncation() {
     assert!(matches!(
         decode_program(&old_version),
         Err(WireError::UnsupportedVersion(9))
+    ));
+
+    let mut previous_version = encoded.clone();
+    previous_version[4..6].copy_from_slice(&10u16.to_le_bytes());
+    assert!(matches!(
+        decode_program(&previous_version),
+        Err(WireError::UnsupportedVersion(10))
     ));
 
     let truncated = &encoded[..encoded.len() - 1];
@@ -165,7 +172,7 @@ fn validate_accepts_known_good_program() {
 }
 
 #[test]
-fn callable_metadata_roundtrips_vmbc_v10() {
+fn callable_metadata_roundtrips_vmbc_v11() {
     let compiled = vm::compile_source_for_repl(
         r#"
             fn add_one(value: int) -> int { value + 1 }
@@ -453,10 +460,10 @@ fn assembler_deduplicates_equal_scalar_constants() {
 #[test]
 fn literal_string_builtin_indices_are_appended_and_publicly_resolved() {
     assert_eq!(BuiltinFunction::Count.call_index(), 65_531);
-    assert_eq!(BuiltinFunction::FormatTemplate.call_index(), 65_439);
-    assert_eq!(BuiltinFunction::ToString.call_index(), 65_440);
-    assert_eq!(BuiltinFunction::TypeOf.call_index(), 65_441);
-    assert_eq!(BuiltinFunction::Assert.call_index(), 65_442);
+    assert_eq!(BuiltinFunction::FormatTemplate.call_index(), 65_438);
+    assert_eq!(BuiltinFunction::ToString.call_index(), 65_439);
+    assert_eq!(BuiltinFunction::TypeOf.call_index(), 65_440);
+    assert_eq!(BuiltinFunction::Assert.call_index(), 65_441);
 
     let first = BuiltinFunction::FormatTemplate.call_index() - 3;
     assert_eq!(builtin_call_index("string_contains"), Some(first));

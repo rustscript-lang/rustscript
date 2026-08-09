@@ -891,25 +891,24 @@ fn builtin_map_iter_close_metadata(map: VmMapRef<'_>, _slot: i64) -> VmMapHandle
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builtins::{BUILTIN_CALL_BASE, BUILTIN_CALL_COUNT, BuiltinFunction};
+    use crate::builtins::BuiltinFunction;
     use std::sync::Arc;
 
     #[test]
     fn internal_builtins_have_unique_reserved_call_indices() {
         let reserved = [
-            (BuiltinFunction::MapIterInit, BUILTIN_CALL_BASE - 9),
-            (BuiltinFunction::MapIterNext, BUILTIN_CALL_BASE - 10),
-            (BuiltinFunction::MapIterTakeKey, BUILTIN_CALL_BASE - 11),
-            (BuiltinFunction::MapIterTakeValue, BUILTIN_CALL_BASE - 12),
-            (BuiltinFunction::MapIterClose, BUILTIN_CALL_BASE - 13),
-            (BuiltinFunction::BindCallable, BUILTIN_CALL_BASE - 14),
-            (BuiltinFunction::DetachLocal, BUILTIN_CALL_BASE - 15),
+            (BuiltinFunction::MapIterInit, 0xFF99),
+            (BuiltinFunction::MapIterNext, 0xFF98),
+            (BuiltinFunction::MapIterTakeKey, 0xFF97),
+            (BuiltinFunction::MapIterTakeValue, 0xFF96),
+            (BuiltinFunction::MapIterClose, 0xFF95),
+            (BuiltinFunction::BindCallable, 0xFF94),
+            (BuiltinFunction::DetachLocal, 0xFF93),
         ];
         for (builtin, index) in reserved {
             assert_eq!(builtin.call_index(), index);
             assert_eq!(BuiltinFunction::from_call_index(index), Some(builtin));
         }
-        assert_eq!(BUILTIN_CALL_COUNT, 89);
         for name in ["__bind_callable", "__detach_local"] {
             assert!(
                 !crate::builtins::language_builtin_specs()
@@ -918,8 +917,8 @@ mod tests {
                 "internal callable metadata operation must not be language-visible: {name}"
             );
         }
-        for alias in BUILTIN_CALL_BASE + 89..=BUILTIN_CALL_BASE + 92 {
-            assert_eq!(BuiltinFunction::from_call_index(alias), None);
+        for reserved_index in 0xFF90..=0xFF92 {
+            assert_eq!(BuiltinFunction::from_call_index(reserved_index), None);
         }
     }
 

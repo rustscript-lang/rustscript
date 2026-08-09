@@ -1,15 +1,24 @@
 # Script call frames and callable values
 
-RustScript bytecode format version 9 introduces runtime script call frames and first-class callable values.
+RustScript bytecode format version 11 (VMBC v11) introduces runtime script call frames, first-class callable values, and the static builtin ID catalog.
 
 ## Bytecode contract
 
-- `call <import:u16> <argc:u8>` remains the direct host/builtin operation.
+- `call <import:u16> <argc:u8>` remains the direct host/builtin operation; the `u16` operand is an explicit static builtin call index from the catalog (or a host-import slot) — never a count-derived offset.
 - `callvalue <argc:u8>` consumes a stack segment in `callee, arg0, ..., argN` order.
 - callable environments are bound through the internal builtin call path; callable creation adds no bytecode opcode.
 - `ret` completes the active script frame. A nested frame leaves exactly one result at the caller segment base, using `null` when the body produced no value. Root `ret` keeps the historical program-result stack behavior.
 
-VMBC v9 is a hard format boundary. Decoders reject older versions. The stream includes script-function entry ranges, callable prototypes, function regions, and root callable bindings. PDRC v4 recordings and AOT artifacts use their corresponding bumped format/ABI versions and include callable metadata in cache identity.
+VMBC v11 is a hard format boundary. Decoders reject all earlier versions (v10 and below) with a deterministic unsupported-version error; there is no compatibility decoder and no old-ID alias. The stream includes script-function entry ranges, callable prototypes, function regions, root callable bindings, and call indices drawn from the static builtin catalog. PDRC v6 recordings and AOT artifacts (format 7, ABI 6) use their corresponding bumped versions and include callable metadata in cache identity.
+
+## Static builtin IDs
+
+Every VM-visible builtin (ordinary, internal, and special-call) has one explicit, immutable `u16` call index assigned in `src/builtins/catalog.rs`. `build.rs` parses that catalog and generates the `BuiltinFunction` enum discriminants, `call_index`/`from_call_index`, the `builtin_call_index` reverse lookup, and the `BUILTIN_CATALOG` iteration from the explicit IDs; no ID is derived from catalog length or source order.
+
+- **Immutable explicit IDs.** IDs never change once assigned. Adding or reordering catalog entries never renumbers existing entries; new builtins take the next free ID in their documented block (extension `0x0000..=0xFF8F` for future builtins and host imports, special-call `0xFF90..=0xFFA1`, ordinary `0xFFA2..=0xFFFF`). The reserved sentinel gap `0xFF90..=0xFF92` stays unassigned.
+- **Build-time validation.** The build fails on duplicate IDs, duplicate source names, duplicate Rust variants, out-of-block IDs, class/gate inconsistencies, a discovered runtime callable without an explicit ID, or a catalog entry without a runtime callable.
+- **Shared std/no-std IDs.** `pd-vm-nostd` dispatches on the same static indices through the checked-in generated mirror `pd-vm-nostd/src/generated_builtin_ids.rs`; the workspace test `static_builtin_ids_are_frozen` fails when the mirror drifts from the catalog.
+- **One-time format break.** The static ID migration bumped VMBC to v11 (and the internal bytecode ABI to 11). Older VMBC versions are rejected, never decoded.
 
 ## Runtime model
 
@@ -36,8 +45,8 @@ PDRC recordings preserve full execution-frame metadata. Callable environments us
 
 ## Optimized backends
 
-Whole-program AOT and Trace JIT use the same builtin call path for environment binding and native frame dispatch for `callvalue`. Script-frame entry and return preserve frame-relative locals and typed continuations.
+Whole-program AOT and Trace JIT use the same builtin call path (static catalog IDs) for environment binding and native frame dispatch for `callvalue`. Script-frame entry and return preserve frame-relative locals and typed continuations.
 
 ## Embedded runtime
 
-`pd-vm-nostd` decodes the same VMBC v9 callable metadata and executes callable binding, `callvalue`, recursive frames, captures, and direct host targets using `core` plus `alloc`.
+`pd-vm-nostd` decodes the same VMBC v11 callable metadata and executes callable binding, `callvalue`, recursive frames, captures, and direct host targets using `core` plus `alloc`, dispatching on the identical static builtin IDs via its checked-in generated mirror.
