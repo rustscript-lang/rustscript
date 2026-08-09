@@ -29,9 +29,9 @@ fn encoded_scalar_program() -> Vec<u8> {
 }
 
 #[test]
-fn embedded_decoder_reads_host_generated_v10() {
+fn embedded_decoder_reads_host_generated_v11() {
     let bytes = encoded_scalar_program();
-    let program = decode_program(&bytes).expect("embedded decoder should accept VMBC v10");
+    let program = decode_program(&bytes).expect("embedded decoder should accept VMBC v11");
 
     assert_eq!(
         program.code(),

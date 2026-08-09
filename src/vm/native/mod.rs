@@ -54,7 +54,7 @@ pub(crate) use layout::{
 #[cfg(feature = "cranelift-jit")]
 pub(crate) use offsets::{HeapIntrinsicAddrs, HeapIntrinsicRefs, ResolvedOffsets, resolve_offsets};
 
-pub(crate) const NATIVE_CALLABLE_ABI_VERSION: u16 = 4;
+pub(crate) const NATIVE_CALLABLE_ABI_VERSION: u16 = 5;
 pub(crate) const MAX_INHERITED_ENTRY_VALUES: usize = 256;
 pub(crate) const INHERITED_STATE_ACTIVE_OFFSET: i32 = 0;
 pub(crate) const INHERITED_STATE_FRAME_KEY_OFFSET: i32 = 8;

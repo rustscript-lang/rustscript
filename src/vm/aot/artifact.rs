@@ -11,8 +11,8 @@ use super::super::jit::JitConfig;
 use super::compile::CompiledProgram;
 
 const MAGIC: [u8; 4] = *b"PAT\0";
-const VERSION: u16 = 6;
-const ABI_VERSION: u16 = 5;
+const VERSION: u16 = 7;
+const ABI_VERSION: u16 = 6;
 const FLAG_INTERPRETER_BOUNDARY_ONLY: u16 = 1;
 const SUPPORTED_FLAGS: u16 = FLAG_INTERPRETER_BOUNDARY_ONLY;
 
@@ -571,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn aot_artifact_v6_roundtrips_callable_metadata_and_rejects_old_revisions() {
+    fn aot_artifact_v7_roundtrips_callable_metadata_and_rejects_old_revisions() {
         let compiled =
             crate::compile_source_for_repl("pub fn add_one(value: int) -> int { value + 1 }")
                 .expect("callable program should compile");
@@ -580,20 +580,20 @@ mod tests {
         let encoded = vm
             .encode_aot_artifact()
             .expect("artifact encode should succeed");
-        assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 6);
-        assert_eq!(u16::from_le_bytes([encoded[6], encoded[7]]), 5);
+        assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 7);
+        assert_eq!(u16::from_le_bytes([encoded[6], encoded[7]]), 6);
 
         let mut old_format = encoded.clone();
-        old_format[4..6].copy_from_slice(&5u16.to_le_bytes());
+        old_format[4..6].copy_from_slice(&6u16.to_le_bytes());
         assert!(matches!(
             Vm::new_from_aot_artifact_with_jit_config(&old_format, JitConfig::default()),
-            Err(AotArtifactError::UnsupportedVersion(5))
+            Err(AotArtifactError::UnsupportedVersion(6))
         ));
         let mut old_abi = encoded.clone();
-        old_abi[6..8].copy_from_slice(&4u16.to_le_bytes());
+        old_abi[6..8].copy_from_slice(&5u16.to_le_bytes());
         assert!(matches!(
             Vm::new_from_aot_artifact_with_jit_config(&old_abi, JitConfig::default()),
-            Err(AotArtifactError::UnsupportedAbiVersion(4))
+            Err(AotArtifactError::UnsupportedAbiVersion(5))
         ));
 
         let mut standalone =
