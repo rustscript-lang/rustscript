@@ -92,7 +92,10 @@ fn nested_module_override_parse_error_preserves_source_text_and_path() {
         Err(error) => error,
     };
     match error {
-        vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
+        vm::SourcePathError::SourceWithMap {
+            error: vm::SourceError::Parse(parse),
+            ..
+        } => {
             assert!(parse.message.contains("virtual/nested.rss"));
         }
         error => panic!("expected source-aware nested error, got {error:?}"),
@@ -125,7 +128,10 @@ fn nested_module_strict_unknown_diagnostic_keeps_module_source() {
         Err(error) => error,
     };
     match error {
-        vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
+        vm::SourcePathError::SourceWithMap {
+            error: vm::SourceError::Parse(parse),
+            ..
+        } => {
             assert!(parse.message.contains(&nested_path.display().to_string()));
         }
         error => panic!("expected nested strict diagnostic, got {error:?}"),
@@ -150,7 +156,10 @@ fn strict_nested_diagnostic_path_is_consistent_across_option_entry_points() {
         Err(error) => error,
     };
     match in_memory_error {
-        vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
+        vm::SourcePathError::SourceWithMap {
+            error: vm::SourceError::Parse(parse),
+            ..
+        } => {
             assert!(parse.message.contains("__pd_vm_inmemory__/nested.rss"));
         }
         error => panic!("expected nested strict diagnostic, got {error:?}"),
@@ -168,7 +177,10 @@ fn strict_nested_diagnostic_path_is_consistent_across_option_entry_points() {
         Err(error) => error,
     };
     match at_path_error {
-        vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
+        vm::SourcePathError::SourceWithMap {
+            error: vm::SourceError::Parse(parse),
+            ..
+        } => {
             assert!(
                 parse
                     .message
@@ -216,7 +228,10 @@ fn compile_source_file_rustscript_named_import_is_selective() {
     assert!(
         matches!(
             err,
-            vm::SourcePathError::Source(vm::SourceError::Parse(vm::ParseError { ref message, .. }))
+            vm::SourcePathError::SourceWithMap {
+            error: vm::SourceError::Parse(vm::ParseError { ref message, .. }),
+            ..
+        }
             if message.contains("unknown function 'add_two'")
         ),
         "expected unknown function error, got {err:?}"
@@ -323,7 +338,10 @@ fn compile_source_file_rustscript_module_exports_only_pub_functions() {
     assert!(
         matches!(
             err,
-            vm::SourcePathError::Source(vm::SourceError::Parse(vm::ParseError { ref message, .. }))
+            vm::SourcePathError::SourceWithMap {
+            error: vm::SourceError::Parse(vm::ParseError { ref message, .. }),
+            ..
+        }
             if message.contains("unknown function 'private_add'")
         ),
         "expected unknown function error, got {err:?}"
@@ -656,7 +674,10 @@ fn nested_module_does_not_reexport_transitive_imports() {
     assert!(
         matches!(
             error,
-            vm::SourcePathError::Source(vm::SourceError::Parse(vm::ParseError { ref message, .. }))
+            vm::SourcePathError::SourceWithMap {
+            error: vm::SourceError::Parse(vm::ParseError { ref message, .. }),
+            ..
+        }
                 if message.contains("nested::leaf") || message.contains("unknown namespace")
         ),
         "expected transitive export boundary error, got {error:?}"

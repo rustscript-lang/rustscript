@@ -171,7 +171,9 @@ pub(super) fn expr_uses_slot(expr: &Expr, slot: LocalSlot) -> bool {
         | Expr::Bool(_)
         | Expr::Bytes(_)
         | Expr::String(_)
-        | Expr::FunctionRef(..) => false,
+        | Expr::FunctionRef(..)
+        | Expr::ModuleFunctionRef(..)
+        | Expr::UnresolvedFunctionRef { .. } => false,
         Expr::Var(index) | Expr::MoveVar(index) => *index == slot,
         Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => *root == slot,
         Expr::OptionalGet {
@@ -190,7 +192,7 @@ pub(super) fn expr_uses_slot(expr: &Expr, slot: LocalSlot) -> bool {
             value_slot,
             fallback,
         } => *value_slot == slot || expr_uses_slot(value, slot) || expr_uses_slot(fallback, slot),
-        Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) => {
+        Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) | Expr::ModuleCall(_, _, args) => {
             args.iter().any(|arg| expr_uses_slot(arg, slot))
         }
         Expr::Closure(closure) => {
@@ -376,6 +378,8 @@ pub(super) fn collect_consumed_positions_from_expr(
         | Expr::Bytes(_)
         | Expr::String(_)
         | Expr::FunctionRef(..)
+        | Expr::ModuleFunctionRef(..)
+        | Expr::UnresolvedFunctionRef { .. }
         | Expr::Var(_) => {}
         Expr::MoveVar(slot) => {
             if let Some(position) = function_impl
@@ -457,6 +461,18 @@ pub(super) fn collect_consumed_positions_from_expr(
                     }
                     _ => {}
                 }
+            }
+        }
+        // Resolved module calls (pre-merge only) have no per-unit consumed
+        // position table; their arguments are still scanned.
+        Expr::ModuleCall(_, _, args) => {
+            for arg in args {
+                collect_consumed_positions_from_expr(
+                    arg,
+                    function_impl,
+                    known_consumed_positions,
+                    out,
+                );
             }
         }
         Expr::LocalCall(_, _, args) => {

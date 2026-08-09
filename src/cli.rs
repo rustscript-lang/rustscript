@@ -332,6 +332,9 @@ fn run_vm_loop(
 
 fn render_source_path_error(source_path: &Path, err: &SourcePathError) -> String {
     match err {
+        SourcePathError::SourceWithMap { .. } => {
+            vm::render_source_path_error(source_path, err, true)
+        }
         SourcePathError::Source(error) => render_source_error_at_path(source_path, None, error),
         SourcePathError::InvalidImportSyntax {
             path,

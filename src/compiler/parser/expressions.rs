@@ -398,7 +398,7 @@ impl Parser {
                     .get(1..)
                     .map(|tail| tail.to_vec())
                     .unwrap_or_default();
-                if let Some((builtin_namespace, builtin_member)) =
+                let expr = if let Some((builtin_namespace, builtin_member)) =
                     self.resolve_builtins_call_path(&name, &member, &subpath)
                 {
                     let builtin_namespace = builtin_namespace.to_string();
@@ -406,23 +406,37 @@ impl Parser {
                     if let Some(builtin) =
                         resolve_builtin_namespace_call(&builtin_namespace, &builtin_member)
                     {
-                        let expr =
-                            self.build_builtin_call_expr_with_type_args(builtin, args, type_args)?;
-                        return Ok(expr);
+                        self.build_builtin_call_expr_with_type_args(builtin, args, type_args)?
+                    } else {
+                        return Err(ParseError {
+                            span: None,
+                            code: None,
+                            line: self.current_line(),
+                            message: format!(
+                                "unknown builtin function '{}::{}'",
+                                builtin_namespace, builtin_member
+                            ),
+                        });
                     }
+                } else if let Some(host_name) =
+                    self.resolve_host_namespace_call_target(&name, &member, &subpath)
+                {
+                    self.build_host_call_expr_with_type_args(&host_name, args, type_args)?
+                } else if self.allow_implicit_externs
+                    && self.module_namespace_alias(&name).is_some()
+                {
+                    // File-module namespace call (`alias::member(...)`): the
+                    // parser cannot resolve the member against the target
+                    // module's exports — only the source loader can. Emit an
+                    // implicit extern carrying the qualified name; the loader
+                    // resolves the call to a `ModuleCall` or rejects it.
+                    // Type-argument validation is deferred to the loader,
+                    // which knows the exported type parameters.
+                    let qualified = format!("{}::{}", name, path_segments.join("::"));
+                    let decl = self.resolve_function_for_call(&qualified, args.len())?;
+                    Expr::Call(decl.index, type_args, args)
+                } else {
                     return Err(ParseError {
-                        span: None,
-                        code: None,
-                        line: self.current_line(),
-                        message: format!(
-                            "unknown builtin function '{}::{}'",
-                            builtin_namespace, builtin_member
-                        ),
-                    });
-                }
-                let host_name = self
-                    .resolve_host_namespace_call_target(&name, &member, &subpath)
-                    .ok_or_else(|| ParseError {
                         span: None,
                         code: None,
                         line: self.current_line(),
@@ -432,8 +446,11 @@ impl Parser {
                             path_segments.join("::"),
                             builtin_namespace_hint()
                         ),
-                    })?;
-                let expr = self.build_host_call_expr_with_type_args(&host_name, args, type_args)?;
+                    });
+                };
+                // Namespace calls participate in postfix access like any
+                // other call (`iter::range(n)[0]`, `json::decode::<T>(s).x`).
+                let expr = self.parse_postfix_access(expr)?;
                 return Ok(expr);
             }
 
@@ -488,7 +505,11 @@ impl Parser {
                             }
                         } else {
                             let decl = self.resolve_function_for_call(&name, args.len())?;
-                            self.validate_named_call_type_args(&decl, &type_args)?;
+                            // Implicit externs mirror imported calls the loader
+                            // validates against the exported signature.
+                            if !self.is_implicit_extern(&name) {
+                                self.validate_named_call_type_args(&decl, &type_args)?;
+                            }
                             Expr::Call(decl.index, type_args, args)
                         }
                     } else if let Some(expr) = self.try_build_language_builtin_call(&name, &args)? {
@@ -507,7 +528,14 @@ impl Parser {
                         self.build_host_call_expr_with_type_args(&host_name, args, type_args)?
                     } else {
                         let decl = self.resolve_function_for_call(&name, args.len())?;
-                        self.validate_named_call_type_args(&decl, &type_args)?;
+                        // Import-scan and module-mode parses tolerate type
+                        // arguments on calls whose target only the source
+                        // loader can type; the loader validates them against
+                        // the exported signature. Plain compile parses
+                        // validate locally declared functions normally.
+                        if !self.import_scan_mode && !self.is_implicit_extern(&name) {
+                            self.validate_named_call_type_args(&decl, &type_args)?;
+                        }
                         Expr::Call(decl.index, type_args, args)
                     }
                 } else {
@@ -541,6 +569,11 @@ impl Parser {
                             });
                         }
                         Expr::FunctionRef(index, Vec::new())
+                    } else if self.allow_implicit_externs {
+                        // Module mode: the name may be an imported function
+                        // binding the loader resolves to a module symbol
+                        // (`Expr::ModuleFunctionRef`) before unit merge.
+                        Expr::UnresolvedFunctionRef { name, type_args }
                     } else {
                         return Err(ParseError {
                             span: None,
@@ -1610,7 +1643,12 @@ impl Parser {
         args: Vec<Expr>,
         type_args: Vec<TypeSchema>,
     ) -> Result<Expr, ParseError> {
-        self.validate_host_call_type_args(host_name, &type_args)?;
+        // Import-scan parses discard their IR; the compile parse validates
+        // host type arguments unless the namespace may name a file module
+        // (deferred to the source loader, which knows the exports).
+        if !self.import_scan_mode && self.host_type_args_validated_at_parse(host_name) {
+            self.validate_host_call_type_args(host_name, &type_args)?;
+        }
         let arity = u8::try_from(args.len()).map_err(|_| ParseError {
             span: None,
             code: None,
@@ -1619,6 +1657,20 @@ impl Parser {
         })?;
         let decl = self.define_host_function(host_name, arity)?;
         Ok(Expr::Call(decl.index, type_args, args))
+    }
+
+    /// Whether host type arguments are validated at parse time.
+    ///
+    /// Single-segment import forms (`use module;`, `use module::{wrap}`) may
+    /// name a file module; the parser cannot know, so calls through such
+    /// namespaces defer type-argument validation to the source loader, which
+    /// validates against the module's exported type parameters. Builtin
+    /// namespaces keep their parse-time validation.
+    fn host_type_args_validated_at_parse(&self, host_name: &str) -> bool {
+        match host_name.split_once("::") {
+            Some((namespace, _)) => is_builtin_namespace(namespace),
+            None => true,
+        }
     }
 
     pub(super) fn contextualize_function_value(
@@ -2392,7 +2444,7 @@ fn builtin_generic_type_arg_arity(builtin: BuiltinFunction) -> GenericCallableTy
     }
 }
 
-fn host_generic_type_arg_arity(host_name: &str) -> Option<usize> {
+pub(crate) fn host_generic_type_arg_arity(host_name: &str) -> Option<usize> {
     match host_name {
         "json::decode" => Some(1),
         _ => None,

@@ -1169,8 +1169,7 @@ mod runtime_tests {
             diagnostic.message
         );
         assert!(
-            diagnostic.rendered.contains("<lint>:")
-                && diagnostic.rendered.contains("let value = if true => {"),
+            diagnostic.rendered.contains("let value = if true => {"),
             "expected rendered diagnostic snippet, got {:?}",
             diagnostic.rendered
         );

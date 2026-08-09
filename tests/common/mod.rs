@@ -141,6 +141,7 @@ pub enum CompileErrorKind {
     InvalidFieldAccess,
     FunctionParameterTypeConflict,
     StrictTypingRequired,
+    UnresolvedModuleCall,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -184,6 +185,7 @@ fn compile_error_kind(err: &vm::CompileError) -> CompileErrorKind {
             CompileErrorKind::FunctionParameterTypeConflict
         }
         vm::CompileError::StrictTypingRequired { .. } => CompileErrorKind::StrictTypingRequired,
+        vm::CompileError::UnresolvedModuleCall => CompileErrorKind::UnresolvedModuleCall,
     }
 }
 

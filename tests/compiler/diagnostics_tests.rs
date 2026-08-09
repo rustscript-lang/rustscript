@@ -95,16 +95,19 @@ pub fn ok() {
     let _ = fs::remove_dir(&root);
 
     match result {
-        Err(SourcePathError::Source(SourceError::Compile(compile))) => {
+        Err(SourcePathError::SourceWithMap {
+            error: SourceError::Compile(compile),
+            sources,
+        }) => {
             assert_eq!(
                 compile.source_name(),
                 Some(module_path.to_string_lossy().as_ref())
             );
             assert_eq!(compile.line(), Some(2));
 
-            let mut source_map = SourceMap::new();
-            source_map.add_source(module_path.display().to_string(), module_source);
-            let rendered = render_compile_error(&source_map, &compile, false);
+            // Milestone 5: the compilation-wide map travels with the error,
+            // so the rendered diagnostic reads the owning module source.
+            let rendered = render_compile_error(&sources, &compile, false);
             assert!(rendered.contains(&format!("{}:2:1", module_path.display())));
             assert!(rendered.contains("let broken = if cond => {"));
             assert!(rendered.contains("int vs string"));
