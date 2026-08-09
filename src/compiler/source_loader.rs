@@ -14,8 +14,8 @@ mod model;
 mod rewrite;
 
 use graph::{build_rustscript_import_prelude, collect_module_units};
-use imports::{parse_module_imports, strip_import_directives};
-use line_map::remap_frontend_ir_line_numbers;
+use imports::{module_identity, parse_module_imports, strip_import_directives};
+use line_map::remap_frontend_ir_source_metadata;
 use model::ModuleCollectState;
 pub use model::{FrontendImportSyntax, ImportClause, ModuleImport, NamedImport};
 use rewrite::rewrite_imported_call_sites;
@@ -26,6 +26,12 @@ pub(super) fn load_units_for_source_file(
     source_raw: &str,
     options: &CompileSourceFileOptions,
 ) -> Result<(String, Vec<ParsedUnit>), SourcePathError> {
+    // The root participates in the same identity scheme as every module:
+    // canonical disk identity when the file exists, normalized virtual
+    // identity otherwise. This keeps `seen`/`visiting`/exports/overrides
+    // keyed uniformly across the whole import graph.
+    let path = module_identity(path.to_path_buf());
+    let path = path.as_path();
     let root_imports = parse_module_imports(source_raw, flavor, path, options)?;
     let source = strip_import_directives(source_raw, flavor, options)?;
 
@@ -64,7 +70,13 @@ pub(super) fn load_units_for_source_file(
         })
         .map_err(SourcePathError::Source)?;
     if root_prelude_lines > 0 {
-        remap_frontend_ir_line_numbers(&mut root_parsed, root_prelude_lines);
+        remap_frontend_ir_source_metadata(
+            &mut root_parsed,
+            &root_parse_source,
+            source_raw,
+            root_source_id,
+            root_prelude_lines,
+        );
     }
     collect_state.units.push(ParsedUnit {
         parsed: root_parsed,

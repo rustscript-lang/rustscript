@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::builtins::is_builtin_namespace;
 
@@ -158,9 +158,13 @@ fn rustscript_use_module_to_spec(
 
     let mut path_prefix = PathBuf::new();
     let mut cursor = 0usize;
+    let mut explicit_self = false;
     while cursor < segments.len() {
         match segments[cursor] {
-            "self" => cursor += 1,
+            "self" => {
+                explicit_self = true;
+                cursor += 1;
+            }
             "super" => {
                 path_prefix.push("..");
                 cursor += 1;
@@ -203,6 +207,9 @@ fn rustscript_use_module_to_spec(
             line,
             message: "expected module path after 'use'".to_string(),
         });
+    }
+    if explicit_self && path_prefix.as_os_str().is_empty() == false && !spec.starts_with("../") {
+        spec = format!("./{spec}");
     }
     if !spec.ends_with(".rss") {
         spec.push_str(".rss");
@@ -278,7 +285,7 @@ pub(super) fn resolve_module_path(
         if path.extension().and_then(|value| value.to_str()) != Some("rss") {
             return Err(SourcePathError::NonRustScriptModule(path));
         }
-        return Ok(path);
+        return Ok(module_identity(path));
     }
     if options.module_override_source(spec).is_some() {
         let parent = base_path
@@ -295,7 +302,7 @@ pub(super) fn resolve_module_path(
         if path.extension().and_then(|value| value.to_str()) != Some("rss") {
             return Err(SourcePathError::NonRustScriptModule(path));
         }
-        return Ok(path);
+        return Ok(module_identity(path));
     }
 
     let parent = base_path
@@ -312,7 +319,47 @@ pub(super) fn resolve_module_path(
     if path.extension().and_then(|value| value.to_str()) != Some("rss") {
         return Err(SourcePathError::NonRustScriptModule(path));
     }
-    Ok(path)
+    Ok(module_identity(path))
+}
+
+/// Resolve the module identity for a normalized path.
+///
+/// Files that exist on disk use their canonical path so that lexically
+/// distinct but equivalent paths (`.`, `..`, symlinks) collapse to one
+/// module identity for `seen`/`visiting`/exports/overrides. Paths that do not
+/// exist on disk (virtual source overrides, in-memory entry points) keep the
+/// normalized lexical path as their explicit virtual identity.
+pub(super) fn module_identity(path: PathBuf) -> PathBuf {
+    let normalized = normalize_module_path(path);
+    if normalized.is_file()
+        && let Ok(canonical) = normalized.canonicalize()
+    {
+        return canonical;
+    }
+    normalized
+}
+
+fn normalize_module_path(path: PathBuf) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(Component::ParentDir) | None => normalized.push(component.as_os_str()),
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                Some(Component::CurDir) => {
+                    unreachable!("normalized paths omit current-dir components")
+                }
+            },
+            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
 }
 
 pub(super) fn strip_import_directives(
@@ -414,4 +461,65 @@ pub(super) fn should_treat_missing_module_as_host_namespace(
         err.kind(),
         std::io::ErrorKind::NotFound | std::io::ErrorKind::Unsupported
     ) && is_virtual_host_namespace_spec(spec, options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{module_identity, normalize_module_path};
+    use std::path::PathBuf;
+
+    #[test]
+    fn normalize_module_path_preserves_unmatched_parent_components() {
+        assert_eq!(
+            normalize_module_path(PathBuf::from("../foo/../../bar")),
+            PathBuf::from("../../bar")
+        );
+        assert_eq!(
+            normalize_module_path(PathBuf::from("foo/../../../bar")),
+            PathBuf::from("../../bar")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_module_path_does_not_escape_absolute_root() {
+        assert_eq!(
+            normalize_module_path(PathBuf::from("/foo/../../bar")),
+            PathBuf::from("/bar")
+        );
+    }
+
+    #[test]
+    fn module_identity_keeps_normalized_virtual_path_for_missing_files() {
+        assert_eq!(
+            module_identity(PathBuf::from("/no/such/dir/../virtual/nested.rss")),
+            PathBuf::from("/no/such/virtual/nested.rss")
+        );
+    }
+
+    #[test]
+    fn module_identity_uses_canonical_path_for_existing_files() {
+        let unique = format!(
+            "pd-vm-module-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&root).expect("temp root should be created");
+        let module = root.join("a.rss");
+        std::fs::write(&module, "pub fn value() -> int { 1 }\n").expect("module should write");
+
+        let via_dot = module_identity(root.join("./a.rss"));
+        let via_parent = module_identity(root.join("sub/../a.rss"));
+        let canonical = module.canonicalize().expect("module should canonicalize");
+
+        assert_eq!(via_dot, canonical);
+        assert_eq!(via_parent, canonical);
+        assert_eq!(via_dot, via_parent);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

@@ -168,6 +168,19 @@ pub(super) fn rewrite_imported_call_sites(
     })
 }
 
+/// Append `source[..to]` verbatim to `out`, skipping the prefix already copied.
+///
+/// Scanners advance byte-wise for ASCII token recognition (the grammar only
+/// allows ASCII identifiers and separators) but must never translate
+/// individual UTF-8 bytes into chars. Copying whole source slices keeps
+/// untouched multi-byte sequences byte-for-byte identical.
+fn copy_through(out: &mut String, source: &str, copied: &mut usize, to: usize) {
+    if *copied < to {
+        out.push_str(&source[*copied..to]);
+        *copied = to;
+    }
+}
+
 fn rewrite_host_namespace_call_paths(
     source: &str,
     flavor: SourceFlavor,
@@ -180,6 +193,7 @@ fn rewrite_host_namespace_call_paths(
     let bytes = source.as_bytes();
     let mut out = String::with_capacity(source.len());
     let mut i = 0usize;
+    let mut copied = 0usize;
     let mut in_line_comment = false;
     let mut in_block_comment = false;
     let mut string_delim: Option<u8> = None;
@@ -189,7 +203,6 @@ fn rewrite_host_namespace_call_paths(
         let b = bytes[i];
 
         if let Some(delim) = string_delim {
-            out.push(b as char);
             if escaped {
                 escaped = false;
             } else if b == b'\\' {
@@ -202,7 +215,6 @@ fn rewrite_host_namespace_call_paths(
         }
 
         if in_line_comment {
-            out.push(b as char);
             if b == b'\n' {
                 in_line_comment = false;
             }
@@ -211,9 +223,7 @@ fn rewrite_host_namespace_call_paths(
         }
 
         if in_block_comment {
-            out.push(b as char);
             if b == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                out.push('/');
                 i += 2;
                 in_block_comment = false;
                 continue;
@@ -223,23 +233,18 @@ fn rewrite_host_namespace_call_paths(
         }
 
         if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-            out.push('/');
-            out.push('/');
             i += 2;
             in_line_comment = true;
             continue;
         }
 
         if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
-            out.push('/');
-            out.push('*');
             i += 2;
             in_block_comment = true;
             continue;
         }
 
         if b == b'"' || b == b'\'' || b == b'`' {
-            out.push(b as char);
             i += 1;
             string_delim = Some(b);
             escaped = false;
@@ -247,7 +252,6 @@ fn rewrite_host_namespace_call_paths(
         }
 
         if !is_ident_start(b as char) {
-            out.push(b as char);
             i += 1;
             continue;
         }
@@ -262,13 +266,16 @@ fn rewrite_host_namespace_call_paths(
         if let Some(prefix) = namespace_prefix_calls.get(ident)
             && namespace_call_target_is_function(source, i, flavor)
         {
+            copy_through(&mut out, source, &mut copied, start);
             out.push_str(prefix);
+            // The replaced identifier occupies [start..i]; skip it so the next
+            // slice copy does not resurrect it.
+            copied = i;
             continue;
         }
-
-        out.push_str(ident);
     }
 
+    copy_through(&mut out, source, &mut copied, bytes.len());
     out
 }
 
@@ -419,6 +426,7 @@ fn rewrite_function_call_paths(
     let bytes = source.as_bytes();
     let mut out = String::with_capacity(source.len());
     let mut i = 0usize;
+    let mut copied = 0usize;
     let mut in_line_comment = false;
     let mut in_block_comment = false;
     let mut string_delim: Option<u8> = None;
@@ -428,7 +436,6 @@ fn rewrite_function_call_paths(
         let b = bytes[i];
 
         if let Some(delim) = string_delim {
-            out.push(b as char);
             if escaped {
                 escaped = false;
             } else if b == b'\\' {
@@ -441,7 +448,6 @@ fn rewrite_function_call_paths(
         }
 
         if in_line_comment {
-            out.push(b as char);
             if b == b'\n' {
                 in_line_comment = false;
             }
@@ -450,9 +456,7 @@ fn rewrite_function_call_paths(
         }
 
         if in_block_comment {
-            out.push(b as char);
             if b == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                out.push('/');
                 i += 2;
                 in_block_comment = false;
                 continue;
@@ -462,23 +466,18 @@ fn rewrite_function_call_paths(
         }
 
         if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-            out.push('/');
-            out.push('/');
             i += 2;
             in_line_comment = true;
             continue;
         }
 
         if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
-            out.push('/');
-            out.push('*');
             i += 2;
             in_block_comment = true;
             continue;
         }
 
         if b == b'"' || b == b'\'' || b == b'`' {
-            out.push(b as char);
             i += 1;
             string_delim = Some(b);
             escaped = false;
@@ -544,7 +543,12 @@ fn rewrite_function_call_paths(
                                 || namespace_methods
                                     .is_some_and(|methods| methods.contains(member)))
                         {
+                            copy_through(&mut out, source, &mut copied, start);
                             out.push_str(member);
+                            // The rewritten `namespace::member` occupies
+                            // [start..k]; skip it so the next slice copy does
+                            // not resurrect it.
+                            copied = k;
                             i = k;
                             continue;
                         }
@@ -555,7 +559,9 @@ fn rewrite_function_call_paths(
             if let Some(target) = alias_calls.get(ident)
                 && call_starts_after_position(bytes, i, flavor)
             {
+                copy_through(&mut out, source, &mut copied, start);
                 out.push_str(target);
+                copied = i;
                 continue;
             }
 
@@ -569,7 +575,9 @@ fn rewrite_function_call_paths(
                     continue;
                 }
                 if call_starts_after_position(bytes, i, flavor) {
+                    copy_through(&mut out, source, &mut copied, start);
                     out.push_str(rem);
+                    copied = i;
                     rewritten_by_prefix = true;
                     break;
                 }
@@ -578,14 +586,13 @@ fn rewrite_function_call_paths(
                 continue;
             }
 
-            out.push_str(ident);
             continue;
         }
 
-        out.push(b as char);
         i += 1;
     }
 
+    copy_through(&mut out, source, &mut copied, bytes.len());
     out
 }
 
@@ -776,5 +783,131 @@ is_empty("");
         .expect("rewrite should succeed");
 
         assert_eq!(rewritten.source.trim(), "sleep(3);");
+    }
+
+    #[test]
+    fn rewrite_preserves_utf8_string_literals_byte_for_byte() {
+        // Regression: the scanners previously appended `byte as char`, turning
+        // the UTF-8 bytes of 猫 (E7 8C AB) into `ç\u{8c}«`.
+        let source = "string::non_empty(\"猫\");\nlet s = \"🐱 にゃん\";\n// コメント: 猫\ns;\n";
+        let path = Path::new("tests/main.rss");
+        let imports = vec![ModuleImport {
+            spec: "strings.rss".to_string(),
+            clause: ImportClause::Namespace("string".to_string()),
+            line: 1,
+        }];
+        let mut module_exports =
+            HashMap::<PathBuf, HashMap<String, ExportedFunctionSignature>>::new();
+        module_exports.insert(
+            PathBuf::from("tests").join("strings.rss"),
+            HashMap::from([(
+                "non_empty".to_string(),
+                ExportedFunctionSignature {
+                    arity: 1,
+                    type_params: Vec::new(),
+                },
+            )]),
+        );
+
+        let rewritten = rewrite_imported_call_sites(
+            source,
+            SourceFlavor::RustScript,
+            path,
+            &imports,
+            &module_exports,
+            &CompileSourceFileOptions::default(),
+        )
+        .expect("rewrite should succeed");
+
+        // Byte-for-byte equality: only the namespace call path changes.
+        assert_eq!(
+            rewritten.source,
+            "non_empty(\"猫\");\nlet s = \"🐱 にゃん\";\n// コメント: 猫\ns;\n"
+        );
+        assert!(
+            rewritten.source.contains("猫"),
+            "UTF-8 bytes must survive rewriting: {:?}",
+            rewritten.source
+        );
+    }
+
+    #[test]
+    fn rewrite_preserves_utf8_around_named_import_aliases() {
+        let source = "/* 前置ブロック: 猫 */\ndedup_items(\"猫\", \"犬\");\n// 行コメント \"not a string\" 猫\n";
+        let path = Path::new("tests/main.rss");
+        let imports = vec![ModuleImport {
+            spec: "collections.rss".to_string(),
+            clause: ImportClause::Named(vec![NamedImport {
+                imported: "dedup".to_string(),
+                local: "dedup_items".to_string(),
+            }]),
+            line: 1,
+        }];
+        let mut module_exports =
+            HashMap::<PathBuf, HashMap<String, ExportedFunctionSignature>>::new();
+        module_exports.insert(
+            PathBuf::from("tests").join("collections.rss"),
+            HashMap::from([(
+                "dedup".to_string(),
+                ExportedFunctionSignature {
+                    arity: 2,
+                    type_params: vec!["T".to_string()],
+                },
+            )]),
+        );
+
+        let rewritten = rewrite_imported_call_sites(
+            source,
+            SourceFlavor::RustScript,
+            path,
+            &imports,
+            &module_exports,
+            &CompileSourceFileOptions::default(),
+        )
+        .expect("rewrite should succeed");
+
+        assert_eq!(
+            rewritten.source,
+            "/* 前置ブロック: 猫 */\ndedup(\"猫\", \"犬\");\n// 行コメント \"not a string\" 猫\n"
+        );
+    }
+
+    #[test]
+    fn rewrite_preserves_utf8_in_block_comments_and_escaped_strings() {
+        let source =
+            "string::non_empty(\"猫\\\"犬\"); /* ブロック 猫 */\nstring::non_empty(`猫`);\n";
+        let path = Path::new("tests/main.rss");
+        let imports = vec![ModuleImport {
+            spec: "strings.rss".to_string(),
+            clause: ImportClause::Namespace("string".to_string()),
+            line: 1,
+        }];
+        let mut module_exports =
+            HashMap::<PathBuf, HashMap<String, ExportedFunctionSignature>>::new();
+        module_exports.insert(
+            PathBuf::from("tests").join("strings.rss"),
+            HashMap::from([(
+                "non_empty".to_string(),
+                ExportedFunctionSignature {
+                    arity: 1,
+                    type_params: Vec::new(),
+                },
+            )]),
+        );
+
+        let rewritten = rewrite_imported_call_sites(
+            source,
+            SourceFlavor::RustScript,
+            path,
+            &imports,
+            &module_exports,
+            &CompileSourceFileOptions::default(),
+        )
+        .expect("rewrite should succeed");
+
+        assert_eq!(
+            rewritten.source,
+            "non_empty(\"猫\\\"犬\"); /* ブロック 猫 */\nnon_empty(`猫`);\n"
+        );
     }
 }

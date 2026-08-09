@@ -12,7 +12,9 @@ use super::imports::{
     parse_module_imports, resolve_module_path, should_treat_missing_module_as_host_namespace,
     strip_import_directives,
 };
+use super::line_map::remap_frontend_ir_source_metadata;
 use super::model::{ExportedFunctionSignature, ImportClause, ModuleCollectState, ModuleImport};
+use super::rewrite::rewrite_imported_call_sites;
 
 pub(super) fn collect_module_units(
     path: &Path,
@@ -68,18 +70,55 @@ pub(super) fn collect_module_units(
         )?;
         state.visiting.pop();
 
+        let module_imports = parse_module_imports(
+            &module_source_raw,
+            SourceFlavor::RustScript,
+            &resolved,
+            options,
+        )?;
         let module_source =
             strip_import_directives(&module_source_raw, SourceFlavor::RustScript, options)?;
+        let rewritten_module = rewrite_imported_call_sites(
+            &module_source,
+            SourceFlavor::RustScript,
+            &resolved,
+            &module_imports,
+            &state.module_exports,
+            options,
+        )?;
+        let mut module_parse_source = build_rustscript_import_prelude(
+            &resolved,
+            &module_imports,
+            &state.module_exports,
+            options,
+        )?;
+        let module_prelude_lines = module_parse_source.lines().count();
+        module_parse_source.push_str(&rewritten_module.source);
+
         let mut module_source_map = SourceMap::new();
-        let module_source_id =
-            module_source_map.add_source(resolved.display().to_string(), module_source.clone());
-        let parsed = frontends::parse_source(&module_source, SourceFlavor::RustScript, options)
-            .map_err(|err| {
-                SourceError::Parse(
-                    err.with_line_span_from_source(&module_source_map, module_source_id),
-                )
-            })
-            .map_err(SourcePathError::Source)?;
+        let module_source_id = module_source_map
+            .add_source(resolved.display().to_string(), module_source_raw.as_str());
+        let mut parsed =
+            frontends::parse_source(&module_parse_source, SourceFlavor::RustScript, options)
+                .map_err(|mut err| {
+                    if module_prelude_lines > 0 {
+                        err.line = err.line.saturating_sub(module_prelude_lines).max(1);
+                        err.span = None;
+                    }
+                    let mut parse =
+                        err.with_line_span_from_source(&module_source_map, module_source_id);
+                    parse.message = format!("{}: {}", resolved.display(), parse.message);
+                    SourceError::Parse(parse)
+                })?;
+        if module_prelude_lines > 0 {
+            remap_frontend_ir_source_metadata(
+                &mut parsed,
+                &module_parse_source,
+                &module_source_raw,
+                module_source_id,
+                module_prelude_lines,
+            );
+        }
         let exports = parsed
             .functions
             .iter()
@@ -133,7 +172,7 @@ pub(super) fn build_rustscript_import_prelude(
             .map(|idx| format!("arg{idx}"))
             .collect::<Vec<_>>()
             .join(", ");
-        prelude.push_str(&format!("pub fn {name}{type_params}({args});\n"));
+        prelude.push_str(&format!("fn {name}{type_params}({args});\n"));
     }
     Ok(prelude)
 }

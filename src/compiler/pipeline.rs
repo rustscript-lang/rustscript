@@ -7,7 +7,7 @@ use super::ReplLocalState;
 use super::codegen::Compiler;
 use super::frontends;
 use super::ir::{Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, Stmt, TypeSchema};
-use super::linker::merge_units;
+use super::linker::{ParsedUnit, merge_units};
 use super::source_loader::load_units_for_source_file;
 use super::source_map::SourceMap;
 use super::{
@@ -1321,6 +1321,34 @@ fn compile_source_with_flavor_impl(
     }
 }
 
+fn compile_loaded_units(
+    source: String,
+    units: Vec<ParsedUnit>,
+    flavor: SourceFlavor,
+) -> Result<CompiledProgram, SourcePathError> {
+    let diagnostic_path = units
+        .iter()
+        .find(|unit| !unit.parsed.unknown_type_spans.is_empty())
+        .map(|unit| PathBuf::from(&unit.source_name));
+    let merged = merge_units(units)?;
+    compile_parsed_output(
+        source,
+        merged,
+        CompileBehavior::DEFAULT,
+        TypingMode::for_flavor(flavor),
+        matches!(flavor, SourceFlavor::RustScript),
+    )
+    .map_err(|error| match (error, diagnostic_path) {
+        (SourceError::Parse(mut parse), Some(path))
+            if parse.code.as_deref() == Some("E_STRICT_UNKNOWN_TYPE") =>
+        {
+            parse.message = format!("{}: {}", path.display(), parse.message);
+            SourcePathError::Source(SourceError::Parse(parse))
+        }
+        (error, _) => SourcePathError::Source(error),
+    })
+}
+
 fn compile_source_with_flavor_and_options_impl(
     source: &str,
     flavor: SourceFlavor,
@@ -1333,15 +1361,7 @@ fn compile_source_with_flavor_and_options_impl(
 
     let path = virtual_inmemory_entry_path(flavor);
     let (_root_parse_source, units) = load_units_for_source_file(&path, flavor, source, options)?;
-    let merged = merge_units(units)?;
-    compile_parsed_output(
-        source.to_string(),
-        merged,
-        CompileBehavior::DEFAULT,
-        TypingMode::for_flavor(flavor),
-        matches!(flavor, SourceFlavor::RustScript),
-    )
-    .map_err(SourcePathError::Source)
+    compile_loaded_units(source.to_string(), units, flavor)
 }
 
 fn compile_source_at_path_with_flavor_and_options_impl(
@@ -1351,15 +1371,7 @@ fn compile_source_at_path_with_flavor_and_options_impl(
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
     let (_root_parse_source, units) = load_units_for_source_file(path, flavor, source, options)?;
-    let merged = merge_units(units)?;
-    compile_parsed_output(
-        source.to_string(),
-        merged,
-        CompileBehavior::DEFAULT,
-        TypingMode::for_flavor(flavor),
-        matches!(flavor, SourceFlavor::RustScript),
-    )
-    .map_err(SourcePathError::Source)
+    compile_loaded_units(source.to_string(), units, flavor)
 }
 
 fn virtual_inmemory_entry_path(flavor: SourceFlavor) -> PathBuf {
@@ -1391,15 +1403,7 @@ fn compile_source_file_impl(
     let source_raw = std::fs::read_to_string(path)?;
     let (_root_parse_source, units) =
         load_units_for_source_file(path, flavor, &source_raw, options)?;
-    let merged = merge_units(units)?;
-    compile_parsed_output(
-        source_raw,
-        merged,
-        CompileBehavior::DEFAULT,
-        TypingMode::for_flavor(flavor),
-        matches!(flavor, SourceFlavor::RustScript),
-    )
-    .map_err(SourcePathError::Source)
+    compile_loaded_units(source_raw, units, flavor)
 }
 
 fn run_with_compiler_stack<T, F>(f: F) -> T

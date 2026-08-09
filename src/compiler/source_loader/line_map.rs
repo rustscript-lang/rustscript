@@ -1,4 +1,5 @@
 use super::super::ir::{Expr, FrontendIr, Stmt};
+use super::super::source_map::Span;
 
 pub(super) fn remap_frontend_ir_line_numbers(ir: &mut FrontendIr, prelude_lines: usize) {
     let offset = u32::try_from(prelude_lines).unwrap_or(u32::MAX);
@@ -10,7 +11,47 @@ pub(super) fn remap_frontend_ir_line_numbers(ir: &mut FrontendIr, prelude_lines:
             remap_stmt_line_numbers(stmt, offset);
         }
         remap_expr_line_numbers(&mut function.body_expr, offset);
+        remap_line(&mut function.body_expr_line, offset);
     }
+}
+
+pub(super) fn remap_frontend_ir_source_metadata(
+    ir: &mut FrontendIr,
+    synthetic_source: &str,
+    original_source: &str,
+    original_source_id: u32,
+    prelude_lines: usize,
+) {
+    remap_frontend_ir_line_numbers(ir, prelude_lines);
+    for span in &mut ir.unknown_type_spans {
+        let synthetic_line = line_number_at_offset(synthetic_source, span.lo);
+        let original_line = synthetic_line.saturating_sub(prelude_lines).max(1);
+        let (lo, hi) = line_range(original_source, original_line);
+        *span = Span::new(original_source_id, lo, hi);
+    }
+}
+
+fn line_number_at_offset(source: &str, offset: usize) -> usize {
+    source[..offset.min(source.len())]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1
+}
+
+fn line_range(source: &str, line: usize) -> (usize, usize) {
+    let mut current_line = 1usize;
+    let mut start = 0usize;
+    for (offset, byte) in source.bytes().enumerate() {
+        if byte == b'\n' {
+            if current_line == line {
+                return (start, offset);
+            }
+            current_line += 1;
+            start = offset + 1;
+        }
+    }
+    (start, source.len())
 }
 
 fn remap_line(line: &mut u32, offset: u32) {
