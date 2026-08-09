@@ -610,23 +610,55 @@ impl<C> Vm<C> {
     }
 
     fn call_core_builtin(&mut self, index: u16, arity: u8) -> Option<VmResult<()>> {
-        const BUILTIN_BASE: u16 = 0xFFA3;
-        const ARRAY_NEW: u16 = BUILTIN_BASE + 3;
-        const ARRAY_PUSH: u16 = BUILTIN_BASE + 4;
-        const MAP_NEW: u16 = BUILTIN_BASE + 5;
-        const SET: u16 = BUILTIN_BASE + 8;
-        const BIND_CALLABLE: u16 = BUILTIN_BASE - 14;
-        const DETACH_LOCAL: u16 = BUILTIN_BASE - 15;
+        use super::generated_builtin_ids::{
+            ARRAY_NEW_CALL_INDEX, ARRAY_PUSH_CALL_INDEX, BIND_CALLABLE_CALL_INDEX,
+            CONCAT_CALL_INDEX, DETACH_LOCAL_CALL_INDEX, MAP_NEW_CALL_INDEX, SET_CALL_INDEX,
+        };
 
         Some(match index {
-            ARRAY_NEW => {
+            CONCAT_CALL_INDEX => {
+                if let Err(error) = self.require_builtin_arity("concat", arity, 2) {
+                    return Some(Err(error));
+                }
+                let start = match self.stack.len().checked_sub(2) {
+                    Some(start) => start,
+                    None => return Some(Err(VmError::StackUnderflow)),
+                };
+                let lhs = self.stack[start].clone();
+                let rhs = self.stack[start + 1].clone();
+                let result = match (lhs, rhs) {
+                    (Value::String(lhs), Value::String(rhs)) => {
+                        let mut value = String::with_capacity(lhs.len() + rhs.len());
+                        value.push_str(&lhs);
+                        value.push_str(&rhs);
+                        Value::string(value)
+                    }
+                    (Value::Bytes(lhs), Value::Bytes(rhs)) => {
+                        let mut value = Vec::with_capacity(lhs.len() + rhs.len());
+                        value.extend_from_slice(&lhs);
+                        value.extend_from_slice(&rhs);
+                        Value::bytes(value)
+                    }
+                    (Value::Array(lhs), Value::Array(rhs)) => {
+                        let mut value = Vec::with_capacity(lhs.len() + rhs.len());
+                        value.extend_from_slice(&lhs);
+                        value.extend_from_slice(&rhs);
+                        Value::array(value)
+                    }
+                    _ => return Some(Err(VmError::TypeMismatch("concat operands"))),
+                };
+                self.stack.truncate(start);
+                self.stack.push(result);
+                Ok(())
+            }
+            ARRAY_NEW_CALL_INDEX => {
                 if let Err(error) = self.require_builtin_arity("array_new", arity, 0) {
                     return Some(Err(error));
                 }
                 self.stack.push(Value::array(Vec::new()));
                 Ok(())
             }
-            ARRAY_PUSH => {
+            ARRAY_PUSH_CALL_INDEX => {
                 if let Err(error) = self.require_builtin_arity("array_push", arity, 2) {
                     return Some(Err(error));
                 }
@@ -643,14 +675,14 @@ impl<C> Vm<C> {
                 self.stack.push(Value::Array(values));
                 Ok(())
             }
-            MAP_NEW => {
+            MAP_NEW_CALL_INDEX => {
                 if let Err(error) = self.require_builtin_arity("map_new", arity, 0) {
                     return Some(Err(error));
                 }
                 self.stack.push(Value::map(Vec::new()));
                 Ok(())
             }
-            SET => {
+            SET_CALL_INDEX => {
                 if let Err(error) = self.require_builtin_arity("set", arity, 3) {
                     return Some(Err(error));
                 }
@@ -674,7 +706,7 @@ impl<C> Vm<C> {
                 self.stack.push(Value::Map(entries));
                 Ok(())
             }
-            DETACH_LOCAL => {
+            DETACH_LOCAL_CALL_INDEX => {
                 if let Err(error) = self.require_builtin_arity("__detach_local", arity, 1) {
                     return Some(Err(error));
                 }
@@ -698,7 +730,7 @@ impl<C> Vm<C> {
                 self.stack.truncate(start);
                 Ok(())
             }
-            BIND_CALLABLE => {
+            BIND_CALLABLE_CALL_INDEX => {
                 if let Err(error) = self.require_builtin_arity("__bind_callable", arity, 2) {
                     return Some(Err(error));
                 }

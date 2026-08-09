@@ -11,7 +11,7 @@ use crate::debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
 use crate::vm::{HostImport, OpCode, Program, Value};
 
 const MAGIC: [u8; 4] = *b"VMBC";
-const VERSION_V10: u16 = 10;
+const VERSION_V11: u16 = 11;
 const FLAGS: u16 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,7 +241,7 @@ fn read_constant(cursor: &mut Cursor<'_>, depth: usize) -> Result<Value, WireErr
 pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&VERSION_V10.to_le_bytes());
+    out.extend_from_slice(&VERSION_V11.to_le_bytes());
     out.extend_from_slice(&FLAGS.to_le_bytes());
     write_u32_count("constants", program.constants.len(), &mut out)?;
 
@@ -275,7 +275,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     }
 
     let version = cursor.read_u16()?;
-    if version != VERSION_V10 {
+    if version != VERSION_V11 {
         return Err(WireError::UnsupportedVersion(version));
     }
 

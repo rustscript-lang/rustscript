@@ -8,7 +8,7 @@ use super::{
 };
 
 const MAGIC: [u8; 4] = *b"VMBC";
-const VERSION_V10: u16 = 10;
+const VERSION_V11: u16 = 11;
 const FLAGS: u16 = 0;
 const MAX_SCHEMA_DEPTH: usize = 64;
 const MAX_CONSTANT_DEPTH: usize = 64;
@@ -57,7 +57,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     }
 
     let version = cursor.read_u16()?;
-    if version != VERSION_V10 {
+    if version != VERSION_V11 {
         return Err(WireError::UnsupportedVersion(version));
     }
     let flags = cursor.read_u16()?;

@@ -5,7 +5,10 @@ use std::sync::{Arc, OnceLock};
 
 use crate::compiler::TypeSchema;
 
-pub const BYTECODE_ABI_VERSION: u16 = 10;
+/// Bytecode ABI version used for VM-internal cache identity (JIT trace cache,
+/// program cache keys). The VMBC wire format version lives in `src/vmbc.rs`
+/// (`VERSION_V11`); both were bumped together for the static builtin ID break.
+pub const BYTECODE_ABI_VERSION: u16 = 11;
 
 pub type SharedString = Arc<String>;
 pub type SharedBytes = Arc<Vec<u8>>;

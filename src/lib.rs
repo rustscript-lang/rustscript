@@ -24,10 +24,11 @@ pub use assembler::{AsmParseError, Assembler, AssemblerError, BytecodeBuilder, a
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::print::{PrintHostFunction, PrintlnHostFunction, format_value};
 pub use builtins::{
-    BuiltinFunction, BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec, CallableDef, CallableParam,
-    CallableParamType, CallableSignature, LanguageBuiltinSpec, builtin_namespace_specs,
-    callable_signatures_for_builtin_namespace_member, default_host_callables, is_builtin_namespace,
-    language_builtin_specs, resolve_builtin_namespace_call,
+    BUILTIN_CATALOG, BuiltinFunction, BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec,
+    CallableDef, CallableParam, CallableParamType, CallableSignature, LanguageBuiltinSpec,
+    builtin_namespace_specs, callable_signatures_for_builtin_namespace_member,
+    default_host_callables, is_builtin_namespace, language_builtin_specs,
+    resolve_builtin_namespace_call,
 };
 pub use bytecode::{
     CallableEnvironment, CallableKind, CallablePrototype, CallableTarget, CallableValue,
@@ -37,20 +38,7 @@ pub use bytecode::{
 pub fn builtin_call_index(name: &str) -> Option<u16> {
     use builtins::BuiltinFunction;
 
-    match name {
-        "len" => Some(BuiltinFunction::Len.call_index()),
-        "slice" => Some(BuiltinFunction::Slice.call_index()),
-        "concat" => Some(BuiltinFunction::Concat.call_index()),
-        "get" => Some(BuiltinFunction::Get.call_index()),
-        "has" => Some(BuiltinFunction::Has.call_index()),
-        "set" => Some(BuiltinFunction::Set.call_index()),
-        "keys" => Some(BuiltinFunction::Keys.call_index()),
-        "string_contains" => Some(BuiltinFunction::StringContains.call_index()),
-        "string_replace_literal" => Some(BuiltinFunction::StringReplaceLiteral.call_index()),
-        "string_lower_ascii" => Some(BuiltinFunction::StringLowerAscii.call_index()),
-        "string_split_literal" => Some(BuiltinFunction::StringSplitLiteral.call_index()),
-        _ => BuiltinFunction::from_namespaced_name(name).map(|builtin| builtin.call_index()),
-    }
+    BuiltinFunction::from_source_name(name).map(|builtin| builtin.call_index())
 }
 pub use compiler::diagnostics::{render_compile_error, render_source_error};
 pub use compiler::source_map::{LineSpanMapping, LoweredSource, SourceId, SourceMap, Span};
