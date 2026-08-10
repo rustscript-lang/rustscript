@@ -6,6 +6,8 @@
 
 **Tech Stack:** Rust 2024, generated builtin catalog, host function registry, proc macro, binding-plan tests.
 
+**Status:** Completed
+
 ---
 
 ## Independence and dependency
