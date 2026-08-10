@@ -534,23 +534,38 @@ fn validate_resolved_addresses(
 fn is_restricted_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(ip) => {
-            ip.is_loopback()
-                || ip.is_private()
-                || ip.is_link_local()
-                || ip.is_broadcast()
-                || ip.is_documentation()
-                || ip.is_multicast()
-                || ip.is_unspecified()
+            let octets = ip.octets();
+            matches!(octets[0], 0 | 10 | 127)
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 169 && octets[1] == 254)
+                || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                || (octets[0] == 192
+                    && matches!(
+                        (octets[1], octets[2]),
+                        (0, 0) | (0, 2) | (31, 196) | (52, 193) | (88, 99) | (168, _) | (175, 48)
+                    ))
+                || (octets[0] == 198
+                    && ((18..=19).contains(&octets[1]) || (octets[1] == 51 && octets[2] == 100)))
+                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+                || octets[0] >= 224
         }
         std::net::IpAddr::V6(ip) => {
             if let Some(mapped) = ip.to_ipv4_mapped() {
                 return is_restricted_ip(std::net::IpAddr::V4(mapped));
             }
-            ip.is_loopback()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
-                || ip.is_unspecified()
-                || ip.is_multicast()
+            let segments = ip.segments();
+            let outside_global_unicast = segments[0] & 0xe000 != 0x2000;
+            let protocol_assignments = segments[0] == 0x2001 && segments[1] <= 0x01ff;
+            let documentation = (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                || (segments[0] == 0x3fff && segments[1] & 0xf000 == 0);
+            let six_to_four = segments[0] == 0x2002;
+            let direct_delegation_as112 =
+                segments[0] == 0x2620 && segments[1] == 0x004f && segments[2] == 0x8000;
+            outside_global_unicast
+                || protocol_assignments
+                || documentation
+                || six_to_four
+                || direct_delegation_as112
         }
     }
 }
@@ -710,7 +725,8 @@ mod tests {
     #[cfg(feature = "http-client")]
     use super::{
         CancellationReason, HttpRequest, HttpRequestResource, OperationOwner, ResourceTypeId,
-        execute_request, is_restricted_ip, schedule_request, validate_url,
+        execute_request, is_restricted_ip, schedule_request, validate_resolved_addresses,
+        validate_url,
     };
     #[cfg(feature = "http-client")]
     use crate::builtins::runtime::cancellation::OperationId;
@@ -837,6 +853,50 @@ mod tests {
         let default_port = "https://example.com/".parse().expect("valid URL");
         assert!(validate_url(&config, &explicit).is_err());
         assert!(validate_url(&config, &default_port).is_err());
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn special_use_networks_and_mixed_dns_answers_are_restricted() {
+        for address in [
+            "0.1.2.3",
+            "100.64.0.1",
+            "192.0.0.8",
+            "192.0.2.1",
+            "192.31.196.1",
+            "192.52.193.1",
+            "192.88.99.1",
+            "192.175.48.1",
+            "198.18.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "240.0.0.1",
+            "100::1",
+            "2001::1",
+            "2001:db8::1",
+            "2002::1",
+            "2620:4f:8000::1",
+            "3fff::1",
+            "fc00::1",
+        ] {
+            assert!(
+                is_restricted_ip(address.parse().expect("valid IP")),
+                "{address} must be restricted"
+            );
+        }
+        for address in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
+            assert!(
+                !is_restricted_ip(address.parse().expect("valid IP")),
+                "{address} must remain globally routable"
+            );
+        }
+
+        let config = HttpConfig::default();
+        let addresses = [
+            "8.8.8.8:443".parse().expect("valid socket address"),
+            "100.64.0.1:443".parse().expect("valid socket address"),
+        ];
+        assert!(validate_resolved_addresses(&config, &addresses).is_err());
     }
 
     #[cfg(feature = "http-client")]
