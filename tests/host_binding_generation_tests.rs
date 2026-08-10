@@ -6,7 +6,10 @@ use build_script::{
     HostBindingKind, HostExecutionKind, classify_host_binding, infer_host_execution,
 };
 use syn::parse_quote;
-use vm::{HostFunctionRegistry, JitConfig, JitTraceTerminal, Value, Vm, VmStatus, compile_source};
+use vm::{
+    BuiltinFunction, CapabilityProfile, HostFunctionRegistry, JitConfig, JitTraceTerminal, Value,
+    Vm, VmStatus, compile_source,
+};
 
 fn native_jit_supported() -> bool {
     (cfg!(target_arch = "x86_64")
@@ -239,11 +242,15 @@ fn restricted_capabilities_disable_trace_jit_for_host_imports_and_builtins() {
             hot_loop_threshold: 1,
             max_trace_len: 512,
         });
-        HostFunctionRegistry::restricted()
+        let error = HostFunctionRegistry::restricted()
             .bind_vm_cached(&mut vm)
-            .expect("restricted registry should bind program imports");
+            .expect_err("restricted registry should reject ungranted capability during preflight");
 
-        assert!(matches!(vm.run(), Err(vm::VmError::UnboundImport(_))));
+        assert!(
+            error
+                .to_string()
+                .contains("capability profile does not allow")
+        );
         assert_eq!(vm.jit_native_exec_count(), 0);
     }
 }
@@ -272,4 +279,107 @@ fn runtime_exit_still_halts_for_direct_and_cached_default_bindings() {
         );
         assert!(vm.stack().is_empty());
     }
+}
+
+#[test]
+fn capability_profile_fingerprint_uses_stable_callable_identities() {
+    let first = CapabilityProfile::builder()
+        .allow_builtin(BuiltinFunction::JsonEncode)
+        .allow_host_import("custom::echo")
+        .build();
+    let reordered = CapabilityProfile::builder()
+        .allow_host_import("custom::echo")
+        .allow_builtin(BuiltinFunction::JsonEncode)
+        .build();
+
+    assert_eq!(first, reordered);
+    assert_eq!(first.fingerprint(), reordered.fingerprint());
+    assert!(first.allows_builtin(BuiltinFunction::JsonEncode));
+    assert!(first.allows_host_import("custom::echo"));
+    assert!(!first.allows_host_import("custom::other"));
+    assert_ne!(
+        first.fingerprint(),
+        CapabilityProfile::deny_all().fingerprint()
+    );
+    assert_ne!(
+        CapabilityProfile::allow_all().fingerprint(),
+        CapabilityProfile::deny_all().fingerprint()
+    );
+}
+
+#[test]
+fn capability_profile_fingerprint_covers_http_policy() {
+    let first_policy = vm::HttpConfig {
+        allowed_hosts: vec!["example.com".to_string()],
+        max_redirects: 1,
+        ..vm::HttpConfig::default()
+    };
+    let second_policy = vm::HttpConfig {
+        allowed_hosts: vec!["example.com".to_string()],
+        max_redirects: 2,
+        ..vm::HttpConfig::default()
+    };
+    let first = CapabilityProfile::builder()
+        .http_policy(first_policy)
+        .build();
+    let second = CapabilityProfile::builder()
+        .http_policy(second_policy)
+        .build();
+
+    assert_eq!(first.http_policy().expect("HTTP policy").max_redirects, 1);
+    assert_ne!(first.fingerprint(), second.fingerprint());
+}
+
+#[test]
+fn capability_profile_fingerprint_covers_io_policy() {
+    let first = CapabilityProfile::builder()
+        .io_policy(vm::IoPolicy {
+            allowed_roots: vec!["/tmp/b".to_string(), "/tmp/a".to_string()],
+            max_read_bytes: 10,
+            ..vm::IoPolicy::default()
+        })
+        .build();
+    let reordered = CapabilityProfile::builder()
+        .io_policy(vm::IoPolicy {
+            allowed_roots: vec!["/tmp/a".to_string(), "/tmp/b".to_string()],
+            max_read_bytes: 10,
+            ..vm::IoPolicy::default()
+        })
+        .build();
+    let changed = CapabilityProfile::builder()
+        .io_policy(vm::IoPolicy {
+            allowed_roots: vec!["/tmp/a".to_string(), "/tmp/b".to_string()],
+            max_read_bytes: 11,
+            ..vm::IoPolicy::default()
+        })
+        .build();
+
+    assert_eq!(first, reordered);
+    assert_eq!(first.fingerprint(), reordered.fingerprint());
+    assert_ne!(first.fingerprint(), changed.fingerprint());
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn capability_profile_fingerprint_covers_sqlite_policy() {
+    let mut first_policy = vm::SqlitePolicy::default();
+    first_policy.limits.max_rows = 10;
+    let mut second_policy = first_policy.clone();
+    second_policy.limits.max_rows = 11;
+    let first = CapabilityProfile::builder()
+        .sqlite_policy(first_policy)
+        .build();
+    let second = CapabilityProfile::builder()
+        .sqlite_policy(second_policy)
+        .build();
+
+    assert_eq!(
+        first
+            .sqlite_policy()
+            .expect("SQLite policy")
+            .limits
+            .max_rows,
+        10
+    );
+    assert_ne!(first.fingerprint(), second.fingerprint());
 }

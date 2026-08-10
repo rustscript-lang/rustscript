@@ -46,6 +46,70 @@ fn unused_host_operation_ids_do_not_consume_registry_capacity() {
     assert_eq!(vm.host.runtime_operations.active_count(), 0);
 }
 
+#[cfg(feature = "http-client")]
+#[test]
+fn capability_profile_binding_installs_http_policy() {
+    let policy = crate::builtins::runtime::HttpConfig {
+        allowed_hosts: vec!["example.com".to_string()],
+        max_redirects: 2,
+        ..crate::builtins::runtime::HttpConfig::default()
+    };
+    let mut registry = HostFunctionRegistry::empty();
+    registry.set_capability_profile(
+        CapabilityProfile::builder()
+            .http_policy(policy.clone())
+            .build(),
+    );
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("profile should bind");
+
+    assert_eq!(vm.host.http_state.configuration(), Some(&policy));
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn capability_profile_binding_installs_sqlite_policy() {
+    let mut policy = crate::vm::SqlitePolicy::default();
+    policy.limits.max_rows = 10;
+    let mut registry = HostFunctionRegistry::empty();
+    registry.set_capability_profile(
+        CapabilityProfile::builder()
+            .sqlite_policy(policy.clone())
+            .build(),
+    );
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("profile should bind");
+
+    assert_eq!(vm.host.sqlite_policy, policy);
+}
+
+#[test]
+fn capability_profile_binding_installs_io_policy() {
+    let policy = crate::vm::IoPolicy {
+        allowed_roots: vec!["/tmp".to_string()],
+        allow_write: true,
+        allow_process: false,
+        max_read_bytes: 128,
+        max_write_bytes: 64,
+    };
+    let mut registry = HostFunctionRegistry::empty();
+    registry.set_capability_profile(
+        CapabilityProfile::builder()
+            .io_policy(policy.clone())
+            .build(),
+    );
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("profile should bind");
+
+    assert_eq!(vm.host.io_policy.as_ref(), Some(&policy));
+}
+
 #[test]
 fn external_host_operations_join_the_shared_registry_without_id_collisions() {
     use crate::builtins::runtime::cancellation::{OperationId, OperationOwner};

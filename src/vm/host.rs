@@ -132,8 +132,8 @@ pub struct HostBindingPlan {
     allow_default_builtin_capabilities: bool,
     allowed_host_function_slots: Vec<u16>,
     allow_default_host_capabilities: bool,
-    capability_profile: Arc<()>,
-    capability_state: Arc<()>,
+    capability_profile: Arc<CapabilityProfile>,
+    capability_fingerprint: u64,
     registry_state: Arc<()>,
     registry_generation_token: Arc<()>,
     registry_generation: u64,
@@ -146,10 +146,8 @@ pub struct HostFunctionRegistry {
     plan_cache: Arc<RwLock<HashMap<Vec<HostImport>, Arc<HostBindingPlan>>>>,
     allowed_builtin_calls: Arc<Vec<u16>>,
     allow_default_builtin_capabilities: bool,
-    allowed_host_registry_slots: Arc<Vec<u16>>,
     allow_default_host_capabilities: bool,
-    capability_profile: Arc<()>,
-    capability_state: Arc<()>,
+    capability_profile: Arc<CapabilityProfile>,
     registry_state: Arc<()>,
     registry_generation_token: Arc<()>,
     registry_generation: Arc<AtomicU64>,
@@ -169,10 +167,8 @@ impl HostFunctionRegistry {
             plan_cache: Arc::new(RwLock::new(HashMap::new())),
             allowed_builtin_calls: Arc::new(Vec::new()),
             allow_default_builtin_capabilities: true,
-            allowed_host_registry_slots: Arc::new(Vec::new()),
             allow_default_host_capabilities: true,
-            capability_profile: Arc::new(()),
-            capability_state: Arc::new(()),
+            capability_profile: Arc::new(CapabilityProfile::allow_all()),
             registry_state: Arc::new(()),
             registry_generation_token: Arc::new(()),
             registry_generation: Arc::new(AtomicU64::new(0)),
@@ -192,8 +188,7 @@ impl HostFunctionRegistry {
             })
             .clone();
         registry.plan_cache = Arc::new(RwLock::new(HashMap::new()));
-        registry.capability_profile = Arc::new(());
-        registry.capability_state = Arc::new(());
+        registry.capability_profile = Arc::new(CapabilityProfile::allow_all());
         registry.registry_state = Arc::new(());
         registry.registry_generation_token = Arc::new(());
         registry.registry_generation = Arc::new(AtomicU64::new(0));
@@ -206,9 +201,7 @@ impl HostFunctionRegistry {
         let mut registry = Self::new();
         registry.allow_default_builtin_capabilities = false;
         registry.allow_default_host_capabilities = false;
-        registry.allowed_host_registry_slots = Arc::new(Vec::new());
-        registry.capability_profile = Arc::new(());
-        registry.capability_state = Arc::new(());
+        registry.capability_profile = Arc::new(CapabilityProfile::deny_all());
         registry.registry_state = Arc::new(());
         registry.registry_generation_token = Arc::new(());
         registry.registry_generation = Arc::new(AtomicU64::new(0));
@@ -216,16 +209,20 @@ impl HostFunctionRegistry {
         registry
     }
 
+    /// Replaces the registry's immutable capability profile.
+    pub fn set_capability_profile(&mut self, profile: CapabilityProfile) {
+        self.allowed_builtin_calls = Arc::new(profile.allowed_builtin_calls().to_vec());
+        self.allow_default_builtin_capabilities = profile.allows_all_builtins();
+        self.allow_default_host_capabilities = profile.allows_all_host_imports();
+        self.capability_profile = Arc::new(profile);
+        self.invalidate_plan_cache();
+    }
+
     /// Explicitly permits a namespaced builtin when this registry is used as a capability plan.
     pub fn allow_builtin(&mut self, name: impl AsRef<str>) -> VmResult<()> {
         let name = name.as_ref();
-        if let Some(&registry_slot) = self.by_name.get(name) {
-            let slots = Arc::make_mut(&mut self.allowed_host_registry_slots);
-            if !slots.contains(&registry_slot) {
-                slots.push(registry_slot);
-                slots.sort_unstable();
-            }
-            self.capability_state = Arc::new(());
+        if self.by_name.contains_key(name) {
+            self.capability_profile = Arc::new(self.capability_profile.with_host_import(name));
             self.invalidate_plan_cache();
             return Ok(());
         }
@@ -236,7 +233,7 @@ impl HostFunctionRegistry {
             calls.push(builtin.call_index());
             calls.sort_unstable();
         }
-        self.capability_state = Arc::new(());
+        self.capability_profile = Arc::new(self.capability_profile.with_builtin(builtin));
         self.invalidate_plan_cache();
         Ok(())
     }
@@ -455,7 +452,51 @@ impl HostFunctionRegistry {
         self.invalidate_plan_cache();
     }
 
+    fn validate_builtin_capability(&self, call_index: u16) -> VmResult<()> {
+        if let Some(builtin) = BuiltinFunction::from_call_index(call_index)
+            && builtin.requires_explicit_host_capability()
+            && !self.allowed_builtin_calls.contains(&call_index)
+        {
+            return Err(VmError::HostError(format!(
+                "capability profile does not allow builtin '{}'",
+                builtin.name()
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_program_capabilities(&self, program: &Program) -> VmResult<()> {
+        if self.allow_default_builtin_capabilities {
+            return Ok(());
+        }
+        let mut ip = 0usize;
+        while let Some(&raw_opcode) = program.code.get(ip) {
+            let opcode =
+                OpCode::try_from(raw_opcode).map_err(|_| VmError::InvalidOpcode(raw_opcode))?;
+            let operand_end = ip
+                .checked_add(1 + opcode.operand_len())
+                .ok_or(VmError::BytecodeBounds)?;
+            if operand_end > program.code.len() {
+                return Err(VmError::BytecodeBounds);
+            }
+            if opcode == OpCode::Call {
+                let bytes: [u8; 2] = program.code[ip + 1..ip + 3]
+                    .try_into()
+                    .map_err(|_| VmError::BytecodeBounds)?;
+                self.validate_builtin_capability(u16::from_le_bytes(bytes))?;
+            }
+            ip = operand_end;
+        }
+        for prototype in &program.callable_prototypes {
+            if let CallableTarget::HostImport(call_index) = prototype.target {
+                self.validate_builtin_capability(call_index)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn bind_vm_cached(&self, vm: &mut Vm) -> VmResult<()> {
+        self.validate_program_capabilities(&vm.program)?;
         let plan = self.prepare_shared_plan(&vm.program.imports)?;
         self.bind_vm_with_plan(vm, &plan)
     }
@@ -469,8 +510,8 @@ impl HostFunctionRegistry {
     }
 
     fn plan_matches_current(&self, plan: &HostBindingPlan) -> bool {
-        Arc::ptr_eq(&self.capability_profile, &plan.capability_profile)
-            && Arc::ptr_eq(&self.capability_state, &plan.capability_state)
+        self.capability_profile.fingerprint() == plan.capability_fingerprint
+            && self.capability_profile.as_ref() == plan.capability_profile.as_ref()
             && Arc::ptr_eq(&self.registry_state, &plan.registry_state)
             && Arc::ptr_eq(
                 &self.registry_generation_token,
@@ -505,6 +546,14 @@ impl HostFunctionRegistry {
                 .entries
                 .get(registry_slot as usize)
                 .ok_or(VmError::InvalidCall(registry_slot))?;
+            if !self.allow_default_host_capabilities
+                && !self.capability_profile.allows_host_import(&import.name)
+            {
+                return Err(VmError::HostError(format!(
+                    "capability profile does not allow host import '{}'",
+                    import.name
+                )));
+            }
             if entry.arity != import.arity {
                 return Err(VmError::InvalidCallArity {
                     import: import.name.clone(),
@@ -524,16 +573,17 @@ impl HostFunctionRegistry {
             resolved_calls.push(vm_slot);
         }
 
-        let allowed_host_function_slots = self
-            .allowed_host_registry_slots
+        let mut allowed_host_function_slots = imports
             .iter()
-            .filter_map(|registry_slot| {
-                registry_slots
-                    .iter()
-                    .position(|slot| slot == registry_slot)
-                    .map(|slot| slot as u16)
+            .zip(resolved_calls.iter().copied())
+            .filter_map(|(import, vm_slot)| {
+                self.capability_profile
+                    .allows_host_import(&import.name)
+                    .then_some(vm_slot)
             })
-            .collect();
+            .collect::<Vec<_>>();
+        allowed_host_function_slots.sort_unstable();
+        allowed_host_function_slots.dedup();
         let runtime_owned_pending_slots = registry_slots
             .iter()
             .enumerate()
@@ -555,7 +605,7 @@ impl HostFunctionRegistry {
             allowed_host_function_slots,
             allow_default_host_capabilities: self.allow_default_host_capabilities,
             capability_profile: Arc::clone(&self.capability_profile),
-            capability_state: Arc::clone(&self.capability_state),
+            capability_fingerprint: self.capability_profile.fingerprint(),
             registry_state: Arc::clone(&self.registry_state),
             registry_generation_token: Arc::clone(&self.registry_generation_token),
             registry_generation: self.registry_generation.load(Ordering::Relaxed),
@@ -569,19 +619,17 @@ impl HostFunctionRegistry {
     }
 
     pub fn bind_vm_with_plan(&self, vm: &mut Vm, plan: &HostBindingPlan) -> VmResult<()> {
+        self.validate_program_capabilities(&vm.program)?;
         if vm.program.imports != plan.import_signature {
             return Err(VmError::HostError(
                 "host binding plan does not match vm import signature".to_string(),
             ));
         }
-        if !Arc::ptr_eq(&self.capability_profile, &plan.capability_profile) {
+        if self.capability_profile.fingerprint() != plan.capability_fingerprint
+            || self.capability_profile.as_ref() != plan.capability_profile.as_ref()
+        {
             return Err(VmError::HostError(
                 "host binding plan belongs to a different capability profile".to_string(),
-            ));
-        }
-        if !Arc::ptr_eq(&self.capability_state, &plan.capability_state) {
-            return Err(VmError::HostError(
-                "host binding plan belongs to a different capability state".to_string(),
             ));
         }
         if !Arc::ptr_eq(&self.registry_state, &plan.registry_state) {
@@ -604,6 +652,26 @@ impl HostFunctionRegistry {
             ));
         }
 
+        if !plan.allow_default_host_capabilities {
+            match plan.capability_profile.http_policy() {
+                Some(policy) => vm.host.http_state.configure(policy.clone()),
+                None => vm.host.http_state.clear_configuration(),
+            }
+            vm.host.io_policy = Some(
+                plan.capability_profile
+                    .io_policy()
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            #[cfg(feature = "sqlite")]
+            {
+                vm.host.sqlite_policy = plan
+                    .capability_profile
+                    .sqlite_policy()
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        }
         vm.host.host_functions.reserve(plan.registry_slots.len());
         for &registry_slot in &plan.registry_slots {
             let entry = self
