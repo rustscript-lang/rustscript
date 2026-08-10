@@ -308,13 +308,13 @@ fn generate_vm_wrapper(
 
     Ok(quote! {
         #[allow(dead_code)]
-        pub(super) fn #wrapper_name(#(#imm_wrapper_params),*) -> #wrapper_output {
+        pub(crate) fn #wrapper_name(#(#imm_wrapper_params),*) -> #wrapper_output {
             #(#imm_extract_stmts)*
             #call_expr
         }
 
         #[allow(dead_code)]
-        pub(super) fn #mutable_wrapper_name(#(#mut_wrapper_params),*) -> #wrapper_output {
+        pub(crate) fn #mutable_wrapper_name(#(#mut_wrapper_params),*) -> #wrapper_output {
             #(#mut_extract_stmts)*
             #call_expr
         }
@@ -344,7 +344,7 @@ fn generate_async_vm_wrapper(
         let ty = &pat_type.ty;
         if is_host_context_param(input) {
             extract_stmts.push(quote! {
-                let #ident = <#ty as super::CaptureAsyncHostContext>::capture(vm)?;
+                let #ident = <#ty as super::CaptureAsyncHostContext>::capture_with_args(vm, args)?;
             });
             call_args.push(quote!(#ident));
             continue;
@@ -366,12 +366,14 @@ fn generate_async_vm_wrapper(
     } else {
         quote!(#impl_name(#(#call_args),*).await)
     };
-    let body = quote! {
-        #(#extract_stmts)*
-        vm.submit_host_future(Box::pin(async move {
-            let value = #await_value;
+    let future_result = if return_is_host_future_output(&item.sig.output) {
+        quote!(Ok(value.map(super::return_one)))
+    } else {
+        quote! {
             match super::IntoHostCallOutcome::into_host_call_outcome(value) {
-                super::CallOutcome::Return(values) => Ok(values),
+                super::CallOutcome::Return(values) => {
+                    Ok(super::HostFutureOutput::returning(values))
+                }
                 super::CallOutcome::Pending(op_id) => Err(super::VmError::HostError(
                     format!("async host function returned nested pending operation {op_id}"),
                 )),
@@ -381,12 +383,19 @@ fn generate_async_vm_wrapper(
                     ),
                 ),
             }
+        }
+    };
+    let body = quote! {
+        #(#extract_stmts)*
+        vm.submit_host_future(Box::pin(async move {
+            let value = #await_value;
+            #future_result
         }))
     };
 
     Ok(quote! {
         #[allow(dead_code)]
-        pub(super) fn #wrapper_name(
+        pub(crate) fn #wrapper_name(
             vm: &mut super::super::Vm,
             args: &[super::super::Value],
         ) -> super::super::VmResult<super::CallOutcome> {
@@ -394,7 +403,7 @@ fn generate_async_vm_wrapper(
         }
 
         #[allow(dead_code)]
-        pub(super) fn #mutable_wrapper_name(
+        pub(crate) fn #mutable_wrapper_name(
             vm: &mut super::super::Vm,
             args: &mut [super::super::Value],
         ) -> super::super::VmResult<super::CallOutcome> {
@@ -465,6 +474,20 @@ fn unwrap_vm_result_type(ty: &Type) -> Result<Option<Type>, Error> {
     }
 }
 
+fn return_is_host_future_output(output: &ReturnType) -> bool {
+    vm_result_inner_type(output)
+        .expect("pd_host_function return type should already be validated")
+        .and_then(|ty| match ty {
+            Type::Path(path) => path
+                .path
+                .segments
+                .last()
+                .map(|segment| segment.ident.clone()),
+            _ => None,
+        })
+        .is_some_and(|ident| ident == "HostFutureOutput")
+}
+
 fn return_is_vm_result(output: &ReturnType) -> bool {
     vm_result_inner_type(output)
         .expect("pd_host_function return type should already be validated")
@@ -526,7 +549,7 @@ fn type_label(ty: &Type) -> Result<String, Error> {
                     let inner_label = type_label(inner)?;
                     Ok(format!("{inner_label} | null"))
                 }
-                "VmResult" | "HostCallResult" => {
+                "VmResult" | "HostCallResult" | "HostFutureOutput" => {
                     let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
                         return Err(Error::new_spanned(
                             &segment.arguments,
@@ -720,7 +743,24 @@ mod tests {
         assert!(expanded.contains("async move"));
         assert!(expanded.contains("borrow_arg"));
         assert!(expanded.contains("CaptureAsyncHostContext"));
+        assert!(expanded.contains("capture_with_args"));
         assert!(!expanded.contains("pd_host_context"));
+    }
+
+    #[test]
+    fn async_host_future_output_maps_its_inner_value_to_call_return() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "test::completion");
+        let item: ItemFn = parse_quote! {
+            /// Completes after mutating VM-owned state.
+            async fn completion() -> VmResult<HostFutureOutput<i64>> {
+                todo!()
+            }
+        };
+
+        let expanded = expand_pd_host_function(attr, item)
+            .expect("host future output should be accepted")
+            .to_string();
+        assert!(expanded.contains("value . map (super :: return_one)"));
     }
 
     #[test]

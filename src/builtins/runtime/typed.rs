@@ -130,6 +130,15 @@ impl<'a> FromVmValue<'a> for &'a str {
     }
 }
 
+impl FromVmValue<'_> for String {
+    fn from_vm_value(value: &Value, _label: &str) -> VmResult<Self> {
+        match value {
+            Value::String(text) => Ok(text.to_string()),
+            _ => Err(VmError::TypeMismatch("string")),
+        }
+    }
+}
+
 impl<'a> FromVmValue<'a> for &'a [u8] {
     fn from_vm_value(value: &'a Value, _label: &str) -> VmResult<Self> {
         match value {
@@ -459,6 +468,17 @@ where
 {
     fn into_builtin_call_outcome(self) -> BuiltinCallOutcome {
         BuiltinCallOutcome::Return(return_one(self))
+    }
+}
+
+impl IntoBuiltinCallOutcome for CallOutcome {
+    fn into_builtin_call_outcome(self) -> BuiltinCallOutcome {
+        match self {
+            CallOutcome::Return(values) => BuiltinCallOutcome::Return(values),
+            CallOutcome::Halt => BuiltinCallOutcome::Halt,
+            CallOutcome::Pending(op_id) => BuiltinCallOutcome::Pending(op_id),
+            CallOutcome::Yield => unreachable!("async builtin wrappers cannot return Yield"),
+        }
     }
 }
 

@@ -5,7 +5,7 @@ use std::task::{Context, Poll};
 use crate::builtins::BuiltinFunction;
 use crate::vm::{CallOutcome, CallReturn, HostOpId, Value, Vm, VmResult};
 #[cfg(feature = "async")]
-use crate::vm::{CaptureAsyncHostContext, VmError};
+use crate::vm::{CaptureAsyncHostContext, HostFutureOutput, VmError};
 
 use self::cancellation::{CancellationReason, OperationId, OperationOwner, OperationState};
 use self::error::{RuntimeError, RuntimeErrorCode};
@@ -16,6 +16,7 @@ use self::resource::ResourceTypeId;
 type RuntimeOperationPoller = fn(&mut Vm, HostOpId, &mut Context<'_>) -> Poll<VmResult<CallReturn>>;
 
 const RUNTIME_OPERATION_POLLERS: &[(OperationOwner, RuntimeOperationPoller)] = &[
+    #[cfg(not(feature = "async"))]
     (OperationOwner::Io, io::poll_builtin_io_op),
     #[cfg(feature = "sqlite")]
     (OperationOwner::Sqlite, sqlite::poll_pending_op),
@@ -31,7 +32,6 @@ pub(crate) mod error;
 pub(crate) mod event;
 mod host;
 mod http;
-#[cfg(not(target_arch = "wasm32"))]
 mod io;
 #[cfg(target_arch = "wasm32")]
 mod io_wasm;
@@ -46,11 +46,10 @@ pub(crate) mod resource;
 mod sqlite;
 mod typed;
 
-#[cfg(target_arch = "wasm32")]
-use io_wasm as io;
-
-pub use http::HttpConfig;
-pub(crate) use http::HttpState;
+pub use http::{HttpConfig, HttpHostExt};
+pub use io::{IoHostExt, IoPolicy};
+#[cfg(feature = "sqlite")]
+pub use sqlite::{SqliteHostExt, SqliteLimits, SqlitePolicy};
 pub use typed::HostCallResult;
 use typed::{
     AnyValue, IntoBuiltinCallOutcome, IntoHostCallOutcome, NumberValue, UnknownValue, VmArray,

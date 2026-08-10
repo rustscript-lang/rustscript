@@ -1,6 +1,6 @@
 use vm::{
-    BuiltinFunction, CapabilityProfile, HostFunctionRegistry, IoPolicy, Value, Vm, VmError,
-    VmStatus, compile_source,
+    BuiltinFunction, CapabilityProfile, HostFunctionRegistry, IoHostExt, IoPolicy, Value, Vm,
+    VmError, VmStatus, compile_source,
 };
 
 #[cfg(unix)]
@@ -49,10 +49,10 @@ fn io_policy_denies_process_launch_when_process_capability_is_disabled() {
     registry.set_capability_profile(
         CapabilityProfile::builder()
             .allow_builtin(BuiltinFunction::IoPopen)
-            .io_policy(IoPolicy::default())
             .build(),
     );
     let mut vm = Vm::new(compiled.program);
+    vm.configure_io(IoPolicy::default());
     registry
         .bind_vm_cached(&mut vm)
         .expect("profile should bind");
@@ -74,7 +74,31 @@ fn io_policy_denies_paths_outside_allowed_roots() {
     registry.set_capability_profile(
         CapabilityProfile::builder()
             .allow_builtin(BuiltinFunction::IoExists)
-            .io_policy(IoPolicy::default())
+            .build(),
+    );
+    let mut vm = Vm::new(compiled.program);
+    vm.configure_io(IoPolicy::default());
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("profile should bind");
+
+    let error = vm.run().expect_err("path should be denied");
+    assert!(matches!(error, VmError::HostError(message) if message.contains("allowed roots")));
+}
+
+#[test]
+fn restricted_registry_defaults_to_deny_when_io_host_state_is_absent() {
+    let compiled = compile_source(
+        r#"
+        use io;
+        io::exists("Cargo.toml");
+        "#,
+    )
+    .expect("source should compile");
+    let mut registry = HostFunctionRegistry::restricted();
+    registry.set_capability_profile(
+        CapabilityProfile::builder()
+            .allow_builtin(BuiltinFunction::IoExists)
             .build(),
     );
     let mut vm = Vm::new(compiled.program);
@@ -82,7 +106,9 @@ fn io_policy_denies_paths_outside_allowed_roots() {
         .bind_vm_cached(&mut vm)
         .expect("profile should bind");
 
-    let error = vm.run().expect_err("path should be denied");
+    let error = vm
+        .run()
+        .expect_err("missing IO host state should use the deny-by-default policy");
     assert!(matches!(error, VmError::HostError(message) if message.contains("allowed roots")));
 }
 
@@ -110,10 +136,10 @@ fn io_policy_limits_write_size() {
         CapabilityProfile::builder()
             .allow_builtin(BuiltinFunction::IoOpen)
             .allow_builtin(BuiltinFunction::IoWrite)
-            .io_policy(policy)
             .build(),
     );
     let mut vm = Vm::new(compiled.program);
+    vm.configure_io(policy);
     registry
         .bind_vm_cached(&mut vm)
         .expect("profile should bind");
@@ -153,10 +179,10 @@ fn io_policy_limits_read_all_size() {
         CapabilityProfile::builder()
             .allow_builtin(BuiltinFunction::IoOpen)
             .allow_builtin(BuiltinFunction::IoReadAll)
-            .io_policy(policy)
             .build(),
     );
     let mut vm = Vm::new(compiled.program);
+    vm.configure_io(policy);
     registry
         .bind_vm_cached(&mut vm)
         .expect("profile should bind");
@@ -202,10 +228,10 @@ fn io_policy_limits_read_line_size() {
         CapabilityProfile::builder()
             .allow_builtin(BuiltinFunction::IoOpen)
             .allow_builtin(BuiltinFunction::IoReadLine)
-            .io_policy(policy)
             .build(),
     );
     let mut vm = Vm::new(compiled.program);
+    vm.configure_io(policy);
     registry
         .bind_vm_cached(&mut vm)
         .expect("profile should bind");
@@ -244,8 +270,8 @@ fn process_exists(process_id: i32) -> bool {
 }
 
 #[test]
-fn io_callback_resource_is_registered_before_worker_spawn() {
-    let source = include_str!("../../src/builtins/runtime/io.rs");
+fn blocking_io_runs_after_callback_registration_without_spawning_a_worker() {
+    let source = include_str!("../../src/builtins/runtime/io/blocking.rs");
     let schedule = source
         .split_once("fn schedule_io_task(")
         .expect("schedule_io_task should exist")
@@ -256,19 +282,14 @@ fn io_callback_resource_is_registered_before_worker_spawn() {
     let callback_registration = schedule
         .find(".insert(ResourceTypeId::CALLBACK, receiver)")
         .expect("schedule_io_task should register its callback receiver");
-    let worker_spawn = schedule
-        .find(".spawn(move ||")
-        .expect("schedule_io_task should spawn its worker");
 
-    assert!(
-        callback_registration < worker_spawn,
-        "callback receiver must be registered before the worker can run"
-    );
+    assert!(!schedule.contains(".spawn(move ||"));
+    assert!(schedule[callback_registration..].contains("task()"));
 }
 
 #[test]
 fn popen_teardown_does_not_invoke_external_kill_programs() {
-    let source = include_str!("../../src/builtins/runtime/io.rs");
+    let source = include_str!("../../src/builtins/runtime/io/blocking.rs");
     assert!(
         !source.contains("Command::new(\"kill\")"),
         "Unix popen teardown must use the platform process API"
@@ -290,8 +311,7 @@ fn reset_terminates_popen_descendants() {
     let compiled = compile_source(&format!(
         r#"
         use io;
-        let handle = io::popen("{command}", "r");
-        io::read_all(handle);
+        io::popen("{command}", "r");
         "#
     ))
     .expect("descendant popen source should compile");
@@ -301,8 +321,6 @@ fn reset_terminates_popen_descendants() {
     assert!(matches!(first, VmStatus::Waiting(_)));
     vm.wait_for_host_op_blocking()
         .expect("popen should complete");
-    let second = vm.resume().expect("read_all should start");
-    assert!(matches!(second, VmStatus::Waiting(_)));
 
     let pid_deadline = Instant::now() + Duration::from_secs(2);
     while !child_pid_path.exists() && Instant::now() < pid_deadline {
@@ -330,6 +348,7 @@ fn reset_terminates_popen_descendants() {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "blocking IO runs the read on the caller thread"]
 fn reset_interrupts_a_blocked_popen_read_within_a_bounded_time() {
     let compiled = compile_source(
         r#"

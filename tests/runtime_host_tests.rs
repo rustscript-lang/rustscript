@@ -2,6 +2,8 @@
 
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "sqlite")]
+use vm::SqliteHostExt;
 use vm::{
     EventPayload, EventSink, HostFunctionRegistry, RuntimeResult, Value, Vm, VmStatus,
     compile_source,

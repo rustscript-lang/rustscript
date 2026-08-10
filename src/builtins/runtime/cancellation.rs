@@ -410,6 +410,7 @@ impl OperationState {
         self.core.status()
     }
 
+    #[cfg_attr(feature = "async", allow(dead_code))]
     pub fn set_payload(&self, payload: ResourceHandle) {
         self.core
             .inner
@@ -453,6 +454,7 @@ impl OperationState {
             .payload
     }
 
+    #[cfg_attr(feature = "async", allow(dead_code))]
     pub fn set_resource(&self, resource: ResourceHandle) {
         self.core
             .inner
@@ -560,6 +562,7 @@ impl OperationRegistry {
         Ok(id)
     }
 
+    #[cfg_attr(feature = "async", allow(dead_code))]
     pub fn start_owned(
         &mut self,
         owner: OperationOwner,

@@ -2,6 +2,8 @@ use super::async_host::WaitingHostOp;
 use super::*;
 use crate::builtins::BuiltinFunction;
 use crate::bytecode::TypeMap;
+#[cfg(feature = "sqlite")]
+use crate::{SqliteHostExt, SqlitePolicy};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -117,7 +119,9 @@ fn async_host_future_is_submitted_to_the_host_bridge() {
     }));
 
     let outcome = vm
-        .submit_host_future(Box::pin(async { Ok(CallReturn::one(Value::Int(42))) }))
+        .submit_host_future(Box::pin(async {
+            Ok(HostFutureOutput::returning(CallReturn::one(Value::Int(42))))
+        }))
         .expect("host bridge should accept future");
     let CallOutcome::Pending(op_id) = outcome else {
         panic!("async host submission should suspend");
@@ -132,7 +136,9 @@ fn async_host_future_is_submitted_to_the_host_bridge() {
 fn async_host_submission_without_driver_fails_and_retires_the_id() {
     let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
     let error = vm
-        .submit_host_future(Box::pin(async { Ok(CallReturn::none()) }))
+        .submit_host_future(Box::pin(async {
+            Ok(HostFutureOutput::returning(CallReturn::none()))
+        }))
         .expect_err("missing host async driver should fail");
 
     assert!(
@@ -145,76 +151,112 @@ fn async_host_submission_without_driver_fails_and_retires_the_id() {
 }
 
 #[test]
+fn completing_a_submitted_host_op_cancels_the_driver_future() {
+    use std::sync::{Arc, Mutex};
+
+    struct CancelRecordingBridge(Arc<Mutex<Vec<HostOpId>>>);
+
+    impl HostAsyncBridge for CancelRecordingBridge {
+        fn submit_op(&mut self, _op_id: HostOpId, _future: HostFuture) -> VmResult<()> {
+            Ok(())
+        }
+
+        fn poll_op(
+            &mut self,
+            _op_id: HostOpId,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<VmResult<CallReturn>> {
+            std::task::Poll::Pending
+        }
+
+        fn cancel_op(&mut self, op_id: HostOpId) {
+            self.0.lock().expect("cancel lock").push(op_id);
+        }
+    }
+
+    let cancelled = Arc::new(Mutex::new(Vec::new()));
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.set_async_bridge(Box::new(CancelRecordingBridge(Arc::clone(&cancelled))));
+    let CallOutcome::Pending(op_id) = vm
+        .submit_host_future(Box::pin(async {
+            Ok(HostFutureOutput::returning(CallReturn::none()))
+        }))
+        .expect("future should submit")
+    else {
+        panic!("submission should return pending");
+    };
+    vm.set_waiting_host_op(op_id)
+        .expect("submitted op should register");
+
+    vm.complete_host_op(op_id, CallReturn::none())
+        .expect("manual completion should succeed");
+
+    assert_eq!(*cancelled.lock().expect("cancel lock"), vec![op_id]);
+    assert_eq!(vm.waiting_host_op_id(), None);
+    assert_eq!(vm.host.runtime_operations.active_count(), 0);
+}
+
+#[test]
+fn failed_submitted_host_completion_clears_waiting_state() {
+    struct FailingCompletionBridge;
+
+    impl HostAsyncBridge for FailingCompletionBridge {
+        fn submit_op(&mut self, _op_id: HostOpId, _future: HostFuture) -> VmResult<()> {
+            Ok(())
+        }
+
+        fn poll_op(
+            &mut self,
+            _op_id: HostOpId,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<VmResult<CallReturn>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_submitted_op(
+            &mut self,
+            _op_id: HostOpId,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<VmResult<HostFutureOutput>> {
+            std::task::Poll::Ready(Ok(HostFutureOutput::complete(|_| {
+                Err(VmError::HostError("completion failed".to_string()))
+            })))
+        }
+    }
+
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.set_async_bridge(Box::new(FailingCompletionBridge));
+    let CallOutcome::Pending(op_id) = vm
+        .submit_host_future(Box::pin(async {
+            Ok(HostFutureOutput::returning(CallReturn::none()))
+        }))
+        .expect("future should submit")
+    else {
+        panic!("submission should return pending");
+    };
+    vm.set_waiting_host_op(op_id)
+        .expect("submitted op should register");
+    let waker = futures_util::task::noop_waker();
+    let mut context = std::task::Context::from_waker(&waker);
+
+    let result = vm.poll_waiting_host_op(&mut context);
+
+    assert!(matches!(
+        result,
+        std::task::Poll::Ready(Err(VmError::HostError(message)))
+            if message == "completion failed"
+    ));
+    assert_eq!(vm.waiting_host_op_id(), None);
+    assert_eq!(vm.host.runtime_operations.active_count(), 0);
+}
+
+#[test]
 fn unused_host_operation_ids_do_not_consume_registry_capacity() {
     let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
     for _ in 0..128 {
         vm.allocate_host_op_id();
     }
     assert_eq!(vm.host.runtime_operations.active_count(), 0);
-}
-
-#[cfg(feature = "async")]
-#[test]
-fn capability_profile_binding_installs_http_policy() {
-    let policy = crate::builtins::runtime::HttpConfig {
-        allowed_hosts: vec!["example.com".to_string()],
-        max_redirects: 2,
-        ..crate::builtins::runtime::HttpConfig::default()
-    };
-    let mut registry = HostFunctionRegistry::empty();
-    registry.set_capability_profile(
-        CapabilityProfile::builder()
-            .http_policy(policy.clone())
-            .build(),
-    );
-    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
-    registry
-        .bind_vm_cached(&mut vm)
-        .expect("profile should bind");
-
-    assert_eq!(vm.host.http_state.configuration(), Some(&policy));
-}
-
-#[cfg(feature = "sqlite")]
-#[test]
-fn capability_profile_binding_installs_sqlite_policy() {
-    let mut policy = crate::vm::SqlitePolicy::default();
-    policy.limits.max_rows = 10;
-    let mut registry = HostFunctionRegistry::empty();
-    registry.set_capability_profile(
-        CapabilityProfile::builder()
-            .sqlite_policy(policy.clone())
-            .build(),
-    );
-    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
-    registry
-        .bind_vm_cached(&mut vm)
-        .expect("profile should bind");
-
-    assert_eq!(vm.host.sqlite_policy, policy);
-}
-
-#[test]
-fn capability_profile_binding_installs_io_policy() {
-    let policy = crate::vm::IoPolicy {
-        allowed_roots: vec!["/tmp".to_string()],
-        allow_write: true,
-        allow_process: false,
-        max_read_bytes: 128,
-        max_write_bytes: 64,
-    };
-    let mut registry = HostFunctionRegistry::empty();
-    registry.set_capability_profile(
-        CapabilityProfile::builder()
-            .io_policy(policy.clone())
-            .build(),
-    );
-    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
-    registry
-        .bind_vm_cached(&mut vm)
-        .expect("profile should bind");
-
-    assert_eq!(vm.host.io_policy.as_ref(), Some(&policy));
 }
 
 #[test]
@@ -530,7 +572,7 @@ fn sqlite_reconfiguration_only_closes_sqlite_owned_state() {
         .expect("SQLite operation should start");
     sqlite_operation.set_resource(sqlite_resource);
 
-    vm.configure_sqlite(crate::vm::SqlitePolicy::default());
+    vm.configure_sqlite(SqlitePolicy::default());
 
     assert!(
         vm.host

@@ -1,11 +1,59 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::task::{Context, Poll};
 use std::thread;
 
 use vm::{
-    CallOutcome, CallReturn, HostFunctionRegistry, HttpConfig, Program, Value, Vm, VmStatus,
+    CallOutcome, CallReturn, HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput,
+    HostOpId, HttpConfig, HttpHostExt, Program, Value, Vm, VmError, VmResult, VmStatus,
     compile_source,
 };
+
+#[derive(Default)]
+struct TokioHostDriver {
+    submitted: HashMap<HostOpId, HostFuture>,
+}
+
+impl HostAsyncBridge for TokioHostDriver {
+    fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
+        self.submitted.insert(op_id, future);
+        Ok(())
+    }
+
+    fn poll_op(&mut self, op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
+        Poll::Ready(Err(VmError::HostError(format!(
+            "unknown external host operation {op_id}"
+        ))))
+    }
+
+    fn poll_submitted_op(
+        &mut self,
+        op_id: HostOpId,
+        cx: &mut Context<'_>,
+    ) -> Poll<VmResult<HostFutureOutput>> {
+        let poll = self.submitted.get_mut(&op_id).map_or_else(
+            || {
+                Poll::Ready(Err(VmError::HostError(format!(
+                    "unknown submitted host operation {op_id}"
+                ))))
+            },
+            |future| future.as_mut().poll(cx),
+        );
+        if poll.is_ready() {
+            self.submitted.remove(&op_id);
+        }
+        poll
+    }
+
+    fn cancel_op(&mut self, op_id: HostOpId) {
+        self.submitted.remove(&op_id);
+    }
+}
+
+fn install_host_driver(vm: &mut Vm) {
+    vm.set_async_bridge(Box::<TokioHostDriver>::default());
+}
 
 fn build_request_program(url: String) -> Program {
     compile_source(&format!(
@@ -85,6 +133,7 @@ async fn http_host_executes_a_bounded_request_and_returns_a_response_map() {
     let (port, server) = spawn_test_server();
     let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
     vm.configure_http(local_http_config(port));
+    install_host_driver(&mut vm);
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
         .expect("default host registry should bind HTTP");
@@ -272,6 +321,7 @@ async fn explicitly_allowed_http_capability_reaches_http_policy() {
         allow_private_ips: true,
         ..HttpConfig::default()
     });
+    install_host_driver(&mut vm);
     let mut registry = HostFunctionRegistry::restricted();
     registry
         .allow_builtin("http::client::request")

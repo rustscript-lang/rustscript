@@ -5,10 +5,61 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use super::*;
 
-pub type HostFuture = Pin<Box<dyn Future<Output = VmResult<CallReturn>> + Send + 'static>>;
+type HostVmCompletion<T> = Box<dyn FnOnce(&mut Vm) -> VmResult<T> + Send + 'static>;
+
+pub enum HostFutureOutput<T = CallReturn> {
+    Return(T),
+    VmCompletion(HostVmCompletion<T>),
+}
+
+impl<T> HostFutureOutput<T> {
+    pub fn returning(value: T) -> Self {
+        Self::Return(value)
+    }
+
+    pub fn complete(completion: impl FnOnce(&mut Vm) -> VmResult<T> + Send + 'static) -> Self {
+        Self::VmCompletion(Box::new(completion))
+    }
+
+    pub fn map<U: Send + 'static>(
+        self,
+        map: impl FnOnce(T) -> U + Send + 'static,
+    ) -> HostFutureOutput<U>
+    where
+        T: Send + 'static,
+    {
+        match self {
+            Self::Return(value) => HostFutureOutput::Return(map(value)),
+            Self::VmCompletion(completion) => {
+                HostFutureOutput::VmCompletion(Box::new(move |vm| completion(vm).map(map)))
+            }
+        }
+    }
+}
+
+impl HostFutureOutput<CallReturn> {
+    fn finish(self, vm: &mut Vm) -> VmResult<CallReturn> {
+        match self {
+            Self::Return(values) => Ok(values),
+            Self::VmCompletion(completion) => completion(vm),
+        }
+    }
+}
+
+impl From<CallReturn> for HostFutureOutput<CallReturn> {
+    fn from(values: CallReturn) -> Self {
+        Self::Return(values)
+    }
+}
+
+pub type HostFuture = Pin<Box<dyn Future<Output = VmResult<HostFutureOutput>> + Send + 'static>>;
 
 pub trait CaptureAsyncHostContext: Send + 'static + Sized {
     fn capture(vm: &mut Vm) -> VmResult<Self>;
+
+    fn capture_with_args(vm: &mut Vm, _args: &[Value]) -> VmResult<Self> {
+        Self::capture(vm)
+    }
 }
 
 pub trait HostAsyncBridge: Send {
@@ -19,6 +70,15 @@ pub trait HostAsyncBridge: Send {
     }
 
     fn poll_op(&mut self, op_id: HostOpId, cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>>;
+
+    fn poll_submitted_op(
+        &mut self,
+        op_id: HostOpId,
+        cx: &mut Context<'_>,
+    ) -> Poll<VmResult<HostFutureOutput>> {
+        self.poll_op(op_id, cx)
+            .map(|result| result.map(HostFutureOutput::Return))
+    }
 
     fn cancel_op(&mut self, _op_id: HostOpId) {}
 
@@ -67,6 +127,7 @@ impl Vm {
             VmError::HostError("async host function requires a host async bridge".to_string())
         })?;
         bridge.submit_op(op_id, future)?;
+        self.host.submitted_host_ops.insert(op_id);
         Ok(CallOutcome::Pending(op_id))
     }
 
@@ -102,6 +163,7 @@ impl Vm {
             if let Some(bridge) = self.host.async_bridge.as_mut() {
                 bridge.cancel_op_with_reason(waiting.op_id, reason);
             }
+            self.host.submitted_host_ops.remove(&waiting.op_id);
             let _ = self.host.runtime_operations.cancel(operation_id, reason);
         } else {
             crate::builtins::runtime::cancel_builtin_io_op_with_reason(self, waiting.op_id, reason);
@@ -140,6 +202,11 @@ impl Vm {
             .runtime_operations
             .complete(operation_id)
             .map_err(|error| VmError::HostError(error.to_string()))?;
+        if self.host.submitted_host_ops.remove(&op_id)
+            && let Some(bridge) = self.host.async_bridge.as_mut()
+        {
+            bridge.cancel_op(op_id);
+        }
         self.complete_waiting_host_op(op_id, values.into())
     }
 
@@ -169,25 +236,53 @@ impl Vm {
                     ))));
                 }
             };
-            unsafe { (&mut *bridge_ptr).poll_op(waiting.op_id, cx) }
+            if self.host.submitted_host_ops.contains(&waiting.op_id) {
+                unsafe { (&mut *bridge_ptr).poll_submitted_op(waiting.op_id, cx) }
+            } else {
+                unsafe { (&mut *bridge_ptr).poll_op(waiting.op_id, cx) }
+                    .map(|result| result.map(HostFutureOutput::Return))
+            }
         } else {
             crate::builtins::runtime::poll_builtin_io_op(self, waiting.op_id, cx)
+                .map(|result| result.map(HostFutureOutput::Return))
         };
 
         match poll_result {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(values)) => {
+            Poll::Ready(Ok(output)) => {
+                let values = match output.finish(self) {
+                    Ok(values) => values,
+                    Err(err) => {
+                        if host_bridge_owned {
+                            self.host.submitted_host_ops.remove(&waiting.op_id);
+                            let runtime_error = crate::builtins::runtime::error::RuntimeError::new(
+                                crate::builtins::runtime::error::RuntimeErrorCode::OperationFailed,
+                                "runtime::host_bridge",
+                                err.to_string(),
+                            )
+                            .with_value(waiting.op_id);
+                            let _ = self
+                                .host
+                                .runtime_operations
+                                .fail(operation_id, runtime_error);
+                        }
+                        self.instance.waiting_host_op = None;
+                        return Poll::Ready(Err(err));
+                    }
+                };
                 if host_bridge_owned {
                     self.host
                         .runtime_operations
                         .complete(operation_id)
                         .map_err(|error| VmError::HostError(error.to_string()))?;
+                    self.host.submitted_host_ops.remove(&waiting.op_id);
                 }
                 self.complete_waiting_host_op(waiting.op_id, values)?;
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(err)) => {
                 if host_bridge_owned {
+                    self.host.submitted_host_ops.remove(&waiting.op_id);
                     let runtime_error = crate::builtins::runtime::error::RuntimeError::new(
                         crate::builtins::runtime::error::RuntimeErrorCode::OperationFailed,
                         "runtime::host_bridge",

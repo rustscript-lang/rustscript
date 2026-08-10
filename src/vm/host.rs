@@ -643,26 +643,6 @@ impl HostFunctionRegistry {
             ));
         }
 
-        if !plan.allow_default_host_capabilities {
-            match plan.capability_profile.http_policy() {
-                Some(policy) => vm.host.http_state.configure(policy.clone()),
-                None => vm.host.http_state.clear_configuration(),
-            }
-            vm.host.io_policy = Some(
-                plan.capability_profile
-                    .io_policy()
-                    .cloned()
-                    .unwrap_or_default(),
-            );
-            #[cfg(feature = "sqlite")]
-            {
-                vm.host.sqlite_policy = plan
-                    .capability_profile
-                    .sqlite_policy()
-                    .cloned()
-                    .unwrap_or_default();
-            }
-        }
         vm.host.host_functions.reserve(plan.registry_slots.len());
         for &registry_slot in &plan.registry_slots {
             let entry = self
@@ -1166,61 +1146,6 @@ impl Vm {
             .map_err(|error| VmError::HostError(error.to_string()))
     }
 
-    #[cfg(feature = "sqlite")]
-    pub fn configure_sqlite(&mut self, policy: crate::vm::SqlitePolicy) {
-        crate::builtins::runtime::cancel_operations_by_owner(
-            self,
-            crate::builtins::runtime::cancellation::OperationOwner::Sqlite,
-            crate::builtins::runtime::cancellation::CancellationReason::ResourceClosed,
-        );
-        crate::builtins::runtime::close_resources_by_type(
-            self,
-            crate::builtins::runtime::resource::ResourceTypeId::SQLITE_CONNECTION,
-            crate::builtins::runtime::cancellation::CancellationReason::ResourceClosed,
-        );
-        self.host.sqlite_policy = policy;
-    }
-
-    #[cfg(feature = "sqlite")]
-    pub fn clear_sqlite_configuration(&mut self) {
-        crate::builtins::runtime::cancel_operations_by_owner(
-            self,
-            crate::builtins::runtime::cancellation::OperationOwner::Sqlite,
-            crate::builtins::runtime::cancellation::CancellationReason::ResourceClosed,
-        );
-        crate::builtins::runtime::close_resources_by_type(
-            self,
-            crate::builtins::runtime::resource::ResourceTypeId::SQLITE_CONNECTION,
-            crate::builtins::runtime::cancellation::CancellationReason::ResourceClosed,
-        );
-        self.host.sqlite_policy = crate::vm::SqlitePolicy::default();
-    }
-
-    pub fn configure_http(&mut self, config: crate::builtins::runtime::HttpConfig) {
-        self.host.http_state.configure(config);
-    }
-
-    pub fn set_http_max_in_flight(&mut self, max_in_flight: usize) {
-        self.host.http_state.max_in_flight = max_in_flight;
-    }
-
-    pub fn http_max_in_flight(&self) -> usize {
-        self.host.http_state.max_in_flight
-    }
-
-    pub fn clear_http_configuration(&mut self) {
-        crate::builtins::runtime::cancel_operations_by_owner(
-            self,
-            crate::builtins::runtime::cancellation::OperationOwner::Http,
-            crate::builtins::runtime::cancellation::CancellationReason::Requested,
-        );
-        self.host.http_state.clear_configuration();
-    }
-
-    pub fn http_is_configured(&self) -> bool {
-        self.host.http_state.is_configured()
-    }
-
     /// Enables or disables implicit binding of built-in host functions.
     ///
     /// Disabling this makes the VM use only explicitly registered host functions. The default
@@ -1390,7 +1315,17 @@ impl Vm {
             crate::builtins::runtime::BuiltinCallOutcome::Pending(op_id) => {
                 self.instance.stack.truncate(arg_start);
                 let resume_ip = self.call_resume_ip(call_ip)?;
-                self.set_waiting_registered_op(op_id)?;
+                if self.host.submitted_host_ops.contains(&op_id) {
+                    if let Err(error) = self.set_waiting_host_op(op_id) {
+                        self.host.submitted_host_ops.remove(&op_id);
+                        if let Some(bridge) = self.host.async_bridge.as_mut() {
+                            bridge.cancel_op(op_id);
+                        }
+                        return Err(error);
+                    }
+                } else {
+                    self.set_waiting_registered_op(op_id)?;
+                }
                 self.instance.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
             }

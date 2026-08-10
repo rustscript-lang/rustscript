@@ -24,9 +24,11 @@ pub use assembler::{AsmParseError, Assembler, AssemblerError, BytecodeBuilder, a
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::HostCallResult;
 #[cfg(feature = "runtime")]
-pub use builtins::runtime::HttpConfig;
-#[cfg(feature = "runtime")]
 pub use builtins::runtime::print::{PrintHostFunction, PrintlnHostFunction, format_value};
+#[cfg(feature = "runtime")]
+pub use builtins::runtime::{HttpConfig, HttpHostExt, IoHostExt, IoPolicy};
+#[cfg(feature = "sqlite")]
+pub use builtins::runtime::{SqliteHostExt, SqliteLimits, SqlitePolicy};
 pub use builtins::{
     BUILTIN_CATALOG, BuiltinFunction, BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec,
     CallableDef, CallableParam, CallableParamType, CallableSignature, HostExecution,
@@ -91,13 +93,12 @@ pub use vm::{
     AotArtifactError, CallOutcome, CallReturn, CancellationReason, CapabilityProfile,
     CapabilityProfileBuilder, DEFAULT_MAX_SCRIPT_CALL_DEPTH, EpochCheckpoint, EpochHandle,
     FuelCheckpoint, HostArgsFunction, HostAsyncBridge, HostBindingPlan, HostFunction,
-    HostFunctionRegistry, HostOpId, HostStackFunction, IntoScriptValue, IoPolicy,
-    QueuedScriptInvocation, ScriptArgs, ScriptCallback, ScriptResult, StaticHostArgsFunction,
-    StaticHostFunction, StaticHostStackFunction, Store, Vm, VmError, VmResult, VmStatus,
-    VmYieldReason,
+    HostFunctionRegistry, HostFuture, HostFutureOutput, HostOpId, HostStackFunction,
+    IntoScriptValue, QueuedScriptInvocation, ScriptArgs, ScriptCallback, ScriptResult,
+    StaticHostArgsFunction, StaticHostFunction, StaticHostStackFunction, Store, Vm, VmError,
+    VmResult, VmStatus, VmYieldReason,
 };
-#[cfg(feature = "sqlite")]
-pub use vm::{SqliteLimits, SqlitePolicy};
+
 #[cfg(feature = "runtime")]
 pub use vmbc::{
     DisassembleOptions, ValidationError, WireError, decode_program, disassemble_program,

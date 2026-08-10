@@ -251,10 +251,21 @@ fn write_generated_file(path: &Path, contents: &str) {
 fn builtin_source_specs(namespaces: &[NamespaceDecl]) -> Vec<SourceSpec> {
     namespaces
         .iter()
-        .map(|namespace| SourceSpec {
-            path: format!("src/builtins/runtime/{}.rs", namespace.module),
-            module: namespace.module.clone(),
-            category: SourceCategory::NamespacedBuiltin,
+        .map(|namespace| {
+            let path = if namespace.module == "io" {
+                if cfg!(feature = "async") {
+                    "src/builtins/runtime/io/async_io.rs".to_string()
+                } else {
+                    "src/builtins/runtime/io/blocking.rs".to_string()
+                }
+            } else {
+                format!("src/builtins/runtime/{}.rs", namespace.module)
+            };
+            SourceSpec {
+                path,
+                module: namespace.module.clone(),
+                category: SourceCategory::NamespacedBuiltin,
+            }
         })
         .collect()
 }
@@ -2108,7 +2119,7 @@ fn type_label(ty: &Type) -> String {
                     };
                     format!("{} | null", type_label(inner))
                 }
-                "VmResult" | "HostCallResult" => {
+                "VmResult" | "HostCallResult" | "HostFutureOutput" => {
                     let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
                         panic!("{ident}<T> requires one generic argument");
                     };

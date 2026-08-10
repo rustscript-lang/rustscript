@@ -67,7 +67,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 rusqlite = { version = "0.32", default-features = false, features = ["bundled", "hooks", "limits"], optional = true }
 url = { version = "2", optional = true }
 futures-util = { version = "0.3", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "fs", "io-util", "process"], optional = true }
 edge_abi = { package = "pd-edge-abi", version = "0.1.1", default-features = false, optional = true }
 futures-channel = "0.3"
 paste = "1"

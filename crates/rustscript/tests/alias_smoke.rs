@@ -1,3 +1,6 @@
+#[cfg(feature = "sqlite")]
+use rustscript::SqliteHostExt;
+
 /// Verify that the `rustscript` alias crate re-exports the same API as `pd-vm`.
 #[test]
 fn alias_exports_compile_source() {

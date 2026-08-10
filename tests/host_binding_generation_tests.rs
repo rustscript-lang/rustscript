@@ -311,78 +311,32 @@ fn capability_profile_fingerprint_uses_stable_callable_identities() {
 }
 
 #[test]
-fn capability_profile_fingerprint_covers_http_policy() {
-    let first_policy = vm::HttpConfig {
-        allowed_hosts: vec!["example.com".to_string()],
-        max_redirects: 1,
-        ..vm::HttpConfig::default()
-    };
-    let second_policy = vm::HttpConfig {
-        allowed_hosts: vec!["example.com".to_string()],
-        max_redirects: 2,
-        ..vm::HttpConfig::default()
-    };
-    let first = CapabilityProfile::builder()
-        .http_policy(first_policy)
-        .build();
-    let second = CapabilityProfile::builder()
-        .http_policy(second_policy)
-        .build();
+fn vm_host_core_does_not_name_builtin_subsystem_policies() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let host_runtime = std::fs::read_to_string(manifest.join("src/vm/host_runtime.rs"))
+        .expect("host runtime source");
+    let capability =
+        std::fs::read_to_string(manifest.join("src/vm/capability.rs")).expect("capability source");
+    let host = std::fs::read_to_string(manifest.join("src/vm/host.rs")).expect("host source");
 
-    assert_eq!(first.http_policy().expect("HTTP policy").max_redirects, 1);
-    assert_ne!(first.fingerprint(), second.fingerprint());
-}
-
-#[test]
-fn capability_profile_fingerprint_covers_io_policy() {
-    let first = CapabilityProfile::builder()
-        .io_policy(vm::IoPolicy {
-            allowed_roots: vec!["/tmp/b".to_string(), "/tmp/a".to_string()],
-            max_read_bytes: 10,
-            ..vm::IoPolicy::default()
-        })
-        .build();
-    let reordered = CapabilityProfile::builder()
-        .io_policy(vm::IoPolicy {
-            allowed_roots: vec!["/tmp/a".to_string(), "/tmp/b".to_string()],
-            max_read_bytes: 10,
-            ..vm::IoPolicy::default()
-        })
-        .build();
-    let changed = CapabilityProfile::builder()
-        .io_policy(vm::IoPolicy {
-            allowed_roots: vec!["/tmp/a".to_string(), "/tmp/b".to_string()],
-            max_read_bytes: 11,
-            ..vm::IoPolicy::default()
-        })
-        .build();
-
-    assert_eq!(first, reordered);
-    assert_eq!(first.fingerprint(), reordered.fingerprint());
-    assert_ne!(first.fingerprint(), changed.fingerprint());
-}
-
-#[cfg(feature = "sqlite")]
-#[test]
-fn capability_profile_fingerprint_covers_sqlite_policy() {
-    let mut first_policy = vm::SqlitePolicy::default();
-    first_policy.limits.max_rows = 10;
-    let mut second_policy = first_policy.clone();
-    second_policy.limits.max_rows = 11;
-    let first = CapabilityProfile::builder()
-        .sqlite_policy(first_policy)
-        .build();
-    let second = CapabilityProfile::builder()
-        .sqlite_policy(second_policy)
-        .build();
-
-    assert_eq!(
-        first
-            .sqlite_policy()
-            .expect("SQLite policy")
-            .limits
-            .max_rows,
-        10
-    );
-    assert_ne!(first.fingerprint(), second.fingerprint());
+    for forbidden in [
+        "HttpState",
+        "IoPolicy",
+        "SqlitePolicy",
+        "http_state",
+        "io_policy",
+        "sqlite_policy",
+    ] {
+        assert!(
+            !host_runtime.contains(forbidden),
+            "HostRuntime leaked {forbidden}"
+        );
+        assert!(
+            !capability.contains(forbidden),
+            "CapabilityProfile leaked {forbidden}"
+        );
+    }
+    for forbidden in ["configure_http", "configure_sqlite", "http_is_configured"] {
+        assert!(!host.contains(forbidden), "Vm API leaked {forbidden}");
+    }
 }

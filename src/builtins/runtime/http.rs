@@ -1,17 +1,22 @@
 #[cfg(feature = "async")]
 use futures_util::StreamExt;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+#[cfg(feature = "async")]
+use std::sync::atomic::Ordering;
 
 #[cfg(feature = "async")]
 use pd_host_function::pd_host_function;
 
 #[cfg(feature = "async")]
-use super::{Vm, VmMap, VmResult};
+use super::{VmMap, VmResult};
 #[cfg(feature = "async")]
 use crate::builtins::runtime::cancellation::{CancellationReason, CancellationToken};
 #[cfg(feature = "async")]
 use crate::vm::CaptureAsyncHostContext;
 #[cfg(feature = "async")]
 use crate::vm::Value;
+use crate::vm::Vm;
 #[cfg(feature = "async")]
 use crate::vm::VmError;
 
@@ -44,50 +49,86 @@ impl Default for HttpConfig {
     }
 }
 
-pub(crate) struct HttpState {
+#[derive(Default)]
+struct HttpHostState {
     #[cfg(feature = "async")]
     config: Option<HttpConfig>,
-    pub(crate) max_in_flight: usize,
+    max_in_flight: usize,
+    in_flight: Arc<AtomicUsize>,
 }
 
-impl Default for HttpState {
-    fn default() -> Self {
-        Self {
+/// HTTP host configuration owned by the HTTP host implementation.
+pub trait HttpHostExt {
+    fn configure_http(&mut self, config: HttpConfig);
+    fn set_http_max_in_flight(&mut self, max_in_flight: usize);
+    fn http_max_in_flight(&self) -> usize;
+    fn clear_http_configuration(&mut self);
+    fn http_is_configured(&self) -> bool;
+}
+
+impl HttpHostExt for Vm {
+    fn configure_http(&mut self, config: HttpConfig) {
+        let (max_in_flight, in_flight) = self
+            .host
+            .host_function_state::<HttpHostState>()
+            .map_or_else(
+                || {
+                    (
+                        crate::builtins::runtime::cancellation::DEFAULT_MAX_PENDING_OPERATIONS,
+                        Arc::new(AtomicUsize::new(0)),
+                    )
+                },
+                |state| (state.max_in_flight, Arc::clone(&state.in_flight)),
+            );
+        self.host.set_host_function_state(HttpHostState {
             #[cfg(feature = "async")]
-            config: None,
-            max_in_flight: crate::builtins::runtime::cancellation::DEFAULT_MAX_PENDING_OPERATIONS,
-        }
-    }
-}
-
-impl HttpState {
-    pub(crate) fn reset_for_reuse(&mut self) {}
-
-    pub(crate) fn configure(&mut self, config: HttpConfig) {
-        #[cfg(feature = "async")]
-        {
-            self.config = Some(config);
-        }
+            config: Some(config),
+            max_in_flight,
+            in_flight,
+        });
         #[cfg(not(feature = "async"))]
         let _ = config;
     }
 
-    pub(crate) fn clear_configuration(&mut self) {
-        #[cfg(feature = "async")]
-        {
-            self.config = None;
+    fn set_http_max_in_flight(&mut self, max_in_flight: usize) {
+        if self.host.host_function_state::<HttpHostState>().is_none() {
+            self.host.set_host_function_state(HttpHostState {
+                #[cfg(feature = "async")]
+                config: None,
+                max_in_flight:
+                    crate::builtins::runtime::cancellation::DEFAULT_MAX_PENDING_OPERATIONS,
+                in_flight: Arc::new(AtomicUsize::new(0)),
+            });
         }
+        self.host
+            .host_function_state_mut::<HttpHostState>()
+            .expect("HTTP host state was inserted")
+            .max_in_flight = max_in_flight;
     }
 
-    #[cfg(all(test, feature = "async"))]
-    pub(crate) fn configuration(&self) -> Option<&HttpConfig> {
-        self.config.as_ref()
+    fn http_max_in_flight(&self) -> usize {
+        self.host.host_function_state::<HttpHostState>().map_or(
+            crate::builtins::runtime::cancellation::DEFAULT_MAX_PENDING_OPERATIONS,
+            |state| state.max_in_flight,
+        )
     }
 
-    pub(crate) fn is_configured(&self) -> bool {
+    fn clear_http_configuration(&mut self) {
+        crate::builtins::runtime::cancel_operations_by_owner(
+            self,
+            crate::builtins::runtime::cancellation::OperationOwner::Http,
+            crate::builtins::runtime::cancellation::CancellationReason::Requested,
+        );
+        self.host.remove_host_function_state::<HttpHostState>();
+    }
+
+    fn http_is_configured(&self) -> bool {
         #[cfg(feature = "async")]
         {
-            self.config.is_some()
+            self.host
+                .host_function_state::<HttpHostState>()
+                .and_then(|state| state.config.as_ref())
+                .is_some()
         }
         #[cfg(not(feature = "async"))]
         false
@@ -111,20 +152,65 @@ fn cancellation_vm_error(token: &CancellationToken) -> VmError {
 pub(super) struct HttpRequestContext {
     config: HttpConfig,
     cancellation: CancellationToken,
+    _permit: HttpInFlightPermit,
+}
+
+#[cfg(feature = "async")]
+struct HttpInFlightPermit {
+    active: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "async")]
+impl HttpInFlightPermit {
+    fn acquire(state: &HttpHostState) -> VmResult<Self> {
+        let mut active = state.in_flight.load(Ordering::Acquire);
+        loop {
+            if active >= state.max_in_flight {
+                return Err(VmError::HostError(format!(
+                    "HTTP in-flight request limit of {} was reached",
+                    state.max_in_flight
+                )));
+            }
+            match state.in_flight.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(Self {
+                        active: Arc::clone(&state.in_flight),
+                    });
+                }
+                Err(observed) => active = observed,
+            }
+        }
+    }
+}
+
+#[cfg(feature = "async")]
+impl Drop for HttpInFlightPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[cfg(feature = "async")]
 impl CaptureAsyncHostContext for HttpRequestContext {
     fn capture(vm: &mut Vm) -> VmResult<Self> {
-        let config = vm
+        let state = vm
             .host
-            .http_state
+            .host_function_state::<HttpHostState>()
+            .ok_or_else(|| VmError::HostError("HTTP host is not configured".to_string()))?;
+        let config = state
             .config
             .clone()
             .ok_or_else(|| VmError::HostError("HTTP host is not configured".to_string()))?;
+        let permit = HttpInFlightPermit::acquire(state)?;
         Ok(Self {
             config,
             cancellation: CancellationToken::root(),
+            _permit: permit,
         })
     }
 }
@@ -544,6 +630,8 @@ async fn execute_request(
 #[cfg(test)]
 mod tests {
     use super::HttpConfig;
+    #[cfg(feature = "async")]
+    use super::HttpHostExt;
     #[cfg(feature = "async")]
     use super::{
         CancellationReason, HttpRequest, VmMap, builtin_http_client_request, execute_request,
