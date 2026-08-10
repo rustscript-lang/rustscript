@@ -135,13 +135,10 @@ fn empty_registry_keeps_language_builtins_but_rejects_http_capability() {
     );
 
     let mut http_vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
-    HostFunctionRegistry::restricted()
+    let error = HostFunctionRegistry::restricted()
         .bind_vm_cached(&mut http_vm)
-        .expect("empty registry should prepare the program");
-    let error = http_vm
-        .run()
-        .expect_err("unapproved HTTP capability must be rejected");
-    assert!(matches!(error, vm::VmError::UnboundImport(name) if name == "http::client::request"));
+        .expect_err("unapproved HTTP capability must fail during preflight");
+    assert!(error.to_string().contains("http::client::request"));
 }
 
 #[test]
@@ -152,13 +149,10 @@ io::open("/tmp/rustscript-capability-test", "r");"#,
     )
     .expect("namespaced host builtin should compile");
     let mut vm = Vm::new(compiled.program);
-    HostFunctionRegistry::restricted()
+    let error = HostFunctionRegistry::restricted()
         .bind_vm_cached(&mut vm)
-        .expect("restricted registry should bind namespaced host builtin");
-    let error = vm
-        .run()
-        .expect_err("restricted registry should reject ungranted namespaced builtin");
-    assert!(matches!(error, vm::VmError::UnboundImport(name) if name == "io_open"));
+        .expect_err("ungranted namespaced builtin must fail during preflight");
+    assert!(error.to_string().contains("io_open"));
 }
 
 #[test]
@@ -189,13 +183,16 @@ fn capability_binding_plan_cannot_outlive_registry_mutation() {
     let error = registry
         .bind_vm_with_plan(&mut vm, &plan)
         .expect_err("stale capability plan must not bind");
-    assert!(error.to_string().contains("different capability state"));
+    assert!(error.to_string().contains("different capability profile"));
 }
 
 #[test]
 fn capability_binding_plan_detects_divergent_registry_clone_mutations() {
     let unchanged_program = build_request_program("http://127.0.0.1:1/".to_string());
-    let unchanged_registry = HostFunctionRegistry::restricted();
+    let mut unchanged_registry = HostFunctionRegistry::restricted();
+    unchanged_registry
+        .allow_builtin("http::client::request")
+        .expect("HTTP capability should be known");
     let unchanged_plan = unchanged_registry
         .prepare_plan(&unchanged_program.imports)
         .expect("restricted registry should prepare HTTP plan");
@@ -222,7 +219,7 @@ fn capability_binding_plan_detects_divergent_registry_clone_mutations() {
     let error = second_mutation
         .bind_vm_with_plan(&mut mutated_vm, &plan)
         .expect_err("divergent capability branches must reject each other's plan");
-    assert!(error.to_string().contains("different capability state"));
+    assert!(error.to_string().contains("different capability profile"));
 }
 
 #[test]

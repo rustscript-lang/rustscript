@@ -1,8 +1,8 @@
 #![allow(unused_imports)]
 
 pub use vm::{
-    Assembler, BytecodeBuilder, CallOutcome, CompileSourceFileOptions, Compiler, Expr,
-    HostArgsFunction, HostFunction, HostFunctionRegistry, Program, SourceFlavor,
+    Assembler, BytecodeBuilder, CallOutcome, CapabilityProfile, CompileSourceFileOptions, Compiler,
+    Expr, HostArgsFunction, HostFunction, HostFunctionRegistry, Program, SourceFlavor,
     StaticHostArgsFunction, Stmt, Store, Value, Vm, VmStatus, assemble, compile_source,
     compile_source_file, compile_source_file_with_options, compile_source_with_flavor,
 };
