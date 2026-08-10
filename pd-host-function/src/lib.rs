@@ -11,7 +11,7 @@ mod edge;
 pub fn pd_host_function(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr with Punctuated::<Meta, Token![,]>::parse_terminated);
     let item = parse_macro_input!(item as ItemFn);
-    let result = if uses_edge_host_contract(&args, &item) {
+    let result = if selects_edge_host_contract(&args) {
         edge::expand_scoped_pd_host_function(args, item)
     } else {
         expand_pd_host_function(args, item)
@@ -22,11 +22,11 @@ pub fn pd_host_function(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-fn uses_edge_host_contract(args: &Punctuated<Meta, Token![,]>, item: &ItemFn) -> bool {
-    if item.sig.asyncness.is_some() {
-        return true;
-    }
+fn selects_edge_host_contract(args: &Punctuated<Meta, Token![,]>) -> bool {
+    uses_edge_host_contract(args)
+}
 
+fn uses_edge_host_contract(args: &Punctuated<Meta, Token![,]>) -> bool {
     args.iter().any(|meta| match meta {
         Meta::NameValue(name_value) if name_value.path.is_ident("scope") => true,
         Meta::List(list) if list.path.is_ident("bind") => true,
@@ -39,6 +39,12 @@ fn expand_pd_host_function(
     mut item: ItemFn,
 ) -> Result<proc_macro2::TokenStream, Error> {
     parse_name_arg(&attr)?;
+    if item.sig.asyncness.is_some() {
+        return Err(Error::new_spanned(
+            item.sig.asyncness,
+            "async host functions require an explicit scope = ... or bind(...) Edge contract",
+        ));
+    }
     let docs = doc_string(&item.attrs);
     for input in &item.sig.inputs {
         validate_param(input)?;
@@ -505,7 +511,7 @@ fn uses_taken_extractor(ty: &Type) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_pd_host_function, uses_edge_host_contract};
+    use super::{expand_pd_host_function, selects_edge_host_contract, uses_edge_host_contract};
     use syn::{ItemFn, Meta, Token, parse_quote, punctuated::Punctuated};
 
     #[test]
@@ -525,24 +531,24 @@ mod tests {
     }
 
     #[test]
-    fn native_async_signature_selects_edge_contract() {
+    fn ordinary_async_signature_does_not_select_edge_contract() {
         let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "test::async_call");
-        let item: ItemFn = parse_quote! {
-            async fn async_call() -> VmResult<HostCallResult<Value>> {
-                todo!()
-            }
-        };
-        assert!(uses_edge_host_contract(&attr, &item));
+        let item: ItemFn = parse_quote!(
+            async fn async_call() {}
+        );
+        assert!(!uses_edge_host_contract(&attr));
+        assert!(!selects_edge_host_contract(&attr));
+        assert!(
+            expand_pd_host_function(attr, item)
+                .expect_err("ordinary async function should require an explicit Edge contract")
+                .to_string()
+                .contains("explicit scope")
+        );
     }
 
     #[test]
     fn name_expression_alone_does_not_select_edge_contract() {
         let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = NAME_PATH);
-        let item: ItemFn = parse_quote! {
-            fn sync_call() -> VmResult<HostCallResult<Value>> {
-                todo!()
-            }
-        };
-        assert!(!uses_edge_host_contract(&attr, &item));
+        assert!(!uses_edge_host_contract(&attr));
     }
 }

@@ -481,7 +481,13 @@ fn generate_edge_host_binder(
         }
 
         let decoder = edge_arg_decoder_kind(ty)?;
-        extract_stmts.push(edge_extract_stmt(ident, decoder, arg_index, wrapper_name));
+        extract_stmts.push(edge_extract_stmt(
+            ident,
+            decoder,
+            arg_index,
+            wrapper_name,
+            ty,
+        ));
         call_args.push(quote!(#ident));
         arg_index += 1;
     }
@@ -538,6 +544,7 @@ fn generate_scoped_edge_host_static_wrapper(
     let static_wrapper_name = format_ident!("__pd_edge_static_{}", wrapper_name);
     let uses_vm = scoped_wrapper_uses_vm(item);
     let scope_tokens = edge_scope_tokens(scope);
+    let name_expr = &attr.name;
     let scope_requires_prepare = matches!(
         scope,
         EdgeHostScopeAttr::Http | EdgeHostScopeAttr::HttpExtension
@@ -597,7 +604,13 @@ fn generate_scoped_edge_host_static_wrapper(
         }
 
         let decoder = edge_arg_decoder_kind(ty)?;
-        extract_stmts.push(edge_extract_stmt(ident, decoder, arg_index, wrapper_name));
+        extract_stmts.push(edge_extract_stmt(
+            ident,
+            decoder,
+            arg_index,
+            wrapper_name,
+            ty,
+        ));
         call_args.push(quote!(#ident));
         arg_index += 1;
     }
@@ -631,6 +644,19 @@ fn generate_scoped_edge_host_static_wrapper(
                         #arg_index,
                         args.len()
                     )));
+                }
+                if #scope_requires_prepare {
+                    let __pd_edge_context = crate::abi_impl::current_vm_context()?;
+                    if !crate::abi_impl::scoped_host_call_can_run_synchronously(
+                        &__pd_edge_context,
+                        #scope_tokens,
+                        #name_expr,
+                    )? {
+                        return Err(::vm::VmError::HostError(format!(
+                            "synchronous scoped host function {} requires an async signature",
+                            #name_expr,
+                        )));
+                    }
                 }
                 #(#setup_stmts)*
                 let __pd_edge_outcome = {
@@ -869,6 +895,7 @@ fn edge_extract_stmt(
     decoder: EdgeArgDecoderKind,
     arg_index: usize,
     wrapper_name: &syn::Ident,
+    target_ty: &Type,
 ) -> proc_macro2::TokenStream {
     let label = LitStr::new(
         &format!("{} {}", wrapper_name, ident),
@@ -901,8 +928,15 @@ fn edge_extract_stmt(
             };
         },
         EdgeArgDecoderKind::Int => quote! {
-            let #ident = match args.get(#index) {
-                Some(::vm::Value::Int(value)) => *value,
+            let #ident: #target_ty = match args.get(#index) {
+                Some(::vm::Value::Int(value)) => {
+                    ::core::convert::TryInto::try_into(*value).map_err(|_| {
+                        ::vm::VmError::HostError(format!(
+                            "integer argument {} is out of range",
+                            #label
+                        ))
+                    })?
+                }
                 Some(_) => return Err(::vm::VmError::TypeMismatch("int")),
                 None => {
                     return Err(::vm::VmError::HostError(format!(
