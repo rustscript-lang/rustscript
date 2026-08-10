@@ -50,6 +50,7 @@ pub(crate) use codegen::{
 pub(crate) use exec::{ExecutableBuffer, prepare_for_execution};
 pub(crate) use layout::{
     NativeStackLayout, ValueLayout, checked_add_i32, detect_native_stack_layout,
+    native_stack_layout_fingerprint,
 };
 #[cfg(feature = "cranelift-jit")]
 pub(crate) use offsets::{HeapIntrinsicAddrs, HeapIntrinsicRefs, ResolvedOffsets, resolve_offsets};

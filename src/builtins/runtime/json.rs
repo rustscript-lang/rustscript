@@ -10,6 +10,10 @@ use pd_host_function::pd_host_function;
 /// Encodes a `Value` into a JSON string.
 #[pd_host_function(name = "json::encode")]
 pub(super) fn builtin_json_encode(value: &AnyValue) -> VmResult<String> {
+    encode_value_to_string(value)
+}
+
+pub(super) fn encode_value_to_string(value: &Value) -> VmResult<String> {
     let json_value = vm_to_json_value(value)?;
     serde_json::to_string(&json_value)
         .map_err(|err| VmError::HostError(format!("json_encode failed: {err}")))
