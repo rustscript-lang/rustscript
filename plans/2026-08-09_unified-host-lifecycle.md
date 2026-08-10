@@ -6,6 +6,8 @@
 
 **Tech Stack:** Rust 2024, existing runtime hosts, `HostOpId`, HTTP client, SQLite, VM reset/drop tests.
 
+**Status:** Completed
+
 ---
 
 ## Independence and dependency
