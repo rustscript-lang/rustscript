@@ -1,4 +1,7 @@
-use vm::{Value, Vm, VmError, VmStatus, compile_source};
+use vm::{
+    BuiltinFunction, CapabilityProfile, HostFunctionRegistry, IoPolicy, Value, Vm, VmError,
+    VmStatus, compile_source,
+};
 
 #[cfg(unix)]
 use std::path::PathBuf;
@@ -31,6 +34,197 @@ fn run_source_host_error(source: &str) -> String {
         Err(VmError::HostError(message)) => message,
         Err(other) => panic!("expected host error, got: {other:?}"),
     }
+}
+
+#[test]
+fn io_policy_denies_process_launch_when_process_capability_is_disabled() {
+    let compiled = compile_source(
+        r#"
+        use io;
+        io::popen("exit 0", "r");
+        "#,
+    )
+    .expect("source should compile");
+    let mut registry = HostFunctionRegistry::restricted();
+    registry.set_capability_profile(
+        CapabilityProfile::builder()
+            .allow_builtin(BuiltinFunction::IoPopen)
+            .io_policy(IoPolicy::default())
+            .build(),
+    );
+    let mut vm = Vm::new(compiled.program);
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("profile should bind");
+
+    let error = vm.run().expect_err("process launch should be denied");
+    assert!(matches!(error, VmError::HostError(message) if message.contains("process capability")));
+}
+
+#[test]
+fn io_policy_denies_paths_outside_allowed_roots() {
+    let compiled = compile_source(
+        r#"
+        use io;
+        io::exists("Cargo.toml");
+        "#,
+    )
+    .expect("source should compile");
+    let mut registry = HostFunctionRegistry::restricted();
+    registry.set_capability_profile(
+        CapabilityProfile::builder()
+            .allow_builtin(BuiltinFunction::IoExists)
+            .io_policy(IoPolicy::default())
+            .build(),
+    );
+    let mut vm = Vm::new(compiled.program);
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("profile should bind");
+
+    let error = vm.run().expect_err("path should be denied");
+    assert!(matches!(error, VmError::HostError(message) if message.contains("allowed roots")));
+}
+
+#[cfg(unix)]
+#[test]
+fn io_policy_limits_write_size() {
+    let path = unique_temp_path("policy-write-limit");
+    let compiled = compile_source(&format!(
+        r#"
+        use io;
+        let handle = io::open("{}", "w");
+        io::write(handle, "four");
+        "#,
+        path.display()
+    ))
+    .expect("source should compile");
+    let policy = IoPolicy {
+        allowed_roots: vec![std::env::temp_dir().display().to_string()],
+        allow_write: true,
+        max_write_bytes: 3,
+        ..IoPolicy::default()
+    };
+    let mut registry = HostFunctionRegistry::restricted();
+    registry.set_capability_profile(
+        CapabilityProfile::builder()
+            .allow_builtin(BuiltinFunction::IoOpen)
+            .allow_builtin(BuiltinFunction::IoWrite)
+            .io_policy(policy)
+            .build(),
+    );
+    let mut vm = Vm::new(compiled.program);
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("profile should bind");
+
+    assert!(matches!(
+        vm.run().expect("open should start"),
+        VmStatus::Waiting(_)
+    ));
+    vm.wait_for_host_op_blocking()
+        .expect("open should complete");
+    let error = vm.resume().expect_err("oversized write should be denied");
+    assert!(matches!(error, VmError::HostError(message) if message.contains("write limit")));
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(unix)]
+#[test]
+fn io_policy_limits_read_all_size() {
+    let path = unique_temp_path("policy-read-limit");
+    std::fs::write(&path, "four").expect("fixture should be written");
+    let compiled = compile_source(&format!(
+        r#"
+        use io;
+        let handle = io::open("{}", "r");
+        io::read_all(handle);
+        "#,
+        path.display()
+    ))
+    .expect("source should compile");
+    let policy = IoPolicy {
+        allowed_roots: vec![std::env::temp_dir().display().to_string()],
+        max_read_bytes: 3,
+        ..IoPolicy::default()
+    };
+    let mut registry = HostFunctionRegistry::restricted();
+    registry.set_capability_profile(
+        CapabilityProfile::builder()
+            .allow_builtin(BuiltinFunction::IoOpen)
+            .allow_builtin(BuiltinFunction::IoReadAll)
+            .io_policy(policy)
+            .build(),
+    );
+    let mut vm = Vm::new(compiled.program);
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("profile should bind");
+
+    assert!(matches!(
+        vm.run().expect("open should start"),
+        VmStatus::Waiting(_)
+    ));
+    vm.wait_for_host_op_blocking()
+        .expect("open should complete");
+    assert!(matches!(
+        vm.resume().expect("read should start"),
+        VmStatus::Waiting(_)
+    ));
+    let error = vm
+        .wait_for_host_op_blocking()
+        .expect_err("oversized read should be denied");
+    assert!(matches!(error, VmError::HostError(message) if message.contains("read limit")));
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(unix)]
+#[test]
+fn io_policy_limits_read_line_size() {
+    let path = unique_temp_path("policy-read-line-limit");
+    std::fs::write(&path, "four\n").expect("fixture should be written");
+    let compiled = compile_source(&format!(
+        r#"
+        use io;
+        let handle = io::open("{}", "r");
+        io::read_line(handle);
+        "#,
+        path.display()
+    ))
+    .expect("source should compile");
+    let policy = IoPolicy {
+        allowed_roots: vec![std::env::temp_dir().display().to_string()],
+        max_read_bytes: 3,
+        ..IoPolicy::default()
+    };
+    let mut registry = HostFunctionRegistry::restricted();
+    registry.set_capability_profile(
+        CapabilityProfile::builder()
+            .allow_builtin(BuiltinFunction::IoOpen)
+            .allow_builtin(BuiltinFunction::IoReadLine)
+            .io_policy(policy)
+            .build(),
+    );
+    let mut vm = Vm::new(compiled.program);
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("profile should bind");
+
+    assert!(matches!(
+        vm.run().expect("open should start"),
+        VmStatus::Waiting(_)
+    ));
+    vm.wait_for_host_op_blocking()
+        .expect("open should complete");
+    assert!(matches!(
+        vm.resume().expect("read should start"),
+        VmStatus::Waiting(_)
+    ));
+    let error = vm
+        .wait_for_host_op_blocking()
+        .expect_err("oversized line should be denied");
+    assert!(matches!(error, VmError::HostError(message) if message.contains("read limit")));
+    let _ = std::fs::remove_file(path);
 }
 
 #[cfg(unix)]
