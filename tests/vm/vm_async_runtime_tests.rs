@@ -12,8 +12,8 @@ use std::{
 
 use tokio::sync::oneshot;
 use vm::{
-    BytecodeBuilder, CallOutcome, HostAsyncBridge, HostFunction, HostImport, HostOpId, Program,
-    Value, ValueType, Vm, VmError, VmStatus,
+    BytecodeBuilder, CallOutcome, CancellationReason, HostAsyncBridge, HostFunction, HostImport,
+    HostOpId, Program, Value, ValueType, Vm, VmError, VmStatus,
 };
 
 type AsyncHostResult = Result<vm::CallReturn, VmError>;
@@ -22,6 +22,7 @@ type SharedAsyncOps = Arc<Mutex<TestAsyncOps>>;
 #[derive(Default)]
 struct TestAsyncOps {
     pending: HashMap<HostOpId, oneshot::Receiver<AsyncHostResult>>,
+    cancellations: Vec<(HostOpId, CancellationReason)>,
 }
 
 impl TestAsyncOps {
@@ -96,6 +97,12 @@ impl HostAsyncBridge for TestAsyncBridge {
             .pending
             .remove(&op_id);
     }
+
+    fn cancel_op_with_reason(&mut self, op_id: HostOpId, reason: CancellationReason) {
+        let mut ops = self.ops.lock().expect("test async ops lock poisoned");
+        ops.pending.remove(&op_id);
+        ops.cancellations.push((op_id, reason));
+    }
 }
 
 struct AsyncAddOneFunction {
@@ -131,6 +138,14 @@ impl HostFunction for AsyncAddOneFunction {
             Ok(vec![Value::Int(value + 1)].into())
         })?;
         Ok(CallOutcome::Pending(op_id))
+    }
+}
+
+struct InvalidPendingFunction;
+
+impl HostFunction for InvalidPendingFunction {
+    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, VmError> {
+        Ok(CallOutcome::Pending(0))
     }
 }
 
@@ -226,8 +241,61 @@ async fn reset_cancels_pending_host_bridge_operation() {
     ));
     assert_eq!(ops.lock().unwrap().pending.len(), 1);
     vm.reset_for_reuse();
-    assert_eq!(ops.lock().unwrap().pending.len(), 0);
+    let ops = ops.lock().unwrap();
+    assert_eq!(ops.pending.len(), 0);
+    assert_eq!(ops.cancellations.len(), 1);
+    assert_eq!(ops.cancellations[0].1, CancellationReason::VmReset);
+    drop(ops);
     assert_eq!(vm.waiting_host_op_id(), None);
+}
+
+#[test]
+fn rejected_pending_result_cancels_bridge_owned_work() {
+    let ops = Arc::new(Mutex::new(TestAsyncOps::default()));
+    let mut vm = Vm::new(build_async_import_program(41));
+    vm.bind_function("edge::async_add_one", Box::new(InvalidPendingFunction));
+    vm.set_async_bridge(Box::new(TestAsyncBridge::new(ops.clone())));
+
+    vm.run()
+        .expect_err("zero host operation id should be rejected");
+    assert_eq!(
+        ops.lock().unwrap().cancellations,
+        vec![(0, CancellationReason::ResourceClosed)]
+    );
+    assert_eq!(vm.waiting_host_op_id(), None);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn user_cancellation_reaches_host_bridge_and_clears_waiting_state() {
+    let ops = Arc::new(Mutex::new(TestAsyncOps::default()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut vm = Vm::new(build_async_import_program(41));
+    vm.bind_function(
+        "edge::async_add_one",
+        Box::new(AsyncAddOneFunction::new(
+            ops.clone(),
+            calls,
+            Duration::from_secs(60),
+        )),
+    );
+    vm.set_async_bridge(Box::new(TestAsyncBridge::new(ops.clone())));
+
+    let op_id = match vm.run().expect("pending call") {
+        VmStatus::Waiting(op_id) => op_id,
+        status => panic!("expected waiting status, got {status:?}"),
+    };
+    let error = vm
+        .wait_for_host_op_blocking_with_cancel(|| true)
+        .expect_err("user cancellation should stop the wait");
+    assert!(error.to_string().contains("cancelled"));
+    let ops = ops.lock().unwrap();
+    assert_eq!(ops.pending.len(), 0);
+    assert_eq!(
+        ops.cancellations,
+        vec![(op_id, CancellationReason::Requested)]
+    );
+    assert_eq!(vm.waiting_host_op_id(), None);
+    assert!(op_id > 0);
 }
 
 #[tokio::test(flavor = "current_thread")]

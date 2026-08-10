@@ -211,6 +211,44 @@ fn runtime_sleep_default_bindings_remain_inside_jit_loop_traces() {
 }
 
 #[test]
+fn restricted_capabilities_disable_trace_jit_for_host_imports_and_builtins() {
+    for source in [
+        r#"
+            use runtime;
+            let mut i = 0;
+            while i < 4 {
+                let _ = runtime::sleep(0);
+                i = i + 1;
+            }
+            i;
+        "#,
+        r#"
+            use re;
+            let mut i = 0;
+            while i < 4 {
+                let _ = re::match("a", "a");
+                i = i + 1;
+            }
+            i;
+        "#,
+    ] {
+        let compiled = compile_source(source).expect("restricted loop should compile");
+        let mut vm = Vm::new(compiled.program);
+        vm.set_jit_config(JitConfig {
+            enabled: native_jit_supported(),
+            hot_loop_threshold: 1,
+            max_trace_len: 512,
+        });
+        HostFunctionRegistry::restricted()
+            .bind_vm_cached(&mut vm)
+            .expect("restricted registry should bind program imports");
+
+        assert!(matches!(vm.run(), Err(vm::VmError::UnboundImport(_))));
+        assert_eq!(vm.jit_native_exec_count(), 0);
+    }
+}
+
+#[test]
 fn runtime_exit_still_halts_for_direct_and_cached_default_bindings() {
     for bind_cached_registry in [false, true] {
         let compiled = compile_source(

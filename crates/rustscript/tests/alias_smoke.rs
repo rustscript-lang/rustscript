@@ -21,3 +21,38 @@ fn alias_exports_op_code() {
     let _ = rustscript::OpCode::Nop;
     let _ = rustscript::OpCode::Add;
 }
+
+#[cfg(feature = "runtime")]
+#[test]
+fn alias_exports_public_runtime_event_contract() {
+    fn accept_sink<S: rustscript::EventSink>(_sink: S) {}
+
+    struct Sink;
+    impl rustscript::EventSink for Sink {
+        fn emit(&mut self, _payload: rustscript::EventPayload) -> rustscript::RuntimeResult<()> {
+            Ok(())
+        }
+    }
+
+    accept_sink(Sink);
+}
+
+#[cfg(feature = "http-client")]
+#[test]
+fn alias_http_client_includes_runtime_contract() {
+    fn accept_runtime_result(_result: rustscript::RuntimeResult<()>) {}
+
+    accept_runtime_result(Ok(()));
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn alias_exports_public_sqlite_configuration() {
+    let program = rustscript::compile_source("0;")
+        .expect("minimal alias SQLite program should compile")
+        .program;
+    let mut vm = rustscript::Vm::new(program);
+    vm.configure_sqlite(rustscript::SqlitePolicy::default());
+    let _limits = rustscript::SqliteLimits::default();
+    vm.clear_sqlite_configuration();
+}

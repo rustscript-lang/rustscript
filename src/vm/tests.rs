@@ -1,7 +1,9 @@
+use super::host::WaitingHostOp;
 use super::*;
 use crate::builtins::BuiltinFunction;
 use crate::bytecode::TypeMap;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 fn native_cache_test_lock() -> &'static Mutex<()> {
@@ -12,15 +14,18 @@ fn native_cache_test_lock() -> &'static Mutex<()> {
 #[test]
 fn root_ret_completes_explicit_halt_frame() {
     let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
-    assert_eq!(vm.execution_frames.len(), 1);
-    assert_eq!(vm.execution_frames[0].continuation, FrameContinuation::Halt);
+    assert_eq!(vm.instance.execution_frames.len(), 1);
+    assert_eq!(
+        vm.instance.execution_frames[0].continuation,
+        FrameContinuation::Halt
+    );
 
     assert_eq!(vm.run().expect("root ret should run"), VmStatus::Halted);
-    assert!(vm.execution_frames.is_empty());
+    assert!(vm.instance.execution_frames.is_empty());
     assert!(vm.stack().is_empty());
 
     vm.reset_for_reuse();
-    assert_eq!(vm.execution_frames.len(), 1);
+    assert_eq!(vm.instance.execution_frames.len(), 1);
     assert_eq!(vm.stack(), &[]);
 }
 
@@ -33,10 +38,355 @@ fn reset_for_reuse_keeps_host_operation_ids_monotonic() {
 }
 
 #[test]
+fn unused_host_operation_ids_do_not_consume_registry_capacity() {
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    for _ in 0..128 {
+        vm.allocate_host_op_id();
+    }
+    assert_eq!(vm.host.runtime_operations.active_count(), 0);
+}
+
+#[test]
+fn external_host_operations_join_the_shared_registry_without_id_collisions() {
+    use crate::builtins::runtime::cancellation::{OperationId, OperationOwner};
+
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    let runtime_operation = vm
+        .host
+        .runtime_operations
+        .start_owned(
+            OperationOwner::Io,
+            Some(&vm.run_ctx.cancellation),
+            None,
+            None,
+        )
+        .expect("runtime operation should start");
+
+    let collision = vm
+        .set_waiting_host_op(runtime_operation.id().raw())
+        .expect_err("host operation must not reuse a runtime-owned id");
+    assert!(collision.to_string().contains("collides"));
+    assert!(
+        vm.host
+            .runtime_operations
+            .get(runtime_operation.id())
+            .is_ok()
+    );
+    vm.host
+        .runtime_operations
+        .complete(runtime_operation.id())
+        .expect("runtime operation should complete");
+    vm.set_waiting_host_op(runtime_operation.id().raw())
+        .expect_err("colliding external operation id must remain retired");
+
+    vm.set_waiting_host_op(99)
+        .expect("external host operation should register");
+    let external = vm
+        .host
+        .runtime_operations
+        .get(OperationId::from_raw(99).expect("operation id should be valid"))
+        .expect("external operation should be registered");
+    assert_eq!(external.owner(), OperationOwner::HostBridge);
+}
+
+#[test]
+fn invalid_host_completion_preserves_the_registered_operation() {
+    use crate::builtins::runtime::cancellation::{OperationId, OperationOwner};
+
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.set_waiting_host_op(101)
+        .expect("external host operation should register");
+
+    vm.complete_host_op(102, CallReturn::none())
+        .expect_err("completion for a different operation should fail");
+    let operation_id = OperationId::from_raw(101).expect("operation id should be valid");
+    assert_eq!(
+        vm.host
+            .runtime_operations
+            .get(operation_id)
+            .expect("waiting operation should remain registered")
+            .owner(),
+        OperationOwner::HostBridge
+    );
+    assert_eq!(vm.waiting_host_op_id(), Some(101));
+}
+
+#[test]
+fn reset_and_drop_cleanup_real_host_resources_exactly_once() {
+    use crate::builtins::runtime::cancellation::CancellationReason;
+    use crate::builtins::runtime::resource::ResourceTypeId;
+
+    let cleanup_count = Arc::new(AtomicUsize::new(0));
+    let reasons = Arc::new(Mutex::new(Vec::new()));
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    let cleanup_count_for_resource = Arc::clone(&cleanup_count);
+    let reasons_for_resource = Arc::clone(&reasons);
+    vm.host
+        .runtime_resources
+        .insert_with_cleanup(ResourceTypeId::IO_FILE, (), move |(), reason| {
+            cleanup_count_for_resource.fetch_add(1, Ordering::SeqCst);
+            reasons_for_resource
+                .lock()
+                .expect("reason lock")
+                .push(reason);
+            Ok(())
+        })
+        .expect("test resource should be inserted");
+
+    vm.reset_for_reuse();
+    assert_eq!(cleanup_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        reasons.lock().expect("reason lock").as_slice(),
+        &[CancellationReason::VmReset]
+    );
+
+    drop(vm);
+    assert_eq!(cleanup_count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn drop_cleans_real_host_resources_without_prior_reset() {
+    use crate::builtins::runtime::cancellation::CancellationReason;
+    use crate::builtins::runtime::resource::ResourceTypeId;
+
+    let cleanup_count = Arc::new(AtomicUsize::new(0));
+    let cleanup_reason = Arc::new(Mutex::new(None));
+    {
+        let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+        let cleanup_count_for_resource = Arc::clone(&cleanup_count);
+        let cleanup_reason_for_resource = Arc::clone(&cleanup_reason);
+        vm.host
+            .runtime_resources
+            .insert_with_cleanup(ResourceTypeId::IO_FILE, (), move |(), reason| {
+                cleanup_count_for_resource.fetch_add(1, Ordering::SeqCst);
+                *cleanup_reason_for_resource.lock().expect("reason lock") = Some(reason);
+                Ok(())
+            })
+            .expect("test resource should be inserted");
+    }
+
+    assert_eq!(cleanup_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *cleanup_reason.lock().expect("reason lock"),
+        Some(CancellationReason::VmReset)
+    );
+}
+
+#[test]
+fn reset_propagates_to_real_host_operation_cleanup() {
+    use crate::builtins::runtime::cancellation::{
+        CancellationReason, OperationEnd, OperationOwner, OperationStatus,
+    };
+
+    let cleanup_end = Arc::new(Mutex::new(None));
+    let cleanup_end_for_operation = Arc::clone(&cleanup_end);
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    let operation = vm
+        .host
+        .runtime_operations
+        .start_owned(
+            OperationOwner::Io,
+            Some(&vm.run_ctx.cancellation),
+            None,
+            Some(Box::new(move |end| {
+                *cleanup_end_for_operation.lock().expect("cleanup lock") = Some(end);
+                Ok(())
+            })),
+        )
+        .expect("test operation should start");
+    vm.instance.waiting_host_op = Some(WaitingHostOp {
+        op_id: operation.id().raw(),
+    });
+
+    vm.reset_for_reuse();
+    assert_eq!(
+        operation.status(),
+        OperationStatus::Cancelled(CancellationReason::VmReset)
+    );
+    assert_eq!(
+        *cleanup_end.lock().expect("cleanup lock"),
+        Some(OperationEnd::Cancelled(CancellationReason::VmReset))
+    );
+}
+
+#[test]
+fn deadline_cancellation_closes_operation_payload_before_registry_removal() {
+    use crate::builtins::runtime::cancellation::{CancellationReason, OperationOwner};
+    use crate::builtins::runtime::resource::ResourceTypeId;
+    use std::task::{Context, Poll};
+    use std::time::{Duration, Instant};
+
+    let cleanup_reason = Arc::new(Mutex::new(None));
+    let cleanup_reason_for_payload = Arc::clone(&cleanup_reason);
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    let operation = vm
+        .host
+        .runtime_operations
+        .start_owned(
+            OperationOwner::Http,
+            Some(&vm.run_ctx.cancellation),
+            Some(Instant::now() - Duration::from_millis(1)),
+            None,
+        )
+        .expect("deadline operation should start");
+    let payload = vm
+        .host
+        .runtime_resources
+        .insert_with_cleanup(ResourceTypeId::CALLBACK, (), move |(), reason| {
+            *cleanup_reason_for_payload.lock().expect("cleanup lock") = Some(reason);
+            Ok(())
+        })
+        .expect("payload should be inserted");
+    operation.set_payload(payload);
+
+    let waker = futures_util::task::noop_waker();
+    let mut context = Context::from_waker(&waker);
+    let result =
+        crate::builtins::runtime::poll_builtin_io_op(&mut vm, operation.id().raw(), &mut context);
+
+    assert!(matches!(result, Poll::Ready(Err(_))));
+    assert_eq!(
+        *cleanup_reason.lock().expect("cleanup lock"),
+        Some(CancellationReason::Deadline)
+    );
+    assert!(vm.host.runtime_operations.get(operation.id()).is_err());
+    assert!(
+        vm.host
+            .runtime_resources
+            .get::<()>(payload, ResourceTypeId::CALLBACK)
+            .is_err()
+    );
+}
+
+#[test]
+fn worker_observed_deadline_retains_payload_until_vm_consumes_operation() {
+    use crate::builtins::runtime::cancellation::{CancellationReason, OperationOwner};
+    use crate::builtins::runtime::error::{RuntimeError, RuntimeErrorCode};
+    use crate::builtins::runtime::resource::ResourceTypeId;
+    use std::task::{Context, Poll};
+    use std::time::{Duration, Instant};
+
+    let cleanup_reason = Arc::new(Mutex::new(None));
+    let cleanup_reason_for_payload = Arc::clone(&cleanup_reason);
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    let operation = vm
+        .host
+        .runtime_operations
+        .start_owned(
+            OperationOwner::Http,
+            Some(&vm.run_ctx.cancellation),
+            Some(Instant::now() - Duration::from_millis(1)),
+            None,
+        )
+        .expect("deadline operation should start");
+    let payload = vm
+        .host
+        .runtime_resources
+        .insert_with_cleanup(ResourceTypeId::CALLBACK, (), move |(), reason| {
+            *cleanup_reason_for_payload.lock().expect("cleanup lock") = Some(reason);
+            Ok(())
+        })
+        .expect("payload should be inserted");
+    operation.set_payload(payload);
+
+    assert!(
+        operation
+            .fail(RuntimeError::new(
+                RuntimeErrorCode::OperationFailed,
+                "test::worker",
+                "worker failure",
+            ))
+            .expect("worker terminal transition should succeed")
+    );
+    assert!(vm.host.runtime_operations.get(operation.id()).is_ok());
+
+    let waker = futures_util::task::noop_waker();
+    let mut context = Context::from_waker(&waker);
+    let result =
+        crate::builtins::runtime::poll_builtin_io_op(&mut vm, operation.id().raw(), &mut context);
+
+    assert!(matches!(result, Poll::Ready(Err(_))));
+    assert_eq!(
+        *cleanup_reason.lock().expect("cleanup lock"),
+        Some(CancellationReason::Deadline)
+    );
+    assert!(vm.host.runtime_operations.get(operation.id()).is_err());
+    assert!(
+        vm.host
+            .runtime_resources
+            .get::<()>(payload, ResourceTypeId::CALLBACK)
+            .is_err()
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_reconfiguration_only_closes_sqlite_owned_state() {
+    use crate::builtins::runtime::cancellation::OperationOwner;
+    use crate::builtins::runtime::resource::ResourceTypeId;
+
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    let io_resource = vm
+        .host
+        .runtime_resources
+        .insert(ResourceTypeId::IO_FILE, 11_i64)
+        .expect("IO resource should be inserted");
+    let sqlite_resource = vm
+        .host
+        .runtime_resources
+        .insert(ResourceTypeId::SQLITE_CONNECTION, 22_i64)
+        .expect("SQLite resource should be inserted");
+    let io_operation = vm
+        .host
+        .runtime_operations
+        .start_owned(
+            OperationOwner::Io,
+            Some(&vm.run_ctx.cancellation),
+            None,
+            None,
+        )
+        .expect("IO operation should start");
+    io_operation.set_resource(io_resource);
+    let sqlite_operation = vm
+        .host
+        .runtime_operations
+        .start_owned(
+            OperationOwner::Sqlite,
+            Some(&vm.run_ctx.cancellation),
+            None,
+            None,
+        )
+        .expect("SQLite operation should start");
+    sqlite_operation.set_resource(sqlite_resource);
+
+    vm.configure_sqlite(crate::vm::SqlitePolicy::default());
+
+    assert!(
+        vm.host
+            .runtime_resources
+            .get::<i64>(io_resource, ResourceTypeId::IO_FILE)
+            .is_ok()
+    );
+    assert!(vm.host.runtime_operations.get(io_operation.id()).is_ok());
+    assert!(
+        vm.host
+            .runtime_resources
+            .get::<i64>(sqlite_resource, ResourceTypeId::SQLITE_CONNECTION)
+            .is_err()
+    );
+    assert!(
+        vm.host
+            .runtime_operations
+            .get(sqlite_operation.id())
+            .is_err()
+    );
+}
+
+#[test]
 fn shared_capture_cell_rejects_callable_ownership_cycle() {
     let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]).with_local_count(1));
     let cell = Arc::new(Mutex::new(Value::Null));
-    vm.capture_cells.insert(0, Arc::clone(&cell));
+    vm.instance.capture_cells.insert(0, Arc::clone(&cell));
     let environment = Arc::new(crate::CallableEnvironment {
         cells: Mutex::new(vec![cell]),
     });
@@ -109,7 +459,7 @@ fn callvalue_decodes_its_arity_before_callable_validation() {
         Vec::new(),
         vec![OpCode::CallValue as u8, 0, OpCode::Ret as u8],
     ));
-    vm.stack.push(Value::Null);
+    vm.instance.stack.push(Value::Null);
     assert!(matches!(vm.run(), Err(VmError::InvalidCallable)));
     assert_eq!(vm.ip(), 2);
 }
@@ -293,7 +643,7 @@ fn aot_executes_move_detach_without_stack_contract_mismatch() {
         VmStatus::Halted
     );
     assert_eq!(vm.stack(), &[Value::String(Arc::new("x".to_string()))]);
-    assert!(!vm.aot_interpreter_boundary_hit);
+    assert!(!vm.engine.aot_interpreter_boundary_hit);
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -314,7 +664,7 @@ fn aot_executes_script_callable_frames_without_interpreter_boundary() {
     );
     assert_eq!(vm.stack(), &[Value::Int(42)]);
     assert!(vm.aot_exec_count() >= 3);
-    assert!(!vm.aot_interpreter_boundary_hit);
+    assert!(!vm.engine.aot_interpreter_boundary_hit);
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -334,7 +684,7 @@ fn aot_executes_typed_script_callable_parameter_equality_without_interpreter_bou
         VmStatus::Halted
     );
     assert_eq!(vm.stack(), &[Value::Bool(true)]);
-    assert!(!vm.aot_interpreter_boundary_hit);
+    assert!(!vm.engine.aot_interpreter_boundary_hit);
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -355,7 +705,7 @@ fn aot_executes_script_callable_bool_return_in_branch_without_interpreter_bounda
         VmStatus::Halted
     );
     assert_eq!(vm.stack(), &[Value::Int(1)]);
-    assert!(!vm.aot_interpreter_boundary_hit);
+    assert!(!vm.engine.aot_interpreter_boundary_hit);
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -377,7 +727,7 @@ fn aot_executes_capturing_closure_without_interpreter_boundary() {
     );
     assert_eq!(vm.stack(), &[Value::Int(42)]);
     assert!(vm.aot_exec_count() >= 3);
-    assert!(!vm.aot_interpreter_boundary_hit);
+    assert!(!vm.engine.aot_interpreter_boundary_hit);
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -397,7 +747,7 @@ fn aot_executes_builtin_callable_values_without_interpreter_boundary() {
         VmStatus::Halted
     );
     assert_eq!(vm.stack(), &[Value::Int(3)]);
-    assert!(!vm.aot_interpreter_boundary_hit);
+    assert!(!vm.engine.aot_interpreter_boundary_hit);
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -424,7 +774,7 @@ fn aot_callable_call_resumes_after_fuel_yield_without_interpreter_boundary() {
         VmStatus::Halted
     );
     assert_eq!(vm.stack(), &[Value::Int(42)]);
-    assert!(!vm.aot_interpreter_boundary_hit);
+    assert!(!vm.engine.aot_interpreter_boundary_hit);
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -445,7 +795,7 @@ fn aot_executes_nested_script_callables_without_interpreter_boundary() {
         VmStatus::Halted
     );
     assert_eq!(vm.stack(), &[Value::Int(42)]);
-    assert!(!vm.aot_interpreter_boundary_hit);
+    assert!(!vm.engine.aot_interpreter_boundary_hit);
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -464,7 +814,7 @@ fn aot_recursive_script_callable_reports_depth_limit_without_interpreter_boundar
         vm.run(),
         Err(VmError::CallStackOverflow { limit: 1024 })
     ));
-    assert!(!vm.aot_interpreter_boundary_hit);
+    assert!(!vm.engine.aot_interpreter_boundary_hit);
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -493,7 +843,7 @@ fn aot_host_callable_value_waits_and_resumes_without_interpreter_boundary() {
         vm.run().expect("pending host callable should wait"),
         VmStatus::Waiting(812)
     );
-    assert!(!vm.aot_interpreter_boundary_hit);
+    assert!(!vm.engine.aot_interpreter_boundary_hit);
     vm.complete_host_op(812, vec![Value::Int(42)])
         .expect("host operation should complete");
     assert_eq!(
@@ -501,7 +851,7 @@ fn aot_host_callable_value_waits_and_resumes_without_interpreter_boundary() {
         VmStatus::Halted
     );
     assert_eq!(vm.stack(), &[Value::Int(42)]);
-    assert!(!vm.aot_interpreter_boundary_hit);
+    assert!(!vm.engine.aot_interpreter_boundary_hit);
 }
 
 #[test]
@@ -943,8 +1293,8 @@ fn vm_instances_share_decoded_instruction_metadata_across_program_clones() {
 
     assert!(
         Arc::ptr_eq(
-            &vm_one.decoded_instruction_data,
-            &vm_two.decoded_instruction_data
+            &vm_one.engine.decoded_instruction_data,
+            &vm_two.engine.decoded_instruction_data
         ),
         "program clones should share decoded instruction metadata"
     );
@@ -969,7 +1319,11 @@ fn borrowed_map_iterator_state_is_released_after_break() {
 
     assert_eq!(vm.run().expect("vm should run"), VmStatus::Halted);
     assert!(
-        vm.map_iterators.iter().flatten().all(Option::is_none),
+        vm.instance
+            .map_iterators
+            .iter()
+            .flatten()
+            .all(Option::is_none),
         "break must release every iterator owned by the exited loop"
     );
 }
@@ -991,7 +1345,11 @@ fn borrowed_map_iterator_state_is_released_after_runtime_error() {
 
     vm.run().expect_err("program should fail at runtime");
     assert!(
-        vm.map_iterators.iter().flatten().all(Option::is_none),
+        vm.instance
+            .map_iterators
+            .iter()
+            .flatten()
+            .all(Option::is_none),
         "runtime errors must release active map iterators"
     );
 }
@@ -1008,7 +1366,7 @@ fn map_iterator_ids_are_isolated_by_call_depth() {
     };
 
     vm.init_map_iterator(7, outer).expect("outer init");
-    vm.call_depth = 1;
+    vm.instance.call_depth = 1;
     vm.init_map_iterator(7, inner).expect("inner init");
     assert!(vm.advance_map_iterator(7).expect("inner advance"));
     assert_eq!(
@@ -1017,7 +1375,7 @@ fn map_iterator_ids_are_isolated_by_call_depth() {
     );
     vm.close_map_iterator(7).expect("inner close");
 
-    vm.call_depth = 0;
+    vm.instance.call_depth = 0;
     assert!(vm.advance_map_iterator(7).expect("outer advance"));
     assert_eq!(
         vm.take_map_iterator_key(7).expect("outer key"),
@@ -1079,7 +1437,7 @@ fn native_trace_cache_resets_when_program_changes() {
         jit::runtime::native_trace_cache_snapshot_for_tests();
     assert_eq!(
         cache_program_after_one,
-        Some(vm_one.program_cache_key),
+        Some(vm_one.engine.program_cache_key),
         "cache should be keyed to first program after first run"
     );
     assert_eq!(
@@ -1094,7 +1452,7 @@ fn native_trace_cache_resets_when_program_changes() {
         max_trace_len: 512,
     });
     assert_ne!(
-        vm_one.program_cache_key, vm_two.program_cache_key,
+        vm_one.engine.program_cache_key, vm_two.engine.program_cache_key,
         "test programs should have different cache keys"
     );
     let status_two = vm_two.run().expect("second vm should run");
@@ -1109,7 +1467,7 @@ fn native_trace_cache_resets_when_program_changes() {
         jit::runtime::native_trace_cache_snapshot_for_tests();
     assert_eq!(
         cache_program_after_two,
-        Some(vm_two.program_cache_key),
+        Some(vm_two.engine.program_cache_key),
         "cache should switch to second program key"
     );
     assert_eq!(
@@ -1161,7 +1519,7 @@ fn native_trace_cache_reuses_entries_for_same_program() {
         jit::runtime::native_trace_cache_snapshot_for_tests();
     assert_eq!(
         cache_program_after_one,
-        Some(vm_one.program_cache_key),
+        Some(vm_one.engine.program_cache_key),
         "cache should be keyed to the first program"
     );
     assert_eq!(
@@ -1176,7 +1534,7 @@ fn native_trace_cache_reuses_entries_for_same_program() {
         max_trace_len: 512,
     });
     assert_eq!(
-        vm_two.program_cache_key, vm_one.program_cache_key,
+        vm_two.engine.program_cache_key, vm_one.engine.program_cache_key,
         "same program should use identical cache key"
     );
 
@@ -1192,7 +1550,7 @@ fn native_trace_cache_reuses_entries_for_same_program() {
         jit::runtime::native_trace_cache_snapshot_for_tests();
     assert_eq!(
         cache_program_after_two,
-        Some(vm_two.program_cache_key),
+        Some(vm_two.engine.program_cache_key),
         "cache key should remain the same for identical program"
     );
     assert_eq!(
@@ -1344,7 +1702,7 @@ fn interpreter_superinstructions_use_local_type_hints() {
     let outcome = step_once(&mut vm).expect("ldloc should fuse scalar sequence");
 
     assert!(matches!(outcome, ExecOutcome::Continue));
-    assert_eq!(vm.locals[0], Value::Int(10));
+    assert_eq!(vm.instance.locals[0], Value::Int(10));
     let metrics = vm.interpreter_metrics_snapshot();
     assert_eq!(metrics.scalar_superinstruction_count, 1);
     assert!(
@@ -1375,7 +1733,8 @@ fn interpreter_ldc_shares_string_constant_backing() {
 fn interpreter_dup_shares_array_backing() {
     let program = Program::new(vec![], vec![OpCode::Dup as u8, OpCode::Ret as u8]);
     let mut vm = Vm::new(program);
-    vm.stack
+    vm.instance
+        .stack
         .push(Value::array(vec![Value::Int(1), Value::Int(2)]));
 
     let outcome = step_once(&mut vm).expect("dup should execute");
@@ -1503,14 +1862,17 @@ fn interpreter_ldloc_preserves_local_slot() {
 
     let outcome = step_once(&mut vm).expect("ldloc should execute");
     assert!(matches!(outcome, ExecOutcome::Continue));
-    assert_eq!(vm.ip, 2);
-    assert_eq!(vm.locals[0], map_value, "ldloc should leave local intact");
+    assert_eq!(vm.instance.ip, 2);
+    assert_eq!(
+        vm.instance.locals[0], map_value,
+        "ldloc should leave local intact"
+    );
     assert_eq!(
         vm.stack(),
         &[map_value],
         "stack should receive copied value"
     );
-    assert_shared_heap_backing(&vm.locals[0], &vm.stack()[0]);
+    assert_shared_heap_backing(&vm.instance.locals[0], &vm.stack()[0]);
     assert_eq!(vm.drop_contract_event_count(), 0);
 }
 
@@ -1539,9 +1901,9 @@ fn interpreter_explicit_move_sequence_clears_local_slot() {
 
     let ldloc = step_once(&mut vm).expect("ldloc should execute");
     assert!(matches!(ldloc, ExecOutcome::Continue));
-    assert_eq!(vm.locals[0], map_value);
+    assert_eq!(vm.instance.locals[0], map_value);
     assert_eq!(vm.stack(), std::slice::from_ref(&map_value));
-    assert_shared_heap_backing(&vm.locals[0], &vm.stack()[0]);
+    assert_shared_heap_backing(&vm.instance.locals[0], &vm.stack()[0]);
 
     let ldc = step_once(&mut vm).expect("ldc should execute");
     assert!(matches!(ldc, ExecOutcome::Continue));
@@ -1549,8 +1911,8 @@ fn interpreter_explicit_move_sequence_clears_local_slot() {
 
     let stloc = step_once(&mut vm).expect("stloc should execute");
     assert!(matches!(stloc, ExecOutcome::Continue));
-    assert_eq!(vm.ip, 9);
-    assert_eq!(vm.locals[0], Value::Null);
+    assert_eq!(vm.instance.ip, 9);
+    assert_eq!(vm.instance.locals[0], Value::Null);
     assert_eq!(vm.stack(), &[map_value]);
 }
 
@@ -1579,9 +1941,9 @@ fn interpreter_fuses_ldloc_ldc_add_stloc_without_touching_stack() {
 
     let outcome = step_once(&mut vm).expect("fused sequence should execute");
     assert!(matches!(outcome, ExecOutcome::Continue));
-    assert_eq!(vm.ip, 10, "fusion should consume ldc/add/stloc");
-    assert_eq!(vm.locals[0], Value::Int(41));
-    assert_eq!(vm.locals[1], Value::Int(42));
+    assert_eq!(vm.instance.ip, 10, "fusion should consume ldc/add/stloc");
+    assert_eq!(vm.instance.locals[0], Value::Int(41));
+    assert_eq!(vm.instance.locals[1], Value::Int(42));
     assert!(
         vm.stack().is_empty(),
         "fusion should avoid transient stack traffic"
@@ -1621,7 +1983,10 @@ fn interpreter_fuses_ldloc_ldc_compare_brfalse() {
 
     let outcome = step_once(&mut vm).expect("fused compare should execute");
     assert!(matches!(outcome, ExecOutcome::Continue));
-    assert_eq!(vm.ip, 15, "fusion should jump directly to branch target");
+    assert_eq!(
+        vm.instance.ip, 15,
+        "fusion should jump directly to branch target"
+    );
     assert!(
         vm.stack().is_empty(),
         "fusion should avoid bool stack traffic"
@@ -1664,9 +2029,9 @@ fn interpreter_fuses_generic_scalar_update_chain() {
 
     let outcome = step_once(&mut vm).expect("generic chain should fuse");
     assert!(matches!(outcome, ExecOutcome::Continue));
-    assert_eq!(vm.ip, 19);
-    assert_eq!(vm.locals[0], Value::Int(29));
-    assert_eq!(vm.locals[1], Value::Int(4));
+    assert_eq!(vm.instance.ip, 19);
+    assert_eq!(vm.instance.locals[0], Value::Int(29));
+    assert_eq!(vm.instance.locals[1], Value::Int(4));
     assert!(vm.stack().is_empty());
 }
 
@@ -1708,13 +2073,13 @@ fn interpreter_fuses_float_scalar_sequences() {
 
     let first = step_once(&mut vm).expect("float update should fuse");
     assert!(matches!(first, ExecOutcome::Continue));
-    assert_eq!(vm.ip, 10);
-    assert_eq!(vm.locals[0], Value::Float(2.5));
+    assert_eq!(vm.instance.ip, 10);
+    assert_eq!(vm.instance.locals[0], Value::Float(2.5));
     assert!(vm.stack().is_empty());
 
     let second = step_once(&mut vm).expect("float compare should fuse");
     assert!(matches!(second, ExecOutcome::Continue));
-    assert_eq!(vm.ip, 23);
+    assert_eq!(vm.instance.ip, 23);
     assert!(vm.stack().is_empty());
 }
 
@@ -1747,9 +2112,12 @@ fn interpreter_does_not_fuse_ldloc_sequences_when_fuel_is_enabled() {
         .execute_interpreter_instruction(opcode, false)
         .expect("ldloc should execute without fusion");
     assert!(matches!(outcome, ExecOutcome::Continue));
-    assert_eq!(vm.ip, 2, "ldloc should advance only past its operand");
+    assert_eq!(
+        vm.instance.ip, 2,
+        "ldloc should advance only past its operand"
+    );
     assert_eq!(vm.stack(), &[Value::Int(41)]);
-    assert_eq!(vm.locals[0], Value::Int(41));
+    assert_eq!(vm.instance.locals[0], Value::Int(41));
 }
 
 #[test]
@@ -1776,7 +2144,7 @@ fn interpreter_copy_like_ldloc_dup_stloc_shares_map_backing_with_fuel() {
     let _ = step_once(&mut vm).expect("stloc should execute");
 
     assert_eq!(vm.stack().len(), 1);
-    assert_shared_heap_backing(&vm.locals[0], &vm.stack()[0]);
+    assert_shared_heap_backing(&vm.instance.locals[0], &vm.stack()[0]);
 }
 
 #[test]
@@ -1787,11 +2155,14 @@ fn interpreter_fuses_call_ret_without_fuel() {
         vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
     );
     let mut vm = Vm::new(program);
-    vm.stack.push(Value::string("tail"));
+    vm.instance.stack.push(Value::string("tail"));
 
     let outcome = step_once(&mut vm).expect("call should execute");
     assert!(matches!(outcome, ExecOutcome::Halted));
-    assert_eq!(vm.ip, 5, "tail-call fusion should consume trailing ret");
+    assert_eq!(
+        vm.instance.ip, 5,
+        "tail-call fusion should consume trailing ret"
+    );
     assert_eq!(vm.stack(), &[Value::Int(4)]);
 }
 
@@ -1804,12 +2175,15 @@ fn interpreter_fuses_call_ret_when_fuel_enabled_if_tail_tick_available() {
     );
     let mut vm = Vm::new(program);
     vm.set_fuel(1);
-    vm.stack.push(Value::string("tail"));
+    vm.instance.stack.push(Value::string("tail"));
 
     // `step_once` bypasses the outer run-loop pre-tick, so this fuel only covers fused `ret`.
     let call = step_once(&mut vm).expect("call should execute");
     assert!(matches!(call, ExecOutcome::Halted));
-    assert_eq!(vm.ip, 5, "tail-call fusion should consume trailing ret");
+    assert_eq!(
+        vm.instance.ip, 5,
+        "tail-call fusion should consume trailing ret"
+    );
     assert_eq!(vm.stack(), &[Value::Int(4)]);
     assert_eq!(vm.get_fuel(), Some(0));
 }
@@ -1823,7 +2197,7 @@ fn interpreter_call_ret_fusion_preserves_ip_when_tail_tick_exhausted() {
     );
     let mut vm = Vm::new(program);
     vm.set_fuel(0);
-    vm.stack.push(Value::string("tail"));
+    vm.instance.stack.push(Value::string("tail"));
 
     let err = match step_once(&mut vm) {
         Ok(_) => panic!("tail tick should fail with out-of-fuel"),
@@ -1831,7 +2205,7 @@ fn interpreter_call_ret_fusion_preserves_ip_when_tail_tick_exhausted() {
     };
     assert!(matches!(err, VmError::OutOfFuel { .. }));
     assert_eq!(
-        vm.ip, 4,
+        vm.instance.ip, 4,
         "ret must remain pending when tail tick cannot be charged"
     );
     assert_eq!(vm.stack(), &[Value::Int(4)]);
@@ -1847,7 +2221,7 @@ fn interpreter_call_ret_fusion_preserves_ip_when_epoch_deadline_is_reached() {
     let mut vm = Vm::new(program);
     vm.set_epoch_deadline(0)
         .expect("setting epoch deadline should succeed");
-    vm.stack.push(Value::string("tail"));
+    vm.instance.stack.push(Value::string("tail"));
 
     let err = match step_once(&mut vm) {
         Ok(_) => panic!("tail tick should fail with epoch deadline reached"),
@@ -1855,7 +2229,7 @@ fn interpreter_call_ret_fusion_preserves_ip_when_epoch_deadline_is_reached() {
     };
     assert!(matches!(err, VmError::EpochDeadlineReached { .. }));
     assert_eq!(
-        vm.ip, 4,
+        vm.instance.ip, 4,
         "ret must remain pending when the epoch check trips during fused tail execution"
     );
     assert_eq!(vm.stack(), &[Value::Int(4)]);
@@ -1870,11 +2244,11 @@ fn run_consumes_two_ticks_for_call_ret_when_fuel_enabled() {
     );
     let mut vm = Vm::new(program);
     vm.set_fuel(2);
-    vm.stack.push(Value::string("tail"));
+    vm.instance.stack.push(Value::string("tail"));
 
     let status = vm.run().expect("run should complete");
     assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.ip, 5);
+    assert_eq!(vm.instance.ip, 5);
     assert_eq!(vm.stack(), &[Value::Int(4)]);
     assert_eq!(
         vm.get_fuel(),
@@ -1892,12 +2266,12 @@ fn run_yields_before_ret_in_call_ret_sequence_when_out_of_fuel() {
     );
     let mut vm = Vm::new(program);
     vm.set_fuel(1);
-    vm.stack.push(Value::string("tail"));
+    vm.instance.stack.push(Value::string("tail"));
 
     let status = vm.run().expect("first run should yield");
     assert_eq!(status, VmStatus::Yielded);
     assert_eq!(
-        vm.ip, 4,
+        vm.instance.ip, 4,
         "fuel exhaustion should happen before trailing ret"
     );
     assert_eq!(vm.stack(), &[Value::Int(4)]);
@@ -1906,7 +2280,7 @@ fn run_yields_before_ret_in_call_ret_sequence_when_out_of_fuel() {
     vm.add_fuel(1).expect("recharging fuel should succeed");
     let resumed = vm.resume().expect("resume should execute trailing ret");
     assert_eq!(resumed, VmStatus::Halted);
-    assert_eq!(vm.ip, 5);
+    assert_eq!(vm.instance.ip, 5);
     assert_eq!(vm.stack(), &[Value::Int(4)]);
 }
 
@@ -1923,12 +2297,12 @@ fn run_yields_before_ret_in_call_ret_sequence_when_epoch_deadline_is_reached() {
     vm.set_epoch_deadline(1)
         .expect("setting epoch deadline should succeed");
     assert_eq!(vm.increment_epoch(), 1);
-    vm.stack.push(Value::string("tail"));
+    vm.instance.stack.push(Value::string("tail"));
 
     let status = vm.run().expect("first run should yield");
     assert_eq!(status, VmStatus::Yielded);
     assert_eq!(
-        vm.ip, 4,
+        vm.instance.ip, 4,
         "epoch interruption should happen before trailing ret"
     );
     assert_eq!(vm.last_yield_reason(), Some(VmYieldReason::Epoch));
@@ -1938,7 +2312,7 @@ fn run_yields_before_ret_in_call_ret_sequence_when_epoch_deadline_is_reached() {
         .resume()
         .expect("resume should auto re-arm the epoch deadline and execute trailing ret");
     assert_eq!(resumed, VmStatus::Halted);
-    assert_eq!(vm.ip, 5);
+    assert_eq!(vm.instance.ip, 5);
     assert_eq!(vm.stack(), &[Value::Int(4)]);
 }
 
@@ -1950,7 +2324,7 @@ fn call_ret_fusion_pattern_requires_immediate_ret() {
         vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
     );
     let mut vm_with_ret = Vm::new(with_ret);
-    vm_with_ret.ip = 4;
+    vm_with_ret.instance.ip = 4;
     assert!(vm_with_ret.can_fuse_call_ret_pattern());
 
     let wrong_next = Program::new(
@@ -1958,11 +2332,11 @@ fn call_ret_fusion_pattern_requires_immediate_ret() {
         vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Nop as u8],
     );
     let mut vm_wrong_next = Vm::new(wrong_next);
-    vm_wrong_next.ip = 4;
+    vm_wrong_next.instance.ip = 4;
     assert!(!vm_wrong_next.can_fuse_call_ret_pattern());
 
     let no_next = Program::new(vec![], vec![OpCode::Call as u8, call_lo, call_hi, 1]);
     let mut vm_no_next = Vm::new(no_next);
-    vm_no_next.ip = 4;
+    vm_no_next.instance.ip = 4;
     assert!(!vm_no_next.can_fuse_call_ret_pattern());
 }

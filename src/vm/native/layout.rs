@@ -56,6 +56,101 @@ pub(crate) struct NativeStackLayout {
     pub(crate) value: ValueLayout,
 }
 
+pub(crate) fn native_stack_layout_fingerprint(layout: NativeStackLayout) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let NativeStackLayout {
+        vm_stack_offset,
+        vm_locals_offset,
+        vm_program_constants_ptr_offset,
+        vm_ip_offset,
+        vm_fuel_remaining_offset,
+        vm_fuel_ops_until_check_offset,
+        vm_epoch_deadline_offset,
+        vm_epoch_counter_ptr_offset,
+        vm_jit_native_region_edge_count_offset,
+        vm_jit_native_direct_link_count_offset,
+        vm_jit_native_active_direct_trace_id_offset,
+        stack_vec,
+        map,
+        value,
+    } = layout;
+    let VecLayout {
+        ptr_offset: stack_vec_ptr_offset,
+        len_offset: stack_vec_len_offset,
+    } = stack_vec;
+    let MapLayout {
+        len_offset: map_len_offset,
+    } = map;
+    let ValueLayout {
+        size: value_size,
+        tag_offset: value_tag_offset,
+        tag_size: value_tag_size,
+        null_tag,
+        int_tag,
+        float_tag,
+        bool_tag,
+        string_tag,
+        bytes_tag,
+        array_tag,
+        map_tag,
+        int_payload_offset,
+        float_payload_offset,
+        bool_payload_offset,
+        heap_payload_offset,
+        arc_data_offset,
+    } = value;
+
+    let mut fingerprint = FNV_OFFSET_BASIS;
+    for byte in b"pd-vm-native-stack-layout-v1\0" {
+        fingerprint ^= u64::from(*byte);
+        fingerprint = fingerprint.wrapping_mul(FNV_PRIME);
+    }
+
+    macro_rules! hash_field {
+        ($value:expr) => {
+            for byte in $value.to_le_bytes() {
+                fingerprint ^= u64::from(byte);
+                fingerprint = fingerprint.wrapping_mul(FNV_PRIME);
+            }
+        };
+    }
+
+    hash_field!(vm_stack_offset);
+    hash_field!(vm_locals_offset);
+    hash_field!(vm_program_constants_ptr_offset);
+    hash_field!(vm_ip_offset);
+    hash_field!(vm_fuel_remaining_offset);
+    hash_field!(vm_fuel_ops_until_check_offset);
+    hash_field!(vm_epoch_deadline_offset);
+    hash_field!(vm_epoch_counter_ptr_offset);
+    hash_field!(vm_jit_native_region_edge_count_offset);
+    hash_field!(vm_jit_native_direct_link_count_offset);
+    hash_field!(vm_jit_native_active_direct_trace_id_offset);
+    hash_field!(stack_vec_ptr_offset);
+    hash_field!(stack_vec_len_offset);
+    hash_field!(map_len_offset);
+    hash_field!(value_size);
+    hash_field!(value_tag_offset);
+    hash_field!(value_tag_size);
+    hash_field!(null_tag);
+    hash_field!(int_tag);
+    hash_field!(float_tag);
+    hash_field!(bool_tag);
+    hash_field!(string_tag);
+    hash_field!(bytes_tag);
+    hash_field!(array_tag);
+    hash_field!(map_tag);
+    hash_field!(int_payload_offset);
+    hash_field!(float_payload_offset);
+    hash_field!(bool_payload_offset);
+    hash_field!(heap_payload_offset);
+    hash_field!(arc_data_offset);
+
+    fingerprint
+}
+
 pub(crate) fn detect_native_stack_layout() -> VmResult<NativeStackLayout> {
     let cached = NATIVE_STACK_LAYOUT
         .get_or_init(|| detect_native_stack_layout_uncached().map_err(layout_probe_error_message));
@@ -66,39 +161,43 @@ pub(crate) fn detect_native_stack_layout() -> VmResult<NativeStackLayout> {
 }
 
 fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
-    let vm_stack_offset = usize_to_i32(std::mem::offset_of!(Vm, stack), "Vm::stack offset")?;
-    let vm_locals_offset = usize_to_i32(std::mem::offset_of!(Vm, locals), "Vm::locals offset")?;
+    let vm_stack_offset =
+        usize_to_i32(std::mem::offset_of!(Vm, instance.stack), "Vm::stack offset")?;
+    let vm_locals_offset = usize_to_i32(
+        std::mem::offset_of!(Vm, instance.locals),
+        "Vm::locals offset",
+    )?;
     let vm_program_constants_ptr_offset = usize_to_i32(
-        std::mem::offset_of!(Vm, program_constants_ptr),
+        std::mem::offset_of!(Vm, engine.program_constants_ptr),
         "Vm::program_constants_ptr offset",
     )?;
-    let vm_ip_offset = usize_to_i32(std::mem::offset_of!(Vm, ip), "Vm::ip offset")?;
+    let vm_ip_offset = usize_to_i32(std::mem::offset_of!(Vm, instance.ip), "Vm::ip offset")?;
     let vm_fuel_remaining_offset = usize_to_i32(
-        std::mem::offset_of!(Vm, fuel_remaining),
+        std::mem::offset_of!(Vm, run_ctx.fuel_remaining),
         "Vm::fuel_remaining offset",
     )?;
     let vm_fuel_ops_until_check_offset = usize_to_i32(
-        std::mem::offset_of!(Vm, fuel_ops_until_check),
+        std::mem::offset_of!(Vm, run_ctx.fuel_ops_until_check),
         "Vm::fuel_ops_until_check offset",
     )?;
     let vm_epoch_deadline_offset = usize_to_i32(
-        std::mem::offset_of!(Vm, epoch_deadline),
+        std::mem::offset_of!(Vm, run_ctx.epoch_deadline),
         "Vm::epoch_deadline offset",
     )?;
     let vm_epoch_counter_ptr_offset = usize_to_i32(
-        std::mem::offset_of!(Vm, epoch_counter_ptr),
+        std::mem::offset_of!(Vm, run_ctx.epoch_counter_ptr),
         "Vm::epoch_counter_ptr offset",
     )?;
     let vm_jit_native_region_edge_count_offset = usize_to_i32(
-        std::mem::offset_of!(Vm, jit_native_region_edge_count),
+        std::mem::offset_of!(Vm, engine.jit_native_region_edge_count),
         "Vm::jit_native_region_edge_count offset",
     )?;
     let vm_jit_native_direct_link_count_offset = usize_to_i32(
-        std::mem::offset_of!(Vm, jit_native_direct_link_count),
+        std::mem::offset_of!(Vm, engine.jit_native_direct_link_count),
         "Vm::jit_native_direct_link_count offset",
     )?;
     let vm_jit_native_active_direct_trace_id_offset = usize_to_i32(
-        std::mem::offset_of!(Vm, jit_native_active_direct_trace_id),
+        std::mem::offset_of!(Vm, engine.jit_native_active_direct_trace_id),
         "Vm::jit_native_active_direct_trace_id offset",
     )?;
     let stack_vec = detect_vec_layout()?;
@@ -507,4 +606,106 @@ pub(crate) fn checked_add_i32(lhs: i32, rhs: i32, context: &str) -> VmResult<i32
 fn usize_to_i32(value: usize, context: &str) -> VmResult<i32> {
     i32::try_from(value)
         .map_err(|_| VmError::JitNative(format!("{} exceeds 32-bit displacement range", context)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_layout() -> NativeStackLayout {
+        NativeStackLayout {
+            vm_stack_offset: 1,
+            vm_locals_offset: 2,
+            vm_program_constants_ptr_offset: 3,
+            vm_ip_offset: 4,
+            vm_fuel_remaining_offset: 5,
+            vm_fuel_ops_until_check_offset: 6,
+            vm_epoch_deadline_offset: 7,
+            vm_epoch_counter_ptr_offset: 8,
+            vm_jit_native_region_edge_count_offset: 9,
+            vm_jit_native_direct_link_count_offset: 10,
+            vm_jit_native_active_direct_trace_id_offset: 11,
+            stack_vec: VecLayout {
+                ptr_offset: 12,
+                len_offset: 13,
+            },
+            map: MapLayout { len_offset: 14 },
+            value: ValueLayout {
+                size: 15,
+                tag_offset: 16,
+                tag_size: 17,
+                null_tag: 18,
+                int_tag: 19,
+                float_tag: 20,
+                bool_tag: 21,
+                string_tag: 22,
+                bytes_tag: 23,
+                array_tag: 24,
+                map_tag: 25,
+                int_payload_offset: 26,
+                float_payload_offset: 27,
+                bool_payload_offset: 28,
+                heap_payload_offset: 29,
+                arc_data_offset: 30,
+            },
+        }
+    }
+
+    #[test]
+    fn native_stack_layout_fingerprint_has_stable_encoding() {
+        assert_eq!(
+            native_stack_layout_fingerprint(fixture_layout()),
+            0x5730_e57f_2190_5082
+        );
+    }
+
+    #[test]
+    fn native_stack_layout_fingerprint_covers_every_embedded_field() {
+        let layout = fixture_layout();
+        let original = native_stack_layout_fingerprint(layout);
+
+        macro_rules! assert_field_is_covered {
+            ($($field:ident).+) => {{
+                let mut changed = layout;
+                changed.$($field).+ = changed.$($field).+.wrapping_add(1);
+                assert_ne!(
+                    native_stack_layout_fingerprint(changed),
+                    original,
+                    "{} must affect the native layout fingerprint",
+                    stringify!($($field).+)
+                );
+            }};
+        }
+
+        assert_field_is_covered!(vm_stack_offset);
+        assert_field_is_covered!(vm_locals_offset);
+        assert_field_is_covered!(vm_program_constants_ptr_offset);
+        assert_field_is_covered!(vm_ip_offset);
+        assert_field_is_covered!(vm_fuel_remaining_offset);
+        assert_field_is_covered!(vm_fuel_ops_until_check_offset);
+        assert_field_is_covered!(vm_epoch_deadline_offset);
+        assert_field_is_covered!(vm_epoch_counter_ptr_offset);
+        assert_field_is_covered!(vm_jit_native_region_edge_count_offset);
+        assert_field_is_covered!(vm_jit_native_direct_link_count_offset);
+        assert_field_is_covered!(vm_jit_native_active_direct_trace_id_offset);
+        assert_field_is_covered!(stack_vec.ptr_offset);
+        assert_field_is_covered!(stack_vec.len_offset);
+        assert_field_is_covered!(map.len_offset);
+        assert_field_is_covered!(value.size);
+        assert_field_is_covered!(value.tag_offset);
+        assert_field_is_covered!(value.tag_size);
+        assert_field_is_covered!(value.null_tag);
+        assert_field_is_covered!(value.int_tag);
+        assert_field_is_covered!(value.float_tag);
+        assert_field_is_covered!(value.bool_tag);
+        assert_field_is_covered!(value.string_tag);
+        assert_field_is_covered!(value.bytes_tag);
+        assert_field_is_covered!(value.array_tag);
+        assert_field_is_covered!(value.map_tag);
+        assert_field_is_covered!(value.int_payload_offset);
+        assert_field_is_covered!(value.float_payload_offset);
+        assert_field_is_covered!(value.bool_payload_offset);
+        assert_field_is_covered!(value.heap_payload_offset);
+        assert_field_is_covered!(value.arc_data_offset);
+    }
 }

@@ -1,6 +1,9 @@
 #![cfg(feature = "runtime")]
 #![allow(clippy::duplicate_mod)]
 
+#[path = "vm/ownership_tests.rs"]
+mod ownership_tests;
+
 #[path = "vm/drop_contract_tests.rs"]
 mod drop_contract_tests;
 
