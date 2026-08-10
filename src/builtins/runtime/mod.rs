@@ -4,6 +4,8 @@ use std::task::{Context, Poll};
 
 use crate::builtins::BuiltinFunction;
 use crate::vm::{CallOutcome, CallReturn, HostOpId, Value, Vm, VmResult};
+#[cfg(feature = "async")]
+use crate::vm::{CaptureAsyncHostContext, VmError};
 
 use self::cancellation::{CancellationReason, OperationId, OperationOwner, OperationState};
 use self::error::{RuntimeError, RuntimeErrorCode};
@@ -15,7 +17,6 @@ type RuntimeOperationPoller = fn(&mut Vm, HostOpId, &mut Context<'_>) -> Poll<Vm
 
 const RUNTIME_OPERATION_POLLERS: &[(OperationOwner, RuntimeOperationPoller)] = &[
     (OperationOwner::Io, io::poll_builtin_io_op),
-    (OperationOwner::Http, http::poll_pending_op),
     #[cfg(feature = "sqlite")]
     (OperationOwner::Sqlite, sqlite::poll_pending_op),
 ];

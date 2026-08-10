@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub(crate) mod aot;
+mod async_host;
 mod capability;
 pub mod diagnostics;
 mod engine;
@@ -22,13 +23,15 @@ mod superinstructions;
 #[cfg(test)]
 mod tests;
 pub use self::aot::AotArtifactError;
+
+pub use self::async_host::{CaptureAsyncHostContext, HostAsyncBridge, HostFuture};
 pub use self::capability::{CapabilityProfile, CapabilityProfileBuilder, IoPolicy};
 use self::engine::Engine;
 pub use self::epoch::{EpochCheckpoint, EpochHandle};
 pub use self::fuel::FuelCheckpoint;
 pub use self::host::{
-    CallOutcome, CallReturn, HostArgsFunction, HostAsyncBridge, HostBindingPlan, HostFunction,
-    HostFunctionRegistry, HostOpId, HostStackFunction, StaticHostArgsFunction, StaticHostFunction,
+    CallOutcome, CallReturn, HostArgsFunction, HostBindingPlan, HostFunction, HostFunctionRegistry,
+    HostOpId, HostStackFunction, StaticHostArgsFunction, StaticHostFunction,
     StaticHostStackFunction,
 };
 use self::host::{HostCallExecOutcome, VmHostFunction};

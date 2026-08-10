@@ -139,6 +139,18 @@ fn infers_host_suspension_from_the_return_signature() {
         );
     }
 
+    let asynchronous = parse_quote!(
+        async fn host(value: String) -> VmResult<String> {}
+    );
+    assert_eq!(
+        infer_host_execution(&asynchronous),
+        HostExecutionKind::MaySuspend
+    );
+    assert_eq!(
+        classify_host_binding(&asynchronous),
+        HostBindingKind::StaticStack
+    );
+
     let synchronous = parse_quote!(
         fn host() -> VmResult<Value> {}
     );

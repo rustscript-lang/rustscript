@@ -157,6 +157,15 @@ impl<'a> FromVmValue<'a> for &'a VmMap {
     }
 }
 
+impl FromVmValue<'_> for VmMap {
+    fn from_vm_value(value: &Value, _label: &str) -> VmResult<Self> {
+        match value {
+            Value::Map(entries) => Ok(entries.as_ref().clone()),
+            _ => Err(VmError::TypeMismatch("map")),
+        }
+    }
+}
+
 impl FromVmValue<'_> for SharedArray {
     fn from_vm_value(value: &Value, _label: &str) -> VmResult<Self> {
         match value {

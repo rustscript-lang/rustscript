@@ -33,8 +33,7 @@ pub struct ResourceTypeId(u16);
 
 impl ResourceTypeId {
     pub const IO_FILE: Self = Self(1);
-    #[cfg_attr(not(feature = "http-client"), allow(dead_code))]
-    pub const HTTP_REQUEST: Self = Self(3);
+
     #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
     pub const SQLITE_CONNECTION: Self = Self(5);
     pub const CALLBACK: Self = Self(6);

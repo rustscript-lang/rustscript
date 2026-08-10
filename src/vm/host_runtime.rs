@@ -22,7 +22,8 @@ use crate::builtins::runtime::resource::{DEFAULT_MAX_RESOURCES, ResourceArena};
 use crate::vm::IoPolicy;
 #[cfg(feature = "sqlite")]
 use crate::vm::SqlitePolicy;
-use crate::vm::host::{HostAsyncBridge, VmHostFunction};
+use crate::vm::async_host::HostAsyncBridge;
+use crate::vm::host::VmHostFunction;
 
 /// Embedder-supplied print sink for `print`/`debug` output.
 pub(crate) type RuntimePrintSink = dyn FnMut(String) + Send;
