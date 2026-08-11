@@ -20,7 +20,7 @@ use crate::builtins::runtime::resource::ResourceTypeId;
 use crate::vm::Value;
 use crate::vm::{CallReturn, HostOpId, VmError};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HttpConfig {
     pub allowed_schemes: Vec<String>,
     pub allowed_hosts: Vec<String>,
@@ -92,6 +92,11 @@ impl HttpState {
         {
             self.config = None;
         }
+    }
+
+    #[cfg(all(test, feature = "http-client"))]
+    pub(crate) fn configuration(&self) -> Option<&HttpConfig> {
+        self.config.as_ref()
     }
 
     pub(crate) fn is_configured(&self) -> bool {
@@ -534,23 +539,38 @@ fn validate_resolved_addresses(
 fn is_restricted_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(ip) => {
-            ip.is_loopback()
-                || ip.is_private()
-                || ip.is_link_local()
-                || ip.is_broadcast()
-                || ip.is_documentation()
-                || ip.is_multicast()
-                || ip.is_unspecified()
+            let octets = ip.octets();
+            matches!(octets[0], 0 | 10 | 127)
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 169 && octets[1] == 254)
+                || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                || (octets[0] == 192
+                    && matches!(
+                        (octets[1], octets[2]),
+                        (0, 0) | (0, 2) | (31, 196) | (52, 193) | (88, 99) | (168, _) | (175, 48)
+                    ))
+                || (octets[0] == 198
+                    && ((18..=19).contains(&octets[1]) || (octets[1] == 51 && octets[2] == 100)))
+                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+                || octets[0] >= 224
         }
         std::net::IpAddr::V6(ip) => {
             if let Some(mapped) = ip.to_ipv4_mapped() {
                 return is_restricted_ip(std::net::IpAddr::V4(mapped));
             }
-            ip.is_loopback()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local()
-                || ip.is_unspecified()
-                || ip.is_multicast()
+            let segments = ip.segments();
+            let outside_global_unicast = segments[0] & 0xe000 != 0x2000;
+            let protocol_assignments = segments[0] == 0x2001 && segments[1] <= 0x01ff;
+            let documentation = (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                || (segments[0] == 0x3fff && segments[1] & 0xf000 == 0);
+            let six_to_four = segments[0] == 0x2002;
+            let direct_delegation_as112 =
+                segments[0] == 0x2620 && segments[1] == 0x004f && segments[2] == 0x8000;
+            outside_global_unicast
+                || protocol_assignments
+                || documentation
+                || six_to_four
+                || direct_delegation_as112
         }
     }
 }
@@ -663,13 +683,15 @@ async fn execute_request(
         while let Some(chunk) = {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
-                return Err(VmError::HostError(
-                    "HTTP response read timed out".to_string(),
-                ));
+                token.cancel(CancellationReason::Deadline);
+                return Err(cancellation_vm_error(token));
             }
             tokio::time::timeout(remaining, stream.next())
                 .await
-                .map_err(|_| VmError::HostError("HTTP response read timed out".to_string()))?
+                .map_err(|_| {
+                    token.cancel(CancellationReason::Deadline);
+                    cancellation_vm_error(token)
+                })?
         } {
             token.check().map_err(runtime_host_error)?;
             let chunk = chunk.map_err(|error| {
@@ -710,7 +732,8 @@ mod tests {
     #[cfg(feature = "http-client")]
     use super::{
         CancellationReason, HttpRequest, HttpRequestResource, OperationOwner, ResourceTypeId,
-        execute_request, is_restricted_ip, schedule_request, validate_url,
+        execute_request, is_restricted_ip, schedule_request, validate_resolved_addresses,
+        validate_url,
     };
     #[cfg(feature = "http-client")]
     use crate::builtins::runtime::cancellation::OperationId;
@@ -827,6 +850,59 @@ mod tests {
 
     #[cfg(feature = "http-client")]
     #[test]
+    fn response_body_timeout_sets_structured_deadline_reason() {
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("request should connect");
+            let mut request = [0u8; 1024];
+            let _ = socket
+                .read(&mut request)
+                .expect("request should be readable");
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n")
+                .expect("headers should be written");
+            socket.flush().expect("headers should flush");
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        let config = HttpConfig {
+            allowed_schemes: vec!["http".to_string()],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            allowed_ports: vec![address.port()],
+            allow_private_ips: true,
+            connect_timeout: Duration::from_millis(50),
+            request_timeout: Duration::from_millis(20),
+            ..HttpConfig::default()
+        };
+        let request = HttpRequest {
+            method: reqwest::Method::GET,
+            url: format!("http://{address}/").parse().expect("valid URL"),
+            headers: Vec::new(),
+            body: None,
+        };
+        let token = crate::builtins::runtime::cancellation::CancellationToken::root();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime should build");
+
+        runtime
+            .block_on(execute_request(
+                &config,
+                &request,
+                &token,
+                Instant::now() + config.request_timeout,
+            ))
+            .expect_err("stalled response body should time out");
+        assert_eq!(token.reason(), Some(CancellationReason::Deadline));
+        server.join().expect("server should exit");
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
     fn empty_port_allowlist_rejects_explicit_and_default_ports() {
         let config = HttpConfig {
             allowed_schemes: vec!["https".to_string()],
@@ -837,6 +913,50 @@ mod tests {
         let default_port = "https://example.com/".parse().expect("valid URL");
         assert!(validate_url(&config, &explicit).is_err());
         assert!(validate_url(&config, &default_port).is_err());
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn special_use_networks_and_mixed_dns_answers_are_restricted() {
+        for address in [
+            "0.1.2.3",
+            "100.64.0.1",
+            "192.0.0.8",
+            "192.0.2.1",
+            "192.31.196.1",
+            "192.52.193.1",
+            "192.88.99.1",
+            "192.175.48.1",
+            "198.18.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "240.0.0.1",
+            "100::1",
+            "2001::1",
+            "2001:db8::1",
+            "2002::1",
+            "2620:4f:8000::1",
+            "3fff::1",
+            "fc00::1",
+        ] {
+            assert!(
+                is_restricted_ip(address.parse().expect("valid IP")),
+                "{address} must be restricted"
+            );
+        }
+        for address in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
+            assert!(
+                !is_restricted_ip(address.parse().expect("valid IP")),
+                "{address} must remain globally routable"
+            );
+        }
+
+        let config = HttpConfig::default();
+        let addresses = [
+            "8.8.8.8:443".parse().expect("valid socket address"),
+            "100.64.0.1:443".parse().expect("valid socket address"),
+        ];
+        assert!(validate_resolved_addresses(&config, &addresses).is_err());
     }
 
     #[cfg(feature = "http-client")]
