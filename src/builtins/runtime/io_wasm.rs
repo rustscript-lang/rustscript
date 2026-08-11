@@ -5,14 +5,6 @@ use pd_host_function::pd_host_function;
 use super::HostCallResult;
 use crate::vm::{CallReturn, HostOpId, Value, Vm, VmError, VmResult};
 
-pub(crate) struct IoState;
-
-impl Default for IoState {
-    fn default() -> Self {
-        Self
-    }
-}
-
 pub(super) fn poll_builtin_io_op(
     _vm: &mut Vm,
     op_id: HostOpId,
@@ -22,8 +14,6 @@ pub(super) fn poll_builtin_io_op(
         "builtin io op {op_id} is unsupported on wasm32 runtime",
     ))))
 }
-
-pub(super) fn close_all_handles(_vm: &mut Vm) {}
 
 /// Opens a file handle for runtime I/O.
 #[pd_host_function(name = "io::open")]
