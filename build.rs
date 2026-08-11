@@ -115,6 +115,7 @@ struct CallableDecl {
     wrapper: Option<WrapperDecl>,
     host_binding_kind: HostBindingKind,
     host_execution: HostExecutionKind,
+    runtime_owned_pending: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -156,16 +157,18 @@ fn main() {
             category: SourceCategory::DefaultHost,
         },
         SourceSpec {
-            path: "src/builtins/runtime/http.rs".to_string(),
-            module: "http".to_string(),
-            category: SourceCategory::DefaultHost,
-        },
-        SourceSpec {
             path: "src/builtins/runtime/context_host.rs".to_string(),
             module: "context_host".to_string(),
             category: SourceCategory::DefaultHost,
         },
     ];
+    if env::var_os("CARGO_FEATURE_ASYNC").is_some() {
+        host_sources.push(SourceSpec {
+            path: "src/builtins/runtime/http.rs".to_string(),
+            module: "http".to_string(),
+            category: SourceCategory::DefaultHost,
+        });
+    }
     if env::var_os("CARGO_FEATURE_SQLITE").is_some() {
         host_sources.push(SourceSpec {
             path: "src/builtins/runtime/sqlite.rs".to_string(),
@@ -273,6 +276,9 @@ fn parse_sources(
 }
 
 pub(crate) fn classify_host_binding(function: &ItemFn) -> HostBindingKind {
+    if function.sig.asyncness.is_some() {
+        return HostBindingKind::StaticStack;
+    }
     if function.sig.inputs.iter().any(|input| match input {
         FnArg::Typed(pat_type) => is_vm_context_type(&pat_type.ty),
         _ => false,
@@ -298,6 +304,9 @@ pub(crate) fn classify_host_binding(function: &ItemFn) -> HostBindingKind {
 }
 
 pub(crate) fn infer_host_execution(function: &ItemFn) -> HostExecutionKind {
+    if function.sig.asyncness.is_some() {
+        return HostExecutionKind::MaySuspend;
+    }
     let return_type = normalized_return_type(&function.sig.output);
     if contains_host_call_result(&return_type) {
         HostExecutionKind::MaySuspend
@@ -444,6 +453,8 @@ fn parse_source_file(path: &Path, spec: &SourceSpec, _order_offset: usize) -> Ve
             wrapper,
             host_binding_kind: classify_host_binding(function),
             host_execution: infer_host_execution(function),
+            runtime_owned_pending: function.sig.asyncness.is_none()
+                && contains_host_call_result(&normalized_return_type(&function.sig.output)),
         });
     }
     out
@@ -1095,12 +1106,14 @@ fn render_builtin_runtime_dispatch(
             )
             .unwrap();
         }
-        writeln!(
-            &mut out,
-            "    registry.mark_runtime_owned_pending({:?});",
-            callable.name
-        )
-        .unwrap();
+        if callable.runtime_owned_pending {
+            writeln!(
+                &mut out,
+                "    registry.mark_runtime_owned_pending({:?});",
+                callable.name
+            )
+            .unwrap();
+        }
     }
     writeln!(&mut out, "}}").unwrap();
     writeln!(&mut out).unwrap();
@@ -1117,12 +1130,14 @@ fn render_builtin_runtime_dispatch(
             .render_bind_static_call(&callable.name, &host_wrapper_adapter_name(callable));
         writeln!(&mut out, "        {:?} => {{", callable.name).unwrap();
         writeln!(&mut out, "            {bind_call}").unwrap();
-        writeln!(
-            &mut out,
-            "            vm.mark_runtime_owned_pending_binding({:?});",
-            callable.name
-        )
-        .unwrap();
+        if callable.runtime_owned_pending {
+            writeln!(
+                &mut out,
+                "            vm.mark_runtime_owned_pending_binding({:?});",
+                callable.name
+            )
+            .unwrap();
+        }
         writeln!(&mut out, "            true").unwrap();
         writeln!(&mut out, "        }}").unwrap();
     }
@@ -1891,6 +1906,9 @@ fn host_wrapper_adapter_name(callable: &CallableDecl) -> String {
 
 fn generated_wrapper_decl(function: &ItemFn) -> WrapperDecl {
     let mut params = Vec::new();
+    if function.sig.asyncness.is_some() {
+        params.push(WrapperParamKind::Vm);
+    }
     for input in &function.sig.inputs {
         let FnArg::Typed(pat_type) = input else {
             panic!("methods are not supported in #[pd_host_function] declarations");
@@ -1917,6 +1935,13 @@ fn parse_callable_params(function: &ItemFn) -> Vec<CallableParamDecl> {
             let FnArg::Typed(pat_type) = input else {
                 panic!("methods are not supported in #[pd_host_function] declarations");
             };
+            if pat_type
+                .attrs
+                .iter()
+                .any(|attr| attr.path().is_ident("pd_host_context"))
+            {
+                return None;
+            }
             if is_vm_context_type(&pat_type.ty) {
                 return None;
             }

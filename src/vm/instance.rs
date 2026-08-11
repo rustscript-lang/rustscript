@@ -18,7 +18,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Weak};
 
 use crate::bytecode::{CallableValue, Program, SharedCaptureCell, Value};
-use crate::vm::host::WaitingHostOp;
+use crate::vm::async_host::WaitingHostOp;
 use crate::vm::map_iter::MapIteratorState;
 use crate::vm::{DEFAULT_MAX_SCRIPT_CALL_DEPTH, VmYieldReason};
 

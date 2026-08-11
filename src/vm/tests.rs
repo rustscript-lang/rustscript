@@ -1,4 +1,4 @@
-use super::host::WaitingHostOp;
+use super::async_host::WaitingHostOp;
 use super::*;
 use crate::builtins::BuiltinFunction;
 use crate::bytecode::TypeMap;
@@ -27,6 +27,7 @@ fn failed_dynamic_builtin_override_preserves_runtime_owned_pending_binding() {
     vm.ensure_call_bindings()
         .expect("default fallback should bind runtime sleep");
     let slot = vm.host.host_function_symbols["runtime::sleep"];
+    vm.host.runtime_owned_pending_host_slots.insert(slot);
     assert!(vm.host.runtime_owned_pending_host_slots.contains(&slot));
 
     vm.bind_builtin_override("runtime::sleep", Box::new(Dummy))
@@ -47,6 +48,7 @@ fn failed_static_builtin_override_preserves_runtime_owned_pending_binding() {
     vm.ensure_call_bindings()
         .expect("default fallback should bind runtime sleep");
     let slot = vm.host.host_function_symbols["runtime::sleep"];
+    vm.host.runtime_owned_pending_host_slots.insert(slot);
     assert!(vm.host.runtime_owned_pending_host_slots.contains(&slot));
 
     vm.bind_builtin_static_override("runtime::sleep", dummy)
@@ -82,6 +84,67 @@ fn reset_for_reuse_keeps_host_operation_ids_monotonic() {
 }
 
 #[test]
+fn async_host_future_is_submitted_to_the_host_bridge() {
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingBridge {
+        submitted: Arc<Mutex<Vec<HostOpId>>>,
+        future: Arc<Mutex<Option<HostFuture>>>,
+    }
+
+    impl HostAsyncBridge for RecordingBridge {
+        fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
+            self.submitted.lock().expect("submitted lock").push(op_id);
+            *self.future.lock().expect("future lock") = Some(future);
+            Ok(())
+        }
+
+        fn poll_op(
+            &mut self,
+            _op_id: HostOpId,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<VmResult<CallReturn>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    let submitted = Arc::new(Mutex::new(Vec::new()));
+    let future = Arc::new(Mutex::new(None));
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.set_async_bridge(Box::new(RecordingBridge {
+        submitted: Arc::clone(&submitted),
+        future: Arc::clone(&future),
+    }));
+
+    let outcome = vm
+        .submit_host_future(Box::pin(async { Ok(CallReturn::one(Value::Int(42))) }))
+        .expect("host bridge should accept future");
+    let CallOutcome::Pending(op_id) = outcome else {
+        panic!("async host submission should suspend");
+    };
+
+    assert_eq!(*submitted.lock().expect("submitted lock"), vec![op_id]);
+    assert!(future.lock().expect("future lock").is_some());
+    assert_eq!(vm.host.runtime_operations.active_count(), 0);
+}
+
+#[test]
+fn async_host_submission_without_driver_fails_and_retires_the_id() {
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    let error = vm
+        .submit_host_future(Box::pin(async { Ok(CallReturn::none()) }))
+        .expect_err("missing host async driver should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("async host function requires a host async bridge")
+    );
+    assert_eq!(vm.allocate_host_op_id(), 2);
+    assert_eq!(vm.host.runtime_operations.active_count(), 0);
+}
+
+#[test]
 fn unused_host_operation_ids_do_not_consume_registry_capacity() {
     let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
     for _ in 0..128 {
@@ -90,7 +153,7 @@ fn unused_host_operation_ids_do_not_consume_registry_capacity() {
     assert_eq!(vm.host.runtime_operations.active_count(), 0);
 }
 
-#[cfg(feature = "http-client")]
+#[cfg(feature = "async")]
 #[test]
 fn capability_profile_binding_installs_http_policy() {
     let policy = crate::builtins::runtime::HttpConfig {

@@ -1,24 +1,19 @@
-use std::task::{Context, Poll};
-
-#[cfg(feature = "http-client")]
+#[cfg(feature = "async")]
 use futures_util::StreamExt;
-#[cfg(feature = "http-client")]
-use futures_util::future::{AbortHandle, Abortable};
 
+#[cfg(feature = "async")]
 use pd_host_function::pd_host_function;
 
-use super::{HostCallResult, Vm, VmMap, VmResult};
-#[cfg(feature = "http-client")]
-use crate::builtins::runtime::cancellation::{
-    CancellationReason, CancellationToken, OperationId, OperationOwner,
-};
-#[cfg(feature = "http-client")]
-use crate::builtins::runtime::error::{RuntimeError, RuntimeErrorCode};
-#[cfg(feature = "http-client")]
-use crate::builtins::runtime::resource::ResourceTypeId;
-#[cfg(feature = "http-client")]
+#[cfg(feature = "async")]
+use super::{Vm, VmMap, VmResult};
+#[cfg(feature = "async")]
+use crate::builtins::runtime::cancellation::{CancellationReason, CancellationToken};
+#[cfg(feature = "async")]
+use crate::vm::CaptureAsyncHostContext;
+#[cfg(feature = "async")]
 use crate::vm::Value;
-use crate::vm::{CallReturn, HostOpId, VmError};
+#[cfg(feature = "async")]
+use crate::vm::VmError;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HttpConfig {
@@ -49,18 +44,8 @@ impl Default for HttpConfig {
     }
 }
 
-#[cfg(feature = "http-client")]
-struct HttpCompletion {
-    result: VmResult<CallReturn>,
-}
-
-#[cfg(feature = "http-client")]
-struct HttpRequestResource {
-    receiver: futures_channel::oneshot::Receiver<HttpCompletion>,
-}
-
 pub(crate) struct HttpState {
-    #[cfg(feature = "http-client")]
+    #[cfg(feature = "async")]
     config: Option<HttpConfig>,
     pub(crate) max_in_flight: usize,
 }
@@ -68,7 +53,7 @@ pub(crate) struct HttpState {
 impl Default for HttpState {
     fn default() -> Self {
         Self {
-            #[cfg(feature = "http-client")]
+            #[cfg(feature = "async")]
             config: None,
             max_in_flight: crate::builtins::runtime::cancellation::DEFAULT_MAX_PENDING_OPERATIONS,
         }
@@ -79,157 +64,42 @@ impl HttpState {
     pub(crate) fn reset_for_reuse(&mut self) {}
 
     pub(crate) fn configure(&mut self, config: HttpConfig) {
-        #[cfg(feature = "http-client")]
+        #[cfg(feature = "async")]
         {
             self.config = Some(config);
         }
-        #[cfg(not(feature = "http-client"))]
+        #[cfg(not(feature = "async"))]
         let _ = config;
     }
 
     pub(crate) fn clear_configuration(&mut self) {
-        #[cfg(feature = "http-client")]
+        #[cfg(feature = "async")]
         {
             self.config = None;
         }
     }
 
-    #[cfg(all(test, feature = "http-client"))]
+    #[cfg(all(test, feature = "async"))]
     pub(crate) fn configuration(&self) -> Option<&HttpConfig> {
         self.config.as_ref()
     }
 
     pub(crate) fn is_configured(&self) -> bool {
-        #[cfg(feature = "http-client")]
+        #[cfg(feature = "async")]
         {
             self.config.is_some()
         }
-        #[cfg(not(feature = "http-client"))]
+        #[cfg(not(feature = "async"))]
         false
     }
 }
 
-#[cfg(feature = "http-client")]
-fn schedule_request(vm: &mut Vm, config: HttpConfig, request: HttpRequest) -> VmResult<HostOpId> {
-    let max_in_flight = vm.host.http_state.max_in_flight;
-    if vm
-        .host
-        .runtime_operations
-        .operations_by_owner(OperationOwner::Http)
-        .len()
-        >= max_in_flight
-    {
-        return Err(VmError::HostError(format!(
-            "HTTP in-flight request limit of {} has been reached",
-            max_in_flight
-        )));
-    }
-
-    let deadline = std::time::Instant::now() + config.request_timeout;
-    let (sender, receiver) = futures_channel::oneshot::channel();
-    let (abort_handle, abort_registration) = AbortHandle::new_pair();
-    let operation = vm
-        .host
-        .runtime_operations
-        .start_owned(
-            OperationOwner::Http,
-            Some(&vm.run_ctx.cancellation),
-            Some(deadline),
-            Some(Box::new(move |_| {
-                abort_handle.abort();
-                Ok(())
-            })),
-        )
-        .map_err(runtime_host_error)?;
-    let operation_id = operation.id();
-    let op_id = operation_id.raw();
-    let token = operation.token();
-    let worker_operation = operation.clone();
-    let resource = match vm.host.runtime_resources.insert(
-        ResourceTypeId::HTTP_REQUEST,
-        HttpRequestResource { receiver },
-    ) {
-        Ok(resource) => resource,
-        Err(error) => {
-            let _ = vm
-                .host
-                .runtime_operations
-                .cancel(operation_id, CancellationReason::ResourceClosed);
-            return Err(runtime_host_error(error));
-        }
-    };
-    operation.set_payload(resource);
-
-    let thread_name = format!("rustscript-http-{op_id}");
-    if let Err(error) = std::thread::Builder::new()
-        .name(thread_name)
-        .spawn(move || {
-            let result = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime.block_on(async move {
-                    match Abortable::new(
-                        execute_request(&config, &request, &token, deadline),
-                        abort_registration,
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => cancellation_error(&token),
-                    }
-                }),
-                Err(error) => Err(VmError::HostError(format!(
-                    "failed to create HTTP runtime: {error}"
-                ))),
-            };
-            match &result {
-                Ok(_) => {
-                    let _ = worker_operation.complete();
-                }
-                Err(error) => {
-                    let _ = worker_operation.fail(
-                        RuntimeError::new(
-                            RuntimeErrorCode::OperationFailed,
-                            "http::request",
-                            error.to_string(),
-                        )
-                        .with_value(op_id),
-                    );
-                }
-            }
-            let _ = sender.send(HttpCompletion { result });
-        })
-    {
-        super::cancel_runtime_operation(vm, operation_id, CancellationReason::ResourceClosed);
-        return Err(VmError::HostError(format!(
-            "failed to start HTTP request: {error}"
-        )));
-    }
-
-    Ok(op_id)
-}
-
-#[cfg(feature = "http-client")]
-fn close_request_resource(vm: &mut Vm, op_id: HostOpId, reason: CancellationReason) {
-    let Ok(operation_id) = OperationId::from_raw(op_id) else {
-        return;
-    };
-    let Ok(operation) = vm.host.runtime_operations.get(operation_id) else {
-        return;
-    };
-    let Some(resource) = operation.payload() else {
-        return;
-    };
-    let _ = super::close_runtime_resource(vm, resource, reason);
-}
-
-#[cfg(feature = "http-client")]
+#[cfg(feature = "async")]
 fn runtime_host_error(error: impl std::fmt::Display) -> VmError {
     VmError::HostError(error.to_string())
 }
 
-#[cfg(feature = "http-client")]
+#[cfg(feature = "async")]
 fn cancellation_vm_error(token: &CancellationToken) -> VmError {
     token
         .check()
@@ -237,97 +107,44 @@ fn cancellation_vm_error(token: &CancellationToken) -> VmError {
         .unwrap_or_else(runtime_host_error)
 }
 
-#[cfg(feature = "http-client")]
-fn cancellation_error(token: &CancellationToken) -> VmResult<CallReturn> {
-    Err(cancellation_vm_error(token))
+#[cfg(feature = "async")]
+pub(super) struct HttpRequestContext {
+    config: HttpConfig,
+    cancellation: CancellationToken,
 }
 
-/// Starts an HTTP request under the VM's configured network policy.
-///
-/// The request map accepts `method`, `url`, optional `headers`, and optional `body`.
-/// The response map contains `status`, `headers`, `body`, and the final `url`.
-#[pd_host_function(name = "http::client::request")]
-pub(super) fn builtin_http_client_request(
-    vm: &mut Vm,
-    request: &VmMap,
-) -> VmResult<HostCallResult<VmMap>> {
-    #[cfg(not(feature = "http-client"))]
-    {
-        let _ = (vm, request);
-        Err(VmError::HostError(
-            "HTTP client support is disabled; enable the http-client feature".to_string(),
-        ))
-    }
-
-    #[cfg(feature = "http-client")]
-    {
+#[cfg(feature = "async")]
+impl CaptureAsyncHostContext for HttpRequestContext {
+    fn capture(vm: &mut Vm) -> VmResult<Self> {
         let config = vm
             .host
             .http_state
             .config
             .clone()
             .ok_or_else(|| VmError::HostError("HTTP host is not configured".to_string()))?;
-        let request = parse_request(request, &config)?;
-        let op_id = schedule_request(vm, config, request)?;
-        Ok(HostCallResult::Pending(op_id))
+        Ok(Self {
+            config,
+            cancellation: CancellationToken::root(),
+        })
     }
 }
 
-pub(super) fn poll_pending_op(
-    vm: &mut Vm,
-    op_id: HostOpId,
-    cx: &mut Context<'_>,
-) -> Poll<VmResult<CallReturn>> {
-    #[cfg(feature = "http-client")]
-    {
-        use std::pin::Pin;
-
-        let operation_id = match OperationId::from_raw(op_id) {
-            Ok(operation_id) => operation_id,
-            Err(error) => return Poll::Ready(Err(runtime_host_error(error))),
-        };
-        let operation = match vm.host.runtime_operations.get(operation_id) {
-            Ok(operation) => operation,
-            Err(error) => return Poll::Ready(Err(runtime_host_error(error))),
-        };
-        let Some(resource) = operation.payload() else {
-            return Poll::Ready(Err(VmError::HostError(format!(
-                "HTTP op {op_id} has no completion payload",
-            ))));
-        };
-        let poll_result = match vm
-            .host
-            .runtime_resources
-            .get_mut::<HttpRequestResource>(resource, ResourceTypeId::HTTP_REQUEST)
-        {
-            Ok(request) => Pin::new(&mut request.receiver).poll(cx),
-            Err(error) => return Poll::Ready(Err(runtime_host_error(error))),
-        };
-        match poll_result {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(completion)) => {
-                close_request_resource(vm, op_id, CancellationReason::ResourceClosed);
-                Poll::Ready(completion.result)
-            }
-            Poll::Ready(Err(_)) => {
-                close_request_resource(vm, op_id, CancellationReason::ResourceClosed);
-                Poll::Ready(Err(VmError::HostError(format!(
-                    "HTTP op {op_id} was cancelled",
-                ))))
-            }
-        }
-    }
-
-    #[cfg(not(feature = "http-client"))]
-    {
-        let _ = (vm, cx);
-        Poll::Ready(Err(VmError::HostError(format!(
-            "HTTP support is disabled for op {op_id}",
-        ))))
-    }
+/// Starts an HTTP request under the VM's configured network policy.
+///
+/// The request map accepts `method`, `url`, optional `headers`, and optional `body`.
+/// The response map contains `status`, `headers`, `body`, and the final `url`.
+#[cfg(feature = "async")]
+#[pd_host_function(name = "http::client::request")]
+pub(super) async fn builtin_http_client_request(
+    #[pd_host_context] context: HttpRequestContext,
+    request: VmMap,
+) -> VmResult<VmMap> {
+    let request = parse_request(&request, &context.config)?;
+    let deadline = std::time::Instant::now() + context.config.request_timeout;
+    execute_request(&context.config, &request, &context.cancellation, deadline).await
 }
 
-#[cfg(feature = "http-client")]
+#[cfg(feature = "async")]
 struct HttpRequest {
     method: reqwest::Method,
     url: url::Url,
@@ -335,7 +152,7 @@ struct HttpRequest {
     body: Option<Vec<u8>>,
 }
 
-#[cfg(feature = "http-client")]
+#[cfg(feature = "async")]
 fn parse_request(map: &VmMap, config: &HttpConfig) -> VmResult<HttpRequest> {
     let method = map_string(map, "method")?.to_ascii_uppercase();
     if !matches!(
@@ -413,7 +230,7 @@ fn parse_request(map: &VmMap, config: &HttpConfig) -> VmResult<HttpRequest> {
     })
 }
 
-#[cfg(feature = "http-client")]
+#[cfg(feature = "async")]
 fn map_string(map: &VmMap, key: &str) -> VmResult<String> {
     match map.get(&Value::string(key)) {
         Some(Value::String(value)) => Ok(value.as_ref().clone()),
@@ -424,7 +241,7 @@ fn map_string(map: &VmMap, key: &str) -> VmResult<String> {
     }
 }
 
-#[cfg(feature = "http-client")]
+#[cfg(feature = "async")]
 fn validate_url_policy<'a>(config: &HttpConfig, url: &'a url::Url) -> VmResult<(&'a str, u16)> {
     let scheme = url.scheme().to_ascii_lowercase();
     if !config
@@ -459,7 +276,7 @@ fn validate_url_policy<'a>(config: &HttpConfig, url: &'a url::Url) -> VmResult<(
     Ok((host, port))
 }
 
-#[cfg(all(feature = "http-client", test))]
+#[cfg(all(feature = "async", test))]
 fn validate_url(config: &HttpConfig, url: &url::Url) -> VmResult<Option<std::net::SocketAddr>> {
     let (host, port) = validate_url_policy(config, url)?;
     if config.allow_private_ips {
@@ -480,7 +297,7 @@ fn validate_url(config: &HttpConfig, url: &url::Url) -> VmResult<Option<std::net
     Ok(addresses.first().copied())
 }
 
-#[cfg(feature = "http-client")]
+#[cfg(feature = "async")]
 async fn resolve_url(
     config: &HttpConfig,
     url: &url::Url,
@@ -517,7 +334,7 @@ async fn resolve_url(
         .ok_or_else(|| VmError::HostError("HTTP target resolves to a restricted IP".to_string()))
 }
 
-#[cfg(feature = "http-client")]
+#[cfg(feature = "async")]
 fn validate_resolved_addresses(
     config: &HttpConfig,
     addresses: &[std::net::SocketAddr],
@@ -535,7 +352,7 @@ fn validate_resolved_addresses(
     Ok(())
 }
 
-#[cfg(feature = "http-client")]
+#[cfg(feature = "async")]
 fn is_restricted_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(ip) => {
@@ -575,13 +392,13 @@ fn is_restricted_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-#[cfg(feature = "http-client")]
+#[cfg(feature = "async")]
 async fn execute_request(
     config: &HttpConfig,
     request: &HttpRequest,
     token: &CancellationToken,
     deadline: std::time::Instant,
-) -> VmResult<CallReturn> {
+) -> VmResult<VmMap> {
     token.check().map_err(runtime_host_error)?;
     let mut method = request.method.clone();
     let mut url = request.url.clone();
@@ -716,9 +533,7 @@ async fn execute_request(
             (Value::string("body"), Value::bytes(bytes)),
             (Value::string("url"), Value::string(url.as_str())),
         ]);
-        return Ok(CallReturn::one(Value::Map(std::sync::Arc::new(
-            response_map,
-        ))));
+        return Ok(response_map);
     }
 
     Err(VmError::HostError(
@@ -729,14 +544,15 @@ async fn execute_request(
 #[cfg(test)]
 mod tests {
     use super::HttpConfig;
-    #[cfg(feature = "http-client")]
+    #[cfg(feature = "async")]
     use super::{
-        CancellationReason, HttpRequest, HttpRequestResource, OperationOwner, ResourceTypeId,
-        execute_request, is_restricted_ip, schedule_request, validate_resolved_addresses,
-        validate_url,
+        CancellationReason, HttpRequest, VmMap, builtin_http_client_request, execute_request,
+        is_restricted_ip, validate_resolved_addresses, validate_url,
     };
-    #[cfg(feature = "http-client")]
-    use crate::builtins::runtime::cancellation::OperationId;
+    #[cfg(feature = "async")]
+    use crate::vm::{
+        CallOutcome, CallReturn, HostAsyncBridge, HostFuture, HostOpId, Value, VmResult,
+    };
 
     #[test]
     fn default_http_policy_denies_all_hosts() {
@@ -747,64 +563,57 @@ mod tests {
         assert!(!config.allow_private_ips);
     }
 
-    #[cfg(feature = "http-client")]
+    #[cfg(feature = "async")]
     #[test]
-    fn request_uses_shared_operation_and_resource_lifecycle() {
+    fn request_submits_future_to_host_driver_without_runtime_operation() {
+        use std::sync::{Arc, Mutex};
+        use std::task::{Context, Poll};
+
+        struct RecordingBridge {
+            submitted: Arc<Mutex<Option<(HostOpId, HostFuture)>>>,
+        }
+
+        impl HostAsyncBridge for RecordingBridge {
+            fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
+                *self.submitted.lock().expect("submission lock") = Some((op_id, future));
+                Ok(())
+            }
+
+            fn poll_op(
+                &mut self,
+                _op_id: HostOpId,
+                _cx: &mut Context<'_>,
+            ) -> Poll<VmResult<CallReturn>> {
+                Poll::Pending
+            }
+        }
+
+        let submitted = Arc::new(Mutex::new(None));
         let mut vm = crate::vm::Vm::new(crate::vm::Program::new(Vec::new(), Vec::new()));
-        vm.set_http_max_in_flight(1);
-        let config = HttpConfig {
-            allowed_schemes: vec!["http".to_string()],
-            allowed_hosts: vec!["127.0.0.1".to_string()],
-            allowed_ports: vec![1],
-            allow_private_ips: true,
-            ..HttpConfig::default()
-        };
-        let request = HttpRequest {
-            method: reqwest::Method::GET,
-            url: "http://127.0.0.1:1/".parse().expect("valid URL"),
-            headers: Vec::new(),
-            body: None,
-        };
+        vm.configure_http(HttpConfig::default());
+        vm.set_async_bridge(Box::new(RecordingBridge {
+            submitted: Arc::clone(&submitted),
+        }));
+        let args = [Value::Map(Arc::new(VmMap::default()))];
 
-        let op_id = schedule_request(&mut vm, config, request).expect("request should schedule");
-        let operation_id = OperationId::from_raw(op_id).expect("operation id should be valid");
+        let outcome = builtin_http_client_request(&mut vm, &args)
+            .expect("HTTP async host call should submit");
+        let CallOutcome::Pending(op_id) = outcome else {
+            panic!("HTTP async host call should suspend");
+        };
+        assert_eq!(op_id, 1);
         assert_eq!(
-            vm.host
-                .runtime_operations
-                .get(operation_id)
-                .expect("operation should be registered")
-                .owner(),
-            OperationOwner::Http
+            submitted
+                .lock()
+                .expect("submission lock")
+                .as_ref()
+                .map(|(submitted_id, _)| *submitted_id),
+            Some(op_id)
         );
-        let operation = vm
-            .host
-            .runtime_operations
-            .get(operation_id)
-            .expect("request should remain registered");
-        let resource = operation
-            .payload()
-            .expect("operation should reference the request resource");
-        assert_eq!(resource.resource_type(), ResourceTypeId::HTTP_REQUEST);
-        assert!(
-            vm.host
-                .runtime_resources
-                .get::<HttpRequestResource>(resource, ResourceTypeId::HTTP_REQUEST)
-                .is_ok()
-        );
-
-        let token = operation.token();
-        vm.clear_http_configuration();
-        assert_eq!(token.reason(), Some(CancellationReason::Requested));
-        assert!(
-            vm.host
-                .runtime_resources
-                .get::<HttpRequestResource>(resource, ResourceTypeId::HTTP_REQUEST)
-                .is_err()
-        );
-        assert!(vm.host.runtime_operations.get(operation_id).is_err());
+        assert_eq!(vm.host.runtime_operations.active_count(), 0);
     }
 
-    #[cfg(feature = "http-client")]
+    #[cfg(feature = "async")]
     #[test]
     fn production_request_timeout_sets_structured_deadline_reason() {
         use std::time::{Duration, Instant};
@@ -848,7 +657,7 @@ mod tests {
         server.join().expect("server should exit");
     }
 
-    #[cfg(feature = "http-client")]
+    #[cfg(feature = "async")]
     #[test]
     fn response_body_timeout_sets_structured_deadline_reason() {
         use std::io::{Read, Write};
@@ -901,7 +710,7 @@ mod tests {
         server.join().expect("server should exit");
     }
 
-    #[cfg(feature = "http-client")]
+    #[cfg(feature = "async")]
     #[test]
     fn empty_port_allowlist_rejects_explicit_and_default_ports() {
         let config = HttpConfig {
@@ -915,7 +724,7 @@ mod tests {
         assert!(validate_url(&config, &default_port).is_err());
     }
 
-    #[cfg(feature = "http-client")]
+    #[cfg(feature = "async")]
     #[test]
     fn special_use_networks_and_mixed_dns_answers_are_restricted() {
         for address in [
@@ -959,7 +768,7 @@ mod tests {
         assert!(validate_resolved_addresses(&config, &addresses).is_err());
     }
 
-    #[cfg(feature = "http-client")]
+    #[cfg(feature = "async")]
     #[test]
     fn ipv4_mapped_ipv6_loopback_is_restricted() {
         assert!(is_restricted_ip(
