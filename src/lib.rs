@@ -88,12 +88,13 @@ pub use jit::{
 pub use vm::diagnostics::render_vm_error;
 #[cfg(feature = "runtime")]
 pub use vm::{
-    AotArtifactError, CallOutcome, CallReturn, CancellationReason, DEFAULT_MAX_SCRIPT_CALL_DEPTH,
-    EpochCheckpoint, EpochHandle, FuelCheckpoint, HostArgsFunction, HostAsyncBridge,
-    HostBindingPlan, HostFunction, HostFunctionRegistry, HostOpId, HostStackFunction,
-    IntoScriptValue, QueuedScriptInvocation, ScriptArgs, ScriptCallback, ScriptResult,
-    StaticHostArgsFunction, StaticHostFunction, StaticHostStackFunction, Store, Vm, VmError,
-    VmResult, VmStatus, VmYieldReason,
+    AotArtifactError, CallOutcome, CallReturn, CancellationReason, CapabilityProfile,
+    CapabilityProfileBuilder, DEFAULT_MAX_SCRIPT_CALL_DEPTH, EpochCheckpoint, EpochHandle,
+    FuelCheckpoint, HostArgsFunction, HostAsyncBridge, HostBindingPlan, HostFunction,
+    HostFunctionRegistry, HostOpId, HostStackFunction, IntoScriptValue, IoPolicy,
+    QueuedScriptInvocation, ScriptArgs, ScriptCallback, ScriptResult, StaticHostArgsFunction,
+    StaticHostFunction, StaticHostStackFunction, Store, Vm, VmError, VmResult, VmStatus,
+    VmYieldReason,
 };
 #[cfg(feature = "sqlite")]
 pub use vm::{SqliteLimits, SqlitePolicy};

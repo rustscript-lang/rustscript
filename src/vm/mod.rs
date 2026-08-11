@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub(crate) mod aot;
+mod capability;
 pub mod diagnostics;
 mod engine;
 mod epoch;
@@ -21,6 +22,7 @@ mod superinstructions;
 #[cfg(test)]
 mod tests;
 pub use self::aot::AotArtifactError;
+pub use self::capability::{CapabilityProfile, CapabilityProfileBuilder, IoPolicy};
 use self::engine::Engine;
 pub use self::epoch::{EpochCheckpoint, EpochHandle};
 pub use self::fuel::FuelCheckpoint;
@@ -36,7 +38,7 @@ use self::run_context::{InterruptMode, RunContext};
 pub use crate::builtins::runtime::cancellation::CancellationReason;
 
 #[cfg(feature = "sqlite")]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SqliteLimits {
     pub max_connections: usize,
     pub max_statements: usize,
@@ -71,7 +73,7 @@ impl Default for SqliteLimits {
 }
 
 #[cfg(feature = "sqlite")]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SqlitePolicy {
     pub database_root: Option<String>,
     pub allow_unsafe_sql: bool,

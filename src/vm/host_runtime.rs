@@ -19,6 +19,7 @@ use crate::builtins::runtime::cancellation::{
 };
 use crate::builtins::runtime::resource::{DEFAULT_MAX_RESOURCES, ResourceArena};
 
+use crate::vm::IoPolicy;
 #[cfg(feature = "sqlite")]
 use crate::vm::SqlitePolicy;
 use crate::vm::host::{HostAsyncBridge, VmHostFunction};
@@ -46,6 +47,7 @@ pub(crate) struct HostRuntime {
     pub(crate) resolved_calls_dirty: bool,
     pub(crate) runtime_resources: ResourceArena,
     pub(crate) runtime_operations: OperationRegistry,
+    pub(crate) io_policy: Option<IoPolicy>,
     #[cfg(feature = "sqlite")]
     pub(crate) sqlite_policy: SqlitePolicy,
     pub(crate) http_state: HttpState,
@@ -73,6 +75,7 @@ impl HostRuntime {
                 .expect("default runtime resource limit should be valid"),
             runtime_operations: OperationRegistry::with_limit(DEFAULT_MAX_PENDING_OPERATIONS)
                 .expect("default runtime operation limit should be valid"),
+            io_policy: None,
             #[cfg(feature = "sqlite")]
             sqlite_policy: SqlitePolicy::default(),
             http_state: HttpState::default(),
