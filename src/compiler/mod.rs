@@ -14,6 +14,7 @@ mod frontends;
 pub mod ir;
 mod lifetime;
 mod linker;
+mod modules;
 mod parser;
 mod pipeline;
 mod source_loader;
@@ -30,6 +31,10 @@ pub use self::frontends::parse_source_with_dialect;
 pub use self::ir::{
     AssignmentKind, ClosureExpr, Expr, FrontendIr, FunctionDecl, FunctionImpl, FunctionParam,
     LocalIrBuilder, LocalSlot, MatchPattern, MatchTypePattern, Stmt, StructDecl, TypeSchema,
+};
+pub use self::modules::{
+    DeclSymbol, ExportEntry, ImportTargetKind, ImportedBinding, ModuleGraph, ModuleId, ModuleNode,
+    ResolvedImport, SymbolId, UseDecl, UsePathSegment,
 };
 pub use self::parser::ParserDialect;
 pub use self::pipeline::{
@@ -90,6 +95,10 @@ pub enum CompileError {
         source_name: Option<String>,
         detail: String,
     },
+    /// Internal error: a symbol-resolved module call or function value
+    /// survived unit merge and reached codegen, where flat function indices
+    /// are the only valid call targets.
+    UnresolvedModuleCall,
 }
 
 impl CompileError {
@@ -160,6 +169,9 @@ impl CompileError {
             CompileError::InvalidFieldAccess { detail, .. } => detail.clone(),
             CompileError::FunctionParameterTypeConflict { detail, .. } => detail.clone(),
             CompileError::StrictTypingRequired { detail, .. } => detail.clone(),
+            CompileError::UnresolvedModuleCall => {
+                "internal compiler error: unresolved module call reached codegen".to_string()
+            }
         }
     }
 }
@@ -272,6 +284,25 @@ pub enum SourcePathError {
         message: String,
     },
     Source(SourceError),
+    /// A source error plus the compilation-wide [`SourceMap`] that resolves
+    /// every span it carries (milestone 5). Produced by the module-loading
+    /// compile entry points; spans reference the semantic module graph's
+    /// `SourceId` space, so rendering against this map always reads from the
+    /// owning source. `Display` delegates to the inner error.
+    SourceWithMap {
+        error: SourceError,
+        sources: SourceMap,
+    },
+}
+
+impl SourcePathError {
+    /// The compilation-wide source map carried with this error, if any.
+    pub fn sources(&self) -> Option<&SourceMap> {
+        match self {
+            SourcePathError::SourceWithMap { sources, .. } => Some(sources),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for SourcePathError {
@@ -309,6 +340,7 @@ impl fmt::Display for SourcePathError {
                 message
             ),
             SourcePathError::Source(err) => write!(f, "{err}"),
+            SourcePathError::SourceWithMap { error, .. } => write!(f, "{error}"),
         }
     }
 }
@@ -366,6 +398,12 @@ pub struct SharedParserOptions {
     pub allow_implicit_externs: bool,
     pub allow_implicit_semicolons: bool,
     pub enforce_mutable_bindings: bool,
+    /// Import-scan mode: used by the source loader's discovery parse. The
+    /// parser tolerates calls to not-yet-declared imported functions
+    /// (`allow_implicit_externs`) and records host aliases for multi-segment
+    /// file-module paths so namespace calls parse during the scan; the
+    /// resulting IR is discarded after `use` declarations are extracted.
+    pub import_scan_mode: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

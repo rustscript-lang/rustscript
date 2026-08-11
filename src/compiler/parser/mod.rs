@@ -15,8 +15,10 @@ use crate::builtins::{
     BuiltinFunction, builtin_namespace_hint, default_host_callable, is_builtin_namespace,
     resolve_builtin_namespace_call,
 };
+use crate::compiler::modules::{UseDecl, UsePathSegment};
 use crate::compiler::source_map::{SourceId, Span};
 
+pub(crate) use self::expressions::host_generic_type_arg_arity;
 use self::lexer::{Lexer, ParserFormatArg, Token, TokenKind, is_ident_continue, is_ident_start};
 use self::symbols::is_virtual_host_namespace_spec;
 use super::{
@@ -138,6 +140,19 @@ pub(super) struct Parser {
     host_namespace_aliases: HashMap<String, String>,
     direct_host_call_aliases: HashMap<String, String>,
     direct_host_wildcard_imports: HashSet<String>,
+    /// Names created through the implicit-extern fallback (module mode).
+    /// The source loader uses this marker to keep synthetic externs out of
+    /// module declaration/export tables and to resolve (or reject) their
+    /// call sites.
+    implicit_extern_names: HashSet<String>,
+    /// Namespace aliases introduced by file-module `use` directives.
+    ///
+    /// Unlike [`Parser::host_namespace_aliases`] these are recorded in every
+    /// parse mode; a namespace call that is neither builtin nor host resolves
+    /// through this map into a loader-resolved module call placeholder.
+    module_namespace_aliases: HashMap<String, String>,
+    use_declarations: Vec<UseDecl>,
+    import_scan_mode: bool,
     mutable_locals: Vec<bool>,
     borrowed_map_iter_locals: Vec<LocalSlot>,
     local_schemas: HashMap<LocalSlot, TypeSchema>,
@@ -155,6 +170,7 @@ impl Parser {
         allow_implicit_externs: bool,
         allow_implicit_semicolons: bool,
         enforce_mutable_bindings: bool,
+        import_scan_mode: bool,
         dialect: &'static dyn ParserDialect,
     ) -> Result<Self, ParseError> {
         let mut lexer = Lexer::new(source, source_id, dialect);
@@ -193,6 +209,10 @@ impl Parser {
             host_namespace_aliases: HashMap::new(),
             direct_host_call_aliases: HashMap::new(),
             direct_host_wildcard_imports: HashSet::new(),
+            implicit_extern_names: HashSet::new(),
+            module_namespace_aliases: HashMap::new(),
+            use_declarations: Vec::new(),
+            import_scan_mode,
             mutable_locals: Vec::new(),
             borrowed_map_iter_locals: Vec::new(),
             local_schemas: HashMap::new(),
@@ -214,12 +234,17 @@ impl Parser {
             allow_implicit_externs,
             allow_implicit_semicolons,
             enforce_mutable_bindings,
+            false,
             dialect,
         )?;
         for binding in predeclared_locals {
             parser.predeclare_local(binding)?;
         }
         Ok(parser)
+    }
+
+    pub(super) fn use_declarations(&self) -> Vec<UseDecl> {
+        self.use_declarations.clone()
     }
 
     pub(super) fn parse_program(&mut self) -> Result<Vec<Stmt>, ParseError> {
@@ -336,6 +361,7 @@ impl Parser {
                         type_params,
                         exported,
                         return_type: ValueType::Unknown,
+                        symbol: None,
                     };
                     self.functions.insert(name, decl.clone());
                     self.function_list.push(decl);
@@ -386,6 +412,28 @@ impl Parser {
 
     pub(super) fn unknown_type_spans(&self) -> Vec<Span> {
         self.unknown_type_spans.clone()
+    }
+
+    pub(super) fn implicit_extern_names(&self) -> Vec<String> {
+        let mut names = self
+            .implicit_extern_names
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    pub(super) fn is_implicit_extern(&self, name: &str) -> bool {
+        self.implicit_extern_names.contains(name)
+    }
+
+    /// Look up a file-module namespace alias recorded from a structured
+    /// `use` directive (both parse modes).
+    pub(super) fn module_namespace_alias(&self, namespace: &str) -> Option<&str> {
+        self.module_namespace_aliases
+            .get(namespace)
+            .map(String::as_str)
     }
 
     fn validate_schema_reference_sites(&self) -> Result<(), ParseError> {

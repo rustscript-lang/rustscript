@@ -44,14 +44,18 @@ pub fn builtin_call_index(name: &str) -> Option<u16> {
 
     BuiltinFunction::from_source_name(name).map(|builtin| builtin.call_index())
 }
-pub use compiler::diagnostics::{render_compile_error, render_source_error};
+pub use compiler::diagnostics::{
+    render_compile_error, render_source_error, render_source_path_error,
+};
 pub use compiler::source_map::{LineSpanMapping, LoweredSource, SourceId, SourceMap, Span};
 pub use compiler::{
     AssignmentKind, ClosureExpr, CompileError, CompileSourceFileOptions, CompiledProgram,
-    CompiledReplProgram, Compiler, Expr, FormatError, FrontendImportSyntax, FrontendIr,
-    FunctionDecl, ImportClause, InferredLocalTypeHint, LocalIrBuilder, LocalSlot, ModuleImport,
-    NamedImport, ParseError, ParserDialect, ReplLocalBinding, ReplLocalState, SharedParserOptions,
-    SourceError, SourceFlavor, SourcePathError, SourcePlugin, Stmt, UnknownInferredLocal,
+    CompiledReplProgram, Compiler, DeclSymbol, ExportEntry, Expr, FormatError,
+    FrontendImportSyntax, FrontendIr, FunctionDecl, ImportClause, ImportTargetKind,
+    ImportedBinding, InferredLocalTypeHint, LocalIrBuilder, LocalSlot, ModuleGraph, ModuleId,
+    ModuleImport, ModuleNode, NamedImport, ParseError, ParserDialect, ReplLocalBinding,
+    ReplLocalState, ResolvedImport, SharedParserOptions, SourceError, SourceFlavor,
+    SourcePathError, SourcePlugin, Stmt, SymbolId, UnknownInferredLocal, UseDecl, UsePathSegment,
     collect_inferred_local_type_hints, collect_inferred_local_type_hints_at_path_with_options,
     collect_inferred_local_type_hints_with_options, compile_source,
     compile_source_at_path_with_flavor_and_options, compile_source_file,

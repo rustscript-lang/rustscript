@@ -26,3 +26,23 @@ mod type_inference_tests;
 #[cfg(feature = "runtime")]
 #[path = "compiler/whitespace_resilience_tests.rs"]
 mod whitespace_resilience_tests;
+
+#[cfg(feature = "runtime")]
+#[path = "compiler/semantic_module_m12_tests.rs"]
+mod semantic_module_m12_tests;
+
+#[cfg(feature = "runtime")]
+#[path = "compiler/semantic_module_m3_tests.rs"]
+mod semantic_module_m3_tests;
+
+#[cfg(feature = "runtime")]
+#[path = "compiler/semantic_module_m4_tests.rs"]
+mod semantic_module_m4_tests;
+
+#[cfg(feature = "runtime")]
+#[path = "compiler/semantic_module_m5_tests.rs"]
+mod semantic_module_m5_tests;
+
+#[cfg(feature = "runtime")]
+#[path = "compiler/semantic_module_m6_tests.rs"]
+mod semantic_module_m6_tests;
