@@ -9,6 +9,7 @@ mod aot;
 mod bytes;
 pub(crate) mod core;
 mod host;
+mod http;
 #[cfg(not(target_arch = "wasm32"))]
 mod io;
 #[cfg(target_arch = "wasm32")]
@@ -24,6 +25,8 @@ mod typed;
 #[cfg(target_arch = "wasm32")]
 use io_wasm as io;
 
+pub use http::HttpConfig;
+pub(crate) use http::HttpState;
 pub(crate) use io::IoState;
 pub use typed::HostCallResult;
 use typed::{
@@ -126,6 +129,7 @@ pub(crate) fn execute_builtin_call(
 
 pub(crate) fn cancel_builtin_io_op(vm: &mut Vm, op_id: HostOpId) {
     io::cancel_pending_op(vm, op_id);
+    http::cancel_pending_op(vm, op_id);
 }
 
 pub(crate) fn poll_builtin_io_op(
@@ -133,11 +137,24 @@ pub(crate) fn poll_builtin_io_op(
     op_id: HostOpId,
     cx: &mut Context<'_>,
 ) -> Poll<VmResult<CallReturn>> {
-    io::poll_builtin_io_op(vm, op_id, cx)
+    if io::has_pending_op(vm, op_id) {
+        io::poll_builtin_io_op(vm, op_id, cx)
+    } else {
+        http::poll_pending_op(vm, op_id, cx)
+    }
+}
+
+pub(crate) fn is_builtin_io_op(vm: &Vm, op_id: HostOpId) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    if io::has_pending_op(vm, op_id) {
+        return true;
+    }
+    http::has_pending_op(vm, op_id)
 }
 
 pub(crate) fn close_all_handles(vm: &mut Vm) {
     io::close_all_handles(vm);
+    http::cancel_all_pending_ops(vm);
 }
 
 #[cfg(test)]

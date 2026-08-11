@@ -149,11 +149,18 @@ fn main() {
     println!("cargo:rerun-if-changed={}", catalog_path.display());
     let catalog = parse_catalog(&catalog_path);
 
-    let host_sources = [SourceSpec {
-        path: "src/builtins/runtime/host.rs".to_string(),
-        module: "host".to_string(),
-        category: SourceCategory::DefaultHost,
-    }];
+    let host_sources = [
+        SourceSpec {
+            path: "src/builtins/runtime/host.rs".to_string(),
+            module: "host".to_string(),
+            category: SourceCategory::DefaultHost,
+        },
+        SourceSpec {
+            path: "src/builtins/runtime/http.rs".to_string(),
+            module: "http".to_string(),
+            category: SourceCategory::DefaultHost,
+        },
+    ];
     let builtin_sources = builtin_source_specs(&namespaces);
     let core_sources = [SourceSpec {
         path: "src/builtins/runtime/core.rs".to_string(),
