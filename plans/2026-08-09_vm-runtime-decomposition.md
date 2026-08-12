@@ -2,7 +2,7 @@
 
 **Goal:** Split the current monolithic `Vm` state into explicit engine, program, instance, run-context, and host-runtime ownership layers.
 
-**Architecture:** Immutable compiled artifacts and backend caches live outside per-run execution state. An `Instance` owns interpreter state, a `RunContext` owns one execution's input/budgets/events/cancellation, and `HostRuntime` owns capabilities/resources/operations. The migration preserves observable execution behavior while removing subsystem-specific fields from the central VM object.
+**Architecture:** Immutable compiled artifacts and backend caches live outside per-run execution state. An `Instance` owns interpreter state, a `RunContext` owns one invocation's pending stream item, budgets, and cancellation, and `HostRuntime` owns capabilities/resources/operations. Invocation input remains in ordinary callable arguments. The migration preserves observable execution behavior while removing subsystem-specific fields from the central VM object.
 
 **Tech Stack:** Rust 2024, `pd-vm` interpreter/JIT/AOT integration, existing compiler and runtime tests.
 
@@ -11,7 +11,7 @@
 ## Independence and dependency
 
 - Static builtin IDs should land first so decomposition does not move an unstable wire catalog.
-- Defines ownership required by the unified host-lifecycle and RunOutcome plans.
+- Defines ownership required by the unified host-lifecycle and invocation-item-stream plans.
 - Independent of agent providers, gateway routes, module semantics, and new host functions.
 
 ## Scope boundary
@@ -50,10 +50,8 @@ Instance
   yield/wait state
 
 RunContext
-  input
-  event channel
+  one pending invocation item
   fuel/deadline/cancellation
-  usage accounting
 
 HostRuntime
   capability profile
@@ -75,7 +73,7 @@ The public facade may be renamed or retained, but ownership must follow this mod
 Prove:
 
 - one immutable program can create multiple isolated instances;
-- run input/events/budgets never leak between runs;
+- pending invocation items and budgets never leak between runs;
 - backend cache may be shared without sharing stacks/resources;
 - reset closes run-scoped state and retains only documented reusable state.
 
@@ -104,11 +102,11 @@ Move IP, stack, locals, frames, captures, callbacks, waiting/yield state, and in
 
 **Files:**
 - Create: `src/vm/run_context.rs`
-- Move runtime input, event sink, fuel, epoch/deadline, cancellation, and usage state
+- Move the pending invocation item, fuel, epoch/deadline, and cancellation state
 
-1. Create a fresh RunContext per execution.
+1. Create a fresh RunContext per invocation.
 2. Make cancellation and deadline mandatory run-owned data, with explicit unlimited settings where allowed.
-3. Remove source injection and embedding-global event ownership from execution paths.
+3. Keep invocation input in callable arguments and remove source injection and embedding-global event ownership from execution paths.
 4. Make run completion consume/finalize the context.
 
 ### Milestone 5: Extract HostRuntime shell
@@ -143,7 +141,7 @@ Add behavioral comparison fixtures that run the same program before and after ea
 
 - Immutable Program data and backend caches are not owned by per-run state.
 - Stack/frame/wait state is isolated in Instance.
-- Input/events/budget/cancellation are isolated in RunContext.
+- Pending invocation item, budget, and cancellation are isolated in RunContext; input stays in callable arguments.
 - Capabilities/resources/operations are isolated in HostRuntime.
 - Reset and drop no longer enumerate every runtime subsystem in one central method.
 - Multiple instances from one program cannot share mutable run or host resources.

@@ -55,9 +55,9 @@ Exit gate: module semantics have explicit identities; VM has explicit ownership 
 ### Wave 2: Unified execution lifecycle
 
 1. Unified host resource/operation/cancellation lifecycle after VM ownership exists.
-2. RunOutcome/event/error implementation on RunContext, integrating lifecycle cancellation as it becomes available.
+2. Invocation item stream and typed-error implementation on RunContext, integrating lifecycle cancellation as it becomes available.
 
-Exit gate: production host subsystems use one lifecycle, and every run has one structured terminal outcome with live bounded events.
+Exit gate: production host subsystems use one lifecycle, and every invocation yields bounded `Event` items followed by one `Complete` item or typed error, then ends.
 
 ### Wave 3: Specialized consumers
 
