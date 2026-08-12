@@ -314,6 +314,31 @@ fn cached_plan_refreshes_after_a_sibling_registry_mutation() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn max_stream_duration_does_not_shorten_buffered_requests() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut request = [0; 1024];
+        assert!(socket.read(&mut request).unwrap() > 0);
+        thread::sleep(std::time::Duration::from_millis(30));
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .unwrap();
+    });
+    let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
+    let mut buffered_config = local_http_config(port);
+    buffered_config.max_stream_duration = std::time::Duration::from_millis(1);
+    buffered_config.request_timeout = std::time::Duration::from_millis(200);
+    vm.configure_http(buffered_config).unwrap();
+    install_host_driver(&mut vm);
+    HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
+    drive_vm_to_halt(&mut vm).await.unwrap();
+    assert_eq!(response_field(&vm.stack()[0], "status"), &Value::Int(200));
+    server.join().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn explicitly_allowed_http_capability_reaches_http_policy() {
     let mut vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
     vm.configure_http(HttpConfig {
@@ -371,8 +396,19 @@ fn http_config_accepts_bounded_stream_defaults_and_rejects_zero_bounds() {
     assert!(defaults.max_sse_line_bytes > 0);
     assert!(defaults.max_websocket_frame_bytes > 0);
     assert!(defaults.max_websocket_send_bytes > 0);
+    assert_eq!(
+        defaults.max_stream_duration,
+        std::time::Duration::from_secs(5 * 60)
+    );
     assert!(!defaults.stream_idle_timeout.is_zero());
     assert!(!defaults.websocket_close_timeout.is_zero());
+
+    HttpConfig {
+        max_stream_duration: std::time::Duration::from_millis(1),
+        ..defaults.clone()
+    }
+    .validate()
+    .expect("an explicit positive stream duration should be valid");
 
     let invalid = [
         HttpConfig {
@@ -393,6 +429,10 @@ fn http_config_accepts_bounded_stream_defaults_and_rejects_zero_bounds() {
         },
         HttpConfig {
             max_websocket_send_bytes: 0,
+            ..defaults.clone()
+        },
+        HttpConfig {
+            max_stream_duration: std::time::Duration::ZERO,
             ..defaults.clone()
         },
         HttpConfig {
@@ -435,6 +475,22 @@ fn http_config_rejects_request_timeout_that_cannot_form_a_deadline() {
         .configure_http(invalid)
         .expect_err("configuration must reject an overflowing request timeout");
     assert!(configure_error.to_string().contains("request_timeout"));
+    assert!(!vm.http_is_configured());
+
+    let invalid = HttpConfig {
+        max_stream_duration: std::time::Duration::MAX,
+        ..HttpConfig::default()
+    };
+    let validation_error = invalid
+        .validate()
+        .expect_err("overflowing stream duration must be rejected");
+    assert!(validation_error.to_string().contains("max_stream_duration"));
+
+    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let configure_error = vm
+        .configure_http(invalid)
+        .expect_err("configuration must reject an overflowing stream duration");
+    assert!(configure_error.to_string().contains("max_stream_duration"));
     assert!(!vm.http_is_configured());
 }
 

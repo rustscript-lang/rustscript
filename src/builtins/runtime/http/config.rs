@@ -19,6 +19,7 @@ pub struct HttpConfig {
     pub max_sse_line_bytes: usize,
     pub max_websocket_frame_bytes: usize,
     pub max_websocket_send_bytes: usize,
+    pub max_stream_duration: Duration,
     pub stream_idle_timeout: Duration,
     pub websocket_close_timeout: Duration,
 }
@@ -41,6 +42,7 @@ impl HttpConfig {
         let positive_timeouts = [
             ("connect_timeout", self.connect_timeout),
             ("request_timeout", self.request_timeout),
+            ("max_stream_duration", self.max_stream_duration),
             ("stream_idle_timeout", self.stream_idle_timeout),
             ("websocket_close_timeout", self.websocket_close_timeout),
         ];
@@ -81,6 +83,7 @@ impl Default for HttpConfig {
             max_sse_line_bytes: 64 * 1024,
             max_websocket_frame_bytes: 1024 * 1024,
             max_websocket_send_bytes: 1024 * 1024,
+            max_stream_duration: Duration::from_secs(5 * 60),
             stream_idle_timeout: Duration::from_secs(30),
             websocket_close_timeout: Duration::from_secs(5),
         }

@@ -227,11 +227,12 @@ pub max_stream_total_bytes: usize;      // entire streaming call
 pub max_sse_line_bytes: usize;
 pub max_websocket_frame_bytes: usize;
 pub max_websocket_send_bytes: usize;
+pub max_stream_duration: Duration;      // 5 minute host total-duration cap
 pub stream_idle_timeout: Duration;
 pub websocket_close_timeout: Duration;
 ```
 
-`request_timeout` remains the total duration for buffered requests. Streaming calls use an optional request-map `timeout_ms` capped by host policy; when absent, the embedding's invocation deadline and idle timeout are the terminal bounds. The script cannot disable a host limit.
+`request_timeout` remains the total duration for buffered requests. Streaming calls have a positive `max_stream_duration` host limit, defaulting to 5 minutes. At admission, compute one absolute deadline from the smaller of that host limit and optional positive request-map `timeout_ms`; the script cannot disable or extend the host limit. The SSE implementation enforces this deadline while opening and reading. Milestone 6 WebSocket integration must apply the same field and capping rule. Embedding invocation retirement may still terminate a call sooner, and idle timeout remains a separate progress-based bound.
 
 Allowed schemes are protocol-aware:
 
@@ -423,7 +424,7 @@ The HTTP tests must additionally prove that reset/shutdown/drop retire an active
 5. Emit `open`, parsed `event` items, and `end` through the generic pump. Do not buffer the whole body.
 6. Decode callback maps into only `continue` or `stop`; all other actions are errors.
 7. Track wire bytes and delivered item count for the terminal summary.
-8. Apply idle timeout while waiting for bytes. Time spent inside the callback is excluded from network idle accounting but remains subject to the embedding invocation deadline.
+8. Apply the admission-time absolute deadline continuously while opening and reading, using `min(max_stream_duration, timeout_ms)` when `timeout_ms` is supplied. Apply idle timeout separately while waiting for bytes. Time spent inside the callback is excluded from network idle accounting but remains subject to the embedding invocation deadline.
 
 **Tests:**
 

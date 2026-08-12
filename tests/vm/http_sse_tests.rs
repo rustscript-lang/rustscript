@@ -256,11 +256,39 @@ async fn sse_delivers_open_events_end_and_terminal_summary() {
 }
 
 #[test]
-fn sse_rejects_wrong_callback_schema_and_uncapped_script_timeout_before_connecting() {
+fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission() {
     assert!(compile_source(
         r#"use http; http::client::sse({"method":"GET","url":"http://127.0.0.1:1/"}, |item| 1);"#
     )
     .is_err());
+
+    for (timeout, expected) in [
+        ("0", "positive"),
+        ("-1", "positive"),
+        ("\"1\"", "type mismatch"),
+    ] {
+        let source = format!(
+            r#"
+            use http;
+            fn callback(item: map) -> map {{ {{action: "continue"}} }}
+            http::client::sse(
+                {{method: "GET", url: "http://127.0.0.1:1/events", timeout_ms: {timeout}}},
+                callback
+            );
+            "#
+        );
+        let compiled = compile_source(&source).unwrap();
+        let mut vm = Vm::new(compiled.program);
+        vm.set_http_max_in_flight(0);
+        vm.configure_http(config(1)).unwrap();
+        HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
+        let error = vm.run().unwrap_err();
+        assert!(error.to_string().contains(expected), "{timeout}: {error}");
+        assert!(
+            !error.to_string().contains("in-flight request limit"),
+            "timeout validation must precede permit admission: {error}"
+        );
+    }
 
     let source = r#"
         use http;
@@ -272,12 +300,13 @@ fn sse_rejects_wrong_callback_schema_and_uncapped_script_timeout_before_connecti
     "#;
     let compiled = compile_source(source).unwrap();
     let mut vm = Vm::new(compiled.program);
+    vm.set_http_max_in_flight(0);
     vm.configure_http(config(1)).unwrap();
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
     let error = vm.run().unwrap_err();
     assert!(
-        error.to_string().contains("external invocation deadline"),
-        "{error}"
+        error.to_string().contains("in-flight request limit"),
+        "a positive timeout should pass timeout admission: {error}"
     );
 
     let source = r#"
@@ -594,6 +623,136 @@ async fn sse_rejects_status_content_type_and_idle_peer() {
         error.to_string().contains("idle timeout while opening"),
         "{error}"
     );
+    server.join().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sse_script_timeout_shortens_the_host_stream_duration() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut request = [0; 1024];
+        assert!(socket.read(&mut request).unwrap() > 0);
+        thread::sleep(std::time::Duration::from_millis(80));
+    });
+    let mut deadline_config = config(port);
+    deadline_config.max_stream_duration = std::time::Duration::from_millis(200);
+    deadline_config.stream_idle_timeout = std::time::Duration::from_millis(200);
+    let source = format!(
+        r#"use http; fn go(item: map) -> map {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events","timeout_ms":20}}, go);"#
+    );
+    let error = match run_sse_source(&source, deadline_config).await {
+        Ok(_) => panic!("script deadline should shorten the host maximum"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("total deadline"), "{error}");
+    server.join().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sse_host_stream_duration_caps_script_timeout_while_opening() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut request = [0; 1024];
+        assert!(socket.read(&mut request).unwrap() > 0);
+        thread::sleep(std::time::Duration::from_millis(80));
+    });
+    let mut deadline_config = config(port);
+    deadline_config.max_stream_duration = std::time::Duration::from_millis(20);
+    deadline_config.stream_idle_timeout = std::time::Duration::from_millis(200);
+    let source = format!(
+        r#"use http; fn go(item: map) -> map {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events","timeout_ms":1000}}, go);"#
+    );
+    let error = match run_sse_source(&source, deadline_config).await {
+        Ok(_) => panic!("host duration should cap the script timeout during opening"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("total deadline"), "{error}");
+    server.join().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sse_total_deadline_expires_despite_periodic_progress_below_idle_timeout() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut request = [0; 1024];
+        assert!(socket.read(&mut request).unwrap() > 0);
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+        socket.flush().unwrap();
+        for _ in 0..20 {
+            thread::sleep(std::time::Duration::from_millis(10));
+            if socket.write_all(b"2\r\n:\n\r\n").is_err() {
+                break;
+            }
+            if socket.flush().is_err() {
+                break;
+            }
+        }
+    });
+    let mut deadline_config = config(port);
+    deadline_config.max_stream_duration = std::time::Duration::from_millis(55);
+    deadline_config.stream_idle_timeout = std::time::Duration::from_millis(30);
+    let source = format!(
+        r#"use http; fn go(item: map) -> map {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
+    );
+    let error = match run_sse_source(&source, deadline_config).await {
+        Ok(_) => panic!("periodic progress must not extend the total deadline"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("total deadline"), "{error}");
+    server.join().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sse_total_deadline_releases_the_connection_permit_for_reuse() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        let mut request = [0; 1024];
+        assert!(first.read(&mut request).unwrap() > 0);
+        let first = thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(80));
+            drop(first);
+        });
+
+        let (mut second, _) = listener.accept().unwrap();
+        let mut request = [0; 1024];
+        assert!(second.read(&mut request).unwrap() > 0);
+        second
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\n\r\n",
+            )
+            .unwrap();
+        first.join().unwrap();
+    });
+    let source = format!(
+        r#"use http; http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, |item| {{action:"continue"}});"#
+    );
+    let compiled = compile_source(&source).unwrap();
+    let mut vm = Vm::new(compiled.program);
+    vm.set_http_max_in_flight(1);
+    let mut deadline_config = config(port);
+    deadline_config.max_stream_duration = std::time::Duration::from_millis(20);
+    deadline_config.stream_idle_timeout = std::time::Duration::from_millis(200);
+    vm.configure_http(deadline_config).unwrap();
+    vm.set_async_bridge(Box::<TokioHostDriver>::default());
+    HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
+
+    let error = drive(&mut vm)
+        .await
+        .expect_err("the first stream should reach its total deadline");
+    assert!(error.to_string().contains("total deadline"), "{error}");
+    vm.reset_for_reuse();
+    drive(&mut vm)
+        .await
+        .expect("the second stream should acquire the released permit");
+    assert_eq!(field(&vm.stack()[0], "outcome"), &Value::string("eof"));
     server.join().unwrap();
 }
 

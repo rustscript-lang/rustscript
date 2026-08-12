@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use pd_host_function::pd_host_function;
 
@@ -13,8 +13,7 @@ use super::{HttpRequestContext, policy};
 use crate::builtins::runtime::typed::VmMapHandle;
 use crate::builtins::runtime::{HostCallResult, VmCallable, VmMap};
 use crate::vm::{
-    CallOutcome, CaptureAsyncHostContext, HostStreamAction, HostStreamDriver, HostStreamPoll,
-    Value, Vm, VmError, VmResult,
+    CallOutcome, HostStreamAction, HostStreamDriver, HostStreamPoll, Value, Vm, VmError, VmResult,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -310,7 +309,7 @@ struct SseDriver {
     config: super::HttpConfig,
     observer: ResponseReadObserver,
     permit: Option<super::ConnectionPermit>,
-    deadline: Option<Instant>,
+    deadline: Instant,
     status: Option<hyper::StatusCode>,
     headers: Option<std::sync::Arc<VmMap>>,
     url: Option<url::Url>,
@@ -325,13 +324,13 @@ impl Drop for SseDriver {
 }
 
 impl SseDriver {
-    fn new(context: HttpRequestContext, request: HttpRequest, deadline: Option<Instant>) -> Self {
+    fn new(context: HttpRequestContext, request: HttpRequest, deadline: Instant) -> Self {
         let super::HttpRequestContext { config, _permit } = context;
         let observer = ResponseReadObserver::default();
         let open_config = config.clone();
         let open_observer = observer.clone();
         let future = Box::pin(async move {
-            open_stream_response(&open_config, &request, open_observer, deadline).await
+            open_stream_response(&open_config, &request, open_observer, Some(deadline)).await
         });
         let idle_deadline = Instant::now()
             .checked_add(config.stream_idle_timeout)
@@ -448,6 +447,12 @@ impl SseDriver {
 impl HostStreamDriver for SseDriver {
     fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<HostStreamPoll>> {
         loop {
+            if Instant::now() >= self.deadline {
+                self.retire();
+                return Poll::Ready(Err(VmError::HostError(
+                    "SSE total deadline exceeded".to_string(),
+                )));
+            }
             if let Some(chunk) = self.chunk.as_ref() {
                 let (consumed, event) =
                     self.parser.push_until_event(&chunk[self.chunk_offset..])?;
@@ -477,17 +482,14 @@ impl HostStreamDriver for SseDriver {
                     idle_deadline,
                     timeout,
                 } => {
-                    let open_deadline = self
-                        .deadline
-                        .map_or(*idle_deadline, |total| total.min(*idle_deadline));
+                    let open_deadline = self.deadline.min(*idle_deadline);
                     let timeout = timeout.get_or_insert_with(|| {
                         Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
                             open_deadline,
                         )))
                     });
                     if timeout.as_mut().poll(cx).is_ready() {
-                        let total_expired =
-                            self.deadline.is_some_and(|total| total <= *idle_deadline);
+                        let total_expired = self.deadline <= *idle_deadline;
                         self.retire();
                         return Poll::Ready(Err(VmError::HostError(
                             if total_expired {
@@ -526,9 +528,7 @@ impl HostStreamDriver for SseDriver {
                     let idle_deadline = Instant::now()
                         .checked_add(self.config.stream_idle_timeout)
                         .expect("validated idle timeout");
-                    let deadline = self
-                        .deadline
-                        .map_or(idle_deadline, |total| total.min(idle_deadline));
+                    let deadline = self.deadline.min(idle_deadline);
                     self.state = DriverState::Reading {
                         future: Box::pin(async move {
                             let frame = response.next_frame().await;
@@ -546,8 +546,7 @@ impl HostStreamDriver for SseDriver {
                     timeout,
                 } => {
                     if timeout.as_mut().poll(cx).is_ready() {
-                        let total_expired =
-                            self.deadline.is_some_and(|total| total <= *idle_deadline);
+                        let total_expired = self.deadline <= *idle_deadline;
                         self.retire();
                         return Poll::Ready(Err(VmError::HostError(
                             if total_expired {
@@ -642,19 +641,18 @@ fn map_value(entries: Vec<(&'static str, Value)>) -> Value {
     )))
 }
 
-fn parse_stream_timeout(request: &VmMap) -> VmResult<Option<Instant>> {
+fn parse_stream_timeout(request: &VmMap) -> VmResult<Option<Duration>> {
     let Some(value) = request.get(&Value::string("timeout_ms")) else {
         return Ok(None);
     };
     let Value::Int(milliseconds) = value else {
         return Err(VmError::TypeMismatch("SSE timeout_ms"));
     };
-    let _milliseconds = u64::try_from(*milliseconds)
-        .map_err(|_| VmError::HostError("SSE timeout_ms must be nonnegative".to_string()))?;
-    Err(VmError::HostError(
-        "SSE timeout_ms requires an external invocation deadline, which this host import cannot observe"
-            .to_string(),
-    ))
+    let milliseconds = u64::try_from(*milliseconds)
+        .ok()
+        .filter(|milliseconds| *milliseconds > 0)
+        .ok_or_else(|| VmError::HostError("SSE timeout_ms must be positive".to_string()))?;
+    Ok(Some(Duration::from_millis(milliseconds)))
 }
 
 /// Streams one bounded SSE item into one script callback at a time.
@@ -666,8 +664,8 @@ pub(super) fn builtin_http_client_sse_impl(
 ) -> VmResult<HostCallResult<VmMap>> {
     let callback = on_event.into_value();
     vm.validate_stream_callback_value(&callback)?;
-    let deadline = parse_stream_timeout(request.as_ref())?;
-    let context = HttpRequestContext::capture(vm)?;
+    let script_timeout = parse_stream_timeout(request.as_ref())?;
+    let (context, deadline) = HttpRequestContext::capture_stream(vm, script_timeout)?;
     let mut request = parse_request(request.as_ref(), &context.config)?;
     policy::validate_url_policy(&context.config, policy::SchemeFamily::Http, &request.url)?;
     if request.method != hyper::Method::GET && request.method != hyper::Method::POST {

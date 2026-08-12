@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use pd_host_function::pd_host_function;
 
 use super::{borrow_arg, take_arg};
@@ -87,6 +89,39 @@ pub(super) struct HttpRequestContext {
     _permit: ConnectionPermit,
 }
 
+impl HttpRequestContext {
+    fn capture_stream(vm: &mut Vm, script_timeout: Option<Duration>) -> VmResult<(Self, Instant)> {
+        let state = vm
+            .host
+            .host_function_state::<HttpHostState>()
+            .ok_or_else(|| VmError::HostError("HTTP host is not configured".to_string()))?;
+        let config = state
+            .config
+            .clone()
+            .ok_or_else(|| VmError::HostError("HTTP host is not configured".to_string()))?;
+        let admitted_at = Instant::now();
+        if script_timeout.is_some_and(|timeout| admitted_at.checked_add(timeout).is_none()) {
+            return Err(VmError::HostError(
+                "SSE timeout_ms cannot form a deadline".to_string(),
+            ));
+        }
+        let duration = script_timeout.map_or(config.max_stream_duration, |timeout| {
+            timeout.min(config.max_stream_duration)
+        });
+        let deadline = admitted_at.checked_add(duration).ok_or_else(|| {
+            VmError::HostError("HTTP max_stream_duration cannot form a deadline".to_string())
+        })?;
+        let permit = state.admission.acquire()?;
+        Ok((
+            Self {
+                config,
+                _permit: permit,
+            },
+            deadline,
+        ))
+    }
+}
+
 impl CaptureAsyncHostContext for HttpRequestContext {
     fn capture(vm: &mut Vm) -> VmResult<Self> {
         let state = vm
@@ -130,7 +165,7 @@ mod tests {
         HttpRequest, ResponseReadObserver, execute_request, execute_request_with_observer,
         execute_request_with_tls_config, pending_connection_test,
     };
-    use super::{HttpConfig, HttpHostExt, builtin_http_client_request};
+    use super::{HttpConfig, HttpHostExt, HttpRequestContext, builtin_http_client_request};
     use crate::builtins::runtime::VmMap;
     use crate::vm::{
         CallOutcome, CallReturn, HostAsyncBridge, HostFuture, HostOpId, Value, VmResult,
@@ -144,6 +179,23 @@ mod tests {
         assert!(config.allowed_ports.is_empty());
         assert!(!config.allow_private_ips);
         config.validate().expect("default bounds should be valid");
+    }
+
+    #[test]
+    fn stream_timeout_validation_precedes_permit_admission() {
+        let mut vm = crate::vm::Vm::new(crate::vm::Program::new(Vec::new(), Vec::new()));
+        vm.set_http_max_in_flight(0);
+        vm.configure_http(HttpConfig::default())
+            .expect("default config should be valid");
+
+        let error = HttpRequestContext::capture_stream(&mut vm, Some(Duration::MAX))
+            .err()
+            .expect("an unrepresentable script timeout should be rejected");
+        assert!(error.to_string().contains("timeout_ms"), "{error}");
+        assert!(
+            !error.to_string().contains("in-flight request limit"),
+            "deadline validation must happen before permit admission: {error}"
+        );
     }
 
     #[test]
