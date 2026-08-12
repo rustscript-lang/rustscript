@@ -673,7 +673,7 @@ pub(super) fn builtin_http_client_sse_impl(
     let callback = on_event.into_value();
     vm.validate_stream_callback_value(&callback)?;
     let script_timeout = parse_stream_timeout(request.as_ref())?;
-    let (context, deadline) = HttpRequestContext::capture_stream(vm, script_timeout)?;
+    let (context, deadline) = HttpRequestContext::capture_stream(vm, script_timeout, "SSE")?;
     let mut request = parse_request(request.as_ref(), &context.config)?;
     policy::validate_url_policy(&context.config, policy::SchemeFamily::Http, &request.url)?;
     if request.method != hyper::Method::GET && request.method != hyper::Method::POST {

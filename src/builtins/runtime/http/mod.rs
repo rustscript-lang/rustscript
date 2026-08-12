@@ -90,7 +90,11 @@ pub(super) struct HttpRequestContext {
 }
 
 impl HttpRequestContext {
-    fn capture_stream(vm: &mut Vm, script_timeout: Option<Duration>) -> VmResult<(Self, Instant)> {
+    fn capture_stream(
+        vm: &mut Vm,
+        script_timeout: Option<Duration>,
+        protocol: &str,
+    ) -> VmResult<(Self, Instant)> {
         let state = vm
             .host
             .host_function_state::<HttpHostState>()
@@ -101,9 +105,9 @@ impl HttpRequestContext {
             .ok_or_else(|| VmError::HostError("HTTP host is not configured".to_string()))?;
         let admitted_at = Instant::now();
         if script_timeout.is_some_and(|timeout| admitted_at.checked_add(timeout).is_none()) {
-            return Err(VmError::HostError(
-                "SSE timeout_ms cannot form a deadline".to_string(),
-            ));
+            return Err(VmError::HostError(format!(
+                "{protocol} timeout_ms cannot form a deadline"
+            )));
         }
         let duration = script_timeout.map_or(config.max_stream_duration, |timeout| {
             timeout.min(config.max_stream_duration)
@@ -119,6 +123,10 @@ impl HttpRequestContext {
             },
             deadline,
         ))
+    }
+
+    fn into_parts(self) -> (HttpConfig, ConnectionPermit) {
+        (self.config, self._permit)
     }
 }
 
@@ -188,7 +196,7 @@ mod tests {
         vm.configure_http(HttpConfig::default())
             .expect("default config should be valid");
 
-        let error = HttpRequestContext::capture_stream(&mut vm, Some(Duration::MAX))
+        let error = HttpRequestContext::capture_stream(&mut vm, Some(Duration::MAX), "SSE")
             .err()
             .expect("an unrepresentable script timeout should be rejected");
         assert!(error.to_string().contains("timeout_ms"), "{error}");

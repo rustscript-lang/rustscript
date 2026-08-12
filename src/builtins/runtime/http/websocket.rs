@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures_util::{Sink, Stream};
 use pd_host_function::pd_host_function;
@@ -15,7 +15,7 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, WebSocketCon
 
 use super::super::typed::VmMapHandle;
 use super::super::{HostCallResult, VmCallable, VmMap};
-use super::HttpHostState;
+use super::HttpRequestContext;
 use super::config::HttpConfig;
 use super::policy::{ConnectionPermit, SchemeFamily, request_deadline, resolve_url, with_deadline};
 use crate::vm::{
@@ -95,17 +95,11 @@ pub(super) fn builtin_http_client_websocket_impl(
     let callback = callback.into_value();
     vm.validate_stream_callback_value(&callback)?;
 
-    let state = vm
-        .host
-        .host_function_state::<HttpHostState>()
-        .ok_or_else(|| VmError::HostError("HTTP host is not configured".to_string()))?;
-    let config = state
-        .config
-        .clone()
-        .ok_or_else(|| VmError::HostError("HTTP host is not configured".to_string()))?;
-    let request = parse_websocket_request(request.as_ref(), &config)?;
-    let permit = state.admission.acquire()?;
-    let driver = WebSocketDriver::new(config, request, permit, None)?;
+    let script_timeout = parse_websocket_timeout(request.as_ref())?;
+    let (context, deadline) = HttpRequestContext::capture_stream(vm, script_timeout, "WebSocket")?;
+    let request = parse_websocket_request(request.as_ref(), &context.config)?;
+    let (config, permit) = context.into_parts();
+    let driver = WebSocketDriver::new(config, request, permit, Some(deadline))?;
     match vm.submit_callable_stream(callback, driver)? {
         CallOutcome::Pending(op_id) => Ok(HostCallResult::Pending(op_id)),
         _ => Err(VmError::InvalidFrameState(
@@ -730,17 +724,25 @@ fn parse_websocket_request(map: &VmMap, config: &HttpConfig) -> VmResult<WebSock
         Some(_) => return Err(VmError::TypeMismatch("WebSocket protocols")),
     };
 
-    if map.get(&Value::string("timeout_ms")).is_some() {
-        return Err(VmError::HostError(
-            "WebSocket timeout_ms is unavailable because no externally bounded streaming deadline is available"
-                .to_string(),
-        ));
-    }
     Ok(WebSocketRequest {
         url,
         headers,
         protocols,
     })
+}
+
+fn parse_websocket_timeout(request: &VmMap) -> VmResult<Option<Duration>> {
+    let Some(value) = request.get(&Value::string("timeout_ms")) else {
+        return Ok(None);
+    };
+    let Value::Int(milliseconds) = value else {
+        return Err(VmError::TypeMismatch("WebSocket timeout_ms"));
+    };
+    let milliseconds = u64::try_from(*milliseconds)
+        .ok()
+        .filter(|milliseconds| *milliseconds > 0)
+        .ok_or_else(|| VmError::HostError("WebSocket timeout_ms must be positive".to_string()))?;
+    Ok(Some(Duration::from_millis(milliseconds)))
 }
 
 fn open_item(status: u16, headers: &VmMap, url: &url::Url, protocol: Option<&str>) -> Value {

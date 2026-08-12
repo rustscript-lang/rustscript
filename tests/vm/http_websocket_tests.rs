@@ -1,13 +1,66 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use vm::{
-    HostFunctionRegistry, HttpConfig, HttpHostExt, Value, Vm, VmStatus, compile_source,
-    default_host_callables,
+    CallOutcome, CallReturn, HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput,
+    HostOpId, HostStackFunction, HttpConfig, HttpHostExt, Value, Vm, VmError, VmResult, VmStatus,
+    compile_source, default_host_callables,
 };
+
+#[derive(Default)]
+struct TokioHostDriver {
+    submitted: HashMap<HostOpId, HostFuture>,
+}
+
+impl HostAsyncBridge for TokioHostDriver {
+    fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
+        self.submitted.insert(op_id, future);
+        Ok(())
+    }
+
+    fn poll_op(&mut self, op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
+        Poll::Ready(Err(VmError::HostError(format!(
+            "unknown external host operation {op_id}"
+        ))))
+    }
+
+    fn poll_submitted_op(
+        &mut self,
+        op_id: HostOpId,
+        cx: &mut Context<'_>,
+    ) -> Poll<VmResult<HostFutureOutput>> {
+        self.submitted.get_mut(&op_id).map_or_else(
+            || {
+                Poll::Ready(Err(VmError::HostError(format!(
+                    "unknown submitted host operation {op_id}"
+                ))))
+            },
+            |future| future.as_mut().poll(cx),
+        )
+    }
+
+    fn cancel_op(&mut self, op_id: HostOpId) {
+        self.submitted.remove(&op_id);
+    }
+}
+
+struct AsyncWaitOnce;
+
+impl HostStackFunction for AsyncWaitOnce {
+    fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+        vm.submit_host_future(Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            Ok(HostFutureOutput::returning(CallReturn::one(Value::Bool(
+                true,
+            ))))
+        }))
+    }
+}
 
 fn websocket_config(port: u16) -> HttpConfig {
     HttpConfig {
@@ -49,8 +102,225 @@ async fn run_websocket(source: &str, config: HttpConfig) -> Result<Vm, vm::VmErr
     }
 }
 
+async fn drive_websocket(vm: &mut Vm) -> VmResult<()> {
+    let mut status = vm.run()?;
+    loop {
+        match status {
+            VmStatus::Halted => return Ok(()),
+            VmStatus::Yielded => status = vm.resume()?,
+            VmStatus::Waiting(_) => {
+                vm.await_waiting_host_op().await?;
+                status = vm.resume()?;
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn websocket_callback_wait_cannot_return_stop_after_the_total_deadline() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("client should connect");
+        let _socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake should succeed");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    });
+    let source = format!(
+        r#"
+        use http;
+        fn async_wait() -> bool;
+        fn callback(item: map) -> map {{
+            {{ action: if async_wait() => {{ "stop" }} else => {{ "stop" }} }}
+        }}
+        http::client::websocket({{
+            url: "ws://{address}/",
+            timeout_ms: 90
+        }}, callback);
+        "#
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    let mut config = websocket_config(address.port());
+    config.max_stream_duration = Duration::from_secs(1);
+    vm.configure_http(config)
+        .expect("configuration should install");
+    vm.set_async_bridge(Box::<TokioHostDriver>::default());
+    let mut registry = HostFunctionRegistry::new();
+    registry.register_stack("async_wait", 0, || Box::new(AsyncWaitOnce));
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("imports should bind");
+
+    let error = drive_websocket(&mut vm)
+        .await
+        .expect_err("callback time must count against the total deadline");
+    assert!(error.to_string().contains("deadline exceeded"), "{error}");
+    assert!(vm.stack().iter().all(|value| {
+        !matches!(value, Value::Map(map) if map.get(&Value::string("outcome")) == Some(&Value::string("stopped")))
+    }));
+    server.await.expect("server should finish");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn websocket_host_deadline_releases_permit_for_vm_reuse() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        let (first, _) = listener
+            .accept()
+            .await
+            .expect("first client should connect");
+        let first = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(first);
+        });
+        let (second, _) = listener
+            .accept()
+            .await
+            .expect("second client should connect");
+        let mut socket = tokio_tungstenite::accept_async(second)
+            .await
+            .expect("second handshake should succeed");
+        let terminal = tokio::time::timeout(Duration::from_millis(300), socket.next())
+            .await
+            .expect("second client should stop promptly");
+        assert!(terminal.is_none() || terminal.is_some_and(|item| item.is_err()));
+        first.await.expect("first connection holder should finish");
+    });
+    let source = format!(
+        r#"
+        use http;
+        http::client::websocket({{
+            url: "ws://{address}/",
+            timeout_ms: 500
+        }}, |item| {{ action: "stop" }});
+        "#
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_http_max_in_flight(1);
+    let mut config = websocket_config(address.port());
+    config.max_stream_duration = Duration::from_millis(100);
+    config.stream_idle_timeout = Duration::from_secs(1);
+    vm.configure_http(config)
+        .expect("configuration should install");
+    HostFunctionRegistry::new()
+        .bind_vm_cached(&mut vm)
+        .expect("imports should bind");
+
+    let error = drive_websocket(&mut vm)
+        .await
+        .expect_err("host deadline should bound the first handshake");
+    assert!(error.to_string().contains("deadline"), "{error}");
+    vm.reset_for_reuse();
+    drive_websocket(&mut vm)
+        .await
+        .expect("second run should acquire the released permit");
+    assert_eq!(
+        map_field(&vm.stack()[0], "outcome"),
+        &Value::string("stopped")
+    );
+    server.await.expect("server should finish");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn websocket_script_timeout_expires_during_periodic_active_traffic() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("client should connect");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake should succeed");
+        for index in 0..10 {
+            if socket
+                .send(Message::text(format!("item-{index}")))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    });
+    let source = format!(
+        r#"
+        use http;
+        fn callback(item: map) -> map {{ {{ action: "continue" }} }}
+        http::client::websocket({{
+            url: "ws://{address}/",
+            timeout_ms: 110
+        }}, callback);
+        "#
+    );
+    let mut config = websocket_config(address.port());
+    config.max_stream_duration = Duration::from_secs(2);
+    config.stream_idle_timeout = Duration::from_millis(250);
+    let started = tokio::time::Instant::now();
+    let error = match run_websocket(&source, config).await {
+        Ok(_) => panic!("total deadline must terminate active traffic"),
+        Err(error) => error,
+    };
+    let elapsed = started.elapsed();
+    assert!(error.to_string().contains("deadline exceeded"), "{error}");
+    assert!(elapsed >= Duration::from_millis(80), "elapsed {elapsed:?}");
+    assert!(elapsed < Duration::from_millis(400), "elapsed {elapsed:?}");
+    server.await.expect("server should finish");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn websocket_invalid_timeout_is_rejected_before_permit_or_socket_admission() {
+    for timeout in ["0", "-1", "\"wrong\""] {
+        let source = format!(
+            r#"
+            use http;
+            fn callback(item: map) -> map {{ {{ action: "stop" }} }}
+            http::client::websocket({{
+                url: "ws://127.0.0.1:1/",
+                timeout_ms: {timeout}
+            }}, callback);
+            "#
+        );
+        let compiled = compile_source(&source).expect("source should compile");
+        let mut vm = Vm::new(compiled.program);
+        vm.configure_http(websocket_config(1))
+            .expect("configuration should install");
+        vm.set_http_max_in_flight(0);
+        HostFunctionRegistry::new()
+            .bind_vm_cached(&mut vm)
+            .expect("host functions should bind");
+        let error = vm.run().expect_err("invalid timeout must fail");
+        assert!(error.to_string().contains("timeout_ms"), "{error}");
+        assert!(
+            !error.to_string().contains("in-flight request limit"),
+            "timeout validation must precede permit admission: {error}"
+        );
+    }
+}
+
 #[test]
 fn websocket_callable_is_feature_gated_with_typed_callback_metadata() {
+    assert!(
+        compile_source(
+            r#"
+            use http;
+            http::client::websocket(
+                { url: "ws://example.test/socket" },
+                |item| 1
+            );
+            "#,
+        )
+        .is_err(),
+        "wrong callback schema must fail before transport admission"
+    );
     let callable = default_host_callables()
         .iter()
         .find(|callable| callable.name == "http::client::websocket")
@@ -681,12 +951,13 @@ async fn local_close_uses_close_timeout_instead_of_idle_timeout() {
     );
     let mut config = websocket_config(address.port());
     config.stream_idle_timeout = Duration::from_millis(10);
-    config.websocket_close_timeout = Duration::from_millis(40);
+    config.websocket_close_timeout = Duration::from_millis(200);
+    config.max_stream_duration = Duration::from_millis(60);
     let error = match run_websocket(&source, config).await {
         Ok(_) => panic!("missing close acknowledgment must time out"),
         Err(error) => error,
     };
-    assert!(error.to_string().contains("close handshake timed out"));
+    assert!(error.to_string().contains("deadline exceeded"));
     server.await.expect("server should finish");
 }
 
@@ -721,38 +992,37 @@ fn request_validation_rejects_managed_headers_before_connection() {
     }
 }
 
-#[test]
-fn timeout_ms_is_rejected_before_any_connection_attempt() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener should bind");
-    listener
-        .set_nonblocking(true)
-        .expect("listener should become nonblocking");
+#[tokio::test(flavor = "current_thread")]
+async fn timeout_ms_bounds_the_opening_handshake() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
     let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.expect("client should connect");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    });
     let source = format!(
         r#"
         use http;
         fn callback(item: map) -> map {{ {{ action: "stop" }} }}
         http::client::websocket({{
             url: "ws://{address}/",
-            timeout_ms: 25
+            timeout_ms: 60
         }}, callback);
         "#
     );
-    let compiled = compile_source(&source).expect("source should compile");
-    let mut vm = Vm::new(compiled.program);
-    vm.configure_http(websocket_config(address.port())).unwrap();
-    HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
-    let error = vm
-        .run()
-        .expect_err("timeout_ms must fail during synchronous admission");
-    assert!(
-        error
-            .to_string()
-            .contains("no externally bounded streaming deadline is available"),
-        "unexpected error: {error}"
-    );
-    let accept_error = listener
-        .accept()
-        .expect_err("admission failure must prevent a connection attempt");
-    assert_eq!(accept_error.kind(), std::io::ErrorKind::WouldBlock);
+    let mut config = websocket_config(address.port());
+    config.connect_timeout = Duration::from_secs(1);
+    config.max_stream_duration = Duration::from_secs(2);
+    let started = tokio::time::Instant::now();
+    let error = match run_websocket(&source, config).await {
+        Ok(_) => panic!("opening handshake must be bounded by timeout_ms"),
+        Err(error) => error,
+    };
+    let elapsed = started.elapsed();
+    assert!(error.to_string().contains("deadline"), "{error}");
+    assert!(elapsed >= Duration::from_millis(40), "elapsed {elapsed:?}");
+    assert!(elapsed < Duration::from_millis(250), "elapsed {elapsed:?}");
+    server.await.expect("server should finish");
 }
