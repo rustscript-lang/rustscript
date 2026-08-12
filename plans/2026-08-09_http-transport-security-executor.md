@@ -1,5 +1,7 @@
 # Async Host Transport Security Plan
 
+> **HTTP streaming supersession (2026-08-12):** This plan remains authoritative for the generic host-driven async ABI, IO feature selection, buffered `http::client::request`, transport security, and VM-internal lifecycle cleanup. `2026-08-12_callable-streaming-http-client.md` supersedes any extension of this design to streaming HTTP. SSE and WebSocket use script callables and do not expose request handles, `next_*`, `close`, or cancellation APIs.
+
 **Goal:** Make HTTP a host-driven async host function, provide feature-selected blocking/async IO implementations, and preserve transport security without any HTTP-owned scheduler.
 
 **Architecture:** `#[pd_host_function] async fn` produces a generic async host factory. The VM allocates an operation ID and hands the resulting `'static` future to the embedding's `HostAsyncBridge`; the host owns submission, waking, polling, cancellation, and reactor/executor integration. HTTP contains only policy, request construction, transport, redirect, deadline, and response decoding logic. Edge scopes and `SharedProxyVmContext` expansion remain owned by `pd-edge`.
@@ -44,6 +46,7 @@
 - A VM-owned Tokio runtime or process executor.
 - HTTP-specific scheduling infrastructure.
 - Provider JSON, retries, model selection, SSE semantic parsing, or agent loops.
+- SSE/WebSocket delivery and their callable stream pump; these are owned by `2026-08-12_callable-streaming-http-client.md`.
 - Ambient proxy support by default.
 - Script-controlled policy relaxation.
 - Source-language futures or `await` syntax.
@@ -130,6 +133,8 @@ The core proc-macro must retain only name-based generic sync/async host expansio
 8. Disable ambient environment proxies unless the embedding supplies explicit policy.
 
 ### Milestone 6: Cancellation and lifecycle convergence
+
+This milestone defines VM/embedding cleanup of pending host work. It does not define a script-visible HTTP cancellation callable, request ID, or resource handle. Streaming HTTP follows the callable-controlled terminal contract in `2026-08-12_callable-streaming-http-client.md`.
 
 1. Propagate run cancellation/deadline/reset/drop to `HostAsyncBridge::cancel_op_with_reason`.
 2. Ensure driver completion after a terminal run cannot re-enter the VM.

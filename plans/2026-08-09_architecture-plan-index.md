@@ -22,6 +22,7 @@
 | Execution contract | Return/event ambiguity, buffered-only events, string errors, fragmented terminal state | `2026-08-09_run-outcome-event-error-contract.md` | RunContext; host lifecycle for final cancellation integration |
 | Authorization | Builtin fast-path bypass, mutable identity/cache complexity, Edge macro leakage | `2026-08-09_capability-profile-host-binding.md` | static IDs |
 | Async host transport | Core macro contains Edge scope knowledge; HTTP owns a synchronous scheduler; IO lacks feature-selected blocking/async bindings | `2026-08-09_http-transport-security-executor.md` | capability profile and host lifecycle |
+| Streaming HTTP | Buffered HTTP cannot expose SSE/WebSocket items incrementally; a network future cannot re-enter the VM safely | `2026-08-12_callable-streaming-http-client.md` | async host transport, real script call frames/callable schemas, capability profile |
 | Structured concurrency | One waiting slot, no generic multi-operation/child-program supervisor | `2026-08-09_structured-task-supervisor.md` | VM decomposition, host lifecycle, capability profile |
 | Backend architecture | Repeated semantics across interpreter/JIT/AOT/native/no-std | `2026-08-09_backend-semantic-convergence.md` | static IDs, VM decomposition |
 
@@ -66,9 +67,10 @@ Exit gate: production host subsystems use one lifecycle, and every invocation yi
 Can run in parallel after their dependencies:
 
 1. Generic host-driven async ABI, IO dual implementation, and async-only HTTP transport security.
-2. Structured task supervisor.
-3. Backend semantic convergence.
-4. Agent run lifecycle and durable state integration.
+2. Callable-driven SSE and WebSocket after the async-host boundary and callable schemas are complete.
+3. Structured task supervisor.
+4. Backend semantic convergence.
+5. Agent run lifecycle and durable state integration.
 
 ### Local-slot correction and capacity route
 
@@ -90,6 +92,7 @@ Exit gate: separate frames reuse relative slots, direct-only named functions do 
 - Structural plans remove superseded transitional paths after migration; they do not retain dual long-term architectures.
 - New generic host functions require their own implementation plans; this index covers the architecture findings already identified.
 - Async host futures are driven by the embedding host. VM, HTTP, and IO do not own a private executor or synchronous polling scheduler.
+- Streaming HTTP is delivered by a one-item host-to-callable pump. Scripts receive no request ID, stream/socket handle, pull API, or HTTP cancellation callable.
 - Core host macros contain no pd-edge scopes, context types, registry generation, or downstream module paths.
 
 ## Target criteria
