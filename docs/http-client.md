@@ -1,12 +1,14 @@
 # HTTP client callable contract
 
-RustScript exposes HTTP as bounded host imports. The buffered request API returns one complete response. The streaming APIs keep one ordinary host call active and invoke a script callable for each protocol item. They do not expose a response stream or socket object.
+RustScript exposes HTTP as bounded host imports. The current buffered request API returns one complete response. The target streaming APIs keep one ordinary host call active and invoke a script callable for each protocol item; they expose no response stream or socket object.
 
-The embedding must configure destination policy and grant each callable explicitly. HTTP configuration and capability bindings are snapshotted when a call is admitted, so later profile or configuration changes cannot widen an active connection.
+The embedding must configure destination policy and grant each available callable explicitly. HTTP configuration and capability bindings are snapshotted when a call is admitted, so later profile or configuration changes cannot widen an active connection.
+
+**Milestone boundary:** At this documentation baseline, the script-facing HTTP API is limited to buffered `http::client::request`. Milestones 1–4 establish the typed callback admission, generic callable stream pump, and shared connection policy used by streaming transports. The SSE and WebSocket sections below define the target contracts delivered by Milestones 5 and 6, respectively.
 
 ## Capabilities and profiles
 
-The three imports are independent capabilities:
+Across the complete Milestones 1–6 contract, the three imports are independent capabilities:
 
 - `http::client::request`
 - `http::client::sse`
@@ -14,12 +16,13 @@ The three imports are independent capabilities:
 
 Granting `http::client::request` does not grant either streaming protocol, and granting one streaming protocol does not grant the other. A restricted host-function profile must allow every imported callable used by the program. Profiles remain isolated: a grant or configuration in one VM/profile does not authorize another.
 
-These APIs are host imports gated by the HTTP client feature. They do not consume or change static builtin IDs. See [Script call frames and callable values](callable-runtime.md) for callable execution and backend behavior.
+Each available API is a host import gated by the HTTP client feature. The complete three-import contract does not consume or change static builtin IDs. See [Script call frames and callable values](callable-runtime.md) for callable execution and backend behavior.
 
 ## Buffered requests
 
 ```rust
 use http;
+use bytes;
 
 let response = http::client::request({
     "method": "POST",
@@ -51,6 +54,8 @@ The response is buffered under the configured response-body limit and returned a
 
 ## Server-sent events
 
+> **Milestone 5 target contract:** `http::client::sse` becomes script-facing when the SSE protocol adapter is integrated; it is not part of the Milestones 1–4 API surface.
+
 ```rust
 fn on_sse(item: map) -> map {
     if item["kind"] == "event" {
@@ -66,7 +71,17 @@ let result = http::client::sse({
 }, on_sse);
 ```
 
-`http::client::sse(request, on_event)` accepts a GET or POST request over `http` or `https`. The callback schema is `fn(map) -> map`. `Accept: text/event-stream` is supplied when absent, and the response must have an event-stream content type.
+`http::client::sse(request, on_event)` uses this request map:
+
+| Field | Required | Accepted type and value | Bound or policy |
+| --- | --- | --- | --- |
+| `method` | yes | string: `GET` or `POST` | Other methods are rejected before transport admission |
+| `url` | yes | string containing an `http` or `https` URL | Protocol family and the configured scheme, host, port, and address policy must all admit it |
+| `headers` | no | map from string header names to string values | Subject to the shared request-header bound; client-managed request headers remain forbidden, and `Accept: text/event-stream` is supplied when absent |
+| `body` | no | bytes or string, including for `POST` | Bounded by `max_request_body_bytes` |
+| `timeout_ms` | no | positive integer milliseconds | Capped by host policy; it cannot disable or extend an embedding deadline |
+
+The callback schema is `fn(map) -> map`, and the response must have an event-stream content type.
 
 The callback receives exactly one map at a time, in this order:
 
@@ -115,6 +130,8 @@ There is no automatic reconnection. Values such as a provider's `[DONE]` marker 
 
 ## WebSocket sessions
 
+> **Milestone 6 target contract:** `http::client::websocket` becomes script-facing when the WebSocket protocol adapter is integrated; it is not part of the Milestones 1–4 API surface.
+
 ```rust
 fn on_socket(item: map) -> map {
     if item["kind"] == "open" {
@@ -133,7 +150,16 @@ let result = http::client::websocket({
 }, on_socket);
 ```
 
-`http::client::websocket(request, on_event)` accepts a `ws` or `wss` URL, optional headers, and optional subprotocol strings. Upgrade headers are client-managed. The callback schema is `fn(map) -> map`.
+`http::client::websocket(request, on_event)` uses this request map:
+
+| Field | Required | Accepted type and value | Bound or policy |
+| --- | --- | --- | --- |
+| `url` | yes | string containing a `ws` or `wss` URL | Protocol family and the configured scheme, host, port, and address policy must all admit it |
+| `headers` | no | map from string header names to string values | Subject to the shared handshake-header bound; client-managed upgrade headers are rejected |
+| `protocols` | no | array of subprotocol strings | The encoded offer is subject to the shared handshake-header bound; the peer-selected subprotocol must match this offered list |
+| `timeout_ms` | no | positive integer milliseconds | Capped by host policy; it cannot disable or extend an embedding deadline |
+
+The callback schema is `fn(map) -> map`.
 
 After a validated `101` upgrade, the callback receives `open`, followed by incoming protocol items:
 
@@ -212,7 +238,7 @@ The network future never owns or re-enters the VM. Callback error, protocol comp
 
 ## Configuration defaults
 
-`HttpConfig` uses explicit positive limits. Its reviewed defaults are:
+`HttpConfig` uses explicit bounded defaults. Streaming byte limits and all timeout fields must remain positive:
 
 | Field | Default | Purpose |
 | --- | ---: | --- |
@@ -233,11 +259,11 @@ The network future never owns or re-enters the VM. Callback error, protocol comp
 | `stream_idle_timeout` | 30 s | Wait-for-network-data bound |
 | `websocket_close_timeout` | 5 s | Close-handshake wait bound |
 
-The shared in-flight connection default is 64. Zero byte limits or zero timeouts are invalid configuration. Embeddings should set explicit host and port allowlists and add `http`, `ws`, or `wss` only when those schemes are required. Buffered HTTP and SSE accept only `http`/`https`; WebSocket accepts only `ws`/`wss`. `https` and `wss` are the public-network defaults.
+The shared in-flight connection default is 64. Zero values for streaming byte limits or any timeout are invalid configuration; buffered `max_request_body_bytes` and `max_response_body_bytes` may be zero to prohibit request or response payload bytes. `HttpConfig::default()` allows only `https`, so an embedding must explicitly add `wss` before a secure WebSocket URL can pass admission. Embeddings should set explicit host and port allowlists and add `http`, `ws`, or `wss` only when those schemes are required. Buffered HTTP and SSE accept only `http`/`https`; WebSocket accepts only `ws`/`wss`. The recommended secure protocol families are `https` and `wss`; that recommendation does not widen the actual default allowlist.
 
-## Destination and transport security
+## Destination policy and protocol transports
 
-Every connection attempt uses the shared Hyper/Rustls-based destination policy:
+Every protocol uses the same admission, address-pinning, and security policy:
 
 - URLs require a host and reject userinfo;
 - both the protocol's scheme family and the configured scheme allowlist must admit the URL;
@@ -250,6 +276,8 @@ Every connection attempt uses the shared Hyper/Rustls-based destination policy:
 - ambient proxy settings are ignored. There is no implicit cookie jar, authentication source, or global proxy state.
 
 The policy snapshot taken at call admission applies for the complete operation.
+
+Protocol transport remains separate from that shared policy. Buffered HTTP and the SSE target use reviewed direct Hyper HTTP/1 over Tokio/Rustls connections. The WebSocket protocol adapter may use Tungstenite over a prevalidated, pinned Tokio/Rustls stream; it must not perform an independent DNS lookup or connection outside the shared admission and pinning path.
 
 ## Deliberately absent APIs and semantics
 

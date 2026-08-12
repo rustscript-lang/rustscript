@@ -80,7 +80,7 @@ Polling drives execution and provides backpressure: at most one event item is bu
 
 ## Callable-driven HTTP streams
 
-The HTTP client keeps buffered `http::client::request(request)` and defines `http::client::sse(request, on_event)` and `http::client::websocket(request, on_event)` as long-running ordinary host calls. Each handler has the schema `fn(map) -> map`. The host produces one protocol item, the VM runs one child callback frame, and the returned action controls continuation or a WebSocket write before another item can arrive at the VM boundary.
+At this documentation baseline, buffered `http::client::request(request)` remains the only script-facing HTTP call. Milestones 1–4 establish the typed callback admission, generic callable stream pump, and shared connection policy. Milestones 5–6 deliver `http::client::sse(request, on_event)` and `http::client::websocket(request, on_event)` as long-running ordinary host calls. The remainder of this section describes that Milestones 5–6 target contract. Each handler has the schema `fn(map) -> map`. The host produces one protocol item, the VM runs one child callback frame, and the returned action controls continuation or a WebSocket write before another item can arrive at the VM boundary.
 
 The callback may yield or wait in an ordinary async host call. Existing frame machinery resumes the callback first and returns its final action to the suspended HTTP call. The network future does not own or enter the VM and is not polled while the callback is active, so at most one item remains unacknowledged and callback completion supplies backpressure.
 
