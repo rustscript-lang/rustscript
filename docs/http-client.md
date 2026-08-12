@@ -79,7 +79,7 @@ let result = http::client::sse({
 | `url` | yes | string containing an `http` or `https` URL | Protocol family and the configured scheme, host, port, and address policy must all admit it |
 | `headers` | no | map from string header names to string values | Names and values must be syntactically valid; client-managed request headers remain forbidden, and `Accept: text/event-stream` is supplied when absent |
 | `body` | no | bytes or string, including for `POST` | Bounded by `max_request_body_bytes` |
-| `timeout_ms` | no | positive integer milliseconds | Optional shortening deadline capped by `HttpConfig::max_stream_duration` |
+| `timeout_ms` | no | positive integer milliseconds | Milestone 5 will cap this optional shortening deadline by `HttpConfig::max_stream_duration` |
 
 The callback schema is `fn(map) -> map`, and the response must have an event-stream content type. The response head remains bounded by the existing HTTP parser. The target contract adds no configurable request-header byte accounting.
 
@@ -157,7 +157,7 @@ let result = http::client::websocket({
 | `url` | yes | string containing a `ws` or `wss` URL | Protocol family and the configured scheme, host, port, and address policy must all admit it |
 | `headers` | no | map from string header names to string values | Names and values must be syntactically valid; client-managed upgrade headers are rejected |
 | `protocols` | no | array of syntactically valid subprotocol strings | The peer-selected subprotocol must match this offered list |
-| `timeout_ms` | no | positive integer milliseconds | Future WebSocket integration must cap this shortening deadline by `HttpConfig::max_stream_duration`, matching SSE |
+| `timeout_ms` | no | positive integer milliseconds | Milestone 6 will cap this optional shortening deadline by `HttpConfig::max_stream_duration`, matching the Milestone 5 SSE contract |
 
 The callback schema is `fn(map) -> map`. The handshake response head remains bounded by the existing HTTP parser. The target contract adds no configurable request-header byte accounting.
 
@@ -234,7 +234,7 @@ At most one unacknowledged protocol item crosses the host/VM boundary. Decoder s
 
 The network future never owns or re-enters the VM. Callback error, protocol completion, configured deadline, VM reset/shutdown/drop, invocation termination, or normal return retires the operation exactly once. The embedding owns pending futures: retiring a call drops its transport and permit, and a late completion cannot re-enter the VM.
 
-`request_timeout` is the total bound for a buffered request and does not apply to streaming. `max_stream_duration` is the host-controlled absolute total-duration bound for a streaming call. SSE computes one admission-time deadline from the smaller of `max_stream_duration` and optional positive `timeout_ms`; the script value can only shorten the call and cannot disable or extend the host maximum. The same field and capping rule are required when WebSocket integration is added. Embedding invocation retirement may still terminate either protocol sooner. `stream_idle_timeout` remains a separate wait-for-network-progress bound and resets only after progress; periodic traffic cannot extend the total deadline. Network idle time excludes time spent inside the callback, while callback work remains subject to embedding invocation lifecycle. WebSocket close waiting is additionally bounded by `websocket_close_timeout`.
+`request_timeout` is the current total bound for a buffered request and does not apply to streaming. Under the target Milestones 5–6 contract, `max_stream_duration` becomes the host-controlled absolute total-duration bound for each streaming call. SSE will compute one admission-time deadline from the smaller of `max_stream_duration` and optional positive `timeout_ms`; the script value can only shorten the call and cannot disable or extend the host maximum. WebSocket will use the same field and capping rule when its adapter is integrated. Embedding invocation retirement may still terminate either protocol sooner. `stream_idle_timeout` remains a separate wait-for-network-progress bound and resets only after progress; periodic traffic cannot extend the total deadline. Network idle time excludes time spent inside the callback, while callback work remains subject to embedding invocation lifecycle. WebSocket close waiting is additionally bounded by `websocket_close_timeout`.
 
 ## Configuration defaults
 
@@ -256,7 +256,7 @@ The network future never owns or re-enters the VM. Callback error, protocol comp
 | `max_sse_line_bytes` | 64 KiB | SSE line bound |
 | `max_websocket_frame_bytes` | 1 MiB | WebSocket frame bound |
 | `max_websocket_send_bytes` | 1 MiB | One WebSocket outbound action bound |
-| `max_stream_duration` | 5 min | Host maximum total duration for one streaming call; currently enforced by SSE and required for future WebSocket integration |
+| `max_stream_duration` | 5 min | Target Milestones 5–6 host maximum total duration for SSE and WebSocket calls |
 | `stream_idle_timeout` | 30 s | Wait-for-network-data bound |
 | `websocket_close_timeout` | 5 s | Close-handshake wait bound |
 
