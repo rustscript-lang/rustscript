@@ -27,17 +27,30 @@ fn alias_exports_op_code() {
 
 #[cfg(feature = "runtime")]
 #[test]
-fn alias_exports_public_runtime_event_contract() {
-    fn accept_sink<S: rustscript::EventSink>(_sink: S) {}
+fn alias_exports_public_invocation_stream_contract() {
+    fn accept_item(_item: rustscript::InvocationItem) {}
 
-    struct Sink;
-    impl rustscript::EventSink for Sink {
-        fn emit(&mut self, _payload: rustscript::EventPayload) -> rustscript::RuntimeResult<()> {
-            Ok(())
-        }
-    }
+    accept_item(rustscript::InvocationItem::Complete(
+        rustscript::Value::Null,
+    ));
+    accept_item(rustscript::InvocationItem::Event(rustscript::Value::Bool(
+        true,
+    )));
 
-    accept_sink(Sink);
+    fn accept_poll(_poll: rustscript::InvocationPoll) {}
+    accept_poll(rustscript::InvocationPoll::Pending);
+    accept_poll(rustscript::InvocationPoll::Ready(None));
+    accept_poll(rustscript::InvocationPoll::Ready(Some(Ok(
+        rustscript::InvocationItem::Complete(rustscript::Value::Null),
+    ))));
+
+    fn accept_error(_error: rustscript::InvocationError) {}
+    accept_error(rustscript::InvocationError::Cancelled(
+        rustscript::CancellationReason::Requested,
+    ));
+    accept_error(rustscript::InvocationError::Host {
+        message: "boom".to_string(),
+    });
 }
 
 #[cfg(feature = "http-client")]

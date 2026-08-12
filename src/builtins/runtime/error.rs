@@ -8,12 +8,8 @@ pub type RuntimeResult<T> = Result<T, RuntimeError>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeErrorCode {
     InvalidConfiguration,
-    InputUnavailable,
-    EventSinkUnavailable,
     EventPayloadTooLarge,
     EventDepthExceeded,
-    EventSequenceExhausted,
-    EventSinkRejected,
     ResourceLimitExceeded,
     InvalidResourceHandle,
     ResourceHandleWrongTable,
@@ -35,12 +31,8 @@ impl RuntimeErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidConfiguration => "invalid_configuration",
-            Self::InputUnavailable => "input_unavailable",
-            Self::EventSinkUnavailable => "event_sink_unavailable",
             Self::EventPayloadTooLarge => "event_payload_too_large",
             Self::EventDepthExceeded => "event_depth_exceeded",
-            Self::EventSequenceExhausted => "event_sequence_exhausted",
-            Self::EventSinkRejected => "event_sink_rejected",
             Self::ResourceLimitExceeded => "resource_limit_exceeded",
             Self::InvalidResourceHandle => "invalid_resource_handle",
             Self::ResourceHandleWrongTable => "resource_handle_wrong_table",
@@ -150,14 +142,14 @@ mod tests {
     fn structured_error_preserves_code_and_fields() {
         let error = RuntimeError::new(
             RuntimeErrorCode::EventPayloadTooLarge,
-            "runtime::emit",
+            "stream::emit",
             "event payload exceeds the configured bound",
         )
         .with_limit(32)
         .with_value(64);
 
         assert_eq!(error.code(), RuntimeErrorCode::EventPayloadTooLarge);
-        assert_eq!(error.operation(), "runtime::emit");
+        assert_eq!(error.operation(), "stream::emit");
         assert_eq!(error.limit(), Some(32));
         assert_eq!(error.value(), Some(64));
         assert!(error.to_string().contains("event_payload_too_large"));

@@ -4,46 +4,32 @@ use super::error::{RuntimeError, RuntimeErrorCode, RuntimeResult};
 
 pub const DEFAULT_MAX_EVENT_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_EVENT_DEPTH: usize = 64;
-pub const DEFAULT_MAX_EVENTS: u64 = 1_024;
-pub const DEFAULT_MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
 
-/// Bounds applied before an event is handed to an embedding-owned sink.
+/// Per-item bounds applied to one `stream::emit(value)` call.
+///
+/// The core validates only this per-item value bound before placing the value
+/// in the active invocation's single pending-event slot. Sequence assignment,
+/// cumulative byte accounting, event receipts, and embedding-owned sinks are
+/// not part of the core contract; delivery policy belongs to the embedding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EventLimits {
     max_payload_bytes: usize,
     max_depth: usize,
-    max_events: u64,
-    max_total_bytes: usize,
 }
 
+#[allow(dead_code)]
 impl EventLimits {
     pub fn new(max_payload_bytes: usize, max_depth: usize) -> RuntimeResult<Self> {
-        Self::with_budget(
-            max_payload_bytes,
-            max_depth,
-            DEFAULT_MAX_EVENTS,
-            DEFAULT_MAX_EVENT_BYTES,
-        )
-    }
-
-    pub fn with_budget(
-        max_payload_bytes: usize,
-        max_depth: usize,
-        max_events: u64,
-        max_total_bytes: usize,
-    ) -> RuntimeResult<Self> {
-        if max_payload_bytes == 0 || max_depth == 0 || max_events == 0 || max_total_bytes == 0 {
+        if max_payload_bytes == 0 || max_depth == 0 {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidConfiguration,
-                "runtime::emit",
+                "stream::emit",
                 "event payload and depth limits must be positive",
             ));
         }
         Ok(Self {
             max_payload_bytes,
             max_depth,
-            max_events,
-            max_total_bytes,
         })
     }
 
@@ -54,14 +40,6 @@ impl EventLimits {
     pub const fn max_depth(self) -> usize {
         self.max_depth
     }
-
-    pub const fn max_events(self) -> u64 {
-        self.max_events
-    }
-
-    pub const fn max_total_bytes(self) -> usize {
-        self.max_total_bytes
-    }
 }
 
 impl Default for EventLimits {
@@ -69,13 +47,11 @@ impl Default for EventLimits {
         Self {
             max_payload_bytes: DEFAULT_MAX_EVENT_PAYLOAD_BYTES,
             max_depth: DEFAULT_MAX_EVENT_DEPTH,
-            max_events: DEFAULT_MAX_EVENTS,
-            max_total_bytes: DEFAULT_MAX_EVENT_BYTES,
         }
     }
 }
 
-/// An event value whose size and nesting have already been checked.
+/// An event value whose per-item bound has been validated.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventPayload {
     value: Value,
@@ -88,10 +64,7 @@ impl EventPayload {
         Ok(Self { value, size_bytes })
     }
 
-    pub fn value(&self) -> &Value {
-        &self.value
-    }
-
+    #[allow(dead_code)]
     pub fn size_bytes(&self) -> usize {
         self.size_bytes
     }
@@ -101,148 +74,7 @@ impl EventPayload {
     }
 }
 
-/// Embedding-owned transport hook for bounded runtime events.
-pub trait EventSink: Send {
-    fn emit(&mut self, payload: EventPayload) -> RuntimeResult<()>;
-}
-
-impl<F> EventSink for F
-where
-    F: FnMut(EventPayload) -> RuntimeResult<()> + Send + 'static,
-{
-    fn emit(&mut self, payload: EventPayload) -> RuntimeResult<()> {
-        self(payload)
-    }
-}
-
-/// Validates and forwards generic values without attaching agent or platform semantics.
-pub struct EventEmitter {
-    limits: EventLimits,
-    sink: Option<Box<dyn EventSink>>,
-    emitted_events: u64,
-    emitted_bytes: usize,
-}
-
-#[allow(dead_code)]
-impl EventEmitter {
-    pub fn new(limits: EventLimits) -> Self {
-        Self {
-            limits,
-            sink: None,
-            emitted_events: 0,
-            emitted_bytes: 0,
-        }
-    }
-
-    pub fn limits(&self) -> EventLimits {
-        self.limits
-    }
-
-    pub fn set_sink<S>(&mut self, sink: S)
-    where
-        S: EventSink + 'static,
-    {
-        self.sink = Some(Box::new(sink));
-    }
-
-    pub fn clear_sink(&mut self) {
-        self.sink = None;
-    }
-
-    pub fn reset_for_reuse(&mut self) {
-        self.sink = None;
-        self.emitted_events = 0;
-        self.emitted_bytes = 0;
-    }
-
-    pub fn emitted_events(&self) -> u64 {
-        self.emitted_events
-    }
-
-    pub fn emit(&mut self, value: Value) -> RuntimeResult<EventReceipt> {
-        let payload = EventPayload::try_new(value, self.limits)?;
-        if self.emitted_events >= self.limits.max_events {
-            return Err(RuntimeError::new(
-                RuntimeErrorCode::EventSequenceExhausted,
-                "runtime::emit",
-                "event count exceeds the configured bound",
-            )
-            .with_limit(self.limits.max_events.min(usize::MAX as u64) as usize)
-            .with_value(self.emitted_events));
-        }
-        let total_bytes = self
-            .emitted_bytes
-            .checked_add(payload.size_bytes())
-            .ok_or_else(|| {
-                RuntimeError::new(
-                    RuntimeErrorCode::EventPayloadTooLarge,
-                    "runtime::emit",
-                    "cumulative event bytes overflowed",
-                )
-            })?;
-        if total_bytes > self.limits.max_total_bytes {
-            return Err(RuntimeError::new(
-                RuntimeErrorCode::EventPayloadTooLarge,
-                "runtime::emit",
-                "cumulative event bytes exceed the configured bound",
-            )
-            .with_limit(self.limits.max_total_bytes)
-            .with_value(total_bytes as u64));
-        }
-        let sequence = self.emitted_events.checked_add(1).ok_or_else(|| {
-            RuntimeError::new(
-                RuntimeErrorCode::EventSequenceExhausted,
-                "runtime::emit",
-                "event sequence exhausted",
-            )
-        })?;
-        let sink = self.sink.as_mut().ok_or_else(|| {
-            RuntimeError::new(
-                RuntimeErrorCode::EventSinkUnavailable,
-                "runtime::emit",
-                "an event sink has not been configured",
-            )
-        })?;
-        sink.emit(payload.clone()).map_err(|error| {
-            RuntimeError::new(
-                RuntimeErrorCode::EventSinkRejected,
-                "runtime::emit",
-                error.to_string(),
-            )
-        })?;
-        self.emitted_events = sequence;
-        self.emitted_bytes = total_bytes;
-        Ok(EventReceipt {
-            sequence,
-            payload_bytes: payload.size_bytes(),
-        })
-    }
-}
-
-impl Default for EventEmitter {
-    fn default() -> Self {
-        Self::new(EventLimits::default())
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EventReceipt {
-    sequence: u64,
-    payload_bytes: usize,
-}
-
-#[allow(dead_code)]
-impl EventReceipt {
-    pub const fn sequence(self) -> u64 {
-        self.sequence
-    }
-
-    pub const fn payload_bytes(self) -> usize {
-        self.payload_bytes
-    }
-}
-
-/// Estimates the bounded representation size used by [`EventPayload`].
+/// Estimates the bounded representation size of a value.
 ///
 /// The estimate is deliberately independent of serialization formats. It counts scalar tags,
 /// container headers, string/byte contents, and recursively contained values. The host transport
@@ -255,7 +87,7 @@ fn measure_value(value: &Value, depth: usize, limits: EventLimits) -> RuntimeRes
     if depth > limits.max_depth {
         return Err(RuntimeError::new(
             RuntimeErrorCode::EventDepthExceeded,
-            "runtime::emit",
+            "stream::emit",
             "event payload nesting exceeds the configured bound",
         )
         .with_limit(limits.max_depth)
@@ -288,7 +120,7 @@ fn measure_value(value: &Value, depth: usize, limits: EventLimits) -> RuntimeRes
     if size > limits.max_payload_bytes {
         return Err(RuntimeError::new(
             RuntimeErrorCode::EventPayloadTooLarge,
-            "runtime::emit",
+            "stream::emit",
             "event payload exceeds the configured byte bound",
         )
         .with_limit(limits.max_payload_bytes)
@@ -305,7 +137,7 @@ fn checked_payload_add(
     let total = current.checked_add(additional).ok_or_else(|| {
         RuntimeError::new(
             RuntimeErrorCode::EventPayloadTooLarge,
-            "runtime::emit",
+            "stream::emit",
             "event payload size overflowed",
         )
         .with_limit(limits.max_payload_bytes)
@@ -313,7 +145,7 @@ fn checked_payload_add(
     if total > limits.max_payload_bytes {
         return Err(RuntimeError::new(
             RuntimeErrorCode::EventPayloadTooLarge,
-            "runtime::emit",
+            "stream::emit",
             "event payload exceeds the configured byte bound",
         )
         .with_limit(limits.max_payload_bytes)
@@ -324,22 +156,35 @@ fn checked_payload_add(
 
 #[cfg(test)]
 mod tests {
-    use super::{EventEmitter, EventLimits, EventPayload};
+    use super::{EventLimits, EventPayload};
     use crate::vm::Value;
 
     #[test]
-    fn payload_size_and_sequence_are_exposed_after_validation() {
-        let limits = EventLimits::new(128, 4).expect("limits should be valid");
+    fn per_item_limits_validate_payload_and_depth() {
+        let limits = EventLimits::new(32, 4).expect("limits should be valid");
         let payload =
             EventPayload::try_new(Value::string("event"), limits).expect("payload should fit");
         assert!(payload.size_bytes() >= 5);
+        assert_eq!(payload.into_value(), Value::string("event"));
+    }
 
-        let mut emitter = EventEmitter::new(limits);
-        emitter.set_sink(|_| Ok(()));
-        let receipt = emitter
-            .emit(Value::string("event"))
-            .expect("event should be emitted");
-        assert_eq!(receipt.sequence(), 1);
-        assert_eq!(emitter.emitted_events(), 1);
+    #[test]
+    fn oversized_or_too_deep_values_are_rejected_before_placement() {
+        let limits = EventLimits::new(8, 2).expect("limits should be valid");
+        let too_large = EventPayload::try_new(Value::string("payload-too-large"), limits)
+            .expect_err("oversized event should be rejected");
+        assert_eq!(
+            too_large.code(),
+            super::super::error::RuntimeErrorCode::EventPayloadTooLarge
+        );
+        let too_deep = EventPayload::try_new(
+            Value::array(vec![Value::array(vec![Value::array(vec![Value::Int(1)])])]),
+            limits,
+        )
+        .expect_err("too-deep event should be rejected");
+        assert_eq!(
+            too_deep.code(),
+            super::super::error::RuntimeErrorCode::EventDepthExceeded
+        );
     }
 }

@@ -1,5 +1,5 @@
 mod vm {
-    pub use ::vm::{Value, VmError, VmResult};
+    pub use ::vm::Value;
 }
 
 #[allow(dead_code)]
@@ -30,55 +30,37 @@ use resource::{CloseStatus, ResourceArena, ResourceHandle, ResourceTypeId};
 use vm::Value;
 
 #[test]
-fn runtime_input_is_run_scoped_and_missing_input_is_typed() {
-    let mut context = RuntimeContext::default();
-    let missing = context.input().expect_err("unset input should be rejected");
-    assert_eq!(missing.code(), RuntimeErrorCode::InputUnavailable);
+fn per_item_event_limits_are_run_scoped_configuration() {
+    let context = RuntimeContext::default();
+    assert_eq!(context.event_limits(), EventLimits::default());
+    assert_eq!(context.config().event_limits(), EventLimits::default());
 
-    let input = Value::map(vec![(Value::string("kind"), Value::string("message"))]);
-    context
-        .set_input(input.clone())
-        .expect("input should be accepted");
-    assert_eq!(context.input().expect("input should be available"), input);
-}
-
-#[test]
-fn runtime_emit_validates_payload_before_calling_the_sink() {
-    let mut context = RuntimeContext::with_config(RuntimeContextConfig::new(
+    let configured = RuntimeContext::with_config(RuntimeContextConfig::new(
         EventLimits::new(8, 4).expect("test limits should be valid"),
     ))
     .expect("context should be constructible");
-    let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
-    let seen_by_sink = Arc::clone(&seen);
-    context
-        .set_event_sink(move |payload: EventPayload| {
-            seen_by_sink
-                .lock()
-                .expect("event sink lock should not be poisoned")
-                .push(payload.into_value());
-            Ok(())
-        })
-        .expect("event sink should be installed");
-
-    context
-        .emit(Value::string("ok"))
-        .expect("bounded event should reach the sink");
-    assert_eq!(seen.lock().expect("event sink lock").len(), 1);
-
-    let too_large = context
-        .emit(Value::string("payload-too-large"))
-        .expect_err("oversized event should be rejected");
-    assert_eq!(too_large.code(), RuntimeErrorCode::EventPayloadTooLarge);
-    assert_eq!(seen.lock().expect("event sink lock").len(), 1);
+    assert_eq!(configured.event_limits().max_payload_bytes(), 8);
+    assert_eq!(configured.event_limits().max_depth(), 4);
 }
 
 #[test]
-fn runtime_emit_reports_missing_sink_without_dropping_the_value_contract() {
-    let mut context = RuntimeContext::default();
-    let error = context
-        .emit(Value::Bool(true))
-        .expect_err("emit without a sink should fail");
-    assert_eq!(error.code(), RuntimeErrorCode::EventSinkUnavailable);
+fn event_payload_validates_the_per_item_bound_before_placement() {
+    let limits = EventLimits::new(8, 4).expect("test limits should be valid");
+
+    let payload =
+        EventPayload::try_new(Value::string("ok"), limits).expect("bounded event should validate");
+    assert_eq!(payload.into_value(), Value::string("ok"));
+
+    let too_large = EventPayload::try_new(Value::string("payload-too-large"), limits)
+        .expect_err("oversized event should be rejected");
+    assert_eq!(too_large.code(), RuntimeErrorCode::EventPayloadTooLarge);
+
+    let too_deep = EventPayload::try_new(
+        Value::array(vec![Value::array(vec![Value::array(vec![Value::Int(1)])])]),
+        EventLimits::new(1024, 2).expect("depth test limits should be valid"),
+    )
+    .expect_err("too-deep event should be rejected");
+    assert_eq!(too_deep.code(), RuntimeErrorCode::EventDepthExceeded);
 }
 
 #[test]
