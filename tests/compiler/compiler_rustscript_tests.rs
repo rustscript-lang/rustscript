@@ -3636,6 +3636,46 @@ fn rustscript_explicit_optional_type_annotations_work() {
             expected_contains_all: &["callable body result expects 'int'", "got bool"],
         },
         SourceErrorCase {
+            name: "typed host callable parameters reject wrong closure arity",
+            source: r#"
+                fn stream(handler: fn(map) -> map) -> map;
+                stream(|value, extra| value);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::CallableArgumentTypeMismatch),
+            expected_contains_all: &[
+                "argument 'handler'",
+                "fn(map<unknown>) -> map<unknown>",
+                "takes 2 parameters",
+            ],
+        },
+        SourceErrorCase {
+            name: "typed host callable parameters reject wrong closure parameter type",
+            source: r#"
+                fn stream(handler: fn(map) -> map) -> map;
+                fn handle(value: int) -> map { { action: "continue" } }
+                stream(handle);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::CallableArgumentTypeMismatch),
+            expected_contains_all: &[
+                "argument 'handler' type mismatch",
+                "arg[0]",
+                "map<unknown>",
+                "int",
+            ],
+        },
+        SourceErrorCase {
+            name: "typed host callable parameters reject wrong closure return type",
+            source: r#"
+                fn stream(handler: fn(map) -> map) -> map;
+                stream(|value| 1);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::CallableArgumentTypeMismatch),
+            expected_contains_all: &["callable body result type mismatch", "map<unknown>", "int"],
+        },
+        SourceErrorCase {
             name: "json encode rejects bytes under strict rustscript typing",
             source: r#"
                 use json;

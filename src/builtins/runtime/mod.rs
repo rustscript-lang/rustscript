@@ -51,9 +51,10 @@ pub use io::{IoHostExt, IoPolicy};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SqliteHostExt, SqliteLimits, SqlitePolicy};
 pub use typed::HostCallResult;
+#[allow(unused_imports)]
 use typed::{
     AnyValue, IntoBuiltinCallOutcome, IntoHostCallOutcome, NumberValue, UnknownValue, VmArray,
-    VmBytes, VmMap, arg, borrow_arg, return_none, return_one, take_arg,
+    VmBytes, VmCallable, VmMap, arg, borrow_arg, return_none, return_one, take_arg,
 };
 
 pub(crate) enum BuiltinCallOutcome {

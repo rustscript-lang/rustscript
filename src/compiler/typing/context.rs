@@ -1977,6 +1977,34 @@ impl<'a> TypeContext<'a> {
         line_context: Option<u32>,
         source_name: Option<&str>,
     ) -> Result<(), CompileError> {
+        for (index, param) in signature.params.iter().enumerate() {
+            let crate::builtins::CallableParamType::Callable(callable) = param.ty else {
+                continue;
+            };
+            let Some(arg) = args.get(index) else {
+                continue;
+            };
+            let expected = crate::compiler::TypeSchema::Callable {
+                params: callable
+                    .params
+                    .iter()
+                    .copied()
+                    .map(callable_param_schema)
+                    .collect(),
+                result: Box::new(callable_param_schema(*callable.return_type)),
+            };
+            super::validate::validate_callable_expr_against_schema(
+                &format!("argument '{}'", param.name),
+                &expected,
+                arg,
+                state,
+                super::validate::DiagnosticSite {
+                    line: line_context,
+                    source_name,
+                },
+                self,
+            )?;
+        }
         if matches!(signature.name.as_str(), "print" | "println") {
             if args
                 .first()
@@ -2207,6 +2235,31 @@ impl<'a> TypeContext<'a> {
             state.set_with_optional_schema_origin(slot, ty, schema, from_declared_schema, optional);
             ty
         }
+    }
+}
+
+fn callable_param_schema(param: crate::builtins::CallableParamType) -> crate::compiler::TypeSchema {
+    use crate::builtins::CallableParamType;
+    use crate::compiler::TypeSchema;
+    match param {
+        CallableParamType::Any => TypeSchema::Unknown,
+        CallableParamType::Null => TypeSchema::Null,
+        CallableParamType::Int => TypeSchema::Int,
+        CallableParamType::Float | CallableParamType::Number => TypeSchema::Number,
+        CallableParamType::Bool => TypeSchema::Bool,
+        CallableParamType::String => TypeSchema::String,
+        CallableParamType::Bytes => TypeSchema::Bytes,
+        CallableParamType::Array => TypeSchema::Array(Box::new(TypeSchema::Unknown)),
+        CallableParamType::Map => TypeSchema::Map(Box::new(TypeSchema::Unknown)),
+        CallableParamType::Callable(signature) => TypeSchema::Callable {
+            params: signature
+                .params
+                .iter()
+                .copied()
+                .map(callable_param_schema)
+                .collect(),
+            result: Box::new(callable_param_schema(*signature.return_type)),
+        },
     }
 }
 

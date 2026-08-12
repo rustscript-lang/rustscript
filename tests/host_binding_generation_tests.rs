@@ -3,7 +3,8 @@
 mod build_script;
 
 use build_script::{
-    HostBindingKind, HostExecutionKind, classify_host_binding, infer_host_execution,
+    HostBindingKind, HostExecutionKind, callable_param_expr, classify_host_binding,
+    infer_host_execution, type_label,
 };
 use syn::parse_quote;
 use vm::{
@@ -16,6 +17,16 @@ fn native_jit_supported() -> bool {
         && (cfg!(target_os = "windows") || (cfg!(unix) && !cfg!(target_os = "macos"))))
         || (cfg!(target_arch = "aarch64")
             && (cfg!(target_os = "linux") || cfg!(target_os = "macos")))
+}
+
+#[test]
+fn preserves_typed_callable_host_parameter_schema() {
+    let ty: syn::Type = parse_quote!(VmCallable<fn(VmMap) -> VmMap>);
+    assert_eq!(type_label(&ty), "fn(map) -> map");
+    assert_eq!(
+        callable_param_expr("fn(map) -> map"),
+        "CallableParamType::Callable(CallableType { params: &[CallableParamType::Map], return_type: &CallableParamType::Map })"
+    );
 }
 
 #[test]

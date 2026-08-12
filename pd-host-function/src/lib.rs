@@ -531,6 +531,7 @@ fn type_label(ty: &Type) -> Result<String, Error> {
                 "Array" | "VmArray" | "VmArrayRef" | "VmArrayHandle" => Ok("array".to_string()),
                 "Map" | "VmMap" | "VmMapRef" | "VmMapHandle" => Ok("map".to_string()),
                 "Number" | "NumberValue" => Ok("number".to_string()),
+                "VmCallable" => callable_type_label(segment),
                 "Unknown" | "UnknownValue" => Ok("unknown".to_string()),
                 "CallOutcome" => Ok("unknown".to_string()),
                 "Option" => {
@@ -573,6 +574,31 @@ fn type_label(ty: &Type) -> Result<String, Error> {
         }
         _ => Err(Error::new_spanned(ty, "unsupported callable type")),
     }
+}
+
+fn callable_type_label(segment: &syn::PathSegment) -> Result<String, Error> {
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return Err(Error::new_spanned(
+            &segment.arguments,
+            "VmCallable requires a function signature",
+        ));
+    };
+    let Some(syn::GenericArgument::Type(Type::BareFn(function))) = args.args.first() else {
+        return Err(Error::new_spanned(
+            args,
+            "VmCallable requires fn(...) -> ...",
+        ));
+    };
+    let params = function
+        .inputs
+        .iter()
+        .map(|input| type_label(&input.ty))
+        .collect::<Result<Vec<_>, _>>()?;
+    let result = match &function.output {
+        ReturnType::Default => "null".to_string(),
+        ReturnType::Type(_, ty) => type_label(ty)?,
+    };
+    Ok(format!("fn({}) -> {result}", params.join(", ")))
 }
 
 fn type_label_for_vec(segment: &syn::PathSegment) -> Result<String, Error> {
@@ -672,8 +698,8 @@ fn uses_taken_extractor(ty: &Type) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::expand_pd_host_function;
-    use syn::{ItemFn, Meta, Token, parse_quote, punctuated::Punctuated};
+    use super::{expand_pd_host_function, type_label};
+    use syn::{ItemFn, Meta, Token, Type, parse_quote, punctuated::Punctuated};
 
     #[test]
     fn accepts_host_call_result_from_the_function_signature() {
@@ -778,5 +804,21 @@ mod tests {
                 .to_string()
                 .contains("parameters must be owned and 'static")
         );
+    }
+
+    #[test]
+    fn callable_wrapper_preserves_parameter_and_result_schema() {
+        let ty: Type = parse_quote!(VmCallable<fn(VmMap) -> VmMap>);
+        assert_eq!(type_label(&ty).unwrap(), "fn(map) -> map");
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "test::stream");
+        let item: ItemFn = parse_quote! {
+            /// Starts a synthetic callable stream.
+            fn stream(callback: VmCallable<fn(VmMap) -> VmMap>) -> VmResult<CallOutcome> {
+                todo!()
+            }
+        };
+        let expanded = expand_pd_host_function(attr, item).unwrap().to_string();
+        assert!(expanded.contains("VmCallable < fn (VmMap) -> VmMap >"));
+        assert!(expanded.contains("borrow_arg"));
     }
 }

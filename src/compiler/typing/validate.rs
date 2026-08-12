@@ -223,7 +223,7 @@ fn validate_expr_matches_schema(
     )
 }
 
-fn validate_callable_expr_against_schema(
+pub(super) fn validate_callable_expr_against_schema(
     label: &str,
     expected_schema: &TypeSchema,
     expr: &Expr,
@@ -424,6 +424,7 @@ fn param_accepts_bound_type(expected: CallableParamType, actual: BoundType, stri
         }
         CallableParamType::Map => matches!(actual, BoundType::Map | BoundType::MapOf(_)),
         CallableParamType::Number => is_numeric_bound_type(actual),
+        CallableParamType::Callable(_) => actual == BoundType::Callable,
     }
 }
 
@@ -440,9 +441,9 @@ fn format_param_types(params: &[CallableParam]) -> String {
         .iter()
         .map(|param| {
             if param.optional {
-                format!("{}?: {}", param.name, param.ty.label())
+                format!("{}?: {}", param.name, param.ty.display_label())
             } else {
-                format!("{}: {}", param.name, param.ty.label())
+                format!("{}: {}", param.name, param.ty.display_label())
             }
         })
         .collect::<Vec<_>>()
