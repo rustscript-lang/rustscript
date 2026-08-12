@@ -986,7 +986,13 @@ impl Vm {
     }
 
     pub fn run(&mut self) -> VmResult<VmStatus> {
-        let status = self.run_internal(None, true)?;
+        let status = match self.run_internal(None, true) {
+            Ok(status) => status,
+            Err(error) => {
+                self.abort_callable_stream_on_run_error();
+                return Err(error);
+            }
+        };
         self.resume_callable_stream_after_run(status)
     }
 
@@ -994,7 +1000,13 @@ impl Vm {
         &mut self,
         debugger: &mut crate::debugger::Debugger,
     ) -> VmResult<VmStatus> {
-        let status = self.run_internal(Some(debugger), false)?;
+        let status = match self.run_internal(Some(debugger), false) {
+            Ok(status) => status,
+            Err(error) => {
+                self.abort_callable_stream_on_run_error();
+                return Err(error);
+            }
+        };
         self.resume_callable_stream_after_run(status)
     }
 }
@@ -2738,7 +2750,13 @@ impl Vm {
                 .map(|frame| &frame.continuation),
             Some(FrameContinuation::ReturnToHost)
         );
-        let status = self.run_internal(None, allow_jit)?;
+        let status = match self.run_internal(None, allow_jit) {
+            Ok(status) => status,
+            Err(error) => {
+                self.abort_callable_stream_on_run_error();
+                return Err(error);
+            }
+        };
         self.resume_callable_stream_after_run(status)
     }
 

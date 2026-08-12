@@ -126,6 +126,7 @@ impl Invocation<'_> {
     pub fn cancel(&mut self, reason: CancellationReason) -> VmResult<()> {
         let cancellation_result = self.vm.run_ctx.cancel(reason);
         self.vm.cancel_waiting_host_op_with_reason(reason);
+        self.vm.cancel_callable_stream();
         cancellation_result
     }
 }
@@ -472,6 +473,7 @@ impl Vm {
             .as_ref()
             .map(|state| (state.stack_base, state.frame_count))
             .unwrap_or((0, 0));
+        self.cancel_callable_stream();
         self.abort_host_invocation(stack_base, frame_count);
         if let Some(state) = self.instance.invocation.as_mut() {
             state.phase = InvocationPhase::Fused;

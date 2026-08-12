@@ -213,6 +213,17 @@ impl Vm {
         self.finish_callable_stream_callback()
     }
 
+    pub(crate) fn abort_callable_stream_on_run_error(&mut self) {
+        if self
+            .instance
+            .host_stream
+            .as_ref()
+            .is_some_and(|stream| stream.phase == HostStreamPhase::RunCallback)
+        {
+            self.abort_callable_stream();
+        }
+    }
+
     fn finish_callable_stream_callback(&mut self) -> VmResult<VmStatus> {
         let action = self
             .instance

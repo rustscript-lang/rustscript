@@ -1,11 +1,13 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use vm::{
-    CallOutcome, HostFunction, HostStreamAction, HostStreamDriver, HostStreamPoll, JitConfig,
-    Value, Vm, VmError, VmMap, VmStatus, compile_source,
+    CallOutcome, CallReturn, CancellationReason, HostAsyncBridge, HostFunction, HostFuture,
+    HostFutureOutput, HostOpId, HostStreamAction, HostStreamDriver, HostStreamPoll,
+    InvocationError, InvocationPoll, JitConfig, Value, Vm, VmError, VmMap, VmResult, VmStatus,
+    compile_source,
 };
 
 fn map(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
@@ -114,8 +116,58 @@ impl HostFunction for YieldOnceHost {
 struct WaitHost;
 
 impl HostFunction for WaitHost {
+    fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, VmError> {
+        vm.submit_host_future(Box::pin(std::future::pending()))
+    }
+}
+
+#[derive(Default)]
+struct PendingBridge {
+    futures: HashMap<HostOpId, HostFuture>,
+}
+
+impl HostAsyncBridge for PendingBridge {
+    fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
+        self.futures.insert(op_id, future);
+        Ok(())
+    }
+
+    fn poll_op(&mut self, op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
+        Poll::Ready(Err(VmError::HostError(format!(
+            "unknown host operation {op_id}"
+        ))))
+    }
+
+    fn poll_submitted_op(
+        &mut self,
+        op_id: HostOpId,
+        cx: &mut Context<'_>,
+    ) -> Poll<VmResult<HostFutureOutput>> {
+        self.futures.get_mut(&op_id).map_or(
+            Poll::Ready(Err(VmError::HostError(format!(
+                "unknown submitted host operation {op_id}"
+            )))),
+            |future| future.as_mut().poll(cx),
+        )
+    }
+
+    fn cancel_op(&mut self, op_id: HostOpId) {
+        self.futures.remove(&op_id);
+    }
+}
+
+struct ErrorAfterYieldHost(bool);
+
+impl HostFunction for ErrorAfterYieldHost {
     fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, VmError> {
-        Ok(CallOutcome::Pending(900))
+        if !self.0 {
+            self.0 = true;
+            Ok(CallOutcome::Yield)
+        } else {
+            Err(VmError::HostError(
+                "callback resumed into failure".to_string(),
+            ))
+        }
     }
 }
 
@@ -158,6 +210,7 @@ fn setup(source: &str) -> (Vm, Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<AtomicUsi
     let applied = Arc::new(AtomicUsize::new(0));
     let stopped = Arc::new(AtomicUsize::new(0));
     let mut vm = Vm::new(compiled.program);
+    vm.set_async_bridge(Box::new(PendingBridge::default()));
     for function in compiled.functions {
         match function.name.as_str() {
             "synthetic_stream" | "synthetic_invalid" => {
@@ -174,6 +227,9 @@ fn setup(source: &str) -> (Vm, Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<AtomicUsi
             }
             "wait_once" => {
                 vm.register_function(Box::new(WaitHost));
+            }
+            "error_after_yield" => {
+                vm.register_function(Box::new(ErrorAfterYieldHost(false)));
             }
             other => panic!("unexpected host import {other}"),
         }
@@ -270,11 +326,64 @@ fn waiting_callback_resumes_to_the_outer_stream_continuation() {
     let (mut vm, polls, applied, _) = setup(source);
     assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
     assert!(matches!(poll_once(&mut vm), Poll::Ready(Ok(()))));
-    assert_eq!(vm.run().unwrap(), VmStatus::Waiting(900));
-    vm.complete_host_op(900, vec![Value::Null]).unwrap();
+    assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+    let inner_id = vm.waiting_host_op_id().unwrap();
+    assert_ne!(inner_id, 0);
+    vm.complete_host_op(inner_id, vec![Value::Null]).unwrap();
     assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
     assert_eq!(polls.load(Ordering::SeqCst), 1);
     assert_eq!(applied.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn resumed_callback_error_releases_the_stream_driver() {
+    let source = r#"
+        fn synthetic_stream(callback: fn(map) -> map) -> map;
+        fn error_after_yield();
+        fn callback(item: map) -> map { error_after_yield(); item }
+        synthetic_stream(callback);
+    "#;
+    let (mut vm, polls, applied, stopped) = setup(source);
+    assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+    assert!(matches!(poll_once(&mut vm), Poll::Ready(Ok(()))));
+    assert!(
+        matches!(vm.resume(), Err(VmError::HostError(message)) if message == "callback resumed into failure")
+    );
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    assert_eq!(applied.load(Ordering::SeqCst), 0);
+    assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    assert!(vm.waiting_host_op_id().is_none());
+}
+
+#[test]
+fn invocation_cancellation_during_callback_wait_releases_the_stream_driver() {
+    let source = r#"
+        fn synthetic_stream(callback: fn(map) -> map) -> map;
+        fn wait_once();
+        fn callback(item: map) -> map { wait_once(); item }
+        pub fn run() -> map { synthetic_stream(callback) }
+    "#;
+    let (mut vm, polls, applied, stopped) = setup(source);
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    let callable = vm.resolve_exported_callable("run").unwrap();
+    {
+        let mut invocation = vm.start_invocation(callable, vec![]).unwrap();
+        assert!(matches!(
+            invocation.poll_next().unwrap(),
+            InvocationPoll::Pending
+        ));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        invocation.cancel(CancellationReason::Requested).unwrap();
+        assert!(matches!(
+            invocation.poll_next().unwrap(),
+            InvocationPoll::Ready(Some(Err(InvocationError::Cancelled(
+                CancellationReason::Requested
+            ))))
+        ));
+    }
+    assert_eq!(applied.load(Ordering::SeqCst), 0);
+    assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    assert!(vm.waiting_host_op_id().is_none());
 }
 
 #[test]
