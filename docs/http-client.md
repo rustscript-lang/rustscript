@@ -77,11 +77,11 @@ let result = http::client::sse({
 | --- | --- | --- | --- |
 | `method` | yes | string: `GET` or `POST` | Other methods are rejected before transport admission |
 | `url` | yes | string containing an `http` or `https` URL | Protocol family and the configured scheme, host, port, and address policy must all admit it |
-| `headers` | no | map from string header names to string values | Subject to the shared request-header bound; client-managed request headers remain forbidden, and `Accept: text/event-stream` is supplied when absent |
+| `headers` | no | map from string header names to string values | Names and values must be syntactically valid; client-managed request headers remain forbidden, and `Accept: text/event-stream` is supplied when absent |
 | `body` | no | bytes or string, including for `POST` | Bounded by `max_request_body_bytes` |
-| `timeout_ms` | no | positive integer milliseconds | Capped by host policy; it cannot disable or extend an embedding deadline |
+| `timeout_ms` | no | positive integer milliseconds | Optional shortening deadline; its externally supplied embedding/host ceiling is outside `HttpConfig` |
 
-The callback schema is `fn(map) -> map`, and the response must have an event-stream content type.
+The callback schema is `fn(map) -> map`, and the response must have an event-stream content type. The response head remains bounded by the existing HTTP parser. The target contract adds no configurable request-header byte accounting.
 
 The callback receives exactly one map at a time, in this order:
 
@@ -124,7 +124,7 @@ SSE parsing follows the event-stream grammar:
 - `event`, `id`, and decimal non-negative `retry` fields are normalized into the event map;
 - comments and unknown fields are ignored;
 - a blank line dispatches only after at least one `data:` field;
-- malformed UTF-8 and an over-limit line, event, or cumulative stream are host errors.
+- malformed UTF-8, an over-limit line or event, and cumulative received event-stream application bytes exceeding the call limit are host errors.
 
 There is no automatic reconnection. Values such as a provider's `[DONE]` marker remain ordinary event data.
 
@@ -155,11 +155,11 @@ let result = http::client::websocket({
 | Field | Required | Accepted type and value | Bound or policy |
 | --- | --- | --- | --- |
 | `url` | yes | string containing a `ws` or `wss` URL | Protocol family and the configured scheme, host, port, and address policy must all admit it |
-| `headers` | no | map from string header names to string values | Subject to the shared handshake-header bound; client-managed upgrade headers are rejected |
-| `protocols` | no | array of subprotocol strings | The encoded offer is subject to the shared handshake-header bound; the peer-selected subprotocol must match this offered list |
-| `timeout_ms` | no | positive integer milliseconds | Capped by host policy; it cannot disable or extend an embedding deadline |
+| `headers` | no | map from string header names to string values | Names and values must be syntactically valid; client-managed upgrade headers are rejected |
+| `protocols` | no | array of syntactically valid subprotocol strings | The peer-selected subprotocol must match this offered list |
+| `timeout_ms` | no | positive integer milliseconds | Optional shortening deadline; its externally supplied embedding/host ceiling is outside `HttpConfig` |
 
-The callback schema is `fn(map) -> map`.
+The callback schema is `fn(map) -> map`. The handshake response head remains bounded by the existing HTTP parser. The target contract adds no configurable request-header byte accounting.
 
 After a validated `101` upgrade, the callback receives `open`, followed by incoming protocol items:
 
@@ -199,7 +199,7 @@ Action rules depend on the current item:
 - `stop` drops the connection locally and does not synthesize a close callback;
 - local `close` sends one close frame and waits only through the configured close-handshake timeout.
 
-Exactly one callback action is applied before another inbound item is polled. Fragmented text or binary frames are reassembled into one callback item under the message limit. Frame, message, control payload, outbound payload, close code/reason, and cumulative byte limits apply. Invalid UTF-8 text, invalid actions, protocol violations, write failures, and abnormal transport EOF are host errors.
+Exactly one callback action is applied before another inbound item is polled. Fragmented text or binary frames are reassembled into one callback item under the message limit. Frame, message, control payload, outbound payload, and close code/reason limits apply. For WebSocket, `max_stream_total_bytes` counts combined text/binary application payload bytes sent and received across the entire call; frame and control overhead are bounded separately by protocol and frame caps. Invalid UTF-8 text, invalid actions, protocol violations, write failures, and abnormal transport EOF are host errors.
 
 ## Terminal summaries and errors
 
@@ -217,7 +217,7 @@ After callback processing terminates normally, either streaming call returns one
 }
 ```
 
-SSE normally reports `eof` or `stopped`; WebSocket may also report `closed` after peer/local close semantics complete. `items` counts delivered callback items. Byte counters describe protocol traffic accounted to the streaming call and remain subject to host limits.
+SSE normally reports `eof` or `stopped`; WebSocket may also report `closed` after peer/local close semantics complete. `items` counts delivered callback items. `bytes_received` and `bytes_sent` are observational summary counters. Limit enforcement uses independent entire-call accounting and does not depend on whether or how these counters are displayed.
 
 Transport, parser, destination-policy, timeout, and callback failures stay errors. They are never converted into a successful terminal summary.
 
@@ -234,7 +234,7 @@ At most one unacknowledged protocol item crosses the host/VM boundary. Decoder s
 
 The network future never owns or re-enters the VM. Callback error, protocol completion, configured deadline, VM reset/shutdown/drop, invocation termination, or normal return retires the operation exactly once. The embedding owns pending futures: retiring a call drops its transport and permit, and a late completion cannot re-enter the VM.
 
-`request_timeout` is the total bound for a buffered request. A streaming request may provide `timeout_ms`; the host caps it by policy. Without it, the embedding invocation deadline and stream idle timeout bound the operation. Network idle time excludes time spent inside the callback, while callback work remains subject to the embedding's invocation deadline. A script cannot disable or raise a host limit. WebSocket close waiting is additionally bounded by `websocket_close_timeout`.
+`request_timeout` is the total bound for a buffered request and does not apply to streaming. In the target streaming contract, `timeout_ms` is only an additional shortening deadline: it can never extend the embedding invocation deadline or another host bound. Its maximum is embedding-supplied policy outside `HttpConfig`; an implementation must cap a supplied value to that external maximum, or reject `timeout_ms` when no embedding/host maximum exists. Without `timeout_ms`, the embedding invocation deadline and stream idle timeout bound the operation. Network idle time excludes time spent inside the callback, while callback work remains subject to the embedding's invocation deadline. A script cannot disable or raise a host limit. WebSocket close waiting is additionally bounded by `websocket_close_timeout`.
 
 ## Configuration defaults
 
@@ -252,7 +252,7 @@ The network future never owns or re-enters the VM. Callback error, protocol comp
 | `connect_timeout` | 10 s | DNS/connect/TLS phase bound |
 | `request_timeout` | 30 s | Buffered request total duration |
 | `max_stream_item_bytes` | 1 MiB | SSE event or WebSocket message bound |
-| `max_stream_total_bytes` | 64 MiB | Streaming call cumulative receive bound |
+| `max_stream_total_bytes` | 64 MiB | Entire-call cumulative application-byte bound: received event-stream bytes for SSE; sent plus received application payload for WebSocket |
 | `max_sse_line_bytes` | 64 KiB | SSE line bound |
 | `max_websocket_frame_bytes` | 1 MiB | WebSocket frame bound |
 | `max_websocket_send_bytes` | 1 MiB | One WebSocket outbound action bound |
