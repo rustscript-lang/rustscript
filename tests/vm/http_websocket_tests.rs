@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -62,6 +63,17 @@ impl HostStackFunction for AsyncWaitOnce {
     }
 }
 
+struct CountCloseCallbacks {
+    calls: Arc<AtomicUsize>,
+}
+
+impl HostStackFunction for CountCloseCallbacks {
+    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true))))
+    }
+}
+
 fn websocket_config(port: u16) -> HttpConfig {
     HttpConfig {
         allowed_schemes: vec!["ws".to_string()],
@@ -114,6 +126,16 @@ async fn drive_websocket(vm: &mut Vm) -> VmResult<()> {
             }
         }
     }
+}
+
+async fn poll_websocket_once(vm: &mut Vm) -> VmResult<bool> {
+    std::future::poll_fn(|cx| {
+        Poll::Ready(match vm.poll_waiting_host_op(cx) {
+            Poll::Ready(result) => result.map(|()| true),
+            Poll::Pending => Ok(false),
+        })
+    })
+    .await
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -230,6 +252,84 @@ async fn websocket_host_deadline_releases_permit_for_vm_reuse() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn local_close_timeout_includes_delay_before_driver_repoll() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("client should connect");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake should succeed");
+        let terminal = tokio::time::timeout(Duration::from_millis(500), socket.next())
+            .await
+            .expect("client should terminate after close timeout");
+        assert!(terminal.is_none() || terminal.is_some_and(|item| item.is_err()));
+    });
+    let source = format!(
+        r#"
+        use http;
+        fn count_close_callback() -> bool;
+        fn callback(item: map) -> map {{
+            {{
+                action: if count_close_callback() => {{ "close" }} else => {{ "close" }},
+                code: 1000,
+                reason: "done"
+            }}
+        }}
+        http::client::websocket({{ url: "ws://{address}/" }}, callback);
+        "#
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    let mut config = websocket_config(address.port());
+    config.websocket_close_timeout = Duration::from_millis(50);
+    config.stream_idle_timeout = Duration::from_secs(1);
+    config.max_stream_duration = Duration::from_secs(1);
+    vm.configure_http(config)
+        .expect("configuration should install");
+    let callbacks = Arc::new(AtomicUsize::new(0));
+    let mut registry = HostFunctionRegistry::new();
+    registry.register_stack("count_close_callback", 0, {
+        let callbacks = Arc::clone(&callbacks);
+        move || {
+            Box::new(CountCloseCallbacks {
+                calls: Arc::clone(&callbacks),
+            })
+        }
+    });
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("imports should bind");
+    assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while callbacks.load(Ordering::SeqCst) == 0 {
+            assert!(!poll_websocket_once(&mut vm).await.unwrap());
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("local close action should be applied");
+    tokio::time::sleep(Duration::from_millis(90)).await;
+
+    let repolled_at = tokio::time::Instant::now();
+    let error = poll_websocket_once(&mut vm)
+        .await
+        .expect_err("the transition-time close deadline should already be expired");
+    assert!(
+        error.to_string().contains("close handshake timed out"),
+        "{error}"
+    );
+    assert!(
+        repolled_at.elapsed() < Duration::from_millis(30),
+        "delayed repoll must not receive a fresh close timeout"
+    );
+    server.await.expect("server should finish");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn websocket_script_timeout_expires_during_periodic_active_traffic() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -341,6 +441,30 @@ fn websocket_callable_is_feature_gated_with_typed_callback_metadata() {
         "#,
     )
     .expect("typed WebSocket callback should compile");
+}
+
+#[test]
+fn websocket_admission_and_permit_reuse_do_not_require_a_tokio_reactor() {
+    let source = r#"
+        use http;
+        http::client::websocket(
+            { url: "ws://127.0.0.1:1/socket" },
+            |item| { action: "continue" }
+        );
+    "#;
+    let compiled = compile_source(source).expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_http_max_in_flight(1);
+    vm.configure_http(websocket_config(1))
+        .expect("configuration should install");
+    HostFunctionRegistry::new()
+        .bind_vm_cached(&mut vm)
+        .expect("host functions should bind");
+
+    assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+    vm.reset_for_reuse();
+    assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+    vm.reset_for_reuse();
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -63,6 +63,7 @@ struct ActiveSocket {
     flush_required: bool,
     local_closing: bool,
     complete_after_flush: bool,
+    close_deadline: Option<Instant>,
     close_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
     idle_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
 }
@@ -214,8 +215,18 @@ impl WebSocketDriver {
         }
 
         if active.local_closing || active.complete_after_flush {
+            let deadline = active.close_deadline.ok_or(VmError::InvalidFrameState(
+                "WebSocket close handshake has no deadline",
+            ))?;
+            if Instant::now() >= deadline {
+                return Poll::Ready(Err(VmError::HostError(
+                    "WebSocket close handshake timed out".to_string(),
+                )));
+            }
             let sleep = active.close_sleep.get_or_insert_with(|| {
-                Box::pin(tokio::time::sleep(self.config.websocket_close_timeout))
+                Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
+                    deadline,
+                )))
             });
             if sleep.as_mut().poll(cx).is_ready() {
                 return Poll::Ready(Err(VmError::HostError(
@@ -373,6 +384,7 @@ impl HostStreamDriver for WebSocketDriver {
                             flush_required: false,
                             local_closing: false,
                             complete_after_flush: false,
+                            close_deadline: None,
                             close_sleep: None,
                             idle_sleep: None,
                         }));
@@ -409,6 +421,8 @@ impl HostStreamDriver for WebSocketDriver {
         let summary_items = self.items;
         let summary_received = self.bytes_received;
         let summary_sent = self.bytes_sent;
+        let close_timeout = self.config.websocket_close_timeout;
+        let call_deadline = self.call_deadline;
         let DriverState::Active(active) = &mut self.state else {
             return Err(VmError::InvalidFrameState(
                 "WebSocket action applied without an active connection",
@@ -445,9 +459,12 @@ impl HostStreamDriver for WebSocketDriver {
                 ItemKind::Close => {
                     active.complete_after_flush = true;
                     active.flush_required = true;
-                    active.close_sleep = Some(Box::pin(tokio::time::sleep(
-                        self.config.websocket_close_timeout,
-                    )));
+                    start_close_deadline(
+                        &mut active.close_deadline,
+                        Instant::now(),
+                        close_timeout,
+                        call_deadline,
+                    )?;
                     None
                 }
                 _ => None,
@@ -494,15 +511,21 @@ impl HostStreamDriver for WebSocketDriver {
                 if kind == ItemKind::Close {
                     active.complete_after_flush = true;
                     active.flush_required = true;
-                    active.close_sleep = Some(Box::pin(tokio::time::sleep(
-                        self.config.websocket_close_timeout,
-                    )));
+                    start_close_deadline(
+                        &mut active.close_deadline,
+                        Instant::now(),
+                        close_timeout,
+                        call_deadline,
+                    )?;
                     None
                 } else {
                     active.local_closing = true;
-                    active.close_sleep = Some(Box::pin(tokio::time::sleep(
-                        self.config.websocket_close_timeout,
-                    )));
+                    start_close_deadline(
+                        &mut active.close_deadline,
+                        Instant::now(),
+                        close_timeout,
+                        call_deadline,
+                    )?;
                     Some(Message::Close(Some(frame)))
                 }
             }
@@ -515,6 +538,22 @@ impl HostStreamDriver for WebSocketDriver {
         active.outbound = outbound;
         Ok(HostStreamAction::Continue)
     }
+}
+
+fn start_close_deadline(
+    close_deadline: &mut Option<Instant>,
+    now: Instant,
+    close_timeout: Duration,
+    call_deadline: Option<Instant>,
+) -> VmResult<()> {
+    if close_deadline.is_some() {
+        return Ok(());
+    }
+    let deadline = now.checked_add(close_timeout).ok_or_else(|| {
+        VmError::HostError("WebSocket close timeout cannot form a deadline".to_string())
+    })?;
+    *close_deadline = Some(call_deadline.map_or(deadline, |call| call.min(deadline)));
+    Ok(())
 }
 
 async fn connect_socket(
@@ -973,6 +1012,31 @@ mod tests {
                 .to_string()
                 .contains("overflowed")
         );
+    }
+
+    #[test]
+    fn close_deadline_starts_once_at_transition_and_is_bounded_by_call_deadline() {
+        let started = Instant::now();
+        let call_deadline = started + Duration::from_millis(80);
+        let mut close_deadline = None;
+
+        start_close_deadline(
+            &mut close_deadline,
+            started,
+            Duration::from_millis(100),
+            Some(call_deadline),
+        )
+        .expect("close deadline should initialize");
+        assert_eq!(close_deadline, Some(call_deadline));
+
+        start_close_deadline(
+            &mut close_deadline,
+            started + Duration::from_millis(20),
+            Duration::from_millis(5),
+            None,
+        )
+        .expect("repeated close transition should be a no-op");
+        assert_eq!(close_deadline, Some(call_deadline));
     }
 
     #[test]
