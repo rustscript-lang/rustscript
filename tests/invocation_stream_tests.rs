@@ -109,6 +109,7 @@ fn invocation_without_events_yields_complete_then_fused_end() {
         ),
         "the stream must stay fused after Complete"
     );
+    drop(invocation);
 
     // Once the first invocation has fused, a new invocation may start on the
     // same VM.
@@ -126,7 +127,7 @@ fn invocation_without_events_yields_complete_then_fused_end() {
 }
 
 #[test]
-fn invocation_starting_a_second_invocation_while_one_is_active_is_rejected() {
+fn dropping_an_unpolled_invocation_allows_a_second_invocation() {
     let mut vm = compiled_vm(
         r#"
         pub fn run() -> int {
@@ -138,21 +139,19 @@ fn invocation_starting_a_second_invocation_while_one_is_active_is_rejected() {
         .resolve_exported_callable("run")
         .expect("exported run callable should resolve");
     {
-        // The handle is dropped without polling; the invocation stays active
-        // on the VM until it fuses.
+        // Dropping the handle retires even a CompletePending invocation whose
+        // terminal item was never observed.
         let _invocation = vm
             .start_invocation(callable.clone(), vec![])
             .expect("first invocation should start");
     }
-    // Dropping the handle keeps the invocation active on the VM; starting a
-    // second invocation must be rejected while the first one has not fused.
-    let rejected = vm
+    let mut second = vm
         .start_invocation(callable, vec![])
-        .expect_err("a second active invocation must be rejected");
-    assert!(
-        matches!(rejected, VmError::InvalidFrameState(_)),
-        "unexpected rejection error: {rejected:?}"
-    );
+        .expect("dropping the first handle must release the vm immediately");
+    assert!(matches!(
+        second.poll_next().expect("poll should succeed"),
+        InvocationPoll::Ready(Some(Ok(InvocationItem::Complete(Value::Int(42)))))
+    ));
 }
 
 #[test]
@@ -642,6 +641,7 @@ fn invocation_cancellation_is_consumed_at_the_invocation_boundary() {
         invocation.poll_next().expect("poll should succeed"),
         InvocationPoll::Ready(None)
     ));
+    drop(invocation);
 
     // A fresh invocation on the same VM must not inherit the old reason: it
     // runs to completion instead of being cancelled on arrival.
@@ -713,6 +713,7 @@ fn invocation_cancel_during_event_pending_discards_the_pending_event() {
         invocation.poll_next().expect("poll should succeed"),
         InvocationPoll::Ready(None)
     ));
+    drop(invocation);
 
     // The discarded event payload (map plus its two key/value pairs) must be
     // dropped through the VM drop-contract path, not leaked.

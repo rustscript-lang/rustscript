@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
 use vm::{
@@ -132,6 +132,57 @@ impl HostStreamDriver for DropOnlyDriver {
     }
 }
 
+struct PendingProducerDriver {
+    polls: Arc<AtomicUsize>,
+    applied: Arc<AtomicUsize>,
+    stopped: Arc<AtomicUsize>,
+}
+
+impl Drop for PendingProducerDriver {
+    fn drop(&mut self) {
+        self.stopped.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl HostStreamDriver for PendingProducerDriver {
+    fn poll_next(&mut self, _cx: &mut Context<'_>) -> Poll<VmResult<HostStreamPoll>> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        Poll::Pending
+    }
+
+    fn apply_action(&mut self, _action: Value) -> VmResult<HostStreamAction> {
+        self.applied.fetch_add(1, Ordering::SeqCst);
+        panic!("a pending producer must never receive a callback action")
+    }
+}
+
+struct PendingProducerHost {
+    polls: Arc<AtomicUsize>,
+    applied: Arc<AtomicUsize>,
+    stopped: Arc<AtomicUsize>,
+    op_id: Arc<AtomicUsize>,
+}
+
+impl HostFunction for PendingProducerHost {
+    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+        let [callback] = args else {
+            return Err(VmError::HostError("expected one callback".to_string()));
+        };
+        let outcome = vm.submit_callable_stream(
+            callback.clone(),
+            PendingProducerDriver {
+                polls: Arc::clone(&self.polls),
+                applied: Arc::clone(&self.applied),
+                stopped: Arc::clone(&self.stopped),
+            },
+        )?;
+        if let CallOutcome::Pending(op_id) = outcome {
+            self.op_id.store(op_id as usize, Ordering::SeqCst);
+        }
+        Ok(outcome)
+    }
+}
+
 struct SyntheticStreamHost {
     polls: Arc<AtomicUsize>,
     applied: Arc<AtomicUsize>,
@@ -150,6 +201,15 @@ impl HostFunction for YieldOnceHost {
         } else {
             Ok(CallOutcome::Return(vec![Value::Null].into()))
         }
+    }
+}
+
+struct YieldForeverHost(Arc<AtomicUsize>);
+
+impl HostFunction for YieldForeverHost {
+    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, VmError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(CallOutcome::Yield)
     }
 }
 
@@ -201,6 +261,57 @@ impl HostAsyncBridge for PendingBridge {
 
     fn cancel_op(&mut self, op_id: HostOpId) {
         self.futures.remove(&op_id);
+    }
+}
+
+#[derive(Default)]
+struct CancellationLog {
+    pending: HashMap<HostOpId, HostFuture>,
+    cancellations: Vec<(HostOpId, CancellationReason)>,
+}
+
+struct RecordingPendingBridge(Arc<Mutex<CancellationLog>>);
+
+impl HostAsyncBridge for RecordingPendingBridge {
+    fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
+        self.0
+            .lock()
+            .expect("cancellation log lock")
+            .pending
+            .insert(op_id, future);
+        Ok(())
+    }
+
+    fn poll_op(&mut self, op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
+        Poll::Ready(Err(VmError::HostError(format!(
+            "unknown host operation {op_id}"
+        ))))
+    }
+
+    fn poll_submitted_op(
+        &mut self,
+        op_id: HostOpId,
+        _cx: &mut Context<'_>,
+    ) -> Poll<VmResult<HostFutureOutput>> {
+        if self
+            .0
+            .lock()
+            .expect("cancellation log lock")
+            .pending
+            .contains_key(&op_id)
+        {
+            Poll::Pending
+        } else {
+            Poll::Ready(Err(VmError::HostError(format!(
+                "unknown submitted host operation {op_id}"
+            ))))
+        }
+    }
+
+    fn cancel_op_with_reason(&mut self, op_id: HostOpId, reason: CancellationReason) {
+        let mut log = self.0.lock().expect("cancellation log lock");
+        log.pending.remove(&op_id);
+        log.cancellations.push((op_id, reason));
     }
 }
 
@@ -601,6 +712,200 @@ fn invocation_cancellation_during_callback_wait_releases_the_stream_driver() {
     assert_eq!(applied.load(Ordering::SeqCst), 0);
     assert_eq!(stopped.load(Ordering::SeqCst), 1);
     assert!(vm.waiting_host_op_id().is_none());
+}
+
+#[test]
+fn dropping_invocation_during_callback_wait_cancels_once_and_reuses_the_vm() {
+    let source = r#"
+        fn synthetic_stream(callback: fn(map) -> map) -> map;
+        fn wait_once();
+        fn callback(item: map) -> map { wait_once(); item }
+        pub fn run() -> map { synthetic_stream(callback) }
+        pub fn plain() -> int { 42 }
+    "#;
+    let (mut vm, polls, applied, stopped) = setup(source);
+    let cancellations = Arc::new(Mutex::new(CancellationLog::default()));
+    vm.set_async_bridge(Box::new(RecordingPendingBridge(Arc::clone(&cancellations))));
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    let run = vm.resolve_exported_callable("run").unwrap();
+    let plain = vm.resolve_exported_callable("plain").unwrap();
+
+    {
+        let mut invocation = vm.start_invocation(run, vec![]).unwrap();
+        assert!(matches!(
+            invocation.poll_next().unwrap(),
+            InvocationPoll::Pending
+        ));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+
+    assert_eq!(applied.load(Ordering::SeqCst), 0);
+    assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    let cancelled = cancellations
+        .lock()
+        .expect("cancellation log lock")
+        .cancellations
+        .clone();
+    assert_eq!(cancelled.len(), 1);
+    assert_eq!(cancelled[0].1, CancellationReason::Requested);
+    let late = vm
+        .complete_host_op(cancelled[0].0, vec![Value::Null])
+        .expect_err("a cancelled callback wait must reject late completion");
+    assert!(late.to_string().contains("vm is not waiting on any op"));
+
+    let mut replacement = vm.start_invocation(plain, vec![]).unwrap();
+    assert!(matches!(
+        replacement.poll_next().unwrap(),
+        InvocationPoll::Ready(Some(Ok(vm::InvocationItem::Complete(Value::Int(42)))))
+    ));
+}
+
+#[test]
+fn dropping_invocation_during_callback_yield_does_not_resume_the_callback() {
+    let source = r#"
+        fn synthetic_stream(callback: fn(map) -> map) -> map;
+        fn yield_forever();
+        fn callback(item: map) -> map { yield_forever(); item }
+        pub fn run() -> map { synthetic_stream(callback) }
+        pub fn plain() -> int { 42 }
+    "#;
+    let compiled = compile_source(source).expect("stream source should compile");
+    let polls = Arc::new(AtomicUsize::new(0));
+    let applied = Arc::new(AtomicUsize::new(0));
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let callback_calls = Arc::new(AtomicUsize::new(0));
+    let mut vm = Vm::new(compiled.program);
+    vm.set_async_bridge(Box::new(PendingBridge::default()));
+    for function in compiled.functions {
+        match function.name.as_str() {
+            "synthetic_stream" => {
+                vm.register_function(Box::new(SyntheticStreamHost {
+                    polls: Arc::clone(&polls),
+                    applied: Arc::clone(&applied),
+                    stopped: Arc::clone(&stopped),
+                    invalid_first: false,
+                    producer_error: false,
+                }));
+            }
+            "yield_forever" => {
+                vm.register_function(Box::new(YieldForeverHost(Arc::clone(&callback_calls))));
+            }
+            other => panic!("unexpected host import {other}"),
+        }
+    }
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    let run = vm.resolve_exported_callable("run").unwrap();
+    let plain = vm.resolve_exported_callable("plain").unwrap();
+
+    {
+        let mut invocation = vm.start_invocation(run, vec![]).unwrap();
+        assert!(matches!(
+            invocation.poll_next().unwrap(),
+            InvocationPoll::Pending
+        ));
+        assert_eq!(callback_calls.load(Ordering::SeqCst), 2);
+    }
+
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    assert_eq!(applied.load(Ordering::SeqCst), 0);
+    assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    assert_eq!(callback_calls.load(Ordering::SeqCst), 2);
+    let mut replacement = vm.start_invocation(plain, vec![]).unwrap();
+    assert!(matches!(
+        replacement.poll_next().unwrap(),
+        InvocationPoll::Ready(Some(Ok(vm::InvocationItem::Complete(Value::Int(42)))))
+    ));
+}
+
+#[test]
+fn explicit_cancel_then_drop_cancels_callback_wait_and_driver_once() {
+    let source = r#"
+        fn synthetic_stream(callback: fn(map) -> map) -> map;
+        fn wait_once();
+        fn callback(item: map) -> map { wait_once(); item }
+        pub fn run() -> map { synthetic_stream(callback) }
+    "#;
+    let (mut vm, polls, applied, stopped) = setup(source);
+    let cancellations = Arc::new(Mutex::new(CancellationLog::default()));
+    vm.set_async_bridge(Box::new(RecordingPendingBridge(Arc::clone(&cancellations))));
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    let run = vm.resolve_exported_callable("run").unwrap();
+
+    {
+        let mut invocation = vm.start_invocation(run, vec![]).unwrap();
+        assert!(matches!(
+            invocation.poll_next().unwrap(),
+            InvocationPoll::Pending
+        ));
+        invocation.cancel(CancellationReason::Deadline).unwrap();
+    }
+
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    assert_eq!(applied.load(Ordering::SeqCst), 0);
+    assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    let cancelled = &cancellations
+        .lock()
+        .expect("cancellation log lock")
+        .cancellations;
+    assert_eq!(cancelled.len(), 1);
+    assert_eq!(cancelled[0].1, CancellationReason::Deadline);
+}
+
+#[test]
+fn dropping_invocation_during_producer_wait_retires_the_stream_and_reuses_the_vm() {
+    let source = r#"
+        fn synthetic_pending(callback: fn(map) -> map) -> map;
+        pub fn run() -> map { synthetic_pending(|item| item) }
+        pub fn plain() -> int { 42 }
+    "#;
+    let compiled = compile_source(source).expect("stream source should compile");
+    let polls = Arc::new(AtomicUsize::new(0));
+    let applied = Arc::new(AtomicUsize::new(0));
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let op_id = Arc::new(AtomicUsize::new(0));
+    let mut vm = Vm::new(compiled.program);
+    for function in compiled.functions {
+        match function.name.as_str() {
+            "synthetic_pending" => {
+                vm.register_function(Box::new(PendingProducerHost {
+                    polls: Arc::clone(&polls),
+                    applied: Arc::clone(&applied),
+                    stopped: Arc::clone(&stopped),
+                    op_id: Arc::clone(&op_id),
+                }));
+            }
+            other => panic!("unexpected host import {other}"),
+        }
+    }
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    let run = vm.resolve_exported_callable("run").unwrap();
+    let plain = vm.resolve_exported_callable("plain").unwrap();
+
+    {
+        let mut invocation = vm.start_invocation(run, vec![]).unwrap();
+        assert!(matches!(
+            invocation.poll_next().unwrap(),
+            InvocationPoll::Pending
+        ));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+
+    assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    assert_eq!(applied.load(Ordering::SeqCst), 0);
+    let retired_op_id = op_id.load(Ordering::SeqCst) as HostOpId;
+    let late = vm
+        .complete_host_op(retired_op_id, vec![Value::Null])
+        .expect_err("a retired invocation must reject late completion");
+    assert!(late.to_string().contains("vm is not waiting on any op"));
+
+    let mut replacement = vm
+        .start_invocation(plain, vec![])
+        .expect("the vm must accept a replacement invocation immediately");
+    assert!(matches!(
+        replacement.poll_next().unwrap(),
+        InvocationPoll::Ready(Some(Ok(vm::InvocationItem::Complete(Value::Int(42)))))
+    ));
 }
 
 #[test]

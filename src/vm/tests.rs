@@ -2537,12 +2537,10 @@ fn run_yields_before_ret_in_call_ret_sequence_when_epoch_deadline_is_reached() {
 }
 
 #[test]
-fn pre_cancelled_invocation_stays_pending_until_error_delivery() {
-    // Regression: starting an invocation on an already-cancelled run context
-    // must not release early (no callable, frame, or host operation has
-    // started yet). The reason stays pending on the run context until normal
-    // error delivery consumes the typed error item, which releases exactly
-    // once.
+fn dropping_pre_cancelled_invocation_consumes_cancellation_at_the_boundary() {
+    // Dropping an invocation with a pending typed cancellation retires that
+    // invocation without manufacturing an unobservable terminal item. The VM
+    // cancellation root is refreshed for immediate reuse.
     let compiled = crate::compile_source(
         r#"
         pub fn run() -> int {
@@ -2562,15 +2560,21 @@ fn pre_cancelled_invocation_stays_pending_until_error_delivery() {
         .expect("exported run callable should resolve");
     {
         let _invocation = vm
-            .start_invocation(callable, vec![])
+            .start_invocation(callable.clone(), vec![])
             .expect("invocation should start");
-        // Dropping the handle abandons the invocation but keeps it active on
-        // the VM; the pre-cancelled transition must not have released it.
     }
     assert!(
-        vm.run_ctx.cancellation.reason().is_some(),
-        "the pre-cancellation must remain pending until the error item is consumed"
+        vm.run_ctx.cancellation.reason().is_none(),
+        "dropping the invocation must consume its pending cancellation"
     );
+
+    let mut replacement = vm
+        .start_invocation(callable, vec![])
+        .expect("the vm should be reusable after the dropped invocation");
+    assert!(matches!(
+        replacement.poll_next().expect("poll should succeed"),
+        InvocationPoll::Ready(Some(Ok(InvocationItem::Complete(Value::Int(42)))))
+    ));
 }
 
 #[test]
