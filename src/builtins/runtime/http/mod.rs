@@ -120,10 +120,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::policy::{
-        SchemeFamily, is_restricted_ip, validate_resolved_addresses, validate_url,
-        validate_url_policy,
+        SchemeFamily, is_restricted_ip, request_deadline, validate_resolved_addresses,
+        validate_url, validate_url_policy,
     };
-    use super::request::{HttpRequest, execute_request};
+    use super::request::{
+        HttpRequest, ResponseReadObserver, execute_request, execute_request_with_observer,
+    };
     use super::{HttpConfig, HttpHostExt, builtin_http_client_request};
     use crate::builtins::runtime::VmMap;
     use crate::vm::{
@@ -223,7 +225,7 @@ mod tests {
             ..HttpConfig::default()
         };
         let request = HttpRequest {
-            method: reqwest::Method::GET,
+            method: hyper::Method::GET,
             url: format!("http://{address}/").parse().expect("valid URL"),
             headers: Vec::new(),
             body: None,
@@ -235,7 +237,7 @@ mod tests {
 
         let error = runtime
             .block_on(super::policy::with_deadline(
-                Instant::now() + config.request_timeout,
+                request_deadline(config.request_timeout).expect("valid request deadline"),
                 execute_request(&config, &request),
             ))
             .expect_err("hanging server should time out");
@@ -271,7 +273,7 @@ mod tests {
             ..HttpConfig::default()
         };
         let request = HttpRequest {
-            method: reqwest::Method::GET,
+            method: hyper::Method::GET,
             url: format!("http://{address}/").parse().expect("valid URL"),
             headers: Vec::new(),
             body: None,
@@ -283,7 +285,7 @@ mod tests {
 
         let error = runtime
             .block_on(super::policy::with_deadline(
-                Instant::now() + config.request_timeout,
+                request_deadline(config.request_timeout).expect("valid request deadline"),
                 execute_request(&config, &request),
             ))
             .expect_err("stalled response body should time out");
@@ -331,18 +333,18 @@ mod tests {
             ..HttpConfig::default()
         };
         let request = HttpRequest {
-            method: reqwest::Method::GET,
+            method: hyper::Method::GET,
             url: format!("http://{first_address}/")
                 .parse()
                 .expect("valid URL"),
             headers: vec![
                 (
-                    reqwest::header::AUTHORIZATION,
-                    reqwest::header::HeaderValue::from_static("Bearer secret"),
+                    hyper::header::AUTHORIZATION,
+                    hyper::header::HeaderValue::from_static("Bearer secret"),
                 ),
                 (
-                    reqwest::header::COOKIE,
-                    reqwest::header::HeaderValue::from_static("session=secret"),
+                    hyper::header::COOKIE,
+                    hyper::header::HeaderValue::from_static("session=secret"),
                 ),
             ],
             body: None,
@@ -353,7 +355,7 @@ mod tests {
             .expect("runtime should build");
         let response = runtime
             .block_on(super::policy::with_deadline(
-                Instant::now() + config.request_timeout,
+                request_deadline(config.request_timeout).expect("valid request deadline"),
                 execute_request(&config, &request),
             ))
             .expect("redirected request should complete");
@@ -396,7 +398,7 @@ mod tests {
             ..HttpConfig::default()
         };
         let request = HttpRequest {
-            method: reqwest::Method::GET,
+            method: hyper::Method::GET,
             url: format!("http://{address}/").parse().expect("valid URL"),
             headers: Vec::new(),
             body: None,
@@ -407,12 +409,183 @@ mod tests {
             .expect("runtime should build");
         let error = runtime
             .block_on(super::policy::with_deadline(
-                Instant::now() + config.request_timeout,
+                request_deadline(config.request_timeout).expect("valid request deadline"),
                 execute_request(&config, &request),
             ))
             .expect_err("redirect target should be denied");
         assert!(error.to_string().contains("target host is not allowed"));
         server.join().expect("server should exit");
+    }
+
+    fn assert_redirect_userinfo_is_rejected(userinfo: &str) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let userinfo = userinfo.to_string();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("first request should connect");
+            let mut request = [0_u8; 2048];
+            let read = socket
+                .read(&mut request)
+                .expect("request should be readable");
+            let request = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+            assert!(!request.contains("authorization:"));
+            assert!(!request.contains(&userinfo.to_ascii_lowercase()));
+            write!(
+                socket,
+                "HTTP/1.1 302 Found\r\nLocation: http://{userinfo}@{address}/blocked\r\nContent-Length: 0\r\n\r\n"
+            )
+            .expect("redirect should be writable");
+            drop(socket);
+
+            listener
+                .set_nonblocking(true)
+                .expect("listener should become nonblocking");
+            let deadline = Instant::now() + Duration::from_millis(200);
+            loop {
+                match listener.accept() {
+                    Ok(_) => panic!("redirect userinfo must be rejected before a second request"),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("unexpected accept error: {error}"),
+                }
+            }
+        });
+        let config = HttpConfig {
+            allowed_schemes: vec!["http".to_string()],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            allowed_ports: vec![address.port()],
+            allow_private_ips: true,
+            ..HttpConfig::default()
+        };
+        let request = HttpRequest {
+            method: hyper::Method::GET,
+            url: format!("http://{address}/").parse().expect("valid URL"),
+            headers: Vec::new(),
+            body: None,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime should build");
+
+        let error = runtime
+            .block_on(super::policy::with_deadline(
+                request_deadline(config.request_timeout).expect("valid request deadline"),
+                execute_request(&config, &request),
+            ))
+            .expect_err("redirect userinfo should be denied");
+        assert!(error.to_string().contains("URL userinfo is not allowed"));
+        server.join().expect("server should exit");
+    }
+
+    #[test]
+    fn redirect_username_is_rejected_before_a_second_request() {
+        assert_redirect_userinfo_is_rejected("redirect-user");
+    }
+
+    #[test]
+    fn redirect_username_and_password_are_rejected_before_a_second_request() {
+        assert_redirect_userinfo_is_rejected("redirect-user:redirect-password");
+    }
+
+    fn execute_fixture_response(
+        response: &'static [u8],
+        max_response_body_bytes: usize,
+    ) -> (VmResult<VmMap>, ResponseReadObserver) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("request should connect");
+            let mut request = [0_u8; 2048];
+            let _ = socket
+                .read(&mut request)
+                .expect("request should be readable");
+            socket
+                .write_all(response)
+                .expect("response should be writable");
+        });
+        let config = HttpConfig {
+            allowed_schemes: vec!["http".to_string()],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            allowed_ports: vec![address.port()],
+            allow_private_ips: true,
+            max_response_body_bytes,
+            ..HttpConfig::default()
+        };
+        let request = HttpRequest {
+            method: hyper::Method::GET,
+            url: format!("http://{address}/").parse().expect("valid URL"),
+            headers: Vec::new(),
+            body: None,
+        };
+        let observer = ResponseReadObserver::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime should build");
+        let result = runtime.block_on(execute_request_with_observer(
+            &config,
+            &request,
+            observer.clone(),
+        ));
+        server.join().expect("server should exit");
+        (result, observer)
+    }
+
+    #[test]
+    fn declared_oversized_body_is_rejected_before_body_transport_polling() {
+        let (result, observer) = execute_fixture_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nabcde",
+            4,
+        );
+        let error = result.expect_err("declared oversized body must fail");
+        assert!(error.to_string().contains("response body exceeds limit"));
+        assert_eq!(observer.body_read_calls(), 0);
+        assert_eq!(observer.max_body_transport_read(), 0);
+    }
+
+    #[test]
+    fn chunked_single_write_is_observed_only_through_remaining_plus_sentinel() {
+        let (result, observer) = execute_fixture_response(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nabcde\r\n0\r\n\r\n",
+            4,
+        );
+        let error = result.expect_err("chunked limit plus one must fail");
+        assert!(error.to_string().contains("response body exceeds limit"));
+        assert!(observer.body_read_calls() > 0);
+        assert!(observer.max_body_transport_read() <= 5);
+        assert!(observer.max_application_chunk() <= 5);
+    }
+
+    #[test]
+    fn unknown_length_body_at_exact_limit_succeeds() {
+        let (result, observer) =
+            execute_fixture_response(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabcd", 4);
+        let response = result.expect("exact-limit body should succeed");
+        assert_eq!(
+            response.get(&Value::string("body")),
+            Some(&Value::bytes(b"abcd".to_vec()))
+        );
+        assert!(observer.max_body_transport_read() <= 5);
+        assert!(observer.max_application_chunk() <= 4);
+    }
+
+    #[test]
+    fn unknown_length_body_at_limit_plus_one_reads_only_the_sentinel() {
+        let (result, observer) =
+            execute_fixture_response(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabcde", 4);
+        let error = result.expect_err("limit plus one body must fail");
+        assert!(error.to_string().contains("response body exceeds limit"));
+        assert!(observer.max_body_transport_read() <= 5);
+        assert!(observer.max_application_chunk() <= 5);
     }
 
     #[test]

@@ -39,6 +39,8 @@ impl HttpConfig {
             )));
         }
         let positive_timeouts = [
+            ("connect_timeout", self.connect_timeout),
+            ("request_timeout", self.request_timeout),
             ("stream_idle_timeout", self.stream_idle_timeout),
             ("websocket_close_timeout", self.websocket_close_timeout),
         ];
@@ -48,6 +50,14 @@ impl HttpConfig {
         {
             return Err(VmError::HostError(format!(
                 "HTTP configuration field '{name}' must be positive"
+            )));
+        }
+        if let Some((name, _)) = positive_timeouts
+            .iter()
+            .find(|(_, timeout)| std::time::Instant::now().checked_add(*timeout).is_none())
+        {
+            return Err(VmError::HostError(format!(
+                "HTTP configuration field '{name}' is too large"
             )));
         }
         Ok(())

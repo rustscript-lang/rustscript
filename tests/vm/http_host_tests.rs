@@ -419,6 +419,25 @@ fn http_config_accepts_bounded_stream_defaults_and_rejects_zero_bounds() {
     assert!(!vm.http_is_configured());
 }
 
+#[test]
+fn http_config_rejects_request_timeout_that_cannot_form_a_deadline() {
+    let invalid = HttpConfig {
+        request_timeout: std::time::Duration::MAX,
+        ..HttpConfig::default()
+    };
+    let validation_error = invalid
+        .validate()
+        .expect_err("overflowing request timeout must be rejected");
+    assert!(validation_error.to_string().contains("request_timeout"));
+
+    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let configure_error = vm
+        .configure_http(invalid)
+        .expect_err("configuration must reject an overflowing request timeout");
+    assert!(configure_error.to_string().contains("request_timeout"));
+    assert!(!vm.http_is_configured());
+}
+
 #[derive(Default)]
 struct RetirementState {
     submitted: HashMap<HostOpId, HostFuture>,

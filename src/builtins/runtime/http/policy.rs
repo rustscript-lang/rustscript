@@ -94,6 +94,7 @@ pub(super) fn validate_url_policy(
     family: SchemeFamily,
     url: &url::Url,
 ) -> VmResult<(String, u16)> {
+    validate_url_structure(url)?;
     let scheme = url.scheme().to_ascii_lowercase();
     if !family.accepts(&scheme)
         || !config
@@ -107,7 +108,7 @@ pub(super) fn validate_url_policy(
     }
     let host = url
         .host_str()
-        .ok_or_else(|| VmError::HostError("HTTP URL has no host".to_string()))?;
+        .expect("structurally validated HTTP URL must have a host");
     if !config
         .allowed_hosts
         .iter()
@@ -126,6 +127,17 @@ pub(super) fn validate_url_policy(
         )));
     }
     Ok((host.to_string(), port))
+}
+
+fn validate_url_structure(url: &url::Url) -> VmResult<()> {
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(VmError::HostError(
+            "HTTP URL userinfo is not allowed".to_string(),
+        ));
+    }
+    url.host_str()
+        .ok_or_else(|| VmError::HostError("HTTP URL has no host".to_string()))?;
+    Ok(())
 }
 
 pub(super) async fn resolve_url(
@@ -213,6 +225,12 @@ pub(super) async fn with_deadline<T>(
     tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), future)
         .await
         .map_err(|_| VmError::HostError("HTTP request deadline exceeded".to_string()))?
+}
+
+pub(super) fn request_deadline(timeout: std::time::Duration) -> VmResult<Instant> {
+    Instant::now().checked_add(timeout).ok_or_else(|| {
+        VmError::HostError("HTTP request_timeout cannot form a deadline".to_string())
+    })
 }
 
 #[cfg(test)]

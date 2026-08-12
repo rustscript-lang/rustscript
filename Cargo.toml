@@ -28,7 +28,16 @@ name = "vm"
 default = ["runtime", "cli", "cranelift-jit"]
 runtime = []
 async = ["runtime", "dep:tokio", "dep:futures-util"]
-http-client = ["async", "dep:reqwest", "dep:url"]
+http-client = [
+    "async",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:url",
+    "dep:webpki-roots",
+]
 sqlite = ["runtime", "dep:rusqlite"]
 edge-abi = [
     "dep:edge_abi",
@@ -63,7 +72,12 @@ cranelift-jit = { version = "0.129.1", optional = true }
 cranelift-module = { version = "0.129.1", optional = true }
 cranelift-native = { version = "0.129.1", optional = true }
 pd-host-function = { path = "./pd-host-function", version = "0.1.0" }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1", default-features = false, features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
 rusqlite = { version = "0.32", default-features = false, features = ["bundled", "hooks", "limits"], optional = true }
 url = { version = "2", optional = true }
 futures-util = { version = "0.3", optional = true }
