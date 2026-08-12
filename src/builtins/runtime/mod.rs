@@ -31,6 +31,7 @@ pub(crate) mod core;
 pub(crate) mod error;
 pub(crate) mod event;
 mod host;
+#[cfg(feature = "http-client")]
 mod http;
 mod io;
 #[cfg(target_arch = "wasm32")]
@@ -46,6 +47,7 @@ pub(crate) mod resource;
 mod sqlite;
 mod typed;
 
+#[cfg(feature = "http-client")]
 pub use http::{HttpConfig, HttpHostExt};
 pub use io::{IoHostExt, IoPolicy};
 #[cfg(feature = "sqlite")]
@@ -235,6 +237,7 @@ pub(crate) fn close_resources_by_type(
     }
 }
 
+#[cfg(feature = "sqlite")]
 pub(crate) fn cancel_operations_by_owner(
     vm: &mut Vm,
     owner: OperationOwner,

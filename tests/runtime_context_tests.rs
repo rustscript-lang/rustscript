@@ -320,7 +320,7 @@ fn concurrent_completion_and_cancellation_choose_one_terminal_state() {
 fn completed_child_ignores_later_parent_cancellation() {
     let mut registry = OperationRegistry::with_limit(4).expect("operation limit should be valid");
     let parent = registry
-        .start_owned(cancellation::OperationOwner::Http, None, None, None)
+        .start_owned(cancellation::OperationOwner::Io, None, None, None)
         .expect("parent should start");
     let child = registry
         .start_owned(

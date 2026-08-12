@@ -25,8 +25,10 @@ pub use assembler::{AsmParseError, Assembler, AssemblerError, BytecodeBuilder, a
 pub use builtins::runtime::HostCallResult;
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::print::{PrintHostFunction, PrintlnHostFunction, format_value};
+#[cfg(feature = "http-client")]
+pub use builtins::runtime::{HttpConfig, HttpHostExt};
 #[cfg(feature = "runtime")]
-pub use builtins::runtime::{HttpConfig, HttpHostExt, IoHostExt, IoPolicy};
+pub use builtins::runtime::{IoHostExt, IoPolicy};
 #[cfg(feature = "sqlite")]
 pub use builtins::runtime::{SqliteHostExt, SqliteLimits, SqlitePolicy};
 pub use builtins::{

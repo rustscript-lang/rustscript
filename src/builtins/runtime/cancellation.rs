@@ -35,7 +35,6 @@ impl OperationId {
 pub enum OperationOwner {
     HostBridge,
     Io,
-    Http,
     #[cfg(feature = "sqlite")]
     Sqlite,
 }
@@ -689,6 +688,7 @@ impl OperationRegistry {
             .ok_or_else(|| operation_not_found(id))
     }
 
+    #[cfg(feature = "sqlite")]
     pub fn operations_by_owner(&self, owner: OperationOwner) -> Vec<OperationState> {
         let operations = self.registered_operations();
         operations
@@ -815,10 +815,10 @@ mod tests {
     fn parent_cancellation_propagates_and_deadline_is_structured() {
         let mut registry = OperationRegistry::with_limit(4).expect("registry should be valid");
         let parent = registry
-            .start_owned(OperationOwner::Http, None, None, None)
+            .start_owned(OperationOwner::Io, None, None, None)
             .expect("parent should start");
         let child = registry
-            .start_owned(OperationOwner::Http, Some(&parent.token()), None, None)
+            .start_owned(OperationOwner::Io, Some(&parent.token()), None, None)
             .expect("child should start");
         assert!(
             parent
@@ -845,7 +845,7 @@ mod tests {
     fn cancel_all_counts_children_cancelled_by_parent_propagation() {
         let mut registry = OperationRegistry::with_limit(2).expect("registry should be valid");
         let parent = registry
-            .start_owned(OperationOwner::Http, None, None, None)
+            .start_owned(OperationOwner::Io, None, None, None)
             .expect("parent should start");
         let child = registry
             .start_owned(OperationOwner::Io, Some(&parent.token()), None, None)
@@ -874,7 +874,7 @@ mod tests {
         let cleanup_count = Arc::clone(&child_cleanup_count);
         let mut registry = OperationRegistry::with_limit(2).expect("registry should be valid");
         let parent = registry
-            .start_owned(OperationOwner::Http, None, None, None)
+            .start_owned(OperationOwner::Io, None, None, None)
             .expect("parent should start");
         let child = registry
             .start_owned(
@@ -920,7 +920,7 @@ mod tests {
     fn parent_cancellation_propagates_child_cleanup_failure() {
         let mut registry = OperationRegistry::with_limit(2).expect("registry should be valid");
         let parent = registry
-            .start_owned(OperationOwner::Http, None, None, None)
+            .start_owned(OperationOwner::Io, None, None, None)
             .expect("parent should start");
         registry
             .start_owned(
@@ -985,7 +985,7 @@ mod tests {
     fn attaching_children_prunes_completed_parent_links() {
         let mut registry = OperationRegistry::with_limit(2).expect("registry should be valid");
         let parent = registry
-            .start_owned(OperationOwner::Http, None, None, None)
+            .start_owned(OperationOwner::Io, None, None, None)
             .expect("parent should start");
 
         for _ in 0..32 {

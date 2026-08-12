@@ -436,7 +436,7 @@ fn deadline_cancellation_closes_operation_payload_before_registry_removal() {
         .host
         .runtime_operations
         .start_owned(
-            OperationOwner::Http,
+            OperationOwner::Io,
             Some(&vm.run_ctx.cancellation),
             Some(Instant::now() - Duration::from_millis(1)),
             None,
@@ -486,7 +486,7 @@ fn worker_observed_deadline_retains_payload_until_vm_consumes_operation() {
         .host
         .runtime_operations
         .start_owned(
-            OperationOwner::Http,
+            OperationOwner::Io,
             Some(&vm.run_ctx.cancellation),
             Some(Instant::now() - Duration::from_millis(1)),
             None,

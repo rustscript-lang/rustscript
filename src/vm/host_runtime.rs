@@ -113,6 +113,7 @@ impl HostRuntime {
             .downcast_ref()
     }
 
+    #[cfg(feature = "http-client")]
     pub(crate) fn host_function_state_mut<T>(&mut self) -> Option<&mut T>
     where
         T: Any + Send,

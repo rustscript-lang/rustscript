@@ -27,8 +27,8 @@ name = "vm"
 [features]
 default = ["runtime", "cli", "cranelift-jit"]
 runtime = []
-async = ["runtime", "dep:reqwest", "dep:url", "dep:tokio", "dep:futures-util"]
-http-client = ["async"]
+async = ["runtime", "dep:tokio", "dep:futures-util"]
+http-client = ["async", "dep:reqwest", "dep:url"]
 sqlite = ["runtime", "dep:rusqlite"]
 edge-abi = [
     "dep:edge_abi",

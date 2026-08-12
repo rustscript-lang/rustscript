@@ -162,9 +162,9 @@ fn main() {
             category: SourceCategory::DefaultHost,
         },
     ];
-    if env::var_os("CARGO_FEATURE_ASYNC").is_some() {
+    if env::var_os("CARGO_FEATURE_HTTP_CLIENT").is_some() {
         host_sources.push(SourceSpec {
-            path: "src/builtins/runtime/http.rs".to_string(),
+            path: "src/builtins/runtime/http/mod.rs".to_string(),
             module: "http".to_string(),
             category: SourceCategory::DefaultHost,
         });

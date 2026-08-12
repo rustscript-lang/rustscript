@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::thread;
 
@@ -132,7 +133,8 @@ async fn drive_vm_to_halt(vm: &mut Vm) -> Result<(), vm::VmError> {
 async fn http_host_executes_a_bounded_request_and_returns_a_response_map() {
     let (port, server) = spawn_test_server();
     let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
-    vm.configure_http(local_http_config(port));
+    vm.configure_http(local_http_config(port))
+        .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
@@ -320,7 +322,8 @@ async fn explicitly_allowed_http_capability_reaches_http_policy() {
         allowed_ports: vec![1],
         allow_private_ips: true,
         ..HttpConfig::default()
-    });
+    })
+    .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     let mut registry = HostFunctionRegistry::restricted();
     registry
@@ -346,7 +349,8 @@ fn http_in_flight_limit_rejects_before_starting_a_request() {
         allow_private_ips: true,
 
         ..HttpConfig::default()
-    });
+    })
+    .expect("HTTP configuration should be valid");
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
         .expect("default host registry should bind HTTP");
@@ -354,4 +358,152 @@ fn http_in_flight_limit_rejects_before_starting_a_request() {
         .run()
         .expect_err("zero in-flight capacity must reject the request");
     assert!(error.to_string().contains("in-flight request limit"));
+}
+
+#[test]
+fn http_config_accepts_bounded_stream_defaults_and_rejects_zero_bounds() {
+    let defaults = HttpConfig::default();
+    defaults
+        .validate()
+        .expect("default HTTP stream bounds should be valid");
+    assert!(defaults.max_stream_item_bytes > 0);
+    assert!(defaults.max_stream_total_bytes > 0);
+    assert!(defaults.max_sse_line_bytes > 0);
+    assert!(defaults.max_websocket_frame_bytes > 0);
+    assert!(defaults.max_websocket_send_bytes > 0);
+    assert!(!defaults.stream_idle_timeout.is_zero());
+    assert!(!defaults.websocket_close_timeout.is_zero());
+
+    let invalid = [
+        HttpConfig {
+            max_stream_item_bytes: 0,
+            ..defaults.clone()
+        },
+        HttpConfig {
+            max_stream_total_bytes: 0,
+            ..defaults.clone()
+        },
+        HttpConfig {
+            max_sse_line_bytes: 0,
+            ..defaults.clone()
+        },
+        HttpConfig {
+            max_websocket_frame_bytes: 0,
+            ..defaults.clone()
+        },
+        HttpConfig {
+            max_websocket_send_bytes: 0,
+            ..defaults.clone()
+        },
+        HttpConfig {
+            stream_idle_timeout: std::time::Duration::ZERO,
+            ..defaults.clone()
+        },
+        HttpConfig {
+            websocket_close_timeout: std::time::Duration::ZERO,
+            ..defaults
+        },
+    ];
+    for config in invalid {
+        assert!(config.validate().is_err(), "zero stream bound must fail");
+    }
+
+    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let error = vm
+        .configure_http(HttpConfig {
+            max_stream_item_bytes: 0,
+            ..HttpConfig::default()
+        })
+        .expect_err("configuration must reject a zero stream bound");
+    assert!(error.to_string().contains("max_stream_item_bytes"));
+    assert!(!vm.http_is_configured());
+}
+
+#[derive(Default)]
+struct RetirementState {
+    submitted: HashMap<HostOpId, HostFuture>,
+    retired: Vec<HostOpId>,
+}
+
+struct RetirementBridge {
+    state: Arc<Mutex<RetirementState>>,
+}
+
+impl HostAsyncBridge for RetirementBridge {
+    fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
+        self.state
+            .lock()
+            .expect("retirement state lock")
+            .submitted
+            .insert(op_id, future);
+        Ok(())
+    }
+
+    fn poll_op(&mut self, op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
+        Poll::Ready(Err(VmError::HostError(format!(
+            "unknown external host operation {op_id}"
+        ))))
+    }
+
+    fn cancel_op(&mut self, op_id: HostOpId) {
+        let mut state = self.state.lock().expect("retirement state lock");
+        state.submitted.remove(&op_id);
+        state.retired.push(op_id);
+    }
+}
+
+fn pending_http_vm(state: Arc<Mutex<RetirementState>>) -> Vm {
+    let mut vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
+    vm.set_http_max_in_flight(1);
+    vm.configure_http(local_http_config(1))
+        .expect("HTTP configuration should be valid");
+    vm.set_async_bridge(Box::new(RetirementBridge { state }));
+    HostFunctionRegistry::new()
+        .bind_vm_cached(&mut vm)
+        .expect("default host registry should bind HTTP");
+    assert!(matches!(vm.run(), Ok(VmStatus::Waiting(_))));
+    vm
+}
+
+#[test]
+fn reset_retires_buffered_http_future_and_releases_its_permit() {
+    let state = Arc::new(Mutex::new(RetirementState::default()));
+    let mut vm = pending_http_vm(Arc::clone(&state));
+
+    vm.reset_for_reuse();
+
+    let retired_id = {
+        let state = state.lock().expect("retirement state lock");
+        assert_eq!(state.submitted.len(), 0);
+        assert_eq!(state.retired.len(), 1);
+        state.retired[0]
+    };
+    assert!(
+        vm.complete_host_op(retired_id, CallReturn::none()).is_err(),
+        "a retired future must not complete back into the VM"
+    );
+    vm.configure_http(local_http_config(1))
+        .expect("HTTP policy should remain reusable after reset");
+    assert!(
+        matches!(vm.run(), Ok(VmStatus::Waiting(_))),
+        "a second request should acquire the released permit"
+    );
+}
+
+#[test]
+fn shutdown_and_drop_retire_buffered_http_futures() {
+    let shutdown_state = Arc::new(Mutex::new(RetirementState::default()));
+    let mut vm = pending_http_vm(Arc::clone(&shutdown_state));
+    vm.shutdown();
+    {
+        let state = shutdown_state.lock().expect("retirement state lock");
+        assert!(state.submitted.is_empty());
+        assert_eq!(state.retired.len(), 1);
+    }
+
+    let drop_state = Arc::new(Mutex::new(RetirementState::default()));
+    drop(pending_http_vm(Arc::clone(&drop_state)));
+    let state = drop_state.lock().expect("retirement state lock");
+    assert!(state.submitted.is_empty());
+    assert_eq!(state.retired.len(), 1);
 }
