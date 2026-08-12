@@ -66,6 +66,9 @@ impl Vm {
         let Value::Callable(callable) = callback else {
             return Err(VmError::TypeMismatch("callable"));
         };
+        if !self.owns_callable(callback) {
+            return Err(VmError::InvalidCallable);
+        }
         let prototype = self
             .program
             .callable_prototypes
@@ -147,7 +150,12 @@ impl Vm {
                 }
                 match self.start_callable_stream_callback() {
                     Ok(VmStatus::Halted) => match self.finish_callable_stream_callback() {
-                        Ok(_) => Poll::Pending,
+                        Ok(VmStatus::Halted) => Poll::Ready(Ok(())),
+                        Ok(VmStatus::Waiting(_)) => {
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                        Ok(VmStatus::Yielded) => Poll::Ready(Ok(())),
                         Err(error) => Poll::Ready(Err(error)),
                     },
                     Ok(VmStatus::Yielded | VmStatus::Waiting(_)) => Poll::Ready(Ok(())),

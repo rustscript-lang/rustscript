@@ -42,11 +42,25 @@ fn context() -> Context<'static> {
     Context::from_waker(Box::leak(Box::new(waker)))
 }
 
+#[derive(Default)]
+struct CountingWake(AtomicUsize);
+
+impl Wake for CountingWake {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 struct SyntheticDriver {
     items: VecDeque<Value>,
     polls: Arc<AtomicUsize>,
     applied: Arc<AtomicUsize>,
     stopped: Arc<AtomicUsize>,
+    producer_error: bool,
 }
 
 impl Drop for SyntheticDriver {
@@ -58,6 +72,11 @@ impl Drop for SyntheticDriver {
 impl HostStreamDriver for SyntheticDriver {
     fn poll_next(&mut self, _cx: &mut Context<'_>) -> Poll<Result<HostStreamPoll, VmError>> {
         self.polls.fetch_add(1, Ordering::SeqCst);
+        if self.producer_error {
+            return Poll::Ready(Err(VmError::HostError(
+                "synthetic producer failed".to_string(),
+            )));
+        }
         match self.items.pop_front() {
             Some(item) => Poll::Ready(Ok(HostStreamPoll::Item(item))),
             None => Poll::Ready(Ok(HostStreamPoll::Complete(map([
@@ -93,11 +112,32 @@ impl HostStreamDriver for SyntheticDriver {
     }
 }
 
+struct DropOnlyDriver {
+    stopped: Arc<AtomicUsize>,
+}
+
+impl Drop for DropOnlyDriver {
+    fn drop(&mut self) {
+        self.stopped.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl HostStreamDriver for DropOnlyDriver {
+    fn poll_next(&mut self, _cx: &mut Context<'_>) -> Poll<VmResult<HostStreamPoll>> {
+        panic!("rejected driver must never be polled")
+    }
+
+    fn apply_action(&mut self, _action: Value) -> VmResult<HostStreamAction> {
+        panic!("rejected driver must never receive an action")
+    }
+}
+
 struct SyntheticStreamHost {
     polls: Arc<AtomicUsize>,
     applied: Arc<AtomicUsize>,
     stopped: Arc<AtomicUsize>,
     invalid_first: bool,
+    producer_error: bool,
 }
 
 struct YieldOnceHost(bool);
@@ -198,6 +238,7 @@ impl HostFunction for SyntheticStreamHost {
             polls: Arc::clone(&self.polls),
             applied: Arc::clone(&self.applied),
             stopped: Arc::clone(&self.stopped),
+            producer_error: self.producer_error,
         };
         let outcome = vm.submit_callable_stream(callback.clone(), driver)?;
         Ok(outcome)
@@ -213,13 +254,15 @@ fn setup(source: &str) -> (Vm, Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<AtomicUsi
     vm.set_async_bridge(Box::new(PendingBridge::default()));
     for function in compiled.functions {
         match function.name.as_str() {
-            "synthetic_stream" | "synthetic_invalid" => {
+            "synthetic_stream" | "synthetic_invalid" | "synthetic_error" => {
                 let invalid_first = function.name == "synthetic_invalid";
+                let producer_error = function.name == "synthetic_error";
                 vm.register_function(Box::new(SyntheticStreamHost {
                     polls: Arc::clone(&polls),
                     applied: Arc::clone(&applied),
                     stopped: Arc::clone(&stopped),
                     invalid_first,
+                    producer_error,
                 }));
             }
             "yield_once" => {
@@ -241,6 +284,14 @@ fn poll_once(vm: &mut Vm) -> Poll<Result<(), VmError>> {
     vm.poll_waiting_host_op(&mut context())
 }
 
+fn direct_callback_vm(source: &str, export: &str) -> (Vm, Value) {
+    let compiled = compile_source(source).expect("direct callback source should compile");
+    let mut vm = Vm::new(compiled.program);
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    let callback = vm.resolve_exported_callable(export).unwrap();
+    (vm, callback)
+}
+
 #[test]
 fn delivers_three_maps_to_a_closure_in_order_and_returns_summary() {
     let source = r#"
@@ -250,7 +301,12 @@ fn delivers_three_maps_to_a_closure_in_order_and_returns_summary() {
     let (mut vm, polls, applied, stopped) = setup(source);
     assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
     for expected in 1..=3 {
-        assert!(matches!(poll_once(&mut vm), Poll::Pending));
+        let poll = poll_once(&mut vm);
+        if expected < 3 {
+            assert!(matches!(poll, Poll::Pending));
+        } else {
+            assert!(matches!(poll, Poll::Ready(Ok(()))));
+        }
         assert_eq!(polls.load(Ordering::SeqCst), expected);
         assert_eq!(applied.load(Ordering::SeqCst), expected);
     }
@@ -261,6 +317,48 @@ fn delivers_three_maps_to_a_closure_in_order_and_returns_summary() {
         Some(&string("stopped"))
     );
     assert_eq!(map_field(&vm.stack()[0], "items"), Some(&Value::Int(3)));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ready_callbacks_self_wake_until_the_stream_reaches_a_terminal_result() {
+    let source = r#"
+        fn synthetic_stream(callback: fn(map) -> map) -> map;
+        synthetic_stream(|item| item);
+    "#;
+    let (mut vm, polls, applied, stopped) = setup(source);
+    assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        vm.await_waiting_host_op(),
+    )
+    .await
+    .expect("ready producer and callback must make executor-driven progress")
+    .unwrap();
+
+    assert_eq!(polls.load(Ordering::SeqCst), 3);
+    assert_eq!(applied.load(Ordering::SeqCst), 3);
+    assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+}
+
+#[test]
+fn continuing_callback_returns_pending_after_scheduling_its_own_repoll() {
+    let source = r#"
+        fn synthetic_stream(callback: fn(map) -> map) -> map;
+        synthetic_stream(|item| item);
+    "#;
+    let (mut vm, polls, applied, _) = setup(source);
+    assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+    let wake = Arc::new(CountingWake::default());
+    let waker = Waker::from(Arc::clone(&wake));
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(matches!(vm.poll_waiting_host_op(&mut cx), Poll::Pending));
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    assert_eq!(applied.load(Ordering::SeqCst), 1);
+    assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+    vm.reset_for_reuse();
 }
 
 #[test]
@@ -291,6 +389,24 @@ fn invalid_action_aborts_before_a_second_producer_poll() {
     };
     assert!(message.contains("invalid synthetic stream action"));
     assert_eq!(polls.load(Ordering::SeqCst), 1);
+    assert!(vm.waiting_host_op_id().is_none());
+}
+
+#[test]
+fn producer_error_releases_the_driver_and_clears_stream_waiting_state() {
+    let source = r#"
+        fn synthetic_error(callback: fn(map) -> map) -> map;
+        synthetic_error(|item| item);
+    "#;
+    let (mut vm, polls, applied, stopped) = setup(source);
+    assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+    let Poll::Ready(Err(VmError::HostError(message))) = poll_once(&mut vm) else {
+        panic!("producer error should terminate the stream")
+    };
+    assert_eq!(message, "synthetic producer failed");
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    assert_eq!(applied.load(Ordering::SeqCst), 0);
+    assert_eq!(stopped.load(Ordering::SeqCst), 1);
     assert!(vm.waiting_host_op_id().is_none());
 }
 
@@ -403,6 +519,114 @@ fn reset_and_shutdown_release_a_waiting_stream_driver() {
     assert!(shutdown_vm.waiting_host_op_id().is_none());
 }
 
+fn enter_callback_wait(vm: &mut Vm) {
+    assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+    assert!(matches!(poll_once(vm), Poll::Ready(Ok(()))));
+    assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+}
+
+#[test]
+fn reset_shutdown_and_drop_release_a_stream_during_callback_wait() {
+    let source = r#"
+        fn synthetic_stream(callback: fn(map) -> map) -> map;
+        fn wait_once();
+        fn callback(item: map) -> map { wait_once(); item }
+        synthetic_stream(callback);
+    "#;
+
+    let (mut reset_vm, _, _, reset_stopped) = setup(source);
+    enter_callback_wait(&mut reset_vm);
+    reset_vm.reset_for_reuse();
+    assert_eq!(reset_stopped.load(Ordering::SeqCst), 1);
+    assert!(reset_vm.waiting_host_op_id().is_none());
+
+    let (mut shutdown_vm, _, _, shutdown_stopped) = setup(source);
+    enter_callback_wait(&mut shutdown_vm);
+    shutdown_vm.shutdown();
+    assert_eq!(shutdown_stopped.load(Ordering::SeqCst), 1);
+    assert!(shutdown_vm.waiting_host_op_id().is_none());
+
+    let (mut dropped_vm, _, _, drop_stopped) = setup(source);
+    enter_callback_wait(&mut dropped_vm);
+    drop(dropped_vm);
+    assert_eq!(drop_stopped.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn direct_submit_rejects_wrong_schema_before_admitting_the_driver() {
+    let (mut vm, callback) =
+        direct_callback_vm(r#"pub fn callback(item: int) -> int { item }"#, "callback");
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let error = vm
+        .submit_callable_stream(
+            callback,
+            DropOnlyDriver {
+                stopped: Arc::clone(&stopped),
+            },
+        )
+        .expect_err("wrong callback schema must be rejected");
+    assert!(matches!(error, VmError::TypeMismatch("fn(map) -> map")));
+    assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    assert!(vm.waiting_host_op_id().is_none());
+}
+
+#[test]
+fn direct_submit_rejects_foreign_callable_with_matching_prototype_metadata() {
+    let source = r#"pub fn callback(item: map) -> map { item }"#;
+    let (foreign_vm, foreign_callback) = direct_callback_vm(source, "callback");
+    let (mut receiving_vm, receiving_callback) = direct_callback_vm(source, "callback");
+    let (Value::Callable(foreign), Value::Callable(receiving)) =
+        (&foreign_callback, &receiving_callback)
+    else {
+        panic!("exports must be callables")
+    };
+    assert_eq!(foreign.prototype_id, receiving.prototype_id);
+    let stopped = Arc::new(AtomicUsize::new(0));
+
+    let error = receiving_vm
+        .submit_callable_stream(
+            foreign_callback,
+            DropOnlyDriver {
+                stopped: Arc::clone(&stopped),
+            },
+        )
+        .expect_err("callable from another vm must be rejected");
+    assert!(matches!(error, VmError::InvalidCallable));
+    assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    assert!(receiving_vm.waiting_host_op_id().is_none());
+    drop(foreign_vm);
+}
+
+#[test]
+fn terminal_stream_rejects_late_completion_through_the_direct_vm_api() {
+    let (mut vm, callback) =
+        direct_callback_vm(r#"pub fn callback(item: map) -> map { item }"#, "callback");
+    let polls = Arc::new(AtomicUsize::new(0));
+    let applied = Arc::new(AtomicUsize::new(0));
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let CallOutcome::Pending(op_id) = vm
+        .submit_callable_stream(
+            callback,
+            SyntheticDriver {
+                items: VecDeque::from([map([("action", string("stop"))])]),
+                polls,
+                applied,
+                stopped,
+                producer_error: false,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("stream admission must return pending")
+    };
+
+    assert!(matches!(poll_once(&mut vm), Poll::Ready(Ok(()))));
+    let error = vm
+        .complete_host_op(op_id, vec![Value::Null])
+        .expect_err("terminal stream must reject a late completion");
+    assert!(error.to_string().contains("vm is not waiting on any op"));
+}
+
 #[test]
 fn callback_schema_accepts_closures_and_named_generic_functions() {
     for source in [
@@ -447,9 +671,16 @@ fn dropping_vm_releases_a_waiting_stream_driver_once() {
 fn interpreter_jit_and_aot_use_the_same_host_stream_continuation() {
     let source = r#"
         fn synthetic_stream(callback: fn(map) -> map) -> map;
+        let mut warm = 0;
+        while warm < 100 {
+            warm = warm + 1;
+        }
         synthetic_stream(|item| item);
     "#;
-    for backend in ["interpreter", "jit", "aot"] {
+    let mut backends = vec!["interpreter"];
+    #[cfg(feature = "cranelift-jit")]
+    backends.extend(["jit", "aot"]);
+    for backend in backends {
         let (mut vm, polls, applied, _stopped) = setup(source);
         vm.set_jit_config(JitConfig {
             enabled: backend == "jit",
@@ -460,11 +691,28 @@ fn interpreter_jit_and_aot_use_the_same_host_stream_continuation() {
             vm.compile_aot().expect("aot compile should succeed");
         }
         assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
-        for _ in 0..3 {
-            assert!(matches!(poll_once(&mut vm), Poll::Pending));
-        }
+        assert!(matches!(poll_once(&mut vm), Poll::Pending));
+        assert!(matches!(poll_once(&mut vm), Poll::Pending));
+        assert!(matches!(poll_once(&mut vm), Poll::Ready(Ok(()))));
         assert_eq!(vm.run().unwrap(), VmStatus::Halted, "{backend}");
         assert_eq!(polls.load(Ordering::SeqCst), 3, "{backend}");
         assert_eq!(applied.load(Ordering::SeqCst), 3, "{backend}");
+        if backend == "jit" && native_jit_supported() {
+            assert!(
+                vm.jit_native_exec_count() > 0,
+                "jit stream setup must execute a native hot path: {}",
+                vm.dump_jit_info()
+            );
+        }
+        if backend == "aot" {
+            assert!(vm.aot_exec_count() > 0, "aot stream path must execute");
+        }
     }
+}
+
+fn native_jit_supported() -> bool {
+    (cfg!(target_arch = "x86_64")
+        && (cfg!(target_os = "windows") || (cfg!(unix) && !cfg!(target_os = "macos"))))
+        || (cfg!(target_arch = "aarch64")
+            && (cfg!(target_os = "linux") || cfg!(target_os = "macos")))
 }

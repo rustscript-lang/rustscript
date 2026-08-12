@@ -820,5 +820,8 @@ mod tests {
         let expanded = expand_pd_host_function(attr, item).unwrap().to_string();
         assert!(expanded.contains("VmCallable < fn (VmMap) -> VmMap >"));
         assert!(expanded.contains("borrow_arg"));
+
+        let float_ty: Type = parse_quote!(VmCallable<fn(f64) -> f64>);
+        assert_eq!(type_label(&float_ty).unwrap(), "fn(float) -> float");
     }
 }

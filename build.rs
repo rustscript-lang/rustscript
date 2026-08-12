@@ -2364,5 +2364,12 @@ mod callable_schema_tests {
             callable_param_expr("fn(map) -> map"),
             "CallableParamType::Callable(CallableType { params: &[CallableParamType::Map], return_type: &CallableParamType::Map })"
         );
+
+        let float_ty: Type = parse_quote!(VmCallable<fn(f64) -> f64>);
+        assert_eq!(type_label(&float_ty), "fn(float) -> float");
+        assert_eq!(
+            callable_param_expr("fn(float) -> float"),
+            "CallableParamType::Callable(CallableType { params: &[CallableParamType::Float], return_type: &CallableParamType::Float })"
+        );
     }
 }

@@ -2245,7 +2245,8 @@ fn callable_param_schema(param: crate::builtins::CallableParamType) -> crate::co
         CallableParamType::Any => TypeSchema::Unknown,
         CallableParamType::Null => TypeSchema::Null,
         CallableParamType::Int => TypeSchema::Int,
-        CallableParamType::Float | CallableParamType::Number => TypeSchema::Number,
+        CallableParamType::Float => TypeSchema::Float,
+        CallableParamType::Number => TypeSchema::Number,
         CallableParamType::Bool => TypeSchema::Bool,
         CallableParamType::String => TypeSchema::String,
         CallableParamType::Bytes => TypeSchema::Bytes,
@@ -2688,6 +2689,73 @@ fn literal_int_index(key: &Expr) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::builtins::{CallableParam, CallableParamType};
+
+    #[test]
+    fn generated_callable_float_schema_remains_distinct_from_number() {
+        assert_eq!(
+            callable_param_schema(CallableParamType::Float),
+            TypeSchema::Float
+        );
+        assert_eq!(
+            callable_param_schema(CallableParamType::Number),
+            TypeSchema::Number
+        );
+    }
+
+    #[test]
+    fn generated_float_callable_metadata_rejects_non_float_callback_results() {
+        static FLOAT_PARAMS: &[CallableParamType] = &[CallableParamType::Float];
+        static FLOAT_RESULT: CallableParamType = CallableParamType::Float;
+        let signature = HostCallableSignature {
+            name: "test::float_callback".to_string(),
+            params: vec![CallableParam {
+                name: "callback",
+                ty: CallableParamType::Callable(crate::builtins::CallableType {
+                    params: FLOAT_PARAMS,
+                    return_type: &FLOAT_RESULT,
+                }),
+                optional: false,
+            }],
+            runtime_builtin: true,
+        };
+        let empty_impls = HashMap::new();
+        let empty_decls = HashMap::new();
+        let empty_structs = HashMap::new();
+        let empty_names = HashMap::new();
+        let empty_returns = HashMap::new();
+        let empty_signatures = HashMap::new();
+        let mut context = TypeContext::new(
+            &empty_impls,
+            &empty_decls,
+            &empty_structs,
+            &empty_names,
+            &empty_returns,
+            &empty_signatures,
+            TypingMode::StrictRustScript,
+        );
+        let state = LocalTypeState::default();
+        let wrong = [Expr::Closure(ClosureExpr {
+            param_slots: vec![0],
+            capture_copies: vec![],
+            body: Box::new(Expr::Int(1)),
+        })];
+        let error = context
+            .validate_host_argument_types(&signature, &wrong, &state, None, None)
+            .expect_err("fn(float) -> float metadata must reject an int result");
+        assert!(
+            error.to_string().contains("float") && error.to_string().contains("int"),
+            "unexpected compiler diagnostic: {error}"
+        );
+
+        let valid = [Expr::Closure(ClosureExpr {
+            param_slots: vec![0],
+            capture_copies: vec![],
+            body: Box::new(Expr::Float(1.0)),
+        })];
+        context
+            .validate_host_argument_types(&signature, &valid, &state, None, None)
+            .expect("fn(float) -> float metadata must accept a float result");
+    }
 
     /// The authoritative `stream::emit` signature: one `any` payload.
     fn emit_signature(runtime_builtin: bool) -> HostCallableSignature {
