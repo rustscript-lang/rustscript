@@ -173,6 +173,11 @@ fn main() {
             module: "http::websocket".to_string(),
             category: SourceCategory::DefaultHost,
         });
+        host_sources.push(SourceSpec {
+            path: "src/builtins/runtime/http/sse.rs".to_string(),
+            module: "http::sse".to_string(),
+            category: SourceCategory::DefaultHost,
+        });
     }
     if env::var_os("CARGO_FEATURE_SQLITE").is_some() {
         host_sources.push(SourceSpec {

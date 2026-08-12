@@ -36,7 +36,7 @@ impl ResponseReadObserver {
         self.inner.phase.store(1, Ordering::Release);
     }
 
-    fn admit_body(&self, limit: usize) {
+    pub(super) fn admit_body(&self, limit: usize) {
         self.inner
             .remaining_body_bytes
             .store(limit, Ordering::Release);
@@ -78,7 +78,7 @@ impl ResponseReadObserver {
             .fetch_max(bytes, Ordering::AcqRel);
     }
 
-    fn observe_application_chunk(&self, bytes: usize) {
+    pub(super) fn observe_application_chunk(&self, bytes: usize) {
         self.inner
             .max_application_chunk
             .fetch_max(bytes, Ordering::AcqRel);
@@ -533,18 +533,7 @@ async fn execute_request_until(
         if has_body {
             reject_declared_oversize(response.response(), config.max_response_body_bytes)?;
         }
-        let response_headers = response
-            .response()
-            .headers()
-            .iter()
-            .map(|(name, value)| {
-                let value = value
-                    .to_str()
-                    .map(Value::string)
-                    .unwrap_or_else(|_| Value::bytes(value.as_bytes().to_vec()));
-                (Value::string(name.as_str()), value)
-            })
-            .collect::<Vec<_>>();
+        let response_headers = response_header_entries(response.response().headers());
         if !has_body {
             return Ok(response_map(status, response_headers, Vec::new(), &url));
         }
@@ -580,17 +569,19 @@ async fn execute_request_until(
 type BoxConnection =
     Pin<Box<dyn std::future::Future<Output = Result<(), hyper::Error>> + Send + 'static>>;
 
-struct OwnedResponse {
+pub(super) struct OwnedResponse {
     connection: Option<BoxConnection>,
     response: hyper::Response<hyper::body::Incoming>,
 }
 
 impl OwnedResponse {
-    fn response(&self) -> &hyper::Response<hyper::body::Incoming> {
+    pub(super) fn response(&self) -> &hyper::Response<hyper::body::Incoming> {
         &self.response
     }
 
-    async fn next_frame(&mut self) -> VmResult<Option<hyper::body::Frame<hyper::body::Bytes>>> {
+    pub(super) async fn next_frame(
+        &mut self,
+    ) -> VmResult<Option<hyper::body::Frame<hyper::body::Bytes>>> {
         enum Progress {
             Frame(Option<Result<hyper::body::Frame<hyper::body::Bytes>, hyper::Error>>),
             Connection(Result<(), hyper::Error>),
@@ -646,6 +637,97 @@ fn follows_location(status: hyper::StatusCode) -> bool {
             | hyper::StatusCode::TEMPORARY_REDIRECT
             | hyper::StatusCode::PERMANENT_REDIRECT
     )
+}
+
+pub(super) fn response_header_entries(headers: &hyper::HeaderMap) -> Vec<(Value, Value)> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let value = value
+                .to_str()
+                .map(Value::string)
+                .unwrap_or_else(|_| Value::bytes(value.as_bytes().to_vec()));
+            (Value::string(name.as_str()), value)
+        })
+        .collect()
+}
+
+pub(super) async fn open_stream_response(
+    config: &HttpConfig,
+    request: &HttpRequest,
+    observer: ResponseReadObserver,
+    deadline: Option<Instant>,
+) -> VmResult<(OwnedResponse, url::Url)> {
+    let mut method = request.method.clone();
+    let mut url = request.url.clone();
+    let mut body = request.body.clone();
+    let mut headers = request.headers.clone();
+    for redirect_index in 0..=config.max_redirects {
+        let mut connect_deadline = Instant::now()
+            .checked_add(config.connect_timeout)
+            .ok_or_else(|| {
+                VmError::HostError("HTTP connect_timeout cannot form a deadline".to_string())
+            })?;
+        if let Some(deadline) = deadline {
+            connect_deadline = connect_deadline.min(deadline);
+        }
+        let resolved = with_deadline(
+            connect_deadline,
+            resolve_url(config, SchemeFamily::Http, &url),
+        )
+        .await?;
+        let origin = url.origin();
+        let response = send_request(
+            &method,
+            &url,
+            &resolved,
+            &headers,
+            body.as_deref(),
+            ConnectionStage {
+                observer: observer.clone(),
+                deadline: connect_deadline,
+                tls_config: None,
+            },
+        )
+        .await?;
+        if follows_location(response.response().status()) {
+            if redirect_index == config.max_redirects {
+                return Err(VmError::HostError(
+                    "HTTP redirect limit exceeded".to_string(),
+                ));
+            }
+            let location = response
+                .response()
+                .headers()
+                .get(hyper::header::LOCATION)
+                .ok_or_else(|| VmError::HostError("HTTP redirect has no location".to_string()))?
+                .to_str()
+                .map_err(|_| VmError::HostError("HTTP redirect location is invalid".to_string()))?;
+            let next_url = url
+                .join(location)
+                .map_err(|error| VmError::HostError(format!("invalid HTTP redirect: {error}")))?;
+            super::policy::validate_url_policy(config, SchemeFamily::Http, &next_url)?;
+            if next_url.origin() != origin {
+                headers.retain(|(name, _)| {
+                    name != hyper::header::AUTHORIZATION && name != hyper::header::COOKIE
+                });
+            }
+            if response.response().status() == hyper::StatusCode::SEE_OTHER
+                || ((response.response().status() == hyper::StatusCode::MOVED_PERMANENTLY
+                    || response.response().status() == hyper::StatusCode::FOUND)
+                    && method == hyper::Method::POST)
+            {
+                method = hyper::Method::GET;
+                body = None;
+            }
+            url = next_url;
+            continue;
+        }
+        return Ok((response, url));
+    }
+    Err(VmError::HostError(
+        "HTTP redirect processing failed".to_string(),
+    ))
 }
 
 fn response_map(

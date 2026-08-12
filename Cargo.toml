@@ -117,6 +117,11 @@ path = "tests/vm/http_host_tests.rs"
 required-features = ["runtime", "http-client"]
 
 [[test]]
+name = "http_sse_tests"
+path = "tests/vm/http_sse_tests.rs"
+required-features = ["runtime", "http-client"]
+
+[[test]]
 name = "host_stream_callback_tests"
 path = "tests/vm/host_stream_callback_tests.rs"
 required-features = ["runtime"]

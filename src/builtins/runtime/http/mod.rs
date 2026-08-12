@@ -7,6 +7,7 @@ use crate::vm::{CaptureAsyncHostContext, Vm, VmError, VmResult};
 mod config;
 pub(super) mod policy;
 pub(super) mod request;
+pub(super) mod sse;
 pub(super) mod websocket;
 
 pub use config::HttpConfig;
