@@ -53,6 +53,44 @@ fn alias_exports_public_invocation_stream_contract() {
     });
 }
 
+#[cfg(feature = "runtime")]
+#[test]
+fn alias_exports_public_host_callable_stream_embedding_api() {
+    use rustscript::{HostStreamAction, HostStreamDriver, HostStreamPoll, Vm};
+
+    struct CompileOnlyDriver;
+
+    impl HostStreamDriver for CompileOnlyDriver {
+        fn poll_next(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<rustscript::VmResult<HostStreamPoll>> {
+            unreachable!("compile-only API smoke")
+        }
+
+        fn apply_action(
+            &mut self,
+            _action: rustscript::Value,
+        ) -> rustscript::VmResult<HostStreamAction> {
+            unreachable!("compile-only API smoke")
+        }
+    }
+
+    fn submit(
+        vm: &mut Vm,
+        callback: rustscript::Value,
+        driver: CompileOnlyDriver,
+    ) -> rustscript::VmResult<rustscript::CallOutcome> {
+        vm.submit_callable_stream(callback, driver)
+    }
+
+    let _submit: fn(
+        &mut Vm,
+        rustscript::Value,
+        CompileOnlyDriver,
+    ) -> rustscript::VmResult<rustscript::CallOutcome> = submit;
+}
+
 #[cfg(feature = "http-client")]
 #[test]
 fn alias_http_client_includes_runtime_contract() {

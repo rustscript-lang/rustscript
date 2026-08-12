@@ -3,20 +3,52 @@ use std::task::{Context, Poll};
 use crate::compiler::TypeSchema;
 use crate::vm::{CallOutcome, HostOpId, Value, Vm, VmError, VmResult, VmStatus};
 
+/// The result of one host-side producer poll for a callable stream.
+///
+/// This is a host-only embedding extension point. It does not expose a stream
+/// handle or polling operation to scripts. A [`HostStreamDriver::poll_next`]
+/// call may yield at most one `Item`; the VM serializes that item with its
+/// script callback before polling the producer again.
 #[derive(Debug)]
 pub enum HostStreamPoll {
+    /// Deliver one producer item to the script callback.
     Item(Value),
+    /// Finish the stream and return the supplied summary to the script call.
     Complete(Value),
 }
 
+/// The host driver's response to one completed script callback.
+///
+/// Values returned by the callback remain inside the host embedding boundary:
+/// no action handle is exposed to scripts.
 #[derive(Debug)]
 pub enum HostStreamAction {
+    /// Continue by returning control to producer polling.
     Continue,
+    /// Finish the stream and return the supplied summary to the script call.
     Complete(Value),
 }
 
+/// Host-only producer integration for a VM-serialized callable stream.
+///
+/// The VM validates the callback's callable provenance, arity, and available
+/// schema before installing a driver. Scripts receive ordinary callback items
+/// and a final value; they never receive a stream handle or a producer poll API.
+///
+/// Implementors must observe these contracts:
+///
+/// - [`poll_next`](Self::poll_next) yields at most one item per call and must
+///   never re-enter the VM.
+/// - [`apply_action`](Self::apply_action) takes ownership of the callback's
+///   returned [`Value`], validates it as a driver-specific action, and must not
+///   poll the producer.
+/// - Dropping the driver means cancellation. `Drop` implementations must
+///   release producer resources without requiring another poll.
 pub trait HostStreamDriver: Send + 'static {
+    /// Polls the producer for at most one item or its final summary.
     fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<HostStreamPoll>>;
+
+    /// Validates and applies one callback-returned action value.
     fn apply_action(&mut self, action: Value) -> VmResult<HostStreamAction>;
 }
 
@@ -37,6 +69,17 @@ pub(crate) struct HostStreamContinuation {
 }
 
 impl Vm {
+    /// Installs a host-only callable stream and suspends the current VM call.
+    ///
+    /// This Rust embedding API does not create a script-visible handle. The VM
+    /// validates that `callback` is a callable owned by this VM, has arity one,
+    /// and, when schema information is present, matches `fn(map) -> map`. It
+    /// then owns the callback and driver until completion, cancellation, reset,
+    /// or error; removing the driver drops it to release producer resources.
+    ///
+    /// The driver contract is documented on [`HostStreamDriver`]. In
+    /// particular, producer polling and callback action application stay
+    /// serialized and neither driver method may re-enter the VM.
     pub fn submit_callable_stream(
         &mut self,
         callback: Value,
