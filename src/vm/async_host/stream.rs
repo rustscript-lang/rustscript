@@ -233,13 +233,12 @@ impl Vm {
     }
 
     fn finish_callable_stream_callback(&mut self) -> VmResult<VmStatus> {
-        let action = self
-            .instance
-            .host_return
-            .take()
-            .ok_or(VmError::InvalidFrameState(
+        let Some(action) = self.instance.host_return.take() else {
+            self.abort_callable_stream();
+            return Err(VmError::InvalidFrameState(
                 "callable stream callback returned no action",
-            ))?;
+            ));
+        };
         let op_id = self
             .instance
             .host_stream

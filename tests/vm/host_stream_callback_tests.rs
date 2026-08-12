@@ -161,6 +161,14 @@ impl HostFunction for WaitHost {
     }
 }
 
+struct RuntimeExitHost;
+
+impl HostFunction for RuntimeExitHost {
+    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, VmError> {
+        Ok(CallOutcome::Halt)
+    }
+}
+
 #[derive(Default)]
 struct PendingBridge {
     futures: HashMap<HostOpId, HostFuture>,
@@ -273,6 +281,9 @@ fn setup(source: &str) -> (Vm, Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<AtomicUsi
             }
             "error_after_yield" => {
                 vm.register_function(Box::new(ErrorAfterYieldHost(false)));
+            }
+            "runtime::exit" => {
+                vm.register_function(Box::new(RuntimeExitHost));
             }
             other => panic!("unexpected host import {other}"),
         }
@@ -465,6 +476,96 @@ fn resumed_callback_error_releases_the_stream_driver() {
     assert!(
         matches!(vm.resume(), Err(VmError::HostError(message)) if message == "callback resumed into failure")
     );
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    assert_eq!(applied.load(Ordering::SeqCst), 0);
+    assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    assert!(vm.waiting_host_op_id().is_none());
+}
+
+#[test]
+fn runtime_exit_in_callback_retires_the_direct_stream_before_reporting_failure() {
+    let source = r#"
+        use runtime;
+        fn synthetic_stream(callback: fn(map) -> map) -> map;
+        fn yield_once();
+        pub fn callback(item: map) -> map { yield_once(); runtime::exit(); item }
+        synthetic_stream(callback);
+    "#;
+    let (mut vm, polls, applied, stopped) = setup(source);
+    let VmStatus::Waiting(op_id) = vm.run().unwrap() else {
+        panic!("stream should wait for its first producer item")
+    };
+
+    assert!(matches!(poll_once(&mut vm), Poll::Ready(Ok(()))));
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    assert_eq!(applied.load(Ordering::SeqCst), 0);
+    assert_eq!(stopped.load(Ordering::SeqCst), 0);
+
+    let VmError::InvalidFrameState(message) = vm
+        .resume()
+        .expect_err("runtime::exit in the callback should report a typed terminal failure")
+    else {
+        panic!("runtime::exit in the callback should report invalid callback completion")
+    };
+    assert_eq!(message, "callable stream callback returned no action");
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    assert_eq!(applied.load(Ordering::SeqCst), 0);
+    assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    assert!(vm.waiting_host_op_id().is_none());
+
+    assert!(matches!(poll_once(&mut vm), Poll::Ready(Ok(()))));
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+    assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    let late = vm
+        .complete_host_op(op_id, vec![Value::Null])
+        .expect_err("a retired stream must reject late completion");
+    assert!(late.to_string().contains("vm is not waiting on any op"));
+
+    let callback = vm.resolve_exported_callable("callback").unwrap();
+    let replacement_stopped = Arc::new(AtomicUsize::new(0));
+    assert!(matches!(
+        vm.submit_callable_stream(
+            callback,
+            DropOnlyDriver {
+                stopped: Arc::clone(&replacement_stopped),
+            },
+        )
+        .unwrap(),
+        CallOutcome::Pending(_)
+    ));
+    vm.reset_for_reuse();
+    assert_eq!(replacement_stopped.load(Ordering::SeqCst), 1);
+    assert_eq!(stopped.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn runtime_exit_in_callback_is_a_fused_typed_invocation_failure() {
+    let source = r#"
+        use runtime;
+        fn synthetic_stream(callback: fn(map) -> map) -> map;
+        fn callback(item: map) -> map { runtime::exit(); item }
+        pub fn run() -> map { synthetic_stream(callback) }
+    "#;
+    let (mut vm, polls, applied, stopped) = setup(source);
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    let callable = vm.resolve_exported_callable("run").unwrap();
+    {
+        let mut invocation = vm.start_invocation(callable, vec![]).unwrap();
+        assert!(matches!(
+            invocation.poll_next().unwrap(),
+            InvocationPoll::Ready(Some(Err(InvocationError::Vm(VmError::InvalidFrameState(
+                "callable stream callback returned no action"
+            )))))
+        ));
+        assert!(matches!(
+            invocation.poll_next().unwrap(),
+            InvocationPoll::Ready(None)
+        ));
+        assert!(matches!(
+            invocation.poll_next().unwrap(),
+            InvocationPoll::Ready(None)
+        ));
+    }
     assert_eq!(polls.load(Ordering::SeqCst), 1);
     assert_eq!(applied.load(Ordering::SeqCst), 0);
     assert_eq!(stopped.load(Ordering::SeqCst), 1);
