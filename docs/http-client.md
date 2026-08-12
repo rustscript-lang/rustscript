@@ -1,14 +1,14 @@
 # HTTP client callable contract
 
-RustScript exposes HTTP as bounded host imports. The current buffered request API returns one complete response. The target streaming APIs keep one ordinary host call active and invoke a script callable for each protocol item; they expose no response stream or socket object.
+RustScript exposes buffered HTTP, SSE, and WebSocket as bounded host imports. Streaming calls keep one ordinary host call active and invoke a script callable for each protocol item; they expose no response stream or socket object.
 
 The embedding must configure destination policy and grant each available callable explicitly. HTTP configuration and capability bindings are snapshotted when a call is admitted, so later profile or configuration changes cannot widen an active connection.
 
-**Milestone boundary:** At this documentation baseline, the script-facing HTTP API is limited to buffered `http::client::request`. Milestones 1–4 establish the typed callback admission, generic callable stream pump, and shared connection policy used by streaming transports. The SSE and WebSocket sections below define the target contracts delivered by Milestones 5 and 6, respectively.
+All three APIs described below are available with the `http-client` feature.
 
 ## Capabilities and profiles
 
-Across the complete Milestones 1–6 contract, the three imports are independent capabilities:
+The three imports are independent capabilities:
 
 - `http::client::request`
 - `http::client::sse`
@@ -54,7 +54,7 @@ The response is buffered under the configured response-body limit and returned a
 
 ## Server-sent events
 
-> **Milestone 5 target contract:** `http::client::sse` becomes script-facing when the SSE protocol adapter is integrated; it is not part of the Milestones 1–4 API surface.
+`http::client::sse` is available with the `http-client` feature.
 
 ```rust
 fn on_sse(item: map) -> map {
@@ -79,9 +79,9 @@ let result = http::client::sse({
 | `url` | yes | string containing an `http` or `https` URL | Protocol family and the configured scheme, host, port, and address policy must all admit it |
 | `headers` | no | map from string header names to string values | Names and values must be syntactically valid; client-managed request headers remain forbidden, and `Accept: text/event-stream` is supplied when absent |
 | `body` | no | bytes or string, including for `POST` | Bounded by `max_request_body_bytes` |
-| `timeout_ms` | no | positive integer milliseconds | Milestone 5 will cap this optional shortening deadline by `HttpConfig::max_stream_duration` |
+| `timeout_ms` | no | positive integer milliseconds | Caps this optional shortening deadline by `HttpConfig::max_stream_duration` |
 
-The callback schema is `fn(map) -> map`, and the response must have an event-stream content type. The response head remains bounded by the existing HTTP parser. The target contract adds no configurable request-header byte accounting.
+The callback schema is `fn(map) -> map`, and the response must have an event-stream content type. The response head remains bounded by the existing HTTP parser. The contract adds no configurable request-header byte accounting.
 
 The callback receives exactly one map at a time, in this order:
 
@@ -130,7 +130,7 @@ There is no automatic reconnection. Values such as a provider's `[DONE]` marker 
 
 ## WebSocket sessions
 
-> **Milestone 6 target contract:** `http::client::websocket` becomes script-facing when the WebSocket protocol adapter is integrated; it is not part of the Milestones 1–4 API surface.
+`http::client::websocket` is available with the `http-client` feature.
 
 ```rust
 fn on_socket(item: map) -> map {
@@ -157,9 +157,9 @@ let result = http::client::websocket({
 | `url` | yes | string containing a `ws` or `wss` URL | Protocol family and the configured scheme, host, port, and address policy must all admit it |
 | `headers` | no | map from string header names to string values | Names and values must be syntactically valid; client-managed upgrade headers are rejected |
 | `protocols` | no | array of syntactically valid subprotocol strings | The peer-selected subprotocol must match this offered list |
-| `timeout_ms` | no | positive integer milliseconds | Milestone 6 will cap this optional shortening deadline by `HttpConfig::max_stream_duration`, matching the Milestone 5 SSE contract |
+| `timeout_ms` | no | positive integer milliseconds | Caps this optional shortening deadline by `HttpConfig::max_stream_duration`, matching SSE |
 
-The callback schema is `fn(map) -> map`. The handshake response head remains bounded by the existing HTTP parser. The target contract adds no configurable request-header byte accounting.
+The callback schema is `fn(map) -> map`. The handshake response head remains bounded by the existing HTTP parser. The contract adds no configurable request-header byte accounting.
 
 After a validated `101` upgrade, the callback receives `open`, followed by incoming protocol items:
 
@@ -234,7 +234,7 @@ At most one unacknowledged protocol item crosses the host/VM boundary. Decoder s
 
 The network future never owns or re-enters the VM. Callback error, protocol completion, configured deadline, VM reset/shutdown/drop, invocation termination, or normal return retires the operation exactly once. The embedding owns pending futures: retiring a call drops its transport and permit, and a late completion cannot re-enter the VM.
 
-`request_timeout` is the current total bound for a buffered request and does not apply to streaming. Under the target Milestones 5–6 contract, `max_stream_duration` becomes the host-controlled absolute total-duration bound for each streaming call. SSE will compute one admission-time deadline from the smaller of `max_stream_duration` and optional positive `timeout_ms`; the script value can only shorten the call and cannot disable or extend the host maximum. WebSocket will use the same field and capping rule when its adapter is integrated. Embedding invocation retirement may still terminate either protocol sooner. `stream_idle_timeout` remains a separate wait-for-network-progress bound and resets only after progress; periodic traffic cannot extend the total deadline. Network idle time excludes time spent inside the callback, while callback work remains subject to embedding invocation lifecycle. WebSocket close waiting is additionally bounded by `websocket_close_timeout`.
+`request_timeout` is the total bound for a buffered request and does not apply to streaming. `max_stream_duration` is the host-controlled absolute total-duration bound for each SSE and WebSocket call. Both protocols compute one admission-time deadline from the smaller of `max_stream_duration` and optional positive `timeout_ms`; the script value can only shorten the call and cannot disable or extend the host maximum. DNS, TCP, TLS, handshake, active reads and writes, callback execution, callback waits, and close flushing all count against the same deadline. Embedding invocation retirement may still terminate either protocol sooner. `stream_idle_timeout` remains a separate wait-for-network-progress bound and resets only after progress; periodic traffic cannot extend the total deadline. Network idle time excludes time spent inside the callback, while callback work remains inside the total deadline. WebSocket close waiting is additionally bounded by `websocket_close_timeout`, which cannot extend the total deadline.
 
 ## Configuration defaults
 
@@ -242,7 +242,7 @@ The network future never owns or re-enters the VM. Callback error, protocol comp
 
 | Field | Default | Purpose |
 | --- | ---: | --- |
-| `allowed_schemes` | `https` | Scheme allowlist; protocol-family checks still apply |
+| `allowed_schemes` | `https`, `wss` | Scheme allowlist; protocol-family checks still apply |
 | `allowed_hosts` | empty | Destination host allowlist; empty denies every host |
 | `allowed_ports` | empty | Destination port allowlist; empty denies every port |
 | `allow_private_ips` | `false` | Reject private and other special-use addresses |
@@ -256,11 +256,11 @@ The network future never owns or re-enters the VM. Callback error, protocol comp
 | `max_sse_line_bytes` | 64 KiB | SSE line bound |
 | `max_websocket_frame_bytes` | 1 MiB | WebSocket frame bound |
 | `max_websocket_send_bytes` | 1 MiB | One WebSocket outbound action bound |
-| `max_stream_duration` | 5 min | Target Milestones 5–6 host maximum total duration for SSE and WebSocket calls |
+| `max_stream_duration` | 5 min | Host maximum total duration for SSE and WebSocket calls |
 | `stream_idle_timeout` | 30 s | Wait-for-network-data bound |
 | `websocket_close_timeout` | 5 s | Close-handshake wait bound |
 
-The shared in-flight connection default is 64. Zero values for streaming byte limits or any timeout are invalid configuration; buffered `max_request_body_bytes` and `max_response_body_bytes` may be zero to prohibit request or response payload bytes. `HttpConfig::default()` allows only `https`, so an embedding must explicitly add `wss` before a secure WebSocket URL can pass admission. Embeddings should set explicit host and port allowlists and add `http`, `ws`, or `wss` only when those schemes are required. Buffered HTTP and SSE accept only `http`/`https`; WebSocket accepts only `ws`/`wss`. The recommended secure protocol families are `https` and `wss`; that recommendation does not widen the actual default allowlist.
+The shared in-flight connection default is 64. Zero values for streaming byte limits or any timeout are invalid configuration; buffered `max_request_body_bytes` and `max_response_body_bytes` may be zero to prohibit request or response payload bytes. `HttpConfig::default()` allows `https` and `wss`. Embeddings should set explicit host and port allowlists and add `http` or `ws` only when those schemes are required. Buffered HTTP and SSE accept only `http`/`https`; WebSocket accepts only `ws`/`wss`.
 
 ## Destination policy and protocol transports
 
@@ -278,7 +278,7 @@ Every protocol uses the same admission, address-pinning, and security policy:
 
 The policy snapshot taken at call admission applies for the complete operation.
 
-Protocol transport remains separate from that shared policy. Buffered HTTP and the SSE target use reviewed direct Hyper HTTP/1 over Tokio/Rustls connections. The WebSocket protocol adapter may use Tungstenite over a prevalidated, pinned Tokio/Rustls stream; it must not perform an independent DNS lookup or connection outside the shared admission and pinning path.
+Protocol transport remains separate from that shared policy. Buffered HTTP and SSE use direct Hyper HTTP/1 over Tokio/Rustls connections. WebSocket uses Tungstenite over a prevalidated, pinned Tokio/Rustls stream and performs no independent DNS lookup or connection outside the shared admission and pinning path.
 
 ## Deliberately absent APIs and semantics
 
@@ -288,7 +288,7 @@ RustScript core provides no script-visible HTTP request ID, response/stream/sock
 
 PR #13 introduced HTTP-private pending-operation and abort-handle maps, one abort pair per request, HTTP owner routes, request-local runtimes, and HTTP-synthesized cancellation errors. The callable streaming contract supersedes those mechanisms. Buffered requests, SSE, and WebSocket submit ordinary futures through the embedding-owned async bridge; HTTP has no private pending map, abort map, operation-ID namespace, token owner route, or cancellation state machine.
 
-The later generic `src/builtins/runtime/cancellation.rs` remains for non-HTTP runtime callers until their separate migration. HTTP does not depend on `CancellationToken`, `CancellationReason`, `OperationOwner::Http`, or owner-wide cancellation routing. Embedding-owned retirement of a pending future remains VM lifecycle control and rejects late completion; it is not an HTTP API-level cancellation facility.
+The generic `src/builtins/runtime/cancellation.rs` remains for non-HTTP runtime callers. HTTP does not depend on `CancellationToken`, `CancellationReason`, `OperationOwner::Http`, or owner-wide cancellation routing. Embedding-owned retirement of a pending future remains VM lifecycle control and rejects late completion; dropping an `Invocation` also retires active producer/callback waits and returns the VM and connection permit for reuse. This lifecycle cleanup is not an HTTP API-level cancellation facility.
 
 ## Target and backend notes
 
