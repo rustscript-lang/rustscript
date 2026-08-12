@@ -226,8 +226,110 @@ async fn callback_actions_are_applied_before_next_message_and_close_handshake_co
         &Value::string("closed")
     );
     assert_eq!(map_field(&vm.stack()[0], "items"), &Value::Int(5));
-    assert_eq!(map_field(&vm.stack()[0], "bytes_received"), &Value::Int(16));
-    assert_eq!(map_field(&vm.stack()[0], "bytes_sent"), &Value::Int(16));
+    assert_eq!(map_field(&vm.stack()[0], "bytes_received"), &Value::Int(7));
+    assert_eq!(map_field(&vm.stack()[0], "bytes_sent"), &Value::Int(5));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn control_frames_do_not_consume_an_exhausted_application_byte_budget() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("client should connect");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake should succeed");
+        socket
+            .send(Message::text("full"))
+            .await
+            .expect("application payload should send");
+        assert_eq!(
+            socket.next().await.expect("ping").expect("valid ping"),
+            Message::Ping(vec![7, 8, 9].into())
+        );
+        socket
+            .send(Message::Pong(vec![7, 8, 9].into()))
+            .await
+            .expect("pong should send");
+        socket
+            .send(Message::Close(Some(
+                tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                    code: 1000.into(),
+                    reason: "done".into(),
+                },
+            )))
+            .await
+            .expect("close should send");
+        assert!(matches!(
+            socket.next().await.expect("close acknowledgment"),
+            Ok(Message::Close(_))
+        ));
+    });
+    let source = format!(
+        r#"
+        use http;
+        use bytes;
+        fn callback(item: map) -> map {{
+            if item["kind"] == "text" => {{
+                {{ action: "ping", data: bytes::from_array_u8([7, 8, 9]) }}
+            }} else => {{
+                {{ action: "continue" }}
+            }}
+        }}
+        http::client::websocket({{ url: "ws://{address}/" }}, callback);
+        "#
+    );
+    let mut config = websocket_config(address.port());
+    config.max_stream_total_bytes = 4;
+    let vm = run_websocket(&source, config)
+        .await
+        .expect("control traffic after the exact application limit should complete");
+    server.await.expect("server should finish");
+    assert_eq!(
+        map_field(&vm.stack()[0], "outcome"),
+        &Value::string("closed")
+    );
+    assert_eq!(map_field(&vm.stack()[0], "bytes_received"), &Value::Int(4));
+    assert_eq!(map_field(&vm.stack()[0], "bytes_sent"), &Value::Int(0));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn application_payload_one_byte_over_the_total_budget_is_rejected() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("client should connect");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake should succeed");
+        socket
+            .send(Message::text("limit"))
+            .await
+            .expect("application payload should send");
+        let terminal = tokio::time::timeout(Duration::from_millis(500), socket.next())
+            .await
+            .expect("client should terminate promptly");
+        assert!(terminal.is_none() || terminal.is_some_and(|item| item.is_err()));
+    });
+    let source = format!(
+        r#"
+        use http;
+        fn callback(item: map) -> map {{ {{ action: "continue" }} }}
+        http::client::websocket({{ url: "ws://{address}/" }}, callback);
+        "#
+    );
+    let mut config = websocket_config(address.port());
+    config.max_stream_total_bytes = 4;
+    let error = match run_websocket(&source, config).await {
+        Ok(_) => panic!("application payload above the total budget must fail"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("total byte limit"));
+    server.await.expect("server should finish");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -334,6 +436,65 @@ async fn peer_close_is_delivered_once_and_continue_acknowledges_it() {
         &Value::string("closed")
     );
     assert_eq!(map_field(&vm.stack()[0], "items"), &Value::Int(2));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn peer_close_callback_close_validates_and_flushes_the_queued_acknowledgment() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("client should connect");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake should succeed");
+        socket
+            .send(Message::Close(Some(
+                tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                    code: 1001.into(),
+                    reason: "away".into(),
+                },
+            )))
+            .await
+            .expect("peer close should send");
+        let acknowledgment = socket
+            .next()
+            .await
+            .expect("client should acknowledge close")
+            .expect("close acknowledgment should be valid");
+        let Message::Close(Some(frame)) = acknowledgment else {
+            panic!("expected close acknowledgment, got {acknowledgment:?}");
+        };
+        assert_eq!(u16::from(frame.code), 1001);
+        assert_eq!(frame.reason, "away");
+    });
+    let source = format!(
+        r#"
+        use http;
+        fn callback(item: map) -> map {{
+            if item["kind"] == "close" => {{
+                assert(item["code"] == 1001);
+                assert(item["reason"] == "away");
+                {{ action: "close", code: 1000, reason: "validated" }}
+            }} else => {{
+                {{ action: "continue", code: 1000, reason: "" }}
+            }}
+        }}
+        http::client::websocket({{ url: "ws://{address}/" }}, callback);
+        "#
+    );
+    let vm = run_websocket(&source, websocket_config(address.port()))
+        .await
+        .expect("peer close callback close should complete without a host write error");
+    server.await.expect("server should finish");
+    assert_eq!(
+        map_field(&vm.stack()[0], "outcome"),
+        &Value::string("closed")
+    );
+    assert_eq!(map_field(&vm.stack()[0], "items"), &Value::Int(2));
+    assert_eq!(map_field(&vm.stack()[0], "bytes_received"), &Value::Int(0));
+    assert_eq!(map_field(&vm.stack()[0], "bytes_sent"), &Value::Int(0));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -558,4 +719,40 @@ fn request_validation_rejects_managed_headers_before_connection() {
             .expect_err("managed header must fail before connect");
         assert!(error.to_string().contains("managed by the client"));
     }
+}
+
+#[test]
+fn timeout_ms_is_rejected_before_any_connection_attempt() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+    listener
+        .set_nonblocking(true)
+        .expect("listener should become nonblocking");
+    let address = listener.local_addr().expect("listener address");
+    let source = format!(
+        r#"
+        use http;
+        fn callback(item: map) -> map {{ {{ action: "stop" }} }}
+        http::client::websocket({{
+            url: "ws://{address}/",
+            timeout_ms: 25
+        }}, callback);
+        "#
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.configure_http(websocket_config(address.port())).unwrap();
+    HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
+    let error = vm
+        .run()
+        .expect_err("timeout_ms must fail during synchronous admission");
+    assert!(
+        error
+            .to_string()
+            .contains("no externally bounded streaming deadline is available"),
+        "unexpected error: {error}"
+    );
+    let accept_error = listener
+        .accept()
+        .expect_err("admission failure must prevent a connection attempt");
+    assert_eq!(accept_error.kind(), std::io::ErrorKind::WouldBlock);
 }

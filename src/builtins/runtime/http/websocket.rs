@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use futures_util::{Sink, Stream};
 use pd_host_function::pd_host_function;
@@ -33,7 +33,6 @@ struct WebSocketRequest {
     url: url::Url,
     headers: Vec<(HeaderName, HeaderValue)>,
     protocols: Vec<String>,
-    total_timeout: Option<Duration>,
 }
 
 struct ConnectedSocket {
@@ -63,7 +62,6 @@ struct ActiveSocket {
     outbound: Option<Message>,
     flush_required: bool,
     local_closing: bool,
-    peer_close_seen: bool,
     complete_after_flush: bool,
     close_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
     idle_sleep: Option<Pin<Box<tokio::time::Sleep>>>,
@@ -107,7 +105,7 @@ pub(super) fn builtin_http_client_websocket_impl(
         .ok_or_else(|| VmError::HostError("HTTP host is not configured".to_string()))?;
     let request = parse_websocket_request(request.as_ref(), &config)?;
     let permit = state.admission.acquire()?;
-    let driver = WebSocketDriver::new(config, request, permit)?;
+    let driver = WebSocketDriver::new(config, request, permit, None)?;
     match vm.submit_callable_stream(callback, driver)? {
         CallOutcome::Pending(op_id) => Ok(HostCallResult::Pending(op_id)),
         _ => Err(VmError::InvalidFrameState(
@@ -121,15 +119,12 @@ impl WebSocketDriver {
         config: HttpConfig,
         request: WebSocketRequest,
         permit: ConnectionPermit,
+        externally_bounded_deadline: Option<Instant>,
     ) -> VmResult<Self> {
-        let call_deadline = request.total_timeout.map(request_deadline).transpose()?;
         let connect_deadline = request_deadline(config.connect_timeout)?;
-        let connect_deadline =
-            call_deadline.map_or(connect_deadline, |total| total.min(connect_deadline));
+        let connect_deadline = externally_bounded_deadline
+            .map_or(connect_deadline, |deadline| deadline.min(connect_deadline));
         let future = connect_socket(config.clone(), request.clone(), connect_deadline);
-        let call_sleep = request
-            .total_timeout
-            .map(|timeout| Box::pin(tokio::time::sleep(timeout)));
         Ok(Self {
             config,
             request,
@@ -138,8 +133,8 @@ impl WebSocketDriver {
             items: 0,
             bytes_received: 0,
             bytes_sent: 0,
-            call_deadline,
-            call_sleep,
+            call_deadline: externally_bounded_deadline,
+            call_sleep: None,
         })
     }
 
@@ -184,6 +179,13 @@ impl WebSocketDriver {
 
     fn poll_total_deadline(&mut self, cx: &mut Context<'_>) -> VmResult<()> {
         self.check_total_deadline()?;
+        if self.call_sleep.is_none()
+            && let Some(deadline) = self.call_deadline
+        {
+            self.call_sleep = Some(Box::pin(tokio::time::sleep_until(
+                tokio::time::Instant::from_std(deadline),
+            )));
+        }
         if self
             .call_sleep
             .as_mut()
@@ -217,6 +219,17 @@ impl WebSocketDriver {
             ))));
         }
 
+        if active.local_closing || active.complete_after_flush {
+            let sleep = active.close_sleep.get_or_insert_with(|| {
+                Box::pin(tokio::time::sleep(self.config.websocket_close_timeout))
+            });
+            if sleep.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Err(VmError::HostError(
+                    "WebSocket close handshake timed out".to_string(),
+                )));
+            }
+        }
+
         if let Some(message) = active.outbound.take() {
             match Pin::new(&mut active.socket).poll_ready(cx) {
                 Poll::Pending => {
@@ -246,17 +259,6 @@ impl WebSocketDriver {
             return Poll::Ready(Ok(self.complete("closed", active)));
         }
 
-        if active.local_closing {
-            let sleep = active.close_sleep.get_or_insert_with(|| {
-                Box::pin(tokio::time::sleep(self.config.websocket_close_timeout))
-            });
-            if sleep.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(Err(VmError::HostError(
-                    "WebSocket close handshake timed out".to_string(),
-                )));
-            }
-        }
-
         if !active.local_closing {
             if active.idle_sleep.is_none() {
                 active.idle_sleep = Some(Box::pin(tokio::time::sleep(
@@ -284,18 +286,14 @@ impl WebSocketDriver {
             }
             Poll::Ready(Some(Ok(message))) => {
                 active.idle_sleep = None;
-                let payload_len = message.len();
-                if self
-                    .bytes_received
-                    .saturating_add(self.bytes_sent)
-                    .saturating_add(payload_len)
-                    > self.config.max_stream_total_bytes
-                {
-                    return Poll::Ready(Err(VmError::HostError(
-                        "WebSocket stream exceeds total byte limit".to_string(),
-                    )));
+                if matches!(&message, Message::Text(_) | Message::Binary(_)) {
+                    self.bytes_received = checked_application_counter(
+                        self.bytes_received,
+                        self.bytes_sent,
+                        message.len(),
+                        self.config.max_stream_total_bytes,
+                    )?;
                 }
-                self.bytes_received += payload_len;
                 self.items += 1;
                 let (kind, item) = match message {
                     Message::Text(text) => (
@@ -327,7 +325,6 @@ impl WebSocketDriver {
                         ]),
                     ),
                     Message::Close(frame) => {
-                        active.peer_close_seen = true;
                         let (code, reason) = frame.map_or((Value::Null, String::new()), |frame| {
                             (
                                 Value::Int(u16::from(frame.code) as i64),
@@ -381,7 +378,6 @@ impl HostStreamDriver for WebSocketDriver {
                             outbound: None,
                             flush_required: false,
                             local_closing: false,
-                            peer_close_seen: false,
                             complete_after_flush: false,
                             close_sleep: None,
                             idle_sleep: None,
@@ -455,41 +451,36 @@ impl HostStreamDriver for WebSocketDriver {
                 ItemKind::Close => {
                     active.complete_after_flush = true;
                     active.flush_required = true;
+                    active.close_sleep = Some(Box::pin(tokio::time::sleep(
+                        self.config.websocket_close_timeout,
+                    )));
                     None
                 }
                 _ => None,
             },
             "send_text" if matches!(kind, ItemKind::Open | ItemKind::Text | ItemKind::Binary) => {
                 let text = required_string(action_map, "text", "WebSocket send_text action")?;
-                validate_send_size(
+                self.bytes_sent = validate_send_size(
                     &self.config,
                     self.bytes_received,
                     self.bytes_sent,
                     text.len(),
                 )?;
-                self.bytes_sent = self.bytes_sent.saturating_add(text.len());
                 Some(Message::text(text))
             }
             "send_binary" if matches!(kind, ItemKind::Open | ItemKind::Text | ItemKind::Binary) => {
                 let data = required_bytes(action_map, "data", "WebSocket send_binary action")?;
-                validate_send_size(
+                self.bytes_sent = validate_send_size(
                     &self.config,
                     self.bytes_received,
                     self.bytes_sent,
                     data.len(),
                 )?;
-                self.bytes_sent = self.bytes_sent.saturating_add(data.len());
                 Some(Message::binary(data))
             }
             "ping" if !matches!(kind, ItemKind::Ping | ItemKind::Close) => {
                 let data = required_bytes(action_map, "data", "WebSocket ping action")?;
-                validate_control_payload(
-                    &self.config,
-                    self.bytes_received,
-                    self.bytes_sent,
-                    &data,
-                )?;
-                self.bytes_sent = self.bytes_sent.saturating_add(data.len());
+                validate_control_payload(&self.config, &data)?;
                 Some(Message::Ping(data.into()))
             }
             "pong"
@@ -499,34 +490,27 @@ impl HostStreamDriver for WebSocketDriver {
                 ) =>
             {
                 let data = required_bytes(action_map, "data", "WebSocket pong action")?;
-                validate_control_payload(
-                    &self.config,
-                    self.bytes_received,
-                    self.bytes_sent,
-                    &data,
-                )?;
-                self.bytes_sent = self.bytes_sent.saturating_add(data.len());
+                validate_control_payload(&self.config, &data)?;
                 Some(Message::Pong(data.into()))
             }
             "close" => {
                 let frame = parse_close_action(action_map)?;
                 let payload_len = 2 + frame.reason.len();
-                validate_send_size(
-                    &self.config,
-                    self.bytes_received,
-                    self.bytes_sent,
-                    payload_len,
-                )?;
-                self.bytes_sent = self.bytes_sent.saturating_add(payload_len);
+                validate_control_size(&self.config, payload_len)?;
                 if kind == ItemKind::Close {
                     active.complete_after_flush = true;
+                    active.flush_required = true;
+                    active.close_sleep = Some(Box::pin(tokio::time::sleep(
+                        self.config.websocket_close_timeout,
+                    )));
+                    None
                 } else {
                     active.local_closing = true;
                     active.close_sleep = Some(Box::pin(tokio::time::sleep(
                         self.config.websocket_close_timeout,
                     )));
+                    Some(Message::Close(Some(frame)))
                 }
-                Some(Message::Close(Some(frame)))
             }
             _ => {
                 return Err(VmError::HostError(format!(
@@ -746,24 +730,16 @@ fn parse_websocket_request(map: &VmMap, config: &HttpConfig) -> VmResult<WebSock
         Some(_) => return Err(VmError::TypeMismatch("WebSocket protocols")),
     };
 
-    let total_timeout = match map.get(&Value::string("timeout_ms")) {
-        None | Some(Value::Null) => None,
-        Some(Value::Int(value)) if *value > 0 => {
-            let requested = Duration::from_millis(*value as u64);
-            Some(requested.min(config.request_timeout))
-        }
-        Some(Value::Int(_)) => {
-            return Err(VmError::HostError(
-                "WebSocket timeout_ms must be positive".to_string(),
-            ));
-        }
-        Some(_) => return Err(VmError::TypeMismatch("WebSocket timeout_ms")),
-    };
+    if map.get(&Value::string("timeout_ms")).is_some() {
+        return Err(VmError::HostError(
+            "WebSocket timeout_ms is unavailable because no externally bounded streaming deadline is available"
+                .to_string(),
+        ));
+    }
     Ok(WebSocketRequest {
         url,
         headers,
         protocols,
-        total_timeout,
     })
 }
 
@@ -842,32 +818,51 @@ fn validate_send_size(
     bytes_received: usize,
     bytes_sent: usize,
     size: usize,
-) -> VmResult<()> {
+) -> VmResult<usize> {
     if size > config.max_websocket_send_bytes {
         return Err(VmError::HostError(
             "WebSocket send payload exceeds limit".to_string(),
         ));
     }
-    if bytes_received
-        .saturating_add(bytes_sent)
-        .saturating_add(size)
-        > config.max_stream_total_bytes
-    {
+    checked_application_counter(
+        bytes_sent,
+        bytes_received,
+        size,
+        config.max_stream_total_bytes,
+    )
+}
+
+fn checked_application_counter(
+    current: usize,
+    other: usize,
+    additional: usize,
+    maximum: usize,
+) -> VmResult<usize> {
+    let updated = current.checked_add(additional).ok_or_else(|| {
+        VmError::HostError("WebSocket stream application byte count overflowed".to_string())
+    })?;
+    let total = updated.checked_add(other).ok_or_else(|| {
+        VmError::HostError("WebSocket stream application byte count overflowed".to_string())
+    })?;
+    if total > maximum {
         return Err(VmError::HostError(
             "WebSocket stream exceeds total byte limit".to_string(),
         ));
     }
-    Ok(())
+    Ok(updated)
 }
 
-fn validate_control_payload(
-    config: &HttpConfig,
-    bytes_received: usize,
-    bytes_sent: usize,
-    data: &[u8],
-) -> VmResult<()> {
-    validate_send_size(config, bytes_received, bytes_sent, data.len())?;
-    if data.len() > 125 {
+fn validate_control_payload(config: &HttpConfig, data: &[u8]) -> VmResult<()> {
+    validate_control_size(config, data.len())
+}
+
+fn validate_control_size(config: &HttpConfig, size: usize) -> VmResult<()> {
+    if size > config.max_websocket_send_bytes {
+        return Err(VmError::HostError(
+            "WebSocket send payload exceeds limit".to_string(),
+        ));
+    }
+    if size > 125 {
         return Err(VmError::HostError(
             "WebSocket control payload exceeds 125 bytes".to_string(),
         ));
@@ -905,6 +900,8 @@ fn socket_error(prefix: &str, error: tokio_tungstenite::tungstenite::Error) -> V
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn config() -> HttpConfig {
@@ -918,7 +915,7 @@ mod tests {
     #[test]
     fn send_and_total_limits_accept_exact_boundaries_and_reject_overflow() {
         let config = config();
-        assert!(validate_send_size(&config, 2, 2, 5).is_ok());
+        assert_eq!(validate_send_size(&config, 2, 2, 5).unwrap(), 7);
         assert!(
             validate_send_size(&config, 2, 2, 6)
                 .unwrap_err()
@@ -938,9 +935,9 @@ mod tests {
         let mut config = config();
         config.max_websocket_send_bytes = 126;
         config.max_stream_total_bytes = 1024;
-        assert!(validate_control_payload(&config, 0, 0, &[0; 125]).is_ok());
+        assert!(validate_control_payload(&config, &[0; 125]).is_ok());
         assert!(
-            validate_control_payload(&config, 0, 0, &[0; 126])
+            validate_control_payload(&config, &[0; 126])
                 .unwrap_err()
                 .to_string()
                 .contains("125 bytes")
@@ -951,6 +948,29 @@ mod tests {
         for code in [0, 999, 1004, 1005, 1006, 1015, 2999, 5000] {
             assert!(!valid_close_code(code), "code {code} should be invalid");
         }
+    }
+
+    #[test]
+    fn application_byte_counter_is_checked_at_the_limit_and_on_overflow() {
+        assert_eq!(checked_application_counter(4, 5, 0, 9).unwrap(), 4);
+        assert!(
+            checked_application_counter(4, 5, 1, 9)
+                .unwrap_err()
+                .to_string()
+                .contains("total byte limit")
+        );
+        assert!(
+            checked_application_counter(usize::MAX, 0, 1, usize::MAX)
+                .unwrap_err()
+                .to_string()
+                .contains("overflowed")
+        );
+        assert!(
+            checked_application_counter(usize::MAX, 1, 0, usize::MAX)
+                .unwrap_err()
+                .to_string()
+                .contains("overflowed")
+        );
     }
 
     #[test]
