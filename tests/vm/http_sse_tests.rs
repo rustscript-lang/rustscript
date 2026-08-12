@@ -1,14 +1,18 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::task::{Context, Poll};
 use std::thread;
 
 use vm::{
-    CallReturn, HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput, HostOpId,
-    HttpConfig, HttpHostExt, Value, Vm, VmError, VmMap, VmResult, VmStatus, compile_source,
+    CallOutcome, CallReturn, HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput,
+    HostOpId, HostStackFunction, HttpConfig, HttpHostExt, Value, Vm, VmError, VmMap, VmResult,
+    VmStatus, compile_source,
 };
 
 #[derive(Default)]
@@ -45,6 +49,36 @@ impl HostAsyncBridge for TokioHostDriver {
 
     fn cancel_op(&mut self, op_id: HostOpId) {
         self.submitted.remove(&op_id);
+    }
+}
+
+struct AsyncWaitOnce {
+    calls: Arc<AtomicUsize>,
+}
+
+struct CountCalls {
+    calls: Arc<AtomicUsize>,
+}
+
+impl HostStackFunction for CountCalls {
+    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true))))
+    }
+}
+
+impl HostStackFunction for AsyncWaitOnce {
+    fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            vm.submit_host_future(Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                Ok(HostFutureOutput::returning(CallReturn::one(Value::Bool(
+                    true,
+                ))))
+            }))
+        } else {
+            Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true))))
+        }
     }
 }
 
@@ -684,9 +718,9 @@ async fn sse_total_deadline_expires_despite_periodic_progress_below_idle_timeout
         assert!(socket.read(&mut request).unwrap() > 0);
         socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
         socket.flush().unwrap();
-        for _ in 0..20 {
-            thread::sleep(std::time::Duration::from_millis(10));
-            if socket.write_all(b"2\r\n:\n\r\n").is_err() {
+        for _ in 0..40 {
+            thread::sleep(std::time::Duration::from_millis(25));
+            if socket.write_all(b"c\r\ndata: tick\n\n\r\n").is_err() {
                 break;
             }
             if socket.flush().is_err() {
@@ -695,17 +729,40 @@ async fn sse_total_deadline_expires_despite_periodic_progress_below_idle_timeout
         }
     });
     let mut deadline_config = config(port);
-    deadline_config.max_stream_duration = std::time::Duration::from_millis(55);
-    deadline_config.stream_idle_timeout = std::time::Duration::from_millis(30);
+    deadline_config.max_stream_duration = std::time::Duration::from_millis(600);
+    deadline_config.stream_idle_timeout = std::time::Duration::from_millis(250);
+    let callbacks = Arc::new(AtomicUsize::new(0));
     let source = format!(
-        r#"use http; fn go(item: map) -> map {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
+        r#"use http;
+        fn count_call() -> bool;
+        fn go(item: map) -> map {{
+            {{action: if count_call() => {{"continue"}} else => {{"continue"}}}}
+        }}
+        http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
     );
-    let error = match run_sse_source(&source, deadline_config).await {
-        Ok(_) => panic!("periodic progress must not extend the total deadline"),
-        Err(error) => error,
-    };
+    let compiled = compile_source(&source).unwrap();
+    let mut vm = Vm::new(compiled.program);
+    vm.configure_http(deadline_config).unwrap();
+    vm.set_async_bridge(Box::<TokioHostDriver>::default());
+    let mut registry = HostFunctionRegistry::new();
+    registry.register_stack("count_call", 0, {
+        let callbacks = Arc::clone(&callbacks);
+        move || {
+            Box::new(CountCalls {
+                calls: Arc::clone(&callbacks),
+            })
+        }
+    });
+    registry.bind_vm_cached(&mut vm).unwrap();
+    let error = drive(&mut vm)
+        .await
+        .expect_err("periodic progress must not extend the total deadline");
     assert!(error.to_string().contains("total deadline"), "{error}");
     server.join().unwrap();
+    assert!(
+        callbacks.load(Ordering::SeqCst) >= 4,
+        "multiple progress events must reach callbacks inside the idle bound"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -753,6 +810,149 @@ async fn sse_total_deadline_releases_the_connection_permit_for_reuse() {
         .await
         .expect("the second stream should acquire the released permit");
     assert_eq!(field(&vm.stack()[0], "outcome"), &Value::string("eof"));
+    server.join().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sse_callback_stop_after_deadline_fails_and_releases_permit_without_another_poll() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        let mut request = [0; 1024];
+        assert!(first.read(&mut request).unwrap() > 0);
+        first
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .unwrap();
+        first.flush().unwrap();
+        let first = thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(500));
+            drop(first);
+        });
+
+        let (mut second, _) = listener.accept().unwrap();
+        let mut request = [0; 1024];
+        assert!(second.read(&mut request).unwrap() > 0);
+        second
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\n\r\n",
+            )
+            .unwrap();
+        first.join().unwrap();
+    });
+    let source = format!(
+        r#"
+        use http;
+        fn async_wait() -> bool;
+        http::client::sse(
+            {{"method":"GET","url":"http://127.0.0.1:{port}/events"}},
+            |item| {{
+                action: if async_wait() => {{ "stop" }} else => {{ "stop" }}
+            }}
+        );
+        "#
+    );
+    let compiled = compile_source(&source).unwrap();
+    let mut vm = Vm::new(compiled.program);
+    vm.set_http_max_in_flight(1);
+    let mut deadline_config = config(port);
+    deadline_config.max_stream_duration = std::time::Duration::from_millis(100);
+    deadline_config.stream_idle_timeout = std::time::Duration::from_secs(1);
+    vm.configure_http(deadline_config).unwrap();
+    vm.set_async_bridge(Box::<TokioHostDriver>::default());
+    let wait_calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = HostFunctionRegistry::new();
+    registry.register_stack("async_wait", 0, {
+        let wait_calls = Arc::clone(&wait_calls);
+        move || {
+            Box::new(AsyncWaitOnce {
+                calls: Arc::clone(&wait_calls),
+            })
+        }
+    });
+    registry.bind_vm_cached(&mut vm).unwrap();
+
+    let error = drive(&mut vm)
+        .await
+        .expect_err("a callback action after the total deadline must fail");
+    assert!(
+        matches!(error, VmError::HostError(ref message) if message == "SSE total deadline exceeded"),
+        "{error}"
+    );
+    assert_eq!(wait_calls.load(Ordering::SeqCst), 1);
+    assert!(vm.stack().iter().all(|value| {
+        let Value::Map(map) = value else {
+            return true;
+        };
+        map.get(&Value::string("outcome")) != Some(&Value::string("stopped"))
+    }));
+
+    vm.reset_for_reuse();
+    drive(&mut vm)
+        .await
+        .expect("the next stream should acquire the released permit");
+    assert_eq!(wait_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(field(&vm.stack()[0], "outcome"), &Value::string("stopped"));
+    server.join().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sse_callback_continue_after_deadline_fails_before_another_network_poll() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut request = [0; 1024];
+        assert!(socket.read(&mut request).unwrap() > 0);
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .unwrap();
+        socket.flush().unwrap();
+        thread::sleep(std::time::Duration::from_millis(500));
+    });
+    let source = format!(
+        r#"
+        use http;
+        fn async_wait() -> bool;
+        http::client::sse(
+            {{"method":"GET","url":"http://127.0.0.1:{port}/events"}},
+            |item| {{
+                action: if async_wait() => {{ "continue" }} else => {{ "continue" }}
+            }}
+        );
+        "#
+    );
+    let compiled = compile_source(&source).unwrap();
+    let mut vm = Vm::new(compiled.program);
+    let mut deadline_config = config(port);
+    deadline_config.max_stream_duration = std::time::Duration::from_millis(100);
+    deadline_config.stream_idle_timeout = std::time::Duration::from_secs(1);
+    vm.configure_http(deadline_config).unwrap();
+    vm.set_async_bridge(Box::<TokioHostDriver>::default());
+    let wait_calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = HostFunctionRegistry::new();
+    registry.register_stack("async_wait", 0, {
+        let wait_calls = Arc::clone(&wait_calls);
+        move || {
+            Box::new(AsyncWaitOnce {
+                calls: Arc::clone(&wait_calls),
+            })
+        }
+    });
+    registry.bind_vm_cached(&mut vm).unwrap();
+
+    let error = drive(&mut vm)
+        .await
+        .expect_err("a continue action after the total deadline must fail");
+    assert!(
+        matches!(error, VmError::HostError(ref message) if message == "SSE total deadline exceeded"),
+        "{error}"
+    );
+    assert_eq!(wait_calls.load(Ordering::SeqCst), 1);
     server.join().unwrap();
 }
 

@@ -442,16 +442,23 @@ impl SseDriver {
         self.eof_pending = false;
         self.permit.take();
     }
+
+    fn ensure_before_deadline(&mut self) -> VmResult<()> {
+        if Instant::now() >= self.deadline {
+            self.retire();
+            return Err(VmError::HostError(
+                "SSE total deadline exceeded".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl HostStreamDriver for SseDriver {
     fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<HostStreamPoll>> {
         loop {
-            if Instant::now() >= self.deadline {
-                self.retire();
-                return Poll::Ready(Err(VmError::HostError(
-                    "SSE total deadline exceeded".to_string(),
-                )));
+            if let Err(error) = self.ensure_before_deadline() {
+                return Poll::Ready(Err(error));
             }
             if let Some(chunk) = self.chunk.as_ref() {
                 let (consumed, event) =
@@ -600,6 +607,7 @@ impl HostStreamDriver for SseDriver {
     }
 
     fn apply_action(&mut self, action: Value) -> VmResult<HostStreamAction> {
+        self.ensure_before_deadline()?;
         let Value::Map(action) = action else {
             self.retire();
             return Err(VmError::HostError(
