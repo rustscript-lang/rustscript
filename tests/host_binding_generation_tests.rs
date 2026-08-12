@@ -8,9 +8,11 @@ use build_script::{
 };
 use syn::parse_quote;
 use vm::{
-    BuiltinFunction, CapabilityProfile, HostExecution, HostFunctionRegistry, JitConfig,
-    JitTraceTerminal, Value, Vm, VmStatus, compile_source, default_host_callables,
+    BuiltinFunction, CapabilityProfile, HostFunctionRegistry, JitConfig, JitTraceTerminal, Value,
+    Vm, VmStatus, compile_source,
 };
+#[cfg(feature = "http-client")]
+use vm::{HostExecution, default_host_callables};
 
 fn native_jit_supported() -> bool {
     (cfg!(target_arch = "x86_64")
