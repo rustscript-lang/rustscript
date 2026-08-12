@@ -865,6 +865,7 @@ fn aot_executes_script_callable_frames_without_interpreter_boundary() {
     let compiled = crate::compile_source_for_repl(
         r#"
             fn add_one(value: int) -> int { value + 1 }
+            let f = add_one;
             add_one(41);
         "#,
     )
@@ -886,6 +887,7 @@ fn aot_executes_typed_script_callable_parameter_equality_without_interpreter_bou
     let compiled = crate::compile_source(
         r#"
             fn is_zero(value: int) -> bool { value == 0 }
+            let f = is_zero;
             is_zero(0);
         "#,
     )
@@ -906,6 +908,7 @@ fn aot_executes_script_callable_bool_return_in_branch_without_interpreter_bounda
     let compiled = crate::compile_source(
         r#"
             fn is_zero(value: int) -> bool { value == 0 }
+            let f = is_zero;
             let selected = if is_zero(0) => { 1 } else => { 2 };
             selected;
         "#,
@@ -969,6 +972,7 @@ fn aot_callable_call_resumes_after_fuel_yield_without_interpreter_boundary() {
     let compiled = crate::compile_source_for_repl(
         r#"
             fn add_one(value: int) -> int { value + 1 }
+            let f = add_one;
             add_one(41);
         "#,
     )
@@ -997,6 +1001,8 @@ fn aot_executes_nested_script_callables_without_interpreter_boundary() {
         r#"
             fn inc(value: int) -> int { value + 1 }
             fn twice(value: int) -> int { inc(inc(value)) }
+            let f = inc;
+            let g = twice;
             twice(40);
         "#,
     )
@@ -1017,6 +1023,7 @@ fn aot_recursive_script_callable_reports_depth_limit_without_interpreter_boundar
     let compiled = crate::compile_source_for_repl(
         r#"
             fn recurse(value: int) -> int { recurse(value) }
+            let f = recurse;
             recurse(1);
         "#,
     )
@@ -2643,4 +2650,53 @@ fn call_ret_fusion_pattern_requires_immediate_ret() {
     let mut vm_no_next = Vm::new(no_next);
     vm_no_next.instance.ip = 4;
     assert!(!vm_no_next.can_fuse_call_ret_pattern());
+}
+
+#[test]
+fn program_cache_key_distinguishes_call_script_from_call_value() {
+    // A direct-only call lowers to `CallScript`; the same call through a
+    // materialized callable lowers to `CallValue`. The static cache identity
+    // must treat the two programs as different even when their metadata
+    // otherwise matches, because the native call boundary differs.
+    let direct = crate::compile_source("fn add2(value: int) -> int { value + 2 } add2(40);")
+        .expect("direct call source should compile");
+    let materialized =
+        crate::compile_source("fn add2(value: int) -> int { value + 2 } let f = add2; f(40);")
+            .expect("materialized call source should compile");
+
+    let mut direct_vm = Vm::new(direct.program);
+    let mut materialized_vm = Vm::new(materialized.program);
+    let direct_key = direct_vm.ensure_program_cache_key();
+    let materialized_key = materialized_vm.ensure_program_cache_key();
+    assert_ne!(
+        direct_key, materialized_key,
+        "CallScript and CallValue programs must not share cache identity"
+    );
+
+    // The same direct program reproduces the same key across VMs.
+    let direct_repeat = crate::compile_source("fn add2(value: int) -> int { value + 2 } add2(40);")
+        .expect("direct call source should compile");
+    let mut repeat_vm = Vm::new(direct_repeat.program);
+    assert_eq!(
+        repeat_vm.ensure_program_cache_key(),
+        direct_key,
+        "identical programs must share cache identity"
+    );
+}
+
+#[test]
+fn native_callable_abi_version_covers_direct_script_calls() {
+    // `CallScript` adds a new native boundary helper and exit contract; the
+    // native callable ABI revision must reflect it so every directly coupled
+    // program/native cache is invalidated exactly once.
+    assert_eq!(
+        super::native::NATIVE_CALLABLE_ABI_VERSION,
+        6,
+        "native callable ABI revision must cover direct script call semantics"
+    );
+    let direct = crate::compile_source("fn add2(value: int) -> int { value + 2 } add2(40);")
+        .expect("direct call source should compile");
+    let mut vm = Vm::new(direct.program);
+    let key = vm.ensure_program_cache_key();
+    assert_ne!(key, 0, "cache key must be non-trivial");
 }

@@ -447,7 +447,8 @@ fn offset_terminator(
         }
         SsaTerminator::Exit { exit }
         | SsaTerminator::Return { exit }
-        | SsaTerminator::CallValue { exit, .. } => {
+        | SsaTerminator::CallValue { exit, .. }
+        | SsaTerminator::CallScript { exit, .. } => {
             *exit = offset_exit_id(*exit, exit_offset)?;
         }
     }

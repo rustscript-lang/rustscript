@@ -765,7 +765,8 @@ fn named_function_recursion_uses_runtime_frames_and_hits_depth_limit() {
         compiled
             .program
             .code
-            .contains(&(vm::OpCode::CallValue as u8))
+            .contains(&(vm::OpCode::CallScript as u8)),
+        "non-capturing direct recursion lowers through CallScript"
     );
     assert_eq!(compiled.program.script_functions.len(), 1);
 
@@ -799,16 +800,16 @@ fn repeated_named_calls_share_one_emitted_body() {
         1
     );
     let mut ip = 0usize;
-    let mut callvalue_count = 0usize;
+    let mut callscript_count = 0usize;
     while ip < compiled.program.code.len() {
         let opcode = vm::OpCode::try_from(compiled.program.code[ip])
             .expect("compiler should emit valid opcodes");
-        if opcode == vm::OpCode::CallValue {
-            callvalue_count += 1;
+        if opcode == vm::OpCode::CallScript {
+            callscript_count += 1;
         }
         ip += 1 + opcode.operand_len();
     }
-    assert_eq!(callvalue_count, 3);
+    assert_eq!(callscript_count, 3);
 
     let mut runtime = vm::Vm::new(compiled.program.with_local_count(compiled.locals));
     assert_eq!(

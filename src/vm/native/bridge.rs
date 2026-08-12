@@ -316,6 +316,14 @@ pub(crate) fn enter_call_value_inherited_entry_address() -> usize {
     pd_vm_native_enter_call_value_inherited as *const () as usize
 }
 
+pub(crate) fn enter_call_script_entry_address() -> usize {
+    pd_vm_native_enter_call_script as *const () as usize
+}
+
+pub(crate) fn enter_call_script_inherited_entry_address() -> usize {
+    pd_vm_native_enter_call_script_inherited as *const () as usize
+}
+
 pub(crate) fn leave_frame_entry_address() -> usize {
     pd_vm_native_leave_frame as *const () as usize
 }
@@ -1005,6 +1013,78 @@ pub(crate) extern "C" fn pd_vm_native_enter_call_value_inherited(
     })
 }
 
+fn native_enter_call_script(
+    vm: &mut Vm,
+    prototype_id: i64,
+    argc: i64,
+    call_ip: i64,
+    resume_ip: i64,
+    inherited_state: *mut u8,
+) -> VmResult<i32> {
+    let prototype_id = u32::try_from(prototype_id)
+        .map_err(|_| VmError::InvalidFrameState("native call-script prototype id out of range"))?;
+    let argc = u8::try_from(argc)
+        .map_err(|_| VmError::InvalidFrameState("native call-script argc out of range"))?;
+    let call_ip = usize::try_from(call_ip)
+        .map_err(|_| VmError::InvalidFrameState("native call-script ip out of range"))?;
+    let resume_ip = usize::try_from(resume_ip)
+        .map_err(|_| VmError::InvalidFrameState("native call-script resume ip out of range"))?;
+    if vm.instance.ip != call_ip {
+        vm.jump_to(call_ip)?;
+    }
+    if resume_ip > vm.program.code.len() {
+        return Err(VmError::BytecodeBounds);
+    }
+    vm.instance.ip = resume_ip;
+    let status = match vm.execute_call_script(prototype_id, argc, call_ip)? {
+        ExecOutcome::Continue => STATUS_LINKED_CONTINUE,
+        ExecOutcome::Halted => STATUS_HALTED,
+        ExecOutcome::Yielded => STATUS_YIELDED,
+        ExecOutcome::Waiting(_) => STATUS_WAITING,
+    };
+    if status == STATUS_LINKED_CONTINUE {
+        if vm.active_frame_has_shared_capture_cells() {
+            return Ok(STATUS_CONTINUE);
+        }
+        if !inherited_state.is_null() {
+            write_inherited_state_packet(vm, inherited_state)?;
+        }
+    }
+    Ok(status)
+}
+
+pub(crate) extern "C" fn pd_vm_native_enter_call_script(
+    vm: *mut Vm,
+    prototype_id: i64,
+    argc: i64,
+    call_ip: i64,
+    resume_ip: i64,
+) -> i32 {
+    run_step(vm, "enter_call_script", |vm| {
+        native_enter_call_script(
+            vm,
+            prototype_id,
+            argc,
+            call_ip,
+            resume_ip,
+            std::ptr::null_mut(),
+        )
+    })
+}
+
+pub(crate) extern "C" fn pd_vm_native_enter_call_script_inherited(
+    vm: *mut Vm,
+    prototype_id: i64,
+    argc: i64,
+    call_ip: i64,
+    resume_ip: i64,
+    inherited_state: *mut u8,
+) -> i32 {
+    run_step(vm, "enter_call_script", |vm| {
+        native_enter_call_script(vm, prototype_id, argc, call_ip, resume_ip, inherited_state)
+    })
+}
+
 fn native_leave_frame(vm: &mut Vm, ret_ip: i64, inherited_state: *mut u8) -> VmResult<i32> {
     let ret_ip = usize::try_from(ret_ip)
         .map_err(|_| VmError::InvalidFrameState("native ret ip out of range"))?;
@@ -1316,8 +1396,17 @@ pub(crate) extern "C" fn pd_vm_native_restore_virtual_frame(
                 "virtual frame local count does not match prototype",
             ));
         }
-        if call_ip.saturating_add(2) != return_ip
-            || vm.program.code.get(call_ip).copied() != Some(crate::OpCode::CallValue as u8)
+        // The virtual frame continuation must resume exactly after the call
+        // instruction that produced it: `CallValue` carries a one-byte
+        // `argc` operand, `CallScript` a five-byte `(prototype_id, argc)`
+        // operand.
+        let call_instruction_len = match vm.program.code.get(call_ip).copied() {
+            Some(opcode) if opcode == crate::OpCode::CallValue as u8 => 2,
+            Some(opcode) if opcode == crate::OpCode::CallScript as u8 => 6,
+            _ => 0,
+        };
+        if call_instruction_len == 0
+            || call_ip.saturating_add(call_instruction_len) != return_ip
             || return_ip > vm.program.code.len()
             || resume_ip < function.entry_ip as usize
             || resume_ip >= function.end_ip as usize

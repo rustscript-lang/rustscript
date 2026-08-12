@@ -563,6 +563,15 @@ pub(crate) enum SsaTerminator {
         resume_ip: usize,
         exit: SsaExitId,
     },
+    /// Static direct script-function call: the callee prototype is part of
+    /// the instruction, so no runtime callable value is consumed.
+    CallScript {
+        prototype_id: u32,
+        argc: u8,
+        call_ip: usize,
+        resume_ip: usize,
+        exit: SsaExitId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1044,7 +1053,8 @@ fn verify_terminator(
         }
         SsaTerminator::Exit { exit }
         | SsaTerminator::Return { exit }
-        | SsaTerminator::CallValue { exit, .. } => {
+        | SsaTerminator::CallValue { exit, .. }
+        | SsaTerminator::CallScript { exit, .. } => {
             if !exit_ids.contains(exit) {
                 return Err(SsaVerifyError::UnknownExit(*exit));
             }
@@ -1277,6 +1287,15 @@ fn render_terminator(terminator: &SsaTerminator) -> String {
             resume_ip,
             exit,
         } => format!("call_value argc={argc} call_ip={call_ip} resume_ip={resume_ip} {exit}"),
+        SsaTerminator::CallScript {
+            prototype_id,
+            argc,
+            call_ip,
+            resume_ip,
+            exit,
+        } => format!(
+            "call_script prototype={prototype_id} argc={argc} call_ip={call_ip} resume_ip={resume_ip} {exit}"
+        ),
     }
 }
 

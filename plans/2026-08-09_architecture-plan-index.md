@@ -15,6 +15,7 @@
 | Wire/ABI | Count-derived builtin indices change existing call IDs | `2026-08-09_static-builtin-id.md` | none |
 | Compiler correctness | UTF-8 rewrite, parent-path normalization, nested source diagnostics, public entry-point parity | `2026-08-09_nested-module-correctness.md` | none |
 | Compiler architecture | Text rewrite, synthetic preludes, flat global symbols, basename identity, source ownership | `2026-08-09_semantic-module-system.md` | nested correctness |
+| Compiler/runtime correctness | Named script calls count separate callee frames as caller-live locals; aggregate overflow reports a sentinel; direct-only functions reserve hidden callable slots | `2026-08-11_frame-aware-local-allocation.md` | real script call frames; semantic module identities for cross-module use classification |
 | VM ownership | Monolithic VM mixes engine/program/instance/run/host state | `2026-08-09_vm-runtime-decomposition.md` | static IDs |
 | Host lifecycle | Generic resource/operation code unused; IO/HTTP/SQLite duplicate lifecycle/cancellation | `2026-08-09_unified-host-lifecycle.md` | VM decomposition |
 | Execution contract | Return/event ambiguity, buffered-only events, string errors, fragmented terminal state | `2026-08-09_run-outcome-event-error-contract.md` | RunContext; host lifecycle for final cancellation integration |
@@ -67,6 +68,15 @@ Can run in parallel after their dependencies:
 2. Structured task supervisor.
 3. Backend semantic convergence.
 4. Agent run lifecycle and durable state integration.
+
+### Local-slot correction route
+
+This route is ordered independently of the host-lifecycle waves:
+
+1. Execute `2026-08-11_frame-aware-local-allocation.md` first. Land named-call frame-aware liveness and real-count diagnostics before direct-call/selective callable materialization.
+2. Verify the storage-shaped dispatch fixture stays below the short-bytecode ceiling and the true same-frame 257-local control still fails for the declared capacity reason.
+
+Exit gate: separate frames reuse relative slots, direct-only named functions do not require hidden callable locals, and aggregate diagnostics report actual counts.
 
 ## Scope boundary
 

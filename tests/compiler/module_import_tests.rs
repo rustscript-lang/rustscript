@@ -911,3 +911,108 @@ fn nested_module_host_namespace_import_stays_host() {
 
     remove_module_root(&root);
 }
+
+#[test]
+fn frame_local_dispatch_module_split_pressure_is_bounded() {
+    // The same 77-function/32-branch call graph as the single-file frame-local
+    // dispatch test, split across semantic modules. Named-call pressure must
+    // be independent of import discovery order and linker local-base
+    // assignment: callee body footprints stay inside their own frames.
+    let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("modules")
+        .join("frame_local_dispatch");
+    let main_path = fixture_root.join("main.rss");
+    let compiled = compile_source_file(&main_path)
+        .expect("frame-local module dispatch program should compile");
+    assert!(
+        compiled.locals <= 100,
+        "aggregate frame locals should stay within per-frame pressure plus callable slots, got {}",
+        compiled.locals
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(1), Value::Int(32)]);
+}
+
+#[test]
+fn named_callable_materialization_module_split_same_name_materialization() {
+    // Two modules each declare a private `helper` with the same source name.
+    // Milestone 5 classification follows the resolved function identity, and
+    // milestone 6 lowering keeps every named function's prototype while
+    // omitting hidden slots for the direct-only helpers: each module's
+    // exported `run` stays materialized, and each module's `run` calls its
+    // own helper through the direct script-call path.
+    let root = temp_module_root("named_callable_materialization_same_name");
+    let a_dir = root.join("a");
+    let b_dir = root.join("b");
+    std::fs::create_dir_all(&a_dir).expect("a dir should be created");
+    std::fs::create_dir_all(&b_dir).expect("b dir should be created");
+    write_source(
+        &a_dir.join("util.rss"),
+        "pub fn run() { helper(); }\nfn helper() { 11; }\n",
+        "a/util source",
+    );
+    write_source(
+        &b_dir.join("util.rss"),
+        "pub fn run() { helper(); }\nfn helper() { 22; }\n",
+        "b/util source",
+    );
+    let main_path = root.join("main.rss");
+    write_source(
+        &main_path,
+        "use a::util as au;\nuse b::util as bu;\nau::run();\nbu::run();\n",
+        "main source",
+    );
+
+    let compiled =
+        compile_source_file(&main_path).expect("same-named module helpers should compile");
+    let program = &compiled.program;
+    assert_eq!(
+        program.callable_prototypes.len(),
+        4,
+        "each module's run and each module's same-named helper keep a prototype"
+    );
+    assert_eq!(
+        program.root_callable_bindings.len(),
+        2,
+        "only the exported run functions stay materialized with root bindings"
+    );
+    assert_eq!(
+        program
+            .callable_prototypes
+            .iter()
+            .filter(|prototype| prototype.self_slot.is_some())
+            .count(),
+        2,
+        "only the exported run functions keep their runtime self slot"
+    );
+    assert_eq!(
+        program
+            .callable_prototypes
+            .iter()
+            .filter(|prototype| prototype.self_slot.is_none())
+            .count(),
+        2,
+        "the direct-only same-named helpers keep no runtime self slot"
+    );
+    assert_eq!(
+        program.code.iter().filter(|byte| **byte == 0x1A).count(),
+        2,
+        "each module's run calls its own helper through CallScript"
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[Value::Int(11), Value::Int(22)],
+        "each module's run must resolve its own same-named helper"
+    );
+
+    remove_module_root(&root);
+}

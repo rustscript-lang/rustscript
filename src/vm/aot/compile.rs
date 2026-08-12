@@ -21,10 +21,11 @@ use crate::vm::native::{
     clear_value_slot_entry_address, clone_value_signature, clone_value_to_slot_entry_address,
     collection_get_signature, collection_mutation_signature, collection_set_entry_address,
     copy_bytes_entry_address, copy_bytes_signature, detect_native_stack_layout,
-    enter_call_value_entry_address, enter_call_value_signature, entry_signature,
-    frame_state_entry_address, frame_state_signature, free_buffer_signature, helper_entry_offset,
-    helper_signature, init_null_value_slot_entry_address, jump_with_status,
-    leave_frame_entry_address, leave_frame_signature, pack_shared_signature, resolve_offsets,
+    enter_call_script_entry_address, enter_call_script_signature, enter_call_value_entry_address,
+    enter_call_value_signature, entry_signature, frame_state_entry_address, frame_state_signature,
+    free_buffer_signature, helper_entry_offset, helper_signature,
+    init_null_value_slot_entry_address, jump_with_status, leave_frame_entry_address,
+    leave_frame_signature, pack_shared_signature, resolve_offsets,
     restore_active_exit_state_entry_address, restore_exit_signature,
     restore_exit_state_entry_address, shared_array_from_buffer_entry_address,
     shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
@@ -332,6 +333,7 @@ struct AotDeoptHelperRefs {
     interrupt_ref: cranelift_codegen::ir::SigRef,
     frame_state_ref: cranelift_codegen::ir::SigRef,
     enter_call_value_ref: cranelift_codegen::ir::SigRef,
+    enter_call_script_ref: cranelift_codegen::ir::SigRef,
     leave_frame_ref: cranelift_codegen::ir::SigRef,
     clone_value_ref: cranelift_codegen::ir::SigRef,
     value_eq_ref: cranelift_codegen::ir::SigRef,
@@ -349,6 +351,7 @@ struct AotDeoptHelperAddrs {
     aot_interrupt: usize,
     frame_state: usize,
     enter_call_value: usize,
+    enter_call_script: usize,
     leave_frame: usize,
     clone_value: usize,
     value_eq: usize,
@@ -500,6 +503,7 @@ fn compile_ssa(
     let alloc_buffer_sig = alloc_buffer_signature(pointer_type, call_conv);
     let frame_state_sig = frame_state_signature(pointer_type, call_conv);
     let enter_call_value_sig = enter_call_value_signature(pointer_type, call_conv);
+    let enter_call_script_sig = enter_call_script_signature(pointer_type, call_conv);
     let leave_frame_sig = leave_frame_signature(pointer_type, call_conv);
     let free_buffer_sig = free_buffer_signature(pointer_type, call_conv);
     let pack_shared_sig = pack_shared_signature(pointer_type, call_conv);
@@ -530,6 +534,7 @@ fn compile_ssa(
         aot_interrupt: aot_call_boundary_interrupt_entry_address(),
         frame_state: frame_state_entry_address(),
         enter_call_value: enter_call_value_entry_address(),
+        enter_call_script: enter_call_script_entry_address(),
         leave_frame: leave_frame_entry_address(),
         clone_value: clone_value_to_slot_entry_address(),
         value_eq: value_eq_entry_address(),
@@ -587,6 +592,7 @@ fn compile_ssa(
             interrupt_ref: b.import_signature(interrupt_sig),
             frame_state_ref: b.import_signature(frame_state_sig),
             enter_call_value_ref: b.import_signature(enter_call_value_sig),
+            enter_call_script_ref: b.import_signature(enter_call_script_sig),
             leave_frame_ref: b.import_signature(leave_frame_sig),
             clone_value_ref: b.import_signature(clone_value_sig),
             value_eq_ref: b.import_signature(value_eq_sig),
@@ -1618,6 +1624,58 @@ fn lower_aot_ssa_terminator(
                 helper_refs.enter_call_value_ref,
                 helper_ptr,
                 &[vm_ptr, argc, call_ip, resume_ip],
+            );
+            let status = b.inst_results(call)[0];
+            jump_with_status(b, exit_block, status);
+        }
+        AotSsaTerminator::CallScript {
+            prototype_id,
+            argc,
+            call_ip,
+            resume_ip,
+            stack,
+            locals,
+        } => {
+            materialize_state_to_vm(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                helper_refs,
+                helper_addrs,
+                stack,
+                locals,
+                values,
+                *call_ip,
+            )?;
+            emit_call_boundary_interrupt(
+                b,
+                vm_ptr,
+                helper_refs.interrupt_ref,
+                helper_addrs.aot_interrupt,
+                pointer_type,
+                exit_block,
+            )?;
+            let helper_ptr = iconst_ptr_from_addr(b, pointer_type, helper_addrs.enter_call_script)?;
+            let prototype_id = b.ins().iconst(types::I64, i64::from(*prototype_id));
+            let argc = b.ins().iconst(types::I64, i64::from(*argc));
+            let call_ip = b.ins().iconst(
+                types::I64,
+                i64::try_from(*call_ip).map_err(|_| {
+                    AotCompileError::Codegen("callscript ip does not fit i64".to_string())
+                })?,
+            );
+            let resume_ip = b.ins().iconst(
+                types::I64,
+                i64::try_from(*resume_ip).map_err(|_| {
+                    AotCompileError::Codegen("callscript resume ip does not fit i64".to_string())
+                })?,
+            );
+            let call = b.ins().call_indirect(
+                helper_refs.enter_call_script_ref,
+                helper_ptr,
+                &[vm_ptr, prototype_id, argc, call_ip, resume_ip],
             );
             let status = b.inst_results(call)[0];
             jump_with_status(b, exit_block, status);

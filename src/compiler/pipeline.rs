@@ -13,8 +13,8 @@ use super::source_loader::load_units_for_source_file;
 use super::source_map::SourceMap;
 use super::{
     CompileError, CompileSourceFileOptions, CompiledProgram, CompiledReplProgram, ParseError,
-    ReplLocalBinding, SourceError, SourceFlavor, SourcePathError, TypingMode, lifetime, parser,
-    typing,
+    ReplLocalBinding, SourceError, SourceFlavor, SourcePathError, TypingMode, lifetime,
+    materialization, parser, typing,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -389,6 +389,11 @@ fn compile_parsed_output_with_entry_locals(
         enable_local_move_semantics,
     )
     .map_err(SourceError::Parse)?;
+    // Classify named callable materialization on the final merged IR
+    // (post-lifetime, so capture metadata and rewritten uses are
+    // authoritative). Codegen consumes `requires_callable_slot` to omit
+    // hidden callable slots for direct-only functions.
+    let callable_use_facts = materialization::classify_named_callables(&parsed);
     let type_info = typing::infer_types(&parsed, typing_mode, entry_local_types);
     let FrontendIr {
         stmts,
@@ -404,6 +409,27 @@ fn compile_parsed_output_with_entry_locals(
         .cloned()
         .map(|decl| (decl.index, decl))
         .collect::<HashMap<_, _>>();
+
+    // Milestone-5 observation for the crate's unit tests: capture the
+    // classification keyed by the merged flat function identity before the
+    // facts move into the Compiler, so tests observe exactly what the
+    // compiler received. Compiled into unit-test builds only; never part of
+    // the public API.
+    #[cfg(test)]
+    let mut callable_use_observations = functions
+        .iter()
+        .filter_map(|decl| {
+            callable_use_facts.get(&decl.index).map(|facts| {
+                materialization::CallableUseObservation {
+                    function_index: decl.index,
+                    name: decl.name.clone(),
+                    facts: *facts,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    #[cfg(test)]
+    callable_use_observations.sort_unstable_by_key(|observation| observation.function_index);
 
     let mut runtime_import_functions: Vec<FunctionDecl> = functions
         .iter()
@@ -442,6 +468,7 @@ fn compile_parsed_output_with_entry_locals(
     compiler.set_root_local_count(locals);
     compiler.set_function_decls(function_decls);
     compiler.set_function_impls(function_impls);
+    compiler.set_callable_use_facts(callable_use_facts);
     compiler.set_struct_schemas(struct_schemas);
     compiler.set_host_import_return_types(host_import_return_types);
     compiler.set_host_import_signatures(host_import_signatures);
@@ -473,6 +500,8 @@ fn compile_parsed_output_with_entry_locals(
         program,
         locals: runtime_locals,
         functions: visible_runtime_import_functions,
+        #[cfg(test)]
+        callable_use_facts: callable_use_observations,
     })
 }
 
@@ -1461,5 +1490,271 @@ where
             Ok(value) => value,
             Err(payload) => std::panic::resume_unwind(payload),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::vm::Vm;
+
+    use super::*;
+
+    #[test]
+    fn production_path_callable_use_facts_observed() {
+        // Observe the milestone-5 classification through the real production
+        // pipeline (parse -> module merge -> lifetime -> classification ->
+        // Compiler) via the crate-internal test observation on
+        // CompiledProgram. Facts must be keyed by resolved flat identity
+        // and include the flow-aware dynamic-target and runtime-self facts;
+        // allocation behavior stays untouched (every named function keeps
+        // its prototype and hidden callable slot).
+        let source = r#"
+            fn direct_helper(x: int) -> int { x + 1 }
+            pub fn exported_helper(x: int) -> int { x + 2 }
+            fn stored_helper(x: int) -> int { x + 3 }
+            fn flow_helper() -> int { 4 }
+            fn consume(f) -> int { 1 }
+            fn apply(f) -> int { f(1) }
+            fn direct_recursive(n: int) -> int {
+                if n <= 0 => { 0 } else => { direct_recursive(n - 1) }
+            }
+            let captured = 42;
+            fn read_captured() -> int { captured }
+            fn captured_walk(n: int) -> int {
+                if n <= 0 => { captured } else => { captured_walk(n - 1) }
+            }
+            let stored = stored_helper;
+            let a = flow_helper;
+            let b = a;
+            b();
+            consume(stored_helper);
+            apply(consume);
+            direct_helper(1);
+            exported_helper(1);
+            direct_recursive(3);
+            read_captured;
+            captured_walk(2);
+        "#;
+        let compiled = compile_source(source).expect("classification program should compile");
+        let observations = &compiled.callable_use_facts;
+        let find = |name: &str| {
+            observations
+                .iter()
+                .find(|observation| observation.name == name)
+                .unwrap_or_else(|| panic!("observation for '{name}' missing: {observations:#?}"))
+                .facts
+        };
+        assert_eq!(
+            observations.len(),
+            9,
+            "every named script function must carry production-path facts"
+        );
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.function_index)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            9,
+            "facts must be keyed by distinct resolved flat identities"
+        );
+
+        let direct = find("direct_helper");
+        assert!(direct.called_directly);
+        assert!(!direct.referenced_as_value);
+        assert!(!direct.exported);
+        assert!(!direct.captures_environment);
+        assert!(!direct.dynamic_target_required);
+        assert!(!direct.runtime_self_required);
+        assert!(!direct.requires_callable_slot());
+
+        let exported = find("exported_helper");
+        assert!(exported.called_directly);
+        assert!(exported.exported);
+        assert!(exported.requires_callable_slot());
+
+        let stored = find("stored_helper");
+        assert!(stored.referenced_as_value);
+        assert!(
+            !stored.dynamic_target_required,
+            "passing a function value to a callee that never invokes it must not \
+             mark a dynamic target (tracked flow only)"
+        );
+        assert!(stored.requires_callable_slot());
+
+        let flow = find("flow_helper");
+        assert!(flow.referenced_as_value);
+        assert!(
+            flow.dynamic_target_required,
+            "the alias chain `let a = flow_helper; let b = a; b();` must propagate \
+             to the dynamic invocation"
+        );
+
+        let consume = find("consume");
+        assert!(consume.called_directly);
+        assert!(
+            consume.dynamic_target_required,
+            "consume is passed to `apply`, whose parameter is dynamically invoked"
+        );
+
+        let recursive = find("direct_recursive");
+        assert!(recursive.called_directly);
+        assert!(!recursive.captures_environment);
+        assert!(
+            !recursive.runtime_self_required,
+            "non-capturing direct recursion needs no runtime self identity"
+        );
+        assert!(!recursive.requires_callable_slot());
+
+        let read_captured = find("read_captured");
+        assert!(read_captured.captures_environment);
+        assert!(!read_captured.runtime_self_required);
+
+        let captured_walk = find("captured_walk");
+        assert!(captured_walk.captures_environment);
+        assert!(
+            captured_walk.runtime_self_required,
+            "capturing direct recursion retains the runtime self identity"
+        );
+        assert!(captured_walk.requires_callable_slot());
+
+        // Milestone 6 lowering: every named function keeps its prototype;
+        // direct-only functions (no value reference, export, capture, or
+        // dynamic target) keep no hidden callable slot, while the
+        // materialized functions retain their runtime self slot.
+        assert_eq!(compiled.program.callable_prototypes.len(), 9);
+        let self_slots = compiled
+            .program
+            .callable_prototypes
+            .iter()
+            .filter(|prototype| prototype.self_slot.is_some())
+            .count();
+        assert_eq!(
+            self_slots, 6,
+            "exported, stored, flow, consume, and both capturing functions stay materialized"
+        );
+        assert_eq!(
+            compiled
+                .program
+                .callable_prototypes
+                .iter()
+                .filter(|prototype| prototype.self_slot.is_none())
+                .count(),
+            3,
+            "direct_helper, apply, and direct_recursive are direct-only"
+        );
+        assert_eq!(compiled.program.root_callable_bindings.len(), 4);
+        assert!(
+            compiled
+                .program
+                .code
+                .contains(&(crate::OpCode::CallScript as u8)),
+            "direct-only call sites emit CallScript"
+        );
+
+        let mut vm = Vm::new(compiled.program);
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, crate::vm::VmStatus::Halted);
+    }
+
+    #[test]
+    fn production_path_module_merge_facts_follow_flat_indices() {
+        // Two modules each declare a private `helper` plus a `pub run` that
+        // calls it, merged through the real production pipeline. The
+        // classification must attribute facts to distinct resolved flat
+        // identities; assertions never parse the merged display names (a
+        // mangling policy change must not affect them) and instead check
+        // counts, index uniqueness, and the exported-vs-private semantic
+        // facts.
+        let options = CompileSourceFileOptions::new()
+            .with_module_override_source(
+                "a/util.rss",
+                "pub fn run() { helper(); }\nfn helper() { 11; }\n",
+            )
+            .with_module_override_source(
+                "b/util.rss",
+                "pub fn run() { helper(); }\nfn helper() { 22; }\n",
+            );
+        let source = "use a::util as au;\nuse b::util as bu;\nau::run();\nbu::run();\n";
+        let compiled =
+            compile_source_with_flavor_and_options(source, SourceFlavor::RustScript, options)
+                .expect("same-named module helpers should compile");
+
+        let observations = &compiled.callable_use_facts;
+        assert_eq!(
+            observations.len(),
+            4,
+            "both modules' run and both same-named helpers must carry facts: {observations:#?}"
+        );
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.function_index)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            4,
+            "classification must be keyed by distinct resolved flat identities"
+        );
+
+        let runs = observations
+            .iter()
+            .filter(|observation| observation.facts.exported)
+            .collect::<Vec<_>>();
+        assert_eq!(runs.len(), 2, "both exported runs must survive the merge");
+        for run in runs {
+            assert!(run.facts.called_directly);
+            assert!(run.facts.requires_callable_slot());
+        }
+
+        let helpers = observations
+            .iter()
+            .filter(|observation| !observation.facts.exported)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            helpers.len(),
+            2,
+            "both same-named private helpers must survive the merge"
+        );
+        for helper in helpers {
+            assert!(
+                helper.facts.called_directly,
+                "each module's run calls its own same-named helper"
+            );
+            assert!(!helper.facts.dynamic_target_required);
+            assert!(!helper.facts.requires_callable_slot());
+        }
+
+        // Milestone 6 allocation: every merged function keeps its prototype;
+        // the same-named private helpers are direct-only (no hidden slot),
+        // and both exported runs stay materialized and exported.
+        assert_eq!(compiled.program.callable_prototypes.len(), 4);
+        assert_eq!(
+            compiled
+                .program
+                .callable_prototypes
+                .iter()
+                .filter(|prototype| prototype.self_slot.is_some())
+                .count(),
+            2,
+            "both exported runs keep their runtime self slot"
+        );
+        assert_eq!(
+            compiled
+                .program
+                .callable_prototypes
+                .iter()
+                .filter(|prototype| prototype.self_slot.is_none())
+                .count(),
+            2,
+            "both same-named private helpers are direct-only"
+        );
+        assert_eq!(compiled.program.root_callable_bindings.len(), 2);
+        assert_eq!(compiled.program.exported_callables.len(), 2);
+
+        let mut vm = Vm::new(compiled.program);
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, crate::vm::VmStatus::Halted);
     }
 }

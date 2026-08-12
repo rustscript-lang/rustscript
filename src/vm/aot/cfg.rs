@@ -47,6 +47,12 @@ pub(crate) enum AotBlockTerminal {
         call_ip: usize,
         resume_ip: usize,
     },
+    CallScript {
+        prototype_id: u32,
+        argc: u8,
+        call_ip: usize,
+        resume_ip: usize,
+    },
     InterpreterExit {
         exit_ip: usize,
     },
@@ -56,9 +62,11 @@ pub(crate) enum AotBlockTerminal {
 impl AotBlockTerminal {
     pub(crate) fn successor_ips(&self) -> Vec<usize> {
         match self {
-            Self::Return | Self::CallValue { .. } | Self::InterpreterExit { .. } | Self::Stop => {
-                Vec::new()
-            }
+            Self::Return
+            | Self::CallValue { .. }
+            | Self::CallScript { .. }
+            | Self::InterpreterExit { .. }
+            | Self::Stop => Vec::new(),
             Self::Jump { target_ip } => vec![*target_ip],
             Self::ConditionalJump {
                 target_ip,
@@ -129,6 +137,16 @@ pub(crate) fn build_cfg(program: &Program) -> Result<AotCfg, AotCfgError> {
                     call_ip: ip,
                     resume_ip: next_ip,
                 }),
+                OpCode::CallScript => Some(AotBlockTerminal::CallScript {
+                    prototype_id: u32::from_le_bytes(
+                        code[ip + 1..ip + 5]
+                            .try_into()
+                            .expect("callscript operand width validated by bounds decoder"),
+                    ),
+                    argc: code[ip + 5],
+                    call_ip: ip,
+                    resume_ip: next_ip,
+                }),
                 _ if next_ip == code.len() => Some(AotBlockTerminal::Stop),
                 _ if Some(next_ip) == next_block_start => {
                     validate_fallthrough_region(&regions, ip, next_ip)?;
@@ -183,7 +201,7 @@ fn collect_block_starts(
                     starts.insert(next_ip);
                 }
             }
-            OpCode::CallValue => {
+            OpCode::CallValue | OpCode::CallScript => {
                 if next_ip < code.len() {
                     starts.insert(next_ip);
                 }

@@ -131,6 +131,7 @@ pub enum CompileErrorKind {
     CallableUsedAsValue,
     NonCallableLocal,
     LocalSlotOverflow,
+    FrameLocalLimitExceeded,
     CallableArityMismatch,
     BreakOutsideLoop,
     ContinueOutsideLoop,
@@ -167,6 +168,9 @@ fn compile_error_kind(err: &vm::CompileError) -> CompileErrorKind {
         vm::CompileError::CallableUsedAsValue => CompileErrorKind::CallableUsedAsValue,
         vm::CompileError::NonCallableLocal(_) => CompileErrorKind::NonCallableLocal,
         vm::CompileError::LocalSlotOverflow(_) => CompileErrorKind::LocalSlotOverflow,
+        vm::CompileError::FrameLocalLimitExceeded { .. } => {
+            CompileErrorKind::FrameLocalLimitExceeded
+        }
         vm::CompileError::CallableArityMismatch { .. } => CompileErrorKind::CallableArityMismatch,
         vm::CompileError::BreakOutsideLoop => CompileErrorKind::BreakOutsideLoop,
         vm::CompileError::ContinueOutsideLoop => CompileErrorKind::ContinueOutsideLoop,

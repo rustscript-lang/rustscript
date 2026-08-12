@@ -1,3 +1,32 @@
+//! Frame-local lifetime analysis.
+//!
+//! # Same-frame interference
+//!
+//! Locals that are simultaneously live inside one execution frame share a
+//! single interference domain: the coloring pass must give them distinct
+//! relative slot numbers. This applies to the root body and to each named
+//! function body independently — argument evaluation and values used after
+//! a call keep the caller's slots live across the call.
+//!
+//! # Cross-frame reuse
+//!
+//! Every script invocation allocates its own runtime frame with a fresh
+//! `local_base` (see `docs/callable-runtime.md`). A statically resolved
+//! named call (`Expr::Call`) therefore contributes only caller-side
+//! argument uses to the caller live set; the callee body's locals are
+//! analyzed inside the callee frame and never union into the caller.
+//! Locals from different frames may reuse the same relative slot numbers —
+//! the runtime frame bases already separate them, so cross-frame live
+//! ranges need no interference edges.
+//!
+//! # Conservative dynamic paths
+//!
+//! Dynamic targets keep their pre-frame conservatism on purpose:
+//! `Expr::LocalCall` marks the whole live set because the invoked slot can
+//! hold an inline closure whose captures are not visible from the call
+//! expression, and closure bodies contribute their transitive footprint so
+//! captured slots stay live for the duration of the call.
+
 mod availability;
 mod liveness;
 

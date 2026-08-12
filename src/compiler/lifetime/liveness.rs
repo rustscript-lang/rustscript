@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -16,10 +15,7 @@ struct DefInfo {
 pub(super) struct LivenessRewriter {
     local_count: usize,
     clearable_slots: Vec<bool>,
-    conservative_call_indices: HashSet<u16>,
     function_impls: HashMap<u16, FunctionImpl>,
-    function_footprint_cache: RefCell<HashMap<u16, LiveSet>>,
-    full_footprint: LiveSet,
 }
 
 impl LivenessRewriter {
@@ -32,19 +28,10 @@ impl LivenessRewriter {
         // inline-call parameters, and parser-generated temporaries, so excluding
         // them leaves stale values past their last use.
         let clearable_slots = vec![true; local_count];
-        let conservative_call_indices = function_impls
-            .iter()
-            .filter_map(|(index, function_impl)| {
-                function_impl_uses_local_call(function_impl).then_some(*index)
-            })
-            .collect::<HashSet<_>>();
         Self {
             local_count,
             clearable_slots,
-            conservative_call_indices,
             function_impls: function_impls.clone(),
-            function_footprint_cache: RefCell::new(HashMap::new()),
-            full_footprint: vec![true; local_count],
         }
     }
 
@@ -464,14 +451,14 @@ impl LivenessRewriter {
                 self.add_expr_uses(value, live);
                 self.add_expr_uses(fallback, live);
             }
-            Expr::Call(index, _, args) => {
+            Expr::Call(_, _, args) => {
+                // Known named script calls execute in a separate runtime frame
+                // with its own local_base: the callee body footprint is
+                // analyzed inside the callee frame and must not be unioned
+                // into the caller live set. Arguments and caller-after-call
+                // uses stay live in the caller.
                 for arg in args {
                     self.add_expr_uses(arg, live);
-                }
-                if self.function_impls.contains_key(index) {
-                    let mut stack = Vec::new();
-                    let footprint = self.function_footprint(*index, &mut stack);
-                    self.union_inplace(live, &footprint);
                 }
             }
             // Resolved module calls (pre-merge only) contribute their
@@ -625,360 +612,7 @@ impl LivenessRewriter {
         }
         live_out
     }
-
-    fn function_footprint(&self, index: u16, stack: &mut Vec<u16>) -> LiveSet {
-        if let Some(cached) = self.function_footprint_cache.borrow().get(&index).cloned() {
-            return cached;
-        }
-        if stack.contains(&index) || self.conservative_call_indices.contains(&index) {
-            return self.full_footprint.clone();
-        }
-        let Some(function_impl) = self.function_impls.get(&index) else {
-            return self.empty_set();
-        };
-
-        stack.push(index);
-        let mut footprint = self.empty_set();
-        for slot in &function_impl.param_slots {
-            self.mark_live(&mut footprint, *slot);
-        }
-        for (_, captured_slot) in &function_impl.capture_copies {
-            self.mark_live(&mut footprint, *captured_slot);
-        }
-        for stmt in &function_impl.body_stmts {
-            self.collect_stmt_footprint(stmt, &mut footprint, stack);
-        }
-        self.collect_expr_footprint(&function_impl.body_expr, &mut footprint, stack);
-        stack.pop();
-
-        self.function_footprint_cache
-            .borrow_mut()
-            .insert(index, footprint.clone());
-        footprint
-    }
-
-    fn closure_footprint(&self, closure: &ClosureExpr, stack: &mut Vec<u16>) -> LiveSet {
-        if expr_contains_local_call(&closure.body) {
-            return self.full_footprint.clone();
-        }
-
-        let mut footprint = self.empty_set();
-        for slot in &closure.param_slots {
-            self.mark_live(&mut footprint, *slot);
-        }
-        for (source_slot, captured_slot) in &closure.capture_copies {
-            self.mark_live(&mut footprint, *source_slot);
-            self.mark_live(&mut footprint, *captured_slot);
-        }
-        self.collect_expr_footprint(&closure.body, &mut footprint, stack);
-        footprint
-    }
-
-    fn collect_stmt_footprint(&self, stmt: &Stmt, footprint: &mut LiveSet, stack: &mut Vec<u16>) {
-        match stmt {
-            Stmt::Noop { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
-            Stmt::FuncDecl {
-                index, has_impl, ..
-            } => {
-                if *has_impl && let Some(function_impl) = self.function_impls.get(index) {
-                    for (source_slot, captured_slot) in &function_impl.capture_copies {
-                        self.mark_live(footprint, *source_slot);
-                        self.mark_live(footprint, *captured_slot);
-                    }
-                }
-            }
-            Stmt::Drop { index, .. } => self.mark_live(footprint, *index),
-            Stmt::Let { index, expr, .. } | Stmt::Assign { index, expr, .. } => {
-                self.mark_live(footprint, *index);
-                self.collect_expr_footprint(expr, footprint, stack);
-            }
-            Stmt::ClosureLet { closure, .. } => {
-                for (source_slot, captured_slot) in &closure.capture_copies {
-                    self.mark_live(footprint, *source_slot);
-                    self.mark_live(footprint, *captured_slot);
-                }
-            }
-            Stmt::Expr { expr, .. } => self.collect_expr_footprint(expr, footprint, stack),
-            Stmt::IfElse {
-                condition,
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                self.collect_expr_footprint(condition, footprint, stack);
-                for nested in then_branch {
-                    self.collect_stmt_footprint(nested, footprint, stack);
-                }
-                for nested in else_branch {
-                    self.collect_stmt_footprint(nested, footprint, stack);
-                }
-            }
-            Stmt::For {
-                init,
-                condition,
-                post,
-                body,
-                ..
-            } => {
-                self.collect_stmt_footprint(init, footprint, stack);
-                self.collect_expr_footprint(condition, footprint, stack);
-                self.collect_stmt_footprint(post, footprint, stack);
-                for nested in body {
-                    self.collect_stmt_footprint(nested, footprint, stack);
-                }
-            }
-            Stmt::While {
-                condition, body, ..
-            } => {
-                self.collect_expr_footprint(condition, footprint, stack);
-                for nested in body {
-                    self.collect_stmt_footprint(nested, footprint, stack);
-                }
-            }
-        }
-    }
-
-    fn collect_expr_footprint(&self, expr: &Expr, footprint: &mut LiveSet, stack: &mut Vec<u16>) {
-        match expr {
-            Expr::Null
-            | Expr::Int(_)
-            | Expr::Float(_)
-            | Expr::Bool(_)
-            | Expr::Bytes(_)
-            | Expr::String(_)
-            | Expr::FunctionRef(..)
-            | Expr::ModuleFunctionRef(..)
-            | Expr::UnresolvedFunctionRef { .. } => {}
-            Expr::Var(index) | Expr::MoveVar(index) | Expr::LocalCall(index, _, _) => {
-                self.mark_live(footprint, *index);
-            }
-            Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
-                self.mark_live(footprint, *root);
-            }
-            Expr::OptionalGet {
-                container,
-                key,
-                container_slot,
-                key_slot,
-            } => {
-                self.mark_live(footprint, *container_slot);
-                self.mark_live(footprint, *key_slot);
-                self.collect_expr_footprint(container, footprint, stack);
-                self.collect_expr_footprint(key, footprint, stack);
-            }
-            Expr::OptionUnwrapOr {
-                value,
-                value_slot,
-                fallback,
-            } => {
-                self.mark_live(footprint, *value_slot);
-                self.collect_expr_footprint(value, footprint, stack);
-                self.collect_expr_footprint(fallback, footprint, stack);
-            }
-            Expr::Call(index, _, args) => {
-                let called = self.function_footprint(*index, stack);
-                self.union_inplace(footprint, &called);
-                for arg in args {
-                    self.collect_expr_footprint(arg, footprint, stack);
-                }
-            }
-            // Resolved module calls (pre-merge only) contribute their
-            // arguments' footprint; the callee lives in another unit and is
-            // folded in by the post-merge call lowering.
-            Expr::ModuleCall(_, _, args) => {
-                for arg in args {
-                    self.collect_expr_footprint(arg, footprint, stack);
-                }
-            }
-            Expr::Closure(closure) => {
-                for slot in &closure.param_slots {
-                    self.mark_live(footprint, *slot);
-                }
-                for (source_slot, captured_slot) in &closure.capture_copies {
-                    self.mark_live(footprint, *source_slot);
-                    self.mark_live(footprint, *captured_slot);
-                }
-            }
-            Expr::ClosureCall(closure, args) => {
-                let called = self.closure_footprint(closure, stack);
-                self.union_inplace(footprint, &called);
-                for arg in args {
-                    self.collect_expr_footprint(arg, footprint, stack);
-                }
-            }
-            Expr::Add(lhs, rhs)
-            | Expr::Sub(lhs, rhs)
-            | Expr::Mul(lhs, rhs)
-            | Expr::Div(lhs, rhs)
-            | Expr::Mod(lhs, rhs)
-            | Expr::And(lhs, rhs)
-            | Expr::Or(lhs, rhs)
-            | Expr::Eq(lhs, rhs)
-            | Expr::Lt(lhs, rhs)
-            | Expr::Gt(lhs, rhs) => {
-                self.collect_expr_footprint(lhs, footprint, stack);
-                self.collect_expr_footprint(rhs, footprint, stack);
-            }
-            Expr::Neg(inner)
-            | Expr::Not(inner)
-            | Expr::ToOwned(inner)
-            | Expr::Borrow(inner)
-            | Expr::BorrowMut(inner) => self.collect_expr_footprint(inner, footprint, stack),
-            Expr::IfElse {
-                condition,
-                then_expr,
-                else_expr,
-            } => {
-                self.collect_expr_footprint(condition, footprint, stack);
-                self.collect_expr_footprint(then_expr, footprint, stack);
-                self.collect_expr_footprint(else_expr, footprint, stack);
-            }
-            Expr::Match {
-                value_slot,
-                result_slot,
-                value,
-                arms,
-                default,
-            } => {
-                self.mark_live(footprint, *value_slot);
-                self.mark_live(footprint, *result_slot);
-                self.collect_expr_footprint(value, footprint, stack);
-                for (pattern, arm_expr) in arms {
-                    if let Some(binding_slot) = pattern.binding_slot() {
-                        self.mark_live(footprint, binding_slot);
-                    }
-                    self.collect_expr_footprint(arm_expr, footprint, stack);
-                }
-                self.collect_expr_footprint(default, footprint, stack);
-            }
-            Expr::Block { stmts, expr } => {
-                for stmt in stmts {
-                    self.collect_stmt_footprint(stmt, footprint, stack);
-                }
-                self.collect_expr_footprint(expr, footprint, stack);
-            }
-        }
-    }
 }
-
-fn function_impl_uses_local_call(function_impl: &FunctionImpl) -> bool {
-    function_impl
-        .body_stmts
-        .iter()
-        .any(stmt_contains_local_call)
-        || expr_contains_local_call(&function_impl.body_expr)
-}
-
-fn stmt_contains_local_call(stmt: &Stmt) -> bool {
-    match stmt {
-        Stmt::Noop { .. }
-        | Stmt::FuncDecl { .. }
-        | Stmt::Break { .. }
-        | Stmt::Continue { .. }
-        | Stmt::Drop { .. } => false,
-        Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
-            expr_contains_local_call(expr)
-        }
-        Stmt::ClosureLet { closure, .. } => expr_contains_local_call(&closure.body),
-        Stmt::IfElse {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            expr_contains_local_call(condition)
-                || then_branch.iter().any(stmt_contains_local_call)
-                || else_branch.iter().any(stmt_contains_local_call)
-        }
-        Stmt::For {
-            init,
-            condition,
-            post,
-            body,
-            ..
-        } => {
-            stmt_contains_local_call(init)
-                || expr_contains_local_call(condition)
-                || stmt_contains_local_call(post)
-                || body.iter().any(stmt_contains_local_call)
-        }
-        Stmt::While {
-            condition, body, ..
-        } => expr_contains_local_call(condition) || body.iter().any(stmt_contains_local_call),
-    }
-}
-
-fn expr_contains_local_call(expr: &Expr) -> bool {
-    match expr {
-        Expr::LocalCall(..) => true,
-        Expr::Null
-        | Expr::Int(_)
-        | Expr::Float(_)
-        | Expr::Bool(_)
-        | Expr::Bytes(_)
-        | Expr::String(_)
-        | Expr::FunctionRef(..)
-        | Expr::ModuleFunctionRef(..)
-        | Expr::UnresolvedFunctionRef { .. }
-        | Expr::Var(_)
-        | Expr::MoveVar(_)
-        | Expr::MoveField { .. }
-        | Expr::MoveIndex { .. } => false,
-        Expr::OptionalGet { container, key, .. } => {
-            expr_contains_local_call(container) || expr_contains_local_call(key)
-        }
-        Expr::OptionUnwrapOr {
-            value, fallback, ..
-        } => expr_contains_local_call(value) || expr_contains_local_call(fallback),
-        Expr::Call(_, _, args) | Expr::ModuleCall(_, _, args) => {
-            args.iter().any(expr_contains_local_call)
-        }
-        Expr::Closure(closure) => expr_contains_local_call(&closure.body),
-        Expr::ClosureCall(closure, args) => {
-            args.iter().any(expr_contains_local_call) || expr_contains_local_call(&closure.body)
-        }
-        Expr::Add(lhs, rhs)
-        | Expr::Sub(lhs, rhs)
-        | Expr::Mul(lhs, rhs)
-        | Expr::Div(lhs, rhs)
-        | Expr::Mod(lhs, rhs)
-        | Expr::And(lhs, rhs)
-        | Expr::Or(lhs, rhs)
-        | Expr::Eq(lhs, rhs)
-        | Expr::Lt(lhs, rhs)
-        | Expr::Gt(lhs, rhs) => expr_contains_local_call(lhs) || expr_contains_local_call(rhs),
-        Expr::Neg(inner)
-        | Expr::Not(inner)
-        | Expr::ToOwned(inner)
-        | Expr::Borrow(inner)
-        | Expr::BorrowMut(inner) => expr_contains_local_call(inner),
-        Expr::IfElse {
-            condition,
-            then_expr,
-            else_expr,
-        } => {
-            expr_contains_local_call(condition)
-                || expr_contains_local_call(then_expr)
-                || expr_contains_local_call(else_expr)
-        }
-        Expr::Match {
-            value,
-            arms,
-            default,
-            ..
-        } => {
-            expr_contains_local_call(value)
-                || arms
-                    .iter()
-                    .any(|(_, arm_expr)| expr_contains_local_call(arm_expr))
-                || expr_contains_local_call(default)
-        }
-        Expr::Block { stmts, expr } => {
-            stmts.iter().any(stmt_contains_local_call) || expr_contains_local_call(expr)
-        }
-    }
-}
-
 fn stmt_line(stmt: &Stmt) -> u32 {
     match stmt {
         Stmt::Noop { line }
@@ -1001,7 +635,6 @@ pub(super) struct LocalSlotAllocator {
     liveness: LivenessRewriter,
     function_impls: HashMap<u16, FunctionImpl>,
     adjacency: Vec<HashSet<usize>>,
-    function_footprint_cache: HashMap<u16, LiveSet>,
     full_footprint: LiveSet,
 }
 
@@ -1017,7 +650,6 @@ impl LocalSlotAllocator {
             liveness,
             function_impls: function_impls.clone(),
             adjacency: (0..local_count).map(|_| HashSet::new()).collect(),
-            function_footprint_cache: HashMap::new(),
             full_footprint: vec![true; local_count],
         }
     }
@@ -1186,14 +818,14 @@ impl LocalSlotAllocator {
                 self.collect_expr_constraints(value, &live_during)?;
                 self.collect_expr_constraints(fallback, &live_during)?;
             }
-            Expr::Call(index, _, args) => {
+            Expr::Call(_, _, args) => {
+                // Arguments are evaluated in the caller frame, so their
+                // constraints belong here. The callee body runs in a separate
+                // runtime frame with its own local_base, so caller/callee
+                // cross-live edges would only needlessly separate slots that
+                // frame bases already isolate.
                 for arg in args {
                     self.collect_expr_constraints(arg, &live_during)?;
-                }
-                if self.function_impls.contains_key(index) {
-                    let mut stack = Vec::new();
-                    let footprint = self.function_footprint(*index, &mut stack);
-                    self.add_cross_live_with_set(&live_during, &footprint);
                 }
             }
             // Resolved module calls (pre-merge only) constrain their
@@ -1276,31 +908,6 @@ impl LocalSlotAllocator {
             }
         }
         Ok(())
-    }
-
-    fn function_footprint(&mut self, index: u16, stack: &mut Vec<u16>) -> LiveSet {
-        if let Some(cached) = self.function_footprint_cache.get(&index) {
-            return cached.clone();
-        }
-        if stack.contains(&index) {
-            return self.full_footprint.clone();
-        }
-        let Some(function_impl) = self.function_impls.get(&index).cloned() else {
-            return self.liveness.empty_set();
-        };
-        stack.push(index);
-        let mut footprint = self.liveness.empty_set();
-        for slot in &function_impl.param_slots {
-            self.mark_set_slot(&mut footprint, *slot);
-        }
-        for stmt in &function_impl.body_stmts {
-            self.collect_stmt_footprint(stmt, &mut footprint, stack);
-        }
-        self.collect_expr_footprint(&function_impl.body_expr, &mut footprint, stack);
-        stack.pop();
-        self.function_footprint_cache
-            .insert(index, footprint.clone());
-        footprint
     }
 
     fn closure_footprint(&mut self, closure: &ClosureExpr, stack: &mut Vec<u16>) -> LiveSet {
@@ -1419,15 +1026,10 @@ impl LocalSlotAllocator {
                 self.collect_expr_footprint(value, set, stack);
                 self.collect_expr_footprint(fallback, set, stack);
             }
-            Expr::Call(index, _, args) => {
-                if self.function_impls.contains_key(index) {
-                    let footprint = self.function_footprint(*index, stack);
-                    for (slot, used) in footprint.iter().enumerate() {
-                        if *used {
-                            set[slot] = true;
-                        }
-                    }
-                }
+            Expr::Call(_, _, args) => {
+                // The callee runs in its own frame even when called from a
+                // closure body, so only argument slots join the caller-side
+                // footprint.
                 for arg in args {
                     self.collect_expr_footprint(arg, set, stack);
                 }
