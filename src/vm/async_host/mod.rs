@@ -5,6 +5,9 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use super::*;
 
+pub(crate) mod stream;
+pub use stream::{HostStreamAction, HostStreamDriver, HostStreamPoll};
+
 type HostVmCompletion<T> = Box<dyn FnOnce(&mut Vm) -> VmResult<T> + Send + 'static>;
 
 pub enum HostFutureOutput<T = CallReturn> {
@@ -148,6 +151,10 @@ impl Vm {
         let Some(waiting) = self.instance.waiting_host_op.take() else {
             return;
         };
+        if self.host.stream_drivers.contains_key(&waiting.op_id) {
+            self.cancel_callable_stream();
+            return;
+        }
         let Ok(operation_id) =
             crate::builtins::runtime::cancellation::OperationId::from_raw(waiting.op_id)
         else {
@@ -214,6 +221,9 @@ impl Vm {
         let Some(waiting) = self.instance.waiting_host_op else {
             return Poll::Ready(Ok(()));
         };
+        if self.host.stream_drivers.contains_key(&waiting.op_id) {
+            return self.poll_callable_stream(waiting.op_id, cx);
+        }
         let operation_id =
             match crate::builtins::runtime::cancellation::OperationId::from_raw(waiting.op_id) {
                 Ok(operation_id) => operation_id,

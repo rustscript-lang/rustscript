@@ -1,11 +1,11 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use vm::{
-    CallOutcome, HostFunction, HostStreamAction, HostStreamDriver, HostStreamPoll, Value, Vm,
-    VmError, VmMap, VmStatus, compile_source,
+    CallOutcome, HostFunction, HostStreamAction, HostStreamDriver, HostStreamPoll, JitConfig,
+    Value, Vm, VmError, VmMap, VmStatus, compile_source,
 };
 
 fn map(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
@@ -47,6 +47,12 @@ struct SyntheticDriver {
     stopped: Arc<AtomicUsize>,
 }
 
+impl Drop for SyntheticDriver {
+    fn drop(&mut self) {
+        self.stopped.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 impl HostStreamDriver for SyntheticDriver {
     fn poll_next(&mut self, _cx: &mut Context<'_>) -> Poll<Result<HostStreamPoll, VmError>> {
         self.polls.fetch_add(1, Ordering::SeqCst);
@@ -71,16 +77,13 @@ impl HostStreamDriver for SyntheticDriver {
         self.applied.fetch_add(1, Ordering::SeqCst);
         match action.as_str() {
             "continue" => Ok(HostStreamAction::Continue),
-            "stop" => {
-                self.stopped.fetch_add(1, Ordering::SeqCst);
-                Ok(HostStreamAction::Complete(map([
-                    ("outcome", string("stopped")),
-                    (
-                        "items",
-                        Value::Int(self.applied.load(Ordering::SeqCst) as i64),
-                    ),
-                ])))
-            }
+            "stop" => Ok(HostStreamAction::Complete(map([
+                ("outcome", string("stopped")),
+                (
+                    "items",
+                    Value::Int(self.applied.load(Ordering::SeqCst) as i64),
+                ),
+            ]))),
             other => Err(VmError::HostError(format!(
                 "invalid synthetic stream action '{other}'"
             ))),
@@ -127,13 +130,16 @@ impl HostFunction for SyntheticStreamHost {
                     map([
                         ("kind", string("item")),
                         ("n", Value::Int(number)),
-                        ("action", string(if self.invalid_first && number == 1 {
-                            "invalid"
-                        } else if number == 3 {
-                            "stop"
-                        } else {
-                            "continue"
-                        })),
+                        (
+                            "action",
+                            string(if self.invalid_first && number == 1 {
+                                "invalid"
+                            } else if number == 3 {
+                                "stop"
+                            } else {
+                                "continue"
+                            }),
+                        ),
                     ])
                 })
                 .collect(),
@@ -194,7 +200,10 @@ fn delivers_three_maps_to_a_closure_in_order_and_returns_summary() {
     }
     assert_eq!(stopped.load(Ordering::SeqCst), 1);
     assert_eq!(vm.run().unwrap(), VmStatus::Halted);
-    assert_eq!(map_field(&vm.stack()[0], "outcome"), Some(&string("stopped")));
+    assert_eq!(
+        map_field(&vm.stack()[0], "outcome"),
+        Some(&string("stopped"))
+    );
     assert_eq!(map_field(&vm.stack()[0], "items"), Some(&Value::Int(3)));
 }
 
@@ -242,7 +251,10 @@ fn yielded_callback_resumes_before_the_producer_is_polled_again() {
     assert!(matches!(poll_once(&mut vm), Poll::Ready(Ok(()))));
     assert_eq!(polls.load(Ordering::SeqCst), 1);
     assert_eq!(applied.load(Ordering::SeqCst), 0);
-    assert_eq!(vm.resume().unwrap(), VmStatus::Waiting(vm.waiting_host_op_id().unwrap()));
+    assert_eq!(
+        vm.resume().unwrap(),
+        VmStatus::Waiting(vm.waiting_host_op_id().unwrap())
+    );
     assert_eq!(polls.load(Ordering::SeqCst), 1);
     assert_eq!(applied.load(Ordering::SeqCst), 1);
 }
@@ -283,12 +295,67 @@ fn reset_and_shutdown_release_a_waiting_stream_driver() {
 }
 
 #[test]
+fn callback_schema_accepts_closures_and_named_generic_functions() {
+    for source in [
+        r#"fn synthetic_stream(callback: fn(map) -> map) -> map; synthetic_stream(|value| value);"#,
+        r#"
+            fn synthetic_stream(callback: fn(map) -> map) -> map;
+            fn identity<T>(value: T) -> T { value }
+            synthetic_stream(identity);
+        "#,
+    ] {
+        compile_source(source).expect("typed callable should compile");
+    }
+}
+
+#[test]
 fn callback_schema_mismatches_are_rejected_at_compile_time() {
     for source in [
-        r#"fn synthetic_stream(callback: fn(map) -> map) -> map; synthetic_stream(|| {action: "stop"});"#,
+        r#"fn synthetic_stream(callback: fn(map) -> map) -> map; synthetic_stream(|value, extra| {action: "stop"});"#,
         r#"fn synthetic_stream(callback: fn(map) -> map) -> map; synthetic_stream(|value: int| {action: "stop"});"#,
         r#"fn synthetic_stream(callback: fn(map) -> map) -> map; synthetic_stream(|value| 1);"#,
     ] {
-        assert!(compile_source(source).is_err(), "source unexpectedly compiled: {source}");
+        assert!(
+            compile_source(source).is_err(),
+            "source unexpectedly compiled: {source}"
+        );
+    }
+}
+
+#[test]
+fn dropping_vm_releases_a_waiting_stream_driver_once() {
+    let source = r#"
+        fn synthetic_stream(callback: fn(map) -> map) -> map;
+        synthetic_stream(|item| item);
+    "#;
+    let (mut vm, _polls, _applied, stopped) = setup(source);
+    assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+    drop(vm);
+    assert_eq!(stopped.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn interpreter_jit_and_aot_use_the_same_host_stream_continuation() {
+    let source = r#"
+        fn synthetic_stream(callback: fn(map) -> map) -> map;
+        synthetic_stream(|item| item);
+    "#;
+    for backend in ["interpreter", "jit", "aot"] {
+        let (mut vm, polls, applied, _stopped) = setup(source);
+        vm.set_jit_config(JitConfig {
+            enabled: backend == "jit",
+            hot_loop_threshold: 1,
+            max_trace_len: 128,
+        });
+        if backend == "aot" {
+            vm.compile_aot().expect("aot compile should succeed");
+        }
+        assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+        for _ in 0..3 {
+            assert!(matches!(poll_once(&mut vm), Poll::Pending));
+        }
+        assert_eq!(vm.run().unwrap(), VmStatus::Halted, "{backend}");
+        assert_eq!(polls.load(Ordering::SeqCst), 3, "{backend}");
+        assert_eq!(applied.load(Ordering::SeqCst), 3, "{backend}");
     }
 }

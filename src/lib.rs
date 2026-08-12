@@ -31,7 +31,7 @@ pub use builtins::runtime::{HttpConfig, HttpHostExt, IoHostExt, IoPolicy};
 pub use builtins::runtime::{SqliteHostExt, SqliteLimits, SqlitePolicy};
 pub use builtins::{
     BUILTIN_CATALOG, BuiltinFunction, BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec,
-    CallableDef, CallableParam, CallableParamType, CallableSignature, HostExecution,
+    CallableDef, CallableParam, CallableParamType, CallableSignature, CallableType, HostExecution,
     LanguageBuiltinSpec, builtin_namespace_specs, callable_signatures_for_builtin_namespace_member,
     default_host_callables, is_builtin_namespace, language_builtin_specs,
     resolve_builtin_namespace_call,
@@ -92,10 +92,10 @@ pub use vm::{
     CapabilityProfileBuilder, DEFAULT_MAX_SCRIPT_CALL_DEPTH, EpochCheckpoint, EpochHandle,
     FuelCheckpoint, HostArgsFunction, HostAsyncBridge, HostBindingPlan, HostFunction,
     HostFunctionRegistry, HostFuture, HostFutureOutput, HostOpId, HostStackFunction,
-    IntoScriptValue, Invocation, InvocationError, InvocationItem, InvocationPoll,
-    QueuedScriptInvocation, ScriptArgs, ScriptCallback, ScriptResult, StaticHostArgsFunction,
-    StaticHostFunction, StaticHostStackFunction, Store, Vm, VmError, VmResult, VmStatus,
-    VmYieldReason,
+    HostStreamAction, HostStreamDriver, HostStreamPoll, IntoScriptValue, Invocation,
+    InvocationError, InvocationItem, InvocationPoll, QueuedScriptInvocation, ScriptArgs,
+    ScriptCallback, ScriptResult, StaticHostArgsFunction, StaticHostFunction,
+    StaticHostStackFunction, Store, Vm, VmError, VmResult, VmStatus, VmYieldReason,
 };
 
 #[cfg(feature = "runtime")]
