@@ -1,6 +1,10 @@
 #[test]
 fn http_callables_follow_the_http_client_feature_gate() {
-    for name in ["http::client::request", "http::client::sse"] {
+    for name in [
+        "http::client::request",
+        "http::client::sse",
+        "http::client::websocket",
+    ] {
         let published = vm::default_host_callables()
             .iter()
             .any(|callable| callable.name == name);

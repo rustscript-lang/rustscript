@@ -8,8 +8,8 @@ use build_script::{
 };
 use syn::parse_quote;
 use vm::{
-    BuiltinFunction, CapabilityProfile, HostFunctionRegistry, JitConfig, JitTraceTerminal, Value,
-    Vm, VmStatus, compile_source,
+    BuiltinFunction, CapabilityProfile, HostExecution, HostFunctionRegistry, JitConfig,
+    JitTraceTerminal, Value, Vm, VmStatus, compile_source, default_host_callables,
 };
 
 fn native_jit_supported() -> bool {
@@ -299,6 +299,74 @@ fn runtime_exit_still_halts_for_direct_and_cached_default_bindings() {
             VmStatus::Halted
         );
         assert!(vm.stack().is_empty());
+    }
+}
+
+#[cfg(feature = "http-client")]
+#[test]
+fn generated_http_imports_are_unique_typed_and_independently_capability_gated() {
+    const IMPORTS: [&str; 3] = [
+        "http::client::request",
+        "http::client::sse",
+        "http::client::websocket",
+    ];
+    let callables = default_host_callables();
+    for name in IMPORTS {
+        let discovered = callables
+            .iter()
+            .filter(|callable| callable.name == name)
+            .collect::<Vec<_>>();
+        assert_eq!(discovered.len(), 1, "{name} discovery count");
+        let callable = discovered[0];
+        assert_eq!(callable.signature.return_type, "map");
+        if name == "http::client::request" {
+            assert_eq!(callable.signature.params.len(), 1);
+            assert_eq!(callable.signature.params[0].ty.display_label(), "map");
+        } else {
+            assert_eq!(callable.signature.params.len(), 2);
+            assert_eq!(callable.signature.params[0].ty.display_label(), "map");
+            assert_eq!(
+                callable.signature.params[1].ty.display_label(),
+                "fn(map) -> map"
+            );
+            assert_eq!(callable.host_execution, HostExecution::MaySuspend);
+        }
+    }
+
+    for mask in 0_u8..8 {
+        let mut builder = CapabilityProfile::builder();
+        for (index, name) in IMPORTS.iter().enumerate() {
+            if mask & (1 << index) != 0 {
+                builder = builder.allow_host_import(*name);
+            }
+        }
+        let profile = builder.build();
+        for (index, name) in IMPORTS.iter().enumerate() {
+            assert_eq!(
+                profile.allows_host_import(name),
+                mask & (1 << index) != 0,
+                "mask {mask:03b}, import {name}"
+            );
+        }
+
+        let source = r#"
+            use http;
+            fn callback(item: map) -> map { { action: "stop" } }
+            http::client::request({ url: "https://example.test/" });
+            http::client::sse({ url: "https://example.test/" }, callback);
+            http::client::websocket({ url: "wss://example.test/" }, callback);
+        "#;
+        let compiled = compile_source(source).expect("HTTP imports should compile");
+        let mut vm = Vm::new(compiled.program);
+        let mut registry = HostFunctionRegistry::new();
+        registry.set_capability_profile(profile);
+        let result = registry.bind_vm_cached(&mut vm);
+        if mask == 0b111 {
+            result.expect("all three explicit capabilities should bind");
+        } else {
+            let error = result.expect_err("a missing HTTP capability must reject binding");
+            assert!(error.to_string().contains("capability profile"), "{error}");
+        }
     }
 }
 
