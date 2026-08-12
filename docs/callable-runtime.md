@@ -78,6 +78,14 @@ PDRC recordings preserve full execution-frame metadata. Callable environments us
 
 Polling drives execution and provides backpressure: at most one event item is buffered between polls, and the VM does not produce items while the consumer is not polling. `stream::emit` validates only the configured per-item value bound; sequence assignment, receipts, persistence, and delivery policy belong to the embedding. At most one invocation is active per VM, `Invocation::cancel(reason)` cancels with a typed `CancellationReason`, and the low-level `Vm::run` pump is unchanged for custom drivers.
 
+## Callable-driven HTTP streams
+
+The HTTP client keeps buffered `http::client::request(request)` and defines `http::client::sse(request, on_event)` and `http::client::websocket(request, on_event)` as long-running ordinary host calls. Each handler has the schema `fn(map) -> map`. The host produces one protocol item, the VM runs one child callback frame, and the returned action controls continuation or a WebSocket write before another item can arrive at the VM boundary.
+
+The callback may yield or wait in an ordinary async host call. Existing frame machinery resumes the callback first and returns its final action to the suspended HTTP call. The network future does not own or enter the VM and is not polled while the callback is active, so at most one item remains unacknowledged and callback completion supplies backpressure.
+
+Each buffered, SSE, and WebSocket import is an independent capability. Streaming calls expose no script request IDs, handles, detached resources, `next`, `close`, or cancellation callables. Their complete event maps, action maps, terminal summaries, bounds, destination policy, and lifecycle contract are documented in [HTTP client callable contract](http-client.md).
+
 ## Optimized backends
 
 Whole-program AOT and Trace JIT use the same builtin call path (static catalog IDs) for environment binding, native frame dispatch for `callvalue`, and prototype-direct native dispatch for `callscript`. Script-frame entry and return preserve frame-relative locals and typed continuations.
