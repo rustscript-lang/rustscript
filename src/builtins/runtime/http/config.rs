@@ -67,7 +67,7 @@ impl HttpConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
-            allowed_schemes: vec!["https".to_string()],
+            allowed_schemes: vec!["https".to_string(), "wss".to_string()],
             allowed_hosts: Vec::new(),
             allowed_ports: Vec::new(),
             max_redirects: 5,

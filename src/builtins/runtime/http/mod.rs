@@ -1,11 +1,13 @@
 use pd_host_function::pd_host_function;
 
+use super::{borrow_arg, take_arg};
 use crate::builtins::runtime::VmMap;
 use crate::vm::{CaptureAsyncHostContext, Vm, VmError, VmResult};
 
 mod config;
 pub(super) mod policy;
 pub(super) mod request;
+pub(super) mod websocket;
 
 pub use config::HttpConfig;
 use policy::{ConnectionAdmission, ConnectionPermit};
@@ -136,7 +138,7 @@ mod tests {
     #[test]
     fn default_http_policy_denies_all_hosts() {
         let config = HttpConfig::default();
-        assert_eq!(config.allowed_schemes, ["https"]);
+        assert_eq!(config.allowed_schemes, ["https", "wss"]);
         assert!(config.allowed_hosts.is_empty());
         assert!(config.allowed_ports.is_empty());
         assert!(!config.allow_private_ips);
