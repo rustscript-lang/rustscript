@@ -149,7 +149,6 @@ impl SseParser {
         self.data.clear();
         self.has_data = false;
         self.event = None;
-        self.retry_ms = None;
         Ok(events)
     }
 
@@ -188,7 +187,6 @@ impl SseParser {
                 return Ok(Some(self.dispatch_event()));
             }
             self.event = None;
-            self.retry_ms = None;
             return Ok(None);
         }
         if line.starts_with(':') {
@@ -267,7 +265,7 @@ impl SseParser {
             event: self.event.take(),
             data,
             id: self.id.clone(),
-            retry_ms: self.retry_ms.take(),
+            retry_ms: self.retry_ms,
         }
     }
 }
@@ -468,13 +466,10 @@ impl HostStreamDriver for SseDriver {
                 }
                 self.eof_pending = false;
                 self.state = DriverState::Closed;
-                return Poll::Ready(Ok(HostStreamPoll::Item(map_value(vec![
-                    ("kind", Value::string("end")),
-                    (
-                        "url",
-                        Value::string(self.url.as_ref().expect("open URL must exist").as_str()),
-                    ),
-                ]))));
+                return Poll::Ready(Ok(HostStreamPoll::Item(map_value(vec![(
+                    "kind",
+                    Value::string("end"),
+                )]))));
             }
             match &mut self.state {
                 DriverState::Opening {
@@ -758,7 +753,20 @@ mod tests {
             parse_fragments(&[input], 64, 128, 512).unwrap(),
             vec![
                 event("one", None, Some("keep"), Some(42)),
-                event("two", Some(""), Some(""), None),
+                event("two", Some(""), Some(""), Some(99)),
+            ]
+        );
+    }
+
+    #[test]
+    fn parser_persists_retry_state_across_empty_blocks_events_and_invalid_values() {
+        let input = b"retry:5000\n\ndata:ready\n\ndata:next\n\nretry:\nretry: -1\nretry: 5x\nretry: 9223372036854775808\n\ndata:still\n\n";
+        assert_eq!(
+            parse_fragments(&[input], 64, 128, 512).unwrap(),
+            vec![
+                event("ready", None, None, Some(5000)),
+                event("next", None, None, Some(5000)),
+                event("still", None, None, Some(5000)),
             ]
         );
     }

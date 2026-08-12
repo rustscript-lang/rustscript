@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::task::{Context, Poll};
 use std::thread;
 
 use vm::{
     CallReturn, HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput, HostOpId,
-    HttpConfig, HttpHostExt, Value, Vm, VmError, VmResult, VmStatus, compile_source,
+    HttpConfig, HttpHostExt, Value, Vm, VmError, VmMap, VmResult, VmStatus, compile_source,
 };
 
 #[derive(Default)]
@@ -53,6 +54,15 @@ fn field<'a>(value: &'a Value, key: &str) -> &'a Value {
     };
     map.get(&Value::string(key))
         .unwrap_or_else(|| panic!("missing field {key}"))
+}
+
+fn map(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
+    Value::Map(Arc::new(VmMap::from_entries(
+        entries
+            .into_iter()
+            .map(|(key, value)| (Value::string(key), value))
+            .collect(),
+    )))
 }
 
 async fn drive(vm: &mut Vm) -> VmResult<()> {
@@ -145,6 +155,65 @@ fn config(port: u16) -> HttpConfig {
     }
 }
 
+fn assert_no_connection(listener: TcpListener, context: &'static str) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            match listener.accept() {
+                Ok(_) => panic!("{context} must be rejected before a second connection"),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return;
+                    }
+                    thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("unexpected accept error: {error}"),
+            }
+        }
+    })
+}
+
+fn rejecting_redirect_server(
+    location: impl FnOnce(u16) -> String + Send + 'static,
+) -> (u16, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let location = location(port);
+    let (sender, receiver) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        sender.send(String::from_utf8(request).unwrap()).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
+        )
+        .unwrap();
+        drop(stream);
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            match listener.accept() {
+                Ok(_) => panic!("invalid redirect must be rejected before a second connection"),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return;
+                    }
+                    thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("unexpected accept error: {error}"),
+            }
+        }
+    });
+    (port, receiver, handle)
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn sse_delivers_open_events_end_and_terminal_summary() {
     let (port, server) = server(vec![
@@ -160,7 +229,7 @@ async fn sse_delivers_open_events_end_and_terminal_summary() {
             if item["kind"] == "open" && item["status"] != 200 {{ let _ = 1 / 0; }}
             if item["kind"] == "event" && item["data"] == "one" && item["event"] != null {{ let _ = 1 / 0; }}
             if item["kind"] == "event" && item["data"] == "two" && item["event"] != "named" {{ let _ = 1 / 0; }}
-            if item["kind"] == "end" && item["url"] != "http://127.0.0.1:{port}/events" {{ let _ = 1 / 0; }}
+            if item["kind"] == "end" && item != {{kind: "end"}} {{ let _ = 1 / 0; }}
             {{action: "continue"}}
         }}
         let result = http::client::sse(
@@ -350,6 +419,75 @@ async fn sse_post_redirect_method_and_body_follow_http_rules() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn sse_rejects_redirect_userinfo_before_reconnecting() {
+    let (port, requests, server) = rejecting_redirect_server(|port| {
+        format!("http://redirect-user:redirect-password@127.0.0.1:{port}/final")
+    });
+    let source = format!(
+        r#"use http;
+        fn callback(item: map) -> map {{ {{action: "continue"}} }}
+        http::client::sse(
+            {{method:"GET", url:"http://127.0.0.1:{port}/start", headers:{{Authorization:"Bearer secret", Cookie:"a=b"}}}},
+            callback
+        );"#
+    );
+    let error = match run_sse_source(&source, config(port)).await {
+        Ok(_) => panic!("redirect userinfo must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("URL userinfo is not allowed"),
+        "{error}"
+    );
+    let request = requests.recv().unwrap().to_ascii_lowercase();
+    assert!(request.contains("authorization:"));
+    assert!(request.contains("cookie: a=b"));
+    assert!(!request.contains("redirect-user"));
+    assert!(!request.contains("redirect-password"));
+    server.join().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sse_rejects_disallowed_redirect_targets_before_connecting() {
+    for (host, allow_target_port, expected) in [
+        ("127.0.0.1", false, "target port"),
+        ("localhost", true, "target host"),
+    ] {
+        let target_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let target_port = target_listener.local_addr().unwrap().port();
+        let no_target_connection = assert_no_connection(target_listener, expected);
+        let location = format!("http://{host}:{target_port}/final");
+        let redirect = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
+        );
+        let redirect = Box::leak(redirect.into_bytes().into_boxed_slice());
+        let (source_port, requests, source_server) = recording_server(vec![vec![redirect]]);
+        let source = format!(
+            r#"use http;
+            fn callback(item: map) -> map {{ {{action: "continue"}} }}
+            http::client::sse(
+                {{method:"GET", url:"http://127.0.0.1:{source_port}/start", headers:{{Authorization:"Bearer secret", Cookie:"a=b"}}}},
+                callback
+            );"#
+        );
+        let mut allowed = config(source_port);
+        if allow_target_port {
+            allowed.allowed_ports.push(target_port);
+        }
+        let error = match run_sse_source(&source, allowed).await {
+            Ok(_) => panic!("disallowed redirect target must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(expected), "{error}");
+        let request = requests.recv().unwrap().to_ascii_lowercase();
+        assert!(request.contains("authorization:"));
+        assert!(request.contains("cookie: a=b"));
+        source_server.join().unwrap();
+        no_target_connection.join().unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn sse_stop_retires_without_end_and_returns_stopped_summary() {
     let (port, server) = server(vec![
         b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
@@ -462,7 +600,7 @@ async fn sse_rejects_status_content_type_and_idle_peer() {
 #[tokio::test(flavor = "current_thread")]
 async fn sse_revalidates_redirects_and_strips_cross_origin_credentials() {
     let (target_port, target_requests, target) = recording_server(vec![vec![
-        b"HTTP/1.1 200 OK\r\nContent-Type: Text/Event-Stream; Charset=UTF-8\r\nContent-Length: 0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Type: Text/Event-Stream; Charset=UTF-8\r\nX-Obs: \x80\r\nContent-Length: 0\r\n\r\n",
     ]]);
     let redirect = format!(
         "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{target_port}/final\r\nContent-Length: 0\r\n\r\n"
@@ -472,7 +610,16 @@ async fn sse_revalidates_redirects_and_strips_cross_origin_credentials() {
     let source_code = format!(
         r#"
         use http;
-        fn record(item: map) -> map {{ {{action: "continue"}} }}
+        fn record(item: map) -> map {{
+            if item["kind"] == "open" && item != {{
+                kind: "open",
+                status: 200,
+                headers: {{"content-type": "Text/Event-Stream; Charset=UTF-8", "x-obs": b"\x80", "content-length": "0"}},
+                url: "http://127.0.0.1:{target_port}/final"
+            }} {{ let _ = 1 / 0; }}
+            if item["kind"] == "end" && item != {{kind: "end"}} {{ let _ = 1 / 0; }}
+            {{action: "continue"}}
+        }}
         http::client::sse(
             {{method: "POST", url: "http://127.0.0.1:{source_port}/start", body: "payload", headers: {{Authorization: "Bearer secret", Cookie: "a=b"}}}},
             record
@@ -482,7 +629,29 @@ async fn sse_revalidates_redirects_and_strips_cross_origin_credentials() {
     let mut allowed = config(source_port);
     allowed.allowed_ports.push(target_port);
     let vm = run_sse_source(&source_code, allowed).await.unwrap();
-    assert_eq!(field(&vm.stack()[0], "outcome"), &Value::string("eof"));
+    let final_url = format!("http://127.0.0.1:{target_port}/final");
+    assert_eq!(
+        &vm.stack()[0],
+        &map([
+            ("outcome", Value::string("eof")),
+            ("status", Value::Int(200)),
+            (
+                "headers",
+                map([
+                    (
+                        "content-type",
+                        Value::string("Text/Event-Stream; Charset=UTF-8"),
+                    ),
+                    ("x-obs", Value::bytes(vec![0x80])),
+                    ("content-length", Value::string("0")),
+                ]),
+            ),
+            ("url", Value::string(final_url)),
+            ("items", Value::Int(2)),
+            ("bytes_received", Value::Int(0)),
+            ("bytes_sent", Value::Int(0)),
+        ])
+    );
     let first = source_requests.recv().unwrap().to_ascii_lowercase();
     assert!(first.starts_with("post /start http/1.1"));
     assert!(first.ends_with("payload"));
