@@ -2,6 +2,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use futures_util::task::AtomicWaker;
 use http_body_util::BodyExt;
@@ -26,20 +27,25 @@ struct ResponseReadMetrics {
     remaining_body_bytes: AtomicUsize,
     body_read_calls: AtomicUsize,
     max_body_transport_read: AtomicUsize,
+    max_raw_transport_read: AtomicUsize,
     max_application_chunk: AtomicUsize,
 }
 
 impl ResponseReadObserver {
-    fn mark_body(&self, limit: usize) {
+    fn mark_final_head(&self) {
+        self.inner.phase.store(1, Ordering::Release);
+    }
+
+    fn admit_body(&self, limit: usize) {
         self.inner
             .remaining_body_bytes
             .store(limit, Ordering::Release);
-        self.inner.phase.store(1, Ordering::Release);
+        self.inner.phase.store(2, Ordering::Release);
         self.inner.transport_waker.wake();
     }
 
     fn body_is_admitted(&self) -> bool {
-        self.inner.phase.load(Ordering::Acquire) == 1
+        self.inner.phase.load(Ordering::Acquire) == 2
     }
 
     fn register_transport_waker(&self, waker: &std::task::Waker) {
@@ -47,7 +53,7 @@ impl ResponseReadObserver {
     }
 
     fn transport_read_limit(&self) -> usize {
-        if self.inner.phase.load(Ordering::Acquire) == 0 {
+        if !self.body_is_admitted() {
             1
         } else {
             self.inner
@@ -58,12 +64,18 @@ impl ResponseReadObserver {
     }
 
     fn observe_transport_read(&self, bytes: usize) {
-        if self.inner.phase.load(Ordering::Acquire) == 1 {
+        if self.body_is_admitted() {
             self.inner.body_read_calls.fetch_add(1, Ordering::AcqRel);
             self.inner
                 .max_body_transport_read
                 .fetch_max(bytes, Ordering::AcqRel);
         }
+    }
+
+    fn observe_raw_transport_read(&self, bytes: usize) {
+        self.inner
+            .max_raw_transport_read
+            .fetch_max(bytes, Ordering::AcqRel);
     }
 
     fn observe_application_chunk(&self, bytes: usize) {
@@ -89,8 +101,87 @@ impl ResponseReadObserver {
     }
 
     #[cfg(test)]
+    pub(super) fn max_raw_transport_read(&self) -> usize {
+        self.inner.max_raw_transport_read.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
     pub(super) fn max_application_chunk(&self) -> usize {
         self.inner.max_application_chunk.load(Ordering::Acquire)
+    }
+}
+
+// Rustls accepts a 16 KiB TLS fragment plus at most 2 KiB of protocol
+// expansion and the five-byte record header. Bounding the adapter below TLS
+// makes raw socket reads explicit. Rustls may retain one such record after the
+// final HTTP head; ReadCapIo still exposes only remaining application bytes
+// plus one overflow sentinel to Hyper.
+const TLS_MAX_WIRE_READ: usize = 16_384 + 2_048 + 5;
+const HTTP_MAX_HEAD_BYTES: usize = 64 * 1024;
+
+struct RawReadCapIo<T> {
+    inner: T,
+    observer: ResponseReadObserver,
+}
+
+impl<T> RawReadCapIo<T> {
+    fn new(inner: T, observer: ResponseReadObserver) -> Self {
+        Self { inner, observer }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for RawReadCapIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let mut bounded = buf.take(TLS_MAX_WIRE_READ);
+        match Pin::new(&mut this.inner).poll_read(cx, &mut bounded) {
+            Poll::Ready(Ok(())) => {
+                let read = bounded.filled().len();
+                let initialized = bounded.initialized().len();
+                unsafe {
+                    buf.assume_init(initialized);
+                    buf.set_filled(before + read);
+                }
+                this.observer.observe_raw_transport_read(read);
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for RawReadCapIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, bufs)
     }
 }
 
@@ -100,6 +191,8 @@ struct ReadCapIo<T> {
     header_suffix: [u8; 4],
     header_bytes: usize,
     header_complete: bool,
+    status_prefix: [u8; 12],
+    status_prefix_len: usize,
 }
 
 impl<T> ReadCapIo<T> {
@@ -110,6 +203,34 @@ impl<T> ReadCapIo<T> {
             header_suffix: [0; 4],
             header_bytes: 0,
             header_complete: false,
+            status_prefix: [0; 12],
+            status_prefix_len: 0,
+        }
+    }
+
+    fn observe_head_byte(&mut self, byte: u8) {
+        if self.status_prefix_len < self.status_prefix.len() {
+            self.status_prefix[self.status_prefix_len] = byte;
+            self.status_prefix_len += 1;
+        }
+        self.header_suffix.rotate_left(1);
+        self.header_suffix[3] = byte;
+        self.header_bytes = self.header_bytes.saturating_add(1);
+        if self.header_bytes < 4 || self.header_suffix != *b"\r\n\r\n" {
+            return;
+        }
+
+        let status = std::str::from_utf8(&self.status_prefix[9..12])
+            .ok()
+            .and_then(|digits| digits.parse::<u16>().ok());
+        if matches!(status, Some(100..=199)) && status != Some(101) {
+            self.header_suffix = [0; 4];
+            self.header_bytes = 0;
+            self.status_prefix = [0; 12];
+            self.status_prefix_len = 0;
+        } else {
+            self.header_complete = true;
+            self.observer.mark_final_head();
         }
     }
 }
@@ -134,12 +255,7 @@ impl<T: AsyncRead + Unpin> AsyncRead for ReadCapIo<T> {
                 let read = bounded.filled().len();
                 let initialized = bounded.initialized().len();
                 for byte in &bounded.filled()[..read] {
-                    this.header_suffix.rotate_left(1);
-                    this.header_suffix[3] = *byte;
-                    this.header_bytes = this.header_bytes.saturating_add(1);
-                    if this.header_bytes >= 4 && this.header_suffix == *b"\r\n\r\n" {
-                        this.header_complete = true;
-                    }
+                    this.observe_head_byte(*byte);
                 }
                 unsafe {
                     buf.assume_init(initialized);
@@ -280,17 +396,70 @@ pub(super) async fn perform_buffered_request(
 ) -> VmResult<VmMap> {
     let request = parse_request(&request, &context.config)?;
     let deadline = request_deadline(context.config.request_timeout)?;
-    with_deadline(deadline, execute_request(&context.config, &request)).await
+    with_deadline(
+        deadline,
+        execute_request_until(
+            &context.config,
+            &request,
+            ResponseReadObserver::default(),
+            deadline,
+            None,
+        ),
+    )
+    .await
 }
 
+#[cfg(test)]
 pub(super) async fn execute_request(config: &HttpConfig, request: &HttpRequest) -> VmResult<VmMap> {
-    execute_request_with_observer(config, request, ResponseReadObserver::default()).await
+    let deadline = request_deadline(config.request_timeout)?;
+    with_deadline(
+        deadline,
+        execute_request_until(
+            config,
+            request,
+            ResponseReadObserver::default(),
+            deadline,
+            None,
+        ),
+    )
+    .await
 }
 
+#[cfg(test)]
 pub(super) async fn execute_request_with_observer(
     config: &HttpConfig,
     request: &HttpRequest,
     observer: ResponseReadObserver,
+) -> VmResult<VmMap> {
+    let deadline = request_deadline(config.request_timeout)?;
+    with_deadline(
+        deadline,
+        execute_request_until(config, request, observer, deadline, None),
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(super) async fn execute_request_with_tls_config(
+    config: &HttpConfig,
+    request: &HttpRequest,
+    observer: ResponseReadObserver,
+    tls_config: Arc<rustls::ClientConfig>,
+) -> VmResult<VmMap> {
+    let deadline = request_deadline(config.request_timeout)?;
+    with_deadline(
+        deadline,
+        execute_request_until(config, request, observer, deadline, Some(tls_config)),
+    )
+    .await
+}
+
+async fn execute_request_until(
+    config: &HttpConfig,
+    request: &HttpRequest,
+    observer: ResponseReadObserver,
+    request_deadline: Instant,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
 ) -> VmResult<VmMap> {
     let mut method = request.method.clone();
     let mut url = request.url.clone();
@@ -298,25 +467,40 @@ pub(super) async fn execute_request_with_observer(
     let mut headers = request.headers.clone();
 
     for redirect_index in 0..=config.max_redirects {
-        let resolved = resolve_url(config, SchemeFamily::Http, &url).await?;
+        let connect_deadline = request_deadline.min(
+            Instant::now()
+                .checked_add(config.connect_timeout)
+                .ok_or_else(|| {
+                    VmError::HostError("HTTP connect_timeout cannot form a deadline".to_string())
+                })?,
+        );
+        let resolved = with_deadline(
+            connect_deadline,
+            resolve_url(config, SchemeFamily::Http, &url),
+        )
+        .await?;
         let origin = url.origin();
         let mut response = send_request(
-            config,
             &method,
             &url,
             &resolved,
             &headers,
             body.as_deref(),
-            observer.clone(),
+            ConnectionStage {
+                observer: observer.clone(),
+                deadline: connect_deadline,
+                tls_config: tls_config.clone(),
+            },
         )
         .await?;
-        if response.status().is_redirection() {
+        if follows_location(response.response().status()) {
             if redirect_index == config.max_redirects {
                 return Err(VmError::HostError(
                     "HTTP redirect limit exceeded".to_string(),
                 ));
             }
             let location = response
+                .response()
                 .headers()
                 .get(hyper::header::LOCATION)
                 .ok_or_else(|| VmError::HostError("HTTP redirect has no location".to_string()))?
@@ -331,9 +515,9 @@ pub(super) async fn execute_request_with_observer(
                     name != hyper::header::AUTHORIZATION && name != hyper::header::COOKIE
                 });
             }
-            if response.status() == hyper::StatusCode::SEE_OTHER
-                || ((response.status() == hyper::StatusCode::MOVED_PERMANENTLY
-                    || response.status() == hyper::StatusCode::FOUND)
+            if response.response().status() == hyper::StatusCode::SEE_OTHER
+                || ((response.response().status() == hyper::StatusCode::MOVED_PERMANENTLY
+                    || response.response().status() == hyper::StatusCode::FOUND)
                     && method != hyper::Method::GET
                     && method != hyper::Method::HEAD)
             {
@@ -344,8 +528,13 @@ pub(super) async fn execute_request_with_observer(
             continue;
         }
 
-        reject_declared_oversize(&response, config.max_response_body_bytes)?;
+        let status = response.response().status();
+        let has_body = response_has_body(&method, status);
+        if has_body {
+            reject_declared_oversize(response.response(), config.max_response_body_bytes)?;
+        }
         let response_headers = response
+            .response()
             .headers()
             .iter()
             .map(|(name, value)| {
@@ -356,10 +545,13 @@ pub(super) async fn execute_request_with_observer(
                 (Value::string(name.as_str()), value)
             })
             .collect::<Vec<_>>();
-        let status = response.status();
-        observer.mark_body(config.max_response_body_bytes);
+        if !has_body {
+            return Ok(response_map(status, response_headers, Vec::new(), &url));
+        }
+        observer.admit_body(config.max_response_body_bytes);
         let mut bytes = Vec::with_capacity(
             response
+                .response()
                 .body()
                 .size_hint()
                 .exact()
@@ -367,10 +559,7 @@ pub(super) async fn execute_request_with_observer(
                 .unwrap_or(0)
                 .min(config.max_response_body_bytes),
         );
-        while let Some(frame) = response.body_mut().frame().await {
-            let frame = frame.map_err(|error| {
-                VmError::HostError(format!("HTTP response read failed: {error}"))
-            })?;
+        while let Some(frame) = response.next_frame().await? {
             let Ok(chunk) = frame.into_data() else {
                 continue;
             };
@@ -380,23 +569,103 @@ pub(super) async fn execute_request_with_observer(
             }
             bytes.extend_from_slice(&chunk);
         }
-        return Ok(VmMap::from_entries(vec![
-            (
-                Value::string("status"),
-                Value::Int(i64::from(status.as_u16())),
-            ),
-            (
-                Value::string("headers"),
-                Value::Map(std::sync::Arc::new(VmMap::from_entries(response_headers))),
-            ),
-            (Value::string("body"), Value::bytes(bytes)),
-            (Value::string("url"), Value::string(url.as_str())),
-        ]));
+        return Ok(response_map(status, response_headers, bytes, &url));
     }
 
     Err(VmError::HostError(
         "HTTP redirect processing failed".to_string(),
     ))
+}
+
+type BoxConnection =
+    Pin<Box<dyn std::future::Future<Output = Result<(), hyper::Error>> + Send + 'static>>;
+
+struct OwnedResponse {
+    connection: Option<BoxConnection>,
+    response: hyper::Response<hyper::body::Incoming>,
+}
+
+impl OwnedResponse {
+    fn response(&self) -> &hyper::Response<hyper::body::Incoming> {
+        &self.response
+    }
+
+    async fn next_frame(&mut self) -> VmResult<Option<hyper::body::Frame<hyper::body::Bytes>>> {
+        enum Progress {
+            Frame(Option<Result<hyper::body::Frame<hyper::body::Bytes>, hyper::Error>>),
+            Connection(Result<(), hyper::Error>),
+        }
+
+        loop {
+            let Some(connection) = self.connection.as_mut() else {
+                return self
+                    .response
+                    .body_mut()
+                    .frame()
+                    .await
+                    .transpose()
+                    .map_err(|error| {
+                        VmError::HostError(format!("HTTP response read failed: {error}"))
+                    });
+            };
+            let progress = tokio::select! {
+                biased;
+                frame = self.response.body_mut().frame() => Progress::Frame(frame),
+                result = connection.as_mut() => Progress::Connection(result),
+            };
+            match progress {
+                Progress::Frame(frame) => {
+                    return frame.transpose().map_err(|error| {
+                        VmError::HostError(format!("HTTP response read failed: {error}"))
+                    });
+                }
+                Progress::Connection(Ok(())) => self.connection = None,
+                Progress::Connection(Err(error)) => {
+                    return Err(VmError::HostError(format!(
+                        "HTTP connection failed: {error}"
+                    )));
+                }
+            }
+        }
+    }
+}
+
+fn response_has_body(method: &hyper::Method, status: hyper::StatusCode) -> bool {
+    *method != hyper::Method::HEAD
+        && !status.is_informational()
+        && status != hyper::StatusCode::NO_CONTENT
+        && status != hyper::StatusCode::NOT_MODIFIED
+}
+
+fn follows_location(status: hyper::StatusCode) -> bool {
+    matches!(
+        status,
+        hyper::StatusCode::MOVED_PERMANENTLY
+            | hyper::StatusCode::FOUND
+            | hyper::StatusCode::SEE_OTHER
+            | hyper::StatusCode::TEMPORARY_REDIRECT
+            | hyper::StatusCode::PERMANENT_REDIRECT
+    )
+}
+
+fn response_map(
+    status: hyper::StatusCode,
+    headers: Vec<(Value, Value)>,
+    body: Vec<u8>,
+    url: &url::Url,
+) -> VmMap {
+    VmMap::from_entries(vec![
+        (
+            Value::string("status"),
+            Value::Int(i64::from(status.as_u16())),
+        ),
+        (
+            Value::string("headers"),
+            Value::Map(std::sync::Arc::new(VmMap::from_entries(headers))),
+        ),
+        (Value::string("body"), Value::bytes(body)),
+        (Value::string("url"), Value::string(url.as_str())),
+    ])
 }
 
 fn response_body_limit_error() -> VmError {
@@ -421,41 +690,94 @@ fn reject_declared_oversize(
     Ok(())
 }
 
+struct ConnectionStage {
+    observer: ResponseReadObserver,
+    deadline: Instant,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
+}
+
 async fn send_request(
-    config: &HttpConfig,
     method: &hyper::Method,
     url: &url::Url,
     resolved: &super::policy::ResolvedTarget,
     headers: &[(hyper::header::HeaderName, hyper::header::HeaderValue)],
     body: Option<&[u8]>,
-    observer: ResponseReadObserver,
-) -> VmResult<hyper::Response<hyper::body::Incoming>> {
-    let stream = tokio::time::timeout(
-        config.connect_timeout,
-        tokio::net::TcpStream::connect(resolved.address),
-    )
-    .await
-    .map_err(|_| VmError::HostError("HTTP request deadline exceeded".to_string()))?
-    .map_err(|error| VmError::HostError(format!("HTTP request failed: {error}")))?;
+    stage: ConnectionStage,
+) -> VmResult<OwnedResponse> {
+    let ConnectionStage {
+        observer,
+        deadline: connect_deadline,
+        tls_config,
+    } = stage;
+    let stream = with_deadline(connect_deadline, async {
+        tokio::net::TcpStream::connect(resolved.address)
+            .await
+            .map_err(|error| VmError::HostError(format!("HTTP request failed: {error}")))
+    })
+    .await?;
     stream
         .set_nodelay(true)
         .map_err(|error| VmError::HostError(format!("HTTP request failed: {error}")))?;
 
+    let raw = RawReadCapIo::new(stream, observer.clone());
     if url.scheme() == "https" {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls_config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let mut tls_config = tls_config.map_or_else(
+            || {
+                let mut roots = rustls::RootCertStore::empty();
+                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth()
+            },
+            Arc::unwrap_or_clone,
+        );
+        tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
         let server_name = rustls::pki_types::ServerName::try_from(resolved.host.clone())
             .map_err(|_| VmError::HostError("HTTP TLS server name is invalid".to_string()))?;
-        let stream = tokio_rustls::TlsConnector::from(Arc::new(tls_config))
-            .connect(server_name, stream)
-            .await
-            .map_err(|error| VmError::HostError(format!("HTTP request failed: {error}")))?;
+        let stream = with_deadline(connect_deadline, async {
+            tokio_rustls::TlsConnector::from(Arc::new(tls_config))
+                .connect(server_name, raw)
+                .await
+                .map_err(|error| VmError::HostError(format!("HTTP request failed: {error}")))
+        })
+        .await?;
         send_over_io(method, url, headers, body, ReadCapIo::new(stream, observer)).await
     } else {
-        send_over_io(method, url, headers, body, ReadCapIo::new(stream, observer)).await
+        send_over_io(method, url, headers, body, ReadCapIo::new(raw, observer)).await
+    }
+}
+
+#[cfg(test)]
+pub(super) struct PendingConnectionTest {
+    pub(super) future: Pin<Box<dyn std::future::Future<Output = VmResult<VmMap>>>>,
+}
+
+#[cfg(test)]
+pub(super) fn pending_connection_test(
+    io: tokio::io::DuplexStream,
+    url: url::Url,
+) -> PendingConnectionTest {
+    let request = HttpRequest {
+        method: hyper::Method::GET,
+        url,
+        headers: Vec::new(),
+        body: None,
+    };
+    let observer = ResponseReadObserver::default();
+    PendingConnectionTest {
+        future: Box::pin(async move {
+            let mut response = send_over_io(
+                &request.method,
+                &request.url,
+                &request.headers,
+                None,
+                ReadCapIo::new(RawReadCapIo::new(io, observer.clone()), observer.clone()),
+            )
+            .await?;
+            observer.admit_body(1024);
+            while response.next_frame().await?.is_some() {}
+            Ok(VmMap::default())
+        }),
     }
 }
 
@@ -465,12 +787,15 @@ async fn send_over_io<T>(
     headers: &[(hyper::header::HeaderName, hyper::header::HeaderValue)],
     body: Option<&[u8]>,
     io: ReadCapIo<T>,
-) -> VmResult<hyper::Response<hyper::body::Incoming>>
+) -> VmResult<OwnedResponse>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut connection_builder = hyper::client::conn::http1::Builder::new();
-    connection_builder.read_buf_exact_size(Some(8 * 1024));
+    connection_builder
+        .read_buf_exact_size(Some(8 * 1024))
+        .max_buf_size(HTTP_MAX_HEAD_BYTES)
+        .max_headers(100);
     let (mut sender, connection) = connection_builder
         .handshake(hyper_util::rt::TokioIo::new(io))
         .await
@@ -496,11 +821,39 @@ where
     let request = builder
         .body(request_body)
         .map_err(|error| VmError::HostError(format!("HTTP request setup failed: {error}")))?;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    sender
-        .send_request(request)
-        .await
-        .map_err(|error| VmError::HostError(format!("HTTP request failed: {error}")))
+    let mut connection: BoxConnection = Box::pin(connection);
+    let (response, connection) = {
+        let response = sender.send_request(request);
+        tokio::pin!(response);
+        tokio::select! {
+            biased;
+            response = &mut response => (
+                response.map_err(|error| {
+                    VmError::HostError(format!("HTTP request failed: {error}"))
+                })?,
+                Some(connection),
+            ),
+            connection_result = connection.as_mut() => {
+                let response_result = response.await;
+                let response = match (connection_result, response_result) {
+                    (_, Ok(response)) => response,
+                    (Ok(()), Err(error)) => {
+                        return Err(VmError::HostError(format!(
+                            "HTTP request failed: {error}"
+                        )));
+                    }
+                    (Err(connection_error), Err(request_error)) => {
+                        return Err(VmError::HostError(format!(
+                            "HTTP connection failed before the response: {connection_error}; request failed: {request_error}"
+                        )));
+                    }
+                };
+                (response, None)
+            }
+        }
+    };
+    Ok(OwnedResponse {
+        connection,
+        response,
+    })
 }

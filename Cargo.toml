@@ -81,7 +81,7 @@ webpki-roots = { version = "1", optional = true }
 rusqlite = { version = "0.32", default-features = false, features = ["bundled", "hooks", "limits"], optional = true }
 url = { version = "2", optional = true }
 futures-util = { version = "0.3", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "fs", "io-util", "process"], optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "fs", "io-util", "process"], optional = true }
 edge_abi = { package = "pd-edge-abi", version = "0.1.1", default-features = false, optional = true }
 futures-channel = "0.3"
 paste = "1"
@@ -100,6 +100,7 @@ libc = "0.2"
 
 [dev-dependencies]
 futures-util = "0.3"
+rcgen = "0.13"
 syn = { version = "2", features = ["full"] }
 tokio = { version = "1", features = ["macros", "rt", "time", "sync"] }
 
