@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -6,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::{Sink, Stream};
 use pd_host_function::pd_host_function;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue, StatusCode};
@@ -25,8 +26,152 @@ use crate::vm::{
 trait WebSocketIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> WebSocketIo for T {}
 type BoxIo = Box<dyn WebSocketIo>;
-type Socket = WebSocketStream<BoxIo>;
+type Socket = WebSocketStream<CloseAckIo>;
 type ConnectFuture = Pin<Box<dyn Future<Output = VmResult<ConnectedSocket>> + Send>>;
+
+struct CloseAckIo {
+    inner: BoxIo,
+    override_frame: Option<CloseFrame>,
+    pending_replacement: Option<PendingCloseAck>,
+}
+
+struct PendingCloseAck {
+    original: Vec<u8>,
+    replacement: Vec<u8>,
+    written: usize,
+}
+
+impl CloseAckIo {
+    fn new(inner: BoxIo) -> Self {
+        Self {
+            inner,
+            override_frame: None,
+            pending_replacement: None,
+        }
+    }
+
+    fn set_override(&mut self, frame: CloseFrame) {
+        self.override_frame = Some(frame);
+    }
+
+    fn poll_replacement(
+        &mut self,
+        cx: &mut Context<'_>,
+        original: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let pending = self
+            .pending_replacement
+            .as_mut()
+            .expect("pending close acknowledgment replacement");
+        if pending.original != original {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WebSocket close acknowledgment retry changed buffered bytes",
+            )));
+        }
+        match Pin::new(&mut self.inner).poll_write(cx, &pending.replacement[pending.written..]) {
+            Poll::Ready(Ok(0)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write WebSocket close acknowledgment",
+            ))),
+            Poll::Ready(Ok(written)) => {
+                pending.written += written;
+                if pending.written == pending.replacement.len() {
+                    let consumed = pending.original.len();
+                    self.pending_replacement = None;
+                    self.override_frame = None;
+                    Poll::Ready(Ok(consumed))
+                } else {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn replacement_frame(frame: CloseFrame, tungstenite_frame: &[u8]) -> io::Result<Vec<u8>> {
+        if tungstenite_frame.len() < 6
+            || tungstenite_frame[0] != 0x88
+            || tungstenite_frame[1] & 0x80 == 0
+            || tungstenite_frame[1] & 0x7f >= 126
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected a complete masked WebSocket close acknowledgment",
+            ));
+        }
+        let original_len = usize::from(tungstenite_frame[1] & 0x7f);
+        if tungstenite_frame.len() != 6 + original_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected a complete masked WebSocket close acknowledgment",
+            ));
+        }
+
+        let mut payload = Vec::with_capacity(2 + frame.reason.len());
+        payload.extend_from_slice(&u16::from(frame.code).to_be_bytes());
+        payload.extend_from_slice(frame.reason.as_bytes());
+        let mask: [u8; 4] = tungstenite_frame[2..6]
+            .try_into()
+            .expect("four-byte WebSocket mask");
+        let mut replacement = Vec::with_capacity(6 + payload.len());
+        replacement.extend_from_slice(&[0x88, 0x80 | payload.len() as u8]);
+        replacement.extend_from_slice(&mask);
+        replacement.extend(
+            payload
+                .into_iter()
+                .enumerate()
+                .map(|(index, byte)| byte ^ mask[index & 3]),
+        );
+        Ok(replacement)
+    }
+}
+
+impl AsyncRead for CloseAckIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for CloseAckIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.pending_replacement.is_some() {
+            return self.poll_replacement(cx, buf);
+        }
+        let Some(frame) = self.override_frame.clone() else {
+            return Pin::new(&mut self.inner).poll_write(cx, buf);
+        };
+        let replacement = Self::replacement_frame(frame.clone(), buf)?;
+        self.pending_replacement = Some(PendingCloseAck {
+            original: buf.to_vec(),
+            replacement,
+            written: 0,
+        });
+        self.poll_replacement(cx, buf)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        false
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
 
 #[derive(Clone)]
 struct WebSocketRequest {
@@ -281,79 +426,106 @@ impl WebSocketDriver {
             }
         }
 
-        match Pin::new(&mut active.socket).poll_next(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(None) => Poll::Ready(Err(VmError::HostError(
-                "WebSocket transport ended without a close handshake".to_string(),
-            ))),
-            Poll::Ready(Some(Err(error))) => {
-                Poll::Ready(Err(socket_error("WebSocket receive failed", error)))
-            }
-            Poll::Ready(Some(Ok(message))) => {
-                active.idle_sleep = None;
-                if matches!(&message, Message::Text(_) | Message::Binary(_)) {
-                    self.bytes_received = checked_application_counter(
-                        self.bytes_received,
-                        self.bytes_sent,
-                        message.len(),
-                        self.config.max_stream_total_bytes,
-                    )?;
+        const MAX_DISCARDED_MESSAGES_PER_POLL: usize = 32;
+        let mut discarded_messages = 0;
+        loop {
+            let message = match Pin::new(&mut active.socket).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    return Poll::Ready(Err(VmError::HostError(
+                        "WebSocket transport ended without a close handshake".to_string(),
+                    )));
                 }
-                self.items += 1;
-                let (kind, item) = match message {
-                    Message::Text(text) => (
-                        ItemKind::Text,
-                        item_map(vec![
-                            ("kind", Value::string("text")),
-                            ("text", Value::string(text.as_str())),
-                        ]),
-                    ),
-                    Message::Binary(data) => (
-                        ItemKind::Binary,
-                        item_map(vec![
-                            ("kind", Value::string("binary")),
-                            ("data", Value::bytes(data.to_vec())),
-                        ]),
-                    ),
-                    Message::Ping(data) => (
-                        ItemKind::Ping,
-                        item_map(vec![
-                            ("kind", Value::string("ping")),
-                            ("data", Value::bytes(data.to_vec())),
-                        ]),
-                    ),
-                    Message::Pong(data) => (
-                        ItemKind::Pong,
-                        item_map(vec![
-                            ("kind", Value::string("pong")),
-                            ("data", Value::bytes(data.to_vec())),
-                        ]),
-                    ),
-                    Message::Close(frame) => {
-                        let (code, reason) = frame.map_or((Value::Null, String::new()), |frame| {
-                            (
-                                Value::Int(u16::from(frame.code) as i64),
-                                frame.reason.to_string(),
-                            )
-                        });
-                        (
-                            ItemKind::Close,
-                            item_map(vec![
-                                ("kind", Value::string("close")),
-                                ("code", code),
-                                ("reason", Value::string(reason)),
-                            ]),
-                        )
+                Poll::Ready(Some(Err(error))) => {
+                    return Poll::Ready(Err(socket_error("WebSocket receive failed", error)));
+                }
+                Poll::Ready(Some(Ok(message))) => message,
+            };
+            active.idle_sleep = None;
+
+            if active.local_closing {
+                match message {
+                    Message::Close(_) => {
+                        return Poll::Ready(Ok(self.complete("closed", active)));
+                    }
+                    Message::Text(_) | Message::Binary(_) | Message::Ping(_) | Message::Pong(_) => {
+                        discarded_messages += 1;
+                        if discarded_messages == MAX_DISCARDED_MESSAGES_PER_POLL {
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                        continue;
                     }
                     Message::Frame(_) => {
                         return Poll::Ready(Err(VmError::HostError(
                             "WebSocket exposed an unexpected raw frame".to_string(),
                         )));
                     }
-                };
-                active.current_item = Some(kind);
-                Poll::Ready(Ok(HostStreamPoll::Item(item)))
+                }
             }
+
+            if matches!(&message, Message::Text(_) | Message::Binary(_)) {
+                self.bytes_received = checked_application_counter(
+                    self.bytes_received,
+                    self.bytes_sent,
+                    message.len(),
+                    self.config.max_stream_total_bytes,
+                )?;
+            }
+            self.items += 1;
+            let (kind, item) = match message {
+                Message::Text(text) => (
+                    ItemKind::Text,
+                    item_map(vec![
+                        ("kind", Value::string("text")),
+                        ("text", Value::string(text.as_str())),
+                    ]),
+                ),
+                Message::Binary(data) => (
+                    ItemKind::Binary,
+                    item_map(vec![
+                        ("kind", Value::string("binary")),
+                        ("data", Value::bytes(data.to_vec())),
+                    ]),
+                ),
+                Message::Ping(data) => (
+                    ItemKind::Ping,
+                    item_map(vec![
+                        ("kind", Value::string("ping")),
+                        ("data", Value::bytes(data.to_vec())),
+                    ]),
+                ),
+                Message::Pong(data) => (
+                    ItemKind::Pong,
+                    item_map(vec![
+                        ("kind", Value::string("pong")),
+                        ("data", Value::bytes(data.to_vec())),
+                    ]),
+                ),
+                Message::Close(frame) => {
+                    let (code, reason) = frame.map_or((Value::Null, String::new()), |frame| {
+                        (
+                            Value::Int(u16::from(frame.code) as i64),
+                            frame.reason.to_string(),
+                        )
+                    });
+                    (
+                        ItemKind::Close,
+                        item_map(vec![
+                            ("kind", Value::string("close")),
+                            ("code", code),
+                            ("reason", Value::string(reason)),
+                        ]),
+                    )
+                }
+                Message::Frame(_) => {
+                    return Poll::Ready(Err(VmError::HostError(
+                        "WebSocket exposed an unexpected raw frame".to_string(),
+                    )));
+                }
+            };
+            active.current_item = Some(kind);
+            return Poll::Ready(Ok(HostStreamPoll::Item(item)));
         }
     }
 }
@@ -509,6 +681,7 @@ impl HostStreamDriver for WebSocketDriver {
                 let payload_len = 2 + frame.reason.len();
                 validate_control_size(&self.config, payload_len)?;
                 if kind == ItemKind::Close {
+                    active.socket.get_mut().set_override(frame);
                     active.complete_after_flush = true;
                     active.flush_required = true;
                     start_close_deadline(
@@ -626,6 +799,7 @@ async fn connect_socket_with_tls_config(
             .max_write_buffer_size(config.max_websocket_send_bytes.saturating_add(1024))
             .max_message_size(Some(config.max_stream_item_bytes))
             .max_frame_size(Some(config.max_websocket_frame_bytes));
+        let io = CloseAckIo::new(io);
         let (socket, response) =
             tokio_tungstenite::client_async_with_config(handshake, io, Some(ws_config))
                 .await

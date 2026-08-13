@@ -737,9 +737,131 @@ async fn callback_actions_are_applied_before_next_message_and_close_handshake_co
         map_field(&vm.stack()[0], "outcome"),
         &Value::string("closed")
     );
-    assert_eq!(map_field(&vm.stack()[0], "items"), &Value::Int(5));
+    assert_eq!(map_field(&vm.stack()[0], "items"), &Value::Int(4));
     assert_eq!(map_field(&vm.stack()[0], "bytes_received"), &Value::Int(7));
     assert_eq!(map_field(&vm.stack()[0], "bytes_sent"), &Value::Int(5));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn local_close_discards_pipelined_messages_until_peer_acknowledgment() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("listener address");
+    let (close_received, mut close_received_rx) = tokio::sync::oneshot::channel();
+    let (release_acknowledgment, release_acknowledgment_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("client should connect");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake should succeed");
+        socket
+            .send(Message::text("close-now"))
+            .await
+            .expect("trigger message should send");
+        socket
+            .send(Message::text("discard-after-local-close"))
+            .await
+            .expect("pipelined message should send");
+        let close = socket
+            .next()
+            .await
+            .expect("client should send close")
+            .expect("client close should be valid");
+        assert!(matches!(close, Message::Close(_)));
+        close_received
+            .send(())
+            .expect("client should await the peer acknowledgment");
+        release_acknowledgment_rx
+            .await
+            .expect("test should release the peer acknowledgment");
+        socket
+            .flush()
+            .await
+            .expect("close acknowledgment should flush");
+    });
+    let source = format!(
+        r#"
+        use http;
+        fn count_close_callback() -> bool;
+        fn callback(item: map) -> map {{
+            assert(count_close_callback());
+            if item["kind"] == "text" => {{
+                assert(item["text"] == "close-now");
+                {{ action: "close", code: 1000, reason: "done" }}
+            }} else => {{
+                {{ action: "continue" }}
+            }}
+        }}
+        http::client::websocket({{ url: "ws://{address}/" }}, callback);
+        "#
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.configure_http(websocket_config(address.port()))
+        .expect("configuration should install");
+    let callbacks = Arc::new(AtomicUsize::new(0));
+    let mut registry = HostFunctionRegistry::new();
+    registry.register_stack("count_close_callback", 0, {
+        let callbacks = Arc::clone(&callbacks);
+        move || {
+            Box::new(CountCloseCallbacks {
+                calls: Arc::clone(&callbacks),
+            })
+        }
+    });
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("imports should bind");
+    assert!(matches!(
+        vm.run().expect("WebSocket should start"),
+        VmStatus::Waiting(_)
+    ));
+    tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            match close_received_rx.try_recv() {
+                Ok(()) => break,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    if poll_websocket_once(&mut vm)
+                        .await
+                        .expect("WebSocket operation should progress")
+                    {
+                        assert!(matches!(
+                            vm.resume().expect("WebSocket callback should resume"),
+                            VmStatus::Waiting(_)
+                        ));
+                    }
+                    tokio::task::yield_now().await;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    panic!("server closed before receiving the client close")
+                }
+            }
+        }
+    })
+    .await
+    .expect("client close should reach the server");
+    assert_eq!(callbacks.load(Ordering::SeqCst), 2);
+    assert!(vm.waiting_host_op_id().is_some());
+    assert!(vm.stack().iter().all(|value| {
+        !matches!(value, Value::Map(map) if map.get(&Value::string("outcome")) == Some(&Value::string("closed")))
+    }));
+
+    release_acknowledgment
+        .send(())
+        .expect("server should await acknowledgment release");
+    drive_websocket(&mut vm)
+        .await
+        .expect("peer acknowledgment should complete the WebSocket");
+    server.await.expect("server should finish");
+    assert_eq!(callbacks.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        map_field(&vm.stack()[0], "outcome"),
+        &Value::string("closed")
+    );
+    assert_eq!(map_field(&vm.stack()[0], "items"), &Value::Int(2));
+    assert_eq!(map_field(&vm.stack()[0], "bytes_received"), &Value::Int(9));
+    assert_eq!(map_field(&vm.stack()[0], "bytes_sent"), &Value::Int(0));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -897,7 +1019,7 @@ async fn fragmented_text_is_reassembled_before_callback_delivery() {
         .await
         .expect("fragmented text should complete");
     server.await.expect("server should finish");
-    assert_eq!(map_field(&vm.stack()[0], "items"), &Value::Int(3));
+    assert_eq!(map_field(&vm.stack()[0], "items"), &Value::Int(2));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -951,7 +1073,7 @@ async fn peer_close_is_delivered_once_and_continue_acknowledges_it() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn peer_close_callback_close_validates_and_flushes_the_queued_acknowledgment() {
+async fn peer_close_callback_close_sends_the_supplied_acknowledgment() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("listener should bind");
@@ -978,8 +1100,8 @@ async fn peer_close_callback_close_validates_and_flushes_the_queued_acknowledgme
         let Message::Close(Some(frame)) = acknowledgment else {
             panic!("expected close acknowledgment, got {acknowledgment:?}");
         };
-        assert_eq!(u16::from(frame.code), 1001);
-        assert_eq!(frame.reason, "away");
+        assert_eq!(u16::from(frame.code), 1000);
+        assert_eq!(frame.reason, "validated");
     });
     let source = format!(
         r#"
