@@ -330,6 +330,124 @@ async fn local_close_timeout_includes_delay_before_driver_repoll() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn peer_close_timeout_includes_delay_before_driver_repoll() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("listener address");
+    let (close_sent, mut close_sent_rx) = tokio::sync::oneshot::channel();
+    let (release_server, release_server_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("client should connect");
+        let mut socket = tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("handshake should succeed");
+        socket
+            .send(Message::Close(Some(
+                tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                    code: 1001.into(),
+                    reason: "away".into(),
+                },
+            )))
+            .await
+            .expect("peer close should send");
+        close_sent.send(()).expect("client should await peer close");
+        release_server_rx
+            .await
+            .expect("test should retain the unresolved close handshake");
+        drop(socket);
+    });
+    let source = format!(
+        r#"
+        use http;
+        fn count_peer_close_callback() -> bool;
+        fn callback(item: map) -> map {{
+            if item["kind"] == "close" => {{
+                assert(item["code"] == 1001);
+                assert(item["reason"] == "away");
+                assert(count_peer_close_callback());
+                {{ action: "close", code: 1000, reason: "validated" }}
+            }} else => {{
+                {{ action: "continue", code: 1000, reason: "" }}
+            }}
+        }}
+        http::client::websocket({{ url: "ws://{address}/" }}, callback);
+        "#
+    );
+    let compiled = compile_source(&source).expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    let mut config = websocket_config(address.port());
+    config.websocket_close_timeout = Duration::from_millis(60);
+    config.stream_idle_timeout = Duration::from_secs(1);
+    config.max_stream_duration = Duration::from_secs(2);
+    vm.configure_http(config)
+        .expect("configuration should install");
+    let callbacks = Arc::new(AtomicUsize::new(0));
+    let mut registry = HostFunctionRegistry::new();
+    registry.register_stack("count_peer_close_callback", 0, {
+        let callbacks = Arc::clone(&callbacks);
+        move || {
+            Box::new(CountCloseCallbacks {
+                calls: Arc::clone(&callbacks),
+            })
+        }
+    });
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("imports should bind");
+    assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+
+    tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            match close_sent_rx.try_recv() {
+                Ok(()) => break,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    assert!(!poll_websocket_once(&mut vm).await.unwrap());
+                    tokio::task::yield_now().await;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    panic!("server closed before sending peer close")
+                }
+            }
+        }
+        while callbacks.load(Ordering::SeqCst) == 0 {
+            assert!(!poll_websocket_once(&mut vm).await.unwrap());
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer close action should be applied");
+    assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+    assert!(
+        vm.waiting_host_op_id().is_some(),
+        "driver should be suspended after applying the peer-close action"
+    );
+    assert!(
+        !server.is_finished(),
+        "server must retain the unresolved close handshake"
+    );
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let repolled_at = tokio::time::Instant::now();
+    let error = poll_websocket_once(&mut vm)
+        .await
+        .expect_err("the peer-close transition deadline should already be expired");
+    assert!(
+        error.to_string().contains("close handshake timed out"),
+        "{error}"
+    );
+    assert!(
+        repolled_at.elapsed() < Duration::from_millis(30),
+        "delayed peer-close repoll must not receive a fresh timeout"
+    );
+    assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+    release_server
+        .send(())
+        .expect("server should still await release");
+    server.await.expect("server should finish");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn websocket_script_timeout_expires_during_periodic_active_traffic() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
