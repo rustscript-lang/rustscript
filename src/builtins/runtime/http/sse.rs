@@ -475,9 +475,11 @@ impl HostStreamDriver for SseDriver {
                 }
             }
             if self.eof_pending {
-                if let Some(event) = self.parser.finish()?.into_iter().next() {
-                    return Poll::Ready(Ok(HostStreamPoll::Item(Self::event_value(event))));
-                }
+                // `finish` only validates and cleans up: it can surface a
+                // partial BOM/UTF-8 or line-limit error, but it can never
+                // dispatch an event because EventSource dispatch requires a
+                // blank line and EOF discards a partial final event.
+                self.parser.finish()?;
                 self.eof_pending = false;
                 self.state = DriverState::Closed;
                 return Poll::Ready(Ok(HostStreamPoll::Item(map_value(vec![(
@@ -833,7 +835,14 @@ mod tests {
 
     #[test]
     fn parser_rejects_malformed_and_incomplete_utf8() {
-        for input in [b"data: \xff\n\n".as_slice(), b"data: \xc3".as_slice()] {
+        for input in [
+            b"data: \xff\n\n".as_slice(),
+            b"data: \xc3".as_slice(),
+            // A BOM prefix that never completes is still invalid UTF-8 and
+            // must surface from `finish` at EOF instead of being dropped.
+            b"\xef".as_slice(),
+            b"\xef\xbb".as_slice(),
+        ] {
             assert!(
                 parse_fragments(&[input], 64, 128, 256)
                     .unwrap_err()

@@ -710,11 +710,10 @@ impl HostStreamDriver for WebSocketDriver {
                         _ => unreachable!(),
                     };
                     let result = self.poll_active(cx, &mut active);
-                    if matches!(self.state, DriverState::Finished) {
-                        if !matches!(result, Poll::Ready(Ok(HostStreamPoll::Complete(_)))) {
-                            self.state = DriverState::Active(active);
-                        }
-                    } else {
+                    // `poll_active` never touches `self.state`, which is
+                    // `Finished` here; restore it only when the active socket
+                    // must be resumed after a non-terminal poll.
+                    if !matches!(result, Poll::Ready(Ok(HostStreamPoll::Complete(_)))) {
                         self.state = DriverState::Active(active);
                     }
                     return result;
