@@ -185,6 +185,9 @@ impl SseParser {
             if self.data_seen() {
                 return Ok(Some(self.dispatch_event()));
             }
+            // The WHATWG dispatch algorithm clears both data and event type
+            // buffers even when empty data causes dispatch to return early.
+            self.event = None;
             return Ok(None);
         }
         if line.starts_with(':') {
@@ -743,26 +746,34 @@ mod tests {
     }
 
     #[test]
-    fn parser_preserves_event_type_across_empty_data_dispatch_boundary() {
+    fn parser_clears_event_type_at_empty_data_dispatch_boundary() {
         assert_eq!(
-            parse_fragments(&[b"event: custom\n\ndata: payload\n\n"], 64, 128, 256).unwrap(),
-            vec![event("payload", Some("custom"), None, None)]
+            parse_fragments(
+                &[b"event: custom\nid: 7\nretry: 25\n\ndata: payload\n\n"],
+                64,
+                128,
+                256
+            )
+            .unwrap(),
+            vec![event("payload", None, Some("7"), Some(25))]
         );
     }
 
     #[test]
-    fn parser_preserves_fragmented_event_type_with_crlf_and_resets_after_dispatch() {
+    fn parser_clears_fragmented_event_type_at_crlf_boundaries() {
         let fragments: &[&[u8]] = &[
             b"event: custom\r",
-            b"\n\r",
-            b"\nid: 7\r\nretry: 25\r\ndata: pay",
+            b"\nid: 7\r\nretry: 25\r",
+            b"\n\r\ndata: pay",
             b"load\r\n\r",
-            b"\ndata: next\r\n\r\n",
+            b"\nevent: named\r\ndata: second\r\n\r\n",
+            b"data: next\r\n\r\n",
         ];
         assert_eq!(
             parse_fragments(fragments, 64, 128, 256).unwrap(),
             vec![
-                event("payload", Some("custom"), Some("7"), Some(25)),
+                event("payload", None, Some("7"), Some(25)),
+                event("second", Some("named"), Some("7"), Some(25)),
                 event("next", None, Some("7"), Some(25)),
             ]
         );
