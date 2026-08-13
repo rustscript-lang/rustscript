@@ -32,100 +32,175 @@ type ConnectFuture = Pin<Box<dyn Future<Output = VmResult<ConnectedSocket>> + Se
 struct CloseAckIo {
     inner: BoxIo,
     override_frame: Option<CloseFrame>,
-    pending_replacement: Option<PendingCloseAck>,
+    collected: Vec<u8>,
+    queued_output: Vec<u8>,
+    output_written: usize,
+    failure: Option<CloseAckFailure>,
+    shutdown_flushed: bool,
 }
 
-struct PendingCloseAck {
-    original: Vec<u8>,
-    replacement: Vec<u8>,
-    written: usize,
+#[derive(Clone, Copy)]
+struct CloseAckFailure {
+    kind: io::ErrorKind,
+    message: &'static str,
+}
+
+enum CloseFrameParse {
+    Incomplete,
+    Complete(usize),
 }
 
 impl CloseAckIo {
+    const MAX_CLOSE_FRAME_BYTES: usize = 2 + 4 + 125;
+    const MAX_QUEUED_OUTPUT_BYTES: usize = Self::MAX_CLOSE_FRAME_BYTES * 2;
+
     fn new(inner: BoxIo) -> Self {
         Self {
             inner,
             override_frame: None,
-            pending_replacement: None,
+            collected: Vec::with_capacity(Self::MAX_CLOSE_FRAME_BYTES),
+            queued_output: Vec::with_capacity(Self::MAX_QUEUED_OUTPUT_BYTES),
+            output_written: 0,
+            failure: None,
+            shutdown_flushed: false,
         }
     }
 
     fn set_override(&mut self, frame: CloseFrame) {
+        debug_assert!(self.override_frame.is_none());
+        debug_assert!(self.collected.is_empty());
+        debug_assert!(self.queued_output.is_empty());
         self.override_frame = Some(frame);
     }
 
-    fn poll_replacement(
-        &mut self,
-        cx: &mut Context<'_>,
-        original: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let pending = self
-            .pending_replacement
-            .as_mut()
-            .expect("pending close acknowledgment replacement");
-        if pending.original != original {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "WebSocket close acknowledgment retry changed buffered bytes",
-            )));
-        }
-        match Pin::new(&mut self.inner).poll_write(cx, &pending.replacement[pending.written..]) {
-            Poll::Ready(Ok(0)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "failed to write WebSocket close acknowledgment",
-            ))),
-            Poll::Ready(Ok(written)) => {
-                pending.written += written;
-                if pending.written == pending.replacement.len() {
-                    let consumed = pending.original.len();
-                    self.pending_replacement = None;
-                    self.override_frame = None;
-                    Poll::Ready(Ok(consumed))
-                } else {
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-            }
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-            Poll::Pending => Poll::Pending,
-        }
+    fn failure(&self) -> Option<io::Error> {
+        self.failure
+            .map(|failure| io::Error::new(failure.kind, failure.message))
     }
 
-    fn replacement_frame(frame: CloseFrame, tungstenite_frame: &[u8]) -> io::Result<Vec<u8>> {
-        if tungstenite_frame.len() < 6
-            || tungstenite_frame[0] != 0x88
-            || tungstenite_frame[1] & 0x80 == 0
-            || tungstenite_frame[1] & 0x7f >= 126
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "expected a complete masked WebSocket close acknowledgment",
-            ));
-        }
-        let original_len = usize::from(tungstenite_frame[1] & 0x7f);
-        if tungstenite_frame.len() != 6 + original_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "expected a complete masked WebSocket close acknowledgment",
-            ));
-        }
+    fn fail<T>(&mut self, kind: io::ErrorKind, message: &'static str) -> Poll<io::Result<T>> {
+        self.failure = Some(CloseAckFailure { kind, message });
+        Poll::Ready(Err(io::Error::new(kind, message)))
+    }
 
+    fn parse_collected_frame(&self) -> io::Result<CloseFrameParse> {
+        let Some(&first) = self.collected.first() else {
+            return Ok(CloseFrameParse::Incomplete);
+        };
+        if first & 0x80 == 0 || first & 0x70 != 0 || first & 0x0f != 0x08 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected a final WebSocket close acknowledgment without reserved bits",
+            ));
+        }
+        let Some(&second) = self.collected.get(1) else {
+            return Ok(CloseFrameParse::Incomplete);
+        };
+        if second & 0x80 == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected a masked WebSocket close acknowledgment",
+            ));
+        }
+        let payload_len = usize::from(second & 0x7f);
+        if payload_len > 125 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WebSocket close acknowledgment payload exceeds 125 bytes",
+            ));
+        }
+        let frame_len = 6 + payload_len;
+        if self.collected.len() < frame_len {
+            return Ok(CloseFrameParse::Incomplete);
+        }
+        if payload_len == 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WebSocket close acknowledgment has a one-byte payload",
+            ));
+        }
+        if payload_len >= 2 {
+            let mask: [u8; 4] = self.collected[2..6]
+                .try_into()
+                .expect("four-byte WebSocket mask");
+            let payload = self.collected[6..frame_len]
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| byte ^ mask[index & 3])
+                .collect::<Vec<_>>();
+            let code = CloseCode::from(u16::from_be_bytes([payload[0], payload[1]]));
+            if !code.is_allowed() || std::str::from_utf8(&payload[2..]).is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WebSocket close acknowledgment payload is invalid",
+                ));
+            }
+        }
+        Ok(CloseFrameParse::Complete(frame_len))
+    }
+
+    fn finish_collected_frame(&mut self, frame_len: usize) -> io::Result<()> {
+        let frame = self
+            .override_frame
+            .take()
+            .expect("armed close acknowledgment override");
+        let payload_len = 2 + frame.reason.len();
+        if payload_len > 125 || !frame.code.is_allowed() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "replacement WebSocket close acknowledgment is invalid",
+            ));
+        }
+        let mask: [u8; 4] = self.collected[2..6]
+            .try_into()
+            .expect("four-byte WebSocket mask");
+        let trailing_len = self.collected.len() - frame_len;
+        let replacement_len = 6 + payload_len;
+        if replacement_len + trailing_len > Self::MAX_QUEUED_OUTPUT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "WebSocket close acknowledgment output exceeds adapter bound",
+            ));
+        }
         let mut payload = Vec::with_capacity(2 + frame.reason.len());
         payload.extend_from_slice(&u16::from(frame.code).to_be_bytes());
         payload.extend_from_slice(frame.reason.as_bytes());
-        let mask: [u8; 4] = tungstenite_frame[2..6]
-            .try_into()
-            .expect("four-byte WebSocket mask");
-        let mut replacement = Vec::with_capacity(6 + payload.len());
-        replacement.extend_from_slice(&[0x88, 0x80 | payload.len() as u8]);
-        replacement.extend_from_slice(&mask);
-        replacement.extend(
+        self.queued_output.clear();
+        self.queued_output
+            .extend_from_slice(&[0x88, 0x80 | payload.len() as u8]);
+        self.queued_output.extend_from_slice(&mask);
+        self.queued_output.extend(
             payload
                 .into_iter()
                 .enumerate()
                 .map(|(index, byte)| byte ^ mask[index & 3]),
         );
-        Ok(replacement)
+        self.queued_output
+            .extend_from_slice(&self.collected[frame_len..]);
+        self.collected.clear();
+        self.output_written = 0;
+        Ok(())
+    }
+
+    fn poll_drain_output(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while self.output_written < self.queued_output.len() {
+            match Pin::new(&mut self.inner)
+                .poll_write(cx, &self.queued_output[self.output_written..])
+            {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to write WebSocket close acknowledgment",
+                    )));
+                }
+                Poll::Ready(Ok(written)) => self.output_written += written,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        self.queued_output.clear();
+        self.output_written = 0;
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -145,19 +220,51 @@ impl AsyncWrite for CloseAckIo {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.pending_replacement.is_some() {
-            return self.poll_replacement(cx, buf);
+        if let Some(error) = self.failure() {
+            return Poll::Ready(Err(error));
         }
-        let Some(frame) = self.override_frame.clone() else {
+        if !self.queued_output.is_empty() {
+            match self.poll_drain_output(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        if self.override_frame.is_none() {
+            self.shutdown_flushed = false;
             return Pin::new(&mut self.inner).poll_write(cx, buf);
-        };
-        let replacement = Self::replacement_frame(frame.clone(), buf)?;
-        self.pending_replacement = Some(PendingCloseAck {
-            original: buf.to_vec(),
-            replacement,
-            written: 0,
-        });
-        self.poll_replacement(cx, buf)
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let available = Self::MAX_CLOSE_FRAME_BYTES - self.collected.len();
+        if available == 0 {
+            return self.fail(
+                io::ErrorKind::InvalidData,
+                "WebSocket close acknowledgment exceeds adapter bound",
+            );
+        }
+        let accepted = available.min(buf.len());
+        self.collected.extend_from_slice(&buf[..accepted]);
+        match self.parse_collected_frame() {
+            Ok(CloseFrameParse::Incomplete) => {}
+            Ok(CloseFrameParse::Complete(frame_len)) => {
+                if self.finish_collected_frame(frame_len).is_err() {
+                    return self.fail(
+                        io::ErrorKind::InvalidData,
+                        "replacement WebSocket close acknowledgment is invalid",
+                    );
+                }
+            }
+            Err(_) => {
+                return self.fail(
+                    io::ErrorKind::InvalidData,
+                    "invalid WebSocket close acknowledgment frame",
+                );
+            }
+        }
+        self.shutdown_flushed = false;
+        Poll::Ready(Ok(accepted))
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -165,10 +272,45 @@ impl AsyncWrite for CloseAckIo {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(error) = self.failure() {
+            return Poll::Ready(Err(error));
+        }
+        if self.override_frame.is_some() {
+            return self.fail(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete WebSocket close acknowledgment frame",
+            );
+        }
+        match self.poll_drain_output(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(error) = self.failure() {
+            return Poll::Ready(Err(error));
+        }
+        if self.override_frame.is_some() {
+            return self.fail(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete WebSocket close acknowledgment frame",
+            );
+        }
+        match self.poll_drain_output(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
+        if !self.shutdown_flushed {
+            match Pin::new(&mut self.inner).poll_flush(cx) {
+                Poll::Ready(Ok(())) => self.shutdown_flushed = true,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -795,7 +937,7 @@ async fn connect_socket_with_tls_config(
         }
         let ws_config = WebSocketConfig::default()
             .read_buffer_size(config.max_websocket_frame_bytes.min(128 * 1024))
-            .write_buffer_size(0)
+            .write_buffer_size(config.max_websocket_send_bytes.min(128 * 1024))
             .max_write_buffer_size(config.max_websocket_send_bytes.saturating_add(1024))
             .max_message_size(Some(config.max_stream_item_bytes))
             .max_frame_size(Some(config.max_websocket_frame_bytes));
@@ -1115,9 +1257,311 @@ fn socket_error(prefix: &str, error: tokio_tungstenite::tungstenite::Error) -> V
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[derive(Clone, Copy)]
+    enum ScriptStep {
+        Write(usize),
+        Pending,
+        Error(io::ErrorKind),
+    }
+
+    #[derive(Default)]
+    struct ScriptState {
+        bytes: Vec<u8>,
+        writes: VecDeque<ScriptStep>,
+        flushes: VecDeque<ScriptStep>,
+        shutdowns: VecDeque<ScriptStep>,
+        events: Vec<&'static str>,
+    }
+
+    struct ScriptedIo {
+        state: Arc<Mutex<ScriptState>>,
+    }
+
+    impl AsyncRead for ScriptedIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for ScriptedIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let mut state = self.state.lock().unwrap();
+            state.events.push("write");
+            match state
+                .writes
+                .pop_front()
+                .unwrap_or(ScriptStep::Write(buf.len()))
+            {
+                ScriptStep::Write(limit) => {
+                    let written = limit.min(buf.len());
+                    state.bytes.extend_from_slice(&buf[..written]);
+                    Poll::Ready(Ok(written))
+                }
+                ScriptStep::Pending => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                ScriptStep::Error(kind) => Poll::Ready(Err(io::Error::new(kind, "scripted"))),
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let mut state = self.state.lock().unwrap();
+            state.events.push("flush");
+            match state.flushes.pop_front().unwrap_or(ScriptStep::Write(0)) {
+                ScriptStep::Write(_) => Poll::Ready(Ok(())),
+                ScriptStep::Pending => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                ScriptStep::Error(kind) => Poll::Ready(Err(io::Error::new(kind, "scripted"))),
+            }
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let mut state = self.state.lock().unwrap();
+            state.events.push("shutdown");
+            match state.shutdowns.pop_front().unwrap_or(ScriptStep::Write(0)) {
+                ScriptStep::Write(_) => Poll::Ready(Ok(())),
+                ScriptStep::Pending => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                ScriptStep::Error(kind) => Poll::Ready(Err(io::Error::new(kind, "scripted"))),
+            }
+        }
+    }
+
+    fn scripted_adapter(
+        writes: impl IntoIterator<Item = ScriptStep>,
+    ) -> (CloseAckIo, Arc<Mutex<ScriptState>>) {
+        let state = Arc::new(Mutex::new(ScriptState {
+            writes: writes.into_iter().collect(),
+            ..ScriptState::default()
+        }));
+        let io = ScriptedIo {
+            state: Arc::clone(&state),
+        };
+        (CloseAckIo::new(Box::new(io)), state)
+    }
+
+    fn masked_close(mask: [u8; 4], code: u16, reason: &str) -> Vec<u8> {
+        let mut payload = Vec::from(code.to_be_bytes());
+        payload.extend_from_slice(reason.as_bytes());
+        let mut frame = vec![0x88, 0x80 | payload.len() as u8];
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            payload
+                .into_iter()
+                .enumerate()
+                .map(|(index, byte)| byte ^ mask[index & 3]),
+        );
+        frame
+    }
+
+    fn custom_close() -> CloseFrame {
+        CloseFrame {
+            code: CloseCode::from(4001),
+            reason: "custom".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn close_ack_adapter_collects_a_frame_split_across_writes() {
+        let (mut io, state) = scripted_adapter([]);
+        io.set_override(custom_close());
+        let original = masked_close([1, 2, 3, 4], 1000, "peer");
+
+        io.write_all(&original[..1]).await.unwrap();
+        io.write_all(&original[1..4]).await.unwrap();
+        io.write_all(&original[4..]).await.unwrap();
+        assert!(state.lock().unwrap().bytes.is_empty());
+        io.flush().await.unwrap();
+
+        assert_eq!(
+            state.lock().unwrap().bytes,
+            masked_close([1, 2, 3, 4], 4001, "custom")
+        );
+    }
+
+    #[tokio::test]
+    async fn close_ack_adapter_preserves_coalesced_trailing_bytes_after_replacement() {
+        let (mut io, state) = scripted_adapter([]);
+        io.set_override(custom_close());
+        let original = masked_close([9, 8, 7, 6], 1000, "peer");
+        let trailing = [0x89, 0x80, 4, 3, 2, 1];
+        let mut coalesced = original.clone();
+        coalesced.extend_from_slice(&trailing);
+
+        assert_eq!(io.write(&coalesced).await.unwrap(), coalesced.len());
+        io.flush().await.unwrap();
+
+        let mut expected = masked_close([9, 8, 7, 6], 4001, "custom");
+        expected.extend_from_slice(&trailing);
+        assert_eq!(state.lock().unwrap().bytes, expected);
+    }
+
+    #[tokio::test]
+    async fn close_ack_adapter_accepts_different_input_after_short_pending_inner_writes() {
+        let (mut io, state) = scripted_adapter([
+            ScriptStep::Write(2),
+            ScriptStep::Pending,
+            ScriptStep::Write(3),
+            ScriptStep::Pending,
+            ScriptStep::Write(usize::MAX),
+        ]);
+        io.set_override(custom_close());
+        let original = masked_close([1, 3, 5, 7], 1000, "peer");
+        let next = b"different-buffer";
+
+        assert_eq!(io.write(&original).await.unwrap(), original.len());
+        io.write_all(next).await.unwrap();
+        io.flush().await.unwrap();
+
+        let mut expected = masked_close([1, 3, 5, 7], 4001, "custom");
+        expected.extend_from_slice(next);
+        assert_eq!(state.lock().unwrap().bytes, expected);
+    }
+
+    #[tokio::test]
+    async fn close_ack_adapter_flush_drains_replacement_before_inner_flush() {
+        let (mut io, state) = scripted_adapter([
+            ScriptStep::Write(1),
+            ScriptStep::Pending,
+            ScriptStep::Write(usize::MAX),
+        ]);
+        io.set_override(custom_close());
+        let original = masked_close([2, 4, 6, 8], 1000, "peer");
+        io.write_all(&original).await.unwrap();
+
+        io.flush().await.unwrap();
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.bytes, masked_close([2, 4, 6, 8], 4001, "custom"));
+        assert_eq!(state.events.last(), Some(&"flush"));
+    }
+
+    #[tokio::test]
+    async fn close_ack_adapter_shutdown_drains_flushes_then_shuts_down() {
+        let (mut io, state) = scripted_adapter([
+            ScriptStep::Write(2),
+            ScriptStep::Pending,
+            ScriptStep::Write(usize::MAX),
+        ]);
+        io.set_override(custom_close());
+        let original = masked_close([8, 6, 4, 2], 1000, "peer");
+        io.write_all(&original).await.unwrap();
+
+        io.shutdown().await.unwrap();
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.bytes, masked_close([8, 6, 4, 2], 4001, "custom"));
+        assert!(state.events.ends_with(&["flush", "shutdown"]));
+    }
+
+    #[tokio::test]
+    async fn close_ack_adapter_propagates_write_error_without_duplicate_output() {
+        let (mut io, state) = scripted_adapter([
+            ScriptStep::Write(3),
+            ScriptStep::Error(io::ErrorKind::BrokenPipe),
+            ScriptStep::Write(usize::MAX),
+        ]);
+        io.set_override(custom_close());
+        let expected = masked_close([7, 7, 7, 7], 4001, "custom");
+        io.write_all(&masked_close([7, 7, 7, 7], 1000, "peer"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            io.flush().await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        io.flush().await.unwrap();
+
+        assert_eq!(state.lock().unwrap().bytes, expected);
+    }
+
+    #[tokio::test]
+    async fn close_ack_adapter_propagates_flush_and_shutdown_errors_without_rewriting() {
+        let (mut io, state) = scripted_adapter([]);
+        {
+            let mut state = state.lock().unwrap();
+            state.flushes.extend([
+                ScriptStep::Error(io::ErrorKind::Other),
+                ScriptStep::Write(0),
+            ]);
+            state.shutdowns.extend([
+                ScriptStep::Error(io::ErrorKind::ConnectionReset),
+                ScriptStep::Write(0),
+            ]);
+        }
+        io.set_override(custom_close());
+        let expected = masked_close([3, 3, 3, 3], 4001, "custom");
+        io.write_all(&masked_close([3, 3, 3, 3], 1000, "peer"))
+            .await
+            .unwrap();
+
+        assert_eq!(io.flush().await.unwrap_err().kind(), io::ErrorKind::Other);
+        io.flush().await.unwrap();
+        assert_eq!(
+            io.shutdown().await.unwrap_err().kind(),
+            io::ErrorKind::ConnectionReset
+        );
+        io.shutdown().await.unwrap();
+
+        assert_eq!(state.lock().unwrap().bytes, expected);
+    }
+
+    #[tokio::test]
+    async fn close_ack_adapter_rejects_invalid_target_frames_within_bound() {
+        for invalid in [
+            vec![0x89, 0x80],
+            vec![0x08, 0x80],
+            vec![0x88, 0x00],
+            vec![0x88, 0xfe],
+            vec![0xc8, 0x80],
+        ] {
+            let (mut io, state) = scripted_adapter([]);
+            io.set_override(custom_close());
+            assert_eq!(
+                io.write(&invalid).await.unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert!(state.lock().unwrap().bytes.is_empty());
+            assert!(io.collected.len() <= CloseAckIo::MAX_CLOSE_FRAME_BYTES);
+        }
+    }
+
+    #[tokio::test]
+    async fn close_ack_adapter_rejects_incomplete_target_on_flush_and_shutdown() {
+        for shutdown in [false, true] {
+            let (mut io, state) = scripted_adapter([]);
+            io.set_override(custom_close());
+            assert_eq!(io.write(&[0x88]).await.unwrap(), 1);
+            let error = if shutdown {
+                io.shutdown().await.unwrap_err()
+            } else {
+                io.flush().await.unwrap_err()
+            };
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+            assert!(state.lock().unwrap().bytes.is_empty());
+        }
+    }
 
     fn config() -> HttpConfig {
         HttpConfig {
