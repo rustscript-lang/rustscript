@@ -185,7 +185,6 @@ impl SseParser {
             if self.data_seen() {
                 return Ok(Some(self.dispatch_event()));
             }
-            self.event = None;
             return Ok(None);
         }
         if line.starts_with(':') {
@@ -740,6 +739,32 @@ mod tests {
         assert_eq!(
             parse_fragments(fragments, 64, 128, 256).unwrap(),
             vec![event("hé\ntwo", Some("final"), Some("7"), Some(25))]
+        );
+    }
+
+    #[test]
+    fn parser_preserves_event_type_across_empty_data_dispatch_boundary() {
+        assert_eq!(
+            parse_fragments(&[b"event: custom\n\ndata: payload\n\n"], 64, 128, 256).unwrap(),
+            vec![event("payload", Some("custom"), None, None)]
+        );
+    }
+
+    #[test]
+    fn parser_preserves_fragmented_event_type_with_crlf_and_resets_after_dispatch() {
+        let fragments: &[&[u8]] = &[
+            b"event: custom\r",
+            b"\n\r",
+            b"\nid: 7\r\nretry: 25\r\ndata: pay",
+            b"load\r\n\r",
+            b"\ndata: next\r\n\r\n",
+        ];
+        assert_eq!(
+            parse_fragments(fragments, 64, 128, 256).unwrap(),
+            vec![
+                event("payload", Some("custom"), Some("7"), Some(25)),
+                event("next", None, Some("7"), Some(25)),
+            ]
         );
     }
 
