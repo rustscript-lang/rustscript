@@ -100,7 +100,11 @@ The callback receives exactly one map at a time:
     "url": string,
 }
 
-// One parsed SSE event. Missing event/id/retry fields use null.
+// One parsed SSE event. "event" is per-dispatch state, reset to null at
+// every dispatch boundary (including a blank line that dispatches no
+// event); "id" and "retry_ms" are persistent stream state, retaining the
+// last valid values seen so far and null only before any value has been
+// seen.
 {
     "kind": "event",
     "event": string | null,
