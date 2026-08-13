@@ -31,9 +31,11 @@ pub enum HostStreamAction {
 
 /// Host-only producer integration for a VM-serialized callable stream.
 ///
-/// The VM validates the callback's callable provenance, arity, and available
-/// schema before installing a driver. Scripts receive ordinary callback items
-/// and a final value; they never receive a stream handle or a producer poll API.
+/// The VM always validates the callback's callable provenance and arity before
+/// installing a driver. When its metadata is [`TypeSchema::Callable`], it also
+/// validates the argument and result schemas against `fn(map) -> map`. Scripts
+/// receive ordinary callback items and a final value; they never receive a
+/// stream handle or a producer poll API.
 ///
 /// Implementors must observe these contracts:
 ///
@@ -42,8 +44,10 @@ pub enum HostStreamAction {
 /// - [`apply_action`](Self::apply_action) takes ownership of the callback's
 ///   returned [`Value`], validates it as a driver-specific action, and must not
 ///   poll the producer.
-/// - Dropping the driver means cancellation. `Drop` implementations must
-///   release producer resources without requiring another poll.
+/// - Dropping the driver is terminal resource cleanup after normal completion,
+///   cancellation, or error. Only an early drop represents cancellation, and a
+///   `Drop` implementation cannot infer the terminal reason; it must release
+///   producer resources without requiring another poll.
 pub trait HostStreamDriver: Send + 'static {
     /// Polls the producer for at most one item or its final summary.
     fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<HostStreamPoll>>;
@@ -72,8 +76,9 @@ impl Vm {
     /// Installs a host-only callable stream and suspends the current VM call.
     ///
     /// This Rust embedding API does not create a script-visible handle. The VM
-    /// validates that `callback` is a callable owned by this VM, has arity one,
-    /// and, when schema information is present, matches `fn(map) -> map`. It
+    /// always validates that `callback` is a callable owned by this VM and has
+    /// arity one. When its metadata is [`TypeSchema::Callable`], the VM also
+    /// validates its argument and result schemas against `fn(map) -> map`. It
     /// then owns the callback and driver until completion, cancellation, reset,
     /// or error; removing the driver drops it to release producer resources.
     ///
