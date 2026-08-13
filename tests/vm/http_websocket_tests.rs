@@ -1,10 +1,12 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use vm::{
@@ -72,6 +74,65 @@ impl HostStackFunction for CountCloseCallbacks {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true))))
     }
+}
+
+struct CaptureReads {
+    inner: tokio::net::TcpStream,
+    enabled: Arc<AtomicBool>,
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl AsyncRead for CaptureReads {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if result.is_ready() && self.enabled.load(Ordering::SeqCst) {
+            self.bytes
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buf.filled()[before..]);
+        }
+        result
+    }
+}
+
+impl AsyncWrite for CaptureReads {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+fn decode_masked_close(frame: &[u8]) -> (u16, String) {
+    assert_eq!(frame[0], 0x88);
+    assert_ne!(frame[1] & 0x80, 0);
+    let payload_len = usize::from(frame[1] & 0x7f);
+    assert_eq!(frame.len(), 6 + payload_len);
+    let mask: [u8; 4] = frame[2..6].try_into().unwrap();
+    let payload = frame[6..]
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| byte ^ mask[index & 3])
+        .collect::<Vec<_>>();
+    (
+        u16::from_be_bytes([payload[0], payload[1]]),
+        String::from_utf8(payload[2..].to_vec()).unwrap(),
+    )
 }
 
 fn websocket_config(port: u16) -> HttpConfig {
@@ -1129,6 +1190,66 @@ async fn peer_close_callback_close_sends_the_supplied_acknowledgment() {
     assert_eq!(map_field(&vm.stack()[0], "items"), &Value::Int(2));
     assert_eq!(map_field(&vm.stack()[0], "bytes_received"), &Value::Int(0));
     assert_eq!(map_field(&vm.stack()[0], "bytes_sent"), &Value::Int(0));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn peer_close_callback_code_1014_is_emitted_on_the_wire() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let address = listener.local_addr().expect("listener address");
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let capture_enabled = Arc::new(AtomicBool::new(false));
+    let server_captured = Arc::clone(&captured);
+    let server_capture_enabled = Arc::clone(&capture_enabled);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("client should connect");
+        let io = CaptureReads {
+            inner: stream,
+            enabled: Arc::clone(&server_capture_enabled),
+            bytes: Arc::clone(&server_captured),
+        };
+        let mut socket = tokio_tungstenite::accept_async(io)
+            .await
+            .expect("handshake should succeed");
+        server_capture_enabled.store(true, Ordering::SeqCst);
+        socket
+            .send(Message::Close(Some(
+                tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                    code: 1001.into(),
+                    reason: "away".into(),
+                },
+            )))
+            .await
+            .expect("peer close should send");
+        let _ = socket.next().await;
+    });
+    let source = format!(
+        r#"
+        use http;
+        fn callback(item: map) -> map {{
+            if item["kind"] == "close" => {{
+                {{ action: "close", code: 1014, reason: "代理错误" }}
+            }} else => {{
+                {{ action: "continue" }}
+            }}
+        }}
+        http::client::websocket({{ url: "ws://{address}/" }}, callback);
+        "#
+    );
+    let vm = run_websocket(&source, websocket_config(address.port()))
+        .await
+        .expect("code 1014 close acknowledgment should complete");
+    server.await.expect("server should finish");
+
+    assert_eq!(
+        decode_masked_close(&captured.lock().unwrap()),
+        (1014, "代理错误".to_string())
+    );
+    assert_eq!(
+        map_field(&vm.stack()[0], "outcome"),
+        &Value::string("closed")
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

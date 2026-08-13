@@ -128,8 +128,7 @@ impl CloseAckIo {
                 .enumerate()
                 .map(|(index, byte)| byte ^ mask[index & 3])
                 .collect::<Vec<_>>();
-            let code = CloseCode::from(u16::from_be_bytes([payload[0], payload[1]]));
-            if !code.is_allowed() || std::str::from_utf8(&payload[2..]).is_err() {
+            if std::str::from_utf8(&payload[2..]).is_err() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "WebSocket close acknowledgment payload is invalid",
@@ -145,7 +144,7 @@ impl CloseAckIo {
             .take()
             .expect("armed close acknowledgment override");
         let payload_len = 2 + frame.reason.len();
-        if payload_len > 125 || !frame.code.is_allowed() {
+        if payload_len > 125 || !valid_close_code(frame.code.into()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "replacement WebSocket close acknowledgment is invalid",
@@ -1382,6 +1381,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_ack_adapter_serializes_code_1014_with_utf8_reason() {
+        let (mut io, state) = scripted_adapter([]);
+        io.set_override(CloseFrame {
+            code: CloseCode::from(1014),
+            reason: "代理错误".into(),
+        });
+        let original = masked_close([1, 2, 3, 4], 1001, "away");
+
+        io.write_all(&original).await.unwrap();
+        io.flush().await.unwrap();
+
+        assert_eq!(
+            state.lock().unwrap().bytes,
+            masked_close([1, 2, 3, 4], 1014, "代理错误")
+        );
+    }
+
+    #[tokio::test]
+    async fn close_ack_adapter_rejects_reserved_replacement_codes_without_output() {
+        for code in [1004, 1005, 1006, 1015] {
+            let (mut io, state) = scripted_adapter([]);
+            io.set_override(CloseFrame {
+                code: CloseCode::from(code),
+                reason: "reserved".into(),
+            });
+
+            assert_eq!(
+                io.write(&masked_close([4, 3, 2, 1], 1000, "peer"))
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert!(state.lock().unwrap().bytes.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn close_ack_adapter_collects_a_frame_split_across_writes() {
         let (mut io, state) = scripted_adapter([]);
         io.set_override(custom_close());
@@ -1601,11 +1638,31 @@ mod tests {
                 .to_string()
                 .contains("125 bytes")
         );
-        for code in [1000, 1003, 1007, 1014, 3000, 4999] {
+        for code in [
+            1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014, 3000, 4999,
+        ] {
             assert!(valid_close_code(code), "code {code} should be valid");
         }
-        for code in [0, 999, 1004, 1005, 1006, 1015, 2999, 5000] {
+        for code in [0, 999, 1004, 1005, 1006, 1015, 1016, 2999, 5000, u16::MAX] {
             assert!(!valid_close_code(code), "code {code} should be invalid");
+        }
+    }
+
+    #[test]
+    fn close_action_rejects_reserved_codes_before_creating_a_frame() {
+        for code in [1004, 1005, 1006, 1015] {
+            let action = VmMap::from_entries(vec![
+                (Value::string("code"), Value::Int(code)),
+                (Value::string("reason"), Value::string("reserved")),
+            ]);
+
+            assert!(
+                parse_close_action(&action)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("close code is invalid"),
+                "reserved code {code} must fail during callback action admission"
+            );
         }
     }
 
