@@ -820,12 +820,14 @@ impl<'a> TypeContext<'a> {
                 None => self.infer_declared_callable_call_schema(*slot, args, state),
             },
             Expr::IfElse {
+                condition,
                 then_expr,
                 else_expr,
-                ..
             } => {
-                let then_schema = self.infer_expr_schema(then_expr, state);
-                let else_schema = self.infer_expr_schema(else_expr, state);
+                let then_state = refine_state_for_condition(state, condition, true);
+                let else_state = refine_state_for_condition(state, condition, false);
+                let then_schema = self.infer_expr_schema(then_expr, &then_state);
+                let else_schema = self.infer_expr_schema(else_expr, &else_state);
                 match (then_schema, else_schema) {
                     (Some(TypeSchema::Null), rhs) => rhs,
                     (lhs, Some(TypeSchema::Null)) => lhs,
@@ -949,12 +951,14 @@ impl<'a> TypeContext<'a> {
                 infer_unary_type(expr, inner_ty)
             }
             Expr::IfElse {
-                condition: _,
+                condition,
                 then_expr,
                 else_expr,
             } => {
-                let then_ty = self.infer_expr_type(then_expr, state);
-                let else_ty = self.infer_expr_type(else_expr, state);
+                let then_state = refine_state_for_condition(state, condition, true);
+                let else_state = refine_state_for_condition(state, condition, false);
+                let then_ty = self.infer_expr_type(then_expr, &then_state);
+                let else_ty = self.infer_expr_type(else_expr, &else_state);
                 if then_ty == else_ty {
                     then_ty
                 } else {

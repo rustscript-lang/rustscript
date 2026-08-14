@@ -3872,3 +3872,267 @@ fn rustscript_strict_stream_emit_accepts_any_payload() {
     )
     .expect("strict stream::emit with any payloads must compile");
 }
+
+#[test]
+fn tail_expression_if_collects_annotated_literal_local() {
+    // Port of the `letif_a.rss` provider repro: an annotated `let` declared
+    // inside a block used by a tail-position expression-if must be collected
+    // with the branch's refined state so strict slot validation sees a
+    // concrete compile-time type.
+    run_runtime_cases(&[rustscript_runtime_case(
+        "annotated literal local in tail expression-if else branch",
+        r#"
+            fn pick(model: string) -> string {
+                if model == "" => {
+                    "empty"
+                } else => {
+                    let body_text: string = "literal";
+                    body_text
+                }
+            }
+
+            pick("x");
+        "#,
+        vec![Value::string("literal")],
+    )]);
+}
+
+#[test]
+fn tail_expression_if_collects_json_encode_local() {
+    run_runtime_cases(&[rustscript_runtime_case(
+        "annotated json::encode local in tail expression-if branch",
+        r#"
+            use json;
+
+            fn pick(model: string) -> string {
+                if model == "" => {
+                    ""
+                } else => {
+                    let encoded: string = json::encode({ text: "literal" });
+                    encoded
+                }
+            }
+
+            pick("x");
+        "#,
+        vec![Value::string("{\"text\":\"literal\"}")],
+    )]);
+}
+
+#[test]
+fn tail_expression_if_collects_module_call_local() {
+    // Port of the `tailif_root.rss` / `tailif_m2.rss` repro: a local bound to
+    // a module call inside a tail expression-if branch must resolve to the
+    // module function's declared return schema. The temp root is canonicalized
+    // and panic-safe: it is removed on drop even when a later assertion
+    // panics, so no cleanup call is needed on any path.
+    let root = TempModuleRoot::new("a3_b2_tailif_module");
+
+    let main_path = root.path().join("main.rss");
+    std::fs::write(
+        &main_path,
+        r#"
+            use self::m2 as adapter;
+            adapter::call("other");
+        "#,
+    )
+    .expect("main source should write");
+
+    let options = CompileSourceFileOptions::new().with_module_override_source(
+        "m2.rss",
+        r#"
+            pub fn call(request: string) -> string {
+                if request == "hello" => {
+                    "matched"
+                } else => {
+                    let transformed: string = inner(request);
+                    transformed
+                }
+            }
+
+            fn inner(value: string) -> string {
+                value + "!"
+            }
+        "#,
+    );
+
+    let compiled = compile_source_file_with_options(&main_path, options)
+        .expect("tail expression-if module-call local should compile");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("other!")]);
+}
+
+#[test]
+fn tail_expression_if_branch_local_does_not_leak_to_sibling_branch() {
+    // A local declared inside one tail expression-if branch must not be
+    // visible in the sibling branch: the then branch sees `body_text` as
+    // unknown and the parser rejects the reference.
+    let case = SourceErrorCase {
+        name: "tail if branch local does not leak into sibling branch",
+        source: r#"
+            fn pick(model: string) -> string {
+                if model == "" => {
+                    body_text
+                } else => {
+                    let body_text: string = "literal";
+                    body_text
+                }
+            }
+
+            pick("x");
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_kind: SourceErrorKind::Parse,
+        expected_contains_all: &["unknown local 'body_text'"],
+    };
+    expect_source_error_case(&case);
+}
+
+#[test]
+fn tail_expression_if_branch_local_is_unavailable_after_branch() {
+    // A local declared inside an expression-if branch stays branch-scoped:
+    // using it after the branch is rejected as possibly-unavailable on the
+    // other control-flow path.
+    let case = SourceErrorCase {
+        name: "tail if branch local is unavailable after the branch",
+        source: r#"
+            fn pick(model: string) -> string {
+                if model == "" => {
+                    "empty"
+                } else => {
+                    let body_text: string = "literal";
+                    body_text
+                };
+                body_text
+            }
+
+            pick("x");
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_kind: SourceErrorKind::Parse,
+        expected_contains_all: &["local 'body_text'", "may be unavailable"],
+    };
+    expect_source_error_case(&case);
+}
+
+#[test]
+fn tail_expression_if_rejects_incompatible_branch_results() {
+    // Incompatible tail branch results must still be rejected even though
+    // branch collection is now state-refined.
+    let case = SourceErrorCase {
+        name: "tail if rejects incompatible branch result types",
+        source: r#"
+            fn pick(model: string) -> string {
+                if model == "" => {
+                    1
+                } else => {
+                    "literal"
+                }
+            }
+
+            pick("x");
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_kind: SourceErrorKind::Compile(CompileErrorKind::IfElseBranchTypeMismatch),
+        expected_contains_all: &["incompatible expression result", "int vs string"],
+    };
+    expect_source_error_case(&case);
+}
+
+#[test]
+fn tail_expression_if_unknown_annotation_keeps_strict_diagnostic() {
+    // A genuinely unknown declaration inside a tail expression-if branch must
+    // keep the strict typing diagnostic: the branch-state refinement must not
+    // turn `unknown` annotations into concrete types.
+    let case = SourceErrorCase {
+        name: "tail if unknown annotation keeps strict typing diagnostic",
+        source: r#"
+            fn pick(model: string) -> string {
+                if model == "" => {
+                    "empty"
+                } else => {
+                    let body_text: unknown = "literal";
+                    body_text
+                }
+            }
+
+            pick("x");
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_kind: SourceErrorKind::Parse,
+        expected_contains_all: &[
+            "concrete compile-time types",
+            "'unknown' annotations are not allowed",
+        ],
+    };
+    expect_source_error_case(&case);
+}
+
+#[test]
+fn non_tail_expression_if_annotated_local_control() {
+    // Control: an annotated local inside a non-tail expression-if branch.
+    run_runtime_cases(&[rustscript_runtime_case(
+        "annotated literal local in non-tail expression-if branch",
+        r#"
+            fn pick(model: string) -> string {
+                let label: string = if model == "" => {
+                    "empty"
+                } else => {
+                    let body_text: string = "literal";
+                    body_text
+                };
+                label + "!"
+            }
+
+            pick("x");
+        "#,
+        vec![Value::string("literal!")],
+    )]);
+}
+
+#[test]
+fn tail_expression_if_unannotated_local_control() {
+    // Control: an unannotated local in a tail expression-if branch executes
+    // to the same value as the annotated form.
+    run_runtime_cases(&[rustscript_runtime_case(
+        "unannotated literal local in tail expression-if else branch",
+        r#"
+            fn pick(model: string) -> string {
+                if model == "" => {
+                    "empty"
+                } else => {
+                    let body_text = "literal";
+                    body_text
+                }
+            }
+
+            pick("x");
+        "#,
+        vec![Value::string("literal")],
+    )]);
+}
+
+#[test]
+fn tail_match_with_annotated_let_in_arm_branch() {
+    // Match arm bodies parse as expression syntax (`{ ... }` in an arm is an
+    // array literal, not a statement block), so the closest supported form of
+    // "tail match with an annotated let" is an if-expression arm whose branch
+    // declares the local. It must resolve and execute through the refined
+    // branch states.
+    run_runtime_cases(&[rustscript_runtime_case(
+        "annotated literal local in tail match arm if-branch",
+        r#"
+            fn pick(model: string) -> string {
+                match model {
+                    "" => if model == "x" => { "a" } else => { let body_text: string = "literal"; body_text },
+                    _ => "other"
+                }
+            }
+
+            pick("");
+        "#,
+        vec![Value::string("literal")],
+    )]);
+}
