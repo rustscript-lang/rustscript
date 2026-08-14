@@ -1016,3 +1016,667 @@ fn named_callable_materialization_module_split_same_name_materialization() {
 
     remove_module_root(&root);
 }
+
+/// Compile an in-memory root source with inline module overrides and return
+/// the compiled program. Module overrides map module paths (relative to the
+/// root module directory) to source text.
+fn compile_with_module_overrides(
+    root_source: &str,
+    overrides: &[(&str, &str)],
+) -> vm::CompiledProgram {
+    let mut options = CompileSourceFileOptions::new();
+    for (path, source) in overrides {
+        options = options.with_module_override_source(*path, *source);
+    }
+    vm::compile_source_with_flavor_and_options(root_source, SourceFlavor::RustScript, options)
+        .expect("root source with module overrides should compile")
+}
+
+/// Assert that EVERY callable prototype whose schema parameters equal
+/// `params` declares the same callable schema with result
+/// `expected_result`, and that at least one such prototype exists. Returns
+/// the number of matching prototypes so callers can pin the expected count.
+///
+/// The assertion deliberately covers all matches instead of picking the
+/// first one: a merged module graph can contain several functions with
+/// identical parameter schemas (the `call`/`dispatch` fixtures are both
+/// `(map, map)`), and a first-match lookup would silently validate only
+/// one of them. Script prototypes carry no source name, so the strongest
+/// available contract is schema identity across every prototype that
+/// shares the same declared parameters.
+fn assert_all_prototypes_with_params(
+    program: &vm::Program,
+    params: &[vm::compiler::TypeSchema],
+    expected_result: &vm::compiler::TypeSchema,
+) -> usize {
+    let matches = program
+        .callable_prototypes
+        .iter()
+        .filter(|prototype| {
+            matches!(
+                prototype.schema.as_ref(),
+                Some(vm::compiler::TypeSchema::Callable { params: candidate, .. })
+                    if candidate == params
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !matches.is_empty(),
+        "no callable prototype carries schema params {params:?}"
+    );
+    for prototype in &matches {
+        match prototype.schema.as_ref() {
+            Some(vm::compiler::TypeSchema::Callable { result, .. }) => {
+                assert_eq!(
+                    result.as_ref(),
+                    expected_result,
+                    "every prototype with schema params {params:?} must declare the same result"
+                );
+            }
+            other => panic!("unexpected non-callable schema on prototype: {other:?}"),
+        }
+    }
+    matches.len()
+}
+
+fn assert_result_map_kind(vm: &Vm, expected_kind: &str) {
+    match vm.stack().last() {
+        Some(Value::Map(map)) => {
+            assert_eq!(
+                map.get(&Value::string("kind")),
+                Some(&Value::string(expected_kind)),
+                "result map must carry kind {expected_kind:?}"
+            );
+        }
+        other => panic!("expected a result map on the stack, got {other:?}"),
+    }
+}
+
+fn assert_result_map_has_kind(vm: &Vm) {
+    match vm.stack().last() {
+        Some(Value::Map(map)) => {
+            assert!(
+                map.get(&Value::string("kind")).is_some(),
+                "result map must carry a kind key, got {map:?}"
+            );
+        }
+        other => panic!("expected a result map on the stack, got {other:?}"),
+    }
+}
+
+/// B1: a cross-module accessor returning an array, passed into a local
+/// script function with a declared `fn(string, array) -> string` schema,
+/// must keep the callee's prototype schema and execute.
+///
+/// Ports `root_splice.rss` + `chain_m1.rss` from the A3 provider repro set.
+#[test]
+fn module_callable_schema_preserves_cross_module_array_argument() {
+    let root_source = r#"
+        use self::chain_m1 as types;
+
+        pub fn run(context: map) -> map {
+            let request: map = context["request"];
+            let tools: array = types::request_array(request, "tools");
+            let body: string = splice("{ }", tools);
+            { kind: "ok", body: body }
+        }
+
+        fn splice(body: string, tools: array) -> string {
+            body
+        }
+
+        let result: map = run({
+            request: {
+                tools: [
+                    { name: "read_file", description: "read", schema_json: "{}" }
+                ]
+            }
+        });
+        result;
+    "#;
+    let chain_m1 = r#"
+        pub fn request_array(request: map, key: string) -> array {
+            let mut items: array = [];
+            if request.has(key) {
+                if type(request[key]) == "array" {
+                    let coerced: array = request[key];
+                    items = coerced;
+                }
+            }
+            items
+        }
+    "#;
+    let compiled = compile_with_module_overrides(root_source, &[("chain_m1.rss", chain_m1)]);
+    assert_eq!(
+        assert_all_prototypes_with_params(
+            &compiled.program,
+            &[
+                vm::compiler::TypeSchema::String,
+                vm::compiler::TypeSchema::Array(Box::new(vm::compiler::TypeSchema::Unknown)),
+            ],
+            &vm::compiler::TypeSchema::String,
+        ),
+        1,
+        "only splice declares (string, array) and it must keep its string result"
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm
+        .run()
+        .expect("cross-module array argument call should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_result_map_kind(&vm, "ok");
+}
+
+/// B1 control: the same call with a literal array argument must pass.
+/// Ports `root_splice2.rss`.
+#[test]
+fn module_callable_schema_literal_array_control() {
+    let root_source = r#"
+        pub fn run(context: map) -> map {
+            let body: string = splice("{ }", []);
+            { kind: "ok", body: body }
+        }
+
+        fn splice(body: string, tools: array) -> string {
+            body
+        }
+
+        let result: map = run({});
+        result;
+    "#;
+    let compiled = compile_source(root_source).expect("literal array control should compile");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("literal array control should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_result_map_kind(&vm, "ok");
+}
+
+/// B1: a two-map module function that string-reads its FIRST map parameter
+/// and passes the second onward must keep every declared parameter in source
+/// order and execute. Ports the `hop4` behavior (`hop4_root.rss` +
+/// `hop4_m2.rss` + `chain_m1.rss`).
+#[test]
+fn module_callable_schema_preserves_first_map_parameter() {
+    let root_source = r#"
+        use self::hop4_m2 as adapter;
+
+        pub fn run(context: map) -> map {
+            let request: map = context["request"];
+            let profile: map = context["profile"];
+            adapter::call(request, profile)
+        }
+
+        let result: map = run({
+            request: { model: "m" },
+            profile: { base_url: "http://127.0.0.1:1", api_key: "k", provider: "p" }
+        });
+        result;
+    "#;
+    let hop4_m2 = r#"
+        use self::chain_m1 as types;
+
+        pub fn call(request: map, profile: map) -> map {
+            let stream: bool = false;
+            if stream => {
+                { kind: "stream" }
+            } else => {
+                dispatch(profile, request)
+            }
+        }
+
+        fn dispatch(profile: map, request: map) -> map {
+            let base_url: string = types::request_string(profile, "base_url");
+            let api_key: string = types::request_string(profile, "api_key");
+            let provider: string = types::request_string(profile, "provider");
+            complete(request, base_url, api_key, provider)
+        }
+
+        fn complete(request: map, base_url: string, api_key: string, provider: string) -> map {
+            let model: string = types::request_string(request, "model");
+            let body_text: string = local_helper(request, model, false);
+            if model == "" => {
+                { kind: "missing" }
+            } else => {
+                { kind: "ok", body: body_text, url: base_url, provider: provider }
+            }
+        }
+
+        fn local_helper(request: map, model: string, stream: bool) -> string {
+            "stub"
+        }
+    "#;
+    let chain_m1 = r#"
+        pub fn request_string(request: map, key: string) -> string {
+            let mut text: string = "";
+            if request.has(key) {
+                if type(request[key]) == "string" {
+                    let coerced: string = request[key];
+                    text = coerced;
+                }
+            }
+            text
+        }
+    "#;
+    let compiled = compile_with_module_overrides(
+        root_source,
+        &[("hop4_m2.rss", hop4_m2), ("chain_m1.rss", chain_m1)],
+    );
+    // All declared map parameters stay in source order: `dispatch` is
+    // (map, map), `complete` is (map, string, string, string). The
+    // (map, map) parameter list is shared by `call` and `dispatch`, so the
+    // assertion must cover every matching prototype instead of picking the
+    // first one — both must keep their `(map, map) -> map` schema.
+    assert_eq!(
+        assert_all_prototypes_with_params(
+            &compiled.program,
+            &[
+                vm::compiler::TypeSchema::Map(Box::new(vm::compiler::TypeSchema::Unknown)),
+                vm::compiler::TypeSchema::Map(Box::new(vm::compiler::TypeSchema::Unknown)),
+            ],
+            &vm::compiler::TypeSchema::Map(Box::new(vm::compiler::TypeSchema::Unknown)),
+        ),
+        2,
+        "call and dispatch both declare (map, map) -> map and keep their schemas"
+    );
+    assert_eq!(
+        assert_all_prototypes_with_params(
+            &compiled.program,
+            &[
+                vm::compiler::TypeSchema::Map(Box::new(vm::compiler::TypeSchema::Unknown)),
+                vm::compiler::TypeSchema::String,
+                vm::compiler::TypeSchema::String,
+                vm::compiler::TypeSchema::String,
+            ],
+            &vm::compiler::TypeSchema::Map(Box::new(vm::compiler::TypeSchema::Unknown)),
+        ),
+        1,
+        "complete must keep its (map, string, string, string) -> map schema"
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm
+        .run()
+        .expect("first-map-parameter module graph should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_result_map_kind(&vm, "ok");
+}
+
+/// B1 control: the same two-map layout reading the SECOND map parameter
+/// passes. Ports the `hop13` behavior (`hop13_root.rss` + `hop13_m2.rss` +
+/// `chain_m1.rss`).
+#[test]
+fn module_callable_schema_second_parameter_control() {
+    let root_source = r#"
+        use self::hop13_m2 as adapter;
+
+        pub fn run(context: map) -> map {
+            let request: map = context["request"];
+            let profile: map = context["profile"];
+            adapter::call(request, profile)
+        }
+
+        let result: map = run({
+            request: { model: "m" },
+            profile: { base_url: "http://127.0.0.1:1", api_key: "k", provider: "p" }
+        });
+        result;
+    "#;
+    let hop13_m2 = r#"
+        use self::chain_m1 as types;
+
+        pub fn call(request: map, profile: map) -> map {
+            let stream: bool = false;
+            if stream => {
+                { kind: "stream" }
+            } else => {
+                dispatch(profile, request)
+            }
+        }
+
+        fn dispatch(profile: map, request: map) -> map {
+            let model: string = types::request_string(request, "model");
+            complete(profile, "u", "k", "p")
+        }
+
+        fn complete(request: map, base_url: string, api_key: string, provider: string) -> map {
+            let model: string = types::request_string(request, "model");
+            let result: map = if model == "" => {
+                { kind: "missing" }
+            } else => {
+                { kind: "ok", url: base_url, key: api_key, provider: provider }
+            };
+            result
+        }
+    "#;
+    let chain_m1 = r#"
+        pub fn request_string(request: map, key: string) -> string {
+            let mut text: string = "";
+            if request.has(key) {
+                if type(request[key]) == "string" {
+                    let coerced: string = request[key];
+                    text = coerced;
+                }
+            }
+            text
+        }
+    "#;
+    let compiled = compile_with_module_overrides(
+        root_source,
+        &[("hop13_m2.rss", hop13_m2), ("chain_m1.rss", chain_m1)],
+    );
+    // Same merged-graph schema contract as the first-map fixture: every
+    // (map, map) prototype — `call` and `dispatch` — must keep its
+    // `(map, map) -> map` schema, and `complete` its four-parameter one.
+    assert_eq!(
+        assert_all_prototypes_with_params(
+            &compiled.program,
+            &[
+                vm::compiler::TypeSchema::Map(Box::new(vm::compiler::TypeSchema::Unknown)),
+                vm::compiler::TypeSchema::Map(Box::new(vm::compiler::TypeSchema::Unknown)),
+            ],
+            &vm::compiler::TypeSchema::Map(Box::new(vm::compiler::TypeSchema::Unknown)),
+        ),
+        2,
+        "call and dispatch both declare (map, map) -> map and keep their schemas"
+    );
+    assert_eq!(
+        assert_all_prototypes_with_params(
+            &compiled.program,
+            &[
+                vm::compiler::TypeSchema::Map(Box::new(vm::compiler::TypeSchema::Unknown)),
+                vm::compiler::TypeSchema::String,
+                vm::compiler::TypeSchema::String,
+                vm::compiler::TypeSchema::String,
+            ],
+            &vm::compiler::TypeSchema::Map(Box::new(vm::compiler::TypeSchema::Unknown)),
+        ),
+        1,
+        "complete must keep its (map, string, string, string) -> map schema"
+    );
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("second-map-parameter control should run");
+    assert_eq!(status, VmStatus::Halted);
+    // The fixture's `complete(profile, ...)` reads `model` from the profile
+    // map (absent), so the semantic result is `missing`; the control's
+    // contract is that the merged call graph executes without a callable
+    // schema mismatch.
+    assert_result_map_has_kind(&vm);
+}
+
+/// B1: VMBC round-trip must preserve every script prototype's callable
+/// schema for a merged module graph, and the decoded program must execute.
+#[test]
+fn callable_schema_survives_vmbc_round_trip_for_merged_modules() {
+    let root_source = r#"
+        use self::chain_m1 as types;
+
+        pub fn run(context: map) -> map {
+            let request: map = context["request"];
+            let tools: array = types::request_array(request, "tools");
+            let body: string = splice("{ }", tools);
+            { kind: "ok", body: body }
+        }
+
+        fn splice(body: string, tools: array) -> string {
+            body
+        }
+
+        let result: map = run({
+            request: {
+                tools: [
+                    { name: "read_file", description: "read", schema_json: "{}" }
+                ]
+            }
+        });
+        result;
+    "#;
+    let chain_m1 = r#"
+        pub fn request_array(request: map, key: string) -> array {
+            let mut items: array = [];
+            if request.has(key) {
+                if type(request[key]) == "array" {
+                    let coerced: array = request[key];
+                    items = coerced;
+                }
+            }
+            items
+        }
+    "#;
+    let compiled = compile_with_module_overrides(root_source, &[("chain_m1.rss", chain_m1)]);
+    let encoded = vm::encode_program(&compiled.program).expect("merged program should encode");
+    let decoded = vm::decode_program(&encoded).expect("merged program should decode");
+    assert_eq!(
+        decoded.callable_prototypes.len(),
+        compiled.program.callable_prototypes.len(),
+        "round trip must preserve the prototype count"
+    );
+    for (before, after) in compiled
+        .program
+        .callable_prototypes
+        .iter()
+        .zip(&decoded.callable_prototypes)
+    {
+        assert_eq!(
+            before.schema, after.schema,
+            "round trip must preserve prototype schemas"
+        );
+    }
+    vm::validate_program(&decoded, 0).expect("decoded merged program should validate");
+
+    let mut vm = Vm::new(decoded);
+    let status = vm.run().expect("decoded merged program should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_result_map_kind(&vm, "ok");
+}
+
+/// B1: a merged module graph must still enforce the callee's callable
+/// schema at runtime. The module accessor `request_value` declares no
+/// return schema, so the root binding `tools: array` accepts the module's
+/// map value statically; the actual runtime value is a map, and the
+/// `splice(string, array)` call must fail with the precise
+/// `TypeMismatch("callable argument schema")` error instead of passing
+/// silently or corrupting operand placement.
+#[test]
+fn merged_module_graph_wrong_argument_reports_callable_argument_schema_mismatch() {
+    let root_source = r#"
+        use self::chain_m1 as types;
+
+        pub fn run(context: map) -> map {
+            let request: map = context["request"];
+            let tools: array = types::request_value(request, "tools");
+            let body: string = splice("{ }", tools);
+            { kind: "ok", body: body }
+        }
+
+        fn splice(body: string, tools: array) -> string {
+            body
+        }
+
+        let result: map = run({
+            request: {
+                tools: { name: "read_file", description: "read", schema_json: "{}" }
+            }
+        });
+        result;
+    "#;
+    let chain_m1 = r#"
+        pub fn request_value(request: map, key: string) {
+            request[key]
+        }
+    "#;
+    let compiled = compile_with_module_overrides(root_source, &[("chain_m1.rss", chain_m1)]);
+    // The merged graph still carries splice's (string, array) -> string schema.
+    assert_eq!(
+        assert_all_prototypes_with_params(
+            &compiled.program,
+            &[
+                vm::compiler::TypeSchema::String,
+                vm::compiler::TypeSchema::Array(Box::new(vm::compiler::TypeSchema::Unknown)),
+            ],
+            &vm::compiler::TypeSchema::String,
+        ),
+        1,
+        "splice must keep its (string, array) -> string schema in the merged graph"
+    );
+    let mut vm = Vm::new(compiled.program);
+    assert!(matches!(
+        vm.run(),
+        Err(vm::VmError::TypeMismatch("callable argument schema"))
+    ));
+}
+
+/// B1: the liveness allocator only compacts once the merged program's
+/// local count exceeds `LOCAL_SLOT_ALLOCATOR_COMPAT_THRESHOLD` (8). This
+/// fixture proves the frame layout really sits beyond that threshold:
+/// `wide` declares ten parameters, and because every parameter stays live
+/// for the whole body, compaction must keep ten distinct physical slots
+/// (parameter_slots pairwise distinct, compacted frame above 8) and the
+/// call site must place each operand in its own slot. The tenth parameter
+/// `j` is never used by the body — exactly the dead-parameter shape that
+/// used to let the colorer alias two parameters onto one physical slot and
+/// corrupt operand placement at the call site.
+#[test]
+fn wide_frame_exceeds_liveness_compaction_threshold() {
+    let root_source = r#"
+        pub fn run(context: map) -> map {
+            let text: string = wide(
+                "a", "b", "c", "d", "e", "f", "g", "h", "i", "j"
+            );
+            { kind: "ok", text: text }
+        }
+
+        fn wide(
+            a: string, b: string, c: string, d: string,
+            e: string, f: string, g: string, h: string,
+            i: string, j: string
+        ) -> string {
+            let s1: string = a;
+            let s2: string = b;
+            let s3: string = c;
+            let s4: string = d;
+            let s5: string = e;
+            let s6: string = f;
+            let s7: string = g;
+            let s8: string = h;
+            let s9: string = i;
+            s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9
+        }
+
+        let result: map = run({});
+        result;
+    "#;
+    let compiled = compile_source(root_source).expect("wide-frame fixture should compile");
+    let string_params =
+        std::iter::repeat_n(vm::compiler::TypeSchema::String, 10).collect::<Vec<_>>();
+    let wide_prototypes = compiled
+        .program
+        .callable_prototypes
+        .iter()
+        .filter(|prototype| {
+            matches!(
+                prototype.schema.as_ref(),
+                Some(vm::compiler::TypeSchema::Callable { params: candidate, .. })
+                    if *candidate == string_params
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        wide_prototypes.len(),
+        1,
+        "exactly one prototype declares ten string parameters"
+    );
+    let wide = wide_prototypes[0];
+    let distinct_param_slots = wide
+        .parameter_slots
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        distinct_param_slots.len(),
+        10,
+        "every parameter must keep a distinct physical slot, got {:?}",
+        wide.parameter_slots
+    );
+    assert!(
+        compiled.program.local_count > 8,
+        "the compacted frame ({}) must exceed the liveness compaction threshold of 8",
+        compiled.program.local_count
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("wide-frame call should run");
+    assert_eq!(status, VmStatus::Halted);
+    match vm.stack().last() {
+        Some(Value::Map(map)) => {
+            assert_eq!(map.get(&Value::string("kind")), Some(&Value::string("ok")));
+            assert_eq!(
+                map.get(&Value::string("text")),
+                Some(&Value::string("abcdefghi")),
+                "operand placement must survive compaction: j is unused, a..i must keep their values"
+            );
+        }
+        other => panic!("expected a result map on the stack, got {other:?}"),
+    }
+}
+
+/// B1 A/B contract: a root-module function and an imported-module function
+/// with identical signatures must carry identical callable schemas in the
+/// merged program, and both call sites must execute. The root `root_ident`
+/// and the module `ident` both declare `(map, string) -> string`; the
+/// merged graph must contain both prototypes with that schema (the root
+/// one and the non-root one), each keeping its declared result.
+#[test]
+fn root_and_module_functions_share_schema_ab_contract() {
+    let root_source = r#"
+        use self::chain_m1 as types;
+
+        pub fn run(context: map) -> map {
+            let local: string = root_ident(context, "local");
+            let remote: string = types::ident(context, "remote");
+            { kind: "ok", local: local, remote: remote }
+        }
+
+        fn root_ident(context: map, key: string) -> string {
+            let text: string = context[key];
+            text
+        }
+
+        let result: map = run({
+            local: "L",
+            remote: "R"
+        });
+        result;
+    "#;
+    let chain_m1 = r#"
+        pub fn ident(context: map, key: string) -> string {
+            let text: string = context[key];
+            text
+        }
+    "#;
+    let compiled = compile_with_module_overrides(root_source, &[("chain_m1.rss", chain_m1)]);
+    // Both the root `ident` and the module `ident` share the same
+    // (map, string) -> string schema; both must be present and identical.
+    assert_eq!(
+        assert_all_prototypes_with_params(
+            &compiled.program,
+            &[
+                vm::compiler::TypeSchema::Map(Box::new(vm::compiler::TypeSchema::Unknown)),
+                vm::compiler::TypeSchema::String,
+            ],
+            &vm::compiler::TypeSchema::String,
+        ),
+        2,
+        "root and module ident must both keep their (map, string) -> string schema"
+    );
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("root and module ident calls should run");
+    assert_eq!(status, VmStatus::Halted);
+    match vm.stack().last() {
+        Some(Value::Map(map)) => {
+            assert_eq!(map.get(&Value::string("local")), Some(&Value::string("L")));
+            assert_eq!(map.get(&Value::string("remote")), Some(&Value::string("R")));
+        }
+        other => panic!("expected a result map on the stack, got {other:?}"),
+    }
+}

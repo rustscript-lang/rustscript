@@ -669,7 +669,20 @@ impl LocalSlotAllocator {
             );
             self.add_live_clique(&live_after);
             self.collect_expr_constraints(&function_impl.body_expr, &live_after)?;
-            let _ = self.collect_block(&function_impl.body_stmts, &live_after)?;
+            let body_live_in = self.collect_block(&function_impl.body_stmts, &live_after)?;
+            // Parameters are written by the caller at frame entry and stay
+            // live for the whole body, so each parameter must interfere with
+            // every other parameter and with every slot live when the body
+            // begins. Without this clique, a parameter that the body never
+            // uses (or whose uses do not overlap another parameter's) has no
+            // liveness edges and the colorer aliases distinct parameters
+            // onto one physical slot, corrupting operand placement at every
+            // call site that targets the function.
+            let mut entry_live = body_live_in;
+            for slot in &function_impl.param_slots {
+                self.liveness.mark_live(&mut entry_live, *slot);
+            }
+            self.add_live_clique(&entry_live);
         }
 
         let (mapping, compacted_local_count) = self.color_slots()?;
