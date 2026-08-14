@@ -22,6 +22,80 @@ use super::validate::{
     validate_json_encode_argument, validate_signature_overloads,
 };
 
+/// Maximum number of times the same named declaration may be re-entered
+/// on the active expansion path before `resolve_schema` stops expanding
+/// it and emits a cycle marker instead.
+///
+/// The seen-set terminates exact cycle re-entries (a key that repeats on
+/// the active path), and trip collapse terminates named wrapping
+/// (`Node<Node<T>>` re-enters the same collapsed identity). Neither helps
+/// when a recursion re-enters the *same declaration* while wrapping its
+/// type argument in a container at every re-entry
+/// (`Node<T>{ child: Node<[T]> }` resolves to `Node<int>`, `Node<[int]>`,
+/// `Node<[[int]]>`, ...): every key is structurally fresh, so the walk
+/// would grow without bound. This budget is the hard bound for exactly
+/// that case: it counts repeated re-entries of the *same declaration
+/// identity* on the active path, so a deep non-recursive chain of
+/// distinct structs never consumes it and expands in full, while a
+/// recursive family is stopped at the budget. Hitting the budget emits
+/// the node - with its fully resolved arguments - as a cycle marker
+/// exactly like a seen-trip, so caller cycle keys stay consistent.
+///
+/// A marker usually carries concrete arguments, but it may retain raw
+/// generic parameters when an argument could not be concretized (an
+/// unbound parameter, or a self-referential binding the
+/// `schema_mentions_generic_param` guard refuses to expand). Re-resolving
+/// such a marker terminates: the retained parameter fails to resolve
+/// (the guard leaves it unresolved), so the marker re-renders itself
+/// instead of restarting the growth - the failed resolution closes the
+/// expansion rather than reopening it.
+///
+/// 32 re-entries of one declaration is far beyond any practical JSON
+/// payload depth (each level is one more container wrap of the type
+/// argument), and the walk cost grows quadratically with the budget
+/// (every level re-resolves its own increasingly wrapped arguments), so
+/// the bound also keeps the compile-time walk fast and shallow enough
+/// for the constrained-stack regression probes.
+const MAX_NAMED_SCHEMA_REENTRY: usize = 32;
+
+/// True when `schema` mentions the generic parameter `name` anywhere.
+/// Used to break self-referential bindings (`T` bound to `[T]`): such a
+/// binding can only arise from an unbound parameter root, and expanding
+/// it would loop through containers forever without ever re-entering a
+/// named declaration (so the named re-entry budget would never trip), so
+/// the parameter is left unresolved instead - the honest marker for a
+/// circular binding.
+fn schema_mentions_generic_param(schema: &TypeSchema, name: &str) -> bool {
+    match schema {
+        TypeSchema::GenericParam(other) => other == name,
+        TypeSchema::Named(_, type_args) => type_args
+            .iter()
+            .any(|arg| schema_mentions_generic_param(arg, name)),
+        TypeSchema::Array(element) => schema_mentions_generic_param(element, name),
+        TypeSchema::ArrayTuple(items) => items
+            .iter()
+            .any(|item| schema_mentions_generic_param(item, name)),
+        TypeSchema::ArrayTupleRest { prefix, rest } => {
+            prefix
+                .iter()
+                .any(|item| schema_mentions_generic_param(item, name))
+                || schema_mentions_generic_param(rest, name)
+        }
+        TypeSchema::Map(value) => schema_mentions_generic_param(value, name),
+        TypeSchema::Optional(inner) => schema_mentions_generic_param(inner, name),
+        TypeSchema::Object(fields) => fields
+            .values()
+            .any(|value| schema_mentions_generic_param(value, name)),
+        TypeSchema::Callable { params, result } => {
+            params
+                .iter()
+                .any(|param| schema_mentions_generic_param(param, name))
+                || schema_mentions_generic_param(result, name)
+        }
+        _ => false,
+    }
+}
+
 pub(super) struct TypeContext<'a> {
     pub(super) function_impls: &'a HashMap<u16, FunctionImpl>,
     pub(super) function_decls: &'a HashMap<u16, FunctionDecl>,
@@ -159,78 +233,243 @@ impl<'a> TypeContext<'a> {
         schema: &TypeSchema,
         seen: &mut HashSet<String>,
     ) -> TypeSchema {
+        self.resolve_schema_with_seen_tripped(schema, seen, &mut HashMap::new())
+            .0
+    }
+
+    /// Resolves `schema` against `seen`, also reporting the innermost cycle
+    /// key the resolution re-entered. `Some(key)` means the resolution
+    /// terminated on a cycle, so the result is a cycle marker for an
+    /// active ancestor; `None` means it completed without re-entering one.
+    ///
+    /// The trip key lets callers build cycle keys from the *identity* of a
+    /// resolved argument instead of its structural render. A recursive
+    /// generic whose type arguments wrap the recursion in a named type
+    /// (`Node<Node<T>>`) re-enters with one more nesting at every level,
+    /// so a structural key (`Node<int>`, `Node<Node<int>>`,
+    /// `Node<Node<Node<int>>>`, ...) never repeats and the walk never
+    /// terminates. Collapsing a wrapped chain to the trip key of its
+    /// innermost re-entry keeps the key stable across every wrap depth
+    /// while still distinguishing chains rooted at different ancestors.
+    /// Containers (`Array`/`Map`/`Object`/tuples/`Optional`/`Callable`)
+    /// propagate their children's innermost trip, so a resolved argument
+    /// that *contains* a cycle marker collapses to the same identity
+    /// instead of re-rendering the marker one nesting deeper per re-entry.
+    ///
+    /// `reentries` is the named re-entry budget
+    /// (`MAX_NAMED_SCHEMA_REENTRY`): it counts how many times each
+    /// declaration identity is already being expanded on the active path.
+    /// When a recursion wraps its type argument in a *container* at every
+    /// re-entry (`Node<T>{ child: Node<[T]> }`), even the collapsed keys
+    /// stay structurally fresh (`Node<[int]>`, `Node<[[int]]>`, ...), so
+    /// neither the seen-set nor trip collapse can terminate the walk. The
+    /// budget is the hard bound for that recursive family: at the limit
+    /// the node is emitted - with its fully resolved arguments - as a
+    /// cycle marker, exactly like a seen-trip. Declarations with distinct
+    /// identities never accumulate a count, so deep non-recursive chains
+    /// expand in full.
+    fn resolve_schema_with_seen_tripped(
+        &mut self,
+        schema: &TypeSchema,
+        seen: &mut HashSet<String>,
+        reentries: &mut HashMap<String, usize>,
+    ) -> (TypeSchema, Option<String>) {
         match schema {
             TypeSchema::GenericParam(name) => {
                 let bound = self.resolve_generic_binding(name).cloned();
-                bound.map_or_else(
-                    || schema.clone(),
-                    |bound| {
-                        if bound == *schema {
-                            schema.clone()
-                        } else {
-                            self.resolve_schema_with_seen(&bound, seen)
-                        }
-                    },
-                )
+                match bound {
+                    Some(bound)
+                        if bound != *schema && !schema_mentions_generic_param(&bound, name) =>
+                    {
+                        self.resolve_schema_with_seen_tripped(&bound, seen, reentries)
+                    }
+                    _ => (schema.clone(), None),
+                }
             }
             TypeSchema::Named(name, type_args) => {
-                let substituted_args = type_args
-                    .iter()
-                    .map(|arg| self.resolve_schema_with_seen(arg, seen))
-                    .collect::<Vec<_>>();
+                let mut resolved_args = Vec::with_capacity(type_args.len());
+                let mut arg_trips = Vec::with_capacity(type_args.len());
+                for arg in type_args {
+                    let (resolved, trip) =
+                        self.resolve_schema_with_seen_tripped(arg, seen, reentries);
+                    resolved_args.push(resolved);
+                    arg_trips.push(trip);
+                }
+                let reentry_count = reentries.get(name.as_str()).copied().unwrap_or(0);
+                if reentry_count >= MAX_NAMED_SCHEMA_REENTRY {
+                    // Container-wrapped recursion has no repeating key to
+                    // trip on; the same declaration has re-entered the
+                    // active path past the budget, so stop expanding and
+                    // emit the node with its fully resolved arguments as a
+                    // cycle marker. Concrete arguments matter: a marker
+                    // with raw generic parameters would push a
+                    // self-referential binding when re-resolved (`T` bound
+                    // to `[T]`). Raw parameters can still appear when an
+                    // argument itself failed to concretize (unbound or
+                    // self-referential binding); re-resolving such a
+                    // marker terminates because the retained parameter
+                    // fails to resolve, closing the expansion instead of
+                    // restarting its growth.
+                    let key = schema_instance_key(name, &resolved_args, &arg_trips);
+                    return (TypeSchema::Named(name.clone(), resolved_args), Some(key));
+                }
                 let Some(decl) = self.struct_schemas.get(name) else {
-                    return TypeSchema::Named(name.clone(), substituted_args);
+                    return (TypeSchema::Named(name.clone(), resolved_args), None);
                 };
-                if decl.type_params.len() != substituted_args.len() {
-                    return TypeSchema::Named(name.clone(), substituted_args);
+                if decl.type_params.len() != resolved_args.len() {
+                    return (TypeSchema::Named(name.clone(), resolved_args), None);
                 }
-                let key =
-                    render_schema_label(&TypeSchema::Named(name.clone(), substituted_args.clone()));
+                let key = schema_instance_key(name, &resolved_args, &arg_trips);
                 if !seen.insert(key.clone()) {
-                    return TypeSchema::Named(name.clone(), substituted_args);
+                    // Re-entered an active cycle. Report the innermost
+                    // re-entry of the resolved arguments (this node's own
+                    // key when the arguments resolved without a trip) so a
+                    // wrapped chain collapses to one stable identity.
+                    let trip = arg_trips.into_iter().flatten().next().unwrap_or(key);
+                    return (TypeSchema::Named(name.clone(), resolved_args), Some(trip));
                 }
-                self.push_generic_bindings(&decl.type_params, &substituted_args);
-                let resolved = self.resolve_schema_with_seen(&decl.body_schema, seen);
+                reentries.insert(name.clone(), reentry_count + 1);
+                self.push_generic_bindings(&decl.type_params, &resolved_args);
+                let (resolved, body_trip) =
+                    self.resolve_schema_with_seen_tripped(&decl.body_schema, seen, reentries);
                 self.pop_generic_bindings();
                 seen.remove(&key);
-                resolved
+                if reentry_count == 0 {
+                    reentries.remove(name);
+                } else {
+                    reentries.insert(name.clone(), reentry_count);
+                }
+                // The node's own key was fresh, but its body re-entered a
+                // cycle: the resolved form embeds that cycle marker, so the
+                // node's identity collapses to the body's innermost trip
+                // instead of re-rendering the marker one nesting deeper.
+                (resolved, body_trip)
             }
             TypeSchema::Array(element) => {
-                TypeSchema::Array(Box::new(self.resolve_schema_with_seen(element, seen)))
+                let (resolved, trip) =
+                    self.resolve_schema_with_seen_tripped(element, seen, reentries);
+                (TypeSchema::Array(Box::new(resolved)), trip)
             }
-            TypeSchema::ArrayTuple(items) => TypeSchema::ArrayTuple(
-                items
-                    .iter()
-                    .map(|item| self.resolve_schema_with_seen(item, seen))
-                    .collect(),
-            ),
-            TypeSchema::ArrayTupleRest { prefix, rest } => TypeSchema::ArrayTupleRest {
-                prefix: prefix
-                    .iter()
-                    .map(|item| self.resolve_schema_with_seen(item, seen))
-                    .collect(),
-                rest: Box::new(self.resolve_schema_with_seen(rest, seen)),
-            },
+            TypeSchema::ArrayTuple(items) => {
+                let mut resolved = Vec::with_capacity(items.len());
+                let mut innermost_trip = None;
+                for item in items {
+                    let (resolved_item, trip) =
+                        self.resolve_schema_with_seen_tripped(item, seen, reentries);
+                    if innermost_trip.is_none() {
+                        innermost_trip = trip;
+                    }
+                    resolved.push(resolved_item);
+                }
+                (TypeSchema::ArrayTuple(resolved), innermost_trip)
+            }
+            TypeSchema::ArrayTupleRest { prefix, rest } => {
+                let mut resolved_prefix = Vec::with_capacity(prefix.len());
+                let mut innermost_trip = None;
+                for item in prefix {
+                    let (resolved_item, trip) =
+                        self.resolve_schema_with_seen_tripped(item, seen, reentries);
+                    if innermost_trip.is_none() {
+                        innermost_trip = trip;
+                    }
+                    resolved_prefix.push(resolved_item);
+                }
+                let (resolved_rest, trip) =
+                    self.resolve_schema_with_seen_tripped(rest, seen, reentries);
+                if innermost_trip.is_none() {
+                    innermost_trip = trip;
+                }
+                (
+                    TypeSchema::ArrayTupleRest {
+                        prefix: resolved_prefix,
+                        rest: Box::new(resolved_rest),
+                    },
+                    innermost_trip,
+                )
+            }
             TypeSchema::Map(value) => {
-                TypeSchema::Map(Box::new(self.resolve_schema_with_seen(value, seen)))
+                let (resolved, trip) =
+                    self.resolve_schema_with_seen_tripped(value, seen, reentries);
+                (TypeSchema::Map(Box::new(resolved)), trip)
             }
             TypeSchema::Optional(inner) => {
-                TypeSchema::Optional(Box::new(self.resolve_schema_with_seen(inner, seen)))
+                let (resolved, trip) =
+                    self.resolve_schema_with_seen_tripped(inner, seen, reentries);
+                (TypeSchema::Optional(Box::new(resolved)), trip)
             }
-            TypeSchema::Object(fields) => TypeSchema::Object(
-                fields
-                    .iter()
-                    .map(|(key, value)| (key.clone(), self.resolve_schema_with_seen(value, seen)))
-                    .collect(),
-            ),
-            TypeSchema::Callable { params, result } => TypeSchema::Callable {
-                params: params
-                    .iter()
-                    .map(|param| self.resolve_schema_with_seen(param, seen))
-                    .collect(),
-                result: Box::new(self.resolve_schema_with_seen(result, seen)),
-            },
-            _ => schema.clone(),
+            TypeSchema::Object(fields) => {
+                let mut resolved_fields = HashMap::with_capacity(fields.len());
+                let mut innermost_trip = None;
+                // `TypeSchema::Object` is a HashMap, so raw iteration order
+                // is per-process random. The first trip on the path is the
+                // one propagated to the parent's cycle key, so which field
+                // contributes it must be deterministic: visit fields in
+                // sorted name order.
+                let mut sorted_fields: Vec<(&String, &TypeSchema)> = fields.iter().collect();
+                sorted_fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+                for (name, value) in sorted_fields {
+                    let (resolved_value, trip) =
+                        self.resolve_schema_with_seen_tripped(value, seen, reentries);
+                    if innermost_trip.is_none() {
+                        innermost_trip = trip;
+                    }
+                    resolved_fields.insert(name.clone(), resolved_value);
+                }
+                (TypeSchema::Object(resolved_fields), innermost_trip)
+            }
+            TypeSchema::Callable { params, result } => {
+                let mut resolved_params = Vec::with_capacity(params.len());
+                let mut innermost_trip = None;
+                for param in params {
+                    let (resolved_param, trip) =
+                        self.resolve_schema_with_seen_tripped(param, seen, reentries);
+                    if innermost_trip.is_none() {
+                        innermost_trip = trip;
+                    }
+                    resolved_params.push(resolved_param);
+                }
+                let (resolved_result, trip) =
+                    self.resolve_schema_with_seen_tripped(result, seen, reentries);
+                if innermost_trip.is_none() {
+                    innermost_trip = trip;
+                }
+                (
+                    TypeSchema::Callable {
+                        params: resolved_params,
+                        result: Box::new(resolved_result),
+                    },
+                    innermost_trip,
+                )
+            }
+            _ => (schema.clone(), None),
+        }
+    }
+
+    /// Cycle key for a named schema: the struct name plus the identity of
+    /// each type argument resolved through the current context. Arguments
+    /// that resolve to a cycle marker contribute the key of the innermost
+    /// re-entry they collapsed to; everything else contributes its fully
+    /// resolved render. The identity is stable across wrap depths, so
+    /// different instantiations that re-enter the same cycle class share
+    /// one key and are not mistaken for fresh expansions.
+    pub(super) fn schema_cycle_key(
+        &mut self,
+        schema: &TypeSchema,
+        seen: &mut HashSet<String>,
+    ) -> String {
+        match schema {
+            TypeSchema::Named(name, type_args) => {
+                let mut resolved_args = Vec::with_capacity(type_args.len());
+                let mut arg_trips = Vec::with_capacity(type_args.len());
+                for arg in type_args {
+                    let (resolved, trip) =
+                        self.resolve_schema_with_seen_tripped(arg, seen, &mut HashMap::new());
+                    resolved_args.push(resolved);
+                    arg_trips.push(trip);
+                }
+                schema_instance_key(name, &resolved_args, &arg_trips)
+            }
+            _ => render_schema_label(schema),
         }
     }
 
@@ -2638,6 +2877,29 @@ pub(crate) fn render_schema_label(schema: &TypeSchema) -> String {
             entries.sort();
             format!("{{ {} }}", entries.join(", "))
         }
+    }
+}
+
+/// Cycle key for a named schema instantiation: the struct name plus, for
+/// each resolved type argument, the innermost re-entry key it collapsed to
+/// (when the argument resolved to a cycle marker) or its fully resolved
+/// render. Two wrapped re-entries of the same recursive instantiation
+/// (`Node<Node<int>>` re-entered from `Node<int>`) therefore produce the
+/// same key, while chains rooted at different ancestors stay distinct.
+fn schema_instance_key(
+    name: &str,
+    resolved_args: &[TypeSchema],
+    arg_trips: &[Option<String>],
+) -> String {
+    if resolved_args.is_empty() {
+        name.to_string()
+    } else {
+        let parts = resolved_args
+            .iter()
+            .zip(arg_trips)
+            .map(|(arg, trip)| trip.clone().unwrap_or_else(|| render_schema_label(arg)))
+            .collect::<Vec<_>>();
+        format!("{name}<{}>", parts.join(", "))
     }
 }
 
