@@ -1680,3 +1680,857 @@ fn root_and_module_functions_share_schema_ab_contract() {
         other => panic!("expected a result map on the stack, got {other:?}"),
     }
 }
+
+/// B1 follow-up: a local defined after body entry must never be colored
+/// onto a parameter slot. The five-parameter caller below uses every
+/// parameter, defines body locals (`body`, `status`, `tag`, `result`)
+/// after entry, and dispatches through a statement-if to the imported
+/// parse helper (sibling dispatch between the two imported modules). At
+/// `d8cf291` this shape fails the VM callable-schema check with
+/// `TypeMismatch("string")` (`type mismatch: expected string`) because a
+/// body-defined local aliases a parameter slot, so the callee frame reads
+/// the wrong slot while evaluating call arguments even though every value
+/// is correctly typed.
+///
+/// Minimal cross-module repro: root -> adapter (five-parameter caller) ->
+/// parse (schema-typed helper). The two-parameter control variant passes
+/// at the same revision, isolating the corruption to the caller's
+/// parameter-slot layout. The parse module carries no json/bytes/loop
+/// machinery and the dispatch if has no else branch; only the minimal
+/// strict-typing accessors remain.
+#[test]
+fn body_defined_local_never_aliases_parameter_slot() {
+    let root_source = r#"
+        use self::param_aliasing_m2 as adapter;
+
+        pub fn run(context: map) -> map {
+            let request: map = context["request"];
+            adapter::chat_send_complete(request, "m", "http://127.0.0.1:1", "k", "p")
+        }
+
+        let result: map = run({
+            request: { model: "m" }
+        });
+        result;
+    "#;
+    let m2 = r#"
+        use self::param_aliasing_parse as parse;
+
+        pub fn chat_send_complete(
+            request: map,
+            model: string,
+            base_url: string,
+            api_key: string,
+            provider: string
+        ) -> map {
+            let body: map = {
+                choices: [
+                    { message: { role: "assistant", content: "hi" } }
+                ],
+                usage: { total_tokens: 27 }
+            };
+            let status: int = 200;
+            let tag: string = model + base_url + api_key;
+            let mut result: map = {};
+            if status >= 200 && status < 300 {
+                result = parse::parse_body(body, status, provider);
+            }
+            result
+        }
+    "#;
+    let parse = r#"
+        pub fn parse_body(body: map, status: int, provider: string) -> map {
+            let choices: array = request_array(body, "choices");
+            let first: map = array_entry(choices, 0);
+            let message: map = request_map(first, "message");
+            let content: string = request_string(message, "content");
+            { ok: true, response: { text: content, provider: provider }, error: {} }
+        }
+
+        pub fn request_array(request: map, key: string) -> array {
+            let mut items: array = [];
+            if request.has(key) {
+                if type(request[key]) == "array" {
+                    let coerced: array = request[key];
+                    items = coerced;
+                }
+            }
+            items
+        }
+
+        pub fn request_string(request: map, key: string) -> string {
+            let mut text: string = "";
+            if request.has(key) {
+                if type(request[key]) == "string" {
+                    let coerced: string = request[key];
+                    text = coerced;
+                }
+            }
+            text
+        }
+
+        pub fn request_map(request: map, key: string) -> map {
+            let mut items: map = {};
+            if request.has(key) {
+                if type(request[key]) == "map" {
+                    let coerced: map = request[key];
+                    items = coerced;
+                }
+            }
+            items
+        }
+
+        pub fn array_entry(items: array, index: int) -> map {
+            let mut result: map = {};
+            if items.has(index) {
+                if type(items[index].copy()) == "map" {
+                    let coerced: map = items[index].copy();
+                    result = coerced;
+                }
+            }
+            result
+        }
+    "#;
+    let compiled = compile_with_module_overrides(
+        root_source,
+        &[
+            ("param_aliasing_m2.rss", m2),
+            ("param_aliasing_parse.rss", parse),
+        ],
+    );
+    // The five-parameter caller keeps one distinct physical slot per
+    // parameter, and every body-defined local (`body`, `status`, `tag`,
+    // `result`) must land on a slot that no parameter uses: the callee
+    // frame reads parameter slots while evaluating the parse call's
+    // arguments, so a body local sharing a parameter slot corrupts the
+    // operand placement even though every value is correctly typed.
+    let string_params =
+        std::iter::repeat_n(vm::compiler::TypeSchema::String, 4).collect::<Vec<_>>();
+    let caller_prototypes = compiled
+        .program
+        .callable_prototypes
+        .iter()
+        .filter(|prototype| {
+            matches!(
+                prototype.schema.as_ref(),
+                Some(vm::compiler::TypeSchema::Callable { params: candidate, .. })
+                    if candidate.len() == 5
+                        && candidate[1..] == string_params[..]
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        caller_prototypes.len(),
+        1,
+        "exactly one prototype declares the five-parameter caller shape"
+    );
+    let param_slots = caller_prototypes[0].parameter_slots.clone();
+    let distinct_param_slots = param_slots
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        distinct_param_slots.len(),
+        5,
+        "every parameter must keep a distinct physical slot, got {:?}",
+        param_slots
+    );
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("compiled program should include debug info");
+    // Imported-module locals carry module-qualified names in debug info
+    // (e.g. `..._param_aliasing_m2_rss__m1::body`); look up the
+    // five-parameter caller's body locals by their qualified suffix.
+    for local in ["body", "status", "tag", "result"] {
+        let slot = debug
+            .locals
+            .iter()
+            .find(|info| {
+                info.name.contains("param_aliasing_m2")
+                    && info.name.ends_with(&format!("::{local}"))
+            })
+            .unwrap_or_else(|| panic!("{local} should be in debug info"))
+            .index as u16;
+        assert!(
+            !param_slots.contains(&slot),
+            "body-defined local {local} must not share its final slot with a parameter: params {param_slots:?}, {local} at {slot}"
+        );
+    }
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm
+        .run()
+        .expect("five-parameter caller with body-defined locals must run");
+    assert_eq!(status, VmStatus::Halted);
+    match vm.stack().last() {
+        Some(Value::Map(map)) => {
+            assert_eq!(
+                map.get(&Value::string("ok")),
+                Some(&Value::Bool(true)),
+                "the success path must return ok(...)"
+            );
+            match map.get(&Value::string("response")) {
+                Some(Value::Map(response)) => {
+                    assert_eq!(
+                        response.get(&Value::string("text")),
+                        Some(&Value::string("hi")),
+                        "the parsed response text must survive parameter-slot coloring"
+                    );
+                    assert_eq!(
+                        response.get(&Value::string("provider")),
+                        Some(&Value::string("p")),
+                        "the fifth parameter must survive parameter-slot coloring"
+                    );
+                }
+                other => panic!("expected a response map, got {other:?}"),
+            }
+        }
+        other => panic!("expected a result map on the stack, got {other:?}"),
+    }
+}
+
+/// B1 follow-up smoke guard: parameter interference must be scoped to
+/// parameter slots, not a global freeze of slot coloring. `mixed` declares
+/// six parameters (each live for the whole body, so each needs its own
+/// physical slot) and six body locals whose live ranges overlap at most
+/// two deep (`s1` dies when `s2` is defined, and so on). The allocator must
+/// still compact the locals onto a shared pair of slots, keeping the
+/// compacted frame strictly below the twelve slots `mixed` alone declares.
+///
+/// Smoke only: on the base compiler (no full-body parameter rule) the
+/// locals compact at least as well, so this fixture cannot be RED there —
+/// it guards against future over-conservatism (an all-interfere coloring or
+/// a disabled allocator) rather than pinning a base defect.
+#[test]
+fn parameter_interference_preserves_local_slot_compaction_smoke() {
+    let source = r#"
+        pub fn run(context: map) -> map {
+            let text: string = mixed("a", "b", "c", "d", "e", "f");
+            { kind: "ok", text: text }
+        }
+
+        fn mixed(
+            a: string, b: string, c: string,
+            d: string, e: string, f: string
+        ) -> string {
+            let s1: string = a + "1";
+            let s2: string = s1 + b;
+            let s3: string = s2 + c;
+            let s4: string = s3 + d;
+            let s5: string = s4 + e;
+            let s6: string = s5 + f;
+            s6
+        }
+
+        let result: map = run({});
+        result;
+    "#;
+    let compiled = compile_source(source).expect("boundary fixture should compile");
+    let string_params =
+        std::iter::repeat_n(vm::compiler::TypeSchema::String, 6).collect::<Vec<_>>();
+    let mixed_prototypes = compiled
+        .program
+        .callable_prototypes
+        .iter()
+        .filter(|prototype| {
+            matches!(
+                prototype.schema.as_ref(),
+                Some(vm::compiler::TypeSchema::Callable { params: candidate, .. })
+                    if *candidate == string_params
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mixed_prototypes.len(),
+        1,
+        "exactly one prototype declares six string parameters"
+    );
+    let distinct_param_slots = mixed_prototypes[0]
+        .parameter_slots
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        distinct_param_slots.len(),
+        6,
+        "every parameter must keep a distinct physical slot, got {:?}",
+        mixed_prototypes[0].parameter_slots
+    );
+    // `mixed` alone declares twelve pre-compaction slots (six parameters +
+    // six locals). Locals with two-deep overlap must share physical slots,
+    // so the compacted program stays well below twelve; an all-interfere
+    // coloring or a disabled allocator would exceed it.
+    assert!(
+        compiled.program.local_count < 12,
+        "non-parameter locals must still be compacted: compacted frame {} must stay below the twelve slots mixed declares",
+        compiled.program.local_count
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("boundary fixture should run");
+    assert_eq!(status, VmStatus::Halted);
+    match vm.stack().last() {
+        Some(Value::Map(map)) => {
+            assert_eq!(map.get(&Value::string("kind")), Some(&Value::string("ok")));
+            assert_eq!(
+                map.get(&Value::string("text")),
+                Some(&Value::string("a1bcdef")),
+                "chained local values must survive compaction: {:?}",
+                map
+            );
+        }
+        other => panic!("expected a result map on the stack, got {other:?}"),
+    }
+}
+
+/// B1 follow-up: closure parameters must stay live for the whole closure
+/// body, exactly like named-function parameters. The closure below declares
+/// one parameter (`x`), defines a body local (`local`) before reading the
+/// parameter, and returns the concatenation. If the body local were colored
+/// onto the parameter's physical slot, invoking the closure would read the
+/// local's value instead of the argument, so the returned string would be
+/// wrong.
+///
+/// The closure is deliberately never invoked from the script: source-level
+/// closure invocation lowers to a dynamic `LocalCall`, whose conservative
+/// liveness fill (keep every slot live across a dynamic call) masks the
+/// aliasing defect on the pre-fix compiler by making every slot interfere
+/// with every other slot. `run` takes no parameters and defines its own
+/// locals only *after* the closure, so nothing is live at the closure's
+/// definition site on the pre-fix compiler: the closure's parameter and its
+/// body local receive no interference edges at all and are colored onto the
+/// same physical slot. The slot-level assertion pins the compile-time
+/// invariant directly: the closure's parameter slot and its body local's
+/// final slot stay distinct.
+#[test]
+fn closure_parameter_stays_live_for_whole_closure_body() {
+    let source = r#"
+        pub fn run() -> map {
+            let f = |x| if true => {
+                let local: string = "zz";
+                local + x
+            } else => {
+                "?"
+            };
+            let a: string = "a";
+            let b: string = a + "b";
+            let c: string = b + "c";
+            let d: string = c + "d";
+            let out: string = d;
+            { ok: out }
+        }
+        let result: map = run();
+        result;
+    "#;
+    let compiled = compile_source(source).expect("closure fixture should compile");
+    let closure_prototypes = compiled
+        .program
+        .callable_prototypes
+        .iter()
+        .filter(|prototype| prototype.kind == vm::CallableKind::Closure)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        closure_prototypes.len(),
+        1,
+        "exactly one closure prototype should be emitted"
+    );
+    let param_slots = closure_prototypes[0].parameter_slots.clone();
+    assert_eq!(param_slots.len(), 1);
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("compiled program should include debug info");
+    let local_slot = debug
+        .locals
+        .iter()
+        .find(|info| info.name == "local")
+        .expect("body local should be in debug info")
+        .index as u16;
+    assert_ne!(
+        param_slots[0], local_slot,
+        "the closure body local must not share the parameter's physical slot: param {param_slots:?}, local at {local_slot}"
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("closure fixture should run");
+    assert_eq!(status, VmStatus::Halted);
+    match vm.stack().last() {
+        Some(Value::Map(map)) => {
+            assert_eq!(
+                map.get(&Value::string("ok")),
+                Some(&Value::string("abcd")),
+                "the enclosing frame must stay correct beside the closure"
+            );
+        }
+        other => panic!("expected a result map on the stack, got {other:?}"),
+    }
+}
+
+/// B1 follow-up: nested closures keep their parameter protection scoped to
+/// their own bodies. The outer closure (`f`, parameter `x`) creates the
+/// inner closure (`g`, parameters `y`, `z`) inside its body; `g`'s body
+/// writes its own local before reading its parameters. The inner closure's
+/// parameters must stay distinct from its own body local, and the outer
+/// closure's protection must never leak into the inner closure's frame (and
+/// vice versa).
+///
+/// Neither closure is invoked from the script (see
+/// `closure_parameter_stays_live_for_whole_closure_body` for why
+/// source-level invocation would mask the aliasing defect on the pre-fix
+/// compiler). The inner closure captures nothing and the outer body's tail
+/// is a constant, so on the pre-fix compiler nothing is live at the inner
+/// closure's definition site: `g`'s parameters and `inner_local` receive no
+/// interference edges and are colored onto the same physical slots. The
+/// slot-level assertion pins the invariant directly: each of `g`'s
+/// parameter slots stays distinct from `inner_local`'s final slot.
+#[test]
+fn nested_closure_parameters_stay_scoped_to_own_bodies() {
+    let source = r#"
+        pub fn run() -> map {
+            let f = |x| if true => {
+                let outer_local: string = "O";
+                let g = |y, z| if true => {
+                    let inner_local: string = "I";
+                    inner_local + y + z
+                } else => {
+                    "?"
+                };
+                "done"
+            } else => {
+                "?"
+            };
+            let a: string = "a";
+            let b: string = a + "b";
+            let c: string = b + "c";
+            let d: string = c + "d";
+            let out: string = d;
+            { ok: out }
+        }
+        let result: map = run();
+        result;
+    "#;
+    let compiled = compile_source(source).expect("nested closure fixture should compile");
+    let closure_prototypes = compiled
+        .program
+        .callable_prototypes
+        .iter()
+        .filter(|prototype| prototype.kind == vm::CallableKind::Closure)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        closure_prototypes.len(),
+        2,
+        "exactly two closure prototypes should be emitted"
+    );
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("compiled program should include debug info");
+    // The inner closure declares two parameters; the outer closure declares
+    // one. Assert the inner closure's parameters stay distinct from its body
+    // local.
+    let inner = closure_prototypes
+        .iter()
+        .find(|prototype| prototype.parameter_slots.len() == 2)
+        .expect("inner closure should declare two parameters");
+    let inner_param_slots = inner.parameter_slots.clone();
+    let inner_local_slot = debug
+        .locals
+        .iter()
+        .find(|info| info.name == "inner_local")
+        .expect("inner_local should be in debug info")
+        .index as u16;
+    assert!(
+        !inner_param_slots.contains(&inner_local_slot),
+        "the inner closure body local must not share a parameter's physical slot: params {inner_param_slots:?}, inner_local at {inner_local_slot}"
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("nested closure fixture should run");
+    assert_eq!(status, VmStatus::Halted);
+    match vm.stack().last() {
+        Some(Value::Map(map)) => {
+            assert_eq!(
+                map.get(&Value::string("ok")),
+                Some(&Value::string("abcd")),
+                "the enclosing frame must stay correct beside nested closures"
+            );
+        }
+        other => panic!("expected a result map on the stack, got {other:?}"),
+    }
+}
+
+/// B1 follow-up smoke guard: the full-body parameter rule must survive
+/// `Assign` statements that target a parameter slot. `mixed` defines a body
+/// local before reassigning its parameter, and reads the local afterwards.
+/// The allocator keeps parameter slots live for the whole body as a
+/// conservative safety rule for caller-written frame-entry state, so the
+/// local and the parameter stay distinct and the result survives.
+///
+/// Smoke only: on the base compiler the reassignment's def-edge already
+/// separates the parameter from anything live after the assignment, so this
+/// fixture cannot be RED there — it guards the full-body rule against future
+/// regressions rather than pinning a base defect.
+#[test]
+fn assign_to_parameter_keeps_full_body_interference_smoke() {
+    let source = r#"
+        fn mixed(a: string) -> string {
+            let c: string = "x";
+            a = "fixed";
+            c + "!"
+        }
+        pub fn run(context: map) -> map {
+            let out: string = mixed("orig");
+            let tag: string = "t";
+            let t2: string = tag + "!";
+            let u1: string = t2 + "u";
+            let u2: string = u1 + "v";
+            { ok: out, t: u2 }
+        }
+        let result: map = run({});
+        result;
+    "#;
+    let compiled = compile_source(source).expect("assign-to-param fixture should compile");
+    // The (string) -> string prototype is uniquely `mixed` (run takes a map).
+    let string_params =
+        std::iter::repeat_n(vm::compiler::TypeSchema::String, 1).collect::<Vec<_>>();
+    let mixed_prototypes = compiled
+        .program
+        .callable_prototypes
+        .iter()
+        .filter(|prototype| {
+            matches!(
+                prototype.schema.as_ref(),
+                Some(vm::compiler::TypeSchema::Callable { params: candidate, .. })
+                    if *candidate == string_params
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mixed_prototypes.len(),
+        1,
+        "exactly one prototype declares the single-string-parameter shape"
+    );
+    let param_slots = mixed_prototypes[0].parameter_slots.clone();
+    assert_eq!(param_slots.len(), 1);
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("compiled program should include debug info");
+    let local_slot = debug
+        .locals
+        .iter()
+        .find(|info| info.name == "c")
+        .expect("body local c should be in debug info")
+        .index as u16;
+    assert_ne!(
+        param_slots[0], local_slot,
+        "the body local must not share the parameter's physical slot even after an assign-to-param: param {param_slots:?}, c at {local_slot}"
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("assign-to-param fixture should run");
+    assert_eq!(status, VmStatus::Halted);
+    match vm.stack().last() {
+        Some(Value::Map(map)) => {
+            assert_eq!(
+                map.get(&Value::string("ok")),
+                Some(&Value::string("x!")),
+                "the pre-assign local must survive the parameter reassignment"
+            );
+            assert_eq!(
+                map.get(&Value::string("t")),
+                Some(&Value::string("t!uv")),
+                "the enclosing frame must stay correct beside the assign-to-param"
+            );
+        }
+        other => panic!("expected a result map on the stack, got {other:?}"),
+    }
+}
+
+/// B1 follow-up boundary: parameter-heavy frames near the 256-slot limit
+/// must fail with the existing typed compile error when coloring cannot
+/// proceed — never a panic and never a miscompiled program. 250
+/// parameters (each kept live for the whole body by the full-body
+/// parameter rule) plus seven simultaneously live body locals exceed the
+/// 256 physical slots the allocator can color, so compilation reports the
+/// typed "too many simultaneously live locals" error.
+#[test]
+fn parameter_heavy_frame_near_boundary_returns_typed_error() {
+    let param_count = 250;
+    let local_count = 7;
+    let mut source = String::from("fn crowded(");
+    for idx in 0..param_count {
+        if idx > 0 {
+            source.push_str(", ");
+        }
+        source.push_str(&format!("p{idx}"));
+    }
+    source.push_str(") -> int {\n");
+    for idx in 0..local_count {
+        source.push_str(&format!("    let v{idx} = {idx};\n"));
+    }
+    source.push_str("    ");
+    for idx in 0..param_count.min(8) {
+        if idx > 0 {
+            source.push_str(" + ");
+        }
+        source.push_str(&format!("p{idx}"));
+    }
+    for idx in 0..local_count {
+        source.push_str(&format!(" + v{idx}"));
+    }
+    source.push_str(";\n}\ncrowded(");
+    for idx in 0..param_count {
+        if idx > 0 {
+            source.push_str(", ");
+        }
+        source.push_str(&format!("{idx}"));
+    }
+    source.push_str(");\n");
+
+    let err = match compile_source(&source) {
+        Ok(_) => panic!("compile should fail with the frame-local limit"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse_err) => {
+            assert!(
+                parse_err
+                    .message
+                    .contains("too many simultaneously live locals"),
+                "unexpected parse error: {parse_err:?}"
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+/// B1 follow-up boundary: near the 256-slot limit, non-parameter locals
+/// must still compact. `spacious` declares 200 parameters (each keeping
+/// its own physical slot under the full-body rule) plus 100 chained body
+/// locals whose live ranges overlap at most two deep, and the top level
+/// additionally calls a closure through a local binding (a dynamic
+/// `LocalCall`). The compacted frame must stay below the 300 declared
+/// slots, must fit within the 256-slot frame limit, and the chained values
+/// must survive.
+///
+/// RED at base: without the full-body parameter rule *and* with the
+/// dynamic-local-call liveness fill, every slot in the program interferes
+/// with every other slot, so the 300-slot frame cannot color at all and
+/// compilation fails with a spurious "too many simultaneously live locals"
+/// error even though no frame needs more than ~205 slots.
+#[test]
+fn non_param_locals_still_compact_beside_wide_parameter_frames() {
+    let param_count = 200;
+    let local_count = 100;
+    let mut source = String::from("fn spacious(");
+    for idx in 0..param_count {
+        if idx > 0 {
+            source.push_str(", ");
+        }
+        source.push_str(&format!("p{idx}"));
+    }
+    source.push_str(") -> int {\n");
+    for idx in 0..local_count {
+        source.push_str(&format!("    let s{idx} = "));
+        if idx == 0 {
+            source.push_str("p0");
+        } else {
+            source.push_str(&format!("s{} + p{idx}", idx - 1));
+        }
+        source.push_str(";\n");
+    }
+    source.push_str(&format!(
+        "    s{} + p{};\n}}\nspacious(",
+        local_count - 1,
+        param_count - 1
+    ));
+    for idx in 0..param_count {
+        if idx > 0 {
+            source.push_str(", ");
+        }
+        source.push_str(&format!("{idx}"));
+    }
+    // A dynamic closure call: without the precise allocator liveness this
+    // one `LocalCall` fills every slot live and turns the 300-slot program
+    // into one interference clique, failing the 256-slot limit spuriously.
+    source.push_str(");\nlet f = |q| q;\nlet g: int = f(1);\n");
+
+    let compiled = compile_source(&source).expect("wide-parameter program should compile");
+    assert!(
+        compiled.locals < param_count + local_count,
+        "chained non-parameter locals must still compact: frame {} must stay below the {} declared slots",
+        compiled.locals,
+        param_count + local_count
+    );
+    assert!(
+        compiled.locals <= (u8::MAX as usize) + 1,
+        "compacted frame {} must fit within the 256-slot frame limit",
+        compiled.locals
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("wide-parameter program should run");
+    assert_eq!(status, VmStatus::Halted);
+    let expected: i64 = (0..local_count as i64).sum::<i64>() + (param_count as i64 - 1);
+    assert_eq!(vm.stack(), &[Value::Int(expected)]);
+}
+
+/// P2-2 regression: a closure whose body invokes another closure through a
+/// dynamic `LocalCall` must not turn the whole program into one interference
+/// clique. `run` declares 250 chained locals whose live ranges overlap at
+/// most two deep, then calls the closure `f`, whose body creates and calls
+/// the inner closure `g` through a local binding. Before the fix the
+/// closure-body live-out was seeded with every slot used in the body, and
+/// the dynamic-local-call liveness fill kept every slot live across the
+/// call, so the whole program became one clique: the frame could not
+/// compact and a spurious "too many simultaneously live locals" error fired
+/// even though no frame needs more than a handful of slots. The compacted
+/// frame must stay well below the declared slots, must fit within the
+/// 256-slot frame limit, and the chained values must survive.
+#[test]
+fn closure_local_call_keeps_unrelated_locals_compact() {
+    let local_count = 250;
+    let mut source = String::from(
+        "pub fn run(context: map) -> map {\n\
+         let f = |x| if true => {\n\
+             let g = |y| if true => {\n\
+                 y + \"?\"\n\
+             } else => {\n\
+                 \"?\"\n\
+             };\n\
+             g(x) + \"!\"\n\
+         } else => {\n\
+             \"?\"\n\
+         };\n",
+    );
+    source.push_str("    let s0: string = \"a\";\n");
+    for idx in 1..local_count {
+        source.push_str(&format!("    let s{idx}: string = s{} + \"b\";\n", idx - 1));
+    }
+    source.push_str(&format!(
+        "    let out: string = f(s{});\n    {{ ok: out }}\n}}\nlet result: map = run({{}});\nresult;\n",
+        local_count - 1
+    ));
+    let compiled = compile_source(&source).expect("closure LocalCall program should compile");
+    assert!(
+        compiled.locals < local_count,
+        "unrelated chained locals must still compact beside a closure LocalCall: frame {} must stay well below the {} declared slots",
+        compiled.locals,
+        local_count + 8
+    );
+    assert!(
+        compiled.locals <= (u8::MAX as usize) + 1,
+        "compacted frame {} must fit within the 256-slot frame limit",
+        compiled.locals
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("closure LocalCall program should run");
+    assert_eq!(status, VmStatus::Halted);
+    let mut expected = String::from("a");
+    for _ in 1..local_count {
+        expected.push('b');
+    }
+    expected.push_str("?!");
+    match vm.stack().last() {
+        Some(Value::Map(map)) => {
+            assert_eq!(
+                map.get(&Value::string("ok")),
+                Some(&Value::string(expected.as_str())),
+                "chained local values must survive the closure LocalCall"
+            );
+        }
+        other => panic!("expected a result map on the stack, got {other:?}"),
+    }
+}
+
+/// P2 regression: a dynamic `LocalCall` nested inside a plain named-call
+/// argument, an optional-access key (`?.[...]`), or an `unwrap_or`
+/// fallback must not leak the conservative dynamic-call liveness fill into
+/// the allocator's precise path. `run` binds the closure `f` and calls it
+/// from exactly those three positions (`helper(f(10))`, `?.[f(20)]`,
+/// `.unwrap_or(f(30))`) while 250 chained locals whose live ranges overlap
+/// at most two deep are alive. Before the fix `add_expr_uses_impl`
+/// descended into `OptionalGet` container/key, `OptionUnwrapOr`
+/// value/fallback, and `Expr::Call`/`Expr::ModuleCall` args through the
+/// conservative wrapper `add_expr_uses`, so the nested `LocalCall` filled
+/// every slot live: the whole program became one interference clique, the
+/// chained locals lost compaction, and the frame could not color (a
+/// spurious "too many simultaneously live locals" error near the 256-slot
+/// limit) even though no frame needs more than a handful of slots. The
+/// compacted frame must stay well below the declared slots, must fit
+/// within the 256-slot frame limit, and every nested-call result must
+/// survive.
+#[test]
+fn nested_local_call_in_call_arg_optional_key_and_unwrap_fallback_stays_compact() {
+    let local_count = 250;
+    let mut source = String::from(
+        "struct Payload { values: [int] }\n\
+         fn helper(x: int) -> int { x + 1 }\n\
+         pub fn run(context: map) -> map {\n\
+             let f = |x| x + 1;\n\
+             let payload: Payload = { values: [1, 2, 3] };\n\
+             let a: int = helper(f(10));\n\
+             let b: int = payload?.values?.[f(20)].unwrap_or(-1);\n\
+             let c: int = payload?.values?.[1].unwrap_or(f(30));\n\
+             let s0: string = \"a\";\n",
+    );
+    for idx in 1..local_count {
+        source.push_str(&format!("    let s{idx}: string = s{} + \"b\";\n", idx - 1));
+    }
+    source.push_str(&format!(
+        "    {{ a: a, b: b, c: c, tail: s{} }}\n}}\nlet result: map = run({{}});\nresult;\n",
+        local_count - 1
+    ));
+    let compiled = compile_source(&source).expect("nested-LocalCall program should compile");
+    assert!(
+        compiled.locals < local_count,
+        "unrelated chained locals must still compact beside nested LocalCalls: frame {} must stay well below the {} declared slots",
+        compiled.locals,
+        local_count
+    );
+    assert!(
+        compiled.locals <= (u8::MAX as usize) + 1,
+        "compacted frame {} must fit within the 256-slot frame limit",
+        compiled.locals
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("nested-LocalCall program should run");
+    assert_eq!(status, VmStatus::Halted);
+    let mut expected_tail = String::from("a");
+    for _ in 1..local_count {
+        expected_tail.push('b');
+    }
+    match vm.stack().last() {
+        Some(Value::Map(map)) => {
+            assert_eq!(
+                map.get(&Value::string("a")),
+                Some(&Value::Int(12)),
+                "named-call argument LocalCall must evaluate"
+            );
+            assert_eq!(
+                map.get(&Value::string("b")),
+                Some(&Value::Int(-1)),
+                "optional-access key LocalCall must evaluate (out-of-range key unwraps to the fallback)"
+            );
+            assert_eq!(
+                map.get(&Value::string("c")),
+                Some(&Value::Int(2)),
+                "unwrap_or fallback LocalCall must keep the present value"
+            );
+            assert_eq!(
+                map.get(&Value::string("tail")),
+                Some(&Value::string(expected_tail.as_str())),
+                "chained local values must survive the nested LocalCalls"
+            );
+        }
+        other => panic!("expected a result map on the stack, got {other:?}"),
+    }
+}

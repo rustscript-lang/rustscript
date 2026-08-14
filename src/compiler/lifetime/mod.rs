@@ -60,3 +60,5 @@ pub(super) fn enforce_local_availability_with_entry_locals(
         enable_local_move_semantics,
     )
 }
+
+pub(super) use availability::allocate_local_slots;

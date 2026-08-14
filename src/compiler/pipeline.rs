@@ -393,7 +393,15 @@ fn compile_parsed_output_with_entry_locals(
     // (post-lifetime, so capture metadata and rewritten uses are
     // authoritative). Codegen consumes `requires_callable_slot` to omit
     // hidden callable slots for direct-only functions.
+    //
+    // The classification runs BEFORE local-slot compaction: it tracks
+    // named-function values through slot flows, and merged physical slots
+    // would collapse distinct flows into one slot, producing spurious
+    // dynamic-target facts. Pre-compaction slots are the true frame-relative
+    // value identities, so the classification is strictly more precise on
+    // the unallocated IR.
     let callable_use_facts = materialization::classify_named_callables(&parsed);
+    let parsed = lifetime::allocate_local_slots(parsed).map_err(SourceError::Parse)?;
     let type_info = typing::infer_types(&parsed, typing_mode, entry_local_types);
     let FrontendIr {
         stmts,

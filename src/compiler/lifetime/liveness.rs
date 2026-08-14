@@ -307,14 +307,47 @@ impl LivenessRewriter {
     }
 
     fn compute_live_before_block(&self, stmts: &[Stmt], live_out: &LiveSet) -> LiveSet {
+        self.compute_live_before_block_impl(stmts, live_out, true)
+    }
+
+    /// Like `compute_live_before_block` but without the conservative
+    /// dynamic-local-call fill: the slot allocator needs the actual live
+    /// sets, not the drop-insertion safety margin, so a `LocalCall` does not
+    /// turn every statement's live set (and therefore the interference
+    /// graph) into the whole program.
+    fn compute_live_before_block_precise(&self, stmts: &[Stmt], live_out: &LiveSet) -> LiveSet {
+        self.compute_live_before_block_impl(stmts, live_out, false)
+    }
+
+    fn compute_live_before_block_impl(
+        &self,
+        stmts: &[Stmt],
+        live_out: &LiveSet,
+        conservative: bool,
+    ) -> LiveSet {
         let mut live = live_out.clone();
         for stmt in stmts.iter().rev() {
-            live = self.compute_live_before_stmt(stmt, &live);
+            live = self.compute_live_before_stmt_impl(stmt, &live, conservative);
         }
         live
     }
 
     fn compute_live_before_stmt(&self, stmt: &Stmt, live_after: &LiveSet) -> LiveSet {
+        self.compute_live_before_stmt_impl(stmt, live_after, true)
+    }
+
+    /// Like `compute_live_before_stmt` but without the conservative
+    /// dynamic-local-call fill (see `compute_live_before_block_precise`).
+    fn compute_live_before_stmt_precise(&self, stmt: &Stmt, live_after: &LiveSet) -> LiveSet {
+        self.compute_live_before_stmt_impl(stmt, live_after, false)
+    }
+
+    fn compute_live_before_stmt_impl(
+        &self,
+        stmt: &Stmt,
+        live_after: &LiveSet,
+        conservative: bool,
+    ) -> LiveSet {
         match stmt {
             Stmt::Noop { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => live_after.clone(),
             Stmt::FuncDecl {
@@ -336,13 +369,23 @@ impl LivenessRewriter {
             }
             Stmt::Expr { expr, .. } => {
                 let mut live_before = live_after.clone();
-                self.union_inplace(&mut live_before, &self.uses_expr(expr));
+                let uses = if conservative {
+                    self.uses_expr(expr)
+                } else {
+                    self.uses_expr_precise(expr)
+                };
+                self.union_inplace(&mut live_before, &uses);
                 live_before
             }
             Stmt::Let { index, expr, .. } | Stmt::Assign { index, expr, .. } => {
                 let mut live_before = live_after.clone();
                 self.kill_slot(&mut live_before, *index);
-                self.union_inplace(&mut live_before, &self.uses_expr(expr));
+                let uses = if conservative {
+                    self.uses_expr(expr)
+                } else {
+                    self.uses_expr_precise(expr)
+                };
+                self.union_inplace(&mut live_before, &uses);
                 live_before
             }
             Stmt::ClosureLet { closure, .. } => {
@@ -359,21 +402,33 @@ impl LivenessRewriter {
                 else_branch,
                 ..
             } => {
-                let then_live = self.compute_live_before_block(then_branch, live_after);
-                let else_live = self.compute_live_before_block(else_branch, live_after);
+                let then_live =
+                    self.compute_live_before_block_impl(then_branch, live_after, conservative);
+                let else_live =
+                    self.compute_live_before_block_impl(else_branch, live_after, conservative);
                 let mut live_before = then_live;
                 self.union_inplace(&mut live_before, &else_live);
-                self.union_inplace(&mut live_before, &self.uses_expr(condition));
+                let cond_uses = if conservative {
+                    self.uses_expr(condition)
+                } else {
+                    self.uses_expr_precise(condition)
+                };
+                self.union_inplace(&mut live_before, &cond_uses);
                 live_before
             }
             Stmt::While {
                 condition, body, ..
             } => {
-                let cond_uses = self.uses_expr(condition);
+                let cond_uses = if conservative {
+                    self.uses_expr(condition)
+                } else {
+                    self.uses_expr_precise(condition)
+                };
                 let mut live_cond = live_after.clone();
                 self.union_inplace(&mut live_cond, &cond_uses);
                 loop {
-                    let body_live = self.compute_live_before_block(body, &live_cond);
+                    let body_live =
+                        self.compute_live_before_block_impl(body, &live_cond, conservative);
                     let mut next = live_after.clone();
                     self.union_inplace(&mut next, &cond_uses);
                     self.union_inplace(&mut next, &body_live);
@@ -391,12 +446,18 @@ impl LivenessRewriter {
                 body,
                 ..
             } => {
-                let cond_uses = self.uses_expr(condition);
+                let cond_uses = if conservative {
+                    self.uses_expr(condition)
+                } else {
+                    self.uses_expr_precise(condition)
+                };
                 let mut live_cond = live_after.clone();
                 self.union_inplace(&mut live_cond, &cond_uses);
                 loop {
-                    let post_live = self.compute_live_before_stmt(post, &live_cond);
-                    let body_live = self.compute_live_before_block(body, &post_live);
+                    let post_live =
+                        self.compute_live_before_stmt_impl(post, &live_cond, conservative);
+                    let body_live =
+                        self.compute_live_before_block_impl(body, &post_live, conservative);
                     let mut next = live_after.clone();
                     self.union_inplace(&mut next, &cond_uses);
                     self.union_inplace(&mut next, &body_live);
@@ -405,7 +466,7 @@ impl LivenessRewriter {
                     }
                     live_cond = next;
                 }
-                self.compute_live_before_stmt(init, &live_cond)
+                self.compute_live_before_stmt_impl(init, &live_cond, conservative)
             }
         }
     }
@@ -416,7 +477,24 @@ impl LivenessRewriter {
         live
     }
 
+    /// Like `uses_expr` but without the conservative dynamic-local-call
+    /// fill: `Expr::LocalCall` contributes only its target slot and argument
+    /// uses. The liveness *rewriter* keeps the conservative fill so captured
+    /// slots are never cleared before a dynamic call executes; the slot
+    /// *allocator* uses this precise variant so a single closure- or
+    /// callable-variable call does not turn the whole program's live sets
+    /// (and therefore the interference graph) into one complete clique.
+    fn uses_expr_precise(&self, expr: &Expr) -> LiveSet {
+        let mut live = self.empty_set();
+        self.add_expr_uses_impl(expr, &mut live, false);
+        live
+    }
+
     fn add_expr_uses(&self, expr: &Expr, live: &mut LiveSet) {
+        self.add_expr_uses_impl(expr, live, true);
+    }
+
+    fn add_expr_uses_impl(&self, expr: &Expr, live: &mut LiveSet, conservative: bool) {
         match expr {
             Expr::Null
             | Expr::Int(_)
@@ -439,8 +517,8 @@ impl LivenessRewriter {
             } => {
                 self.mark_live(live, *container_slot);
                 self.mark_live(live, *key_slot);
-                self.add_expr_uses(container, live);
-                self.add_expr_uses(key, live);
+                self.add_expr_uses_impl(container, live, conservative);
+                self.add_expr_uses_impl(key, live, conservative);
             }
             Expr::OptionUnwrapOr {
                 value,
@@ -448,8 +526,8 @@ impl LivenessRewriter {
                 fallback,
             } => {
                 self.mark_live(live, *value_slot);
-                self.add_expr_uses(value, live);
-                self.add_expr_uses(fallback, live);
+                self.add_expr_uses_impl(value, live, conservative);
+                self.add_expr_uses_impl(fallback, live, conservative);
             }
             Expr::Call(_, _, args) => {
                 // Known named script calls execute in a separate runtime frame
@@ -458,7 +536,7 @@ impl LivenessRewriter {
                 // into the caller live set. Arguments and caller-after-call
                 // uses stay live in the caller.
                 for arg in args {
-                    self.add_expr_uses(arg, live);
+                    self.add_expr_uses_impl(arg, live, conservative);
                 }
             }
             // Resolved module calls (pre-merge only) contribute their
@@ -466,34 +544,39 @@ impl LivenessRewriter {
             // footprint is folded in by the post-merge call lowering.
             Expr::ModuleCall(_, _, args) => {
                 for arg in args {
-                    self.add_expr_uses(arg, live);
+                    self.add_expr_uses_impl(arg, live, conservative);
                 }
             }
             Expr::LocalCall(index, _, args) => {
                 self.mark_live(live, *index);
                 for arg in args {
-                    self.add_expr_uses(arg, live);
+                    self.add_expr_uses_impl(arg, live, conservative);
                 }
-                // Local-call targets can be inline closures whose captured
-                // slots are not directly visible from the call expression.
-                // Keep locals live conservatively so closure captures are not
-                // cleared before the call executes.
-                live.fill(true);
+                if conservative {
+                    // Local-call targets can be inline closures whose captured
+                    // slots are not directly visible from the call expression.
+                    // Keep locals live conservatively so closure captures are
+                    // not cleared before the call executes. The allocator's
+                    // precise variant (used for interference constraints)
+                    // skips this fill so a dynamic call cannot collapse the
+                    // whole program into one interference clique.
+                    live.fill(true);
+                }
             }
             Expr::Closure(closure) => {
                 for (source_slot, _) in &closure.capture_copies {
                     self.mark_live(live, *source_slot);
                 }
-                self.add_expr_uses(&closure.body, live);
+                self.add_expr_uses_impl(&closure.body, live, conservative);
             }
             Expr::ClosureCall(closure, args) => {
                 for arg in args {
-                    self.add_expr_uses(arg, live);
+                    self.add_expr_uses_impl(arg, live, conservative);
                 }
                 for (source_slot, _) in &closure.capture_copies {
                     self.mark_live(live, *source_slot);
                 }
-                self.add_expr_uses(&closure.body, live);
+                self.add_expr_uses_impl(&closure.body, live, conservative);
             }
             Expr::Add(lhs, rhs)
             | Expr::Sub(lhs, rhs)
@@ -505,22 +588,22 @@ impl LivenessRewriter {
             | Expr::Eq(lhs, rhs)
             | Expr::Lt(lhs, rhs)
             | Expr::Gt(lhs, rhs) => {
-                self.add_expr_uses(lhs, live);
-                self.add_expr_uses(rhs, live);
+                self.add_expr_uses_impl(lhs, live, conservative);
+                self.add_expr_uses_impl(rhs, live, conservative);
             }
             Expr::Neg(inner)
             | Expr::Not(inner)
             | Expr::ToOwned(inner)
             | Expr::Borrow(inner)
-            | Expr::BorrowMut(inner) => self.add_expr_uses(inner, live),
+            | Expr::BorrowMut(inner) => self.add_expr_uses_impl(inner, live, conservative),
             Expr::IfElse {
                 condition,
                 then_expr,
                 else_expr,
             } => {
-                self.add_expr_uses(condition, live);
-                self.add_expr_uses(then_expr, live);
-                self.add_expr_uses(else_expr, live);
+                self.add_expr_uses_impl(condition, live, conservative);
+                self.add_expr_uses_impl(then_expr, live, conservative);
+                self.add_expr_uses_impl(else_expr, live, conservative);
             }
             Expr::Match {
                 value,
@@ -528,15 +611,23 @@ impl LivenessRewriter {
                 default,
                 ..
             } => {
-                self.add_expr_uses(value, live);
+                self.add_expr_uses_impl(value, live, conservative);
                 for (_, arm) in arms {
-                    self.add_expr_uses(arm, live);
+                    self.add_expr_uses_impl(arm, live, conservative);
                 }
-                self.add_expr_uses(default, live);
+                self.add_expr_uses_impl(default, live, conservative);
             }
             Expr::Block { stmts, expr } => {
-                let live_out = self.uses_expr(expr);
-                let live_before = self.compute_live_before_block(stmts, &live_out);
+                let live_out = if conservative {
+                    self.uses_expr(expr)
+                } else {
+                    self.uses_expr_precise(expr)
+                };
+                let live_before = if conservative {
+                    self.compute_live_before_block(stmts, &live_out)
+                } else {
+                    self.compute_live_before_block_precise(stmts, &live_out)
+                };
                 self.union_inplace(live, &live_before);
             }
         }
@@ -612,6 +703,25 @@ impl LivenessRewriter {
         }
         live_out
     }
+
+    /// Precise variant of `function_body_live_out` for the slot allocator
+    /// (no conservative dynamic-local-call fill, see
+    /// `compute_live_before_block_precise`).
+    fn function_body_live_out_precise(
+        &self,
+        body_expr: &Expr,
+        capture_copies: &[(LocalSlot, LocalSlot)],
+        persistent_slots: &[LocalSlot],
+    ) -> LiveSet {
+        let mut live_out = self.uses_expr_precise(body_expr);
+        for (_, captured_slot) in capture_copies {
+            self.mark_live(&mut live_out, *captured_slot);
+        }
+        for slot in persistent_slots {
+            self.mark_live(&mut live_out, *slot);
+        }
+        live_out
+    }
 }
 fn stmt_line(stmt: &Stmt) -> u32 {
     match stmt {
@@ -636,6 +746,13 @@ pub(super) struct LocalSlotAllocator {
     function_impls: HashMap<u16, FunctionImpl>,
     adjacency: Vec<HashSet<usize>>,
     full_footprint: LiveSet,
+    /// True while collecting a closure body's constraints. Closure bodies run
+    /// in their own callee frame, so the conservative dynamic-local-call
+    /// cross-live (which exists to keep unknown callable targets separated at
+    /// the call site) must not spread into closure collection: there it would
+    /// turn the closure body's slots into a program-wide clique and destroy
+    /// compaction (and can push frames past the 256-slot limit spuriously).
+    in_closure_body: bool,
 }
 
 impl LocalSlotAllocator {
@@ -651,6 +768,7 @@ impl LocalSlotAllocator {
             function_impls: function_impls.clone(),
             adjacency: (0..local_count).map(|_| HashSet::new()).collect(),
             full_footprint: vec![true; local_count],
+            in_closure_body: false,
         }
     }
 
@@ -660,24 +778,72 @@ impl LocalSlotAllocator {
         for slot in &persistent_slots {
             self.liveness.mark_live(&mut live_out, *slot);
         }
-        let _ = self.collect_block(&ir.stmts, &live_out)?;
+        let _ = self.collect_block(&ir.stmts, &live_out, &[])?;
         for function_impl in ir.function_impls.values() {
-            let live_after = self.liveness.function_body_live_out(
+            let mut live_after = self.liveness.function_body_live_out_precise(
                 &function_impl.body_expr,
                 &function_impl.capture_copies,
                 &persistent_slots,
             );
+            // Parameters are written by the caller at frame entry and may be
+            // read at any point in the body, so every parameter must interfere
+            // with every other slot in the function for the WHOLE body, not
+            // only with the slots live at body entry. A local that is defined
+            // after entry (and is therefore absent from the entry live set)
+            // must still never be colored onto a parameter slot: when it is,
+            // the callee frame reads the wrong slot while evaluating call
+            // arguments and the VM callable-schema check fails
+            // (`type mismatch: expected string`) even though every value is
+            // correctly typed.
+            //
+            // This invariant is deliberately conservative. Body statements
+            // *can* define parameter slots: an `Assign` may target a
+            // parameter, and the liveness rewriter may emit `Drop`
+            // statements for parameter slots after their last use. The
+            // rule is therefore not "the body never defines a parameter
+            // slot"; it is a safety rule: parameter slots are
+            // caller-written frame-entry state that the callee frame may
+            // read at any point (directly, through captures, or through
+            // nested closures), so the allocator treats them as live for
+            // the entire body no matter what the body does to them.
+            // `collect_block` re-marks the current function's parameter
+            // slots after every statement, so the backward sweep can never
+            // let a body-local share a parameter's physical slot, while
+            // non-parameter locals keep sharing physical slots exactly as
+            // before.
+            //
+            // Closures execute in their own callee frame whose slot layout
+            // is drawn from the same flat slot space, so the same full-body
+            // rule applies to every closure: each closure's own parameter
+            // slots are seeded into its own body live-out
+            // (`collect_closure_body_constraints`) and kept live for the
+            // whole closure body regardless of body Assign/Drop statements.
+            // Nested closures are traversed recursively, and each closure's
+            // protection is scoped to its own body: an inner closure's
+            // parameters never leak into the outer closure's or the
+            // enclosing function's interference sets, and vice versa,
+            // because each closure body is collected against its own fresh
+            // live-out.
+            for slot in &function_impl.param_slots {
+                self.liveness.mark_live(&mut live_after, *slot);
+            }
             self.add_live_clique(&live_after);
-            self.collect_expr_constraints(&function_impl.body_expr, &live_after)?;
-            let body_live_in = self.collect_block(&function_impl.body_stmts, &live_after)?;
-            // Parameters are written by the caller at frame entry and stay
-            // live for the whole body, so each parameter must interfere with
-            // every other parameter and with every slot live when the body
-            // begins. Without this clique, a parameter that the body never
-            // uses (or whose uses do not overlap another parameter's) has no
-            // liveness edges and the colorer aliases distinct parameters
-            // onto one physical slot, corrupting operand placement at every
-            // call site that targets the function.
+            self.collect_expr_constraints(
+                &function_impl.body_expr,
+                &live_after,
+                &function_impl.param_slots,
+            )?;
+            let body_live_in = self.collect_block(
+                &function_impl.body_stmts,
+                &live_after,
+                &function_impl.param_slots,
+            )?;
+            // Parameters stay live from body entry to the end, so the entry
+            // clique must keep every parameter mutually interfering as well
+            // (a parameter the body never uses has no other liveness edges
+            // and the colorer would otherwise alias distinct parameters onto
+            // one physical slot, corrupting operand placement at every call
+            // site that targets the function).
             let mut entry_live = body_live_in;
             for slot in &function_impl.param_slots {
                 self.liveness.mark_live(&mut entry_live, *slot);
@@ -690,14 +856,28 @@ impl LocalSlotAllocator {
         Ok(ir)
     }
 
-    fn collect_block(&mut self, stmts: &[Stmt], live_out: &LiveSet) -> Result<LiveSet, ParseError> {
+    fn collect_block(
+        &mut self,
+        stmts: &[Stmt],
+        live_out: &LiveSet,
+        protected_slots: &[LocalSlot],
+    ) -> Result<LiveSet, ParseError> {
         let mut live_after = live_out.clone();
         self.add_live_clique(&live_after);
         for stmt in stmts.iter().rev() {
-            let live_before = self.liveness.compute_live_before_stmt(stmt, &live_after);
+            let mut live_before = self
+                .liveness
+                .compute_live_before_stmt_precise(stmt, &live_after);
+            // Parameter slots stay live for the whole body no matter what the
+            // statement does to them (see `allocate`); re-mark them so the
+            // interference invariants never depend on def-use precision for
+            // caller-written frame-entry state.
+            for slot in protected_slots {
+                self.liveness.mark_live(&mut live_before, *slot);
+            }
             self.add_live_clique(&live_before);
             self.add_stmt_def_edges(stmt, &live_after);
-            self.collect_stmt_constraints(stmt, &live_before, &live_after)?;
+            self.collect_stmt_constraints(stmt, &live_before, &live_after, protected_slots)?;
             live_after = live_before;
         }
         Ok(live_after)
@@ -708,6 +888,7 @@ impl LocalSlotAllocator {
         stmt: &Stmt,
         live_before: &LiveSet,
         live_after: &LiveSet,
+        protected_slots: &[LocalSlot],
     ) -> Result<(), ParseError> {
         match stmt {
             Stmt::Noop { .. } | Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Drop { .. } => {}
@@ -723,13 +904,14 @@ impl LocalSlotAllocator {
                 }
             }
             Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
-                self.collect_expr_constraints(expr, live_before)?;
+                self.collect_expr_constraints(expr, live_before, protected_slots)?;
             }
             Stmt::ClosureLet { closure, .. } => {
                 for (source_slot, captured_slot) in &closure.capture_copies {
                     self.add_slot_live_edges(*source_slot, live_before);
                     self.add_slot_live_edges(*captured_slot, live_before);
                 }
+                self.collect_closure_body_constraints(closure)?;
             }
             Stmt::IfElse {
                 condition,
@@ -737,18 +919,20 @@ impl LocalSlotAllocator {
                 else_branch,
                 ..
             } => {
-                self.collect_expr_constraints(condition, live_before)?;
-                let _ = self.collect_block(then_branch, live_after)?;
-                let _ = self.collect_block(else_branch, live_after)?;
+                self.collect_expr_constraints(condition, live_before, protected_slots)?;
+                let _ = self.collect_block(then_branch, live_after, protected_slots)?;
+                let _ = self.collect_block(else_branch, live_after, protected_slots)?;
             }
             Stmt::While {
                 condition, body, ..
             } => {
-                let cond_uses = self.liveness.uses_expr(condition);
+                let cond_uses = self.liveness.uses_expr_precise(condition);
                 let mut live_cond = live_after.clone();
                 self.liveness.union_inplace(&mut live_cond, &cond_uses);
                 loop {
-                    let body_live = self.liveness.compute_live_before_block(body, &live_cond);
+                    let body_live = self
+                        .liveness
+                        .compute_live_before_block_precise(body, &live_cond);
                     let mut next = live_after.clone();
                     self.liveness.union_inplace(&mut next, &cond_uses);
                     self.liveness.union_inplace(&mut next, &body_live);
@@ -757,8 +941,8 @@ impl LocalSlotAllocator {
                     }
                     live_cond = next;
                 }
-                self.collect_expr_constraints(condition, &live_cond)?;
-                let _ = self.collect_block(body, &live_cond)?;
+                self.collect_expr_constraints(condition, &live_cond, protected_slots)?;
+                let _ = self.collect_block(body, &live_cond, protected_slots)?;
             }
             Stmt::For {
                 init,
@@ -767,12 +951,16 @@ impl LocalSlotAllocator {
                 body,
                 ..
             } => {
-                let cond_uses = self.liveness.uses_expr(condition);
+                let cond_uses = self.liveness.uses_expr_precise(condition);
                 let mut live_cond = live_after.clone();
                 self.liveness.union_inplace(&mut live_cond, &cond_uses);
                 loop {
-                    let post_live = self.liveness.compute_live_before_stmt(post, &live_cond);
-                    let body_live = self.liveness.compute_live_before_block(body, &post_live);
+                    let post_live = self
+                        .liveness
+                        .compute_live_before_stmt_precise(post, &live_cond);
+                    let body_live = self
+                        .liveness
+                        .compute_live_before_block_precise(body, &post_live);
                     let mut next = live_after.clone();
                     self.liveness.union_inplace(&mut next, &cond_uses);
                     self.liveness.union_inplace(&mut next, &body_live);
@@ -781,20 +969,32 @@ impl LocalSlotAllocator {
                     }
                     live_cond = next;
                 }
-                let post_live_before = self.liveness.compute_live_before_stmt(post, &live_cond);
-                self.collect_expr_constraints(condition, &live_cond)?;
-                self.collect_stmt_constraints(post, &post_live_before, &live_cond)?;
-                let _ = self.collect_block(body, &post_live_before)?;
-                self.collect_stmt_constraints(init, live_before, &live_cond)?;
+                let post_live_before = self
+                    .liveness
+                    .compute_live_before_stmt_precise(post, &live_cond);
+                self.collect_expr_constraints(condition, &live_cond, protected_slots)?;
+                self.collect_stmt_constraints(
+                    post,
+                    &post_live_before,
+                    &live_cond,
+                    protected_slots,
+                )?;
+                let _ = self.collect_block(body, &post_live_before, protected_slots)?;
+                self.collect_stmt_constraints(init, live_before, &live_cond, protected_slots)?;
             }
         }
         Ok(())
     }
 
-    fn collect_expr_constraints(&mut self, expr: &Expr, live: &LiveSet) -> Result<(), ParseError> {
+    fn collect_expr_constraints(
+        &mut self,
+        expr: &Expr,
+        live: &LiveSet,
+        protected_slots: &[LocalSlot],
+    ) -> Result<(), ParseError> {
         let mut live_during = live.clone();
         self.liveness
-            .union_inplace(&mut live_during, &self.liveness.uses_expr(expr));
+            .union_inplace(&mut live_during, &self.liveness.uses_expr_precise(expr));
         match expr {
             Expr::Null
             | Expr::Int(_)
@@ -819,8 +1019,8 @@ impl LocalSlotAllocator {
             } => {
                 self.add_slot_live_edges(*container_slot, &live_during);
                 self.add_slot_live_edges(*key_slot, &live_during);
-                self.collect_expr_constraints(container, &live_during)?;
-                self.collect_expr_constraints(key, &live_during)?;
+                self.collect_expr_constraints(container, &live_during, protected_slots)?;
+                self.collect_expr_constraints(key, &live_during, protected_slots)?;
             }
             Expr::OptionUnwrapOr {
                 value,
@@ -828,8 +1028,8 @@ impl LocalSlotAllocator {
                 fallback,
             } => {
                 self.add_slot_live_edges(*value_slot, &live_during);
-                self.collect_expr_constraints(value, &live_during)?;
-                self.collect_expr_constraints(fallback, &live_during)?;
+                self.collect_expr_constraints(value, &live_during, protected_slots)?;
+                self.collect_expr_constraints(fallback, &live_during, protected_slots)?;
             }
             Expr::Call(_, _, args) => {
                 // Arguments are evaluated in the caller frame, so their
@@ -838,29 +1038,47 @@ impl LocalSlotAllocator {
                 // cross-live edges would only needlessly separate slots that
                 // frame bases already isolate.
                 for arg in args {
-                    self.collect_expr_constraints(arg, &live_during)?;
+                    self.collect_expr_constraints(arg, &live_during, protected_slots)?;
                 }
             }
             // Resolved module calls (pre-merge only) constrain their
             // arguments; the callee's footprint is folded in post-merge.
             Expr::ModuleCall(_, _, args) => {
                 for arg in args {
-                    self.collect_expr_constraints(arg, &live_during)?;
+                    self.collect_expr_constraints(arg, &live_during, protected_slots)?;
                 }
             }
             Expr::LocalCall(index, _, args) => {
                 self.add_slot_live_edges(*index, &live_during);
                 for arg in args {
-                    self.collect_expr_constraints(arg, &live_during)?;
+                    self.collect_expr_constraints(arg, &live_during, protected_slots)?;
                 }
-                let full_footprint = self.full_footprint.clone();
-                self.add_cross_live_with_set(&live_during, &full_footprint);
+                if !self.in_closure_body {
+                    // Dynamic local-call targets may be closures whose
+                    // capture state is not visible from the call expression;
+                    // keep the caller-side interference conservative outside
+                    // closure bodies. Inside a closure body the target still
+                    // runs in its own callee frame (same flat slot space,
+                    // separate frame base), so this program-wide cross-live
+                    // would only turn the closure body's slots into a
+                    // program-wide clique, destroying compaction and
+                    // spuriously failing frames near the 256-slot limit.
+                    let full_footprint = self.full_footprint.clone();
+                    self.add_cross_live_with_set(&live_during, &full_footprint);
+                }
             }
-            Expr::Closure(_closure) => {}
+            Expr::Closure(closure) => {
+                // The closure runs in its own callee frame drawn from the
+                // same flat slot space; collect its body against a fresh
+                // live-out seeded with its own parameter slots so the
+                // full-body parameter rule holds for closures too.
+                self.collect_closure_body_constraints(closure)?;
+            }
             Expr::ClosureCall(closure, args) => {
                 for arg in args {
-                    self.collect_expr_constraints(arg, &live_during)?;
+                    self.collect_expr_constraints(arg, &live_during, protected_slots)?;
                 }
+                self.collect_closure_body_constraints(closure)?;
                 let mut stack = Vec::new();
                 let footprint = self.closure_footprint(closure, &mut stack);
                 self.add_cross_live_with_set(&live_during, &footprint);
@@ -875,24 +1093,24 @@ impl LocalSlotAllocator {
             | Expr::Eq(lhs, rhs)
             | Expr::Lt(lhs, rhs)
             | Expr::Gt(lhs, rhs) => {
-                self.collect_expr_constraints(lhs, &live_during)?;
-                self.collect_expr_constraints(rhs, &live_during)?;
+                self.collect_expr_constraints(lhs, &live_during, protected_slots)?;
+                self.collect_expr_constraints(rhs, &live_during, protected_slots)?;
             }
             Expr::Neg(inner)
             | Expr::Not(inner)
             | Expr::ToOwned(inner)
             | Expr::Borrow(inner)
             | Expr::BorrowMut(inner) => {
-                self.collect_expr_constraints(inner, &live_during)?;
+                self.collect_expr_constraints(inner, &live_during, protected_slots)?;
             }
             Expr::IfElse {
                 condition,
                 then_expr,
                 else_expr,
             } => {
-                self.collect_expr_constraints(condition, &live_during)?;
-                self.collect_expr_constraints(then_expr, &live_during)?;
-                self.collect_expr_constraints(else_expr, &live_during)?;
+                self.collect_expr_constraints(condition, &live_during, protected_slots)?;
+                self.collect_expr_constraints(then_expr, &live_during, protected_slots)?;
+                self.collect_expr_constraints(else_expr, &live_during, protected_slots)?;
             }
             Expr::Match {
                 value_slot,
@@ -903,24 +1121,71 @@ impl LocalSlotAllocator {
             } => {
                 self.add_slot_live_edges(*value_slot, &live_during);
                 self.add_slot_live_edges(*result_slot, &live_during);
-                self.collect_expr_constraints(value, &live_during)?;
+                self.collect_expr_constraints(value, &live_during, protected_slots)?;
                 for (pattern, arm_expr) in arms {
                     if let Some(binding_slot) = pattern.binding_slot() {
                         self.add_slot_live_edges(binding_slot, &live_during);
                     }
-                    self.collect_expr_constraints(arm_expr, &live_during)?;
+                    self.collect_expr_constraints(arm_expr, &live_during, protected_slots)?;
                 }
-                self.collect_expr_constraints(default, &live_during)?;
+                self.collect_expr_constraints(default, &live_during, protected_slots)?;
             }
             Expr::Block { stmts, expr } => {
-                self.collect_expr_constraints(expr, &live_during)?;
+                self.collect_expr_constraints(expr, &live_during, protected_slots)?;
                 let mut block_live_out = live_during.clone();
                 self.liveness
-                    .union_inplace(&mut block_live_out, &self.liveness.uses_expr(expr));
-                let _ = self.collect_block(stmts, &block_live_out)?;
+                    .union_inplace(&mut block_live_out, &self.liveness.uses_expr_precise(expr));
+                let _ = self.collect_block(stmts, &block_live_out, protected_slots)?;
             }
         }
         Ok(())
+    }
+
+    /// Collect the interference constraints of a closure body the way a named
+    /// function body is collected: a fresh live-out seeded ONLY with the
+    /// closure's own parameter slots and its capture targets. The real tail
+    /// and body uses are computed by the backward collector itself
+    /// (`collect_expr_constraints` / `collect_block`); seeding the live-out
+    /// with `uses_expr(closure.body)` instead would put every slot the body
+    /// ever touches into the live-out, turning the whole body (and, through
+    /// a dynamic `LocalCall`'s conservative fill, the whole program) into
+    /// one interference clique. Nested closures recurse through
+    /// `collect_expr_constraints`, and each closure's protection is scoped
+    /// to its own body: an inner closure's parameters never mix with the
+    /// outer closure's or the enclosing function's interference sets.
+    fn collect_closure_body_constraints(
+        &mut self,
+        closure: &ClosureExpr,
+    ) -> Result<(), ParseError> {
+        let mut live_out = self.liveness.empty_set();
+        // Capture targets are caller-side state the closure body may read at
+        // any point (through its capture cells), so they stay live for the
+        // whole closure body just like the parameters.
+        for (_, captured_slot) in &closure.capture_copies {
+            self.liveness.mark_live(&mut live_out, *captured_slot);
+        }
+        for slot in &closure.param_slots {
+            self.liveness.mark_live(&mut live_out, *slot);
+        }
+        self.add_live_clique(&live_out);
+        let saved_closure_scope = self.in_closure_body;
+        self.in_closure_body = true;
+        let result = match &*closure.body {
+            // Mirror the named-function collection for the common block body:
+            // the tail expression is collected against the seeded live-out,
+            // then the statements are swept backward with the tail live-out.
+            Expr::Block { stmts, expr } => {
+                self.collect_expr_constraints(expr, &live_out, &closure.param_slots)?;
+                let mut block_live_out = live_out.clone();
+                self.liveness
+                    .union_inplace(&mut block_live_out, &self.liveness.uses_expr_precise(expr));
+                let _ = self.collect_block(stmts, &block_live_out, &closure.param_slots)?;
+                Ok(())
+            }
+            other => self.collect_expr_constraints(other, &live_out, &closure.param_slots),
+        };
+        self.in_closure_body = saved_closure_scope;
+        result
     }
 
     fn closure_footprint(&mut self, closure: &ClosureExpr, stack: &mut Vec<u16>) -> LiveSet {
