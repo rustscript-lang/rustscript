@@ -102,6 +102,10 @@ pub enum VmError {
     InvalidCallable,
 
     InvalidCallablePrototype(u32),
+    /// A JIT bridge received a callable prototype id outside the valid `u32`
+    /// index range (e.g. a negative value). Carries the raw value so the
+    /// error stays accurate instead of masquerading as a truncated id.
+    InvalidCallablePrototypeId(i64),
     InvalidBranchTarget {
         target: usize,
     },
@@ -169,6 +173,9 @@ impl std::fmt::Display for VmError {
 
             VmError::InvalidCallablePrototype(id) => {
                 write!(f, "invalid callable prototype {id}")
+            }
+            VmError::InvalidCallablePrototypeId(id) => {
+                write!(f, "invalid callable prototype id {id}")
             }
             VmError::InvalidBranchTarget { target } => {
                 write!(
@@ -2852,6 +2859,11 @@ impl Vm {
         if !matches!(&callable, Value::Callable(_)) {
             return Err(VmError::InvalidCallable);
         }
+        if !self.owns_callable(&callable) {
+            return Err(VmError::InvalidFrameState(
+                "callable does not belong to this vm",
+            ));
+        }
         self.instance.queued_callables.push_back(QueuedCallable {
             callable,
             args,
@@ -2957,6 +2969,11 @@ impl Vm {
         }
         if !matches!(&callable, Value::Callable(_)) {
             return Err(VmError::InvalidCallable);
+        }
+        if !self.owns_callable(&callable) {
+            return Err(VmError::InvalidFrameState(
+                "callable does not belong to this vm",
+            ));
         }
         if !self.instance.execution_frames.is_empty() {
             return Err(VmError::InvalidFrameState(

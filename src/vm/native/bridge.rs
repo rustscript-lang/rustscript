@@ -675,6 +675,64 @@ pub(crate) extern "C" fn pd_vm_native_replace_value_in_slot(
     STATUS_CONTINUE
 }
 
+pub(crate) fn materialize_root_callable_entry_address() -> usize {
+    pd_vm_native_materialize_root_callable as *const () as usize
+}
+
+/// Materializes the fresh environment-free callable for one root callable
+/// binding of an inlined JIT callee frame and registers it with the VM's
+/// owned-callable set.
+///
+/// Every call mints a brand-new `Arc` (never a shared constant) and writes it
+/// into `dst`, mirroring the interpreter's `enter_script_frame`
+/// re-initialization. Because the identity is fresh per materialization, a
+/// host handle from a previous lifecycle can never be re-legalized by a later
+/// run, while the fresh handle is immediately legal at every host entry gate.
+pub(crate) extern "C" fn pd_vm_native_materialize_root_callable(
+    vm: *mut Vm,
+    dst: *mut Value,
+    prototype_id: i64,
+) -> i32 {
+    let Some(vm) = (unsafe { vm.as_mut() }) else {
+        store_bridge_error(VmError::JitNative(
+            "native materialize-root-callable helper received null vm pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    };
+    if dst.is_null() {
+        store_bridge_error(VmError::JitNative(
+            "native materialize-root-callable helper received null slot pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    }
+    let Ok(prototype_id) = u32::try_from(prototype_id) else {
+        // Keep the raw (possibly negative) value in a dedicated typed error
+        // instead of truncating it into `InvalidCallablePrototype(u32::MAX)`.
+        store_bridge_error(VmError::InvalidCallablePrototypeId(prototype_id));
+        return STATUS_ERROR;
+    };
+    let Some(prototype) = vm.program().callable_prototypes.get(prototype_id as usize) else {
+        store_bridge_error(VmError::InvalidCallablePrototype(prototype_id));
+        return STATUS_ERROR;
+    };
+    let callable = Arc::new(crate::bytecode::CallableValue {
+        prototype_id,
+        kind: prototype.kind,
+        env: None,
+    });
+    vm.instance.owned_callables.push(Arc::downgrade(&callable));
+    unsafe {
+        // The owned temp slot may already hold a previous iteration's
+        // materialized callable (the trace reuses the slot on every loop
+        // iteration). Overwriting with `ptr::write` would leak the previous
+        // Arc; replace it and drop the previous value like the other bridge
+        // slot helpers (`replace_value_in_slot`, `clear_value_slot`).
+        let previous = std::ptr::replace(dst, Value::Callable(callable));
+        drop(previous);
+    }
+    STATUS_CONTINUE
+}
+
 pub(crate) extern "C" fn pd_vm_native_init_null_value_slot(dst: *mut Value) -> i32 {
     if dst.is_null() {
         store_bridge_error(VmError::JitNative(
@@ -2209,6 +2267,37 @@ mod tests {
             frame.continuation,
             FrameContinuation::ResumeBytecode { return_ip: 2 }
         );
+    }
+
+    #[test]
+    fn materialize_root_callable_rejects_negative_prototype_id_typed() {
+        let mut vm = Vm::new(virtual_frame_program());
+        let mut slot = MaybeUninit::<Value>::uninit();
+        let status = pd_vm_native_materialize_root_callable(&mut vm, slot.as_mut_ptr(), -1);
+        assert_eq!(status, STATUS_ERROR);
+        assert!(matches!(
+            take_bridge_error(),
+            Some(VmError::InvalidCallablePrototypeId(-1))
+        ));
+        // The error must be the accurate typed variant, never a truncated
+        // `InvalidCallablePrototype` masquerading as u32::MAX.
+        let error = take_bridge_error();
+        assert!(
+            !matches!(error, Some(VmError::InvalidCallablePrototype(_))),
+            "negative prototype id must not masquerade as a u32 prototype: {error:?}"
+        );
+    }
+
+    #[test]
+    fn materialize_root_callable_rejects_out_of_range_prototype_id() {
+        let mut vm = Vm::new(virtual_frame_program());
+        let mut slot = MaybeUninit::<Value>::uninit();
+        let status = pd_vm_native_materialize_root_callable(&mut vm, slot.as_mut_ptr(), 99);
+        assert_eq!(status, STATUS_ERROR);
+        assert!(matches!(
+            take_bridge_error(),
+            Some(VmError::InvalidCallablePrototype(99))
+        ));
     }
 
     #[test]

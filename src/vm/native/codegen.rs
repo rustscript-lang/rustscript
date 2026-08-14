@@ -285,6 +285,21 @@ pub(crate) fn non_yielding_i64_host_call_signature(
     sig
 }
 
+/// Signature of the JIT root-callable materialization helper:
+/// `(vm, out: *mut Value, prototype_id: i64) -> i32`.
+#[cfg(feature = "cranelift-jit")]
+pub(crate) fn materialize_root_callable_signature(
+    pointer_type: cranelift_codegen::ir::Type,
+    call_conv: cranelift_codegen::isa::CallConv,
+) -> Signature {
+    let mut sig = Signature::new(call_conv);
+    sig.params.push(AbiParam::new(pointer_type));
+    sig.params.push(AbiParam::new(pointer_type));
+    sig.params.push(AbiParam::new(types::I64));
+    sig.returns.push(AbiParam::new(types::I32));
+    sig
+}
+
 #[cfg(feature = "cranelift-jit")]
 pub(crate) fn collection_predicate_signature(
     pointer_type: cranelift_codegen::ir::Type,

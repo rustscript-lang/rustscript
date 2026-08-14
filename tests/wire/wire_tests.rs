@@ -205,6 +205,56 @@ fn callable_metadata_roundtrips_vmbc_v12() {
 }
 
 #[test]
+fn closure_shared_capture_vmbc_round_trip() {
+    let compiled = vm::compile_source_with_flavor(
+        r#"
+            let mut state: string = "";
+            let sink = |delta| if true => {
+                state = state + delta;
+                { action: "continue" }
+            } else => {
+                { action: "skip" }
+            };
+            let _ = sink("a");
+            state;
+        "#,
+        vm::SourceFlavor::RustScript,
+    )
+    .expect("mutable capture source should compile");
+    let sink_prototype = compiled
+        .program
+        .callable_prototypes
+        .iter()
+        .find(|prototype| {
+            prototype.kind == vm::CallableKind::Closure
+                && prototype
+                    .capture_modes
+                    .contains(&vm::CaptureBindingMode::BorrowMut)
+        })
+        .expect("closure prototype should carry a BorrowMut capture");
+    assert!(
+        sink_prototype
+            .capture_modes
+            .iter()
+            .all(|mode| *mode != vm::CaptureBindingMode::Move),
+        "mutation capture must not be classified as a move"
+    );
+    let encoded = encode_program(&compiled.program).expect("encode shared capture program");
+    let decoded = decode_program(&encoded).expect("decode shared capture program");
+    assert_eq!(
+        decoded.callable_prototypes, compiled.program.callable_prototypes,
+        "capture modes must survive the VMBC round trip"
+    );
+    validate_program(&decoded, 0).expect("decoded program should validate");
+    let mut runtime = vm::Vm::new(decoded);
+    assert_eq!(
+        runtime.run().expect("decoded program should run"),
+        vm::VmStatus::Halted
+    );
+    assert_eq!(runtime.stack(), &[Value::string("a")]);
+}
+
+#[test]
 fn callvalue_roundtrips_validation_and_disassembly() {
     let mut bc = BytecodeBuilder::new();
     bc.call_value(2);

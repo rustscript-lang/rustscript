@@ -24,6 +24,7 @@ use crate::vm::native::{
     map_get_entry_address, map_has_entry_address, map_iter_next_entry_address,
     map_iter_next_signature, map_iter_take_key_entry_address, map_iter_take_signature,
     map_iter_take_value_entry_address, map_set_entry_address, map_set_signature,
+    materialize_root_callable_entry_address, materialize_root_callable_signature,
     non_yielding_host_call_entry_address, non_yielding_host_call_signature,
     non_yielding_i64_host_call_entry_address, non_yielding_i64_host_call_signature,
     non_yielding_scalar_host_call_entry_address, non_yielding_scalar_host_call_signature,
@@ -599,6 +600,8 @@ fn try_compile_ssa_trace(
         non_yielding_scalar_host_call_signature(pointer_type, call_conv);
     let non_yielding_i64_host_call_sig =
         non_yielding_i64_host_call_signature(pointer_type, call_conv);
+    let materialize_root_callable_sig =
+        materialize_root_callable_signature(pointer_type, call_conv);
     let value_slot_sig = value_slot_signature(pointer_type, call_conv);
     let value_eq_sig = value_eq_signature(pointer_type, call_conv);
     let value_len_sig = value_len_signature(pointer_type, call_conv);
@@ -689,6 +692,7 @@ fn try_compile_ssa_trace(
             non_yielding_scalar_host_call_ref: b
                 .import_signature(non_yielding_scalar_host_call_sig),
             non_yielding_i64_host_call_ref: b.import_signature(non_yielding_i64_host_call_sig),
+            materialize_root_callable_ref: b.import_signature(materialize_root_callable_sig),
             clear_value_slot_ref: b.import_signature(value_slot_sig),
             clear_bridge_error_ref: b.import_signature(clear_bridge_error_sig),
             box_heap_value_ref: b.import_signature(box_heap_value_sig),
@@ -716,6 +720,7 @@ fn try_compile_ssa_trace(
             non_yielding_host_call: non_yielding_host_call_entry_address(),
             non_yielding_scalar_host_call: non_yielding_scalar_host_call_entry_address(),
             non_yielding_i64_host_call: non_yielding_i64_host_call_entry_address(),
+            materialize_root_callable: materialize_root_callable_entry_address(),
             clear_value_slot: clear_value_slot_entry_address(),
             clear_bridge_error: clear_bridge_error_entry_address(),
             box_heap_value: write_heap_value_to_slot_entry_address(),
@@ -1195,6 +1200,7 @@ struct SsaDeoptHelperRefs {
     non_yielding_host_call_ref: cranelift_codegen::ir::SigRef,
     non_yielding_scalar_host_call_ref: cranelift_codegen::ir::SigRef,
     non_yielding_i64_host_call_ref: cranelift_codegen::ir::SigRef,
+    materialize_root_callable_ref: cranelift_codegen::ir::SigRef,
     clear_value_slot_ref: cranelift_codegen::ir::SigRef,
     clear_bridge_error_ref: cranelift_codegen::ir::SigRef,
     box_heap_value_ref: cranelift_codegen::ir::SigRef,
@@ -1224,6 +1230,7 @@ struct SsaDeoptHelperAddrs {
     non_yielding_host_call: usize,
     non_yielding_scalar_host_call: usize,
     non_yielding_i64_host_call: usize,
+    materialize_root_callable: usize,
     clear_value_slot: usize,
     clear_bridge_error: usize,
     box_heap_value: usize,
@@ -1362,6 +1369,7 @@ fn ssa_trace_supported(ssa: &SsaTrace) -> bool {
             if !matches!(
                 inst.kind,
                 SsaInstKind::Constant(_)
+                    | SsaInstKind::MaterializeRootCallable { .. }
                     | SsaInstKind::CloneTagged { .. }
                     | SsaInstKind::ValueIsType { .. }
                     | SsaInstKind::UnboxHeapPtr { .. }
@@ -1717,6 +1725,7 @@ fn ssa_inst_requires_owned_value_slot(kind: &SsaInstKind) -> bool {
     matches!(
         kind,
         SsaInstKind::CloneTagged { .. }
+            | SsaInstKind::MaterializeRootCallable { .. }
             | SsaInstKind::ArrayGet { .. }
             | SsaInstKind::ArraySet { .. }
             | SsaInstKind::ArrayPush { .. }
@@ -2144,6 +2153,28 @@ fn lower_ssa_inst(
                 helper_refs.replace_value_ref,
                 helper_addrs.replace_value,
                 &[out, values[input]],
+            )?;
+            out
+        }
+        SsaInstKind::MaterializeRootCallable { prototype_id } => {
+            // Mint a fresh, VM-registered root-binding callable for this
+            // lifecycle and materialize it into the output value slot. Every
+            // execution gets a new `Arc`, so no callable identity escapes
+            // into the host unregistered or survives into a later run.
+            let out = owned_value_temp_slot_addr(
+                b,
+                pointer_type,
+                owned_value_temps,
+                SsaTempValueSlotKey::Output(output.id),
+            )?;
+            let prototype_id = b.ins().iconst(types::I64, i64::from(*prototype_id));
+            ssa_call_status_helper(
+                b,
+                exit_block,
+                pointer_type,
+                helper_refs.materialize_root_callable_ref,
+                helper_addrs.materialize_root_callable,
+                &[vm_ptr, out, prototype_id],
             )?;
             out
         }

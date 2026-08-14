@@ -251,6 +251,17 @@ pub(crate) enum SsaInstKind {
         import: u16,
         args: Vec<SsaValueId>,
     },
+    /// Materialize the fresh environment-free callable for one root callable
+    /// binding slot of an inlined callee frame.
+    ///
+    /// The runtime helper mints a brand-new `Arc` (never a shared constant)
+    /// and registers it with the VM's owned-callable set on every execution,
+    /// mirroring `enter_script_frame`'s per-entry re-initialization. No
+    /// callable identity is ever shared across runs, so a host handle from a
+    /// previous lifecycle can never be re-legalized by a later run.
+    MaterializeRootCallable {
+        prototype_id: u32,
+    },
 
     IntNeg {
         input: SsaValueId,
@@ -396,6 +407,7 @@ impl SsaInstKind {
         match self {
             Self::Constant(_) => Vec::new(),
             Self::HostCall { args, .. } => args.clone(),
+            Self::MaterializeRootCallable { .. } => Vec::new(),
 
             Self::CloneTagged { input }
             | Self::ValueIsType { input, .. }
@@ -1149,6 +1161,9 @@ fn verify_materialization(
 fn render_inst_kind(kind: &SsaInstKind) -> String {
     match kind {
         SsaInstKind::Constant(value) => format!("const {value:?}"),
+        SsaInstKind::MaterializeRootCallable { prototype_id } => {
+            format!("materialize_root_callable {prototype_id}")
+        }
         SsaInstKind::CloneTagged { input } => format!("clone_tagged {input}"),
         SsaInstKind::ValueIsType { input, tag } => {
             format!("value_is_type {input}, {tag:?}")

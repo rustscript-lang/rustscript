@@ -163,7 +163,6 @@ impl Instance {
         self.host_return = None;
         self.queued_callables.clear();
         self.completed_callable_results.clear();
-        self.owned_callables.clear();
         self.draining_queued_callables = false;
         self.shutdown = false;
         self.waiting_host_op = None;

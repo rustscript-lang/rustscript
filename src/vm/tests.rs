@@ -2690,13 +2690,14 @@ fn program_cache_key_distinguishes_call_script_from_call_value() {
 
 #[test]
 fn native_callable_abi_version_covers_direct_script_calls() {
-    // `CallScript` adds a new native boundary helper and exit contract; the
-    // native callable ABI revision must reflect it so every directly coupled
-    // program/native cache is invalidated exactly once.
+    // `CallScript` adds a new native boundary helper and exit contract, and
+    // the JIT inline ownership bridge adds the root-callable materialization
+    // helper; the native callable ABI revision must reflect both so every
+    // directly coupled program/native cache is invalidated exactly once.
     assert_eq!(
         super::native::NATIVE_CALLABLE_ABI_VERSION,
-        6,
-        "native callable ABI revision must cover direct script call semantics"
+        7,
+        "native callable ABI revision must cover direct script call and root-callable materialization semantics"
     );
     let direct = crate::compile_source("fn add2(value: int) -> int { value + 2 } add2(40);")
         .expect("direct call source should compile");

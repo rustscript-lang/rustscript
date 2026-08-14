@@ -329,7 +329,8 @@ impl AvailabilityAnalyzer {
                             &mut out,
                             *source_slot,
                             *captured_slot,
-                            capture_mode,
+                            capture_mode.0,
+                            capture_mode.1,
                         );
                     }
                 }
@@ -419,7 +420,8 @@ impl AvailabilityAnalyzer {
                             &mut out,
                             *source_slot,
                             *captured_slot,
-                            capture_mode,
+                            capture_mode.0,
+                            capture_mode.1,
                         );
                     }
                 }
@@ -777,7 +779,8 @@ impl AvailabilityAnalyzer {
                         &mut out,
                         *source_slot,
                         *captured_slot,
-                        capture_mode,
+                        capture_mode.0,
+                        capture_mode.1,
                     );
                 }
                 Ok(out)
@@ -792,7 +795,8 @@ impl AvailabilityAnalyzer {
                         &mut out,
                         *source_slot,
                         *captured_slot,
-                        capture_mode,
+                        capture_mode.0,
+                        capture_mode.1,
                     );
                 }
                 Ok(out)

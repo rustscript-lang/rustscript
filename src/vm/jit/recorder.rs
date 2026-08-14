@@ -1,8 +1,6 @@
 use std::fmt;
-use std::sync::Arc;
 
 use crate::builtins::BuiltinFunction;
-use crate::bytecode::CallableValue;
 use crate::compiler::TypeSchema;
 use crate::vm::{OpCode, Program, Value, ValueType, checked_int_div};
 
@@ -338,10 +336,12 @@ fn init_inline_callee_locals(
             ));
         }
         binding_slots.push(slot);
-        let kind = program
+        // Validate the prototype at record time; the runtime helper re-derives
+        // the kind from the program on every materialization, so the IR inst
+        // only needs the id.
+        program
             .callable_prototypes
             .get(binding.prototype_id as usize)
-            .map(|prototype| prototype.kind)
             .ok_or(TraceRecordError::UnsupportedTrace(
                 "root callable binding references an unknown prototype".to_string(),
             ))?;
@@ -350,11 +350,9 @@ fn init_inline_callee_locals(
                 current_block,
                 ip,
                 SsaValueRepr::Tagged,
-                SsaInstKind::Constant(Value::Callable(Arc::new(CallableValue {
+                SsaInstKind::MaterializeRootCallable {
                     prototype_id: binding.prototype_id,
-                    kind,
-                    env: None,
-                }))),
+                },
             )
             .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
         callee_locals[slot] = SymbolicValue {

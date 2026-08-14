@@ -21,9 +21,9 @@ pub(crate) use bridge::{
     interrupt_helper_entry_offset, leave_frame_entry_address, leave_frame_inherited_entry_address,
     map_get_entry_address, map_has_entry_address, map_iter_next_entry_address,
     map_iter_take_key_entry_address, map_iter_take_value_entry_address, map_set_entry_address,
-    non_yielding_host_call_entry_address, non_yielding_i64_host_call_entry_address,
-    non_yielding_scalar_host_call_entry_address, regex_match_entry_address,
-    regex_replace_entry_address, replace_value_in_slot_entry_address,
+    materialize_root_callable_entry_address, non_yielding_host_call_entry_address,
+    non_yielding_i64_host_call_entry_address, non_yielding_scalar_host_call_entry_address,
+    regex_match_entry_address, regex_replace_entry_address, replace_value_in_slot_entry_address,
     restore_active_exit_state_entry_address, restore_active_sparse_exit_state_entry_address,
     restore_exit_state_entry_address, restore_sparse_exit_state_entry_address,
     restore_virtual_frame_entry_address, shared_array_from_buffer_entry_address,
@@ -41,13 +41,13 @@ pub(crate) use codegen::{
     enter_call_value_inherited_signature, enter_call_value_signature, entry_signature,
     frame_state_signature, free_buffer_signature, helper_signature, jump_with_status,
     leave_frame_inherited_signature, leave_frame_signature, map_iter_next_signature,
-    map_iter_take_signature, map_set_signature, non_yielding_host_call_signature,
-    non_yielding_i64_host_call_signature, non_yielding_scalar_host_call_signature,
-    pack_shared_signature, regex_match_signature, regex_replace_signature, restore_exit_signature,
-    restore_virtual_frame_signature, sparse_restore_exit_signature,
-    string_binary_transform_signature, string_contains_signature, string_replace_signature,
-    string_unary_transform_signature, value_eq_signature, value_len_signature,
-    value_slot_signature,
+    map_iter_take_signature, map_set_signature, materialize_root_callable_signature,
+    non_yielding_host_call_signature, non_yielding_i64_host_call_signature,
+    non_yielding_scalar_host_call_signature, pack_shared_signature, regex_match_signature,
+    regex_replace_signature, restore_exit_signature, restore_virtual_frame_signature,
+    sparse_restore_exit_signature, string_binary_transform_signature, string_contains_signature,
+    string_replace_signature, string_unary_transform_signature, value_eq_signature,
+    value_len_signature, value_slot_signature,
 };
 pub(crate) use exec::{ExecutableBuffer, prepare_for_execution};
 pub(crate) use layout::{
@@ -61,7 +61,7 @@ pub(crate) use offsets::{HeapIntrinsicAddrs, HeapIntrinsicRefs, ResolvedOffsets,
 /// callable boundary helpers or their status contract; it is hashed into the
 /// program cache identity so stale native products are invalidated exactly
 /// once per semantics change.
-pub(crate) const NATIVE_CALLABLE_ABI_VERSION: u16 = 6;
+pub(crate) const NATIVE_CALLABLE_ABI_VERSION: u16 = 7;
 pub(crate) const MAX_INHERITED_ENTRY_VALUES: usize = 256;
 pub(crate) const INHERITED_STATE_ACTIVE_OFFSET: i32 = 0;
 pub(crate) const INHERITED_STATE_FRAME_KEY_OFFSET: i32 = 8;

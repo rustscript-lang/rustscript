@@ -213,7 +213,9 @@ fn remap_inst_inputs(
         }};
     }
     match kind {
-        SsaInstKind::Constant(_) | SsaInstKind::ArrayNew => {}
+        SsaInstKind::Constant(_)
+        | SsaInstKind::MaterializeRootCallable { .. }
+        | SsaInstKind::ArrayNew => {}
         SsaInstKind::HostCall { args, .. } => {
             for arg in args {
                 one!(arg);

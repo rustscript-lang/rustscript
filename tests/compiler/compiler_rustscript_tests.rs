@@ -1091,6 +1091,323 @@ fn rustscript_closure_value_parse_rejection_cases_work() {
 }
 
 #[test]
+fn closure_mut_capture_updates_outer_local() {
+    let case = rustscript_runtime_case(
+        "closure mutation capture updates outer local",
+        r#"
+            let mut state: string = "";
+            let sink = |delta| if true => {
+                state = state + delta;
+                { action: "continue" }
+            } else => {
+                { action: "skip" }
+            };
+            let _ = sink("a");
+            state;
+        "#,
+        vec![Value::string("a")],
+    );
+    run_runtime_case(&case);
+}
+
+#[test]
+fn closure_mut_capture_survives_multiple_calls() {
+    let case = rustscript_runtime_case(
+        "closure mutation capture survives multiple calls",
+        r#"
+            let mut state: string = "";
+            let sink = |delta| if true => {
+                state = state + delta;
+                { action: "continue" }
+            } else => {
+                { action: "skip" }
+            };
+            let _ = sink("a");
+            let _ = sink("b");
+            let _ = sink("c");
+            state;
+        "#,
+        vec![Value::string("abc")],
+    );
+    run_runtime_case(&case);
+}
+
+#[test]
+fn closure_mut_capture_is_visible_after_callback_returns() {
+    let case = rustscript_runtime_case(
+        "closure mutation capture visible after callback returns",
+        r#"
+            fn invoke(cb, x) {
+                let _ = cb(x);
+                null
+            }
+            let mut state: string = "";
+            let sink = |delta| if true => {
+                state = state + delta;
+                { action: "continue" }
+            } else => {
+                { action: "skip" }
+            };
+            invoke(sink, "a");
+            invoke(sink, "b");
+            state;
+        "#,
+        vec![Value::Null, Value::Null, Value::string("ab")],
+    );
+    run_runtime_case(&case);
+}
+
+#[test]
+fn closure_mut_capture_two_closures_share_one_cell() {
+    let case = rustscript_runtime_case(
+        "two closures mutating one captured local observe one value",
+        r#"
+            let mut state: string = "";
+            let first = |delta| if true => {
+                state = state + delta;
+                { action: "continue" }
+            } else => {
+                { action: "skip" }
+            };
+            let second = |delta| if true => {
+                state = state + delta;
+                { action: "continue" }
+            } else => {
+                { action: "skip" }
+            };
+            let _ = first("x");
+            let _ = second("y");
+            state;
+        "#,
+        vec![Value::string("xy")],
+    );
+    run_runtime_case(&case);
+}
+
+#[test]
+fn closure_copy_capture_keeps_source_reusable() {
+    let case = rustscript_runtime_case(
+        "closure copy capture keeps source reusable",
+        r#"
+            let a = "x";
+            let f = |d| d + a.copy();
+            let d = a;
+            f(d);
+        "#,
+        vec![Value::string("xx")],
+    );
+    run_runtime_case(&case);
+}
+
+#[test]
+fn closure_by_value_move_still_rejects_later_outer_use() {
+    let case = ParseErrorCase {
+        name: "closure by-value capture of movable local rejects later outer use",
+        source: r#"
+            let a = "";
+            let f = |d| d + a;
+            let _ = f("x");
+            a;
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_contains_all: &["local 'a'", "moved"],
+    };
+    expect_parse_error_case(&case);
+}
+
+#[test]
+fn closure_mut_capture_from_immutable_source_is_rejected() {
+    let case = ParseErrorCase {
+        name: "closure mutation capture from immutable source is rejected",
+        source: r#"
+            let state: string = "";
+            let sink = |delta| if true => {
+                state = state + delta;
+                { action: "continue" }
+            } else => {
+                { action: "skip" }
+            };
+            let _ = sink("a");
+            state;
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_contains_all: &["immutable local 'state'"],
+    };
+    expect_parse_error_case(&case);
+}
+
+#[test]
+fn closure_mut_capture_compound_add_assign_updates_outer_local() {
+    let case = rustscript_runtime_case(
+        "closure `+=` on captured local updates outer local",
+        r#"
+            let mut state: int = 0;
+            let bump = |delta| if true => {
+                state += delta;
+                { action: "continue" }
+            } else => {
+                { action: "skip" }
+            };
+            let _ = bump(1);
+            let _ = bump(2);
+            state;
+        "#,
+        vec![Value::Int(3)],
+    );
+    run_runtime_case(&case);
+}
+
+#[test]
+fn closure_write_only_capture_assignment_overwrites_outer_local() {
+    let case = rustscript_runtime_case(
+        "closure write-only capture assignment (RHS does not read the slot) overwrites outer local",
+        r#"
+            let mut state: string = "initial";
+            let reset = |value| if true => {
+                state = value;
+                { action: "continue" }
+            } else => {
+                { action: "skip" }
+            };
+            let _ = reset("after");
+            state;
+        "#,
+        vec![Value::string("after")],
+    );
+    run_runtime_case(&case);
+}
+
+#[test]
+fn closure_mut_capture_compound_and_write_only_modes_stay_shared() {
+    for (name, source) in [
+        (
+            "compound `+=` capture is shared-mutable, not a move",
+            r#"
+                let mut state: int = 0;
+                let bump = |delta| if true => {
+                    state += delta;
+                    null
+                } else => {
+                    null
+                };
+                let _ = bump(1);
+                state;
+            "#,
+        ),
+        (
+            "write-only `=` capture is shared-mutable, not a move",
+            r#"
+                let mut state: string = "initial";
+                let reset = |value| if true => {
+                    state = value;
+                    null
+                } else => {
+                    null
+                };
+                let _ = reset("after");
+                state;
+            "#,
+        ),
+    ] {
+        let compiled = vm::compile_source_with_flavor(source, SourceFlavor::RustScript)
+            .unwrap_or_else(|err| panic!("{name} should compile: {err}"));
+        let prototype = compiled
+            .program
+            .callable_prototypes
+            .iter()
+            .find(|prototype| {
+                prototype.kind == vm::CallableKind::Closure
+                    && prototype
+                        .capture_modes
+                        .contains(&vm::CaptureBindingMode::BorrowMut)
+            })
+            .unwrap_or_else(|| panic!("{name} should carry a BorrowMut capture"));
+        assert!(
+            prototype
+                .capture_modes
+                .iter()
+                .all(|mode| *mode != vm::CaptureBindingMode::Move),
+            "{name} must not be classified as a move"
+        );
+    }
+}
+
+#[test]
+fn closure_mut_capture_cell_is_fresh_after_vm_reset() {
+    // A re-run of the same program on the same VM starts from a fresh
+    // capture cell: the second run never reads the previous run's cell
+    // value.
+    let compiled = vm::compile_source_with_flavor(
+        r#"
+            let mut state: string = "";
+            let sink = |delta| if true => {
+                state = state + delta;
+                { action: "continue" }
+            } else => {
+                { action: "skip" }
+            };
+            let _ = sink("a");
+            let _ = sink("b");
+            state;
+        "#,
+        SourceFlavor::RustScript,
+    )
+    .expect("mutable capture source should compile");
+    let mut vm = Vm::new(compiled.program);
+    assert_eq!(vm.run().expect("first run should halt"), VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[Value::string("ab")],
+        "first run should accumulate both deltas in the shared cell"
+    );
+
+    // Reset must close the run-scoped capture state: the operand stack
+    // empties and the cell-backed local slot returns to Null.
+    vm.reset_for_reuse();
+    assert!(
+        vm.stack().is_empty(),
+        "reset should clear the operand stack"
+    );
+    assert!(
+        vm.locals().iter().all(|local| *local == Value::Null),
+        "reset should clear every local slot, including the cell-backed one"
+    );
+
+    // The second run starts from a fresh cell: accumulating the same two
+    // deltas yields exactly "ab", not a value derived from the first run's
+    // cell contents.
+    assert_eq!(vm.run().expect("second run should halt"), VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[Value::string("ab")],
+        "a re-run must not read the previous run's capture cell value"
+    );
+}
+
+#[test]
+fn closure_explicit_move_then_use_inside_body_is_rejected() {
+    let case = ParseErrorCase {
+        name: "closure explicit move inside body rejects later use of captured local",
+        source: r#"
+            let a = "";
+            let f = |d| if true => {
+                let y = a;
+                let z = a;
+                y + z
+            } else => {
+                ""
+            };
+            let _ = f("x");
+        "#,
+        flavor: SourceFlavor::RustScript,
+        // The captured slot is an unnamed hidden local (`#N`), so the moved
+        // local is reported by its generated name.
+        expected_contains_all: &["local '#", "moved"],
+    };
+    expect_parse_error_case(&case);
+}
+
+#[test]
 fn rustscript_closure_captured_callable_invocation_works() {
     let cases = vec![
         RuntimeCase {
