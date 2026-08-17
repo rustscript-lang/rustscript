@@ -53,6 +53,14 @@ fn alias_exports_public_invocation_stream_contract() {
     });
 }
 
+#[cfg(feature = "http-client")]
+#[test]
+fn alias_http_client_includes_runtime_contract() {
+    fn accept_runtime_result(_result: rustscript::RuntimeResult<()>) {}
+
+    accept_runtime_result(Ok(()));
+}
+
 #[cfg(feature = "sqlite")]
 #[test]
 fn alias_exports_public_sqlite_configuration() {

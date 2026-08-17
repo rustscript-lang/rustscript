@@ -16,6 +16,7 @@ runtime = ["pd_vm_crate/runtime"]
 edge-abi = ["pd_vm_crate/edge-abi"]
 cli = ["pd_vm_crate/cli"]
 cranelift-jit = ["pd_vm_crate/cranelift-jit"]
+http-client = ["runtime", "pd_vm_crate/http-client"]
 sqlite = ["pd_vm_crate/sqlite"]
 
 [dependencies]

@@ -5,10 +5,8 @@ mod metadata;
 #[cfg(feature = "runtime")]
 pub(crate) mod runtime;
 
-#[cfg(test)]
-pub use self::metadata::CallableType;
 pub use self::metadata::{
-    CallableDef, CallableParam, CallableParamType, CallableSignature, HostExecution,
+    CallableDef, CallableParam, CallableParamType, CallableSignature, CallableType, HostExecution,
 };
 use crate::ValueType;
 #[cfg(feature = "runtime")]

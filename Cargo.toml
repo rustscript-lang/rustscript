@@ -27,7 +27,17 @@ name = "vm"
 [features]
 default = ["runtime", "cli", "cranelift-jit"]
 runtime = []
-async = ["runtime", "dep:tokio"]
+async = ["runtime", "dep:tokio", "dep:futures-util"]
+http-client = [
+    "async",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:url",
+    "dep:webpki-roots",
+]
 sqlite = ["runtime", "dep:rusqlite"]
 edge-abi = [
     "dep:edge_abi",
@@ -62,8 +72,16 @@ cranelift-jit = { version = "0.129.1", optional = true }
 cranelift-module = { version = "0.129.1", optional = true }
 cranelift-native = { version = "0.129.1", optional = true }
 pd-host-function = { path = "./pd-host-function", version = "0.1.0" }
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1", default-features = false, features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
 rusqlite = { version = "0.32", default-features = false, features = ["bundled", "hooks", "limits"], optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "fs", "io-util", "process"], optional = true }
+url = { version = "2", optional = true }
+futures-util = { version = "0.3", optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "fs", "io-util", "process"], optional = true }
 edge_abi = { package = "pd-edge-abi", version = "0.1.1", default-features = false, optional = true }
 futures-channel = "0.3"
 paste = "1"
@@ -82,6 +100,7 @@ libc = "0.2"
 
 [dev-dependencies]
 futures-util = "0.3"
+rcgen = "0.13"
 syn = { version = "2", features = ["full"] }
 tokio = { version = "1", features = ["macros", "rt", "time", "sync"] }
 
@@ -89,6 +108,18 @@ tokio = { version = "1", features = ["macros", "rt", "time", "sync"] }
 name = "host_binding_generation_tests"
 path = "tests/host_binding_generation_tests.rs"
 required-features = ["cranelift-jit"]
+
+[[test]]
+name = "http_host_tests"
+path = "tests/vm/http_host_tests.rs"
+required-features = ["runtime", "http-client"]
+
+[[test]]
+name = "http_sse_tests"
+path = "tests/vm/http_sse_tests.rs"
+required-features = ["runtime", "http-client"]
+
+
 
 [[test]]
 name = "sqlite_host_tests"

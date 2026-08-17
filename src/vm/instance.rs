@@ -19,6 +19,7 @@ use std::sync::{Arc, Weak};
 
 use crate::bytecode::{CallableValue, Program, SharedCaptureCell, Value};
 use crate::vm::async_host::WaitingHostOp;
+use crate::vm::async_host::stream::HostStreamContinuation;
 use crate::vm::invocation::{InvocationPhase, InvocationState};
 use crate::vm::map_iter::MapIteratorState;
 use crate::vm::{DEFAULT_MAX_SCRIPT_CALL_DEPTH, VmYieldReason};
@@ -84,6 +85,7 @@ pub(crate) struct Instance {
     pub(crate) draining_queued_callables: bool,
     pub(crate) shutdown: bool,
     pub(super) waiting_host_op: Option<WaitingHostOp>,
+    pub(crate) host_stream: Option<HostStreamContinuation>,
     pub(crate) last_yield_reason: Option<VmYieldReason>,
     pub(crate) invocation: Option<InvocationState>,
     pub(crate) map_iterators: Vec<Vec<Option<MapIteratorState>>>,
@@ -121,6 +123,7 @@ impl Instance {
             draining_queued_callables: false,
             shutdown: false,
             waiting_host_op: None,
+            host_stream: None,
             last_yield_reason: None,
             invocation: None,
             map_iterators: Vec::new(),
@@ -163,6 +166,7 @@ impl Instance {
         self.draining_queued_callables = false;
         self.shutdown = false;
         self.waiting_host_op = None;
+        self.host_stream = None;
         self.drop_invocation_state();
         self.invocation = None;
         self.map_iterators.clear();

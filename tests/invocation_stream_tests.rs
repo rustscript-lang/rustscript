@@ -63,7 +63,7 @@ fn collect_items(vm: &mut Vm, args: Vec<Value>) -> Vec<Result<InvocationItem, In
 fn invocation_input_arrives_as_ordinary_callable_arguments() {
     let mut vm = compiled_vm(
         r#"
-        pub fn run(input: map<string>) -> map<string> {
+        pub fn run(input: map) -> map {
             input;
         }
         "#,
@@ -730,7 +730,7 @@ fn invocation_cancel_during_complete_pending_discards_the_pending_complete() {
     // Cancelled item, then a fused end.
     let mut vm = compiled_vm(
         r#"
-        pub fn run() -> map<int> {
+        pub fn run() -> map {
             {"a": 1, "b": 2};
         }
         "#,

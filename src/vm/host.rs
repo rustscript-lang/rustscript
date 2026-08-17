@@ -1717,7 +1717,12 @@ impl Vm {
                 saved_stack.append(&mut host_stack);
                 self.instance.stack = saved_stack;
                 let resume_ip = self.call_resume_ip(call_ip)?;
-                self.set_waiting_bound_host_op(resolved_index, op_id)?;
+                self.record_callable_stream_resume_ip(op_id, resume_ip);
+                if self.host.stream_drivers.contains_key(&op_id) {
+                    self.set_waiting_operation(op_id)?;
+                } else {
+                    self.set_waiting_bound_host_op(resolved_index, op_id)?;
+                }
                 self.instance.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
             }
@@ -1832,7 +1837,12 @@ impl Vm {
             CallOutcome::Pending(op_id) => {
                 self.instance.stack.truncate(arg_start);
                 let resume_ip = self.call_resume_ip(call_ip)?;
-                self.set_waiting_bound_host_op(resolved_index, op_id)?;
+                self.record_callable_stream_resume_ip(op_id, resume_ip);
+                if self.host.stream_drivers.contains_key(&op_id) {
+                    self.set_waiting_operation(op_id)?;
+                } else {
+                    self.set_waiting_bound_host_op(resolved_index, op_id)?;
+                }
                 self.instance.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
             }
@@ -1893,7 +1903,12 @@ impl Vm {
             CallOutcome::Pending(op_id) => {
                 self.instance.stack.truncate(arg_start);
                 let resume_ip = self.call_resume_ip(call_ip)?;
-                self.set_waiting_bound_host_op(resolved_index, op_id)?;
+                self.record_callable_stream_resume_ip(op_id, resume_ip);
+                if self.host.stream_drivers.contains_key(&op_id) {
+                    self.set_waiting_operation(op_id)?;
+                } else {
+                    self.set_waiting_bound_host_op(resolved_index, op_id)?;
+                }
                 self.instance.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
             }

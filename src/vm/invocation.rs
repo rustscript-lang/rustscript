@@ -93,8 +93,8 @@ pub(crate) enum InvocationPhase {
 /// One active invocation handle borrowing the VM.
 ///
 /// Polling drives execution. Dropping a handle that has not fused retires its
-/// invocation synchronously, including any waiting host operation, so the VM
-/// can be reused immediately.
+/// invocation synchronously, including any waiting host operation or callable
+/// stream, so the VM can be reused immediately.
 pub struct Invocation<'vm> {
     vm: &'vm mut Vm,
 }
@@ -126,6 +126,7 @@ impl Invocation<'_> {
     pub fn cancel(&mut self, reason: CancellationReason) -> VmResult<()> {
         let cancellation_result = self.vm.run_ctx.cancel(reason);
         self.vm.cancel_waiting_host_op_with_reason(reason);
+        self.vm.cancel_callable_stream();
         cancellation_result
     }
 }
@@ -486,8 +487,15 @@ impl Vm {
             .as_ref()
             .map(|state| (state.stack_base, state.frame_count))
             .unwrap_or((0, 0));
+        // Retire the currently awaited operation before unwinding its frames.
+        // `Requested` is the embedding-owned cancellation reason used when a
+        // consumer abandons a handle. For callable-stream producer waits this
+        // also removes the driver; for callback waits it cancels the nested op.
         self.cancel_waiting_host_op_with_reason(CancellationReason::Requested);
+        self.cancel_callable_stream();
         self.abort_host_invocation(stack_base, frame_count);
+        // Pending Event/Complete values must follow the VM drop contract even
+        // when their terminal item can no longer be observed.
         self.instance.drop_invocation_state();
         self.run_ctx.cancellation = CancellationToken::root();
     }
