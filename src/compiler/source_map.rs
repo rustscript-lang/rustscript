@@ -119,7 +119,7 @@ impl SourceMap {
     }
 
     /// Register a source at an explicit id (the semantic module graph's
-    /// [`SourceId`](crate::compiler::modules::SourceId) space) so spans that
+    /// `SourceId` space) so spans that
     /// reference that id resolve to this text. Missing slots are filled with
     /// empty placeholders; an already-occupied slot keeps its first text.
     pub fn add_source_at(

@@ -5,9 +5,28 @@ use std::task::{Context, Poll};
 use crate::builtins::BuiltinFunction;
 use crate::vm::{CallOutcome, CallReturn, HostOpId, Value, Vm, VmResult};
 
+use self::cancellation::{CancellationReason, OperationId, OperationOwner, OperationState};
+use self::error::{RuntimeError, RuntimeErrorCode};
+use self::resource::ResourceHandle;
+#[cfg(feature = "sqlite")]
+use self::resource::ResourceTypeId;
+
+type RuntimeOperationPoller = fn(&mut Vm, HostOpId, &mut Context<'_>) -> Poll<VmResult<CallReturn>>;
+
+const RUNTIME_OPERATION_POLLERS: &[(OperationOwner, RuntimeOperationPoller)] = &[
+    (OperationOwner::Io, io::poll_builtin_io_op),
+    #[cfg(feature = "sqlite")]
+    (OperationOwner::Sqlite, sqlite::poll_pending_op),
+];
+
 mod aot;
 mod bytes;
+pub(crate) mod cancellation;
+pub(crate) mod context;
+mod context_host;
 pub(crate) mod core;
+pub(crate) mod error;
+pub(crate) mod event;
 mod host;
 #[cfg(not(target_arch = "wasm32"))]
 mod io;
@@ -19,12 +38,14 @@ mod map_iter;
 mod math;
 pub(crate) mod print;
 pub(crate) mod regex;
+pub(crate) mod resource;
+#[cfg(feature = "sqlite")]
+mod sqlite;
 mod typed;
 
 #[cfg(target_arch = "wasm32")]
 use io_wasm as io;
 
-pub(crate) use io::IoState;
 pub use typed::HostCallResult;
 use typed::{
     AnyValue, IntoBuiltinCallOutcome, IntoHostCallOutcome, NumberValue, UnknownValue, VmArray,
@@ -124,8 +145,99 @@ pub(crate) fn execute_builtin_call(
     }
 }
 
-pub(crate) fn cancel_builtin_io_op(vm: &mut Vm, op_id: HostOpId) {
-    io::cancel_pending_op(vm, op_id);
+pub(crate) fn cancel_builtin_io_op_with_reason(
+    vm: &mut Vm,
+    op_id: HostOpId,
+    reason: CancellationReason,
+) {
+    let Ok(op_id) = OperationId::from_raw(op_id) else {
+        return;
+    };
+    let target_resource = vm
+        .host
+        .runtime_operations
+        .get(op_id)
+        .ok()
+        .filter(|operation| operation.owner() == OperationOwner::Io)
+        .and_then(|operation| operation.resource());
+    cancel_runtime_operation(vm, op_id, reason);
+    if let Some(target_resource) = target_resource {
+        let _ = close_runtime_resource(vm, target_resource, reason);
+    }
+}
+
+pub(crate) fn cancel_runtime_operation(
+    vm: &mut Vm,
+    op_id: OperationId,
+    reason: CancellationReason,
+) {
+    let payload = vm
+        .host
+        .runtime_operations
+        .get(op_id)
+        .ok()
+        .and_then(|operation| operation.payload());
+    let _ = vm.host.runtime_operations.cancel(op_id, reason);
+    if let Some(payload) = payload {
+        let _ = close_runtime_resource(vm, payload, reason);
+    }
+}
+
+fn cancel_runtime_operations(
+    vm: &mut Vm,
+    operations: Vec<OperationState>,
+    reason: CancellationReason,
+) {
+    let operations = operations
+        .into_iter()
+        .map(|operation| {
+            let payload = operation.payload();
+            (operation, payload)
+        })
+        .collect::<Vec<_>>();
+    for (operation, _) in &operations {
+        operation.token().mark_cancelled(reason);
+    }
+    for (operation, _) in &operations {
+        let _ = vm.host.runtime_operations.cancel(operation.id(), reason);
+    }
+    for (_, payload) in operations {
+        if let Some(payload) = payload {
+            let _ = close_runtime_resource(vm, payload, reason);
+        }
+    }
+}
+
+pub(crate) fn close_runtime_resource(
+    vm: &mut Vm,
+    handle: ResourceHandle,
+    reason: CancellationReason,
+) -> error::RuntimeResult<resource::CloseStatus> {
+    let operations = vm.host.runtime_operations.operations_for_resource(handle);
+    cancel_runtime_operations(vm, operations, reason);
+    vm.host.runtime_resources.close(handle, reason)
+}
+
+#[cfg(feature = "sqlite")]
+pub(crate) fn close_resources_by_type(
+    vm: &mut Vm,
+    resource_type: ResourceTypeId,
+    reason: CancellationReason,
+) {
+    let handles = vm.host.runtime_resources.handles_of_type(resource_type);
+    for handle in handles {
+        let _ = close_runtime_resource(vm, handle, reason);
+    }
+}
+
+#[cfg(feature = "sqlite")]
+pub(crate) fn cancel_operations_by_owner(
+    vm: &mut Vm,
+    owner: OperationOwner,
+    reason: CancellationReason,
+) {
+    let operations = vm.host.runtime_operations.operations_by_owner(owner);
+    cancel_runtime_operations(vm, operations, reason);
 }
 
 pub(crate) fn poll_builtin_io_op(
@@ -133,11 +245,63 @@ pub(crate) fn poll_builtin_io_op(
     op_id: HostOpId,
     cx: &mut Context<'_>,
 ) -> Poll<VmResult<CallReturn>> {
-    io::poll_builtin_io_op(vm, op_id, cx)
+    let operation_id = match OperationId::from_raw(op_id) {
+        Ok(operation_id) => operation_id,
+        Err(error) => {
+            return Poll::Ready(Err(crate::vm::VmError::HostError(error.to_string())));
+        }
+    };
+    let operation = match vm.host.runtime_operations.get(operation_id) {
+        Ok(operation) => operation,
+        Err(error) => {
+            return Poll::Ready(Err(crate::vm::VmError::HostError(error.to_string())));
+        }
+    };
+    if let Err(error) = operation.token().check() {
+        let reason = operation
+            .token()
+            .reason()
+            .unwrap_or(CancellationReason::Requested);
+        cancel_builtin_io_op_with_reason(vm, op_id, reason);
+        return Poll::Ready(Err(crate::vm::VmError::HostError(error.to_string())));
+    }
+
+    let Some((_, poller)) = RUNTIME_OPERATION_POLLERS
+        .iter()
+        .find(|(owner, _)| *owner == operation.owner())
+    else {
+        return Poll::Ready(Err(crate::vm::VmError::HostError(format!(
+            "runtime operation owner {:?} is unavailable in this build",
+            operation.owner()
+        ))));
+    };
+    let result = poller(vm, op_id, cx);
+
+    match result {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Ok(values)) => {
+            let _ = vm.host.runtime_operations.complete(operation_id);
+            Poll::Ready(Ok(values))
+        }
+        Poll::Ready(Err(error)) => {
+            if let Some(reason) = operation.token().reason() {
+                cancel_builtin_io_op_with_reason(vm, op_id, reason);
+                return Poll::Ready(Err(error));
+            }
+            let runtime_error = RuntimeError::new(
+                RuntimeErrorCode::OperationFailed,
+                "runtime::operation",
+                error.to_string(),
+            )
+            .with_value(op_id);
+            let _ = vm.host.runtime_operations.fail(operation_id, runtime_error);
+            Poll::Ready(Err(error))
+        }
+    }
 }
 
 pub(crate) fn close_all_handles(vm: &mut Vm) {
-    io::close_all_handles(vm);
+    vm.host.reset_for_reuse();
 }
 
 #[cfg(test)]

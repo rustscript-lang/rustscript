@@ -149,11 +149,25 @@ fn main() {
     println!("cargo:rerun-if-changed={}", catalog_path.display());
     let catalog = parse_catalog(&catalog_path);
 
-    let host_sources = [SourceSpec {
-        path: "src/builtins/runtime/host.rs".to_string(),
-        module: "host".to_string(),
-        category: SourceCategory::DefaultHost,
-    }];
+    let mut host_sources = vec![
+        SourceSpec {
+            path: "src/builtins/runtime/host.rs".to_string(),
+            module: "host".to_string(),
+            category: SourceCategory::DefaultHost,
+        },
+        SourceSpec {
+            path: "src/builtins/runtime/context_host.rs".to_string(),
+            module: "context_host".to_string(),
+            category: SourceCategory::DefaultHost,
+        },
+    ];
+    if env::var_os("CARGO_FEATURE_SQLITE").is_some() {
+        host_sources.push(SourceSpec {
+            path: "src/builtins/runtime/sqlite.rs".to_string(),
+            module: "sqlite".to_string(),
+            category: SourceCategory::DefaultHost,
+        });
+    }
     let builtin_sources = builtin_source_specs(&namespaces);
     let core_sources = [SourceSpec {
         path: "src/builtins/runtime/core.rs".to_string(),
@@ -934,6 +948,7 @@ fn render_builtin_catalog(
 
     writeln!(&mut out, "impl BuiltinFunction {{").unwrap();
     render_builtin_name_method(&mut out, &builtin_variant_order, &actual_builtin_by_variant);
+    render_builtin_capability_method(&mut out, builtin_callables);
     render_builtin_arity_method(&mut out, &builtin_variant_order, &actual_builtin_by_variant);
     render_builtin_accepts_arity_method(
         &mut out,
@@ -1075,6 +1090,12 @@ fn render_builtin_runtime_dispatch(
             )
             .unwrap();
         }
+        writeln!(
+            &mut out,
+            "    registry.mark_runtime_owned_pending({:?});",
+            callable.name
+        )
+        .unwrap();
     }
     writeln!(&mut out, "}}").unwrap();
     writeln!(&mut out).unwrap();
@@ -1091,6 +1112,12 @@ fn render_builtin_runtime_dispatch(
             .render_bind_static_call(&callable.name, &host_wrapper_adapter_name(callable));
         writeln!(&mut out, "        {:?} => {{", callable.name).unwrap();
         writeln!(&mut out, "            {bind_call}").unwrap();
+        writeln!(
+            &mut out,
+            "            vm.mark_runtime_owned_pending_binding({:?});",
+            callable.name
+        )
+        .unwrap();
         writeln!(&mut out, "            true").unwrap();
         writeln!(&mut out, "        }}").unwrap();
     }
@@ -1404,6 +1431,35 @@ fn render_builtin_name_method(
         .unwrap();
     }
     writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+}
+
+fn render_builtin_capability_method(out: &mut String, builtin_callables: &[CallableDecl]) {
+    let mut capability_variants = Vec::new();
+    for callable in builtin_callables {
+        let variant = builtin_variant_name(&callable.name);
+        if !capability_variants.contains(&variant) {
+            capability_variants.push(variant);
+        }
+    }
+    capability_variants.sort();
+    writeln!(out, "    #[cfg(feature = \"runtime\")]").unwrap();
+    writeln!(
+        out,
+        "    pub(crate) const fn requires_explicit_host_capability(self) -> bool {{"
+    )
+    .unwrap();
+    if capability_variants.is_empty() {
+        writeln!(out, "        false").unwrap();
+    } else {
+        let patterns = capability_variants
+            .iter()
+            .map(|variant| format!("BuiltinFunction::{variant}"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        writeln!(out, "        matches!(self, {patterns})").unwrap();
+    }
     writeln!(out, "    }}").unwrap();
     writeln!(out).unwrap();
 }

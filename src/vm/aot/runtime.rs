@@ -8,32 +8,33 @@ use crate::vm::{ExecOutcome, Vm, VmError, VmResult};
 
 impl Vm {
     pub fn compile_aot(&mut self) -> VmResult<()> {
-        self.aot_program = Some(compile_program(self.program())?);
-        self.aot_exec_count = 0;
+        self.engine.aot_program = Some(compile_program(self.program())?);
+        self.engine.aot_exec_count = 0;
         Ok(())
     }
 
     pub fn clear_aot(&mut self) {
-        self.aot_program = None;
-        self.aot_exec_count = 0;
+        self.engine.aot_program = None;
+        self.engine.aot_exec_count = 0;
     }
 
     pub fn has_aot_program(&self) -> bool {
-        self.aot_program.is_some()
+        self.engine.aot_program.is_some()
     }
 
     pub fn aot_exec_count(&self) -> u64 {
-        self.aot_exec_count
+        self.engine.aot_exec_count
     }
 
     pub fn aot_resume_ips(&self) -> Option<&[usize]> {
-        self.aot_program
+        self.engine
+            .aot_program
             .as_ref()
             .map(|program| program.resume_ips.as_ref())
     }
 
     pub fn dump_aot_info(&self) -> String {
-        let Some(program) = self.aot_program.as_ref() else {
+        let Some(program) = self.engine.aot_program.as_ref() else {
             return "whole-program aot: disabled\n".to_string();
         };
 
@@ -43,7 +44,10 @@ impl Vm {
             "  native codegen backend: {}\n",
             selected_codegen_backend()
         ));
-        out.push_str(&format!("  aot executions: {}\n", self.aot_exec_count));
+        out.push_str(&format!(
+            "  aot executions: {}\n",
+            self.engine.aot_exec_count
+        ));
         out.push_str(&format!("  code_bytes={}\n", program.code.len()));
         out.push_str(&format!(
             "  lowering={}\n",
@@ -58,38 +62,51 @@ impl Vm {
     }
 
     pub(crate) fn execute_aot_entry(&mut self) -> VmResult<ExecOutcome> {
-        let Some(entry) = self.aot_program.as_ref().map(|program| program.entry) else {
+        if !self.host.allow_default_host_capabilities {
+            self.engine.aot_interpreter_boundary_hit = true;
+            return Ok(ExecOutcome::Continue);
+        }
+        let Some(entry) = self
+            .engine
+            .aot_program
+            .as_ref()
+            .map(|program| program.entry)
+        else {
             return Ok(ExecOutcome::Continue);
         };
 
         clear_bridge_error();
         unsafe { crate::vm::native::prepare_for_execution() };
         let status = unsafe { entry(self as *mut Vm) };
-        self.aot_exec_count = self.aot_exec_count.saturating_add(1);
+        self.engine.aot_exec_count = self.engine.aot_exec_count.saturating_add(1);
 
         match status {
             STATUS_CONTINUE | STATUS_LINKED_CONTINUE => Ok(ExecOutcome::Continue),
             STATUS_HALTED => Ok(ExecOutcome::Halted),
             STATUS_YIELDED => {
-                self.last_yield_reason = Some(super::super::VmYieldReason::Host);
+                self.instance.last_yield_reason = Some(super::super::VmYieldReason::Host);
                 Ok(ExecOutcome::Yielded)
             }
             STATUS_WAITING => {
-                let op_id = self.waiting_host_op.map(|op| op.op_id).ok_or_else(|| {
-                    VmError::JitNative(
-                        "aot call bridge reported waiting without a pending op".to_string(),
-                    )
-                })?;
+                let op_id = self
+                    .instance
+                    .waiting_host_op
+                    .map(|op| op.op_id)
+                    .ok_or_else(|| {
+                        VmError::JitNative(
+                            "aot call bridge reported waiting without a pending op".to_string(),
+                        )
+                    })?;
                 Ok(ExecOutcome::Waiting(op_id))
             }
-            STATUS_OUT_OF_FUEL => match self.interrupt_mode {
+            STATUS_OUT_OF_FUEL => match self.run_ctx.interrupt_mode {
                 super::super::InterruptMode::Fuel => Err(VmError::OutOfFuel {
                     needed: 1,
-                    remaining: self.fuel_remaining,
+                    remaining: self.run_ctx.fuel_remaining,
                 }),
                 super::super::InterruptMode::Epoch => Err(VmError::EpochDeadlineReached {
                     current: self.current_epoch(),
-                    deadline: self.epoch_deadline,
+                    deadline: self.run_ctx.epoch_deadline,
                 }),
                 super::super::InterruptMode::None => Err(VmError::JitNative(
                     "aot interruption checkpoint fired while interruption was disabled".to_string(),
@@ -99,18 +116,18 @@ impl Vm {
                 if let Some(err) = take_bridge_error() {
                     return Err(err);
                 }
-                if self.ip == self.program.code.len() {
+                if self.instance.ip == self.program.code.len() {
                     return Err(VmError::BytecodeBounds);
                 }
                 Err(VmError::JitNative(format!(
                     "aot entry reported failure without VmError (ip={} stack_len={} aot={})",
-                    self.ip,
-                    self.stack.len(),
+                    self.instance.ip,
+                    self.instance.stack.len(),
                     self.has_aot_program()
                 )))
             }
             STATUS_TRACE_EXIT => {
-                self.aot_interpreter_boundary_hit = true;
+                self.engine.aot_interpreter_boundary_hit = true;
                 Ok(ExecOutcome::Continue)
             }
             other => Err(VmError::JitNative(format!(

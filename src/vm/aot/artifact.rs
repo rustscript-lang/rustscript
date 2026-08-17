@@ -3,7 +3,8 @@ use std::path::Path;
 
 use crate::bytecode::Program;
 use crate::vm::native::{
-    helper_entry_offset, interrupt_helper_entry_offset, selected_codegen_backend,
+    detect_native_stack_layout, helper_entry_offset, interrupt_helper_entry_offset,
+    native_stack_layout_fingerprint, selected_codegen_backend,
 };
 use crate::vm::{Vm, VmError};
 
@@ -12,7 +13,7 @@ use super::compile::CompiledProgram;
 
 const MAGIC: [u8; 4] = *b"PAT\0";
 const VERSION: u16 = 7;
-const ABI_VERSION: u16 = 6;
+const ABI_VERSION: u16 = 7;
 const FLAG_INTERPRETER_BOUNDARY_ONLY: u16 = 1;
 const SUPPORTED_FLAGS: u16 = FLAG_INTERPRETER_BOUNDARY_ONLY;
 
@@ -108,11 +109,12 @@ impl From<crate::WireError> for AotArtifactError {
 
 impl Vm {
     pub fn encode_aot_artifact(&mut self) -> Result<Vec<u8>, AotArtifactError> {
-        if self.aot_program.is_none() {
+        if self.engine.aot_program.is_none() {
             self.compile_aot()?;
         }
         let program_hash = self.ensure_program_cache_key();
         let aot_program = self
+            .engine
             .aot_program
             .as_ref()
             .ok_or(AotArtifactError::MissingAotProgram)?;
@@ -135,8 +137,8 @@ impl Vm {
         } else {
             CompiledProgram::from_code(decoded.code, decoded.resume_ips)?
         };
-        self.aot_program = Some(compiled);
-        self.aot_exec_count = 0;
+        self.engine.aot_program = Some(compiled);
+        self.engine.aot_exec_count = 0;
         Ok(())
     }
 
@@ -159,8 +161,8 @@ impl Vm {
         } else {
             CompiledProgram::from_code(decoded.code, decoded.resume_ips)?
         };
-        vm.aot_program = Some(compiled);
-        vm.aot_exec_count = 0;
+        vm.engine.aot_program = Some(compiled);
+        vm.engine.aot_exec_count = 0;
         Ok(vm)
     }
 
@@ -201,7 +203,8 @@ fn encode_artifact(
     write_string("os", std::env::consts::OS, &mut out)?;
     write_string("backend", selected_codegen_backend(), &mut out)?;
 
-    write_u32("vm ip offset", std::mem::offset_of!(Vm, ip), &mut out)?;
+    let native_layout_fingerprint = native_stack_layout_fingerprint(detect_native_stack_layout()?);
+    out.extend_from_slice(&native_layout_fingerprint.to_le_bytes());
     write_u32(
         "native helper offset",
         helper_entry_offset() as usize,
@@ -281,10 +284,12 @@ fn decode_artifact(
         selected_codegen_backend().to_string(),
         cursor.read_string()?,
     )?;
+    let expected_layout_fingerprint =
+        native_stack_layout_fingerprint(detect_native_stack_layout()?);
     validate_runtime_field(
-        "vm ip offset",
-        std::mem::offset_of!(Vm, ip).to_string(),
-        cursor.read_u32()?.to_string(),
+        "native stack layout fingerprint",
+        format!("{expected_layout_fingerprint:#018x}"),
+        format!("{:#018x}", cursor.read_u64()?),
     )?;
     validate_runtime_field(
         "native helper offset",
@@ -438,7 +443,21 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm::native::{detect_native_stack_layout, native_stack_layout_fingerprint};
     use crate::{BytecodeBuilder, Program, Value, ValueType, VmStatus};
+
+    fn native_layout_fingerprint_offset(encoded: &[u8]) -> usize {
+        let mut offset = 11;
+        for _ in 0..3 {
+            let len = u32::from_le_bytes(
+                encoded[offset..offset + 4]
+                    .try_into()
+                    .expect("runtime string length"),
+            ) as usize;
+            offset += 4 + len;
+        }
+        offset
+    }
 
     #[test]
     fn aot_artifact_preserves_interpreter_boundary_mode() {
@@ -446,7 +465,8 @@ mod tests {
         bc.ret();
         let mut vm = Vm::new(Program::new(Vec::new(), bc.finish()));
         vm.compile_aot().expect("aot compile should succeed");
-        vm.aot_program
+        vm.engine
+            .aot_program
             .as_mut()
             .expect("compiled program")
             .interpreter_boundary_only = true;
@@ -468,6 +488,7 @@ mod tests {
         .expect("boundary artifact should load");
         assert!(
             standalone
+                .engine
                 .aot_program
                 .as_ref()
                 .expect("loaded aot program")
@@ -498,6 +519,74 @@ mod tests {
         assert!(matches!(
             vm.load_aot_artifact(&trailing),
             Err(AotArtifactError::TrailingBytes)
+        ));
+    }
+
+    #[test]
+    fn aot_artifact_decode_rejects_previous_native_layout_abi() {
+        let mut bc = BytecodeBuilder::new();
+        bc.ret();
+        let mut vm = Vm::new(Program::new(Vec::new(), bc.finish()));
+        vm.compile_aot().expect("aot compile should succeed");
+        let mut encoded = vm
+            .encode_aot_artifact()
+            .expect("artifact encode should succeed");
+        encoded[6..8].copy_from_slice(&6_u16.to_le_bytes());
+
+        assert!(matches!(
+            vm.load_aot_artifact(&encoded),
+            Err(AotArtifactError::UnsupportedAbiVersion(6))
+        ));
+    }
+
+    #[test]
+    fn aot_artifact_records_complete_native_layout_fingerprint() {
+        let mut bc = BytecodeBuilder::new();
+        bc.ret();
+        let mut vm = Vm::new(Program::new(Vec::new(), bc.finish()));
+        vm.compile_aot().expect("aot compile should succeed");
+        let encoded = vm
+            .encode_aot_artifact()
+            .expect("artifact encode should succeed");
+        let fingerprint_offset = native_layout_fingerprint_offset(&encoded);
+        let stored = u64::from_le_bytes(
+            encoded[fingerprint_offset..fingerprint_offset + 8]
+                .try_into()
+                .expect("native layout fingerprint"),
+        );
+        let expected = native_stack_layout_fingerprint(
+            detect_native_stack_layout().expect("native layout should be detected"),
+        );
+
+        assert_eq!(stored, expected);
+        vm.load_aot_artifact(&encoded)
+            .expect("matching native layout should load");
+    }
+
+    #[test]
+    fn aot_artifact_rejects_native_layout_fingerprint_mismatch() {
+        let mut bc = BytecodeBuilder::new();
+        bc.ret();
+        let mut vm = Vm::new(Program::new(Vec::new(), bc.finish()));
+        vm.compile_aot().expect("aot compile should succeed");
+        let mut encoded = vm
+            .encode_aot_artifact()
+            .expect("artifact encode should succeed");
+        let fingerprint_offset = native_layout_fingerprint_offset(&encoded);
+        let stored = u64::from_le_bytes(
+            encoded[fingerprint_offset..fingerprint_offset + 8]
+                .try_into()
+                .expect("native layout fingerprint"),
+        );
+        encoded[fingerprint_offset..fingerprint_offset + 8]
+            .copy_from_slice(&stored.wrapping_add(1).to_le_bytes());
+
+        assert!(matches!(
+            vm.load_aot_artifact(&encoded),
+            Err(AotArtifactError::IncompatibleRuntime {
+                field: "native stack layout fingerprint",
+                ..
+            })
         ));
     }
 
@@ -581,7 +670,7 @@ mod tests {
             .encode_aot_artifact()
             .expect("artifact encode should succeed");
         assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 7);
-        assert_eq!(u16::from_le_bytes([encoded[6], encoded[7]]), 6);
+        assert_eq!(u16::from_le_bytes([encoded[6], encoded[7]]), 7);
 
         let mut old_format = encoded.clone();
         old_format[4..6].copy_from_slice(&6u16.to_le_bytes());
@@ -590,10 +679,10 @@ mod tests {
             Err(AotArtifactError::UnsupportedVersion(6))
         ));
         let mut old_abi = encoded.clone();
-        old_abi[6..8].copy_from_slice(&5u16.to_le_bytes());
+        old_abi[6..8].copy_from_slice(&6u16.to_le_bytes());
         assert!(matches!(
             Vm::new_from_aot_artifact_with_jit_config(&old_abi, JitConfig::default()),
-            Err(AotArtifactError::UnsupportedAbiVersion(5))
+            Err(AotArtifactError::UnsupportedAbiVersion(6))
         ));
 
         let mut standalone =
