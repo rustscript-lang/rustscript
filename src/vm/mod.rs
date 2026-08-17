@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub(crate) mod aot;
+mod async_host;
+mod capability;
 pub mod diagnostics;
 mod engine;
 mod epoch;
@@ -21,12 +23,17 @@ mod superinstructions;
 #[cfg(test)]
 mod tests;
 pub use self::aot::AotArtifactError;
+
+pub use self::async_host::{
+    CaptureAsyncHostContext, HostAsyncBridge, HostFuture, HostFutureOutput,
+};
+pub use self::capability::{CapabilityProfile, CapabilityProfileBuilder};
 use self::engine::Engine;
 pub use self::epoch::{EpochCheckpoint, EpochHandle};
 pub use self::fuel::FuelCheckpoint;
 pub use self::host::{
-    CallOutcome, CallReturn, HostArgsFunction, HostAsyncBridge, HostBindingPlan, HostFunction,
-    HostFunctionRegistry, HostOpId, HostStackFunction, StaticHostArgsFunction, StaticHostFunction,
+    CallOutcome, CallReturn, HostArgsFunction, HostBindingPlan, HostFunction, HostFunctionRegistry,
+    HostOpId, HostStackFunction, StaticHostArgsFunction, StaticHostFunction,
     StaticHostStackFunction,
 };
 use self::host::{HostCallExecOutcome, VmHostFunction};
@@ -35,48 +42,6 @@ use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable
 use self::run_context::{InterruptMode, RunContext};
 pub use crate::builtins::runtime::cancellation::CancellationReason;
 
-#[cfg(feature = "sqlite")]
-#[derive(Clone, Copy, Debug)]
-pub struct SqliteLimits {
-    pub max_connections: usize,
-    pub max_statements: usize,
-    pub max_rows: usize,
-    pub max_columns: usize,
-    pub max_result_bytes: usize,
-    pub max_statement_bytes: usize,
-    pub max_parameters: usize,
-    pub max_parameter_bytes: usize,
-    pub max_pending_operations: usize,
-    pub max_transaction_ms: u64,
-    pub busy_timeout_ms: u64,
-}
-
-#[cfg(feature = "sqlite")]
-impl Default for SqliteLimits {
-    fn default() -> Self {
-        Self {
-            max_connections: 16,
-            max_statements: 128,
-            max_rows: 1_000,
-            max_columns: 128,
-            max_result_bytes: 4 * 1024 * 1024,
-            max_statement_bytes: 1024 * 1024,
-            max_parameters: 128,
-            max_parameter_bytes: 1024 * 1024,
-            max_pending_operations: 32,
-            max_transaction_ms: 5_000,
-            busy_timeout_ms: 5_000,
-        }
-    }
-}
-
-#[cfg(feature = "sqlite")]
-#[derive(Clone, Debug, Default)]
-pub struct SqlitePolicy {
-    pub database_root: Option<String>,
-    pub allow_unsafe_sql: bool,
-    pub limits: SqliteLimits,
-}
 pub use crate::bytecode::{
     CallableTarget, CallableValue, HostImport, OpCode, Program, Value, ValueType,
 };
