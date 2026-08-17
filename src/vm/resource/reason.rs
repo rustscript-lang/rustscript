@@ -91,9 +91,15 @@ mod tests {
 
 /// Architecture guard: the resource support modules must stay free of
 /// `crate::builtins` (and comment-only noise) so they can be reused without
-/// pulling in the core crate's builtin registry.
+/// pulling in the core crate's builtin registry. The scan is dynamic: every
+/// production `.rs` file directly under `src/vm/resource/` is enumerated at
+/// test time, so any future module is covered automatically without editing
+/// this test.
 #[cfg(test)]
 mod architecture_tests {
+    use std::fs;
+    use std::path::PathBuf;
+
     /// Removes `//` line comments (including `//!` / `///`) and `/* ... */`
     /// block comments so the guard only inspects real code, not doc text.
     fn strip_comments(source: &str) -> String {
@@ -120,29 +126,76 @@ mod architecture_tests {
     }
 
     /// Built via `join` so the guard never matches its own source.
-    fn forbidden() -> String {
+    fn forbidden_builtins() -> String {
         ["crate", "::builtins"].join("")
     }
 
+    /// Any remaining direct reference to a builtin registry entry.
+    fn forbidden_builtins_path() -> String {
+        ["::", "builtins", "::"].join("")
+    }
+
+    /// Every production `.rs` file directly under `src/vm/resource`.
+    fn production_sources() -> Vec<PathBuf> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/vm/resource");
+        let mut files: Vec<PathBuf> = fs::read_dir(&dir)
+            .expect("src/vm/resource must exist")
+            .map(|entry| entry.expect("readable directory entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+            .collect();
+        files.sort();
+        files
+    }
+
     #[test]
-    fn support_modules_reject_builtins_in_all_production_sources() {
-        let forbidden = forbidden();
-        // Every production `.rs` file under `src/vm/resource`. None may reach
-        // into the core crate's builtin registry: this module family must stay
-        // reusable without pulling builtins in.
-        for source in [
-            include_str!("mod.rs"),
-            include_str!("error.rs"),
-            include_str!("reason.rs"),
-            include_str!("handle.rs"),
-            include_str!("close.rs"),
-            include_str!("table.rs"),
-        ] {
-            let code = strip_comments(source);
+    fn resource_production_sources_reject_core_and_domain_imports() {
+        let sources = production_sources();
+        assert!(
+            !sources.is_empty(),
+            "dynamic enumeration must find production sources under src/vm/resource"
+        );
+        let forbidden = [forbidden_builtins(), forbidden_builtins_path()];
+        for path in &sources {
+            let source = fs::read_to_string(path).expect("read production source");
+            let code = strip_comments(&source);
+            for needle in &forbidden {
+                assert!(
+                    !code.contains(needle),
+                    "{} must stay decoupled from the core crate builtin registry / domain modules: found `{needle}`",
+                    path.display(),
+                );
+            }
+            // Explicit rusqlite (or any external domain resource) coupling is
+            // forbidden; this module family must stay host- and domain-agnostic.
+            // Built via join so the guarded token cannot accidentally appear in
+            // this very test's source.
+            let external_domain = ["rus", "qlite"].join("");
             assert!(
-                !code.contains(&forbidden),
-                "src/vm/resource production modules must stay decoupled from the core crate: found `{forbidden}`",
+                !code.contains(&external_domain),
+                "{} must not import an external domain dependency",
+                path.display(),
             );
         }
+    }
+
+    #[test]
+    fn resource_production_sources_never_make_unchecked_typed_construction_public() {
+        // `Resource::from_handle` is a safe, unchecked typed constructor. It
+        // must stay crate-private: public host recovery goes through the
+        // validated `ResourceTable::typed`. This asserts the public-surface
+        // boundary at the source level.
+        let handle_src = {
+            let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/vm/resource");
+            fs::read_to_string(dir.join("handle.rs")).expect("read handle.rs")
+        };
+        let code = strip_comments(&handle_src);
+        assert!(
+            !code.contains("pub fn from_handle"),
+            "Resource::from_handle must not be public safe arbitrary-type construction"
+        );
+        assert!(
+            code.contains("pub(crate) fn from_handle"),
+            "Resource::from_handle must be crate-private"
+        );
     }
 }

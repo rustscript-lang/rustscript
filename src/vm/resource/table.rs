@@ -53,6 +53,14 @@ struct ResourceSlot {
     state: SlotState,
 }
 
+/// Cumulative state persisted across [`ResourceTable::poll_close_all`] polls
+/// until the table is quiescent.
+struct CloseAllState {
+    reason: ResourceCloseReason,
+    closed: usize,
+    first_error: Option<ResourceError>,
+}
+
 /// Bounded arena of erased resources owned by one execution scope.
 ///
 /// `Send + !Sync` by construction: it must never be shared; the owning scope
@@ -63,6 +71,8 @@ pub struct ResourceTable {
     slots: Vec<ResourceSlot>,
     vacant_slots: Vec<usize>,
     active_entries: usize,
+    /// In-flight `poll_close_all` sweep, if one is active.
+    close_all: Option<CloseAllState>,
 }
 
 impl ResourceTable {
@@ -93,6 +103,7 @@ impl ResourceTable {
             slots: Vec::new(),
             vacant_slots: Vec::new(),
             active_entries: 0,
+            close_all: None,
         })
     }
 
@@ -135,6 +146,27 @@ impl ResourceTable {
         let parent_index = self.resolve_index(parent_handle)?;
         self.slots[parent_index].children.insert(child_handle);
         Ok(Resource::from_handle(child_handle))
+    }
+
+    /// Validates a raw [`ResourceHandle`] and recovers a typed token.
+    ///
+    /// This is the only public way to lift an arbitrary raw handle (for example
+    /// one stored inside a script value) into a typed [`Resource<T>`]. It
+    /// rejects the handle if it belongs to a different table (arena), refers to
+    /// a stale slot generation, names the wrong concrete `TypeId`, or points at
+    /// a resource that is no longer `Open`:
+    ///
+    /// - foreign arena → [`ResourceErrorCode::ResourceHandleWrongTable`]
+    /// - stale generation → [`ResourceErrorCode::ResourceStale`]
+    /// - wrong type → [`ResourceErrorCode::ResourceTypeMismatch`]
+    /// - closed/closing → [`ResourceErrorCode::ResourceAlreadyClosed`]
+    ///
+    /// A rejected recovery is purely read-only: no slot, generation, link, or
+    /// type state is mutated.
+    pub fn typed<T: HostResource>(&self, handle: ResourceHandle) -> ResourceResult<Resource<T>> {
+        // Parentheses drop the index: validation is the sole purpose here.
+        let _slot_index = self.validate_active::<T>(handle)?;
+        Ok(Resource::from_handle(handle))
     }
 
     /// Immutably borrows one live resource for the duration of a host call.
@@ -249,25 +281,76 @@ impl ResourceTable {
                     Poll::Pending
                 }
             },
-            other => {
-                self.slots[slot_index].state = other;
+            SlotState::Open(resource) => {
+                // Not closing: restore the open resource and report the precise
+                // wrong-state error (distinct from an invalid handle).
+                self.slots[slot_index].state = SlotState::Open(resource);
                 Poll::Ready(Err(not_closing_error(handle)))
             }
+            SlotState::Vacant => Poll::Ready(Err(already_closed_error(handle))),
         }
     }
 
-    /// Synchronously drives a child-first close of every live resource.
+    /// Drives a caller-context close of every live resource, child first.
     ///
-    /// Leaves are closed before their parents (post-order). A cleanup failure
-    /// does not stop the remaining best-effort closes; every resource close is
-    /// attempted and the first failure is returned after the sweep completes.
-    pub fn close_all(&mut self, reason: ResourceCloseReason) -> ResourceResult<usize> {
-        let mut closed = 0usize;
-        let mut first_error = None;
-        loop {
-            let mut progressed = false;
-            // Phase 1: begin closing every open leaf (no live children). Parents
-            // whose children closed on a previous round become leaves here.
+    /// This is the event-driven close-all: unlike a synchronous sweep it can
+    /// wait on genuinely `Pending` resources using the caller's waker. Leaves
+    /// close before their parents (post-order). A cleanup failure does not stop
+    /// the remaining best-effort closes: every resource close is attempted and
+    /// the first failure is retained until the whole sweep finishes.
+    ///
+    /// Contract:
+    /// - Returns [`Poll::Ready`] **only** once the table is quiescent
+    ///   ([`len`](ResourceTable::len) `== 0`). `Ready(Ok(n))` reports the
+    ///   cumulative number of resources closed across all polls; `Ready(Err)`
+    ///   reports the first cleanup failure once every resource has finished.
+    /// - Returns [`Poll::Pending`] whenever any Open or Closing resource
+    ///   remains. The cumulative closed count, the first cleanup error, and the
+    ///   initial `reason` are persisted across Pending polls.
+    /// - The `reason` is bound on the first poll of a sweep. Supplying a
+    ///   conflicting reason is rejected deterministically with
+    ///   [`ResourceErrorCode::ResourceCloseInProgress`] and leaves the in-flight
+    ///   sweep (and its original reason) untouched.
+    ///
+    /// ```ignore
+    /// let mut cx = Context::from_waker(&waker);
+    /// loop {
+    ///     match table.poll_close_all(reason, &mut cx) {
+    ///         Poll::Ready(result) => break result,
+    ///         Poll::Pending => /* yield; woken when a resource makes progress */,
+    ///     }
+    /// }
+    /// ```
+    pub fn poll_close_all(
+        &mut self,
+        reason: ResourceCloseReason,
+        cx: &mut Context<'_>,
+    ) -> Poll<ResourceResult<usize>> {
+        // Deterministically reject a conflicting reason. The in-flight sweep
+        // keeps the reason it started with; we do not mutate any state here.
+        if let Some(state) = self.close_all.as_ref()
+            && state.reason != reason
+        {
+            return Poll::Ready(Err(close_in_progress_error(reason, state.reason)));
+        }
+        if self.close_all.is_none() {
+            self.close_all = Some(CloseAllState {
+                reason,
+                closed: 0,
+                first_error: None,
+            });
+        }
+        let reason = self.close_all.as_ref().unwrap().reason;
+        let mut closed = self.close_all.as_ref().unwrap().closed;
+        let mut first_error = self.close_all.as_ref().unwrap().first_error.clone();
+
+        // Sweep until a full pass makes no progress: every current leaf is
+        // begun, every Closing resource is polled, and both repeat until the
+        // state stabilizes. Genuinely-Pending resources stay in `Closing` and
+        // are re-polled on a later `poll_close_all` call with the real waker.
+        let mut progressed = true;
+        while progressed {
+            progressed = false;
             let mut leaf_indices = self.open_leaf_indices();
             leaf_indices.sort_unstable();
             for slot_index in leaf_indices {
@@ -281,18 +364,54 @@ impl ResourceTable {
                 progressed |=
                     self.try_begin_close(slot_index, reason, &mut closed, &mut first_error);
             }
-            // Phase 2: drive every Closing resource forward.
             let closing_indices = self.closing_indices();
             for slot_index in closing_indices {
-                progressed |= self.try_poll_close(slot_index, &mut closed, &mut first_error);
-            }
-            if !progressed {
-                break;
+                progressed |= self.try_poll_close(slot_index, cx, &mut closed, &mut first_error);
             }
         }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(closed),
+
+        // Persist cumulative progress across Pending polls.
+        let state = self.close_all.as_mut().unwrap();
+        state.closed = closed;
+        state.first_error = first_error;
+
+        if self.is_empty() {
+            // Quiescent: this, and only this, warrants a Ready completion.
+            let state = self.close_all.take().unwrap();
+            match state.first_error {
+                Some(error) => Poll::Ready(Err(error)),
+                None => Poll::Ready(Ok(state.closed)),
+            }
+        } else {
+            Poll::Pending
+        }
+    }
+
+    /// Best-effort synchronous child-first close of every live resource.
+    ///
+    /// Drives a single [`poll_close_all`](ResourceTable::poll_close_all) sweep
+    /// with a no-op waker and returns only once the table is quiescent:
+    /// - `Ready(Ok(n))` is reported exactly when [`len`](ResourceTable::len)
+    ///   reached zero and every close succeeded;
+    /// - `Ready(Err(_))` is reported when every resource finished but the first
+    ///   cleanup failed;
+    /// - [`ResourceErrorCode::ResourceClosePending`] is returned (never success)
+    ///   when at least one resource remains pending at the end of the single
+    ///   no-op sweep, because such a resource needs an external waker that a
+    ///   synchronous no-op driver cannot provide.
+    ///
+    /// For genuinely event-driven resources use
+    /// [`poll_close_all`](ResourceTable::poll_close_all) so their waker is
+    /// honored.
+    pub fn close_all(&mut self, reason: ResourceCloseReason) -> ResourceResult<usize> {
+        let mut cx = noop_context();
+        match self.poll_close_all(reason, &mut cx) {
+            Poll::Ready(result) => result,
+            Poll::Pending => Err(ResourceError::new(
+                ResourceErrorCode::ResourceClosePending,
+                "resource::close_all",
+                "synchronous close-all cannot drive pending resources to quiescence",
+            )),
         }
     }
 
@@ -342,6 +461,7 @@ impl ResourceTable {
     fn try_poll_close(
         &mut self,
         slot_index: usize,
+        cx: &mut Context<'_>,
         closed: &mut usize,
         first_error: &mut Option<ResourceError>,
     ) -> bool {
@@ -350,8 +470,7 @@ impl ResourceTable {
             self.slots[slot_index].state = state;
             return false;
         };
-        let mut cx = noop_context();
-        match resource.poll_close(&mut cx) {
+        match resource.poll_close(cx) {
             Poll::Ready(result) => {
                 self.reclaim(slot_index);
                 *closed += 1;
@@ -526,8 +645,13 @@ impl Default for ResourceTable {
 
 impl Drop for ResourceTable {
     fn drop(&mut self) {
-        // Last-resort synchronous sweep. In the intended flow the owning scope
-        // drives poll-based close to quiescence before dropping the table.
+        // Best-effort last-resort cleanup with a no-op waker. This performs at
+        // most one synchronous sweep; it explicitly does NOT claim quiescence.
+        // In the intended flow the owning scope drives poll-based close to
+        // quiescence via `poll_close_all` before dropping the table, so this
+        // path only catches resources whose close was never driven. Genuinely
+        // event-driven Pending resources may remain live here and are released
+        // by their own `Drop` guards.
         let _ = self.close_all(ResourceCloseReason::VmReset);
     }
 }
@@ -581,11 +705,25 @@ fn has_children_error(handle: ResourceHandle) -> ResourceError {
 
 fn not_closing_error(handle: ResourceHandle) -> ResourceError {
     ResourceError::new(
-        ResourceErrorCode::InvalidResourceHandle,
+        ResourceErrorCode::ResourceNotClosing,
         "resource::table",
         "resource is not in the closing state",
     )
     .with_value(handle.raw())
+}
+
+fn close_in_progress_error(
+    reason: ResourceCloseReason,
+    in_progress: ResourceCloseReason,
+) -> ResourceError {
+    ResourceError::new(
+        ResourceErrorCode::ResourceCloseInProgress,
+        "resource::poll_close_all",
+        format!(
+            "a close-all sweep is already in progress with reason `{in_progress}`; \
+             requested reason `{reason}` was rejected"
+        ),
+    )
 }
 
 // ---- noop waker for synchronous poll driving ---------------------------------------
@@ -595,4 +733,162 @@ fn not_closing_error(handle: ResourceHandle) -> ResourceError {
 /// this path are expected to complete without external wakeup.
 fn noop_context() -> Context<'static> {
     Context::from_waker(core::task::Waker::noop())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Poll;
+
+    const REASON: ResourceCloseReason = ResourceCloseReason::ResourceClosed;
+
+    /// A resource that counts synchronous closes.
+    struct UnitRes(Arc<AtomicUsize>);
+
+    impl UnitRes {
+        fn new() -> (Self, Arc<AtomicUsize>) {
+            let closes = Arc::new(AtomicUsize::new(0));
+            (Self(closes.clone()), closes)
+        }
+    }
+
+    impl HostResource for UnitRes {
+        fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(CloseProgress::Ready)
+        }
+    }
+
+    /// A distinct inert type used to mint a mismatched `Resource<Other>`.
+    struct OtherRes;
+
+    impl HostResource for OtherRes {}
+
+    fn poll_err(poll: Poll<ResourceResult<()>>) -> ResourceErrorCode {
+        match poll {
+            Poll::Ready(Err(error)) => error.code(),
+            other => panic!("expected Ready(Err), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_recovery_with_crate_private_resource_constructor_is_consistent() {
+        let mut table = ResourceTable::new();
+        let (res, closes) = UnitRes::new();
+        let token = table.push(res).unwrap();
+
+        // Public validated recovery returns an equivalent token.
+        let recovered = table.typed::<UnitRes>(token.handle()).expect("recovery");
+        assert_eq!(recovered.handle(), token.handle());
+        table.get(&recovered).expect("recovered token borrows");
+
+        // The crate-private constructor is only reachable inside this crate,
+        // and `typed` is the checked path; constructing a mismatched token here
+        // is exactly what unit tests may do to exercise rejection logic.
+        let wrong: Resource<OtherRes> = Resource::from_handle(token.handle());
+        assert_eq!(
+            table.get(&wrong).unwrap_err().code(),
+            ResourceErrorCode::ResourceTypeMismatch
+        );
+        assert_eq!(
+            table.get_mut(&wrong).unwrap_err().code(),
+            ResourceErrorCode::ResourceTypeMismatch
+        );
+        assert_eq!(table.len(), 1);
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
+        table.get(&token).expect("real token unaffected");
+    }
+
+    #[test]
+    fn begin_close_rejects_mismatched_type_without_firing_close() {
+        let mut table = ResourceTable::new();
+        let (res, closes) = UnitRes::new();
+        let token = table.push(res).unwrap();
+        let wrong: Resource<OtherRes> = Resource::from_handle(token.handle());
+
+        assert_eq!(
+            table.begin_close(wrong, REASON).unwrap_err().code(),
+            ResourceErrorCode::ResourceTypeMismatch
+        );
+        assert_eq!(table.len(), 1);
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
+
+        // The real token still closes exactly once.
+        assert_eq!(
+            table.begin_close(token, REASON).unwrap(),
+            CloseProgress::Ready
+        );
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn poll_close_distinguishes_not_closing_vacant_and_mismatched_type() {
+        let mut table = ResourceTable::new();
+        let (res, _) = UnitRes::new();
+        let token = table.push(res).unwrap();
+        let handle = token.handle();
+        let mut cx = noop_context();
+
+        // Open resource must report ResourceNotClosing, not InvalidResourceHandle.
+        assert_eq!(
+            poll_err(table.poll_close(token, &mut cx)),
+            ResourceErrorCode::ResourceNotClosing
+        );
+        // And it stays open, unmutated, and fully usable.
+        assert_eq!(table.len(), 1);
+        table.get(&token).expect("still open");
+
+        // Mismatched type on poll_close -> type mismatch.
+        let wrong: Resource<OtherRes> = Resource::from_handle(handle);
+        assert_eq!(
+            poll_err(table.poll_close(wrong, &mut cx)),
+            ResourceErrorCode::ResourceTypeMismatch
+        );
+
+        // After a synchronous-close the slot is vacant at the same generation,
+        // so poll_close reports ResourceAlreadyClosed (precise, not generic).
+        assert_eq!(
+            table.begin_close(token, REASON).unwrap(),
+            CloseProgress::Ready
+        );
+        assert_eq!(
+            poll_err(table.poll_close(token, &mut cx)),
+            ResourceErrorCode::ResourceAlreadyClosed
+        );
+    }
+
+    #[test]
+    fn push_child_rejects_wrong_parent_type_and_closed_parent() {
+        let mut table = ResourceTable::new();
+        let parent = table.push(UnitRes::new().0).unwrap();
+        let wrong_parent: Resource<OtherRes> = Resource::from_handle(parent.handle());
+
+        assert_eq!(
+            table
+                .push_child(UnitRes::new().0, &wrong_parent)
+                .unwrap_err()
+                .code(),
+            ResourceErrorCode::ResourceTypeMismatch
+        );
+        // No orphan child was left behind.
+        assert_eq!(table.len(), 1);
+
+        // A closed parent (vacant slot, same generation) rejects new children.
+        let parent_handle = parent.handle();
+        assert_eq!(
+            table.begin_close(parent, REASON).unwrap(),
+            CloseProgress::Ready
+        );
+        let stale_parent: Resource<UnitRes> = Resource::from_handle(parent_handle);
+        assert_eq!(
+            table
+                .push_child(UnitRes::new().0, &stale_parent)
+                .unwrap_err()
+                .code(),
+            ResourceErrorCode::ResourceAlreadyClosed
+        );
+        assert_eq!(table.len(), 0);
+    }
 }

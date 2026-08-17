@@ -40,6 +40,14 @@ pub enum ResourceErrorCode {
     ResourceIdExhausted,
     /// Best-effort cleanup of a closing resource reported a failure.
     ResourceCleanupFailed,
+    /// `poll_close` was called on a resource that is not in the closing state.
+    ResourceNotClosing,
+    /// A close-all sweep is already in progress and a conflicting reason was
+    /// supplied; the in-flight sweep keeps its original reason.
+    ResourceCloseInProgress,
+    /// A best-effort synchronous close-all could not drive every resource to
+    /// quiescence (at least one remains pending) and so must not claim success.
+    ResourceClosePending,
 }
 
 impl ResourceErrorCode {
@@ -56,6 +64,9 @@ impl ResourceErrorCode {
             Self::ResourceHasChildren => "resource_has_children",
             Self::ResourceIdExhausted => "resource_id_exhausted",
             Self::ResourceCleanupFailed => "resource_cleanup_failed",
+            Self::ResourceNotClosing => "resource_not_closing",
+            Self::ResourceCloseInProgress => "resource_close_in_progress",
+            Self::ResourceClosePending => "resource_close_pending",
         }
     }
 }
@@ -165,6 +176,9 @@ mod tests {
             ResourceErrorCode::ResourceHasChildren,
             ResourceErrorCode::ResourceIdExhausted,
             ResourceErrorCode::ResourceCleanupFailed,
+            ResourceErrorCode::ResourceNotClosing,
+            ResourceErrorCode::ResourceCloseInProgress,
+            ResourceErrorCode::ResourceClosePending,
         ]
     }
 
@@ -207,6 +221,18 @@ mod tests {
             (
                 ResourceErrorCode::ResourceCleanupFailed,
                 "resource_cleanup_failed",
+            ),
+            (
+                ResourceErrorCode::ResourceNotClosing,
+                "resource_not_closing",
+            ),
+            (
+                ResourceErrorCode::ResourceCloseInProgress,
+                "resource_close_in_progress",
+            ),
+            (
+                ResourceErrorCode::ResourceClosePending,
+                "resource_close_pending",
             ),
         ];
         // Exhaustive: every code has exactly one stable string mapping.

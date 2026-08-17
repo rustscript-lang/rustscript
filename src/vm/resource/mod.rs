@@ -17,9 +17,11 @@
 //!   [`ResourceTable::get`] / [`ResourceTable::get_mut`], returning
 //!   [`ResourceRef`] / [`ResourceMut`], which must not outlive the call.
 //! - Close is poll-based: [`HostResource::begin_close`] issues the synchronous
-//!   cancel/close request, then [`ResourceTable::poll_close`] drives it to
-//!   completion. Stale handles and slot reuse after close are rejected by the
-//!   generation in the handle.
+//!   cancel/close request, then [`ResourceTable::poll_close`] drives a single
+//!   resource to completion and [`ResourceTable::poll_close_all`] drives the
+//!   whole table to quiescence (child first) using the caller's waker. Stale
+//!   handles and slot reuse after close are rejected by the generation in the
+//!   handle.
 
 pub mod close;
 pub mod error;

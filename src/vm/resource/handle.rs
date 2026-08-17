@@ -148,11 +148,15 @@ pub struct Resource<T> {
 }
 
 impl<T> Resource<T> {
-    /// Builds a typed token over a validated raw handle.
+    /// Builds a typed token over a validated raw handle (crate-private).
     ///
-    /// This is the reclaim path for host code that carries a raw integer token
-    /// (for example one stored inside a script value) and wants typed access.
-    pub fn from_handle(raw: ResourceHandle) -> Self {
+    /// Safe typed recovery from an arbitrary raw handle must go through
+    /// [`ResourceTable::typed`](super::table::ResourceTable::typed), which
+    /// validates the arena, slot, generation, open state, and `TypeId` before
+    /// returning a token. This unchecked constructor is intentionally not part
+    /// of the public surface so nothing can mint a `Resource<T>` over a random
+    /// handle or a mismatched `TypeId`.
+    pub(crate) fn from_handle(raw: ResourceHandle) -> Self {
         Self {
             raw,
             marker: PhantomData,

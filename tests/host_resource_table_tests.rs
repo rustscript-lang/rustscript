@@ -2,8 +2,13 @@
 //!
 //! These exercise the generic resource layer in isolation: handle encoding,
 //! arena/scope identity, slot generation, typed access, type erasure,
-//! parent/child links, stale-handle rejection, child-first close, and the
-//! close state/progress contracts. No concrete VM builtin resource is involved.
+//! validated recovery, parent/child links, stale-handle rejection, child-first
+//! close, the poll-based close-all contract, and the close state/progress
+//! errors. No concrete VM builtin resource is involved.
+//!
+//! Public host recovery from a raw handle always goes through the validated
+//! [`ResourceTable::typed`]; the unchecked `Resource::from_handle` constructor
+//! is crate-private and exercised only from unit tests inside the crate.
 
 use vm::resource::{
     CloseProgress, HostResource, Resource, ResourceCloseReason, ResourceError, ResourceErrorCode,
@@ -11,7 +16,7 @@ use vm::resource::{
 };
 use vm::{ResourceHandle, Value};
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
@@ -69,8 +74,9 @@ impl HostResource for TwoPollResource {
         Ok(CloseProgress::Pending)
     }
 
-    fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
+    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
         if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+            let _ = cx;
             Poll::Pending
         } else {
             Poll::Ready(Ok(()))
@@ -114,6 +120,81 @@ impl HostResource for CloseRecorder {
     }
 }
 
+/// Shared gate driving genuinely-async closes. While `released` is false a
+/// poll stays Pending and remembers the caller's waker, so an external event
+/// can wake/drive it; once released the close completes.
+struct GateState {
+    released: AtomicBool,
+    wakes_registered: AtomicUsize,
+    last_waker: Mutex<Option<Waker>>,
+}
+
+impl Default for GateState {
+    fn default() -> Self {
+        Self {
+            released: AtomicBool::new(false),
+            wakes_registered: AtomicUsize::new(0),
+            last_waker: Mutex::new(None),
+        }
+    }
+}
+
+/// A resource that is genuinely `Pending` until a shared gate is released.
+struct GateResource {
+    state: Arc<GateState>,
+}
+
+impl GateResource {
+    fn new() -> (Self, Arc<GateState>) {
+        let state = Arc::new(GateState::default());
+        (
+            Self {
+                state: state.clone(),
+            },
+            state,
+        )
+    }
+}
+
+impl HostResource for GateResource {
+    fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
+        Ok(CloseProgress::Pending)
+    }
+
+    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
+        if self.state.released.load(Ordering::SeqCst) {
+            Poll::Ready(Ok(()))
+        } else {
+            self.state.wakes_registered.fetch_add(1, Ordering::SeqCst);
+            *self.state.last_waker.lock().unwrap() = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+/// Child-first close order with an async (gated) child mixed in.
+struct GateRecorder {
+    state: Arc<GateState>,
+    order: Arc<Mutex<Vec<&'static str>>>,
+    name: &'static str,
+}
+
+impl HostResource for GateRecorder {
+    fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
+        self.order.lock().unwrap().push(self.name);
+        Ok(CloseProgress::Pending)
+    }
+
+    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
+        if self.state.released.load(Ordering::SeqCst) {
+            Poll::Ready(Ok(()))
+        } else {
+            *self.state.last_waker.lock().unwrap() = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
 // ---- helpers ------------------------------------------------------------------------
 
 struct NoopWake;
@@ -124,6 +205,20 @@ impl Wake for NoopWake {
 
 fn noop_waker() -> Waker {
     Waker::from(Arc::new(NoopWake))
+}
+
+/// A waker that counts every wake call (for testing caller-waker progress).
+struct LatchWake(Arc<AtomicUsize>);
+
+impl Wake for LatchWake {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn tracking_waker() -> (Waker, Arc<AtomicUsize>) {
+    let latch = Arc::new(AtomicUsize::new(0));
+    (Waker::from(Arc::new(LatchWake(latch.clone()))), latch)
 }
 
 fn require_send<T: Send>() {}
@@ -181,7 +276,7 @@ fn typed_push_get_and_mut_round_trip() {
 }
 
 #[test]
-fn handle_round_trips_through_value() {
+fn handle_round_trips_through_value_and_recovers_through_typed() {
     let mut table = ResourceTable::new();
     let (res, _, _) = CountingResource::new("f");
     let token = table.push(res).expect("push");
@@ -190,8 +285,9 @@ fn handle_round_trips_through_value() {
     let as_value = raw.as_value();
     let back = ResourceHandle::from_value(&as_value).expect("round trip");
 
-    // The decoded handle is usable through the table.
-    let token2: Resource<CountingResource> = Resource::from_handle(back);
+    // Public recovery of a raw handle is validated by `typed`.
+    let token2: Resource<CountingResource> =
+        table.typed::<CountingResource>(back).expect("recover");
     let _ = table.get(&token2).expect("reclaimed handle works");
 
     // Zero and negative tokens are invalid encodings.
@@ -210,69 +306,59 @@ fn handle_round_trips_through_value() {
 }
 
 #[test]
-fn typed_access_rejects_wrong_concrete_type() {
+fn typed_recovery_rejects_wrong_type_and_leaves_state_unchanged() {
     let mut table = ResourceTable::new();
     let (res, closes, drops) = CountingResource::new("a");
     let token = table.push(res).expect("push");
+    let handle = token.handle();
 
-    // Same raw handle, wrong type marker.
-    let wrong: Resource<RecordMarker> = Resource::from_handle(token.handle());
+    // Wrong-type validated recovery is rejected with ResourceTypeMismatch.
     assert_eq!(
-        table.get(&wrong).unwrap_err().code(),
+        table.typed::<RecordMarker>(handle).unwrap_err().code(),
         ResourceErrorCode::ResourceTypeMismatch
     );
-    assert_eq!(
-        table.get_mut(&wrong).unwrap_err().code(),
-        ResourceErrorCode::ResourceTypeMismatch
-    );
-    // Wrong-type begin_close must also be rejected without touching the
-    // resource's state transitions.
-    assert_eq!(
-        table
-            .begin_close(wrong, ResourceCloseReason::VmReset)
-            .unwrap_err()
-            .code(),
-        ResourceErrorCode::ResourceTypeMismatch
-    );
+    // The rejected recovery left the real resource fully untouched.
+    assert_eq!(table.len(), 1);
+    assert_eq!(closes.load(Ordering::SeqCst), 0);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
 
-    // The wrong-type probes left the real resource Open and untouched: the
-    // original token is still readable, unmutated, never begun-closing, and
-    // still closable.
-    assert_eq!(table.get(&token).unwrap().label, "a");
+    // The correct type still recovers and borrows.
+    let recovered: Resource<CountingResource> = table
+        .typed::<CountingResource>(handle)
+        .expect("correct type recovers");
+    assert_eq!(table.get(&recovered).unwrap().label, "a");
     assert_eq!(
         table.len(),
         1,
-        "resource must remain open after wrong-type access"
+        "a successful typed recovery must not mutate the table either"
     );
-    assert_eq!(
-        closes.load(Ordering::SeqCst),
-        0,
-        "wrong-type close must not fire the real close"
-    );
+
     drive_close(&mut table, token, ResourceCloseReason::ResourceClosed);
     assert_eq!(closes.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        drops.load(Ordering::SeqCst),
-        1,
-        "only the real close drops the value"
-    );
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
 #[test]
-fn cross_table_handle_is_rejected() {
+fn typed_recovery_rejects_foreign_arena_and_leaves_state_unchanged() {
     let mut table_a = ResourceTable::new();
-    let token = table_a.push(CountingResource::new("a").0).expect("push");
-    let stale_token = token;
+    let token_a = table_a.push(CountingResource::new("a").0).expect("push");
+    let handle_a = token_a.handle();
 
     let table_b = ResourceTable::new();
     assert_eq!(
-        table_b.get(&stale_token).unwrap_err().code(),
+        table_b
+            .typed::<CountingResource>(handle_a)
+            .unwrap_err()
+            .code(),
         ResourceErrorCode::ResourceHandleWrongTable
     );
+    // Neither table is mutated by a rejected foreign recovery.
+    assert_eq!(table_a.len(), 1);
+    assert!(table_b.is_empty());
 }
 
 #[test]
-fn stale_generation_rejects_handle_after_slot_reuse() {
+fn typed_recovery_rejects_stale_generation_after_slot_reuse() {
     let mut table = ResourceTable::with_limit(1).expect("table");
     let first = table.push(CountingResource::new("one").0).expect("push");
     let first_handle = first.handle();
@@ -292,11 +378,16 @@ fn stale_generation_rejects_handle_after_slot_reuse() {
         "generation must advance on reuse"
     );
 
-    let stale: Resource<CountingResource> = Resource::from_handle(first_handle);
+    // The stale old handle is rejected by validated recovery...
     assert_eq!(
-        table.get(&stale).unwrap_err().code(),
+        table
+            .typed::<CountingResource>(first_handle)
+            .unwrap_err()
+            .code(),
         ResourceErrorCode::ResourceStale
     );
+    // ...leaving the reused resource open and untouched.
+    assert_eq!(table.get(&second).unwrap().label, "two");
 }
 
 #[test]
@@ -331,7 +422,6 @@ fn pending_close_holds_generation_until_poll_finishes() {
     let mut table = ResourceTable::new();
     let (res, polls) = TwoPollResource::new();
     let token = table.push(res).expect("push");
-    let handle = token.handle();
 
     assert_eq!(
         table
@@ -359,13 +449,12 @@ fn pending_close_holds_generation_until_poll_finishes() {
     assert!(table.poll_close(token, &mut cx).is_ready());
     assert_eq!(table.len(), 0);
 
-    // The closed handle is rejected: the slot is vacant (and, on a reuse, the
-    // generation would additionally make it stale — covered elsewhere).
-    let closed: Resource<TwoPollResource> = Resource::from_handle(handle);
-    assert_eq!(
-        table.get(&closed).unwrap_err().code(),
-        ResourceErrorCode::ResourceAlreadyClosed
-    );
+    // A closed (vacant, same generation) slot is rejected by validated
+    // recovery as AlreadyClosed.
+    let closed = table
+        .typed::<TwoPollResource>(token.handle())
+        .expect_err("closed slot must not recover");
+    assert_eq!(closed.code(), ResourceErrorCode::ResourceAlreadyClosed);
 }
 
 #[test]
@@ -392,33 +481,33 @@ fn parent_cannot_close_while_live_children_exist() {
 }
 
 #[test]
-fn child_insert_validates_parent_type_and_liveness() {
+fn child_insert_validates_parent_handle_and_liveness() {
     let mut table = ResourceTable::new();
-    let parent: Resource<CountingResource> =
-        table.push(CountingResource::new("p").0).expect("parent");
+    let parent = table.push(CountingResource::new("p").0).expect("parent");
     let _child = table
         .push_child(CountingResource::new("c").0, &parent)
         .expect("child");
 
-    // Wrong parent type marker is rejected.
-    let wrong_parent: Resource<RecordMarker> = Resource::from_handle(parent.handle());
+    // Wrong parent type is rejected at validated recovery.
     assert_eq!(
         table
-            .push_child(CountingResource::new("orphan").0, &wrong_parent)
+            .typed::<RecordMarker>(parent.handle())
             .unwrap_err()
             .code(),
         ResourceErrorCode::ResourceTypeMismatch
     );
 
-    // A closed (but not yet vacated-slot-reused) parent cannot accept children.
+    // A closed (but not yet slot-reused) parent cannot accept new children.
     let mut table2 = ResourceTable::new();
     let gone = table2.push(CountingResource::new("gone").0).expect("push");
     drive_close(&mut table2, gone, ResourceCloseReason::ResourceClosed);
-    let gone: Resource<CountingResource> = Resource::from_handle(gone.handle());
-    let err = table2
-        .push_child(CountingResource::new("late").0, &gone)
-        .unwrap_err();
-    assert_eq!(err.code(), ResourceErrorCode::ResourceAlreadyClosed);
+    assert_eq!(
+        table2
+            .typed::<CountingResource>(gone.handle())
+            .expect_err("closed parent")
+            .code(),
+        ResourceErrorCode::ResourceAlreadyClosed
+    );
 }
 
 #[test]
@@ -492,6 +581,216 @@ fn close_all_continues_past_failures_and_reports_first() {
         table.is_empty(),
         "every resource was attempted despite a failure"
     );
+}
+
+#[test]
+fn sync_close_all_never_succeeds_while_resources_remain_pending() {
+    let mut table = ResourceTable::new();
+    table.push(GateResource::new().0).expect("gated");
+
+    // A genuinely pending resource cannot be synchronously driven with a
+    // no-op waker; close_all must not claim success.
+    let err = table.close_all(ResourceCloseReason::VmReset).unwrap_err();
+    assert_eq!(err.code(), ResourceErrorCode::ResourceClosePending);
+    assert_eq!(
+        table.len(),
+        1,
+        "the pending resource is still present (close_all did NOT succeed)"
+    );
+}
+
+#[test]
+fn poll_close_open_resource_reports_not_closing() {
+    let mut table = ResourceTable::new();
+    let token = table.push(CountingResource::new("o").0).expect("push");
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    // poll_close on an Open resource must be ResourceNotClosing, never a
+    // confusing InvalidResourceHandle.
+    let poll = table.poll_close(token, &mut cx);
+    let Poll::Ready(Err(error)) = poll else {
+        panic!("expected Ready(Err) for poll_close on an open resource");
+    };
+    assert_eq!(error.code(), ResourceErrorCode::ResourceNotClosing);
+
+    // The naive poll must leave the resource open and fully usable.
+    assert_eq!(table.len(), 1);
+    table
+        .get(&token)
+        .expect("still open after stray poll_close");
+}
+
+#[test]
+fn poll_close_all_pending_across_calls_uses_caller_waker_and_progresses() {
+    let mut table = ResourceTable::new();
+    let (gate, state) = GateResource::new();
+    let token = table.push(gate).expect("push");
+
+    let (waker, wake_latch) = tracking_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    // First call: the gate holds; everything stays live and NOT done.
+    let result = table.poll_close_all(ResourceCloseReason::VmReset, &mut cx);
+    assert!(
+        matches!(result, Poll::Pending),
+        "must not prematurely complete"
+    );
+    assert_eq!(table.len(), 1, "no premature Ok while resource remains");
+
+    // The resource captured the caller-supplied waker, so a real external
+    // event can drive it: waking that waker uses the caller's context.
+    let captured = state.last_waker.lock().unwrap().clone();
+    let captured = captured.expect("resource must register the caller waker");
+    assert!(
+        waker.will_wake(&captured),
+        "resource used the caller's waker"
+    );
+    captured.wake();
+    assert_eq!(
+        wake_latch.load(Ordering::SeqCst),
+        1,
+        "waking the captured caller waker drives progress notification"
+    );
+
+    // Release the gate; the next poll drives close to quiescence.
+    state.released.store(true, Ordering::SeqCst);
+    let Poll::Ready(result) = table.poll_close_all(ResourceCloseReason::VmReset, &mut cx) else {
+        panic!("a released gate must complete");
+    };
+    assert_eq!(result.expect("clean close"), 1, "cumulative closed count");
+    assert!(table.is_empty());
+    let _ = token;
+}
+
+#[test]
+fn poll_close_all_is_child_first_across_pending_polls() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let state = Arc::new(GateState::default());
+    let mut table = ResourceTable::new();
+
+    let root = table
+        .push(GateRecorder {
+            state: state.clone(),
+            order: order.clone(),
+            name: "root",
+        })
+        .expect("root");
+    let mid = table
+        .push_child(
+            GateRecorder {
+                state: state.clone(),
+                order: order.clone(),
+                name: "mid",
+            },
+            &root,
+        )
+        .expect("mid");
+    let _leaf = table
+        .push_child(
+            GateRecorder {
+                state: state.clone(),
+                order: order.clone(),
+                name: "leaf",
+            },
+            &mid,
+        )
+        .expect("leaf");
+
+    let (waker, _latch) = tracking_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    // First poll: only the leaf can begin (mid/root have live children), and
+    // it is genuinely pending. The parent and child remain.
+    assert!(matches!(
+        table.poll_close_all(ResourceCloseReason::VmReset, &mut cx),
+        Poll::Pending
+    ));
+    assert_eq!(table.len(), 3);
+    // Only leaf's begin_close has fired so far; parents are still waiting.
+    let order0 = order.lock().unwrap().clone();
+    assert_eq!(order0, vec!["leaf"], "leaf begins first");
+
+    // Release the gate: the leaf finishes, then mid and root close in order.
+    state.released.store(true, Ordering::SeqCst);
+    let Poll::Ready(result) = table.poll_close_all(ResourceCloseReason::VmReset, &mut cx) else {
+        panic!("released gate must complete the sweep");
+    };
+    assert_eq!(result.expect("clean close"), 3);
+
+    let order = order.lock().unwrap().clone();
+    let position = |name: &str| order.iter().position(|e| *e == name).unwrap();
+    assert!(
+        position("leaf") < position("mid") && position("mid") < position("root"),
+        "child-first order held across pending polls: {order:?}"
+    );
+    assert!(table.is_empty());
+}
+
+#[test]
+fn poll_close_all_retains_first_cleanup_error_until_all_resources_finish() {
+    let mut table = ResourceTable::new();
+    // A resource that fails synchronously on its first poll.
+    table.push(PollFailingResource).expect("failing");
+    // A genuinely pending resource behind it.
+    let (gate, state) = GateResource::new();
+    table.push(gate).expect("gated");
+
+    let (waker, _latch) = tracking_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    // First poll: the failure was recorded, but the gate is still pending, so
+    // we must NOT surface the error prematurely.
+    assert!(matches!(
+        table.poll_close_all(ResourceCloseReason::VmReset, &mut cx),
+        Poll::Pending
+    ));
+    assert_eq!(table.len(), 1, "only the pending gate remains");
+
+    // Release the gate; only now, at quiescence, is the retained error reported.
+    state.released.store(true, Ordering::SeqCst);
+    let Poll::Ready(result) = table.poll_close_all(ResourceCloseReason::VmReset, &mut cx) else {
+        panic!("released gate must finish the sweep");
+    };
+    let err = result.expect_err("first cleanup error retained until quiescence");
+    assert_eq!(err.code(), ResourceErrorCode::ResourceCleanupFailed);
+    assert!(
+        table.is_empty(),
+        "error reported exactly once all resources finished"
+    );
+    let _ = waker;
+}
+
+#[test]
+fn poll_close_all_rejects_conflicting_reason_deterministically() {
+    let mut table = ResourceTable::new();
+    let (gate, state) = GateResource::new();
+    let _token = table.push(gate).expect("push");
+    let (waker, _latch) = tracking_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    // Begin a sweep with VmReset.
+    assert!(matches!(
+        table.poll_close_all(ResourceCloseReason::VmReset, &mut cx),
+        Poll::Pending
+    ));
+
+    // A conflicting reason is rejected deterministically and leaves the
+    // in-flight sweep (and its original reason) untouched.
+    let Poll::Ready(Err(conflict)) = table.poll_close_all(ResourceCloseReason::Deadline, &mut cx)
+    else {
+        panic!("conflicting reason must be rejected");
+    };
+    assert_eq!(conflict.code(), ResourceErrorCode::ResourceCloseInProgress);
+    assert_eq!(table.len(), 1, "the in-flight sweep is untouched");
+
+    // The original reason still completes it.
+    state.released.store(true, Ordering::SeqCst);
+    let Poll::Ready(result) = table.poll_close_all(ResourceCloseReason::VmReset, &mut cx) else {
+        panic!("original reason must complete the sweep");
+    };
+    assert!(result.is_ok());
+    assert!(table.is_empty());
 }
 
 #[test]
