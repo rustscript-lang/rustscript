@@ -39,9 +39,10 @@ fn concrete_catalog() -> HostApiCatalog {
     );
     builder.function(HostFunctionSchema::new(
         "io::read_all",
-        vec![HostParamSchema::value(
+        vec![HostParamSchema::with_passing(
             "handle",
             HostTypeSchema::Resource(io_file()),
+            HostParamPassing::Borrow,
         )],
     ));
     builder.function(HostFunctionSchema::new(
@@ -110,9 +111,10 @@ fn reordered_catalog() -> HostApiCatalog {
     builder.resource(ResourceTypeSchema::new(sqlite_connection(), "db"));
     builder.function(HostFunctionSchema::new(
         "io::read_all",
-        vec![HostParamSchema::value(
+        vec![HostParamSchema::with_passing(
             "handle",
             HostTypeSchema::Resource(io_file()),
+            HostParamPassing::Borrow,
         )],
     ));
     builder.resource(ResourceTypeSchema::new(io_file(), "file"));
@@ -145,4 +147,78 @@ fn public_api_reachable_without_runtime_feature() {
         Some("io.file")
     );
     assert!(!HostParamPassing::Value.is_reference_mode());
+}
+
+#[test]
+fn len_overloads_are_supported_and_order_independent() {
+    let len_string = || {
+        HostFunctionSchema::with_return(
+            "len",
+            vec![HostParamSchema::value("value", HostTypeSchema::String)],
+            HostTypeSchema::Int,
+        )
+    };
+    let len_array = || {
+        HostFunctionSchema::with_return(
+            "len",
+            vec![HostParamSchema::value(
+                "value",
+                HostTypeSchema::Array(Box::new(HostTypeSchema::Int)),
+            )],
+            HostTypeSchema::Int,
+        )
+    };
+    let len_bytes = || {
+        HostFunctionSchema::with_return(
+            "len",
+            vec![HostParamSchema::value("value", HostTypeSchema::Bytes)],
+            HostTypeSchema::Int,
+        )
+    };
+
+    // Registration order must not affect the overloaded fingerprint.
+    let mut a = HostApiCatalog::builder();
+    a.function(len_string());
+    a.function(len_array());
+    a.function(len_bytes());
+    let catalog_a = a.build().expect("legal overloads");
+
+    let mut b = HostApiCatalog::builder();
+    b.function(len_bytes());
+    b.function(len_string());
+    b.function(len_array());
+    let catalog_b = b.build().expect("legal overloads");
+
+    assert_eq!(catalog_a.fingerprint(), catalog_b.fingerprint());
+    assert_eq!(catalog_a.functions_named("len").len(), 3);
+    assert!(
+        catalog_a.function("len").is_none(),
+        "overloaded name is ambiguous"
+    );
+
+    // An exact duplicate overload must be rejected.
+    let mut c = HostApiCatalog::builder();
+    c.function(len_string());
+    c.function(len_string());
+    assert!(
+        c.build().is_err(),
+        "exact duplicate overload must be rejected"
+    );
+}
+
+#[test]
+fn host_api_serde_rejects_hostile_json() {
+    // Value-passing a containing resource must be rejected by the validating
+    // deserializer reached through the public API.
+    let hostile = r#"{
+        "resources": [{ "key": "io.file", "description": "file" }],
+        "functions": [{
+            "name": "io::read_all",
+            "params": [{ "name": "handle", "ty": { "Resource": "io.file" }, "passing": "Value" }],
+            "return_type": "String",
+            "description": ""
+        }]
+    }"#;
+    let result: Result<HostApiCatalog, _> = serde_json::from_str(hostile);
+    assert!(result.is_err(), "Value-passing a resource must be rejected");
 }
