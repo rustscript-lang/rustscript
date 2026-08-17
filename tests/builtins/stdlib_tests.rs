@@ -14,6 +14,8 @@ fn run_rustscript_spec(path: &Path) -> Vec<Value> {
     );
 
     let mut vm = Vm::new(compiled.program);
+    #[cfg(feature = "async")]
+    super::async_test_bridge::install(&mut vm);
     loop {
         let status = vm.run().expect("spec vm should run");
         match status {

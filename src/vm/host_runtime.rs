@@ -3,14 +3,16 @@
 //! [`HostRuntime`] owns the host-facing capability surface: bound host
 //! functions and their symbol table, capability allow-lists, builtin
 //! overrides, resolved call slots, the opaque resource arena, the pending
-//! operation registry, and the IO/SQLite subsystem state plus the async
-//! bridge and print sink. Interpreter state and run budgets live outside this
-//! struct (see [`Instance`](super::instance::Instance) and
+//! operation registry, a type-erased host-function state store, the async
+//! bridge, and the print sink. Concrete IO/HTTP/SQLite state is defined and
+//! interpreted only by those host modules. Interpreter state and run budgets
+//! live outside this struct (see [`Instance`](super::instance::Instance) and
 //! [`RunContext`](super::run_context::RunContext)).
 //!
-//! The unified host-lifecycle plan migrates individual subsystems behind this
-//! shell; for now it groups their ownership and their reset/drop behavior.
+//! The VM provides lifecycle storage without depending on host-specific state
+//! types or configuration APIs.
 
+use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 
 use crate::builtins::runtime::cancellation::{
@@ -18,9 +20,8 @@ use crate::builtins::runtime::cancellation::{
 };
 use crate::builtins::runtime::resource::{DEFAULT_MAX_RESOURCES, ResourceArena};
 
-#[cfg(feature = "sqlite")]
-use crate::vm::SqlitePolicy;
-use crate::vm::host::{HostAsyncBridge, VmHostFunction};
+use crate::vm::async_host::HostAsyncBridge;
+use crate::vm::host::VmHostFunction;
 
 /// Embedder-supplied print sink for `print`/`debug` output.
 pub(crate) type RuntimePrintSink = dyn FnMut(String) + Send;
@@ -45,9 +46,9 @@ pub(crate) struct HostRuntime {
     pub(crate) resolved_calls_dirty: bool,
     pub(crate) runtime_resources: ResourceArena,
     pub(crate) runtime_operations: OperationRegistry,
-    #[cfg(feature = "sqlite")]
-    pub(crate) sqlite_policy: SqlitePolicy,
+    host_function_states: HashMap<TypeId, Box<dyn Any + Send>>,
     pub(crate) async_bridge: Option<Box<dyn HostAsyncBridge>>,
+    pub(crate) submitted_host_ops: HashSet<u64>,
     pub(crate) runtime_print_sink: Option<Box<RuntimePrintSink>>,
 }
 
@@ -71,9 +72,9 @@ impl HostRuntime {
                 .expect("default runtime resource limit should be valid"),
             runtime_operations: OperationRegistry::with_limit(DEFAULT_MAX_PENDING_OPERATIONS)
                 .expect("default runtime operation limit should be valid"),
-            #[cfg(feature = "sqlite")]
-            sqlite_policy: SqlitePolicy::default(),
+            host_function_states: HashMap::new(),
             async_bridge: None,
+            submitted_host_ops: HashSet::new(),
             runtime_print_sink: None,
         }
     }
@@ -89,6 +90,39 @@ impl HostRuntime {
         let _ = self
             .runtime_resources
             .close_all(CancellationReason::VmReset);
+        self.submitted_host_ops.clear();
+    }
+
+    pub(crate) fn set_host_function_state<T>(&mut self, state: T)
+    where
+        T: Any + Send,
+    {
+        self.host_function_states
+            .insert(TypeId::of::<T>(), Box::new(state));
+    }
+
+    pub(crate) fn host_function_state<T>(&self) -> Option<&T>
+    where
+        T: Any + Send,
+    {
+        self.host_function_states
+            .get(&TypeId::of::<T>())?
+            .downcast_ref()
+    }
+
+    pub(crate) fn remove_host_function_state<T>(&mut self) -> Option<T>
+    where
+        T: Any + Send,
+    {
+        self.host_function_states
+            .remove(&TypeId::of::<T>())?
+            .downcast::<T>()
+            .ok()
+            .map(|state| *state)
+    }
+
+    pub(crate) fn default_builtin_capabilities_enabled(&self) -> bool {
+        self.allow_default_builtin_capabilities
     }
 }
 

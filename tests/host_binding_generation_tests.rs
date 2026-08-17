@@ -6,7 +6,10 @@ use build_script::{
     HostBindingKind, HostExecutionKind, classify_host_binding, infer_host_execution,
 };
 use syn::parse_quote;
-use vm::{HostFunctionRegistry, JitConfig, JitTraceTerminal, Value, Vm, VmStatus, compile_source};
+use vm::{
+    BuiltinFunction, CapabilityProfile, HostFunctionRegistry, JitConfig, JitTraceTerminal, Value,
+    Vm, VmStatus, compile_source,
+};
 
 fn native_jit_supported() -> bool {
     (cfg!(target_arch = "x86_64")
@@ -136,6 +139,18 @@ fn infers_host_suspension_from_the_return_signature() {
         );
     }
 
+    let asynchronous = parse_quote!(
+        async fn host(value: String) -> VmResult<String> {}
+    );
+    assert_eq!(
+        infer_host_execution(&asynchronous),
+        HostExecutionKind::MaySuspend
+    );
+    assert_eq!(
+        classify_host_binding(&asynchronous),
+        HostBindingKind::StaticStack
+    );
+
     let synchronous = parse_quote!(
         fn host() -> VmResult<Value> {}
     );
@@ -230,11 +245,15 @@ fn restricted_capabilities_disable_trace_jit_for_host_imports_and_builtins() {
             hot_loop_threshold: 1,
             max_trace_len: 512,
         });
-        HostFunctionRegistry::restricted()
+        let error = HostFunctionRegistry::restricted()
             .bind_vm_cached(&mut vm)
-            .expect("restricted registry should bind program imports");
+            .expect_err("restricted registry should reject ungranted capability during preflight");
 
-        assert!(matches!(vm.run(), Err(vm::VmError::UnboundImport(_))));
+        assert!(
+            error
+                .to_string()
+                .contains("capability profile does not allow")
+        );
         assert_eq!(vm.jit_native_exec_count(), 0);
     }
 }
@@ -262,5 +281,62 @@ fn runtime_exit_still_halts_for_direct_and_cached_default_bindings() {
             VmStatus::Halted
         );
         assert!(vm.stack().is_empty());
+    }
+}
+
+#[test]
+fn capability_profile_fingerprint_uses_stable_callable_identities() {
+    let first = CapabilityProfile::builder()
+        .allow_builtin(BuiltinFunction::JsonEncode)
+        .allow_host_import("custom::echo")
+        .build();
+    let reordered = CapabilityProfile::builder()
+        .allow_host_import("custom::echo")
+        .allow_builtin(BuiltinFunction::JsonEncode)
+        .build();
+
+    assert_eq!(first, reordered);
+    assert_eq!(first.fingerprint(), reordered.fingerprint());
+    assert!(first.allows_builtin(BuiltinFunction::JsonEncode));
+    assert!(first.allows_host_import("custom::echo"));
+    assert!(!first.allows_host_import("custom::other"));
+    assert_ne!(
+        first.fingerprint(),
+        CapabilityProfile::deny_all().fingerprint()
+    );
+    assert_ne!(
+        CapabilityProfile::allow_all().fingerprint(),
+        CapabilityProfile::deny_all().fingerprint()
+    );
+}
+
+#[test]
+fn vm_host_core_does_not_name_builtin_subsystem_policies() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let host_runtime = std::fs::read_to_string(manifest.join("src/vm/host_runtime.rs"))
+        .expect("host runtime source");
+    let capability =
+        std::fs::read_to_string(manifest.join("src/vm/capability.rs")).expect("capability source");
+    let host = std::fs::read_to_string(manifest.join("src/vm/host.rs")).expect("host source");
+
+    for forbidden in [
+        "HttpState",
+        "IoPolicy",
+        "SqlitePolicy",
+        "http_state",
+        "io_policy",
+        "sqlite_policy",
+    ] {
+        assert!(
+            !host_runtime.contains(forbidden),
+            "HostRuntime leaked {forbidden}"
+        );
+        assert!(
+            !capability.contains(forbidden),
+            "CapabilityProfile leaked {forbidden}"
+        );
+    }
+    for forbidden in ["configure_http", "configure_sqlite", "http_is_configured"] {
+        assert!(!host.contains(forbidden), "Vm API leaked {forbidden}");
     }
 }

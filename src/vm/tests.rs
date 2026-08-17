@@ -1,7 +1,9 @@
-use super::host::WaitingHostOp;
+use super::async_host::WaitingHostOp;
 use super::*;
 use crate::builtins::BuiltinFunction;
 use crate::bytecode::TypeMap;
+#[cfg(feature = "sqlite")]
+use crate::{SqliteHostExt, SqlitePolicy};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -27,6 +29,7 @@ fn failed_dynamic_builtin_override_preserves_runtime_owned_pending_binding() {
     vm.ensure_call_bindings()
         .expect("default fallback should bind runtime sleep");
     let slot = vm.host.host_function_symbols["runtime::sleep"];
+    vm.host.runtime_owned_pending_host_slots.insert(slot);
     assert!(vm.host.runtime_owned_pending_host_slots.contains(&slot));
 
     vm.bind_builtin_override("runtime::sleep", Box::new(Dummy))
@@ -47,6 +50,7 @@ fn failed_static_builtin_override_preserves_runtime_owned_pending_binding() {
     vm.ensure_call_bindings()
         .expect("default fallback should bind runtime sleep");
     let slot = vm.host.host_function_symbols["runtime::sleep"];
+    vm.host.runtime_owned_pending_host_slots.insert(slot);
     assert!(vm.host.runtime_owned_pending_host_slots.contains(&slot));
 
     vm.bind_builtin_static_override("runtime::sleep", dummy)
@@ -79,6 +83,171 @@ fn reset_for_reuse_keeps_host_operation_ids_monotonic() {
     assert_eq!(vm.allocate_host_op_id(), 1);
     vm.reset_for_reuse();
     assert_eq!(vm.allocate_host_op_id(), 2);
+}
+
+#[test]
+fn async_host_future_is_submitted_to_the_host_bridge() {
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingBridge {
+        submitted: Arc<Mutex<Vec<HostOpId>>>,
+        future: Arc<Mutex<Option<HostFuture>>>,
+    }
+
+    impl HostAsyncBridge for RecordingBridge {
+        fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
+            self.submitted.lock().expect("submitted lock").push(op_id);
+            *self.future.lock().expect("future lock") = Some(future);
+            Ok(())
+        }
+
+        fn poll_op(
+            &mut self,
+            _op_id: HostOpId,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<VmResult<CallReturn>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    let submitted = Arc::new(Mutex::new(Vec::new()));
+    let future = Arc::new(Mutex::new(None));
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.set_async_bridge(Box::new(RecordingBridge {
+        submitted: Arc::clone(&submitted),
+        future: Arc::clone(&future),
+    }));
+
+    let outcome = vm
+        .submit_host_future(Box::pin(async {
+            Ok(HostFutureOutput::returning(CallReturn::one(Value::Int(42))))
+        }))
+        .expect("host bridge should accept future");
+    let CallOutcome::Pending(op_id) = outcome else {
+        panic!("async host submission should suspend");
+    };
+
+    assert_eq!(*submitted.lock().expect("submitted lock"), vec![op_id]);
+    assert!(future.lock().expect("future lock").is_some());
+    assert_eq!(vm.host.runtime_operations.active_count(), 0);
+}
+
+#[test]
+fn async_host_submission_without_driver_fails_and_retires_the_id() {
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    let error = vm
+        .submit_host_future(Box::pin(async {
+            Ok(HostFutureOutput::returning(CallReturn::none()))
+        }))
+        .expect_err("missing host async driver should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("async host function requires a host async bridge")
+    );
+    assert_eq!(vm.allocate_host_op_id(), 2);
+    assert_eq!(vm.host.runtime_operations.active_count(), 0);
+}
+
+#[test]
+fn completing_a_submitted_host_op_cancels_the_driver_future() {
+    use std::sync::{Arc, Mutex};
+
+    struct CancelRecordingBridge(Arc<Mutex<Vec<HostOpId>>>);
+
+    impl HostAsyncBridge for CancelRecordingBridge {
+        fn submit_op(&mut self, _op_id: HostOpId, _future: HostFuture) -> VmResult<()> {
+            Ok(())
+        }
+
+        fn poll_op(
+            &mut self,
+            _op_id: HostOpId,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<VmResult<CallReturn>> {
+            std::task::Poll::Pending
+        }
+
+        fn cancel_op(&mut self, op_id: HostOpId) {
+            self.0.lock().expect("cancel lock").push(op_id);
+        }
+    }
+
+    let cancelled = Arc::new(Mutex::new(Vec::new()));
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.set_async_bridge(Box::new(CancelRecordingBridge(Arc::clone(&cancelled))));
+    let CallOutcome::Pending(op_id) = vm
+        .submit_host_future(Box::pin(async {
+            Ok(HostFutureOutput::returning(CallReturn::none()))
+        }))
+        .expect("future should submit")
+    else {
+        panic!("submission should return pending");
+    };
+    vm.set_waiting_host_op(op_id)
+        .expect("submitted op should register");
+
+    vm.complete_host_op(op_id, CallReturn::none())
+        .expect("manual completion should succeed");
+
+    assert_eq!(*cancelled.lock().expect("cancel lock"), vec![op_id]);
+    assert_eq!(vm.waiting_host_op_id(), None);
+    assert_eq!(vm.host.runtime_operations.active_count(), 0);
+}
+
+#[test]
+fn failed_submitted_host_completion_clears_waiting_state() {
+    struct FailingCompletionBridge;
+
+    impl HostAsyncBridge for FailingCompletionBridge {
+        fn submit_op(&mut self, _op_id: HostOpId, _future: HostFuture) -> VmResult<()> {
+            Ok(())
+        }
+
+        fn poll_op(
+            &mut self,
+            _op_id: HostOpId,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<VmResult<CallReturn>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_submitted_op(
+            &mut self,
+            _op_id: HostOpId,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<VmResult<HostFutureOutput>> {
+            std::task::Poll::Ready(Ok(HostFutureOutput::complete(|_| {
+                Err(VmError::HostError("completion failed".to_string()))
+            })))
+        }
+    }
+
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.set_async_bridge(Box::new(FailingCompletionBridge));
+    let CallOutcome::Pending(op_id) = vm
+        .submit_host_future(Box::pin(async {
+            Ok(HostFutureOutput::returning(CallReturn::none()))
+        }))
+        .expect("future should submit")
+    else {
+        panic!("submission should return pending");
+    };
+    vm.set_waiting_host_op(op_id)
+        .expect("submitted op should register");
+    let waker = futures_util::task::noop_waker();
+    let mut context = std::task::Context::from_waker(&waker);
+
+    let result = vm.poll_waiting_host_op(&mut context);
+
+    assert!(matches!(
+        result,
+        std::task::Poll::Ready(Err(VmError::HostError(message)))
+            if message == "completion failed"
+    ));
+    assert_eq!(vm.waiting_host_op_id(), None);
+    assert_eq!(vm.host.runtime_operations.active_count(), 0);
 }
 
 #[test]
@@ -403,7 +572,7 @@ fn sqlite_reconfiguration_only_closes_sqlite_owned_state() {
         .expect("SQLite operation should start");
     sqlite_operation.set_resource(sqlite_resource);
 
-    vm.configure_sqlite(crate::vm::SqlitePolicy::default());
+    vm.configure_sqlite(SqlitePolicy::default());
 
     assert!(
         vm.host

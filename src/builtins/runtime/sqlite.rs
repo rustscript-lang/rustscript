@@ -18,10 +18,98 @@ use super::error::{RuntimeError, RuntimeErrorCode};
 use super::resource::{ResourceHandle, ResourceTypeId};
 use super::typed::{VmArrayRef, VmMapRef};
 use super::{HostCallResult, VmMap};
-use crate::vm::{CallReturn, HostOpId, SqliteLimits, Value, Vm, VmError, VmResult};
+use crate::vm::{CallReturn, HostOpId, Value, Vm, VmError, VmResult};
 
 const SQLITE_PROGRESS_STEPS: i32 = 1_000;
 const SQLITE_CLOSE_GRACE: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SqliteLimits {
+    pub max_connections: usize,
+    pub max_statements: usize,
+    pub max_rows: usize,
+    pub max_columns: usize,
+    pub max_result_bytes: usize,
+    pub max_statement_bytes: usize,
+    pub max_parameters: usize,
+    pub max_parameter_bytes: usize,
+    pub max_pending_operations: usize,
+    pub max_transaction_ms: u64,
+    pub busy_timeout_ms: u64,
+}
+
+impl Default for SqliteLimits {
+    fn default() -> Self {
+        Self {
+            max_connections: 16,
+            max_statements: 128,
+            max_rows: 1_000,
+            max_columns: 128,
+            max_result_bytes: 4 * 1024 * 1024,
+            max_statement_bytes: 1024 * 1024,
+            max_parameters: 128,
+            max_parameter_bytes: 1024 * 1024,
+            max_pending_operations: 32,
+            max_transaction_ms: 5_000,
+            busy_timeout_ms: 5_000,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SqlitePolicy {
+    pub database_root: Option<String>,
+    pub allow_unsafe_sql: bool,
+    pub limits: SqliteLimits,
+}
+
+struct SqliteHostState {
+    policy: SqlitePolicy,
+}
+
+/// SQLite host configuration owned by the SQLite host implementation.
+#[allow(dead_code)]
+pub trait SqliteHostExt {
+    fn configure_sqlite(&mut self, policy: SqlitePolicy);
+    fn clear_sqlite_configuration(&mut self);
+}
+
+impl SqliteHostExt for Vm {
+    fn configure_sqlite(&mut self, policy: SqlitePolicy) {
+        super::cancel_operations_by_owner(
+            self,
+            OperationOwner::Sqlite,
+            CancellationReason::ResourceClosed,
+        );
+        super::close_resources_by_type(
+            self,
+            ResourceTypeId::SQLITE_CONNECTION,
+            CancellationReason::ResourceClosed,
+        );
+        self.host
+            .set_host_function_state(SqliteHostState { policy });
+    }
+
+    fn clear_sqlite_configuration(&mut self) {
+        super::cancel_operations_by_owner(
+            self,
+            OperationOwner::Sqlite,
+            CancellationReason::ResourceClosed,
+        );
+        super::close_resources_by_type(
+            self,
+            ResourceTypeId::SQLITE_CONNECTION,
+            CancellationReason::ResourceClosed,
+        );
+        self.host.remove_host_function_state::<SqliteHostState>();
+    }
+}
+
+fn sqlite_policy(vm: &Vm) -> SqlitePolicy {
+    vm.host
+        .host_function_state::<SqliteHostState>()
+        .map_or_else(SqlitePolicy::default, |state| state.policy.clone())
+}
 
 /// Returns the affected-row count from a SQLite result envelope.
 #[pd_host_function(name = "sqlite::rows_affected")]
@@ -241,12 +329,8 @@ fn parse_open_options(vm: &Vm, options: &VmMap) -> VmResult<OpenOptions> {
             )));
         }
     };
-    let configured_root = vm
-        .host
-        .sqlite_policy
-        .database_root
-        .as_deref()
-        .map(PathBuf::from);
+    let policy = sqlite_policy(vm);
+    let configured_root = policy.database_root.as_deref().map(PathBuf::from);
     if let Some(requested_root) = optional_string(options, "root")? {
         let requested_root = PathBuf::from(requested_root);
         if configured_root.as_ref() != Some(&requested_root) {
@@ -260,13 +344,13 @@ fn parse_open_options(vm: &Vm, options: &VmMap) -> VmResult<OpenOptions> {
             "SQLite database root is not configured".to_string(),
         ));
     }
-    let limits = parse_limits(map_value(options, "limits"), vm.host.sqlite_policy.limits)?;
+    let limits = parse_limits(map_value(options, "limits"), policy.limits)?;
     Ok(OpenOptions {
         path,
         mode,
         root: configured_root,
         limits,
-        allow_unsafe_sql: vm.host.sqlite_policy.allow_unsafe_sql,
+        allow_unsafe_sql: policy.allow_unsafe_sql,
     })
 }
 
