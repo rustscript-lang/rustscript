@@ -20,7 +20,7 @@ use crate::builtins::runtime::cancellation::{
 };
 use crate::builtins::runtime::resource::{DEFAULT_MAX_RESOURCES, ResourceArena};
 
-use crate::vm::async_host::HostAsyncBridge;
+use crate::vm::async_host::{HostAsyncBridge, HostStreamDriver};
 use crate::vm::host::VmHostFunction;
 
 /// Embedder-supplied print sink for `print`/`debug` output.
@@ -49,6 +49,7 @@ pub(crate) struct HostRuntime {
     host_function_states: HashMap<TypeId, Box<dyn Any + Send>>,
     pub(crate) async_bridge: Option<Box<dyn HostAsyncBridge>>,
     pub(crate) submitted_host_ops: HashSet<u64>,
+    pub(crate) stream_drivers: HashMap<u64, Box<dyn HostStreamDriver>>,
     pub(crate) runtime_print_sink: Option<Box<RuntimePrintSink>>,
 }
 
@@ -75,6 +76,7 @@ impl HostRuntime {
             host_function_states: HashMap::new(),
             async_bridge: None,
             submitted_host_ops: HashSet::new(),
+            stream_drivers: HashMap::new(),
             runtime_print_sink: None,
         }
     }
@@ -91,6 +93,7 @@ impl HostRuntime {
             .runtime_resources
             .close_all(CancellationReason::VmReset);
         self.submitted_host_ops.clear();
+        self.stream_drivers.clear();
     }
 
     pub(crate) fn set_host_function_state<T>(&mut self, state: T)
@@ -108,6 +111,16 @@ impl HostRuntime {
         self.host_function_states
             .get(&TypeId::of::<T>())?
             .downcast_ref()
+    }
+
+    #[cfg(feature = "http-client")]
+    pub(crate) fn host_function_state_mut<T>(&mut self) -> Option<&mut T>
+    where
+        T: Any + Send,
+    {
+        self.host_function_states
+            .get_mut(&TypeId::of::<T>())?
+            .downcast_mut()
     }
 
     pub(crate) fn remove_host_function_state<T>(&mut self) -> Option<T>
