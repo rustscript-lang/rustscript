@@ -1,0 +1,64 @@
+pub fn f_32(a: int, b: int) -> int {
+    let t = a + b;
+    t;
+}
+
+pub fn f_33(a: int, b: int) -> int {
+    let t = a + b;
+    t;
+}
+
+pub fn f_34(a: int, b: int) -> int {
+    let t = a + b;
+    t;
+}
+
+pub fn f_35(a: int, b: int) -> int {
+    let t = a + b;
+    t;
+}
+
+pub fn f_36(a: int, b: int) -> int {
+    let t = a + b;
+    t;
+}
+
+pub fn f_37(a: int, b: int) -> int {
+    let t = a + b;
+    t;
+}
+
+pub fn f_38(a: int, b: int) -> int {
+    let t = a + b;
+    t;
+}
+
+pub fn f_39(a: int, b: int) -> int {
+    let t = a + b;
+    t;
+}
+
+pub fn f_40(a: int, b: int) -> int {
+    let t = a + b;
+    t;
+}
+
+pub fn f_41(a: int, b: int) -> int {
+    let t = a + b;
+    t;
+}
+
+pub fn f_42(a: int, b: int) -> int {
+    let t = a + b;
+    t;
+}
+
+pub fn f_43(a: int, b: int) -> int {
+    let t = a + b;
+    t;
+}
+
+pub fn f_44(a: int, b: int) -> int {
+    let t = a + b;
+    t;
+}

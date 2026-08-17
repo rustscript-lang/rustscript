@@ -144,6 +144,19 @@ pub(super) fn enforce_local_availability(
     // grows past the compat threshold, compact onto the minimal physical slot
     // set while still rejecting programs that need more than 256 simultaneous
     // locals.
+    Ok(ir)
+}
+
+/// Compact the flat local slot space onto the minimal physical slot set.
+///
+/// Kept separate from `enforce_local_availability` so callers can run the
+/// callable-materialization classification on the *pre-compaction* IR: the
+/// classifier tracks named-function values through slot flows, and merged
+/// physical slots would collapse distinct flows into one slot, producing
+/// spurious dynamic-target facts. Pre-compaction slots are the true
+/// frame-relative value identities, so the classification is strictly more
+/// precise on the unallocated IR.
+pub(crate) fn allocate_local_slots(mut ir: FrontendIr) -> Result<FrontendIr, ParseError> {
     if ir.locals > LOCAL_SLOT_ALLOCATOR_COMPAT_THRESHOLD {
         let allocator = LocalSlotAllocator::new(ir.locals, &ir.local_bindings, &ir.function_impls);
         ir = allocator.allocate(ir)?;
@@ -329,7 +342,8 @@ impl AvailabilityAnalyzer {
                             &mut out,
                             *source_slot,
                             *captured_slot,
-                            capture_mode,
+                            capture_mode.0,
+                            capture_mode.1,
                         );
                     }
                 }
@@ -419,7 +433,8 @@ impl AvailabilityAnalyzer {
                             &mut out,
                             *source_slot,
                             *captured_slot,
-                            capture_mode,
+                            capture_mode.0,
+                            capture_mode.1,
                         );
                     }
                 }
@@ -777,7 +792,8 @@ impl AvailabilityAnalyzer {
                         &mut out,
                         *source_slot,
                         *captured_slot,
-                        capture_mode,
+                        capture_mode.0,
+                        capture_mode.1,
                     );
                 }
                 Ok(out)
@@ -792,7 +808,8 @@ impl AvailabilityAnalyzer {
                         &mut out,
                         *source_slot,
                         *captured_slot,
-                        capture_mode,
+                        capture_mode.0,
+                        capture_mode.1,
                     );
                 }
                 Ok(out)

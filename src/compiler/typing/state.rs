@@ -440,5 +440,6 @@ pub(crate) struct HostCallableSignature {
     /// catalog such as edge ABI host functions. Strict-typing exemptions that
     /// are tied to a builtin identity must check this marker so a same-name
     /// function from another catalog cannot inherit them.
+    #[cfg_attr(not(feature = "runtime"), allow(dead_code))]
     pub(crate) runtime_builtin: bool,
 }
