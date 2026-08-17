@@ -35,13 +35,17 @@ pub use builtins::{
 pub use bytecode::{
     CallableEnvironment, CallableKind, CallablePrototype, CallableTarget, CallableValue,
     CaptureBindingMode, ExportedCallable, FunctionRegion, HostImport, OpCode, Program,
-    RootCallableBinding, ScriptFunction, TypeMap, Value, ValueType,
+    RootCallableBinding, ScriptFunction, TypeMap, Value, ValueType, VmMap,
 };
 pub fn builtin_call_index(name: &str) -> Option<u16> {
     use builtins::BuiltinFunction;
 
     BuiltinFunction::from_source_name(name).map(|builtin| builtin.call_index())
 }
+#[cfg(feature = "runtime")]
+pub use builtins::runtime::error::{RuntimeError, RuntimeErrorCode, RuntimeResult};
+#[cfg(feature = "runtime")]
+pub use builtins::runtime::event::{EventPayload, EventSink};
 pub use compiler::diagnostics::{
     render_compile_error, render_source_error, render_source_path_error,
 };
@@ -82,12 +86,15 @@ pub use jit::{
 pub use vm::diagnostics::render_vm_error;
 #[cfg(feature = "runtime")]
 pub use vm::{
-    AotArtifactError, CallOutcome, CallReturn, DEFAULT_MAX_SCRIPT_CALL_DEPTH, EpochCheckpoint,
-    EpochHandle, FuelCheckpoint, HostArgsFunction, HostAsyncBridge, HostBindingPlan, HostFunction,
-    HostFunctionRegistry, HostOpId, HostStackFunction, IntoScriptValue, QueuedScriptInvocation,
-    ScriptArgs, ScriptCallback, ScriptResult, StaticHostArgsFunction, StaticHostFunction,
-    StaticHostStackFunction, Store, Vm, VmError, VmResult, VmStatus, VmYieldReason,
+    AotArtifactError, CallOutcome, CallReturn, CancellationReason, DEFAULT_MAX_SCRIPT_CALL_DEPTH,
+    EpochCheckpoint, EpochHandle, FuelCheckpoint, HostArgsFunction, HostAsyncBridge,
+    HostBindingPlan, HostFunction, HostFunctionRegistry, HostOpId, HostStackFunction,
+    IntoScriptValue, QueuedScriptInvocation, ScriptArgs, ScriptCallback, ScriptResult,
+    StaticHostArgsFunction, StaticHostFunction, StaticHostStackFunction, Store, Vm, VmError,
+    VmResult, VmStatus, VmYieldReason,
 };
+#[cfg(feature = "sqlite")]
+pub use vm::{SqliteLimits, SqlitePolicy};
 #[cfg(feature = "runtime")]
 pub use vmbc::{
     DisassembleOptions, ValidationError, WireError, decode_program, disassemble_program,

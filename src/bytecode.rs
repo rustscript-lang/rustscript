@@ -80,6 +80,7 @@ pub struct ExportedCallable {
 
 #[derive(Debug)]
 pub struct CallableEnvironment {
+    #[cfg_attr(not(feature = "runtime"), allow(dead_code))]
     pub(crate) cells: std::sync::Mutex<Vec<SharedCaptureCell>>,
 }
 

@@ -9,7 +9,7 @@ RustScript bytecode format version 11 (VMBC v11) introduces runtime script call 
 - callable environments are bound through the internal builtin call path; callable creation adds no bytecode opcode.
 - `ret` completes the active script frame. A nested frame leaves exactly one result at the caller segment base, using `null` when the body produced no value. Root `ret` keeps the historical program-result stack behavior.
 
-VMBC v11 is a hard format boundary. Decoders reject all earlier versions (v10 and below) with a deterministic unsupported-version error; there is no compatibility decoder and no old-ID alias. The stream includes script-function entry ranges, callable prototypes, function regions, root callable bindings, and call indices drawn from the static builtin catalog. PDRC v6 recordings and AOT artifacts (format 7, ABI 6) use their corresponding bumped versions and include callable metadata in cache identity.
+VMBC v11 is a hard format boundary. Decoders reject all earlier versions (v10 and below) with a deterministic unsupported-version error; there is no compatibility decoder and no old-ID alias. The stream includes script-function entry ranges, callable prototypes, function regions, root callable bindings, and call indices drawn from the static builtin catalog. PDRC v6 recordings and AOT artifacts (format 7, ABI 7) use their corresponding bumped versions and include callable metadata in cache identity.
 
 ## Static builtin IDs
 

@@ -23,6 +23,66 @@ fn non_yielding_returns_bool(_: &[Value]) -> Result<CallOutcome, vm::VmError> {
     Ok(CallOutcome::Return(vm::CallReturn::one(Value::Bool(true))))
 }
 
+fn returns_registered_value(_: &[Value]) -> Result<CallOutcome, vm::VmError> {
+    Ok(CallOutcome::Return(vm::CallReturn::one(Value::Int(42))))
+}
+
+#[test]
+fn empty_registry_allows_functions_registered_by_the_embedder() {
+    let compiled =
+        compile_source("fn action() -> int; action();").expect("host call source should compile");
+    let mut registry = HostFunctionRegistry::empty();
+    registry.register_static_args("action", 0, returns_registered_value);
+    let mut vm = Vm::new(compiled.program);
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("custom registry should bind its registered import");
+
+    assert_eq!(
+        vm.run().expect("custom host call should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+}
+
+#[test]
+fn empty_registry_preserves_default_builtin_capabilities() {
+    let compiled = compile_source("use bytes; bytes::from_array_u8([1, 2, 3]);")
+        .expect("bytes source should compile");
+    let mut vm = Vm::new(compiled.program);
+    HostFunctionRegistry::empty()
+        .bind_vm_cached(&mut vm)
+        .expect("empty registry should bind builtin calls");
+
+    assert_eq!(vm.run().expect("builtin call should run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::bytes(vec![1, 2, 3])]);
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[test]
+fn restricted_builtin_capabilities_match_between_interpreter_and_aot() {
+    let source = "use bytes; bytes::from_array_u8([1, 2, 3]);";
+    let program = compile_source(source)
+        .expect("bytes source should compile")
+        .program;
+
+    let mut interpreter = Vm::new(program.clone());
+    HostFunctionRegistry::restricted()
+        .bind_vm_cached(&mut interpreter)
+        .expect("restricted registry should bind");
+    assert!(matches!(
+        interpreter.run(),
+        Err(vm::VmError::UnboundImport(_))
+    ));
+
+    let mut aot = Vm::new(program);
+    HostFunctionRegistry::restricted()
+        .bind_vm_cached(&mut aot)
+        .expect("restricted registry should bind");
+    aot.compile_aot().expect("AOT compile should succeed");
+    assert!(matches!(aot.run(), Err(vm::VmError::UnboundImport(_))));
+}
+
 #[test]
 fn non_yielding_args_return_type_contract_is_enforced_before_jit_compilation() {
     let compiled =
@@ -322,6 +382,48 @@ fn namespaced_builtin_io_call_can_be_overridden_by_host_binding() {
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Bool(false)]);
+}
+
+#[test]
+fn builtin_override_does_not_bypass_restricted_capability_profile() {
+    struct ExistsOverride;
+
+    impl HostFunction for ExistsOverride {
+        fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+            Ok(CallOutcome::Return(vec![Value::Bool(false)].into()))
+        }
+    }
+
+    let program = compile_source(
+        r#"
+        use io;
+        io::exists("request_body");
+    "#,
+    )
+    .expect("source should compile")
+    .program;
+
+    let mut denied = Vm::new(program.clone());
+    HostFunctionRegistry::restricted()
+        .bind_vm_cached(&mut denied)
+        .expect("restricted registry should bind");
+    denied.bind_function("io::exists", Box::new(ExistsOverride));
+    assert!(matches!(denied.run(), Err(vm::VmError::UnboundImport(_))));
+
+    let mut allowed_registry = HostFunctionRegistry::restricted();
+    allowed_registry
+        .allow_builtin("io::exists")
+        .expect("IO builtin should be known");
+    let mut allowed = Vm::new(program);
+    allowed_registry
+        .bind_vm_cached(&mut allowed)
+        .expect("allowlisted registry should bind");
+    allowed.bind_function("io::exists", Box::new(ExistsOverride));
+    assert_eq!(
+        allowed.run().expect("override should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(allowed.stack(), &[Value::Bool(false)]);
 }
 
 #[test]
