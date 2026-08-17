@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use crate::builtins::{BuiltinFunction, CallableParam, CallableParamType, CallableSignature};
 
 use super::super::CompileError;
@@ -223,7 +225,7 @@ fn validate_expr_matches_schema(
     )
 }
 
-fn validate_callable_expr_against_schema(
+pub(super) fn validate_callable_expr_against_schema(
     label: &str,
     expected_schema: &TypeSchema,
     expr: &Expr,
@@ -295,7 +297,131 @@ fn validate_json_schema(
     context: &mut TypeContext<'_>,
     path: &str,
 ) -> Result<(), String> {
-    match context.resolve_schema(schema) {
+    validate_json_schema_with_seen(
+        schema,
+        context,
+        path,
+        &mut HashSet::new(),
+        &mut HashMap::new(),
+    )
+}
+
+/// Maximum number of times the same named declaration may be re-entered
+/// on the active walk path before the `json::encode` compile-time walk
+/// accepts the node as a structural recursion edge. The resolver's own
+/// budget (`MAX_NAMED_SCHEMA_REENTRY`) bounds every schema it returns,
+/// but the walk re-resolves each named node it visits, so a
+/// container-wrapped recursion (`Node<T>{ child: Node<[T]> }`) would
+/// still descend one bounded tree after another forever. This budget is
+/// the walk's own hard bound for exactly that recursive family; it
+/// matches the resolver budget so the walk always stops before it could
+/// re-resolve a budget marker.
+///
+/// The budget counts repeated re-entries of the *same declaration
+/// identity* on the active walk path, so distinct declaration names never
+/// consume it: a deep non-recursive chain of distinct structs is walked
+/// in full and every unsupported field it contains is rejected with its
+/// precise path. Hitting the budget accepts the node as a structural
+/// recursion edge, per the JSON compile/runtime contract: the node's
+/// struct body is the same body already walked at every shallower level
+/// of this chain, so fixed unsupported fields (`bytes`, callables) were
+/// already rejected at the first level, and fields derived from the type
+/// argument are container-wrapped encodables. The runtime encoder
+/// remains the final gate for actual values (string keys, bytes,
+/// callables, NaN/infinity), and every runtime value of a structurally
+/// recursive type is finite.
+const MAX_JSON_SCHEMA_VALIDATION_REENTRY: usize = 32;
+
+/// Walks `schema` for `json::encode` legality. `seen` tracks the named
+/// schemas currently being expanded on the active path, so a self- or
+/// mutually-recursive struct terminates instead of re-resolving its own
+/// cycle marker one level deeper on every descent (the resolver leaves a
+/// raw `TypeSchema::Named` marker for the schema already being expanded,
+/// and re-entering that marker on the active path is the encodable cycle
+/// edge, so it is accepted). `seen` is shared across every recursion -
+/// `Array`/`Optional`/`Object`/`Map`/tuples all descend through the same
+/// set - and each name is removed on exit, so a name reused by *different*
+/// branches of the tree is still fully validated.
+///
+/// The key for a named schema is its name plus the type arguments resolved
+/// through the current context (`TypeContext::schema_cycle_key`), not the
+/// raw render of the node. A raw render would collide across generic
+/// parameter shadowing (a struct named `T` and a parameter named `T` both
+/// render `Node<T>`) and would grow without bound for wrapped re-entries
+/// of a recursive instantiation (`Node<Node<T>>` renders one nesting
+/// deeper at every level), so the walk would either short-circuit a
+/// different instantiation or never terminate. The resolved-identity key
+/// collapses wrapped re-entries into one cycle class while keeping
+/// instantiations rooted at different ancestors distinct.
+///
+/// The walk matches the raw schema instead of a whole-tree
+/// `resolve_schema`: a blanket resolution would re-expand the cycle
+/// markers inside already-resolved bodies before the guard could see them.
+/// `Named` and `GenericParam` are resolved lazily at their own level, and
+/// `Named` bodies resolve with a fresh seen so the first encounter always
+/// expands the node before its cycle edge is accepted. `reentries` is the
+/// walk's own budget (`MAX_JSON_SCHEMA_VALIDATION_REENTRY`): it counts
+/// repeated re-entries of the *same declaration identity* on the active
+/// walk path, so container-wrapped recursion is accepted at the budget
+/// while distinct declarations are always walked in full; see its
+/// documentation for the contract at the boundary.
+fn validate_json_schema_with_seen(
+    schema: &TypeSchema,
+    context: &mut TypeContext<'_>,
+    path: &str,
+    seen: &mut HashSet<String>,
+    reentries: &mut HashMap<String, usize>,
+) -> Result<(), String> {
+    match schema {
+        TypeSchema::GenericParam(name) => {
+            let resolved = context.resolve_schema(schema);
+            if resolved == *schema {
+                Err(format!(
+                    "{path} depends on generic schema parameter '{name}', which is not concrete enough for json::encode"
+                ))
+            } else {
+                validate_json_schema_with_seen(&resolved, context, path, seen, reentries)
+            }
+        }
+        TypeSchema::Named(name, _) => {
+            let reentry_count = reentries.get(name.as_str()).copied().unwrap_or(0);
+            if reentry_count >= MAX_JSON_SCHEMA_VALIDATION_REENTRY {
+                // Budget exhausted: this re-entry is a pure structural
+                // recursion edge (container-wrapped recursion has no
+                // repeating cycle key to trip the seen-set). Accept it
+                // per the contract documented on the budget constant:
+                // its body is the same struct already walked at
+                // shallower levels, so unsupported sibling fields were
+                // already rejected there, and the runtime encoder stays
+                // the final gate for values.
+                return Ok(());
+            }
+            // The cycle key is the struct name plus the type arguments
+            // resolved through the current context (see
+            // `TypeContext::schema_cycle_key`): a raw render would collide
+            // across generic-parameter shadowing and grow without bound for
+            // wrapped re-entries of the same recursive instantiation.
+            let key = context.schema_cycle_key(schema, seen);
+            if !seen.insert(key.clone()) {
+                // This named schema is already being expanded on the
+                // active path: the recursion edge itself is encodable.
+                return Ok(());
+            }
+            // Resolve the body with a fresh seen: the resolver must expand
+            // this node at least once even though its cycle key is now on
+            // the active path, or the first encounter would short-circuit
+            // as its own cycle edge.
+            reentries.insert(name.clone(), reentry_count + 1);
+            let resolved = context.resolve_schema(schema);
+            let result = validate_json_schema_with_seen(&resolved, context, path, seen, reentries);
+            seen.remove(&key);
+            if reentry_count == 0 {
+                reentries.remove(name);
+            } else {
+                reentries.insert(name.clone(), reentry_count);
+            }
+            result
+        }
         TypeSchema::Unknown => Err(format!("{path} has unknown schema")),
         TypeSchema::Null
         | TypeSchema::Int
@@ -306,43 +432,76 @@ fn validate_json_schema(
         TypeSchema::Bytes => Err(format!(
             "{path} uses bytes, which json::encode does not support"
         )),
-        TypeSchema::Optional(inner) => validate_json_schema(&inner, context, path),
-        TypeSchema::GenericParam(name) => Err(format!(
-            "{path} depends on generic schema parameter '{name}', which is not concrete enough for json::encode"
-        )),
+        TypeSchema::Optional(inner) => {
+            validate_json_schema_with_seen(inner, context, path, seen, reentries)
+        }
         TypeSchema::Callable { .. } => Err(format!(
             "{path} is callable, which json::encode does not support"
         )),
-        TypeSchema::Named(_, _) | TypeSchema::Object(_) => match context.resolve_schema(schema) {
-            TypeSchema::Object(fields) => {
-                for (field, value_schema) in &fields {
-                    let child_path = if path.is_empty() {
-                        format!("field '{field}'")
-                    } else {
-                        format!("{path}.{field}")
-                    };
-                    validate_json_schema(value_schema, context, child_path.as_str())?;
-                }
-                Ok(())
+        TypeSchema::Object(fields) => {
+            // `TypeSchema::Object` is a HashMap, so raw iteration order is
+            // per-process random. The first unsupported field decides the
+            // rejection path; walking fields in sorted name order keeps
+            // the diagnostic (and probe assertions on it) deterministic
+            // across processes and runs.
+            let mut sorted_fields: Vec<(&String, &TypeSchema)> = fields.iter().collect();
+            sorted_fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+            for (field, value_schema) in sorted_fields {
+                let child_path = if path.is_empty() {
+                    format!("field '{field}'")
+                } else {
+                    format!("{path}.{field}")
+                };
+                validate_json_schema_with_seen(
+                    value_schema,
+                    context,
+                    child_path.as_str(),
+                    seen,
+                    reentries,
+                )?;
             }
-            other => validate_json_schema(&other, context, path),
-        },
-        TypeSchema::Array(element) => validate_json_schema(&element, context, path),
+            Ok(())
+        }
+        TypeSchema::Array(element) => {
+            validate_json_schema_with_seen(element, context, path, seen, reentries)
+        }
         TypeSchema::ArrayTuple(items) => {
             for (index, item) in items.iter().enumerate() {
-                validate_json_schema(item, context, format!("{path}[{index}]").as_str())?;
+                validate_json_schema_with_seen(
+                    item,
+                    context,
+                    format!("{path}[{index}]").as_str(),
+                    seen,
+                    reentries,
+                )?;
             }
             Ok(())
         }
         TypeSchema::ArrayTupleRest { prefix, rest } => {
             for (index, item) in prefix.iter().enumerate() {
-                validate_json_schema(item, context, format!("{path}[{index}]").as_str())?;
+                validate_json_schema_with_seen(
+                    item,
+                    context,
+                    format!("{path}[{index}]").as_str(),
+                    seen,
+                    reentries,
+                )?;
             }
-            validate_json_schema(&rest, context, path)
+            validate_json_schema_with_seen(rest, context, path, seen, reentries)
         }
-        TypeSchema::Map(_) => Err(format!(
-            "{path} is a generic map; json::encode in RustScript requires object/struct-shaped data so keys are provably strings"
-        )),
+        TypeSchema::Map(inner) => {
+            // Runtime maps carry no compile-time key type, so key legality
+            // cannot be proven statically. Admit the map and defer the
+            // recursive checks: an `Unknown` inner schema means the runtime
+            // encoder's own string-key and encodable-value checks decide;
+            // a concrete inner schema is still checked statically so bytes
+            // and callable values fail at compile time when provable.
+            if matches!(inner.as_ref(), TypeSchema::Unknown) {
+                Ok(())
+            } else {
+                validate_json_schema_with_seen(inner, context, path, seen, reentries)
+            }
+        }
     }
 }
 
@@ -424,6 +583,7 @@ fn param_accepts_bound_type(expected: CallableParamType, actual: BoundType, stri
         }
         CallableParamType::Map => matches!(actual, BoundType::Map | BoundType::MapOf(_)),
         CallableParamType::Number => is_numeric_bound_type(actual),
+        CallableParamType::Callable(_) => actual == BoundType::Callable,
     }
 }
 
@@ -440,9 +600,9 @@ fn format_param_types(params: &[CallableParam]) -> String {
         .iter()
         .map(|param| {
             if param.optional {
-                format!("{}?: {}", param.name, param.ty.label())
+                format!("{}?: {}", param.name, param.ty.display_label())
             } else {
-                format!("{}: {}", param.name, param.ty.label())
+                format!("{}: {}", param.name, param.ty.display_label())
             }
         })
         .collect::<Vec<_>>()

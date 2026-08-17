@@ -11,6 +11,7 @@ use super::ir::{
     ClosureExpr, Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern, MatchTypePattern, Stmt,
     StructDecl, TypeSchema,
 };
+use super::materialization::CallableUseFacts;
 use super::{CompileError, TypingMode, typing};
 
 pub struct Compiler {
@@ -33,7 +34,21 @@ pub struct Compiler {
     frame_local_count: usize,
     function_slots: HashMap<u16, LocalSlot>,
     specialized_function_slots: Vec<(u16, Vec<TypeSchema>, LocalSlot)>,
+    /// Prototype-only specializations for direct generic calls: the same
+    /// function target as the base prototype but carrying the instantiated
+    /// concrete schema. Unlike [`Self::specialized_function_slots`] these
+    /// allocate no hidden local or root binding, so direct-only generic
+    /// calls stay slot-free.
+    specialized_direct_prototypes: Vec<(u16, Vec<TypeSchema>, u32)>,
     function_prototype_ids: HashMap<u16, u32>,
+    /// Semantic use classification for every named script function, keyed
+    /// by resolved flat function index, delivered by the pipeline. Codegen
+    /// consumes `requires_callable_slot` when counting callable slots and
+    /// assigning hidden callable locals, so direct-only functions are
+    /// lowered by `CallScript` with no hidden slot. Direct `Compiler` users
+    /// (the public API) provide no facts; absent facts conservatively mean
+    /// full materialization (legacy behavior).
+    callable_use_facts: HashMap<u16, CallableUseFacts>,
     script_functions: Vec<ScriptFunction>,
     callable_prototypes: Vec<CallablePrototype>,
     function_regions: Vec<FunctionRegion>,
@@ -82,7 +97,9 @@ impl Compiler {
             frame_local_count: 0,
             function_slots: HashMap::new(),
             specialized_function_slots: Vec::new(),
+            specialized_direct_prototypes: Vec::new(),
             function_prototype_ids: HashMap::new(),
+            callable_use_facts: HashMap::new(),
             script_functions: Vec::new(),
             callable_prototypes: Vec::new(),
             function_regions: Vec::new(),
@@ -128,6 +145,13 @@ impl Compiler {
 
     pub fn set_function_decls(&mut self, function_decls: HashMap<u16, FunctionDecl>) {
         self.function_decls = function_decls;
+    }
+
+    pub(crate) fn set_callable_use_facts(
+        &mut self,
+        callable_use_facts: HashMap<u16, CallableUseFacts>,
+    ) {
+        self.callable_use_facts = callable_use_facts;
     }
 
     pub fn set_struct_schemas(&mut self, struct_schemas: HashMap<String, StructDecl>) {
@@ -248,17 +272,53 @@ impl Compiler {
     fn prepare_named_callables(&mut self) -> Result<Vec<u16>, CompileError> {
         let mut indices = self.function_impls.keys().copied().collect::<Vec<_>>();
         indices.sort_unstable();
-        self.frame_local_count = self
-            .root_local_count
-            .checked_add(indices.len())
-            .ok_or(CompileError::LocalSlotOverflow(LocalSlot::MAX))?;
-        if self.frame_local_count > usize::from(u8::MAX) + 1 {
-            return Err(CompileError::LocalSlotOverflow(LocalSlot::MAX));
+        // Classification facts may be absent for direct `Compiler` users
+        // (the public API); the conservative default is full
+        // materialization, which is exactly the allocation performed below
+        // when no facts are present. The pipeline-delivered facts refine
+        // this decision: a function that only needs a prototype (direct
+        // calls, including non-capturing direct recursion) is lowered by
+        // `CallScript` and gets no hidden callable slot.
+        //
+        // Report the real aggregate before mutating callable metadata: data
+        // slots (compacted root frame) plus one hidden callable slot per
+        // materialized named function. A saturated add reports the
+        // saturated total rather than a fabricated slot number.
+        let data_slots = self.root_local_count;
+        let callable_slots = indices
+            .iter()
+            .filter(|index| {
+                self.callable_use_facts
+                    .get(index)
+                    .is_none_or(|facts| facts.requires_callable_slot())
+            })
+            .count();
+        let total_slots = data_slots.saturating_add(callable_slots);
+        let max_slots = usize::from(u8::MAX) + 1;
+        if total_slots > max_slots {
+            return Err(CompileError::FrameLocalLimitExceeded {
+                data_slots,
+                callable_slots,
+                total_slots,
+                max_slots,
+            });
         }
+        self.frame_local_count = total_slots;
 
+        let mut materialized_position = 0usize;
         for (position, function_index) in indices.iter().copied().enumerate() {
-            let hidden_slot = LocalSlot::try_from(self.root_local_count + position)
-                .map_err(|_| CompileError::LocalSlotOverflow(LocalSlot::MAX))?;
+            let requires_slot = self
+                .callable_use_facts
+                .get(&function_index)
+                .is_none_or(|facts| facts.requires_callable_slot());
+            let hidden_slot = if requires_slot {
+                let slot = LocalSlot::try_from(self.root_local_count + materialized_position)
+                    .map_err(|_| CompileError::LocalSlotOverflow(LocalSlot::MAX))?;
+                materialized_position += 1;
+                Some(slot)
+            } else {
+                None
+            };
             let prototype_id = self.callable_prototypes.len() as u32;
             let script_function_id = self.script_functions.len() as u32 + position as u32;
             let function_impl = self
@@ -266,7 +326,9 @@ impl Compiler {
                 .get(&function_index)
                 .expect("function index came from implementation map");
             let decl = self.function_decls.get(&function_index);
-            self.function_slots.insert(function_index, hidden_slot);
+            if let Some(hidden_slot) = hidden_slot {
+                self.function_slots.insert(function_index, hidden_slot);
+            }
             self.function_prototype_ids
                 .insert(function_index, prototype_id);
             self.callable_prototypes.push(CallablePrototype {
@@ -296,7 +358,7 @@ impl Compiler {
                         super::lifetime::function_capture_binding_mode(function_impl, *target)
                     })
                     .collect(),
-                self_slot: Some(hidden_slot),
+                self_slot: hidden_slot,
                 schema: decl.map(|decl| TypeSchema::Callable {
                     params: decl
                         .arg_schemas
@@ -306,7 +368,9 @@ impl Compiler {
                     result: Box::new(decl.return_schema.clone().unwrap_or(TypeSchema::Unknown)),
                 }),
             });
-            if function_impl.capture_copies.is_empty() {
+            if function_impl.capture_copies.is_empty()
+                && let Some(hidden_slot) = hidden_slot
+            {
                 self.root_callable_bindings.push(RootCallableBinding {
                     local_slot: hidden_slot,
                     prototype_id,
@@ -676,8 +740,8 @@ impl Compiler {
             | Expr::UnresolvedFunctionRef { .. } => {
                 return Err(CompileError::UnresolvedModuleCall);
             }
-            Expr::Call(index, _, args) => {
-                self.compile_function_call(*index, args)?;
+            Expr::Call(index, type_args, args) => {
+                self.compile_function_call(*index, type_args, args)?;
             }
             Expr::Closure(closure) => {
                 let _ = self.emit_closure_callable(closure)?;
@@ -1330,6 +1394,17 @@ impl Compiler {
         let (target_index, arity) = if let Some(builtin) = BuiltinFunction::from_call_index(index) {
             (index, builtin.arity())
         } else if let Some(decl) = self.function_decls.get(&index) {
+            if self.function_impls.contains_key(&index) {
+                // A script-function implementation reached the value domain
+                // without a materialized `function_slots` entry (a
+                // callable-use classifier miss on a direct-only function).
+                // Never synthesize a HostImport prototype for a script
+                // implementation: the frame-local budget and the script
+                // prototype were already fixed by
+                // `prepare_named_callables`, so a late slot allocation
+                // would silently corrupt the callable metadata.
+                return Err(CompileError::CallableUsedAsValue);
+            }
             (
                 self.call_index_remap.get(&index).copied().unwrap_or(index),
                 decl.args.len() as u8,
@@ -1362,6 +1437,40 @@ impl Compiler {
         } else {
             self.ensure_specialized_function_slot(index, type_args)
         }
+    }
+
+    /// Resolve (or create) the prototype-only specialization for a direct
+    /// generic call: the same script-function target as the base prototype
+    /// but carrying the instantiated concrete schema. No hidden local or
+    /// root binding is allocated, so direct-only generic calls stay
+    /// slot-free. Falls back to the base prototype when the instantiated
+    /// schema is unavailable.
+    fn ensure_direct_specialized_prototype(
+        &mut self,
+        index: u16,
+        type_args: &[TypeSchema],
+    ) -> Result<u32, CompileError> {
+        if let Some((_, _, prototype_id)) = self
+            .specialized_direct_prototypes
+            .iter()
+            .find(|(candidate, args, _)| *candidate == index && args == type_args)
+        {
+            return Ok(*prototype_id);
+        }
+        let base_prototype_id = *self
+            .function_prototype_ids
+            .get(&index)
+            .ok_or(CompileError::CallableUsedAsValue)?;
+        let Some(schema) = self.instantiated_callable_schema(index, type_args) else {
+            return Ok(base_prototype_id);
+        };
+        let mut prototype = self.callable_prototypes[base_prototype_id as usize].clone();
+        prototype.schema = Some(schema);
+        let prototype_id = self.callable_prototypes.len() as u32;
+        self.callable_prototypes.push(prototype);
+        self.specialized_direct_prototypes
+            .push((index, type_args.to_vec(), prototype_id));
+        Ok(prototype_id)
     }
 
     fn ensure_specialized_function_slot(
@@ -1477,8 +1586,49 @@ impl Compiler {
             .or_insert(hints);
     }
 
-    fn compile_function_call(&mut self, index: u16, args: &[Expr]) -> Result<(), CompileError> {
+    fn compile_function_call(
+        &mut self,
+        index: u16,
+        type_args: &[TypeSchema],
+        args: &[Expr],
+    ) -> Result<(), CompileError> {
         if self.function_impls.contains_key(&index) {
+            let direct_only = self
+                .callable_use_facts
+                .get(&index)
+                .is_some_and(|facts| !facts.requires_callable_slot());
+            if direct_only {
+                // Direct script call: evaluate the arguments and call the
+                // function's prototype without loading a hidden callable
+                // local. The prototype was pre-created for every named
+                // function in `prepare_named_callables`; a direct generic
+                // call with explicit type arguments resolves the
+                // specialized prototype carrying the instantiated schema
+                // so the runtime schema check reflects the call-site
+                // types instead of the accept-all generic base.
+                let prototype_id = if type_args.is_empty() {
+                    *self
+                        .function_prototype_ids
+                        .get(&index)
+                        .ok_or(CompileError::CallableUsedAsValue)?
+                } else {
+                    self.ensure_direct_specialized_prototype(index, type_args)?
+                };
+                let return_type = self
+                    .function_decls
+                    .get(&index)
+                    .map(|decl| decl.return_type)
+                    .unwrap_or(ValueType::Unknown);
+                for arg in args {
+                    self.compile_scalar_expr(arg)?;
+                }
+                let argc = u8::try_from(args.len()).map_err(|_| CompileError::CallArityOverflow)?;
+                if return_type != ValueType::Unknown {
+                    self.record_operand_types(ValueType::Callable, return_type);
+                }
+                self.assembler.call_script(prototype_id, argc);
+                return Ok(());
+            }
             let slot = *self
                 .function_slots
                 .get(&index)
@@ -2005,5 +2155,92 @@ fn eval_const_int_expr(expr: &Expr) -> Option<i64> {
             eval_const_int_expr(lhs)?.checked_div(rhs)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A script function classified as direct-only (script prototype
+    /// created, no hidden callable slot) reaches `ensure_function_value_slot`
+    /// through a callable-use classifier miss. The compiler must refuse
+    /// with a typed `CallableUsedAsValue` error instead of synthesizing a
+    /// host-import prototype for the script implementation.
+    #[test]
+    fn ensure_function_value_slot_rejects_script_impl_without_slot() {
+        let mut compiler = Compiler::new();
+        compiler.function_decls.insert(
+            0,
+            FunctionDecl {
+                name: "direct_only".to_string(),
+                arity: 0,
+                index: 0,
+                args: Vec::new(),
+                arg_schemas: Vec::new(),
+                return_schema: None,
+                type_params: Vec::new(),
+                exported: false,
+                return_type: ValueType::Int,
+                symbol: None,
+            },
+        );
+        compiler.function_impls.insert(
+            0,
+            FunctionImpl {
+                param_slots: Vec::new(),
+                capture_copies: Vec::new(),
+                body_stmts: Vec::new(),
+                body_expr: Expr::Null,
+                body_expr_line: 1,
+            },
+        );
+        // The pipeline classifier reports direct calls only, so
+        // `prepare_named_callables` created the script prototype but no
+        // `function_slots` entry and no root binding.
+        compiler
+            .callable_use_facts
+            .insert(0, CallableUseFacts::default());
+        compiler.function_prototype_ids.insert(0, 0);
+        compiler.callable_prototypes.push(CallablePrototype {
+            kind: CallableKind::FunctionItem,
+            target: CallableTarget::ScriptFunction(0),
+            arity: 0,
+            frame_local_count: 0,
+            parameter_slots: Vec::new(),
+            capture_source_slots: Vec::new(),
+            capture_slots: Vec::new(),
+            capture_modes: Vec::new(),
+            self_slot: None,
+            schema: None,
+        });
+
+        let prototypes = compiler.callable_prototypes.len();
+        let bindings = compiler.root_callable_bindings.len();
+        let frame_local_count = compiler.frame_local_count;
+
+        let result = compiler.ensure_function_value_slot(0, &[]);
+        assert!(
+            matches!(result, Err(CompileError::CallableUsedAsValue)),
+            "classifier-miss value use must be a typed compile error, got {result:?}"
+        );
+        assert_eq!(
+            compiler.callable_prototypes.len(),
+            prototypes,
+            "no host-import prototype may be synthesized for a script implementation"
+        );
+        assert_eq!(
+            compiler.root_callable_bindings.len(),
+            bindings,
+            "no root callable binding may be allocated"
+        );
+        assert!(
+            !compiler.function_slots.contains_key(&0),
+            "no hidden callable slot may be allocated"
+        );
+        assert_eq!(
+            compiler.frame_local_count, frame_local_count,
+            "the frame local count must stay unchanged across the typed rejection"
+        );
     }
 }

@@ -1,5 +1,7 @@
 #![allow(unused_imports)]
 
+use std::path::{Path, PathBuf};
+
 pub use vm::{
     Assembler, BytecodeBuilder, CallOutcome, CapabilityProfile, CompileSourceFileOptions, Compiler,
     Expr, HostArgsFunction, HostFunction, HostFunctionRegistry, Program, SourceFlavor,
@@ -131,6 +133,7 @@ pub enum CompileErrorKind {
     CallableUsedAsValue,
     NonCallableLocal,
     LocalSlotOverflow,
+    FrameLocalLimitExceeded,
     CallableArityMismatch,
     BreakOutsideLoop,
     ContinueOutsideLoop,
@@ -167,6 +170,9 @@ fn compile_error_kind(err: &vm::CompileError) -> CompileErrorKind {
         vm::CompileError::CallableUsedAsValue => CompileErrorKind::CallableUsedAsValue,
         vm::CompileError::NonCallableLocal(_) => CompileErrorKind::NonCallableLocal,
         vm::CompileError::LocalSlotOverflow(_) => CompileErrorKind::LocalSlotOverflow,
+        vm::CompileError::FrameLocalLimitExceeded { .. } => {
+            CompileErrorKind::FrameLocalLimitExceeded
+        }
         vm::CompileError::CallableArityMismatch { .. } => CompileErrorKind::CallableArityMismatch,
         vm::CompileError::BreakOutsideLoop => CompileErrorKind::BreakOutsideLoop,
         vm::CompileError::ContinueOutsideLoop => CompileErrorKind::ContinueOutsideLoop,
@@ -394,6 +400,44 @@ pub fn make_runtime_sleep() -> Box<dyn HostFunction> {
     Box::new(RuntimeSleep)
 }
 
+/// Panic-safe temporary module root for module-override tests.
+///
+/// The root is canonicalized so module identities and diagnostic paths match
+/// under symlinked temp directories, and the directory is removed on drop
+/// even when a test panics mid-way.
+pub struct TempModuleRoot {
+    root: PathBuf,
+}
+
+impl TempModuleRoot {
+    pub fn new(prefix: &str) -> Self {
+        let unique = format!(
+            "{prefix}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&root).expect("temp module root should be created");
+        // Module identities are canonical for existing files; keep the root
+        // canonical too so paths match under symlinked temp directories.
+        let root = root.canonicalize().unwrap_or(root);
+        Self { root }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+}
+
+impl Drop for TempModuleRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
 #[test]
 fn common_helpers_are_referenced() {
     let _runtime_case = RuntimeCase {
@@ -416,6 +460,10 @@ fn common_helpers_are_referenced() {
         expected_kind: SourceErrorKind::Parse,
         expected_contains_all: &[],
     };
+    // Constructing a real root exercises the panic-safe guard: it is created
+    // under the test temp dir and removed again on drop.
+    let _temp_root = TempModuleRoot::new("common_helpers_are_referenced");
+    let _ = _temp_root.path();
     let _host_binding = HostBindingCase {
         name: "x",
         factory: make_add_one,

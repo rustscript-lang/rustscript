@@ -765,7 +765,8 @@ fn named_function_recursion_uses_runtime_frames_and_hits_depth_limit() {
         compiled
             .program
             .code
-            .contains(&(vm::OpCode::CallValue as u8))
+            .contains(&(vm::OpCode::CallScript as u8)),
+        "non-capturing direct recursion lowers through CallScript"
     );
     assert_eq!(compiled.program.script_functions.len(), 1);
 
@@ -799,16 +800,16 @@ fn repeated_named_calls_share_one_emitted_body() {
         1
     );
     let mut ip = 0usize;
-    let mut callvalue_count = 0usize;
+    let mut callscript_count = 0usize;
     while ip < compiled.program.code.len() {
         let opcode = vm::OpCode::try_from(compiled.program.code[ip])
             .expect("compiler should emit valid opcodes");
-        if opcode == vm::OpCode::CallValue {
-            callvalue_count += 1;
+        if opcode == vm::OpCode::CallScript {
+            callscript_count += 1;
         }
         ip += 1 + opcode.operand_len();
     }
-    assert_eq!(callvalue_count, 3);
+    assert_eq!(callscript_count, 3);
 
     let mut runtime = vm::Vm::new(compiled.program.with_local_count(compiled.locals));
     assert_eq!(
@@ -1087,6 +1088,323 @@ fn rustscript_closure_value_parse_rejection_cases_work() {
     for case in &cases {
         expect_parse_error_case(case);
     }
+}
+
+#[test]
+fn closure_mut_capture_updates_outer_local() {
+    let case = rustscript_runtime_case(
+        "closure mutation capture updates outer local",
+        r#"
+            let mut state: string = "";
+            let sink = |delta| if true => {
+                state = state + delta;
+                { action: "continue" }
+            } else => {
+                { action: "skip" }
+            };
+            let _ = sink("a");
+            state;
+        "#,
+        vec![Value::string("a")],
+    );
+    run_runtime_case(&case);
+}
+
+#[test]
+fn closure_mut_capture_survives_multiple_calls() {
+    let case = rustscript_runtime_case(
+        "closure mutation capture survives multiple calls",
+        r#"
+            let mut state: string = "";
+            let sink = |delta| if true => {
+                state = state + delta;
+                { action: "continue" }
+            } else => {
+                { action: "skip" }
+            };
+            let _ = sink("a");
+            let _ = sink("b");
+            let _ = sink("c");
+            state;
+        "#,
+        vec![Value::string("abc")],
+    );
+    run_runtime_case(&case);
+}
+
+#[test]
+fn closure_mut_capture_is_visible_after_callback_returns() {
+    let case = rustscript_runtime_case(
+        "closure mutation capture visible after callback returns",
+        r#"
+            fn invoke(cb, x) {
+                let _ = cb(x);
+                null
+            }
+            let mut state: string = "";
+            let sink = |delta| if true => {
+                state = state + delta;
+                { action: "continue" }
+            } else => {
+                { action: "skip" }
+            };
+            invoke(sink, "a");
+            invoke(sink, "b");
+            state;
+        "#,
+        vec![Value::Null, Value::Null, Value::string("ab")],
+    );
+    run_runtime_case(&case);
+}
+
+#[test]
+fn closure_mut_capture_two_closures_share_one_cell() {
+    let case = rustscript_runtime_case(
+        "two closures mutating one captured local observe one value",
+        r#"
+            let mut state: string = "";
+            let first = |delta| if true => {
+                state = state + delta;
+                { action: "continue" }
+            } else => {
+                { action: "skip" }
+            };
+            let second = |delta| if true => {
+                state = state + delta;
+                { action: "continue" }
+            } else => {
+                { action: "skip" }
+            };
+            let _ = first("x");
+            let _ = second("y");
+            state;
+        "#,
+        vec![Value::string("xy")],
+    );
+    run_runtime_case(&case);
+}
+
+#[test]
+fn closure_copy_capture_keeps_source_reusable() {
+    let case = rustscript_runtime_case(
+        "closure copy capture keeps source reusable",
+        r#"
+            let a = "x";
+            let f = |d| d + a.copy();
+            let d = a;
+            f(d);
+        "#,
+        vec![Value::string("xx")],
+    );
+    run_runtime_case(&case);
+}
+
+#[test]
+fn closure_by_value_move_still_rejects_later_outer_use() {
+    let case = ParseErrorCase {
+        name: "closure by-value capture of movable local rejects later outer use",
+        source: r#"
+            let a = "";
+            let f = |d| d + a;
+            let _ = f("x");
+            a;
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_contains_all: &["local 'a'", "moved"],
+    };
+    expect_parse_error_case(&case);
+}
+
+#[test]
+fn closure_mut_capture_from_immutable_source_is_rejected() {
+    let case = ParseErrorCase {
+        name: "closure mutation capture from immutable source is rejected",
+        source: r#"
+            let state: string = "";
+            let sink = |delta| if true => {
+                state = state + delta;
+                { action: "continue" }
+            } else => {
+                { action: "skip" }
+            };
+            let _ = sink("a");
+            state;
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_contains_all: &["immutable local 'state'"],
+    };
+    expect_parse_error_case(&case);
+}
+
+#[test]
+fn closure_mut_capture_compound_add_assign_updates_outer_local() {
+    let case = rustscript_runtime_case(
+        "closure `+=` on captured local updates outer local",
+        r#"
+            let mut state: int = 0;
+            let bump = |delta| if true => {
+                state += delta;
+                { action: "continue" }
+            } else => {
+                { action: "skip" }
+            };
+            let _ = bump(1);
+            let _ = bump(2);
+            state;
+        "#,
+        vec![Value::Int(3)],
+    );
+    run_runtime_case(&case);
+}
+
+#[test]
+fn closure_write_only_capture_assignment_overwrites_outer_local() {
+    let case = rustscript_runtime_case(
+        "closure write-only capture assignment (RHS does not read the slot) overwrites outer local",
+        r#"
+            let mut state: string = "initial";
+            let reset = |value| if true => {
+                state = value;
+                { action: "continue" }
+            } else => {
+                { action: "skip" }
+            };
+            let _ = reset("after");
+            state;
+        "#,
+        vec![Value::string("after")],
+    );
+    run_runtime_case(&case);
+}
+
+#[test]
+fn closure_mut_capture_compound_and_write_only_modes_stay_shared() {
+    for (name, source) in [
+        (
+            "compound `+=` capture is shared-mutable, not a move",
+            r#"
+                let mut state: int = 0;
+                let bump = |delta| if true => {
+                    state += delta;
+                    null
+                } else => {
+                    null
+                };
+                let _ = bump(1);
+                state;
+            "#,
+        ),
+        (
+            "write-only `=` capture is shared-mutable, not a move",
+            r#"
+                let mut state: string = "initial";
+                let reset = |value| if true => {
+                    state = value;
+                    null
+                } else => {
+                    null
+                };
+                let _ = reset("after");
+                state;
+            "#,
+        ),
+    ] {
+        let compiled = vm::compile_source_with_flavor(source, SourceFlavor::RustScript)
+            .unwrap_or_else(|err| panic!("{name} should compile: {err}"));
+        let prototype = compiled
+            .program
+            .callable_prototypes
+            .iter()
+            .find(|prototype| {
+                prototype.kind == vm::CallableKind::Closure
+                    && prototype
+                        .capture_modes
+                        .contains(&vm::CaptureBindingMode::BorrowMut)
+            })
+            .unwrap_or_else(|| panic!("{name} should carry a BorrowMut capture"));
+        assert!(
+            prototype
+                .capture_modes
+                .iter()
+                .all(|mode| *mode != vm::CaptureBindingMode::Move),
+            "{name} must not be classified as a move"
+        );
+    }
+}
+
+#[test]
+fn closure_mut_capture_cell_is_fresh_after_vm_reset() {
+    // A re-run of the same program on the same VM starts from a fresh
+    // capture cell: the second run never reads the previous run's cell
+    // value.
+    let compiled = vm::compile_source_with_flavor(
+        r#"
+            let mut state: string = "";
+            let sink = |delta| if true => {
+                state = state + delta;
+                { action: "continue" }
+            } else => {
+                { action: "skip" }
+            };
+            let _ = sink("a");
+            let _ = sink("b");
+            state;
+        "#,
+        SourceFlavor::RustScript,
+    )
+    .expect("mutable capture source should compile");
+    let mut vm = Vm::new(compiled.program);
+    assert_eq!(vm.run().expect("first run should halt"), VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[Value::string("ab")],
+        "first run should accumulate both deltas in the shared cell"
+    );
+
+    // Reset must close the run-scoped capture state: the operand stack
+    // empties and the cell-backed local slot returns to Null.
+    vm.reset_for_reuse();
+    assert!(
+        vm.stack().is_empty(),
+        "reset should clear the operand stack"
+    );
+    assert!(
+        vm.locals().iter().all(|local| *local == Value::Null),
+        "reset should clear every local slot, including the cell-backed one"
+    );
+
+    // The second run starts from a fresh cell: accumulating the same two
+    // deltas yields exactly "ab", not a value derived from the first run's
+    // cell contents.
+    assert_eq!(vm.run().expect("second run should halt"), VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[Value::string("ab")],
+        "a re-run must not read the previous run's capture cell value"
+    );
+}
+
+#[test]
+fn closure_explicit_move_then_use_inside_body_is_rejected() {
+    let case = ParseErrorCase {
+        name: "closure explicit move inside body rejects later use of captured local",
+        source: r#"
+            let a = "";
+            let f = |d| if true => {
+                let y = a;
+                let z = a;
+                y + z
+            } else => {
+                ""
+            };
+            let _ = f("x");
+        "#,
+        flavor: SourceFlavor::RustScript,
+        // The captured slot is an unnamed hidden local (`#N`), so the moved
+        // local is reported by its generated name.
+        expected_contains_all: &["local '#", "moved"],
+    };
+    expect_parse_error_case(&case);
 }
 
 #[test]
@@ -3635,6 +3953,46 @@ fn rustscript_explicit_optional_type_annotations_work() {
             expected_contains_all: &["callable body result expects 'int'", "got bool"],
         },
         SourceErrorCase {
+            name: "typed host callable parameters reject wrong closure arity",
+            source: r#"
+                fn stream(handler: fn(map) -> map) -> map;
+                stream(|value, extra| value);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::CallableArgumentTypeMismatch),
+            expected_contains_all: &[
+                "argument 'handler'",
+                "fn(map<unknown>) -> map<unknown>",
+                "takes 2 parameters",
+            ],
+        },
+        SourceErrorCase {
+            name: "typed host callable parameters reject wrong closure parameter type",
+            source: r#"
+                fn stream(handler: fn(map) -> map) -> map;
+                fn handle(value: int) -> map { { action: "continue" } }
+                stream(handle);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::CallableArgumentTypeMismatch),
+            expected_contains_all: &[
+                "argument 'handler' type mismatch",
+                "arg[0]",
+                "map<unknown>",
+                "int",
+            ],
+        },
+        SourceErrorCase {
+            name: "typed host callable parameters reject wrong closure return type",
+            source: r#"
+                fn stream(handler: fn(map) -> map) -> map;
+                stream(|value| 1);
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::CallableArgumentTypeMismatch),
+            expected_contains_all: &["callable body result type mismatch", "map<unknown>", "int"],
+        },
+        SourceErrorCase {
             name: "json encode rejects bytes under strict rustscript typing",
             source: r#"
                 use json;
@@ -3830,4 +4188,1346 @@ fn rustscript_strict_stream_emit_accepts_any_payload() {
         "#,
     )
     .expect("strict stream::emit with any payloads must compile");
+}
+
+#[test]
+fn tail_expression_if_collects_annotated_literal_local() {
+    // Port of the `letif_a.rss` provider repro: an annotated `let` declared
+    // inside a block used by a tail-position expression-if must be collected
+    // with the branch's refined state so strict slot validation sees a
+    // concrete compile-time type.
+    run_runtime_cases(&[rustscript_runtime_case(
+        "annotated literal local in tail expression-if else branch",
+        r#"
+            fn pick(model: string) -> string {
+                if model == "" => {
+                    "empty"
+                } else => {
+                    let body_text: string = "literal";
+                    body_text
+                }
+            }
+
+            pick("x");
+        "#,
+        vec![Value::string("literal")],
+    )]);
+}
+
+#[test]
+fn tail_expression_if_collects_json_encode_local() {
+    run_runtime_cases(&[rustscript_runtime_case(
+        "annotated json::encode local in tail expression-if branch",
+        r#"
+            use json;
+
+            fn pick(model: string) -> string {
+                if model == "" => {
+                    ""
+                } else => {
+                    let encoded: string = json::encode({ text: "literal" });
+                    encoded
+                }
+            }
+
+            pick("x");
+        "#,
+        vec![Value::string("{\"text\":\"literal\"}")],
+    )]);
+}
+
+#[test]
+fn tail_expression_if_collects_module_call_local() {
+    // Port of the `tailif_root.rss` / `tailif_m2.rss` repro: a local bound to
+    // a module call inside a tail expression-if branch must resolve to the
+    // module function's declared return schema. The temp root is canonicalized
+    // and panic-safe: it is removed on drop even when a later assertion
+    // panics, so no cleanup call is needed on any path.
+    let root = TempModuleRoot::new("a3_b2_tailif_module");
+
+    let main_path = root.path().join("main.rss");
+    std::fs::write(
+        &main_path,
+        r#"
+            use self::m2 as adapter;
+            adapter::call("other");
+        "#,
+    )
+    .expect("main source should write");
+
+    let options = CompileSourceFileOptions::new().with_module_override_source(
+        "m2.rss",
+        r#"
+            pub fn call(request: string) -> string {
+                if request == "hello" => {
+                    "matched"
+                } else => {
+                    let transformed: string = inner(request);
+                    transformed
+                }
+            }
+
+            fn inner(value: string) -> string {
+                value + "!"
+            }
+        "#,
+    );
+
+    let compiled = compile_source_file_with_options(&main_path, options)
+        .expect("tail expression-if module-call local should compile");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("other!")]);
+}
+
+#[test]
+fn tail_expression_if_branch_local_does_not_leak_to_sibling_branch() {
+    // A local declared inside one tail expression-if branch must not be
+    // visible in the sibling branch: the then branch sees `body_text` as
+    // unknown and the parser rejects the reference.
+    let case = SourceErrorCase {
+        name: "tail if branch local does not leak into sibling branch",
+        source: r#"
+            fn pick(model: string) -> string {
+                if model == "" => {
+                    body_text
+                } else => {
+                    let body_text: string = "literal";
+                    body_text
+                }
+            }
+
+            pick("x");
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_kind: SourceErrorKind::Parse,
+        expected_contains_all: &["unknown local 'body_text'"],
+    };
+    expect_source_error_case(&case);
+}
+
+#[test]
+fn tail_expression_if_branch_local_is_unavailable_after_branch() {
+    // A local declared inside an expression-if branch stays branch-scoped:
+    // using it after the branch is rejected as possibly-unavailable on the
+    // other control-flow path.
+    let case = SourceErrorCase {
+        name: "tail if branch local is unavailable after the branch",
+        source: r#"
+            fn pick(model: string) -> string {
+                if model == "" => {
+                    "empty"
+                } else => {
+                    let body_text: string = "literal";
+                    body_text
+                };
+                body_text
+            }
+
+            pick("x");
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_kind: SourceErrorKind::Parse,
+        expected_contains_all: &["local 'body_text'", "may be unavailable"],
+    };
+    expect_source_error_case(&case);
+}
+
+#[test]
+fn tail_expression_if_rejects_incompatible_branch_results() {
+    // Incompatible tail branch results must still be rejected even though
+    // branch collection is now state-refined.
+    let case = SourceErrorCase {
+        name: "tail if rejects incompatible branch result types",
+        source: r#"
+            fn pick(model: string) -> string {
+                if model == "" => {
+                    1
+                } else => {
+                    "literal"
+                }
+            }
+
+            pick("x");
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_kind: SourceErrorKind::Compile(CompileErrorKind::IfElseBranchTypeMismatch),
+        expected_contains_all: &["incompatible expression result", "int vs string"],
+    };
+    expect_source_error_case(&case);
+}
+
+#[test]
+fn tail_expression_if_unknown_annotation_keeps_strict_diagnostic() {
+    // A genuinely unknown declaration inside a tail expression-if branch must
+    // keep the strict typing diagnostic: the branch-state refinement must not
+    // turn `unknown` annotations into concrete types.
+    let case = SourceErrorCase {
+        name: "tail if unknown annotation keeps strict typing diagnostic",
+        source: r#"
+            fn pick(model: string) -> string {
+                if model == "" => {
+                    "empty"
+                } else => {
+                    let body_text: unknown = "literal";
+                    body_text
+                }
+            }
+
+            pick("x");
+        "#,
+        flavor: SourceFlavor::RustScript,
+        expected_kind: SourceErrorKind::Parse,
+        expected_contains_all: &[
+            "concrete compile-time types",
+            "'unknown' annotations are not allowed",
+        ],
+    };
+    expect_source_error_case(&case);
+}
+
+#[test]
+fn non_tail_expression_if_annotated_local_control() {
+    // Control: an annotated local inside a non-tail expression-if branch.
+    run_runtime_cases(&[rustscript_runtime_case(
+        "annotated literal local in non-tail expression-if branch",
+        r#"
+            fn pick(model: string) -> string {
+                let label: string = if model == "" => {
+                    "empty"
+                } else => {
+                    let body_text: string = "literal";
+                    body_text
+                };
+                label + "!"
+            }
+
+            pick("x");
+        "#,
+        vec![Value::string("literal!")],
+    )]);
+}
+
+#[test]
+fn tail_expression_if_unannotated_local_control() {
+    // Control: an unannotated local in a tail expression-if branch executes
+    // to the same value as the annotated form.
+    run_runtime_cases(&[rustscript_runtime_case(
+        "unannotated literal local in tail expression-if else branch",
+        r#"
+            fn pick(model: string) -> string {
+                if model == "" => {
+                    "empty"
+                } else => {
+                    let body_text = "literal";
+                    body_text
+                }
+            }
+
+            pick("x");
+        "#,
+        vec![Value::string("literal")],
+    )]);
+}
+
+#[test]
+fn tail_match_with_annotated_let_in_arm_branch() {
+    // Match arm bodies parse as expression syntax (`{ ... }` in an arm is an
+    // array literal, not a statement block), so the closest supported form of
+    // "tail match with an annotated let" is an if-expression arm whose branch
+    // declares the local. It must resolve and execute through the refined
+    // branch states.
+    run_runtime_cases(&[rustscript_runtime_case(
+        "annotated literal local in tail match arm if-branch",
+        r#"
+            fn pick(model: string) -> string {
+                match model {
+                    "" => if model == "x" => { "a" } else => { let body_text: string = "literal"; body_text },
+                    _ => "other"
+                }
+            }
+
+            pick("");
+        "#,
+        vec![Value::string("literal")],
+    )]);
+}
+
+#[test]
+fn json_encode_accepts_string_key_runtime_map() {
+    // A runtime map annotated as `map` has schema `map<unknown>`: key
+    // legality cannot be proven statically, so the compile-time validator
+    // must admit it and the runtime encoder's string-key check decides.
+    let compiled = compile_source(
+        r#"
+        use json;
+        let request: map = {
+            "model": "test-model",
+            "stream": false,
+        };
+        json::encode(request);
+        "#,
+    )
+    .expect("string-key runtime maps must compile for json::encode");
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("json::encode should run");
+    assert_eq!(status, VmStatus::Halted);
+    let [Value::String(text)] = vm.stack() else {
+        panic!("expected encoded json string, got {:?}", vm.stack());
+    };
+    let parsed: serde_json::Value =
+        serde_json::from_str(text).expect("encoded text must be valid json");
+    assert_eq!(
+        parsed,
+        serde_json::json!({ "model": "test-model", "stream": false })
+    );
+}
+
+#[test]
+fn json_encode_accepts_nested_runtime_maps_and_arrays() {
+    // Provider-shaped payload: nested maps and arrays inside a runtime map.
+    // The generated object key order is unspecified, so the assertion parses
+    // the text and compares semantic JSON.
+    let compiled = compile_source(
+        r#"
+        use json;
+        let request: map = {
+            "model": "test-model",
+            "stream": false,
+            "messages": [
+                { "role": "user", "content": [{ "type": "text", "text": "hello" }] }
+            ],
+            "tools": [
+                { "type": "function", "function": { "name": "read_file", "parameters": { "type": "object" } } }
+            ]
+        };
+        json::encode(request);
+        "#,
+    )
+    .expect("nested runtime maps must compile for json::encode");
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("json::encode should run");
+    assert_eq!(status, VmStatus::Halted);
+    let [Value::String(text)] = vm.stack() else {
+        panic!("expected encoded json string, got {:?}", vm.stack());
+    };
+    let parsed: serde_json::Value =
+        serde_json::from_str(text).expect("encoded text must be valid json");
+    assert_eq!(
+        parsed,
+        serde_json::json!({
+            "model": "test-model",
+            "stream": false,
+            "messages": [
+                { "role": "user", "content": [{ "type": "text", "text": "hello" }] }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "parameters": { "type": "object" }
+                    }
+                }
+            ]
+        })
+    );
+}
+
+#[test]
+fn json_encode_preserves_struct_support() {
+    // Control: struct/object-shaped encoding must remain green while runtime
+    // maps are admitted.
+    let compiled = compile_source(
+        r#"
+        use json;
+        struct Inner { name: string }
+        struct Payload {
+            answer: int,
+            ok: bool,
+            arr: [int],
+            inner: Inner,
+        }
+        let payload = {
+            answer: 42,
+            ok: true,
+            arr: [1, 2],
+            inner: { name: "pd" },
+        };
+        json::encode(payload);
+        "#,
+    )
+    .expect("struct-shaped values must keep compiling for json::encode");
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("json::encode should run");
+    assert_eq!(status, VmStatus::Halted);
+    let [Value::String(text)] = vm.stack() else {
+        panic!("expected encoded json string, got {:?}", vm.stack());
+    };
+    let parsed: serde_json::Value =
+        serde_json::from_str(text).expect("encoded text must be valid json");
+    assert_eq!(
+        parsed,
+        serde_json::json!({
+            "answer": 42,
+            "ok": true,
+            "arr": [1, 2],
+            "inner": { "name": "pd" },
+        })
+    );
+}
+
+#[test]
+fn json_encode_runtime_map_rejects_non_string_key() {
+    // Non-string keys are not representable in `TypeSchema::Map`, so the
+    // rejection must come from the runtime encoder, not the compiler.
+    let compiled = compile_source(
+        r#"
+        use json;
+        let payload = { 1: "one" };
+        json::encode(payload);
+        "#,
+    )
+    .expect("non-string-key maps must compile; runtime must reject them");
+
+    let mut vm = Vm::new(compiled.program);
+    let err = vm
+        .run()
+        .expect_err("json::encode must reject non-string map keys");
+    match err {
+        vm::VmError::HostError(message) => {
+            assert!(
+                message.contains("json_encode map keys must be strings"),
+                "{message}"
+            );
+        }
+        other => panic!("unexpected vm error: {other}"),
+    }
+}
+
+#[test]
+fn json_encode_runtime_map_rejects_nested_bytes() {
+    let compiled = compile_source(
+        r#"
+        use json;
+        let payload: map = { "data": b"abc" };
+        json::encode(payload);
+        "#,
+    )
+    .expect("runtime maps with bytes values must compile; runtime must reject them");
+
+    let mut vm = Vm::new(compiled.program);
+    let err = vm
+        .run()
+        .expect_err("json::encode must reject bytes values inside maps");
+    match err {
+        vm::VmError::HostError(message) => {
+            assert!(
+                message.contains("json_encode does not support bytes values"),
+                "{message}"
+            );
+        }
+        other => panic!("unexpected vm error: {other}"),
+    }
+}
+
+#[test]
+fn json_encode_runtime_map_rejects_nested_callable() {
+    let compiled = compile_source(
+        r#"
+        use json;
+        fn handler(value: int) -> int { value + 1 }
+        let payload: map = { "handler": handler };
+        json::encode(payload);
+        "#,
+    )
+    .expect("runtime maps with callable values must compile; runtime must reject them");
+
+    let mut vm = Vm::new(compiled.program);
+    let err = vm
+        .run()
+        .expect_err("json::encode must reject callable values inside maps");
+    match err {
+        vm::VmError::HostError(message) => {
+            assert!(
+                message.contains("json_encode does not support callable values"),
+                "{message}"
+            );
+        }
+        other => panic!("unexpected vm error: {other}"),
+    }
+}
+
+#[test]
+fn json_encode_rejects_concrete_inner_map_of_bytes_at_compile_time() {
+    // A map with a concrete `bytes` inner schema is provably non-encodable,
+    // so the compile-time validator must recurse through the `map<bytes>`
+    // arm and reject the program without ever running it. This is the
+    // compile-time counterpart to `json_encode_runtime_map_rejects_nested_bytes`,
+    // which uses an `Unknown` inner schema and defers to the runtime.
+    match compile_source(
+        r#"
+        use json;
+        let payload: map<bytes> = { "data": b"abc" };
+        json::encode(payload);
+        "#,
+    ) {
+        Err(err) => match err {
+            vm::SourceError::Compile(vm::CompileError::CallableArgumentTypeMismatch {
+                detail,
+                ..
+            }) => {
+                assert!(
+                    detail.contains("builtin 'json::encode' cannot encode this value"),
+                    "{detail}"
+                );
+                // The recursion must reach the bytes check through the map arm
+                // and report the original value path.
+                assert!(detail.contains("value uses bytes"), "{detail}");
+            }
+            other => panic!("unexpected compiler error: {other}"),
+        },
+        Ok(_) => panic!("map<bytes> must be rejected at compile time"),
+    }
+}
+
+#[test]
+fn json_encode_rejects_nested_concrete_inner_maps_at_compile_time() {
+    // Recursive validation must apply at every map nesting level: the outer
+    // `map<map<bytes>>` arm recurses into the inner `map<bytes>` arm, which
+    // recurses into the bytes check.
+    match compile_source(
+        r#"
+        use json;
+        let payload: map<map<bytes>> = { "outer": { "data": b"abc" } };
+        json::encode(payload);
+        "#,
+    ) {
+        Err(err) => match err {
+            vm::SourceError::Compile(vm::CompileError::CallableArgumentTypeMismatch {
+                detail,
+                ..
+            }) => {
+                assert!(
+                    detail.contains("builtin 'json::encode' cannot encode this value"),
+                    "{detail}"
+                );
+                assert!(detail.contains("value uses bytes"), "{detail}");
+            }
+            other => panic!("unexpected compiler error: {other}"),
+        },
+        Ok(_) => panic!("nested concrete map inners must be rejected at compile time"),
+    }
+}
+
+#[test]
+fn json_encode_accepts_concrete_inner_map_of_encodable_values() {
+    // Control: a map with a concrete encodable inner schema (`map<int>`)
+    // must pass the recursive compile-time validation and encode at runtime,
+    // proving the map arm does not blanket-reject concrete inners.
+    let compiled = compile_source(
+        r#"
+        use json;
+        let payload: map<int> = { "one": 1, "two": 2 };
+        json::encode(payload);
+        "#,
+    )
+    .expect("map<int> must compile for json::encode");
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("json::encode should run");
+    assert_eq!(status, VmStatus::Halted);
+    let [Value::String(text)] = vm.stack() else {
+        panic!("expected encoded json string, got {:?}", vm.stack());
+    };
+    let parsed: serde_json::Value =
+        serde_json::from_str(text).expect("encoded text must be valid json");
+    assert_eq!(parsed, serde_json::json!({ "one": 1, "two": 2 }));
+}
+
+// ---------------------------------------------------------------------------
+// Recursive schema guards for json::encode
+// ---------------------------------------------------------------------------
+//
+// `validate_json_schema` walks the resolved schema of the encoded value. For
+// a self- or mutually-recursive struct placed inside a concrete `map<A>`
+// inner, the resolver terminates its own expansion by leaving a `Named`
+// marker for the schema already being expanded, but the validator used to
+// re-resolve at every level with a fresh seen set, so the marker
+// re-expanded one level deeper on every descent and the compile-time
+// validation recursed without bound: the compiler ground for minutes
+// without terminating instead of overflowing quickly.
+//
+// The regression probes below therefore run the compile inside a
+// subprocess. The child is spawned with a constrained stack (so a
+// regression aborts in well under a second instead of grinding for
+// minutes) and a hard deadline (so a non-terminating compiler can never
+// hang the harness); either way the failure surfaces as a normal
+// assertion failure in the parent instead of killing the whole test
+// process.
+//
+// The positive probe is the deterministic regression: its literal is
+// well-formed only because the declared-schema check admits partial
+// objects at recursive re-entries (the innermost `{}` is an `A` whose
+// required `b` is filled by nothing at runtime - structs are
+// compile-time-typed maps, so the encoded value is exactly the literal
+// map as written). The negative control keeps a `bytes` field in the
+// cycle; `TypeSchema::Object` is a `HashMap`, so field order is
+// randomized per process and the rejection path may be `value.tag` or
+// `value.b.a.tag` - the assertion accepts either as long as the `tag`
+// field is named.
+
+/// Runs `child` inline when `probe_env` is set (subprocess mode). The parent
+/// path returns immediately and `spawn_json_probe` drives the subprocess.
+/// The child prints `sentinel` at probe entry *before* running the closure,
+/// so the parent can distinguish "the right test ran but hung" (sentinel
+/// present, deadline hit) from "a different test ran" (sentinel absent).
+fn run_json_probe_child(probe_env: &str, sentinel: &str, child: impl FnOnce() -> bool) {
+    if std::env::var_os(probe_env).is_some() {
+        println!("{sentinel}");
+        std::process::exit(if child() { 0 } else { 1 });
+    }
+}
+
+/// Spawns this test binary with `--exact <test_name>` and `probe_env` set,
+/// under a 512 KiB stack limit and a 60 s deadline. The child re-enters the
+/// same test, prints `sentinel` via `run_json_probe_child`, runs its probe
+/// closure, and exits 0/1. A stack overflow aborts the child with a
+/// non-success status, and a non-terminating compiler is killed at the
+/// deadline.
+///
+/// The parent does not trust the exit status alone: a mistyped filter makes
+/// libtest exit 0 while running zero tests, which would silently void the
+/// probe. The child's output is therefore captured and must show that
+/// exactly one test was selected (`running 1 test`) *and* that the
+/// test-specific `sentinel` was printed. The sentinel is unique per test,
+/// so a filter that accidentally matches a *different* probe test still
+/// fails: that test prints its own sentinel, not the demanded one. The
+/// probe closure then exits the child with 0/1, so a successful status
+/// plus the matched filter plus the sentinel is the reliable success
+/// signal. On any failure the returned error includes the child's output
+/// so the regression is diagnosable.
+fn spawn_json_probe(probe_env: &str, test_name: &str, sentinel: &str) -> Result<(), String> {
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -s 512; exec \"$0\" --exact \"$1\" --nocapture")
+        .arg(std::env::current_exe().expect("test binary path"))
+        .arg(test_name)
+        .env(probe_env, "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("json probe subprocess should start");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let outcome = loop {
+        match child
+            .try_wait()
+            .expect("json probe subprocess should be waitable")
+        {
+            Some(status) => break Ok(status),
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err("child did not finish within 60 s (compiler did not terminate)");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    use std::io::Read;
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    let child_output = format!("--- child stdout ---\n{stdout}--- child stderr ---\n{stderr}");
+    match outcome {
+        Err(reason) => return Err(format!("{reason}\n{child_output}")),
+        Ok(status) if !status.success() => {
+            return Err(format!("child exited with {status}\n{child_output}"));
+        }
+        _ => {}
+    }
+    if !stdout.contains("running 1 test") {
+        return Err(format!(
+            "child did not select exactly one test (filter matched nothing?)\n{child_output}"
+        ));
+    }
+    if !stdout.contains(sentinel) {
+        return Err(format!(
+            "child did not print the test-specific probe sentinel '{sentinel}' (a different test ran?)\n{child_output}"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn json_encode_accepts_mutually_recursive_structs_inside_concrete_map() {
+    // A `map<A>` whose inner schema is a mutually recursive struct pair
+    // (A -> B -> A) must compile and encode: the recursion is structural,
+    // every runtime value is finite, and the cycle edge itself is
+    // encodable. The innermost partial literal `{}` (an `A` missing its
+    // required `b`) is admitted only because the declared-schema check
+    // allows partial objects at recursive re-entries, so the runtime
+    // value is exactly the map literal as written and the expected
+    // encoding is `{"x":{"b":{"a":{"b":{"a":{}}}}}}`.
+    const PROBE: &str = "RUSTSCRIPT_JSON_PROBE_ACCEPT_RECURSIVE_MAP";
+    const SENTINEL: &str = "json-probe-entered:RUSTSCRIPT_JSON_PROBE_ACCEPT_RECURSIVE_MAP";
+    run_json_probe_child(PROBE, SENTINEL, || {
+        let compiled = match compile_source(
+            r#"
+            use json;
+            struct A { b: B }
+            struct B { a: A }
+            let payload: map<A> = { "x": { b: { a: { b: { a: {} } } } } };
+            json::encode(payload);
+            "#,
+        ) {
+            Ok(compiled) => compiled,
+            Err(err) => {
+                eprintln!("mutually recursive map<A> must compile, got: {err}");
+                return false;
+            }
+        };
+        let mut vm = Vm::new(compiled.program);
+        let status = match vm.run() {
+            Ok(status) => status,
+            Err(err) => {
+                eprintln!("mutually recursive map<A> must run, got: {err}");
+                return false;
+            }
+        };
+        if status != VmStatus::Halted {
+            eprintln!("mutually recursive map<A> must halt, got: {status:?}");
+            return false;
+        }
+        let [Value::String(text)] = vm.stack() else {
+            eprintln!("expected encoded json string, got {:?}", vm.stack());
+            return false;
+        };
+        let parsed = match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                eprintln!("encoded text must be valid json: {err}");
+                return false;
+            }
+        };
+        let expected = serde_json::json!({ "x": { "b": { "a": { "b": { "a": {} } } } } });
+        if parsed != expected {
+            eprintln!("unexpected encoding: {parsed}");
+            return false;
+        }
+        true
+    });
+    if let Err(reason) = spawn_json_probe(
+        PROBE,
+        "compiler_rustscript_tests::json_encode_accepts_mutually_recursive_structs_inside_concrete_map",
+        SENTINEL,
+    ) {
+        panic!(
+            "mutually recursive structs in map<A> must compile and encode (probe failed): {reason}"
+        );
+    }
+}
+
+#[test]
+fn json_encode_rejects_unsupported_field_in_recursive_struct_inside_concrete_map() {
+    // Negative control for the cycle contract: the cycle edge itself is
+    // encodable and must not be rejected, but unsupported field types that
+    // are reachable from the cycle (here `tag: bytes` as a sibling of the
+    // recursive field `b`) must still fail at compile time. The literal
+    // supplies `tag` at every level the declared-schema check inspects
+    // strictly (the top-level `A` and the first `A` re-entry at `x.b.a`);
+    // only the innermost `{}` at the cycle marker stays partial, exactly
+    // like the positive probe. The `json::encode` rejection then always
+    // names the top-level `tag` field (`value.tag`) - the cycle guard only
+    // short-circuits the marker edge, never sibling fields.
+    const PROBE: &str = "RUSTSCRIPT_JSON_PROBE_REJECT_RECURSIVE_MAP_BYTES";
+    const SENTINEL: &str = "json-probe-entered:RUSTSCRIPT_JSON_PROBE_REJECT_RECURSIVE_MAP_BYTES";
+    run_json_probe_child(PROBE, SENTINEL, || {
+        match compile_source(
+            r#"
+            use json;
+            struct A { b: B, tag: bytes }
+            struct B { a: A }
+            let payload: map<A> = { "x": { b: { a: { b: { a: {} }, tag: b"t" } }, tag: b"t" } };
+            json::encode(payload);
+            "#,
+        ) {
+            Err(vm::SourceError::Compile(vm::CompileError::CallableArgumentTypeMismatch {
+                detail,
+                ..
+            })) => {
+                if detail.contains("uses bytes") && detail.contains("tag") {
+                    true
+                } else {
+                    eprintln!("unexpected rejection detail: {detail}");
+                    false
+                }
+            }
+            Err(err) => {
+                eprintln!("recursive struct with bytes field must be rejected, got: {err}");
+                false
+            }
+            Ok(_) => {
+                eprintln!("recursive struct with bytes field must be rejected at compile time");
+                false
+            }
+        }
+    });
+    if let Err(reason) = spawn_json_probe(
+        PROBE,
+        "compiler_rustscript_tests::json_encode_rejects_unsupported_field_in_recursive_struct_inside_concrete_map",
+        SENTINEL,
+    ) {
+        panic!(
+            "bytes reachable from a recursive map<A> must be rejected at compile time (probe failed): {reason}"
+        );
+    }
+}
+
+#[test]
+fn json_probe_harness_rejects_child_that_runs_no_tests() {
+    // The probe harness must not treat a child that matched no test as
+    // success: a mistyped filter makes libtest exit 0 with "running 0
+    // tests", which would silently void every probe's regression value.
+    let ran = spawn_json_probe(
+        "RUSTSCRIPT_JSON_PROBE_NO_MATCH",
+        "compiler_rustscript_tests::json_probe_no_such_test_exists",
+        "json-probe-entered:never-printed",
+    );
+    assert!(
+        ran.is_err(),
+        "probe with a non-matching test name must not be reported as success"
+    );
+}
+
+#[test]
+fn json_encode_rejects_unsupported_field_in_nested_generic_instantiation_map() {
+    // `Node<Node<T>>` re-enters the recursion wrapped in a *different*
+    // instantiation at every level. A cycle key built from the raw render
+    // of the node grows one nesting per re-entry (`Node<int>`,
+    // `Node<Node<int>>`, `Node<Node<Node<int>>>`, ...) and never repeats,
+    // so the walk neither terminates nor reaches the unsupported `tag`
+    // field. The key must collapse the wrapped re-entries to the one cycle
+    // class and still reject the bytes reachable from the body.
+    const PROBE: &str = "RUSTSCRIPT_JSON_PROBE_REJECT_NESTED_INSTANTIATION";
+    const SENTINEL: &str = "json-probe-entered:RUSTSCRIPT_JSON_PROBE_REJECT_NESTED_INSTANTIATION";
+    run_json_probe_child(PROBE, SENTINEL, || {
+        match compile_source(
+            r#"
+            use json;
+            struct Node<T> { child: Node<Node<T>>, tag: bytes }
+            fn enc(m: map<Node<int>>) {
+                json::encode(m);
+            }
+            "#,
+        ) {
+            Err(vm::SourceError::Compile(vm::CompileError::CallableArgumentTypeMismatch {
+                detail,
+                ..
+            })) => {
+                if detail.contains("uses bytes") && detail.contains("tag") {
+                    true
+                } else {
+                    eprintln!("unexpected rejection detail: {detail}");
+                    false
+                }
+            }
+            Err(err) => {
+                eprintln!("nested generic instantiation with bytes must be rejected, got: {err}");
+                false
+            }
+            Ok(_) => {
+                eprintln!(
+                    "nested generic instantiation with bytes must be rejected at compile time"
+                );
+                false
+            }
+        }
+    });
+    if let Err(reason) = spawn_json_probe(
+        PROBE,
+        "compiler_rustscript_tests::json_encode_rejects_unsupported_field_in_nested_generic_instantiation_map",
+        SENTINEL,
+    ) {
+        panic!(
+            "bytes reachable through a nested generic instantiation must be rejected (probe failed): {reason}"
+        );
+    }
+}
+
+#[test]
+fn json_encode_rejects_shadowed_generic_param_with_unsupported_field() {
+    // The struct named `T` occupies the same name space as a generic
+    // parameter named `T`: the raw render of `Node<T>` is ambiguous
+    // between the struct instantiation `Node<struct T>` and a generic
+    // instantiation `Node<param T>`. The resolved-identity cycle key must
+    // keep the two readings distinct and still terminate the
+    // named-wrapped recursion (`Node<Node<T>>` re-enters the same
+    // collapsed identity), while the bytes reachable through `tagged: T`
+    // (the struct - the parameter here is named `X`) are rejected at
+    // compile time. Note that when a same-named parameter is actually in
+    // scope, the parameter wins, so a struct name colliding with a live
+    // parameter is unreachable inside that generic's body; this test
+    // keeps the parameter under a different name to exercise the
+    // name-space collision itself. This is a regression guard for the
+    // current behavior, not a claim that the case previously failed.
+    const PROBE: &str = "RUSTSCRIPT_JSON_PROBE_REJECT_SHADOWED_PARAM";
+    const SENTINEL: &str = "json-probe-entered:RUSTSCRIPT_JSON_PROBE_REJECT_SHADOWED_PARAM";
+    run_json_probe_child(PROBE, SENTINEL, || {
+        match compile_source(
+            r#"
+            use json;
+            struct T { tag: bytes }
+            struct Node<X> { child: Node<Node<T>>, tagged: T }
+            fn enc<U>(m: map<Node<U>>) {
+                json::encode(m);
+            }
+            "#,
+        ) {
+            Err(vm::SourceError::Compile(vm::CompileError::CallableArgumentTypeMismatch {
+                detail,
+                ..
+            })) => {
+                if detail.contains("uses bytes") && detail.contains("tag") {
+                    true
+                } else {
+                    eprintln!("unexpected rejection detail: {detail}");
+                    false
+                }
+            }
+            Err(err) => {
+                eprintln!("shadowed generic param with bytes must be rejected, got: {err}");
+                false
+            }
+            Ok(_) => {
+                eprintln!("shadowed generic param with bytes must be rejected at compile time");
+                false
+            }
+        }
+    });
+    if let Err(reason) = spawn_json_probe(
+        PROBE,
+        "compiler_rustscript_tests::json_encode_rejects_shadowed_generic_param_with_unsupported_field",
+        SENTINEL,
+    ) {
+        panic!(
+            "bytes reachable through a shadowed generic parameter must be rejected (probe failed): {reason}"
+        );
+    }
+}
+
+#[test]
+fn json_probe_harness_rejects_child_without_matching_sentinel() {
+    // The harness must demand the test-specific sentinel in addition to
+    // `running 1 test`: any single test satisfies the latter, so a filter
+    // typo that matches a *different* probe test would otherwise report
+    // success while running the wrong closure. Spawn the acceptance probe
+    // but demand a sentinel it never prints; the child still compiles and
+    // runs fine, so the failure must come from the sentinel check.
+    let ran = spawn_json_probe(
+        "RUSTSCRIPT_JSON_PROBE_ACCEPT_RECURSIVE_MAP",
+        "compiler_rustscript_tests::json_encode_accepts_mutually_recursive_structs_inside_concrete_map",
+        "json-probe-entered:this-sentinel-is-never-printed",
+    );
+    assert!(
+        ran.is_err(),
+        "probe without its test-specific sentinel must not be reported as success"
+    );
+}
+
+#[test]
+fn json_encode_reports_unsupported_fields_in_deterministic_sorted_order() {
+    // `TypeSchema::Object` is a HashMap, so raw iteration order is
+    // per-process random. The compile-time `json::encode` walk must visit
+    // object fields in sorted name order: with two unsupported fields the
+    // rejection path must always name `a` first, never `z`, so error text
+    // (and therefore probe assertions) are stable across processes and
+    // runs instead of depending on the process hash seed.
+    match compile_source(
+        r#"
+        use json;
+        struct S { z: bytes, a: bytes }
+        fn enc(m: map<S>) {
+            json::encode(m);
+        }
+        "#,
+    ) {
+        Err(vm::SourceError::Compile(vm::CompileError::CallableArgumentTypeMismatch {
+            detail,
+            ..
+        })) => {
+            assert!(detail.contains("value.a uses bytes"), "{detail}");
+            assert!(!detail.contains("value.z uses bytes"), "{detail}");
+        }
+        Err(err) => panic!("unexpected compile error: {err}"),
+        Ok(_) => panic!("map<S> with two bytes fields must be rejected at compile time"),
+    }
+}
+
+#[test]
+fn json_encode_accepts_wrapped_recursion_in_concrete_map() {
+    // Positive control for container-wrapped recursion. `Node<T>` wraps
+    // the recursion in an array at every re-entry (`Node<int>`,
+    // `Node<[int]>`, `Node<[[int]]>`, ...), so the resolved type
+    // arguments grow one wrapping per level and no cycle key ever
+    // repeats; only an explicit depth budget keeps the walk terminating.
+    // The type has no unsupported fields, so it must compile and the
+    // finite runtime value must encode. The optional base case
+    // (`child: Node<[T]>?` with `child: null`) is what makes a finite
+    // literal constructible: the declared-schema check only admits
+    // partial objects at re-entries whose identity repeats, and wrapped
+    // re-entries never repeat. An empty map exercises the non-optional
+    // wrap without needing any value.
+    const PROBE: &str = "RUSTSCRIPT_JSON_PROBE_ACCEPT_WRAPPED_RECURSION";
+    const SENTINEL: &str = "json-probe-entered:RUSTSCRIPT_JSON_PROBE_ACCEPT_WRAPPED_RECURSION";
+    run_json_probe_child(PROBE, SENTINEL, || {
+        // Array wrap with an optional base case: a real value must encode.
+        // Null map entries are dropped when the literal is built, so the
+        // optional `child: null` disappears from the encoding and only
+        // `data` survives - the point is that the wrapped recursion
+        // compiles (the walk terminates on the budget) and the finite
+        // value encodes.
+        let compiled = match compile_source(
+            r#"
+            use json;
+            struct Node<T> { child: Node<[T]>?, data: int }
+            let payload: map<Node<int>> = { "x": { child: null, data: 1 } };
+            json::encode(payload);
+            "#,
+        ) {
+            Ok(compiled) => compiled,
+            Err(err) => {
+                eprintln!("wrapped array recursion must compile, got: {err}");
+                return false;
+            }
+        };
+        let mut vm = Vm::new(compiled.program);
+        let status = match vm.run() {
+            Ok(status) => status,
+            Err(err) => {
+                eprintln!("wrapped array recursion must run, got: {err}");
+                return false;
+            }
+        };
+        if status != VmStatus::Halted {
+            eprintln!("wrapped array recursion must halt, got: {status:?}");
+            return false;
+        }
+        let [Value::String(text)] = vm.stack() else {
+            eprintln!("expected encoded json string, got {:?}", vm.stack());
+            return false;
+        };
+        let parsed = match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                eprintln!("encoded text must be valid json: {err}");
+                return false;
+            }
+        };
+        let expected = serde_json::json!({ "x": { "data": 1 } });
+        if parsed != expected {
+            eprintln!("unexpected encoding: {parsed}");
+            return false;
+        }
+
+        // Same wrap with no optional base and an empty map value: the
+        // schema walk still has to terminate on the budget.
+        let compiled = match compile_source(
+            r#"
+            use json;
+            struct Node<T> { child: Node<[T]> }
+            let payload: map<Node<int>> = {};
+            json::encode(payload);
+            "#,
+        ) {
+            Ok(compiled) => compiled,
+            Err(err) => {
+                eprintln!("non-optional wrapped recursion must compile, got: {err}");
+                return false;
+            }
+        };
+        let mut vm = Vm::new(compiled.program);
+        let status = match vm.run() {
+            Ok(status) => status,
+            Err(err) => {
+                eprintln!("non-optional wrapped recursion must run, got: {err}");
+                return false;
+            }
+        };
+        if status != VmStatus::Halted {
+            eprintln!("non-optional wrapped recursion must halt, got: {status:?}");
+            return false;
+        }
+        let [Value::String(text)] = vm.stack() else {
+            eprintln!("expected encoded json string, got {:?}", vm.stack());
+            return false;
+        };
+        let parsed = match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                eprintln!("encoded text must be valid json: {err}");
+                return false;
+            }
+        };
+        if parsed != serde_json::json!({}) {
+            eprintln!("unexpected encoding: {parsed}");
+            return false;
+        }
+        true
+    });
+    if let Err(reason) = spawn_json_probe(
+        PROBE,
+        "compiler_rustscript_tests::json_encode_accepts_wrapped_recursion_in_concrete_map",
+        SENTINEL,
+    ) {
+        panic!(
+            "container-wrapped recursion without unsupported fields must compile and encode (probe failed): {reason}"
+        );
+    }
+}
+
+#[test]
+fn json_encode_rejects_wrapped_array_recursion_with_unsupported_sibling() {
+    // Negative control for container-wrapped recursion: the cycle edge is
+    // encodable and the depth budget must accept it, but the `tag: bytes`
+    // sibling is reachable at the very first level and must still be
+    // rejected at compile time. The budget must never mask the current
+    // layer's explicitly unsupported fields.
+    const PROBE: &str = "RUSTSCRIPT_JSON_PROBE_REJECT_WRAPPED_ARRAY_RECURSION";
+    const SENTINEL: &str =
+        "json-probe-entered:RUSTSCRIPT_JSON_PROBE_REJECT_WRAPPED_ARRAY_RECURSION";
+    run_json_probe_child(PROBE, SENTINEL, || {
+        match compile_source(
+            r#"
+            use json;
+            struct Node<T> { child: Node<[T]>, tag: bytes }
+            fn enc(m: map<Node<int>>) {
+                json::encode(m);
+            }
+            "#,
+        ) {
+            Err(vm::SourceError::Compile(vm::CompileError::CallableArgumentTypeMismatch {
+                detail,
+                ..
+            })) => {
+                if detail.contains("uses bytes") && detail.contains("tag") {
+                    true
+                } else {
+                    eprintln!("unexpected rejection detail: {detail}");
+                    false
+                }
+            }
+            Err(err) => {
+                eprintln!("wrapped array recursion with bytes must be rejected, got: {err}");
+                false
+            }
+            Ok(_) => {
+                eprintln!("wrapped array recursion with bytes must be rejected at compile time");
+                false
+            }
+        }
+    });
+    if let Err(reason) = spawn_json_probe(
+        PROBE,
+        "compiler_rustscript_tests::json_encode_rejects_wrapped_array_recursion_with_unsupported_sibling",
+        SENTINEL,
+    ) {
+        panic!(
+            "bytes reachable through array-wrapped recursion must be rejected at compile time (probe failed): {reason}"
+        );
+    }
+}
+
+#[test]
+fn json_encode_rejects_wrapped_map_recursion_with_unsupported_sibling() {
+    // Map-container variant of the wrapped-recursion negative control:
+    // `Node<map<T>>` wraps the recursion in a map at every re-entry, so
+    // the argument grows (`map<int>`, `map<map<int>>`, ...) and no cycle
+    // key repeats. The walk must terminate on the depth budget and still
+    // reject the `tag: bytes` sibling at the first level.
+    const PROBE: &str = "RUSTSCRIPT_JSON_PROBE_REJECT_WRAPPED_MAP_RECURSION";
+    const SENTINEL: &str = "json-probe-entered:RUSTSCRIPT_JSON_PROBE_REJECT_WRAPPED_MAP_RECURSION";
+    run_json_probe_child(PROBE, SENTINEL, || {
+        match compile_source(
+            r#"
+            use json;
+            struct Node<T> { child: Node<map<T>>, tag: bytes }
+            fn enc(m: map<Node<int>>) {
+                json::encode(m);
+            }
+            "#,
+        ) {
+            Err(vm::SourceError::Compile(vm::CompileError::CallableArgumentTypeMismatch {
+                detail,
+                ..
+            })) => {
+                if detail.contains("uses bytes") && detail.contains("tag") {
+                    true
+                } else {
+                    eprintln!("unexpected rejection detail: {detail}");
+                    false
+                }
+            }
+            Err(err) => {
+                eprintln!("wrapped map recursion with bytes must be rejected, got: {err}");
+                false
+            }
+            Ok(_) => {
+                eprintln!("wrapped map recursion with bytes must be rejected at compile time");
+                false
+            }
+        }
+    });
+    if let Err(reason) = spawn_json_probe(
+        PROBE,
+        "compiler_rustscript_tests::json_encode_rejects_wrapped_map_recursion_with_unsupported_sibling",
+        SENTINEL,
+    ) {
+        panic!(
+            "bytes reachable through map-wrapped recursion must be rejected at compile time (probe failed): {reason}"
+        );
+    }
+}
+
+/// Builds a pathological but non-recursive chain of `depth` distinct
+/// struct declarations (`L0 { f: L1 }` -> `L1 { f: L2 }` -> ... ->
+/// `L{depth-1}`), with `deepest` as the type of the single field of the
+/// deepest struct. Every declaration name is unique, so the walk must
+/// expand the chain in full: the resolution/validation budget only bounds
+/// repeated re-entries of the *same* declaration identity (recursive
+/// families like `Node<[T]>`), and distinct names must not consume any
+/// shared budget.
+fn distinct_named_chain_source(depth: usize, deepest: &str) -> String {
+    let mut source = String::from("use json;\n");
+    for index in 0..depth - 1 {
+        source.push_str(&format!("struct L{index} {{ f: L{} }}\n", index + 1));
+    }
+    source.push_str(&format!("struct L{} {{ f: {deepest} }}\n", depth - 1));
+    source.push_str("fn enc(m: map<L0>) {\n    json::encode(m);\n}\n");
+    source
+}
+
+/// The exact `json::encode` rejection path for the deepest field of a
+/// `depth`-layer distinct chain: `value` plus one `f` segment per layer.
+fn deep_chain_path(depth: usize) -> String {
+    format!("value.{}", "f.".repeat(depth - 1) + "f")
+}
+
+#[test]
+fn json_encode_rejects_deep_distinct_named_chain_with_deepest_bytes() {
+    // 40 distinct struct declarations chained by a single `f` field, with
+    // `bytes` reachable only at the deepest level. The chain must expand
+    // in full and the deepest `bytes` must be rejected at compile time
+    // with the precise 40-segment path.
+    let source = distinct_named_chain_source(40, "bytes");
+    match compile_source(&source) {
+        Err(vm::SourceError::Compile(vm::CompileError::CallableArgumentTypeMismatch {
+            detail,
+            ..
+        })) => {
+            let path = deep_chain_path(40);
+            assert!(detail.contains(&format!("{path} uses bytes")), "{detail}");
+        }
+        Err(err) => {
+            panic!("deep distinct chain with deepest bytes must be rejected, got: {err}");
+        }
+        Ok(_) => {
+            panic!("deep distinct chain with deepest bytes must be rejected at compile time");
+        }
+    }
+}
+
+#[test]
+fn json_encode_rejects_deep_distinct_named_chain_with_deepest_callable() {
+    // Callable counterpart of the deep distinct-chain regression: the
+    // deepest field is a `fn(int) -> int` callable, which `json::encode`
+    // must reject at compile time with the precise 40-segment path.
+    let source = distinct_named_chain_source(40, "fn(int) -> int");
+    match compile_source(&source) {
+        Err(vm::SourceError::Compile(vm::CompileError::CallableArgumentTypeMismatch {
+            detail,
+            ..
+        })) => {
+            let path = deep_chain_path(40);
+            assert!(detail.contains(&format!("{path} is callable")), "{detail}");
+        }
+        Err(err) => {
+            panic!("deep distinct chain with deepest callable must be rejected, got: {err}");
+        }
+        Ok(_) => {
+            panic!("deep distinct chain with deepest callable must be rejected at compile time");
+        }
+    }
+}
+
+#[test]
+fn json_encode_accepts_deep_distinct_named_chain_of_encodable_fields() {
+    // Positive control for the same 40-declaration chain: with an
+    // encodable leaf (`int`) the walk must expand the chain in full and
+    // accept it, proving the re-entry budget never trips on distinct
+    // declaration names.
+    let source = distinct_named_chain_source(40, "int");
+    compile_source(&source).expect("deep distinct chain of encodable fields must compile");
+}
+
+#[test]
+fn json_encode_rejects_very_deep_distinct_named_chain_with_deepest_bytes() {
+    // The regression this fix targets: a chain of 1100 distinct struct
+    // declarations, well past the old global named-depth budget. The
+    // global budget stopped the walk at 32 nested expansions and accepted
+    // the chain as a structural recursion edge, so `json::encode`
+    // compiled even though the deepest field is `bytes` - the compile-time
+    // diagnostic was masked. The budget must only bound repeated
+    // re-entries of the *same* declaration, so this chain expands in full
+    // and the deepest `bytes` is rejected with the precise 1100-segment
+    // path.
+    let source = distinct_named_chain_source(1100, "bytes");
+    match compile_source(&source) {
+        Err(vm::SourceError::Compile(vm::CompileError::CallableArgumentTypeMismatch {
+            detail,
+            ..
+        })) => {
+            let path = deep_chain_path(1100);
+            assert!(detail.contains(&format!("{path} uses bytes")), "{detail}");
+        }
+        Err(err) => {
+            panic!("very deep distinct chain with deepest bytes must be rejected, got: {err}");
+        }
+        Ok(_) => {
+            panic!("very deep distinct chain with deepest bytes must be rejected at compile time");
+        }
+    }
+}
+
+#[test]
+fn json_encode_rejects_very_deep_distinct_named_chain_with_deepest_callable() {
+    // Callable counterpart at the same depth: the deepest field is a
+    // `fn(int) -> int` callable, which the global named-depth budget used
+    // to mask exactly like the bytes variant.
+    let source = distinct_named_chain_source(1100, "fn(int) -> int");
+    match compile_source(&source) {
+        Err(vm::SourceError::Compile(vm::CompileError::CallableArgumentTypeMismatch {
+            detail,
+            ..
+        })) => {
+            let path = deep_chain_path(1100);
+            assert!(detail.contains(&format!("{path} is callable")), "{detail}");
+        }
+        Err(err) => {
+            panic!("very deep distinct chain with deepest callable must be rejected, got: {err}");
+        }
+        Ok(_) => {
+            panic!(
+                "very deep distinct chain with deepest callable must be rejected at compile time"
+            );
+        }
+    }
 }

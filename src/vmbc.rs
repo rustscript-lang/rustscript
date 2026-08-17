@@ -11,7 +11,7 @@ use crate::debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
 use crate::vm::{HostImport, OpCode, Program, Value};
 
 const MAGIC: [u8; 4] = *b"VMBC";
-const VERSION_V11: u16 = 11;
+const VERSION_V12: u16 = 12;
 const FLAGS: u16 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +92,16 @@ pub enum ValidationError {
         expected: u8,
         got: u8,
     },
+    InvalidCallScriptTarget {
+        offset: usize,
+        prototype_id: u32,
+    },
+    InvalidCallScriptArity {
+        offset: usize,
+        prototype_id: u32,
+        expected: u8,
+        got: u8,
+    },
     InvalidJumpTarget {
         offset: usize,
         target: u32,
@@ -128,6 +138,22 @@ impl std::fmt::Display for ValidationError {
             } => write!(
                 f,
                 "invalid call arity {got} for import index {index} at offset {offset}, expected {expected}",
+            ),
+            ValidationError::InvalidCallScriptTarget {
+                offset,
+                prototype_id,
+            } => write!(
+                f,
+                "invalid callscript prototype {prototype_id} at offset {offset}",
+            ),
+            ValidationError::InvalidCallScriptArity {
+                offset,
+                prototype_id,
+                expected,
+                got,
+            } => write!(
+                f,
+                "invalid callscript arity {got} for prototype {prototype_id} at offset {offset}, expected {expected}",
             ),
             ValidationError::InvalidJumpTarget { offset, target } => write!(
                 f,
@@ -241,7 +267,7 @@ fn read_constant(cursor: &mut Cursor<'_>, depth: usize) -> Result<Value, WireErr
 pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&VERSION_V11.to_le_bytes());
+    out.extend_from_slice(&VERSION_V12.to_le_bytes());
     out.extend_from_slice(&FLAGS.to_le_bytes());
     write_u32_count("constants", program.constants.len(), &mut out)?;
 
@@ -275,7 +301,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     }
 
     let version = cursor.read_u16()?;
-    if version != VERSION_V11 {
+    if version != VERSION_V12 {
         return Err(WireError::UnsupportedVersion(version));
     }
 
@@ -489,6 +515,19 @@ pub fn disassemble_program_with_options(program: &Program, options: DisassembleO
                     instruction.push_str(&format!("callvalue {argc}"));
                 } else {
                     instruction.push_str("callvalue <truncated>");
+                    truncated = true;
+                }
+            }
+            x if x == OpCode::CallScript as u8 => {
+                if let Some(prototype_id) = read_u32(code, &mut ip) {
+                    if let Some(argc) = read_u8(code, &mut ip) {
+                        instruction.push_str(&format!("callscript {prototype_id} {argc}"));
+                    } else {
+                        instruction.push_str("callscript <truncated>");
+                        truncated = true;
+                    }
+                } else {
+                    instruction.push_str("callscript <truncated>");
                     truncated = true;
                 }
             }
@@ -764,6 +803,43 @@ fn analyze_program(
                     opcode,
                     expected_bytes: 1,
                 })?;
+            }
+            x if x == OpCode::CallScript as u8 => {
+                let prototype_id =
+                    read_u32(code, &mut ip).ok_or(ValidationError::TruncatedOperand {
+                        offset: start,
+                        opcode,
+                        expected_bytes: 5,
+                    })?;
+                let argc = read_u8(code, &mut ip).ok_or(ValidationError::TruncatedOperand {
+                    offset: start,
+                    opcode,
+                    expected_bytes: 5,
+                })?;
+                let Some(prototype) = program.callable_prototypes.get(prototype_id as usize) else {
+                    return Err(ValidationError::InvalidCallScriptTarget {
+                        offset: start,
+                        prototype_id,
+                    });
+                };
+                // `CallScript` is a static script-function call: a
+                // host-import prototype must never be routed to the host
+                // path (the VM rejects it with `InvalidCallablePrototype`),
+                // so reject it deterministically here as well.
+                if !matches!(prototype.target, CallableTarget::ScriptFunction(_)) {
+                    return Err(ValidationError::InvalidCallScriptTarget {
+                        offset: start,
+                        prototype_id,
+                    });
+                }
+                if argc != prototype.arity {
+                    return Err(ValidationError::InvalidCallScriptArity {
+                        offset: start,
+                        prototype_id,
+                        expected: prototype.arity,
+                        got: argc,
+                    });
+                }
             }
 
             other => {

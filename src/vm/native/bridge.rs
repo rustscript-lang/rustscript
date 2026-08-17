@@ -316,6 +316,14 @@ pub(crate) fn enter_call_value_inherited_entry_address() -> usize {
     pd_vm_native_enter_call_value_inherited as *const () as usize
 }
 
+pub(crate) fn enter_call_script_entry_address() -> usize {
+    pd_vm_native_enter_call_script as *const () as usize
+}
+
+pub(crate) fn enter_call_script_inherited_entry_address() -> usize {
+    pd_vm_native_enter_call_script_inherited as *const () as usize
+}
+
 pub(crate) fn leave_frame_entry_address() -> usize {
     pd_vm_native_leave_frame as *const () as usize
 }
@@ -667,6 +675,64 @@ pub(crate) extern "C" fn pd_vm_native_replace_value_in_slot(
     STATUS_CONTINUE
 }
 
+pub(crate) fn materialize_root_callable_entry_address() -> usize {
+    pd_vm_native_materialize_root_callable as *const () as usize
+}
+
+/// Materializes the fresh environment-free callable for one root callable
+/// binding of an inlined JIT callee frame and registers it with the VM's
+/// owned-callable set.
+///
+/// Every call mints a brand-new `Arc` (never a shared constant) and writes it
+/// into `dst`, mirroring the interpreter's `enter_script_frame`
+/// re-initialization. Because the identity is fresh per materialization, a
+/// host handle from a previous lifecycle can never be re-legalized by a later
+/// run, while the fresh handle is immediately legal at every host entry gate.
+pub(crate) extern "C" fn pd_vm_native_materialize_root_callable(
+    vm: *mut Vm,
+    dst: *mut Value,
+    prototype_id: i64,
+) -> i32 {
+    let Some(vm) = (unsafe { vm.as_mut() }) else {
+        store_bridge_error(VmError::JitNative(
+            "native materialize-root-callable helper received null vm pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    };
+    if dst.is_null() {
+        store_bridge_error(VmError::JitNative(
+            "native materialize-root-callable helper received null slot pointer".to_string(),
+        ));
+        return STATUS_ERROR;
+    }
+    let Ok(prototype_id) = u32::try_from(prototype_id) else {
+        // Keep the raw (possibly negative) value in a dedicated typed error
+        // instead of truncating it into `InvalidCallablePrototype(u32::MAX)`.
+        store_bridge_error(VmError::InvalidCallablePrototypeId(prototype_id));
+        return STATUS_ERROR;
+    };
+    let Some(prototype) = vm.program().callable_prototypes.get(prototype_id as usize) else {
+        store_bridge_error(VmError::InvalidCallablePrototype(prototype_id));
+        return STATUS_ERROR;
+    };
+    let callable = Arc::new(crate::bytecode::CallableValue {
+        prototype_id,
+        kind: prototype.kind,
+        env: None,
+    });
+    vm.instance.owned_callables.push(Arc::downgrade(&callable));
+    unsafe {
+        // The owned temp slot may already hold a previous iteration's
+        // materialized callable (the trace reuses the slot on every loop
+        // iteration). Overwriting with `ptr::write` would leak the previous
+        // Arc; replace it and drop the previous value like the other bridge
+        // slot helpers (`replace_value_in_slot`, `clear_value_slot`).
+        let previous = std::ptr::replace(dst, Value::Callable(callable));
+        drop(previous);
+    }
+    STATUS_CONTINUE
+}
+
 pub(crate) extern "C" fn pd_vm_native_init_null_value_slot(dst: *mut Value) -> i32 {
     if dst.is_null() {
         store_bridge_error(VmError::JitNative(
@@ -1005,6 +1071,78 @@ pub(crate) extern "C" fn pd_vm_native_enter_call_value_inherited(
     })
 }
 
+fn native_enter_call_script(
+    vm: &mut Vm,
+    prototype_id: i64,
+    argc: i64,
+    call_ip: i64,
+    resume_ip: i64,
+    inherited_state: *mut u8,
+) -> VmResult<i32> {
+    let prototype_id = u32::try_from(prototype_id)
+        .map_err(|_| VmError::InvalidFrameState("native call-script prototype id out of range"))?;
+    let argc = u8::try_from(argc)
+        .map_err(|_| VmError::InvalidFrameState("native call-script argc out of range"))?;
+    let call_ip = usize::try_from(call_ip)
+        .map_err(|_| VmError::InvalidFrameState("native call-script ip out of range"))?;
+    let resume_ip = usize::try_from(resume_ip)
+        .map_err(|_| VmError::InvalidFrameState("native call-script resume ip out of range"))?;
+    if vm.instance.ip != call_ip {
+        vm.jump_to(call_ip)?;
+    }
+    if resume_ip > vm.program.code.len() {
+        return Err(VmError::BytecodeBounds);
+    }
+    vm.instance.ip = resume_ip;
+    let status = match vm.execute_call_script(prototype_id, argc, call_ip)? {
+        ExecOutcome::Continue => STATUS_LINKED_CONTINUE,
+        ExecOutcome::Halted => STATUS_HALTED,
+        ExecOutcome::Yielded => STATUS_YIELDED,
+        ExecOutcome::Waiting(_) => STATUS_WAITING,
+    };
+    if status == STATUS_LINKED_CONTINUE {
+        if vm.active_frame_has_shared_capture_cells() {
+            return Ok(STATUS_CONTINUE);
+        }
+        if !inherited_state.is_null() {
+            write_inherited_state_packet(vm, inherited_state)?;
+        }
+    }
+    Ok(status)
+}
+
+pub(crate) extern "C" fn pd_vm_native_enter_call_script(
+    vm: *mut Vm,
+    prototype_id: i64,
+    argc: i64,
+    call_ip: i64,
+    resume_ip: i64,
+) -> i32 {
+    run_step(vm, "enter_call_script", |vm| {
+        native_enter_call_script(
+            vm,
+            prototype_id,
+            argc,
+            call_ip,
+            resume_ip,
+            std::ptr::null_mut(),
+        )
+    })
+}
+
+pub(crate) extern "C" fn pd_vm_native_enter_call_script_inherited(
+    vm: *mut Vm,
+    prototype_id: i64,
+    argc: i64,
+    call_ip: i64,
+    resume_ip: i64,
+    inherited_state: *mut u8,
+) -> i32 {
+    run_step(vm, "enter_call_script", |vm| {
+        native_enter_call_script(vm, prototype_id, argc, call_ip, resume_ip, inherited_state)
+    })
+}
+
 fn native_leave_frame(vm: &mut Vm, ret_ip: i64, inherited_state: *mut u8) -> VmResult<i32> {
     let ret_ip = usize::try_from(ret_ip)
         .map_err(|_| VmError::InvalidFrameState("native ret ip out of range"))?;
@@ -1316,8 +1454,17 @@ pub(crate) extern "C" fn pd_vm_native_restore_virtual_frame(
                 "virtual frame local count does not match prototype",
             ));
         }
-        if call_ip.saturating_add(2) != return_ip
-            || vm.program.code.get(call_ip).copied() != Some(crate::OpCode::CallValue as u8)
+        // The virtual frame continuation must resume exactly after the call
+        // instruction that produced it: `CallValue` carries a one-byte
+        // `argc` operand, `CallScript` a five-byte `(prototype_id, argc)`
+        // operand.
+        let call_instruction_len = match vm.program.code.get(call_ip).copied() {
+            Some(opcode) if opcode == crate::OpCode::CallValue as u8 => 2,
+            Some(opcode) if opcode == crate::OpCode::CallScript as u8 => 6,
+            _ => 0,
+        };
+        if call_instruction_len == 0
+            || call_ip.saturating_add(call_instruction_len) != return_ip
             || return_ip > vm.program.code.len()
             || resume_ip < function.entry_ip as usize
             || resume_ip >= function.end_ip as usize
@@ -2120,6 +2267,37 @@ mod tests {
             frame.continuation,
             FrameContinuation::ResumeBytecode { return_ip: 2 }
         );
+    }
+
+    #[test]
+    fn materialize_root_callable_rejects_negative_prototype_id_typed() {
+        let mut vm = Vm::new(virtual_frame_program());
+        let mut slot = MaybeUninit::<Value>::uninit();
+        let status = pd_vm_native_materialize_root_callable(&mut vm, slot.as_mut_ptr(), -1);
+        assert_eq!(status, STATUS_ERROR);
+        assert!(matches!(
+            take_bridge_error(),
+            Some(VmError::InvalidCallablePrototypeId(-1))
+        ));
+        // The error must be the accurate typed variant, never a truncated
+        // `InvalidCallablePrototype` masquerading as u32::MAX.
+        let error = take_bridge_error();
+        assert!(
+            !matches!(error, Some(VmError::InvalidCallablePrototype(_))),
+            "negative prototype id must not masquerade as a u32 prototype: {error:?}"
+        );
+    }
+
+    #[test]
+    fn materialize_root_callable_rejects_out_of_range_prototype_id() {
+        let mut vm = Vm::new(virtual_frame_program());
+        let mut slot = MaybeUninit::<Value>::uninit();
+        let status = pd_vm_native_materialize_root_callable(&mut vm, slot.as_mut_ptr(), 99);
+        assert_eq!(status, STATUS_ERROR);
+        assert!(matches!(
+            take_bridge_error(),
+            Some(VmError::InvalidCallablePrototype(99))
+        ));
     }
 
     #[test]
