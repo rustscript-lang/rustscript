@@ -46,6 +46,39 @@ fn empty_registry_allows_functions_registered_by_the_embedder() {
 }
 
 #[test]
+fn explicit_capability_profile_authorizes_host_imports_during_preflight() {
+    let program = compile_source("fn action() -> int; action();")
+        .expect("host call source should compile")
+        .program;
+    let mut registry = HostFunctionRegistry::empty();
+    registry.register_static_args("action", 0, returns_registered_value);
+    registry.set_capability_profile(CapabilityProfile::deny_all());
+
+    let mut denied = Vm::new(program.clone());
+    let error = registry
+        .bind_vm_cached(&mut denied)
+        .expect_err("deny-all profile must reject the host import during binding");
+    assert!(error.to_string().contains("capability"));
+
+    let mut allowed_registry = HostFunctionRegistry::empty();
+    allowed_registry.set_capability_profile(
+        CapabilityProfile::builder()
+            .allow_host_import("action")
+            .build(),
+    );
+    allowed_registry.register_static_args("action", 0, returns_registered_value);
+    let mut allowed = Vm::new(program);
+    allowed_registry
+        .bind_vm_cached(&mut allowed)
+        .expect("allowed host import should bind");
+    assert_eq!(
+        allowed.run().expect("host call should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(allowed.stack(), &[Value::Int(42)]);
+}
+
+#[test]
 fn empty_registry_preserves_default_builtin_capabilities() {
     let compiled = compile_source("use bytes; bytes::from_array_u8([1, 2, 3]);")
         .expect("bytes source should compile");
@@ -58,29 +91,81 @@ fn empty_registry_preserves_default_builtin_capabilities() {
     assert_eq!(vm.stack(), &[Value::bytes(vec![1, 2, 3])]);
 }
 
+#[test]
+fn explicit_capability_profile_authorizes_builtin_calls_during_preflight() {
+    let program = compile_source("use bytes; bytes::from_array_u8([1, 2, 3]);")
+        .expect("bytes source should compile")
+        .program;
+    let mut registry = HostFunctionRegistry::empty();
+    registry.set_capability_profile(CapabilityProfile::deny_all());
+
+    let mut denied = Vm::new(program.clone());
+    let error = registry
+        .bind_vm_cached(&mut denied)
+        .expect_err("deny-all profile must reject builtin calls during binding");
+    assert!(error.to_string().contains("capability"));
+
+    registry.set_capability_profile(
+        CapabilityProfile::builder()
+            .allow_builtin(vm::BuiltinFunction::BytesFromArrayU8)
+            .build(),
+    );
+    let mut allowed = Vm::new(program);
+    registry
+        .bind_vm_cached(&mut allowed)
+        .expect("allowed builtin should bind");
+    assert_eq!(
+        allowed.run().expect("builtin call should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(allowed.stack(), &[Value::bytes(vec![1, 2, 3])]);
+}
+
+#[test]
+fn explicit_capability_profile_rejects_builtin_callable_metadata_during_preflight() {
+    let mut program = Program::new(Vec::new(), vec![OpCode::Ret as u8]);
+    program.callable_prototypes.push(vm::CallablePrototype {
+        kind: vm::CallableKind::HostFunction,
+        target: vm::CallableTarget::HostImport(vm::BuiltinFunction::BytesFromArrayU8.call_index()),
+        arity: 1,
+        frame_local_count: 0,
+        parameter_slots: Vec::new(),
+        capture_source_slots: Vec::new(),
+        capture_slots: Vec::new(),
+        capture_modes: Vec::new(),
+        self_slot: None,
+        schema: None,
+    });
+    let mut vm = Vm::new(program);
+    let mut registry = HostFunctionRegistry::empty();
+    registry.set_capability_profile(CapabilityProfile::deny_all());
+
+    let error = registry
+        .bind_vm_cached(&mut vm)
+        .expect_err("builtin callable metadata must be authorized during binding");
+    assert!(error.to_string().contains("capability"));
+}
+
 #[cfg(feature = "cranelift-jit")]
 #[test]
-fn restricted_builtin_capabilities_match_between_interpreter_and_aot() {
+fn restricted_builtin_capabilities_are_rejected_before_interpreter_or_aot_execution() {
     let source = "use bytes; bytes::from_array_u8([1, 2, 3]);";
     let program = compile_source(source)
         .expect("bytes source should compile")
         .program;
 
     let mut interpreter = Vm::new(program.clone());
-    HostFunctionRegistry::restricted()
+    let interpreter_error = HostFunctionRegistry::restricted()
         .bind_vm_cached(&mut interpreter)
-        .expect("restricted registry should bind");
-    assert!(matches!(
-        interpreter.run(),
-        Err(vm::VmError::UnboundImport(_))
-    ));
+        .expect_err("restricted profile should reject before interpreter execution");
 
     let mut aot = Vm::new(program);
-    HostFunctionRegistry::restricted()
-        .bind_vm_cached(&mut aot)
-        .expect("restricted registry should bind");
     aot.compile_aot().expect("AOT compile should succeed");
-    assert!(matches!(aot.run(), Err(vm::VmError::UnboundImport(_))));
+    let aot_error = HostFunctionRegistry::restricted()
+        .bind_vm_cached(&mut aot)
+        .expect_err("restricted profile should reject before AOT execution");
+    assert_eq!(interpreter_error.to_string(), aot_error.to_string());
+    assert!(interpreter_error.to_string().contains("capability"));
 }
 
 #[test]
@@ -404,11 +489,10 @@ fn builtin_override_does_not_bypass_restricted_capability_profile() {
     .program;
 
     let mut denied = Vm::new(program.clone());
-    HostFunctionRegistry::restricted()
+    let error = HostFunctionRegistry::restricted()
         .bind_vm_cached(&mut denied)
-        .expect("restricted registry should bind");
-    denied.bind_function("io::exists", Box::new(ExistsOverride));
-    assert!(matches!(denied.run(), Err(vm::VmError::UnboundImport(_))));
+        .expect_err("restricted profile should reject before override installation");
+    assert!(error.to_string().contains("capability"));
 
     let mut allowed_registry = HostFunctionRegistry::restricted();
     allowed_registry

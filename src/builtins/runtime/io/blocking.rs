@@ -1,6 +1,7 @@
 use std::fs::OpenOptions;
 use std::future::Future;
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -14,13 +15,13 @@ use std::os::unix::process::CommandExt;
 use futures_channel::oneshot;
 use pd_host_function::pd_host_function;
 
-use super::HostCallResult;
-use super::cancellation::{CancellationReason, OperationId, OperationOwner};
-use super::error::{RuntimeError, RuntimeErrorCode};
-use super::resource::{ResourceHandle, ResourceTypeId};
+use super::super::HostCallResult;
+use super::super::cancellation::{CancellationReason, OperationId, OperationOwner};
+use super::super::error::{RuntimeError, RuntimeErrorCode};
+use super::super::resource::{ResourceHandle, ResourceTypeId};
 use crate::vm::{CallReturn, HostOpId, Value, Vm, VmError, VmResult};
 
-pub(super) enum IoHandle {
+pub(crate) enum IoHandle {
     File(std::fs::File),
     PopenRead { child: Child },
     PopenWrite { child: Child },
@@ -134,7 +135,7 @@ impl Drop for IoAsyncCompletion {
     }
 }
 
-pub(super) fn poll_builtin_io_op(
+pub(crate) fn poll_builtin_io_op(
     vm: &mut Vm,
     op_id: HostOpId,
     cx: &mut Context<'_>,
@@ -167,10 +168,14 @@ pub(super) fn poll_builtin_io_op(
     match poll_result {
         Poll::Pending => Poll::Pending,
         Poll::Ready(Ok(mut completion)) => {
-            let _ = super::close_runtime_resource(vm, callback, CancellationReason::ResourceClosed);
+            let _ = super::super::close_runtime_resource(
+                vm,
+                callback,
+                CancellationReason::ResourceClosed,
+            );
 
             if let Some(closed_handle) = completion.closed_handle
-                && let Err(error) = super::close_runtime_resource(
+                && let Err(error) = super::super::close_runtime_resource(
                     vm,
                     closed_handle,
                     CancellationReason::ResourceClosed,
@@ -189,7 +194,8 @@ pub(super) fn poll_builtin_io_op(
             ))
         }
         Poll::Ready(Err(_)) => {
-            let _ = super::close_runtime_resource(vm, callback, CancellationReason::Requested);
+            let _ =
+                super::super::close_runtime_resource(vm, callback, CancellationReason::Requested);
             Poll::Ready(Err(VmError::HostError(format!(
                 "builtin io op {op_id} was cancelled",
             ))))
@@ -199,12 +205,21 @@ pub(super) fn poll_builtin_io_op(
 
 /// Opens a file handle for runtime I/O.
 #[pd_host_function(name = "io::open")]
-pub(super) fn builtin_io_open(
+pub(crate) fn builtin_io_open(
     vm: &mut Vm,
     path: &str,
     mode: &str,
 ) -> VmResult<HostCallResult<i64>> {
-    let path = path.to_string();
+    let writes = match mode {
+        "r" => false,
+        "w" | "a" | "r+" | "w+" | "a+" => true,
+        other => {
+            return Err(VmError::HostError(format!(
+                "unsupported io_open mode '{other}', expected r/w/a/r+/w+/a+"
+            )));
+        }
+    };
+    let path = authorize_io_path(vm, path, writes)?;
     let mode = mode.to_string();
     let op_id = schedule_io_task(vm, None, move || {
         let mut options = OpenOptions::new();
@@ -250,7 +265,7 @@ pub(super) fn builtin_io_open(
 
 /// Starts a child process and returns a process-backed handle.
 #[pd_host_function(name = "io::popen")]
-pub(super) fn builtin_io_popen(
+pub(crate) fn builtin_io_popen(
     vm: &mut Vm,
     command: &str,
     mode: &str,
@@ -259,6 +274,11 @@ pub(super) fn builtin_io_popen(
         return Err(VmError::HostError(format!(
             "unsupported io_popen mode '{mode}', expected r or w"
         )));
+    }
+    if super::io_policy(vm).is_some_and(|policy| !policy.allow_process) {
+        return Err(VmError::HostError(
+            "io_popen requires the process capability".to_string(),
+        ));
     }
     let command = command.to_string();
     let mode = mode.to_string();
@@ -297,24 +317,28 @@ pub(super) fn builtin_io_popen(
 
 /// Reads all remaining text from an I/O handle.
 #[pd_host_function(name = "io::read_all")]
-pub(super) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<HostCallResult<String>> {
+pub(crate) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<HostCallResult<String>> {
+    let max_read_bytes = super::io_policy(vm).map(|policy| policy.max_read_bytes);
     let handle = resource_handle(handle_id)?;
     let resource = io_resource_for_handle(vm, handle)?;
     let op_id = schedule_io_task(vm, Some(handle), move || {
         let result = resource.with_handle_mut(|handle| {
             let mut out = String::new();
             match handle {
-                IoHandle::File(file) => file
-                    .read_to_string(&mut out)
-                    .map_err(|err| VmError::HostError(format!("io_read_all failed: {err}")))?,
-                IoHandle::PopenRead { child } => child
-                    .stdout
-                    .as_mut()
-                    .ok_or_else(|| {
-                        VmError::HostError("io_read_all popen handle missing stdout".to_string())
-                    })?
-                    .read_to_string(&mut out)
-                    .map_err(|err| VmError::HostError(format!("io_read_all failed: {err}")))?,
+                IoHandle::File(file) => {
+                    read_to_string_with_limit(file, max_read_bytes, &mut out)?;
+                }
+                IoHandle::PopenRead { child } => {
+                    read_to_string_with_limit(
+                        child.stdout.as_mut().ok_or_else(|| {
+                            VmError::HostError(
+                                "io_read_all popen handle missing stdout".to_string(),
+                            )
+                        })?,
+                        max_read_bytes,
+                        &mut out,
+                    )?;
+                }
                 IoHandle::PopenWrite { .. } => {
                     return Err(VmError::HostError(
                         "io_read_all requires a readable handle".to_string(),
@@ -330,21 +354,23 @@ pub(super) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<HostC
 
 /// Reads a single line of text from an I/O handle.
 #[pd_host_function(name = "io::read_line")]
-pub(super) fn builtin_io_read_line(
+pub(crate) fn builtin_io_read_line(
     vm: &mut Vm,
     handle_id: i64,
 ) -> VmResult<HostCallResult<String>> {
+    let max_read_bytes = super::io_policy(vm).map(|policy| policy.max_read_bytes);
     let handle = resource_handle(handle_id)?;
     let resource = io_resource_for_handle(vm, handle)?;
     let op_id = schedule_io_task(vm, Some(handle), move || {
         let result = resource.with_handle_mut(|handle| {
             let line = match handle {
-                IoHandle::File(file) => read_line_from_reader(file)?,
-                IoHandle::PopenRead { child } => {
-                    read_line_from_reader(child.stdout.as_mut().ok_or_else(|| {
+                IoHandle::File(file) => read_line_from_reader(file, max_read_bytes)?,
+                IoHandle::PopenRead { child } => read_line_from_reader(
+                    child.stdout.as_mut().ok_or_else(|| {
                         VmError::HostError("io_read_line popen handle missing stdout".to_string())
-                    })?)?
-                }
+                    })?,
+                    max_read_bytes,
+                )?,
                 IoHandle::PopenWrite { .. } => {
                     return Err(VmError::HostError(
                         "io_read_line requires a readable handle".to_string(),
@@ -360,11 +386,19 @@ pub(super) fn builtin_io_read_line(
 
 /// Writes text to an I/O handle.
 #[pd_host_function(name = "io::write")]
-pub(super) fn builtin_io_write(
+pub(crate) fn builtin_io_write(
     vm: &mut Vm,
     handle_id: i64,
     text: &str,
 ) -> VmResult<HostCallResult<i64>> {
+    if let Some(policy) = super::io_policy(vm)
+        && text.len() > policy.max_write_bytes
+    {
+        return Err(VmError::HostError(format!(
+            "io_write exceeds the configured write limit of {} bytes",
+            policy.max_write_bytes
+        )));
+    }
     let bytes = text.as_bytes().to_vec();
     let handle = resource_handle(handle_id)?;
     let resource = io_resource_for_handle(vm, handle)?;
@@ -397,7 +431,7 @@ pub(super) fn builtin_io_write(
 
 /// Flushes buffered output for an I/O handle.
 #[pd_host_function(name = "io::flush")]
-pub(super) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<HostCallResult<bool>> {
+pub(crate) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<HostCallResult<bool>> {
     let handle = resource_handle(handle_id)?;
     let resource = io_resource_for_handle(vm, handle)?;
     let op_id = schedule_io_task(vm, Some(handle), move || {
@@ -425,7 +459,7 @@ pub(super) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<HostCall
 
 /// Closes an I/O handle.
 #[pd_host_function(name = "io::close")]
-pub(super) fn builtin_io_close(vm: &mut Vm, handle_id: i64) -> VmResult<HostCallResult<bool>> {
+pub(crate) fn builtin_io_close(vm: &mut Vm, handle_id: i64) -> VmResult<HostCallResult<bool>> {
     let handle = resource_handle(handle_id)?;
     let resource = io_resource_for_handle(vm, handle)?;
     let op_id = schedule_io_task(vm, Some(handle), move || {
@@ -444,14 +478,64 @@ pub(super) fn builtin_io_close(vm: &mut Vm, handle_id: i64) -> VmResult<HostCall
 
 /// Returns whether a file system path exists.
 #[pd_host_function(name = "io::exists")]
-pub(super) fn builtin_io_exists(vm: &mut Vm, path: &str) -> VmResult<HostCallResult<bool>> {
-    let path = path.to_string();
+pub(crate) fn builtin_io_exists(vm: &mut Vm, path: &str) -> VmResult<HostCallResult<bool>> {
+    let path = authorize_io_path(vm, path, false)?;
     let op_id = schedule_io_task(vm, None, move || {
-        IoAsyncCompletion::result(Ok(CallReturn::one(Value::Bool(
-            std::path::Path::new(path.as_str()).exists(),
-        ))))
+        IoAsyncCompletion::result(Ok(CallReturn::one(Value::Bool(path.exists()))))
     })?;
     Ok(HostCallResult::Pending(op_id))
+}
+
+fn authorize_io_path(vm: &Vm, path: &str, writes: bool) -> VmResult<PathBuf> {
+    let requested = PathBuf::from(path);
+    let Some(policy) = super::io_policy(vm) else {
+        return Ok(requested);
+    };
+    if writes && !policy.allow_write {
+        return Err(VmError::HostError(
+            "io path write requires the write capability".to_string(),
+        ));
+    }
+    let absolute = if requested.is_absolute() {
+        requested
+    } else {
+        std::env::current_dir()
+            .map_err(|error| VmError::HostError(format!("io path resolution failed: {error}")))?
+            .join(requested)
+    };
+    let canonical = canonicalize_io_target(&absolute)?;
+    for root in &policy.allowed_roots {
+        let root = Path::new(root).canonicalize().map_err(|error| {
+            VmError::HostError(format!(
+                "io allowed root '{root}' cannot be resolved: {error}"
+            ))
+        })?;
+        if canonical.starts_with(root) {
+            return Ok(canonical);
+        }
+    }
+    Err(VmError::HostError(format!(
+        "io path '{}' is outside the allowed roots",
+        canonical.display()
+    )))
+}
+
+fn canonicalize_io_target(path: &Path) -> VmResult<PathBuf> {
+    if path.exists() {
+        return path
+            .canonicalize()
+            .map_err(|error| VmError::HostError(format!("io path resolution failed: {error}")));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| VmError::HostError(format!("io path '{}' has no parent", path.display())))?;
+    let file_name = path.file_name().ok_or_else(|| {
+        VmError::HostError(format!("io path '{}' has no file name", path.display()))
+    })?;
+    parent
+        .canonicalize()
+        .map(|parent| parent.join(file_name))
+        .map_err(|error| VmError::HostError(format!("io path resolution failed: {error}")))
 }
 
 fn spawn_shell_command(command: &str, mode: &str) -> VmResult<Child> {
@@ -549,49 +633,29 @@ fn schedule_io_task(
     };
     operation.set_payload(callback);
 
-    if let Err(error) = std::thread::Builder::new()
-        .name("pd-vm-io".to_string())
-        .spawn(move || {
-            let completion = if let Some(reason) = worker_token.reason() {
-                IoAsyncCompletion::result(Err(VmError::HostError(format!(
-                    "io operation cancelled: {reason:?}"
-                ))))
-            } else {
-                task()
-            };
-            match &completion.result {
-                Ok(_) => {
-                    let _ = worker_operation.complete();
-                }
-                Err(error) => {
-                    let _ = worker_operation.fail(
-                        RuntimeError::new(
-                            RuntimeErrorCode::OperationFailed,
-                            "io::operation",
-                            error.to_string(),
-                        )
-                        .with_value(op_id),
-                    );
-                }
-            }
-            let _ = sender.send(completion);
-        })
-    {
-        let runtime_error = RuntimeError::new(
-            RuntimeErrorCode::OperationFailed,
-            "io::schedule",
-            format!("failed to spawn io task: {error}"),
-        )
-        .with_value(op_id);
-        let _ = super::close_runtime_resource(vm, callback, CancellationReason::Requested);
-        let _ = vm
-            .host
-            .runtime_operations
-            .fail(operation.id(), runtime_error);
-        return Err(VmError::HostError(format!(
-            "failed to spawn io task: {error}"
-        )));
+    let completion = if let Some(reason) = worker_token.reason() {
+        IoAsyncCompletion::result(Err(VmError::HostError(format!(
+            "io operation cancelled: {reason:?}"
+        ))))
+    } else {
+        task()
+    };
+    match &completion.result {
+        Ok(_) => {
+            let _ = worker_operation.complete();
+        }
+        Err(error) => {
+            let _ = worker_operation.fail(
+                RuntimeError::new(
+                    RuntimeErrorCode::OperationFailed,
+                    "io::operation",
+                    error.to_string(),
+                )
+                .with_value(op_id),
+            );
+        }
     }
+    let _ = sender.send(completion);
 
     Ok(op_id)
 }
@@ -747,7 +811,7 @@ mod windows_process_tree {
         fn CloseHandle(handle: Handle) -> i32;
     }
 
-    pub(super) fn terminate(root_process_id: u32) -> VmResult<()> {
+    pub(crate) fn terminate(root_process_id: u32) -> VmResult<()> {
         let descendants = match descendant_processes(root_process_id) {
             Ok(descendants) => descendants,
             Err(snapshot_error) => {
@@ -882,7 +946,37 @@ fn terminate_process_tree(process_id: u32) -> VmResult<()> {
     )))
 }
 
-fn read_line_from_reader(reader: &mut impl Read) -> VmResult<String> {
+fn read_to_string_with_limit(
+    reader: &mut impl Read,
+    max_read_bytes: Option<usize>,
+    out: &mut String,
+) -> VmResult<()> {
+    match max_read_bytes {
+        None => {
+            reader
+                .read_to_string(out)
+                .map_err(|err| VmError::HostError(format!("io_read_all failed: {err}")))?;
+        }
+        Some(limit) => {
+            let take_limit = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
+            reader
+                .take(take_limit)
+                .read_to_string(out)
+                .map_err(|err| VmError::HostError(format!("io_read_all failed: {err}")))?;
+            if out.len() > limit {
+                return Err(VmError::HostError(format!(
+                    "io_read_all exceeds the configured read limit of {limit} bytes"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_line_from_reader(
+    reader: &mut impl Read,
+    max_read_bytes: Option<usize>,
+) -> VmResult<String> {
     let mut bytes = Vec::new();
     let mut one = [0u8; 1];
     loop {
@@ -893,6 +987,12 @@ fn read_line_from_reader(reader: &mut impl Read) -> VmResult<String> {
             break;
         }
         bytes.push(one[0]);
+        if max_read_bytes.is_some_and(|limit| bytes.len() > limit) {
+            return Err(VmError::HostError(format!(
+                "io_read_line exceeds the configured read limit of {} bytes",
+                max_read_bytes.expect("read limit should be present")
+            )));
+        }
         if one[0] == b'\n' {
             break;
         }

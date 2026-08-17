@@ -33,8 +33,10 @@ pub struct ResourceTypeId(u16);
 
 impl ResourceTypeId {
     pub const IO_FILE: Self = Self(1);
+
     #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
     pub const SQLITE_CONNECTION: Self = Self(5);
+    #[cfg_attr(feature = "async", allow(dead_code))]
     pub const CALLBACK: Self = Self(6);
 
     pub const fn raw(self) -> u16 {
@@ -183,6 +185,7 @@ impl ResourceArena {
         })
     }
 
+    #[cfg_attr(feature = "async", allow(dead_code))]
     pub fn insert<T>(
         &mut self,
         resource_type: ResourceTypeId,
@@ -254,6 +257,7 @@ impl ResourceArena {
             .ok_or_else(|| type_mismatch(handle, expected_type))
     }
 
+    #[cfg_attr(feature = "async", allow(dead_code))]
     pub fn get_mut<T>(
         &mut self,
         handle: ResourceHandle,
@@ -428,6 +432,7 @@ impl ResourceArena {
         Ok(slot)
     }
 
+    #[cfg_attr(feature = "async", allow(dead_code))]
     fn active_slot_mut(
         &mut self,
         handle: ResourceHandle,

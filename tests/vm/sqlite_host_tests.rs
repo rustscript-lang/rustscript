@@ -1,7 +1,10 @@
 extern crate vm as rustscript_vm;
 
 pub mod vm {
+    use std::any::{Any, TypeId};
+    use std::collections::HashMap;
 
+    pub use crate::builtins::runtime::sqlite::{SqliteLimits, SqlitePolicy};
     pub use crate::rustscript_vm::{
         CallReturn, HostCallResult, HostOpId, OpCode, Program, Value, VmError, VmMap, VmResult,
     };
@@ -9,51 +12,32 @@ pub mod vm {
     use crate::builtins::runtime::cancellation::{CancellationToken, OperationRegistry};
     use crate::builtins::runtime::resource::ResourceArena;
 
-    #[derive(Clone, Copy, Debug)]
-    pub struct SqliteLimits {
-        pub max_connections: usize,
-        pub max_statements: usize,
-        pub max_rows: usize,
-        pub max_columns: usize,
-        pub max_result_bytes: usize,
-        pub max_statement_bytes: usize,
-        pub max_parameters: usize,
-        pub max_parameter_bytes: usize,
-        pub max_pending_operations: usize,
-        pub max_transaction_ms: u64,
-        pub busy_timeout_ms: u64,
-    }
-
-    impl Default for SqliteLimits {
-        fn default() -> Self {
-            Self {
-                max_connections: 16,
-                max_statements: 128,
-                max_rows: 1_000,
-                max_columns: 128,
-                max_result_bytes: 4 * 1024 * 1024,
-                max_statement_bytes: 1024 * 1024,
-                max_parameters: 128,
-                max_parameter_bytes: 1024 * 1024,
-                max_pending_operations: 32,
-                max_transaction_ms: 5_000,
-                busy_timeout_ms: 5_000,
-            }
-        }
-    }
-
-    #[derive(Clone, Debug, Default)]
-    pub struct SqlitePolicy {
-        pub database_root: Option<String>,
-        pub allow_unsafe_sql: bool,
-        pub limits: SqliteLimits,
-    }
-
     pub(crate) struct TestHostRuntime {
         pub(crate) runtime_resources: ResourceArena,
         pub(crate) runtime_operations: OperationRegistry,
+        host_function_states: HashMap<TypeId, Box<dyn Any + Send>>,
+    }
 
-        pub(crate) sqlite_policy: SqlitePolicy,
+    impl TestHostRuntime {
+        pub(crate) fn set_host_function_state<T: Any + Send>(&mut self, state: T) {
+            self.host_function_states
+                .insert(TypeId::of::<T>(), Box::new(state));
+        }
+
+        pub(crate) fn host_function_state<T: Any + Send>(&self) -> Option<&T> {
+            self.host_function_states
+                .get(&TypeId::of::<T>())?
+                .downcast_ref()
+        }
+
+        #[allow(dead_code)]
+        pub(crate) fn remove_host_function_state<T: Any + Send>(&mut self) -> Option<T> {
+            self.host_function_states
+                .remove(&TypeId::of::<T>())?
+                .downcast::<T>()
+                .ok()
+                .map(|state| *state)
+        }
     }
 
     pub(crate) struct TestRunContext {
@@ -71,17 +55,12 @@ pub mod vm {
                 host: TestHostRuntime {
                     runtime_resources: ResourceArena::default(),
                     runtime_operations: OperationRegistry::default(),
-
-                    sqlite_policy: SqlitePolicy::default(),
+                    host_function_states: HashMap::new(),
                 },
                 run_ctx: TestRunContext {
                     cancellation: CancellationToken::root(),
                 },
             }
-        }
-
-        pub fn configure_sqlite(&mut self, policy: SqlitePolicy) {
-            self.host.sqlite_policy = policy;
         }
     }
 }
@@ -159,6 +138,28 @@ mod builtins {
                 }
             }
             vm.host.runtime_resources.close(handle, reason)
+        }
+
+        pub(crate) fn cancel_operations_by_owner(
+            vm: &mut crate::vm::Vm,
+            owner: cancellation::OperationOwner,
+            reason: cancellation::CancellationReason,
+        ) {
+            let operations = vm.host.runtime_operations.operations_by_owner(owner);
+            for operation in operations {
+                cancel_runtime_operation(vm, operation.id(), reason);
+            }
+        }
+
+        pub(crate) fn close_resources_by_type(
+            vm: &mut crate::vm::Vm,
+            resource_type: resource::ResourceTypeId,
+            reason: cancellation::CancellationReason,
+        ) {
+            let handles = vm.host.runtime_resources.handles_of_type(resource_type);
+            for handle in handles {
+                let _ = close_runtime_resource(vm, handle, reason);
+            }
         }
 
         pub mod typed {
@@ -376,6 +377,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use builtins::runtime::sqlite::SqliteHostExt;
 use builtins::runtime::test_api as sqlite;
 use vm::{CallReturn, HostCallResult, OpCode, Program, Value, Vm, VmError};
 
