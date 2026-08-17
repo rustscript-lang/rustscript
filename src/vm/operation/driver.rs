@@ -2,28 +2,24 @@
 //!
 //! This module defines the [`HostOperation`] driver contract that the
 //! operation registry drives. Each pending operation owns its poll and
-//! cancel behaviour; the registry performs no owner/poller dispatch. This is
-//! the host-agnostic replacement for the old `OperationOwner` +
-//! `RUNTIME_OPERATION_POLLERS` static table.
+//! cancel behaviour; the registry performs no owner/poller dispatch.
 //!
 //! Cancellation has a single authority: the operation's *owner* (or the
 //! scope that owns the operation, integrated later). Drivers implement the
 //! concrete [`HostOperation::cancel`] action; the registry records the first
-//! [`CancellationReason`] and the terminal status but does not build a
-//! parent/child [`CancellationToken`] signal graph.
+//! [`OperationCancelReason`] and the terminal status but does not build a
+//! parent/child signal graph.
 
 use std::task::{Context, Poll};
 
-use super::error::OperationError;
+use super::error::{OperationError, OperationResult};
 use super::reason::OperationCancelReason;
-use crate::vm::CancellationReason;
 use crate::vm::resource::ResourceHandle;
 
 /// Opaque terminal result reported by an operation once it finishes.
 ///
 /// A driver returns this from [`HostOperation::poll`]. The registry stores it
-/// as the operation's terminal result and exposes it through
-/// [`crate::vm::operation::OperationRegistry::outcome`]. The actual host
+/// as the operation's terminal result for later retrieval. The actual host
 /// *value* the operation produced is delivered by the driver to its own
 /// consumer (e.g. a captured completion callback); the operation layer tracks
 /// lifecycle and status, not the concrete produced byte stream.
@@ -31,7 +27,7 @@ use crate::vm::resource::ResourceHandle;
 pub enum OperationOutcome {
     /// Operation finished successfully.
     Completed,
-    /// Operation failed with a runtime error.
+    /// Operation failed with an operation error.
     Failed(OperationError),
     /// Operation was cancelled; carries the first recorded cancellation
     /// reason.
@@ -77,7 +73,7 @@ pub type OperationCleanup =
 pub struct OperationSpec {
     /// Optional absolute deadline. If a deadline elapses while the operation
     /// is still pending, the registry cancels it with
-    /// [`CancellationReason::Deadline`] (unless it was already cancelled with
+    /// [`OperationCancelReason::Deadline`] (unless it was already cancelled with
     /// an earlier reason).
     pub deadline: Option<std::time::Instant>,
     /// Optional associated resource handle. Cancelling/`closing` that exact
