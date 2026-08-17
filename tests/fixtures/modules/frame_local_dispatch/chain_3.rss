@@ -1,0 +1,79 @@
+pub fn h_24(a: int, b: int) -> int {
+    let t = a + b;
+    t;
+}
+
+pub fn f_24(a: int, b: int) -> int {
+    let t = a + b;
+    h_24(t, a);
+}
+
+pub fn h_25(a: int, b: int) -> int {
+    let t = a + b;
+    t;
+}
+
+pub fn f_25(a: int, b: int) -> int {
+    let t = a + b;
+    h_25(t, a);
+}
+
+pub fn h_26(a: int, b: int) -> int {
+    let t = a + b;
+    t;
+}
+
+pub fn f_26(a: int, b: int) -> int {
+    let t = a + b;
+    h_26(t, a);
+}
+
+pub fn h_27(a: int, b: int) -> int {
+    let t = a + b;
+    t;
+}
+
+pub fn f_27(a: int, b: int) -> int {
+    let t = a + b;
+    h_27(t, a);
+}
+
+pub fn h_28(a: int, b: int) -> int {
+    let t = a + b;
+    t;
+}
+
+pub fn f_28(a: int, b: int) -> int {
+    let t = a + b;
+    h_28(t, a);
+}
+
+pub fn h_29(a: int, b: int) -> int {
+    let t = a + b;
+    t;
+}
+
+pub fn f_29(a: int, b: int) -> int {
+    let t = a + b;
+    h_29(t, a);
+}
+
+pub fn h_30(a: int, b: int) -> int {
+    let t = a + b;
+    t;
+}
+
+pub fn f_30(a: int, b: int) -> int {
+    let t = a + b;
+    h_30(t, a);
+}
+
+pub fn h_31(a: int, b: int) -> int {
+    let t = a + b;
+    t;
+}
+
+pub fn f_31(a: int, b: int) -> int {
+    let t = a + b;
+    h_31(t, a);
+}

@@ -219,6 +219,19 @@ pub(super) fn collect_function_types(
         outputs.optional_slots,
         &mut context,
     );
+    // The tail expression is stored separately from `body_stmts`; collect it
+    // so bindings declared inside it (e.g. in expression-if branch blocks)
+    // are recorded for strict slot validation.
+    collect_expr_types(
+        &function_impl.body_expr,
+        &state,
+        outputs.local_types,
+        outputs.local_schemas,
+        outputs.local_schema_labels,
+        outputs.callable_slots,
+        outputs.optional_slots,
+        &mut context,
+    );
     let _ = context.infer_expr_type(&function_impl.body_expr, &state);
 }
 
@@ -707,9 +720,15 @@ fn collect_expr_types(
                 optional_slots,
                 context,
             );
+            // Collect each branch under its own refined state, mirroring
+            // `Stmt::IfElse` and strict validation. `Expr::Block` branches
+            // clone the state internally, so branch-local bindings never
+            // leak into the outer state.
+            let then_state = refine_state_for_condition(state, condition, true);
+            let else_state = refine_state_for_condition(state, condition, false);
             collect_expr_types(
                 then_expr,
-                state,
+                &then_state,
                 local_types,
                 local_schemas,
                 local_schema_labels,
@@ -719,7 +738,7 @@ fn collect_expr_types(
             );
             collect_expr_types(
                 else_expr,
-                state,
+                &else_state,
                 local_types,
                 local_schemas,
                 local_schema_labels,

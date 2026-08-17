@@ -14,15 +14,16 @@ pub(crate) use bridge::{
     aot_call_boundary_interrupt_entry_address, array_push_entry_address, array_set_entry_address,
     clear_bridge_error, clear_bridge_error_entry_address, clear_value_slot_entry_address,
     clone_value_to_slot_entry_address, collection_set_entry_address, copy_bytes_entry_address,
-    decode_jit_trace_exit_status, encode_jit_trace_exit_status, enter_call_value_entry_address,
+    decode_jit_trace_exit_status, encode_jit_trace_exit_status, enter_call_script_entry_address,
+    enter_call_script_inherited_entry_address, enter_call_value_entry_address,
     enter_call_value_inherited_entry_address, frame_state_entry_address, helper_entry_address,
     helper_entry_offset, init_null_value_slot_entry_address, interrupt_helper_entry_address,
     interrupt_helper_entry_offset, leave_frame_entry_address, leave_frame_inherited_entry_address,
     map_get_entry_address, map_has_entry_address, map_iter_next_entry_address,
     map_iter_take_key_entry_address, map_iter_take_value_entry_address, map_set_entry_address,
-    non_yielding_host_call_entry_address, non_yielding_i64_host_call_entry_address,
-    non_yielding_scalar_host_call_entry_address, regex_match_entry_address,
-    regex_replace_entry_address, replace_value_in_slot_entry_address,
+    materialize_root_callable_entry_address, non_yielding_host_call_entry_address,
+    non_yielding_i64_host_call_entry_address, non_yielding_scalar_host_call_entry_address,
+    regex_match_entry_address, regex_replace_entry_address, replace_value_in_slot_entry_address,
     restore_active_exit_state_entry_address, restore_active_sparse_exit_state_entry_address,
     restore_exit_state_entry_address, restore_sparse_exit_state_entry_address,
     restore_virtual_frame_entry_address, shared_array_from_buffer_entry_address,
@@ -36,10 +37,11 @@ pub(crate) use bridge::{
 pub(crate) use codegen::{
     alloc_buffer_signature, array_set_signature, box_heap_value_signature, clone_value_signature,
     collection_get_signature, collection_mutation_signature, collection_predicate_signature,
-    copy_bytes_signature, enter_call_value_inherited_signature, enter_call_value_signature,
-    entry_signature, frame_state_signature, free_buffer_signature, helper_signature,
-    jump_with_status, leave_frame_inherited_signature, leave_frame_signature,
-    map_iter_next_signature, map_iter_take_signature, map_set_signature,
+    copy_bytes_signature, enter_call_script_inherited_signature, enter_call_script_signature,
+    enter_call_value_inherited_signature, enter_call_value_signature, entry_signature,
+    frame_state_signature, free_buffer_signature, helper_signature, jump_with_status,
+    leave_frame_inherited_signature, leave_frame_signature, map_iter_next_signature,
+    map_iter_take_signature, map_set_signature, materialize_root_callable_signature,
     non_yielding_host_call_signature, non_yielding_i64_host_call_signature,
     non_yielding_scalar_host_call_signature, pack_shared_signature, regex_match_signature,
     regex_replace_signature, restore_exit_signature, restore_virtual_frame_signature,
@@ -55,7 +57,11 @@ pub(crate) use layout::{
 #[cfg(feature = "cranelift-jit")]
 pub(crate) use offsets::{HeapIntrinsicAddrs, HeapIntrinsicRefs, ResolvedOffsets, resolve_offsets};
 
-pub(crate) const NATIVE_CALLABLE_ABI_VERSION: u16 = 5;
+/// Native callable ABI revision. Bumped for every change to the native
+/// callable boundary helpers or their status contract; it is hashed into the
+/// program cache identity so stale native products are invalidated exactly
+/// once per semantics change.
+pub(crate) const NATIVE_CALLABLE_ABI_VERSION: u16 = 7;
 pub(crate) const MAX_INHERITED_ENTRY_VALUES: usize = 256;
 pub(crate) const INHERITED_STATE_ACTIVE_OFFSET: i32 = 0;
 pub(crate) const INHERITED_STATE_FRAME_KEY_OFFSET: i32 = 8;

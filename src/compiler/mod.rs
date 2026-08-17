@@ -14,6 +14,7 @@ mod frontends;
 pub mod ir;
 mod lifetime;
 mod linker;
+mod materialization;
 mod modules;
 mod parser;
 mod pipeline;
@@ -21,6 +22,8 @@ mod source_loader;
 pub mod source_map;
 mod typing;
 
+#[cfg(test)]
+use self::materialization::CallableUseObservation;
 use self::source_map::{SourceMap, Span};
 
 pub use self::codegen::Compiler;
@@ -58,6 +61,15 @@ pub enum CompileError {
     CallableUsedAsValue,
     NonCallableLocal(LocalSlot),
     LocalSlotOverflow(LocalSlot),
+    /// The aggregate frame-local count (data slots plus materialized callable
+    /// slots) exceeds what the short bytecode operands can address. Carries
+    /// the real counts so the diagnostic is actionable instead of a sentinel.
+    FrameLocalLimitExceeded {
+        data_slots: usize,
+        callable_slots: usize,
+        total_slots: usize,
+        max_slots: usize,
+    },
     CallableArityMismatch {
         expected: usize,
         got: usize,
@@ -155,6 +167,14 @@ impl CompileError {
             CompileError::LocalSlotOverflow(slot) => {
                 format!("local slot {slot} exceeds the supported bytecode encoding")
             }
+            CompileError::FrameLocalLimitExceeded {
+                data_slots,
+                callable_slots,
+                total_slots,
+                max_slots,
+            } => format!(
+                "frame requires {total_slots} local slots ({data_slots} data + {callable_slots} callable); short bytecode supports {max_slots}"
+            ),
             CompileError::CallableArityMismatch { expected, got } => {
                 format!("callable arity mismatch: expected {expected}, got {got}")
             }
@@ -478,6 +498,12 @@ pub struct CompiledProgram {
     pub program: Program,
     pub locals: usize,
     pub functions: Vec<FunctionDecl>,
+    /// Milestone-5 callable-use classification observed through the
+    /// production pipeline, keyed by resolved flat function index and
+    /// sorted by index. Test-only observation compiled into the crate's
+    /// unit-test builds only; never part of the public API.
+    #[cfg(test)]
+    pub(crate) callable_use_facts: Vec<CallableUseObservation>,
 }
 
 impl CompiledProgram {
