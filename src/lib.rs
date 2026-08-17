@@ -48,8 +48,6 @@ pub fn builtin_call_index(name: &str) -> Option<u16> {
 }
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::error::{RuntimeError, RuntimeErrorCode, RuntimeResult};
-#[cfg(feature = "runtime")]
-pub use builtins::runtime::event::{EventPayload, EventSink};
 pub use compiler::diagnostics::{
     render_compile_error, render_source_error, render_source_path_error,
 };
@@ -94,9 +92,10 @@ pub use vm::{
     CapabilityProfileBuilder, DEFAULT_MAX_SCRIPT_CALL_DEPTH, EpochCheckpoint, EpochHandle,
     FuelCheckpoint, HostArgsFunction, HostAsyncBridge, HostBindingPlan, HostFunction,
     HostFunctionRegistry, HostFuture, HostFutureOutput, HostOpId, HostStackFunction,
-    IntoScriptValue, QueuedScriptInvocation, ScriptArgs, ScriptCallback, ScriptResult,
-    StaticHostArgsFunction, StaticHostFunction, StaticHostStackFunction, Store, Vm, VmError,
-    VmResult, VmStatus, VmYieldReason,
+    IntoScriptValue, Invocation, InvocationError, InvocationItem, InvocationPoll,
+    QueuedScriptInvocation, ScriptArgs, ScriptCallback, ScriptResult, StaticHostArgsFunction,
+    StaticHostFunction, StaticHostStackFunction, Store, Vm, VmError, VmResult, VmStatus,
+    VmYieldReason,
 };
 
 #[cfg(feature = "runtime")]

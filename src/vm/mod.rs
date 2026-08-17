@@ -13,6 +13,7 @@ mod fuel;
 mod host;
 mod host_runtime;
 mod instance;
+pub mod invocation;
 pub(crate) mod jit;
 mod map_iter;
 pub(crate) mod native;
@@ -39,6 +40,7 @@ pub use self::host::{
 use self::host::{HostCallExecOutcome, VmHostFunction};
 use self::host_runtime::HostRuntime;
 use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable};
+pub use self::invocation::{Invocation, InvocationError, InvocationItem, InvocationPoll};
 use self::run_context::{InterruptMode, RunContext};
 pub use crate::builtins::runtime::cancellation::CancellationReason;
 
