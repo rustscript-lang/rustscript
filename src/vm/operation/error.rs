@@ -22,17 +22,17 @@ pub enum OperationErrorCode {
     OperationWrongRegistry,
     /// The operation id referred to a generation that had moved on.
     OperationStale,
-    /// The operation was already cancelled / completed / failed and cannot transition again.
-    OperationAlreadyTerminal,
+    /// The requested operation does not exist in this registry.
+    OperationNotFound,
     /// The operation is currently pending.
     OperationPending,
     /// The operation id space was exhausted.
     OperationIdExhausted,
-    /// Best-effort cancellation of a pending operation reported a failure.
+    /// A cleanup hook failed after the operation's terminal transition.
     OperationCleanupFailed,
-    /// A close-all/registry sweep was already in progress with a different reason.
+    /// The registry is sealed and rejects the start of new operations.
     OperationRegistrySealed,
-    /// The driver reported a failure while the operation was closing.
+    /// A driver poll or cancellation action failed.
     OperationDriverFailed,
 }
 
@@ -45,7 +45,7 @@ impl OperationErrorCode {
             Self::InvalidOperationId => "invalid_operation_id",
             Self::OperationWrongRegistry => "operation_wrong_registry",
             Self::OperationStale => "operation_stale",
-            Self::OperationAlreadyTerminal => "operation_already_terminal",
+            Self::OperationNotFound => "operation_not_found",
             Self::OperationPending => "operation_pending",
             Self::OperationIdExhausted => "operation_id_exhausted",
             Self::OperationCleanupFailed => "operation_cleanup_failed",
@@ -168,10 +168,7 @@ mod tests {
                 "operation_wrong_registry",
             ),
             (OperationErrorCode::OperationStale, "operation_stale"),
-            (
-                OperationErrorCode::OperationAlreadyTerminal,
-                "operation_already_terminal",
-            ),
+            (OperationErrorCode::OperationNotFound, "operation_not_found"),
             (OperationErrorCode::OperationPending, "operation_pending"),
             (
                 OperationErrorCode::OperationIdExhausted,
