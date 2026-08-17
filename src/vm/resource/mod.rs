@@ -22,9 +22,13 @@
 //!   generation in the handle.
 
 pub mod close;
+pub mod error;
 pub mod handle;
+pub mod reason;
 pub mod table;
 
 pub use self::close::{CloseProgress, HostResource};
+pub use self::error::{ResourceError, ResourceErrorCode, ResourceResult};
 pub use self::handle::{Resource, ResourceHandle, ResourceMut, ResourceRef};
+pub use self::reason::ResourceCloseReason;
 pub use self::table::ResourceTable;
