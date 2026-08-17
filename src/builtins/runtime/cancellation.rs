@@ -688,7 +688,7 @@ impl OperationRegistry {
             .ok_or_else(|| operation_not_found(id))
     }
 
-    #[cfg_attr(not(any(feature = "async", feature = "sqlite")), allow(dead_code))]
+    #[cfg(feature = "sqlite")]
     pub fn operations_by_owner(&self, owner: OperationOwner) -> Vec<OperationState> {
         let operations = self.registered_operations();
         operations

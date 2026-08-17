@@ -78,6 +78,14 @@ PDRC recordings preserve full execution-frame metadata. Callable environments us
 
 Polling drives execution and provides backpressure: at most one event item is buffered between polls, and the VM does not produce items while the consumer is not polling. `stream::emit` validates only the configured per-item value bound; sequence assignment, receipts, persistence, and delivery policy belong to the embedding. At most one invocation is active per VM, `Invocation::cancel(reason)` cancels with a typed `CancellationReason`, and the low-level `Vm::run` pump is unchanged for custom drivers.
 
+## Callable-driven HTTP streams
+
+With the `http-client` feature, `http::client::request(request)` and `http::client::sse(request, on_event)` are script-facing host imports. SSE is a long-running ordinary host call. Its handler has the schema `fn(map) -> map`. The host produces one event, the VM runs one child callback frame, and the returned action controls continuation before another event can arrive at the VM boundary.
+
+The callback may yield or wait in an ordinary async host call. Existing frame machinery resumes the callback first and returns its final action to the suspended HTTP call. The network future does not own or enter the VM and is not polled while the callback is active, so at most one item remains unacknowledged and callback completion supplies backpressure.
+
+The buffered and SSE imports are independent capabilities. SSE exposes no script request IDs, handles, detached resources, `next`, or cancellation callables. Its complete event maps, action maps, terminal summaries, bounds, destination policy, and lifecycle contract are documented in [HTTP client callable contract](http-client.md).
+
 ## Optimized backends
 
 Whole-program AOT and Trace JIT use the same builtin call path (static catalog IDs) for environment binding, native frame dispatch for `callvalue`, and prototype-direct native dispatch for `callscript`. Script-frame entry and return preserve frame-relative locals and typed continuations.
