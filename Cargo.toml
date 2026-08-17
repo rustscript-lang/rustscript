@@ -110,6 +110,11 @@ path = "tests/host_binding_generation_tests.rs"
 required-features = ["cranelift-jit"]
 
 [[test]]
+name = "host_resource_table_tests"
+path = "tests/host_resource_table_tests.rs"
+required-features = ["runtime"]
+
+[[test]]
 name = "http_host_tests"
 path = "tests/vm/http_host_tests.rs"
 required-features = ["runtime", "http-client"]

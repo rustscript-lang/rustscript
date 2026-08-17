@@ -21,6 +21,7 @@ pub(crate) mod jit;
 mod map_iter;
 pub(crate) mod native;
 pub mod program;
+pub mod resource;
 mod run_context;
 mod store;
 mod superinstructions;
@@ -47,6 +48,7 @@ pub use self::host_context::{HostContext, HostContextError, HostContextResult, H
 use self::host_runtime::HostRuntime;
 use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable};
 pub use self::invocation::{Invocation, InvocationError, InvocationItem, InvocationPoll};
+pub use self::resource::{CloseProgress, HostResource, Resource, ResourceHandle, ResourceTable};
 use self::run_context::{InterruptMode, RunContext};
 pub use crate::builtins::runtime::cancellation::CancellationReason;
 
