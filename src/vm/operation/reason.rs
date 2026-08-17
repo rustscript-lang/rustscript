@@ -5,10 +5,7 @@
 //! covers the *reason* values themselves — the cancellation flow is
 //! implemented by the operation executor.
 
-use core::cmp::Ordering;
 use core::fmt;
-use core::hash;
-use core::ops;
 
 /// Reason why a VM-owned operation was cancelled.
 ///
@@ -20,7 +17,7 @@ use core::ops;
 pub enum OperationCancelReason {
     /// The operation was explicitly requested by the caller.
     Requested = 1,
-    /// The VM was reset while the operation was in flight.
+    /// The operation exceeded its deadline.
     Deadline = 2,
     /// The VM was reset while the operation was still pending.
     VmReset = 3,
@@ -55,7 +52,7 @@ impl OperationCancelReason {
     /// Stable string form of this reason.
     ///
     /// The returned string is a `'static` str and matches the
-    /// variant name in kebab-case exactly.
+    /// variant name in snake_case exactly.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Requested => "requested",
@@ -117,11 +114,10 @@ mod tests {
         assert_eq!(OperationCancelReason::from_raw(0), None);
         assert_eq!(OperationCancelReason::from_raw(255), None);
         assert_eq!(OperationCancelReason::from_raw(6), None);
-        assert_eq!(OperationCancelReason::from_raw(u8::MAX), None);
     }
 
     #[test]
-    fn as_str_matches_exact_kebab_case() {
+    fn as_str_matches_exact_snake_case() {
         assert_eq!(OperationCancelReason::Requested.as_str(), "requested");
         assert_eq!(OperationCancelReason::Deadline.as_str(), "deadline");
         assert_eq!(OperationCancelReason::VmReset.as_str(), "vm_reset");
