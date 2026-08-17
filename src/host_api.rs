@@ -26,9 +26,12 @@
 //!   is forbidden. A parameter whose type contains **no** resource must use
 //!   `Value`; a borrow/ownership mode is forbidden.
 //! * **Overloading.** Host functions may legally share a name with distinct
-//!   signatures (standard builtins such as `len` dispatch for string, array,
-//!   bytes and map). Exact duplicate signatures — identical name and identical
-//!   canonical semantic encoding — are rejected.
+//!   argument signatures (standard builtins such as `len` dispatch for string,
+//!   array, bytes and map). Overloads must differ in their **argument type /
+//!   passing-mode sequence**: two functions sharing a name and an identical
+//!   argument type + passing sequence are ambiguous — parameter names and the
+//!   return type do not disambiguate call sites — so they are rejected even
+//!   when those fields differ.
 //! * **Deterministic fingerprint.** [`HostApiCatalog::fingerprint`] produces a
 //!   stable digest over *semantic* fields only, prefixed by a domain magic and
 //!   a format version. Functions are sorted by their full canonical signature
@@ -416,8 +419,10 @@ impl HostFunctionSchema {
 
     /// Canonical semantic bytes for this function: name, then the parameter
     /// list (each parameter’s name, type and passing mode), then the return
-    /// type. This is the format used by the catalog fingerprint and by
-    /// overload identity, so overloaded registration order is irrelevant.
+    /// type. This is the full semantic encoding used by the catalog
+    /// fingerprint, so any semantic change (including a parameter-label or
+    /// return-type change) alters the digest. It is **not** used for overload
+    /// identity — see [`Self::overload_identity_bytes`].
     fn semantic_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         push_len_str(&mut bytes, &self.name);
@@ -428,6 +433,27 @@ impl HostFunctionSchema {
             push_tag(&mut bytes, passing_tag(param.passing));
         }
         push_type(&mut bytes, &self.return_type);
+        bytes
+    }
+
+    /// Canonical overload-identity bytes: the function name plus the ordered
+    /// parameter type schemas and passing modes only. Parameter names, the
+    /// return schema and documentation are deliberately excluded, so two
+    /// functions have the same identity precisely when their name and argument
+    /// type/passing sequence match. Because argument shape is what dispatch
+    /// and call sites resolve on, that identity being shared makes the
+    /// overload set ambiguous regardless of labels or return type.
+    ///
+    /// This key feeds overload duplicate detection only — never the catalog
+    /// fingerprint, which keeps using [`Self::semantic_bytes`].
+    fn overload_identity_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        push_len_str(&mut bytes, &self.name);
+        push_len(&mut bytes, self.params.len());
+        for param in &self.params {
+            push_type(&mut bytes, &param.ty);
+            push_tag(&mut bytes, passing_tag(param.passing));
+        }
         bytes
     }
 }
@@ -521,9 +547,9 @@ fn validate_function_name(name: &str) -> Result<(), FunctionNameError> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostApiCatalogError {
     DuplicateResourceKey(ResourceTypeKey),
-    /// Two registered functions have the same name and the same canonical
-    /// semantic signature (identical parameters and identical return type);
-    /// legal overloads differ in signature.
+    /// Two registered functions share a name and an identical ordered argument
+    /// type/passing sequence, making the overload set ambiguous. Parameter
+    /// names, return type and documentation do not disambiguate call sites.
     DuplicateFunctionSignature {
         name: String,
     },
@@ -560,7 +586,8 @@ impl fmt::Display for HostApiCatalogError {
             Self::DuplicateFunctionSignature { name } => write!(
                 f,
                 "duplicate host function overload `{name}`: identical name and identical \
-                 semantic signature"
+                 argument type/passing sequence (parameter names and return type cannot \
+                 disambiguate overloads)"
             ),
             Self::InvalidFunctionName { name, reason } => {
                 write!(f, "invalid host function name `{name}`: {reason}")
@@ -868,13 +895,15 @@ fn validate_surface(
         }
     }
 
-    // Reject exact duplicate overloads: identical name AND identical canonical
-    // semantic signature. Legal overloads (same name, distinct signature) are
-    // allowed.
+    // Reject ambiguous overloads: two functions sharing a name and an identical
+    // ordered argument type/passing sequence. Parameter names and the return
+    // type do not disambiguate call sites, so same-name overloads that differ
+    // only in labels or return schema are rejected. Legal overloads (same name,
+    // distinct argument schema) are allowed.
     for (i, function) in functions.iter().enumerate() {
-        let bytes = function.semantic_bytes();
+        let identity = function.overload_identity_bytes();
         for prior in &functions[..i] {
-            if prior.semantic_bytes() == bytes {
+            if prior.overload_identity_bytes() == identity {
                 return Err(HostApiCatalogError::DuplicateFunctionSignature {
                     name: function.name.clone(),
                 });
@@ -1148,6 +1177,91 @@ mod tests {
             builder.build(),
             Err(HostApiCatalogError::DuplicateFunctionSignature {
                 name: "io::open".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn same_signature_different_return_rejected() {
+        // Same name, same argument type/passing sequence, but a differing
+        // return type: still ambiguous at call sites, so rejected.
+        let mut builder = HostApiCatalog::builder();
+        builder.function(HostFunctionSchema::with_return(
+            "convert",
+            vec![HostParamSchema::value("value", HostTypeSchema::Int)],
+            HostTypeSchema::Int,
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "convert",
+            vec![HostParamSchema::value("value", HostTypeSchema::Int)],
+            HostTypeSchema::String,
+        ));
+        assert_eq!(
+            builder.build(),
+            Err(HostApiCatalogError::DuplicateFunctionSignature {
+                name: "convert".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn same_signature_different_parameter_labels_rejected() {
+        // Same name, same argument types+passing, but different parameter
+        // labels => identical overload identity, so rejected.
+        let mut builder = HostApiCatalog::builder();
+        builder.function(HostFunctionSchema::with_return(
+            "get",
+            vec![
+                HostParamSchema::value("a", HostTypeSchema::Int),
+                HostParamSchema::value("b", HostTypeSchema::String),
+            ],
+            HostTypeSchema::Int,
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "get",
+            vec![
+                HostParamSchema::value("x", HostTypeSchema::Int),
+                HostParamSchema::value("y", HostTypeSchema::String),
+            ],
+            HostTypeSchema::Int,
+        ));
+        assert_eq!(
+            builder.build(),
+            Err(HostApiCatalogError::DuplicateFunctionSignature {
+                name: "get".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn ambiguous_argument_identity_with_resource_same_passing_rejected() {
+        // Same resource argument and borrowing mode in both overloads, differing
+        // only in the return resource: argument identity is the same => rejected.
+        let mut builder = HostApiCatalog::builder();
+        builder.resource(io_file_resource());
+        builder.resource(sqlite_connection_resource());
+        builder.function(HostFunctionSchema::with_return(
+            "open",
+            vec![HostParamSchema::with_passing(
+                "path",
+                HostTypeSchema::String,
+                HostParamPassing::Value,
+            )],
+            HostTypeSchema::Resource(io_file_key()),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "open",
+            vec![HostParamSchema::with_passing(
+                "loc",
+                HostTypeSchema::String,
+                HostParamPassing::Value,
+            )],
+            HostTypeSchema::Resource(sqlite_connection_key()),
+        ));
+        assert_eq!(
+            builder.build(),
+            Err(HostApiCatalogError::DuplicateFunctionSignature {
+                name: "open".to_string()
             })
         );
     }
@@ -1567,6 +1681,52 @@ mod tests {
     }
 
     #[test]
+    fn param_label_change_alters_fingerprint() {
+        // Overload identity ignores labels, but the fingerprint must still see
+        // them (semantic_bytes is unchanged and label-full).
+        let mut a = HostApiCatalog::builder();
+        a.function(HostFunctionSchema::with_return(
+            "f",
+            vec![HostParamSchema::value("a", HostTypeSchema::Int)],
+            HostTypeSchema::Int,
+        ));
+        let catalog_a = a.build().expect("valid");
+
+        let mut b = HostApiCatalog::builder();
+        b.function(HostFunctionSchema::with_return(
+            "f",
+            vec![HostParamSchema::value("renamed", HostTypeSchema::Int)],
+            HostTypeSchema::Int,
+        ));
+        let catalog_b = b.build().expect("valid");
+
+        assert_ne!(catalog_a.fingerprint(), catalog_b.fingerprint());
+    }
+
+    #[test]
+    fn return_type_change_alters_fingerprint() {
+        // Two catalogs whose only difference is a return type must have
+        // distinct fingerprints.
+        let mut a = HostApiCatalog::builder();
+        a.function(HostFunctionSchema::with_return(
+            "convert",
+            vec![HostParamSchema::value("value", HostTypeSchema::Int)],
+            HostTypeSchema::Int,
+        ));
+        let catalog_a = a.build().expect("valid");
+
+        let mut b = HostApiCatalog::builder();
+        b.function(HostFunctionSchema::with_return(
+            "convert",
+            vec![HostParamSchema::value("value", HostTypeSchema::Int)],
+            HostTypeSchema::String,
+        ));
+        let catalog_b = b.build().expect("valid");
+
+        assert_ne!(catalog_a.fingerprint(), catalog_b.fingerprint());
+    }
+
+    #[test]
     fn passing_mode_change_alters_fingerprint() {
         let base = catalog_with_io_and_sqlite();
 
@@ -1682,6 +1842,35 @@ mod tests {
         let dup = v["functions"][0].clone();
         v["functions"].as_array_mut().unwrap().push(dup);
         assert!(serde_json::from_value::<HostApiCatalog>(v).is_err());
+    }
+
+    #[test]
+    fn serde_rejects_ambiguous_overload_by_arg_identity() {
+        // The serde path runs the same validate_surface as the builder: two
+        // functions sharing a name and argument type/passing sequence are
+        // rejected even when only the return type differs.
+        let hostile = r#"{
+            "resources": [],
+            "functions": [
+                {
+                    "name": "convert",
+                    "params": [
+                        { "name": "value", "ty": "Int", "passing": "Value" }
+                    ],
+                    "return_type": "Int",
+                    "description": ""
+                },
+                {
+                    "name": "convert",
+                    "params": [
+                        { "name": "value", "ty": "Int", "passing": "Value" }
+                    ],
+                    "return_type": "String",
+                    "description": ""
+                }
+            ]
+        }"#;
+        assert!(serde_json::from_str::<HostApiCatalog>(hostile).is_err());
     }
 
     #[test]
