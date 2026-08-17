@@ -1,3 +1,24 @@
+//! # TRANSITIONAL COMPATIBILITY LAYER
+//!
+//! This module (`crate::builtins::runtime::cancellation`) is the *legacy*
+//! operation/cancellation machinery and is kept on this branch only so the
+//! concrete SQLite/IO/HTTP builtins and existing tests keep compiling. It
+//! must be removed by the host-agnostic operation integration. It uses the
+//! parent/child `CancellationToken` signal graph and the `OperationOwner`
+//! enum; the replacement lives in [`crate::vm::operation`], which:
+//!
+//! * replaces `OperationOwner` + `RUNTIME_OPERATION_POLLERS` dispatch with
+//!   object-safe [`crate::vm::operation::HostOperation`] drivers;
+//! * replaces the `CancellationToken` graph with operation-entry state plus
+//!   direct `driver.cancel(reason)` (single cancellation authority);
+//! * keeps typed [`CancellationReason`] (reused by both layers).
+//!
+//! Integration must delete this file's `OperationOwner`, the children
+//! propagation (`CancellationSignal`, `attach_parent`), and the static
+//! owner→poller table in `super::mod`, migrating host bridge and builtin ops
+//! onto [`crate::vm::operation::OperationRegistry`] and
+//! [`crate::vm::operation::OperationSpec`].
+
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU8, Ordering};

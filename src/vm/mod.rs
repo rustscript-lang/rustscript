@@ -20,6 +20,7 @@ pub mod invocation;
 pub(crate) mod jit;
 mod map_iter;
 pub(crate) mod native;
+pub mod operation;
 pub mod program;
 pub mod resource;
 mod run_context;
