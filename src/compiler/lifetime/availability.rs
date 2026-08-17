@@ -665,7 +665,9 @@ impl AvailabilityAnalyzer {
             | Expr::Bool(_)
             | Expr::Bytes(_)
             | Expr::String(_)
-            | Expr::FunctionRef(..) => Ok(state.clone()),
+            | Expr::FunctionRef(..)
+            | Expr::ModuleFunctionRef(..)
+            | Expr::UnresolvedFunctionRef { .. } => Ok(state.clone()),
             Expr::Var(index) => {
                 self.require_available(*index, state, line)?;
                 self.require_local_not_moved(*index, state, line)?;
@@ -720,6 +722,9 @@ impl AvailabilityAnalyzer {
                 let then_state = self.analyze_expr(fallback, &value_state, line)?;
                 Ok(self.merge_states(then_state, value_state))
             }
+            // Resolved module calls (pre-merge only) analyze their arguments;
+            // interprocedural effects apply to the post-merge flat call.
+            Expr::ModuleCall(_, _, args) => self.analyze_args(args, state, line),
             Expr::Call(index, _, args) => {
                 if !self.enable_local_move_semantics {
                     if let Some(root_slot) = self.extract_collection_mutation_root(*index, args) {

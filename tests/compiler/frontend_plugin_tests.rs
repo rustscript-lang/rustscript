@@ -36,6 +36,8 @@ impl SourcePlugin for ConstantPlugin {
             function_impls: HashMap::new(),
             stmt_sources: Vec::new(),
             function_sources: HashMap::new(),
+            use_declarations: Vec::new(),
+            implicit_extern_names: Vec::new(),
         })
     }
 }

@@ -2642,8 +2642,8 @@ fn compile_source_file_rustscript_imports_merge_with_scoped_locals() {
         debug
             .locals
             .iter()
-            .any(|local| local.name == "module::shared"),
-        "module-scoped local should remain visible in debug metadata"
+            .any(|local| local.name.ends_with("::shared") && local.name != "shared"),
+        "module-scoped local should remain visible in debug metadata with a deterministic module-identity scope (milestone 4), not a bare file stem"
     );
     assert!(
         debug.locals.iter().any(|local| local.name == "shared"),
@@ -2858,7 +2858,10 @@ fn compile_source_file_rustscript_imported_direct_capture_multiple_move_is_rejec
         Err(err) => err,
     };
     match err {
-        vm::SourcePathError::Source(vm::SourceError::Parse(parse)) => {
+        vm::SourcePathError::SourceWithMap {
+            error: vm::SourceError::Parse(parse),
+            ..
+        } => {
             assert!(
                 parse.message.contains("lut") && parse.message.contains("moved"),
                 "unexpected parse error: {parse:?}"
