@@ -12,7 +12,7 @@
 //! The VM provides lifecycle storage without depending on host-specific state
 //! types or configuration APIs.
 
-use std::any::{Any, TypeId};
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 
 use crate::builtins::runtime::cancellation::{
@@ -22,6 +22,7 @@ use crate::builtins::runtime::resource::{DEFAULT_MAX_RESOURCES, ResourceArena};
 
 use crate::vm::async_host::{HostAsyncBridge, HostStreamDriver};
 use crate::vm::host::VmHostFunction;
+use crate::vm::host_context::{HostModule, HostModuleStore};
 
 /// Embedder-supplied print sink for `print`/`debug` output.
 pub(crate) type RuntimePrintSink = dyn FnMut(String) + Send;
@@ -46,7 +47,7 @@ pub(crate) struct HostRuntime {
     pub(crate) resolved_calls_dirty: bool,
     pub(crate) runtime_resources: ResourceArena,
     pub(crate) runtime_operations: OperationRegistry,
-    host_function_states: HashMap<TypeId, Box<dyn Any + Send>>,
+    module_state: HostModuleStore,
     pub(crate) async_bridge: Option<Box<dyn HostAsyncBridge>>,
     pub(crate) submitted_host_ops: HashSet<u64>,
     pub(crate) stream_drivers: HashMap<u64, Box<dyn HostStreamDriver>>,
@@ -73,7 +74,7 @@ impl HostRuntime {
                 .expect("default runtime resource limit should be valid"),
             runtime_operations: OperationRegistry::with_limit(DEFAULT_MAX_PENDING_OPERATIONS)
                 .expect("default runtime operation limit should be valid"),
-            host_function_states: HashMap::new(),
+            module_state: HostModuleStore::new(),
             async_bridge: None,
             submitted_host_ops: HashSet::new(),
             stream_drivers: HashMap::new(),
@@ -98,40 +99,57 @@ impl HostRuntime {
 
     pub(crate) fn set_host_function_state<T>(&mut self, state: T)
     where
-        T: Any + Send,
+        T: Any + Send + 'static,
     {
-        self.host_function_states
-            .insert(TypeId::of::<T>(), Box::new(state));
+        self.module_state.set(state);
     }
 
     pub(crate) fn host_function_state<T>(&self) -> Option<&T>
     where
-        T: Any + Send,
+        T: Any + Send + 'static,
     {
-        self.host_function_states
-            .get(&TypeId::of::<T>())?
-            .downcast_ref()
+        self.module_state.get()
     }
 
     #[cfg(feature = "http-client")]
     pub(crate) fn host_function_state_mut<T>(&mut self) -> Option<&mut T>
     where
-        T: Any + Send,
+        T: Any + Send + 'static,
     {
-        self.host_function_states
-            .get_mut(&TypeId::of::<T>())?
-            .downcast_mut()
+        self.module_state.get_mut()
     }
 
     pub(crate) fn remove_host_function_state<T>(&mut self) -> Option<T>
     where
-        T: Any + Send,
+        T: Any + Send + 'static,
     {
-        self.host_function_states
-            .remove(&TypeId::of::<T>())?
-            .downcast::<T>()
-            .ok()
-            .map(|state| *state)
+        self.module_state.take::<T>()
+    }
+
+    /// Registers typed per-VM module state through the host boundary, returning
+    /// `true` when a value of the same type was replaced.
+    pub(crate) fn set_module_state<M: HostModule>(&mut self, state: M) -> bool {
+        self.module_state.set(state)
+    }
+
+    /// Borrows the registered typed module state, if any.
+    pub(crate) fn get_module_state<M: HostModule>(&self) -> Option<&M> {
+        self.module_state.get()
+    }
+
+    /// Borrows the registered typed module state mutably, if any.
+    pub(crate) fn get_module_state_mut<M: HostModule>(&mut self) -> Option<&mut M> {
+        self.module_state.get_mut()
+    }
+
+    /// Removes and returns the registered typed module state, if any.
+    pub(crate) fn remove_module_state<M: HostModule>(&mut self) -> Option<M> {
+        self.module_state.take::<M>()
+    }
+
+    /// Returns `true` when no module state is currently registered.
+    pub(crate) fn is_module_state_empty(&self) -> bool {
+        self.module_state.is_empty()
     }
 
     pub(crate) fn default_builtin_capabilities_enabled(&self) -> bool {

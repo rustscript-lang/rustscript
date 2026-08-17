@@ -126,5 +126,10 @@ name = "sqlite_host_tests"
 path = "tests/vm/sqlite_host_tests.rs"
 required-features = ["sqlite"]
 
+[[test]]
+name = "host_context_arch_tests"
+path = "tests/host_context_arch_tests.rs"
+required-features = ["runtime"]
+
 [build-dependencies]
 syn = { version = "2", features = ["full"] }
