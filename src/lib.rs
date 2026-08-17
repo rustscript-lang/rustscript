@@ -94,12 +94,10 @@ pub use vm::{
     CapabilityProfileBuilder, DEFAULT_MAX_SCRIPT_CALL_DEPTH, EpochCheckpoint, EpochHandle,
     FuelCheckpoint, HostArgsFunction, HostAsyncBridge, HostBindingPlan, HostContext,
     HostContextError, HostContextResult, HostFunction, HostFunctionRegistry, HostFuture,
-    HostFutureOutput, HostHandle, HostKind, HostModule, HostOpId, HostOperation,
-    HostOperationHandle, HostOperationRegistry, HostResource, HostResourceRegistry,
-    HostStackFunction, IntoScriptValue, Invocation, InvocationError, InvocationItem,
-    InvocationPoll, QueuedScriptInvocation, ScriptArgs, ScriptCallback, ScriptResult,
-    StaticHostArgsFunction, StaticHostFunction, StaticHostStackFunction, Store, Vm, VmError,
-    VmResult, VmStatus, VmYieldReason,
+    HostFutureOutput, HostModule, HostOpId, HostStackFunction, IntoScriptValue, Invocation,
+    InvocationError, InvocationItem, InvocationPoll, QueuedScriptInvocation, ScriptArgs,
+    ScriptCallback, ScriptResult, StaticHostArgsFunction, StaticHostFunction,
+    StaticHostStackFunction, Store, Vm, VmError, VmResult, VmStatus, VmYieldReason,
 };
 
 #[cfg(feature = "runtime")]

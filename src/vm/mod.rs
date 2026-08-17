@@ -43,11 +43,7 @@ pub use self::host::{
     StaticHostStackFunction,
 };
 use self::host::{HostCallExecOutcome, VmHostFunction};
-pub use self::host_context::HostModule;
-pub use self::host_context::{
-    HostContext, HostContextError, HostContextResult, HostHandle, HostKind, HostOperation,
-    HostOperationHandle, HostOperationRegistry, HostResource, HostResourceRegistry,
-};
+pub use self::host_context::{HostContext, HostContextError, HostContextResult, HostModule};
 use self::host_runtime::HostRuntime;
 use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable};
 pub use self::invocation::{Invocation, InvocationError, InvocationItem, InvocationPoll};
@@ -582,10 +578,9 @@ impl Vm {
 
     /// Returns the generic host boundary for this VM.
     ///
-    /// External host extensions register typed, per-VM module state (and,
-    /// through the host-agnostic ports, resource/operation registration)
-    /// without ever touching the underlying host runtime internals or a builtin
-    /// domain module. The returned [`HostContext`] borrows this VM mutably.
+    /// External host extensions register typed, per-VM module state without
+    /// ever touching the underlying host runtime internals or a builtin domain
+    /// module. The returned [`HostContext`] borrows this VM mutably.
     pub fn host_context(&mut self) -> HostContext<'_> {
         HostContext::new(&mut self.host)
     }

@@ -8,24 +8,16 @@
 //!    IO / HTTP / SSE remain same-crate builtins; `src/vm` only owns the generic
 //!    boundary and must stay domain-agnostic.
 //! 2. **Generic external registration** — an external host *extension* registers
-//!    typed, per-VM module state and reaches the resource/operation registration
-//!    ports purely through the public [`HostContext`] surface, without ever
-//!    touching host-runtime internals or a builtin domain type.
+//!    typed, per-VM module state purely through the public [`HostContext`]
+//!    surface, without ever touching host-runtime internals (which stay private)
+//!    or a builtin domain type.
 
-use std::any::Any;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use vm::{
-    HostContextError, HostHandle, HostKind, HostOperation, HostOperationHandle,
-    HostOperationRegistry, HostResource, HostResourceRegistry, Program, Vm,
-};
+use vm::{Program, Vm};
 
-/// The builtin *domain* modules that `src/vm` must not import. Generic host
-/// substrate (e.g. resource handle encoding / cancellation primitives) is
-/// scheduled to be re-homed by the sibling resource-table / operation-driver
-/// scopes; the concrete domain implementations named here are the ones this
-/// boundary must keep out of `src/vm`.
+/// The builtin *domain* modules that `src/vm` must not import.
 const FORBIDDEN_DOMAIN_IMPORTS: &[&str] = &[
     "builtins::runtime::sqlite",
     "builtins::runtime::io",
@@ -142,12 +134,7 @@ fn host_context_boundary_file_is_builtin_free() {
         "the HostContext boundary file itself must be fully host-agnostic \
          (no builtins:: and no rusqlite)"
     );
-    for contract in [
-        "pub struct HostContext",
-        "pub trait HostModule",
-        "pub trait HostResourceRegistry",
-        "pub trait HostOperationRegistry",
-    ] {
+    for contract in ["pub struct HostContext", "pub trait HostModule"] {
         assert!(
             raw.contains(contract),
             "expected `{contract}` in host_context.rs"
@@ -208,6 +195,13 @@ fn external_host_extension_registers_typed_state_through_generic_surface() {
         );
         assert!(cx.module_state::<FlagState>().is_none());
     }
+
+    // is-empty after removing the last entry.
+    {
+        let mut cx = vm.host_context();
+        cx.take_module_state::<CounterState>();
+        assert!(cx.is_module_state_empty());
+    }
 }
 
 #[test]
@@ -224,139 +218,4 @@ fn host_module_state_survives_invocation_reset() {
         let cx = vm.host_context();
         assert_eq!(cx.module_state::<CounterState>().unwrap().count, 7);
     }
-}
-
-// ---------------------------------------------------------------------------
-// Resource / operation registration ports (host-agnostic adapters)
-// ---------------------------------------------------------------------------
-
-struct FakeResource {
-    value: u32,
-}
-impl HostResource for FakeResource {
-    const KIND: HostKind = HostKind::new_unchecked(1);
-}
-
-struct FakeResourceTable {
-    next: u64,
-    slots: Vec<Option<Box<dyn Any + Send>>>,
-    closed: u32,
-}
-
-impl HostResourceRegistry for FakeResourceTable {
-    fn insert_value(&mut self, value: Box<dyn Any + Send>) -> Result<HostHandle, HostContextError> {
-        self.next += 1;
-        let handle = HostHandle::from_raw(self.next)?;
-        self.slots.push(Some(value));
-        Ok(handle)
-    }
-
-    fn insert_value_with_cleanup(
-        &mut self,
-        value: Box<dyn Any + Send>,
-        _cleanup: Box<dyn FnOnce() + Send>,
-    ) -> Result<HostHandle, HostContextError> {
-        self.insert_value(value)
-    }
-
-    fn borrow_value(&self, handle: HostHandle) -> Result<&(dyn Any + Send), HostContextError> {
-        let idx = (handle.raw() - 1) as usize;
-        self.slots
-            .get(idx)
-            .and_then(|slot| slot.as_ref().map(|v| v.as_ref()))
-            .ok_or_else(|| HostContextError::new("host::resource", "no such resource"))
-    }
-
-    fn borrow_value_mut(
-        &mut self,
-        handle: HostHandle,
-    ) -> Result<&mut (dyn Any + Send), HostContextError> {
-        let idx = (handle.raw() - 1) as usize;
-        self.slots
-            .get_mut(idx)
-            .and_then(|slot| slot.as_mut().map(|v| &mut **v))
-            .ok_or_else(|| HostContextError::new("host::resource", "no such resource"))
-    }
-
-    fn close(&mut self, handle: HostHandle) -> Result<(), HostContextError> {
-        let idx = (handle.raw() - 1) as usize;
-        if self.slots.get_mut(idx).and_then(|s| s.take()).is_some() {
-            self.closed += 1;
-        }
-        Ok(())
-    }
-}
-
-struct SomeOperation {
-    name: &'static str,
-}
-impl HostOperation for SomeOperation {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-}
-
-struct FakeOperationRegistry {
-    next: u64,
-    pending: Vec<HostOperationHandle>,
-}
-
-impl HostOperationRegistry for FakeOperationRegistry {
-    fn submit(
-        &mut self,
-        _operation: Box<dyn HostOperation + Send>,
-    ) -> Result<HostOperationHandle, HostContextError> {
-        self.next += 1;
-        let handle = HostOperationHandle::from_raw(self.next)?;
-        self.pending.push(handle);
-        Ok(handle)
-    }
-
-    fn cancel(
-        &mut self,
-        handle: HostOperationHandle,
-        _reason: &'static str,
-    ) -> Result<bool, HostContextError> {
-        let Some(idx) = self.pending.iter().position(|h| *h == handle) else {
-            return Ok(false);
-        };
-        self.pending.swap_remove(idx);
-        Ok(true)
-    }
-}
-
-#[test]
-fn resource_and_operation_ports_work_without_any_builtin_import() {
-    // Resource port: typed insert / borrow / borrow_mut / close.
-    let mut table = FakeResourceTable {
-        next: 0,
-        slots: Vec::new(),
-        closed: 0,
-    };
-    let handle = table.insert(FakeResource { value: 5 }).expect("insert");
-    assert_eq!(
-        table.borrow::<FakeResource>(handle).expect("borrow").value,
-        5
-    );
-    table
-        .borrow_mut::<FakeResource>(handle)
-        .expect("borrow_mut")
-        .value += 1;
-    assert_eq!(
-        table.borrow::<FakeResource>(handle).expect("borrow").value,
-        6
-    );
-    table.close(handle).expect("close");
-    assert_eq!(table.closed, 1);
-
-    // Operation port: submit + cancel through a host-agnostic registry.
-    let mut ops = FakeOperationRegistry {
-        next: 0,
-        pending: Vec::new(),
-    };
-    let op_handle = ops
-        .submit(Box::new(SomeOperation { name: "test-op" }))
-        .expect("submit");
-    assert!(ops.cancel(op_handle, "host::test").expect("cancel"));
-    assert!(!ops.cancel(op_handle, "host::test").expect("cancel-twice"));
 }

@@ -1,5 +1,4 @@
-//! Generic host boundary: typed per-VM module state and host-agnostic
-//! registration ports.
+//! Generic host boundary: typed per-VM module state.
 //!
 //! [`HostContext`] is the public, builtin-agnostic surface that a host
 //! embedding or an external host extension (a module living outside
@@ -12,20 +11,8 @@
 //! **Boundary contract (enforced by `tests/host_context_arch_tests.rs`):**
 //! this module references neither `crate::builtins::*` nor `rusqlite`.
 //!
-//! # Resource / operation registration ports
-//!
-//! The typed [`HostResourceRegistry`] and [`HostOperationRegistry`] traits are
-//! the generic ports through which resource/operation registration is exposed.
-//! The concrete storage — a `ResourceTable` and an `OperationRegistry` bound
-//! per *execution scope* rather than per VM run budget — is owned by the
-//! sibling `resource-table` / `operation-driver` integration scopes. Those
-//! scopes implement these ports so this boundary can adapt without `src/vm`
-//! importing a builtin domain module. The opaque tokens ([`HostHandle`],
-//! [`HostKind`], [`HostOperationHandle`]) live here so the boundary stays
-//! generic while the storage stays downstream.
-//!
-//! Host module state, by contrast, is owned directly by [`HostRuntime`]:
-//! typed, per-VM, and deliberately **not** cleared on
+//! Host module state is owned directly by [`HostRuntime`]: typed, per-VM, and
+//! deliberately **not** cleared on
 //! [`Vm::reset_for_reuse`](super::Vm::reset_for_reuse). Registered state
 //! therefore survives invocation resets for the lifetime of the VM.
 
@@ -68,7 +55,7 @@ impl HostContextError {
         }
     }
 
-    /// The stable non-domain namespace of this error (e.g. `"host::handle"`).
+    /// The stable non-domain namespace of this error (e.g. `"host::module"`).
     pub fn namespace(&self) -> &'static str {
         self.namespace
     }
@@ -95,8 +82,7 @@ pub type HostContextResult<T> = Result<T, HostContextError>;
 /// Obtained from [`Vm::host_context`](super::Vm::host_context). It never leaks
 /// the underlying [`HostRuntime`] and never references a builtin domain module,
 /// so external host extensions can register typed per-VM state through a stable
-/// public surface. Resource / operation registration is exposed separately
-/// through the port traits defined below, supplied per execution scope.
+/// public surface.
 pub struct HostContext<'a> {
     host: &'a mut HostRuntime,
 }
@@ -134,184 +120,6 @@ impl<'a> HostContext<'a> {
     pub fn is_module_state_empty(&self) -> bool {
         self.host.is_module_state_empty()
     }
-}
-
-/// A positive, opaque handle to a typed host resource registered through the
-/// boundary.
-///
-/// Owned by `src/vm` so the resource/operation boundary need not reference any
-/// builtin type. The concrete `ResourceTable` that mints and resolves these is
-/// supplied by the sibling `resource-table` integration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct HostHandle(u64);
-
-impl HostHandle {
-    /// The raw token value.
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-
-    /// Decodes a raw token, rejecting the reserved zero handle.
-    pub fn from_raw(raw: u64) -> HostContextResult<Self> {
-        if raw == 0 {
-            Err(HostContextError::new(
-                "host::handle",
-                "resource handle token must be non-zero",
-            ))
-        } else {
-            Ok(Self(raw))
-        }
-    }
-}
-
-/// An immutable identity for one kind of typed host resource.
-///
-/// This is a generic token owned by the boundary; it is unrelated to any
-/// domain-specific resource id and may be mapped by the resource-table
-/// integration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct HostKind(u16);
-
-impl HostKind {
-    /// Builds a kind token; the zero kind is reserved as invalid.
-    pub const fn new(raw: u16) -> Option<Self> {
-        if raw == 0 { None } else { Some(Self(raw)) }
-    }
-
-    /// Builds a kind token without validating that it is non-zero.
-    pub const fn new_unchecked(raw: u16) -> Self {
-        Self(raw)
-    }
-
-    /// The raw kind identity.
-    pub const fn raw(self) -> u16 {
-        self.0
-    }
-}
-
-/// A typed value a host extension registers as a resource.
-///
-/// Implemented outside `src/vm` (by the resource-table integration or a host
-/// embedding); never by a builtin domain module that `src/vm` may not import.
-pub trait HostResource: Any + Send + 'static {
-    /// The kind of this resource.
-    const KIND: HostKind;
-}
-
-/// Registration port for typed host resources.
-///
-/// A concrete `ResourceTable` (sibling `resource-table` scope, owned per
-/// execution scope) implements the erased-based port below and gains the typed
-/// convenience methods for free. `HostContext` and this port never reference a
-/// builtin domain module, so integration adapts without importing builtins.
-///
-/// # Integration adapter needs
-///
-/// The real adapter mints a [`HostHandle`] encoding arena/slot/generation and a
-/// [`HostKind`]; mints close/borrow; and must be `Send` and per-execution-scope.
-pub trait HostResourceRegistry: Send {
-    /// Inserts an erased typed resource, returning a handle.
-    fn insert_value(&mut self, value: Box<dyn Any + Send>) -> HostContextResult<HostHandle>;
-
-    /// Inserts a typed resource with a cleanup closure invoked on close.
-    fn insert_value_with_cleanup(
-        &mut self,
-        value: Box<dyn Any + Send>,
-        cleanup: Box<dyn FnOnce() + Send>,
-    ) -> HostContextResult<HostHandle>;
-
-    /// Borrows an inserted resource by handle.
-    fn borrow_value(&self, handle: HostHandle) -> HostContextResult<&(dyn Any + Send)>;
-
-    /// Borrows an inserted resource mutably by handle.
-    fn borrow_value_mut(&mut self, handle: HostHandle) -> HostContextResult<&mut (dyn Any + Send)>;
-
-    /// Closes (and cleans up) an inserted resource by handle.
-    fn close(&mut self, handle: HostHandle) -> HostContextResult<()>;
-
-    /// Typed convenience: inserts a host resource value.
-    fn insert<R: HostResource>(&mut self, value: R) -> HostContextResult<HostHandle> {
-        self.insert_value(Box::new(value))
-    }
-
-    /// Typed convenience: borrows a host resource value.
-    fn borrow<R: HostResource>(&self, handle: HostHandle) -> HostContextResult<&R> {
-        self.borrow_value(handle)?
-            .downcast_ref::<R>()
-            .ok_or_else(|| {
-                HostContextError::new("host::resource", "registered resource type mismatch")
-            })
-    }
-
-    /// Typed convenience: borrows a host resource value mutably.
-    fn borrow_mut<R: HostResource>(&mut self, handle: HostHandle) -> HostContextResult<&mut R> {
-        self.borrow_value_mut(handle)?
-            .downcast_mut::<R>()
-            .ok_or_else(|| {
-                HostContextError::new("host::resource", "registered resource type mismatch")
-            })
-    }
-}
-
-/// A positive, opaque handle to a submitted host operation registered through
-/// the boundary.
-///
-/// Owned by `src/vm`; mirrored by the sibling `operation-driver` scope's
-/// registry. The zero token is reserved and rejected on decode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct HostOperationHandle(u64);
-
-impl HostOperationHandle {
-    /// The raw token value.
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-
-    /// Decodes a handle, rejecting the reserved zero value.
-    pub fn from_raw(raw: u64) -> HostContextResult<Self> {
-        if raw == 0 {
-            Err(HostContextError::new(
-                "host::operation",
-                "operation handle token must be non-zero",
-            ))
-        } else {
-            Ok(Self(raw))
-        }
-    }
-}
-
-/// Registration port for host operations.
-///
-/// A concrete `OperationRegistry` (sibling `operation-driver` scope, owned per
-/// execution scope) implements submit/cancel so the host boundary can register
-/// and cancel operations without importing any builtin domain module.
-///
-/// # Integration adapter expected
-///
-/// The real adapter maps a submitted [`HostOperation`] to an owned operation
-/// core, returns a fresh [`HostOperationHandle`], and translates a `reason`
-/// namespace into its internal cancellation cause.
-pub trait HostOperationRegistry: Send {
-    /// Registers a submitted host operation and returns its handle.
-    fn submit(
-        &mut self,
-        operation: Box<dyn HostOperation + Send>,
-    ) -> HostContextResult<HostOperationHandle>;
-
-    /// Cancels a pending host operation. Returns `true` if a pending
-    /// operation was transitioned to cancelled.
-    fn cancel(
-        &mut self,
-        handle: HostOperationHandle,
-        reason: &'static str,
-    ) -> HostContextResult<bool>;
-}
-
-/// The host-agnostic view of a submitted operation. Implementors run (or queue)
-/// the async work; the concrete `OperationRegistry` owns lifecycle.
-pub trait HostOperation: Send {
-    /// The immutable human-readable operation name for diagnostics.
-    fn name(&self) -> &'static str;
 }
 
 /// A thin, typed dictionary of per-VM host module state used internally by
