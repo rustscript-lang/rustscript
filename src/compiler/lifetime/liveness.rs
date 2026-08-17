@@ -437,7 +437,9 @@ impl LivenessRewriter {
             | Expr::Bool(_)
             | Expr::Bytes(_)
             | Expr::String(_)
-            | Expr::FunctionRef(..) => {}
+            | Expr::FunctionRef(..)
+            | Expr::ModuleFunctionRef(..)
+            | Expr::UnresolvedFunctionRef { .. } => {}
             Expr::Var(index) | Expr::MoveVar(index) => self.mark_live(live, *index),
             Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
                 self.mark_live(live, *root)
@@ -470,6 +472,14 @@ impl LivenessRewriter {
                     let mut stack = Vec::new();
                     let footprint = self.function_footprint(*index, &mut stack);
                     self.union_inplace(live, &footprint);
+                }
+            }
+            // Resolved module calls (pre-merge only) contribute their
+            // arguments' uses; the callee lives in another unit and its
+            // footprint is folded in by the post-merge call lowering.
+            Expr::ModuleCall(_, _, args) => {
+                for arg in args {
+                    self.add_expr_uses(arg, live);
                 }
             }
             Expr::LocalCall(index, _, args) => {
@@ -736,7 +746,9 @@ impl LivenessRewriter {
             | Expr::Bool(_)
             | Expr::Bytes(_)
             | Expr::String(_)
-            | Expr::FunctionRef(..) => {}
+            | Expr::FunctionRef(..)
+            | Expr::ModuleFunctionRef(..)
+            | Expr::UnresolvedFunctionRef { .. } => {}
             Expr::Var(index) | Expr::MoveVar(index) | Expr::LocalCall(index, _, _) => {
                 self.mark_live(footprint, *index);
             }
@@ -766,6 +778,14 @@ impl LivenessRewriter {
             Expr::Call(index, _, args) => {
                 let called = self.function_footprint(*index, stack);
                 self.union_inplace(footprint, &called);
+                for arg in args {
+                    self.collect_expr_footprint(arg, footprint, stack);
+                }
+            }
+            // Resolved module calls (pre-merge only) contribute their
+            // arguments' footprint; the callee lives in another unit and is
+            // folded in by the post-merge call lowering.
+            Expr::ModuleCall(_, _, args) => {
                 for arg in args {
                     self.collect_expr_footprint(arg, footprint, stack);
                 }
@@ -898,6 +918,8 @@ fn expr_contains_local_call(expr: &Expr) -> bool {
         | Expr::Bytes(_)
         | Expr::String(_)
         | Expr::FunctionRef(..)
+        | Expr::ModuleFunctionRef(..)
+        | Expr::UnresolvedFunctionRef { .. }
         | Expr::Var(_)
         | Expr::MoveVar(_)
         | Expr::MoveField { .. }
@@ -908,7 +930,9 @@ fn expr_contains_local_call(expr: &Expr) -> bool {
         Expr::OptionUnwrapOr {
             value, fallback, ..
         } => expr_contains_local_call(value) || expr_contains_local_call(fallback),
-        Expr::Call(_, _, args) => args.iter().any(expr_contains_local_call),
+        Expr::Call(_, _, args) | Expr::ModuleCall(_, _, args) => {
+            args.iter().any(expr_contains_local_call)
+        }
         Expr::Closure(closure) => expr_contains_local_call(&closure.body),
         Expr::ClosureCall(closure, args) => {
             args.iter().any(expr_contains_local_call) || expr_contains_local_call(&closure.body)
@@ -1133,7 +1157,9 @@ impl LocalSlotAllocator {
             | Expr::Bool(_)
             | Expr::Bytes(_)
             | Expr::String(_)
-            | Expr::FunctionRef(..) => {}
+            | Expr::FunctionRef(..)
+            | Expr::ModuleFunctionRef(..)
+            | Expr::UnresolvedFunctionRef { .. } => {}
             Expr::Var(index) | Expr::MoveVar(index) => {
                 self.add_slot_live_edges(*index, &live_during);
             }
@@ -1168,6 +1194,13 @@ impl LocalSlotAllocator {
                     let mut stack = Vec::new();
                     let footprint = self.function_footprint(*index, &mut stack);
                     self.add_cross_live_with_set(&live_during, &footprint);
+                }
+            }
+            // Resolved module calls (pre-merge only) constrain their
+            // arguments; the callee's footprint is folded in post-merge.
+            Expr::ModuleCall(_, _, args) => {
+                for arg in args {
+                    self.collect_expr_constraints(arg, &live_during)?;
                 }
             }
             Expr::LocalCall(index, _, args) => {
@@ -1357,7 +1390,9 @@ impl LocalSlotAllocator {
             | Expr::Bool(_)
             | Expr::Bytes(_)
             | Expr::String(_)
-            | Expr::FunctionRef(..) => {}
+            | Expr::FunctionRef(..)
+            | Expr::ModuleFunctionRef(..)
+            | Expr::UnresolvedFunctionRef { .. } => {}
             Expr::Var(index) | Expr::MoveVar(index) | Expr::LocalCall(index, _, _) => {
                 self.mark_set_slot(set, *index)
             }
@@ -1393,6 +1428,11 @@ impl LocalSlotAllocator {
                         }
                     }
                 }
+                for arg in args {
+                    self.collect_expr_footprint(arg, set, stack);
+                }
+            }
+            Expr::ModuleCall(_, _, args) => {
                 for arg in args {
                     self.collect_expr_footprint(arg, set, stack);
                 }
@@ -1745,6 +1785,8 @@ fn collect_persistent_closure_sources_from_expr(expr: &Expr, slots: &mut BTreeSe
         | Expr::String(_)
         | Expr::Bytes(_)
         | Expr::FunctionRef(..)
+        | Expr::ModuleFunctionRef(..)
+        | Expr::UnresolvedFunctionRef { .. }
         | Expr::Var(_)
         | Expr::MoveVar(_)
         | Expr::MoveField { .. }
@@ -1759,7 +1801,7 @@ fn collect_persistent_closure_sources_from_expr(expr: &Expr, slots: &mut BTreeSe
             collect_persistent_closure_sources_from_expr(value, slots);
             collect_persistent_closure_sources_from_expr(fallback, slots);
         }
-        Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) => {
+        Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) | Expr::ModuleCall(_, _, args) => {
             for arg in args {
                 collect_persistent_closure_sources_from_expr(arg, slots);
             }
@@ -1897,8 +1939,10 @@ fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseE
         | Expr::Bool(_)
         | Expr::Bytes(_)
         | Expr::String(_) => {}
-        Expr::FunctionRef(..) => {}
-        Expr::Call(_, _, args) => {
+        Expr::FunctionRef(..)
+        | Expr::ModuleFunctionRef(..)
+        | Expr::UnresolvedFunctionRef { .. } => {}
+        Expr::Call(_, _, args) | Expr::ModuleCall(_, _, args) => {
             for arg in args {
                 remap_expr_slots(arg, mapping)?;
             }

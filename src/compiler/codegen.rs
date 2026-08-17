@@ -668,6 +668,14 @@ impl Compiler {
                 let slot = self.ensure_function_value_slot(*index, type_args)?;
                 self.emit_copy_ldloc(slot)?;
             }
+            // Resolved module targets are lowered into plain flat-index calls
+            // by `linker::merge_units`; reaching codegen means the merge
+            // missed a site.
+            Expr::ModuleFunctionRef(..)
+            | Expr::ModuleCall(..)
+            | Expr::UnresolvedFunctionRef { .. } => {
+                return Err(CompileError::UnresolvedModuleCall);
+            }
             Expr::Call(index, _, args) => {
                 self.compile_function_call(*index, args)?;
             }

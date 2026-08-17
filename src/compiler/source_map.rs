@@ -118,6 +118,33 @@ impl SourceMap {
         id
     }
 
+    /// Register a source at an explicit id (the semantic module graph's
+    /// [`SourceId`](crate::compiler::modules::SourceId) space) so spans that
+    /// reference that id resolve to this text. Missing slots are filled with
+    /// empty placeholders; an already-occupied slot keeps its first text.
+    pub fn add_source_at(
+        &mut self,
+        id: SourceId,
+        name: impl Into<String>,
+        text: impl Into<String>,
+    ) -> SourceId {
+        let id_usize = id as usize;
+        while self.files.len() <= id_usize {
+            let placeholder = self.files.len() as SourceId;
+            self.files
+                .push(SourceFile::new(placeholder, String::new(), String::new()));
+        }
+        if self.files[id_usize].text.is_empty() && self.files[id_usize].name.is_empty() {
+            self.files[id_usize] = SourceFile::new(id, name.into(), text.into());
+        }
+        id
+    }
+
+    /// Display name of the source registered at `id`.
+    pub fn file_name(&self, id: SourceId) -> Option<&str> {
+        self.file(id).map(|file| file.name.as_str())
+    }
+
     pub fn file(&self, id: SourceId) -> Option<&SourceFile> {
         self.files.get(id as usize)
     }

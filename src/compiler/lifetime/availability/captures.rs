@@ -329,7 +329,9 @@ impl AvailabilityAnalyzer {
             | Expr::Bool(_)
             | Expr::Bytes(_)
             | Expr::String(_)
-            | Expr::FunctionRef(..) => {}
+            | Expr::FunctionRef(..)
+            | Expr::ModuleFunctionRef(..)
+            | Expr::UnresolvedFunctionRef { .. } => {}
             Expr::Var(index) => {
                 if *index == captured_slot {
                     *seen = true;
@@ -358,7 +360,7 @@ impl AvailabilityAnalyzer {
                 self.capture_mode_for_expr(value, captured_slot, context, mode, seen);
                 self.capture_mode_for_expr(fallback, captured_slot, context, mode, seen);
             }
-            Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) => {
+            Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) | Expr::ModuleCall(_, _, args) => {
                 for arg in args {
                     self.capture_mode_for_expr(arg, captured_slot, context, mode, seen);
                 }

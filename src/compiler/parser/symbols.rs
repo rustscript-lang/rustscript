@@ -280,6 +280,7 @@ impl Parser {
             type_params: Vec::new(),
             exported: true,
             return_type: ValueType::Unknown,
+            symbol: None,
         };
         self.functions.insert(name.to_string(), decl.clone());
         self.function_list.push(decl.clone());
@@ -310,6 +311,10 @@ impl Parser {
                 message: format!("name '{name}' already used by a local binding"),
             });
         }
+        // The module loader resolves (or rejects) every implicit extern's
+        // call sites; the marker keeps synthetic externs out of module
+        // declaration/export tables.
+        self.implicit_extern_names.insert(name.to_string());
         let index = self.next_function;
         self.next_function = self.next_function.checked_add(1).ok_or(ParseError {
             span: None,
@@ -328,6 +333,7 @@ impl Parser {
             type_params: Vec::new(),
             exported: true,
             return_type: ValueType::Unknown,
+            symbol: None,
         };
         self.functions.insert(name.to_string(), decl.clone());
         self.function_list.push(decl.clone());
@@ -376,6 +382,7 @@ impl Parser {
             type_params: Vec::new(),
             exported: false,
             return_type: known_host_return_type(name),
+            symbol: None,
         };
         self.functions.insert(name.to_string(), decl.clone());
         self.function_list.push(decl.clone());

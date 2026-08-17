@@ -7,7 +7,8 @@ use super::ReplLocalState;
 use super::codegen::Compiler;
 use super::frontends;
 use super::ir::{Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, Stmt, TypeSchema};
-use super::linker::merge_units;
+use super::linker::{ParsedUnit, merge_units};
+use super::modules::ModuleGraph;
 use super::source_loader::load_units_for_source_file;
 use super::source_map::SourceMap;
 use super::{
@@ -173,7 +174,9 @@ fn record_expr_local_debug_ranges(
         | Expr::Bool(_)
         | Expr::Bytes(_)
         | Expr::String(_)
-        | Expr::FunctionRef(..) => {}
+        | Expr::FunctionRef(..)
+        | Expr::ModuleFunctionRef(..)
+        | Expr::UnresolvedFunctionRef { .. } => {}
         Expr::Var(index) | Expr::MoveVar(index) => {
             note_local_use(ranges, *index, line);
         }
@@ -200,7 +203,7 @@ fn record_expr_local_debug_ranges(
             record_expr_local_debug_ranges(value, line, ranges);
             record_expr_local_debug_ranges(fallback, line, ranges);
         }
-        Expr::Call(_, _, args) => {
+        Expr::Call(_, _, args) | Expr::ModuleCall(_, _, args) => {
             for arg in args {
                 record_expr_local_debug_ranges(arg, line, ranges);
             }
@@ -867,8 +870,9 @@ fn lint_unknown_inferred_local_types_at_path_with_options_impl(
 ) -> Result<Vec<UnknownInferredLocal>, SourcePathError> {
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source(path.display().to_string(), source.to_string());
-    let (_root_parse_source, units) = load_units_for_source_file(path, flavor, source, options)?;
-    let parsed = units
+    let loaded = load_units_for_source_file(path, flavor, source, options)?;
+    let parsed = loaded
+        .units
         .into_iter()
         .last()
         .map(|unit| unit.parsed)
@@ -886,8 +890,9 @@ fn collect_inferred_local_type_hints_at_path_with_options_impl(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<Vec<InferredLocalTypeHint>, SourcePathError> {
-    let (_root_parse_source, units) = load_units_for_source_file(path, flavor, source, options)?;
-    let parsed = units
+    let loaded = load_units_for_source_file(path, flavor, source, options)?;
+    let parsed = loaded
+        .units
         .into_iter()
         .last()
         .map(|unit| unit.parsed)
@@ -1319,6 +1324,45 @@ fn compile_source_with_flavor_impl(
     }
 }
 
+fn compile_loaded_units(
+    source: String,
+    units: Vec<ParsedUnit>,
+    flavor: SourceFlavor,
+    // Carried from the loader for Milestone 2+ (structured imports, symbol
+    // resolution); codegen output is unchanged until then.
+    _module_graph: ModuleGraph,
+    // Compilation-wide source map keyed by the module graph's `SourceId`
+    // space (milestone 5). Every span produced during load/merge references
+    // this map, so errors are returned with it and render from the owning
+    // source.
+    sources: SourceMap,
+) -> Result<CompiledProgram, SourcePathError> {
+    let diagnostic_path = units
+        .iter()
+        .find(|unit| !unit.parsed.unknown_type_spans.is_empty())
+        .map(|unit| PathBuf::from(&unit.source_name));
+    let merged = merge_units(units)?;
+    compile_parsed_output(
+        source,
+        merged,
+        CompileBehavior::DEFAULT,
+        TypingMode::for_flavor(flavor),
+        matches!(flavor, SourceFlavor::RustScript),
+    )
+    .map_err(|error| match (error, diagnostic_path) {
+        (SourceError::Parse(mut parse), Some(path))
+            if parse.code.as_deref() == Some("E_STRICT_UNKNOWN_TYPE") =>
+        {
+            parse.message = format!("{}: {}", path.display(), parse.message);
+            SourcePathError::SourceWithMap {
+                error: SourceError::Parse(parse),
+                sources,
+            }
+        }
+        (error, _) => SourcePathError::SourceWithMap { error, sources },
+    })
+}
+
 fn compile_source_with_flavor_and_options_impl(
     source: &str,
     flavor: SourceFlavor,
@@ -1330,16 +1374,14 @@ fn compile_source_with_flavor_and_options_impl(
     }
 
     let path = virtual_inmemory_entry_path(flavor);
-    let (_root_parse_source, units) = load_units_for_source_file(&path, flavor, source, options)?;
-    let merged = merge_units(units)?;
-    compile_parsed_output(
+    let loaded = load_units_for_source_file(&path, flavor, source, options)?;
+    compile_loaded_units(
         source.to_string(),
-        merged,
-        CompileBehavior::DEFAULT,
-        TypingMode::for_flavor(flavor),
-        matches!(flavor, SourceFlavor::RustScript),
+        loaded.units,
+        flavor,
+        loaded.module_graph,
+        loaded.sources,
     )
-    .map_err(SourcePathError::Source)
 }
 
 fn compile_source_at_path_with_flavor_and_options_impl(
@@ -1348,16 +1390,14 @@ fn compile_source_at_path_with_flavor_and_options_impl(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    let (_root_parse_source, units) = load_units_for_source_file(path, flavor, source, options)?;
-    let merged = merge_units(units)?;
-    compile_parsed_output(
+    let loaded = load_units_for_source_file(path, flavor, source, options)?;
+    compile_loaded_units(
         source.to_string(),
-        merged,
-        CompileBehavior::DEFAULT,
-        TypingMode::for_flavor(flavor),
-        matches!(flavor, SourceFlavor::RustScript),
+        loaded.units,
+        flavor,
+        loaded.module_graph,
+        loaded.sources,
     )
-    .map_err(SourcePathError::Source)
 }
 
 fn virtual_inmemory_entry_path(flavor: SourceFlavor) -> PathBuf {
@@ -1387,17 +1427,14 @@ fn compile_source_file_impl(
 ) -> Result<CompiledProgram, SourcePathError> {
     let flavor = SourceFlavor::from_path_with_options(path, options)?;
     let source_raw = std::fs::read_to_string(path)?;
-    let (_root_parse_source, units) =
-        load_units_for_source_file(path, flavor, &source_raw, options)?;
-    let merged = merge_units(units)?;
-    compile_parsed_output(
+    let loaded = load_units_for_source_file(path, flavor, &source_raw, options)?;
+    compile_loaded_units(
         source_raw,
-        merged,
-        CompileBehavior::DEFAULT,
-        TypingMode::for_flavor(flavor),
-        matches!(flavor, SourceFlavor::RustScript),
+        loaded.units,
+        flavor,
+        loaded.module_graph,
+        loaded.sources,
     )
-    .map_err(SourcePathError::Source)
 }
 
 fn run_with_compiler_stack<T, F>(f: F) -> T

@@ -332,26 +332,10 @@ fn run_vm_loop(
 
 fn render_source_path_error(source_path: &Path, err: &SourcePathError) -> String {
     match err {
-        SourcePathError::Source(vm::SourceError::Parse(parse)) => {
-            let source = std::fs::read_to_string(source_path).unwrap_or_default();
-            let mut source_map = SourceMap::new();
-            let source_id = source_map.add_source(source_path.display().to_string(), source);
-            let parse = parse
-                .clone()
-                .with_line_span_from_source(&source_map, source_id);
-            render_source_error(&source_map, &parse, true)
+        SourcePathError::SourceWithMap { .. } => {
+            vm::render_source_path_error(source_path, err, true)
         }
-        SourcePathError::Source(vm::SourceError::Compile(compile)) => {
-            let render_path = compile
-                .source_name()
-                .map(Path::new)
-                .filter(|path| path.exists())
-                .unwrap_or(source_path);
-            let source = std::fs::read_to_string(render_path).unwrap_or_default();
-            let mut source_map = SourceMap::new();
-            source_map.add_source(render_path.display().to_string(), source);
-            vm::render_compile_error(&source_map, compile, true)
-        }
+        SourcePathError::Source(error) => render_source_error_at_path(source_path, None, error),
         SourcePathError::InvalidImportSyntax {
             path,
             line,
@@ -365,6 +349,44 @@ fn render_source_path_error(source_path: &Path, err: &SourcePathError) -> String
             render_source_error(&source_map, &parse, true)
         }
         _ => err.to_string(),
+    }
+}
+
+fn render_source_error_at_path(
+    source_path: &Path,
+    source_override: Option<&str>,
+    error: &vm::SourceError,
+) -> String {
+    match error {
+        vm::SourceError::Parse(parse) => {
+            let render_path = parse
+                .message
+                .split_once(": ")
+                .map(|(path, _)| Path::new(path))
+                .filter(|path| path.exists())
+                .unwrap_or(source_path);
+            let source = source_override
+                .filter(|_| render_path == source_path)
+                .map(str::to_owned)
+                .unwrap_or_else(|| std::fs::read_to_string(render_path).unwrap_or_default());
+            let mut source_map = SourceMap::new();
+            let source_id = source_map.add_source(render_path.display().to_string(), source);
+            let parse = parse
+                .clone()
+                .with_line_span_from_source(&source_map, source_id);
+            render_source_error(&source_map, &parse, true)
+        }
+        vm::SourceError::Compile(compile) => {
+            let render_path = compile
+                .source_name()
+                .map(Path::new)
+                .filter(|path| path.exists())
+                .unwrap_or(source_path);
+            let source = std::fs::read_to_string(render_path).unwrap_or_default();
+            let mut source_map = SourceMap::new();
+            source_map.add_source(render_path.display().to_string(), source);
+            vm::render_compile_error(&source_map, compile, true)
+        }
     }
 }
 
@@ -2371,5 +2393,118 @@ mod tests {
     #[test]
     fn repl_input_incomplete_for_trailing_operator() {
         assert!(!super::is_repl_input_complete("let a = 1 +"));
+    }
+
+    fn cli_diagnostic_root(prefix: &str) -> std::path::PathBuf {
+        let unique = format!(
+            "{prefix}_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&root).expect("cli diagnostic root should be created");
+        root.canonicalize().unwrap_or(root)
+    }
+
+    #[test]
+    fn cli_nested_module_parse_error_renders_nested_source_frame() {
+        let root = cli_diagnostic_root("pd-vm-cli-nested-parse-diag");
+        let main_path = root.join("main.rss");
+        let nested_path = root.join("nested.rss");
+        std::fs::write(&main_path, "use self::nested as nested;\nnested::run();\n")
+            .expect("main fixture should write");
+        std::fs::write(&nested_path, "pub fn run( {\n").expect("nested fixture should write");
+
+        let error = match vm::compile_source_file_with_options(
+            &main_path,
+            vm::CompileSourceFileOptions::default(),
+        ) {
+            Ok(_) => panic!("nested parse error fixture should fail"),
+            Err(error) => error,
+        };
+        let rendered = super::render_source_path_error(&main_path, &error);
+
+        // The rendered frame must belong to the nested source: its path, its
+        // line text, and an underline, not the root file.
+        assert!(
+            rendered.contains(&nested_path.display().to_string()),
+            "rendered diagnostic should name the nested path: {rendered}"
+        );
+        assert!(
+            rendered.contains("pub fn run( {"),
+            "rendered diagnostic should show the nested source line: {rendered}"
+        );
+        assert!(
+            rendered.contains('^'),
+            "rendered diagnostic should underline the nested source: {rendered}"
+        );
+        assert!(
+            !rendered.contains("use self::nested as nested;"),
+            "rendered diagnostic should not show the root source frame: {rendered}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cli_nested_strict_type_error_renders_nested_source_frame() {
+        let root = cli_diagnostic_root("pd-vm-cli-nested-strict-diag");
+        let main_path = root.join("main.rss");
+        let nested_path = root.join("nested.rss");
+        std::fs::write(&main_path, "use self::nested as nested;\nnested::run();\n")
+            .expect("main fixture should write");
+        std::fs::write(&nested_path, "pub fn run() -> unknown { 1 }\n")
+            .expect("nested fixture should write");
+
+        let error = match vm::compile_source_file_with_options(
+            &main_path,
+            vm::CompileSourceFileOptions::default(),
+        ) {
+            Ok(_) => panic!("strict nested fixture should fail"),
+            Err(error) => error,
+        };
+        let rendered = super::render_source_path_error(&main_path, &error);
+
+        assert!(
+            rendered.contains(&nested_path.display().to_string()),
+            "rendered diagnostic should name the nested path: {rendered}"
+        );
+        assert!(
+            rendered.contains("pub fn run() -> unknown { 1 }"),
+            "rendered diagnostic should show the nested source line: {rendered}"
+        );
+        assert!(
+            rendered.contains('^'),
+            "rendered diagnostic should underline the nested source: {rendered}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn render_source_error_uses_source_override_for_virtual_paths() {
+        let virtual_path = std::path::Path::new("__pd_vm_inmemory__/main.rss");
+        let error = vm::SourceError::Parse(vm::ParseError::at_line(2, "boom"));
+        let rendered = super::render_source_error_at_path(
+            virtual_path,
+            Some("line one\nline two target\nline three"),
+            &error,
+        );
+
+        assert!(
+            rendered.contains("__pd_vm_inmemory__/main.rss"),
+            "rendered diagnostic should name the virtual path: {rendered}"
+        );
+        assert!(
+            rendered.contains("line two target"),
+            "rendered diagnostic should show the override source line: {rendered}"
+        );
+        assert!(
+            rendered.contains('^'),
+            "rendered diagnostic should underline the override source: {rendered}"
+        );
     }
 }
