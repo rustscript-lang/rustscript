@@ -5,8 +5,11 @@
 //! parent/child links, stale-handle rejection, child-first close, and the
 //! close state/progress contracts. No concrete VM builtin resource is involved.
 
-use vm::resource::{CloseProgress, HostResource, Resource, ResourceTable};
-use vm::{CancellationReason, ResourceHandle, RuntimeError, RuntimeErrorCode, Value};
+use vm::resource::{
+    CloseProgress, HostResource, Resource, ResourceCloseReason, ResourceError, ResourceErrorCode,
+    ResourceResult, ResourceTable,
+};
+use vm::{ResourceHandle, Value};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -39,7 +42,7 @@ impl CountingResource {
 }
 
 impl HostResource for CountingResource {
-    fn begin_close(&mut self, _reason: CancellationReason) -> vm::RuntimeResult<CloseProgress> {
+    fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         self.closes.fetch_add(1, Ordering::SeqCst);
         Ok(CloseProgress::Ready)
     }
@@ -62,11 +65,11 @@ impl TwoPollResource {
 }
 
 impl HostResource for TwoPollResource {
-    fn begin_close(&mut self, _reason: CancellationReason) -> vm::RuntimeResult<CloseProgress> {
+    fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         Ok(CloseProgress::Pending)
     }
 
-    fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<vm::RuntimeResult<()>> {
+    fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
         if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
             Poll::Pending
         } else {
@@ -85,13 +88,13 @@ impl HostResource for RecordMarker {}
 struct PollFailingResource;
 
 impl HostResource for PollFailingResource {
-    fn begin_close(&mut self, _reason: CancellationReason) -> vm::RuntimeResult<CloseProgress> {
+    fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         Ok(CloseProgress::Pending)
     }
 
-    fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<vm::RuntimeResult<()>> {
-        Poll::Ready(Err(RuntimeError::new(
-            RuntimeErrorCode::OperationFailed,
+    fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
+        Poll::Ready(Err(ResourceError::new(
+            ResourceErrorCode::ResourceCleanupFailed,
             "test",
             "poll cleanup failed",
         )))
@@ -105,7 +108,7 @@ struct CloseRecorder {
 }
 
 impl HostResource for CloseRecorder {
-    fn begin_close(&mut self, _reason: CancellationReason) -> vm::RuntimeResult<CloseProgress> {
+    fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         self.order.lock().unwrap().push(self.name);
         Ok(CloseProgress::Ready)
     }
@@ -129,7 +132,7 @@ fn require_send<T: Send>() {}
 fn drive_close<T: HostResource>(
     table: &mut ResourceTable,
     token: Resource<T>,
-    reason: CancellationReason,
+    reason: ResourceCloseReason,
 ) {
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -196,26 +199,62 @@ fn handle_round_trips_through_value() {
         ResourceHandle::from_value(&Value::Int(0))
             .unwrap_err()
             .code(),
-        RuntimeErrorCode::InvalidResourceHandle
+        ResourceErrorCode::InvalidResourceHandle
     );
     assert_eq!(
         ResourceHandle::from_value(&Value::Int(-1))
             .unwrap_err()
             .code(),
-        RuntimeErrorCode::InvalidResourceHandle
+        ResourceErrorCode::InvalidResourceHandle
     );
 }
 
 #[test]
 fn typed_access_rejects_wrong_concrete_type() {
     let mut table = ResourceTable::new();
-    let token = table.push(CountingResource::new("a").0).expect("push");
+    let (res, closes, drops) = CountingResource::new("a");
+    let token = table.push(res).expect("push");
 
     // Same raw handle, wrong type marker.
     let wrong: Resource<RecordMarker> = Resource::from_handle(token.handle());
     assert_eq!(
         table.get(&wrong).unwrap_err().code(),
-        RuntimeErrorCode::ResourceTypeMismatch
+        ResourceErrorCode::ResourceTypeMismatch
+    );
+    assert_eq!(
+        table.get_mut(&wrong).unwrap_err().code(),
+        ResourceErrorCode::ResourceTypeMismatch
+    );
+    // Wrong-type begin_close must also be rejected without touching the
+    // resource's state transitions.
+    assert_eq!(
+        table
+            .begin_close(wrong, ResourceCloseReason::VmReset)
+            .unwrap_err()
+            .code(),
+        ResourceErrorCode::ResourceTypeMismatch
+    );
+
+    // The wrong-type probes left the real resource Open and untouched: the
+    // original token is still readable, unmutated, never begun-closing, and
+    // still closable.
+    assert_eq!(table.get(&token).unwrap().label, "a");
+    assert_eq!(
+        table.len(),
+        1,
+        "resource must remain open after wrong-type access"
+    );
+    assert_eq!(
+        closes.load(Ordering::SeqCst),
+        0,
+        "wrong-type close must not fire the real close"
+    );
+    drive_close(&mut table, token, ResourceCloseReason::ResourceClosed);
+    assert_eq!(closes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        1,
+        "only the real close drops the value"
     );
 }
 
@@ -228,7 +267,7 @@ fn cross_table_handle_is_rejected() {
     let table_b = ResourceTable::new();
     assert_eq!(
         table_b.get(&stale_token).unwrap_err().code(),
-        RuntimeErrorCode::ResourceHandleWrongTable
+        ResourceErrorCode::ResourceHandleWrongTable
     );
 }
 
@@ -238,7 +277,7 @@ fn stale_generation_rejects_handle_after_slot_reuse() {
     let first = table.push(CountingResource::new("one").0).expect("push");
     let first_handle = first.handle();
 
-    drive_close(&mut table, first, CancellationReason::ResourceClosed);
+    drive_close(&mut table, first, ResourceCloseReason::ResourceClosed);
     assert_eq!(table.len(), 0);
 
     let second = table.push(CountingResource::new("two").0).expect("reuse");
@@ -256,7 +295,7 @@ fn stale_generation_rejects_handle_after_slot_reuse() {
     let stale: Resource<CountingResource> = Resource::from_handle(first_handle);
     assert_eq!(
         table.get(&stale).unwrap_err().code(),
-        RuntimeErrorCode::ResourceStale
+        ResourceErrorCode::ResourceStale
     );
 }
 
@@ -267,7 +306,7 @@ fn close_moves_slot_to_closed_and_rejects_double_close() {
     let token = table.push(res).expect("push");
 
     let progress = table
-        .begin_close(token, CancellationReason::ResourceClosed)
+        .begin_close(token, ResourceCloseReason::ResourceClosed)
         .expect("begin close");
     assert_eq!(progress, CloseProgress::Ready);
     assert_eq!(closes.load(Ordering::SeqCst), 1);
@@ -275,10 +314,10 @@ fn close_moves_slot_to_closed_and_rejects_double_close() {
     assert_eq!(table.len(), 0);
     assert_eq!(
         table
-            .begin_close(token, CancellationReason::ResourceClosed)
+            .begin_close(token, ResourceCloseReason::ResourceClosed)
             .unwrap_err()
             .code(),
-        RuntimeErrorCode::ResourceAlreadyClosed
+        ResourceErrorCode::ResourceAlreadyClosed
     );
     assert_eq!(
         drops.load(Ordering::SeqCst),
@@ -296,7 +335,7 @@ fn pending_close_holds_generation_until_poll_finishes() {
 
     assert_eq!(
         table
-            .begin_close(token, CancellationReason::ResourceClosed)
+            .begin_close(token, ResourceCloseReason::ResourceClosed)
             .expect("begin"),
         CloseProgress::Pending
     );
@@ -313,7 +352,7 @@ fn pending_close_holds_generation_until_poll_finishes() {
     assert_eq!(table.len(), 1);
     assert_eq!(
         table.get(&token).unwrap_err().code(),
-        RuntimeErrorCode::ResourceAlreadyClosed,
+        ResourceErrorCode::ResourceAlreadyClosed,
         "get while closing is rejected"
     );
 
@@ -325,7 +364,7 @@ fn pending_close_holds_generation_until_poll_finishes() {
     let closed: Resource<TwoPollResource> = Resource::from_handle(handle);
     assert_eq!(
         table.get(&closed).unwrap_err().code(),
-        RuntimeErrorCode::ResourceAlreadyClosed
+        ResourceErrorCode::ResourceAlreadyClosed
     );
 }
 
@@ -341,14 +380,14 @@ fn parent_cannot_close_while_live_children_exist() {
 
     assert_eq!(
         table
-            .begin_close(parent, CancellationReason::ResourceClosed)
+            .begin_close(parent, ResourceCloseReason::ResourceClosed)
             .unwrap_err()
             .code(),
-        RuntimeErrorCode::ResourceHasChildren
+        ResourceErrorCode::ResourceHasChildren
     );
 
-    drive_close(&mut table, child, CancellationReason::ResourceClosed);
-    drive_close(&mut table, parent, CancellationReason::ResourceClosed);
+    drive_close(&mut table, child, ResourceCloseReason::ResourceClosed);
+    drive_close(&mut table, parent, ResourceCloseReason::ResourceClosed);
     assert!(table.is_empty());
 }
 
@@ -368,18 +407,18 @@ fn child_insert_validates_parent_type_and_liveness() {
             .push_child(CountingResource::new("orphan").0, &wrong_parent)
             .unwrap_err()
             .code(),
-        RuntimeErrorCode::ResourceTypeMismatch
+        ResourceErrorCode::ResourceTypeMismatch
     );
 
     // A closed (but not yet vacated-slot-reused) parent cannot accept children.
     let mut table2 = ResourceTable::new();
     let gone = table2.push(CountingResource::new("gone").0).expect("push");
-    drive_close(&mut table2, gone, CancellationReason::ResourceClosed);
+    drive_close(&mut table2, gone, ResourceCloseReason::ResourceClosed);
     let gone: Resource<CountingResource> = Resource::from_handle(gone.handle());
     let err = table2
         .push_child(CountingResource::new("late").0, &gone)
         .unwrap_err();
-    assert_eq!(err.code(), RuntimeErrorCode::ResourceAlreadyClosed);
+    assert_eq!(err.code(), ResourceErrorCode::ResourceAlreadyClosed);
 }
 
 #[test]
@@ -422,7 +461,7 @@ fn close_all_is_child_first() {
         .expect("sib");
 
     table
-        .close_all(CancellationReason::VmReset)
+        .close_all(ResourceCloseReason::VmReset)
         .expect("close_all ok");
 
     let order = order.lock().unwrap().clone();
@@ -444,10 +483,10 @@ fn close_all_continues_past_failures_and_reports_first() {
     let _ok = table.push(CountingResource::new("ok").0).expect("ok");
     table.push(PollFailingResource).expect("failing");
 
-    let result = table.close_all(CancellationReason::VmReset);
+    let result = table.close_all(ResourceCloseReason::VmReset);
     assert_eq!(
         result.unwrap_err().code(),
-        RuntimeErrorCode::OperationFailed
+        ResourceErrorCode::ResourceCleanupFailed
     );
     assert!(
         table.is_empty(),
@@ -460,7 +499,7 @@ fn capacity_limit_is_enforced() {
     let mut table = ResourceTable::with_limit(1).expect("valid");
     let _first = table.push(CountingResource::new("only").0).expect("push");
     let err = table.push(CountingResource::new("overflow").0).unwrap_err();
-    assert_eq!(err.code(), RuntimeErrorCode::ResourceLimitExceeded);
+    assert_eq!(err.code(), ResourceErrorCode::ResourceLimitExceeded);
     assert_eq!(table.len(), 1);
 }
 
@@ -487,14 +526,14 @@ fn begin_close_is_idempotent_for_closing_resource() {
 
     assert_eq!(
         table
-            .begin_close(token, CancellationReason::ResourceClosed)
+            .begin_close(token, ResourceCloseReason::ResourceClosed)
             .expect("first begin"),
         CloseProgress::Pending
     );
     // Repeated begin_close on a closing resource is accepted and still Pending.
     assert_eq!(
         table
-            .begin_close(token, CancellationReason::ResourceClosed)
+            .begin_close(token, ResourceCloseReason::ResourceClosed)
             .expect("second begin"),
         CloseProgress::Pending
     );

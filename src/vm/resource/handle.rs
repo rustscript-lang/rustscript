@@ -20,8 +20,9 @@
 
 use std::marker::PhantomData;
 
-use crate::builtins::runtime::error::{RuntimeError, RuntimeErrorCode, RuntimeResult};
 use crate::bytecode::Value;
+
+use super::error::{ResourceError, ResourceErrorCode, ResourceResult};
 
 /// Default bounded capacity of a resource table.
 pub const DEFAULT_MAX_RESOURCES: usize = 1024;
@@ -64,8 +65,8 @@ impl ResourceHandle {
     ///
     /// The raw bytes are not trusted: the encoding is validated, so numbers
     /// that happen to pass the range checks (including zero and non-positive
-    /// values) are rejected with a typed [`RuntimeErrorCode::InvalidResourceHandle`].
-    pub fn from_value(value: &Value) -> RuntimeResult<Self> {
+    /// values) are rejected with a typed [`ResourceErrorCode::InvalidResourceHandle`].
+    pub fn from_value(value: &Value) -> ResourceResult<Self> {
         let Value::Int(raw) = value else {
             return Err(invalid_handle("resource handle must be an integer token"));
         };
@@ -79,7 +80,7 @@ impl ResourceHandle {
 
     /// Rebuilds a handle from the raw encoding, validating that no reserved or
     /// truncated component leaked through.
-    pub fn from_raw(raw: u64) -> RuntimeResult<Self> {
+    pub fn from_raw(raw: u64) -> ResourceResult<Self> {
         if raw == 0 || raw > i64::MAX as u64 {
             return Err(invalid_handle(
                 "resource handle token must be a positive signed integer",
@@ -105,7 +106,7 @@ impl ResourceHandle {
     }
 
     /// Zero-based slot index.
-    pub fn slot_index(self) -> RuntimeResult<usize> {
+    pub fn slot_index(self) -> ResourceResult<usize> {
         usize::try_from(self.slot_identity() - 1)
             .map_err(|_| invalid_handle("resource handle slot is out of range"))
     }
@@ -304,9 +305,9 @@ impl<T> core::ops::DerefMut for ResourceMut<'_, T> {
     }
 }
 
-fn invalid_handle(message: &'static str) -> RuntimeError {
-    RuntimeError::new(
-        RuntimeErrorCode::InvalidResourceHandle,
+fn invalid_handle(message: &'static str) -> ResourceError {
+    ResourceError::new(
+        ResourceErrorCode::InvalidResourceHandle,
         "resource::handle",
         message,
     )

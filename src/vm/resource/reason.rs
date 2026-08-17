@@ -125,13 +125,23 @@ mod architecture_tests {
     }
 
     #[test]
-    fn support_modules_reject_builtins_in_both_sources() {
+    fn support_modules_reject_builtins_in_all_production_sources() {
         let forbidden = forbidden();
-        for source in [include_str!("error.rs"), include_str!("reason.rs")] {
+        // Every production `.rs` file under `src/vm/resource`. None may reach
+        // into the core crate's builtin registry: this module family must stay
+        // reusable without pulling builtins in.
+        for source in [
+            include_str!("mod.rs"),
+            include_str!("error.rs"),
+            include_str!("reason.rs"),
+            include_str!("handle.rs"),
+            include_str!("close.rs"),
+            include_str!("table.rs"),
+        ] {
             let code = strip_comments(source);
             assert!(
                 !code.contains(&forbidden),
-                "resource support modules must stay decoupled from the core crate: found `{forbidden}`"
+                "src/vm/resource production modules must stay decoupled from the core crate: found `{forbidden}`",
             );
         }
     }

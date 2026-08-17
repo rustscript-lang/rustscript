@@ -17,14 +17,13 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
-use crate::builtins::runtime::cancellation::CancellationReason;
-use crate::builtins::runtime::error::{RuntimeError, RuntimeErrorCode, RuntimeResult};
-
 use super::close::{CloseProgress, HostResource};
+use super::error::{ResourceError, ResourceErrorCode, ResourceResult};
 use super::handle::{
     DEFAULT_MAX_RESOURCES, MAX_HANDLE_ARENA_ID, MAX_HANDLE_GENERATION, MAX_RESOURCE_SLOTS,
     Resource, ResourceHandle, ResourceMut, ResourceRef,
 };
+use super::reason::ResourceCloseReason;
 
 /// Process-unique arena identity source, never recycled.
 ///
@@ -68,10 +67,10 @@ pub struct ResourceTable {
 
 impl ResourceTable {
     /// Creates an empty table with a fresh arena identity and capacity limit.
-    pub fn with_limit(max_entries: usize) -> RuntimeResult<Self> {
+    pub fn with_limit(max_entries: usize) -> ResourceResult<Self> {
         if max_entries == 0 || max_entries > MAX_RESOURCE_SLOTS {
-            return Err(RuntimeError::new(
-                RuntimeErrorCode::InvalidConfiguration,
+            return Err(ResourceError::new(
+                ResourceErrorCode::InvalidConfiguration,
                 "resource::table",
                 format!("resource table capacity must be between 1 and {MAX_RESOURCE_SLOTS}"),
             )
@@ -82,8 +81,8 @@ impl ResourceTable {
                 (arena_id <= MAX_HANDLE_ARENA_ID).then_some(arena_id + 1)
             })
             .map_err(|_| {
-                RuntimeError::new(
-                    RuntimeErrorCode::ResourceIdExhausted,
+                ResourceError::new(
+                    ResourceErrorCode::ResourceIdExhausted,
                     "resource::table",
                     "resource table arena identity space is exhausted",
                 )
@@ -113,7 +112,7 @@ impl ResourceTable {
     }
 
     /// Inserts a root resource and returns its typed token.
-    pub fn push<T: HostResource>(&mut self, value: T) -> RuntimeResult<Resource<T>> {
+    pub fn push<T: HostResource>(&mut self, value: T) -> ResourceResult<Resource<T>> {
         let handle = self.allocate(None, value)?;
         Ok(Resource::from_handle(handle))
     }
@@ -127,7 +126,7 @@ impl ResourceTable {
         &mut self,
         value: T,
         parent: &Resource<P>,
-    ) -> Result<Resource<T>, RuntimeError> {
+    ) -> Result<Resource<T>, ResourceError> {
         let parent_handle = parent.handle();
         // Validate the parent before allocating, so a bad parent key leaves no
         // orphan behind.
@@ -142,7 +141,7 @@ impl ResourceTable {
     pub fn get<T: HostResource>(
         &self,
         resource: &Resource<T>,
-    ) -> RuntimeResult<ResourceRef<'_, T>> {
+    ) -> ResourceResult<ResourceRef<'_, T>> {
         let handle = resource.handle();
         let slot_index = self.validate_active::<T>(handle)?;
         let slot = &self.slots[slot_index];
@@ -159,7 +158,7 @@ impl ResourceTable {
     pub fn get_mut<T: HostResource>(
         &mut self,
         resource: &Resource<T>,
-    ) -> RuntimeResult<ResourceMut<'_, T>> {
+    ) -> ResourceResult<ResourceMut<'_, T>> {
         let handle = resource.handle();
         let slot_index = self.validate_active::<T>(handle)?;
         let slot = &mut self.slots[slot_index];
@@ -176,7 +175,7 @@ impl ResourceTable {
     ///
     /// Properties:
     /// - A parent with any live child returns
-    ///   [`RuntimeErrorCode::ResourceHasChildren`].
+    ///   [`ResourceErrorCode::ResourceHasChildren`].
     /// - An already-closing resource returns [`CloseProgress::Pending`]
     ///   (idempotent); the generation is held until close finishes.
     /// - `CloseProgress::Ready` means the slot is already vacant again and the
@@ -184,8 +183,8 @@ impl ResourceTable {
     pub fn begin_close<T: HostResource>(
         &mut self,
         resource: Resource<T>,
-        reason: CancellationReason,
-    ) -> RuntimeResult<CloseProgress> {
+        reason: ResourceCloseReason,
+    ) -> ResourceResult<CloseProgress> {
         let handle = resource.handle();
         let slot_index = self.resolve_index(handle)?;
         self.check_generation(slot_index, handle)?;
@@ -232,7 +231,7 @@ impl ResourceTable {
         &mut self,
         resource: Resource<T>,
         cx: &mut Context<'_>,
-    ) -> Poll<RuntimeResult<()>> {
+    ) -> Poll<ResourceResult<()>> {
         let handle = resource.handle();
         let slot_index = self.resolve_index(handle)?;
         self.check_generation(slot_index, handle)?;
@@ -262,7 +261,7 @@ impl ResourceTable {
     /// Leaves are closed before their parents (post-order). A cleanup failure
     /// does not stop the remaining best-effort closes; every resource close is
     /// attempted and the first failure is returned after the sweep completes.
-    pub fn close_all(&mut self, reason: CancellationReason) -> RuntimeResult<usize> {
+    pub fn close_all(&mut self, reason: ResourceCloseReason) -> ResourceResult<usize> {
         let mut closed = 0usize;
         let mut first_error = None;
         loop {
@@ -307,9 +306,9 @@ impl ResourceTable {
     fn try_begin_close(
         &mut self,
         slot_index: usize,
-        reason: CancellationReason,
+        reason: ResourceCloseReason,
         closed: &mut usize,
-        first_error: &mut Option<RuntimeError>,
+        first_error: &mut Option<ResourceError>,
     ) -> bool {
         let state = std::mem::replace(&mut self.slots[slot_index].state, SlotState::Vacant);
         let SlotState::Open(mut resource) = state else {
@@ -344,7 +343,7 @@ impl ResourceTable {
         &mut self,
         slot_index: usize,
         closed: &mut usize,
-        first_error: &mut Option<RuntimeError>,
+        first_error: &mut Option<ResourceError>,
     ) -> bool {
         let state = std::mem::replace(&mut self.slots[slot_index].state, SlotState::Vacant);
         let SlotState::Closing(mut resource) = state else {
@@ -414,10 +413,10 @@ impl ResourceTable {
         &mut self,
         parent: Option<ResourceHandle>,
         value: T,
-    ) -> Result<ResourceHandle, RuntimeError> {
+    ) -> Result<ResourceHandle, ResourceError> {
         if self.active_entries >= self.max_entries {
-            return Err(RuntimeError::new(
-                RuntimeErrorCode::ResourceLimitExceeded,
+            return Err(ResourceError::new(
+                ResourceErrorCode::ResourceLimitExceeded,
                 "resource::push",
                 "resource table capacity has been reached",
             )
@@ -441,8 +440,8 @@ impl ResourceTable {
             (slot_index, generation)
         } else {
             if self.slots.len() >= MAX_RESOURCE_SLOTS {
-                return Err(RuntimeError::new(
-                    RuntimeErrorCode::ResourceIdExhausted,
+                return Err(ResourceError::new(
+                    ResourceErrorCode::ResourceIdExhausted,
                     "resource::push",
                     "resource table slot space is exhausted",
                 ));
@@ -460,15 +459,15 @@ impl ResourceTable {
         };
         self.active_entries += 1;
         ResourceHandle::encode(self.arena_id, slot_index, u64::from(generation)).ok_or_else(|| {
-            RuntimeError::new(
-                RuntimeErrorCode::ResourceIdExhausted,
+            ResourceError::new(
+                ResourceErrorCode::ResourceIdExhausted,
                 "resource::push",
                 "resource handle encoding overflowed",
             )
         })
     }
 
-    fn resolve_index(&self, handle: ResourceHandle) -> RuntimeResult<usize> {
+    fn resolve_index(&self, handle: ResourceHandle) -> ResourceResult<usize> {
         if handle.arena_id() != self.arena_id {
             return Err(wrong_arena_error(handle));
         }
@@ -480,7 +479,7 @@ impl ResourceTable {
         Ok(slot_index)
     }
 
-    fn check_generation(&self, slot_index: usize, handle: ResourceHandle) -> RuntimeResult<()> {
+    fn check_generation(&self, slot_index: usize, handle: ResourceHandle) -> ResourceResult<()> {
         if u64::from(self.slots[slot_index].generation) != handle.generation() {
             return Err(stale_handle_error(handle));
         }
@@ -491,7 +490,7 @@ impl ResourceTable {
         &self,
         slot_index: usize,
         handle: ResourceHandle,
-    ) -> RuntimeResult<()> {
+    ) -> ResourceResult<()> {
         if self.slots[slot_index].type_id != TypeId::of::<T>() {
             return Err(type_mismatch(handle, TypeId::of::<T>()));
         }
@@ -500,7 +499,7 @@ impl ResourceTable {
 
     /// Validates that the handle points at a live, open resource of the given
     /// concrete type.
-    fn validate_active<T: 'static>(&self, handle: ResourceHandle) -> RuntimeResult<usize> {
+    fn validate_active<T: 'static>(&self, handle: ResourceHandle) -> ResourceResult<usize> {
         let slot_index = self.resolve_index(handle)?;
         self.check_type::<T>(slot_index, handle)?;
         if !matches!(self.slots[slot_index].state, SlotState::Open(_)) {
@@ -509,7 +508,7 @@ impl ResourceTable {
         Ok(slot_index)
     }
 
-    fn validate_open<T: 'static>(&self, handle: ResourceHandle) -> RuntimeResult<()> {
+    fn validate_open<T: 'static>(&self, handle: ResourceHandle) -> ResourceResult<()> {
         let slot_index = self.resolve_index(handle)?;
         self.check_type::<T>(slot_index, handle)?;
         match self.slots[slot_index].state {
@@ -529,60 +528,60 @@ impl Drop for ResourceTable {
     fn drop(&mut self) {
         // Last-resort synchronous sweep. In the intended flow the owning scope
         // drives poll-based close to quiescence before dropping the table.
-        let _ = self.close_all(CancellationReason::VmReset);
+        let _ = self.close_all(ResourceCloseReason::VmReset);
     }
 }
 
 // ---- error constructors ------------------------------------------------------------
 
-fn wrong_arena_error(handle: ResourceHandle) -> RuntimeError {
-    RuntimeError::new(
-        RuntimeErrorCode::ResourceHandleWrongTable,
+fn wrong_arena_error(handle: ResourceHandle) -> ResourceError {
+    ResourceError::new(
+        ResourceErrorCode::ResourceHandleWrongTable,
         "resource::table",
         "resource handle does not belong to this table's arena",
     )
     .with_value(handle.raw())
 }
 
-fn stale_handle_error(handle: ResourceHandle) -> RuntimeError {
-    RuntimeError::new(
-        RuntimeErrorCode::ResourceStale,
+fn stale_handle_error(handle: ResourceHandle) -> ResourceError {
+    ResourceError::new(
+        ResourceErrorCode::ResourceStale,
         "resource::table",
         "resource handle refers to a stale slot generation",
     )
     .with_value(handle.raw())
 }
 
-fn already_closed_error(handle: ResourceHandle) -> RuntimeError {
-    RuntimeError::new(
-        RuntimeErrorCode::ResourceAlreadyClosed,
+fn already_closed_error(handle: ResourceHandle) -> ResourceError {
+    ResourceError::new(
+        ResourceErrorCode::ResourceAlreadyClosed,
         "resource::table",
         "resource is already closed or closing",
     )
     .with_value(handle.raw())
 }
 
-fn type_mismatch(handle: ResourceHandle, expected: TypeId) -> RuntimeError {
-    RuntimeError::new(
-        RuntimeErrorCode::ResourceTypeMismatch,
+fn type_mismatch(handle: ResourceHandle, expected: TypeId) -> ResourceError {
+    ResourceError::new(
+        ResourceErrorCode::ResourceTypeMismatch,
         "resource::table",
         format!("resource type does not match expected type {:?}", expected),
     )
     .with_value(handle.raw())
 }
 
-fn has_children_error(handle: ResourceHandle) -> RuntimeError {
-    RuntimeError::new(
-        RuntimeErrorCode::ResourceHasChildren,
+fn has_children_error(handle: ResourceHandle) -> ResourceError {
+    ResourceError::new(
+        ResourceErrorCode::ResourceHasChildren,
         "resource::table",
         "resource cannot close while it has live child resources",
     )
     .with_value(handle.raw())
 }
 
-fn not_closing_error(handle: ResourceHandle) -> RuntimeError {
-    RuntimeError::new(
-        RuntimeErrorCode::InvalidResourceHandle,
+fn not_closing_error(handle: ResourceHandle) -> ResourceError {
+    ResourceError::new(
+        ResourceErrorCode::InvalidResourceHandle,
         "resource::table",
         "resource is not in the closing state",
     )

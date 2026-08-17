@@ -7,8 +7,8 @@
 use std::any::Any;
 use std::task::{Context, Poll};
 
-use crate::builtins::runtime::cancellation::CancellationReason;
-use crate::builtins::runtime::error::RuntimeResult;
+use super::error::ResourceResult;
+use super::reason::ResourceCloseReason;
 
 /// Outcome of synchronously beginning a close.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,7 +38,7 @@ pub trait HostResource: Any + Send + 'static {
     /// Begins closing the resource, emitting a synchronous cancel/close request.
     ///
     /// The default is a synchronous no-op close.
-    fn begin_close(&mut self, reason: CancellationReason) -> RuntimeResult<CloseProgress> {
+    fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         let _ = reason;
         Ok(CloseProgress::Ready)
     }
@@ -48,7 +48,7 @@ pub trait HostResource: Any + Send + 'static {
     /// Only invoked after `begin_close` returned [`CloseProgress::Pending`].
     /// The default completes synchronously. An `Err` is a cleanup failure
     /// recorded by the table as a generic close error.
-    fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<RuntimeResult<()>> {
+    fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
         Poll::Ready(Ok(()))
     }
 }
