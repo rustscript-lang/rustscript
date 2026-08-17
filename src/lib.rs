@@ -6,6 +6,7 @@ pub mod compiler;
 pub mod debug_info;
 #[cfg(feature = "runtime")]
 pub mod debugger;
+pub mod host_api;
 #[cfg(feature = "runtime")]
 pub mod jit {
     pub use crate::vm::jit::{
@@ -80,6 +81,11 @@ pub use debugger::{
     DebugCommandBridgeStatus, Debugger, StepMode, VmRecording, VmRecordingError, VmRecordingFrame,
     VmRecordingReplayResponse, VmRecordingReplayState, replay_recording_stdio,
     run_recording_replay_command,
+};
+pub use host_api::{
+    HostApiBuilder, HostApiCatalog, HostApiCatalogError, HostApiFingerprint, HostFunctionSchema,
+    HostParamPassing, HostParamSchema, HostTypeSchema, ResourceTypeKey, ResourceTypeKeyError,
+    ResourceTypeSchema,
 };
 #[cfg(feature = "runtime")]
 pub use jit::{

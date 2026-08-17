@@ -86,7 +86,7 @@ edge_abi = { package = "pd-edge-abi", version = "0.1.1", default-features = fals
 futures-channel = "0.3"
 paste = "1"
 regex = "1"
-serde = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rt-format = "0.3.1"
 self_cell = "1"
