@@ -14,9 +14,10 @@
 
 use std::task::{Context, Poll};
 
-use crate::builtins::runtime::error::{RuntimeError, RuntimeResult};
-use crate::builtins::runtime::resource::ResourceHandle;
+use super::error::OperationError;
+use super::reason::OperationCancelReason;
 use crate::vm::CancellationReason;
+use crate::vm::resource::ResourceHandle;
 
 /// Opaque terminal result reported by an operation once it finishes.
 ///
@@ -31,10 +32,10 @@ pub enum OperationOutcome {
     /// Operation finished successfully.
     Completed,
     /// Operation failed with a runtime error.
-    Failed(RuntimeError),
+    Failed(OperationError),
     /// Operation was cancelled; carries the first recorded cancellation
     /// reason.
-    Cancelled(CancellationReason),
+    Cancelled(OperationCancelReason),
 }
 
 /// Object-safe driver contract for a single in-flight host operation.
@@ -51,7 +52,7 @@ pub trait HostOperation: Send + 'static {
     /// terminal state. Implementors must be cancellation-aware: after
     /// [`HostOperation::cancel`] has been observed they should return
     /// `Poll::Ready` promptly so the registry can record the terminal status.
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<RuntimeResult<()>>;
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<OperationResult<()>>;
 
     /// Ask the driver to stop the underlying work.
     ///
@@ -61,14 +62,15 @@ pub trait HostOperation: Send + 'static {
     /// distinguish scope reset, deadline and explicit requests. This is the
     /// single cancellation authority; drivers must not build their own
     /// parent/child token trees.
-    fn cancel(&mut self, reason: CancellationReason);
+    fn cancel(&mut self, reason: OperationCancelReason) -> OperationResult<()>;
 }
 
 /// Optional per-operation cleanup, called exactly once on the first terminal
 /// transition. Failures are isolated by the registry: the operation still
 /// becomes terminal and any batch cancellation continues past a failing
 /// cleanup.
-pub type OperationCleanup = Box<dyn FnOnce(OperationOutcome) -> RuntimeResult<()> + Send + 'static>;
+pub type OperationCleanup =
+    Box<dyn FnOnce(&OperationOutcome) -> OperationResult<()> + Send + 'static>;
 
 /// Configuration describing one operation for
 /// [`OperationRegistry::start`](crate::vm::operation::OperationRegistry::start).

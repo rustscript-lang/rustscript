@@ -1,10 +1,8 @@
 //! Host-agnostic generic operation layer.
 //!
-//! This module is the core, host-agnostic replacement for the old
-//! builtin-specific operation machinery that lived in
-//! `crate::builtins::runtime::cancellation`. It is the piece that will be
-//! wired into the future `ExecutionScope` (fan-out across a scope is a
-//! later step and deliberately not implemented here).
+//! This module owns the host-agnostic operation lifecycle (status,
+//! cancellation, cleanup) for the VM. The concrete driver contract lives
+//! in [`driver`], the registry in [`registry`].
 //!
 //! Key ideas:
 //!
@@ -14,13 +12,13 @@
 //! * **Single cancellation authority** — cancellation is recorded once on the
 //!   operation entry (first reason wins, deadline included) and forwarded
 //!   directly to the owning driver via [`HostOperation::cancel`]. There is no
-//!   standalone [`CancellationToken`](crate::builtins::runtime::cancellation::CancellationToken)
+//!   standalone [`CancellationToken`](crate::vm::cancellation::CancellationToken)
 //!   parent/child signal graph here and no second cancellation framework.
 //! * **Bounded, monotonic ids** — [`OperationRegistry`] allocates non-reusable
 //!   [`OperationId`]s and bounds the number of concurrently *pending*
 //!   operations; consuming a terminal result releases capacity.
 //! * **Optional resource association** — an operation can be tied to a
-//!   [`ResourceHandle`](crate::builtins::runtime::resource::ResourceHandle)
+//!   [`ResourceHandle`](crate::vm::resource::ResourceHandle)
 //!   so cancelling that resource cancels the operation.
 //!
 //! # Transitional compatibility
@@ -40,11 +38,14 @@
 //!   `crate::builtins::runtime::poll_builtin_io_op` / `mod.rs`;
 //! * route host bridge and builtin operations through this registry's
 //!   [`OperationSpec`]/[`HostOperation`] contract instead of `start_owned`.
-
 pub mod driver;
+pub mod error;
+pub mod reason;
 pub mod registry;
 
 pub use driver::{HostOperation, OperationCleanup, OperationOutcome, OperationSpec};
+pub use error::{OperationError, OperationErrorCode};
+pub use reason::OperationCancelReason;
 pub use registry::{
     DEFAULT_MAX_PENDING_OPERATIONS, OperationId, OperationRegistry, OperationStatus,
 };
