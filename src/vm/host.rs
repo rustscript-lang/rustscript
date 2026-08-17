@@ -1092,60 +1092,6 @@ impl Vm {
         self.host.runtime_print_sink = None;
     }
 
-    pub fn set_runtime_input(&mut self, value: Value) -> VmResult<()> {
-        self.run_ctx
-            .runtime_context
-            .set_input(value)
-            .map_err(|error| VmError::HostError(error.to_string()))
-    }
-
-    pub fn clear_runtime_input(&mut self) {
-        self.run_ctx.runtime_context.clear_input();
-    }
-
-    pub fn set_runtime_event_sink<S>(&mut self, sink: S) -> VmResult<()>
-    where
-        S: crate::builtins::runtime::event::EventSink + 'static,
-    {
-        self.run_ctx
-            .runtime_context
-            .set_event_sink(sink)
-            .map_err(|error| VmError::HostError(error.to_string()))
-    }
-
-    pub fn clear_runtime_event_sink(&mut self) {
-        self.run_ctx.runtime_context.clear_event_sink();
-    }
-
-    pub(crate) fn runtime_input_value(&self) -> VmResult<Value> {
-        crate::builtins::runtime::context::runtime_input(&self.run_ctx.runtime_context)
-    }
-
-    pub(crate) fn emit_runtime_event(&mut self, value: Value) -> VmResult<()> {
-        crate::builtins::runtime::context::runtime_emit(&mut self.run_ctx.runtime_context, value)
-    }
-
-    /// Configure a bounded event sink without exposing runtime implementation types.
-    pub fn set_runtime_value_event_sink<F>(&mut self, mut sink: F) -> VmResult<()>
-    where
-        F: FnMut(Value) -> VmResult<()> + Send + 'static,
-    {
-        self.run_ctx
-            .runtime_context
-            .set_event_sink(
-                move |payload: crate::builtins::runtime::event::EventPayload| {
-                    sink(payload.into_value()).map_err(|error| {
-                        crate::builtins::runtime::error::RuntimeError::new(
-                            crate::builtins::runtime::error::RuntimeErrorCode::EventSinkRejected,
-                            "runtime::emit",
-                            error.to_string(),
-                        )
-                    })
-                },
-            )
-            .map_err(|error| VmError::HostError(error.to_string()))
-    }
-
     /// Enables or disables implicit binding of built-in host functions.
     ///
     /// Disabling this makes the VM use only explicitly registered host functions. The default

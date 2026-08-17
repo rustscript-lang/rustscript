@@ -1987,6 +1987,27 @@ impl<'a> TypeContext<'a> {
             }
             return Ok(());
         }
+        // `stream::emit(value)` accepts any single value; the per-item event
+        // bound is validated at runtime by the invocation stream. The
+        // exemption is tied to the authoritative runtime builtin identity; a
+        // same-name function registered through another catalog does not
+        // inherit it. The identity constant lives in the `runtime`-featured
+        // builtins module, so in non-runtime builds the comparison is
+        // compiled out and the exemption does not apply.
+        #[cfg(feature = "runtime")]
+        if signature.runtime_builtin
+            && signature.name == crate::builtins::runtime::context::STREAM_EMIT_NAME
+        {
+            return validate_host_signature(
+                &signature.name,
+                &signature.params,
+                args,
+                state,
+                self,
+                line_context,
+                source_name,
+            );
+        }
         if self.is_strict()
             && signature
                 .params
@@ -2608,4 +2629,68 @@ fn literal_int_index(key: &Expr) -> Option<usize> {
         return None;
     };
     usize::try_from(*index).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builtins::{CallableParam, CallableParamType};
+
+    /// The authoritative `stream::emit` signature: one `any` payload.
+    fn emit_signature(runtime_builtin: bool) -> HostCallableSignature {
+        HostCallableSignature {
+            name: crate::builtins::runtime::context::STREAM_EMIT_NAME.to_string(),
+            params: vec![CallableParam {
+                name: "value",
+                ty: CallableParamType::Any,
+                optional: false,
+            }],
+            runtime_builtin,
+        }
+    }
+
+    #[test]
+    fn stream_emit_any_payload_exemption_requires_authoritative_builtin_identity() {
+        let empty_impls: HashMap<u16, FunctionImpl> = HashMap::new();
+        let empty_decls: HashMap<u16, FunctionDecl> = HashMap::new();
+        let empty_structs: HashMap<String, StructDecl> = HashMap::new();
+        let empty_names: HashMap<u16, String> = HashMap::new();
+        let empty_returns: HashMap<u16, BoundType> = HashMap::new();
+        let empty_signatures: HashMap<u16, HostCallableSignature> = HashMap::new();
+        let mut context = TypeContext::new(
+            &empty_impls,
+            &empty_decls,
+            &empty_structs,
+            &empty_names,
+            &empty_returns,
+            &empty_signatures,
+            TypingMode::StrictRustScript,
+        );
+        let state = LocalTypeState::default();
+        let args = [Expr::Int(1)];
+
+        assert!(
+            context
+                .validate_host_argument_types(&emit_signature(true), &args, &state, None, None,)
+                .is_ok(),
+            "the authoritative stream::emit builtin must accept any payload in strict mode"
+        );
+
+        // A same-name signature that is not the authoritative runtime builtin
+        // (for example one registered through another host catalog) must not
+        // inherit the strict-typing exemption.
+        assert!(
+            matches!(
+                context.validate_host_argument_types(
+                    &emit_signature(false),
+                    &args,
+                    &state,
+                    None,
+                    None,
+                ),
+                Err(CompileError::StrictTypingRequired { .. })
+            ),
+            "a same-name non-builtin signature must not inherit the stream::emit exemption"
+        );
+    }
 }

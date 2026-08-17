@@ -1,79 +1,115 @@
 #![cfg(feature = "runtime")]
 
-use std::sync::{Arc, Mutex};
-
 #[cfg(feature = "sqlite")]
 use vm::SqliteHostExt;
 use vm::{
-    EventPayload, EventSink, HostFunctionRegistry, RuntimeResult, Value, Vm, VmStatus,
-    compile_source,
+    HostFunctionRegistry, InvocationError, InvocationItem, InvocationPoll, Value, Vm, VmError,
+    VmStatus, compile_source,
 };
 
-struct RecordingEventSink(Arc<Mutex<Vec<Value>>>);
-
-impl EventSink for RecordingEventSink {
-    fn emit(&mut self, payload: EventPayload) -> RuntimeResult<()> {
-        self.0
-            .lock()
-            .expect("event capture lock should not be poisoned")
-            .push(payload.into_value());
-        Ok(())
-    }
-}
-
-#[test]
-fn runtime_input_host_reads_embedding_run_value() {
-    let program = compile_source(
-        r#"
-        use runtime;
-        runtime::input();
-        "#,
-    )
-    .expect("runtime input source should compile")
-    .program;
-    let mut vm = Vm::new(program);
-    vm.set_runtime_input(Value::string("run-input"))
-        .expect("runtime input should be configurable");
-    HostFunctionRegistry::new()
-        .bind_vm_cached(&mut vm)
-        .expect("default runtime host registry should bind");
-
-    assert_eq!(
-        vm.run().expect("runtime input should execute"),
-        VmStatus::Halted
-    );
-    assert_eq!(vm.stack().last(), Some(&Value::string("run-input")));
-}
-
-#[test]
-fn runtime_input_host_reports_missing_embedding_value() {
-    let program = compile_source(
-        r#"
-        use runtime;
-        runtime::input();
-        "#,
-    )
-    .expect("runtime input source should compile")
-    .program;
-    let mut vm = Vm::new(program);
-    HostFunctionRegistry::new()
-        .bind_vm_cached(&mut vm)
-        .expect("default runtime host registry should bind");
-
-    let error = vm.run().expect_err("missing runtime input should fail");
-    assert!(error.to_string().contains("input_unavailable"));
-}
-
-#[test]
-fn public_runtime_event_contract_is_implementable_and_configurable() {
-    let program = compile_source("0;")
-        .expect("minimal runtime host program should compile")
+/// Compiles a source, binds the default runtime host registry, and completes
+/// the root frame so exported callables can be started.
+fn prepared_vm(source: &str) -> Vm {
+    let program = compile_source(source)
+        .expect("runtime host source should compile")
         .program;
-    let events = Arc::new(Mutex::new(Vec::new()));
     let mut vm = Vm::new(program);
-    vm.set_runtime_event_sink(RecordingEventSink(Arc::clone(&events)))
-        .expect("public EventSink implementation should be configurable");
-    vm.clear_runtime_event_sink();
+    HostFunctionRegistry::new()
+        .bind_vm_cached(&mut vm)
+        .expect("default runtime host registry should bind");
+    assert_eq!(vm.run().expect("root frame should halt"), VmStatus::Halted);
+    vm
+}
+
+#[test]
+fn invocation_input_arrives_through_exported_callable_arguments() {
+    let mut vm = prepared_vm(
+        r#"
+        pub fn run(input: string) -> string {
+            input;
+        }
+        "#,
+    );
+    let callable = vm
+        .resolve_exported_callable("run")
+        .expect("exported run callable should resolve");
+    let mut invocation = vm
+        .start_invocation(callable, vec![Value::string("run-input")])
+        .expect("invocation should start");
+
+    match invocation.poll_next().expect("poll should succeed") {
+        InvocationPoll::Ready(Some(Ok(InvocationItem::Complete(value)))) => {
+            assert_eq!(value, Value::string("run-input"));
+        }
+        other => panic!("expected the callable input as the Complete value, got {other:?}"),
+    }
+    assert!(matches!(
+        invocation.poll_next().expect("poll should succeed"),
+        InvocationPoll::Ready(None)
+    ));
+}
+
+#[test]
+fn stream_emit_delivers_events_through_the_invocation_stream() {
+    let mut vm = prepared_vm(
+        r#"
+        use stream;
+        pub fn run() -> string {
+            stream::emit("event-one");
+            stream::emit("event-two");
+            "done";
+        }
+        "#,
+    );
+    let callable = vm
+        .resolve_exported_callable("run")
+        .expect("exported run callable should resolve");
+    let mut invocation = vm
+        .start_invocation(callable, vec![])
+        .expect("invocation should start");
+
+    assert!(matches!(
+        invocation.poll_next().expect("poll should succeed"),
+        InvocationPoll::Ready(Some(Ok(InvocationItem::Event(value)))) if value == Value::string("event-one")
+    ));
+    assert!(matches!(
+        invocation.poll_next().expect("poll should succeed"),
+        InvocationPoll::Ready(Some(Ok(InvocationItem::Event(value)))) if value == Value::string("event-two")
+    ));
+    assert!(matches!(
+        invocation.poll_next().expect("poll should succeed"),
+        InvocationPoll::Ready(Some(Ok(InvocationItem::Complete(value)))) if value == Value::string("done")
+    ));
+    assert!(matches!(
+        invocation.poll_next().expect("poll should succeed"),
+        InvocationPoll::Ready(None)
+    ));
+}
+
+#[test]
+fn invocation_errors_are_typed_without_string_parsing() {
+    let mut vm = prepared_vm(
+        r#"
+        pub fn run(input: int) -> int {
+            1 / input;
+        }
+        "#,
+    );
+    let callable = vm
+        .resolve_exported_callable("run")
+        .expect("exported run callable should resolve");
+    let mut invocation = vm
+        .start_invocation(callable, vec![Value::Int(0)])
+        .expect("invocation should start");
+
+    assert!(matches!(
+        invocation.poll_next().expect("poll should succeed"),
+        InvocationPoll::Ready(Some(Err(InvocationError::Vm(VmError::DivisionByZero))))
+    ));
+    assert!(matches!(
+        invocation.poll_next().expect("poll should succeed"),
+        InvocationPoll::Ready(None)
+    ));
 }
 
 #[cfg(feature = "sqlite")]

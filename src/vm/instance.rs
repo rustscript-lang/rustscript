@@ -19,6 +19,7 @@ use std::sync::{Arc, Weak};
 
 use crate::bytecode::{CallableValue, Program, SharedCaptureCell, Value};
 use crate::vm::async_host::WaitingHostOp;
+use crate::vm::invocation::{InvocationPhase, InvocationState};
 use crate::vm::map_iter::MapIteratorState;
 use crate::vm::{DEFAULT_MAX_SCRIPT_CALL_DEPTH, VmYieldReason};
 
@@ -84,6 +85,7 @@ pub(crate) struct Instance {
     pub(crate) shutdown: bool,
     pub(super) waiting_host_op: Option<WaitingHostOp>,
     pub(crate) last_yield_reason: Option<VmYieldReason>,
+    pub(crate) invocation: Option<InvocationState>,
     pub(crate) map_iterators: Vec<Vec<Option<MapIteratorState>>>,
     pub(crate) drop_contract_events_enabled: bool,
     pub(crate) drop_contract_events: u64,
@@ -120,6 +122,7 @@ impl Instance {
             shutdown: false,
             waiting_host_op: None,
             last_yield_reason: None,
+            invocation: None,
             map_iterators: Vec::new(),
             drop_contract_events_enabled: false,
             drop_contract_events: 0,
@@ -161,6 +164,8 @@ impl Instance {
         self.draining_queued_callables = false;
         self.shutdown = false;
         self.waiting_host_op = None;
+        self.drop_invocation_state();
+        self.invocation = None;
         self.map_iterators.clear();
         self.clear_interpreter_metrics();
     }
@@ -168,10 +173,30 @@ impl Instance {
     /// Releases interpreter-owned values with drop-contract accounting. Used by
     /// the facade's `Drop` (and by `shutdown`).
     pub(crate) fn drop_cleanup(&mut self) {
+        self.drop_invocation_state();
         self.clear_stack_with_drop_contract();
         self.capture_cells.clear();
         self.shared_capture_slots.clear();
         self.clear_locals_with_drop_contract();
+    }
+
+    /// Drops pending invocation stream values with drop-contract accounting and
+    /// rewinds the invocation state to a fresh, fused position.
+    pub(crate) fn drop_invocation_state(&mut self) {
+        let Some(state) = self.invocation.as_mut() else {
+            return;
+        };
+        let value = match std::mem::replace(&mut state.phase, InvocationPhase::Fused) {
+            InvocationPhase::EventPending(value) | InvocationPhase::CompletePending(value) => {
+                Some(value)
+            }
+            _ => None,
+        };
+        state.emit_yield_pending = false;
+        state.pending_error = None;
+        if let Some(value) = value {
+            self.drop_value_with_contract(value);
+        }
     }
 
     pub(crate) fn invalidate_callback_registries(&mut self) {

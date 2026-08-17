@@ -1,15 +1,10 @@
-use super::error::{RuntimeError, RuntimeErrorCode, RuntimeResult};
-use super::event::{EventEmitter, EventLimits, EventReceipt, EventSink};
-use crate::vm::{Value, VmResult};
-
-pub const RUNTIME_INPUT_NAME: &str = "runtime::input";
-#[allow(dead_code)]
-pub const RUNTIME_EMIT_NAME: &str = "runtime::emit";
+use super::error::RuntimeResult;
+use super::event::EventLimits;
 
 #[allow(dead_code)]
-pub type RuntimeEventSink = dyn EventSink;
+pub const STREAM_EMIT_NAME: &str = "stream::emit";
 
-/// Configuration for one VM/run-scoped generic runtime context.
+/// Configuration for one VM/run-scoped invocation stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeContextConfig {
     event_limits: EventLimits,
@@ -31,74 +26,29 @@ impl Default for RuntimeContextConfig {
     }
 }
 
-/// Run-scoped input and generic event transport hooks.
+/// Run-scoped invocation stream configuration.
 ///
-/// The context stores values as VM [`Value`]s and delegates event persistence/delivery to the
-/// embedding. It has no knowledge of sessions, providers, platforms, or event names.
+/// The context carries only the per-item event bound. Event values are owned by
+/// the active invocation's single pending-event slot; there is no ambient
+/// input, no embedding event sink, and no sequence or persistence policy here.
 pub struct RuntimeContext {
-    input: Option<Value>,
-    events: EventEmitter,
+    event_limits: EventLimits,
 }
 
 #[allow(dead_code)]
 impl RuntimeContext {
     pub fn with_config(config: RuntimeContextConfig) -> RuntimeResult<Self> {
         Ok(Self {
-            input: None,
-            events: EventEmitter::new(config.event_limits()),
+            event_limits: config.event_limits(),
         })
     }
 
     pub fn config(&self) -> RuntimeContextConfig {
-        RuntimeContextConfig::new(self.events.limits())
-    }
-
-    pub fn set_input(&mut self, value: Value) -> RuntimeResult<()> {
-        self.input = Some(value);
-        Ok(())
-    }
-
-    pub fn clear_input(&mut self) {
-        self.input = None;
-    }
-
-    pub fn reset_for_reuse(&mut self) {
-        self.input = None;
-        self.events.reset_for_reuse();
-    }
-
-    pub fn input(&self) -> RuntimeResult<Value> {
-        self.input.clone().ok_or_else(|| {
-            RuntimeError::new(
-                RuntimeErrorCode::InputUnavailable,
-                RUNTIME_INPUT_NAME,
-                "run input has not been configured",
-            )
-        })
-    }
-
-    pub fn set_event_sink<S>(&mut self, sink: S) -> RuntimeResult<()>
-    where
-        S: EventSink + 'static,
-    {
-        self.events.set_sink(sink);
-        Ok(())
-    }
-
-    pub fn clear_event_sink(&mut self) {
-        self.events.clear_sink();
-    }
-
-    pub fn emit(&mut self, value: Value) -> RuntimeResult<EventReceipt> {
-        self.events.emit(value)
-    }
-
-    pub fn emitted_events(&self) -> u64 {
-        self.events.emitted_events()
+        RuntimeContextConfig::new(self.event_limits)
     }
 
     pub fn event_limits(&self) -> EventLimits {
-        self.events.limits()
+        self.event_limits
     }
 }
 
@@ -109,29 +59,22 @@ impl Default for RuntimeContext {
     }
 }
 
-/// Parent registration helper for the zero-argument `runtime::input()` host function.
-pub fn runtime_input(context: &RuntimeContext) -> VmResult<Value> {
-    context
-        .input()
-        .map_err(|error| crate::vm::VmError::HostError(error.to_string()))
-}
-
-/// Parent registration helper for the one-argument `runtime::emit(value)` host function.
-pub fn runtime_emit(context: &mut RuntimeContext, value: Value) -> VmResult<()> {
-    context
-        .emit(value)
-        .map(|_| ())
-        .map_err(|error| crate::vm::VmError::HostError(error.to_string()))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{RUNTIME_EMIT_NAME, RUNTIME_INPUT_NAME, RuntimeContext};
+    use super::{EventLimits, RuntimeContext, RuntimeContextConfig, STREAM_EMIT_NAME};
 
     #[test]
-    fn host_names_are_generic_and_stable() {
-        assert_eq!(RUNTIME_INPUT_NAME, "runtime::input");
-        assert_eq!(RUNTIME_EMIT_NAME, "runtime::emit");
+    fn host_name_is_generic_and_stable() {
+        assert_eq!(STREAM_EMIT_NAME, "stream::emit");
         assert!(std::mem::size_of::<RuntimeContext>() > 0);
+    }
+
+    #[test]
+    fn per_item_event_limits_are_configurable() {
+        let limits = EventLimits::new(128, 4).expect("limits should be valid");
+        let context = RuntimeContext::with_config(RuntimeContextConfig::new(limits))
+            .expect("context should be constructible");
+        assert_eq!(context.event_limits(), limits);
+        assert_eq!(context.config().event_limits(), limits);
     }
 }

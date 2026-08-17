@@ -435,4 +435,10 @@ pub(crate) struct TypeInferenceResult {
 pub(crate) struct HostCallableSignature {
     pub(crate) name: String,
     pub(crate) params: Vec<CallableParam>,
+    /// True when this signature came from the authoritative runtime builtin
+    /// catalog (`default_host_callable`), false when it came from another
+    /// catalog such as edge ABI host functions. Strict-typing exemptions that
+    /// are tied to a builtin identity must check this marker so a same-name
+    /// function from another catalog cannot inherit them.
+    pub(crate) runtime_builtin: bool,
 }

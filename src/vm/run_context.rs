@@ -1,10 +1,10 @@
 //! Run-scoped execution context.
 //!
 //! [`RunContext`] owns everything that belongs to one execution of a program:
-//! the generic runtime input/event context, fuel and epoch budgets, the
-//! interrupt mode, and the epoch counter handle. A fresh logical run starts
-//! from a reset context; nothing here survives a reset except the epoch handle
-//! identity (which is intentionally process-lifetime).
+//! the run-scoped invocation stream configuration (event limits), fuel and
+//! epoch budgets, the interrupt mode, and the epoch counter handle. A fresh
+//! logical run starts from a reset context; nothing here survives a reset
+//! except the epoch handle identity (which is intentionally process-lifetime).
 //!
 //! The embedder-facing fuel/epoch APIs live on the VM facade (see
 //! `crate::vm::fuel` and `crate::vm::epoch`) and delegate here; cancellation
@@ -35,11 +35,11 @@ impl InterruptMode {
     }
 }
 
-/// Run-scoped input, events, budgets, deadlines, and interruption state.
+/// Run-scoped configuration, budgets, deadlines, and interruption state.
 ///
-/// Thread safety: `RunContext` is `!Sync` (event sink and counters are
-/// mutable) and not shared; one facade owns one context. Clone semantics:
-/// not `Clone` — a clone would duplicate event/input state across runs.
+/// Thread safety: `RunContext` is `!Sync` (mutable counters) and not shared;
+/// one facade owns one context. Clone semantics: not `Clone` — a clone would
+/// duplicate run-scoped state across runs.
 pub(crate) struct RunContext {
     pub(crate) runtime_context: RuntimeContext,
     pub(crate) cancellation: CancellationToken,
@@ -58,8 +58,8 @@ pub(crate) struct RunContext {
 }
 
 impl RunContext {
-    /// Creates a fresh run context with no input, no event sink, and no
-    /// budgets (interrupts disabled).
+    /// Creates a fresh run context with default event limits and no budgets
+    /// (interrupts disabled).
     pub(crate) fn new() -> Self {
         let epoch_handle = EpochHandle::default();
         let epoch_counter_ptr = epoch_handle.as_ptr() as usize;
@@ -78,15 +78,15 @@ impl RunContext {
         }
     }
 
-    /// Closes run-scoped state for reuse: input and events are cleared and
-    /// fuel/epoch budgets are dropped (metering disabled, no leftovers).
+    /// Closes run-scoped state for reuse: fuel/epoch budgets are dropped
+    /// (metering disabled, no leftovers). The invocation stream event limits
+    /// are configuration and intentionally survive a reset.
     pub(crate) fn reset_for_reuse(&mut self) {
         self.cancellation.cancel(CancellationReason::VmReset);
         self.cancellation = CancellationToken::root();
         self.epoch_rearm_pending = false;
         self.clear_fuel_internal();
         self.clear_epoch_deadline_internal();
-        self.runtime_context.reset_for_reuse();
     }
 
     pub(crate) fn cancel(&self, reason: CancellationReason) -> VmResult<()> {
