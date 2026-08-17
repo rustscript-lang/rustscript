@@ -2530,6 +2530,101 @@ fn run_yields_before_ret_in_call_ret_sequence_when_epoch_deadline_is_reached() {
 }
 
 #[test]
+fn dropping_pre_cancelled_invocation_consumes_cancellation_at_the_boundary() {
+    // Dropping an invocation with a pending typed cancellation retires that
+    // invocation without manufacturing an unobservable terminal item. The VM
+    // cancellation root is refreshed for immediate reuse.
+    let compiled = crate::compile_source(
+        r#"
+        pub fn run() -> int {
+            42;
+        }
+        "#,
+    )
+    .expect("invocation source should compile");
+    let mut vm = Vm::new(compiled.program);
+    assert_eq!(vm.run().expect("root frame should halt"), VmStatus::Halted);
+
+    vm.run_ctx
+        .cancel(CancellationReason::Requested)
+        .expect("pre-cancellation should be accepted");
+    let callable = vm
+        .resolve_exported_callable("run")
+        .expect("exported run callable should resolve");
+    {
+        let _invocation = vm
+            .start_invocation(callable.clone(), vec![])
+            .expect("invocation should start");
+    }
+    assert!(
+        vm.run_ctx.cancellation.reason().is_none(),
+        "dropping the invocation must consume its pending cancellation"
+    );
+
+    let mut replacement = vm
+        .start_invocation(callable, vec![])
+        .expect("the vm should be reusable after the dropped invocation");
+    assert!(matches!(
+        replacement.poll_next().expect("poll should succeed"),
+        InvocationPoll::Ready(Some(Ok(InvocationItem::Complete(Value::Int(42)))))
+    ));
+}
+
+#[test]
+fn pre_cancelled_invocation_delivers_one_typed_error_then_fused_end() {
+    // Functional contract of the pre-cancelled path: exactly one typed
+    // Cancelled item, a fused end, and the cancellation consumed at the
+    // invocation boundary (a later invocation runs normally).
+    let compiled = crate::compile_source(
+        r#"
+        pub fn run() -> int {
+            42;
+        }
+        "#,
+    )
+    .expect("invocation source should compile");
+    let mut vm = Vm::new(compiled.program);
+    assert_eq!(vm.run().expect("root frame should halt"), VmStatus::Halted);
+
+    vm.run_ctx
+        .cancel(CancellationReason::Requested)
+        .expect("pre-cancellation should be accepted");
+    let callable = vm
+        .resolve_exported_callable("run")
+        .expect("exported run callable should resolve");
+    {
+        let mut invocation = vm
+            .start_invocation(callable.clone(), vec![])
+            .expect("invocation should start");
+
+        match invocation.poll_next().expect("poll should succeed") {
+            InvocationPoll::Ready(Some(Err(InvocationError::Cancelled(
+                CancellationReason::Requested,
+            )))) => {}
+            other => panic!("expected a typed cancellation item, got {other:?}"),
+        }
+        assert!(matches!(
+            invocation.poll_next().expect("poll should succeed"),
+            InvocationPoll::Ready(None)
+        ));
+    }
+
+    // A new invocation on the same VM must run to completion instead of
+    // being cancelled on arrival.
+    let mut second = vm
+        .start_invocation(callable, vec![])
+        .expect("a new invocation may start after fusion");
+    match second.poll_next().expect("poll should succeed") {
+        InvocationPoll::Ready(Some(Ok(InvocationItem::Complete(Value::Int(42))))) => {}
+        other => panic!("the second invocation must complete normally, got {other:?}"),
+    }
+    assert!(matches!(
+        second.poll_next().expect("poll should succeed"),
+        InvocationPoll::Ready(None)
+    ));
+}
+
+#[test]
 fn call_ret_fusion_pattern_requires_immediate_ret() {
     let [call_lo, call_hi] = BuiltinFunction::Len.call_index().to_le_bytes();
     let with_ret = Program::new(

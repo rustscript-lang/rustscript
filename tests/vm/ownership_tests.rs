@@ -2,7 +2,7 @@
 //!
 //! These tests pin the ownership contract through the public embedding API:
 //! - one immutable program can create multiple isolated instances;
-//! - run input/events/budgets never leak between runs;
+//! - invocation input/events/budgets never leak between runs;
 //! - backend caches may be shared without sharing stacks/resources;
 //! - reset closes run-scoped state and retains only documented reusable state.
 
@@ -10,9 +10,9 @@
 mod common;
 use common::*;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use vm::{HostFunctionRegistry, Value, VmStatus};
+use vm::{HostFunctionRegistry, InvocationError, InvocationItem, InvocationPoll, Value, VmStatus};
 
 fn non_yielding_returns_zero(_: &[Value]) -> Result<vm::CallOutcome, vm::VmError> {
     Ok(vm::CallOutcome::Return(vm::CallReturn::one(Value::Int(0))))
@@ -30,6 +30,31 @@ fn non_yielding_returns_forty_two(_: &[Value]) -> Result<vm::CallOutcome, vm::Vm
     Ok(vm::CallOutcome::Return(vm::CallReturn::one(Value::Int(42))))
 }
 
+/// Drives one exported `run` callable to the end of its invocation stream.
+fn collect_invocation_items(
+    vm: &mut vm::Vm,
+    args: Vec<Value>,
+) -> Vec<Result<InvocationItem, InvocationError>> {
+    let callable = vm
+        .resolve_exported_callable("run")
+        .expect("exported run callable should resolve");
+    let mut invocation = vm
+        .start_invocation(callable, args)
+        .expect("invocation should start");
+    let mut items = Vec::new();
+    loop {
+        match invocation
+            .poll_next()
+            .expect("invocation poll should not fail")
+        {
+            InvocationPoll::Ready(Some(item)) => items.push(item),
+            InvocationPoll::Ready(None) => break,
+            InvocationPoll::Pending => std::thread::sleep(std::time::Duration::from_millis(1)),
+        }
+    }
+    items
+}
+
 struct PendingOneHost;
 
 impl vm::HostArgsFunction for PendingOneHost {
@@ -38,16 +63,16 @@ impl vm::HostArgsFunction for PendingOneHost {
     }
 }
 
-/// One immutable program produces independent instances: each run keeps its own
-/// stack, locals, and input, and no instance observes another's execution.
+/// One immutable program produces independent instances: each invocation keeps
+/// its own stream items, and no instance observes another's execution.
 #[test]
 fn one_immutable_program_creates_multiple_isolated_instances() {
     let program = Arc::new(
         compile_source(
             r#"
-            use runtime;
-            let value: string = runtime::input_json();
-            value;
+            pub fn run(input: string) -> string {
+                input;
+            }
             "#,
         )
         .expect("source should compile")
@@ -62,60 +87,65 @@ fn one_immutable_program_creates_multiple_isolated_instances() {
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut second)
         .expect("runtime hosts should bind");
-
-    first
-        .set_runtime_input(Value::string("first"))
-        .expect("input should be accepted");
-    second
-        .set_runtime_input(Value::string("second"))
-        .expect("input should be accepted");
-
-    assert_eq!(first.run().expect("first should run"), VmStatus::Halted);
     assert_eq!(
-        first.stack().last(),
-        Some(&Value::string("\"first\"")),
-        "first instance must observe its own input"
-    );
-    assert_eq!(second.run().expect("second should run"), VmStatus::Halted);
-    assert_eq!(
-        second.stack().last(),
-        Some(&Value::string("\"second\"")),
-        "second instance must observe its own input"
+        first.run().expect("first root should halt"),
+        VmStatus::Halted
     );
     assert_eq!(
-        first.stack().last(),
-        Some(&Value::string("\"first\"")),
-        "second's run must not overwrite first's stack"
+        second.run().expect("second root should halt"),
+        VmStatus::Halted
     );
 
-    // Re-running one instance after reset must not disturb the other.
+    let first_items = collect_invocation_items(&mut first, vec![Value::string("first")]);
+    let second_items = collect_invocation_items(&mut second, vec![Value::string("second")]);
+
+    assert_eq!(first_items.len(), 1, "first invocation must complete once");
+    assert!(
+        matches!(&first_items[0], Ok(InvocationItem::Complete(value)) if *value == Value::string("first")),
+        "first instance must observe its own input, got {first_items:?}"
+    );
+    assert_eq!(
+        second_items.len(),
+        1,
+        "second invocation must complete once"
+    );
+    assert!(
+        matches!(&second_items[0], Ok(InvocationItem::Complete(value)) if *value == Value::string("second")),
+        "second instance must observe its own input, got {second_items:?}"
+    );
+
+    // Re-running one instance after reset must not disturb the other. Reset
+    // rewinds the root frame, so the root must halt again before callables can
+    // be started.
     first.reset_for_reuse();
-    first
-        .set_runtime_input(Value::string("first-again"))
-        .expect("input should be accepted");
-    assert_eq!(first.run().expect("first should rerun"), VmStatus::Halted);
     assert_eq!(
-        second.stack().last(),
-        Some(&Value::string("\"second\"")),
-        "first's rerun must not disturb second's stack"
+        first.run().expect("first root should halt again"),
+        VmStatus::Halted
+    );
+    let first_again = collect_invocation_items(&mut first, vec![Value::string("first-again")]);
+    assert!(
+        matches!(&first_again[0], Ok(InvocationItem::Complete(value)) if *value == Value::string("first-again")),
+        "first rerun must observe its own fresh input, got {first_again:?}"
     );
     assert_eq!(
-        first.stack().last(),
-        Some(&Value::string("\"first-again\""))
+        second_items.len(),
+        1,
+        "first's rerun must not disturb second"
     );
 }
 
-/// Run input and events are run-scoped: a reset closes them, and a later run
-/// starts with a clean context.
+/// Invocation events and results are run-scoped: a reset closes them, and a
+/// later run starts with a clean stream.
 #[test]
 fn run_input_and_events_do_not_leak_between_runs() {
     let program = Arc::new(
         compile_source(
             r#"
-            use runtime;
-            let value: string = runtime::input_json();
-            runtime::emit_json(value);
-            value;
+            use stream;
+            pub fn run(input: string) -> string {
+                stream::emit(input);
+                input;
+            }
             "#,
         )
         .expect("source should compile")
@@ -125,63 +155,33 @@ fn run_input_and_events_do_not_leak_between_runs() {
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
         .expect("runtime hosts should bind");
+    assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
 
-    let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
-    let sink_seen = Arc::clone(&seen);
-    vm.set_runtime_value_event_sink(move |value: Value| {
-        sink_seen.lock().expect("sink lock").push(value);
-        Ok(())
-    })
-    .expect("event sink should install");
-
-    vm.set_runtime_input(Value::string("run-one"))
-        .expect("input should be accepted");
-    assert_eq!(vm.run().expect("first run should halt"), VmStatus::Halted);
-    assert_eq!(vm.stack().last(), Some(&Value::string("\"run-one\"")));
-    assert_eq!(
-        seen.lock().expect("sink lock").len(),
-        1,
-        "first run must emit exactly one event"
-    );
-    assert_eq!(
-        seen.lock().expect("sink lock")[0],
-        Value::string("\"run-one\"")
-    );
-
-    // A reset closes the run-scoped input: the next run must not see the
-    // previous run's input.
-    vm.reset_for_reuse();
-    let missing = vm.run().expect_err("reset must close run input");
+    let items = collect_invocation_items(&mut vm, vec![Value::string("run-one")]);
+    assert_eq!(items.len(), 2, "first run must emit one event and complete");
     assert!(
-        missing.to_string().contains("input_unavailable"),
-        "unexpected error after reset: {missing:?}"
+        matches!(&items[0], Ok(InvocationItem::Event(value)) if *value == Value::string("run-one"))
+    );
+    assert!(
+        matches!(&items[1], Ok(InvocationItem::Complete(value)) if *value == Value::string("run-one"))
     );
 
-    // A fresh run (new instance from the same program) with fresh input sees
-    // neither the old input nor the old event stream.
-    let mut fresh = Vm::new_shared(Arc::clone(&program));
-    HostFunctionRegistry::new()
-        .bind_vm_cached(&mut fresh)
-        .expect("runtime hosts should bind");
-    let fresh_seen = Arc::new(Mutex::new(Vec::<Value>::new()));
-    let fresh_sink_seen = Arc::clone(&fresh_seen);
-    fresh
-        .set_runtime_value_event_sink(move |value: Value| {
-            fresh_sink_seen.lock().expect("sink lock").push(value);
-            Ok(())
-        })
-        .expect("event sink should install");
-    fresh
-        .set_runtime_input(Value::string("run-two"))
-        .expect("input should be accepted");
+    // A reset closes the run-scoped invocation state: the next run starts with
+    // a fresh stream and neither the old input nor the old events leak.
+    vm.reset_for_reuse();
+    assert_eq!(vm.run().expect("root should halt again"), VmStatus::Halted);
+    let items_after_reset = collect_invocation_items(&mut vm, vec![Value::string("run-two")]);
     assert_eq!(
-        fresh.run().expect("fresh run should halt"),
-        VmStatus::Halted
+        items_after_reset.len(),
+        2,
+        "reset must not leak prior events into the next run"
     );
-    assert_eq!(fresh.stack().last(), Some(&Value::string("\"run-two\"")));
-    let events = fresh_seen.lock().expect("sink lock");
-    assert_eq!(events.len(), 1, "fresh run must emit exactly one event");
-    assert_eq!(events[0], Value::string("\"run-two\""));
+    assert!(
+        matches!(&items_after_reset[0], Ok(InvocationItem::Event(value)) if *value == Value::string("run-two"))
+    );
+    assert!(
+        matches!(&items_after_reset[1], Ok(InvocationItem::Complete(value)) if *value == Value::string("run-two"))
+    );
 }
 /// Fuel budgets are run-scoped: a reset clears the budget, and a new run
 /// starts from its configured amount rather than inheriting leftovers.
@@ -353,33 +353,55 @@ fn reset_closes_waiting_state_before_the_next_run() {
 #[test]
 #[ignore = "pre-existing JIT stale-trace replay after reset; tracked separately"]
 fn reset_after_host_error_reruns_cleanly_on_the_same_instance() {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static FAIL_FIRST: OnceLock<AtomicBool> = OnceLock::new();
+    let fail_first = FAIL_FIRST.get_or_init(|| AtomicBool::new(true));
+    fail_first.store(true, Ordering::SeqCst);
+
+    fn flaky_action(_: &[Value]) -> Result<vm::CallOutcome, vm::VmError> {
+        if FAIL_FIRST
+            .get_or_init(|| AtomicBool::new(true))
+            .swap(false, Ordering::SeqCst)
+        {
+            Err(vm::VmError::HostError("first call fails".to_string()))
+        } else {
+            Ok(vm::CallOutcome::Return(vm::CallReturn::one(Value::Int(42))))
+        }
+    }
+
     let program = compile_source(
         r#"
-        use runtime;
-        let value: string = runtime::input_json();
-        runtime::emit_json(value);
-        value;
+        fn action() -> int;
+        pub fn run() -> int {
+            action();
+        }
         "#,
     )
     .expect("source should compile")
     .program;
-    let mut vm = Vm::new(program);
-    HostFunctionRegistry::new()
-        .bind_vm_cached(&mut vm)
-        .expect("runtime hosts should bind");
-    vm.set_runtime_value_event_sink(|_| Ok(()))
-        .expect("event sink should install");
+    let mut vm = vm::Vm::new(program);
+    vm.bind_static_non_yielding_args_function("action", flaky_action);
+    assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
 
-    vm.set_runtime_input(Value::string("run-one"))
-        .expect("input should be accepted");
-    assert_eq!(vm.run().expect("first run should halt"), VmStatus::Halted);
+    let callable = vm
+        .resolve_exported_callable("run")
+        .expect("exported run callable should resolve");
+    {
+        let mut invocation = vm
+            .start_invocation(callable, vec![])
+            .expect("first invocation should start");
+        assert!(matches!(
+            invocation.poll_next().expect("poll should succeed"),
+            InvocationPoll::Ready(Some(Err(InvocationError::Host { .. })))
+        ));
+    }
 
     vm.reset_for_reuse();
-    let missing = vm.run().expect_err("reset must close run input");
-    assert!(missing.to_string().contains("input_unavailable"));
-
-    vm.set_runtime_input(Value::string("run-two"))
-        .expect("input should be accepted");
-    assert_eq!(vm.run().expect("rerun should halt"), VmStatus::Halted);
-    assert_eq!(vm.stack().last(), Some(&Value::string("\"run-two\"")));
+    let items = collect_invocation_items(&mut vm, vec![]);
+    assert!(
+        matches!(&items[0], Ok(InvocationItem::Complete(Value::Int(42)))),
+        "the rerun must execute cleanly after reset, got {items:?}"
+    );
 }
