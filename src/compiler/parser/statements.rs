@@ -1,5 +1,17 @@
 use super::*;
 
+use crate::compiler::source_loader::{ImportClause, NamedImport};
+
+/// Classify a `use` path segment: leading `self`/`super` words become
+/// qualifiers; every other segment is a plain identifier.
+fn classify_use_segment(segment: &str) -> UsePathSegment {
+    match segment {
+        "self" => UsePathSegment::Self_,
+        "super" => UsePathSegment::Super,
+        _ => UsePathSegment::Ident(segment.to_string()),
+    }
+}
+
 impl Parser {
     pub(super) fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
         if self.match_kind(&TokenKind::Pub) {
@@ -94,21 +106,42 @@ impl Parser {
 
     pub(super) fn parse_use_stmt(&mut self) -> Result<Stmt, ParseError> {
         let line = self.last_line();
-        let namespace = self.expect_ident("expected namespace after 'use'")?;
-        if self.match_kind(&TokenKind::Semicolon) {
-            self.host_namespace_aliases
-                .insert(namespace.clone(), namespace);
-            return Ok(Stmt::Noop { line });
-        }
+        let directive_start = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|token| token.span.lo)
+            .unwrap_or(0);
 
-        if self.match_kind(&TokenKind::As) {
-            let alias = self.expect_ident("expected namespace alias after 'as'")?;
-            self.expect(&TokenKind::Semicolon, "expected ';' after use alias")?;
-            self.host_namespace_aliases.insert(alias, namespace);
-            return Ok(Stmt::Noop { line });
-        }
+        let namespace = self.expect_ident("expected namespace after 'use'")?;
 
         if !self.match_path_separator() {
+            // Single-segment host-namespace forms: `use io;`, `use io as x;`.
+            if self.match_kind(&TokenKind::Semicolon) {
+                self.host_namespace_aliases
+                    .insert(namespace.clone(), namespace.clone());
+                self.record_use_decl(
+                    vec![classify_use_segment(&namespace)],
+                    ImportClause::AllPublic,
+                    line,
+                    directive_start,
+                );
+                return Ok(Stmt::Noop { line });
+            }
+
+            if self.match_kind(&TokenKind::As) {
+                let alias = self.expect_ident("expected namespace alias after 'as'")?;
+                self.expect(&TokenKind::Semicolon, "expected ';' after use alias")?;
+                self.host_namespace_aliases
+                    .insert(alias.clone(), namespace.clone());
+                self.record_use_decl(
+                    vec![classify_use_segment(&namespace)],
+                    ImportClause::Namespace(alias),
+                    line,
+                    directive_start,
+                );
+                return Ok(Stmt::Noop { line });
+            }
+
             return Err(ParseError {
                 span: None,
                 code: None,
@@ -130,23 +163,186 @@ impl Parser {
             });
         }
 
+        if namespace == "crate" {
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line: self.current_line(),
+                message: "crate:: paths are not supported; use relative module paths".to_string(),
+            });
+        }
+
         if self.match_kind(&TokenKind::Star) {
-            self.direct_host_wildcard_imports.insert(namespace);
+            self.direct_host_wildcard_imports.insert(namespace.clone());
             self.expect(
                 &TokenKind::Semicolon,
                 "expected ';' after host wildcard import",
             )?;
+            self.record_use_decl(
+                vec![classify_use_segment(&namespace)],
+                ImportClause::AllPublic,
+                line,
+                directive_start,
+            );
             return Ok(Stmt::Noop { line });
         }
 
-        self.expect(&TokenKind::LBrace, "expected '{' after host import path")?;
-        if self.match_kind(&TokenKind::Star) {
-            self.direct_host_wildcard_imports.insert(namespace);
-            self.expect(&TokenKind::RBrace, "expected '}' after '*'")?;
+        if self.match_kind(&TokenKind::LBrace) {
+            let named = self.parse_use_named_list(&namespace, true)?;
+            self.expect(&TokenKind::RBrace, "expected '}' after use list")?;
             self.expect(&TokenKind::Semicolon, "expected ';' after use list")?;
+            self.record_use_decl(
+                vec![classify_use_segment(&namespace)],
+                ImportClause::Named(named),
+                line,
+                directive_start,
+            );
             return Ok(Stmt::Noop { line });
         }
 
+        // Multi-segment file-module path: `use a::b;`, `use a::b::*;`,
+        // `use a::b::{x};`, `use a::b as alias;`, with optional leading
+        // `self`/`super` qualifiers. These directives are consumed as
+        // structured nodes; the source loader resolves them against the
+        // module graph, so no host aliases are recorded here.
+        let mut path = vec![classify_use_segment(&namespace)];
+        let mut qualifier_run = matches!(path[0], UsePathSegment::Self_ | UsePathSegment::Super);
+        loop {
+            if self.match_kind(&TokenKind::Star) {
+                self.expect(&TokenKind::Semicolon, "expected ';' after use wildcard")?;
+                self.record_use_decl(path, ImportClause::AllPublic, line, directive_start);
+                return Ok(Stmt::Noop { line });
+            }
+            if self.match_kind(&TokenKind::LBrace) {
+                let named = self.parse_use_named_list(&namespace, false)?;
+                self.expect(&TokenKind::RBrace, "expected '}' after use list")?;
+                self.expect(&TokenKind::Semicolon, "expected ';' after use list")?;
+                self.record_use_decl(path, ImportClause::Named(named), line, directive_start);
+                return Ok(Stmt::Noop { line });
+            }
+            let segment = self.expect_ident("expected module path segment after '::'")?;
+            if qualifier_run && segment == "crate" {
+                return Err(ParseError {
+                    span: None,
+                    code: None,
+                    line: self.current_line(),
+                    message: "crate:: paths are not supported; use relative module paths"
+                        .to_string(),
+                });
+            }
+            let classified = if qualifier_run {
+                classify_use_segment(&segment)
+            } else {
+                UsePathSegment::Ident(segment)
+            };
+            qualifier_run = matches!(classified, UsePathSegment::Self_ | UsePathSegment::Super);
+            path.push(classified);
+            if !self.match_path_separator() {
+                break;
+            }
+        }
+
+        if self.match_kind(&TokenKind::As) {
+            let alias = self.expect_ident("expected namespace alias after 'as'")?;
+            self.expect(&TokenKind::Semicolon, "expected ';' after use alias")?;
+            self.record_use_decl(path, ImportClause::Namespace(alias), line, directive_start);
+        } else {
+            self.expect(&TokenKind::Semicolon, "expected ';' after use directive")?;
+            self.record_use_decl(path, ImportClause::AllPublic, line, directive_start);
+        }
+        Ok(Stmt::Noop { line })
+    }
+
+    /// Record a structured `use` declaration with its directive span.
+    ///
+    /// In import-scan mode (source-loader discovery) the parser also records
+    /// host aliases for file-module paths so that namespace calls parse
+    /// before the loader's resolution pass runs; the compile parse runs with
+    /// scan mode off and resolves module namespaces through the structured
+    /// declarations instead. The alias is the clause alias for namespace
+    /// imports and the default namespace (last path segment) for all-public
+    /// and named imports.
+    fn record_use_decl(
+        &mut self,
+        path: Vec<UsePathSegment>,
+        clause: ImportClause,
+        line: u32,
+        directive_start: usize,
+    ) {
+        let source_id = self.current_span().source_id;
+        let end = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|token| token.span.hi)
+            .unwrap_or(directive_start);
+        if self.import_scan_mode {
+            let alias = match &clause {
+                ImportClause::Namespace(alias) => Some(alias.clone()),
+                ImportClause::AllPublic | ImportClause::Named(_) => match path.last() {
+                    Some(UsePathSegment::Ident(name)) => Some(name.clone()),
+                    _ => None,
+                },
+                ImportClause::Prefix(_) => None,
+            };
+            if let Some(alias) = alias {
+                let joined = path
+                    .iter()
+                    .map(|segment| match segment {
+                        UsePathSegment::Self_ => "self".to_string(),
+                        UsePathSegment::Super => "super".to_string(),
+                        UsePathSegment::Ident(name) => name.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("::");
+                self.host_namespace_aliases.insert(alias, joined);
+            }
+        }
+        // File-module namespace aliases are recorded in every parse mode so
+        // the compile parse can recognize `alias::member(...)` calls and emit
+        // a loader-resolved placeholder. The alias mirrors the loader's
+        // clause-based namespace table: the `as` alias for namespace
+        // imports, the last path segment for all-public imports, and no
+        // namespace for named imports (which bind direct names only).
+        let module_alias = match &clause {
+            ImportClause::Namespace(alias) => Some(alias.clone()),
+            ImportClause::AllPublic => match path.last() {
+                Some(UsePathSegment::Ident(name)) => Some(name.clone()),
+                _ => None,
+            },
+            ImportClause::Named(_) | ImportClause::Prefix(_) => None,
+        };
+        if let Some(alias) = module_alias {
+            let joined = path
+                .iter()
+                .map(|segment| match segment {
+                    UsePathSegment::Self_ => "self".to_string(),
+                    UsePathSegment::Super => "super".to_string(),
+                    UsePathSegment::Ident(name) => name.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join("::");
+            self.module_namespace_aliases.insert(alias, joined);
+        }
+        self.use_declarations.push(UseDecl {
+            path,
+            clause,
+            span: Span::new(source_id, directive_start, end),
+            line: line as usize,
+        });
+    }
+
+    /// Parse the named list of a `use` directive.
+    ///
+    /// Single-segment forms keep the legacy host behavior: every binding is
+    /// recorded as a direct host call alias (`use io::{read};` maps `read` to
+    /// `io::read`). Multi-segment file-module forms only collect the bindings;
+    /// the module graph's resolution pass owns their resolution.
+    fn parse_use_named_list(
+        &mut self,
+        namespace: &str,
+        record_host_aliases: bool,
+    ) -> Result<Vec<NamedImport>, ParseError> {
+        let mut named = Vec::<NamedImport>::new();
         loop {
             let imported = self.expect_ident("expected host function name in use list")?;
             let local = if self.match_kind(&TokenKind::As) {
@@ -154,21 +350,23 @@ impl Parser {
             } else {
                 imported.clone()
             };
-            let target = format!("{namespace}::{imported}");
-            if let Some(existing) = self.direct_host_call_aliases.get(&local)
-                && existing != &target
-            {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line: self.current_line(),
-                    message: format!(
-                        "host import alias '{local}' already maps to '{existing}', cannot remap to '{target}'"
-                    ),
-                });
+            if record_host_aliases {
+                let target = format!("{namespace}::{imported}");
+                if let Some(existing) = self.direct_host_call_aliases.get(&local)
+                    && existing != &target
+                {
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line: self.current_line(),
+                        message: format!(
+                            "host import alias '{local}' already maps to '{existing}', cannot remap to '{target}'"
+                        ),
+                    });
+                }
+                self.direct_host_call_aliases.insert(local.clone(), target);
             }
-            self.direct_host_call_aliases.insert(local, target);
-
+            named.push(NamedImport { imported, local });
             if self.match_kind(&TokenKind::Comma) {
                 if self.check(&TokenKind::RBrace) {
                     break;
@@ -177,9 +375,7 @@ impl Parser {
             }
             break;
         }
-        self.expect(&TokenKind::RBrace, "expected '}' after use list")?;
-        self.expect(&TokenKind::Semicolon, "expected ';' after use list")?;
-        Ok(Stmt::Noop { line })
+        Ok(named)
     }
 
     pub(super) fn parse_js_import_stmt(&mut self) -> Result<Stmt, ParseError> {
@@ -494,6 +690,7 @@ impl Parser {
             type_params: type_params.clone(),
             exported,
             return_type,
+            symbol: None,
         };
         self.functions.insert(name.clone(), decl.clone());
         let current_line = self.current_line();

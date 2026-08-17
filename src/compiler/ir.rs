@@ -4,6 +4,7 @@ use crate::ValueType;
 use crate::builtins::default_host_callable;
 
 use super::ParseError;
+use super::modules::SymbolId;
 
 pub type LocalSlot = u16;
 
@@ -186,6 +187,25 @@ pub enum Expr {
     String(String),
     Bytes(Vec<u8>),
     FunctionRef(u16, Vec<TypeSchema>),
+    /// A function value whose target was resolved to a compiler-owned module
+    /// symbol before unit merge (milestone 4).
+    ///
+    /// Produced by the source loader's resolution pass for imported function
+    /// values and lowered by `linker::merge_units` into a plain
+    /// [`Expr::FunctionRef`] against the merged flat function table.
+    ModuleFunctionRef(SymbolId, Vec<TypeSchema>),
+    /// A function value reference whose target is not yet resolved (module
+    /// mode only).
+    ///
+    /// Produced by the parser in module mode when a function value refers to
+    /// a name the parser cannot resolve locally (an imported function binding
+    /// whose export table only the source loader knows). The loader's
+    /// resolution pass maps it to [`Expr::ModuleFunctionRef`] before unit
+    /// merge, so downstream passes never observe it.
+    UnresolvedFunctionRef {
+        name: String,
+        type_args: Vec<TypeSchema>,
+    },
     OptionalGet {
         container: Box<Expr>,
         key: Box<Expr>,
@@ -198,6 +218,17 @@ pub enum Expr {
         fallback: Box<Expr>,
     },
     Call(u16, Vec<TypeSchema>, Vec<Expr>),
+    /// A call whose target was resolved to a compiler-owned module symbol
+    /// before unit merge (milestone 4).
+    ///
+    /// The source loader's resolution pass rewrites calls to imported
+    /// functions into this form, carrying the [`SymbolId`] of the source
+    /// module's declaration; `linker::merge_units` lowers it back into a
+    /// plain [`Expr::Call`] against the merged flat function table. Unlike
+    /// [`Expr::Call`]'s flat index, the symbol identity never depends on
+    /// unit-local index assignment or on the source name, so same-named
+    /// declarations in independent modules resolve to distinct targets.
+    ModuleCall(SymbolId, Vec<TypeSchema>, Vec<Expr>),
     LocalCall(LocalSlot, Vec<TypeSchema>, Vec<Expr>),
     Closure(ClosureExpr),
     ClosureCall(ClosureExpr, Vec<Expr>),
@@ -342,6 +373,10 @@ pub struct FunctionDecl {
     pub type_params: Vec<String>,
     pub exported: bool,
     pub return_type: ValueType,
+    /// Semantic symbol owned by the declaring module, assigned by the source
+    /// loader after parse (milestone 3). `None` for IR that has not been
+    /// attached to a module yet (parser output, REPL snippets).
+    pub symbol: Option<SymbolId>,
 }
 
 #[derive(Clone, Debug)]
@@ -364,6 +399,18 @@ pub struct FrontendIr {
     pub function_impls: HashMap<u16, FunctionImpl>,
     pub stmt_sources: Vec<Option<String>>,
     pub function_sources: HashMap<u16, String>,
+    /// Structured `use` directives parsed from RustScript source, with spans
+    /// and clauses. Consumed by the source loader for import discovery.
+    pub use_declarations: Vec<crate::compiler::modules::UseDecl>,
+    /// Names created by the parser's implicit-extern fallback (module mode).
+    ///
+    /// Module-mode parses tolerate calls whose target only the source loader
+    /// can resolve (imported module functions, module namespace members).
+    /// These synthetic declarations must never receive a module symbol or a
+    /// flat entry; the loader resolves their call sites or rejects them.
+    /// Plain (non-module) parses leave this empty because implicit externs are
+    /// disabled there.
+    pub implicit_extern_names: Vec<String>,
 }
 
 pub struct LocalIrBuilder {
@@ -475,6 +522,7 @@ impl LocalIrBuilder {
             type_params: Vec::new(),
             exported: false,
             return_type: ValueType::Unknown,
+            symbol: None,
         });
         self.function_meta.insert(name.to_string(), (index, arity));
         Ok(())
@@ -521,6 +569,8 @@ impl LocalIrBuilder {
             function_impls: HashMap::new(),
             stmt_sources: Vec::new(),
             function_sources: HashMap::new(),
+            use_declarations: Vec::new(),
+            implicit_extern_names: Vec::new(),
         }
     }
 

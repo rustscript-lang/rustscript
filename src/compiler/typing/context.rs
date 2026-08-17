@@ -922,8 +922,13 @@ impl<'a> TypeContext<'a> {
                     state.get(*root)
                 }
             }
-            Expr::FunctionRef(..) | Expr::Closure(_) => BoundType::Callable,
-            Expr::Call(..) | Expr::LocalCall(..) => self.infer_call_like_expr_type(expr, state),
+            Expr::FunctionRef(..)
+            | Expr::ModuleFunctionRef(..)
+            | Expr::UnresolvedFunctionRef { .. }
+            | Expr::Closure(_) => BoundType::Callable,
+            Expr::Call(..) | Expr::ModuleCall(..) | Expr::LocalCall(..) => {
+                self.infer_call_like_expr_type(expr, state)
+            }
             Expr::ClosureCall(_, _) => self.infer_call_like_expr_type(expr, state),
             Expr::Add(lhs, rhs)
             | Expr::Sub(lhs, rhs)
@@ -1061,7 +1066,14 @@ impl<'a> TypeContext<'a> {
                     .unwrap_or(BoundType::Unknown),
             },
             Expr::ClosureCall(closure, args) => self.infer_closure_return(closure, args, state),
-            Expr::Closure(_) | Expr::FunctionRef(..) => BoundType::Callable,
+            Expr::Closure(_)
+            | Expr::FunctionRef(..)
+            | Expr::ModuleFunctionRef(..)
+            | Expr::UnresolvedFunctionRef { .. } => BoundType::Callable,
+            // Resolved module calls carry no per-unit type information; the
+            // prelude declaration they replaced also had an unknown return
+            // type, so this matches the legacy behavior.
+            Expr::ModuleCall(..) => BoundType::Unknown,
             _ => BoundType::Unknown,
         }
     }

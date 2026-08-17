@@ -98,6 +98,15 @@ fn lint_compile_result(
                 LintReport { diagnostics }
             }
         }
+        // Milestone 5+ load/merge errors carry the compilation-wide source
+        // map; unwrap it so the branch below renders from the owning source.
+        Err(SourcePathError::SourceWithMap { error, .. }) => lint_compile_result(
+            source,
+            flavor,
+            path,
+            options,
+            Err(SourcePathError::Source(error)),
+        ),
         Err(SourcePathError::Source(SourceError::Parse(err))) => {
             let mut diagnostics =
                 lint_trailing_function_return_semicolon_diagnostics(source, flavor);
@@ -115,7 +124,11 @@ fn lint_compile_result(
                 source, flavor, path, options,
             ));
             let mut source_map = SourceMap::new();
-            let source_id = source_map.add_source("<lint>", source.to_string());
+            // Milestone 5+ compile errors name their owning source; register
+            // the root text under that name so the rendered snippet resolves
+            // against the right file.
+            let source_id =
+                source_map.add_source(err.source_name().unwrap_or("<lint>"), source.to_string());
             let line = err.line().unwrap_or(0);
             let span = err.line().and_then(|value| {
                 let span = source_map.line_span(source_id, value)?;
