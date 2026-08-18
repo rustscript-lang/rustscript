@@ -88,11 +88,48 @@ pub enum ExecutionScopeError {
     ScopeClosing,
     /// A close/poll was requested while the scope was still Active.
     ScopeNotClosing,
+    /// A request to replace this already-terminal scope was made before the
+    /// scope actually reached quiescence. Cleanup must be driven to
+    /// completion first; replacement is only legal from Quiescent.
+    ScopeNotQuiescent,
     /// The underlying resource insert failed (limit, invalid parent, …).
     Resource(ResourceError),
     /// The underlying operation start failed (limit, sealed, …).
     Operation(OperationError),
 }
+
+impl std::fmt::Display for ExecutionScopeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CloseAlreadyInProgress { current, requested } => write!(
+                formatter,
+                "execution scope close already in progress with {current:?}; conflicting {requested:?} rejected",
+            ),
+            Self::ScopeClosing => {
+                write!(
+                    formatter,
+                    "execution scope is closing and rejects new inserts"
+                )
+            }
+            Self::ScopeNotClosing => {
+                write!(
+                    formatter,
+                    "execution scope close was requested on an active scope"
+                )
+            }
+            Self::ScopeNotQuiescent => write!(
+                formatter,
+                "execution scope replacement requires the current scope to be quiescent",
+            ),
+            Self::Resource(error) => write!(formatter, "execution scope resource error: {error}"),
+            Self::Operation(error) => {
+                write!(formatter, "execution scope operation error: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ExecutionScopeError {}
 
 /// First cleanup failure preserved across the close sweep.
 ///

@@ -46,7 +46,9 @@ pub use self::host::{
     StaticHostStackFunction,
 };
 use self::host::{HostCallExecOutcome, VmHostFunction};
-pub use self::host_context::{HostContext, HostContextError, HostContextResult, HostModule};
+pub use self::host_context::{
+    HostContext, HostContextError, HostContextErrorKind, HostContextResult, HostModule,
+};
 use self::host_runtime::HostRuntime;
 use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable};
 pub use self::invocation::{Invocation, InvocationError, InvocationItem, InvocationPoll};

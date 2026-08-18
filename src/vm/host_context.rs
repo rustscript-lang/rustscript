@@ -1,9 +1,18 @@
-//! Generic host boundary: typed per-VM module state.
+//! Generic host boundary: typed per-VM module state and a generic
+//! host-agnostic execution-scope SDK.
 //!
 //! [`HostContext`] is the public, builtin-agnostic surface that a host
 //! embedding or an external host extension (a module living outside
-//! `src/builtins/**`) uses to register typed, per-VM module state. It never
-//! hands out the underlying [`HostRuntime`](super::host_runtime::HostRuntime)
+//! `src/builtins/**`) uses to register typed, per-VM module state, push typed
+//! [`HostResource`]s (root or child), start [`HostOperation`]s, and read back
+//! resources / operation status. Every scope SDK method delegates to the
+//! [`ExecutionScope`] owned by the underlying
+//! [`HostRuntime`](super::host_runtime::HostRuntime), so all inserts land in
+//! the same live scope and a Closing/Quiescent scope rejects them with a
+//! structured [`ExecutionScopeError::ScopeClosing`] (propagated through
+//! [`HostContextErrorKind::Scope`]).
+//!
+//! It never hands out the underlying [`HostRuntime`](super::host_runtime::HostRuntime)
 //! and never names a builtin domain module; concrete SQLite / IO / HTTP / SSE
 //! remain same-crate builtins, but `src/vm` must not depend on any of their
 //! implementation modules or on `rusqlite`.
@@ -13,37 +22,67 @@
 //!
 //! Host module state is owned directly by [`HostRuntime`]: typed, per-VM, and
 //! deliberately **not** cleared on
-//! [`Vm::reset_for_reuse`](super::Vm::reset_for_reuse). Registered state
-//! therefore survives invocation resets for the lifetime of the VM.
+//! [`Vm::reset_for_reuse`](super::Vm::reset_for_reuse) or on execution-scope
+//! close. Registered state therefore survives invocation resets — and scope
+//! recycling — for the lifetime of the VM.
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::fmt;
+use std::task::{Context, Poll};
 
+use super::execution_scope::{ExecutionScope, ExecutionScopeError, ScopeCloseOutcome, ScopeState};
 use super::host_runtime::HostRuntime;
+use super::operation::{OperationError, OperationId, OperationSpec, OperationStatus};
+use super::resource::{
+    HostResource, Resource, ResourceCloseReason, ResourceError, ResourceHandle, ResourceRef,
+};
 
 /// Marker bound for a typed chunk of per-VM host module state.
 ///
 /// A host extension implements this for exactly one concrete `State` type and
 /// registers it through [`HostContext::set_module_state`]. State is typed at
 /// compile time (keyed by [`TypeId`]) and is per-`Vm`; it is intentionally not
-/// cleared by [`Vm::reset_for_reuse`](super::Vm::reset_for_reuse), so
-/// policy / extension configuration survives across invocation resets.
+/// cleared by [`Vm::reset_for_reuse`](super::Vm::reset_for_reuse) or by
+/// execution-scope close, so policy / extension configuration survives across
+/// invocation resets.
 pub trait HostModule: Any + Send + 'static {}
 
 /// Blanket implementation so any `Send` value can be registered as typed
 /// per-VM module state; the trait remains a documentation/constraint marker.
 impl<T: Any + Send + 'static> HostModule for T {}
 
+/// Structured failure kind carried by [`HostContextError`].
+///
+/// The generic boundary preserves the underlying structured error instead of
+/// flattening it into a message, so callers can match machine-readably (e.g.
+/// a rejected insert while the scope is Closing surfaces as
+/// [`Self::Scope`]`(ExecutionScopeError::ScopeClosing)`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostContextErrorKind {
+    /// A plain boundary failure carrying only namespace + message.
+    Generic,
+    /// A structured failure from the execution scope (write / lifecycle
+    /// path: insert rejection while Closing, shutdown sequencing).
+    Scope(ExecutionScopeError),
+    /// A structured failure from the resource layer (typed borrow / handle
+    /// recovery).
+    Resource(ResourceError),
+    /// A structured failure from the operation layer (status query).
+    Operation(OperationError),
+}
+
 /// Error surfaced by the generic host boundary.
 ///
 /// Carries a stable, non-domain `namespace` plus a human-readable message so
 /// host-agnostic failures can be surfaced without referencing any builtin
-/// domain type.
+/// domain type, and a structured [`HostContextErrorKind`] so generic
+/// lifecycle violations stay machine-matchable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostContextError {
     namespace: &'static str,
     message: String,
+    kind: HostContextErrorKind,
 }
 
 impl HostContextError {
@@ -52,6 +91,37 @@ impl HostContextError {
         Self {
             namespace,
             message: message.into(),
+            kind: HostContextErrorKind::Generic,
+        }
+    }
+
+    /// Builds a boundary error from a structured execution-scope failure.
+    fn from_scope(error: ExecutionScopeError) -> Self {
+        let message = error.to_string();
+        Self {
+            namespace: "host::scope",
+            message,
+            kind: HostContextErrorKind::Scope(error),
+        }
+    }
+
+    /// Builds a boundary error from a structured resource-layer failure.
+    fn from_resource(error: ResourceError) -> Self {
+        let message = error.to_string();
+        Self {
+            namespace: "host::resource",
+            message,
+            kind: HostContextErrorKind::Resource(error),
+        }
+    }
+
+    /// Builds a boundary error from a structured operation-layer failure.
+    fn from_operation(error: OperationError) -> Self {
+        let message = error.to_string();
+        Self {
+            namespace: "host::operation",
+            message,
+            kind: HostContextErrorKind::Operation(error),
         }
     }
 
@@ -63,6 +133,11 @@ impl HostContextError {
     /// The human readable error message.
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// The structured failure kind of this error.
+    pub fn kind(&self) -> &HostContextErrorKind {
+        &self.kind
     }
 }
 
@@ -81,8 +156,8 @@ pub type HostContextResult<T> = Result<T, HostContextError>;
 ///
 /// Obtained from [`Vm::host_context`](super::Vm::host_context). It never leaks
 /// the underlying [`HostRuntime`] and never references a builtin domain module,
-/// so external host extensions can register typed per-VM state through a stable
-/// public surface.
+/// so external host extensions can register typed per-VM state and drive the
+/// generic execution scope through a stable public surface.
 pub struct HostContext<'a> {
     host: &'a mut HostRuntime,
 }
@@ -119,6 +194,140 @@ impl<'a> HostContext<'a> {
     /// Returns `true` when no module state is currently registered.
     pub fn is_module_state_empty(&self) -> bool {
         self.host.is_module_state_empty()
+    }
+
+    // ---- generic execution-scope SDK ---------------------------------------
+
+    /// Read-only access to the execution scope owned by this VM's host
+    /// runtime (observe lifecycle state, resource/operation counts, typed
+    /// borrows and status).
+    ///
+    /// The scope is never handed out mutably through the generic boundary: all
+    /// mutations flow through the guarded SDK methods below.
+    pub fn execution_scope(&self) -> &ExecutionScope {
+        self.host.execution_scope()
+    }
+
+    /// The current lifecycle phase of this VM's execution scope.
+    pub fn scope_state(&self) -> ScopeState {
+        self.host.execution_scope_state()
+    }
+
+    /// Whether the execution scope is still accepting resource / operation
+    /// inserts.
+    pub fn is_scope_active(&self) -> bool {
+        self.host.execution_scope_is_active()
+    }
+
+    /// Whether the execution scope reached terminal quiescence.
+    pub fn is_scope_quiescent(&self) -> bool {
+        self.host.execution_scope_is_quiescent()
+    }
+
+    /// Number of live resources in the current execution scope.
+    pub fn resource_count(&self) -> usize {
+        self.host.execution_scope_resource_count()
+    }
+
+    /// Number of occupied operation slots in the current execution scope.
+    pub fn operation_count(&self) -> usize {
+        self.host.execution_scope_operation_count()
+    }
+
+    /// Inserts a typed [`HostResource`] into the current execution scope,
+    /// returning its typed capability token.
+    ///
+    /// A Closing/Quiescent scope rejects the insert with a structured
+    /// [`HostContextErrorKind::Scope`]`(`[`ExecutionScopeError::ScopeClosing`]`)`.
+    pub fn push_resource<T: HostResource>(&mut self, value: T) -> HostContextResult<Resource<T>> {
+        self.host
+            .execution_scope_push_resource(value)
+            .map_err(HostContextError::from_scope)
+    }
+
+    /// Inserts a typed child resource linked to `parent`, so the parent cannot
+    /// close before its children.
+    pub fn push_child_resource<T: HostResource, P: HostResource>(
+        &mut self,
+        value: T,
+        parent: &Resource<P>,
+    ) -> HostContextResult<Resource<T>> {
+        self.host
+            .execution_scope_push_child_resource(value, parent)
+            .map_err(HostContextError::from_scope)
+    }
+
+    /// Starts a host operation in the current execution scope from a full
+    /// generic [`OperationSpec`] (driver, optional resource association,
+    /// optional deadline, optional cleanup/cancel).
+    pub fn start_operation(&mut self, spec: OperationSpec) -> HostContextResult<OperationId> {
+        self.host
+            .execution_scope_start_operation(spec)
+            .map_err(HostContextError::from_scope)
+    }
+
+    /// Immutably borrows a live resource for the duration of a host call.
+    ///
+    /// The token is re-validated against the current scope (arena, slot
+    /// generation, `TypeId`, open state); a stale / wrong-type / foreign-scope
+    /// token fails with a structured resource-layer error.
+    pub fn resource<T: HostResource>(
+        &self,
+        token: &Resource<T>,
+    ) -> HostContextResult<ResourceRef<'_, T>> {
+        self.host
+            .execution_scope()
+            .resources()
+            .get(token)
+            .map_err(HostContextError::from_resource)
+    }
+
+    /// Validates a raw [`ResourceHandle`] against the current scope and
+    /// recovers a typed token (read-only).
+    pub fn typed_resource<T: HostResource>(
+        &self,
+        handle: ResourceHandle,
+    ) -> HostContextResult<Resource<T>> {
+        self.host
+            .execution_scope()
+            .resources()
+            .typed(handle)
+            .map_err(HostContextError::from_resource)
+    }
+
+    /// Observes the current status of a host operation in the current scope.
+    pub fn operation_status(&self, id: OperationId) -> HostContextResult<OperationStatus> {
+        self.host
+            .execution_scope()
+            .operations()
+            .status(id)
+            .map_err(HostContextError::from_operation)
+    }
+
+    /// Begins shutdown of the current execution scope (**Active → Closing**),
+    /// sealing new resource/operation inserts.
+    ///
+    /// Idempotent and first-reason-wins, mirroring the underlying scope.
+    pub fn begin_close(&mut self, reason: ResourceCloseReason) -> HostContextResult<bool> {
+        self.host
+            .execution_scope_begin_close(reason)
+            .map_err(HostContextError::from_scope)
+    }
+
+    /// Drives the closing scope to quiescence with the caller's context.
+    ///
+    /// Returns `Poll::Pending` while any operation or resource is still
+    /// pending, and `Poll::Ready` with the terminal outcome once both the
+    /// operation registry and the resource table are empty. Read-only queries
+    /// remain available while closing.
+    pub fn poll_close(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<HostContextResult<ScopeCloseOutcome>> {
+        match self.host.execution_scope_poll_close(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => Poll::Ready(result.map_err(HostContextError::from_scope)),
+        }
     }
 }
 

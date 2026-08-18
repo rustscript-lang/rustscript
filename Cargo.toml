@@ -141,5 +141,10 @@ name = "host_context_arch_tests"
 path = "tests/host_context_arch_tests.rs"
 required-features = ["runtime"]
 
+[[test]]
+name = "host_context_execution_scope_tests"
+path = "tests/host_context_execution_scope_tests.rs"
+required-features = ["runtime"]
+
 [build-dependencies]
 syn = { version = "2", features = ["full"] }
