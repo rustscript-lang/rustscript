@@ -1007,6 +1007,90 @@ pub(crate) fn validate_non_yielding_host_value(
     Err(VmError::TypeMismatch(expected))
 }
 
+/// Exact-return policy for an interpreter host call, derived from the targeted
+/// `HostImport.schema` (C1 resource ABI scope).
+///
+/// * `Legacy` — no exact schema, or a non-resource exact return: old behavior.
+/// * `Resource` — the exact return is `TypeSchema::Resource(_)`: the returned
+///   value must be an `Int` that decodes as a structurally valid resource
+///   handle, otherwise the call fails with a structured `VmError`.
+/// * `NestedResource` — the exact return schema *nest-contains* a resource
+///   (`Optional<Resource>`, `Array<Resource>`, ...) that the current
+///   `Value::Int` handle-carrier ABI cannot represent: any returned value is an
+///   explicit structured rejection; there is no silent coarse pass-through.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ExactHostReturnPolicy {
+    Legacy,
+    Resource,
+    NestedResource,
+}
+
+/// Classifies an import's exact-return policy from its resolved exact schema.
+pub(crate) fn exact_host_return_policy(import: Option<&HostImport>) -> ExactHostReturnPolicy {
+    use crate::compiler::TypeSchema;
+    let Some(schema) = import.and_then(|import| import.schema.as_ref()) else {
+        return ExactHostReturnPolicy::Legacy;
+    };
+    match &schema.return_type {
+        TypeSchema::Resource(_) => ExactHostReturnPolicy::Resource,
+        other if other.contains_resource() => ExactHostReturnPolicy::NestedResource,
+        _ => ExactHostReturnPolicy::Legacy,
+    }
+}
+
+/// Validates a single host-returned value against the exact-return policy.
+///
+/// `Legacy` keeps the coarse `ValueType` consistency check (or passes the value
+/// through unchanged when the caller historically pushed without validation —
+/// the coarse check is supplied via `expected` by the non-yielding paths).
+pub(crate) fn validate_exact_host_return_value(
+    value: Value,
+    policy: ExactHostReturnPolicy,
+    expected: Option<ValueType>,
+) -> VmResult<Value> {
+    match policy {
+        ExactHostReturnPolicy::Legacy => validate_non_yielding_host_value(value, expected),
+        ExactHostReturnPolicy::Resource => {
+            if ResourceHandle::from_value(&value).is_ok() {
+                Ok(value)
+            } else {
+                Err(VmError::TypeMismatch("resource handle"))
+            }
+        }
+        ExactHostReturnPolicy::NestedResource => Err(VmError::TypeMismatch(
+            "nested resource return cannot be represented by the current ABI",
+        )),
+    }
+}
+
+/// Validates a `CallReturn` before it is pushed to the operand stack.
+///
+/// `Legacy` pushes the values unchanged (old behavior); `Resource` requires a
+/// single structurally-valid handle; `NestedResource` rejects any return.
+pub(crate) fn validate_exact_host_return_values(
+    values: CallReturn,
+    policy: ExactHostReturnPolicy,
+) -> VmResult<CallReturn> {
+    match policy {
+        ExactHostReturnPolicy::Legacy => Ok(values),
+        ExactHostReturnPolicy::Resource => match values {
+            CallReturn::One(value) => {
+                if ResourceHandle::from_value(&value).is_ok() {
+                    Ok(CallReturn::One(value))
+                } else {
+                    Err(VmError::TypeMismatch("resource handle"))
+                }
+            }
+            CallReturn::None => Err(VmError::TypeMismatch(
+                "resource-returning host produced no value",
+            )),
+        },
+        ExactHostReturnPolicy::NestedResource => Err(VmError::TypeMismatch(
+            "nested resource return cannot be represented by the current ABI",
+        )),
+    }
+}
+
 #[inline]
 fn builtin_for_binding_name(name: &str) -> Option<BuiltinFunction> {
     if !name.contains("::") {
@@ -1408,6 +1492,7 @@ impl Vm {
             .imports
             .get(usize::from(index))
             .map(|import| import.return_type);
+        let exact_policy = exact_host_return_policy(self.program.imports.get(usize::from(index)));
         let resolved_index = self.resolve_call_target(index, argc_u8)?;
         if !self.host.allow_default_host_capabilities
             && !self
@@ -1436,6 +1521,7 @@ impl Vm {
                 function,
                 argc,
                 expected_return_type,
+                exact_policy,
             );
         }
         if self.bound_host_function_uses_args_slice(resolved_index)? {
@@ -1444,11 +1530,12 @@ impl Vm {
                 argc,
                 call_ip,
                 expected_return_type,
+                exact_policy,
             )
         } else if self.bound_host_function_uses_stack_borrow(resolved_index)? {
-            self.execute_bound_stack_host_function(resolved_index, argc, call_ip)
+            self.execute_bound_stack_host_function(resolved_index, argc, call_ip, exact_policy)
         } else {
-            self.execute_bound_host_function_from_stack(resolved_index, argc, call_ip)
+            self.execute_bound_host_function_from_stack(resolved_index, argc, call_ip, exact_policy)
         }
     }
 
@@ -1470,11 +1557,27 @@ impl Vm {
             })?;
         let argc = argc_u8 as usize;
         if self.bound_host_function_uses_args_slice(resolved_index)? {
-            self.execute_bound_args_host_function(resolved_index, argc, call_ip, None)
+            self.execute_bound_args_host_function(
+                resolved_index,
+                argc,
+                call_ip,
+                None,
+                ExactHostReturnPolicy::Legacy,
+            )
         } else if self.bound_host_function_uses_stack_borrow(resolved_index)? {
-            self.execute_bound_stack_host_function(resolved_index, argc, call_ip)
+            self.execute_bound_stack_host_function(
+                resolved_index,
+                argc,
+                call_ip,
+                ExactHostReturnPolicy::Legacy,
+            )
         } else {
-            self.execute_bound_host_function_from_stack(resolved_index, argc, call_ip)
+            self.execute_bound_host_function_from_stack(
+                resolved_index,
+                argc,
+                call_ip,
+                ExactHostReturnPolicy::Legacy,
+            )
         }
     }
 
@@ -1905,6 +2008,7 @@ impl Vm {
         resolved_index: u16,
         argc: usize,
         call_ip: usize,
+        exact_policy: ExactHostReturnPolicy,
     ) -> VmResult<HostCallExecOutcome> {
         let arg_start = self
             .instance
@@ -1948,6 +2052,7 @@ impl Vm {
             CallOutcome::Return(values) => {
                 saved_stack.truncate(arg_start);
                 saved_stack.append(&mut host_stack);
+                let values = validate_exact_host_return_values(values, exact_policy)?;
                 values.push_onto_stack(&mut saved_stack);
                 self.instance.stack = saved_stack;
                 Ok(HostCallExecOutcome::Returned)
@@ -2013,6 +2118,7 @@ impl Vm {
         function: StaticHostArgsFunction,
         argc: usize,
         expected_return_type: Option<ValueType>,
+        exact_policy: ExactHostReturnPolicy,
     ) -> VmResult<HostCallExecOutcome> {
         let arg_start = self
             .instance
@@ -2024,7 +2130,7 @@ impl Vm {
         let outcome = function(&self.instance.stack[arg_start..]);
         self.instance.call_depth = self.instance.call_depth.saturating_sub(1);
         let value = require_non_yielding_host_value(outcome?)?;
-        let value = validate_non_yielding_host_value(value, expected_return_type)?;
+        let value = validate_exact_host_return_value(value, exact_policy, expected_return_type)?;
         self.instance.stack.truncate(arg_start);
         self.instance.stack.push(value);
         Ok(HostCallExecOutcome::Returned)
@@ -2036,6 +2142,7 @@ impl Vm {
         argc: usize,
         call_ip: usize,
         expected_return_type: Option<ValueType>,
+        exact_policy: ExactHostReturnPolicy,
     ) -> VmResult<HostCallExecOutcome> {
         let arg_start = self
             .instance
@@ -2066,7 +2173,8 @@ impl Vm {
         let outcome = outcome?;
         if non_yielding {
             let value = require_non_yielding_host_value(outcome)?;
-            let value = validate_non_yielding_host_value(value, expected_return_type)?;
+            let value =
+                validate_exact_host_return_value(value, exact_policy, expected_return_type)?;
             self.instance.stack.truncate(arg_start);
             self.instance.stack.push(value);
             return Ok(HostCallExecOutcome::Returned);
@@ -2075,6 +2183,7 @@ impl Vm {
         match outcome {
             CallOutcome::Return(values) => {
                 self.instance.stack.truncate(arg_start);
+                let values = validate_exact_host_return_values(values, exact_policy)?;
                 values.push_onto_stack(&mut self.instance.stack);
                 Ok(HostCallExecOutcome::Returned)
             }
@@ -2106,6 +2215,7 @@ impl Vm {
         resolved_index: u16,
         argc: usize,
         call_ip: usize,
+        exact_policy: ExactHostReturnPolicy,
     ) -> VmResult<HostCallExecOutcome> {
         let arg_start = self
             .instance
@@ -2141,6 +2251,7 @@ impl Vm {
         match outcome {
             CallOutcome::Return(values) => {
                 self.instance.stack.truncate(arg_start);
+                let values = validate_exact_host_return_values(values, exact_policy)?;
                 values.push_onto_stack(&mut self.instance.stack);
                 Ok(HostCallExecOutcome::Returned)
             }
@@ -2382,7 +2493,30 @@ impl Vm {
             .host
             .resolved_calls
             .iter()
-            .map(|&slot| {
+            .enumerate()
+            .map(|(index, &slot)| {
+                // A host import whose exact schema carries a resource anywhere
+                // (params or return) must never be marked native/non-yielding
+                // inline eligible: the native non-yielding scalar/i64 shim has
+                // no resource-handle ABI, so such calls must keep exiting to
+                // the interpreter for return-structure validation (C1). Only
+                // `ArgsStaticNonYielding` bindings are eligible in the first
+                // place.
+                let import = self
+                    .program
+                    .imports
+                    .get(index)
+                    .and_then(|import| import.schema.as_ref());
+                let schema_has_resource = import.is_some_and(|schema| {
+                    schema
+                        .params
+                        .iter()
+                        .any(|param| param.schema.contains_resource())
+                        || schema.return_type.contains_resource()
+                });
+                if schema_has_resource {
+                    return false;
+                }
                 matches!(
                     self.host.host_functions.get(usize::from(slot)),
                     Some(VmHostFunction::ArgsStaticNonYielding(_))

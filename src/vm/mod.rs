@@ -673,10 +673,11 @@ fn value_matches_type_schema(value: &Value, schema: &crate::compiler::TypeSchema
         TypeSchema::Named(_, _) | TypeSchema::Map(_) | TypeSchema::Object(_) => {
             matches!(value, Value::Map(_))
         }
-        // No runtime `Value` can be a resource yet (the resource table/handle
-        // transport is a later scope), so a resource schema never admits an
-        // arbitrary `Value` as a match.
-        TypeSchema::Resource(_) => false,
+        // A resource schema admits exactly the `Value::Int` carriers that
+        // decode as a structurally valid resource handle token. The check is
+        // deliberately structural (`from_raw` reserved-space decode), never a
+        // table/key lookup: nominal identity and liveness are later scopes.
+        TypeSchema::Resource(_) => ResourceHandle::from_value(value).is_ok(),
         TypeSchema::Array(_) | TypeSchema::ArrayTuple(_) | TypeSchema::ArrayTupleRest { .. } => {
             matches!(value, Value::Array(_))
         }
