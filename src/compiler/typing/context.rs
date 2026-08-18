@@ -1042,8 +1042,10 @@ impl<'a> TypeContext<'a> {
                 params: vec![TypeSchema::Unknown; closure.param_slots.len()],
                 result: Box::new(TypeSchema::Unknown),
             }),
-            Expr::Call(index, type_args, args, _) => {
-                if let Some(builtin) = BuiltinFunction::from_call_index(*index) {
+            Expr::Call(index, type_args, args, resolution) => {
+                if let Some(resolved) = resolution {
+                    Some(resolved.return_type.clone())
+                } else if let Some(builtin) = BuiltinFunction::from_call_index(*index) {
                     self.infer_builtin_call_schema(builtin, type_args, args, state)
                 } else {
                     self.infer_named_call_schema(*index, type_args, args, state)
@@ -1257,7 +1259,10 @@ impl<'a> TypeContext<'a> {
         state: &LocalTypeState,
     ) -> BoundType {
         match expr {
-            Expr::Call(index, type_args, args, _) => {
+            Expr::Call(index, type_args, args, resolution) => {
+                if let Some(resolved) = resolution {
+                    return self.bound_type_for_schema(&resolved.return_type);
+                }
                 if let Some(builtin) = BuiltinFunction::from_call_index(*index) {
                     self.infer_builtin_call_like_expr_type(builtin, type_args, args, state)
                 } else {
@@ -2069,7 +2074,14 @@ impl<'a> TypeContext<'a> {
         source_name: Option<&str>,
     ) -> Result<(), CompileError> {
         match expr {
-            Expr::Call(index, type_args, args, _) => {
+            Expr::Call(index, type_args, args, resolution) => {
+                // A catalog-resolved direct call was already validated for
+                // schema, arity, and parameter passing by the exact resolver;
+                // the child expressions are still recursively validated by the
+                // surrounding traversal, so bypass this legacy signature check.
+                if resolution.is_some() {
+                    return Ok(());
+                }
                 if let Some(builtin) = BuiltinFunction::from_call_index(*index) {
                     self.validate_builtin_argument_types(
                         builtin,
@@ -2962,6 +2974,8 @@ fn literal_int_index(key: &Expr) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::builtins::{CallableParam, CallableParamType};
+    use crate::compiler::ir::{ResolvedHostCall, ResolvedHostParam};
+    use crate::host_api::{HostApiFingerprint, HostParamPassing};
 
     #[test]
     fn generated_callable_float_schema_remains_distinct_from_number() {
@@ -3086,5 +3100,144 @@ mod tests {
             ),
             "a same-name non-builtin signature must not inherit the stream::emit exemption"
         );
+    }
+
+    fn fingerprint(n: u64) -> HostApiFingerprint {
+        serde_json::from_value(serde_json::Value::Number(n.into())).unwrap()
+    }
+
+    /// A minimal resolved host call with a privately constructed fingerprint,
+    /// mirroring the helper used in `ir.rs` call-resolution carrier tests.
+    fn resolution(return_type: TypeSchema) -> ResolvedHostCall {
+        ResolvedHostCall {
+            name: "annotated_host".to_string(),
+            params: vec![ResolvedHostParam {
+                name: "value".to_string(),
+                schema: TypeSchema::Int,
+            }],
+            return_type,
+            passing: vec![HostParamPassing::Borrow],
+            fingerprint: fingerprint(0x88),
+        }
+    }
+
+    #[test]
+    fn resolved_host_call_annotation_drives_schema_and_bound_type() {
+        let mut decls = HashMap::new();
+        decls.insert(
+            30u16,
+            FunctionDecl {
+                name: "legacy_diff".to_string(),
+                arity: 1,
+                index: 30,
+                args: vec!["value".to_string()],
+                arg_schemas: vec![Some(TypeSchema::Int)],
+                return_schema: Some(TypeSchema::Int),
+                type_params: vec![],
+                exported: false,
+                return_type: crate::bytecode::ValueType::Int,
+                symbol: None,
+            },
+        );
+        let empty_impls: HashMap<u16, FunctionImpl> = HashMap::new();
+        let empty_structs: HashMap<String, StructDecl> = HashMap::new();
+        let empty_names: HashMap<u16, String> = HashMap::new();
+        // Legacy host return for index 30 is `Int`; the annotation below is
+        // `String`, so consuming the annotation must win over both the legacy
+        // FunctionDecl return_schema and the host_import_return_types map.
+        let mut returns = HashMap::new();
+        returns.insert(30u16, BoundType::Int);
+        let empty_signatures: HashMap<u16, HostCallableSignature> = HashMap::new();
+        let mut context = TypeContext::new(
+            &empty_impls,
+            &decls,
+            &empty_structs,
+            &empty_names,
+            &returns,
+            &empty_signatures,
+            TypingMode::StrictRustScript,
+        );
+        let state = LocalTypeState::default();
+        let annotated = Expr::Call(
+            30,
+            Vec::new(),
+            vec![Expr::Int(1)],
+            Some(Box::new(resolution(TypeSchema::String))),
+        );
+        let bare = Expr::Call(30, Vec::new(), vec![Expr::Int(1)], None);
+
+        // Schema inference follows the annotation, not the legacy decl.
+        assert_eq!(
+            context.infer_expr_schema(&annotated, &state),
+            Some(TypeSchema::String)
+        );
+        assert_eq!(
+            context.infer_expr_schema(&bare, &state),
+            Some(TypeSchema::Int)
+        );
+
+        // Bound-type inference follows the annotation, not the legacy host map.
+        assert_eq!(
+            context.infer_call_like_expr_type(&annotated, &state),
+            BoundType::String
+        );
+        assert_eq!(
+            context.infer_call_like_expr_type(&bare, &state),
+            BoundType::Int
+        );
+    }
+
+    #[test]
+    fn resolved_host_call_annotation_bypasses_incompatible_legacy_signature() {
+        let empty_impls: HashMap<u16, FunctionImpl> = HashMap::new();
+        let empty_decls: HashMap<u16, FunctionDecl> = HashMap::new();
+        let empty_structs: HashMap<String, StructDecl> = HashMap::new();
+        let empty_names: HashMap<u16, String> = HashMap::new();
+        let empty_returns: HashMap<u16, BoundType> = HashMap::new();
+        // The legacy signature expects a `string`, but the call site passes an
+        // `int`. The exact resolver already validated schema/arity/passing for
+        // an annotated call, so that call bypasses this mismatched check; the
+        // unannotated (None) call still reports the mismatch.
+        let mut signatures: HashMap<u16, HostCallableSignature> = HashMap::new();
+        signatures.insert(
+            31u16,
+            HostCallableSignature {
+                name: "string_only".to_string(),
+                params: vec![CallableParam {
+                    name: "value",
+                    ty: CallableParamType::String,
+                    optional: false,
+                }],
+                runtime_builtin: false,
+            },
+        );
+        let mut context = TypeContext::new(
+            &empty_impls,
+            &empty_decls,
+            &empty_structs,
+            &empty_names,
+            &empty_returns,
+            &signatures,
+            TypingMode::StrictRustScript,
+        );
+        let state = LocalTypeState::default();
+
+        let bare = Expr::Call(31, Vec::new(), vec![Expr::Int(1)], None);
+        assert!(
+            context
+                .validate_call_argument_types(&bare, &state, None, None)
+                .is_err(),
+            "None direct call must still validate against the legacy host signature"
+        );
+
+        let annotated = Expr::Call(
+            31,
+            Vec::new(),
+            vec![Expr::Int(1)],
+            Some(Box::new(resolution(TypeSchema::String))),
+        );
+        context
+            .validate_call_argument_types(&annotated, &state, None, None)
+            .expect("a catalog-resolved call must bypass the incompatible legacy signature");
     }
 }
