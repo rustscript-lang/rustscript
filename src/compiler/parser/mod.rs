@@ -250,11 +250,13 @@ impl Parser {
     /// [`HostApiCatalog`] snapshot from the compile options.
     ///
     /// This is the internal entry point used by RustScript file/module parses.
-    /// It performs a single `Arc` clone of the shared snapshot and a single
-    /// allocation of the fingerprint-bound [`HostApiIrMetadata`] carrier, so a
-    /// catalog-backed parse never re-allocs the snapshot. REPL and the public
-    /// [`ParserDialect`] path keep using [`Parser::new`] and thus stay
-    /// catalog-free (`host_api_metadata` `None`).
+    /// The frontend increments the options-held `Arc` when entering the parser
+    /// boundary; this constructor consumes that `Arc` into the parser, so the
+    /// catalog allocation and its data are never copied. The metadata carrier
+    /// is initialized once for the parse. [`Parser::define_host_function`] may
+    /// temporarily increment the `Arc` again per catalog host call to release
+    /// the `self` borrow. REPL and the public [`ParserDialect`] path keep using
+    /// [`Parser::new`] and thus stay catalog-free (`host_api_metadata` `None`).
     pub(super) fn new_with_host_catalog(
         source: &str,
         source_id: SourceId,
