@@ -3116,7 +3116,7 @@ mod tests {
                 schema: TypeSchema::Int,
             }],
             return_type,
-            passing: vec![HostParamPassing::Borrow],
+            passing: vec![HostParamPassing::Value],
             fingerprint: fingerprint(0x88),
         }
     }
