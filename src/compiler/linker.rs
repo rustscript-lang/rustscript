@@ -4,12 +4,12 @@ use std::path::Path;
 use crate::builtins::BuiltinFunction;
 
 use super::{
-    ParseError, SourceError, SourcePathError,
     ir::{
         Expr, FrontendIr, FunctionDecl, FunctionImpl, HostApiIrMetadata, LocalSlot, Stmt,
         StructDecl,
     },
     modules::{ModuleId, SymbolId},
+    ParseError, SourceError, SourcePathError,
 };
 
 pub(super) struct ParsedUnit {
@@ -75,12 +75,13 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
     let mut merged_function_impls = HashMap::<u16, FunctionImpl>::new();
     let mut merged_function_sources = HashMap::<u16, String>::new();
     // Fingerprint-bound host candidate catalog carried by the merged IR. Held
-    // as `None` until the first non-empty unit that carries catalog metadata;
-    // the final value mirrors the uniform metadata-presence state across all
-    // nonempty units (see `merge_host_api_metadata_for_unit`).
+    // as `None` until the first supplied unit that carries catalog metadata;
+    // the final value mirrors the uniform metadata-presence state across every
+    // supplied unit, including zero-function units (see
+    // `merge_host_api_metadata_for_unit`).
     let mut merged_host_api_metadata: Option<HostApiIrMetadata> = None;
-    // Set when a nonempty unit without catalog metadata has been merged.
-    // A later nonempty unit that *does* carry metadata is a split
+    // Set when a supplied unit without catalog metadata has been merged.
+    // A later supplied unit that *does* carry metadata is a split
     // catalog/no-catalog compilation and is rejected.
     let mut rejected_missing_metadata = false;
 
@@ -89,14 +90,15 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
     // Module functions (declarations with implementations) are merged by
     // compiler-owned `SymbolId`, so same-named declarations in independent
     // modules each get their own flat entry. Host imports (declarations
-    // without implementations) keep name-keyed deduplication: their names are
-    // the runtime binding surface (`program.imports`, `Vm::bind_function`),
-    // so deduplication follows name-bound runtime resolution.
+    // without implementations) are deduplicated by `(name, arity)`: the same
+    // name at the same arity is one runtime binding with one merged flat
+    // entry, while the same name at a different arity is a distinct overload
+    // owning its own flat entry and independent candidate set.
     let mut flat_index_by_symbol = HashMap::<SymbolId, u16>::new();
-    let mut host_index_by_name = HashMap::<String, u16>::new();
+    let mut host_index_by_arity = HashMap::<(String, u8), u16>::new();
     // Every flat name claimed so far. Module functions that collide are
-    // deterministically mangled with their module identity; host imports are
-    // deduplicated by name before ever reaching this set.
+    // deterministically mangled with their module identity; host imports
+    // are deduplicated by `(name, arity)` before ever reaching this set.
     let mut claimed_flat_names = HashSet::<String>::new();
 
     let mut local_base = 0usize;
@@ -107,7 +109,7 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
             &unit,
             &mut merged_functions,
             &mut flat_index_by_symbol,
-            &mut host_index_by_name,
+            &mut host_index_by_arity,
             &mut claimed_flat_names,
         )?;
         merge_host_api_metadata_for_unit(
@@ -234,7 +236,7 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
         // carries them.
         implicit_extern_names: Vec::new(),
         // Fingerprint-bound host candidate catalog carried by the merged IR.
-        // `None` when no nonempty unit carried catalog metadata; otherwise the
+        // `None` when no supplied unit carried catalog metadata; otherwise the
         // validated, remapped, uniformly fingerprint-bound carrier.
         host_api_metadata: merged_host_api_metadata,
     })
@@ -263,12 +265,14 @@ fn metadata_error(source_name: &str, message: String) -> SourcePathError {
 /// Merge one unit's fingerprint-bound host candidate metadata onto the
 /// compilation-wide carrier.
 ///
-/// Presence is uniform across **nonempty** units (units that declare at least
-/// one function): an empty unit (no declarations) carries no catalog content
-/// and neither asserts nor refutes metadata presence. Among nonempty units,
-/// mixing `Some`/`None` is rejected so a compilation is never split between a
-/// catalog-backed module and a catalog-less one; all-`None` units keep the
-/// merged carrier as `None`.
+/// Presence is uniform across **every supplied unit**, including zero-function
+/// units: an empty unit carries catalog content solely through its metadata
+/// carrier and still asserts or refutes metadata presence. An empty unit that
+/// carries `Some` metadata contributes its fingerprint with zero recorded
+/// candidates; a zero-function unit with `None` refutes presence. Mixing
+/// `Some`/`None` is rejected so a compilation is never split between a
+/// catalog-backed module and a catalog-less one — in either order. An empty
+/// `Vec<ParsedUnit>` yields `None`.
 ///
 /// For `Some` metadata, every unit must be bound to the same catalog
 /// [`HostApiFingerprint`](crate::host_api::HostApiFingerprint). Each recorded
@@ -280,10 +284,15 @@ fn metadata_error(source_name: &str, message: String) -> SourcePathError {
 /// * a candidate set must be present, whose schemas all match the declared
 ///   name and arity.
 ///
-/// The ordered candidate list is recorded verbatim (pass-only overloads
-/// preserved) at the merged index. When the same host import is deduplicated
-/// across units, the candidate lists must be exactly equal — any difference
-/// is a conflict, never a union or overwrite.
+/// Each ordered candidate list is the **complete** catalog discovery-order
+/// candidate set for the owning `(fingerprint, host name, arity)` — every
+/// candidate the catalog discovered for that identity, including all type and
+/// parameter-passing overloads, never a per-call subset or an arbitrary
+/// slice. The list is recorded verbatim at the merged index. When the same
+/// `(name, arity)` host import is deduplicated across units, the candidate
+/// lists must be exactly equal — any difference is a conflict, never a union
+/// or overwrite. The same host name at a different arity is a distinct flat
+/// function with its own complete candidate set.
 fn merge_host_api_metadata_for_unit(
     unit: &ParsedUnit,
     source_name: &str,
@@ -291,11 +300,6 @@ fn merge_host_api_metadata_for_unit(
     merged: &mut Option<HostApiIrMetadata>,
     rejected_missing_metadata: &mut bool,
 ) -> Result<(), SourcePathError> {
-    if unit.parsed.functions.is_empty() {
-        // A unit with no declarations carries no catalog content; it neither
-        // asserts nor refutes metadata presence.
-        return Ok(());
-    }
     let Some(metadata) = &unit.parsed.host_api_metadata else {
         if merged.is_some() {
             return Err(metadata_error(
@@ -421,7 +425,7 @@ fn register_unit_functions(
     unit: &ParsedUnit,
     merged_functions: &mut Vec<FunctionDecl>,
     flat_index_by_symbol: &mut HashMap<SymbolId, u16>,
-    host_index_by_name: &mut HashMap<String, u16>,
+    host_index_by_arity: &mut HashMap<(String, u8), u16>,
     claimed_flat_names: &mut HashSet<String>,
 ) -> Result<HashMap<u16, u16>, SourcePathError> {
     let mut map = HashMap::new();
@@ -437,9 +441,12 @@ fn register_unit_functions(
         }
         let has_impl = unit.parsed.function_impls.contains_key(&func.index);
         let flat = if !has_impl {
-            // Host import: name-keyed deduplication preserves the runtime
-            // name-binding surface (`program.imports`, `Vm::bind_function`).
-            if let Some(&existing) = host_index_by_name.get(&func.name) {
+            // Host import: `(name, arity)`-keyed deduplication. The same name
+            // at the same arity collapses to one runtime-binding flat entry;
+            // the same name at a different arity is a distinct overload with
+            // its own flat entry and candidate set.
+            let host_identity = (func.name.clone(), func.arity);
+            if let Some(&existing) = host_index_by_arity.get(&host_identity) {
                 merge_host_import_metadata(&mut merged_functions[existing as usize], func)?;
                 flat_index_by_symbol.insert(symbol, existing);
                 map.insert(func.index, existing);
@@ -458,7 +465,7 @@ fn register_unit_functions(
                 return_type: func.return_type,
                 symbol: Some(symbol),
             });
-            host_index_by_name.insert(func.name.clone(), flat);
+            host_index_by_arity.insert(host_identity, flat);
             claimed_flat_names.insert(func.name.clone());
             flat
         } else {
@@ -492,24 +499,17 @@ fn register_unit_functions(
     Ok(map)
 }
 
-/// Apply the name-bound host-import merge rules for a host import that is
-/// declared by more than one unit: arity conflicts are errors, `Unknown`
-/// return types are refined, and schemas/type parameters merge.
+/// Apply the `(name, arity)`-bound host-import merge rules for a host import
+/// that is declared by more than one unit at the same name **and** arity (the
+/// flat dedup key). Different arities of the same host name are distinct flat
+/// functions and never reach this helper, so the caller guarantees
+/// `existing.arity == func.arity`; the arity branch is therefore not needed
+/// here. `Unknown` return types are refined, and schemas/type parameters
+/// merge; conflicting non-`Unknown` returns or arg schemas are errors.
 fn merge_host_import_metadata(
     existing: &mut FunctionDecl,
     func: &FunctionDecl,
 ) -> Result<(), SourcePathError> {
-    if existing.arity != func.arity {
-        return Err(SourcePathError::Source(SourceError::Parse(ParseError {
-            span: None,
-            code: None,
-            line: 1,
-            message: format!(
-                "function '{}' declared with conflicting arity {} vs {}",
-                func.name, existing.arity, func.arity
-            ),
-        })));
-    }
     if existing.return_type != func.return_type {
         match (existing.return_type, func.return_type) {
             (crate::ValueType::Unknown, known) => existing.return_type = known,
@@ -1245,7 +1245,7 @@ mod linker_metadata_remap_tests {
             HashMap::new(),
             None,
         );
-        let merged = merge_units(vec![u]).expect("nonempty none unit must merge");
+        let merged = merge_units(vec![u]).expect("supplied unit without metadata must merge");
         assert!(merged.host_api_metadata.is_none());
     }
 
@@ -1256,5 +1256,125 @@ mod linker_metadata_remap_tests {
         let merged = merge_units(vec![a, b]).expect("empty units must merge");
         assert!(merged.functions.is_empty());
         assert!(merged.host_api_metadata.is_none());
+    }
+
+    #[test]
+    fn single_empty_unit_with_some_metadata_preserves_fingerprint() {
+        // A zero-function unit that carries `Some` metadata must still assert
+        // its fingerprint and yield an empty-but-fingerprint-bound carrier,
+        // never silently drop the catalog identity.
+        let empty_md = HostApiIrMetadata::new(fingerprint(0xCAFE)); // zero candidates
+        let u = unit("empty.rss", 1, Vec::new(), HashMap::new(), Some(empty_md));
+        let merged = merge_units(vec![u]).expect("empty Some unit must merge");
+        assert!(merged.functions.is_empty());
+        let md = merged
+            .host_api_metadata
+            .as_ref()
+            .expect("empty Some unit must preserve metadata");
+        assert_eq!(md.fingerprint(), fingerprint(0xCAFE));
+        assert_eq!(md.function_indices().count(), 0);
+    }
+
+    #[test]
+    fn empty_unit_with_none_metadata_remains_none() {
+        let u = unit("empty.rss", 1, Vec::new(), HashMap::new(), None);
+        let merged = merge_units(vec![u]).expect("empty None unit must merge");
+        assert!(merged.functions.is_empty());
+        assert!(merged.host_api_metadata.is_none());
+    }
+
+    #[test]
+    fn empty_vec_of_units_yields_none() {
+        let merged = merge_units(Vec::new()).expect("empty vec must merge to empty IR");
+        assert!(merged.functions.is_empty());
+        assert!(merged.host_api_metadata.is_none());
+    }
+
+    #[test]
+    fn empty_units_mixed_metadata_presence_is_rejected_in_both_orders() {
+        let some_empty = || {
+            unit(
+                "a.rss",
+                1,
+                Vec::new(),
+                HashMap::new(),
+                Some(HostApiIrMetadata::new(fingerprint(1))),
+            )
+        };
+        let none_empty = || unit("b.rss", 2, Vec::new(), HashMap::new(), None);
+        let err =
+            merge_units(vec![some_empty(), none_empty()]).expect_err("Some-then-None must fail");
+        assert!(
+            err.to_string().contains("host catalog metadata"),
+            "unexpected order Some/None empty error: {err}"
+        );
+        let err2 =
+            merge_units(vec![none_empty(), some_empty()]).expect_err("None-then-Some must fail");
+        assert!(
+            err2.to_string().contains("host catalog metadata"),
+            "unexpected order None/Some empty error: {err2}"
+        );
+    }
+
+    #[test]
+    fn same_host_different_arity_keeps_two_functions_and_exact_candidates() {
+        // The same exposed host name at different arities is a distinct flat
+        // function with its own merged index and its own complete candidate
+        // set; it must never error as a dedup conflict.
+        let arity0_candidates = vec![host_candidate("read", vec![])];
+        let arity1_candidates = vec![host_candidate(
+            "read",
+            vec![HostParamSchema::value("bytes", HostTypeSchema::Bytes)],
+        )];
+        let a = unit(
+            "a.rss",
+            1,
+            vec![decl(0, "read", 0, 1)],
+            HashMap::new(),
+            Some(metadata(1, 0, arity0_candidates.clone())),
+        );
+        let b = unit(
+            "b.rss",
+            2,
+            vec![decl(0, "read", 1, 2)],
+            HashMap::new(),
+            Some(metadata(1, 0, arity1_candidates.clone())),
+        );
+        let merged = merge_units(vec![a, b]).expect("different-arity overloads must merge");
+        assert_eq!(
+            merged.functions.len(),
+            2,
+            "two overloads become two flat functions"
+        );
+        // Candidate sets are matched exactly and independently per flat index.
+        let md = merged
+            .host_api_metadata
+            .as_ref()
+            .expect("metadata must be carried");
+        assert_eq!(md.function_indices().count(), 2);
+        let flat_arity_by_name: Vec<(String, u8, &[crate::host_api::HostFunctionSchema])> = merged
+            .functions
+            .iter()
+            .map(|f| {
+                (
+                    f.name.clone(),
+                    f.arity,
+                    md.candidates(f.index).expect("index has candidates"),
+                )
+            })
+            .collect();
+        assert!(flat_arity_by_name.iter().all(|(n, _, _)| n == "read"));
+        assert_ne!(
+            flat_arity_by_name[0].1, flat_arity_by_name[1].1,
+            "two overloads must differ in arity"
+        );
+        // Each flat index carries exactly its own complete candidate list.
+        let by_arity: std::collections::HashMap<u8, &[crate::host_api::HostFunctionSchema]> =
+            flat_arity_by_name
+                .iter()
+                .map(|(_, a, c)| (*a, *c))
+                .collect();
+        assert_eq!(by_arity[&0], &arity0_candidates[..]);
+        assert_eq!(by_arity[&1], &arity1_candidates[..]);
     }
 }

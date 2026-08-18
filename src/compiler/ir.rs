@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
 
-use crate::ValueType;
 use crate::builtins::default_host_callable;
 use crate::host_api::{HostApiFingerprint, HostFunctionSchema, ResourceTypeKey};
+use crate::ValueType;
 
-use super::ParseError;
 use super::modules::SymbolId;
+use super::ParseError;
 
 pub type LocalSlot = u16;
 
@@ -441,6 +441,15 @@ pub struct FunctionImpl {
 /// records the ordered list of candidate [`HostFunctionSchema`]s in catalog
 /// discovery order, including pass-only overloads (never deduplicated).
 ///
+/// Each recorded list is the **complete** candidate set for its owning
+/// `(fingerprint, host name, arity)`: every candidate the catalog discovered
+/// for that identity — including all type and parameter-passing overloads —
+/// in discovery order. It is never a per-call subset, never a truncated or
+/// reordered slice: the whole catalog set is what later identity layers rely
+/// on to bind and disambiguate a host call. A flat function produced from the
+/// same host name at a different arity belongs to a distinct
+/// `(name, arity)` identity with its own complete candidate set.
+///
 /// Carried on [`FrontendIr::host_api_metadata`]: `None` means the compilation
 /// carries no host-catalog metadata; `Some` is a fingerprint-bound carrier
 /// with no raw ABI attached.
@@ -483,6 +492,13 @@ impl HostApiIrMetadata {
     }
 
     /// Records the ordered candidate list for one flat function.
+    ///
+    /// `candidates` must be the **complete** catalog discovery-order candidate
+    /// set for the owning `(fingerprint, host name, arity)` — every candidate
+    /// the catalog discovered for that identity, including all type and
+    /// parameter-passing overloads. It must never be a per-call subset or an
+    /// arbitrary slice; a flat function's whole catalog candidate set is what
+    /// downstream identity layers bind against.
     ///
     /// Rejects with an actionable [`ParseError`] when:
     /// * `candidates` is empty;
