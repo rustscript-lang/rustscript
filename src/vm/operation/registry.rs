@@ -14,11 +14,10 @@ use std::collections::HashMap;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use crate::builtins::runtime::error::{RuntimeError, RuntimeErrorCode, RuntimeResult};
-use crate::builtins::runtime::resource::ResourceHandle;
-use crate::vm::operation::driver::{
-    HostOperation, OperationCleanup, OperationOutcome, OperationSpec,
-};
+use super::driver::{HostOperation, OperationCleanup, OperationOutcome, OperationSpec};
+use super::error::{OperationError, OperationErrorCode, OperationResult};
+use super::reason::OperationCancelReason;
+use crate::vm::resource::ResourceHandle;
 
 /// Default ceiling for concurrently pending operations.
 pub const DEFAULT_MAX_PENDING_OPERATIONS: usize = 64;
@@ -29,10 +28,10 @@ pub struct OperationId(u64);
 
 impl OperationId {
     /// Wraps a raw non-zero id.
-    pub fn from_raw(raw: u64) -> RuntimeResult<Self> {
+    pub fn from_raw(raw: u64) -> OperationResult<Self> {
         if raw == 0 {
-            return Err(RuntimeError::new(
-                RuntimeErrorCode::OperationIdExhausted,
+            return Err(OperationError::new(
+                OperationErrorCode::InvalidOperationId,
                 "vm::operation",
                 "operation id zero is reserved",
             ));
@@ -55,9 +54,9 @@ pub enum OperationStatus {
     /// Finished successfully.
     Completed,
     /// Cancelled; carries the first cancellation reason.
-    Cancelled(crate::vm::CancellationReason),
-    /// Failed with a runtime error.
-    Failed(RuntimeError),
+    Cancelled(OperationCancelReason),
+    /// Failed with an operation error.
+    Failed(OperationError),
 }
 
 impl OperationStatus {
@@ -101,10 +100,10 @@ pub struct OperationRegistry {
 
 impl OperationRegistry {
     /// Creates an empty registry with the given pending-operation ceiling.
-    pub fn with_limit(max_pending: usize) -> RuntimeResult<Self> {
+    pub fn with_limit(max_pending: usize) -> OperationResult<Self> {
         if max_pending == 0 {
-            return Err(RuntimeError::new(
-                RuntimeErrorCode::InvalidConfiguration,
+            return Err(OperationError::new(
+                OperationErrorCode::InvalidConfiguration,
                 "vm::operation",
                 "operation registry capacity must be positive",
             ));
@@ -131,14 +130,14 @@ impl OperationRegistry {
 
     /// Starts a new operation from a spec, enforcing the capacity ceiling and
     /// monotonic id allocation.
-    pub fn start(&mut self, spec: OperationSpec) -> RuntimeResult<OperationId> {
+    pub fn start(&mut self, spec: OperationSpec) -> OperationResult<OperationId> {
         if self.active_count() >= self.max_pending {
-            return Err(RuntimeError::new(
-                RuntimeErrorCode::OperationLimitExceeded,
+            return Err(OperationError::new(
+                OperationErrorCode::OperationLimitExceeded,
                 "vm::operation",
                 "pending operation capacity has been reached",
             )
-            .with_limit(self.max_pending));
+            .with_limit(self.max_pending as u64));
         }
         let raw = Self::allocate_id(&mut self.next_id)?;
         let id = OperationId::from_raw(raw).expect("allocated id is never zero");
@@ -155,14 +154,14 @@ impl OperationRegistry {
     }
 
     /// Observes the current status of an operation.
-    pub fn status(&self, id: OperationId) -> RuntimeResult<OperationStatus> {
+    pub fn status(&self, id: OperationId) -> OperationResult<OperationStatus> {
         Ok(self.operation(id)?.status.clone())
     }
 
     /// Returns the terminal result of an operation, or `OperationNotFound`
     /// if it does not exist. With a pending operation this returns an error;
     /// use `poll` to drive it to terminal first.
-    pub fn outcome(&self, id: OperationId) -> RuntimeResult<OperationOutcome> {
+    pub fn outcome(&self, id: OperationId) -> OperationResult<OperationOutcome> {
         self.operation(id)?
             .status
             .terminal_outcome()
@@ -170,7 +169,7 @@ impl OperationRegistry {
     }
 
     /// The resource handle an operation is associated with, if any.
-    pub fn resource_of(&self, id: OperationId) -> RuntimeResult<Option<ResourceHandle>> {
+    pub fn resource_of(&self, id: OperationId) -> OperationResult<Option<ResourceHandle>> {
         Ok(self.operation(id)?.resource)
     }
 
@@ -187,14 +186,14 @@ impl OperationRegistry {
     ///
     /// Returns `Poll::Pending` while running, or `Poll::Ready(outcome)` with
     /// the first terminal result. A deadline that has elapsed while the
-    /// operation is pending cancels it with `CancellationReason::Deadline`
+    /// operation is pending cancels it with `OperationCancelReason::Deadline`
     /// (preserving an even earlier reason). Once terminal, later polls
     /// re-report the stored outcome.
     pub fn poll(
         &mut self,
         id: OperationId,
         cx: &mut Context<'_>,
-    ) -> Poll<RuntimeResult<OperationOutcome>> {
+    ) -> Poll<OperationResult<OperationOutcome>> {
         // Fast path: already terminal.
         if let Some(outcome) = self.operation(id)?.status.terminal_outcome() {
             return Poll::Ready(Ok(outcome));
@@ -205,7 +204,7 @@ impl OperationRegistry {
         if let Some(deadline) = self.operation(id)?.deadline
             && Instant::now() >= deadline
         {
-            self.cancel(id, crate::vm::CancellationReason::Deadline)?;
+            self.cancel(id, OperationCancelReason::Deadline)?;
             return Poll::Ready(self.outcome(id));
         }
 
@@ -238,18 +237,24 @@ impl OperationRegistry {
     /// Idempotent: the driver's [`HostOperation::cancel`] is invoked at most
     /// once, and the *first* recorded reason is preserved. Returns `Ok(true)`
     /// if this call performed the cancellation transition, otherwise `Ok(false)`.
+    ///
+    /// A driver cancel failure is propagated (wrapped as
+    /// `OperationDriverFailed`) rather than producing a false success. The
+    /// terminal cancelled status is already recorded before the driver is
+    /// asked to stop; detailed cancel-failure terminal/stats policy is
+    /// deferred to the lifecycle scope.
     pub fn cancel(
         &mut self,
         id: OperationId,
-        reason: crate::vm::CancellationReason,
-    ) -> RuntimeResult<bool> {
+        reason: OperationCancelReason,
+    ) -> OperationResult<bool> {
         let (transitioned, cleanup) = {
             let entry = self.operation_mut(id)?;
             if !matches!(entry.status, OperationStatus::Pending) {
                 (false, None)
             } else {
                 entry.status = OperationStatus::Cancelled(reason);
-                entry.driver.cancel(reason);
+                entry.driver.cancel(reason).map_err(driver_failure)?;
                 (true, entry.cleanup.take())
             }
         };
@@ -270,8 +275,8 @@ impl OperationRegistry {
     pub fn cancel_for_resource(
         &mut self,
         resource: ResourceHandle,
-        reason: crate::vm::CancellationReason,
-    ) -> RuntimeResult<usize> {
+        reason: OperationCancelReason,
+    ) -> OperationResult<usize> {
         let mut count = 0;
         let mut first_error = None;
         for id in self.operations_for_resource(resource) {
@@ -292,7 +297,7 @@ impl OperationRegistry {
     /// Cancels all pending operations, returning how many were transitioned.
     /// Cleanup failures are isolated and reported as the first error; every
     /// operation is still processed.
-    pub fn cancel_all(&mut self, reason: crate::vm::CancellationReason) -> RuntimeResult<usize> {
+    pub fn cancel_all(&mut self, reason: OperationCancelReason) -> OperationResult<usize> {
         let mut count = 0;
         let mut first_error = None;
         for id in self.pending_ids() {
@@ -312,13 +317,13 @@ impl OperationRegistry {
 
     /// Marks an operation completed out-of-band (e.g. a host future resolved
     /// without a poll). Idempotent; returns `false` if already terminal.
-    pub fn complete(&mut self, id: OperationId) -> RuntimeResult<bool> {
+    pub fn complete(&mut self, id: OperationId) -> OperationResult<bool> {
         self.finish(id, OperationOutcome::Completed)
     }
 
     /// Marks an operation failed out-of-band. Idempotent; returns `false` if
     /// already terminal.
-    pub fn fail(&mut self, id: OperationId, error: RuntimeError) -> RuntimeResult<bool> {
+    pub fn fail(&mut self, id: OperationId, error: OperationError) -> OperationResult<bool> {
         self.finish(id, OperationOutcome::Failed(error))
     }
 
@@ -332,14 +337,14 @@ impl OperationRegistry {
     }
 
     /// Removes a single operation regardless of status, returning its status.
-    pub fn remove(&mut self, id: OperationId) -> RuntimeResult<OperationStatus> {
+    pub fn remove(&mut self, id: OperationId) -> OperationResult<OperationStatus> {
         self.operations
             .remove(&id)
             .map(|entry| entry.status)
             .ok_or_else(|| operation_not_found(id))
     }
 
-    fn finish(&mut self, id: OperationId, outcome: OperationOutcome) -> RuntimeResult<bool> {
+    fn finish(&mut self, id: OperationId, outcome: OperationOutcome) -> OperationResult<bool> {
         if self.operation(id)?.status.is_terminal() {
             return Ok(false);
         }
@@ -350,7 +355,7 @@ impl OperationRegistry {
     /// Applies a terminal outcome to a pending operation: records the status,
     /// runs the (once) cleanup and leaves the op terminal. No-op when already
     /// terminal.
-    fn apply_outcome(&mut self, id: OperationId, outcome: OperationOutcome) -> RuntimeResult<()> {
+    fn apply_outcome(&mut self, id: OperationId, outcome: OperationOutcome) -> OperationResult<()> {
         let cleanup = {
             let entry = self.operation_mut(id)?;
             if entry.status.is_terminal() {
@@ -373,10 +378,10 @@ impl OperationRegistry {
         &mut self,
         cleanup: OperationCleanup,
         outcome: OperationOutcome,
-    ) -> RuntimeResult<()> {
-        cleanup(outcome).map_err(|error| {
-            RuntimeError::new(
-                RuntimeErrorCode::OperationCleanupFailed,
+    ) -> OperationResult<()> {
+        cleanup(&outcome).map_err(|error| {
+            OperationError::new(
+                OperationErrorCode::OperationCleanupFailed,
                 "vm::operation",
                 error.to_string(),
             )
@@ -391,24 +396,24 @@ impl OperationRegistry {
             .collect()
     }
 
-    fn operation(&self, id: OperationId) -> RuntimeResult<&Operation> {
+    fn operation(&self, id: OperationId) -> OperationResult<&Operation> {
         self.operations
             .get(&id)
             .ok_or_else(|| operation_not_found(id))
     }
 
-    fn operation_mut(&mut self, id: OperationId) -> RuntimeResult<&mut Operation> {
+    fn operation_mut(&mut self, id: OperationId) -> OperationResult<&mut Operation> {
         self.operations
             .get_mut(&id)
             .ok_or_else(|| operation_not_found(id))
     }
 
-    fn allocate_id(next_id: &mut u64) -> RuntimeResult<u64> {
+    fn allocate_id(next_id: &mut u64) -> OperationResult<u64> {
         let id = OperationId::from_raw(*next_id)?;
         let raw = id.raw();
         *next_id = raw.checked_add(1).ok_or_else(|| {
-            RuntimeError::new(
-                RuntimeErrorCode::OperationIdExhausted,
+            OperationError::new(
+                OperationErrorCode::OperationIdExhausted,
                 "vm::operation",
                 "operation id space exhausted",
             )
@@ -430,23 +435,23 @@ impl Drop for OperationRegistry {
         // release resources. Isolation is irrelevant here because we are
         // dropping the registry.
         for id in self.pending_ids() {
-            let _ = self.cancel(id, crate::vm::CancellationReason::VmReset);
+            let _ = self.cancel(id, OperationCancelReason::VmReset);
         }
     }
 }
 
-fn operation_not_found(id: OperationId) -> RuntimeError {
-    RuntimeError::new(
-        RuntimeErrorCode::OperationNotFound,
+fn operation_not_found(id: OperationId) -> OperationError {
+    OperationError::new(
+        OperationErrorCode::OperationNotFound,
         "vm::operation",
         format!("operation {} is not registered", id.raw()),
     )
     .with_value(id.raw())
 }
 
-fn pending_outcome(id: OperationId) -> RuntimeError {
-    RuntimeError::new(
-        RuntimeErrorCode::OperationCancelled,
+fn pending_outcome(id: OperationId) -> OperationError {
+    OperationError::new(
+        OperationErrorCode::OperationPending,
         "vm::operation",
         format!(
             "operation {} is still pending and has no terminal outcome",
@@ -454,6 +459,18 @@ fn pending_outcome(id: OperationId) -> RuntimeError {
         ),
     )
     .with_value(id.raw())
+}
+
+/// Wraps a driver cancel failure into the `OperationDriverFailed` category so
+/// a failed driver action never produces a false success. The status is
+/// already recorded cancelled before this point; detailed cancel-failure
+/// terminal/stats policy is deferred to the lifecycle scope.
+fn driver_failure(error: OperationError) -> OperationError {
+    OperationError::new(
+        OperationErrorCode::OperationDriverFailed,
+        "vm::operation",
+        error.to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -464,12 +481,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{OperationRegistry, OperationStatus};
-    use crate::builtins::runtime::error::{RuntimeError, RuntimeErrorCode, RuntimeResult};
-    use crate::builtins::runtime::resource::ResourceHandle;
     use crate::vm::operation::driver::{
         HostOperation, OperationCleanup, OperationOutcome, OperationSpec,
     };
-    use crate::vm::{CancellationReason, Value};
+    use crate::vm::operation::error::{OperationError, OperationErrorCode, OperationResult};
+    use crate::vm::operation::reason::OperationCancelReason;
+    use crate::vm::resource::ResourceHandle;
 
     struct TestWake(Arc<AtomicUsize>);
     impl std::task::Wake for TestWake {
@@ -488,19 +505,16 @@ mod tests {
     }
 
     /// Encodes a syntactically valid resource handle with the given slot.
-    /// (arena=1, gen=1, type=1, slot=`slot`).
+    /// (arena=1, gen=1, slot=`slot`).
     fn handle_for_slot(slot: u64) -> ResourceHandle {
-        ResourceHandle::from_value(&crate::vm::Value::Int(
-            ((1i64) << 43) | ((slot as i64) << 25) | (1i64 << 8) | 1,
-        ))
-        .expect("encoded handle should be valid")
+        ResourceHandle::encode(1, slot as usize, 1).expect("encoded handle should be valid")
     }
 
     /// Eagerly-completing fake driver that records every cancellation reason
     /// it receives and can be configured to fail.
     struct RecordingDriver {
-        cancels: Arc<Mutex<Vec<CancellationReason>>>,
-        fail: Option<RuntimeError>,
+        cancels: Arc<Mutex<Vec<OperationCancelReason>>>,
+        fail: Option<OperationError>,
     }
 
     impl RecordingDriver {
@@ -510,26 +524,27 @@ mod tests {
                 fail: None,
             }
         }
-        fn failed(error: RuntimeError) -> Self {
+        fn failed(error: OperationError) -> Self {
             Self {
                 cancels: Arc::new(Mutex::new(Vec::new())),
                 fail: Some(error),
             }
         }
-        fn recorded(&self) -> Vec<CancellationReason> {
+        fn recorded(&self) -> Vec<OperationCancelReason> {
             self.cancels.lock().unwrap().clone()
         }
     }
 
     impl HostOperation for RecordingDriver {
-        fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<RuntimeResult<()>> {
+        fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
             match &self.fail {
                 Some(error) => Poll::Ready(Err(error.clone())),
                 None => Poll::Ready(Ok(())),
             }
         }
-        fn cancel(&mut self, reason: CancellationReason) {
+        fn cancel(&mut self, reason: OperationCancelReason) -> OperationResult<()> {
             self.cancels.lock().unwrap().push(reason);
+            Ok(())
         }
     }
 
@@ -538,24 +553,28 @@ mod tests {
         release: Arc<Mutex<bool>>,
     }
     impl HostOperation for PendingDriver {
-        fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<RuntimeResult<()>> {
+        fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
             if *self.release.lock().unwrap() {
                 Poll::Ready(Ok(()))
             } else {
                 Poll::Pending
             }
         }
-        fn cancel(&mut self, _reason: CancellationReason) {}
+        fn cancel(&mut self, _reason: OperationCancelReason) -> OperationResult<()> {
+            Ok(())
+        }
     }
 
     /// A distinct, minimal driver type proving registry dispatch never
     /// depends on a host domain enum.
     struct AlternateDriver;
     impl HostOperation for AlternateDriver {
-        fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<RuntimeResult<()>> {
+        fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
             Poll::Ready(Ok(()))
         }
-        fn cancel(&mut self, _reason: CancellationReason) {}
+        fn cancel(&mut self, _reason: OperationCancelReason) -> OperationResult<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -598,16 +617,16 @@ mod tests {
             .expect("c should start");
 
         let cancelled = registry
-            .cancel_for_resource(resource_a, CancellationReason::ResourceClosed)
+            .cancel_for_resource(resource_a, OperationCancelReason::ResourceClosed)
             .expect("resource cancellation should succeed");
         assert_eq!(cancelled, 2);
         assert!(matches!(
             registry.status(a).expect("status"),
-            OperationStatus::Cancelled(CancellationReason::ResourceClosed)
+            OperationStatus::Cancelled(OperationCancelReason::ResourceClosed)
         ));
         assert!(matches!(
             registry.status(b).expect("status"),
-            OperationStatus::Cancelled(CancellationReason::ResourceClosed)
+            OperationStatus::Cancelled(OperationCancelReason::ResourceClosed)
         ));
         assert!(matches!(
             registry.status(c).expect("status"),
@@ -632,11 +651,17 @@ mod tests {
         let b = registry.start(OperationSpec::new(driver_b)).expect("b");
 
         let cancelled = registry
-            .cancel_all(CancellationReason::VmReset)
+            .cancel_all(OperationCancelReason::VmReset)
             .expect("all should cancel");
         assert_eq!(cancelled, 2);
-        assert_eq!(cancels_a.lock().unwrap()[..], [CancellationReason::VmReset]);
-        assert_eq!(cancels_b.lock().unwrap()[..], [CancellationReason::VmReset]);
+        assert_eq!(
+            cancels_a.lock().unwrap()[..],
+            [OperationCancelReason::VmReset]
+        );
+        assert_eq!(
+            cancels_b.lock().unwrap()[..],
+            [OperationCancelReason::VmReset]
+        );
         assert_eq!(registry.active_count(), 0);
         let _ = (a, b);
     }
@@ -658,14 +683,17 @@ mod tests {
         assert!(matches!(
             registry.poll(id, &mut cx()),
             Poll::Ready(Ok(OperationOutcome::Cancelled(
-                CancellationReason::Deadline
+                OperationCancelReason::Deadline
             )))
         ));
         assert!(matches!(
             registry.status(id).expect("status"),
-            OperationStatus::Cancelled(CancellationReason::Deadline)
+            OperationStatus::Cancelled(OperationCancelReason::Deadline)
         ));
-        assert_eq!(cancels.lock().unwrap()[..], [CancellationReason::Deadline]);
+        assert_eq!(
+            cancels.lock().unwrap()[..],
+            [OperationCancelReason::Deadline]
+        );
     }
 
     #[test]
@@ -685,21 +713,24 @@ mod tests {
         // is observed, so the first recorded reason wins.
         assert!(
             registry
-                .cancel(id, CancellationReason::Requested)
+                .cancel(id, OperationCancelReason::Requested)
                 .expect("explicit cancel")
         );
         assert!(matches!(
             registry.poll(id, &mut cx()),
             Poll::Ready(Ok(OperationOutcome::Cancelled(
-                CancellationReason::Requested
+                OperationCancelReason::Requested
             )))
         ));
         assert!(matches!(
             registry.status(id).expect("status"),
-            OperationStatus::Cancelled(CancellationReason::Requested)
+            OperationStatus::Cancelled(OperationCancelReason::Requested)
         ));
         // Deadline must not be forwarded to the driver.
-        assert_eq!(cancels.lock().unwrap()[..], [CancellationReason::Requested]);
+        assert_eq!(
+            cancels.lock().unwrap()[..],
+            [OperationCancelReason::Requested]
+        );
     }
 
     #[test]
@@ -714,20 +745,23 @@ mod tests {
 
         assert!(
             registry
-                .cancel(id, CancellationReason::Requested)
+                .cancel(id, OperationCancelReason::Requested)
                 .expect("first cancel transitions")
         );
         assert!(
             !registry
-                .cancel(id, CancellationReason::Parent)
+                .cancel(id, OperationCancelReason::Parent)
                 .expect("second cancel is a no-op")
         );
         assert!(matches!(
             registry.status(id).expect("status"),
-            OperationStatus::Cancelled(CancellationReason::Requested)
+            OperationStatus::Cancelled(OperationCancelReason::Requested)
         ));
         // Driver notified exactly once, with the first reason only.
-        assert_eq!(cancels.lock().unwrap()[..], [CancellationReason::Requested]);
+        assert_eq!(
+            cancels.lock().unwrap()[..],
+            [OperationCancelReason::Requested]
+        );
     }
 
     #[test]
@@ -739,7 +773,7 @@ mod tests {
         let exceeded = registry
             .start(OperationSpec::new(RecordingDriver::completed()))
             .expect_err("second should exceed the single-operation ceiling");
-        assert_eq!(exceeded.code(), RuntimeErrorCode::OperationLimitExceeded);
+        assert_eq!(exceeded.code(), OperationErrorCode::OperationLimitExceeded);
 
         // Driving the first to terminal releases capacity for a new op.
         assert!(matches!(
@@ -768,7 +802,7 @@ mod tests {
     #[test]
     fn driver_poll_failure_records_terminal_failed_status() {
         let mut registry = OperationRegistry::with_limit(4).expect("registry should be valid");
-        let error = RuntimeError::new(RuntimeErrorCode::OperationFailed, "test", "boom");
+        let error = OperationError::new(OperationErrorCode::OperationDriverFailed, "test", "boom");
         let id = registry
             .start(OperationSpec::new(RecordingDriver::failed(error)))
             .expect("start");
@@ -778,7 +812,7 @@ mod tests {
         ));
         assert!(matches!(
             registry.status(id).expect("status"),
-            OperationStatus::Failed(error) if error.code() == RuntimeErrorCode::OperationFailed
+            OperationStatus::Failed(error) if error.code() == OperationErrorCode::OperationDriverFailed
         ));
     }
 
@@ -786,9 +820,9 @@ mod tests {
     fn cleanup_failure_is_isolated_across_cancel_all() {
         let mut registry = OperationRegistry::with_limit(4).expect("registry should be valid");
         let failing_cleanup = |tag: &'static str| -> OperationCleanup {
-            Box::new(move |_outcome: OperationOutcome| {
-                Err(RuntimeError::new(
-                    RuntimeErrorCode::OperationFailed,
+            Box::new(move |_outcome: &OperationOutcome| {
+                Err(OperationError::new(
+                    OperationErrorCode::OperationDriverFailed,
                     "test::cleanup",
                     format!("{tag} cleanup failed"),
                 ))
@@ -809,9 +843,9 @@ mod tests {
             .expect("c");
 
         let error = registry
-            .cancel_all(CancellationReason::VmReset)
+            .cancel_all(OperationCancelReason::VmReset)
             .expect_err("cleanup failure should surface as the first error");
-        assert_eq!(error.code(), RuntimeErrorCode::OperationCleanupFailed);
+        assert_eq!(error.code(), OperationErrorCode::OperationCleanupFailed);
         // Every operation still became terminal despite the cleanup failures.
         assert_eq!(registry.active_count(), 0);
         assert!(matches!(
