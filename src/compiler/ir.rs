@@ -136,7 +136,11 @@ impl TypeSchema {
     /// [`Self::coarse_value_type`], which keeps resources semantically opaque
     /// (`ValueType::Unknown`) so inferred schemas and diagnostics never reveal
     /// the integer backing.
-    pub fn resource_abi_value_type(&self) -> ValueType {
+    // Test-only boundary surface (see compiler::typing::helpers); non-test
+    // builds intentionally don't call it. External crates must not rely on the ABI
+    // token, so this is intentionally crate-visible.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn resource_abi_value_type(&self) -> ValueType {
         match self {
             TypeSchema::Resource(_) => ValueType::Int,
             other => other.coarse_value_type(),

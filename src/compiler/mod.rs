@@ -11,6 +11,7 @@ mod codegen;
 pub mod diagnostics;
 mod format;
 mod frontends;
+mod host_conversion;
 pub mod ir;
 mod lifetime;
 mod linker;
