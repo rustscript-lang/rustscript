@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::Program;
 use crate::assembler::AssemblerError;
@@ -528,21 +529,54 @@ pub struct CompileSourceFileOptions {
     module_path_overrides: HashMap<String, PathBuf>,
     module_source_overrides: HashMap<String, String>,
     source_plugins: Vec<&'static dyn SourcePlugin>,
+    host_api_catalog: Option<Arc<crate::host_api::HostApiCatalog>>,
 }
 
 impl fmt::Debug for CompileSourceFileOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CompileSourceFileOptions")
+        let mut debug = f.debug_struct("CompileSourceFileOptions");
+        debug
             .field("module_path_overrides", &self.module_path_overrides)
             .field("module_source_overrides", &self.module_source_overrides)
-            .field("source_plugin_count", &self.source_plugins.len())
-            .finish()
+            .field("source_plugin_count", &self.source_plugins.len());
+        match &self.host_api_catalog {
+            Some(catalog) => {
+                debug.field("host_api_catalog_present", &true);
+                debug.field("host_api_catalog_fingerprint", &Some(catalog.fingerprint()));
+            }
+            None => {
+                debug.field("host_api_catalog_present", &false);
+                debug.field(
+                    "host_api_catalog_fingerprint",
+                    &Option::<crate::host_api::HostApiFingerprint>::None,
+                );
+            }
+        }
+        debug.finish()
     }
 }
 
 impl CompileSourceFileOptions {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_host_api_catalog(mut self, catalog: Arc<crate::host_api::HostApiCatalog>) -> Self {
+        self.set_host_api_catalog(catalog);
+        self
+    }
+
+    pub fn set_host_api_catalog(&mut self, catalog: Arc<crate::host_api::HostApiCatalog>) {
+        self.host_api_catalog = Some(catalog);
+    }
+
+    pub fn host_api_catalog(&self) -> Option<&Arc<crate::host_api::HostApiCatalog>> {
+        self.host_api_catalog.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_host_api_catalog(&self) -> bool {
+        self.host_api_catalog.is_some()
     }
 
     pub fn with_module_override_path(
@@ -677,5 +711,82 @@ fn split_windows_prefix(input: &str) -> (&str, &str) {
         (&input[..2], &input[2..])
     } else {
         ("", input)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::HostApiCatalog;
+    use crate::host_api::{HostApiBuilder, HostFunctionSchema, HostParamSchema, HostTypeSchema};
+
+    use super::CompileSourceFileOptions;
+
+    fn test_catalog() -> Arc<HostApiCatalog> {
+        let mut builder = HostApiBuilder::new();
+        let mut f = HostFunctionSchema::with_return(
+            "unambiguous_unique_marker_fn",
+            vec![HostParamSchema::value("value", HostTypeSchema::Int)],
+            HostTypeSchema::Int,
+        );
+        f.description = "TOP-SECRET-OPTION-DEBUG-DOC".to_string();
+        builder.function(f);
+        Arc::new(builder.build().expect("test catalog must be valid"))
+    }
+
+    #[test]
+    fn default_has_no_host_api_catalog() {
+        let options = CompileSourceFileOptions::default();
+        assert!(options.host_api_catalog().is_none());
+        assert_eq!(options.has_host_api_catalog(), false);
+    }
+
+    #[test]
+    fn setter_stores_same_catalog() {
+        let catalog = test_catalog();
+        let mut options = CompileSourceFileOptions::default();
+        options.set_host_api_catalog(Arc::clone(&catalog));
+        let stored = options.host_api_catalog().expect("set catalog present");
+        assert!(Arc::ptr_eq(&catalog, stored));
+        assert_eq!(options.has_host_api_catalog(), true);
+    }
+
+    #[test]
+    fn builder_pointer_is_same_catalog() {
+        let catalog = test_catalog();
+        let options =
+            CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog));
+        let stored = options.host_api_catalog().expect("builder catalog present");
+        assert!(Arc::ptr_eq(&catalog, stored));
+    }
+
+    #[test]
+    fn clone_shares_same_catalog() {
+        let options = CompileSourceFileOptions::default().with_host_api_catalog(test_catalog());
+        let cloned = options.clone();
+        let original = options.host_api_catalog().expect("original present");
+        let cloned_catalog = cloned.host_api_catalog().expect("clone present");
+        assert!(Arc::ptr_eq(original, cloned_catalog));
+    }
+
+    #[test]
+    fn debug_reveals_presence_and_fingerprint_only() {
+        let options = CompileSourceFileOptions::default().with_host_api_catalog(test_catalog());
+        let debug = format!("{:?}", options);
+        let fp_debug = format!(
+            "{:?}",
+            options.host_api_catalog().expect("present").fingerprint()
+        );
+        assert!(debug.contains("host_api_catalog_present"));
+        assert!(debug.contains("host_api_catalog_fingerprint"));
+        assert!(debug.contains(&fp_debug));
+        assert!(!debug.contains("unambiguous_unique_marker_fn"));
+        assert!(!debug.contains("TOP-SECRET-OPTION-DEBUG-DOC"));
+
+        let defaults = CompileSourceFileOptions::default();
+        let default_debug = format!("{:?}", defaults);
+        assert!(default_debug.contains("host_api_catalog_present: false"));
+        assert!(default_debug.contains("host_api_catalog_fingerprint: None"));
     }
 }
