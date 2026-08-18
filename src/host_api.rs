@@ -1958,6 +1958,4 @@ mod tests {
             HostTypeSchema::Int,
         )
     }
-
-    // --- host -> compiler schema mapping ---
 }

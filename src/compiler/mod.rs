@@ -11,6 +11,7 @@ mod codegen;
 pub mod diagnostics;
 mod format;
 mod frontends;
+mod host_call_resolve;
 mod host_conversion;
 pub mod ir;
 mod lifetime;
@@ -32,6 +33,9 @@ pub use self::format::{
     FormatError, format_source, format_source_with_flavor, format_source_with_flavor_and_options,
 };
 pub use self::frontends::parse_source_with_dialect;
+pub use self::host_call_resolve::{
+    HostCallResolveError, HostCallResolver, ResolvedHostCall, ResolvedHostParam,
+};
 pub use self::ir::{
     AssignmentKind, ClosureExpr, Expr, FrontendIr, FunctionDecl, FunctionImpl, FunctionParam,
     LocalIrBuilder, LocalSlot, MatchPattern, MatchTypePattern, Stmt, StructDecl, TypeSchema,

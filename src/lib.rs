@@ -74,6 +74,7 @@ pub use compiler::{
     lint_unknown_inferred_local_types_with_options, lint_unknown_type_annotations,
     parse_source_with_dialect,
 };
+pub use compiler::{HostCallResolveError, HostCallResolver, ResolvedHostCall, ResolvedHostParam};
 pub use debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
 #[cfg(feature = "runtime")]
 pub use debugger::{
