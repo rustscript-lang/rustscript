@@ -3,12 +3,14 @@ use std::collections::{HashMap, HashSet};
 use crate::builtins::BuiltinFunction;
 #[cfg(feature = "edge-abi")]
 use crate::builtins::{CallableParam, CallableParamType};
+use crate::host_api::HostParamPassing;
 
 use super::super::CompileError;
 use super::super::TypingMode;
+use super::super::host_call_resolve::{ActualCallArg, resolve_candidate_slice_with_passing};
 use super::super::ir::{
-    AssignmentKind, Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern, Stmt, StructDecl,
-    TypeSchema,
+    AssignmentKind, Expr, FunctionDecl, FunctionImpl, HostApiIrMetadata, LocalSlot, MatchPattern,
+    Stmt, StructDecl, TypeSchema,
 };
 use super::collect::{
     observed_function_param_schema_slice, observed_function_param_slice,
@@ -24,6 +26,172 @@ use super::validate::{
     DiagnosticSite, owned_source_name, refine_state_for_condition, validate_branch_state_merge,
     validate_expr,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HostCallResolutionPhase {
+    Disabled,
+    Refine,
+    Final,
+}
+
+pub(super) struct HostCallResolutionPass<'a> {
+    metadata: Option<&'a HostApiIrMetadata>,
+    phase: HostCallResolutionPhase,
+    enabled: bool,
+    changed: usize,
+    unresolved: usize,
+    first_error: Option<CompileError>,
+}
+
+impl<'a> HostCallResolutionPass<'a> {
+    pub(super) fn new(
+        metadata: Option<&'a HostApiIrMetadata>,
+        phase: HostCallResolutionPhase,
+    ) -> Self {
+        Self {
+            metadata,
+            phase,
+            enabled: phase != HostCallResolutionPhase::Disabled,
+            changed: 0,
+            unresolved: 0,
+            first_error: None,
+        }
+    }
+
+    pub(super) fn changed(&self) -> usize {
+        self.changed
+    }
+
+    pub(super) fn unresolved(&self) -> usize {
+        self.unresolved
+    }
+
+    pub(super) fn take_error(&mut self) -> Option<CompileError> {
+        self.first_error.take()
+    }
+
+    fn set_enabled(&mut self, enabled: bool) -> bool {
+        std::mem::replace(&mut self.enabled, enabled)
+    }
+
+    fn resolve_call(
+        &mut self,
+        expr: &mut Expr,
+        state: &LocalTypeState,
+        context: &mut TypeContext<'_>,
+        site: DiagnosticSite<'_>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let Some(metadata) = self.metadata else {
+            return;
+        };
+        let Expr::Call(index, _, args, resolution) = expr else {
+            return;
+        };
+        if resolution.is_some() {
+            return;
+        }
+        let Some(candidates) = metadata.candidates(*index) else {
+            return;
+        };
+        let Some(name) = candidates.first().map(|candidate| candidate.name.as_str()) else {
+            return;
+        };
+
+        let schemas = args
+            .iter()
+            .map(|arg| {
+                context
+                    .infer_expr_schema(arg, state)
+                    .unwrap_or(TypeSchema::Unknown)
+            })
+            .collect::<Vec<_>>();
+        let actuals = args
+            .iter()
+            .zip(&schemas)
+            .map(|(arg, schema)| ActualCallArg::new(schema, actual_passing(arg, schema)))
+            .collect::<Vec<_>>();
+        let result = resolve_candidate_slice_with_passing(
+            name,
+            candidates,
+            &actuals,
+            metadata.fingerprint(),
+        );
+        match result {
+            Ok(resolved) => {
+                *resolution = Some(Box::new(resolved));
+                self.changed += 1;
+            }
+            Err(error) => {
+                self.unresolved += 1;
+                if self.phase == HostCallResolutionPhase::Final && self.first_error.is_none() {
+                    self.first_error = Some(CompileError::HostCallResolve {
+                        line: site.line,
+                        source_name: owned_source_name(site.source_name),
+                        detail: error.to_string(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn actual_passing(arg: &Expr, schema: &TypeSchema) -> Option<HostParamPassing> {
+    match arg {
+        Expr::Borrow(_) => Some(HostParamPassing::Borrow),
+        Expr::BorrowMut(_) => Some(HostParamPassing::BorrowMut),
+        Expr::ToOwned(_) => Some(HostParamPassing::Value),
+        _ if schema.contains_resource() => Some(HostParamPassing::TakeOwned),
+        _ if schema_contains_unresolved(schema) => None,
+        _ => Some(HostParamPassing::Value),
+    }
+}
+
+fn schema_contains_unresolved(schema: &TypeSchema) -> bool {
+    match schema {
+        TypeSchema::Unknown | TypeSchema::GenericParam(_) => true,
+        TypeSchema::Optional(inner) | TypeSchema::Array(inner) | TypeSchema::Map(inner) => {
+            schema_contains_unresolved(inner)
+        }
+        TypeSchema::Named(_, args) | TypeSchema::ArrayTuple(args) => {
+            args.iter().any(schema_contains_unresolved)
+        }
+        TypeSchema::ArrayTupleRest { prefix, rest } => {
+            prefix.iter().any(schema_contains_unresolved) || schema_contains_unresolved(rest)
+        }
+        TypeSchema::Object(fields) => fields.values().any(schema_contains_unresolved),
+        TypeSchema::Callable { params, result } => {
+            params.iter().any(schema_contains_unresolved) || schema_contains_unresolved(result)
+        }
+        TypeSchema::Null
+        | TypeSchema::Int
+        | TypeSchema::Float
+        | TypeSchema::Number
+        | TypeSchema::Bool
+        | TypeSchema::String
+        | TypeSchema::Bytes
+        | TypeSchema::Resource(_) => false,
+    }
+}
+
+fn stmt_line(stmt: &Stmt) -> u32 {
+    match stmt {
+        Stmt::Noop { line }
+        | Stmt::Let { line, .. }
+        | Stmt::Assign { line, .. }
+        | Stmt::ClosureLet { line, .. }
+        | Stmt::FuncDecl { line, .. }
+        | Stmt::Expr { line, .. }
+        | Stmt::IfElse { line, .. }
+        | Stmt::For { line, .. }
+        | Stmt::While { line, .. }
+        | Stmt::Break { line }
+        | Stmt::Continue { line }
+        | Stmt::Drop { line, .. } => *line,
+    }
+}
 
 pub(super) struct FunctionLegalizeEnv<'a> {
     pub(super) function_impls: &'a HashMap<u16, FunctionImpl>,
@@ -44,7 +212,9 @@ pub(super) struct FunctionLegalizeEnv<'a> {
 pub(super) fn legalize_function_impl(
     function_index: u16,
     function_impl: &mut FunctionImpl,
+    source_name: Option<&str>,
     env: &FunctionLegalizeEnv<'_>,
+    host_resolution: &mut HostCallResolutionPass<'_>,
 ) {
     let mut state = LocalTypeState::default();
     let mut context = TypeContext::new(
@@ -77,8 +247,24 @@ pub(super) fn legalize_function_impl(
         &function_impl.capture_copies,
         env.observed_function_capture_states,
     );
-    legalize_stmts(&mut function_impl.body_stmts, &mut state, &mut context);
-    let _ = legalize_expr(&mut function_impl.body_expr, &state, &mut context);
+    legalize_stmts(
+        &mut function_impl.body_stmts,
+        &mut state,
+        source_name,
+        &mut context,
+        host_resolution,
+    );
+    let body_site = DiagnosticSite {
+        line: Some(function_impl.body_expr_line),
+        source_name,
+    };
+    let _ = legalize_expr(
+        &mut function_impl.body_expr,
+        &state,
+        &mut context,
+        body_site,
+        host_resolution,
+    );
 }
 
 pub(super) fn validate_function_impl(
@@ -205,9 +391,15 @@ pub(super) fn validate_function_impl(
 pub(super) fn legalize_stmts(
     stmts: &mut [Stmt],
     state: &mut LocalTypeState,
+    source_name: Option<&str>,
     context: &mut TypeContext<'_>,
+    host_resolution: &mut HostCallResolutionPass<'_>,
 ) {
     for stmt in stmts {
+        let site = DiagnosticSite {
+            line: Some(stmt_line(stmt)),
+            source_name,
+        };
         match stmt {
             Stmt::Noop { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
             Stmt::FuncDecl {
@@ -225,7 +417,7 @@ pub(super) fn legalize_stmts(
                 state.set(*index, BoundType::Null);
             }
             Stmt::ClosureLet { closure, .. } => {
-                let _ = legalize_expr(&mut closure.body, state, context);
+                let _ = legalize_expr(&mut closure.body, state, context, site, host_resolution);
             }
             Stmt::Let {
                 index,
@@ -234,7 +426,7 @@ pub(super) fn legalize_stmts(
                 ..
             } => {
                 let expr_state = state.clone();
-                let ty = legalize_expr(expr, &expr_state, context);
+                let ty = legalize_expr(expr, &expr_state, context, site, host_resolution);
                 bind_expr_result_to_slot(
                     state,
                     *index,
@@ -247,11 +439,11 @@ pub(super) fn legalize_stmts(
             }
             Stmt::Assign { index, expr, .. } => {
                 let expr_state = state.clone();
-                let ty = legalize_expr(expr, &expr_state, context);
+                let ty = legalize_expr(expr, &expr_state, context, site, host_resolution);
                 bind_expr_result_to_slot(state, *index, None, expr, &expr_state, ty, context);
             }
             Stmt::Expr { expr, .. } => {
-                let _ = legalize_expr(expr, state, context);
+                let _ = legalize_expr(expr, state, context, site, host_resolution);
             }
             Stmt::IfElse {
                 condition,
@@ -259,11 +451,23 @@ pub(super) fn legalize_stmts(
                 else_branch,
                 ..
             } => {
-                let _ = legalize_expr(condition, state, context);
+                let _ = legalize_expr(condition, state, context, site, host_resolution);
                 let mut then_state = state.clone();
                 let mut else_state = state.clone();
-                legalize_stmts(then_branch, &mut then_state, context);
-                legalize_stmts(else_branch, &mut else_state, context);
+                legalize_stmts(
+                    then_branch,
+                    &mut then_state,
+                    source_name,
+                    context,
+                    host_resolution,
+                );
+                legalize_stmts(
+                    else_branch,
+                    &mut else_state,
+                    source_name,
+                    context,
+                    host_resolution,
+                );
                 state.merge_from_branches(&then_state, &else_state);
             }
             Stmt::For {
@@ -273,35 +477,81 @@ pub(super) fn legalize_stmts(
                 body,
                 ..
             } => {
-                legalize_stmts(std::slice::from_mut(init), state, context);
+                legalize_stmts(
+                    std::slice::from_mut(init),
+                    state,
+                    source_name,
+                    context,
+                    host_resolution,
+                );
                 let mut stabilized_state = state.clone();
+                let resolution_was_enabled = host_resolution.set_enabled(false);
                 stabilize_loop_state(&mut stabilized_state, |iterated| {
                     let mut condition_probe = condition.clone();
                     let mut body_probe = body.clone();
                     let mut post_probe = post.as_ref().clone();
-                    let _ = legalize_expr(&mut condition_probe, iterated, context);
-                    legalize_stmts(&mut body_probe, iterated, context);
-                    legalize_stmts(std::slice::from_mut(&mut post_probe), iterated, context);
+                    let _ = legalize_expr(
+                        &mut condition_probe,
+                        iterated,
+                        context,
+                        site,
+                        host_resolution,
+                    );
+                    legalize_stmts(
+                        &mut body_probe,
+                        iterated,
+                        source_name,
+                        context,
+                        host_resolution,
+                    );
+                    legalize_stmts(
+                        std::slice::from_mut(&mut post_probe),
+                        iterated,
+                        source_name,
+                        context,
+                        host_resolution,
+                    );
                 });
+                host_resolution.set_enabled(resolution_was_enabled);
                 let mut loop_state = stabilized_state.clone();
-                let _ = legalize_expr(condition, &loop_state, context);
-                legalize_stmts(body, &mut loop_state, context);
-                legalize_stmts(std::slice::from_mut(post), &mut loop_state, context);
+                let _ = legalize_expr(condition, &loop_state, context, site, host_resolution);
+                legalize_stmts(body, &mut loop_state, source_name, context, host_resolution);
+                legalize_stmts(
+                    std::slice::from_mut(post),
+                    &mut loop_state,
+                    source_name,
+                    context,
+                    host_resolution,
+                );
                 *state = stabilized_state;
             }
             Stmt::While {
                 condition, body, ..
             } => {
                 let mut stabilized_state = state.clone();
+                let resolution_was_enabled = host_resolution.set_enabled(false);
                 stabilize_loop_state(&mut stabilized_state, |iterated| {
                     let mut condition_probe = condition.clone();
                     let mut body_probe = body.clone();
-                    let _ = legalize_expr(&mut condition_probe, iterated, context);
-                    legalize_stmts(&mut body_probe, iterated, context);
+                    let _ = legalize_expr(
+                        &mut condition_probe,
+                        iterated,
+                        context,
+                        site,
+                        host_resolution,
+                    );
+                    legalize_stmts(
+                        &mut body_probe,
+                        iterated,
+                        source_name,
+                        context,
+                        host_resolution,
+                    );
                 });
+                host_resolution.set_enabled(resolution_was_enabled);
                 let mut loop_state = stabilized_state.clone();
-                let _ = legalize_expr(condition, &loop_state, context);
-                legalize_stmts(body, &mut loop_state, context);
+                let _ = legalize_expr(condition, &loop_state, context, site, host_resolution);
+                legalize_stmts(body, &mut loop_state, source_name, context, host_resolution);
                 *state = stabilized_state;
             }
         }
@@ -1598,6 +1848,8 @@ pub(super) fn legalize_expr(
     expr: &mut Expr,
     state: &LocalTypeState,
     context: &mut TypeContext<'_>,
+    site: DiagnosticSite<'_>,
+    host_resolution: &mut HostCallResolutionPass<'_>,
 ) -> BoundType {
     match expr {
         Expr::Null => BoundType::Null,
@@ -1607,15 +1859,15 @@ pub(super) fn legalize_expr(
         Expr::Bytes(_) => BoundType::Bytes,
         Expr::String(_) => BoundType::String,
         Expr::OptionalGet { container, key, .. } => {
-            let _ = legalize_expr(container, state, context);
-            let _ = legalize_expr(key, state, context);
+            let _ = legalize_expr(container, state, context, site, host_resolution);
+            let _ = legalize_expr(key, state, context, site, host_resolution);
             context.infer_expr_type(expr, state)
         }
         Expr::OptionUnwrapOr {
             value, fallback, ..
         } => {
-            let _ = legalize_expr(value, state, context);
-            let _ = legalize_expr(fallback, state, context);
+            let _ = legalize_expr(value, state, context, site, host_resolution);
+            let _ = legalize_expr(fallback, state, context, site, host_resolution);
             context.infer_expr_type(expr, state)
         }
         Expr::FunctionRef(..)
@@ -1625,11 +1877,11 @@ pub(super) fn legalize_expr(
         | Expr::ModuleCall(..)
         | Expr::LocalCall(..)
         | Expr::Closure(_) => {
-            legalize_expr_children(expr, state, context);
+            legalize_expr_children(expr, state, context, site, host_resolution);
             context.infer_call_like_expr_type(expr, state)
         }
         Expr::ClosureCall(_, _) => {
-            legalize_expr_children(expr, state, context);
+            legalize_expr_children(expr, state, context, site, host_resolution);
             context.infer_call_like_expr_type(expr, state)
         }
         Expr::Add(lhs, rhs)
@@ -1642,16 +1894,16 @@ pub(super) fn legalize_expr(
         | Expr::Eq(lhs, rhs)
         | Expr::Lt(lhs, rhs)
         | Expr::Gt(lhs, rhs) => {
-            let lhs_ty = legalize_expr(lhs, state, context);
-            let rhs_ty = legalize_expr(rhs, state, context);
+            let lhs_ty = legalize_expr(lhs, state, context, site, host_resolution);
+            let rhs_ty = legalize_expr(rhs, state, context, site, host_resolution);
             infer_binary_type(expr, lhs_ty, rhs_ty)
         }
         Expr::Neg(inner) | Expr::Not(inner) => {
-            let inner_ty = legalize_expr(inner, state, context);
+            let inner_ty = legalize_expr(inner, state, context, site, host_resolution);
             infer_unary_type(expr, inner_ty)
         }
         Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
-            legalize_expr(inner, state, context)
+            legalize_expr(inner, state, context, site, host_resolution)
         }
         Expr::Var(slot) | Expr::MoveVar(slot) => state.get(*slot),
         Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => state.get(*root),
@@ -1660,9 +1912,9 @@ pub(super) fn legalize_expr(
             then_expr,
             else_expr,
         } => {
-            let _ = legalize_expr(condition, state, context);
-            let then_ty = legalize_expr(then_expr, state, context);
-            let else_ty = legalize_expr(else_expr, state, context);
+            let _ = legalize_expr(condition, state, context, site, host_resolution);
+            let then_ty = legalize_expr(then_expr, state, context, site, host_resolution);
+            let else_ty = legalize_expr(else_expr, state, context, site, host_resolution);
             if then_ty == else_ty {
                 then_ty
             } else {
@@ -1677,7 +1929,7 @@ pub(super) fn legalize_expr(
             ..
         } => {
             let mut nested = state.clone();
-            let value_ty = legalize_expr(value, state, context);
+            let value_ty = legalize_expr(value, state, context, site, host_resolution);
             bind_expr_result_to_slot(
                 &mut nested,
                 *value_slot,
@@ -1690,7 +1942,7 @@ pub(super) fn legalize_expr(
             let mut arm_type = BoundType::Unknown;
             for (pattern, arm_expr) in arms.iter_mut() {
                 let arm_state = refine_state_for_match_pattern(&nested, pattern, *value_slot);
-                let ty = legalize_expr(arm_expr, &arm_state, context);
+                let ty = legalize_expr(arm_expr, &arm_state, context, site, host_resolution);
                 arm_type = if arm_type == BoundType::Unknown {
                     ty
                 } else if arm_type == ty {
@@ -1699,7 +1951,7 @@ pub(super) fn legalize_expr(
                     BoundType::Unknown
                 };
             }
-            let default_ty = legalize_expr(default, &nested, context);
+            let default_ty = legalize_expr(default, &nested, context, site, host_resolution);
             if arms.is_empty() {
                 default_ty
             } else if arm_type != BoundType::Unknown && arm_type == default_ty {
@@ -1710,8 +1962,14 @@ pub(super) fn legalize_expr(
         }
         Expr::Block { stmts, expr } => {
             let mut nested = state.clone();
-            legalize_stmts(stmts, &mut nested, context);
-            legalize_expr(expr, &nested, context)
+            legalize_stmts(
+                stmts,
+                &mut nested,
+                site.source_name,
+                context,
+                host_resolution,
+            );
+            legalize_expr(expr, &nested, context, site, host_resolution)
         }
     }
 }
@@ -1720,33 +1978,36 @@ pub(super) fn legalize_expr_children(
     expr: &mut Expr,
     state: &LocalTypeState,
     context: &mut TypeContext<'_>,
+    site: DiagnosticSite<'_>,
+    host_resolution: &mut HostCallResolutionPass<'_>,
 ) {
     match expr {
         Expr::Call(index, _, args, _) => {
             for arg in args.iter_mut() {
-                let _ = legalize_expr(arg, state, context);
+                let _ = legalize_expr(arg, state, context, site, host_resolution);
             }
             if let Some(builtin) = BuiltinFunction::from_call_index(*index) {
                 fold_builtin_call(expr, builtin, state);
             }
+            host_resolution.resolve_call(expr, state, context, site);
         }
         Expr::ModuleCall(_, _, args) => {
             for arg in args.iter_mut() {
-                let _ = legalize_expr(arg, state, context);
+                let _ = legalize_expr(arg, state, context, site, host_resolution);
             }
         }
         Expr::LocalCall(_, _, args) => {
             for arg in args.iter_mut() {
-                let _ = legalize_expr(arg, state, context);
+                let _ = legalize_expr(arg, state, context, site, host_resolution);
             }
         }
         Expr::Closure(closure) => {
-            let _ = legalize_expr(&mut closure.body, state, context);
+            let _ = legalize_expr(&mut closure.body, state, context, site, host_resolution);
         }
         Expr::ClosureCall(closure, args) => {
-            let _ = legalize_expr(&mut closure.body, state, context);
+            let _ = legalize_expr(&mut closure.body, state, context, site, host_resolution);
             for arg in args.iter_mut() {
-                let _ = legalize_expr(arg, state, context);
+                let _ = legalize_expr(arg, state, context, site, host_resolution);
             }
         }
         _ => {}

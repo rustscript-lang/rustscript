@@ -374,7 +374,8 @@ fn compile_parsed_output_with_entry_locals(
         reject_strict_unknown_annotations(&parsed).map_err(SourceError::Parse)?;
     }
     let local_debug_ranges = collect_named_local_debug_ranges(&parsed);
-    let parsed = typing::legalize_builtins_and_bind_types(parsed, typing_mode, entry_local_types);
+    let parsed = typing::legalize_builtins_and_bind_types(parsed, typing_mode, entry_local_types)
+        .map_err(SourceError::Compile)?;
     typing::validate_if_else_type_consistency(&parsed, typing_mode, entry_local_types)
         .map_err(SourceError::Compile)?;
     if typing_mode.is_strict() {
@@ -855,11 +856,8 @@ fn lint_unknown_inferred_local_types_impl(
         .map_err(|err| {
             SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
         })?;
-    Ok(collect_unknown_inferred_local_types(
-        &source_map,
-        source_id,
-        parsed,
-    ))
+    collect_unknown_inferred_local_types(&source_map, source_id, parsed)
+        .map_err(SourceError::Compile)
 }
 
 fn collect_inferred_local_type_hints_impl(
@@ -872,7 +870,7 @@ fn collect_inferred_local_type_hints_impl(
         .map_err(|err| {
             SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
         })?;
-    Ok(collect_named_local_type_hints(parsed))
+    collect_named_local_type_hints(parsed).map_err(SourceError::Compile)
 }
 
 fn lint_unknown_inferred_local_types_with_options_impl(
@@ -880,7 +878,10 @@ fn lint_unknown_inferred_local_types_with_options_impl(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<Vec<UnknownInferredLocal>, SourcePathError> {
-    if !options.has_module_overrides() && !options.has_source_plugins() {
+    if !options.has_module_overrides()
+        && !options.has_source_plugins()
+        && options.host_api_catalog().is_none()
+    {
         return lint_unknown_inferred_local_types_impl(source, flavor)
             .map_err(SourcePathError::Source);
     }
@@ -894,7 +895,10 @@ fn collect_inferred_local_type_hints_with_options_impl(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<Vec<InferredLocalTypeHint>, SourcePathError> {
-    if !options.has_module_overrides() && !options.has_source_plugins() {
+    if !options.has_module_overrides()
+        && !options.has_source_plugins()
+        && options.host_api_catalog().is_none()
+    {
         return collect_inferred_local_type_hints_impl(source, flavor)
             .map_err(SourcePathError::Source);
     }
@@ -918,11 +922,8 @@ fn lint_unknown_inferred_local_types_at_path_with_options_impl(
         .last()
         .map(|unit| unit.parsed)
         .expect("root parsed unit should always be present");
-    Ok(collect_unknown_inferred_local_types(
-        &source_map,
-        source_id,
-        parsed,
-    ))
+    collect_unknown_inferred_local_types(&source_map, source_id, parsed)
+        .map_err(|error| SourcePathError::Source(SourceError::Compile(error)))
 }
 
 fn collect_inferred_local_type_hints_at_path_with_options_impl(
@@ -938,16 +939,17 @@ fn collect_inferred_local_type_hints_at_path_with_options_impl(
         .last()
         .map(|unit| unit.parsed)
         .expect("root parsed unit should always be present");
-    Ok(collect_named_local_type_hints(parsed))
+    collect_named_local_type_hints(parsed)
+        .map_err(|error| SourcePathError::Source(SourceError::Compile(error)))
 }
 
 fn collect_unknown_inferred_local_types(
     source_map: &SourceMap,
     source_id: u32,
     parsed: FrontendIr,
-) -> Vec<UnknownInferredLocal> {
+) -> Result<Vec<UnknownInferredLocal>, CompileError> {
     let local_debug_ranges = collect_local_debug_ranges(&parsed.stmts, &parsed.function_impls);
-    let parsed = typing::legalize_builtins_and_bind_types(parsed, TypingMode::DynamicHints, &[]);
+    let parsed = typing::legalize_builtins_and_bind_types(parsed, TypingMode::DynamicHints, &[])?;
     let type_info = typing::infer_types(&parsed, TypingMode::DynamicHints, &[]);
 
     let mut warnings = Vec::new();
@@ -986,13 +988,15 @@ fn collect_unknown_inferred_local_types(
                 .or_else(|| source_map.line_span(source_id, line)),
         });
     }
-    warnings
+    Ok(warnings)
 }
 
-fn collect_named_local_type_hints(parsed: FrontendIr) -> Vec<InferredLocalTypeHint> {
+fn collect_named_local_type_hints(
+    parsed: FrontendIr,
+) -> Result<Vec<InferredLocalTypeHint>, CompileError> {
     let slot_ranges = collect_local_debug_ranges(&parsed.stmts, &parsed.function_impls);
     let function_decl_lines = collect_function_decl_lines(&parsed.stmts);
-    let parsed = typing::legalize_builtins_and_bind_types(parsed, TypingMode::DynamicHints, &[]);
+    let parsed = typing::legalize_builtins_and_bind_types(parsed, TypingMode::DynamicHints, &[])?;
     let type_info = typing::infer_types(&parsed, TypingMode::DynamicHints, &[]);
 
     let mut hints = Vec::new();
@@ -1027,7 +1031,7 @@ fn collect_named_local_type_hints(parsed: FrontendIr) -> Vec<InferredLocalTypeHi
         }
     }
 
-    hints
+    Ok(hints)
 }
 
 fn inferred_slot_type_name(type_info: &typing::TypeInferenceResult, slot: LocalSlot) -> String {
@@ -1409,7 +1413,10 @@ fn compile_source_with_flavor_and_options_impl(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    if !options.has_module_overrides() && !options.has_source_plugins() {
+    if !options.has_module_overrides()
+        && !options.has_source_plugins()
+        && options.host_api_catalog().is_none()
+    {
         return compile_source_with_flavor_impl(source, flavor, CompileBehavior::DEFAULT)
             .map_err(SourcePathError::Source);
     }
