@@ -10,8 +10,18 @@
 //!
 //! The dependency direction is intentionally **compiler → host_api only**:
 //! [`crate::host_api`] stays standalone. This resolver is a pure adapter with
-//! no parser, source-loader or compile-entrypoint wiring; later scopes drive
-//! it against a live call site.
+//! no parser, source-loader or compile-entrypoint wiring.
+//!
+//! The same name/arity/scoring/diagnostic algorithm is also exposed as the
+//! catalog-free seam [`resolve_candidate_slice`], which takes the requested
+//! name, a complete in-memory candidate slice, the actual call-site
+//! [`TypeSchema`] arguments and a supplied [`HostApiFingerprint`]. It runs the
+//! identical selection rules and returns the same
+//! [`ResolvedHostCall`]/[`HostCallResolveError`] shapes without owning or
+//! reading a [`HostApiCatalog`]; compiler typing can feed it a candidate slice
+//! carried in the IR. The catalog-driven [`HostCallResolver::resolve`] is a
+//! thin adapter that obtains the catalog's per-name candidates and fingerprint
+//! and delegates to this shared seam, so both entry points stay byte-identical.
 //!
 //! ## Resolution invariants
 //!
@@ -235,111 +245,160 @@ impl<'a> HostCallResolver<'a> {
         args: &[TypeSchema],
     ) -> Result<ResolvedHostCall, HostCallResolveError> {
         let named = self.catalog.functions_named(name);
-        if named.is_empty() {
-            return Err(HostCallResolveError::UnknownFunction(name.to_string()));
-        }
+        resolve_candidate_refs(name, &named, args, self.catalog.fingerprint())
+    }
+}
 
-        let arity = args.len();
-        let mut arity_matching: Vec<&HostFunctionSchema> = Vec::new();
-        let mut expected_arities: Vec<usize> = Vec::new();
-        for function in &named {
-            expected_arities.push(function.params.len());
-            if function.params.len() == arity {
-                arity_matching.push(function);
-            }
-        }
-        if arity_matching.is_empty() {
-            expected_arities.sort_unstable();
-            expected_arities.dedup();
-            // Stable, order-independent structured diagnostics: sort and
-            // de-duplicate the variant labels so reversed registration order
-            // yields an identical `ArityMismatch` payload.
-            let mut variants: Vec<String> = named
-                .iter()
-                .map(|function| signature_label(function))
-                .collect();
-            variants.sort();
-            variants.dedup();
-            return Err(HostCallResolveError::ArityMismatch {
-                name: name.to_string(),
-                actual: arity,
-                expected: expected_arities,
-                variants,
-            });
-        }
+/// Resolves a host call purely from a complete in-memory candidate slice.
+///
+/// This is the catalog-free seam the compiler typing will reuse for
+/// IR-carried candidate slices: it runs the exact same name/arity/scoring/
+/// diagnostic algorithm as the catalog adapter and produces identical
+/// [`ResolvedHostCall`]/[`HostCallResolveError`] shapes. Because it neither
+/// owns nor reads a [`HostApiCatalog`], its provenance is supplied explicitly
+/// by the caller as [`HostApiFingerprint`] and is copied verbatim into the
+/// resolved result.
+///
+/// The slice may carry candidates under other names; only candidates whose
+/// name equals `requested_name` participate, in slice order, and a slice with
+/// no requested-name candidate resolves to [`HostCallResolveError::UnknownFunction`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn resolve_candidate_slice(
+    requested_name: &str,
+    candidates: &[HostFunctionSchema],
+    args: &[TypeSchema],
+    fingerprint: HostApiFingerprint,
+) -> Result<ResolvedHostCall, HostCallResolveError> {
+    let named: Vec<&HostFunctionSchema> = candidates
+        .iter()
+        .filter(|candidate| candidate.name == requested_name)
+        .collect();
+    resolve_candidate_refs(requested_name, &named, args, fingerprint)
+}
 
-        // Classify every arity-matching candidate against the actual args.
-        let mut viable: Vec<(CandidateKey, &HostFunctionSchema)> = Vec::new();
-        let mut non_viable: Vec<(CandidateKey, &HostFunctionSchema)> = Vec::new();
-        for function in &arity_matching {
-            // Sum every argument's recursive match score into the candidate total.
-            let mut score = MatchScore::default();
-            let expected_schemas: Vec<TypeSchema> = function
-                .params
-                .iter()
-                .map(|param| param.ty.to_compiler_schema())
-                .collect();
-            for (expected, actual) in expected_schemas.iter().zip(args.iter()) {
-                score = score.combined(score_pair(expected, actual));
-            }
-            let viable_candidate = score.mismatches == 0;
-            let key = CandidateKey::from_score(&score);
-            if viable_candidate {
-                viable.push((key, function));
-            } else {
-                non_viable.push((key, function));
-            }
-        }
-
-        // Most-specific viable candidate.
-        if let Some(best) = max_candidate(&viable) {
-            let mut tied: Vec<&HostFunctionSchema> = viable
-                .iter()
-                .filter(|(key, _)| *key == best.0)
-                .map(|(_, function)| *function)
-                .collect();
-            if tied.len() == 1 {
-                return Ok(self.build_resolved(best.1));
-            }
-            // Order and de-dupe for a stable diagnostic.
-            tied.sort_by_key(|function| signature_label(function));
-            tied.dedup();
-            return Err(HostCallResolveError::Ambiguous {
-                name: name.to_string(),
-                candidates: tied
-                    .iter()
-                    .map(|function| signature_label(function))
-                    .collect(),
-            });
-        }
-
-        // No viable candidate: report the best concrete mismatch.
-        let (best_candidate, mismatch) = best_concrete_mismatch(&non_viable, args);
-        let suffix = best_candidate
-            .map(|function| format!("; best candidate is `{}`", signature_label(function)))
-            .unwrap_or_default();
-        let detail = best_mismatch_detail(suffix, mismatch);
-        Err(HostCallResolveError::NoMatch {
-            name: name.to_string(),
-            detail,
-        })
+/// Shared selection core over an already requested-name-filtered slice.
+///
+/// `named` holds only candidates whose name equals `name`, in slice order. An
+/// empty slice means the name is unknown. This replicates
+/// [`HostCallResolver::resolve`]'s original algorithm exactly: distinct
+/// [`HostCallResolveError::UnknownFunction`] and
+/// [`HostCallResolveError::ArityMismatch`], deterministic
+/// [`CandidateKey`]-driven specificity ranking with stable
+/// [`signature_label`] tie-breaks, passing-mode-indifferent scoring, and a
+/// best-concrete-mismatch [`HostCallResolveError::NoMatch`].
+fn resolve_candidate_refs<'a>(
+    name: &str,
+    named: &[&'a HostFunctionSchema],
+    args: &[TypeSchema],
+    fingerprint: HostApiFingerprint,
+) -> Result<ResolvedHostCall, HostCallResolveError> {
+    if named.is_empty() {
+        return Err(HostCallResolveError::UnknownFunction(name.to_string()));
     }
 
-    fn build_resolved(&self, function: &HostFunctionSchema) -> ResolvedHostCall {
-        ResolvedHostCall {
-            name: function.name.clone(),
-            params: function
-                .params
-                .iter()
-                .map(|param| ResolvedHostParam {
-                    name: param.name.clone(),
-                    schema: param.ty.to_compiler_schema(),
-                })
-                .collect(),
-            return_type: function.return_type.to_compiler_schema(),
-            passing: function.params.iter().map(|param| param.passing).collect(),
-            fingerprint: self.catalog.fingerprint(),
+    let arity = args.len();
+    let mut arity_matching: Vec<&'a HostFunctionSchema> = Vec::new();
+    let mut expected_arities: Vec<usize> = Vec::new();
+    for function in named {
+        expected_arities.push(function.params.len());
+        if function.params.len() == arity {
+            arity_matching.push(function);
         }
+    }
+    if arity_matching.is_empty() {
+        expected_arities.sort_unstable();
+        expected_arities.dedup();
+        // Stable, deterministic structured diagnostics: sort and
+        // de-duplicate the variant labels so any slice ordering yields an
+        // identical `ArityMismatch` payload.
+        let mut variants: Vec<String> = named
+            .iter()
+            .map(|function| signature_label(function))
+            .collect();
+        variants.sort();
+        variants.dedup();
+        return Err(HostCallResolveError::ArityMismatch {
+            name: name.to_string(),
+            actual: arity,
+            expected: expected_arities,
+            variants,
+        });
+    }
+
+    // Classify every arity-matching candidate against the actual args.
+    let mut viable: Vec<(CandidateKey, &'a HostFunctionSchema)> = Vec::new();
+    let mut non_viable: Vec<(CandidateKey, &'a HostFunctionSchema)> = Vec::new();
+    for function in &arity_matching {
+        // Sum every argument's aggregate into the candidate total.
+        let mut score = MatchScore::default();
+        let expected_schemas: Vec<TypeSchema> = function
+            .params
+            .iter()
+            .map(|param| param.ty.to_compiler_schema())
+            .collect();
+        for (expected, actual) in expected_schemas.iter().zip(args.iter()) {
+            score = score.combined(score_pair(expected, actual));
+        }
+        let viable_candidate = score.mismatches == 0;
+        let key = CandidateKey::from_score(&score);
+        if viable_candidate {
+            viable.push((key, function));
+        } else {
+            non_viable.push((key, function));
+        }
+    }
+
+    // Most-specific viable candidate.
+    if let Some(best) = max_candidate(&viable) {
+        let mut tied: Vec<&'a HostFunctionSchema> = viable
+            .iter()
+            .filter(|(key, _)| *key == best.0)
+            .map(|(_, function)| *function)
+            .collect();
+        if tied.len() == 1 {
+            return Ok(build_resolved(best.1, fingerprint));
+        }
+        // Order and de-dupe for a stable diagnostic.
+        tied.sort_by_key(|function| signature_label(function));
+        tied.dedup();
+        return Err(HostCallResolveError::Ambiguous {
+            name: name.to_string(),
+            candidates: tied
+                .iter()
+                .map(|function| signature_label(function))
+                .collect(),
+        });
+    }
+
+    // No viable candidate: report the best concrete mismatch.
+    let (best_candidate, mismatch) = best_concrete_mismatch(&non_viable, args);
+    let suffix = best_candidate
+        .map(|function| format!("; best candidate is `{}`", signature_label(function)))
+        .unwrap_or_default();
+    let detail = best_mismatch_detail(suffix, mismatch);
+    Err(HostCallResolveError::NoMatch {
+        name: name.to_string(),
+        detail,
+    })
+}
+
+fn build_resolved(
+    function: &HostFunctionSchema,
+    fingerprint: HostApiFingerprint,
+) -> ResolvedHostCall {
+    ResolvedHostCall {
+        name: function.name.clone(),
+        params: function
+            .params
+            .iter()
+            .map(|param| ResolvedHostParam {
+                name: param.name.clone(),
+                schema: param.ty.to_compiler_schema(),
+            })
+            .collect(),
+        return_type: function.return_type.to_compiler_schema(),
+        passing: function.params.iter().map(|param| param.passing).collect(),
+        fingerprint,
     }
 }
 
@@ -1635,5 +1694,264 @@ mod tests {
             .expect("string lands on deferred overload");
         assert_eq!(err_a.return_type, err_b.return_type);
         assert_eq!(err_a.return_type, Ts::String);
+    }
+
+    /// The requested-name candidate slice exactly as the catalog would expose
+    /// it, as owned schemas (the shape the IR will carry).
+    fn slice_candidates(catalog: &HostApiCatalog, name: &str) -> Vec<HostFunctionSchema> {
+        catalog.functions_named(name).into_iter().cloned().collect()
+    }
+
+    #[test]
+    fn slice_seam_equals_catalog_resolve_for_success() {
+        let catalog = concrete_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        let cases: &[(&str, Vec<Ts>)] = &[
+            ("io::open", vec![Ts::String, Ts::String]),
+            ("sqlite::open", vec![Ts::String]),
+            ("io::read_all", vec![compiler_resource(io_file())]),
+            (
+                "sqlite::exec",
+                vec![compiler_resource(sqlite_conn()), Ts::String],
+            ),
+        ];
+        for (name, args) in cases {
+            let expected = resolver.resolve(name, args).expect("catalog resolves");
+            let actual = resolve_candidate_slice(
+                name,
+                &slice_candidates(&catalog, name),
+                args,
+                catalog.fingerprint(),
+            )
+            .expect("slice resolves");
+            assert_eq!(
+                expected, actual,
+                "catalog resolve and slice resolve diverged for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn slice_seam_exact_arity_metadata_slice_resolves() {
+        // A candidate carrying docs metadata plus exact-arity params resolves
+        // through the pure slice seam with passing/return preserved.
+        let metadata_slice = vec![
+            HostFunctionSchema::with_return(
+                "audit::commit",
+                vec![
+                    ref_param("db", resource(sqlite_conn()), HostParamPassing::BorrowMut),
+                    value_param("note", HostTypeSchema::String),
+                ],
+                HostTypeSchema::Bool,
+            )
+            .with_description("persist a committed audit row"),
+        ];
+        let catalog = concrete_catalog();
+        let resolved = resolve_candidate_slice(
+            "audit::commit",
+            &metadata_slice,
+            &[compiler_resource(sqlite_conn()), Ts::String],
+            catalog.fingerprint(),
+        )
+        .expect("metadata-style slice resolves at exact arity");
+        assert_eq!(resolved.name, "audit::commit");
+        assert_eq!(resolved.return_type, Ts::Bool);
+        assert_eq!(
+            resolved.passing,
+            vec![HostParamPassing::BorrowMut, HostParamPassing::Value]
+        );
+        assert_eq!(resolved.fingerprint, catalog.fingerprint());
+    }
+
+    #[test]
+    fn slice_seam_equals_catalog_resolve_for_every_error_class() {
+        let catalog = concrete_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        let fp = catalog.fingerprint();
+
+        // UnknownFunction: the requested name has no candidate at all.
+        let unknown = resolver.resolve("no_such_fn", &[Ts::String]).unwrap_err();
+        assert_eq!(
+            unknown,
+            resolve_candidate_slice("no_such_fn", &[], &[Ts::String], fp).unwrap_err(),
+            "empty slice must equal catalog EmptyFunction"
+        );
+
+        // ArityMismatch: same sorted/deduped structured payload.
+        let arity_args = [Ts::String, Ts::String, Ts::String];
+        assert_eq!(
+            resolver.resolve("sqlite::open", &arity_args).unwrap_err(),
+            resolve_candidate_slice(
+                "sqlite::open",
+                &slice_candidates(&catalog, "sqlite::open"),
+                &arity_args,
+                fp
+            )
+            .unwrap_err(),
+            "ArityMismatch payload must be identical"
+        );
+
+        // NoMatch: best-concrete-mismatch detail must match.
+        let nomatch_args = [compiler_resource(sqlite_conn())];
+        assert_eq!(
+            resolver.resolve("io::read_all", &nomatch_args).unwrap_err(),
+            resolve_candidate_slice(
+                "io::read_all",
+                &slice_candidates(&catalog, "io::read_all"),
+                &nomatch_args,
+                fp
+            )
+            .unwrap_err(),
+            "NoMatch detail must be identical"
+        );
+
+        // Ambiguous: passing-mode-only overloads stay ambiguous in pure scope.
+        let mut builder = HostApiBuilder::new();
+        builder.resource(ResourceTypeSchema::new(io_file(), "file"));
+        for passing in [
+            HostParamPassing::Borrow,
+            HostParamPassing::BorrowMut,
+            HostParamPassing::TakeOwned,
+        ] {
+            builder.function(HostFunctionSchema::with_return(
+                "consume",
+                vec![ref_param("h", resource(io_file()), passing)],
+                HostTypeSchema::Int,
+            ));
+        }
+        let amb_catalog = builder.build().expect("legal passing overloads");
+        let amb_args = [compiler_resource(io_file())];
+        assert_eq!(
+            HostCallResolver::new(&amb_catalog)
+                .resolve("consume", &amb_args)
+                .unwrap_err(),
+            resolve_candidate_slice(
+                "consume",
+                &slice_candidates(&amb_catalog, "consume"),
+                &amb_args,
+                amb_catalog.fingerprint(),
+            )
+            .unwrap_err(),
+            "passing-only equal schemas must remain Ambiguous in the pure slice scope"
+        );
+    }
+
+    #[test]
+    fn slice_seam_preserves_supplied_fingerprint() {
+        let catalog = concrete_catalog();
+        let mut other_builder = HostApiCatalog::builder();
+        other_builder.function(HostFunctionSchema::with_return(
+            "unrelated",
+            Vec::new(),
+            HostTypeSchema::Int,
+        ));
+        let other = other_builder.build().expect("valid");
+        assert_ne!(catalog.fingerprint(), other.fingerprint());
+        let resolved = resolve_candidate_slice(
+            "io::open",
+            &slice_candidates(&catalog, "io::open"),
+            &[Ts::String, Ts::String],
+            other.fingerprint(),
+        )
+        .expect("resolves");
+        assert_eq!(
+            resolved.fingerprint,
+            other.fingerprint(),
+            "slice seam must copy the supplied fingerprint verbatim, never compute its own"
+        );
+    }
+
+    #[test]
+    fn slice_seam_empty_and_mixed_names_fail_safely() {
+        let catalog = concrete_catalog();
+        let fp = catalog.fingerprint();
+
+        // Empty candidate slice => distinct UnknownFunction.
+        assert_eq!(
+            resolve_candidate_slice("ghost", &[], &[Ts::Int], fp),
+            Err(HostCallResolveError::UnknownFunction("ghost".into()))
+        );
+
+        // A wrong-name candidate that would be an exact schema match must not
+        // be selected for a different requested name: no requested-name
+        // candidate exists, so the slice fails safely as UnknownFunction.
+        let wrong_name = vec![HostFunctionSchema::with_return(
+            "io::read_all_imposter",
+            vec![ref_param(
+                "handle",
+                resource(io_file()),
+                HostParamPassing::Borrow,
+            )],
+            HostTypeSchema::String,
+        )];
+        assert_eq!(
+            resolve_candidate_slice(
+                "io::read_all",
+                &wrong_name,
+                &[compiler_resource(io_file())],
+                fp,
+            ),
+            Err(HostCallResolveError::UnknownFunction("io::read_all".into()))
+        );
+
+        // A mixed slice with correct + wrong-name candidates: only the
+        // requested-name candidate participates, even when reversed + shuffled.
+        let mut mixed = slice_candidates(&catalog, "io::read_all");
+        mixed.push(
+            slice_candidates(&catalog, "sqlite::exec")
+                .into_iter()
+                .next()
+                .expect("one sqlite::exec"),
+        );
+        mixed.reverse();
+        let resolved =
+            resolve_candidate_slice("io::read_all", &mixed, &[compiler_resource(io_file())], fp)
+                .expect("requested-name candidate resolves");
+        assert_eq!(resolved.name, "io::read_all");
+        assert_eq!(resolved.passing, vec![HostParamPassing::Borrow]);
+    }
+
+    #[test]
+    fn slice_seam_reversed_slice_identical_deterministic_error() {
+        // Three overloads (int | int,int | string,string) as an owned slice.
+        fn g_candidates() -> Vec<HostFunctionSchema> {
+            vec![
+                HostFunctionSchema::with_return(
+                    "g",
+                    vec![
+                        value_param("a", HostTypeSchema::String),
+                        value_param("b", HostTypeSchema::String),
+                    ],
+                    HostTypeSchema::String,
+                ),
+                HostFunctionSchema::with_return(
+                    "g",
+                    vec![value_param("a", HostTypeSchema::Int)],
+                    HostTypeSchema::Int,
+                ),
+                HostFunctionSchema::with_return(
+                    "g",
+                    vec![
+                        value_param("a", HostTypeSchema::Int),
+                        value_param("b", HostTypeSchema::Int),
+                    ],
+                    HostTypeSchema::Int,
+                ),
+            ]
+        }
+        let catalog = HostApiCatalog::default();
+        let args = [Ts::Int, Ts::Int, Ts::Int];
+        let forward = resolve_candidate_slice("g", &g_candidates(), &args, catalog.fingerprint())
+            .unwrap_err()
+            .to_string();
+        let mut reversed = g_candidates();
+        reversed.reverse();
+        let via_reversed = resolve_candidate_slice("g", &reversed, &args, catalog.fingerprint())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            forward, via_reversed,
+            "reversed slice must roll byte-identical error diagnostics"
+        );
     }
 }
