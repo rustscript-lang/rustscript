@@ -217,11 +217,13 @@ mod architecture_gate {
     }
 
     /// Lexically sanitize `src` for scanning: comments and the bodies of every
-    /// string/char literal (cooked, byte, raw, raw-byte, C, C-raw, with
-    /// arbitrary `#` delimiters, escapes, and multi-line) are replaced with
-    /// spaces while newlines are preserved and code tokens are left intact.
-    /// Lifetimes and labels remain code. Returns valid UTF-8 because sanitized
-    /// boundaries are ASCII and body bytes are blanked.
+    /// string/char literal (cooked, byte, raw, raw-byte, C string, C-raw
+    /// string, with arbitrary `#` delimiters, escapes, and multi-line) are
+    /// replaced with spaces while newlines are preserved and code tokens are
+    /// left intact. Lifetimes and labels remain code. (Rust has no C *char*
+    /// literal, so only `b'…'` byte chars and plain `'…'` chars are handled.)
+    /// Returns valid UTF-8 because sanitized boundaries are ASCII and body
+    /// bytes are blanked.
     fn sanitize(src: &str) -> String {
         let b = src.as_bytes();
         let mut out = Vec::with_capacity(b.len());
@@ -309,15 +311,12 @@ mod architecture_gate {
                         i = blank_cooked_string(b, i, &mut out);
                         continue;
                     }
-                    // Byte / C char literal.
-                    if (c == b'b'
+                    // Byte char literal. (Rust has no C char literal; `c"..."`
+                    // and `cr#"..."#` C strings are handled above.)
+                    if c == b'b'
                         && next == Some(b'\'')
                         && at_token_start(b, i)
-                        && is_char_literal_at(b, i + 1))
-                        || (c == b'c'
-                            && next == Some(b'\'')
-                            && at_token_start(b, i)
-                            && is_char_literal_at(b, i + 1))
+                        && is_char_literal_at(b, i + 1)
                     {
                         out.push(b' '); // prefix
                         i += 1;
@@ -346,22 +345,38 @@ mod architecture_gate {
         String::from_utf8(out).expect("sanitized operation source is valid UTF-8")
     }
 
-    /// Drop whitespace that hugs a `:` so spaced paths like
-    /// `crate :: builtins` normalize to `crate::builtins` and stay detectable
-    /// without merging unrelated identifiers.
+    /// Normalize whitespace so real valid Rust paths are still detectable
+    /// after code has been reformatted or spaced out. Each *maximal* run of
+    /// ASCII whitespace is inspected as a whole: if the byte immediately on
+    /// either side of the run is `:` the entire run is removed (dropping the
+    /// spaces `rustfmt`/`cargo fmt` place around a `::`); otherwise the run
+    /// collapses to a single space so unrelated identifiers never merge.
+    ///
+    /// Because comments are already blanked to spaces by [`sanitize`], paths
+    /// written with interspersed comments normalize too, e.g. all of
+    /// `crate  ::  builtins`, `crate::\n    builtins`,
+    /// `crate /*comment*/ :: builtins`, and
+    /// `crate /*comment*/ :: /*comment*/ builtins` normalize to the same
+    /// contiguous needle `crate::builtins`.
     fn normalize_spaced_paths(code: &str) -> String {
         let b = code.as_bytes();
         let mut out = Vec::with_capacity(b.len());
-        for (idx, &c) in b.iter().enumerate() {
-            if c.is_ascii_whitespace() {
-                let prev = if idx > 0 { b[idx - 1] } else { 0 };
-                let next = b.get(idx + 1).copied().unwrap_or(0);
+        let mut i = 0usize;
+        while i < b.len() {
+            if b[i].is_ascii_whitespace() {
+                let run_start = i;
+                while i < b.len() && b[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                let prev = if run_start > 0 { b[run_start - 1] } else { 0 };
+                let next = if i < b.len() { b[i] } else { 0 };
                 if prev == b':' || next == b':' {
-                    continue;
+                    continue; // run hugs a path separator: drop the whole run
                 }
                 out.push(b' ');
             } else {
-                out.push(c);
+                out.push(b[i]);
+                i += 1;
             }
         }
         String::from_utf8(out).expect("sanitized operation source is valid UTF-8")
@@ -385,6 +400,15 @@ mod architecture_gate {
     /// would make the gate match its own test file). Each entry is
     /// `(needle, identifier)`; identifier needles are matched only on token
     /// boundaries so longer legal identifiers cannot be false-flagged.
+    ///
+    /// The broad `::builtins::` needle is intentionally a substring match with
+    /// **no** token-boundary requirement because it rejects *any* nested
+    /// `builtins` module referenced as a path inside the operation core —
+    /// not merely an external host sink. That includes a hypothetical future
+    /// local `builtins` module declared under `src/vm/operation` and referenced
+    /// as `crate::builtins::…` or `::builtins::…`. Any such module, however
+    /// placed, couples the operation core to the builtins domain and is
+    /// prohibited by the architecture.
     fn forbidden_needles() -> Vec<(String, bool)> {
         vec![
             (["crate", "::", "builtins"].concat(), false),
@@ -430,7 +454,10 @@ mod architecture_gate {
     /// Recursively enumerate every `.rs` file under `dir` in a stable,
     /// deterministic order (paths sorted at each level). Fail-closed: an
     /// unreadable directory or entry propagates as an error rather than being
-    /// silently dropped.
+    /// silently dropped. Symlinks are detected with `symlink_metadata` (which
+    /// never follows the link) and rejected with `InvalidData` naming the exact
+    /// path, so a symlinked directory cannot pull the scan into a cycle or out
+    /// of the operation core (root escape).
     fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
         let entries = fs::read_dir(dir)?;
         let mut paths: Vec<PathBuf> = Vec::new();
@@ -440,7 +467,15 @@ mod architecture_gate {
         }
         paths.sort();
         for p in paths {
-            let md = fs::metadata(&p)?;
+            // lstat: never follow a symlink, so links are detected directly
+            // instead of being transparently traversed.
+            let md = fs::symlink_metadata(&p)?;
+            if md.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("symlink entry not allowed: {}", p.display()),
+                ));
+            }
             if md.is_dir() {
                 collect_rs_files(&p, out)?;
             } else if p.extension().is_some_and(|e| e == "rs") {
@@ -543,8 +578,10 @@ mod architecture_gate {
     }
 
     /// Forbidden needles hidden inside string/char literals are ignored across
-    /// all literal forms (cooked, byte, raw, raw-byte, C, C-raw, `#` delimiters,
-    /// escapes, multi-line) and chars are blanked without swallowing code.
+    /// all literal forms (cooked, byte, raw, raw-byte, C string, C-raw string,
+    /// `#` delimiters, escapes, multi-line) and chars are blanked without
+    /// swallowing code. (There is no C char literal in Rust; `c""` and
+    /// `cr#""#` are C *strings* and are covered by the string cases.)
     #[test]
     fn needles_in_string_and_char_literals_are_ignored() {
         let needle = ["crate", "::", "builtins"].concat();
@@ -576,7 +613,6 @@ mod architecture_gate {
             "let n = '\\n';",
             "let u = '\\u{7f}';",
             "let byte = b'y';",
-            "let cstr = c'z';",
         ] {
             let code = visible_code(src);
             assert!(
@@ -621,6 +657,48 @@ mod architecture_gate {
         );
     }
 
+    /// Maximal-run whitespace normalization: every real valid Rust spelling of
+    /// the forbidden path, including `crate  ::  builtins`,
+    /// `crate::\n    builtins`, `crate /*c*/::builtins`, and
+    /// `crate /*c*/ :: /*c*/ builtins`, normalizes to a detectable contiguous
+    /// needle after the sanitizer blanks the comments — while unrelated spaced
+    /// identifiers do not merge into a false positive.
+    #[test]
+    fn spaced_rustfmt_and_commented_paths_normalize_and_detect() {
+        let needle = ["crate", "::", "builtins"].concat();
+
+        // Each of these is a *real valid* Rust path (comments are valid
+        // whitespace in Rust, and `cargo fmt`/manual spacing are all legal).
+        let variants = [
+            // two-space, no comment
+            "fn f() { crate  ::  builtins::x(); }",
+            // newline + indent between the `::` and the segment
+            "fn f() { crate::\n    builtins::x(); }",
+            // comment glued to the `::`
+            "fn f() { crate/*c*/::builtins::x(); }",
+            // comment around every separator
+            "fn f() { crate /*c*/ :: /*c*/ builtins::x(); }",
+            // comment-only on one side, spaced on the other
+            "fn f() { crate /*c*/ ::  builtins::x(); }",
+            "fn f() { crate  :: /*c*/ builtins::x(); }",
+        ];
+        for (i, src) in variants.iter().enumerate() {
+            let code = visible_code(src);
+            assert!(
+                needle_found(&code, &needle, false),
+                "variant {i} must normalize {needle} so the path is detected: {src}\ncode={code:?}"
+            );
+        }
+
+        // Unrelated spaced identifiers must NOT merge into a false needle.
+        let unrelated = "fn f() { crate  stuff  builtins ::  x; }";
+        let code = visible_code(unrelated);
+        assert!(
+            !needle_found(&code, &needle, false),
+            "unrelated spaced identifiers must not merge: code={code:?}"
+        );
+    }
+
     /// Nested block comments are fully blanked so needles inside are ignored.
     #[test]
     fn nested_block_comments_are_ignored() {
@@ -636,13 +714,16 @@ mod architecture_gate {
 
     /// The recursive enumerator finds a depth-2 tree of `.rs` files (census)
     /// and the sanitizer detects forbidden content inside it, then the RAII
-    /// cleanup guard removes the tree even on the normal completion.
+    /// cleanup guard removes the whole root even on the normal completion. The
+    /// root is a unique direct child `/mnt/TEMP/rustscript/archgate-{pid}-{i}`
+    /// with no shared parent, so the guard removing the root cannot touch work
+    /// done by any other test or process.
     #[test]
     fn recursive_collector_detects_depth2_tree_and_cleans_up() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let root = Path::new("/mnt/TEMP/rustscript/architecture-gate-tests").join(format!(
-            "archgate-{}-{}",
+        let root = PathBuf::from(format!(
+            "/mnt/TEMP/rustscript/archgate-{}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::SeqCst)
         ));
@@ -700,12 +781,14 @@ mod architecture_gate {
     }
 
     /// A missing directory fails closed (returns Err) with no partial census.
+    /// It uses a unique nonexistent direct child under
+    /// `/mnt/TEMP/rustscript/archgate-missing-{pid}-{i}` but never creates it.
     #[test]
     fn collect_rs_files_fails_closed_on_missing_dir() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let missing = Path::new("/mnt/TEMP/rustscript/architecture-gate-tests").join(format!(
-            "missing-{}-{}",
+        let missing = PathBuf::from(format!(
+            "/mnt/TEMP/rustscript/archgate-missing-{}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::SeqCst)
         ));
@@ -713,5 +796,63 @@ mod architecture_gate {
         let result = collect_rs_files(&missing, &mut files);
         assert!(result.is_err(), "missing directory must fail closed");
         assert!(files.is_empty(), "no partial census on failure");
+        assert!(
+            !missing.exists(),
+            "missing-dir test must never create its path"
+        );
+    }
+
+    /// A symlink anywhere in the tree fails closed with `InvalidData` naming
+    /// the exact path, never following the link (which could cause a cycle or
+    /// escape the operation core). The test uses its own unique direct root
+    /// under `/mnt/TEMP/rustscript` and removes target, link, and root on drop.
+    #[cfg(unix)]
+    #[test]
+    fn collect_rs_files_fails_closed_on_symlink() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let root = PathBuf::from(format!(
+            "/mnt/TEMP/rustscript/archgate-symlink-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        {
+            let _guard = Cleanup(root.clone());
+            fs::create_dir_all(&root).expect("create symlink test root");
+            let target = root.join("target");
+            fs::create_dir(&target).expect("create symlink target");
+            fs::write(target.join("inside.rs"), "fn ok() {}\n").expect("write target source");
+
+            // Symlink from the scanned tree to the target dir.
+            let link = root.join("link_to_target");
+            std::os::unix::fs::symlink(&target, &link).expect("create symlink into scanned tree");
+
+            let mut files = Vec::new();
+            let err =
+                collect_rs_files(&root, &mut files).expect_err("symlink in tree must fail closed");
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::InvalidData,
+                "symlink must be reported as InvalidData"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&link.to_string_lossy().to_string()),
+                "error must name the exact symlink path: {msg}"
+            );
+        }
+        // Root (target, link, and everything under it) is removed on drop.
+        assert!(
+            !root.exists(),
+            "symlink test root must be removed by the cleanup guard"
+        );
     }
 }
