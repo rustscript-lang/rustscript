@@ -127,6 +127,52 @@ impl TypeSchema {
         }
     }
 
+    /// Whether this schema contains a host resource anywhere in its shape.
+    ///
+    /// Unlike [`Self::resource_key`], which only sees a direct or single
+    /// optional resource, this walks every recursive position: optional
+    /// inners, named type arguments, array elements/tuples/rest, map values,
+    /// object field values, and callable params/result. A resource at any
+    /// depth makes the whole schema resource-containing, which callers use
+    /// for ownership / substitution decisions.
+    ///
+    /// [`TypeSchema::Named`] is structural (non-nominal): the named node
+    /// itself is never a resource, but any resource-bearing type argument
+    /// makes the instantiation resource-containing. [`TypeSchema::GenericParam`]
+    /// is deliberately `false` here because whether it resolves to a resource
+    /// depends on the caller's substitution context; deferred handling belongs
+    /// to the caller.
+    // Test-only boundary surface (see compiler::typing::catalog): production
+    // is dead until the next catalog typing pass consumes it as its first
+    // resource-substitution check.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn contains_resource(&self) -> bool {
+        match self {
+            TypeSchema::Resource(_) => true,
+            TypeSchema::Optional(inner) => inner.contains_resource(),
+            TypeSchema::Named(_, type_args) => type_args.iter().any(|arg| arg.contains_resource()),
+            TypeSchema::Array(element) => element.contains_resource(),
+            TypeSchema::ArrayTuple(items) => items.iter().any(|item| item.contains_resource()),
+            TypeSchema::ArrayTupleRest { prefix, rest } => {
+                prefix.iter().any(|item| item.contains_resource()) || rest.contains_resource()
+            }
+            TypeSchema::Map(value) => value.contains_resource(),
+            TypeSchema::Object(fields) => fields.values().any(|value| value.contains_resource()),
+            TypeSchema::Callable { params, result } => {
+                params.iter().any(|param| param.contains_resource()) || result.contains_resource()
+            }
+            TypeSchema::Unknown
+            | TypeSchema::Null
+            | TypeSchema::Int
+            | TypeSchema::Float
+            | TypeSchema::Number
+            | TypeSchema::Bool
+            | TypeSchema::String
+            | TypeSchema::Bytes
+            | TypeSchema::GenericParam(_) => false,
+        }
+    }
+
     /// Physical ABI lowering for resources.
     ///
     /// This is the single, explicitly named boundary between the *nominal*
@@ -1042,5 +1088,170 @@ mod call_resolution_carrier_tests {
         assert!(local.host_call_resolution().is_none());
         let literal = Expr::Int(1);
         assert!(literal.host_call_resolution().is_none());
+    }
+}
+
+#[cfg(test)]
+mod type_schema_contains_resource_tests {
+    use super::TypeSchema;
+    use crate::host_api::ResourceTypeKey;
+    use std::collections::HashMap;
+
+    fn resource() -> TypeSchema {
+        TypeSchema::Resource(ResourceTypeKey::new("sqlite.connection").expect("valid key"))
+    }
+
+    fn field(name: &str, schema: TypeSchema) -> (String, TypeSchema) {
+        (name.to_string(), schema)
+    }
+
+    #[test]
+    fn direct_resource() {
+        assert!(resource().contains_resource());
+    }
+
+    #[test]
+    fn optional_recurses_to_resource() {
+        assert!(TypeSchema::Optional(Box::new(resource())).contains_resource());
+        assert!(
+            TypeSchema::Optional(Box::new(TypeSchema::Optional(Box::new(resource()))))
+                .contains_resource()
+        );
+    }
+
+    #[test]
+    fn named_type_args_recursed() {
+        let wrapping = TypeSchema::Named("result".into(), vec![TypeSchema::Int, resource()]);
+        assert!(wrapping.contains_resource());
+        // A named node with only resource-free arguments is not resource-containing.
+        let clean = TypeSchema::Named("result".into(), vec![TypeSchema::Int]);
+        assert!(!clean.contains_resource());
+        // Empty type args must not be a false positive.
+        assert!(!TypeSchema::Named("empty".into(), Vec::new()).contains_resource());
+    }
+
+    #[test]
+    fn array_recursed() {
+        assert!(TypeSchema::Array(Box::new(resource())).contains_resource());
+    }
+
+    #[test]
+    fn array_tuple_recursed() {
+        let tuple = TypeSchema::ArrayTuple(vec![
+            TypeSchema::Int,
+            TypeSchema::Optional(Box::new(resource())),
+            TypeSchema::String,
+        ]);
+        assert!(tuple.contains_resource());
+        // Clean tuple is not a false positive.
+        let clean = TypeSchema::ArrayTuple(vec![TypeSchema::Int, TypeSchema::String]);
+        assert!(!clean.contains_resource());
+        assert!(!TypeSchema::ArrayTuple(Vec::new()).contains_resource());
+    }
+
+    #[test]
+    fn array_tuple_rest_recurse_prefix_and_rest() {
+        // Resource in the prefix.
+        let in_prefix = TypeSchema::ArrayTupleRest {
+            prefix: vec![resource()],
+            rest: Box::new(TypeSchema::Int),
+        };
+        assert!(in_prefix.contains_resource());
+        // Resource in the rest.
+        let in_rest = TypeSchema::ArrayTupleRest {
+            prefix: vec![TypeSchema::Int],
+            rest: Box::new(resource()),
+        };
+        assert!(in_rest.contains_resource());
+        // Clean rest schema.
+        let clean = TypeSchema::ArrayTupleRest {
+            prefix: vec![TypeSchema::Int],
+            rest: Box::new(TypeSchema::String),
+        };
+        assert!(!clean.contains_resource());
+    }
+
+    #[test]
+    fn map_value_recursed() {
+        assert!(TypeSchema::Map(Box::new(resource())).contains_resource());
+        assert!(!TypeSchema::Map(Box::new(TypeSchema::Int)).contains_resource());
+    }
+
+    #[test]
+    fn object_values_recursed() {
+        let mut with_resource = HashMap::new();
+        with_resource.insert("a".to_string(), TypeSchema::Int);
+        with_resource.insert("b".to_string(), resource());
+        assert!(TypeSchema::Object(with_resource).contains_resource());
+
+        let clean = HashMap::from([field("x", TypeSchema::Int), field("y", TypeSchema::String)]);
+        assert!(!TypeSchema::Object(clean).contains_resource());
+        assert!(!TypeSchema::Object(HashMap::new()).contains_resource());
+    }
+
+    #[test]
+    fn callable_params_and_result_recursed() {
+        let in_param = TypeSchema::Callable {
+            params: vec![resource()],
+            result: Box::new(TypeSchema::Null),
+        };
+        assert!(in_param.contains_resource());
+        let in_result = TypeSchema::Callable {
+            params: vec![TypeSchema::Int],
+            result: Box::new(TypeSchema::Optional(Box::new(resource()))),
+        };
+        assert!(in_result.contains_resource());
+        let clean = TypeSchema::Callable {
+            params: vec![TypeSchema::Int],
+            result: Box::new(TypeSchema::Bool),
+        };
+        assert!(!clean.contains_resource());
+    }
+
+    #[test]
+    fn deeply_nested_named_and_container() {
+        // Named(Ok, [ Callable(fn([Map(Optional(resource))]) -> ...) ])
+        let nested = TypeSchema::Named(
+            "provider".into(),
+            vec![TypeSchema::Callable {
+                params: vec![TypeSchema::Map(Box::new(TypeSchema::Optional(Box::new(
+                    resource(),
+                ))))],
+                result: Box::new(TypeSchema::Array(Box::new(TypeSchema::Named(
+                    "row".into(),
+                    Vec::new(),
+                )))),
+            }],
+        );
+        assert!(nested.contains_resource());
+    }
+
+    #[test]
+    fn negative_controls_and_scalars() {
+        for schema in [
+            TypeSchema::Unknown,
+            TypeSchema::Null,
+            TypeSchema::Int,
+            TypeSchema::Float,
+            TypeSchema::Number,
+            TypeSchema::Bool,
+            TypeSchema::String,
+            TypeSchema::Bytes,
+            TypeSchema::GenericParam("T".into()),
+        ] {
+            assert!(!schema.contains_resource());
+        }
+    }
+
+    #[test]
+    fn generic_param_stays_false() {
+        // A generic parameter is not declared a resource even when deeply nested.
+        let nested = TypeSchema::Named(
+            "wrapper".into(),
+            vec![TypeSchema::Array(Box::new(TypeSchema::GenericParam(
+                "T".into(),
+            )))],
+        );
+        assert!(!nested.contains_resource());
     }
 }
