@@ -351,49 +351,108 @@ fn exact_registration_arity_mismatch_is_structured_and_atomic() {
     );
 }
 
-/// (8) Registration-time invalid schema (return coarse `Unknown`, not a resource) →
-/// structured rejection with no slot created.
+/// (8) A `TypeSchema::Number` return (and `Optional<Number>`) is *legal* for exact
+/// registration: registering succeeds; the exact name+schema resolves; and binding
+/// yields the registered host tag. (The registration-time coarse-`Unknown` rejection was
+/// removed, so consistency is verified at bind time instead.)
 #[test]
-fn exact_registration_invalid_schema_rejected() {
-    let fp = int_schema_fingerprint(false);
-    let bad_schema = HostImportSchema {
-        params: vec![HostImportParam {
-            name: "value".into(),
-            schema: TypeSchema::Int,
-            passing: HostParamPassing::Value,
-        }],
-        return_type: TypeSchema::Unknown,
-        fingerprint: fp,
-    };
-    let mut registry = HostFunctionRegistry::new();
-    let err = registry
-        .register_exact("x::f", 1, bad_schema.clone(), tag_factory(1))
-        .expect_err("indeterminate return schema must be rejected");
-    assert!(
-        matches!(
-            err,
-            VmError::HostImportBinding(HostImportBindingError::InvalidSchema {
-                ref import,
-                ref reason,
-            }) if import == "x::f" && reason.contains("coarse")
-        ),
-        "expected structured InvalidSchema, got: {err}"
+fn exact_number_schema_registers_resolves_and_binds() {
+    let catalog = build_catalog(
+        [HostFunctionSchema::with_return(
+            "calc::num",
+            vec![HostParamSchema::value("n", HostTypeSchema::Number)],
+            HostTypeSchema::Number,
+        )]
+        .to_vec(),
     );
 
-    // No slot was created: the same schema still cannot be resolved.
-    let import = HostImport {
-        name: "x::f".into(),
-        arity: 1,
-        return_type: ValueType::Unknown,
-        schema: Some(bad_schema),
-    };
-    assert!(
-        matches!(
-            registry.resolve_import(&import).unwrap_err(),
-            VmError::HostImportBinding(HostImportBindingError::MissingExact { .. })
-        ),
-        "rejected schema must not leave an exact slot behind"
+    let compiled = compile_source_with_flavor_and_options(
+        r#"use calc; calc::num(1);"#,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::default().with_host_api_catalog(catalog),
+    )
+    .expect("catalog source must compile");
+
+    // The compiler resolves the host call against the real catalog and materialises the
+    // exact import (name + schema + real fingerprint). Register the exact binding from
+    // that compiled artifact, then bind the same program.
+    let import = compiled
+        .program
+        .imports
+        .iter()
+        .find(|i| i.name == "calc::num")
+        .expect("compiled program must carry the calc::num import");
+    assert_eq!(
+        import.return_type,
+        ValueType::Unknown,
+        "TypeSchema::Number coarse value type"
     );
+    let schema = import.schema.clone().expect("resolved exact schema");
+
+    let mut registry = HostFunctionRegistry::new();
+    let slot = registry
+        .register_exact("calc::num", 1, schema.clone(), tag_factory(7))
+        .expect("exact Number-returning schema must now register");
+
+    // Exact schema match: resolves to the freshly registered slot.
+    assert_eq!(registry.resolve_import(import).unwrap(), slot);
+
+    let mut vm = Vm::new(compiled.program);
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("exact bind must succeed");
+    assert_eq!(vm.run().expect("run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(7)]);
+}
+
+/// (14) The same is legal for `Optional<Number>`: exact registration on the
+/// `Optional(Number)` return schema registers, resolves by that exact schema, and
+/// binds to yield the registered tag.
+#[test]
+fn exact_optional_number_schema_registers_resolves_and_binds() {
+    let catalog = build_catalog(
+        [HostFunctionSchema::with_return(
+            "calc::opt",
+            vec![HostParamSchema::value("n", HostTypeSchema::Number)],
+            HostTypeSchema::Optional(Box::new(HostTypeSchema::Number)),
+        )]
+        .to_vec(),
+    );
+
+    let compiled = compile_source_with_flavor_and_options(
+        r#"use calc; calc::opt(1);"#,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::default().with_host_api_catalog(catalog),
+    )
+    .expect("catalog source must compile");
+
+    let import = compiled
+        .program
+        .imports
+        .iter()
+        .find(|i| i.name == "calc::opt")
+        .expect("compiled program must carry the calc::opt import");
+    assert_eq!(
+        import.return_type,
+        ValueType::Unknown,
+        "Optional<Number> coarse value type"
+    );
+    let schema = import.schema.clone().expect("resolved exact schema");
+
+    let mut registry = HostFunctionRegistry::new();
+    let slot = registry
+        .register_exact("calc::opt", 1, schema.clone(), tag_factory(21))
+        .expect("exact Optional-Number-returning schema must now register");
+
+    // Exact schema match: resolves to the just-registered slot.
+    assert_eq!(registry.resolve_import(import).unwrap(), slot);
+
+    let mut vm = Vm::new(compiled.program);
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("exact bind must succeed");
+    assert_eq!(vm.run().expect("run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(21)]);
 }
 
 /// (9) Plan cache partitions by exact schema: same name & arity, different exact schemas

@@ -598,19 +598,12 @@ impl HostFunctionRegistry {
                 },
             ));
         }
-        // The schema must carry the coarse return info required to check return consistency at
-        // bind time. An `Unknown` coarse return is only acceptable for a resource-typed return
-        // (semantically opaque by design); otherwise the registration cannot later be verified.
-        if schema.return_type.coarse_value_type() == ValueType::Unknown
-            && !schema.return_type.contains_resource()
-        {
-            return Err(VmError::HostImportBinding(
-                HostImportBindingError::InvalidSchema {
-                    import: name,
-                    reason: "return type has no determinate coarse value type".to_string(),
-                },
-            ));
-        }
+        // No registration-time rejection on the return schema's coarse value type.
+        // A return whose `coarse_value_type()` is `Unknown` (`Number`,
+        // `Optional<Number>`, `Optional<Unknown>`, `GenericParam`, ...) is a
+        // legitimate structured schema and can be registered; return consistency
+        // is verified later at bind time in `resolve_import` against the matched
+        // schema's `coarse_value_type()`.
         if let Some(schemas) = self.by_exact.get(&name)
             && schemas.contains_key(&schema)
         {
