@@ -1934,8 +1934,8 @@ fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseE
 #[cfg(test)]
 mod call_resolution_carrier_tests {
     use super::remap_expr_slots;
-    use crate::compiler::host_call_resolve::{ResolvedHostCall, ResolvedHostParam};
     use crate::compiler::ir::{Expr, TypeSchema};
+    use crate::compiler::{ResolvedHostCall, ResolvedHostParam};
     use crate::host_api::{HostApiFingerprint, HostParamPassing};
 
     fn fingerprint(n: u64) -> HostApiFingerprint {

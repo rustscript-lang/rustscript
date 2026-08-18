@@ -1049,7 +1049,7 @@ fn resolve_expr_imported_calls(
     line: u32,
 ) -> Result<(), SourcePathError> {
     match expr {
-        Expr::Call(index, type_args, args, _) => {
+        Expr::Call(index, type_args, args, _host_annotation) => {
             for arg in args.iter_mut() {
                 resolve_expr_imported_calls(ctx, arg, line)?;
             }
@@ -1070,6 +1070,11 @@ fn resolve_expr_imported_calls(
             }
             let name = decl.name.as_str();
             if let Some(symbol) = ctx.target_for_call(name, args.len(), type_args, line)? {
+                // Post-merge annotation ordering invariant: imported-call
+                // resolution runs before merge/typing, while the exact host
+                // annotation is attached only post-merge, so this loader
+                // never receives `Some` here and [`Expr::ModuleCall`] carries
+                // no host resolution.
                 *expr = Expr::ModuleCall(symbol, std::mem::take(type_args), std::mem::take(args));
             } else {
                 return Err(unknown_function_error(

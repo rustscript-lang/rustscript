@@ -34,12 +34,11 @@ pub use self::format::{
     FormatError, format_source, format_source_with_flavor, format_source_with_flavor_and_options,
 };
 pub use self::frontends::parse_source_with_dialect;
-pub use self::host_call_resolve::{
-    HostCallResolveError, HostCallResolver, ResolvedHostCall, ResolvedHostParam,
-};
+pub use self::host_call_resolve::{HostCallResolveError, HostCallResolver};
 pub use self::ir::{
     AssignmentKind, ClosureExpr, Expr, FrontendIr, FunctionDecl, FunctionImpl, FunctionParam,
-    LocalIrBuilder, LocalSlot, MatchPattern, MatchTypePattern, Stmt, StructDecl, TypeSchema,
+    LocalIrBuilder, LocalSlot, MatchPattern, MatchTypePattern, ResolvedHostCall, ResolvedHostParam,
+    Stmt, StructDecl, TypeSchema,
 };
 pub use self::modules::{
     DeclSymbol, ExportEntry, ImportTargetKind, ImportedBinding, ModuleGraph, ModuleId, ModuleNode,

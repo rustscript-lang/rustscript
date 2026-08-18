@@ -73,38 +73,7 @@ use std::fmt;
 
 use crate::host_api::{HostApiCatalog, HostApiFingerprint, HostFunctionSchema, HostParamPassing};
 
-use super::TypeSchema;
-
-/// One host function parameter mapped into the compiler's inference world.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResolvedHostParam {
-    /// Parameter label, unique within its function.
-    pub name: String,
-    /// Compiler-mapped value schema (resource keys preserved nominally).
-    pub schema: TypeSchema,
-}
-
-/// A successfully resolved host call.
-///
-/// Indexes of [`Self::params`] and [`Self::passing`] are aligned; the
-/// returning [`TypeSchema`] is the compiler view of the catalog's return
-/// schema.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResolvedHostCall {
-    /// The selected function name.
-    pub name: String,
-    /// Compiler-mapped parameter schemas, in declared order.
-    pub params: Vec<ResolvedHostParam>,
-    /// The return schema mapped onto the compiler's [`TypeSchema`].
-    pub return_type: TypeSchema,
-    /// Ordered [`HostParamPassing`] modes, index-aligned with [`Self::params`].
-    ///
-    /// `Borrow`/`BorrowMut`/`TakeOwned` survive resolution verbatim so later
-    /// ownership enforcement can rely on them.
-    pub passing: Vec<HostParamPassing>,
-    /// The catalog fingerprint at resolution time, for provenance/ABI ties.
-    pub fingerprint: HostApiFingerprint,
-}
+use super::ir::{ResolvedHostCall, ResolvedHostParam, TypeSchema};
 
 /// Why a host call could not be resolved to exactly one overload.
 #[derive(Clone, Debug, PartialEq, Eq)]

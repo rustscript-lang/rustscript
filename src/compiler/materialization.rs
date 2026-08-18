@@ -1308,8 +1308,8 @@ mod tests {
 
     #[test]
     fn materialization_preserves_annotated_call_resolution() {
-        use crate::compiler::host_call_resolve::{ResolvedHostCall, ResolvedHostParam};
         use crate::compiler::ir::TypeSchema as IrTypeSchema;
+        use crate::compiler::{ResolvedHostCall, ResolvedHostParam};
         use crate::host_api::{HostApiFingerprint, HostParamPassing};
         fn fingerprint(n: u64) -> HostApiFingerprint {
             serde_json::from_value(serde_json::Value::Number(n.into())).unwrap()

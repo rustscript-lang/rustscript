@@ -2,10 +2,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::ValueType;
 use crate::builtins::default_host_callable;
-use crate::host_api::{HostApiFingerprint, HostFunctionSchema, ResourceTypeKey};
+use crate::host_api::{HostApiFingerprint, HostFunctionSchema, HostParamPassing, ResourceTypeKey};
 
 use super::ParseError;
-use super::host_call_resolve::ResolvedHostCall;
 use super::modules::SymbolId;
 
 pub type LocalSlot = u16;
@@ -153,6 +152,37 @@ impl TypeSchema {
 pub struct FunctionParam {
     pub name: String,
     pub schema: Option<TypeSchema>,
+}
+
+/// One host function parameter mapped into the compiler's inference world.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedHostParam {
+    /// Parameter label, unique within its function.
+    pub name: String,
+    /// Compiler-mapped value schema (resource keys preserved nominally).
+    pub schema: TypeSchema,
+}
+
+/// A successfully resolved host call.
+///
+/// Indexes of [`Self::params`] and [`Self::passing`] are aligned; the
+/// returning [`TypeSchema`] is the compiler view of the catalog's return
+/// schema.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedHostCall {
+    /// The selected function name.
+    pub name: String,
+    /// Compiler-mapped parameter schemas, in declared order.
+    pub params: Vec<ResolvedHostParam>,
+    /// The return schema mapped onto the compiler's [`TypeSchema`].
+    pub return_type: TypeSchema,
+    /// Ordered [`HostParamPassing`] modes, index-aligned with [`Self::params`].
+    ///
+    /// `Borrow`/`BorrowMut`/`TakeOwned` survive resolution verbatim so later
+    /// ownership enforcement can rely on them.
+    pub passing: Vec<HostParamPassing>,
+    /// The catalog fingerprint at resolution time, for provenance/ABI ties.
+    pub fingerprint: HostApiFingerprint,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -947,7 +977,7 @@ mod host_api_ir_metadata_tests {
 #[cfg(test)]
 mod call_resolution_carrier_tests {
     use super::{Expr, ResolvedHostCall, TypeSchema};
-    use crate::compiler::host_call_resolve::ResolvedHostParam;
+    use crate::compiler::ResolvedHostParam;
     use crate::host_api::{HostApiFingerprint, HostParamPassing};
 
     fn fingerprint(n: u64) -> HostApiFingerprint {
