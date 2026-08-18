@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 
+use vm::compiler::TypeSchema;
 use vm::{
     ArgInfo, Assembler, BuiltinFunction, BytecodeBuilder, CallableKind, CallablePrototype,
     CallableTarget, DebugFunction, DebugInfo, DisassembleOptions, HostImport, LineInfo, LocalInfo,
     Program, ScriptFunction, TypeMap, ValidationError, Value, ValueType, WireError,
     builtin_call_index, decode_program, disassemble_vmbc, disassemble_vmbc_with_options,
-    encode_program, infer_local_count, validate_program,
+    encode_program, infer_local_count, validate_program, HostApiCatalog, ResourceTypeKey,
 };
 
 #[test]
@@ -786,4 +787,47 @@ fn call_script_no_script_program_code_bytes_unchanged_by_version_bump() {
     let decoded = decode_program(&encoded).expect("decode should succeed");
     assert_eq!(decoded.code, program.code);
     assert_eq!(decoded.constants, program.constants);
+}
+
+#[test]
+fn schema_round_trip_resource_wire_nominally() {
+    // A nominal host resource must round-trip through the shared wire
+    // type-schema encoding (tag 17), preserving its identity as a resource
+    // rather than being flattened into a structural type.
+    let key = vm::ResourceTypeKey::new("io.file").expect("valid key");
+    let schema = vm::compiler::TypeSchema::Resource(key.clone());
+    let program = vm::Program::new(Vec::new(), Vec::new()).with_type_map(vm::TypeMap {
+        strict_types: false,
+        local_types: vec![vm::ValueType::Int],
+        local_schemas: vec![Some(schema.clone())],
+        callable_slots: vec![false],
+                    optional_slots: vec![false],
+        operand_types: HashMap::new(),
+    });
+
+    let encoded = vm::encode_program(&program).expect("encode should succeed");
+    let decoded = vm::decode_program(&encoded).expect("decode should succeed");
+    assert_eq!(decoded.type_map, program.type_map);
+    assert_eq!(
+        decoded.type_map.as_ref().and_then(|tm| tm.local_schemas[0].as_ref()),
+        Some(&TypeSchema::Resource(key))
+    );
+}
+
+#[test]
+fn malformed_resource_key_is_rejected_on_read() {
+    // A resource key that violates the resource-key grammar must be rejected by the
+    // key's own Deserialize impl.
+    assert!(ResourceTypeKey::new("has space").is_err());
+    assert!(ResourceTypeKey::new("").is_err());
+    assert!(ResourceTypeKey::new(".leading").is_err());
+
+    // ... and a malformed key hiding inside a catalog's resources must also fail
+    // catalog deserialization (serde runs the same validation).
+    let mut v = serde_json::json!({
+        "resources": [{ "key": "io.file", "description": "file" }],
+        "functions": []
+    });
+    v["resources"][0]["key"] = serde_json::json!("bad key");
+    assert!(serde_json::from_value::<HostApiCatalog>(v).is_err());
 }
