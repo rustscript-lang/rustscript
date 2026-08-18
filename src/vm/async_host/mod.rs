@@ -93,6 +93,12 @@ pub trait HostAsyncBridge: Send {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct WaitingHostOp {
     pub(super) op_id: HostOpId,
+    /// Exact host-return policy captured from the *actual call-site resolved
+    /// import* when the pending host op was created (never a name lookup).
+    /// Consumed by `complete_waiting_host_op` to validate async completion
+    /// values before any stack/frame mutation. `Legacy` for non-schema /
+    /// non-resource-exact / runtime-owned builtin / callable-stream ops.
+    pub(super) exact_policy: super::host::ExactHostReturnPolicy,
 }
 
 struct NoopWake;

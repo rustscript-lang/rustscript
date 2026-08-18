@@ -409,6 +409,7 @@ fn reset_propagates_to_real_host_operation_cleanup() {
         .expect("test operation should start");
     vm.instance.waiting_host_op = Some(WaitingHostOp {
         op_id: operation.id().raw(),
+        exact_policy: crate::vm::host::ExactHostReturnPolicy::Legacy,
     });
 
     vm.reset_for_reuse();

@@ -2050,9 +2050,17 @@ impl Vm {
 
         match outcome {
             CallOutcome::Return(values) => {
+                // Validate BEFORE any stack mutation; on failure keep the
+                // pre-call snapshot (no half-truncated state).
+                let values = match validate_exact_host_return_values(values, exact_policy) {
+                    Ok(values) => values,
+                    Err(error) => {
+                        self.instance.stack = saved_stack;
+                        return Err(error);
+                    }
+                };
                 saved_stack.truncate(arg_start);
                 saved_stack.append(&mut host_stack);
-                let values = validate_exact_host_return_values(values, exact_policy)?;
                 values.push_onto_stack(&mut saved_stack);
                 self.instance.stack = saved_stack;
                 Ok(HostCallExecOutcome::Returned)
@@ -2076,9 +2084,9 @@ impl Vm {
                 let resume_ip = self.call_resume_ip(call_ip)?;
                 self.record_callable_stream_resume_ip(op_id, resume_ip);
                 if self.host.stream_drivers.contains_key(&op_id) {
-                    self.set_waiting_operation(op_id)?;
+                    self.set_waiting_operation(op_id, exact_policy)?;
                 } else {
-                    self.set_waiting_bound_host_op(resolved_index, op_id)?;
+                    self.set_waiting_bound_host_op(resolved_index, op_id, exact_policy)?;
                 }
                 self.instance.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
@@ -2182,8 +2190,10 @@ impl Vm {
 
         match outcome {
             CallOutcome::Return(values) => {
-                self.instance.stack.truncate(arg_start);
+                // Validate BEFORE truncating the call operands or pushing; a
+                // bad return must leave the stack at its pre-call snapshot.
                 let values = validate_exact_host_return_values(values, exact_policy)?;
+                self.instance.stack.truncate(arg_start);
                 values.push_onto_stack(&mut self.instance.stack);
                 Ok(HostCallExecOutcome::Returned)
             }
@@ -2200,9 +2210,9 @@ impl Vm {
                 let resume_ip = self.call_resume_ip(call_ip)?;
                 self.record_callable_stream_resume_ip(op_id, resume_ip);
                 if self.host.stream_drivers.contains_key(&op_id) {
-                    self.set_waiting_operation(op_id)?;
+                    self.set_waiting_operation(op_id, exact_policy)?;
                 } else {
-                    self.set_waiting_bound_host_op(resolved_index, op_id)?;
+                    self.set_waiting_bound_host_op(resolved_index, op_id, exact_policy)?;
                 }
                 self.instance.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
@@ -2250,8 +2260,10 @@ impl Vm {
 
         match outcome {
             CallOutcome::Return(values) => {
-                self.instance.stack.truncate(arg_start);
+                // Validate BEFORE truncating the call operands or pushing; a
+                // bad return must leave the stack at its pre-call snapshot.
                 let values = validate_exact_host_return_values(values, exact_policy)?;
+                self.instance.stack.truncate(arg_start);
                 values.push_onto_stack(&mut self.instance.stack);
                 Ok(HostCallExecOutcome::Returned)
             }
@@ -2268,9 +2280,9 @@ impl Vm {
                 let resume_ip = self.call_resume_ip(call_ip)?;
                 self.record_callable_stream_resume_ip(op_id, resume_ip);
                 if self.host.stream_drivers.contains_key(&op_id) {
-                    self.set_waiting_operation(op_id)?;
+                    self.set_waiting_operation(op_id, exact_policy)?;
                 } else {
-                    self.set_waiting_bound_host_op(resolved_index, op_id)?;
+                    self.set_waiting_bound_host_op(resolved_index, op_id, exact_policy)?;
                 }
                 self.instance.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
@@ -2311,10 +2323,17 @@ impl Vm {
                 "builtin pending operation {op_id} is owned by the host bridge",
             )));
         }
-        self.set_waiting_operation(op_id)
+        // Runtime-owned (builtin) pending ops are not host-import resource
+        // returns; they keep the legacy policy.
+        self.set_waiting_operation(op_id, ExactHostReturnPolicy::Legacy)
     }
 
-    fn set_waiting_bound_host_op(&mut self, resolved_index: u16, op_id: HostOpId) -> VmResult<()> {
+    fn set_waiting_bound_host_op(
+        &mut self,
+        resolved_index: u16,
+        op_id: HostOpId,
+        exact_policy: ExactHostReturnPolicy,
+    ) -> VmResult<()> {
         if self
             .host
             .runtime_owned_pending_host_slots
@@ -2322,11 +2341,23 @@ impl Vm {
         {
             self.set_waiting_registered_op(op_id)
         } else {
-            self.set_waiting_host_op(op_id)
+            self.set_waiting_host_op_with_policy(op_id, exact_policy)
         }
     }
 
+    /// Registers a waiting host op under the legacy policy. Used by call sites
+    /// that are not bound-host-import call sites (builtin pending ops, tests).
     pub(super) fn set_waiting_host_op(&mut self, op_id: HostOpId) -> VmResult<()> {
+        self.set_waiting_host_op_with_policy(op_id, ExactHostReturnPolicy::Legacy)
+    }
+
+    /// Registers a waiting host op carrying the exact-return policy captured at
+    /// the actual call-site resolved import.
+    fn set_waiting_host_op_with_policy(
+        &mut self,
+        op_id: HostOpId,
+        exact_policy: ExactHostReturnPolicy,
+    ) -> VmResult<()> {
         let result = (|| {
             let operation_id = crate::builtins::runtime::cancellation::OperationId::from_raw(op_id)
                 .map_err(|error| VmError::HostError(error.to_string()))?;
@@ -2356,7 +2387,7 @@ impl Vm {
                         .map_err(|error| VmError::HostError(error.to_string()))?;
                 }
             }
-            self.set_waiting_operation(op_id)
+            self.set_waiting_operation(op_id, exact_policy)
         })();
 
         if result.is_err() {
@@ -2381,7 +2412,11 @@ impl Vm {
         result
     }
 
-    fn set_waiting_operation(&mut self, op_id: HostOpId) -> VmResult<()> {
+    fn set_waiting_operation(
+        &mut self,
+        op_id: HostOpId,
+        exact_policy: ExactHostReturnPolicy,
+    ) -> VmResult<()> {
         if let Some(active) = self.instance.waiting_host_op
             && active.op_id != op_id
         {
@@ -2390,7 +2425,10 @@ impl Vm {
                 active.op_id, op_id
             )));
         }
-        self.instance.waiting_host_op = Some(WaitingHostOp { op_id });
+        self.instance.waiting_host_op = Some(WaitingHostOp {
+            op_id,
+            exact_policy,
+        });
         Ok(())
     }
 
@@ -2401,16 +2439,26 @@ impl Vm {
     ) -> VmResult<()> {
         let waiting = self.instance.waiting_host_op.ok_or_else(|| {
             VmError::HostError(format!(
-                "host op {} completed but vm is not waiting on any op",
-                op_id
+                "host op {op_id} completed but vm is not waiting on any op",
             ))
         })?;
         if waiting.op_id != op_id {
             return Err(VmError::HostError(format!(
-                "host op {} completed while vm waits on {}",
-                op_id, waiting.op_id
+                "host op {op_id} completed while vm waits on {}",
+                waiting.op_id
             )));
         }
+        // Validate the completion values against the exact-return policy
+        // captured at the call site BEFORE any stack/frame mutation. A bad
+        // value terminates the waiting op (so no poll/completion can deliver
+        // it again) and leaves the stack untouched.
+        let values = match validate_exact_host_return_values(values, waiting.exact_policy) {
+            Ok(values) => values,
+            Err(error) => {
+                self.instance.waiting_host_op = None;
+                return Err(error);
+            }
+        };
         self.instance.waiting_host_op = None;
         values.push_onto_stack(&mut self.instance.stack);
         Ok(())

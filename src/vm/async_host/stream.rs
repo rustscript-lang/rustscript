@@ -313,7 +313,13 @@ impl Vm {
                 if let Some(stream) = self.instance.host_stream.as_mut() {
                     stream.phase = HostStreamPhase::AwaitItem;
                 }
-                self.instance.waiting_host_op = Some(super::WaitingHostOp { op_id });
+                self.instance.waiting_host_op = Some(super::WaitingHostOp {
+                    op_id,
+                    // Callable-stream items are not host-import resource
+                    // returns; they keep the legacy policy (the stream poll
+                    // path never runs exact-return validation).
+                    exact_policy: super::host::ExactHostReturnPolicy::Legacy,
+                });
                 Ok(VmStatus::Waiting(op_id))
             }
             Ok(HostStreamAction::Complete(summary)) => {

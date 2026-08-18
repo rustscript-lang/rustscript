@@ -18,16 +18,18 @@
 //! Handles are always produced by a real `ResourceTable::push`; exact schemas
 //! and fingerprints come from a real catalog + compiler.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use vm::compiler::{CompileSourceFileOptions, SourceFlavor, TypeSchema};
 use vm::resource::{
     CloseProgress, HostResource, ResourceCloseReason, ResourceResult, ResourceTable,
 };
 use vm::{
-    BytecodeBuilder, CallOutcome, CallReturn, HostApiBuilder, HostFunctionRegistry,
-    HostFunctionSchema, HostImport, HostParamSchema, HostTypeSchema, JitConfig, Program,
-    ResourceHandle, ResourceTypeKey, ResourceTypeSchema, Value, ValueType, Vm, VmError, VmStatus,
+    BytecodeBuilder, CallOutcome, CallReturn, HostApiBuilder, HostArgsFunction, HostFunction,
+    HostFunctionRegistry, HostFunctionSchema, HostImport, HostOpId, HostParamSchema,
+    HostStackFunction, HostTypeSchema, JitConfig, Program, ResourceHandle, ResourceTypeKey,
+    ResourceTypeSchema, Value, ValueType, Vm, VmError, VmStatus,
     compile_source_with_flavor_and_options,
 };
 
@@ -83,6 +85,13 @@ fn catalog() -> std::sync::Arc<vm::HostApiCatalog> {
         "acme::maybe",
         vec![HostParamSchema::value("v", HostTypeSchema::Int)],
         HostTypeSchema::Optional(Box::new(HostTypeSchema::Resource(file))),
+    ));
+    // A non-resource exact schema (plain Int return): must keep the legacy
+    // policy so exact non-resource imports do not regress.
+    builder.function(HostFunctionSchema::with_return(
+        "acme::ping2",
+        vec![HostParamSchema::value("v", HostTypeSchema::Int)],
+        HostTypeSchema::Int,
     ));
     std::sync::Arc::new(builder.build().expect("catalog must build"))
 }
@@ -527,4 +536,714 @@ fn resource_import_is_not_native_eligible_and_trace_exits() {
             vm.dump_jit_info()
         );
     }
+}
+
+// ---- 4. async Pending completion (F1) --------------------------------------
+//
+// A bound host function that returns `CallOutcome::Pending` leaves the VM
+// waiting on a `WaitingHostOp`. When the bridge later delivers values (via
+// `complete_host_op` / the polled future) they must be validated against the
+// exact-return policy captured at the *actual call site* before any stack or
+// frame mutation. A good handle is pushed; a plain Int / nested return is a
+// structured rejection that also terminates the waiting op (no re-poll can
+// deliver the bad values again).
+
+/// An args-only host op that reports `Pending` once.
+struct PendingArgsHost {
+    op_id: HostOpId,
+    call_count: Arc<AtomicUsize>,
+}
+
+impl HostArgsFunction for PendingArgsHost {
+    fn call(&mut self, _args: &[Value]) -> vm::VmResult<CallOutcome> {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
+        Ok(CallOutcome::Pending(self.op_id))
+    }
+}
+
+/// A stack-borrowed host op that reports `Pending` once.
+struct PendingStackHost {
+    op_id: HostOpId,
+    call_count: Arc<AtomicUsize>,
+}
+
+impl HostStackFunction for PendingStackHost {
+    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> vm::VmResult<CallOutcome> {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
+        Ok(CallOutcome::Pending(self.op_id))
+    }
+}
+
+/// A VM-aware host op that reports `Pending` once.
+struct PendingDynamicHost {
+    op_id: HostOpId,
+    call_count: Arc<AtomicUsize>,
+}
+
+impl HostFunction for PendingDynamicHost {
+    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> vm::VmResult<CallOutcome> {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
+        Ok(CallOutcome::Pending(self.op_id))
+    }
+}
+
+/// Bytecode program: `ldc 0` (argument), call import 0 arity 1, `ret`.
+/// The single import is `acme::ping` with an exact `TypeSchema::Resource(_)`
+/// return — the same resource ABI target as the interpreter tests above.
+fn pending_resource_call_program() -> vm::Program {
+    let imported = compiled_ping_import();
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.call(0, 1);
+    bc.ret();
+    Program::with_imports_and_debug(
+        vec![Value::Int(7)],
+        bc.finish(),
+        vec![HostImport {
+            name: imported.name.clone(),
+            arity: 1,
+            return_type: imported.return_type,
+            schema: imported.schema.clone(),
+        }],
+        None,
+    )
+}
+
+fn bind_ping_exact_args(
+    program: vm::Program,
+    factory: impl Fn() -> Box<dyn HostArgsFunction> + Send + Sync + 'static,
+) -> vm::VmResult<Vm> {
+    let import = compiled_ping_import();
+    let schema = import.schema.clone().expect("exact schema");
+    let mut registry = HostFunctionRegistry::new();
+    registry
+        .register_exact_args(&import.name, 1, schema, factory)
+        .expect("register exact args");
+    let mut vm = Vm::new(program);
+    registry.bind_vm_cached(&mut vm)?;
+    Ok(vm)
+}
+
+/// Exact `Resource` return, args-dynamic host that yields `Pending`: a later
+/// legitimate real table handle completing the op is validated and pushed, and
+/// the resumed frame halts with the handle on the stack. The host is not
+/// re-entered.
+#[test]
+fn exact_resource_args_dynamic_pending_completion_accepts_valid_handle() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let bound_calls = Arc::clone(&calls);
+    let op_id = 0xC0_DE_00_01;
+    let mut vm = bind_ping_exact_args(pending_resource_call_program(), move || {
+        Box::new(PendingArgsHost {
+            op_id,
+            call_count: Arc::clone(&bound_calls),
+        })
+    })
+    .expect("bind");
+
+    let status = vm.run().expect("first run should wait on host op");
+    assert_eq!(status, VmStatus::Waiting(op_id));
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "host op should run once");
+    assert!(
+        vm.stack().is_empty(),
+        "pending args-only call consumes args"
+    );
+
+    let handle = real_handle_value();
+    vm.complete_host_op(op_id, vec![Value::Int(handle)])
+        .expect("valid handle completion should succeed");
+    assert_eq!(
+        vm.waiting_host_op_id(),
+        None,
+        "completion clears the waiting op"
+    );
+
+    let resumed = vm.resume().expect("resume should halt after completion");
+    assert_eq!(resumed, VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[Value::Int(handle)],
+        "validated handle must be pushed"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "resume must not re-enter the host function"
+    );
+}
+
+/// Exact `Resource` return, args-dynamic host that yields `Pending`: a plain
+/// Int completing the op is a structured rejection. The waiting op is
+/// terminated (a re-completion cannot deliver the bad value) and no value is
+/// ever pushed onto the stack.
+#[test]
+fn exact_resource_args_dynamic_pending_completion_rejects_plain_int() {
+    // Each bad value needs a fresh VM: a rejected completion terminates the
+    // waiting op, so no second completion is possible on the same VM.
+    for bad in [0i64, -1, 7, 12345] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let bound_calls = Arc::clone(&calls);
+        let op_id = 0xC0_DE_00_02;
+        let mut vm = bind_ping_exact_args(pending_resource_call_program(), move || {
+            Box::new(PendingArgsHost {
+                op_id,
+                call_count: Arc::clone(&bound_calls),
+            })
+        })
+        .expect("bind");
+
+        let status = vm.run().expect("first run should wait on host op");
+        assert_eq!(status, VmStatus::Waiting(op_id));
+        assert!(
+            vm.stack().is_empty(),
+            "pending args-only call consumes args"
+        );
+
+        let error = vm
+            .complete_host_op(op_id, vec![Value::Int(bad)])
+            .expect_err("plain int completion must be rejected");
+        assert!(
+            matches!(error, VmError::TypeMismatch("resource handle")),
+            "expected structured resource-handle mismatch, got: {error}"
+        );
+        assert_eq!(
+            vm.waiting_host_op_id(),
+            None,
+            "a bad completion must terminate the waiting op"
+        );
+        assert!(
+            vm.stack().is_empty(),
+            "no value may be pushed after a rejected completion"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "host op must run only once"
+        );
+    }
+
+    // A follow-up completion (even with a good handle) cannot resurrect the
+    // value: the terminated waiting op refuses a second delivery and nothing
+    // is pushed.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let bound_calls = Arc::clone(&calls);
+    let op_id = 0xC0_DE_00_02;
+    let mut vm = bind_ping_exact_args(pending_resource_call_program(), move || {
+        Box::new(PendingArgsHost {
+            op_id,
+            call_count: Arc::clone(&bound_calls),
+        })
+    })
+    .expect("bind");
+    let status = vm.run().expect("first run should wait on host op");
+    assert_eq!(status, VmStatus::Waiting(op_id));
+    let error = vm
+        .complete_host_op(op_id, vec![Value::Int(7)])
+        .expect_err("plain int completion must be rejected");
+    assert!(
+        matches!(error, VmError::TypeMismatch("resource handle")),
+        "expected structured resource-handle mismatch, got: {error}"
+    );
+    assert_eq!(
+        vm.waiting_host_op_id(),
+        None,
+        "waiting op must be terminated"
+    );
+    let again = vm
+        .complete_host_op(op_id, vec![Value::Int(real_handle_value())])
+        .expect_err("terminated waiting op must refuse a follow-up completion");
+    assert!(
+        matches!(again, VmError::HostError(_)),
+        "expected a host error for completing an op the vm no longer waits on, got: {again}"
+    );
+    assert!(vm.stack().is_empty(), "the follow-up must not push either");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "host op must run only once"
+    );
+}
+
+/// A return schema that nests a resource (`Optional<Resource>`) is rejected
+/// even through the async Pending path: completing the op with any value is a
+/// structured rejection and terminates the waiting op.
+#[test]
+fn nested_resource_args_dynamic_pending_completion_explicitly_rejected() {
+    let compiled = compile_catalog_program("acme::maybe(7);\n");
+    let import = compiled
+        .program
+        .imports
+        .iter()
+        .find(|import| import.name == "acme::maybe")
+        .expect("maybe import")
+        .clone();
+    let schema = import.schema.clone().expect("exact schema");
+    assert!(
+        matches!(
+            &schema.return_type,
+            TypeSchema::Optional(inner) if matches!(inner.as_ref(), TypeSchema::Resource(_))
+        ),
+        "maybe return must nest a resource, got: {:?}",
+        schema.return_type
+    );
+
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.call(0, 1);
+    bc.ret();
+    let program = Program::with_imports_and_debug(
+        vec![Value::Int(7)],
+        bc.finish(),
+        vec![HostImport {
+            name: import.name.clone(),
+            arity: 1,
+            return_type: import.return_type,
+            schema: Some(schema.clone()),
+        }],
+        None,
+    );
+
+    // Each value needs a fresh VM: a rejected nested-resource completion
+    // terminates the waiting op, so no second completion is possible on the
+    // same VM.
+    for value in [Value::Null, Value::Int(real_handle_value())] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let bound_calls = Arc::clone(&calls);
+        let op_id = 0xC0_DE_00_03;
+        let mut registry = HostFunctionRegistry::new();
+        registry
+            .register_exact_args(&import.name, 1, schema.clone(), move || {
+                Box::new(PendingArgsHost {
+                    op_id,
+                    call_count: Arc::clone(&bound_calls),
+                })
+            })
+            .expect("register nested-resource exact args");
+        let mut vm = Vm::new(program.clone());
+        registry.bind_vm_cached(&mut vm).expect("bind");
+
+        let status = vm.run().expect("first run should wait on host op");
+        assert_eq!(status, VmStatus::Waiting(op_id));
+        assert!(vm.stack().is_empty());
+
+        // Even a `Null`/valid handle (which a coarse check would have
+        // accepted) must be structure-rejected through the async completion
+        // path.
+        let error = vm
+            .complete_host_op(op_id, CallReturn::one(value))
+            .expect_err("nested-resource completion must be a structured rejection");
+        assert!(
+            matches!(error, VmError::TypeMismatch(_)),
+            "expected structured type mismatch, got: {error}"
+        );
+        assert_eq!(
+            vm.waiting_host_op_id(),
+            None,
+            "rejected completion must terminate the waiting op"
+        );
+        assert!(vm.stack().is_empty(), "no value may be pushed");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+/// `schema:None` legacy bindings keep the old coarse behavior through the
+/// async Pending path: a plain Int completing the op is pushed normally.
+#[test]
+fn schema_none_args_dynamic_pending_completion_keeps_legacy_behavior() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let call_count = Arc::clone(&calls);
+    let op_id = 0xC0_DE_00_04;
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.call(0, 1);
+    bc.ret();
+    let mut vm = Vm::new(Program::new(vec![Value::Int(4)], bc.finish()));
+    vm.register_args_function(Box::new(PendingArgsHost { op_id, call_count }));
+
+    let status = vm.run().expect("first run should wait on host op");
+    assert_eq!(status, VmStatus::Waiting(op_id));
+    assert!(vm.stack().is_empty());
+
+    vm.complete_host_op(op_id, vec![Value::Int(42)])
+        .expect("legacy schema-free completion must stay accepted");
+    let resumed = vm.resume().expect("resume should halt");
+    assert_eq!(resumed, VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[Value::Int(42)],
+        "legacy completion must push the coarse value"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// A non-resource exact schema (`schema:Some`, plain Int return) keeps the
+/// legacy policy through the async Pending path — no regression for exact
+/// non-resource imports.
+#[test]
+fn nonresource_exact_args_dynamic_pending_completion_unaffected() {
+    let compiled = compile_catalog_program("acme::ping2(7);\n");
+    let import = compiled
+        .program
+        .imports
+        .iter()
+        .find(|import| import.name == "acme::ping2")
+        .expect("ping2 import")
+        .clone();
+    assert!(
+        import.schema.is_some()
+            && matches!(
+                import.schema.as_ref().expect("schema").return_type,
+                TypeSchema::Int
+            ),
+        "ping2 must be exact but non-resource, got: {:?}",
+        import.schema.as_ref().map(|schema| &schema.return_type)
+    );
+    let schema = import.schema.clone().expect("exact schema");
+
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.call(0, 1);
+    bc.ret();
+    let program = Program::with_imports_and_debug(
+        vec![Value::Int(7)],
+        bc.finish(),
+        vec![HostImport {
+            name: import.name.clone(),
+            arity: 1,
+            return_type: import.return_type,
+            schema: Some(schema.clone()),
+        }],
+        None,
+    );
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let bound_calls = Arc::clone(&calls);
+    let op_id = 0xC0_DE_00_05;
+    let mut registry = HostFunctionRegistry::new();
+    registry
+        .register_exact_args(&import.name, 1, schema, move || {
+            Box::new(PendingArgsHost {
+                op_id,
+                call_count: Arc::clone(&bound_calls),
+            })
+        })
+        .expect("register exact non-resource args");
+    let mut vm = Vm::new(program);
+    registry.bind_vm_cached(&mut vm).expect("bind");
+
+    let status = vm.run().expect("first run should wait on host op");
+    assert_eq!(status, VmStatus::Waiting(op_id));
+
+    vm.complete_host_op(op_id, vec![Value::Int(77)])
+        .expect("non-resource exact completion must stay accepted");
+    let resumed = vm.resume().expect("resume should halt");
+    assert_eq!(resumed, VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[Value::Int(77)],
+        "non-resource exact completion must push the value"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// The VM-aware `Dynamic` host path (`execute_bound_host_function_from_stack`)
+/// must also carry the call-site exact-return policy into the Pending state: a
+/// real handle completing the op is validated and pushed.
+#[test]
+fn exact_resource_dynamic_pending_completion_accepts_valid_handle() {
+    let import = compiled_ping_import();
+    let schema = import.schema.clone().expect("exact schema");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let bound_calls = Arc::clone(&calls);
+    let op_id = 0xC0_DE_00_06;
+    let mut registry = HostFunctionRegistry::new();
+    registry
+        .register_exact(&import.name, 1, schema, move || {
+            Box::new(PendingDynamicHost {
+                op_id,
+                call_count: Arc::clone(&bound_calls),
+            })
+        })
+        .expect("register exact dynamic");
+    let mut vm = Vm::new(pending_resource_call_program());
+    registry.bind_vm_cached(&mut vm).expect("bind");
+
+    let status = vm.run().expect("first run should wait on host op");
+    assert_eq!(status, VmStatus::Waiting(op_id));
+    assert!(vm.stack().is_empty());
+
+    let handle = real_handle_value();
+    vm.complete_host_op(op_id, vec![Value::Int(handle)])
+        .expect("valid handle completion should succeed");
+    let resumed = vm.resume().expect("resume should halt");
+    assert_eq!(resumed, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(handle)]);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// Bad Int completing the `Dynamic` Pending path is rejected before the value
+/// reaches the stack, and the waiting op is terminated.
+#[test]
+fn exact_resource_dynamic_pending_completion_rejects_plain_int() {
+    let import = compiled_ping_import();
+    let schema = import.schema.clone().expect("exact schema");
+    let op_id = 0xC0_DE_00_07;
+    let mut registry = HostFunctionRegistry::new();
+    registry
+        .register_exact(&import.name, 1, schema, move || {
+            Box::new(PendingDynamicHost {
+                op_id,
+                call_count: Arc::new(AtomicUsize::new(0)),
+            })
+        })
+        .expect("register exact dynamic");
+    let mut vm = Vm::new(pending_resource_call_program());
+    registry.bind_vm_cached(&mut vm).expect("bind");
+
+    let status = vm.run().expect("first run should wait on host op");
+    assert_eq!(status, VmStatus::Waiting(op_id));
+    assert!(vm.stack().is_empty());
+
+    let error = vm
+        .complete_host_op(op_id, vec![Value::Int(7)])
+        .expect_err("plain int completion must be rejected");
+    assert!(
+        matches!(error, VmError::TypeMismatch("resource handle")),
+        "expected structured resource-handle mismatch, got: {error}"
+    );
+    assert_eq!(
+        vm.waiting_host_op_id(),
+        None,
+        "waiting op must be terminated"
+    );
+    assert!(vm.stack().is_empty(), "no value may be pushed");
+}
+
+/// The borrowed-stack `StackDynamic` host path must also carry the call-site
+/// exact-return policy into the Pending state: a real handle completing the op
+/// is validated and pushed; a plain Int is a structured rejection that
+/// terminates the waiting op.
+#[test]
+fn exact_resource_stack_dynamic_pending_completion_validates_handle() {
+    let import = compiled_ping_import();
+    let schema = import.schema.clone().expect("exact schema");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let bound_calls = Arc::clone(&calls);
+    let op_id = 0xC0_DE_00_08;
+    let mut registry = HostFunctionRegistry::new();
+    registry
+        .register_exact_stack(&import.name, 1, schema, move || {
+            Box::new(PendingStackHost {
+                op_id,
+                call_count: Arc::clone(&bound_calls),
+            })
+        })
+        .expect("register exact stack");
+    let mut vm = Vm::new(pending_resource_call_program());
+    registry.bind_vm_cached(&mut vm).expect("bind");
+
+    let status = vm.run().expect("first run should wait on host op");
+    assert_eq!(status, VmStatus::Waiting(op_id));
+    assert!(vm.stack().is_empty());
+
+    // A plain Int completing the op is rejected and terminates the waiting op.
+    let error = vm
+        .complete_host_op(op_id, vec![Value::Int(7)])
+        .expect_err("plain int completion must be rejected");
+    assert!(
+        matches!(error, VmError::TypeMismatch("resource handle")),
+        "expected structured resource-handle mismatch, got: {error}"
+    );
+    assert_eq!(
+        vm.waiting_host_op_id(),
+        None,
+        "rejected completion must terminate the waiting op"
+    );
+    assert!(vm.stack().is_empty(), "no value may be pushed");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // A fresh call with a real table handle is validated and pushed.
+    let op_id2 = 0xC0_DE_00_09;
+    let calls2 = Arc::new(AtomicUsize::new(0));
+    let bound_calls2 = Arc::clone(&calls2);
+    let import = compiled_ping_import();
+    let schema = import.schema.clone().expect("exact schema");
+    let mut registry = HostFunctionRegistry::new();
+    registry
+        .register_exact_stack(&import.name, 1, schema, move || {
+            Box::new(PendingStackHost {
+                op_id: op_id2,
+                call_count: Arc::clone(&bound_calls2),
+            })
+        })
+        .expect("register exact stack");
+    let mut vm = Vm::new(pending_resource_call_program());
+    registry.bind_vm_cached(&mut vm).expect("bind");
+
+    let status = vm.run().expect("first run should wait on host op");
+    assert_eq!(status, VmStatus::Waiting(op_id2));
+    let handle = real_handle_value();
+    vm.complete_host_op(op_id2, vec![Value::Int(handle)])
+        .expect("valid handle completion should succeed");
+    let resumed = vm.resume().expect("resume should halt");
+    assert_eq!(resumed, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(handle)]);
+    assert_eq!(calls2.load(Ordering::SeqCst), 1);
+}
+
+// ---- 5. immediate-return ordering (F2) -------------------------------------
+//
+// On an immediate bad resource return the validation must fail BEFORE the
+// call operands are truncated from the stack, so the stack keeps its pre-call
+// snapshot and no half-truncated state is observable.
+
+struct ImmediateArgsHost {
+    returned: i64,
+}
+
+impl HostArgsFunction for ImmediateArgsHost {
+    fn call(&mut self, _args: &[Value]) -> vm::VmResult<CallOutcome> {
+        Ok(CallOutcome::Return(CallReturn::One(Value::Int(
+            self.returned,
+        ))))
+    }
+}
+
+struct ImmediateStackHost {
+    returned: i64,
+}
+
+impl HostStackFunction for ImmediateStackHost {
+    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> vm::VmResult<CallOutcome> {
+        Ok(CallOutcome::Return(CallReturn::One(Value::Int(
+            self.returned,
+        ))))
+    }
+}
+
+struct ImmediateDynamicHost {
+    returned: i64,
+}
+
+impl HostFunction for ImmediateDynamicHost {
+    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> vm::VmResult<CallOutcome> {
+        Ok(CallOutcome::Return(CallReturn::One(Value::Int(
+            self.returned,
+        ))))
+    }
+}
+
+/// ArgsDynamic immediate bad resource return: the structured rejection must
+/// leave the call operands on the stack (validation precedes truncation).
+#[test]
+fn exact_resource_args_dynamic_immediate_bad_return_keeps_stack_snapshot() {
+    let mut vm = bind_ping_exact_args(pending_resource_call_program(), || {
+        Box::new(ImmediateArgsHost { returned: 7 })
+    })
+    .expect("bind");
+
+    let error = vm
+        .run()
+        .expect_err("plain int immediate return must be rejected");
+    assert!(
+        matches!(error, VmError::TypeMismatch("resource handle")),
+        "expected structured resource-handle mismatch, got: {error}"
+    );
+    assert_eq!(
+        vm.stack(),
+        &[Value::Int(7)],
+        "call args must survive an immediate bad resource return (no truncate-before-validate)"
+    );
+}
+
+/// ArgsDynamic immediate valid handle return: validated and pushed.
+#[test]
+fn exact_resource_args_dynamic_immediate_valid_handle_pushed() {
+    let handle = real_handle_value();
+    let mut vm = bind_ping_exact_args(pending_resource_call_program(), move || {
+        Box::new(ImmediateArgsHost { returned: handle })
+    })
+    .expect("bind");
+
+    let status = vm.run().expect("valid handle immediate return should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(handle)]);
+}
+
+/// StackDynamic immediate bad resource return: same no-truncate-before-validate
+/// guarantee for the borrowed-stack host path.
+#[test]
+fn exact_resource_stack_dynamic_immediate_bad_return_keeps_stack_snapshot() {
+    let import = compiled_ping_import();
+    let schema = import.schema.clone().expect("exact schema");
+    let mut registry = HostFunctionRegistry::new();
+    registry
+        .register_exact_stack(&import.name, 1, schema, || {
+            Box::new(ImmediateStackHost { returned: 7 })
+        })
+        .expect("register exact stack");
+    let mut vm = Vm::new(pending_resource_call_program());
+    registry.bind_vm_cached(&mut vm).expect("bind");
+
+    let error = vm
+        .run()
+        .expect_err("plain int immediate stack return must be rejected");
+    assert!(
+        matches!(error, VmError::TypeMismatch("resource handle")),
+        "expected structured resource-handle mismatch, got: {error}"
+    );
+    assert_eq!(
+        vm.stack(),
+        &[Value::Int(7)],
+        "stack-args must survive an immediate bad resource return"
+    );
+}
+
+/// StackDynamic immediate valid handle return: validated and pushed.
+#[test]
+fn exact_resource_stack_dynamic_immediate_valid_handle_pushed() {
+    let handle = real_handle_value();
+    let import = compiled_ping_import();
+    let schema = import.schema.clone().expect("exact schema");
+    let mut registry = HostFunctionRegistry::new();
+    registry
+        .register_exact_stack(&import.name, 1, schema, move || {
+            Box::new(ImmediateStackHost { returned: handle })
+        })
+        .expect("register exact stack");
+    let mut vm = Vm::new(pending_resource_call_program());
+    registry.bind_vm_cached(&mut vm).expect("bind");
+
+    let status = vm.run().expect("valid handle stack return should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(handle)]);
+}
+
+/// Dynamic (from-stack) immediate bad resource return: validation failure
+/// restores the pre-call snapshot instead of leaving a truncated/empty stack.
+#[test]
+fn exact_resource_dynamic_immediate_bad_return_keeps_stack_snapshot() {
+    let import = compiled_ping_import();
+    let schema = import.schema.clone().expect("exact schema");
+    let mut registry = HostFunctionRegistry::new();
+    registry
+        .register_exact(&import.name, 1, schema, || {
+            Box::new(ImmediateDynamicHost { returned: 7 })
+        })
+        .expect("register exact dynamic");
+    let mut vm = Vm::new(pending_resource_call_program());
+    registry.bind_vm_cached(&mut vm).expect("bind");
+
+    let error = vm
+        .run()
+        .expect_err("plain int immediate dynamic return must be rejected");
+    assert!(
+        matches!(error, VmError::TypeMismatch("resource handle")),
+        "expected structured resource-handle mismatch, got: {error}"
+    );
+    assert_eq!(
+        vm.stack(),
+        &[Value::Int(7)],
+        "pre-call snapshot must be restored when the dynamic return fails validation"
+    );
 }
