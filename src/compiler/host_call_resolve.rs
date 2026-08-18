@@ -1495,60 +1495,58 @@ mod tests {
     }
 
     #[test]
-    fn array_unknown_loses_to_array_exact_for_concrete_arg() {
-        // f(array<Unknown>) vs f(array<Int>) for an actual array<Int>: the
-        // array<Int> overload is exact, array<Unknown> is deferred, so exact wins.
+    fn top_level_unknown_vs_array_unknown_for_concrete_arg() {
+        // f(shape: array<Unknown>) vs f(shape: Unknown) for an actual array<Int>:
+        // the shaped expected array<Unknown> gets an exact structural credit and
+        // only its element is deferred, while the top-level Unknown leaves the
+        // whole arg deferred with no structural credit — so the shaped overload is
+        // more specific and wins.
         let mut builder = HostApiBuilder::new();
         builder.function(HostFunctionSchema::with_return(
             "head",
             vec![value_param(
-                "xs",
+                "shape",
                 HostTypeSchema::Array(Box::new(HostTypeSchema::Unknown)),
             )],
-            HostTypeSchema::Unknown,
+            HostTypeSchema::Int,
         ));
         builder.function(HostFunctionSchema::with_return(
             "head",
-            vec![value_param(
-                "xs",
-                HostTypeSchema::Array(Box::new(HostTypeSchema::Int)),
-            )],
-            HostTypeSchema::Int,
+            vec![value_param("fallback", HostTypeSchema::Unknown)],
+            HostTypeSchema::String,
         ));
         let catalog = builder.build().expect("valid overloads");
         let resolver = HostCallResolver::new(&catalog);
 
         let resolved = resolver
             .resolve("head", &[Ts::Array(Box::new(Ts::Int))])
-            .expect("array<Int> overload wins");
+            .expect("shaped array<Unknown> overload wins");
         assert_eq!(
             resolved.return_type,
             Ts::Int,
-            "array<Int> exact must beat array<Unknown> for an actual array<Int>"
+            "shaped expected array<Unknown> must beat top-level Unknown for an actual array<Int>"
         );
     }
 
     #[test]
-    fn array_unknown_and_array_exact_tie_for_unknown_arg() {
-        // For an actual Unknown argument, both array<Unknown> and array<Int>
-        // are equally deferred (the Unknown param swallows specificity), so
-        // resolution must stay ambiguous.
+    fn top_level_unknown_vs_array_unknown_tie_for_unknown_arg() {
+        // For an actual Unknown argument, Unknown is classified first and swallows
+        // the array shape, so the array<Unknown> overload is a bare deferred with
+        // no structural credit — exactly tying the top-level Unknown overload.
+        // Resolution must therefore stay ambiguous: Unknown-first hides the shape.
         let mut builder = HostApiBuilder::new();
         builder.function(HostFunctionSchema::with_return(
             "head",
             vec![value_param(
-                "xs",
+                "shape",
                 HostTypeSchema::Array(Box::new(HostTypeSchema::Unknown)),
             )],
-            HostTypeSchema::Unknown,
+            HostTypeSchema::Int,
         ));
         builder.function(HostFunctionSchema::with_return(
             "head",
-            vec![value_param(
-                "xs",
-                HostTypeSchema::Array(Box::new(HostTypeSchema::Int)),
-            )],
-            HostTypeSchema::Int,
+            vec![value_param("fallback", HostTypeSchema::Unknown)],
+            HostTypeSchema::String,
         ));
         let catalog = builder.build().expect("valid overloads");
         let resolver = HostCallResolver::new(&catalog);
