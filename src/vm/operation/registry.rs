@@ -1,14 +1,16 @@
-//! Operation registry: lifecycle, bounds, deadline, first cancellation
-//! reason and terminal status tracking for host-agnostic operations.
+//! Operation registry: slot lifecycle, bounds, deadline and first-reason
+//! cancellation tracking for host-agnostic operations.
 //!
-//! The registry drives object-safe [`HostOperation`] drivers directly. It
-//! replaces the old `OperationOwner`/`OperationState`/`CancellationToken`
-//! parent–child signal graph with a single map of operation entries, each
-//! carrying its own driver, deadline, optional resource association and
-//! terminal status. There is deliberately no standalone token tree and no
-//! second cancellation framework: cancellation is recorded once (the first
-//! reason wins) and forwarded to exactly the owning driver via
-//! [`HostOperation::cancel`].
+//! The registry owns a bounded, reusable generational slot arena. Each
+//! occupied slot owns an object-safe [`HostOperation`] driver plus an
+//! optional deadline, resource association, cleanup and its own status.
+//! Packed `tag`/`slot`/`generation` ids are fully validated against the
+//! live slot descriptor before any mutation, so a foreign-tagged, stale or
+//! out-of-range id is rejected rather than aliased to a newer occupant.
+//!
+//! Cancellation is first-reason-wins, recorded once, and forwarded only to
+//! the owning concrete driver via [`HostOperation::cancel`]. There is no
+//! host-domain dispatch and no secondary cancellation channel.
 
 use std::task::{Context, Poll};
 use std::time::Instant;
