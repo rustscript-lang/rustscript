@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::Instant;
 
 pub(crate) mod aot;
 mod async_host;
@@ -39,6 +41,7 @@ pub(crate) use self::async_host::{HostStreamAction, HostStreamDriver, HostStream
 pub use self::capability::{CapabilityProfile, CapabilityProfileBuilder};
 use self::engine::Engine;
 pub use self::epoch::{EpochCheckpoint, EpochHandle};
+use self::execution_scope::{ExecutionScopeError, ScopeCloseError, ScopeCloseOutcome};
 pub use self::fuel::FuelCheckpoint;
 pub use self::host::{
     CallOutcome, CallReturn, HostArgsFunction, HostBindingPlan, HostFunction, HostFunctionRegistry,
@@ -52,6 +55,7 @@ pub use self::host_context::{
 use self::host_runtime::HostRuntime;
 use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable};
 pub use self::invocation::{Invocation, InvocationError, InvocationItem, InvocationPoll};
+use self::resource::ResourceCloseReason;
 pub use self::resource::{CloseProgress, HostResource, Resource, ResourceHandle, ResourceTable};
 use self::run_context::{InterruptMode, RunContext};
 pub use crate::builtins::runtime::cancellation::CancellationReason;
@@ -155,6 +159,8 @@ pub enum VmError {
         current: u64,
         deadline: u64,
     },
+    /// A structured VM reset/reuse contract failure.
+    Reset(VmResetError),
 }
 
 /// Structured error for exact host-import binding and registration.
@@ -321,6 +327,7 @@ impl std::fmt::Display for VmError {
                 f,
                 "epoch deadline reached: current epoch {current}, deadline {deadline}"
             ),
+            VmError::Reset(error) => write!(f, "vm reset error: {error}"),
         }
     }
 }
@@ -328,6 +335,113 @@ impl std::fmt::Display for VmError {
 impl std::error::Error for VmError {}
 
 pub type VmResult<T> = Result<T, VmError>;
+
+/// Reuse/reset lifecycle state of a [`Vm`].
+///
+/// A fresh `Vm` starts [`Ready`](Self::Ready): it is executable and may be
+/// lent out of a reuse pool. [`Vm::begin_reset_for_reuse`] moves it to
+/// [`Resetting`](Self::Resetting) while the execution-scope close is driven
+/// to quiescence; run/resume and pool reuse are rejected until the reset
+/// completes and the `Vm` returns to `Ready`. Any terminal reset failure
+/// (scope cleanup error, deadline, or legacy reset failure) moves the `Vm`
+/// to [`Poisoned`](Self::Poisoned), which is permanent: it never
+/// auto-returns to `Ready`, the old scope and the recorded error are
+/// preserved for diagnostics, and the `Vm` is never lent out again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VmResetState {
+    /// The VM is executable and reusable (a pool may lend it out).
+    Ready,
+    /// A reset is in progress; run/resume and reuse are rejected.
+    Resetting,
+    /// A previous reset failed terminally; the VM is permanently unusable.
+    Poisoned,
+}
+
+/// Outcome of [`Vm::begin_reset_for_reuse`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BeginResetOutcome {
+    /// The reset was started by this call; the first reason/deadline were
+    /// bound now.
+    Started,
+    /// A reset was already in progress; the first reason/deadline are
+    /// retained unchanged (idempotent repeat).
+    AlreadyStarted,
+}
+
+/// Structured failure for the VM reset / reuse contract.
+///
+/// Replaces stringly-typed reset failures so callers and tests can match on
+/// fields (state, deadline timestamps, scope close outcome) instead of
+/// parsing messages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VmResetError {
+    /// Execution (`run` / `resume` / `start_callable`) was attempted while
+    /// the VM was not Ready. `stage` names the blocked entry point.
+    NotReusable {
+        state: VmResetState,
+        stage: &'static str,
+    },
+    /// The synchronous compat [`Vm::reset_for_reuse`] began a scope close
+    /// that cannot complete inline: a genuinely pending resource/operation
+    /// still blocks quiescence. The VM stays `Resetting`; drive
+    /// [`Vm::poll_reset_for_reuse`] to completion.
+    ResetPending {
+        resource_count: usize,
+        operation_count: usize,
+    },
+    /// The reset deadline passed before quiescence; the VM is poisoned and
+    /// resources were NOT forced-clean (the caller must not assume a clean
+    /// teardown).
+    Deadline { deadline: Instant, now: Instant },
+    /// Scope shutdown finished but at least one cleanup failed; the VM is
+    /// poisoned and the old scope is preserved for diagnostics.
+    ScopeCleanup(ScopeCloseError),
+    /// `take_quiescent_scope` was requested but the scope was not quiescent
+    /// (defensive; cannot normally fire after a driven close).
+    ScopeNotQuiescent(ExecutionScopeError),
+    /// The legacy `HostRuntime` reset failed after the generic scope reached
+    /// quiescence; the VM is poisoned and the installed scope is left in
+    /// place (a failed legacy reset never triggers a scope replacement).
+    LegacyReset(String),
+    /// A reset/reuse API was exercised on an already-poisoned VM.
+    AlreadyPoisoned { reason: String },
+}
+
+impl std::fmt::Display for VmResetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotReusable { state, stage } => {
+                write!(f, "{stage} requires a ready vm, but the vm is {state:?}")
+            }
+            Self::ResetPending {
+                resource_count,
+                operation_count,
+            } => write!(
+                f,
+                "reset is pending: {resource_count} resource(s) and {operation_count} operation(s) still closing",
+            ),
+            Self::Deadline { deadline, now } => write!(
+                f,
+                "reset deadline {deadline:?} passed at {now:?}; the vm is poisoned",
+            ),
+            Self::ScopeCleanup(error) => {
+                write!(
+                    f,
+                    "execution scope cleanup failed: {error:?}; the vm is poisoned"
+                )
+            }
+            Self::ScopeNotQuiescent(error) => {
+                write!(f, "execution scope is not quiescent: {error}")
+            }
+            Self::LegacyReset(message) => {
+                write!(f, "legacy host reset failed: {message}; the vm is poisoned",)
+            }
+            Self::AlreadyPoisoned { reason } => write!(f, "vm is permanently poisoned: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for VmResetError {}
 
 pub const DEFAULT_MAX_SCRIPT_CALL_DEPTH: usize = 1024;
 
@@ -398,6 +512,16 @@ pub struct Vm {
     pub(crate) instance: Instance,
     pub(crate) run_ctx: RunContext,
     pub(crate) host: HostRuntime,
+    /// Reuse/reset lifecycle state (Ready → Resetting → Ready | Poisoned).
+    reset_state: VmResetState,
+    /// Deadline bound by the first `begin_reset_for_reuse` call, if any.
+    reset_deadline: Option<Instant>,
+    /// Structured failure that poisoned the VM (or the pending indicator for
+    /// a compat reset still in progress), preserved for diagnostics.
+    reset_error: Option<VmResetError>,
+    /// First reset reason bound by the first `begin_reset_for_reuse` call
+    /// (first-reason-wins; repeated begins are idempotent).
+    reset_first_reason: Option<ResourceCloseReason>,
 }
 
 pub(crate) enum ExecOutcome {
@@ -669,6 +793,10 @@ impl Vm {
             instance,
             run_ctx: RunContext::default(),
             host: HostRuntime::default(),
+            reset_state: VmResetState::Ready,
+            reset_deadline: None,
+            reset_error: None,
+            reset_first_reason: None,
         }
     }
 
@@ -815,17 +943,258 @@ impl Vm {
     /// Reset VM execution state to allow rerunning the same program instance while
     /// preserving JIT artifacts and registered host bindings.
     ///
+    /// Compat path: when the execution scope is empty (the common case for
+    /// existing callers) the reset completes synchronously and the VM returns
+    /// to [`VmResetState::Ready`]. When a genuinely pending scope
+    /// resource/operation blocks quiescence this method does **not**
+    /// busy-loop: it begins the close and moves the VM to
+    /// [`VmResetState::Resetting`] without clearing interpreter state; the
+    /// reset must then be driven to completion through
+    /// [`Vm::poll_reset_for_reuse`] (the structured
+    /// [`VmResetError::ResetPending`] indicator is observable via
+    /// [`Vm::reset_error`] / [`Vm::reset_state`]).
+    ///
     /// Locals are reset to `Null`, stack is cleared, and instruction pointer is
-    /// rewound to the program entry.
+    /// rewound to the program entry — but only once the reset *completes*
+    /// successfully (never while pending, never after poisoning).
     pub fn reset_for_reuse(&mut self) {
+        match self.reset_state {
+            VmResetState::Poisoned => {
+                // Permanently poisoned: never re-attempted. The caller must
+                // consult reset_state()/reset_error() and replace the VM.
+            }
+            VmResetState::Resetting => {
+                // Drive the in-progress reset by a single poll; a still
+                // pending scope simply keeps the VM Resetting.
+                self.drive_reset_once();
+            }
+            VmResetState::Ready => {
+                let _ = self.begin_reset_for_reuse(ResourceCloseReason::VmReset, None);
+                self.drive_reset_once();
+            }
+        }
+    }
+
+    /// The current reuse/reset lifecycle state of this VM.
+    pub fn reset_state(&self) -> VmResetState {
+        self.reset_state
+    }
+
+    /// Whether this VM is Ready: executable and eligible to be lent out of a
+    /// reuse pool. A `Resetting` or `Poisoned` VM is never reusable.
+    pub fn is_reusable(&self) -> bool {
+        self.reset_state == VmResetState::Ready
+    }
+
+    /// The structured error that poisoned this VM (or the `ResetPending`
+    /// indicator while a compat reset is still in progress), preserved for
+    /// diagnostics.
+    pub fn reset_error(&self) -> Option<&VmResetError> {
+        self.reset_error.as_ref()
+    }
+
+    /// The first reset reason bound by the first
+    /// [`begin_reset_for_reuse`](Self::begin_reset_for_reuse) call
+    /// (first-reason-wins; `None` when no reset is in progress or the reset
+    /// already completed).
+    pub fn reset_reason(&self) -> Option<ResourceCloseReason> {
+        self.reset_first_reason
+    }
+
+    /// The reset deadline bound by the first
+    /// [`begin_reset_for_reuse`](Self::begin_reset_for_reuse) call, if any.
+    pub fn reset_deadline(&self) -> Option<Instant> {
+        self.reset_deadline
+    }
+
+    /// Begins the two-phase reset for reuse.
+    ///
+    /// First-reason/deadline-wins and idempotent: the first call binds
+    /// `reason`/`deadline` and starts the execution-scope close
+    /// (Active → Closing, sealing new inserts); every later call returns
+    /// [`BeginResetOutcome::AlreadyStarted`] and leaves the bound
+    /// reason/deadline unchanged. It never clears interpreter state, never
+    /// creates a new scope, and never marks the VM reusable — completion
+    /// happens only through [`Vm::poll_reset_for_reuse`].
+    pub fn begin_reset_for_reuse(
+        &mut self,
+        reason: ResourceCloseReason,
+        deadline: Option<Instant>,
+    ) -> VmResult<BeginResetOutcome> {
+        match self.reset_state {
+            VmResetState::Poisoned => Err(VmError::Reset(VmResetError::AlreadyPoisoned {
+                reason: self.poison_diagnostic(),
+            })),
+            VmResetState::Ready | VmResetState::Resetting => {
+                let starting = self.reset_first_reason.is_none();
+                if starting {
+                    self.reset_first_reason = Some(reason);
+                    self.reset_deadline = deadline;
+                    self.reset_state = VmResetState::Resetting;
+                    self.reset_error = None;
+                    // Start the scope close exactly once (first-reason-wins at
+                    // the scope level too). If the scope is already Closing
+                    // with a different reason (a prior HostContext
+                    // begin_close), we still drive that close to quiescence;
+                    // the Vm-level first reason governs the reset contract.
+                    let _ = self.host.execution_scope_begin_close(reason);
+                }
+                Ok(if starting {
+                    BeginResetOutcome::Started
+                } else {
+                    BeginResetOutcome::AlreadyStarted
+                })
+            }
+        }
+    }
+
+    /// Polls the in-progress reset, using the passed-in `now` as the current
+    /// time for the deadline (deterministic, never sleeps).
+    ///
+    /// - [`Poll::Pending`]: scope cleanup is still running; the VM stays
+    ///   [`VmResetState::Resetting`] (interpreter state untouched, no new
+    ///   scope, not reusable). Poll again later with a fresh `now`.
+    /// - [`Poll::Ready`]`(Ok(()))`: the reset completed (or the VM was
+    ///   already Ready); the VM is `Ready` and reusable. Idempotent — a
+    ///   repeated poll after success returns the same `Ready(Ok(()))`.
+    /// - [`Poll::Ready`]`(Err(_))`: a terminal failure (deadline, scope
+    ///   cleanup error, or legacy reset failure) poisoned the VM; the old
+    ///   scope and the error are preserved and the VM is never reusable
+    ///   again.
+    pub fn poll_reset_for_reuse(
+        &mut self,
+        cx: &mut Context<'_>,
+        now: Instant,
+    ) -> Poll<VmResult<()>> {
+        match self.reset_state {
+            VmResetState::Poisoned => Poll::Ready(Err(VmError::Reset(
+                self.reset_error
+                    .clone()
+                    .unwrap_or_else(|| VmResetError::AlreadyPoisoned {
+                        reason: "vm is permanently poisoned".to_string(),
+                    }),
+            ))),
+            VmResetState::Ready => Poll::Ready(Ok(())),
+            VmResetState::Resetting => {
+                if let Some(deadline) = self.reset_deadline {
+                    if now >= deadline {
+                        // Timeout: poison without pretending cleanup ran. The
+                        // old scope and error stay in place for diagnostics.
+                        let error = VmResetError::Deadline { deadline, now };
+                        self.poison(error.clone());
+                        return Poll::Ready(Err(VmError::Reset(error)));
+                    }
+                }
+                match self.host.execution_scope_poll_close(cx) {
+                    Poll::Pending => {
+                        // Record the current blocking counts as the structured
+                        // pending diagnostic (observable via reset_error()).
+                        self.reset_error = Some(VmResetError::ResetPending {
+                            resource_count: self.host.execution_scope_resource_count(),
+                            operation_count: self.host.execution_scope_operation_count(),
+                        });
+                        Poll::Pending
+                    }
+                    Poll::Ready(Ok(ScopeCloseOutcome::Success)) => {
+                        match self.finish_reset_to_ready() {
+                            Ok(()) => Poll::Ready(Ok(())),
+                            Err(error) => {
+                                self.poison(error.clone());
+                                Poll::Ready(Err(VmError::Reset(error)))
+                            }
+                        }
+                    }
+                    Poll::Ready(Ok(ScopeCloseOutcome::SuccessWithErrors(first))) => {
+                        // Best-effort cleanup finished with a preserved
+                        // failure: poison, keep the old scope, never swap.
+                        let error = VmResetError::ScopeCleanup(first);
+                        self.poison(error.clone());
+                        Poll::Ready(Err(VmError::Reset(error)))
+                    }
+                    Poll::Ready(Err(scope_error)) => {
+                        // Defensive: a scope-level failure (e.g. close never
+                        // begun) is treated as terminal.
+                        let error = VmResetError::ScopeNotQuiescent(scope_error);
+                        self.poison(error.clone());
+                        Poll::Ready(Err(VmError::Reset(error)))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drives one round of the reset with a no-op waker (used by the compat
+    /// [`reset_for_reuse`](Self::reset_for_reuse)). Never loops: a still
+    /// pending scope simply keeps the VM `Resetting`.
+    fn drive_reset_once(&mut self) {
+        struct ResetNoopWake;
+        impl std::task::Wake for ResetNoopWake {
+            fn wake(self: Arc<Self>) {}
+        }
+        let waker = Arc::new(ResetNoopWake).into();
+        let mut cx = Context::from_waker(&waker);
+        let _ = self.poll_reset_for_reuse(&mut cx, Instant::now());
+    }
+
+    /// Executes the post-quiescence reset sequence: legacy HostRuntime reset
+    /// (pre-migration compatibility), then the R2A-safe scope recycle into a
+    /// fresh Active empty scope, then the existing interpreter rewinding.
+    /// The module store is deliberately preserved (never cleared by scope
+    /// cleanup or the legacy reset).
+    ///
+    /// On any failure the caller must poison: this method never swaps the
+    /// scope on error (legacy failures are checked before the recycle).
+    fn finish_reset_to_ready(&mut self) -> Result<(), VmResetError> {
         self.cancel_waiting_host_op_with_reason(
             crate::builtins::runtime::cancellation::CancellationReason::VmReset,
         );
         self.cancel_callable_stream();
         self.host.reset_for_reuse();
+        if let Some(error) = self.host.take_legacy_reset_failure() {
+            // Poison before any scope replacement: a failed legacy reset must
+            // never be followed by a fresh-scope swap.
+            return Err(VmResetError::LegacyReset(error));
+        }
+        // R2A-safe: recycle only a Quiescent scope into a fresh Active scope.
+        let old_scope = self
+            .host
+            .take_quiescent_scope()
+            .map_err(VmResetError::ScopeNotQuiescent)?;
+        drop(old_scope);
         self.run_ctx.reset_for_reuse();
         self.instance.reset(&self.program);
         self.engine.reset_runtime_state(&self.program);
+        self.reset_state = VmResetState::Ready;
+        self.reset_deadline = None;
+        self.reset_error = None;
+        self.reset_first_reason = None;
+        Ok(())
+    }
+
+    /// Moves the VM to the permanent `Poisoned` state: the old scope and the
+    /// recorded error are kept for diagnostics, interpreter state is left
+    /// untouched, and the VM is never marked reusable again.
+    fn poison(&mut self, error: VmResetError) {
+        self.reset_state = VmResetState::Poisoned;
+        self.reset_error = Some(error);
+    }
+
+    fn poison_diagnostic(&self) -> String {
+        self.reset_error
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "vm is permanently poisoned".to_string())
+    }
+
+    fn ensure_executable(&self, stage: &'static str) -> VmResult<()> {
+        if self.reset_state == VmResetState::Ready {
+            Ok(())
+        } else {
+            Err(VmError::Reset(VmResetError::NotReusable {
+                state: self.reset_state,
+                stage,
+            }))
+        }
     }
 
     fn validate_map_iterator_slot(&self, slot: usize) -> VmResult<()> {
@@ -1103,6 +1472,7 @@ impl Vm {
     }
 
     pub fn run(&mut self) -> VmResult<VmStatus> {
+        self.ensure_executable("run")?;
         let status = match self.run_internal(None, true) {
             Ok(status) => status,
             Err(error) => {
@@ -1117,6 +1487,7 @@ impl Vm {
         &mut self,
         debugger: &mut crate::debugger::Debugger,
     ) -> VmResult<VmStatus> {
+        self.ensure_executable("run_with_debugger")?;
         let status = match self.run_internal(Some(debugger), false) {
             Ok(status) => status,
             Err(error) => {
@@ -2860,6 +3231,7 @@ impl Vm {
     }
 
     pub fn resume(&mut self) -> VmResult<VmStatus> {
+        self.ensure_executable("resume")?;
         let allow_jit = !matches!(
             self.instance
                 .execution_frames
@@ -3074,6 +3446,7 @@ impl Vm {
     }
 
     pub fn start_callable(&mut self, callable: Value, args: &[Value]) -> VmResult<VmStatus> {
+        self.ensure_executable("start_callable")?;
         if self.instance.shutdown {
             return Err(VmError::InvalidFrameState("vm is shut down"));
         }

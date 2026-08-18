@@ -51,6 +51,12 @@ pub(crate) struct HostRuntime {
     pub(crate) runtime_owned_pending_host_slots: HashSet<u16>,
     pub(crate) resolved_calls: Vec<u16>,
     pub(crate) resolved_calls_dirty: bool,
+    /// First failure recorded by the most recent legacy
+    /// [`reset_for_reuse`](Self::reset_for_reuse) sweep (legacy operation
+    /// cancel or legacy resource close). The Vm consumes this after driving
+    /// the generic scope to quiescence so a failing legacy reset poisons the
+    /// Vm instead of silently continuing.
+    legacy_reset_failure: Option<String>,
     pub(crate) runtime_resources: ResourceArena,
     pub(crate) runtime_operations: OperationRegistry,
     /// The host-agnostic execution scope of this runtime, created Active.
@@ -86,6 +92,7 @@ impl HostRuntime {
             runtime_owned_pending_host_slots: HashSet::new(),
             resolved_calls: Vec::new(),
             resolved_calls_dirty: true,
+            legacy_reset_failure: None,
             runtime_resources: ResourceArena::with_limit(DEFAULT_MAX_RESOURCES)
                 .expect("default runtime resource limit should be valid"),
             runtime_operations: OperationRegistry::with_limit(DEFAULT_MAX_PENDING_OPERATIONS)
@@ -103,15 +110,40 @@ impl HostRuntime {
     /// cancelled, resources are closed, and the IO subsystem is recreated.
     /// Host bindings, capability allow-lists, and the async bridge are
     /// preserved (documented reusable state).
+    ///
+    /// Best-effort like before, but any legacy failure (operation cancel or
+    /// resource close) is recorded in [`Self::legacy_reset_failure`] so the
+    /// owning `Vm` can poison instead of silently claiming a clean reset.
+    /// The return type stays `()` for the migration-period builtin caller
+    /// (`close_all_handles`); the error surfaces through
+    /// [`Self::take_legacy_reset_failure`].
     pub(crate) fn reset_for_reuse(&mut self) {
-        let _ = self
+        let cancel_error = self
             .runtime_operations
-            .cancel_all(CancellationReason::VmReset);
-        let _ = self
+            .cancel_all(CancellationReason::VmReset)
+            .err()
+            .map(|error| error.to_string());
+        let close_error = self
             .runtime_resources
-            .close_all(CancellationReason::VmReset);
+            .close_all(CancellationReason::VmReset)
+            .err()
+            .map(|error| error.to_string());
+        let first = cancel_error.or(close_error);
+        if first.is_some() {
+            self.legacy_reset_failure = first;
+        }
         self.submitted_host_ops.clear();
         self.stream_drivers.clear();
+    }
+
+    /// Takes the first legacy reset failure recorded by the most recent
+    /// [`reset_for_reuse`](Self::reset_for_reuse) sweep, if any.
+    ///
+    /// `Vm` calls this after the generic scope reached quiescence so a
+    /// failing legacy reset poisons the Vm *before* the scope is recycled:
+    /// the installed scope is never replaced when the legacy path failed.
+    pub(crate) fn take_legacy_reset_failure(&mut self) -> Option<String> {
+        self.legacy_reset_failure.take()
     }
 
     pub(crate) fn set_host_function_state<T>(&mut self, state: T)

@@ -98,16 +98,17 @@ pub use jit::{
 pub use vm::diagnostics::render_vm_error;
 #[cfg(feature = "runtime")]
 pub use vm::{
-    AotArtifactError, CallOutcome, CallReturn, CancellationReason, CapabilityProfile,
-    CapabilityProfileBuilder, CloseProgress, DEFAULT_MAX_SCRIPT_CALL_DEPTH, EpochCheckpoint,
-    EpochHandle, FuelCheckpoint, HostArgsFunction, HostAsyncBridge, HostBindingPlan, HostContext,
-    HostContextError, HostContextErrorKind, HostContextResult, HostFunction, HostFunctionRegistry,
-    HostFuture, HostFutureOutput, HostImportBindingError, HostModule, HostOpId, HostResource,
-    HostStackFunction, IntoScriptValue, Invocation, InvocationError, InvocationItem,
-    InvocationPoll, QueuedScriptInvocation, Resource, ResourceHandle, ResourceTable, ScriptArgs,
-    ScriptCallback, ScriptResult, StaticHostArgsFunction, StaticHostFunction,
-    StaticHostStackFunction, Store, Vm, VmError, VmResult, VmStatus, VmYieldReason,
-    execution_scope, operation, resource,
+    AotArtifactError, BeginResetOutcome, CallOutcome, CallReturn, CancellationReason,
+    CapabilityProfile, CapabilityProfileBuilder, CloseProgress, DEFAULT_MAX_SCRIPT_CALL_DEPTH,
+    EpochCheckpoint, EpochHandle, FuelCheckpoint, HostArgsFunction, HostAsyncBridge,
+    HostBindingPlan, HostContext, HostContextError, HostContextErrorKind, HostContextResult,
+    HostFunction, HostFunctionRegistry, HostFuture, HostFutureOutput, HostImportBindingError,
+    HostModule, HostOpId, HostResource, HostStackFunction, IntoScriptValue, Invocation,
+    InvocationError, InvocationItem, InvocationPoll, QueuedScriptInvocation, Resource,
+    ResourceHandle, ResourceTable, ScriptArgs, ScriptCallback, ScriptResult,
+    StaticHostArgsFunction, StaticHostFunction, StaticHostStackFunction, Store, Vm, VmError,
+    VmResetError, VmResetState, VmResult, VmStatus, VmYieldReason, execution_scope, operation,
+    resource,
 };
 
 #[cfg(feature = "runtime")]

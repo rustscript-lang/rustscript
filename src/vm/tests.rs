@@ -2705,3 +2705,80 @@ fn native_callable_abi_version_covers_direct_script_calls() {
     let key = vm.ensure_program_cache_key();
     assert_ne!(key, 0, "cache key must be non-trivial");
 }
+
+#[test]
+fn legacy_reset_failure_poisons_without_replacing_the_scope() {
+    use crate::builtins::runtime::error::{RuntimeError, RuntimeErrorCode};
+    use crate::builtins::runtime::resource::ResourceTypeId;
+    use crate::vm::execution_scope::ScopeState;
+    use crate::vm::resource::ResourceCloseReason;
+    use std::task::{Context, Poll, Wake, Waker};
+    use std::time::Instant;
+
+    struct ResetWake;
+    impl Wake for ResetWake {
+        fn wake(self: Arc<Self>) {}
+    }
+    fn noop_context() -> Context<'static> {
+        static WAKER: OnceLock<Waker> = OnceLock::new();
+        Context::from_waker(WAKER.get_or_init(|| Waker::from(Arc::new(ResetWake))))
+    }
+
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    // A legacy resource whose cleanup fails makes the legacy HostRuntime
+    // reset report a failure, even though the generic scope is empty and
+    // would otherwise quiesce cleanly.
+    vm.host
+        .runtime_resources
+        .insert_with_cleanup(ResourceTypeId::IO_FILE, (), |_, _| {
+            Err(RuntimeError::new(
+                RuntimeErrorCode::ResourceCleanupFailed,
+                "resource::cleanup",
+                "legacy cleanup failed",
+            ))
+        })
+        .expect("legacy resource should be inserted");
+
+    assert_eq!(
+        vm.begin_reset_for_reuse(ResourceCloseReason::VmReset, None)
+            .expect("begin reset"),
+        BeginResetOutcome::Started
+    );
+
+    let mut cx = noop_context();
+    let result = loop {
+        match vm.poll_reset_for_reuse(&mut cx, Instant::now()) {
+            Poll::Pending => continue,
+            Poll::Ready(result) => break result,
+        }
+    };
+    let Err(VmError::Reset(VmResetError::LegacyReset(message))) = result else {
+        panic!("expected a legacy reset failure to poison the vm, got {result:?}");
+    };
+    assert!(
+        message.contains("legacy cleanup failed"),
+        "the recorded legacy reset failure must carry the cleanup diagnostics"
+    );
+
+    // Poisoned: never reusable, never auto-recovers, run rejected.
+    assert_eq!(vm.reset_state(), VmResetState::Poisoned);
+    assert!(!vm.is_reusable());
+    assert!(matches!(
+        vm.run(),
+        Err(VmError::Reset(VmResetError::NotReusable {
+            state: VmResetState::Poisoned,
+            ..
+        }))
+    ));
+
+    // The installed scope was NOT replaced: it remains Quiescent in place
+    // (the failed legacy reset never triggers a fresh-scope swap).
+    assert_eq!(vm.host.execution_scope_state(), ScopeState::Quiescent);
+    assert!(vm.host.execution_scope_is_quiescent());
+
+    // Repeated polls keep returning the same structured poison error.
+    match vm.poll_reset_for_reuse(&mut cx, Instant::now()) {
+        Poll::Ready(Err(VmError::Reset(VmResetError::LegacyReset(_)))) => {}
+        other => panic!("repeated poll after poisoning must stay stable, got {other:?}"),
+    }
+}
