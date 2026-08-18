@@ -3,13 +3,14 @@ use std::collections::HashMap;
 use crate::assembler::Assembler;
 use crate::builtins::BuiltinFunction;
 use crate::{
-    CallableKind, CallablePrototype, CallableTarget, ExportedCallable, FunctionRegion, Program,
-    RootCallableBinding, ScriptFunction, TypeMap, Value, ValueType,
+    CallableKind, CallablePrototype, CallableTarget, ExportedCallable, FunctionRegion, HostImport,
+    HostImportParam, HostImportSchema, Program, RootCallableBinding, ScriptFunction, TypeMap,
+    Value, ValueType,
 };
 
 use super::ir::{
-    ClosureExpr, Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern, MatchTypePattern, Stmt,
-    StructDecl, TypeSchema,
+    ClosureExpr, Expr, FunctionDecl, FunctionImpl, LocalSlot, MatchPattern, MatchTypePattern,
+    ResolvedHostCall, Stmt, StructDecl, TypeSchema,
 };
 use super::materialization::CallableUseFacts;
 use super::{CompileError, TypingMode, typing};
@@ -24,6 +25,8 @@ pub struct Compiler {
     host_import_return_types: HashMap<u16, typing::BoundType>,
     host_import_signatures: HashMap<u16, typing::HostCallableSignature>,
     call_index_remap: HashMap<u16, u16>,
+    host_imports: Vec<HostImport>,
+    resolved_host_import_indices: HashMap<ResolvedHostCall, u16>,
 
     callable_bindings: HashMap<LocalSlot, CallableBinding>,
     enable_local_move_semantics: bool,
@@ -87,6 +90,8 @@ impl Compiler {
             host_import_return_types: HashMap::new(),
             host_import_signatures: HashMap::new(),
             call_index_remap: HashMap::new(),
+            host_imports: Vec::new(),
+            resolved_host_import_indices: HashMap::new(),
 
             callable_bindings: HashMap::new(),
             enable_local_move_semantics: false,
@@ -176,6 +181,10 @@ impl Compiler {
         self.call_index_remap = call_index_remap;
     }
 
+    pub(crate) fn set_host_imports(&mut self, host_imports: Vec<HostImport>) {
+        self.host_imports = host_imports;
+    }
+
     pub fn set_enable_local_move_semantics(&mut self, enable_local_move_semantics: bool) {
         self.enable_local_move_semantics = enable_local_move_semantics;
     }
@@ -244,6 +253,7 @@ impl Compiler {
         program.function_regions = self.function_regions;
         program.root_callable_bindings = self.root_callable_bindings;
         program.exported_callables = exported_callables;
+        program.imports = self.host_imports;
         Ok(program)
     }
 
@@ -740,8 +750,8 @@ impl Compiler {
             | Expr::UnresolvedFunctionRef { .. } => {
                 return Err(CompileError::UnresolvedModuleCall);
             }
-            Expr::Call(index, type_args, args, _) => {
-                self.compile_function_call(*index, type_args, args)?;
+            Expr::Call(index, type_args, args, resolution) => {
+                self.compile_function_call(*index, type_args, args, resolution.as_deref())?;
             }
             Expr::Closure(closure) => {
                 let _ = self.emit_closure_callable(closure)?;
@@ -1318,7 +1328,7 @@ impl Compiler {
         }
         self.assembler.push_const(Value::Null);
         self.emit_stloc(target)?;
-        self.emit_direct_call(*index, args)?;
+        self.emit_direct_call(*index, args, None)?;
         Ok(true)
     }
 
@@ -1601,6 +1611,7 @@ impl Compiler {
         index: u16,
         type_args: &[TypeSchema],
         args: &[Expr],
+        resolution: Option<&ResolvedHostCall>,
     ) -> Result<(), CompileError> {
         if self.function_impls.contains_key(&index) {
             let direct_only = self
@@ -1651,7 +1662,7 @@ impl Compiler {
             self.emit_copy_ldloc(slot)?;
             return self.compile_callvalue_args(args, return_type);
         }
-        self.compile_direct_call(index, args)
+        self.compile_direct_call(index, args, resolution)
     }
 
     fn compile_callvalue_args(
@@ -1743,14 +1754,24 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_direct_call(&mut self, index: u16, args: &[Expr]) -> Result<(), CompileError> {
+    fn compile_direct_call(
+        &mut self,
+        index: u16,
+        args: &[Expr],
+        resolution: Option<&ResolvedHostCall>,
+    ) -> Result<(), CompileError> {
         for arg in args {
             self.compile_scalar_expr(arg)?;
         }
-        self.emit_direct_call(index, args)
+        self.emit_direct_call(index, args, resolution)
     }
 
-    fn emit_direct_call(&mut self, index: u16, args: &[Expr]) -> Result<(), CompileError> {
+    fn emit_direct_call(
+        &mut self,
+        index: u16,
+        args: &[Expr],
+        resolution: Option<&ResolvedHostCall>,
+    ) -> Result<(), CompileError> {
         let argc = u8::try_from(args.len()).map_err(|_| CompileError::CallArityOverflow)?;
         if let Some(builtin) = BuiltinFunction::from_call_index(index) {
             debug_assert!(builtin.accepts_arity(argc));
@@ -1758,9 +1779,63 @@ impl Compiler {
             self.assembler.call(index, argc);
             return Ok(());
         }
-        let remapped_index = self.call_index_remap.get(&index).copied().unwrap_or(index);
+        let remapped_index = match resolution {
+            Some(resolution) => self.ensure_resolved_host_import(index, resolution)?,
+            None => self.call_index_remap.get(&index).copied().unwrap_or(index),
+        };
         self.assembler.call(remapped_index, argc);
         Ok(())
+    }
+
+    fn ensure_resolved_host_import(
+        &mut self,
+        source_index: u16,
+        resolution: &ResolvedHostCall,
+    ) -> Result<u16, CompileError> {
+        if let Some(index) = self.resolved_host_import_indices.get(resolution).copied() {
+            return Ok(index);
+        }
+        let schema = HostImportSchema {
+            params: resolution
+                .params
+                .iter()
+                .zip(&resolution.passing)
+                .map(|(param, passing)| HostImportParam {
+                    name: param.name.clone(),
+                    schema: param.schema.clone(),
+                    passing: *passing,
+                })
+                .collect(),
+            return_type: resolution.return_type.clone(),
+            fingerprint: resolution.fingerprint,
+        };
+        let base_index = self
+            .call_index_remap
+            .get(&source_index)
+            .copied()
+            .unwrap_or(source_index);
+        let index = if let Some(import) = self.host_imports.get_mut(usize::from(base_index))
+            && import.schema.is_none()
+        {
+            import.name = resolution.name.clone();
+            import.return_type = resolution.return_type.coarse_value_type();
+            import.schema = Some(schema);
+            base_index
+        } else {
+            let index = u16::try_from(self.host_imports.len())
+                .map_err(|_| CompileError::HostImportOverflow)?;
+            self.host_imports.push(HostImport {
+                name: resolution.name.clone(),
+                arity: u8::try_from(resolution.params.len())
+                    .map_err(|_| CompileError::CallArityOverflow)?,
+                return_type: resolution.return_type.coarse_value_type(),
+                schema: Some(schema),
+            });
+            index
+        };
+        self.resolved_host_import_indices
+            .insert(resolution.clone(), index);
+        Ok(index)
     }
 
     fn compile_match_pattern_condition(

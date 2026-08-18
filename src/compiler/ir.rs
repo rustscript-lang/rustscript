@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 
 use crate::ValueType;
 use crate::builtins::default_host_callable;
@@ -42,6 +43,49 @@ pub enum TypeSchema {
     /// resource can never be mistaken for structural data (object/map) or a
     /// generic instantiation.
     Resource(ResourceTypeKey),
+}
+
+impl Hash for TypeSchema {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            TypeSchema::Unknown
+            | TypeSchema::Null
+            | TypeSchema::Int
+            | TypeSchema::Float
+            | TypeSchema::Number
+            | TypeSchema::Bool
+            | TypeSchema::String
+            | TypeSchema::Bytes => {}
+            TypeSchema::Optional(inner) | TypeSchema::Array(inner) | TypeSchema::Map(inner) => {
+                inner.hash(state);
+            }
+            TypeSchema::GenericParam(name) => name.hash(state),
+            TypeSchema::Named(name, args) => {
+                name.hash(state);
+                args.hash(state);
+            }
+            TypeSchema::ArrayTuple(items) => items.hash(state),
+            TypeSchema::ArrayTupleRest { prefix, rest } => {
+                prefix.hash(state);
+                rest.hash(state);
+            }
+            TypeSchema::Object(fields) => {
+                fields.len().hash(state);
+                let mut fields = fields.iter().collect::<Vec<_>>();
+                fields.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+                for (name, schema) in fields {
+                    name.hash(state);
+                    schema.hash(state);
+                }
+            }
+            TypeSchema::Callable { params, result } => {
+                params.hash(state);
+                result.hash(state);
+            }
+            TypeSchema::Resource(key) => key.hash(state),
+        }
+    }
 }
 
 impl TypeSchema {
@@ -198,7 +242,7 @@ pub struct FunctionParam {
 }
 
 /// One host function parameter mapped into the compiler's inference world.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ResolvedHostParam {
     /// Parameter label, unique within its function.
     pub name: String,
@@ -211,7 +255,7 @@ pub struct ResolvedHostParam {
 /// Indexes of [`Self::params`] and [`Self::passing`] are aligned; the
 /// returning [`TypeSchema`] is the compiler view of the catalog's return
 /// schema.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ResolvedHostCall {
     /// The selected function name.
     pub name: String,

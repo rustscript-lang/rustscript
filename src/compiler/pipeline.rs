@@ -482,6 +482,17 @@ fn compile_parsed_output_with_entry_locals(
     compiler.set_host_import_return_types(host_import_return_types);
     compiler.set_host_import_signatures(host_import_signatures);
     compiler.set_call_index_remap(call_index_remap);
+    compiler.set_host_imports(
+        runtime_import_functions
+            .iter()
+            .map(|func| HostImport {
+                name: func.name.clone(),
+                arity: func.arity,
+                return_type: func.return_type,
+                schema: None,
+            })
+            .collect(),
+    );
     compiler.set_enable_local_move_semantics(enable_local_move_semantics);
     for func in &functions {
         compiler.add_function_debug(func);
@@ -496,14 +507,6 @@ fn compile_parsed_output_with_entry_locals(
         .compile_program(&stmts)
         .map_err(SourceError::Compile)?;
     program.local_count = program.local_count.max(locals);
-    program.imports = runtime_import_functions
-        .iter()
-        .map(|func| HostImport {
-            name: func.name.clone(),
-            arity: func.arity,
-            return_type: func.return_type,
-        })
-        .collect();
     let runtime_locals = program.local_count;
     Ok(CompiledProgram {
         program,

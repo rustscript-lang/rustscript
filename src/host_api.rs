@@ -675,6 +675,10 @@ pub struct HostApiCatalog {
 pub struct HostApiFingerprint(u64);
 
 impl HostApiFingerprint {
+    pub(crate) const fn from_wire(value: u64) -> Self {
+        Self(value)
+    }
+
     pub const fn as_u64(self) -> u64 {
         self.0
     }

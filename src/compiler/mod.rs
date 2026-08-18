@@ -62,6 +62,7 @@ pub use self::source_loader::{FrontendImportSyntax, ImportClause, ModuleImport, 
 pub enum CompileError {
     Assembler(AssemblerError),
     CallArityOverflow,
+    HostImportOverflow,
     ClosureUsedAsValue,
     CallableUsedAsValue,
     NonCallableLocal(LocalSlot),
@@ -173,6 +174,9 @@ impl CompileError {
             CompileError::Assembler(err) => err.to_string(),
             CompileError::CallArityOverflow => {
                 "call arity exceeds the supported bytecode encoding".to_string()
+            }
+            CompileError::HostImportOverflow => {
+                "host import count exceeds the supported bytecode encoding".to_string()
             }
             CompileError::ClosureUsedAsValue => {
                 "closures cannot be used as plain values".to_string()

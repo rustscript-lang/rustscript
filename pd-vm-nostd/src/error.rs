@@ -107,6 +107,9 @@ pub enum WireError {
     InvalidDebugFlag(u8),
     InvalidValueType(u8),
     InvalidCaptureBindingMode(u8),
+    InvalidHostParamPassing(u8),
+    InvalidHostImportSchema(&'static str),
+    InvalidResourceKey,
     /// `CallScript` referenced a prototype id that is out of range or does
     /// not target a script function.
     InvalidCallScriptTarget {
@@ -146,6 +149,13 @@ impl fmt::Display for WireError {
             Self::InvalidCaptureBindingMode(value) => {
                 write!(f, "invalid capture binding mode: {value}")
             }
+            Self::InvalidHostParamPassing(value) => {
+                write!(f, "invalid host parameter passing mode: {value}")
+            }
+            Self::InvalidHostImportSchema(message) => {
+                write!(f, "invalid host import schema: {message}")
+            }
+            Self::InvalidResourceKey => f.write_str("invalid resource type key"),
             Self::InvalidCallScriptTarget { prototype_id } => write!(
                 f,
                 "callscript prototype {prototype_id} does not target a script function"

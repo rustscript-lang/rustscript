@@ -41,8 +41,9 @@ pub use builtins::{
 };
 pub use bytecode::{
     CallableEnvironment, CallableKind, CallablePrototype, CallableTarget, CallableValue,
-    CaptureBindingMode, ExportedCallable, FunctionRegion, HostImport, OpCode, Program,
-    RootCallableBinding, ScriptFunction, TypeMap, Value, ValueType, VmMap,
+    CaptureBindingMode, ExportedCallable, FunctionRegion, HostImport, HostImportParam,
+    HostImportSchema, OpCode, Program, RootCallableBinding, ScriptFunction, TypeMap, Value,
+    ValueType, VmMap,
 };
 pub fn builtin_call_index(name: &str) -> Option<u16> {
     use builtins::BuiltinFunction;

@@ -4,12 +4,13 @@ use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
 use crate::compiler::TypeSchema;
+use crate::host_api::{HostApiFingerprint, HostParamPassing};
 
 /// Bytecode ABI version used for VM-internal cache identity (JIT trace cache,
 /// program cache keys). The VMBC wire format version lives in `src/vmbc.rs`
-/// (`VERSION_V12`); both were bumped together for the static builtin ID break
-/// and again for the direct script-call (`CallScript`) opcode break.
-pub const BYTECODE_ABI_VERSION: u16 = 12;
+/// (`VERSION_V13`); both are bumped for bytecode-shape changes, most recently
+/// for exact host-import schemas and per-call catalog identity.
+pub const BYTECODE_ABI_VERSION: u16 = 13;
 
 pub type SharedString = Arc<String>;
 pub type SharedBytes = Arc<Vec<u8>>;
@@ -533,10 +534,25 @@ fn callable_value_eq(lhs: &CallableValue, rhs: &CallableValue) -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct HostImportParam {
+    pub name: String,
+    pub schema: TypeSchema,
+    pub passing: HostParamPassing,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct HostImportSchema {
+    pub params: Vec<HostImportParam>,
+    pub return_type: TypeSchema,
+    pub fingerprint: HostApiFingerprint,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HostImport {
     pub name: String,
     pub arity: u8,
     pub return_type: ValueType,
+    pub schema: Option<HostImportSchema>,
 }
 
 #[allow(dead_code)]

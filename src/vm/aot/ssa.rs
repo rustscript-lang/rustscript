@@ -2860,6 +2860,7 @@ mod tests {
                 name: "host".to_string(),
                 arity: 1,
                 return_type: ValueType::Int,
+                schema: None,
             }],
             None,
         );

@@ -3,11 +3,19 @@ use std::collections::HashMap;
 use vm::compiler::TypeSchema;
 use vm::{
     ArgInfo, Assembler, BuiltinFunction, BytecodeBuilder, CallableKind, CallablePrototype,
-    CallableTarget, DebugFunction, DebugInfo, DisassembleOptions, HostApiCatalog, HostImport,
-    LineInfo, LocalInfo, Program, ResourceTypeKey, ScriptFunction, TypeMap, ValidationError, Value,
-    ValueType, WireError, builtin_call_index, decode_program, disassemble_vmbc,
-    disassemble_vmbc_with_options, encode_program, infer_local_count, validate_program,
+    CallableTarget, DebugFunction, DebugInfo, DisassembleOptions, HostApiBuilder, HostApiCatalog,
+    HostApiFingerprint, HostFunctionSchema, HostImport, HostImportParam, HostImportSchema,
+    HostParamPassing, LineInfo, LocalInfo, Program, ResourceTypeKey, ScriptFunction, TypeMap,
+    ValidationError, Value, ValueType, WireError, builtin_call_index, decode_program,
+    disassemble_vmbc, disassemble_vmbc_with_options, encode_program, infer_local_count,
+    validate_program,
 };
+
+fn test_host_api_fingerprint() -> HostApiFingerprint {
+    let mut builder = HostApiBuilder::new();
+    builder.function(HostFunctionSchema::new("test::host", vec![]));
+    builder.build().expect("test catalog").fingerprint()
+}
 
 #[test]
 fn wire_roundtrip_preserves_constants_and_code() {
@@ -25,6 +33,7 @@ fn wire_roundtrip_preserves_constants_and_code() {
             name: "print".to_string(),
             arity: 1,
             return_type: ValueType::Unknown,
+            schema: None,
         }],
         Some(DebugInfo {
             source: Some("fn a(x);\na(1);".to_string()),
@@ -57,7 +66,7 @@ fn wire_roundtrip_preserves_constants_and_code() {
     });
 
     let encoded = encode_program(&program).expect("encode should succeed");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 12);
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
     let decoded = decode_program(&encoded).expect("decode should succeed");
 
     assert_eq!(decoded.constants, program.constants);
@@ -174,6 +183,7 @@ fn validate_accepts_known_good_program() {
             name: "print".to_string(),
             arity: 1,
             return_type: ValueType::Unknown,
+            schema: None,
         }],
         None,
     );
@@ -181,7 +191,7 @@ fn validate_accepts_known_good_program() {
 }
 
 #[test]
-fn callable_metadata_roundtrips_vmbc_v12() {
+fn callable_metadata_roundtrips_vmbc_v13() {
     let compiled = vm::compile_source_for_repl(
         r#"
             fn add_one(value: int) -> int { value + 1 }
@@ -340,6 +350,7 @@ fn validate_rejects_invalid_call_arity_for_import() {
             name: "print".to_string(),
             arity: 1,
             return_type: ValueType::Unknown,
+            schema: None,
         }],
         None,
     );
@@ -379,6 +390,7 @@ fn disassemble_vmbc_outputs_readable_listing() {
             name: "print".to_string(),
             arity: 1,
             return_type: ValueType::Unknown,
+            schema: None,
         }],
         None,
     );
@@ -466,6 +478,7 @@ fn wire_roundtrip_preserves_host_import_return_types() {
             name: "typed_host".to_string(),
             arity: 1,
             return_type: ValueType::Int,
+            schema: None,
         }],
         None,
     );
@@ -474,6 +487,159 @@ fn wire_roundtrip_preserves_host_import_return_types() {
     let decoded = decode_program(&encoded).expect("decode should succeed");
 
     assert_eq!(decoded.imports, program.imports);
+}
+
+#[test]
+fn wire_rejects_host_import_schema_arity_mismatch() {
+    let program = Program::with_imports_and_debug(
+        vec![],
+        vec![],
+        vec![HostImport {
+            name: "host".to_string(),
+            arity: 1,
+            return_type: ValueType::Null,
+            schema: Some(HostImportSchema {
+                params: vec![],
+                return_type: TypeSchema::Null,
+                fingerprint: test_host_api_fingerprint(),
+            }),
+        }],
+        None,
+    );
+
+    assert!(matches!(
+        encode_program(&program),
+        Err(WireError::InvalidHostImportSchema(
+            "parameter count does not match arity"
+        ))
+    ));
+}
+
+#[test]
+fn wire_rejects_host_import_exact_and_coarse_return_mismatch() {
+    let program = Program::with_imports_and_debug(
+        vec![],
+        vec![],
+        vec![HostImport {
+            name: "host".to_string(),
+            arity: 0,
+            return_type: ValueType::Int,
+            schema: Some(HostImportSchema {
+                params: vec![],
+                return_type: TypeSchema::String,
+                fingerprint: test_host_api_fingerprint(),
+            }),
+        }],
+        None,
+    );
+
+    assert!(matches!(
+        encode_program(&program),
+        Err(WireError::InvalidHostImportSchema(
+            "exact return schema does not match coarse return type"
+        ))
+    ));
+}
+
+#[test]
+fn wire_rejects_invalid_host_param_passing_tag() {
+    let program = Program::with_imports_and_debug(
+        vec![],
+        vec![],
+        vec![HostImport {
+            name: "x".to_string(),
+            arity: 1,
+            return_type: ValueType::Null,
+            schema: Some(HostImportSchema {
+                params: vec![HostImportParam {
+                    name: "p".to_string(),
+                    schema: TypeSchema::Int,
+                    passing: HostParamPassing::Value,
+                }],
+                return_type: TypeSchema::Null,
+                fingerprint: test_host_api_fingerprint(),
+            }),
+        }],
+        None,
+    );
+    let mut encoded = encode_program(&program).expect("fixture should encode");
+    encoded[46] = 0xff;
+
+    assert!(matches!(
+        decode_program(&encoded),
+        Err(WireError::InvalidHostParamPassing(0xff))
+    ));
+}
+
+#[test]
+fn wire_rejects_host_import_schema_beyond_depth_limit() {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(b"VMBC");
+    encoded.extend_from_slice(&13u16.to_le_bytes());
+    encoded.extend_from_slice(&0u16.to_le_bytes());
+    encoded.extend_from_slice(&0u32.to_le_bytes());
+    encoded.extend_from_slice(&0u32.to_le_bytes());
+    encoded.extend_from_slice(&1u32.to_le_bytes());
+    encoded.extend_from_slice(&1u32.to_le_bytes());
+    encoded.push(b'x');
+    encoded.push(0);
+    encoded.push(ValueType::Null as u8);
+    encoded.push(1);
+    encoded.extend_from_slice(&test_host_api_fingerprint().as_u64().to_le_bytes());
+    encoded.extend_from_slice(&0u32.to_le_bytes());
+    encoded.extend(std::iter::repeat(16).take(64));
+    encoded.push(1);
+    encoded.push(0);
+    encoded.push(0);
+    for _ in 0..5 {
+        encoded.extend_from_slice(&0u32.to_le_bytes());
+    }
+
+    assert!(matches!(
+        decode_program(&encoded),
+        Err(WireError::SchemaTooDeep)
+    ));
+}
+
+#[test]
+fn wire_rejects_duplicate_object_fields_inside_host_import_schema() {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(b"VMBC");
+    encoded.extend_from_slice(&13u16.to_le_bytes());
+    encoded.extend_from_slice(&0u16.to_le_bytes());
+    encoded.extend_from_slice(&0u32.to_le_bytes());
+    encoded.extend_from_slice(&0u32.to_le_bytes());
+    encoded.extend_from_slice(&1u32.to_le_bytes());
+    encoded.extend_from_slice(&1u32.to_le_bytes());
+    encoded.push(b'x');
+    encoded.push(1);
+    encoded.push(ValueType::Null as u8);
+    encoded.push(1);
+    encoded.extend_from_slice(&0u64.to_le_bytes());
+    encoded.extend_from_slice(&1u32.to_le_bytes());
+    encoded.extend_from_slice(&1u32.to_le_bytes());
+    encoded.push(b'p');
+    encoded.push(14);
+    encoded.extend_from_slice(&2u32.to_le_bytes());
+    for schema_tag in [2, 6] {
+        encoded.extend_from_slice(&1u32.to_le_bytes());
+        encoded.push(b'a');
+        encoded.push(schema_tag);
+    }
+    encoded.push(0);
+    encoded.push(1);
+    encoded.push(0);
+    encoded.push(0);
+    for _ in 0..5 {
+        encoded.extend_from_slice(&0u32.to_le_bytes());
+    }
+
+    assert!(matches!(
+        decode_program(&encoded),
+        Err(WireError::InvalidHostImportSchema(
+            "duplicate object field name"
+        ))
+    ));
 }
 
 #[test]
@@ -542,7 +708,7 @@ fn literal_string_builtin_indices_are_appended_and_publicly_resolved() {
 }
 
 // ---------------------------------------------------------------------------
-// Milestone 6: CallScript wire support (VMBC V12)
+// Milestone 6: CallScript wire support (VMBC V13)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -551,7 +717,7 @@ fn call_script_roundtrips_validation_and_disassembly() {
     code.extend_from_slice(&7u32.to_le_bytes());
     code.push(2);
     code.push(vm::OpCode::Ret as u8);
-    // The V12 validator resolves the prototype id against the callable
+    // The V13 validator resolves the prototype id against the callable
     // metadata, so the fixture carries a matching prototype (id 7, arity 2,
     // script-function target) plus one script function boundary.
     let program = Program::new(vec![], code).with_callable_metadata(
@@ -728,6 +894,7 @@ fn validate_rejects_call_script_targeting_host_import_prototype() {
             name: "host_fn".to_string(),
             arity: 1,
             return_type: ValueType::Unknown,
+            schema: None,
         }],
         None,
     )
@@ -758,22 +925,22 @@ fn validate_rejects_call_script_targeting_host_import_prototype() {
 }
 
 #[test]
-fn call_script_wire_version_is_v12_and_rejects_v11() {
+fn call_script_wire_version_is_v13_and_rejects_v12() {
     let program = Program::new(vec![], vec![vm::OpCode::Ret as u8]);
     let encoded = encode_program(&program).expect("encode should succeed");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 12);
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
 
     let mut old = encoded.clone();
-    old[4..6].copy_from_slice(&11u16.to_le_bytes());
+    old[4..6].copy_from_slice(&12u16.to_le_bytes());
     assert!(matches!(
         decode_program(&old),
-        Err(WireError::UnsupportedVersion(11))
+        Err(WireError::UnsupportedVersion(12))
     ));
 }
 
 #[test]
 fn call_script_no_script_program_code_bytes_unchanged_by_version_bump() {
-    // The V12 bump must not alter instruction bytes for programs without
+    // The V13 bump must not alter instruction bytes for programs without
     // script calls: encode a plain arithmetic program and verify the
     // embedded code section is exactly the assembler output.
     let mut bc = BytecodeBuilder::new();
@@ -783,7 +950,7 @@ fn call_script_no_script_program_code_bytes_unchanged_by_version_bump() {
     bc.ret();
     let program = Program::new(vec![Value::Int(1), Value::Int(2)], bc.finish());
     let encoded = encode_program(&program).expect("encode should succeed");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 12);
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
     let decoded = decode_program(&encoded).expect("decode should succeed");
     assert_eq!(decoded.code, program.code);
     assert_eq!(decoded.constants, program.constants);

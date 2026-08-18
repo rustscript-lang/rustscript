@@ -4,15 +4,18 @@ use std::fmt::Write;
 use crate::builtins::BuiltinFunction;
 use crate::bytecode::{
     CallableKind, CallablePrototype, CallableTarget, CaptureBindingMode, ExportedCallable,
-    FunctionRegion, RootCallableBinding, ScriptFunction, TypeMap, ValueType,
+    FunctionRegion, HostImportParam, HostImportSchema, RootCallableBinding, ScriptFunction,
+    TypeMap, ValueType,
 };
 use crate::compiler::ir::TypeSchema;
 use crate::debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
+use crate::host_api::{HostApiFingerprint, HostParamPassing};
 use crate::vm::{HostImport, OpCode, Program, Value};
 
 const MAGIC: [u8; 4] = *b"VMBC";
-const VERSION_V12: u16 = 12;
+const VERSION_V13: u16 = 13;
 const FLAGS: u16 = 0;
+const MAX_SCHEMA_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireError {
@@ -26,6 +29,9 @@ pub enum WireError {
     InvalidDebugFlag(u8),
     InvalidValueType(u8),
     InvalidCaptureBindingMode(u8),
+    InvalidHostParamPassing(u8),
+    InvalidHostImportSchema(&'static str),
+    SchemaTooDeep,
     InvalidUtf8,
     InvalidResourceKey(String),
     StringTooLong(usize),
@@ -52,6 +58,13 @@ impl std::fmt::Display for WireError {
             WireError::InvalidCaptureBindingMode(value) => {
                 write!(f, "invalid capture binding mode: {value}")
             }
+            WireError::InvalidHostParamPassing(value) => {
+                write!(f, "invalid host parameter passing mode: {value}")
+            }
+            WireError::InvalidHostImportSchema(message) => {
+                write!(f, "invalid host import schema: {message}")
+            }
+            WireError::SchemaTooDeep => f.write_str("schema nesting depth exceeds the limit"),
             WireError::InvalidUtf8 => write!(f, "invalid utf-8 string"),
             WireError::InvalidResourceKey(reason) => {
                 write!(f, "invalid resource key: {reason}")
@@ -271,7 +284,7 @@ fn read_constant(cursor: &mut Cursor<'_>, depth: usize) -> Result<Value, WireErr
 pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&VERSION_V12.to_le_bytes());
+    out.extend_from_slice(&VERSION_V13.to_le_bytes());
     out.extend_from_slice(&FLAGS.to_le_bytes());
     write_u32_count("constants", program.constants.len(), &mut out)?;
 
@@ -287,6 +300,38 @@ pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
         write_string("import name", &import.name, &mut out)?;
         out.push(import.arity);
         out.push(import.return_type as u8);
+        match &import.schema {
+            Some(schema) => {
+                if schema.params.len() != usize::from(import.arity) {
+                    return Err(WireError::InvalidHostImportSchema(
+                        "parameter count does not match arity",
+                    ));
+                }
+                if schema.return_type.coarse_value_type() != import.return_type {
+                    return Err(WireError::InvalidHostImportSchema(
+                        "exact return schema does not match coarse return type",
+                    ));
+                }
+                out.push(1);
+                out.extend_from_slice(&schema.fingerprint.as_u64().to_le_bytes());
+                write_u32_count("host import params", schema.params.len(), &mut out)?;
+                for (param_index, param) in schema.params.iter().enumerate() {
+                    if schema.params[..param_index]
+                        .iter()
+                        .any(|previous| previous.name == param.name)
+                    {
+                        return Err(WireError::InvalidHostImportSchema(
+                            "duplicate parameter name",
+                        ));
+                    }
+                    write_string("host import parameter name", &param.name, &mut out)?;
+                    write_schema(&param.schema, &mut out)?;
+                    out.push(host_param_passing_tag(param.passing));
+                }
+                write_schema(&schema.return_type, &mut out)?;
+            }
+            None => out.push(0),
+        }
     }
 
     write_type_map(&mut out, program.type_map.as_ref())?;
@@ -305,7 +350,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     }
 
     let version = cursor.read_u16()?;
-    if version != VERSION_V12 {
+    if version != VERSION_V13 {
         return Err(WireError::UnsupportedVersion(version));
     }
 
@@ -325,10 +370,55 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     let import_count = cursor.read_u32()? as usize;
     let mut imports = Vec::with_capacity(import_count);
     for _ in 0..import_count {
+        let name = cursor.read_string()?;
+        let arity = cursor.read_u8()?;
+        let return_type = read_value_type(cursor.read_u8()?)?;
+        let schema = match cursor.read_u8()? {
+            0 => None,
+            1 => {
+                let fingerprint = HostApiFingerprint::from_wire(cursor.read_u64()?);
+                let param_count = cursor.read_u32()? as usize;
+                if param_count != usize::from(arity) {
+                    return Err(WireError::InvalidHostImportSchema(
+                        "parameter count does not match arity",
+                    ));
+                }
+                let mut params = Vec::with_capacity(param_count);
+                for _ in 0..param_count {
+                    let name = cursor.read_string()?;
+                    if params
+                        .iter()
+                        .any(|param: &HostImportParam| param.name == name)
+                    {
+                        return Err(WireError::InvalidHostImportSchema(
+                            "duplicate parameter name",
+                        ));
+                    }
+                    params.push(HostImportParam {
+                        name,
+                        schema: read_schema(&mut cursor)?,
+                        passing: read_host_param_passing(cursor.read_u8()?)?,
+                    });
+                }
+                let return_schema = read_schema(&mut cursor)?;
+                if return_schema.coarse_value_type() != return_type {
+                    return Err(WireError::InvalidHostImportSchema(
+                        "exact return schema does not match coarse return type",
+                    ));
+                }
+                Some(HostImportSchema {
+                    params,
+                    return_type: return_schema,
+                    fingerprint,
+                })
+            }
+            other => return Err(WireError::InvalidBool(other)),
+        };
         imports.push(HostImport {
-            name: cursor.read_string()?,
-            arity: cursor.read_u8()?,
-            return_type: read_value_type(cursor.read_u8()?)?,
+            name,
+            arity,
+            return_type,
+            schema,
         });
     }
     let type_map = read_type_map(&mut cursor)?;
@@ -1307,6 +1397,25 @@ fn read_value_type(raw: u8) -> Result<ValueType, WireError> {
     }
 }
 
+fn host_param_passing_tag(passing: HostParamPassing) -> u8 {
+    match passing {
+        HostParamPassing::Value => 0,
+        HostParamPassing::Borrow => 1,
+        HostParamPassing::BorrowMut => 2,
+        HostParamPassing::TakeOwned => 3,
+    }
+}
+
+fn read_host_param_passing(raw: u8) -> Result<HostParamPassing, WireError> {
+    match raw {
+        0 => Ok(HostParamPassing::Value),
+        1 => Ok(HostParamPassing::Borrow),
+        2 => Ok(HostParamPassing::BorrowMut),
+        3 => Ok(HostParamPassing::TakeOwned),
+        other => Err(WireError::InvalidHostParamPassing(other)),
+    }
+}
+
 fn write_optional_u32(value: Option<u32>, out: &mut Vec<u8>) {
     match value {
         Some(value) => {
@@ -1371,6 +1480,14 @@ fn read_optional_schema(cursor: &mut Cursor<'_>) -> Result<Option<TypeSchema>, W
 }
 
 fn write_schema(schema: &TypeSchema, out: &mut Vec<u8>) -> Result<(), WireError> {
+    write_schema_at(schema, out, 0)
+}
+
+fn write_schema_at(schema: &TypeSchema, out: &mut Vec<u8>, depth: usize) -> Result<(), WireError> {
+    if depth >= MAX_SCHEMA_DEPTH {
+        return Err(WireError::SchemaTooDeep);
+    }
+    let nested = depth + 1;
     match schema {
         TypeSchema::Unknown => out.push(0),
         TypeSchema::Null => out.push(1),
@@ -1382,7 +1499,7 @@ fn write_schema(schema: &TypeSchema, out: &mut Vec<u8>) -> Result<(), WireError>
         TypeSchema::Bytes => out.push(7),
         TypeSchema::Optional(inner) => {
             out.push(16);
-            write_schema(inner, out)?;
+            write_schema_at(inner, out, nested)?;
         }
         TypeSchema::GenericParam(name) => {
             out.push(8);
@@ -1393,31 +1510,31 @@ fn write_schema(schema: &TypeSchema, out: &mut Vec<u8>) -> Result<(), WireError>
             write_string("schema name", name, out)?;
             write_u32_count("schema type args", type_args.len(), out)?;
             for type_arg in type_args {
-                write_schema(type_arg, out)?;
+                write_schema_at(type_arg, out, nested)?;
             }
         }
         TypeSchema::Array(item) => {
             out.push(10);
-            write_schema(item, out)?;
+            write_schema_at(item, out, nested)?;
         }
         TypeSchema::ArrayTuple(items) => {
             out.push(11);
             write_u32_count("schema tuple items", items.len(), out)?;
             for item in items {
-                write_schema(item, out)?;
+                write_schema_at(item, out, nested)?;
             }
         }
         TypeSchema::ArrayTupleRest { prefix, rest } => {
             out.push(12);
             write_u32_count("schema tuple prefix", prefix.len(), out)?;
             for item in prefix {
-                write_schema(item, out)?;
+                write_schema_at(item, out, nested)?;
             }
-            write_schema(rest, out)?;
+            write_schema_at(rest, out, nested)?;
         }
         TypeSchema::Map(item) => {
             out.push(13);
-            write_schema(item, out)?;
+            write_schema_at(item, out, nested)?;
         }
         TypeSchema::Object(fields) => {
             out.push(14);
@@ -1426,16 +1543,16 @@ fn write_schema(schema: &TypeSchema, out: &mut Vec<u8>) -> Result<(), WireError>
             write_u32_count("schema object fields", entries.len(), out)?;
             for (name, value) in entries {
                 write_string("schema object field", name, out)?;
-                write_schema(value, out)?;
+                write_schema_at(value, out, nested)?;
             }
         }
         TypeSchema::Callable { params, result } => {
             out.push(15);
             write_u32_count("schema callable params", params.len(), out)?;
             for param in params {
-                write_schema(param, out)?;
+                write_schema_at(param, out, nested)?;
             }
-            write_schema(result, out)?;
+            write_schema_at(result, out, nested)?;
         }
         TypeSchema::Resource(key) => {
             out.push(17);
@@ -1446,6 +1563,14 @@ fn write_schema(schema: &TypeSchema, out: &mut Vec<u8>) -> Result<(), WireError>
 }
 
 fn read_schema(cursor: &mut Cursor<'_>) -> Result<TypeSchema, WireError> {
+    read_schema_at(cursor, 0)
+}
+
+fn read_schema_at(cursor: &mut Cursor<'_>, depth: usize) -> Result<TypeSchema, WireError> {
+    if depth >= MAX_SCHEMA_DEPTH {
+        return Err(WireError::SchemaTooDeep);
+    }
+    let nested = depth + 1;
     match cursor.read_u8()? {
         0 => Ok(TypeSchema::Unknown),
         1 => Ok(TypeSchema::Null),
@@ -1455,23 +1580,25 @@ fn read_schema(cursor: &mut Cursor<'_>) -> Result<TypeSchema, WireError> {
         5 => Ok(TypeSchema::Bool),
         6 => Ok(TypeSchema::String),
         7 => Ok(TypeSchema::Bytes),
-        16 => Ok(TypeSchema::Optional(Box::new(read_schema(cursor)?))),
+        16 => Ok(TypeSchema::Optional(Box::new(read_schema_at(
+            cursor, nested,
+        )?))),
         8 => Ok(TypeSchema::GenericParam(cursor.read_string()?)),
         9 => {
             let name = cursor.read_string()?;
             let count = cursor.read_u32()? as usize;
             let mut type_args = Vec::with_capacity(count);
             for _ in 0..count {
-                type_args.push(read_schema(cursor)?);
+                type_args.push(read_schema_at(cursor, nested)?);
             }
             Ok(TypeSchema::Named(name, type_args))
         }
-        10 => Ok(TypeSchema::Array(Box::new(read_schema(cursor)?))),
+        10 => Ok(TypeSchema::Array(Box::new(read_schema_at(cursor, nested)?))),
         11 => {
             let count = cursor.read_u32()? as usize;
             let mut items = Vec::with_capacity(count);
             for _ in 0..count {
-                items.push(read_schema(cursor)?);
+                items.push(read_schema_at(cursor, nested)?);
             }
             Ok(TypeSchema::ArrayTuple(items))
         }
@@ -1479,19 +1606,23 @@ fn read_schema(cursor: &mut Cursor<'_>) -> Result<TypeSchema, WireError> {
             let count = cursor.read_u32()? as usize;
             let mut prefix = Vec::with_capacity(count);
             for _ in 0..count {
-                prefix.push(read_schema(cursor)?);
+                prefix.push(read_schema_at(cursor, nested)?);
             }
-            let rest = Box::new(read_schema(cursor)?);
+            let rest = Box::new(read_schema_at(cursor, nested)?);
             Ok(TypeSchema::ArrayTupleRest { prefix, rest })
         }
-        13 => Ok(TypeSchema::Map(Box::new(read_schema(cursor)?))),
+        13 => Ok(TypeSchema::Map(Box::new(read_schema_at(cursor, nested)?))),
         14 => {
             let count = cursor.read_u32()? as usize;
             let mut fields = HashMap::with_capacity(count);
             for _ in 0..count {
                 let name = cursor.read_string()?;
-                let value = read_schema(cursor)?;
-                fields.insert(name, value);
+                let value = read_schema_at(cursor, nested)?;
+                if fields.insert(name, value).is_some() {
+                    return Err(WireError::InvalidHostImportSchema(
+                        "duplicate object field name",
+                    ));
+                }
             }
             Ok(TypeSchema::Object(fields))
         }
@@ -1499,9 +1630,9 @@ fn read_schema(cursor: &mut Cursor<'_>) -> Result<TypeSchema, WireError> {
             let count = cursor.read_u32()? as usize;
             let mut params = Vec::with_capacity(count);
             for _ in 0..count {
-                params.push(read_schema(cursor)?);
+                params.push(read_schema_at(cursor, nested)?);
             }
-            let result = Box::new(read_schema(cursor)?);
+            let result = Box::new(read_schema_at(cursor, nested)?);
             Ok(TypeSchema::Callable { params, result })
         }
         17 => {
@@ -1557,6 +1688,11 @@ impl<'a> Cursor<'a> {
     fn read_u32(&mut self) -> Result<u32, WireError> {
         let bytes = self.read_exact_array::<4>()?;
         Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, WireError> {
+        let bytes = self.read_exact_array::<8>()?;
+        Ok(u64::from_le_bytes(bytes))
     }
 
     fn read_i64(&mut self) -> Result<i64, WireError> {

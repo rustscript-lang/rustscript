@@ -129,6 +129,7 @@ pub fn rustscript_parse_error_case<'a>(
 pub enum CompileErrorKind {
     Assembler,
     CallArityOverflow,
+    HostImportOverflow,
     ClosureUsedAsValue,
     CallableUsedAsValue,
     NonCallableLocal,
@@ -167,6 +168,7 @@ fn compile_error_kind(err: &vm::CompileError) -> CompileErrorKind {
     match err {
         vm::CompileError::Assembler(_) => CompileErrorKind::Assembler,
         vm::CompileError::CallArityOverflow => CompileErrorKind::CallArityOverflow,
+        vm::CompileError::HostImportOverflow => CompileErrorKind::HostImportOverflow,
         vm::CompileError::ClosureUsedAsValue => CompileErrorKind::ClosureUsedAsValue,
         vm::CompileError::CallableUsedAsValue => CompileErrorKind::CallableUsedAsValue,
         vm::CompileError::NonCallableLocal(_) => CompileErrorKind::NonCallableLocal,

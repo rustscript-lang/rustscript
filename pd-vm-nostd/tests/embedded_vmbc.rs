@@ -1,14 +1,19 @@
 use pd_vm_nostd::{
-    OpCode as EmbeddedOpCode, Value as EmbeddedValue, Vm as EmbeddedVm,
+    HostParamPassing as EmbeddedHostParamPassing, OpCode as EmbeddedOpCode,
+    TypeSchema as EmbeddedTypeSchema, Value as EmbeddedValue, Vm as EmbeddedVm,
     VmStatus as EmbeddedVmStatus, WireError, decode_program,
 };
 use vm::compiler::TypeSchema;
 use vm::{
-    HostImport, OpCode, Program, ReplLocalBinding, Value, ValueType, compile_source,
-    compile_source_for_repl, compile_source_for_repl_with_locals, encode_program,
+    HostApiBuilder, HostFunctionSchema, HostImport, HostImportParam, HostImportSchema,
+    HostParamPassing, OpCode, Program, ReplLocalBinding, ResourceTypeKey, Value, ValueType,
+    compile_source, compile_source_for_repl, compile_source_for_repl_with_locals, encode_program,
 };
 
-fn encoded_scalar_program() -> Vec<u8> {
+fn encoded_scalar_program() -> (Vec<u8>, u64) {
+    let mut catalog = HostApiBuilder::new();
+    catalog.function(HostFunctionSchema::new("serial::write", vec![]));
+    let fingerprint = catalog.build().expect("test catalog").fingerprint();
     let mut program = Program::new(
         vec![
             Value::Null,
@@ -24,14 +29,26 @@ fn encoded_scalar_program() -> Vec<u8> {
         name: "serial::write".to_string(),
         arity: 1,
         return_type: ValueType::Null,
+        schema: Some(HostImportSchema {
+            params: vec![HostImportParam {
+                name: "file".to_string(),
+                schema: TypeSchema::Resource(ResourceTypeKey::new("io.file").unwrap()),
+                passing: HostParamPassing::Borrow,
+            }],
+            return_type: TypeSchema::Null,
+            fingerprint,
+        }),
     });
-    encode_program(&program).expect("std VMBC encoder should succeed")
+    (
+        encode_program(&program).expect("std VMBC encoder should succeed"),
+        fingerprint.as_u64(),
+    )
 }
 
 #[test]
-fn embedded_decoder_reads_host_generated_v12() {
-    let bytes = encoded_scalar_program();
-    let program = decode_program(&bytes).expect("embedded decoder should accept VMBC v12");
+fn embedded_decoder_reads_host_generated_v13() {
+    let (bytes, fingerprint) = encoded_scalar_program();
+    let program = decode_program(&bytes).expect("embedded decoder should accept VMBC v13");
 
     assert_eq!(
         program.code(),
@@ -50,6 +67,16 @@ fn embedded_decoder_reads_host_generated_v12() {
     assert_eq!(program.imports().len(), 1);
     assert_eq!(program.imports()[0].name, "serial::write");
     assert_eq!(program.imports()[0].arity, 1);
+    let schema = program.imports()[0]
+        .schema
+        .as_ref()
+        .expect("embedded import should retain exact schema");
+    assert_eq!(schema.fingerprint.as_u64(), fingerprint);
+    assert_eq!(schema.params[0].passing, EmbeddedHostParamPassing::Borrow);
+    assert!(matches!(
+        &schema.params[0].schema,
+        EmbeddedTypeSchema::Resource(key) if key.as_str() == "io.file"
+    ));
 }
 
 #[test]
@@ -145,7 +172,7 @@ fn embedded_decoder_preserves_metadata_only_repl_locals() {
 
 #[test]
 fn embedded_decoder_rejects_trailing_bytes() {
-    let mut bytes = encoded_scalar_program();
+    let (mut bytes, _) = encoded_scalar_program();
     bytes.push(0xff);
 
     assert_eq!(decode_program(&bytes), Err(WireError::TrailingBytes));
@@ -153,12 +180,53 @@ fn embedded_decoder_rejects_trailing_bytes() {
 
 #[test]
 fn embedded_decoder_rejects_invalid_magic() {
-    let mut bytes = encoded_scalar_program();
+    let (mut bytes, _) = encoded_scalar_program();
     bytes[0] = b'X';
 
     assert!(matches!(
         decode_program(&bytes),
         Err(WireError::InvalidMagic(_))
+    ));
+}
+
+#[test]
+fn embedded_decoder_rejects_duplicate_object_fields_in_host_import_schema() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"VMBC");
+    bytes.extend_from_slice(&13u16.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.push(b'x');
+    bytes.push(1);
+    bytes.push(ValueType::Null as u8);
+    bytes.push(1);
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.push(b'p');
+    bytes.push(14);
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    for schema_tag in [2, 6] {
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.push(b'a');
+        bytes.push(schema_tag);
+    }
+    bytes.push(0);
+    bytes.push(1);
+    bytes.push(0);
+    bytes.push(0);
+    for _ in 0..5 {
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+    }
+
+    assert!(matches!(
+        decode_program(&bytes),
+        Err(WireError::InvalidHostImportSchema(
+            "duplicate object field name"
+        ))
     ));
 }
 

@@ -1707,11 +1707,13 @@ mod tests {
                 name: "print".to_string(),
                 arity: 1,
                 return_type: ValueType::Unknown,
+                schema: None,
             },
             HostImport {
                 name: "echo".to_string(),
                 arity: 1,
                 return_type: ValueType::Unknown,
+                schema: None,
             },
         ];
         let program =

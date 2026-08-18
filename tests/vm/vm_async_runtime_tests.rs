@@ -155,6 +155,7 @@ fn build_async_import_program(input: i64) -> Program {
         name: "edge::async_add_one".to_string(),
         arity: 1,
         return_type: ValueType::Int,
+        schema: None,
     }];
     let mut bc = BytecodeBuilder::new();
     bc.ldc(0);

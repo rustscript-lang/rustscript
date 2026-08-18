@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -92,10 +93,121 @@ pub struct ExportedCallable {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceTypeKey(String);
+
+impl ResourceTypeKey {
+    pub(crate) fn from_wire(name: String) -> Option<Self> {
+        if name.is_empty()
+            || name.len() > 128
+            || name.split('.').any(str::is_empty)
+            || !name.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'_' | b'-' | b'.')
+            })
+        {
+            return None;
+        }
+        Some(Self(name))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TypeSchema {
+    Unknown,
+    Null,
+    Int,
+    Float,
+    Number,
+    Bool,
+    String,
+    Bytes,
+    Optional(Box<TypeSchema>),
+    GenericParam(String),
+    Named(String, Vec<TypeSchema>),
+    Array(Box<TypeSchema>),
+    ArrayTuple(Vec<TypeSchema>),
+    ArrayTupleRest {
+        prefix: Vec<TypeSchema>,
+        rest: Box<TypeSchema>,
+    },
+    Map(Box<TypeSchema>),
+    Object(Vec<(String, TypeSchema)>),
+    Callable {
+        params: Vec<TypeSchema>,
+        result: Box<TypeSchema>,
+    },
+    Resource(ResourceTypeKey),
+}
+
+impl TypeSchema {
+    pub(crate) fn coarse_value_type(&self) -> ValueType {
+        match self {
+            TypeSchema::Unknown | TypeSchema::GenericParam(_) | TypeSchema::Number => {
+                ValueType::Unknown
+            }
+            TypeSchema::Null => ValueType::Null,
+            TypeSchema::Int => ValueType::Int,
+            TypeSchema::Float => ValueType::Float,
+            TypeSchema::Bool => ValueType::Bool,
+            TypeSchema::String => ValueType::String,
+            TypeSchema::Bytes => ValueType::Bytes,
+            TypeSchema::Optional(inner) => inner.coarse_value_type(),
+            TypeSchema::Named(_, _) | TypeSchema::Map(_) | TypeSchema::Object(_) => ValueType::Map,
+            TypeSchema::Array(_)
+            | TypeSchema::ArrayTuple(_)
+            | TypeSchema::ArrayTupleRest { .. } => ValueType::Array,
+            TypeSchema::Callable { .. } => ValueType::Callable,
+            TypeSchema::Resource(_) => ValueType::Unknown,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostParamPassing {
+    Value,
+    Borrow,
+    BorrowMut,
+    TakeOwned,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostApiFingerprint(u64);
+
+impl HostApiFingerprint {
+    pub(crate) const fn from_wire(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostImportParam {
+    pub name: String,
+    pub schema: TypeSchema,
+    pub passing: HostParamPassing,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostImportSchema {
+    pub params: Vec<HostImportParam>,
+    pub return_type: TypeSchema,
+    pub fingerprint: HostApiFingerprint,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostImport {
     pub name: String,
     pub arity: u8,
     pub return_type: ValueType,
+    pub schema: Option<HostImportSchema>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

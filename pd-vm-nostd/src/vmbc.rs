@@ -1,14 +1,16 @@
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::{
     CallableKind, CallablePrototype, CallableTarget, CaptureBindingMode, ExportedCallable,
-    FunctionRegion, HostImport, OpCode, Program, RootCallableBinding, ScriptFunction, Value,
-    ValueType, WireError,
+    FunctionRegion, HostApiFingerprint, HostImport, HostImportParam, HostImportSchema,
+    HostParamPassing, OpCode, Program, ResourceTypeKey, RootCallableBinding, ScriptFunction,
+    TypeSchema, Value, ValueType, WireError,
 };
 
 const MAGIC: [u8; 4] = *b"VMBC";
-const VERSION_V12: u16 = 12;
+const VERSION_V13: u16 = 13;
 const FLAGS: u16 = 0;
 const MAX_SCHEMA_DEPTH: usize = 64;
 const MAX_CONSTANT_DEPTH: usize = 64;
@@ -57,7 +59,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     }
 
     let version = cursor.read_u16()?;
-    if version != VERSION_V12 {
+    if version != VERSION_V13 {
         return Err(WireError::UnsupportedVersion(version));
     }
     let flags = cursor.read_u16()?;
@@ -77,10 +79,56 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     let mut imports = Vec::new();
     reserve(&mut imports, "imports", import_count)?;
     for _ in 0..import_count {
+        let name = cursor.read_string()?;
+        let arity = cursor.read_u8()?;
+        let return_type = read_value_type(cursor.read_u8()?)?;
+        let schema = match cursor.read_u8()? {
+            0 => None,
+            1 => {
+                let fingerprint = HostApiFingerprint::from_wire(cursor.read_u64()?);
+                let param_count = cursor.read_u32()? as usize;
+                if param_count != usize::from(arity) {
+                    return Err(WireError::InvalidHostImportSchema(
+                        "parameter count does not match arity",
+                    ));
+                }
+                let mut params = Vec::new();
+                reserve(&mut params, "host import params", param_count)?;
+                for _ in 0..param_count {
+                    let name = cursor.read_string()?;
+                    if params
+                        .iter()
+                        .any(|param: &HostImportParam| param.name == name)
+                    {
+                        return Err(WireError::InvalidHostImportSchema(
+                            "duplicate parameter name",
+                        ));
+                    }
+                    params.push(HostImportParam {
+                        name,
+                        schema: read_schema(&mut cursor, 0)?,
+                        passing: read_host_param_passing(cursor.read_u8()?)?,
+                    });
+                }
+                let return_schema = read_schema(&mut cursor, 0)?;
+                if return_schema.coarse_value_type() != return_type {
+                    return Err(WireError::InvalidHostImportSchema(
+                        "exact return schema does not match coarse return type",
+                    ));
+                }
+                Some(HostImportSchema {
+                    params,
+                    return_type: return_schema,
+                    fingerprint,
+                })
+            }
+            value => return Err(WireError::InvalidBool(value)),
+        };
         imports.push(HostImport {
-            name: cursor.read_string()?,
-            arity: cursor.read_u8()?,
-            return_type: read_value_type(cursor.read_u8()?)?,
+            name,
+            arity,
+            return_type,
+            schema,
         });
     }
 
@@ -120,6 +168,16 @@ fn reserve<T>(items: &mut Vec<T>, field: &'static str, count: usize) -> Result<(
 
 fn read_value_type(raw: u8) -> Result<ValueType, WireError> {
     ValueType::try_from(raw).map_err(|()| WireError::InvalidValueType(raw))
+}
+
+fn read_host_param_passing(raw: u8) -> Result<HostParamPassing, WireError> {
+    match raw {
+        0 => Ok(HostParamPassing::Value),
+        1 => Ok(HostParamPassing::Borrow),
+        2 => Ok(HostParamPassing::BorrowMut),
+        3 => Ok(HostParamPassing::TakeOwned),
+        value => Err(WireError::InvalidHostParamPassing(value)),
+    }
 }
 
 fn skip_type_map(cursor: &mut Cursor<'_>) -> Result<Option<usize>, WireError> {
@@ -164,6 +222,94 @@ fn skip_bool_vector(cursor: &mut Cursor<'_>, expected: usize) -> Result<(), Wire
     Ok(())
 }
 
+fn read_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<TypeSchema, WireError> {
+    if depth >= MAX_SCHEMA_DEPTH {
+        return Err(WireError::SchemaTooDeep);
+    }
+    let nested = depth + 1;
+    match cursor.read_u8()? {
+        0 => Ok(TypeSchema::Unknown),
+        1 => Ok(TypeSchema::Null),
+        2 => Ok(TypeSchema::Int),
+        3 => Ok(TypeSchema::Float),
+        4 => Ok(TypeSchema::Number),
+        5 => Ok(TypeSchema::Bool),
+        6 => Ok(TypeSchema::String),
+        7 => Ok(TypeSchema::Bytes),
+        8 => Ok(TypeSchema::GenericParam(cursor.read_string()?)),
+        9 => {
+            let name = cursor.read_string()?;
+            let count = cursor.read_u32()? as usize;
+            let mut args = Vec::new();
+            reserve(&mut args, "schema type args", count)?;
+            for _ in 0..count {
+                args.push(read_schema(cursor, nested)?);
+            }
+            Ok(TypeSchema::Named(name, args))
+        }
+        10 => Ok(TypeSchema::Array(Box::new(read_schema(cursor, nested)?))),
+        11 => {
+            let count = cursor.read_u32()? as usize;
+            let mut items = Vec::new();
+            reserve(&mut items, "schema tuple items", count)?;
+            for _ in 0..count {
+                items.push(read_schema(cursor, nested)?);
+            }
+            Ok(TypeSchema::ArrayTuple(items))
+        }
+        12 => {
+            let count = cursor.read_u32()? as usize;
+            let mut prefix = Vec::new();
+            reserve(&mut prefix, "schema tuple prefix", count)?;
+            for _ in 0..count {
+                prefix.push(read_schema(cursor, nested)?);
+            }
+            Ok(TypeSchema::ArrayTupleRest {
+                prefix,
+                rest: Box::new(read_schema(cursor, nested)?),
+            })
+        }
+        13 => Ok(TypeSchema::Map(Box::new(read_schema(cursor, nested)?))),
+        14 => {
+            let count = cursor.read_u32()? as usize;
+            let mut fields = Vec::new();
+            reserve(&mut fields, "schema object fields", count)?;
+            for _ in 0..count {
+                let name = cursor.read_string()?;
+                if fields
+                    .iter()
+                    .any(|(field, _): &(String, TypeSchema)| field == &name)
+                {
+                    return Err(WireError::InvalidHostImportSchema(
+                        "duplicate object field name",
+                    ));
+                }
+                fields.push((name, read_schema(cursor, nested)?));
+            }
+            Ok(TypeSchema::Object(fields))
+        }
+        15 => {
+            let count = cursor.read_u32()? as usize;
+            let mut params = Vec::new();
+            reserve(&mut params, "schema callable params", count)?;
+            for _ in 0..count {
+                params.push(read_schema(cursor, nested)?);
+            }
+            Ok(TypeSchema::Callable {
+                params,
+                result: Box::new(read_schema(cursor, nested)?),
+            })
+        }
+        16 => Ok(TypeSchema::Optional(Box::new(read_schema(cursor, nested)?))),
+        17 => {
+            let key = ResourceTypeKey::from_wire(cursor.read_string()?)
+                .ok_or(WireError::InvalidResourceKey)?;
+            Ok(TypeSchema::Resource(key))
+        }
+        value => Err(WireError::InvalidValueType(value)),
+    }
+}
+
 fn skip_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<(), WireError> {
     if depth >= MAX_SCHEMA_DEPTH {
         return Err(WireError::SchemaTooDeep);
@@ -171,7 +317,7 @@ fn skip_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<(), WireError> {
     let nested_depth = depth + 1;
     match cursor.read_u8()? {
         0..=7 => Ok(()),
-        8 => cursor.skip_string(),
+        8 | 17 => cursor.skip_string(),
         9 => {
             cursor.skip_string()?;
             let count = cursor.read_u32()? as usize;
@@ -351,7 +497,7 @@ fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, W
 }
 
 /// Deterministically reject malformed or inconsistent `CallScript` operands,
-/// mirroring the std VMBC V12 decoder: truncated operands, out-of-range
+/// mirroring the std VMBC V13 decoder: truncated operands, out-of-range
 /// prototype ids, prototypes that do not target a script function, and argc
 /// values that disagree with the prototype arity.
 fn validate_call_script_operands(
@@ -492,6 +638,10 @@ impl<'a> Cursor<'a> {
 
     fn read_u32(&mut self) -> Result<u32, WireError> {
         Ok(u32::from_le_bytes(self.read_array()?))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, WireError> {
+        Ok(u64::from_le_bytes(self.read_array()?))
     }
 
     fn read_i64(&mut self) -> Result<i64, WireError> {
