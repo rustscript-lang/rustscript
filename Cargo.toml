@@ -115,6 +115,11 @@ path = "tests/host_resource_table_tests.rs"
 required-features = ["runtime"]
 
 [[test]]
+name = "execution_scope_tests"
+path = "tests/execution_scope_tests.rs"
+required-features = ["runtime"]
+
+[[test]]
 name = "http_host_tests"
 path = "tests/vm/http_host_tests.rs"
 required-features = ["runtime", "http-client"]

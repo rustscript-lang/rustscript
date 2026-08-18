@@ -106,7 +106,8 @@ pub use vm::{
     HostStackFunction, IntoScriptValue, Invocation, InvocationError, InvocationItem,
     InvocationPoll, QueuedScriptInvocation, Resource, ResourceHandle, ResourceTable, ScriptArgs,
     ScriptCallback, ScriptResult, StaticHostArgsFunction, StaticHostFunction,
-    StaticHostStackFunction, Store, Vm, VmError, VmResult, VmStatus, VmYieldReason, resource,
+    StaticHostStackFunction, Store, Vm, VmError, VmResult, VmStatus, VmYieldReason,
+    execution_scope, operation, resource,
 };
 
 #[cfg(feature = "runtime")]

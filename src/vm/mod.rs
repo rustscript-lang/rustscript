@@ -9,6 +9,7 @@ mod capability;
 pub mod diagnostics;
 mod engine;
 mod epoch;
+pub mod execution_scope;
 mod fuel;
 mod host;
 mod host_context;
