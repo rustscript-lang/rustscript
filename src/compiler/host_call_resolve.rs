@@ -23,6 +23,16 @@
 //! thin adapter that obtains the catalog's per-name candidates and fingerprint
 //! and delegates to this shared seam, so both entry points stay byte-identical.
 //!
+//! The passing-aware sibling [`resolve_candidate_slice_with_passing`] takes
+//! the same owned candidate slice but each actual argument as a
+//! [`ActualCallArg`]: a compiler [`TypeSchema`] plus an optional exact
+//! [`HostParamPassing`] intent. It runs the same schema scoring and selection
+//! rules, then additionally requires any [`Some`] call-site passing intent to
+//! equal the candidate parameter's passing mode exactly (`Borrow` is never
+//! treated as `BorrowMut`, and `Value` never as `TakeOwned`); a `None` intent
+//! defers passing and imposes no preference. Resolved output, fingerprint and
+//! the ordered passing modes are identical to the schema-only seam.
+//!
 //! ## Resolution invariants
 //!
 //! * **Name then arity.** An unknown name is a distinct
@@ -175,6 +185,61 @@ impl CandidateKey {
     }
 }
 
+/// A zero-allocation view of one actual call-site argument.
+///
+/// Implementors expose the argument's compiler [`TypeSchema`] and an optional
+/// exact [`HostParamPassing`] intent. The shared selection core is generic over
+/// this view, so the schema-only entry points (which defer passing) never build
+/// or clone a parallel passing array.
+pub(crate) trait ActualCallArgView {
+    /// The compiler-inferred schema of the argument.
+    fn schema(&self) -> &TypeSchema;
+    /// The exact call-site passing intent, or [`None`] to defer it (no
+    /// preference, so any candidate passing mode stays viable).
+    fn passing(&self) -> Option<HostParamPassing>;
+}
+
+impl ActualCallArgView for TypeSchema {
+    fn schema(&self) -> &TypeSchema {
+        self
+    }
+    fn passing(&self) -> Option<HostParamPassing> {
+        None
+    }
+}
+
+/// One actual call-site argument: a compiler [`TypeSchema`] plus an optional
+/// exact [`HostParamPassing`] intent.
+///
+/// Schema and intent live in a single item so a caller can never supply two
+/// slices of differing length — passing intent (when present) is always in
+/// lock-step with the schema it applies to. `None` defers passing and imposes
+/// no preference.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct ActualCallArg<'a> {
+    schema: &'a TypeSchema,
+    passing: Option<HostParamPassing>,
+}
+
+impl<'a> ActualCallArg<'a> {
+    /// Builds one call-site argument from its schema and optional passing
+    /// intent.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn new(schema: &'a TypeSchema, passing: Option<HostParamPassing>) -> Self {
+        Self { schema, passing }
+    }
+}
+
+impl ActualCallArgView for ActualCallArg<'_> {
+    fn schema(&self) -> &TypeSchema {
+        self.schema
+    }
+    fn passing(&self) -> Option<HostParamPassing> {
+        self.passing
+    }
+}
+
 /// A compiler-owned, stateless resolver over an immutable [`HostApiCatalog`].
 ///
 /// ```text
@@ -245,20 +310,59 @@ pub(crate) fn resolve_candidate_slice(
     resolve_candidate_refs(requested_name, &named, args, fingerprint)
 }
 
+/// Resolves a host call from an owned candidate slice with call-site passing
+/// intent.
+///
+/// The passing-aware sibling of [`resolve_candidate_slice`]: it accepts the
+/// same candidate slice but each actual argument as an [`ActualCallArg`], the
+/// argument's compiler [`TypeSchema`] paired with an optional exact
+/// [`HostParamPassing`] intent. A [`Some`] intent must equal the candidate
+/// parameter's passing mode exactly for the candidate to stay viable
+/// (`BorrowMut` is never accepted as `Borrow`, and `TakeOwned` never as
+/// `Value`); a [`None`] intent defers passing and imposes no preference.
+/// Passing gates viability only — it never perturbs the schema specificity
+/// ranking among already-viable candidates. All name/arity/scoring/diagnostic
+/// rules and the returned [`ResolvedHostCall`]/[`HostCallResolveError`]
+/// shapes are shared with the schema-only seam.
+///
+/// The slice may carry candidates under other names; only candidates whose
+/// name equals `requested_name` participate, in slice order, and a slice with
+/// no requested-name candidate resolves to [`HostCallResolveError::UnknownFunction`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn resolve_candidate_slice_with_passing(
+    requested_name: &str,
+    candidates: &[HostFunctionSchema],
+    args: &[ActualCallArg<'_>],
+    fingerprint: HostApiFingerprint,
+) -> Result<ResolvedHostCall, HostCallResolveError> {
+    let named: Vec<&HostFunctionSchema> = candidates
+        .iter()
+        .filter(|candidate| candidate.name == requested_name)
+        .collect();
+    resolve_candidate_refs(requested_name, &named, args, fingerprint)
+}
+
 /// Shared selection core over an already requested-name-filtered slice.
 ///
 /// `named` holds only candidates whose name equals `name`, in slice order. An
-/// empty slice means the name is unknown. This replicates
-/// [`HostCallResolver::resolve`]'s original algorithm exactly: distinct
+/// empty slice means the name is unknown. Selection is generic over the actual
+/// argument view `A`: a schema-only caller (via [`HostCallResolver::resolve`]
+/// or [`resolve_candidate_slice`]) supplies `&[TypeSchema]`, whose passing
+/// intent is always deferred; a passing-aware caller (via
+/// [`resolve_candidate_slice_with_passing`]) supplies `&[ActualCallArg]`.
+///
+/// The algorithm preserves exact distinct
 /// [`HostCallResolveError::UnknownFunction`] and
 /// [`HostCallResolveError::ArityMismatch`], deterministic
-/// [`CandidateKey`]-driven specificity ranking with stable
-/// [`signature_label`] tie-breaks, passing-mode-indifferent scoring, and a
-/// best-concrete-mismatch [`HostCallResolveError::NoMatch`].
-fn resolve_candidate_refs<'a>(
+/// [`CandidateKey`]-driven schema specificity ranking with stable
+/// [`signature_label`] tie-breaks, and a best-concrete-mismatch
+/// [`HostCallResolveError::NoMatch`]. Passing intent is a pure viability gate:
+/// an exact [`Some`] intent that differs from the candidate parameter's mode
+/// rules that candidate non-viable, while anything else leaves it viable.
+fn resolve_candidate_refs<'a, A: ActualCallArgView>(
     name: &str,
     named: &[&'a HostFunctionSchema],
-    args: &[TypeSchema],
+    args: &[A],
     fingerprint: HostApiFingerprint,
 ) -> Result<ResolvedHostCall, HostCallResolveError> {
     if named.is_empty() {
@@ -294,21 +398,28 @@ fn resolve_candidate_refs<'a>(
         });
     }
 
-    // Classify every arity-matching candidate against the actual args.
+    // Classify every arity-matching candidate against the actual args in
+    // lock-step. Schema scoring never allocates a parallel expected-schema
+    // array; each pair is scored and dropped immediately. A candidate is
+    // viable only when its schema has zero mismatches and every `Some`
+    // call-site passing intent equals its parameter's passing mode.
     let mut viable: Vec<(CandidateKey, &'a HostFunctionSchema)> = Vec::new();
     let mut non_viable: Vec<(CandidateKey, &'a HostFunctionSchema)> = Vec::new();
     for function in &arity_matching {
-        // Sum every argument's aggregate into the candidate total.
         let mut score = MatchScore::default();
-        let expected_schemas: Vec<TypeSchema> = function
-            .params
-            .iter()
-            .map(|param| param.ty.to_compiler_schema())
-            .collect();
-        for (expected, actual) in expected_schemas.iter().zip(args.iter()) {
-            score = score.combined(score_pair(expected, actual));
+        let mut passing_conforms = true;
+        for (param, arg) in function.params.iter().zip(args.iter()) {
+            let expected_schema = param.ty.to_compiler_schema();
+            score = score.combined(score_pair(&expected_schema, arg.schema()));
+            if passing_conforms {
+                if let Some(actual_passing) = arg.passing() {
+                    if actual_passing != param.passing {
+                        passing_conforms = false;
+                    }
+                }
+            }
         }
-        let viable_candidate = score.mismatches == 0;
+        let viable_candidate = score.mismatches == 0 && passing_conforms;
         let key = CandidateKey::from_score(&score);
         if viable_candidate {
             viable.push((key, function));
@@ -578,26 +689,35 @@ fn max_candidate<'f>(
 struct ConcreteMismatch {
     /// Zero-based argument index.
     index: usize,
-    /// Expected host schema label, e.g. `resource<io.file>`.
+    /// Expected host parameter label: a schema label such as
+    /// `resource<io.file>`, or a passing-mode label such as `borrow`.
     expected: String,
-    /// Actual (compiler) schema label, e.g. `resource<sqlite.connection>`.
+    /// Actual (call-site) label: a compiler schema label such as
+    /// `resource<sqlite.connection>`, or a passing-mode label.
     found: String,
-    /// Specificity key of the owning candidate, for tie-break reporting.
-    candidate_key: CandidateKey,
+    /// Whether the discrepancy is a passing-mode mismatch (`true`) rather
+    /// than a schema mismatch (`false`); the diagnostic wording differs.
+    passing: bool,
 }
 
 /// Picks the most concrete non-viable candidate and its first concrete
 /// mismatch: `(candidate, mismatch)`.
 ///
 /// Selection is independent of overload registration order: among the
-/// non-viable candidates it first picks the maximum (most specific) relation
+/// non-viable candidates it first picks the maximum (most specific) schema
 /// key, then among equally-specific keys tie-breaks by the stable semantic
-/// [`signature_label`] rather than first registration order, so the reported
-/// `NoMatch` detail is identical no matter how the catalog overloads were
-/// registered.
-fn best_concrete_mismatch<'f>(
+/// [`signature_label`] (which encodes passing mode) rather than first
+/// registration order, so the reported `NoMatch` detail is identical no
+/// matter how the catalog overloads were registered.
+///
+/// The reported mismatch is the first argument (in ascending index order)
+/// where the candidate differs; within an argument a schema discrepancy is
+/// reported ahead of a passing-mode discrepancy. Passing mismatches
+/// therefore surface an `expected passing X, found passing Y` detail and
+/// never mask an earlier schema mismatch.
+fn best_concrete_mismatch<'f, A: ActualCallArgView>(
     non_viable: &[(CandidateKey, &'f HostFunctionSchema)],
-    args: &[TypeSchema],
+    args: &[A],
 ) -> (Option<&'f HostFunctionSchema>, Option<ConcreteMismatch>) {
     if non_viable.is_empty() {
         return (None, None);
@@ -619,16 +739,28 @@ fn best_concrete_mismatch<'f>(
     let mismatch = best_candidate
         .params
         .iter()
+        .zip(args.iter())
         .enumerate()
-        .find_map(|(index, param)| {
-            let actual = &args[index];
-            if score_pair(&param.ty.to_compiler_schema(), actual).mismatches > 0 {
+        .find_map(|(index, (param, arg))| {
+            let expected_schema = param.ty.to_compiler_schema();
+            if score_pair(&expected_schema, arg.schema()).mismatches > 0 {
                 Some(ConcreteMismatch {
                     index,
                     expected: schema_label(&param.ty),
-                    found: tf_schema_label(actual),
-                    candidate_key: best_key.clone(),
+                    found: tf_schema_label(arg.schema()),
+                    passing: false,
                 })
+            } else if let Some(actual_passing) = arg.passing() {
+                if actual_passing != param.passing {
+                    Some(ConcreteMismatch {
+                        index,
+                        expected: passing_label_full(param.passing).to_string(),
+                        found: passing_label_full(actual_passing).to_string(),
+                        passing: true,
+                    })
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -639,6 +771,10 @@ fn best_concrete_mismatch<'f>(
 /// Render the `NoMatch` detail from the best candidate's concrete mismatch.
 fn best_mismatch_detail(suffix: String, mismatch: Option<ConcreteMismatch>) -> String {
     match mismatch {
+        Some(mismatch) if mismatch.passing => format!(
+            "argument {}: expected passing {}, found passing {}{}",
+            mismatch.index, mismatch.expected, mismatch.found, suffix
+        ),
         Some(mismatch) => format!(
             "argument {}: expected {}, found {}{}",
             mismatch.index, mismatch.expected, mismatch.found, suffix
@@ -723,6 +859,18 @@ fn tf_schema_label(schema: &TypeSchema) -> String {
 fn passing_label(passing: HostParamPassing) -> &'static str {
     match passing {
         HostParamPassing::Value => "",
+        HostParamPassing::Borrow => "borrow",
+        HostParamPassing::BorrowMut => "borrow_mut",
+        HostParamPassing::TakeOwned => "take_owned",
+    }
+}
+
+/// Full passing-mode label for diagnostics: `value`, `borrow`,
+/// `borrow_mut`, `take_owned`. Unlike [`passing_label`], the `Value` mode has
+/// an explicit label so a passing mismatch detail can always name both sides.
+fn passing_label_full(passing: HostParamPassing) -> &'static str {
+    match passing {
+        HostParamPassing::Value => "value",
         HostParamPassing::Borrow => "borrow",
         HostParamPassing::BorrowMut => "borrow_mut",
         HostParamPassing::TakeOwned => "take_owned",
@@ -1921,6 +2069,376 @@ mod tests {
         assert_eq!(
             forward, via_reversed,
             "reversed slice must roll byte-identical error diagnostics"
+        );
+    }
+
+    /// Hand-built candidate slice (the exact shape the IR carries) with one
+    /// argument schema over four distinct passing modes. The catalog builder
+    /// requires a reference mode for a resource-containing parameter and
+    /// `Value` for a plain value, but the pure slice seam does not re-validate
+    /// passing/schema pairing, so it can exercise `Value` against the reference
+    /// modes over one schema.
+    fn four_mode_slice() -> Vec<HostFunctionSchema> {
+        [
+            HostParamPassing::Value,
+            HostParamPassing::Borrow,
+            HostParamPassing::BorrowMut,
+            HostParamPassing::TakeOwned,
+        ]
+        .into_iter()
+        .map(|passing| {
+            HostFunctionSchema::with_return(
+                "consume",
+                vec![HostParamSchema::with_passing(
+                    "v",
+                    HostTypeSchema::Bytes,
+                    passing,
+                )],
+                HostTypeSchema::Int,
+            )
+        })
+        .collect()
+    }
+
+    #[test]
+    fn exact_passing_disambiguates_borrow_borrowmut_takeowned_value() {
+        // Four passing modes over one Bytes schema; an exact call-site intent
+        // must select the single matching overload and never substitute one
+        // mode for another (BorrowMut != Borrow, TakeOwned != Value).
+        let slice = four_mode_slice();
+        let fp = HostApiCatalog::default().fingerprint();
+        for passing in [
+            HostParamPassing::Value,
+            HostParamPassing::Borrow,
+            HostParamPassing::BorrowMut,
+            HostParamPassing::TakeOwned,
+        ] {
+            let schema = Ts::Bytes;
+            let args = [ActualCallArg::new(&schema, Some(passing))];
+            let resolved = resolve_candidate_slice_with_passing("consume", &slice, &args, fp)
+                .expect("exact passing must disambiguate");
+            assert_eq!(
+                resolved.passing,
+                vec![passing],
+                "Some({passing:?}) must select exactly the matching overload"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_passing_disambiguates_reference_modes_via_catalog() {
+        let mut builder = HostApiBuilder::new();
+        builder.resource(ResourceTypeSchema::new(io_file(), "file"));
+        for passing in [
+            HostParamPassing::Borrow,
+            HostParamPassing::BorrowMut,
+            HostParamPassing::TakeOwned,
+        ] {
+            builder.function(HostFunctionSchema::with_return(
+                "consume",
+                vec![ref_param("h", resource(io_file()), passing)],
+                HostTypeSchema::Int,
+            ));
+        }
+        let catalog = builder.build().expect("legal reference-mode overloads");
+        let slice = slice_candidates(&catalog, "consume");
+        for passing in [
+            HostParamPassing::Borrow,
+            HostParamPassing::BorrowMut,
+            HostParamPassing::TakeOwned,
+        ] {
+            let schema = compiler_resource(io_file());
+            let args = [ActualCallArg::new(&schema, Some(passing))];
+            let resolved = resolve_candidate_slice_with_passing(
+                "consume",
+                &slice,
+                &args,
+                catalog.fingerprint(),
+            )
+            .expect("exact passing disambiguates reference modes");
+            assert_eq!(resolved.passing, vec![passing]);
+        }
+    }
+
+    #[test]
+    fn wrong_passing_nomatch_detail_names_both_labels() {
+        // io::read_all expects Borrow(Mut resource<io.file>); pass TakeOwned.
+        let catalog = concrete_catalog();
+        let slice = slice_candidates(&catalog, "io::read_all");
+        let schema = compiler_resource(io_file());
+        let args = [ActualCallArg::new(
+            &schema,
+            Some(HostParamPassing::TakeOwned),
+        )];
+        let err = resolve_candidate_slice_with_passing(
+            "io::read_all",
+            &slice,
+            &args,
+            catalog.fingerprint(),
+        )
+        .unwrap_err();
+        match err {
+            HostCallResolveError::NoMatch { name, detail } => {
+                assert_eq!(name, "io::read_all");
+                assert!(
+                    detail
+                        .contains("argument 0: expected passing borrow, found passing take_owned"),
+                    "unexpected passing detail: {detail}"
+                );
+            }
+            other => panic!("expected NoMatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deferred_passing_remains_ambiguous() {
+        // None defers passing, so the four equal-schema passing-only overloads
+        // stay equally viable and ambiguous — passing never silently breaks the
+        // tie.
+        let slice = four_mode_slice();
+        let fp = HostApiCatalog::default().fingerprint();
+        let schema = Ts::Bytes;
+        let args = [ActualCallArg::new(&schema, None)];
+        assert!(matches!(
+            resolve_candidate_slice_with_passing("consume", &slice, &args, fp),
+            Err(HostCallResolveError::Ambiguous { name, .. }) if name == "consume"
+        ));
+    }
+
+    #[test]
+    fn unknown_schema_exact_passing_disambiguates() {
+        // Two Borrow/BorrowMut overloads over one resource; with an Unknown
+        // schema the passing intent is the sole differentiator and must pick
+        // the matching overload instead of reporting an ambiguity.
+        let mut builder = HostApiBuilder::new();
+        builder.resource(ResourceTypeSchema::new(io_file(), "file"));
+        for passing in [HostParamPassing::Borrow, HostParamPassing::BorrowMut] {
+            builder.function(HostFunctionSchema::with_return(
+                "touch",
+                vec![ref_param("h", resource(io_file()), passing)],
+                HostTypeSchema::Int,
+            ));
+        }
+        let catalog = builder.build().expect("legal overloads");
+        let slice = slice_candidates(&catalog, "touch");
+        let schema = Ts::Unknown;
+        let args = [ActualCallArg::new(&schema, Some(HostParamPassing::Borrow))];
+        let resolved =
+            resolve_candidate_slice_with_passing("touch", &slice, &args, catalog.fingerprint())
+                .expect("Unknown schema still resolves via exact passing");
+        assert_eq!(resolved.passing, vec![HostParamPassing::Borrow]);
+    }
+
+    #[test]
+    fn schema_specificity_wins_among_passing_compatible() {
+        // fn(Int, borrow) and fn(Number, borrow): an actual Int with
+        // Some(Borrow) is viable for both, but exact Int must win over the
+        // numeric-compatible Number — passing never perturbs the schema
+        // specificity ranking.
+        let candidates = vec![
+            HostFunctionSchema::with_return(
+                "scale",
+                vec![HostParamSchema::with_passing(
+                    "v",
+                    HostTypeSchema::Int,
+                    HostParamPassing::Borrow,
+                )],
+                HostTypeSchema::Int,
+            ),
+            HostFunctionSchema::with_return(
+                "scale",
+                vec![HostParamSchema::with_passing(
+                    "v",
+                    HostTypeSchema::Number,
+                    HostParamPassing::Borrow,
+                )],
+                HostTypeSchema::String,
+            ),
+        ];
+        let fp = HostApiCatalog::default().fingerprint();
+        let schema = Ts::Int;
+        let args = [ActualCallArg::new(&schema, Some(HostParamPassing::Borrow))];
+        let resolved = resolve_candidate_slice_with_passing("scale", &candidates, &args, fp)
+            .expect("exact Int overload wins");
+        assert_eq!(resolved.return_type, Ts::Int);
+        assert_eq!(resolved.passing, vec![HostParamPassing::Borrow]);
+    }
+
+    #[test]
+    fn reversed_candidate_order_identical_success_and_error() {
+        fn make(forward: bool) -> Vec<HostFunctionSchema> {
+            let borrow = HostFunctionSchema::with_return(
+                "touch",
+                vec![HostParamSchema::with_passing(
+                    "v",
+                    HostTypeSchema::Bytes,
+                    HostParamPassing::Borrow,
+                )],
+                HostTypeSchema::Int,
+            );
+            let borrow_mut = HostFunctionSchema::with_return(
+                "touch",
+                vec![HostParamSchema::with_passing(
+                    "v",
+                    HostTypeSchema::Bytes,
+                    HostParamPassing::BorrowMut,
+                )],
+                HostTypeSchema::String,
+            );
+            if forward {
+                vec![borrow, borrow_mut]
+            } else {
+                vec![borrow_mut, borrow]
+            }
+        }
+        let fp = HostApiCatalog::default().fingerprint();
+        let schema = Ts::Bytes;
+
+        // Success: Some(Borrow) resolves identically in both orders.
+        let forward_args = [ActualCallArg::new(&schema, Some(HostParamPassing::Borrow))];
+        let a = resolve_candidate_slice_with_passing("touch", &make(true), &forward_args, fp)
+            .expect("forward resolves");
+        let b = resolve_candidate_slice_with_passing("touch", &make(false), &forward_args, fp)
+            .expect("reversed resolves");
+        assert_eq!(a.passing, b.passing);
+        assert_eq!(a.passing, vec![HostParamPassing::Borrow]);
+        assert_eq!(a.return_type, b.return_type);
+
+        // Error: Some(TakeOwned) rejects both; identical deterministic detail.
+        let bad_args = [ActualCallArg::new(
+            &schema,
+            Some(HostParamPassing::TakeOwned),
+        )];
+        let e1 = resolve_candidate_slice_with_passing("touch", &make(true), &bad_args, fp)
+            .unwrap_err()
+            .to_string();
+        let e2 = resolve_candidate_slice_with_passing("touch", &make(false), &bad_args, fp)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            e1, e2,
+            "reversed slice must roll byte-identical passing NoMatch diagnostics"
+        );
+    }
+
+    #[test]
+    fn schema_mismatch_reported_before_passing_within_argument() {
+        // Both schema (String vs Bytes) and passing (TakeOwned vs Borrow)
+        // mismatch on argument 0; the schema discrepancy must be reported.
+        let candidates = vec![HostFunctionSchema::with_return(
+            "scrub",
+            vec![HostParamSchema::with_passing(
+                "buf",
+                HostTypeSchema::Bytes,
+                HostParamPassing::Borrow,
+            )],
+            HostTypeSchema::Int,
+        )];
+        let fp = HostApiCatalog::default().fingerprint();
+        let schema = Ts::String;
+        let args = [ActualCallArg::new(
+            &schema,
+            Some(HostParamPassing::TakeOwned),
+        )];
+        let err =
+            resolve_candidate_slice_with_passing("scrub", &candidates, &args, fp).unwrap_err();
+        match err {
+            HostCallResolveError::NoMatch { detail, .. } => {
+                assert!(
+                    detail.contains("argument 0: expected bytes, found string"),
+                    "schema mismatch must precede passing: {detail}"
+                );
+            }
+            other => panic!("expected NoMatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn earlier_argument_mismatch_prioritized_over_later_passing() {
+        // Argument 0 mismatches schema; argument 1 mismatches passing. The
+        // earlier argument's schema discrepancy must be reported first.
+        let candidates = vec![HostFunctionSchema::with_return(
+            "pair",
+            vec![
+                HostParamSchema::with_passing("a", HostTypeSchema::Bytes, HostParamPassing::Borrow),
+                HostParamSchema::with_passing("b", HostTypeSchema::Bytes, HostParamPassing::Borrow),
+            ],
+            HostTypeSchema::Int,
+        )];
+        let fp = HostApiCatalog::default().fingerprint();
+        let a = Ts::String;
+        let b = Ts::Bytes;
+        let args = [
+            ActualCallArg::new(&a, Some(HostParamPassing::Borrow)),
+            ActualCallArg::new(&b, Some(HostParamPassing::TakeOwned)),
+        ];
+        let err = resolve_candidate_slice_with_passing("pair", &candidates, &args, fp).unwrap_err();
+        match err {
+            HostCallResolveError::NoMatch { detail, .. } => {
+                assert!(
+                    detail.contains("argument 0: expected bytes, found string"),
+                    "earlier schema mismatch must win: {detail}"
+                );
+            }
+            other => panic!("expected NoMatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_resource_passing_seam_preserves_labels() {
+        let candidates = vec![HostFunctionSchema::with_return(
+            "collect",
+            vec![HostParamSchema::with_passing(
+                "files",
+                HostTypeSchema::Array(Box::new(resource(io_file()))),
+                HostParamPassing::Borrow,
+            )],
+            HostTypeSchema::Int,
+        )];
+        let fp = HostApiCatalog::default().fingerprint();
+
+        // Correct nested resource + matching passing resolves.
+        let good = Ts::Array(Box::new(compiler_resource(io_file())));
+        let args = [ActualCallArg::new(&good, Some(HostParamPassing::Borrow))];
+        let resolved = resolve_candidate_slice_with_passing("collect", &candidates, &args, fp)
+            .expect("nested resource with matching passing resolves");
+        assert_eq!(resolved.passing, vec![HostParamPassing::Borrow]);
+
+        // Wrong nested resource with a passing mismatch on the same argument:
+        // the nested resource schema discrepancy is reported first.
+        let bad = Ts::Array(Box::new(compiler_resource(sqlite_conn())));
+        let args = [ActualCallArg::new(&bad, Some(HostParamPassing::TakeOwned))];
+        let err =
+            resolve_candidate_slice_with_passing("collect", &candidates, &args, fp).unwrap_err();
+        match err {
+            HostCallResolveError::NoMatch { detail, .. } => {
+                assert!(detail.contains("expected array<resource<io.file>>"));
+                assert!(detail.contains("found array<resource<sqlite.connection>>"));
+            }
+            other => panic!("expected NoMatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn passing_seam_none_equals_schema_only_slice() {
+        // The passing-aware seam with all-None intents is identical to the
+        // schema-only seam for the same candidates.
+        let catalog = concrete_catalog();
+        let slice = slice_candidates(&catalog, "io::read_all");
+        let fp = catalog.fingerprint();
+        let schema = compiler_resource(io_file());
+        let passing_result = resolve_candidate_slice_with_passing(
+            "io::read_all",
+            &slice,
+            &[ActualCallArg::new(&schema, None)],
+            fp,
+        )
+        .expect("none resolves");
+        let schema_result = resolve_candidate_slice("io::read_all", &slice, &[schema], fp)
+            .expect("schema-only resolves");
+        assert_eq!(
+            passing_result, schema_result,
+            "deferred passing must equal the schema-only result"
         );
     }
 }
