@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use super::driver::{HostOperation, OperationCleanup, OperationOutcome, OperationSpec};
 use super::error::{OperationError, OperationErrorCode, OperationResult};
-use super::id::{allocate_registry_tag, encode, OperationId, MAX_GENERATION, MAX_SLOT_IDENTITY};
+use super::id::{MAX_GENERATION, MAX_SLOT_IDENTITY, OperationId, allocate_registry_tag, encode};
 use super::reason::OperationCancelReason;
 use crate::vm::resource::ResourceHandle;
 
@@ -1424,9 +1424,11 @@ mod tests {
             .expect("operation should start");
         // Explicit cancellation arrives before the (already elapsed) deadline
         // is observed, so the first recorded reason wins.
-        assert!(registry
-            .cancel(id, OperationCancelReason::Requested)
-            .expect("explicit cancel"));
+        assert!(
+            registry
+                .cancel(id, OperationCancelReason::Requested)
+                .expect("explicit cancel")
+        );
         assert!(matches!(
             registry.poll(id, &mut cx()),
             Poll::Ready(Ok(OperationOutcome::Cancelled(
@@ -1450,12 +1452,16 @@ mod tests {
         };
         let id = registry.start(OperationSpec::new(driver)).expect("start");
 
-        assert!(registry
-            .cancel(id, OperationCancelReason::Requested)
-            .expect("first cancel transitions"));
-        assert!(!registry
-            .cancel(id, OperationCancelReason::Parent)
-            .expect("second cancel is a no-op"));
+        assert!(
+            registry
+                .cancel(id, OperationCancelReason::Requested)
+                .expect("first cancel transitions")
+        );
+        assert!(
+            !registry
+                .cancel(id, OperationCancelReason::Parent)
+                .expect("second cancel is a no-op")
+        );
         assert!(matches!(
             registry.status(id).expect("status"),
             OperationStatus::Cancelled(OperationCancelReason::Requested)
@@ -1478,10 +1484,12 @@ mod tests {
 
         // Leave the first op terminal out-of-band, then discard it explicitly.
         assert!(registry.complete(first).expect("complete first"));
-        assert!(registry
-            .remove(first)
-            .expect("remove returns status")
-            .is_terminal());
+        assert!(
+            registry
+                .remove(first)
+                .expect("remove returns status")
+                .is_terminal()
+        );
         assert_eq!(registry.active_count(), 0);
 
         // A new operation reuses the same slot with a higher generation.
@@ -1788,9 +1796,11 @@ mod tests {
         assert!(!registry.is_empty());
 
         // A normal cancel then take still works on the same slot.
-        assert!(registry
-            .cancel(id, OperationCancelReason::Requested)
-            .expect("cancel"));
+        assert!(
+            registry
+                .cancel(id, OperationCancelReason::Requested)
+                .expect("cancel")
+        );
         assert_eq!(
             cancels.lock().unwrap()[..],
             [OperationCancelReason::Requested]
@@ -1813,10 +1823,12 @@ mod tests {
 
         // Reach terminal out-of-band, then explicitly discard.
         assert!(registry.complete(first).expect("complete"));
-        assert!(registry
-            .remove(first)
-            .expect("terminal remove returns status")
-            .is_terminal());
+        assert!(
+            registry
+                .remove(first)
+                .expect("terminal remove returns status")
+                .is_terminal()
+        );
         assert_eq!(registry.active_count(), 0);
         assert!(registry.is_empty());
 
