@@ -2782,3 +2782,106 @@ fn legacy_reset_failure_poisons_without_replacing_the_scope() {
         other => panic!("repeated poll after poisoning must stay stable, got {other:?}"),
     }
 }
+
+#[test]
+fn shutdown_legacy_failure_does_not_leak_into_later_clean_reset() {
+    use crate::builtins::runtime::error::{RuntimeError, RuntimeErrorCode};
+    use crate::builtins::runtime::resource::ResourceTypeId;
+    use crate::vm::execution_scope::ScopeState;
+    use crate::vm::resource::ResourceCloseReason;
+    use std::task::{Context, Poll, Wake, Waker};
+    use std::time::Instant;
+
+    struct ResetWake;
+    impl Wake for ResetWake {
+        fn wake(self: Arc<Self>) {}
+    }
+    fn noop_context() -> Context<'static> {
+        static WAKER: OnceLock<Waker> = OnceLock::new();
+        Context::from_waker(WAKER.get_or_init(|| Waker::from(Arc::new(ResetWake))))
+    }
+
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    // A legacy resource whose cleanup fails: `Vm::shutdown` drives the legacy
+    // HostRuntime sweep through `close_all_handles` and records the failure,
+    // but the public shutdown API never consumes the latch afterwards.
+    vm.host
+        .runtime_resources
+        .insert_with_cleanup(ResourceTypeId::IO_FILE, (), |_, _| {
+            Err(RuntimeError::new(
+                RuntimeErrorCode::ResourceCleanupFailed,
+                "resource::cleanup",
+                "legacy cleanup failed",
+            ))
+        })
+        .expect("legacy resource should be inserted");
+
+    // Public shutdown leaves the failure latched inside HostRuntime.
+    vm.shutdown();
+
+    // The failing resource was consumed by that failed close, so the legacy
+    // failure condition is gone. A subsequent clean two-phase reset must NOT
+    // be falsely poisoned by the stale latch from the shutdown sweep.
+    assert_eq!(
+        vm.begin_reset_for_reuse(ResourceCloseReason::VmReset, None)
+            .expect("begin reset"),
+        BeginResetOutcome::Started
+    );
+    let mut cx = noop_context();
+    let result = loop {
+        match vm.poll_reset_for_reuse(&mut cx, Instant::now()) {
+            Poll::Pending => continue,
+            Poll::Ready(result) => break result,
+        }
+    };
+    result.expect("a clean reset after shutdown-latched failure must not be poisoned");
+
+    // Ready, not Poisoned, error cleared, fresh scope installed.
+    assert_eq!(vm.reset_state(), VmResetState::Ready);
+    assert!(vm.is_reusable());
+    assert_eq!(vm.reset_error(), None);
+    assert_eq!(
+        vm.host.execution_scope_state(),
+        ScopeState::Active,
+        "the successful reset must install a fresh active scope"
+    );
+    // The reset sweep's own latch is empty: the shutdown failure was cleared
+    // at the start of the reset sweep, before the sweep ran.
+    assert_eq!(
+        vm.host.take_legacy_reset_failure(),
+        None,
+        "a stale shutdown failure must not survive into a clean reset sweep"
+    );
+}
+
+#[test]
+fn consecutive_host_resets_first_failure_second_success_leaves_no_latch() {
+    use crate::builtins::runtime::error::{RuntimeError, RuntimeErrorCode};
+    use crate::builtins::runtime::resource::ResourceTypeId;
+
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    // Sweep 1 fails: closing the failing resource records it as the first
+    // failure of *that* sweep. The close consumes the resource value even on
+    // error, so the legacy arena is empty again afterwards.
+    vm.host
+        .runtime_resources
+        .insert_with_cleanup(ResourceTypeId::IO_FILE, (), |_, _| {
+            Err(RuntimeError::new(
+                RuntimeErrorCode::ResourceCleanupFailed,
+                "resource::cleanup",
+                "legacy cleanup failed",
+            ))
+        })
+        .expect("failing legacy resource should be inserted");
+    vm.host.reset_for_reuse();
+
+    // Sweep 2 runs on the now-empty arena and succeeds. A failure recorded
+    // by sweep 1 must not survive into sweep 2: the latch is cleared when
+    // sweep 2 begins, so taking it observes `None`.
+    vm.host.reset_for_reuse();
+    assert_eq!(
+        vm.host.take_legacy_reset_failure(),
+        None,
+        "a failure from an earlier reset sweep must not leak into a later clean sweep"
+    );
+}

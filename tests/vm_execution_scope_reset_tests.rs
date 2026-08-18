@@ -674,3 +674,35 @@ fn compat_reset_with_pending_resource_stays_resetting_and_completes_via_poll() {
     assert_eq!(vm.reset_state(), VmResetState::Ready);
     assert!(vm.is_reusable());
 }
+
+// ---- `Vm::shutdown` drives the legacy HostRuntime sweep; a following clean
+//      reset must stay Ready with a fresh scope (no stale legacy latch) --------
+
+#[test]
+fn shutdown_then_clean_reset_stays_ready_with_a_fresh_scope() {
+    let mut vm = Vm::new(seven_program().program);
+    assert_eq!(vm.run().expect("run"), VmStatus::Halted);
+
+    // Public shutdown runs the legacy HostRuntime reset through
+    // `close_all_handles`; it never claims, poisons, or consumes anything
+    // (the migration-period builtin caller only returns `()`).
+    vm.shutdown();
+
+    // A clean two-phase reset afterwards must not trip over that legacy
+    // sweep: the VM returns to Ready with a fresh Active scope and no error.
+    assert_eq!(
+        vm.begin_reset_for_reuse(ResourceCloseReason::VmReset, None)
+            .expect("begin reset after shutdown"),
+        BeginResetOutcome::Started
+    );
+    drive_reset_to_success(&mut vm, Instant::now());
+
+    assert_eq!(vm.reset_state(), VmResetState::Ready);
+    assert!(vm.is_reusable());
+    assert_eq!(vm.reset_error(), None);
+    assert_eq!(
+        vm.host_context().scope_state(),
+        ScopeState::Active,
+        "a clean reset after shutdown must install a fresh active scope"
+    );
+}

@@ -53,8 +53,12 @@ pub(crate) struct HostRuntime {
     pub(crate) resolved_calls_dirty: bool,
     /// First failure recorded by the most recent legacy
     /// [`reset_for_reuse`](Self::reset_for_reuse) sweep (legacy operation
-    /// cancel or legacy resource close). The Vm consumes this after driving
-    /// the generic scope to quiescence so a failing legacy reset poisons the
+    /// cancel or legacy resource close). Each invocation clears the latch
+    /// before running its own sweep, so the value is strictly scoped to one
+    /// sweep: it can never leak the failure of an earlier invocation (e.g.
+    /// via `Vm::shutdown` → [`close_all_handles`](crate::builtins::runtime::close_all_handles))
+    /// into a later clean reset. The Vm consumes this after driving the
+    /// generic scope to quiescence so a failing legacy reset poisons the
     /// Vm instead of silently continuing.
     legacy_reset_failure: Option<String>,
     pub(crate) runtime_resources: ResourceArena,
@@ -117,7 +121,19 @@ impl HostRuntime {
     /// The return type stays `()` for the migration-period builtin caller
     /// (`close_all_handles`); the error surfaces through
     /// [`Self::take_legacy_reset_failure`].
+    ///
+    /// The latch is scoped to one invocation: each sweep atomically clears
+    /// any failure recorded by an earlier invocation before it runs, then
+    /// records only a failure it discovers itself. This keeps the failure
+    /// of a sweep that never had its error consumed (e.g. `Vm::shutdown` →
+    /// [`close_all_handles`](crate::builtins::runtime::close_all_handles),
+    /// or the `Vm` `Drop` path) from later poisoning a clean reset.
     pub(crate) fn reset_for_reuse(&mut self) {
+        // Begin a fresh sweep: drop any failure latched by an earlier
+        // invocation up front, before anything that could fail or return
+        // early, so a stale latch never survives into (or leaks from) this
+        // invocation. Only failures discovered by THIS sweep are recorded.
+        self.legacy_reset_failure = None;
         let cancel_error = self
             .runtime_operations
             .cancel_all(CancellationReason::VmReset)
@@ -129,8 +145,8 @@ impl HostRuntime {
             .err()
             .map(|error| error.to_string());
         let first = cancel_error.or(close_error);
-        if first.is_some() {
-            self.legacy_reset_failure = first;
+        if let Some(first) = first {
+            self.legacy_reset_failure = Some(first);
         }
         self.submitted_host_ops.clear();
         self.stream_drivers.clear();
@@ -142,6 +158,8 @@ impl HostRuntime {
     /// `Vm` calls this after the generic scope reached quiescence so a
     /// failing legacy reset poisons the Vm *before* the scope is recycled:
     /// the installed scope is never replaced when the legacy path failed.
+    /// Because each invocation clears the latch before its own sweep, this
+    /// observes only the current sweep's failure — never a stale one.
     pub(crate) fn take_legacy_reset_failure(&mut self) -> Option<String> {
         self.legacy_reset_failure.take()
     }
