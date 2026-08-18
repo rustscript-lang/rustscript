@@ -140,6 +140,7 @@ pub enum CompileErrorKind {
     InlineFunctionRecursion,
     IfElseBranchTypeMismatch,
     CallableArgumentTypeMismatch,
+    HostCallResolve,
     BinaryOperandTypeMismatch,
     InvalidFieldAccess,
     FunctionParameterTypeConflict,
@@ -183,6 +184,7 @@ fn compile_error_kind(err: &vm::CompileError) -> CompileErrorKind {
         vm::CompileError::CallableArgumentTypeMismatch { .. } => {
             CompileErrorKind::CallableArgumentTypeMismatch
         }
+        vm::CompileError::HostCallResolve { .. } => CompileErrorKind::HostCallResolve,
         vm::CompileError::BinaryOperandTypeMismatch { .. } => {
             CompileErrorKind::BinaryOperandTypeMismatch
         }
