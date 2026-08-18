@@ -101,9 +101,17 @@ impl std::error::Error for ResourceTypeKeyError {}
 /// A validated, stable identifier for a host resource type.
 ///
 /// The key is an ordinary lowercase dot-namespaced name such as `io.file` or
-/// `sqlite.connection`. Validation rejects empty, over-long, non-ASCII and
-/// malformed-namespace names so the value can serve as a stable map key, a
-/// fingerprint input and a serialized identifier without further laundering.
+/// `sqlite.connection`. Each segment is a non-empty run of lowercase ASCII
+/// letters (`a`-`z`), digits (`0`-`9`), `_` or `-`; no segment-leading-letter
+/// requirement exists, so a lone-segment key such as `file` or `0host` is
+/// legal. A single-segment key (e.g. `file`) is allowed and simply carries no
+/// namespace. `.` is reserved purely as the separator between non-empty
+/// segments, so a key may not start or end with a dot and may not contain an
+/// empty segment.
+///
+/// Validation rejects empty, over-long, non-ASCII and malformed-namespace
+/// names so the value can serve as a stable map key, a fingerprint input and
+/// a serialized identifier without further laundering.
 ///
 /// This deliberately replaces any reliance on [`std::any::TypeId`]: resource
 /// identity is a value, not a type reflection.
@@ -161,11 +169,22 @@ fn validate_resource_key(name: &str) -> Result<(), ResourceTypeKeyError> {
             });
         }
     }
-    for segment in name.split('.') {
-        if segment.is_empty() {
-            let index = name.find('.').map(|dot| dot.saturating_sub(1)).unwrap_or(0);
-            return Err(ResourceTypeKeyError::InvalidDotPlacement { index });
+    // Report the exact byte offset of each empty segment: a `.` that directly
+    // follows another `.` (or the leading dot) opens an empty segment at that
+    // dot, and a trailing `.` leaves an empty segment at the end of the name.
+    let mut segment_start = 0usize;
+    for (index, b) in name.bytes().enumerate() {
+        if b == b'.' {
+            if index == segment_start {
+                return Err(ResourceTypeKeyError::InvalidDotPlacement { index });
+            }
+            segment_start = index + 1;
         }
+    }
+    if segment_start == name.len() {
+        return Err(ResourceTypeKeyError::InvalidDotPlacement {
+            index: segment_start,
+        });
     }
     Ok(())
 }
@@ -519,26 +538,35 @@ fn validate_function_name(name: &str) -> Result<(), FunctionNameError> {
             });
         }
     }
+    // Walk the `::`-separated segments tracking each segment's exact byte
+    // offset, so an empty segment is reported at the offset of the separator
+    // that opens it rather than at the first separator found in the name.
+    let mut cursor = 0usize;
     for segment in name.split("::") {
         if segment.is_empty() {
-            let byte_index = name.find("::").unwrap_or(0);
-            return Err(FunctionNameError::EmptySegment { index: byte_index });
+            // `cursor` is the byte offset at which this empty segment begins:
+            // the start of a `::` separator, or the end of the name when the
+            // name ends in `::`.
+            return Err(FunctionNameError::EmptySegment { index: cursor });
         }
         let mut chars = segment.chars();
         let first = chars.next().expect("segment is non-empty");
         let valid_start = first.is_ascii_alphabetic() || first == '_';
         if !valid_start {
             return Err(FunctionNameError::InvalidChar {
-                index: name.find(segment).unwrap_or(0),
+                index: cursor,
                 ch: first,
             });
         }
         for (offset, c) in segment.char_indices() {
             if !(c.is_ascii_alphanumeric() || c == '_') {
-                let index = name.find(segment).unwrap_or(0) + offset;
-                return Err(FunctionNameError::InvalidChar { index, ch: c });
+                return Err(FunctionNameError::InvalidChar {
+                    index: cursor + offset,
+                    ch: c,
+                });
             }
         }
+        cursor += segment.len() + 2; // skip this segment and the `::` separator
     }
     Ok(())
 }

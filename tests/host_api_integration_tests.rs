@@ -5,8 +5,9 @@
 //! `sqlite.connection` catalogs, validate, and fingerprint.
 
 use vm::{
-    HostApiBuilder, HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema,
-    HostTypeSchema, ResourceTypeKey, ResourceTypeSchema,
+    FunctionNameError, HostApiBuilder, HostApiCatalog, HostApiCatalogError, HostFunctionSchema,
+    HostParamPassing, HostParamSchema, HostTypeSchema, ResourceTypeKey, ResourceTypeKeyError,
+    ResourceTypeSchema,
 };
 
 fn io_file() -> ResourceTypeKey {
@@ -221,4 +222,65 @@ fn host_api_serde_rejects_hostile_json() {
     }"#;
     let result: Result<HostApiCatalog, _> = serde_json::from_str(hostile);
     assert!(result.is_err(), "Value-passing a resource must be rejected");
+}
+
+#[test]
+fn resource_type_key_empty_segment_offset_is_precise() {
+    // `a..b` has its empty segment (the doubled dot) at byte offset 2, not at
+    // the first dot in the name (byte 1).
+    assert_eq!(
+        ResourceTypeKey::new("a..b"),
+        Err(ResourceTypeKeyError::InvalidDotPlacement { index: 2 })
+    );
+    // A trailing dot leaves an empty segment at the end-of-name offset.
+    assert_eq!(
+        ResourceTypeKey::new("a."),
+        Err(ResourceTypeKeyError::InvalidDotPlacement { index: 2 })
+    );
+    // A leading dot starts an empty segment at byte offset 0.
+    assert_eq!(
+        ResourceTypeKey::new(".a"),
+        Err(ResourceTypeKeyError::InvalidDotPlacement { index: 0 })
+    );
+    // Single-segment keys and segment charset are legal (verified values).
+    for legal in ["file", "0host", "a-b_c", "io.file", "sqlite.connection"] {
+        assert!(
+            ResourceTypeKey::new(legal).is_ok(),
+            "`{legal}` must be valid"
+        );
+    }
+}
+
+#[test]
+fn function_name_empty_segment_offset_is_precise() {
+    // `a::::b` contains an empty `::`-segment that begins at byte 3 (the second
+    // `::` group), not at the first `::` at byte 1.
+    let mut b = HostApiCatalog::builder();
+    b.function(HostFunctionSchema::new("a::::b", vec![]));
+    match b.build() {
+        Err(HostApiCatalogError::InvalidFunctionName { reason, .. }) => {
+            assert_eq!(reason, FunctionNameError::EmptySegment { index: 3 })
+        }
+        other => panic!("expected InvalidFunctionName, got {other:?}"),
+    }
+
+    // A trailing `::` reports the empty final segment at the end-of-name offset.
+    let mut b = HostApiCatalog::builder();
+    b.function(HostFunctionSchema::new("a::b::", vec![]));
+    match b.build() {
+        Err(HostApiCatalogError::InvalidFunctionName { reason, .. }) => {
+            assert_eq!(reason, FunctionNameError::EmptySegment { index: 6 })
+        }
+        other => panic!("expected InvalidFunctionName, got {other:?}"),
+    }
+
+    // A leading `::` reports the empty first segment at byte offset 0.
+    let mut b = HostApiCatalog::builder();
+    b.function(HostFunctionSchema::new("::b", vec![]));
+    match b.build() {
+        Err(HostApiCatalogError::InvalidFunctionName { reason, .. }) => {
+            assert_eq!(reason, FunctionNameError::EmptySegment { index: 0 })
+        }
+        other => panic!("expected InvalidFunctionName, got {other:?}"),
+    }
 }

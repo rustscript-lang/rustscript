@@ -83,9 +83,9 @@ pub use debugger::{
     run_recording_replay_command,
 };
 pub use host_api::{
-    HostApiBuilder, HostApiCatalog, HostApiCatalogError, HostApiFingerprint, HostFunctionSchema,
-    HostParamPassing, HostParamSchema, HostTypeSchema, ResourceTypeKey, ResourceTypeKeyError,
-    ResourceTypeSchema,
+    FunctionNameError, HostApiBuilder, HostApiCatalog, HostApiCatalogError, HostApiFingerprint,
+    HostFunctionSchema, HostParamPassing, HostParamSchema, HostTypeSchema, ResourceTypeKey,
+    ResourceTypeKeyError, ResourceTypeSchema,
 };
 #[cfg(feature = "runtime")]
 pub use jit::{
