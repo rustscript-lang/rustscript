@@ -10,41 +10,17 @@
 //! reason wins) and forwarded to exactly the owning driver via
 //! [`HostOperation::cancel`].
 
-use std::collections::HashMap;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
 use super::driver::{HostOperation, OperationCleanup, OperationOutcome, OperationSpec};
 use super::error::{OperationError, OperationErrorCode, OperationResult};
+use super::id::{MAX_GENERATION, MAX_SLOT_IDENTITY, OperationId, allocate_registry_tag, encode};
 use super::reason::OperationCancelReason;
 use crate::vm::resource::ResourceHandle;
 
 /// Default ceiling for concurrently pending operations.
 pub const DEFAULT_MAX_PENDING_OPERATIONS: usize = 64;
-
-/// Monotonic, non-reusable operation identifier.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct OperationId(u64);
-
-impl OperationId {
-    /// Wraps a raw non-zero id.
-    pub fn from_raw(raw: u64) -> OperationResult<Self> {
-        if raw == 0 {
-            return Err(OperationError::new(
-                OperationErrorCode::InvalidOperationId,
-                "vm::operation",
-                "operation id zero is reserved",
-            ));
-        }
-        Ok(Self(raw))
-    }
-
-    /// The raw numeric id (safe to pass across a dynamic host call where the
-    /// id is the only capability token the script holds).
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-}
 
 /// Public, observable operation status.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,8 +51,17 @@ impl OperationStatus {
     }
 }
 
+/// One generational slot in the registry's slot arena.
+///
+/// A slot keeps a nonzero generation across reuses; each new occupant of the
+/// same slot sees an incremented generation, so an id from a previous occupant
+/// becomes stale rather than aliasing a newer operation.
+struct OperationSlot {
+    generation: u64,
+    operation: Option<Operation>,
+}
+
 struct Operation {
-    id: OperationId,
     driver: Box<dyn HostOperation>,
     deadline: Option<Instant>,
     resource: Option<ResourceHandle>,
@@ -84,22 +69,32 @@ struct Operation {
     status: OperationStatus,
 }
 
-/// Bounded registry of in-flight host operations.
+/// Reusable, slot-arena registry of in-flight host operations.
 ///
 /// Capacity limits the number of *pending* operations; an operation that has
 /// reached a terminal state no longer counts against capacity, so consuming a
 /// terminal result releases registry capacity for new operations.
 ///
+/// Storage is a [`Vec<OperationSlot>`] backed by a free list of reusable slot
+/// indices. Each operation id packs the registry's process-unique tag, the
+/// slot identity, and the slot's generation, so a caller-supplied id that
+/// carries another registry's tag, an out-of-range/future slot, or a stale
+/// generation is rejected before any status, driver, cleanup or free-list
+/// mutation.
+///
 /// This type is intentionally `!Sync` (no interior mutability for concurrent
 /// access); it is owned and driven by a single thread.
 pub struct OperationRegistry {
     max_pending: usize,
-    next_id: u64,
-    operations: HashMap<OperationId, Operation>,
+    tag: u64,
+    sealed: bool,
+    slots: Vec<OperationSlot>,
+    free: Vec<usize>,
 }
 
 impl OperationRegistry {
-    /// Creates an empty registry with the given pending-operation ceiling.
+    /// Creates an empty sealed-less registry with the given pending-operation
+    /// ceiling, allocating a process-unique registry tag.
     pub fn with_limit(max_pending: usize) -> OperationResult<Self> {
         if max_pending == 0 {
             return Err(OperationError::new(
@@ -108,10 +103,13 @@ impl OperationRegistry {
                 "operation registry capacity must be positive",
             ));
         }
+        let tag = allocate_registry_tag()?;
         Ok(Self {
             max_pending,
-            next_id: 1,
-            operations: HashMap::new(),
+            tag,
+            sealed: false,
+            slots: Vec::new(),
+            free: Vec::new(),
         })
     }
 
@@ -120,17 +118,47 @@ impl OperationRegistry {
         self.max_pending
     }
 
+    /// Whether this registry has been [`seal`](Self::seal)ed and therefore
+    /// rejects new operations.
+    pub fn is_sealed(&self) -> bool {
+        self.sealed
+    }
+
+    /// Seals the registry so no further operations can be started. Idempotent;
+    /// existing operations remain queryable and droppable.
+    pub fn seal(&mut self) {
+        self.sealed = true;
+    }
+
     /// Number of operations still pending.
     pub fn active_count(&self) -> usize {
-        self.operations
-            .values()
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.operation.as_ref())
             .filter(|operation| !operation.status.is_terminal())
             .count()
     }
 
-    /// Starts a new operation from a spec, enforcing the capacity ceiling and
-    /// monotonic id allocation.
+    /// Number of occupied slots (pending and terminal).
+    pub fn len(&self) -> usize {
+        self.slots.iter().filter(|s| s.operation.is_some()).count()
+    }
+
+    /// Whether no operation (pending or terminal) is occupied.
+    pub fn is_empty(&self) -> bool {
+        !self.slots.iter().any(|s| s.operation.is_some())
+    }
+
+    /// Starts a new operation from a spec, enforcing the seal, the capacity
+    /// ceiling, generic slot reuse, and packed id allocation.
     pub fn start(&mut self, spec: OperationSpec) -> OperationResult<OperationId> {
+        if self.sealed {
+            return Err(OperationError::new(
+                OperationErrorCode::OperationRegistrySealed,
+                "vm::operation",
+                "operation registry is sealed and rejects new operations",
+            ));
+        }
         if self.active_count() >= self.max_pending {
             return Err(OperationError::new(
                 OperationErrorCode::OperationLimitExceeded,
@@ -139,17 +167,19 @@ impl OperationRegistry {
             )
             .with_limit(self.max_pending as u64));
         }
-        let raw = Self::allocate_id(&mut self.next_id)?;
-        let id = OperationId::from_raw(raw).expect("allocated id is never zero");
+        let slot_index = self.acquire_slot()?;
+        let generation = self.slots[slot_index].generation;
+        let id = encode(self.tag, slot_index, generation).expect("registry id encodes");
         let operation = Operation {
-            id,
             driver: spec.driver,
             deadline: spec.deadline,
             resource: spec.resource,
             cleanup: spec.cleanup,
             status: OperationStatus::Pending,
         };
-        self.operations.insert(id, operation);
+        // Install exactly once into the acquired slot.
+        self.slots[slot_index].operation = Some(operation);
+        debug_assert!(self.slots[slot_index].generation == generation);
         Ok(id)
     }
 
@@ -175,10 +205,17 @@ impl OperationRegistry {
 
     /// Ids of operations associated with the given resource handle.
     pub fn operations_for_resource(&self, resource: ResourceHandle) -> Vec<OperationId> {
-        self.operations
-            .values()
-            .filter(|entry| entry.resource == Some(resource))
-            .map(|entry| entry.id)
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                let operation = slot.operation.as_ref()?;
+                if operation.resource == Some(resource) {
+                    Some(self.id_at(index, slot.generation))
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
@@ -209,7 +246,7 @@ impl OperationRegistry {
         }
 
         let poll_result = {
-            let entry = self.operations.get_mut(&id).expect("operation exists");
+            let entry = self.operation_mut(id)?;
             entry.driver.poll(cx)
         };
 
@@ -327,21 +364,41 @@ impl OperationRegistry {
         self.finish(id, OperationOutcome::Failed(error))
     }
 
-    /// Removes terminal operation entries from the map, freeing bookkeeping.
-    /// Returns how many entries were removed.
+    /// Removes terminal operation entries from the arena, freeing their slots for
+    /// reuse. Returns how many entries were removed.
     pub fn prune_terminal(&mut self) -> usize {
-        let before = self.operations.len();
-        self.operations
-            .retain(|_, entry| !entry.status.is_terminal());
-        before - self.operations.len()
+        let mut removed = 0;
+        let terminal_indices: Vec<usize> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                slot.operation
+                    .as_ref()
+                    .filter(|operation| operation.status.is_terminal())
+                    .map(|_| index)
+            })
+            .collect();
+        for index in terminal_indices {
+            self.release_slot(index);
+            removed += 1;
+        }
+        removed
     }
 
-    /// Removes a single operation regardless of status, returning its status.
+    /// Removes a single operation regardless of status, returning its status and
+    /// releasing its slot for reuse.
     pub fn remove(&mut self, id: OperationId) -> OperationResult<OperationStatus> {
-        self.operations
-            .remove(&id)
-            .map(|entry| entry.status)
-            .ok_or_else(|| operation_not_found(id))
+        let index = self.location(id)?;
+        let status = {
+            let slot = &mut self.slots[index];
+            match slot.operation.take() {
+                Some(operation) => operation.status,
+                None => return Err(operation_stale(id)),
+            }
+        };
+        self.release_slot(index);
+        Ok(status)
     }
 
     fn finish(&mut self, id: OperationId, outcome: OperationOutcome) -> OperationResult<bool> {
@@ -389,36 +446,93 @@ impl OperationRegistry {
     }
 
     fn pending_ids(&self) -> Vec<OperationId> {
-        self.operations
-            .values()
-            .filter(|entry| !entry.status.is_terminal())
-            .map(|entry| entry.id)
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                slot.operation
+                    .as_ref()
+                    .filter(|operation| !operation.status.is_terminal())
+                    .map(|_| self.id_at(index, slot.generation))
+            })
             .collect()
     }
 
+    /// Resolves a caller-supplied id to a slot index, validating it fully
+    /// against this registry before any status/driver/cleanup/free-list
+    /// mutation is allowed to proceed.
+    fn location(&self, id: OperationId) -> OperationResult<usize> {
+        if id.registry_tag() != self.tag {
+            return Err(operation_wrong_registry(id));
+        }
+        let slot_index = id.slot_index();
+        if slot_index >= self.slots.len() {
+            return Err(operation_not_found(id));
+        }
+        let slot = &self.slots[slot_index];
+        if id.generation() > slot.generation {
+            // A future generation means the occupant does not exist yet.
+            return Err(operation_not_found(id));
+        }
+        if id.generation() < slot.generation || slot.operation.is_none() {
+            // Older generation or vacant (released) slot: the operation moved on.
+            return Err(operation_stale(id));
+        }
+        Ok(slot_index)
+    }
+
     fn operation(&self, id: OperationId) -> OperationResult<&Operation> {
-        self.operations
-            .get(&id)
-            .ok_or_else(|| operation_not_found(id))
+        let slot = self.location(id)?;
+        self.slots[slot]
+            .operation
+            .as_ref()
+            .ok_or_else(|| operation_stale(id))
     }
 
     fn operation_mut(&mut self, id: OperationId) -> OperationResult<&mut Operation> {
-        self.operations
-            .get_mut(&id)
-            .ok_or_else(|| operation_not_found(id))
+        let slot = self.location(id)?;
+        self.slots[slot]
+            .operation
+            .as_mut()
+            .ok_or_else(|| operation_stale(id))
     }
 
-    fn allocate_id(next_id: &mut u64) -> OperationResult<u64> {
-        let id = OperationId::from_raw(*next_id)?;
-        let raw = id.raw();
-        *next_id = raw.checked_add(1).ok_or_else(|| {
-            OperationError::new(
+    /// Reconstructs the packed id for an occupied slot at its current
+    /// generation.
+    fn id_at(&self, slot_index: usize, generation: u64) -> OperationId {
+        encode(self.tag, slot_index, generation).expect("occupied slot encodes a registry id")
+    }
+
+    /// Acquires a reusable slot for a new operation: pops an index from the
+    /// free list, or grows the arena by one new slot up to `MAX_SLOT_IDENTITY`.
+    fn acquire_slot(&mut self) -> OperationResult<usize> {
+        if let Some(index) = self.free.pop() {
+            return Ok(index);
+        }
+        if self.slots.len() >= MAX_SLOT_IDENTITY as usize {
+            return Err(OperationError::new(
                 OperationErrorCode::OperationIdExhausted,
                 "vm::operation",
-                "operation id space exhausted",
-            )
-        })?;
-        Ok(raw)
+                "operation slot identity space exhausted",
+            ));
+        }
+        self.slots.push(OperationSlot {
+            generation: 1,
+            operation: None,
+        });
+        Ok(self.slots.len() - 1)
+    }
+
+    /// Releases an occupied slot: drops the occupant, increments the
+    /// generation, and recycles the slot for reuse — unless the generation is
+    /// at `MAX_GENERATION`, in which case the slot retires permanently.
+    fn release_slot(&mut self, index: usize) {
+        let slot = &mut self.slots[index];
+        slot.operation = None;
+        if slot.generation < MAX_GENERATION {
+            slot.generation += 1;
+            self.free.push(index);
+        }
     }
 }
 
@@ -445,6 +559,24 @@ fn operation_not_found(id: OperationId) -> OperationError {
         OperationErrorCode::OperationNotFound,
         "vm::operation",
         format!("operation {} is not registered", id.raw()),
+    )
+    .with_value(id.raw())
+}
+
+fn operation_wrong_registry(id: OperationId) -> OperationError {
+    OperationError::new(
+        OperationErrorCode::OperationWrongRegistry,
+        "vm::operation",
+        format!("operation {} belongs to a different registry", id.raw()),
+    )
+    .with_value(id.raw())
+}
+
+fn operation_stale(id: OperationId) -> OperationError {
+    OperationError::new(
+        OperationErrorCode::OperationStale,
+        "vm::operation",
+        format!("operation {} refers to a stale slot generation", id.raw()),
     )
     .with_value(id.raw())
 }
@@ -485,6 +617,7 @@ mod tests {
         HostOperation, OperationCleanup, OperationOutcome, OperationSpec,
     };
     use crate::vm::operation::error::{OperationError, OperationErrorCode, OperationResult};
+    use crate::vm::operation::id::encode;
     use crate::vm::operation::reason::OperationCancelReason;
     use crate::vm::resource::ResourceHandle;
 
@@ -877,5 +1010,218 @@ mod tests {
             registry.poll(id, &mut cx()),
             Poll::Ready(Ok(OperationOutcome::Completed))
         ));
+    }
+
+    #[test]
+    fn slot_reused_after_terminal_remove_bumps_generation_and_old_stales() {
+        let mut registry = OperationRegistry::with_limit(4).expect("registry should be valid");
+        let first = registry
+            .start(OperationSpec::new(RecordingDriver::completed()))
+            .expect("first should start");
+        let first_slot = first.slot_index();
+        let first_gen = first.generation();
+
+        // Drive the first op terminal, then remove it so its slot is freed.
+        assert!(matches!(
+            registry.poll(first, &mut cx()),
+            Poll::Ready(Ok(OperationOutcome::Completed))
+        ));
+        assert!(
+            registry
+                .remove(first)
+                .expect("remove returns status")
+                .is_terminal()
+        );
+        assert_eq!(registry.active_count(), 0);
+
+        // A new operation reuses the same slot with a higher generation.
+        let second = registry
+            .start(OperationSpec::new(RecordingDriver::completed()))
+            .expect("second should start into the freed slot");
+        assert_eq!(
+            second.slot_index(),
+            first_slot,
+            "slot identity is preserved on reuse"
+        );
+        assert!(
+            second.generation() > first_gen,
+            "generation must increment on slot reuse"
+        );
+        // The old id is stale now.
+        assert_eq!(
+            registry
+                .status(first)
+                .expect_err("old id must be stale")
+                .code(),
+            OperationErrorCode::OperationStale
+        );
+        // Removing the old id must not touch the new occupant.
+        assert!(matches!(
+            registry.status(second).expect("new occupant"),
+            OperationStatus::Pending
+        ));
+    }
+
+    #[test]
+    fn two_registries_reject_foreign_id_without_driver_mutation() {
+        let mut registry_a = OperationRegistry::with_limit(4).expect("a valid");
+        let mut registry_b = OperationRegistry::with_limit(4).expect("b valid");
+        let cancels_a = Arc::new(Mutex::new(Vec::new()));
+        let driver_a = RecordingDriver {
+            cancels: Arc::clone(&cancels_a),
+            fail: None,
+        };
+        let id_a = registry_a
+            .start(OperationSpec::new(driver_a))
+            .expect("a starts");
+        // Place a live driver in B so we can assert it is never touched.
+        let cancels_b = Arc::new(Mutex::new(Vec::new()));
+        let driver_b = RecordingDriver {
+            cancels: Arc::clone(&cancels_b),
+            fail: None,
+        };
+        registry_b
+            .start(OperationSpec::new(driver_b))
+            .expect("b starts");
+
+        // A's id on B: wrong registry, before any status/driver/cleanup mutation.
+        assert_eq!(
+            registry_b
+                .status(id_a)
+                .expect_err("foreign id must be rejected")
+                .code(),
+            OperationErrorCode::OperationWrongRegistry
+        );
+        assert_eq!(
+            registry_b
+                .cancel(id_a, OperationCancelReason::Requested)
+                .expect_err("foreign id must be rejected")
+                .code(),
+            OperationErrorCode::OperationWrongRegistry
+        );
+        assert_eq!(
+            registry_b
+                .remove(id_a)
+                .expect_err("foreign id must be rejected")
+                .code(),
+            OperationErrorCode::OperationWrongRegistry
+        );
+
+        // No driver's cancel/status path was exercised on either registry.
+        assert!(cancels_a.lock().unwrap().is_empty(), "A's driver untouched");
+        assert!(cancels_b.lock().unwrap().is_empty(), "B's driver untouched");
+        // A's operation is unaffected.
+        assert!(matches!(
+            registry_a.status(id_a).expect("a still queryable"),
+            OperationStatus::Pending
+        ));
+    }
+
+    #[test]
+    fn forged_same_tag_future_slot_and_generation_are_rejected_without_mutation() {
+        let mut registry = OperationRegistry::with_limit(4).expect("registry should be valid");
+        let cancels = Arc::new(Mutex::new(Vec::new()));
+        let driver = RecordingDriver {
+            cancels: Arc::clone(&cancels),
+            fail: None,
+        };
+        let tag = registry.start(OperationSpec::new(driver)).expect("start");
+
+        // Future slot: valid tag but an index beyond the arena.
+        let out_of_range = encode(tag.registry_tag(), 1_000_000, 1).expect("forged slot id");
+        assert_eq!(
+            registry
+                .status(out_of_range)
+                .expect_err("must be rejected")
+                .code(),
+            OperationErrorCode::OperationNotFound
+        );
+        assert_eq!(
+            registry
+                .cancel(out_of_range, OperationCancelReason::Requested)
+                .expect_err("must be rejected")
+                .code(),
+            OperationErrorCode::OperationNotFound
+        );
+
+        // Future generation on an existing slot.
+        let future = encode(tag.registry_tag(), tag.slot_index(), tag.generation() + 1)
+            .expect("forged future-generation id");
+        assert_eq!(
+            registry
+                .status(future)
+                .expect_err("must be rejected")
+                .code(),
+            OperationErrorCode::OperationNotFound
+        );
+
+        // No driver was cancelled and the real operation is unaffected.
+        assert!(cancels.lock().unwrap().is_empty());
+        assert_eq!(registry.active_count(), 1);
+        assert!(matches!(
+            registry.status(tag).expect("real op queryable"),
+            OperationStatus::Pending
+        ));
+    }
+
+    #[test]
+    fn seal_is_idempotent_and_start_rejected_while_existing_operation_queryable() {
+        let mut registry = OperationRegistry::with_limit(4).expect("registry should be valid");
+        let id = registry
+            .start(OperationSpec::new(RecordingDriver::completed()))
+            .expect("start before seal");
+
+        registry.seal();
+        assert!(registry.is_sealed());
+        // Idempotent.
+        registry.seal();
+        assert!(registry.is_sealed());
+
+        let sealed = registry
+            .start(OperationSpec::new(RecordingDriver::completed()))
+            .expect_err("start must be rejected once sealed");
+        assert_eq!(sealed.code(), OperationErrorCode::OperationRegistrySealed);
+
+        // Existing operation remains fully queryable after sealing.
+        assert!(matches!(
+            registry.poll(id, &mut cx()),
+            Poll::Ready(Ok(OperationOutcome::Completed))
+        ));
+        assert!(matches!(
+            registry.status(id).expect("status"),
+            OperationStatus::Completed
+        ));
+        assert_eq!(registry.resource_of(id).expect("resource"), None);
+    }
+
+    #[test]
+    fn prune_terminal_releases_slot_for_reuse_and_stales_old_id() {
+        let mut registry = OperationRegistry::with_limit(4).expect("registry should be valid");
+        let old = registry
+            .start(OperationSpec::new(RecordingDriver::completed()))
+            .expect("start");
+        let old_slot = old.slot_index();
+        let old_gen = old.generation();
+
+        assert!(matches!(
+            registry.poll(old, &mut cx()),
+            Poll::Ready(Ok(OperationOutcome::Completed))
+        ));
+        // Pruning frees the terminal slot (advanced generation).
+        let pruned = registry.prune_terminal();
+        assert_eq!(pruned, 1);
+
+        let new = registry
+            .start(OperationSpec::new(RecordingDriver::completed()))
+            .expect("reuses the pruned slot");
+        assert_eq!(new.slot_index(), old_slot, "pruned slot reused");
+        assert!(new.generation() > old_gen, "prune advances the generation");
+        assert_eq!(
+            registry
+                .status(old)
+                .expect_err("old id must be stale after prune")
+                .code(),
+            OperationErrorCode::OperationStale
+        );
     }
 }

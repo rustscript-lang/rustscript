@@ -15,9 +15,12 @@
 //!   each operation entry, forwarding cancellation directly to the owning
 //!   driver. There is no standalone cancellation-token graph and no second
 //!   cancellation framework.
-//! * **Bounded, monotonic ids** — [`OperationRegistry`] allocates non-reusable
-//!   [`OperationId`]s and bounds the number of concurrently *pending*
-//!   operations; consuming a terminal result releases capacity.
+//! * **Packed, validated, reusable slots** — [`OperationRegistry`] stores
+//!   operations in generational slots addressed by a packed registry-tag /
+//!   slot-identity / generation [`OperationId`]. Caller-supplied ids are
+//!   validated (foreign tag, out-of-range/future slot, or stale generation are
+//!   rejected before any status/driver/cleanup mutation) and a released slot
+//!   is reused under an incremented generation.
 //! * **Optional resource association** — an operation can be tied to a
 //!   [`ResourceHandle`](crate::vm::resource::ResourceHandle)
 //!   so cancelling that resource cancels the operation.
