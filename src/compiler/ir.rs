@@ -1114,6 +1114,7 @@ mod type_schema_contains_resource_tests {
             TypeSchema::Optional(Box::new(TypeSchema::Optional(Box::new(resource()))))
                 .contains_resource()
         );
+        assert!(!TypeSchema::Optional(Box::new(TypeSchema::Int)).contains_resource());
     }
 
     #[test]
@@ -1130,6 +1131,7 @@ mod type_schema_contains_resource_tests {
     #[test]
     fn array_recursed() {
         assert!(TypeSchema::Array(Box::new(resource())).contains_resource());
+        assert!(!TypeSchema::Array(Box::new(TypeSchema::Int)).contains_resource());
     }
 
     #[test]
