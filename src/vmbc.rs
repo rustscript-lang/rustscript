@@ -27,6 +27,7 @@ pub enum WireError {
     InvalidValueType(u8),
     InvalidCaptureBindingMode(u8),
     InvalidUtf8,
+    InvalidResourceKey(String),
     StringTooLong(usize),
     CodeTooLong(usize),
     UnsupportedConstantType(&'static str),
@@ -52,6 +53,9 @@ impl std::fmt::Display for WireError {
                 write!(f, "invalid capture binding mode: {value}")
             }
             WireError::InvalidUtf8 => write!(f, "invalid utf-8 string"),
+            WireError::InvalidResourceKey(reason) => {
+                write!(f, "invalid resource key: {reason}")
+            }
             WireError::StringTooLong(len) => write!(f, "string too long: {len}"),
             WireError::CodeTooLong(len) => write!(f, "code too long: {len}"),
             WireError::UnsupportedConstantType(kind) => {
@@ -1433,6 +1437,10 @@ fn write_schema(schema: &TypeSchema, out: &mut Vec<u8>) -> Result<(), WireError>
             }
             write_schema(result, out)?;
         }
+        TypeSchema::Resource(key) => {
+            out.push(17);
+            write_string("schema resource key", key.as_str(), out)?;
+        }
     }
     Ok(())
 }
@@ -1495,6 +1503,12 @@ fn read_schema(cursor: &mut Cursor<'_>) -> Result<TypeSchema, WireError> {
             }
             let result = Box::new(read_schema(cursor)?);
             Ok(TypeSchema::Callable { params, result })
+        }
+        17 => {
+            let key_text = cursor.read_string()?;
+            let key = crate::host_api::ResourceTypeKey::new(key_text)
+                .map_err(|err| WireError::InvalidResourceKey(err.to_string()))?;
+            Ok(TypeSchema::Resource(key))
         }
         other => Err(WireError::InvalidValueType(other)),
     }
