@@ -288,3 +288,237 @@ fn fingerprint_propagates_into_resolved_result() {
     assert_eq!(resolved.fingerprint, resolver.fingerprint());
     assert_eq!(resolved.fingerprint, catalog.fingerprint());
 }
+
+#[test]
+fn scalar_int_number_float_selection() {
+    // `scale` overloads only on scalar schemas: f(Int) and f(Number).
+    // Int resolves the Int overload (exact beats numeric-compat), Number the
+    // Number overload, and Float must land on f(Number) because f(Int) is a
+    // concrete mismatch for a Float.
+    let mut builder = HostApiBuilder::new();
+    builder.function(HostFunctionSchema::with_return(
+        "scale",
+        vec![value("v", HostTypeSchema::Int)],
+        HostTypeSchema::Int,
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        "scale",
+        vec![value("v", HostTypeSchema::Number)],
+        HostTypeSchema::String,
+    ));
+    let catalog = builder.build().expect("valid scalar overloads");
+    let resolver = HostCallResolver::new(&catalog);
+
+    let via_int = resolver
+        .resolve("scale", &[TypeSchema::Int])
+        .expect("Int resolves");
+    assert_eq!(via_int.return_type, TypeSchema::Int);
+
+    let via_number = resolver
+        .resolve("scale", &[TypeSchema::Number])
+        .expect("Number resolves");
+    assert_eq!(via_number.return_type, TypeSchema::String);
+
+    let via_float = resolver
+        .resolve("scale", &[TypeSchema::Float])
+        .expect("Float resolves");
+    assert_eq!(
+        via_float.return_type,
+        TypeSchema::String,
+        "Float must pick f(Number)"
+    );
+}
+
+#[test]
+fn nested_array_numeric_specificity() {
+    // array<Int> (exact) must outrank array<Number> (nested numeric-compatible)
+    // for an actual array<Int>; array<Number> wins for array<Number>/array<Float>.
+    let mut builder = HostApiBuilder::new();
+    builder.function(HostFunctionSchema::with_return(
+        "sum",
+        vec![value(
+            "xs",
+            HostTypeSchema::Array(Box::new(HostTypeSchema::Int)),
+        )],
+        HostTypeSchema::Int,
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        "sum",
+        vec![value(
+            "xs",
+            HostTypeSchema::Array(Box::new(HostTypeSchema::Number)),
+        )],
+        HostTypeSchema::String,
+    ));
+    let catalog = builder.build().expect("valid overloads");
+    let resolver = HostCallResolver::new(&catalog);
+
+    let ints = resolver
+        .resolve("sum", &[TypeSchema::Array(Box::new(TypeSchema::Int))])
+        .expect("int array resolves");
+    assert_eq!(
+        ints.return_type,
+        TypeSchema::Int,
+        "exact array<Int> must beat numeric array<Number> for an actual array<Int>"
+    );
+
+    let floats = resolver
+        .resolve("sum", &[TypeSchema::Array(Box::new(TypeSchema::Float))])
+        .expect("float array resolves");
+    assert_eq!(
+        floats.return_type,
+        TypeSchema::String,
+        "array<Int> is non-viable for array<Float>; array<Number> matches"
+    );
+}
+
+#[test]
+fn reversed_registration_yields_identical_nomatch_and_arity() {
+    fn take_catalog(io_first: bool) -> HostApiCatalog {
+        let mut builder = HostApiBuilder::new();
+        builder.resource(ResourceTypeSchema::new(io_file(), "file"));
+        builder.resource(ResourceTypeSchema::new(sqlite_conn(), "db"));
+        let io = HostFunctionSchema::with_return(
+            "take",
+            vec![HostParamSchema::with_passing(
+                "h",
+                resource(io_file()),
+                HostParamPassing::Borrow,
+            )],
+            HostTypeSchema::Int,
+        );
+        let sqlite = HostFunctionSchema::with_return(
+            "take",
+            vec![HostParamSchema::with_passing(
+                "h",
+                resource(sqlite_conn()),
+                HostParamPassing::Borrow,
+            )],
+            HostTypeSchema::String,
+        );
+        if io_first {
+            builder.function(io);
+            builder.function(sqlite);
+        } else {
+            builder.function(sqlite);
+            builder.function(io);
+        }
+        builder.build().expect("valid")
+    }
+
+    // NoMatch: a String mismatches both resource overloads; the reported best
+    // candidate and detail must be identical regardless of registration order.
+    let err_a = HostCallResolver::new(&take_catalog(true))
+        .resolve("take", &[TypeSchema::String])
+        .unwrap_err();
+    let err_b = HostCallResolver::new(&take_catalog(false))
+        .resolve("take", &[TypeSchema::String])
+        .unwrap_err();
+    match (err_a, err_b) {
+        (
+            HostCallResolveError::NoMatch { detail: a, .. },
+            HostCallResolveError::NoMatch { detail: b, .. },
+        ) => {
+            assert_eq!(a, b, "NoMatch detail must not depend on registration order");
+            assert!(a.contains("resource<io.file>"), "surprising detail: {a}");
+        }
+        (a, b) => panic!("expected NoMatch in both orders, got {a:?} / {b:?}"),
+    }
+}
+
+#[test]
+fn reversed_registration_yields_identical_arity_mismatch_variants() {
+    fn g_catalog(forward: bool) -> HostApiCatalog {
+        let mut builder = HostApiBuilder::new();
+        let one = HostFunctionSchema::with_return(
+            "g",
+            vec![value("a", HostTypeSchema::Int)],
+            HostTypeSchema::Int,
+        );
+        let two_str = HostFunctionSchema::with_return(
+            "g",
+            vec![
+                value("a", HostTypeSchema::String),
+                value("b", HostTypeSchema::String),
+            ],
+            HostTypeSchema::String,
+        );
+        if forward {
+            builder.function(one);
+            builder.function(two_str);
+        } else {
+            builder.function(two_str);
+            builder.function(one);
+        }
+        builder.build().expect("valid")
+    }
+
+    let args = [TypeSchema::Int, TypeSchema::Int, TypeSchema::Int];
+    let err_a = HostCallResolver::new(&g_catalog(true))
+        .resolve("g", &args)
+        .unwrap_err();
+    let err_b = HostCallResolver::new(&g_catalog(false))
+        .resolve("g", &args)
+        .unwrap_err();
+    match (err_a, err_b) {
+        (
+            HostCallResolveError::ArityMismatch {
+                actual,
+                expected,
+                variants,
+                ..
+            },
+            HostCallResolveError::ArityMismatch {
+                actual: actual_b,
+                expected: expected_b,
+                variants: variants_b,
+                ..
+            },
+        ) => {
+            assert_eq!(actual, 3);
+            assert_eq!(expected, vec![1, 2]);
+            assert_eq!(
+                variants,
+                vec!["g(int)".to_string(), "g(string, string)".to_string()]
+            );
+            // Reversed registration must produce byte-identical payloads.
+            assert_eq!(actual_b, actual);
+            assert_eq!(expected_b, expected);
+            assert_eq!(variants_b, variants);
+        }
+        (a, b) => panic!("expected ArityMismatch in both orders, got {a:?} / {b:?}"),
+    }
+}
+
+#[test]
+fn passing_mode_only_overloads_are_ambiguous() {
+    // Three `consume` overloads with an identical resource argument shape,
+    // differing only in Borrow/BorrowMut/TakeOwned. The call site supplies only
+    // a schema and no passing intent, so resolution is ambiguous rather than
+    // silently picking by registration order.
+    let mut builder = HostApiBuilder::new();
+    builder.resource(ResourceTypeSchema::new(io_file(), "file"));
+    for passing in [
+        HostParamPassing::Borrow,
+        HostParamPassing::BorrowMut,
+        HostParamPassing::TakeOwned,
+    ] {
+        builder.function(HostFunctionSchema::with_return(
+            "consume",
+            vec![HostParamSchema::with_passing(
+                "h",
+                resource(io_file()),
+                passing,
+            )],
+            HostTypeSchema::Int,
+        ));
+    }
+    let catalog = builder
+        .build()
+        .expect("passing-mode-only overloads are legal");
+    let resolver = HostCallResolver::new(&catalog);
+    assert!(matches!(
+        resolver.resolve("consume", &[res(io_file())]),
+        Err(HostCallResolveError::Ambiguous { name, .. }) if name == "consume"
+    ));
+}

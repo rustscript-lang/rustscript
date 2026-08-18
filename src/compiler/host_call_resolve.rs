@@ -23,9 +23,13 @@
 //!   expected resource **only when the key is equal**. Different keys are
 //!   incompatible and surface the `expected resource<X>, found resource<Y>`
 //!   diagnostic; parameters are never matched by structural fallback.
-//! * **Exact scalar/container/callable matching** with one documented
-//!   exception: [`TypeSchema::Number`] accepts `Int`/`Float` (and vice-versa),
-//!   mirroring the compiler's existing numeric-compatibility rule.
+//! * **Exact vs numeric specificity.** A pair is *exact* when `expected ==
+//!   actual` with no nested [`TypeSchema::Unknown`]; the relationship order is
+//!   `Mismatch < Unknown < NumericCompat < Exact`. The sole numeric-compat
+//!   case is [`TypeSchema::Number`] ↔ `Int`/`Float`. Container/callable
+//!   aggregation keeps the *least-specific* nested relation, so an exact
+//!   `array<Int>` overload outranks a numeric-compatible `array<Number>`
+//!   overload for an actual `array<Int>`.
 //! * **Unknown is a deferred/dynamic fallback, not a wildcard concrete match.**
 //!   When either side of a pair is [`TypeSchema::Unknown`] (at any depth) the
 //!   pair is compatible but *deferred*; the resolver never uses that latitude
@@ -35,6 +39,11 @@
 //!   specific viable overloads produce a structured
 //!   [`HostCallResolveError::Ambiguous`]; with no viable overload the resolver
 //!   reports the best concrete mismatch via [`HostCallResolveError::NoMatch`].
+//! * **Registration-order independence.** Best-candidate selection and every
+//!   structured diagnostic (`NoMatch` detail, `ArityMismatch` variants,
+//!   `Ambiguous` candidates) tie-break equal specificity by a stable semantic
+//!   signature label and de-duplicate, so reversed catalog registration order
+//!   yields byte-identical diagnostics.
 //! * **Overload identity is already legal upstream.** The catalog rejects
 //!   same-name + same argument identity at build time, so every overload seen
 //!   here differs by argument schema or passing mode.
@@ -50,7 +59,11 @@ use crate::host_api::{HostApiCatalog, HostApiFingerprint, HostFunctionSchema, Ho
 
 use super::TypeSchema;
 
-/// How one (expected parameter, actual argument) pair matched.
+/// How one (expected parameter, actual argument) pair matched, as an ordered
+/// specificity relation. The relation order matters: candidates are ranked by
+/// the relation of every actual argument, so `Exact` strictly outranks
+/// `NumericCompat`, which outranks the deferred `Unknown`, which outranks a
+/// disqualifying `Mismatch`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Rel {
     /// Concrete, statically known mismatch (resource keys differ, or a scalar
@@ -60,8 +73,15 @@ enum Rel {
     /// The pair is compatible but involved [`TypeSchema::Unknown`] somewhere,
     /// so it is a deferred/dynamic fallback rather than a concrete match.
     Unknown = 1,
-    /// A fully concrete, statically known match.
-    Concrete = 2,
+    /// Numeric compatibility under the compiler's rule: [`TypeSchema::Number`]
+    /// accepts `Int`/`Float` (and vice-versa) without being a fully specific
+    /// match. Distinct from [`Rel::Exact`] so an exact `array<Int>` overload
+    /// outranks a merely numeric-compatible `array<Number>` overload for an
+    /// actual `array<Int>`.
+    NumericCompat = 2,
+    /// A fully concrete, statically known exact match: expected == actual with
+    /// no nested [`TypeSchema::Unknown`].
+    Exact = 3,
 }
 
 /// One host function parameter mapped into the compiler's inference world.
@@ -228,14 +248,20 @@ impl<'a> HostCallResolver<'a> {
         if arity_matching.is_empty() {
             expected_arities.sort_unstable();
             expected_arities.dedup();
+            // Stable, order-independent structured diagnostics: sort and
+            // de-duplicate the variant labels so reversed registration order
+            // yields an identical `ArityMismatch` payload.
+            let mut variants: Vec<String> = named
+                .iter()
+                .map(|function| signature_label(function))
+                .collect();
+            variants.sort();
+            variants.dedup();
             return Err(HostCallResolveError::ArityMismatch {
                 name: name.to_string(),
                 actual: arity,
                 expected: expected_arities,
-                variants: named
-                    .iter()
-                    .map(|function| signature_label(function))
-                    .collect(),
+                variants,
             });
         }
 
@@ -360,7 +386,7 @@ fn relate(expected: &TypeSchema, actual: &TypeSchema) -> Rel {
         return if contains_unknown(expected) || contains_unknown(actual) {
             Rel::Unknown
         } else {
-            Rel::Concrete
+            Rel::Exact
         };
     }
     use TypeSchema::*;
@@ -368,10 +394,10 @@ fn relate(expected: &TypeSchema, actual: &TypeSchema) -> Rel {
         // Unknown is a deferred/dynamic fallback, not a concrete match or a
         // hard mismatch.
         (Unknown, _) | (_, Unknown) => Rel::Unknown,
-        (Number, Int | Float) | (Int | Float, Number) => Rel::Concrete,
+        (Number, Int | Float) | (Int | Float, Number) => Rel::NumericCompat,
         (Resource(expected_key), Resource(actual_key)) => {
             if expected_key == actual_key {
-                Rel::Concrete
+                Rel::Exact
             } else {
                 Rel::Mismatch
             }
@@ -455,9 +481,12 @@ fn relate_tuple(e_items: &[TypeSchema], a_items: &[TypeSchema]) -> Rel {
 }
 
 /// Combine a container's part relations: one mismatch poisons the whole,
-/// otherwise a single deferred element makes it deferred.
+/// otherwise a single deferred element makes it deferred. Uses `min`, so the
+/// aggregate preserves the *least-specific* nested relation — an `array<Int>`
+/// (all `Exact`) outranks an `array<Number>` (a nested `NumericCompat`) for an
+/// actual `array<Int>`.
 fn aggregate(parts: &[Rel]) -> Rel {
-    parts.iter().copied().fold(Rel::Concrete, Rel::min)
+    parts.iter().copied().fold(Rel::Exact, Rel::min)
 }
 
 /// The lexicographically maximum (most-specific) candidate key.
@@ -492,43 +521,52 @@ struct ConcreteMismatch {
 
 /// Picks the most concrete non-viable candidate and its first concrete
 /// mismatch: `(candidate, mismatch)`.
+///
+/// Selection is independent of overload registration order: among the
+/// non-viable candidates it first picks the maximum (most specific) relation
+/// key, then among equally-specific keys tie-breaks by the stable semantic
+/// [`signature_label`] rather than first registration order, so the reported
+/// `NoMatch` detail is identical no matter how the catalog overloads were
+/// registered.
 fn best_concrete_mismatch<'f>(
     non_viable: &[(CandidateKey, &'f HostFunctionSchema)],
     args: &[TypeSchema],
 ) -> (Option<&'f HostFunctionSchema>, Option<ConcreteMismatch>) {
-    let mut best_candidate: Option<&'f HostFunctionSchema> = None;
-    let mut best_key: Option<CandidateKey> = None;
-    let mut best_mismatch: Option<ConcreteMismatch> = None;
-    for (key, function) in non_viable {
-        // Prefer the more specific candidate; on exact ties keep the first
-        // (registration order).
-        match (&best_key, key) {
-            (None, _) => {}
-            (Some(best), candidate) if candidate <= best => continue,
-            _ => {}
-        }
-        let mismatch = function
-            .params
-            .iter()
-            .enumerate()
-            .find_map(|(index, param)| {
-                let actual = &args[index];
-                if relate(&param.ty.to_compiler_schema(), actual) == Rel::Mismatch {
-                    Some(ConcreteMismatch {
-                        index,
-                        expected: schema_label(&param.ty),
-                        found: tf_schema_label(actual),
-                        candidate_key: key.clone(),
-                    })
-                } else {
-                    None
-                }
-            });
-        best_candidate = Some(function);
-        best_key = Some(key.clone());
-        best_mismatch = mismatch.or(best_mismatch);
+    if non_viable.is_empty() {
+        return (None, None);
     }
-    (best_candidate, best_mismatch)
+    // Most specific candidate key (lexicographically largest) — order free.
+    let best_key = non_viable
+        .iter()
+        .map(|(key, _)| key)
+        .max()
+        .expect("non-empty slice");
+    // Among equally-specific candidates, tie-break on the stable semantic
+    // signature label, not the order in which overloads were registered.
+    let best_candidate = non_viable
+        .iter()
+        .filter(|(key, _)| key == best_key)
+        .map(|(_, function)| *function)
+        .min_by_key(|function| signature_label(function))
+        .expect("at least one candidate holds the best key");
+    let mismatch = best_candidate
+        .params
+        .iter()
+        .enumerate()
+        .find_map(|(index, param)| {
+            let actual = &args[index];
+            if relate(&param.ty.to_compiler_schema(), actual) == Rel::Mismatch {
+                Some(ConcreteMismatch {
+                    index,
+                    expected: schema_label(&param.ty),
+                    found: tf_schema_label(actual),
+                    candidate_key: best_key.clone(),
+                })
+            } else {
+                None
+            }
+        });
+    (Some(best_candidate), mismatch)
 }
 
 /// Render the `NoMatch` detail from the best candidate's concrete mismatch.
@@ -1081,5 +1119,276 @@ mod tests {
             .resolve("io::read_all", &[compiler_resource(io_file())])
             .expect("resolves");
         assert_eq!(resolved.fingerprint, other.fingerprint());
+    }
+
+    #[test]
+    fn scalar_exact_beats_numeric_for_int_number_float() {
+        // f(Int) and f(Number), distinguished by return type: Int/Number
+        // resolve exactly, Float must land on f(Number) because f(Int) is a
+        // concrete (not numeric) mismatch for a Float.
+        let mut builder = HostApiBuilder::new();
+        builder.function(HostFunctionSchema::with_return(
+            "scale",
+            vec![value_param("v", HostTypeSchema::Int)],
+            HostTypeSchema::Int,
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "scale",
+            vec![value_param("v", HostTypeSchema::Number)],
+            HostTypeSchema::String,
+        ));
+        let catalog = builder.build().expect("valid scalar overloads");
+        let resolver = HostCallResolver::new(&catalog);
+
+        let via_int = resolver.resolve("scale", &[Ts::Int]).expect("Int resolves");
+        assert_eq!(
+            via_int.return_type,
+            Ts::Int,
+            "f(Int) exact must beat f(Number) numeric-compat for an Int"
+        );
+
+        let via_number = resolver
+            .resolve("scale", &[Ts::Number])
+            .expect("Number resolves");
+        assert_eq!(
+            via_number.return_type,
+            Ts::String,
+            "f(Number) exact must beat f(Int) numeric-compat for a Number"
+        );
+
+        let via_float = resolver
+            .resolve("scale", &[Ts::Float])
+            .expect("Float resolves");
+        assert_eq!(
+            via_float.return_type,
+            Ts::String,
+            "Float must pick f(Number); f(Int) is a concrete mismatch for Float"
+        );
+    }
+
+    #[test]
+    fn nested_array_numeric_specificity_prefers_exact() {
+        // array<Int> is exact for an actual array<Int> and must outrank the
+        // nested numeric-compatible array<Number>; array<Number> is exact for
+        // array<Number> and the only viable candidate for array<Float>.
+        let mut builder = HostApiBuilder::new();
+        builder.function(HostFunctionSchema::with_return(
+            "sum",
+            vec![value_param(
+                "xs",
+                HostTypeSchema::Array(Box::new(HostTypeSchema::Int)),
+            )],
+            HostTypeSchema::Int,
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "sum",
+            vec![value_param(
+                "xs",
+                HostTypeSchema::Array(Box::new(HostTypeSchema::Number)),
+            )],
+            HostTypeSchema::String,
+        ));
+        let catalog = builder.build().expect("valid overloads");
+        let resolver = HostCallResolver::new(&catalog);
+
+        let ints = resolver
+            .resolve("sum", &[Ts::Array(Box::new(Ts::Int))])
+            .expect("int array resolves");
+        assert_eq!(
+            ints.return_type,
+            Ts::Int,
+            "exact array<Int> must beat numeric array<Number> for an actual array<Int>"
+        );
+
+        let numbers = resolver
+            .resolve("sum", &[Ts::Array(Box::new(Ts::Number))])
+            .expect("number array resolves");
+        assert_eq!(
+            numbers.return_type,
+            Ts::String,
+            "array<Number> is exact for an actual array<Number>"
+        );
+
+        let floats = resolver
+            .resolve("sum", &[Ts::Array(Box::new(Ts::Float))])
+            .expect("float array resolves");
+        assert_eq!(
+            floats.return_type,
+            Ts::String,
+            "array<Int> is non-viable for an actual array<Float>; array<Number> is nested-numeric"
+        );
+    }
+
+    #[test]
+    fn nomatch_detail_is_registration_order_independent() {
+        fn catalog(io_first: bool) -> HostApiCatalog {
+            let mut builder = HostApiBuilder::new();
+            builder.resource(ResourceTypeSchema::new(io_file(), "file"));
+            builder.resource(ResourceTypeSchema::new(sqlite_conn(), "db"));
+            let io = HostFunctionSchema::with_return(
+                "take",
+                vec![ref_param(
+                    "h",
+                    resource(io_file()),
+                    HostParamPassing::Borrow,
+                )],
+                HostTypeSchema::Int,
+            );
+            let sqlite = HostFunctionSchema::with_return(
+                "take",
+                vec![ref_param(
+                    "h",
+                    resource(sqlite_conn()),
+                    HostParamPassing::Borrow,
+                )],
+                HostTypeSchema::String,
+            );
+            if io_first {
+                builder.function(io);
+                builder.function(sqlite);
+            } else {
+                builder.function(sqlite);
+                builder.function(io);
+            }
+            builder.build().expect("valid")
+        }
+
+        // A String is a concrete mismatch for both resource overloads; both
+        // are equally (in)viable, so the *reported* best candidate must not
+        // depend on registration order.
+        let err_a = HostCallResolver::new(&catalog(true))
+            .resolve("take", &[Ts::String])
+            .unwrap_err();
+        let err_b = HostCallResolver::new(&catalog(false))
+            .resolve("take", &[Ts::String])
+            .unwrap_err();
+        match (err_a, err_b) {
+            (
+                HostCallResolveError::NoMatch { detail: first, .. },
+                HostCallResolveError::NoMatch { detail: second, .. },
+            ) => {
+                assert_eq!(
+                    first, second,
+                    "NoMatch detail must be identical regardless of registration order"
+                );
+                assert!(
+                    first.contains("resource<io.file>"),
+                    "surprising detail: {first}"
+                );
+            }
+            (a, b) => panic!("expected NoMatch in both orders, got {a:?} / {b:?}"),
+        }
+    }
+
+    #[test]
+    fn arity_mismatch_structured_variants_are_order_independent() {
+        fn g_catalog(forward: bool) -> HostApiCatalog {
+            let mut builder = HostApiBuilder::new();
+            let one = || {
+                HostFunctionSchema::with_return(
+                    "g",
+                    vec![value_param("a", HostTypeSchema::Int)],
+                    HostTypeSchema::Int,
+                )
+            };
+            let two_int = || {
+                HostFunctionSchema::with_return(
+                    "g",
+                    vec![
+                        value_param("a", HostTypeSchema::Int),
+                        value_param("b", HostTypeSchema::Int),
+                    ],
+                    HostTypeSchema::Int,
+                )
+            };
+            let two_str = || {
+                HostFunctionSchema::with_return(
+                    "g",
+                    vec![
+                        value_param("a", HostTypeSchema::String),
+                        value_param("b", HostTypeSchema::String),
+                    ],
+                    HostTypeSchema::String,
+                )
+            };
+            if forward {
+                builder.function(one());
+                builder.function(two_int());
+                builder.function(two_str());
+            } else {
+                builder.function(two_str());
+                builder.function(two_int());
+                builder.function(one());
+            }
+            builder.build().expect("valid")
+        }
+
+        let err_a = HostCallResolver::new(&g_catalog(true))
+            .resolve("g", &[Ts::Int, Ts::Int, Ts::Int])
+            .unwrap_err();
+        let err_b = HostCallResolver::new(&g_catalog(false))
+            .resolve("g", &[Ts::Int, Ts::Int, Ts::Int])
+            .unwrap_err();
+        match (err_a, err_b) {
+            (
+                HostCallResolveError::ArityMismatch {
+                    actual,
+                    expected,
+                    variants,
+                    ..
+                },
+                HostCallResolveError::ArityMismatch {
+                    actual: actual_b,
+                    expected: expected_b,
+                    variants: variants_b,
+                    ..
+                },
+            ) => {
+                assert_eq!(actual, 3);
+                assert_eq!(expected, vec![1, 2]);
+                assert_eq!(
+                    variants,
+                    vec![
+                        "g(int)".to_string(),
+                        "g(int, int)".to_string(),
+                        "g(string, string)".to_string(),
+                    ]
+                );
+                // Reversed registration must produce byte-identical payloads.
+                assert_eq!(actual_b, actual);
+                assert_eq!(expected_b, expected);
+                assert_eq!(variants_b, variants);
+            }
+            (a, b) => panic!("expected ArityMismatch in both orders, got {a:?} / {b:?}"),
+        }
+    }
+
+    #[test]
+    fn passing_mode_only_overloads_are_ambiguous() {
+        // Same resource argument shape in all three overloads, differing only in
+        // the Borrow/BorrowMut/TakeOwned passing mode. The catalog allows these
+        // (distinct argument passing identity) but the call site supplies only a
+        // schema and no passing intent, so resolution must stay ambiguous.
+        let mut builder = HostApiBuilder::new();
+        builder.resource(ResourceTypeSchema::new(io_file(), "file"));
+        for passing in [
+            HostParamPassing::Borrow,
+            HostParamPassing::BorrowMut,
+            HostParamPassing::TakeOwned,
+        ] {
+            builder.function(HostFunctionSchema::with_return(
+                "consume",
+                vec![ref_param("h", resource(io_file()), passing)],
+                HostTypeSchema::Int,
+            ));
+        }
+        let catalog = builder
+            .build()
+            .expect("passing-mode-only overloads are legal");
+        let resolver = HostCallResolver::new(&catalog);
+        assert!(matches!(
+            resolver.resolve("consume", &[compiler_resource(io_file())]),
+            Err(HostCallResolveError::Ambiguous { name, .. }) if name == "consume"
+        ));
     }
 }
