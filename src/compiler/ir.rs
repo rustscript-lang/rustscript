@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::ValueType;
 use crate::builtins::default_host_callable;
-use crate::host_api::ResourceTypeKey;
+use crate::host_api::{HostApiFingerprint, HostFunctionSchema, ResourceTypeKey};
 
 use super::ParseError;
 use super::modules::SymbolId;
@@ -432,6 +432,131 @@ pub struct FunctionImpl {
     pub body_expr_line: u32,
 }
 
+/// Immutable, catalog-fingerprint-bound, per-flat-function host candidate
+/// carrier attached to a [`FrontendIr`].
+///
+/// The candidate set is keyed by the owning catalog's
+/// [`HostApiFingerprint`]: it is only meaningful for the exact catalog
+/// topology a frontend resolved against. For each flat function index it
+/// records the ordered list of candidate [`HostFunctionSchema`]s in catalog
+/// discovery order, including pass-only overloads (never deduplicated).
+///
+/// Carried on [`FrontendIr::host_api_metadata`]: `None` keeps the legacy
+/// resolution path; `Some` is an immutable fingerprint-bound carrier with no
+/// raw ABI attached.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostApiIrMetadata {
+    /// Fingerprint of the catalog the flat functions were resolved against.
+    fingerprint: HostApiFingerprint,
+    /// Per-flat-function candidate lists in catalog discovery order.
+    candidates_by_function_index: BTreeMap<u16, Vec<HostFunctionSchema>>,
+}
+
+impl HostApiIrMetadata {
+    /// Builds empty metadata bound to `fingerprint`, carrying no candidates.
+    ///
+    /// Inert foundation in this scope: construction and candidate recording
+    /// are exercised by tests now and consumed by the catalog integration in
+    /// the follow-up scope, so silence the transient dead-code warning.
+    #[allow(dead_code)]
+    pub(crate) fn new(fingerprint: HostApiFingerprint) -> Self {
+        Self {
+            fingerprint,
+            candidates_by_function_index: BTreeMap::new(),
+        }
+    }
+
+    /// The fingerprint of the catalog this metadata is bound to.
+    pub fn fingerprint(&self) -> HostApiFingerprint {
+        self.fingerprint
+    }
+
+    /// Candidate schemas recorded for `index`, in catalog discovery order,
+    /// or `None` when the function has no recorded candidates.
+    pub fn candidates(&self, index: u16) -> Option<&[HostFunctionSchema]> {
+        self.candidates_by_function_index
+            .get(&index)
+            .map(Vec::as_slice)
+    }
+
+    /// Flat function indices with recorded candidates, ascending (copied).
+    pub fn function_indices(&self) -> impl ExactSizeIterator<Item = u16> + '_ {
+        self.candidates_by_function_index.keys().copied()
+    }
+
+    /// Records the ordered candidate list for one flat function.
+    ///
+    /// Rejects with an actionable [`ParseError`] when:
+    /// * `candidates` is empty;
+    /// * candidate names differ, or candidate parameter arities differ;
+    /// * `index` already has recorded candidates.
+    ///
+    /// Catalog order is preserved and pass-only overloads (same types, a
+    /// different [`crate::host_api::HostParamPassing`]) are retained, never
+    /// deduplicated.
+    #[allow(dead_code)]
+    pub(crate) fn record_candidates(
+        &mut self,
+        index: u16,
+        candidates: Vec<HostFunctionSchema>,
+    ) -> Result<(), ParseError> {
+        if candidates.is_empty() {
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line: 1,
+                message: format!("host metadata: no candidate schemas for flat function {index}"),
+            });
+        }
+        let first = &candidates[0];
+        if candidates.iter().skip(1).any(|c| c.name != first.name) {
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line: 1,
+                message: format!(
+                    "host metadata: flat function {index} candidate names disagree ({} vs {})",
+                    first.name,
+                    candidates
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
+        let arity = first.params.len();
+        if candidates.iter().skip(1).any(|c| c.params.len() != arity) {
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line: 1,
+                message: format!(
+                    "host metadata: flat function {index} candidate arities differ ({} vs {})",
+                    arity,
+                    candidates
+                        .iter()
+                        .map(|c| c.params.len().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
+        if self.candidates_by_function_index.contains_key(&index) {
+            return Err(ParseError {
+                span: None,
+                code: None,
+                line: 1,
+                message: format!(
+                    "host metadata: duplicate candidate record for flat function {index}"
+                ),
+            });
+        }
+        self.candidates_by_function_index.insert(index, candidates);
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FrontendIr {
     pub stmts: Vec<Stmt>,
@@ -455,6 +580,13 @@ pub struct FrontendIr {
     /// Plain (non-module) parses leave this empty because implicit externs are
     /// disabled there.
     pub implicit_extern_names: Vec<String>,
+    /// Fingerprint-bound host candidate catalog carried on this IR.
+    ///
+    /// `None` keeps the legacy path (candidates resolved at a later stage).
+    /// `Some` is an immutable catalog-fingerprint-bound carrier holding, per
+    /// flat function index, the ordered candidate schemas a frontend resolved
+    /// against its catalog; raw ABI is absent here.
+    pub host_api_metadata: Option<HostApiIrMetadata>,
 }
 
 pub struct LocalIrBuilder {
@@ -615,6 +747,7 @@ impl LocalIrBuilder {
             function_sources: HashMap::new(),
             use_declarations: Vec::new(),
             implicit_extern_names: Vec::new(),
+            host_api_metadata: None,
         }
     }
 
@@ -636,5 +769,126 @@ impl LocalIrBuilder {
             message: "local index overflow".to_string(),
         })?;
         Ok(index)
+    }
+}
+
+#[cfg(test)]
+mod host_api_ir_metadata_tests {
+    use super::HostApiIrMetadata;
+    use crate::compiler::ir::LocalIrBuilder;
+    use crate::host_api::{
+        HostApiFingerprint, HostFunctionSchema, HostParamPassing, HostParamSchema, HostTypeSchema,
+    };
+
+    fn fingerprint(n: u64) -> HostApiFingerprint {
+        serde_json::from_value(serde_json::Value::Number(n.into())).unwrap()
+    }
+
+    fn func(name: &str, params: Vec<HostParamSchema>) -> HostFunctionSchema {
+        HostFunctionSchema::with_return(name, params, HostTypeSchema::Unknown)
+    }
+
+    #[test]
+    fn fingerprint_is_accessible() {
+        let md = HostApiIrMetadata::new(fingerprint(0x1234));
+        assert_eq!(md.fingerprint(), fingerprint(0x1234));
+        assert_eq!(md.function_indices().len(), 0);
+        assert!(md.candidates(40).is_none());
+    }
+
+    #[test]
+    fn function_indices_are_sorted_and_copied() {
+        let mut md = HostApiIrMetadata::new(fingerprint(1));
+        md.record_candidates(5, vec![func("f", vec![])]).unwrap();
+        md.record_candidates(2, vec![func("f", vec![])]).unwrap();
+        md.record_candidates(9, vec![func("f", vec![])]).unwrap();
+        assert_eq!(md.function_indices().len(), 3);
+        let indices: Vec<u16> = md.function_indices().collect();
+        assert_eq!(indices, vec![2, 5, 9]);
+        assert!(md.candidates(2).is_some());
+        assert!(md.candidates(4).is_none());
+    }
+
+    #[test]
+    fn candidate_order_preserves_pass_only_overloads() {
+        let mut md = HostApiIrMetadata::new(fingerprint(2));
+        md.record_candidates(
+            0,
+            vec![
+                func("f", vec![HostParamSchema::value("x", HostTypeSchema::Int)]),
+                func(
+                    "f",
+                    vec![HostParamSchema::with_passing(
+                        "x",
+                        HostTypeSchema::Int,
+                        HostParamPassing::Borrow,
+                    )],
+                ),
+            ],
+        )
+        .unwrap();
+        let candidates = md.candidates(0).unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].params[0].passing, HostParamPassing::Value);
+        assert_eq!(candidates[1].params[0].passing, HostParamPassing::Borrow);
+    }
+
+    #[test]
+    fn rejects_empty_candidate_sets() {
+        let mut md = HostApiIrMetadata::new(fingerprint(1));
+        assert!(md.record_candidates(0, Vec::new()).is_err());
+        assert!(md.candidates(0).is_none());
+    }
+
+    #[test]
+    fn rejects_mixed_name_candidate_sets() {
+        let mut md = HostApiIrMetadata::new(fingerprint(1));
+        let err = md
+            .record_candidates(1, vec![func("alpha", vec![]), func("beta", vec![])])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("names disagree"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_mixed_arity_candidate_sets() {
+        let mut md = HostApiIrMetadata::new(fingerprint(1));
+        let err = md
+            .record_candidates(
+                1,
+                vec![
+                    func("f", vec![]),
+                    func("f", vec![HostParamSchema::value("x", HostTypeSchema::Int)]),
+                ],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("arities differ"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_index_records() {
+        let mut md = HostApiIrMetadata::new(fingerprint(1));
+        md.record_candidates(3, vec![func("f", vec![])]).unwrap();
+        let err = md
+            .record_candidates(3, vec![func("f", vec![])])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate candidate record"),
+            "unexpected error: {}",
+            err
+        );
+        assert_eq!(md.candidates(3).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn frontend_ir_builder_defaults_metadata_to_none() {
+        let ir = LocalIrBuilder::new().finish(Vec::new());
+        assert!(ir.host_api_metadata.is_none());
     }
 }

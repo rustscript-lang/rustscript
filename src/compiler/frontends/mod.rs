@@ -163,6 +163,7 @@ fn parse_with_parser(
         function_sources: HashMap::new(),
         use_declarations: parser.use_declarations(),
         implicit_extern_names: parser.implicit_extern_names(),
+        host_api_metadata: None,
     })
 }
 
@@ -200,6 +201,7 @@ fn parse_repl_with_parser(
             function_sources: HashMap::new(),
             use_declarations: parser.use_declarations(),
             implicit_extern_names: parser.implicit_extern_names(),
+            host_api_metadata: None,
         },
         bindings,
     })

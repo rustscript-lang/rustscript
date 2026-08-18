@@ -91,6 +91,21 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
 
     for unit in units {
         let source_name = unit.source_name.clone();
+        // Fingerprint-bound per-flat-function host candidates cannot be
+        // merged yet: flat function indices are remapped during merge, so an
+        // index-keyed catalog would no longer line up. Preserve only the
+        // legacy `None` path and fail loudly rather than silently dropping a
+        // catalog-authoritative candidate set. Index-remapping integration is
+        // a follow-up scope.
+        if unit.parsed.host_api_metadata.is_some() {
+            return Err(SourcePathError::Source(SourceError::Parse(ParseError {
+                span: None,
+                code: None,
+                line: 1,
+                message: "host API candidate metadata cannot be merged in this scope; flat index remapping is not integrated yet"
+                    .to_string(),
+            })));
+        }
         let function_map = register_unit_functions(
             &unit,
             &mut merged_functions,
@@ -214,6 +229,9 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
         // that survived would indicate a loader bug, so the merged IR never
         // carries them.
         implicit_extern_names: Vec::new(),
+        // No fingerprint-bound candidates survive merge in this scope; any
+        // unit carrying metadata is rejected above rather than discarded.
+        host_api_metadata: None,
     })
 }
 

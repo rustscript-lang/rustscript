@@ -1180,6 +1180,7 @@ mod tests {
             function_sources: HashMap::new(),
             use_declarations: Vec::new(),
             implicit_extern_names: Vec::new(),
+            host_api_metadata: None,
         }
     }
 
