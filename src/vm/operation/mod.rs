@@ -34,4 +34,6 @@ pub use driver::{HostOperation, OperationCleanup, OperationOutcome, OperationSpe
 pub use error::{OperationError, OperationErrorCode, OperationResult};
 pub use id::OperationId;
 pub use reason::OperationCancelReason;
-pub use registry::{DEFAULT_MAX_PENDING_OPERATIONS, OperationRegistry, OperationStatus};
+pub use registry::{
+    DEFAULT_MAX_PENDING_OPERATIONS, OperationCancelSummary, OperationRegistry, OperationStatus,
+};
