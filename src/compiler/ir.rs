@@ -441,9 +441,9 @@ pub struct FunctionImpl {
 /// records the ordered list of candidate [`HostFunctionSchema`]s in catalog
 /// discovery order, including pass-only overloads (never deduplicated).
 ///
-/// Carried on [`FrontendIr::host_api_metadata`]: `None` keeps the legacy
-/// resolution path; `Some` is an immutable fingerprint-bound carrier with no
-/// raw ABI attached.
+/// Carried on [`FrontendIr::host_api_metadata`]: `None` means the compilation
+/// carries no host-catalog metadata; `Some` is a fingerprint-bound carrier
+/// with no raw ABI attached.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostApiIrMetadata {
     /// Fingerprint of the catalog the flat functions were resolved against.
@@ -453,12 +453,10 @@ pub struct HostApiIrMetadata {
 }
 
 impl HostApiIrMetadata {
-    /// Builds empty metadata bound to `fingerprint`, carrying no candidates.
-    ///
-    /// Inert foundation in this scope: construction and candidate recording
-    /// are exercised by tests now and consumed by the catalog integration in
-    /// the follow-up scope, so silence the transient dead-code warning.
-    #[allow(dead_code)]
+    /// Builds an empty metadata carrier bound to `fingerprint`, carrying no
+    /// candidates. The linker instantiates, populates, and remaps these
+    /// carriers when it merges frontend units; the compiler-only frontend
+    /// path records candidates with [`Self::record_candidates`].
     pub(crate) fn new(fingerprint: HostApiFingerprint) -> Self {
         Self {
             fingerprint,
@@ -494,7 +492,6 @@ impl HostApiIrMetadata {
     /// Catalog order is preserved and pass-only overloads (same types, a
     /// different [`crate::host_api::HostParamPassing`]) are retained, never
     /// deduplicated.
-    #[allow(dead_code)]
     pub(crate) fn record_candidates(
         &mut self,
         index: u16,
@@ -582,7 +579,7 @@ pub struct FrontendIr {
     pub implicit_extern_names: Vec<String>,
     /// Fingerprint-bound host candidate catalog carried on this IR.
     ///
-    /// `None` keeps the legacy path (candidates resolved at a later stage).
+    /// `None` means this compilation carries no host-catalog metadata.
     /// `Some` is an immutable catalog-fingerprint-bound carrier holding, per
     /// flat function index, the ordered candidate schemas a frontend resolved
     /// against its catalog; raw ABI is absent here.
