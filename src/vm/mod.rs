@@ -134,6 +134,8 @@ pub enum VmError {
     InvalidOpcode(u8),
     BytecodeBounds,
     HostError(String),
+    /// A structured error from exact host-import binding / registration.
+    HostImportBinding(HostImportBindingError),
     JitNative(String),
     InvalidFuelCheckInterval(u32),
     InvalidEpochCheckInterval(u32),
@@ -151,6 +153,84 @@ pub enum VmError {
         deadline: u64,
     },
 }
+
+/// Structured error for exact host-import binding and registration.
+///
+/// These replace the stringly-typed `VmError::HostError(String)` failures so
+/// callers and tests can match on fields (import/name, expected vs. got
+/// values, capacity limit) instead of parsing messages. The legacy
+/// [`VmError::HostError`] variant remains for pre-existing string-based errors
+/// and stays fully compatible.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostImportBindingError {
+    /// Registering the same exact name + schema twice (no silent replacement).
+    Duplicate { import: String },
+    /// A program import carrying an exact schema has no matching registered
+    /// exact binding; it never falls back to a legacy by-name slot.
+    MissingExact { import: String },
+    /// The registered arity disagrees with the schema's parameter count.
+    SchemaArityMismatch {
+        import: String,
+        expected: u8,
+        got: u8,
+    },
+    /// The import's coarse return type disagrees with the schema's coarse
+    /// return type at bind time.
+    ReturnTypeMismatch {
+        import: String,
+        expected: ValueType,
+        got: ValueType,
+    },
+    /// The exact registry's `u16` slot space is exhausted.
+    CapacityExceeded { import: String, limit: usize },
+    /// The supplied schema is internally inconsistent at registration time.
+    InvalidSchema { import: String, reason: String },
+}
+
+impl std::fmt::Display for HostImportBindingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Duplicate { import } => {
+                write!(
+                    f,
+                    "duplicate exact host binding for '{import}' (same import schema)"
+                )
+            }
+            Self::MissingExact { import } => write!(
+                f,
+                "host import '{import}' has no exact binding matching its import schema"
+            ),
+            Self::SchemaArityMismatch {
+                import,
+                expected,
+                got,
+            } => write!(
+                f,
+                "exact host binding '{import}' arity {got} does not match its schema parameter count {expected}"
+            ),
+            Self::ReturnTypeMismatch {
+                import,
+                expected,
+                got,
+            } => write!(
+                f,
+                "exact host binding '{import}' return schema mismatch: expected {expected:?}, got {got:?}"
+            ),
+            Self::CapacityExceeded { import, limit } => write!(
+                f,
+                "exact host binding registry capacity exceeded registering '{import}': limit {limit} slots"
+            ),
+            Self::InvalidSchema { import, reason } => {
+                write!(
+                    f,
+                    "invalid exact host binding schema for '{import}': {reason}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for HostImportBindingError {}
 
 impl std::fmt::Display for VmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -217,6 +297,7 @@ impl std::fmt::Display for VmError {
             VmError::InvalidOpcode(opcode) => write!(f, "invalid opcode {opcode}"),
             VmError::BytecodeBounds => write!(f, "bytecode bounds"),
             VmError::HostError(message) => write!(f, "host error: {message}"),
+            VmError::HostImportBinding(error) => write!(f, "host import binding error: {error}"),
             VmError::JitNative(message) => write!(f, "jit native error: {message}"),
             VmError::InvalidFuelCheckInterval(value) => {
                 write!(f, "invalid fuel check interval {value}, expected >= 1")

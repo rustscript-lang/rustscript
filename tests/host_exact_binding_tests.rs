@@ -3,9 +3,9 @@ use std::sync::Arc;
 use vm::compiler::{CompileSourceFileOptions, SourceFlavor, TypeSchema};
 use vm::{
     CallOutcome, CallReturn, HostApiBuilder, HostApiCatalog, HostApiFingerprint, HostFunction,
-    HostFunctionRegistry, HostFunctionSchema, HostImport, HostImportParam, HostImportSchema,
-    HostParamPassing, HostParamSchema, HostTypeSchema, Value, ValueType, Vm, VmResult, VmStatus,
-    compile_source_with_flavor_and_options,
+    HostFunctionRegistry, HostFunctionSchema, HostImport, HostImportBindingError, HostImportParam,
+    HostImportSchema, HostParamPassing, HostParamSchema, HostTypeSchema, Value, ValueType, Vm,
+    VmError, VmResult, VmStatus, compile_source_with_flavor_and_options,
 };
 
 /// Concrete host fn that answers a fixed Int tag (ignores its argument).
@@ -20,6 +20,55 @@ impl HostFunction for Tag {
 
 fn tag_factory(tag: i64) -> impl Fn() -> Box<dyn HostFunction> + Send + Sync + 'static {
     move || Box::new(Tag(tag))
+}
+
+fn build_catalog(functions: Vec<HostFunctionSchema>) -> Arc<HostApiCatalog> {
+    let mut builder = HostApiBuilder::new();
+    for function in functions {
+        builder.function(function);
+    }
+    Arc::new(builder.build().expect("catalog must build"))
+}
+
+/// A single-`Int`-param, `Int`-return host function schema.
+fn int_fn() -> HostFunctionSchema {
+    HostFunctionSchema::with_return(
+        "x::f",
+        vec![HostParamSchema::value("value", HostTypeSchema::Int)],
+        HostTypeSchema::Int,
+    )
+}
+
+/// Real catalog fingerprint for `int_fn()`. When `extra` is true an unrelated function is
+/// added so the *catalog-level* fingerprint differs while `int_fn`'s own schema stays
+/// identical — mirroring a real catalog-version change.
+fn int_schema_fingerprint(extra: bool) -> HostApiFingerprint {
+    let functions = if extra {
+        vec![
+            int_fn(),
+            HostFunctionSchema::with_return(
+                "extra::other",
+                vec![HostParamSchema::value("s", HostTypeSchema::String)],
+                HostTypeSchema::String,
+            ),
+        ]
+    } else {
+        vec![int_fn()]
+    };
+    build_catalog(functions).fingerprint()
+}
+
+/// Exact schema for one `Int` `Value` param returning `Int`, carrying a real catalog fingerprint.
+fn int_exact_schema(fingerprint: HostApiFingerprint) -> HostImportSchema {
+    HostImportSchema {
+        params: vec![HostImportParam {
+            name: "value".into(),
+            schema: TypeSchema::Int,
+            passing: HostParamPassing::Value,
+        }],
+        return_type: TypeSchema::Int,
+        fingerprint,
+    }
 }
 
 /// Catalog with two same-name overloads differing by *argument* exact schema:
@@ -84,26 +133,21 @@ acme::compute(true);
     assert_eq!(vm.stack(), &[Value::Int(100), Value::Int(200)]);
 }
 
-fn int_exact_schema(fingerprint: u64) -> HostImportSchema {
-    HostImportSchema {
-        params: vec![HostImportParam {
-            name: "value".into(),
-            schema: TypeSchema::Int,
-            passing: HostParamPassing::Value,
-        }],
-        return_type: TypeSchema::Int,
-        fingerprint: HostApiFingerprint::from_raw(fingerprint),
-    }
-}
-
-/// (2) Fingerprint differs (same param/return schema, different catalog fingerprint)
+/// (2) Fingerprint differs (same param/return schema, different real catalog fingerprint)
 /// → `resolve_import` with an unmatched schema rejects and never falls back to the
 /// legacy by-name slot.
 #[test]
 fn fingerprint_mismatch_rejected_without_by_name_fallback() {
-    let schema_a = int_exact_schema(0xAAAA_0000_0000_0001);
+    let fp_a = int_schema_fingerprint(false);
+    let fp_b = int_schema_fingerprint(true);
+    assert_ne!(
+        fp_a, fp_b,
+        "catalog fingerprints must differ with the extra function"
+    );
+
+    let schema_a = int_exact_schema(fp_a);
     let schema_b = HostImportSchema {
-        fingerprint: HostApiFingerprint::from_raw(0xBBBB_0000_0000_0001),
+        fingerprint: fp_b,
         ..schema_a.clone()
     };
 
@@ -111,6 +155,8 @@ fn fingerprint_mismatch_rejected_without_by_name_fallback() {
     registry
         .register_exact("echo::emit", 1, schema_a, tag_factory(5))
         .unwrap();
+    // Also register a legacy by-name slot to prove there is no fallback.
+    registry.register("echo::emit", 1, tag_factory(9));
 
     let import = HostImport {
         name: "echo::emit".into(),
@@ -122,22 +168,22 @@ fn fingerprint_mismatch_rejected_without_by_name_fallback() {
         .resolve_import(&import)
         .expect_err("fingerprint mismatch must be rejected");
     assert!(
-        error.to_string().contains("exact"),
-        "error should state no exact match: {error}"
+        matches!(
+            error,
+            VmError::HostImportBinding(HostImportBindingError::MissingExact { ref import })
+                if import == "echo::emit"
+        ),
+        "expected structured MissingExact, got: {error}"
     );
 }
 
 /// (3) Param passing mismatch (exact `Value` vs import `BorrowMut`) → rejected.
 #[test]
 fn param_passing_schema_mismatch_rejected() {
+    let fp = int_schema_fingerprint(false);
     let mut registry = HostFunctionRegistry::new();
     registry
-        .register_exact(
-            "io::read",
-            1,
-            int_exact_schema(0xCCCC_0000_0000_0001),
-            tag_factory(7),
-        )
+        .register_exact("io::read", 1, int_exact_schema(fp), tag_factory(7))
         .unwrap();
 
     let import = HostImport {
@@ -151,50 +197,60 @@ fn param_passing_schema_mismatch_rejected() {
                 passing: HostParamPassing::BorrowMut,
             }],
             return_type: TypeSchema::Int,
-            fingerprint: HostApiFingerprint::from_raw(0xCCCC_0000_0000_0001),
+            fingerprint: fp,
         }),
     };
     let error = registry
         .resolve_import(&import)
         .expect_err("param passing mismatch must fail");
     assert!(
-        error.to_string().contains("exact"),
-        "error should state the exact-match failure: {error}"
+        matches!(
+            error,
+            VmError::HostImportBinding(HostImportBindingError::MissingExact { .. })
+        ),
+        "expected structured MissingExact, got: {error}"
     );
 }
 
-/// (4) Return-schema mismatch (exact Int vs import Bool return) → rejected.
+/// (4) Return-schema mismatch (exact Int vs import Bool return) → structured rejection.
 #[test]
 fn exact_return_schema_mismatch_rejected() {
+    let fp = int_schema_fingerprint(false);
     let mut registry = HostFunctionRegistry::new();
     registry
-        .register_exact(
-            "io::read",
-            1,
-            int_exact_schema(0xDDDD_0000_0000_0001),
-            tag_factory(8),
-        )
+        .register_exact("io::read", 1, int_exact_schema(fp), tag_factory(8))
         .unwrap();
 
     let import = HostImport {
         name: "io::read".into(),
         arity: 1,
         return_type: ValueType::Bool,
-        schema: Some(int_exact_schema(0xDDDD_0000_0000_0001)),
+        schema: Some(int_exact_schema(fp)),
     };
     let error = registry
         .resolve_import(&import)
         .expect_err("return schema mismatch must fail");
-    assert!(error.to_string().contains("exact"), "{error}");
+    assert!(
+        matches!(
+            error,
+            VmError::HostImportBinding(HostImportBindingError::ReturnTypeMismatch {
+                ref import,
+                expected,
+                got,
+            }) if import == "io::read" && expected == ValueType::Int && got == ValueType::Bool
+        ),
+        "expected structured ReturnTypeMismatch, got: {error}"
+    );
 }
 
 /// (5) A legacy `schema:None` name-only binding cannot hijack an existing exact slot:
 /// the exact binding still resolves to its own slot and its own function.
 #[test]
 fn legacy_name_only_binding_cannot_hijack_exact_slot() {
+    let fp = int_schema_fingerprint(false);
     let mut registry = HostFunctionRegistry::new();
     let slot_exact = registry
-        .register_exact("srv::ping", 1, int_exact_schema(0x4444), tag_factory(5))
+        .register_exact("srv::ping", 1, int_exact_schema(fp), tag_factory(5))
         .unwrap();
     registry.register("srv::ping", 1, tag_factory(9));
 
@@ -202,7 +258,7 @@ fn legacy_name_only_binding_cannot_hijack_exact_slot() {
         name: "srv::ping".into(),
         arity: 1,
         return_type: ValueType::Int,
-        schema: Some(int_exact_schema(0x4444)),
+        schema: Some(int_exact_schema(fp)),
     };
     let slot = registry
         .resolve_import(&import)
@@ -210,37 +266,163 @@ fn legacy_name_only_binding_cannot_hijack_exact_slot() {
     assert_eq!(slot, slot_exact, "exact slot must not be hijacked");
 }
 
-/// (6) Duplicate exact (name+schema) registration → explicit deterministic error.
+/// (6) Duplicate exact (name+schema) registration → structured deterministic error,
+/// with no registry mutation (cache unchanged, original slot still resolves).
 #[test]
 fn duplicate_exact_registration_rejected() {
+    let fp = int_schema_fingerprint(false);
+    let schema = int_exact_schema(fp);
     let mut registry = HostFunctionRegistry::new();
-    let schema = int_exact_schema(0x1111);
-    registry
+    let slot = registry
         .register_exact("io::read", 1, schema.clone(), tag_factory(1))
         .unwrap();
+    let cache_before = registry.plan_cache_len();
     let err = registry
-        .register_exact("io::read", 1, schema, tag_factory(2))
+        .register_exact("io::read", 1, schema.clone(), tag_factory(2))
         .expect_err("duplicate exact registration must error");
-    assert!(err.to_string().contains("duplicate"), "{err}");
+    assert!(
+        matches!(
+            err,
+            VmError::HostImportBinding(HostImportBindingError::Duplicate { ref import })
+                if import == "io::read"
+        ),
+        "expected structured Duplicate, got: {err}"
+    );
+    assert_eq!(
+        registry.plan_cache_len(),
+        cache_before,
+        "failed duplicate registration must not touch the plan cache"
+    );
+    let import = HostImport {
+        name: "io::read".into(),
+        arity: 1,
+        return_type: ValueType::Int,
+        schema: Some(schema),
+    };
+    assert_eq!(
+        registry.resolve_import(&import).unwrap(),
+        slot,
+        "original exact slot must survive a rejected duplicate"
+    );
 }
 
-/// (7) Plan cache partitions by exact schema: same name & arity, different exact schemas
+/// (7) Registration-time arity vs. schema-parameter-count mismatch → structured error,
+/// and the failed registration is atomic (no cache change, no slot created).
+#[test]
+fn exact_registration_arity_mismatch_is_structured_and_atomic() {
+    let fp = int_schema_fingerprint(false);
+    let schema = int_exact_schema(fp);
+    let mut registry = HostFunctionRegistry::new();
+    let slot_ok = registry
+        .register_exact("x::f", 1, schema.clone(), tag_factory(1))
+        .unwrap();
+    let cache_before = registry.plan_cache_len();
+
+    let err = registry
+        .register_exact("x::f", 2, schema.clone(), tag_factory(2))
+        .expect_err("arity mismatch must be rejected at registration");
+    assert!(
+        matches!(
+            err,
+            VmError::HostImportBinding(HostImportBindingError::SchemaArityMismatch {
+                ref import,
+                expected,
+                got,
+            }) if import == "x::f" && expected == 1 && got == 2
+        ),
+        "expected structured SchemaArityMismatch, got: {err}"
+    );
+    assert_eq!(
+        registry.plan_cache_len(),
+        cache_before,
+        "failed registration must not touch the plan cache"
+    );
+
+    let import = HostImport {
+        name: "x::f".into(),
+        arity: 1,
+        return_type: ValueType::Int,
+        schema: Some(schema),
+    };
+    assert_eq!(
+        registry.resolve_import(&import).unwrap(),
+        slot_ok,
+        "original slot must be unchanged after a rejected registration"
+    );
+}
+
+/// (8) Registration-time invalid schema (return coarse `Unknown`, not a resource) →
+/// structured rejection with no slot created.
+#[test]
+fn exact_registration_invalid_schema_rejected() {
+    let fp = int_schema_fingerprint(false);
+    let bad_schema = HostImportSchema {
+        params: vec![HostImportParam {
+            name: "value".into(),
+            schema: TypeSchema::Int,
+            passing: HostParamPassing::Value,
+        }],
+        return_type: TypeSchema::Unknown,
+        fingerprint: fp,
+    };
+    let mut registry = HostFunctionRegistry::new();
+    let err = registry
+        .register_exact("x::f", 1, bad_schema.clone(), tag_factory(1))
+        .expect_err("indeterminate return schema must be rejected");
+    assert!(
+        matches!(
+            err,
+            VmError::HostImportBinding(HostImportBindingError::InvalidSchema {
+                ref import,
+                ref reason,
+            }) if import == "x::f" && reason.contains("coarse")
+        ),
+        "expected structured InvalidSchema, got: {err}"
+    );
+
+    // No slot was created: the same schema still cannot be resolved.
+    let import = HostImport {
+        name: "x::f".into(),
+        arity: 1,
+        return_type: ValueType::Unknown,
+        schema: Some(bad_schema),
+    };
+    assert!(
+        matches!(
+            registry.resolve_import(&import).unwrap_err(),
+            VmError::HostImportBinding(HostImportBindingError::MissingExact { .. })
+        ),
+        "rejected schema must not leave an exact slot behind"
+    );
+}
+
+/// (9) Plan cache partitions by exact schema: same name & arity, different exact schemas
 /// produce separate cache entries / distinct import signatures.
 #[test]
 fn plan_cache_partitions_by_exact_schema() {
     let mut registry = HostFunctionRegistry::new();
     registry
-        .register_exact("calc::m", 1, int_exact_schema(0x15), tag_factory(1))
+        .register_exact(
+            "calc::m",
+            1,
+            int_exact_schema(int_schema_fingerprint(false)),
+            tag_factory(1),
+        )
         .unwrap();
     registry
-        .register_exact("calc::m", 1, int_exact_schema(0x16), tag_factory(2))
+        .register_exact(
+            "calc::m",
+            1,
+            int_exact_schema(int_schema_fingerprint(true)),
+            tag_factory(2),
+        )
         .unwrap();
 
     let imports_1 = [HostImport {
         name: "calc::m".into(),
         arity: 1,
         return_type: ValueType::Int,
-        schema: Some(int_exact_schema(0x15)),
+        schema: Some(int_exact_schema(int_schema_fingerprint(false))),
     }];
     let before = registry.plan_cache_len();
     let plan_1 = registry.prepare_plan(&imports_1).unwrap();
@@ -250,7 +432,7 @@ fn plan_cache_partitions_by_exact_schema() {
         name: "calc::m".into(),
         arity: 1,
         return_type: ValueType::Int,
-        schema: Some(int_exact_schema(0x16)),
+        schema: Some(int_exact_schema(int_schema_fingerprint(true))),
     }];
     let plan_2 = registry.prepare_plan(&imports_2).unwrap();
     assert_eq!(
@@ -262,7 +444,7 @@ fn plan_cache_partitions_by_exact_schema() {
     assert_ne!(plan_1.import_signature(), plan_2.import_signature());
 }
 
-/// (8) `schema: None` legacy static import path keeps working independently.
+/// (10) `schema: None` legacy static import path keeps working independently.
 #[test]
 fn legacy_schema_none_import_path_is_preserved() {
     let mut registry = HostFunctionRegistry::new();

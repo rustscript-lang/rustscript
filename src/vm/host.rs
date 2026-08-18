@@ -566,6 +566,11 @@ impl HostFunctionRegistry {
     /// Core exact-schema slot pusher: duplicate (name+schema) is an explicit structured error;
     /// legacy name-only bindings live in `by_name`, exact bindings in `by_exact`, so a legacy
     /// binding can never hijack a distinct exact slot.
+    ///
+    /// All validation (arity vs. schema parameter count, schema return-coarse determinism,
+    /// duplicate detection, and the `u16` slot-space capacity check) happens **before** any
+    /// mutation, so a rejected registration leaves the registry's entries, `by_exact` map,
+    /// slot numbering, plan cache and generation counter untouched.
     fn push_exact(
         &mut self,
         name: String,
@@ -573,16 +578,55 @@ impl HostFunctionRegistry {
         schema: HostImportSchema,
         kind: RegistryEntryKind,
     ) -> VmResult<u16> {
+        // A schema with more parameters than `u8` can address can never match the `arity` of an
+        // `HostImport`, so it is rejected up front (and `u8::try_from` avoids a silent truncation).
+        let params_len = u8::try_from(schema.params.len()).map_err(|_| {
+            VmError::HostImportBinding(HostImportBindingError::InvalidSchema {
+                import: name.clone(),
+                reason: format!(
+                    "schema declares {} parameters; at most 255 are addressable",
+                    schema.params.len()
+                ),
+            })
+        })?;
+        if params_len != arity {
+            return Err(VmError::HostImportBinding(
+                HostImportBindingError::SchemaArityMismatch {
+                    import: name,
+                    expected: params_len,
+                    got: arity,
+                },
+            ));
+        }
+        // The schema must carry the coarse return info required to check return consistency at
+        // bind time. An `Unknown` coarse return is only acceptable for a resource-typed return
+        // (semantically opaque by design); otherwise the registration cannot later be verified.
+        if schema.return_type.coarse_value_type() == ValueType::Unknown
+            && !schema.return_type.contains_resource()
+        {
+            return Err(VmError::HostImportBinding(
+                HostImportBindingError::InvalidSchema {
+                    import: name,
+                    reason: "return type has no determinate coarse value type".to_string(),
+                },
+            ));
+        }
         if let Some(schemas) = self.by_exact.get(&name)
             && schemas.contains_key(&schema)
         {
-            return Err(VmError::HostError(format!(
-                "duplicate exact host binding '{}' (same import schema)",
-                name
-            )));
+            return Err(VmError::HostImportBinding(
+                HostImportBindingError::Duplicate { import: name },
+            ));
         }
+        // `u16` slot space: check capacity before any map allocation or entry push so an
+        // exhausted registry reports a structured error with no partial mutation.
+        let slot = u16::try_from(self.entries.len()).map_err(|_| {
+            VmError::HostImportBinding(HostImportBindingError::CapacityExceeded {
+                import: name.clone(),
+                limit: u16::MAX as usize + 1,
+            })
+        })?;
         let entries = Arc::make_mut(&mut self.entries);
-        let slot = entries.len() as u16;
         entries.push(RegistryEntry {
             arity,
             runtime_owned_pending: false,
@@ -677,10 +721,9 @@ impl HostFunctionRegistry {
                     .and_then(|schemas| schemas.get(schema))
                     .copied()
                     .ok_or_else(|| {
-                        VmError::HostError(format!(
-                            "host import '{}' has no exact binding matching its import schema",
-                            import.name
-                        ))
+                        VmError::HostImportBinding(HostImportBindingError::MissingExact {
+                            import: import.name.clone(),
+                        })
                     })?;
                 // arity / coarse return-type consistency against the resolved schema:
                 if schema.params.len() as u8 != import.arity {
@@ -691,10 +734,13 @@ impl HostFunctionRegistry {
                     });
                 }
                 if import.return_type != schema.return_type.coarse_value_type() {
-                    return Err(VmError::HostError(format!(
-                        "host import '{}' return schema mismatch (resolved exact binding)",
-                        import.name
-                    )));
+                    return Err(VmError::HostImportBinding(
+                        HostImportBindingError::ReturnTypeMismatch {
+                            import: import.name.clone(),
+                            expected: schema.return_type.coarse_value_type(),
+                            got: import.return_type,
+                        },
+                    ));
                 }
                 Ok(slot)
             }
@@ -2379,5 +2425,109 @@ impl Vm {
             .get(index as usize)
             .copied()
             .ok_or(VmError::InvalidCall(index))
+    }
+}
+
+#[cfg(test)]
+mod exact_binding_registration_tests {
+    use super::*;
+    use crate::compiler::TypeSchema;
+    use crate::host_api::HostApiFingerprint;
+
+    fn dummy_static(_vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+        Ok(CallOutcome::Return(CallReturn::None))
+    }
+
+    fn registry_entry() -> RegistryEntry {
+        RegistryEntry {
+            arity: 0,
+            runtime_owned_pending: false,
+            kind: RegistryEntryKind::Static(dummy_static),
+        }
+    }
+
+    fn empty_int_schema() -> HostImportSchema {
+        HostImportSchema {
+            params: Vec::new(),
+            return_type: TypeSchema::Int,
+            fingerprint: HostApiFingerprint::from_wire(0),
+        }
+    }
+
+    /// When the exact registry's `u16` slot space is full (65536 entries), the next exact
+    /// registration fails with a structured `CapacityExceeded` error and mutates nothing:
+    /// entries, `by_exact` map, plan cache and registry generation all stay untouched.
+    #[test]
+    fn capacity_fails_structurally_at_full_without_mutation() {
+        let mut registry = HostFunctionRegistry::new();
+        let generation_before = registry.registry_generation.load(Ordering::Relaxed);
+        {
+            let entries = Arc::make_mut(&mut registry.entries);
+            // 65536 is exactly one past the largest representable slot index (65535).
+            entries.resize(65536, registry_entry());
+        }
+        // Force an observable plan-cache state so we can assert it survives the rejection.
+        registry.prepare_plan(&[]).unwrap();
+        let cache_before = registry.plan_cache_len();
+
+        let err = registry
+            .push_exact(
+                "overflow::f".to_string(),
+                0,
+                empty_int_schema(),
+                RegistryEntryKind::Static(dummy_static),
+            )
+            .expect_err("exact registration past the u16 boundary must fail");
+        assert!(
+            matches!(
+                err,
+                VmError::HostImportBinding(HostImportBindingError::CapacityExceeded {
+                    ref import,
+                    limit,
+                }) if import == "overflow::f" && limit == 65536
+            ),
+            "expected structured CapacityExceeded, got: {err}"
+        );
+
+        assert_eq!(
+            registry.entries.len(),
+            65536,
+            "no entry may be pushed when capacity is exceeded"
+        );
+        assert!(
+            !registry.by_exact.contains_key("overflow::f"),
+            "no exact slot may be created when capacity is exceeded"
+        );
+        assert_eq!(
+            registry.registry_generation.load(Ordering::Relaxed),
+            generation_before,
+            "registry generation must not change on a rejected registration"
+        );
+        assert_eq!(
+            registry.plan_cache_len(),
+            cache_before,
+            "plan cache must survive a rejected registration"
+        );
+    }
+
+    /// The largest representable exact slot (65535) is still insertable: `u16` conversion uses
+    /// `try_from`, so the boundary itself succeeds without truncation.
+    #[test]
+    fn successful_push_at_last_u16_slot_succeeds_without_truncation() {
+        let mut registry = HostFunctionRegistry::new();
+        {
+            let entries = Arc::make_mut(&mut registry.entries);
+            entries.resize(65535, registry_entry()); // last valid slot index == 65535
+        }
+        let slot = registry
+            .push_exact(
+                "boundary::last".to_string(),
+                0,
+                empty_int_schema(),
+                RegistryEntryKind::Static(dummy_static),
+            )
+            .expect("push into slot 65535 is within u16 capacity");
+        assert_eq!(slot, 65535, "slot must not truncate at the u16 boundary");
+        assert_eq!(registry.entries.len(), 65536);
     }
 }
