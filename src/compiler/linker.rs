@@ -91,9 +91,14 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
     // compiler-owned `SymbolId`, so same-named declarations in independent
     // modules each get their own flat entry. Host imports (declarations
     // without implementations) are deduplicated by `(name, arity)`: the same
-    // name at the same arity is one runtime binding with one merged flat
-    // entry, while the same name at a different arity is a distinct overload
-    // owning its own flat entry and independent candidate set.
+    // name at the same arity merges into one flat *candidate-set identity*
+    // carrying the compiler's full discovery-order candidate list. This flat
+    // identity is a linker-stage dedup key only — it is not a runtime binding.
+    // Later typing resolves each call site to the exact `HostFunctionSchema`
+    // for the chosen candidate (passing modes, return type, and any referenced
+    // resource schemas), and the VMBC `HostImport`/runtime registry bind that
+    // resolved schema identity. The same name at a different arity remains a
+    // distinct flat identity with its own entry and independent candidate set.
     let mut flat_index_by_symbol = HashMap::<SymbolId, u16>::new();
     let mut host_index_by_arity = HashMap::<(String, u8), u16>::new();
     // Every flat name claimed so far. Module functions that collide are
@@ -442,9 +447,10 @@ fn register_unit_functions(
         let has_impl = unit.parsed.function_impls.contains_key(&func.index);
         let flat = if !has_impl {
             // Host import: `(name, arity)`-keyed deduplication. The same name
-            // at the same arity collapses to one runtime-binding flat entry;
-            // the same name at a different arity is a distinct overload with
-            // its own flat entry and candidate set.
+            // at the same arity collapses to one flat candidate-set identity
+            // (full discovery-order candidate list retained) rather than a
+            // runtime binding; the same name at a different arity is a distinct
+            // overload with its own flat identity and candidate set.
             let host_identity = (func.name.clone(), func.arity);
             if let Some(&existing) = host_index_by_arity.get(&host_identity) {
                 merge_host_import_metadata(&mut merged_functions[existing as usize], func)?;
