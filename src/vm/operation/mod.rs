@@ -23,12 +23,12 @@
 //!   so cancelling that resource cancels the operation.
 pub mod driver;
 pub mod error;
+pub mod id;
 pub mod reason;
 pub mod registry;
 
 pub use driver::{HostOperation, OperationCleanup, OperationOutcome, OperationSpec};
 pub use error::{OperationError, OperationErrorCode, OperationResult};
+pub use id::OperationId;
 pub use reason::OperationCancelReason;
-pub use registry::{
-    DEFAULT_MAX_PENDING_OPERATIONS, OperationId, OperationRegistry, OperationStatus,
-};
+pub use registry::{DEFAULT_MAX_PENDING_OPERATIONS, OperationRegistry, OperationStatus};
