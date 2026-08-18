@@ -112,6 +112,14 @@ pub enum CompileError {
         source_name: Option<String>,
         detail: String,
     },
+    /// Catalog host-call overload resolution failed at a call site. Carries
+    /// the optional call-site line and source name plus a diagnostic detail
+    /// describing the failed overload selection.
+    HostCallResolve {
+        line: Option<u32>,
+        source_name: Option<String>,
+        detail: String,
+    },
     /// Internal error: a symbol-resolved module call or function value
     /// survived unit merge and reached codegen, where flat function indices
     /// are the only valid call targets.
@@ -139,6 +147,9 @@ impl CompileError {
             CompileError::StrictTypingRequired { line, .. } => {
                 line.and_then(|value| usize::try_from(value).ok())
             }
+            CompileError::HostCallResolve { line, .. } => {
+                line.and_then(|value| usize::try_from(value).ok())
+            }
 
             _ => None,
         }
@@ -151,7 +162,8 @@ impl CompileError {
             | CompileError::BinaryOperandTypeMismatch { source_name, .. }
             | CompileError::InvalidFieldAccess { source_name, .. }
             | CompileError::FunctionParameterTypeConflict { source_name, .. }
-            | CompileError::StrictTypingRequired { source_name, .. } => source_name.as_deref(),
+            | CompileError::StrictTypingRequired { source_name, .. }
+            | CompileError::HostCallResolve { source_name, .. } => source_name.as_deref(),
             _ => None,
         }
     }
@@ -194,6 +206,7 @@ impl CompileError {
             CompileError::InvalidFieldAccess { detail, .. } => detail.clone(),
             CompileError::FunctionParameterTypeConflict { detail, .. } => detail.clone(),
             CompileError::StrictTypingRequired { detail, .. } => detail.clone(),
+            CompileError::HostCallResolve { detail, .. } => detail.clone(),
             CompileError::UnresolvedModuleCall => {
                 "internal compiler error: unresolved module call reached codegen".to_string()
             }
@@ -720,7 +733,7 @@ mod tests {
     use crate::HostApiCatalog;
     use crate::host_api::{HostApiBuilder, HostFunctionSchema, HostParamSchema, HostTypeSchema};
 
-    use super::CompileSourceFileOptions;
+    use super::{CompileError, CompileSourceFileOptions};
 
     fn test_catalog() -> Arc<HostApiCatalog> {
         let mut builder = HostApiBuilder::new();
@@ -787,5 +800,32 @@ mod tests {
         let default_debug = format!("{:?}", defaults);
         assert!(default_debug.contains("host_api_catalog_present: false"));
         assert!(default_debug.contains("host_api_catalog_fingerprint: None"));
+    }
+
+    #[test]
+    fn host_call_resolve_accessors() {
+        let with_meta = CompileError::HostCallResolve {
+            line: Some(42),
+            source_name: Some("main.rss".to_string()),
+            detail: "no overload of 'fetch' matches (Int)".to_string(),
+        };
+        assert_eq!(with_meta.line(), Some(42));
+        assert_eq!(with_meta.source_name(), Some("main.rss"));
+        assert_eq!(
+            with_meta.diagnostic_message(),
+            "no overload of 'fetch' matches (Int)"
+        );
+
+        let without_meta = CompileError::HostCallResolve {
+            line: None,
+            source_name: None,
+            detail: "catalog resolution failed".to_string(),
+        };
+        assert_eq!(without_meta.line(), None);
+        assert_eq!(without_meta.source_name(), None);
+        assert_eq!(
+            without_meta.diagnostic_message(),
+            "catalog resolution failed"
+        );
     }
 }
