@@ -653,11 +653,27 @@ fn tf_schema_label(schema: &TypeSchema) -> String {
 }
 
 /// Compact signature label, e.g. `read(resource<io.file>)`.
+fn passing_label(passing: HostParamPassing) -> &'static str {
+    match passing {
+        HostParamPassing::Value => "",
+        HostParamPassing::Borrow => "borrow",
+        HostParamPassing::BorrowMut => "borrow_mut",
+        HostParamPassing::TakeOwned => "take_owned",
+    }
+}
+
 fn signature_label(function: &HostFunctionSchema) -> String {
     let args = function
         .params
         .iter()
-        .map(|param| schema_label(&param.ty))
+        .map(|param| {
+            let base = schema_label(&param.ty);
+            if param.passing == HostParamPassing::Value {
+                base
+            } else {
+                format!("{base} {}", passing_label(param.passing))
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
     format!("{}({args})", function.name)
