@@ -23,13 +23,19 @@
 //!   expected resource **only when the key is equal**. Different keys are
 //!   incompatible and surface the `expected resource<X>, found resource<Y>`
 //!   diagnostic; parameters are never matched by structural fallback.
-//! * **Exact vs numeric specificity.** A pair is *exact* when `expected ==
-//!   actual` with no nested [`TypeSchema::Unknown`]; the relationship order is
-//!   `Mismatch < Unknown < NumericCompat < Exact`. The sole numeric-compat
-//!   case is [`TypeSchema::Number`] ↔ `Int`/`Float`. Container/callable
-//!   aggregation keeps the *least-specific* nested relation, so an exact
-//!   `array<Int>` overload outranks a numeric-compatible `array<Number>`
-//!   overload for an actual `array<Int>`.
+//! * **Exact, numeric-compat, deferred and mismatch counts.** A pair is
+//!   *exact* when both sides are equal without nesting [`TypeSchema::Unknown`];
+//!   the sole numeric-compat case is [`TypeSchema::Number`] ↔ `Int`/`Float`.
+//!   Matching structural shapes contribute one exact count and then recurse, so
+//!   an exact `array<Int>` overload outranks a numeric-compatible
+//!   `array<Number>` overload for an actual `array<Int>` by more exact counts.
+//! * **Candidate ordering (larger is better).** Candidates rank by fewer
+//!   mismatches, then fewer deferred ([`TypeSchema::Unknown`]), then fewer
+//!   numeric-compat pairs, then more exact structural matches — in that
+//!   lexicographic order over each candidate's accumulated [`MatchScore`]. A
+//!   candidate is viable exactly when it has zero mismatches; otherwise the
+//!   resolver reports its best concrete mismatch. Equal keys tie-break by a
+//!   canonical [`signature_label`].
 //! * **Unknown is a deferred/dynamic fallback, not a wildcard concrete match.**
 //!   When either side of a pair is [`TypeSchema::Unknown`] (at any depth) the
 //!   pair is compatible but *deferred*; the resolver never uses that latitude
@@ -58,31 +64,6 @@ use std::fmt;
 use crate::host_api::{HostApiCatalog, HostApiFingerprint, HostFunctionSchema, HostParamPassing};
 
 use super::TypeSchema;
-
-/// How one (expected parameter, actual argument) pair matched, as an ordered
-/// specificity relation. The relation order matters: candidates are ranked by
-/// the relation of every actual argument, so `Exact` strictly outranks
-/// `NumericCompat`, which outranks the deferred `Unknown`, which outranks a
-/// disqualifying `Mismatch`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Rel {
-    /// Concrete, statically known mismatch (resource keys differ, or a scalar
-    /// that is neither equal nor numeric-compatible). Disqualifies the
-    /// overload.
-    Mismatch = 0,
-    /// The pair is compatible but involved [`TypeSchema::Unknown`] somewhere,
-    /// so it is a deferred/dynamic fallback rather than a concrete match.
-    Unknown = 1,
-    /// Numeric compatibility under the compiler's rule: [`TypeSchema::Number`]
-    /// accepts `Int`/`Float` (and vice-versa) without being a fully specific
-    /// match. Distinct from [`Rel::Exact`] so an exact `array<Int>` overload
-    /// outranks a merely numeric-compatible `array<Number>` overload for an
-    /// actual `array<Int>`.
-    NumericCompat = 2,
-    /// A fully concrete, statically known exact match: expected == actual with
-    /// no nested [`TypeSchema::Unknown`].
-    Exact = 3,
-}
 
 /// One host function parameter mapped into the compiler's inference world.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,10 +169,32 @@ impl fmt::Display for HostCallResolveError {
 
 impl std::error::Error for HostCallResolveError {}
 
-/// Selection key for a candidate: the per-argument [`Rel`] ranks sorted
-/// descending (most concrete first), so lexicographically larger keys are
-/// strictly more specific and equal keys are an ambiguity tie.
-type CandidateKey = Vec<u8>;
+/// Selection key for a candidate: the per-candidate [`MatchScore`] counters
+/// packed so that larger keys are strictly better — fewer mismatches, fewer
+/// deferred [`TypeSchema::Unknown`], fewer numeric-compat pairs, then more
+/// exact structural matches. Equal keys are an ambiguity tie.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CandidateKey {
+    /// Larger means better: `MAX - mismatches`.
+    neg_mismatches: u32,
+    /// Larger means better: `MAX - deferred`.
+    neg_deferred: u32,
+    /// Larger means better: `MAX - numeric_compat`.
+    neg_numeric_compat: u32,
+    /// More exact structural matches is better.
+    exact_structural: u32,
+}
+
+impl CandidateKey {
+    fn from_score(score: &MatchScore) -> Self {
+        Self {
+            neg_mismatches: u32::MAX - score.mismatches,
+            neg_deferred: u32::MAX - score.deferred,
+            neg_numeric_compat: u32::MAX - score.numeric_compat,
+            exact_structural: score.exact_structural,
+        }
+    }
+}
 
 /// A compiler-owned, stateless resolver over an immutable [`HostApiCatalog`].
 ///
@@ -269,19 +272,19 @@ impl<'a> HostCallResolver<'a> {
         let mut viable: Vec<(CandidateKey, &HostFunctionSchema)> = Vec::new();
         let mut non_viable: Vec<(CandidateKey, &HostFunctionSchema)> = Vec::new();
         for function in &arity_matching {
+            // Sum every argument's recursive match score into the candidate total.
+            let mut score = MatchScore::default();
             let expected_schemas: Vec<TypeSchema> = function
                 .params
                 .iter()
                 .map(|param| param.ty.to_compiler_schema())
                 .collect();
-            let rels: Vec<Rel> = expected_schemas
-                .iter()
-                .zip(args.iter())
-                .map(|(expected, actual)| relate(expected, actual))
-                .collect();
-            let all_compatible = rels.iter().all(|rel| *rel != Rel::Mismatch);
-            let key = sort_key(&rels);
-            if all_compatible {
+            for (expected, actual) in expected_schemas.iter().zip(args.iter()) {
+                score = score.combined(score_pair(expected, actual));
+            }
+            let viable_candidate = score.mismatches == 0;
+            let key = CandidateKey::from_score(&score);
+            if viable_candidate {
                 viable.push((key, function));
             } else {
                 non_viable.push((key, function));
@@ -340,72 +343,123 @@ impl<'a> HostCallResolver<'a> {
     }
 }
 
-fn rel_rank(rel: Rel) -> u8 {
-    rel as u8
+/// Aggregate recursive match counters so a candidate key can rank overloads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct MatchScore {
+    mismatches: u32,
+    deferred: u32,
+    numeric_compat: u32,
+    exact_structural: u32,
 }
 
-fn sort_key(rels: &[Rel]) -> CandidateKey {
-    let mut ranks: Vec<u8> = rels.iter().map(|rel| rel_rank(*rel)).collect();
-    ranks.sort_unstable_by(|a, b| b.cmp(a));
-    ranks
-}
+impl MatchScore {
+    /// Sum another score's counters into this one, saturating every counter.
+    fn combined(self, other: MatchScore) -> MatchScore {
+        MatchScore {
+            mismatches: self.mismatches.saturating_add(other.mismatches),
+            deferred: self.deferred.saturating_add(other.deferred),
+            numeric_compat: self.numeric_compat.saturating_add(other.numeric_compat),
+            exact_structural: self.exact_structural.saturating_add(other.exact_structural),
+        }
+    }
 
-/// Whether the schema tree mentions [`TypeSchema::Unknown`] anywhere.
-fn contains_unknown(schema: &TypeSchema) -> bool {
-    match schema {
-        TypeSchema::Unknown => true,
-        TypeSchema::Null
-        | TypeSchema::Int
-        | TypeSchema::Float
-        | TypeSchema::Number
-        | TypeSchema::Bool
-        | TypeSchema::String
-        | TypeSchema::Bytes
-        | TypeSchema::Resource(_)
-        | TypeSchema::GenericParam(_) => false,
-        TypeSchema::Optional(inner) | TypeSchema::Array(inner) | TypeSchema::Map(inner) => {
-            contains_unknown(inner)
+    /// Increment the exact-structural counter, saturating.
+    fn plus_exact(self) -> MatchScore {
+        MatchScore {
+            exact_structural: self.exact_structural.saturating_add(1),
+            ..self
         }
-        TypeSchema::Named(_, args) => args.iter().any(contains_unknown),
-        TypeSchema::ArrayTuple(items) => items.iter().any(contains_unknown),
-        TypeSchema::ArrayTupleRest { prefix, rest } => {
-            prefix.iter().any(contains_unknown) || contains_unknown(rest)
+    }
+
+    /// Increment the deferred counter, saturating.
+    fn plus_deferred(self) -> MatchScore {
+        MatchScore {
+            deferred: self.deferred.saturating_add(1),
+            ..self
         }
-        TypeSchema::Object(fields) => fields.values().any(contains_unknown),
-        TypeSchema::Callable { params, result } => {
-            params.iter().any(contains_unknown) || contains_unknown(result)
+    }
+
+    /// Increment the numeric-compat counter, saturating.
+    fn plus_numeric(self) -> MatchScore {
+        MatchScore {
+            numeric_compat: self.numeric_compat.saturating_add(1),
+            ..self
+        }
+    }
+
+    /// Increment the mismatch counter, saturating.
+    fn plus_mismatch(self) -> MatchScore {
+        MatchScore {
+            mismatches: self.mismatches.saturating_add(1),
+            ..self
         }
     }
 }
 
-/// Classify one (expected, actual) schema pair under the catalog rules:
-/// nominal resource identity, exact non-numeric schemas, `Number` accepting
-/// `Int`/`Float`, deferred on any [`TypeSchema::Unknown`].
-fn relate(expected: &TypeSchema, actual: &TypeSchema) -> Rel {
-    if expected == actual {
-        return if contains_unknown(expected) || contains_unknown(actual) {
-            Rel::Unknown
-        } else {
-            Rel::Exact
-        };
-    }
+/// Recursively score one (expected, actual) schema pair, counting every
+/// matching nested node. `Unknown` is handled first (deferred), numeric
+/// compatibility second, then exact scalar leaves / GenericParam equality /
+/// Resource key equality, then structural shapes. A shape with a
+/// length/name/field-set mismatch yields exactly one mismatch and stops; a
+/// matching structural shape contributes one exact-structural count and then
+/// recurses into its children.
+fn score_pair(expected: &TypeSchema, actual: &TypeSchema) -> MatchScore {
     use TypeSchema::*;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Kind {
+        Exact,
+        Deferred,
+        Numeric,
+        Mismatch,
+    }
+    // Classify the pair, then apply the recursive rule unless it's structural.
+    fn classify(e: &TypeSchema, a: &TypeSchema) -> Option<Kind> {
+        match (e, a) {
+            // Unknown branch first: deferred/dynamic, never a concrete match.
+            (Unknown, _) | (_, Unknown) => Some(Kind::Deferred),
+            // Numeric compatibility second.
+            (Number, Int | Float) | (Int | Float, Number) => Some(Kind::Numeric),
+            (Null, Null)
+            | (Int, Int)
+            | (Float, Float)
+            | (Number, Number)
+            | (Bool, Bool)
+            | (String, String)
+            | (Bytes, Bytes) => Some(Kind::Exact),
+            (GenericParam(e), GenericParam(a)) => {
+                Some(if e == a { Kind::Exact } else { Kind::Mismatch })
+            }
+            (Resource(e), Resource(a)) => Some(if e == a { Kind::Exact } else { Kind::Mismatch }),
+            // Structural shapes are handled recursively below.
+            _ => None,
+        }
+    }
+
+    match classify(expected, actual) {
+        Some(Kind::Exact) => return MatchScore::default().plus_exact(),
+        Some(Kind::Deferred) => return MatchScore::default().plus_deferred(),
+        Some(Kind::Numeric) => return MatchScore::default().plus_numeric(),
+        Some(Kind::Mismatch) => return MatchScore::default().plus_mismatch(),
+        None => {}
+    }
+
     match (expected, actual) {
-        // Unknown is a deferred/dynamic fallback, not a concrete match or a
-        // hard mismatch.
-        (Unknown, _) | (_, Unknown) => Rel::Unknown,
-        (Number, Int | Float) | (Int | Float, Number) => Rel::NumericCompat,
-        (Resource(expected_key), Resource(actual_key)) => {
-            if expected_key == actual_key {
-                Rel::Exact
+        (Optional(e), Optional(a)) | (Array(e), Array(a)) | (Map(e), Map(a)) => {
+            MatchScore::default()
+                .plus_exact()
+                .combined(score_pair(e, a))
+        }
+        (ArrayTuple(e_items), ArrayTuple(a_items)) => {
+            if e_items.len() != a_items.len() {
+                MatchScore::default().plus_mismatch()
             } else {
-                Rel::Mismatch
+                let mut total = MatchScore::default().plus_exact();
+                for (e, a) in e_items.iter().zip(a_items.iter()) {
+                    total = total.combined(score_pair(e, a));
+                }
+                total
             }
         }
-        (Optional(e_inner), Optional(a_inner))
-        | (Array(e_inner), Array(a_inner))
-        | (Map(e_inner), Map(a_inner)) => relate(e_inner, a_inner),
-        (ArrayTuple(e_items), ArrayTuple(a_items)) => relate_tuple(e_items, a_items),
         (
             ArrayTupleRest {
                 prefix: e_p,
@@ -415,7 +469,17 @@ fn relate(expected: &TypeSchema, actual: &TypeSchema) -> Rel {
                 prefix: a_p,
                 rest: a_r,
             },
-        ) => relate_tuple(e_p, a_p).min(relate(e_r, a_r)),
+        ) => {
+            if e_p.len() != a_p.len() {
+                MatchScore::default().plus_mismatch()
+            } else {
+                let mut total = MatchScore::default().plus_exact();
+                for (e, a) in e_p.iter().zip(a_p.iter()) {
+                    total = total.combined(score_pair(e, a));
+                }
+                total.combined(score_pair(e_r, a_r))
+            }
+        }
         (
             Callable {
                 params: e_params,
@@ -427,66 +491,41 @@ fn relate(expected: &TypeSchema, actual: &TypeSchema) -> Rel {
             },
         ) => {
             if e_params.len() != a_params.len() {
-                return Rel::Mismatch;
+                MatchScore::default().plus_mismatch()
+            } else {
+                let mut total = MatchScore::default().plus_exact();
+                for (e, a) in e_params.iter().zip(a_params.iter()) {
+                    total = total.combined(score_pair(e, a));
+                }
+                total.combined(score_pair(e_result, a_result))
             }
-            let mut parts: Vec<Rel> = e_params
-                .iter()
-                .zip(a_params.iter())
-                .map(|(e, a)| relate(e, a))
-                .collect();
-            parts.push(relate(e_result, a_result));
-            aggregate(&parts)
         }
         (Named(e_name, e_args), Named(a_name, a_args)) => {
             if e_name != a_name || e_args.len() != a_args.len() {
-                return Rel::Mismatch;
+                MatchScore::default().plus_mismatch()
+            } else {
+                let mut total = MatchScore::default().plus_exact();
+                for (e, a) in e_args.iter().zip(a_args.iter()) {
+                    total = total.combined(score_pair(e, a));
+                }
+                total
             }
-            aggregate(
-                &e_args
-                    .iter()
-                    .zip(a_args.iter())
-                    .map(|(e, a)| relate(e, a))
-                    .collect::<Vec<_>>(),
-            )
         }
         (Object(e_fields), Object(a_fields)) => {
-            if e_fields.len() != a_fields.len() {
-                return Rel::Mismatch;
+            if e_fields.len() != a_fields.len()
+                || e_fields.keys().any(|name| !a_fields.contains_key(name))
+            {
+                MatchScore::default().plus_mismatch()
+            } else {
+                let mut total = MatchScore::default().plus_exact();
+                for (name, e_schema) in e_fields.iter() {
+                    total = total.combined(score_pair(e_schema, &a_fields[name]));
+                }
+                total
             }
-            if e_fields.keys().any(|name| !a_fields.contains_key(name)) {
-                return Rel::Mismatch;
-            }
-            aggregate(
-                &e_fields
-                    .iter()
-                    .map(|(name, e_schema)| relate(e_schema, &a_fields[name]))
-                    .collect::<Vec<_>>(),
-            )
         }
-        _ => Rel::Mismatch,
+        _ => MatchScore::default().plus_mismatch(),
     }
-}
-
-fn relate_tuple(e_items: &[TypeSchema], a_items: &[TypeSchema]) -> Rel {
-    if e_items.len() != a_items.len() {
-        return Rel::Mismatch;
-    }
-    aggregate(
-        &e_items
-            .iter()
-            .zip(a_items.iter())
-            .map(|(e, a)| relate(e, a))
-            .collect::<Vec<_>>(),
-    )
-}
-
-/// Combine a container's part relations: one mismatch poisons the whole,
-/// otherwise a single deferred element makes it deferred. Uses `min`, so the
-/// aggregate preserves the *least-specific* nested relation — an `array<Int>`
-/// (all `Exact`) outranks an `array<Number>` (a nested `NumericCompat`) for an
-/// actual `array<Int>`.
-fn aggregate(parts: &[Rel]) -> Rel {
-    parts.iter().copied().fold(Rel::Exact, Rel::min)
 }
 
 /// The lexicographically maximum (most-specific) candidate key.
@@ -555,7 +594,7 @@ fn best_concrete_mismatch<'f>(
         .enumerate()
         .find_map(|(index, param)| {
             let actual = &args[index];
-            if relate(&param.ty.to_compiler_schema(), actual) == Rel::Mismatch {
+            if score_pair(&param.ty.to_compiler_schema(), actual).mismatches > 0 {
                 Some(ConcreteMismatch {
                     index,
                     expected: schema_label(&param.ty),
@@ -1406,5 +1445,197 @@ mod tests {
             resolver.resolve("consume", &[compiler_resource(io_file())]),
             Err(HostCallResolveError::Ambiguous { name, .. }) if name == "consume"
         ));
+    }
+
+    #[test]
+    fn callable_concrete_params_beat_unknown_params() {
+        // f(callable<Int -> Unknown>) is more specific than
+        // f(callable<Unknown -> Unknown>) for an actual callable<Int -> Int>:
+        // the Int param is exact, the Unknown param is deferred.
+        let mut builder = HostApiBuilder::new();
+        let concrete = HostFunctionSchema::with_return(
+            "apply",
+            vec![value_param(
+                "cb",
+                HostTypeSchema::Callable {
+                    params: vec![HostTypeSchema::Int],
+                    result: Box::new(HostTypeSchema::Unknown),
+                },
+            )],
+            HostTypeSchema::Int,
+        );
+        let deferred = HostFunctionSchema::with_return(
+            "apply",
+            vec![value_param(
+                "cb",
+                HostTypeSchema::Callable {
+                    params: vec![HostTypeSchema::Unknown],
+                    result: Box::new(HostTypeSchema::Unknown),
+                },
+            )],
+            HostTypeSchema::String,
+        );
+        builder.function(concrete);
+        builder.function(deferred);
+        let catalog = builder.build().expect("valid overloads");
+        let resolver = HostCallResolver::new(&catalog);
+
+        let actual = Ts::Callable {
+            params: vec![Ts::Int],
+            result: Box::new(Ts::Int),
+        };
+        let resolved = resolver
+            .resolve("apply", &[actual])
+            .expect("concrete callable overload wins");
+        assert_eq!(
+            resolved.return_type,
+            Ts::Int,
+            "callable<Int->Unknown> must beat callable<Unknown->Unknown> for actual callable<Int->Int>"
+        );
+    }
+
+    #[test]
+    fn array_unknown_loses_to_array_exact_for_concrete_arg() {
+        // f(array<Unknown>) vs f(array<Int>) for an actual array<Int>: the
+        // array<Int> overload is exact, array<Unknown> is deferred, so exact wins.
+        let mut builder = HostApiBuilder::new();
+        builder.function(HostFunctionSchema::with_return(
+            "head",
+            vec![value_param(
+                "xs",
+                HostTypeSchema::Array(Box::new(HostTypeSchema::Unknown)),
+            )],
+            HostTypeSchema::Unknown,
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "head",
+            vec![value_param(
+                "xs",
+                HostTypeSchema::Array(Box::new(HostTypeSchema::Int)),
+            )],
+            HostTypeSchema::Int,
+        ));
+        let catalog = builder.build().expect("valid overloads");
+        let resolver = HostCallResolver::new(&catalog);
+
+        let resolved = resolver
+            .resolve("head", &[Ts::Array(Box::new(Ts::Int))])
+            .expect("array<Int> overload wins");
+        assert_eq!(
+            resolved.return_type,
+            Ts::Int,
+            "array<Int> exact must beat array<Unknown> for an actual array<Int>"
+        );
+    }
+
+    #[test]
+    fn array_unknown_and_array_exact_tie_for_unknown_arg() {
+        // For an actual Unknown argument, both array<Unknown> and array<Int>
+        // are equally deferred (the Unknown param swallows specificity), so
+        // resolution must stay ambiguous.
+        let mut builder = HostApiBuilder::new();
+        builder.function(HostFunctionSchema::with_return(
+            "head",
+            vec![value_param(
+                "xs",
+                HostTypeSchema::Array(Box::new(HostTypeSchema::Unknown)),
+            )],
+            HostTypeSchema::Unknown,
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "head",
+            vec![value_param(
+                "xs",
+                HostTypeSchema::Array(Box::new(HostTypeSchema::Int)),
+            )],
+            HostTypeSchema::Int,
+        ));
+        let catalog = builder.build().expect("valid overloads");
+        let resolver = HostCallResolver::new(&catalog);
+
+        assert!(matches!(
+            resolver.resolve("head", &[Ts::Unknown]),
+            Err(HostCallResolveError::Ambiguous { name, .. }) if name == "head"
+        ));
+    }
+
+    #[test]
+    fn unknown_both_positions_are_ambiguous_for_int_int() {
+        // Two-argument overloads [Int, Unknown] and [Unknown, Int] with an
+        // actual [Int, Int]: each has one exact + one deferred, so they tie and
+        // the resolution is ambiguous.
+        let mut builder = HostApiBuilder::new();
+        builder.function(HostFunctionSchema::with_return(
+            "sum",
+            vec![
+                value_param("a", HostTypeSchema::Int),
+                value_param("b", HostTypeSchema::Unknown),
+            ],
+            HostTypeSchema::Int,
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "sum",
+            vec![
+                value_param("a", HostTypeSchema::Unknown),
+                value_param("b", HostTypeSchema::Int),
+            ],
+            HostTypeSchema::Int,
+        ));
+        let catalog = builder.build().expect("valid overloads");
+        let resolver = HostCallResolver::new(&catalog);
+
+        assert!(matches!(
+            resolver.resolve("sum", &[Ts::Int, Ts::Int]),
+            Err(HostCallResolveError::Ambiguous { name, .. }) if name == "sum"
+        ));
+    }
+
+    #[test]
+    fn reversed_registration_identical_selection() {
+        // Building the two overloads in reverse order must still select the
+        // same (exact) overload and yield identical return/error.
+        fn catalog(reversed: bool) -> HostApiCatalog {
+            let mut builder = HostApiBuilder::new();
+            let exact = HostFunctionSchema::with_return(
+                "pick",
+                vec![value_param("v", HostTypeSchema::Int)],
+                HostTypeSchema::Int,
+            );
+            let deferred = HostFunctionSchema::with_return(
+                "pick",
+                vec![value_param("v", HostTypeSchema::Unknown)],
+                HostTypeSchema::String,
+            );
+            if reversed {
+                builder.function(deferred);
+                builder.function(exact);
+            } else {
+                builder.function(exact);
+                builder.function(deferred);
+            }
+            builder.build().expect("valid overloads")
+        }
+
+        let a = HostCallResolver::new(&catalog(false))
+            .resolve("pick", &[Ts::Int])
+            .expect("forward resolves");
+        let b = HostCallResolver::new(&catalog(true))
+            .resolve("pick", &[Ts::Int])
+            .expect("reversed resolves");
+        assert_eq!(a.return_type, b.return_type);
+        assert_eq!(a.return_type, Ts::Int);
+        assert_eq!(a.params, b.params);
+
+        // A String is a concrete mismatch for the Int overload and deferred for
+        // the Unknown overload; the deferred overload is viable and chosen,
+        // identically regardless of registration order.
+        let err_a = HostCallResolver::new(&catalog(false))
+            .resolve("pick", &[Ts::String])
+            .expect("string lands on deferred overload");
+        let err_b = HostCallResolver::new(&catalog(true))
+            .resolve("pick", &[Ts::String])
+            .expect("string lands on deferred overload");
+        assert_eq!(err_a.return_type, err_b.return_type);
+        assert_eq!(err_a.return_type, Ts::String);
     }
 }
