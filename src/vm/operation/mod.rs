@@ -649,7 +649,7 @@ mod architecture_gate {
         );
         assert!(
             needle_found(&code, &sqlite, false),
-            "rusqlite must be found"
+            "segment-joined forbidden database needle must be found"
         );
         assert!(
             needle_found(&code, &needle, false),
