@@ -252,38 +252,37 @@ impl HostRuntime {
         self.execution_scope.poll_close(cx)
     }
 
-    /// Atomically replaces the owned execution scope with `next`, **only**
-    /// once the current scope is Quiescent (all cleanup finished). Returns the
-    /// old quiescent scope so the caller can inspect its terminal outcome.
+    /// Recycles the owned execution scope to a fresh, empty, Active scope.
+    ///
+    /// Takes the current scope out **only** once it is Quiescent (all cleanup
+    /// finished), installs a brand-new scope in its place, and returns the old
+    /// quiescent scope so the caller can inspect its terminal outcome.
+    ///
+    /// The replacement scope is always created internally via
+    /// [`ExecutionScope::new`] — no caller can inject a Closing, Quiescent,
+    /// or resource-bearing `next`. The fresh scope is Active, holds 0
+    /// resources and 0 operations, and carries a brand-new arena/registry
+    /// identity that cannot alias any handle or operation id from the old
+    /// scope.
     ///
     /// A non-Quiescent (Active or Closing) scope is rejected with
-    /// [`ExecutionScopeError::ScopeNotQuiescent`]; this is the only replacement
-    /// path, so cleanup can never be bypassed.
+    /// [`ExecutionScopeError::ScopeNotQuiescent`] *before any mutation*, so a
+    /// failed recycle leaves the owned scope and its content untouched
+    /// (atomic). This is the only scope-replacement path, so cleanup can never
+    /// be bypassed.
     ///
     /// Consumed by the next-scope reset integration (`Vm::reset_for_reuse` →
     /// scope recycle); this wiring-only commit keeps it crate-private and
     /// gated rather than connecting it to `Vm` reset semantics.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn replace_execution_scope(
-        &mut self,
-        next: ExecutionScope,
-    ) -> ExecutionScopeResult<ExecutionScope> {
+    pub(crate) fn take_quiescent_scope(&mut self) -> ExecutionScopeResult<ExecutionScope> {
         if !self.execution_scope.is_quiescent() {
             return Err(ExecutionScopeError::ScopeNotQuiescent);
         }
-        Ok(std::mem::replace(&mut self.execution_scope, next))
-    }
-
-    /// Recycles the owned execution scope: takes the current scope out only
-    /// once it is Quiescent, installs a fresh Active scope in its place, and
-    /// returns the old quiescent scope.
-    ///
-    /// Equivalent to [`replace_execution_scope`](Self::replace_execution_scope)
-    /// with a fresh scope, so the same quiescence gate applies. Forward reset
-    /// hook — see [`replace_execution_scope`](Self::replace_execution_scope).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn take_quiescent_scope(&mut self) -> ExecutionScopeResult<ExecutionScope> {
-        self.replace_execution_scope(ExecutionScope::new())
+        Ok(std::mem::replace(
+            &mut self.execution_scope,
+            ExecutionScope::new(),
+        ))
     }
 }
 
@@ -297,6 +296,9 @@ impl Default for HostRuntime {
 mod tests {
     use super::*;
     use crate::vm::execution_scope::ScopeCloseOutcome;
+    use crate::vm::operation::{
+        HostOperation, OperationCancelReason, OperationResult, OperationSpec,
+    };
     use crate::vm::resource::{CloseProgress, ResourceErrorCode, ResourceResult};
     use std::sync::Arc;
     use std::task::Wake;
@@ -308,6 +310,19 @@ mod tests {
     impl HostResource for TestResource {
         fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
             Ok(CloseProgress::Ready)
+        }
+    }
+
+    /// A generic fake operation that stays pending until cancelled.
+    struct TestOperation;
+
+    impl HostOperation for TestOperation {
+        fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
+            Poll::Pending
+        }
+
+        fn cancel(&mut self, _reason: OperationCancelReason) -> OperationResult<()> {
+            Ok(())
         }
     }
 
@@ -346,79 +361,61 @@ mod tests {
     }
 
     #[test]
-    fn replace_execution_scope_rejects_non_quiescent_scope() {
+    fn take_quiescent_scope_rejects_non_quiescent_scope_atomically() {
         let mut host = HostRuntime::new();
 
         // An Active scope (close was never begun) is not quiescent.
-        let result = host.replace_execution_scope(ExecutionScope::new());
+        let result = host.take_quiescent_scope();
         let Err(error) = result else {
-            panic!("an active scope must refuse replacement");
+            panic!("an active scope must refuse recycle");
         };
         assert_eq!(error, ExecutionScopeError::ScopeNotQuiescent);
+        // Failure is atomic: the owned scope and its content are untouched.
+        assert_eq!(host.execution_scope_state(), ScopeState::Active);
+        assert_eq!(host.execution_scope_resource_count(), 0);
+        assert_eq!(host.execution_scope_operation_count(), 0);
 
+        let mut host = HostRuntime::new();
+        let old_handle = host
+            .execution_scope_push_resource(TestResource)
+            .expect("push into active scope");
         // A Closing scope (close begun, not driven to quiescence) also refuses.
         assert!(
             host.execution_scope_begin_close(ResourceCloseReason::Requested)
                 .expect("begin close")
         );
         assert_eq!(host.execution_scope_state(), ScopeState::Closing);
-        let result = host.replace_execution_scope(ExecutionScope::new());
+        let result = host.take_quiescent_scope();
         let Err(error) = result else {
-            panic!("a closing scope must refuse replacement");
+            panic!("a closing scope must refuse recycle");
         };
         assert_eq!(error, ExecutionScopeError::ScopeNotQuiescent);
-
-        // take_quiescent_scope shares the same gate.
-        let Err(error) = host.take_quiescent_scope() else {
-            panic!("take_quiescent_scope must reject a non-quiescent scope");
-        };
-        assert_eq!(error, ExecutionScopeError::ScopeNotQuiescent);
+        // Atomic: no mutation — the scope is still Closing and its resource
+        // table/arena/state are exactly what they were before the attempt.
+        assert_eq!(host.execution_scope_state(), ScopeState::Closing);
+        assert_eq!(host.execution_scope_resource_count(), 1);
+        assert_eq!(host.execution_scope_operation_count(), 0);
+        host.execution_scope()
+            .resources()
+            .get(&old_handle)
+            .expect("the rejected recycle must leave the owned resource table intact");
     }
 
     #[test]
-    fn replace_execution_scope_after_quiescence_yields_fresh_active_scope() {
+    fn take_quiescent_scope_yields_fresh_active_empty_isolated_scope() {
         let mut host = HostRuntime::new();
         let old_handle = host
             .execution_scope_push_resource(TestResource)
             .expect("push into active scope");
+        let old_op = host
+            .execution_scope_start_operation(OperationSpec::new(TestOperation))
+            .expect("start operation in active scope");
         assert_eq!(host.execution_scope_resource_count(), 1);
+        assert_eq!(host.execution_scope_operation_count(), 1);
 
-        // Close fully: only a Quiescent scope may be replaced.
+        // Close fully: only a Quiescent scope may be recycled.
         assert!(
             host.execution_scope_begin_close(ResourceCloseReason::VmReset)
-                .expect("begin close")
-        );
-        drive_scope_quiescent(&mut host);
-
-        let old_scope = host
-            .replace_execution_scope(ExecutionScope::new())
-            .expect("quiescent scope is replaceable");
-        assert_eq!(old_scope.state(), ScopeState::Quiescent);
-        assert_eq!(old_scope.resources().len(), 0, "old scope is fully closed");
-        assert_eq!(old_scope.terminal(), Some(&ScopeCloseOutcome::Success));
-
-        // The fresh scope starts Active and empty.
-        assert!(host.execution_scope_is_active());
-        assert_eq!(host.execution_scope_resource_count(), 0);
-        assert_eq!(host.execution_scope_operation_count(), 0);
-
-        // A handle from the replaced scope must not resolve in the new scope.
-        let error = host
-            .execution_scope()
-            .resources()
-            .get(&old_handle)
-            .expect_err("an old-scope handle must be rejected by the new scope");
-        assert_eq!(error.code(), ResourceErrorCode::ResourceHandleWrongTable);
-    }
-
-    #[test]
-    fn take_quiescent_scope_recycles_with_fresh_active_scope() {
-        let mut host = HostRuntime::new();
-        let _old_handle = host
-            .execution_scope_push_resource(TestResource)
-            .expect("push into active scope");
-        assert!(
-            host.execution_scope_begin_close(ResourceCloseReason::Requested)
                 .expect("begin close")
         );
         drive_scope_quiescent(&mut host);
@@ -427,8 +424,49 @@ mod tests {
             .take_quiescent_scope()
             .expect("quiescent scope is recyclable");
         assert_eq!(old_scope.state(), ScopeState::Quiescent);
+        assert_eq!(old_scope.resources().len(), 0, "old scope is fully closed");
+        assert_eq!(
+            old_scope.operations().len(),
+            0,
+            "old scope drained all operations"
+        );
+        assert_eq!(old_scope.terminal(), Some(&ScopeCloseOutcome::Success));
+
+        // The fresh scope starts Active and empty.
+        assert_eq!(host.execution_scope_state(), ScopeState::Active);
         assert!(host.execution_scope_is_active());
+        assert!(!host.execution_scope_is_quiescent());
         assert_eq!(host.execution_scope_resource_count(), 0);
         assert_eq!(host.execution_scope_operation_count(), 0);
+
+        // Arena/table isolation: a handle from the recycled scope must not
+        // resolve in the new scope.
+        let error = host
+            .execution_scope()
+            .resources()
+            .get(&old_handle)
+            .expect_err("an old-scope handle must be rejected by the new scope");
+        assert_eq!(error.code(), ResourceErrorCode::ResourceHandleWrongTable);
+
+        // Operation-registry isolation: an id from the old scope is rejected.
+        let status = host.execution_scope().operations().status(old_op);
+        assert!(
+            status.is_err(),
+            "an old-scope operation id must be rejected"
+        );
+
+        // The new scope is live: fresh inserts/operations land and resolve.
+        let new_handle = host
+            .execution_scope_push_resource(TestResource)
+            .expect("fresh scope accepts a new resource");
+        assert_eq!(host.execution_scope_resource_count(), 1);
+        let _new_op = host
+            .execution_scope_start_operation(OperationSpec::new(TestOperation))
+            .expect("fresh scope accepts a new operation");
+        assert_eq!(host.execution_scope_operation_count(), 1);
+        host.execution_scope()
+            .resources()
+            .get(&new_handle)
+            .expect("the new-scope handle must resolve in its own table");
     }
 }
