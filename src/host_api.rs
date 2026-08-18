@@ -679,6 +679,12 @@ impl HostApiFingerprint {
         Self(value)
     }
 
+    /// Public identity helper: builds a fingerprint from its raw 64-bit value.
+    /// Used by embedding/tests to declare an exact host-import binding's catalog fingerprint.
+    pub const fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
+
     pub const fn as_u64(self) -> u64 {
         self.0
     }

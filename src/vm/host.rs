@@ -129,10 +129,21 @@ pub struct HostBindingPlan {
     registry_generation: u64,
 }
 
+impl HostBindingPlan {
+    /// The exact import signature this plan was computed for (includes each import's schema).
+    pub fn import_signature(&self) -> &[HostImport] {
+        &self.import_signature
+    }
+}
+
 #[derive(Clone)]
 pub struct HostFunctionRegistry {
     entries: Arc<Vec<RegistryEntry>>,
     by_name: Arc<HashMap<String, u16>>,
+    /// Exact-schema host imports: name -> (exact schema -> registry slot).
+    /// A single name can host many exact schemas (overloads); each maps to its
+    /// own slot so the plan/dispatch never collapses them onto one `by_name` slot.
+    by_exact: Arc<HashMap<String, HashMap<HostImportSchema, u16>>>,
     plan_cache: Arc<RwLock<HashMap<Vec<HostImport>, Arc<HostBindingPlan>>>>,
     allowed_builtin_calls: Arc<Vec<u16>>,
     allow_default_builtin_capabilities: bool,
@@ -154,6 +165,7 @@ impl HostFunctionRegistry {
         Self {
             entries: Arc::new(Vec::new()),
             by_name: Arc::new(HashMap::new()),
+            by_exact: Arc::new(HashMap::new()),
             plan_cache: Arc::new(RwLock::new(HashMap::new())),
             allowed_builtin_calls: Arc::new(Vec::new()),
             allow_default_builtin_capabilities: true,
@@ -443,6 +455,145 @@ impl HostFunctionRegistry {
         self.invalidate_plan_cache();
     }
 
+    /// Registers a dynamic host fn under an exact `HostImportSchema` (name + ordered param
+    /// schemas/passing + return type + catalog fingerprint).
+    ///
+    /// The import is addressable only by programs whose `HostImport` schema equals `schema`
+    /// (including the catalog fingerprint). It never occupies the legacy by-name slot.
+    /// Registering an identical name+schema twice is an explicit error (no silent replacement).
+    pub fn register_exact(
+        &mut self,
+        name: impl Into<String>,
+        arity: u8,
+        schema: HostImportSchema,
+        factory: impl Fn() -> Box<dyn HostFunction> + Send + Sync + 'static,
+    ) -> VmResult<u16> {
+        let name = name.into();
+        self.push_exact(
+            name,
+            arity,
+            schema,
+            RegistryEntryKind::Factory(Arc::new(factory)),
+        )
+    }
+
+    pub fn register_exact_static(
+        &mut self,
+        name: impl Into<String>,
+        arity: u8,
+        schema: HostImportSchema,
+        function: StaticHostFunction,
+    ) -> VmResult<u16> {
+        let name = name.into();
+        self.push_exact(name, arity, schema, RegistryEntryKind::Static(function))
+    }
+
+    pub fn register_exact_stack(
+        &mut self,
+        name: impl Into<String>,
+        arity: u8,
+        schema: HostImportSchema,
+        factory: impl Fn() -> Box<dyn HostStackFunction> + Send + Sync + 'static,
+    ) -> VmResult<u16> {
+        let name = name.into();
+        self.push_exact(
+            name,
+            arity,
+            schema,
+            RegistryEntryKind::StackFactory(Arc::new(factory)),
+        )
+    }
+
+    pub fn register_exact_static_stack(
+        &mut self,
+        name: impl Into<String>,
+        arity: u8,
+        schema: HostImportSchema,
+        function: StaticHostStackFunction,
+    ) -> VmResult<u16> {
+        let name = name.into();
+        self.push_exact(
+            name,
+            arity,
+            schema,
+            RegistryEntryKind::StackStatic(function),
+        )
+    }
+
+    pub fn register_exact_args(
+        &mut self,
+        name: impl Into<String>,
+        arity: u8,
+        schema: HostImportSchema,
+        factory: impl Fn() -> Box<dyn HostArgsFunction> + Send + Sync + 'static,
+    ) -> VmResult<u16> {
+        let name = name.into();
+        self.push_exact(
+            name,
+            arity,
+            schema,
+            RegistryEntryKind::ArgsFactory(Arc::new(factory)),
+        )
+    }
+
+    pub fn register_exact_static_args(
+        &mut self,
+        name: impl Into<String>,
+        arity: u8,
+        schema: HostImportSchema,
+        function: StaticHostArgsFunction,
+    ) -> VmResult<u16> {
+        let name = name.into();
+        self.push_exact(name, arity, schema, RegistryEntryKind::ArgsStatic(function))
+    }
+
+    pub fn register_exact_static_non_yielding_args(
+        &mut self,
+        name: impl Into<String>,
+        arity: u8,
+        schema: HostImportSchema,
+        function: StaticHostArgsFunction,
+    ) -> VmResult<u16> {
+        let name = name.into();
+        self.push_exact(
+            name,
+            arity,
+            schema,
+            RegistryEntryKind::ArgsStaticNonYielding(function),
+        )
+    }
+
+    /// Core exact-schema slot pusher: duplicate (name+schema) is an explicit structured error;
+    /// legacy name-only bindings live in `by_name`, exact bindings in `by_exact`, so a legacy
+    /// binding can never hijack a distinct exact slot.
+    fn push_exact(
+        &mut self,
+        name: String,
+        arity: u8,
+        schema: HostImportSchema,
+        kind: RegistryEntryKind,
+    ) -> VmResult<u16> {
+        if let Some(schemas) = self.by_exact.get(&name)
+            && schemas.contains_key(&schema)
+        {
+            return Err(VmError::HostError(format!(
+                "duplicate exact host binding '{}' (same import schema)",
+                name
+            )));
+        }
+        let entries = Arc::make_mut(&mut self.entries);
+        let slot = entries.len() as u16;
+        entries.push(RegistryEntry {
+            arity,
+            runtime_owned_pending: false,
+            kind,
+        });
+        let map = Arc::make_mut(&mut self.by_exact);
+        map.entry(name).or_default().insert(schema, slot);
+        self.invalidate_plan_cache();
+        Ok(slot)
+    }
+
     fn validate_builtin_capability(&self, call_index: u16) -> VmResult<()> {
         if let Some(builtin) = BuiltinFunction::from_call_index(call_index)
             && builtin.requires_explicit_host_capability()
@@ -511,6 +662,72 @@ impl HostFunctionRegistry {
             && self.registry_generation.load(Ordering::Relaxed) == plan.registry_generation
     }
 
+    /// Resolves a host import to its exact registry slot.
+    ///
+    /// * `schema: Some(schema)` — the slot is the exact-schema binding whose `HostImportSchema`
+    ///   equals `schema` (including the catalog fingerprint). A legacy by-name slot is **never**
+    ///   used as a fallback; a mismatch is a structured rejection.
+    /// * `schema: None` — legacy by-name (schema-less) resolution, unchanged.
+    pub fn resolve_import(&self, import: &HostImport) -> VmResult<u16> {
+        match import.schema.as_ref() {
+            Some(schema) => {
+                let slot = self
+                    .by_exact
+                    .get(&import.name)
+                    .and_then(|schemas| schemas.get(schema))
+                    .copied()
+                    .ok_or_else(|| {
+                        VmError::HostError(format!(
+                            "host import '{}' has no exact binding matching its import schema",
+                            import.name
+                        ))
+                    })?;
+                // arity / coarse return-type consistency against the resolved schema:
+                if schema.params.len() as u8 != import.arity {
+                    return Err(VmError::InvalidCallArity {
+                        import: import.name.clone(),
+                        expected: schema.params.len() as u8,
+                        got: import.arity,
+                    });
+                }
+                if import.return_type != schema.return_type.coarse_value_type() {
+                    return Err(VmError::HostError(format!(
+                        "host import '{}' return schema mismatch (resolved exact binding)",
+                        import.name
+                    )));
+                }
+                Ok(slot)
+            }
+            None => {
+                let slot = self
+                    .by_name
+                    .get(&import.name)
+                    .copied()
+                    .ok_or_else(|| VmError::UnboundImport(import.name.clone()))?;
+                if self
+                    .entries
+                    .get(slot as usize)
+                    .ok_or(VmError::InvalidCall(slot))?
+                    .arity
+                    != import.arity
+                {
+                    return Err(VmError::InvalidCallArity {
+                        import: import.name.clone(),
+                        expected: self.entries[slot as usize].arity,
+                        got: import.arity,
+                    });
+                }
+                Ok(slot)
+            }
+        }
+    }
+
+    /// Number of distinct plan-cache entries. Each is keyed by the full `Vec<HostImport>`,
+    /// which embeds each import's schema, so exact schemas are plan-cache-partitioned.
+    pub fn plan_cache_len(&self) -> usize {
+        self.plan_cache.read().expect("plan cache read lock").len()
+    }
+
     fn plan_for_imports(&self, imports: &[HostImport]) -> VmResult<Arc<HostBindingPlan>> {
         if let Some(plan) = self
             .plan_cache
@@ -528,11 +745,7 @@ impl HostFunctionRegistry {
         let mut resolved_calls = Vec::with_capacity(imports.len());
 
         for import in imports {
-            let registry_slot = self
-                .by_name
-                .get(&import.name)
-                .copied()
-                .ok_or_else(|| VmError::UnboundImport(import.name.clone()))?;
+            let registry_slot = self.resolve_import(import)?;
             let entry = self
                 .entries
                 .get(registry_slot as usize)

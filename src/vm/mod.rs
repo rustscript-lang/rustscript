@@ -54,7 +54,8 @@ use self::run_context::{InterruptMode, RunContext};
 pub use crate::builtins::runtime::cancellation::CancellationReason;
 
 pub use crate::bytecode::{
-    CallableTarget, CallableValue, HostImport, OpCode, Program, Value, ValueType,
+    CallableTarget, CallableValue, HostImport, HostImportParam, HostImportSchema, OpCode, Program,
+    Value, ValueType,
 };
 use crate::bytecode::{StableHasher, hash_value};
 pub use store::{
