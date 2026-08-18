@@ -740,7 +740,7 @@ impl Compiler {
             | Expr::UnresolvedFunctionRef { .. } => {
                 return Err(CompileError::UnresolvedModuleCall);
             }
-            Expr::Call(index, type_args, args) => {
+            Expr::Call(index, type_args, args, _) => {
                 self.compile_function_call(*index, type_args, args)?;
             }
             Expr::Closure(closure) => {
@@ -1017,11 +1017,13 @@ impl Compiler {
                 BuiltinFunction::Has.call_index(),
                 Vec::new(),
                 vec![Expr::Var(container_slot), Expr::Var(key_slot)],
+                None,
             )),
             then_expr: Box::new(Expr::Call(
                 BuiltinFunction::Get.call_index(),
                 Vec::new(),
                 vec![Expr::Var(container_slot), Expr::Var(key_slot)],
+                None,
             )),
             else_expr: Box::new(Expr::Null),
         };
@@ -1031,6 +1033,7 @@ impl Compiler {
                     BuiltinFunction::TypeOf.call_index(),
                     Vec::new(),
                     vec![Expr::Var(key_slot)],
+                    None,
                 )),
                 Box::new(Expr::String("int".to_string())),
             )),
@@ -1047,12 +1050,14 @@ impl Compiler {
                             BuiltinFunction::Len.call_index(),
                             Vec::new(),
                             vec![Expr::Var(container_slot)],
+                            None,
                         )),
                     )),
                     then_expr: Box::new(Expr::Call(
                         BuiltinFunction::Get.call_index(),
                         Vec::new(),
                         vec![Expr::Var(container_slot), Expr::Var(key_slot)],
+                        None,
                     )),
                     else_expr: Box::new(Expr::Null),
                 }),
@@ -1065,6 +1070,7 @@ impl Compiler {
                     BuiltinFunction::TypeOf.call_index(),
                     Vec::new(),
                     vec![Expr::Var(container_slot)],
+                    None,
                 )),
                 Box::new(Expr::String("null".to_string())),
             )),
@@ -1075,6 +1081,7 @@ impl Compiler {
                         BuiltinFunction::TypeOf.call_index(),
                         Vec::new(),
                         vec![Expr::Var(container_slot)],
+                        None,
                     )),
                     Box::new(Expr::String("map".to_string())),
                 )),
@@ -1085,6 +1092,7 @@ impl Compiler {
                             BuiltinFunction::TypeOf.call_index(),
                             Vec::new(),
                             vec![Expr::Var(container_slot)],
+                            None,
                         )),
                         Box::new(Expr::String("array".to_string())),
                     )),
@@ -1095,6 +1103,7 @@ impl Compiler {
                                 BuiltinFunction::TypeOf.call_index(),
                                 Vec::new(),
                                 vec![Expr::Var(container_slot)],
+                                None,
                             )),
                             Box::new(Expr::String("string".to_string())),
                         )),
@@ -1122,6 +1131,7 @@ impl Compiler {
                     BuiltinFunction::TypeOf.call_index(),
                     Vec::new(),
                     vec![Expr::Var(value_slot)],
+                    None,
                 )),
                 Box::new(Expr::String("null".to_string())),
             )),
@@ -1286,7 +1296,7 @@ impl Compiler {
         if !self.enable_local_move_semantics {
             return Ok(false);
         }
-        let Expr::Call(index, _, args) = expr else {
+        let Expr::Call(index, _, args, _) = expr else {
             return Ok(false);
         };
         let Some(builtin) = BuiltinFunction::from_call_index(*index) else {

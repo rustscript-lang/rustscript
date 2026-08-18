@@ -401,7 +401,7 @@ impl Classifier {
                 self.expr(frame, value);
                 self.expr(frame, fallback);
             }
-            Expr::Call(target, _, args) => {
+            Expr::Call(target, _, args, _) => {
                 if let Some(fact) = self.facts.get_mut(target) {
                     fact.called_directly = true;
                     if self.frames[frame].function == Some(*target) {
@@ -1185,7 +1185,7 @@ mod tests {
     }
 
     fn call(index: u16) -> Expr {
-        Expr::Call(index, Vec::new(), Vec::new())
+        Expr::Call(index, Vec::new(), Vec::new(), None)
     }
 
     fn func_decl_stmt(name: &str, index: u16) -> Stmt {
@@ -1292,6 +1292,7 @@ mod tests {
             200,
             Vec::new(),
             vec![Expr::Var(11), Expr::FunctionRef(0, Vec::new())],
+            None,
         );
         let ir = ir_with(
             vec![func_decl_stmt("helper", 0), let_stmt(12, push)],
@@ -1303,6 +1304,40 @@ mod tests {
         assert!(helper.referenced_as_value);
         assert!(!helper.dynamic_target_required);
         assert!(helper.requires_callable_slot());
+    }
+
+    #[test]
+    fn materialization_preserves_annotated_call_resolution() {
+        use crate::compiler::host_call_resolve::{ResolvedHostCall, ResolvedHostParam};
+        use crate::compiler::ir::TypeSchema as IrTypeSchema;
+        use crate::host_api::{HostApiFingerprint, HostParamPassing};
+        fn fingerprint(n: u64) -> HostApiFingerprint {
+            serde_json::from_value(serde_json::Value::Number(n.into())).unwrap()
+        }
+        let resolution = ResolvedHostCall {
+            name: "read".to_string(),
+            params: vec![ResolvedHostParam {
+                name: "x".to_string(),
+                schema: IrTypeSchema::Int,
+            }],
+            return_type: IrTypeSchema::Int,
+            passing: vec![HostParamPassing::Borrow],
+            fingerprint: fingerprint(1),
+        };
+        let annotated = Expr::Call(0, Vec::new(), Vec::new(), Some(Box::new(resolution)));
+        let ir = ir_with(
+            vec![func_decl_stmt("helper", 0), expr_stmt(annotated.clone())],
+            vec![decl(0, "helper", false, None)],
+            HashMap::from([(0, impl_with(Vec::new(), Vec::new(), Expr::Int(1)))]),
+        );
+        // The materialization classifier must accept an annotated call and
+        // the clone it receives must keep the resolution.
+        let facts = classify_named_callables(&ir);
+        assert!(facts.contains_key(&0));
+        let Expr::Call(_, _, _, resolution_after) = &annotated else {
+            panic!("expected a Call");
+        };
+        assert_eq!(resolution_after.as_deref().unwrap().name, "read");
     }
 
     #[test]
@@ -1868,6 +1903,7 @@ mod tests {
                     1,
                     Vec::new(),
                     vec![Expr::FunctionRef(0, Vec::new())],
+                    None,
                 )),
             ],
             vec![
@@ -1905,6 +1941,7 @@ mod tests {
                     1,
                     Vec::new(),
                     vec![Expr::FunctionRef(0, Vec::new())],
+                    None,
                 )),
             ],
             vec![
@@ -1941,6 +1978,7 @@ mod tests {
                     1,
                     Vec::new(),
                     vec![Expr::FunctionRef(0, Vec::new())],
+                    None,
                 )),
             ],
             vec![
@@ -1971,7 +2009,7 @@ mod tests {
             vec![10],
             Vec::new(),
             Vec::new(),
-            Expr::Call(1, Vec::new(), vec![Expr::Var(10)]),
+            Expr::Call(1, Vec::new(), vec![Expr::Var(10)], None),
         );
         let ir = ir_with(
             vec![
@@ -1982,6 +2020,7 @@ mod tests {
                     2,
                     Vec::new(),
                     vec![Expr::FunctionRef(0, Vec::new())],
+                    None,
                 )),
             ],
             vec![
@@ -2071,7 +2110,7 @@ mod tests {
                 Stmt::Assign {
                     kind: AssignmentKind::Set,
                     index: 10,
-                    expr: Expr::Call(2, Vec::new(), Vec::new()),
+                    expr: Expr::Call(2, Vec::new(), Vec::new(), None),
                     line: 1,
                 },
                 expr_stmt(Expr::LocalCall(
@@ -2179,7 +2218,7 @@ mod tests {
                 Stmt::Assign {
                     kind: AssignmentKind::Set,
                     index: 10,
-                    expr: Expr::Call(2, Vec::new(), Vec::new()),
+                    expr: Expr::Call(2, Vec::new(), Vec::new(), None),
                     line: 1,
                 },
                 let_stmt(11, Expr::Closure(closure)),
@@ -2223,7 +2262,7 @@ mod tests {
                 Stmt::Assign {
                     kind: AssignmentKind::Set,
                     index: 10,
-                    expr: Expr::Call(2, Vec::new(), Vec::new()),
+                    expr: Expr::Call(2, Vec::new(), Vec::new(), None),
                     line: 1,
                 },
                 let_stmt(11, Expr::Var(10)),

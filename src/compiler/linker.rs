@@ -4,12 +4,12 @@ use std::path::Path;
 use crate::builtins::BuiltinFunction;
 
 use super::{
+    ParseError, SourceError, SourcePathError,
     ir::{
         Expr, FrontendIr, FunctionDecl, FunctionImpl, HostApiIrMetadata, LocalSlot, Stmt,
         StructDecl,
     },
     modules::{ModuleId, SymbolId},
-    ParseError, SourceError, SourcePathError,
 };
 
 pub(super) struct ParsedUnit {
@@ -774,7 +774,7 @@ fn remap_expr_indices(
                 message: "unresolved function value reference reached the module merge".to_string(),
             })));
         }
-        Expr::Call(index, _, args) => {
+        Expr::Call(index, _, args, _) => {
             if let Some(remapped_index) = function_map.get(index).copied() {
                 *index = remapped_index;
             } else if BuiltinFunction::from_call_index(*index).is_none() {
@@ -804,7 +804,7 @@ fn remap_expr_indices(
                             .to_string(),
                 }))
             })?;
-            *expr = Expr::Call(flat, std::mem::take(type_args), std::mem::take(args));
+            *expr = Expr::Call(flat, std::mem::take(type_args), std::mem::take(args), None);
         }
         Expr::OptionalGet {
             container,
@@ -1382,5 +1382,32 @@ mod linker_metadata_remap_tests {
                 .collect();
         assert_eq!(by_arity[&0], &arity0_candidates[..]);
         assert_eq!(by_arity[&1], &arity1_candidates[..]);
+    }
+
+    #[test]
+    fn index_remap_preserves_call_resolution() {
+        use super::super::{ResolvedHostCall, ResolvedHostParam};
+        use crate::compiler::TypeSchema;
+        let res = ResolvedHostCall {
+            name: "read".to_string(),
+            params: vec![ResolvedHostParam {
+                name: "x".to_string(),
+                schema: TypeSchema::Int,
+            }],
+            return_type: TypeSchema::Int,
+            passing: vec![crate::host_api::HostParamPassing::Borrow],
+            fingerprint: fingerprint(4),
+        };
+        let mut annotated = Expr::Call(7, Vec::new(), Vec::new(), Some(Box::new(res.clone())));
+        let mut function_map = HashMap::new();
+        function_map.insert(7u16, 11u16);
+        remap_expr_indices(&mut annotated, 0, &function_map, &HashMap::new()).unwrap();
+        let Expr::Call(flat, _, _, resolution) = annotated else {
+            panic!("expected a Call");
+        };
+        assert_eq!(flat, 11);
+        // The remap rewrote the flat index but must carry the resolution.
+        assert_eq!(resolution.as_deref().unwrap().name, "read");
+        assert_eq!(resolution, Some(Box::new(res)));
     }
 }

@@ -37,7 +37,7 @@ fn observe_direct_function_call_types(
     context: &mut TypeContext<'_>,
 ) -> Result<(), CompileError> {
     let function_index = match expr {
-        Expr::Call(index, _, _) if context.function_impls.contains_key(index) => Some(*index),
+        Expr::Call(index, _, _, _) if context.function_impls.contains_key(index) => Some(*index),
         Expr::LocalCall(slot, _, _) => match state.callable(*slot).cloned() {
             Some(InferredCallable::Function(index))
                 if context.function_impls.contains_key(&index) =>
@@ -54,7 +54,7 @@ fn observe_direct_function_call_types(
     };
 
     let args = match expr {
-        Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) => args,
+        Expr::Call(_, _, args, _) | Expr::LocalCall(_, _, args) => args,
         _ => return Ok(()),
     };
     if context
@@ -1029,7 +1029,7 @@ fn validate_expr_children(
     strict_function_add_types: bool,
 ) -> Result<(), CompileError> {
     match expr {
-        Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) => {
+        Expr::Call(_, _, args, _) | Expr::LocalCall(_, _, args) => {
             for arg in args {
                 let _ = validate_expr(
                     arg,
@@ -1194,7 +1194,7 @@ fn validate_schema_access(
     source_name: Option<&str>,
     context: &mut TypeContext<'_>,
 ) -> Result<(), CompileError> {
-    let Expr::Call(index, _, args) = expr else {
+    let Expr::Call(index, _, args, _) = expr else {
         return Ok(());
     };
     if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::Get) || args.len() != 2 {
@@ -1353,7 +1353,7 @@ fn extract_non_null_guard(condition: &Expr) -> Option<LocalSlot> {
 }
 
 fn extract_type_guard_side(lhs: &Expr, rhs: &Expr) -> Option<(LocalSlot, BoundType)> {
-    let Expr::Call(index, _, args) = lhs else {
+    let Expr::Call(index, _, args, _) = lhs else {
         return None;
     };
     if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::TypeOf) || args.len() != 1

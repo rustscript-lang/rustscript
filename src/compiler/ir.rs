@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
 
+use crate::ValueType;
 use crate::builtins::default_host_callable;
 use crate::host_api::{HostApiFingerprint, HostFunctionSchema, ResourceTypeKey};
-use crate::ValueType;
 
-use super::modules::SymbolId;
 use super::ParseError;
+use super::host_call_resolve::ResolvedHostCall;
+use super::modules::SymbolId;
 
 pub type LocalSlot = u16;
 
@@ -261,7 +262,28 @@ pub enum Expr {
         value_slot: LocalSlot,
         fallback: Box<Expr>,
     },
-    Call(u16, Vec<TypeSchema>, Vec<Expr>),
+    /// A call to a flat function-table index as a normalized `(name, arity)`
+    /// candidate-set identity.
+    ///
+    /// The flat `index` names the candidate set for this style of call (two
+    /// calls with equal indices share the same candidate population), but it
+    /// is **not** an ordinal map: it says nothing about which single overload
+    /// (if any) a particular call site resolved to.
+    ///
+    /// The fourth field, when [`Some`], is the exact per-call catalog
+    /// resolution for this specific call site. Distinct `Expr::Call` nodes
+    /// with equal `index` values may carry *different* [`Some`] resolutions
+    /// (parameter schemas and passing modes resolved against each site's own
+    /// argument types). [`None`] means the call has not been catalog-resolved
+    /// yet or targets a non-catalog callable; resolution is carried here per
+    /// call, not reconstructed from the index. It is boxed so the large
+    /// payload does not inflate every `Expr` node.
+    Call(
+        u16,
+        Vec<TypeSchema>,
+        Vec<Expr>,
+        Option<Box<ResolvedHostCall>>,
+    ),
     /// A call whose target was resolved to a compiler-owned module symbol
     /// before unit merge (milestone 4).
     ///
@@ -317,6 +339,22 @@ pub enum Expr {
         stmts: Vec<Stmt>,
         expr: Box<Expr>,
     },
+}
+
+impl Expr {
+    /// The exact per-call host-call catalog resolution carried by this node,
+    /// if it is a catalog-resolved [`Expr::Call`].
+    ///
+    /// Returns [`None`] for every other [`Expr`] variant and for an
+    /// [`Expr::Call`] that has not been catalog-resolved yet (or targets a
+    /// non-catalog callable). See the [`Expr::Call`] carrier docs for the
+    /// index-versus-resolution distinction.
+    pub fn host_call_resolution(&self) -> Option<&ResolvedHostCall> {
+        match self {
+            Expr::Call(_, _, _, Some(resolution)) => Some(resolution.as_ref()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -739,7 +777,7 @@ impl LocalIrBuilder {
                     .insert(name.to_string(), (func_index, Some(call_arity)));
             }
         }
-        Some(Expr::Call(func_index, Vec::new(), args))
+        Some(Expr::Call(func_index, Vec::new(), args, None))
     }
 
     pub fn finish(self, stmts: Vec<Stmt>) -> FrontendIr {
@@ -903,5 +941,76 @@ mod host_api_ir_metadata_tests {
     fn frontend_ir_builder_defaults_metadata_to_none() {
         let ir = LocalIrBuilder::new().finish(Vec::new());
         assert!(ir.host_api_metadata.is_none());
+    }
+}
+
+#[cfg(test)]
+mod call_resolution_carrier_tests {
+    use super::{Expr, ResolvedHostCall, TypeSchema};
+    use crate::compiler::host_call_resolve::ResolvedHostParam;
+    use crate::host_api::{HostApiFingerprint, HostParamPassing};
+
+    fn fingerprint(n: u64) -> HostApiFingerprint {
+        serde_json::from_value(serde_json::Value::Number(n.into())).unwrap()
+    }
+
+    fn resolution(name: &str) -> ResolvedHostCall {
+        ResolvedHostCall {
+            name: name.to_string(),
+            params: vec![ResolvedHostParam {
+                name: name.to_string(),
+                schema: TypeSchema::Int,
+            }],
+            return_type: TypeSchema::Int,
+            passing: vec![HostParamPassing::Borrow],
+            fingerprint: fingerprint(7),
+        }
+    }
+
+    #[test]
+    fn equal_index_calls_carry_distinct_resolutions() {
+        let first = Expr::Call(
+            9,
+            Vec::new(),
+            Vec::new(),
+            Some(Box::new(resolution("alpha"))),
+        );
+        let second = Expr::Call(
+            9,
+            Vec::new(),
+            Vec::new(),
+            Some(Box::new(resolution("beta"))),
+        );
+        // Same flat index (same `(name, arity)` candidate-set identity) but
+        // distinct exact per-call resolutions.
+        assert_eq!(first.host_call_resolution().unwrap().name, "alpha");
+        assert_eq!(second.host_call_resolution().unwrap().name, "beta");
+        assert_ne!(
+            first.host_call_resolution().unwrap(),
+            second.host_call_resolution().unwrap()
+        );
+    }
+
+    #[test]
+    fn clone_preserves_resolution() {
+        let call = Expr::Call(
+            9,
+            Vec::new(),
+            Vec::new(),
+            Some(Box::new(resolution("original"))),
+        );
+        let cloned = call.clone();
+        assert_eq!(cloned.host_call_resolution().unwrap().name, "original");
+        assert_eq!(call.host_call_resolution().unwrap().name, "original");
+    }
+
+    #[test]
+    fn accessor_is_none_for_unresolved_and_non_call() {
+        let unresolved = Expr::Call(9, Vec::new(), Vec::new(), None);
+        assert!(unresolved.host_call_resolution().is_none());
+        let local = Expr::LocalCall(0, Vec::new(), Vec::new());
+        assert!(local.host_call_resolution().is_none());
+        let literal = Expr::Int(1);
+        assert!(literal.host_call_resolution().is_none());
     }
 }

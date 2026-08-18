@@ -203,7 +203,7 @@ fn record_expr_local_debug_ranges(
             record_expr_local_debug_ranges(value, line, ranges);
             record_expr_local_debug_ranges(fallback, line, ranges);
         }
-        Expr::Call(_, _, args) | Expr::ModuleCall(_, _, args) => {
+        Expr::Call(_, _, args, _) | Expr::ModuleCall(_, _, args) => {
             for arg in args {
                 record_expr_local_debug_ranges(arg, line, ranges);
             }

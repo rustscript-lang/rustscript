@@ -529,7 +529,7 @@ impl LivenessRewriter {
                 self.add_expr_uses_impl(value, live, conservative);
                 self.add_expr_uses_impl(fallback, live, conservative);
             }
-            Expr::Call(_, _, args) => {
+            Expr::Call(_, _, args, _) => {
                 // Known named script calls execute in a separate runtime frame
                 // with its own local_base: the callee body footprint is
                 // analyzed inside the callee frame and must not be unioned
@@ -1031,7 +1031,7 @@ impl LocalSlotAllocator {
                 self.collect_expr_constraints(value, &live_during, protected_slots)?;
                 self.collect_expr_constraints(fallback, &live_during, protected_slots)?;
             }
-            Expr::Call(_, _, args) => {
+            Expr::Call(_, _, args, _) => {
                 // Arguments are evaluated in the caller frame, so their
                 // constraints belong here. The callee body runs in a separate
                 // runtime frame with its own local_base, so caller/callee
@@ -1304,7 +1304,7 @@ impl LocalSlotAllocator {
                 self.collect_expr_footprint(value, set, stack);
                 self.collect_expr_footprint(fallback, set, stack);
             }
-            Expr::Call(_, _, args) => {
+            Expr::Call(_, _, args, _) => {
                 // The callee runs in its own frame even when called from a
                 // closure body, so only argument slots join the caller-side
                 // footprint.
@@ -1681,7 +1681,7 @@ fn collect_persistent_closure_sources_from_expr(expr: &Expr, slots: &mut BTreeSe
             collect_persistent_closure_sources_from_expr(value, slots);
             collect_persistent_closure_sources_from_expr(fallback, slots);
         }
-        Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) | Expr::ModuleCall(_, _, args) => {
+        Expr::Call(_, _, args, _) | Expr::LocalCall(_, _, args) | Expr::ModuleCall(_, _, args) => {
             for arg in args {
                 collect_persistent_closure_sources_from_expr(arg, slots);
             }
@@ -1822,7 +1822,7 @@ fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseE
         Expr::FunctionRef(..)
         | Expr::ModuleFunctionRef(..)
         | Expr::UnresolvedFunctionRef { .. } => {}
-        Expr::Call(_, _, args) | Expr::ModuleCall(_, _, args) => {
+        Expr::Call(_, _, args, _) | Expr::ModuleCall(_, _, args) => {
             for arg in args {
                 remap_expr_slots(arg, mapping)?;
             }
@@ -1929,4 +1929,42 @@ fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseE
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod call_resolution_carrier_tests {
+    use super::remap_expr_slots;
+    use crate::compiler::host_call_resolve::{ResolvedHostCall, ResolvedHostParam};
+    use crate::compiler::ir::{Expr, TypeSchema};
+    use crate::host_api::{HostApiFingerprint, HostParamPassing};
+
+    fn fingerprint(n: u64) -> HostApiFingerprint {
+        serde_json::from_value(serde_json::Value::Number(n.into())).unwrap()
+    }
+
+    fn resolution(name: &str) -> ResolvedHostCall {
+        ResolvedHostCall {
+            name: name.to_string(),
+            params: vec![ResolvedHostParam {
+                name: "x".to_string(),
+                schema: TypeSchema::Int,
+            }],
+            return_type: TypeSchema::Int,
+            passing: vec![HostParamPassing::Borrow],
+            fingerprint: fingerprint(3),
+        }
+    }
+
+    #[test]
+    fn slot_remap_preserves_call_resolution() {
+        let mut call = Expr::Call(
+            4,
+            Vec::new(),
+            vec![Expr::Var(7)],
+            Some(Box::new(resolution("read"))),
+        );
+        let identity: Vec<u16> = (0..12).collect();
+        remap_expr_slots(&mut call, &identity).unwrap();
+        assert_eq!(call.host_call_resolution().unwrap().name, "read");
+    }
 }

@@ -740,7 +740,7 @@ impl AvailabilityAnalyzer {
             // Resolved module calls (pre-merge only) analyze their arguments;
             // interprocedural effects apply to the post-merge flat call.
             Expr::ModuleCall(_, _, args) => self.analyze_args(args, state, line),
-            Expr::Call(index, _, args) => {
+            Expr::Call(index, _, args, _) => {
                 if !self.enable_local_move_semantics {
                     if let Some(root_slot) = self.extract_collection_mutation_root(*index, args) {
                         let mut out = self.analyze_args(args, state, line)?;
@@ -903,7 +903,7 @@ impl AvailabilityAnalyzer {
             self.require_local_not_partially_moved(*index, state, line)?;
             return Ok(state.clone());
         }
-        if let Expr::Call(index, _, args) = inner
+        if let Expr::Call(index, _, args, _) = inner
             && let Some((root_slot, field_key)) = self.extract_moved_field_access(*index, args)
         {
             let out = self.analyze_projection_args(args, state, line)?;
@@ -1093,7 +1093,7 @@ impl AvailabilityAnalyzer {
         if !self.enable_local_move_semantics {
             return expr.clone();
         }
-        let Expr::Call(index, _, args) = expr else {
+        let Expr::Call(index, _, args, _) = expr else {
             return expr.clone();
         };
         if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::Get) {

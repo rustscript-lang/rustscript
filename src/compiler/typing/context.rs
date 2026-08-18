@@ -506,7 +506,7 @@ impl<'a> TypeContext<'a> {
             Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
                 self.expr_has_declared_schema(inner, state)
             }
-            Expr::Call(index, _, args) => match BuiltinFunction::from_call_index(*index) {
+            Expr::Call(index, _, args, _) => match BuiltinFunction::from_call_index(*index) {
                 Some(BuiltinFunction::Get)
                 | Some(BuiltinFunction::Set)
                 | Some(BuiltinFunction::Slice)
@@ -579,7 +579,7 @@ impl<'a> TypeContext<'a> {
             Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
                 self.expr_has_struct_schema_source(inner, state)
             }
-            Expr::Call(index, _, args) => match BuiltinFunction::from_call_index(*index) {
+            Expr::Call(index, _, args, _) => match BuiltinFunction::from_call_index(*index) {
                 Some(BuiltinFunction::Get)
                 | Some(BuiltinFunction::Set)
                 | Some(BuiltinFunction::Slice)
@@ -638,7 +638,7 @@ impl<'a> TypeContext<'a> {
             Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => state.is_optional(*root),
             Expr::OptionalGet { .. } => true,
             Expr::OptionUnwrapOr { .. } => false,
-            Expr::Call(index, _, _) => {
+            Expr::Call(index, _, _, _) => {
                 BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::ReFind)
                     || self.function_returns_optional(*index)
             }
@@ -1042,7 +1042,7 @@ impl<'a> TypeContext<'a> {
                 params: vec![TypeSchema::Unknown; closure.param_slots.len()],
                 result: Box::new(TypeSchema::Unknown),
             }),
-            Expr::Call(index, type_args, args) => {
+            Expr::Call(index, type_args, args, _) => {
                 if let Some(builtin) = BuiltinFunction::from_call_index(*index) {
                     self.infer_builtin_call_schema(builtin, type_args, args, state)
                 } else {
@@ -1257,7 +1257,7 @@ impl<'a> TypeContext<'a> {
         state: &LocalTypeState,
     ) -> BoundType {
         match expr {
-            Expr::Call(index, type_args, args) => {
+            Expr::Call(index, type_args, args, _) => {
                 if let Some(builtin) = BuiltinFunction::from_call_index(*index) {
                     self.infer_builtin_call_like_expr_type(builtin, type_args, args, state)
                 } else {
@@ -2069,7 +2069,7 @@ impl<'a> TypeContext<'a> {
         source_name: Option<&str>,
     ) -> Result<(), CompileError> {
         match expr {
-            Expr::Call(index, type_args, args) => {
+            Expr::Call(index, type_args, args, _) => {
                 if let Some(builtin) = BuiltinFunction::from_call_index(*index) {
                     self.validate_builtin_argument_types(
                         builtin,

@@ -1243,16 +1243,19 @@ fn same_local_collection_set_preserves_key_then_rhs_evaluation_order() {
         vm::BuiltinFunction::ArrayNew.call_index(),
         Vec::new(),
         Vec::new(),
+        None,
     );
     let array_with_first = Expr::Call(
         vm::BuiltinFunction::ArrayPush.call_index(),
         Vec::new(),
         vec![array_new, Expr::Int(10)],
+        None,
     );
     let array = Expr::Call(
         vm::BuiltinFunction::ArrayPush.call_index(),
         Vec::new(),
         vec![array_with_first, Expr::Int(20)],
+        None,
     );
     let append_order = |suffix: &str| Stmt::Assign {
         kind: vm::AssignmentKind::Set,
@@ -1273,6 +1276,7 @@ fn same_local_collection_set_preserves_key_then_rhs_evaluation_order() {
             vm::BuiltinFunction::Get.call_index(),
             Vec::new(),
             vec![Expr::Var(0), Expr::Int(1)],
+            None,
         )),
     };
 
@@ -1299,6 +1303,7 @@ fn same_local_collection_set_preserves_key_then_rhs_evaluation_order() {
                     vm::BuiltinFunction::Set.call_index(),
                     Vec::new(),
                     vec![Expr::Var(0), key, rhs],
+                    None,
                 ),
                 line: 2,
             },
@@ -1311,6 +1316,7 @@ fn same_local_collection_set_preserves_key_then_rhs_evaluation_order() {
                     vm::BuiltinFunction::Get.call_index(),
                     Vec::new(),
                     vec![Expr::Var(0), Expr::Int(0)],
+                    None,
                 ),
                 line: 3,
             },
@@ -1335,6 +1341,7 @@ fn same_local_array_push_clears_target_immediately_before_call() {
                     vm::BuiltinFunction::ArrayNew.call_index(),
                     Vec::new(),
                     Vec::new(),
+                    None,
                 ),
                 line: 1,
             },
@@ -1345,6 +1352,7 @@ fn same_local_array_push_clears_target_immediately_before_call() {
                     vm::BuiltinFunction::ArrayPush.call_index(),
                     Vec::new(),
                     vec![Expr::Var(0), Expr::Int(7)],
+                    None,
                 ),
                 line: 2,
             },
@@ -1903,7 +1911,7 @@ fn named_callable_without_facts_keeps_legacy_materialization() {
             line: 1,
         },
         vm::compiler::ir::Stmt::Expr {
-            expr: vm::compiler::ir::Expr::Call(0, Vec::new(), Vec::new()),
+            expr: vm::compiler::ir::Expr::Call(0, Vec::new(), Vec::new(), None),
             line: 1,
         },
     ];
