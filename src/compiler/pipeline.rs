@@ -617,6 +617,8 @@ fn schema_is_fully_known(schema: &TypeSchema) -> bool {
         | TypeSchema::String
         | TypeSchema::Bytes
         | TypeSchema::GenericParam(_) => true,
+        // A resource is fully known: its key fixes the nominal type statically.
+        TypeSchema::Resource(_) => true,
         TypeSchema::Optional(inner) => schema_is_fully_known(inner),
         TypeSchema::Named(_, type_args) => type_args.iter().all(schema_is_fully_known),
         TypeSchema::Array(item) | TypeSchema::Map(item) => {

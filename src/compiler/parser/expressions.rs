@@ -1823,6 +1823,9 @@ impl Parser {
                         Self::unify_contextual_schema(lhs, rhs, type_params, bindings)
                     })
             }
+            // Resources unify only on the exact same nominal key. Different
+            // keys (or a resource vs a structural type) do not unify.
+            (TypeSchema::Resource(lhs_key), TypeSchema::Resource(rhs_key)) => lhs_key == rhs_key,
             (TypeSchema::ArrayTuple(lhs), TypeSchema::ArrayTuple(rhs)) => {
                 lhs.len() == rhs.len()
                     && lhs.iter().zip(rhs).all(|(lhs, rhs)| {

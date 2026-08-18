@@ -471,7 +471,10 @@ fn inline_schema_guard_type(schema: &TypeSchema) -> Option<Option<ValueType>> {
             Some(Some(ValueType::Array))
         }
         TypeSchema::Null => Some(Some(ValueType::Null)),
+        // Resources have no runtime `Value` representation in this scope, so no
+        // inline schema guard can be emitted for them yet.
         TypeSchema::Number | TypeSchema::Optional(_) | TypeSchema::Callable { .. } => None,
+        TypeSchema::Resource(_) => None,
     }
 }
 

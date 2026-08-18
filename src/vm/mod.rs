@@ -464,6 +464,10 @@ fn value_matches_type_schema(value: &Value, schema: &crate::compiler::TypeSchema
         TypeSchema::Named(_, _) | TypeSchema::Map(_) | TypeSchema::Object(_) => {
             matches!(value, Value::Map(_))
         }
+        // No runtime `Value` can be a resource yet (the resource table/handle
+        // transport is a later scope), so a resource schema never admits an
+        // arbitrary `Value` as a match.
+        TypeSchema::Resource(_) => false,
         TypeSchema::Array(_) | TypeSchema::ArrayTuple(_) | TypeSchema::ArrayTupleRest { .. } => {
             matches!(value, Value::Array(_))
         }
@@ -538,6 +542,10 @@ fn hash_type_schema(schema: &crate::compiler::TypeSchema, state: &mut impl Hashe
                 hash_type_schema(param, state);
             }
             hash_type_schema(result, state);
+        }
+        TypeSchema::Resource(key) => {
+            17u8.hash(state);
+            key.hash(state);
         }
     }
 }

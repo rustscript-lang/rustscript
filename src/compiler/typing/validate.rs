@@ -432,6 +432,9 @@ fn validate_json_schema_with_seen(
         TypeSchema::Bytes => Err(format!(
             "{path} uses bytes, which json::encode does not support"
         )),
+        TypeSchema::Resource(key) => Err(format!(
+            "{path} is resource '{key}', which json::encode does not support"
+        )),
         TypeSchema::Optional(inner) => {
             validate_json_schema_with_seen(inner, context, path, seen, reentries)
         }

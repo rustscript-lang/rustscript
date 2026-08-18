@@ -840,6 +840,14 @@ fn find_declared_schema_mismatch_with_recursion(
         | (TypeSchema::Bool, TypeSchema::Bool)
         | (TypeSchema::String, TypeSchema::String)
         | (TypeSchema::Bytes, TypeSchema::Bytes) => None,
+        // Resources are nominal: only the exact same key is compatible. A
+        // different key, or a resource vs any structural/scalar type, falls
+        // through to the generic mismatch arm below.
+        (TypeSchema::Resource(expected_key), TypeSchema::Resource(actual_key))
+            if expected_key == actual_key =>
+        {
+            None
+        }
         (expected, actual)
             if expected.array_prefix_and_rest().is_some()
                 && actual.array_prefix_and_rest().is_some() =>
@@ -1884,5 +1892,100 @@ pub(super) fn bound_type_label(ty: BoundType) -> &'static str {
         BoundType::Array | BoundType::ArrayOf(_) => "array",
         BoundType::Map | BoundType::MapOf(_) => "map",
         BoundType::Callable => "callable",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ValueType;
+    use crate::compiler::typing::context::bound_type_from_schema;
+    use crate::host_api::ResourceTypeKey;
+
+    fn key(name: &str) -> ResourceTypeKey {
+        ResourceTypeKey::new(name).expect("valid key")
+    }
+
+    fn sqlite() -> TypeSchema {
+        TypeSchema::Resource(key("sqlite.connection"))
+    }
+
+    fn io_file() -> TypeSchema {
+        TypeSchema::Resource(key("io.file"))
+    }
+
+    fn schema_mismatch(expected: &TypeSchema, actual: &TypeSchema) -> Option<String> {
+        let impls = HashMap::new();
+        let decls = HashMap::new();
+        let structs = HashMap::new();
+        let names = HashMap::new();
+        let host_returns = HashMap::new();
+        let host_sigs = HashMap::new();
+        let mut context = TypeContext::new(
+            &impls,
+            &decls,
+            &structs,
+            &names,
+            &host_returns,
+            &host_sigs,
+            TypingMode::StrictRustScript,
+        );
+        find_declared_schema_mismatch(expected, actual, &mut context, String::new())
+    }
+
+    #[test]
+    fn resource_exact_key_is_compatible() {
+        assert_eq!(schema_mismatch(&sqlite(), &sqlite()), None);
+        assert_eq!(schema_mismatch(&io_file(), &io_file()), None);
+    }
+
+    #[test]
+    fn resource_optional_wraps_to_same_key() {
+        let expected = TypeSchema::Optional(Box::new(sqlite()));
+        assert_eq!(schema_mismatch(&expected, &sqlite()), None);
+        assert_eq!(schema_mismatch(&sqlite(), &expected), None);
+    }
+
+    #[test]
+    fn resource_different_keys_are_incompatible() {
+        let detail = schema_mismatch(&sqlite(), &io_file()).expect("must mismatch");
+        // Diagnostic renders the nominal keys, never an int/map surrogate.
+        assert!(detail.contains("resource<sqlite.connection>"), "{detail}");
+        assert!(detail.contains("resource<io.file>"), "{detail}");
+    }
+
+    #[test]
+    fn resource_vs_structural_is_incompatible() {
+        let map = TypeSchema::Map(Box::new(TypeSchema::String));
+        let named = TypeSchema::Named("sqlite.connection".to_string(), vec![]);
+        assert!(schema_mismatch(&sqlite(), &map).is_some());
+        assert!(schema_mismatch(&sqlite(), &named).is_some());
+        assert!(schema_mismatch(&map, &sqlite()).is_some());
+    }
+
+    #[test]
+    fn resource_unknown_keeps_dynamic_fallback() {
+        // Unknown stays dynamically compatible in every direction.
+        assert_eq!(schema_mismatch(&sqlite(), &TypeSchema::Unknown), None);
+        assert_eq!(schema_mismatch(&TypeSchema::Unknown, &sqlite()), None);
+    }
+
+    #[test]
+    fn resource_is_nominal_never_int_or_map() {
+        let res = sqlite();
+        // Distinct from the structural Named/Map representation.
+        assert_ne!(
+            res,
+            TypeSchema::Named("sqlite.connection".to_string(), vec![])
+        );
+        assert_ne!(res, TypeSchema::Map(Box::new(TypeSchema::Unknown)));
+        // Semantic views never surface the resource as `int` (or a `map`).
+        assert_eq!(res.coarse_value_type(), ValueType::Unknown);
+        assert_eq!(bound_type_from_schema(&res), BoundType::Unknown);
+        // The physical integer ABI backing exists only behind the named
+        // boundary helper.
+        assert_eq!(res.resource_abi_value_type(), ValueType::Int);
+        // Diagnostics render the nominal key.
+        assert_eq!(render_schema_label(&res), "resource<sqlite.connection>");
     }
 }

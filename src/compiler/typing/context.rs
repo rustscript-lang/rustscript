@@ -2604,6 +2604,9 @@ pub(crate) fn bound_type_from_schema(schema: &TypeSchema) -> BoundType {
             BoundType::Array
         }
         TypeSchema::Map(_) | TypeSchema::Object(_) => BoundType::Map,
+        // Resources are opaque (nominal) values: they are never reduced to the
+        // `Map` bound or to an integral token in semantic inference.
+        TypeSchema::Resource(_) => BoundType::Unknown,
     }
 }
 
@@ -2811,6 +2814,7 @@ pub(super) fn schema_label(schema: &TypeSchema) -> &'static str {
             "array"
         }
         TypeSchema::Map(_) | TypeSchema::Object(_) => "map",
+        TypeSchema::Resource(_) => "resource",
     }
 }
 
@@ -2869,6 +2873,9 @@ pub(crate) fn render_schema_label(schema: &TypeSchema) -> String {
             format!("[{}]", parts.join(", "))
         }
         TypeSchema::Map(value) => format!("map<{}>", render_schema_label(value)),
+        // Resources render as their nominal key (`resource<io.file>`), never as
+        // their physical integer ABI token or a structural `map<...>` shape.
+        TypeSchema::Resource(key) => format!("resource<{key}>"),
         TypeSchema::Object(fields) => {
             let mut entries = fields
                 .iter()

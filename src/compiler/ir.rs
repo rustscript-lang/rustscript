@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::ValueType;
 use crate::builtins::default_host_callable;
+use crate::host_api::ResourceTypeKey;
 
 use super::ParseError;
 use super::modules::SymbolId;
@@ -33,6 +34,14 @@ pub enum TypeSchema {
         params: Vec<TypeSchema>,
         result: Box<TypeSchema>,
     },
+    /// A nominal host resource, identified by its shared [`ResourceTypeKey`].
+    ///
+    /// Resources are nominal and opaque: two schemas match only when they
+    /// carry the *same* key. This variant deliberately does not share a
+    /// representation with [`TypeSchema::Named`] or [`TypeSchema::Map`], so a
+    /// resource can never be mistaken for structural data (object/map) or a
+    /// generic instantiation.
+    Resource(ResourceTypeKey),
 }
 
 impl TypeSchema {
@@ -68,6 +77,11 @@ impl TypeSchema {
             TypeSchema::Bytes => ValueType::Bytes,
             TypeSchema::Optional(inner) => inner.coarse_value_type(),
             TypeSchema::Named(_, _) | TypeSchema::Map(_) | TypeSchema::Object(_) => ValueType::Map,
+            // Semantic (nominal) lowering: a resource is opaque and is *not*
+            // surfaced as an integral token here, so inferred schemas and
+            // diagnostics never present a resource as `int`. The physical ABI
+            // token is isolated behind [`Self::resource_abi_value_type`].
+            TypeSchema::Resource(_) => ValueType::Unknown,
             TypeSchema::Array(_)
             | TypeSchema::ArrayTuple(_)
             | TypeSchema::ArrayTupleRest { .. } => ValueType::Array,
@@ -100,6 +114,32 @@ impl TypeSchema {
             Some(first)
         } else {
             Some(TypeSchema::Unknown)
+        }
+    }
+
+    /// The resource key when this schema (directly, or through a single
+    /// optional layer) denotes a host resource.
+    pub fn resource_key(&self) -> Option<&ResourceTypeKey> {
+        match self {
+            TypeSchema::Resource(key) => Some(key),
+            TypeSchema::Optional(inner) => inner.resource_key(),
+            _ => None,
+        }
+    }
+
+    /// Physical ABI lowering for resources.
+    ///
+    /// This is the single, explicitly named boundary between the *nominal*
+    /// schema and the eventual runtime handle/token ABI. A later scope that
+    /// wires a resource table / handle transport resolves a [`Self::Resource`]
+    /// schema to an integral token here. It is deliberately NOT used by
+    /// [`Self::coarse_value_type`], which keeps resources semantically opaque
+    /// (`ValueType::Unknown`) so inferred schemas and diagnostics never reveal
+    /// the integer backing.
+    pub fn resource_abi_value_type(&self) -> ValueType {
+        match self {
+            TypeSchema::Resource(_) => ValueType::Int,
+            other => other.coarse_value_type(),
         }
     }
 }
