@@ -3,10 +3,10 @@ use std::collections::HashMap;
 use vm::compiler::TypeSchema;
 use vm::{
     ArgInfo, Assembler, BuiltinFunction, BytecodeBuilder, CallableKind, CallablePrototype,
-    CallableTarget, DebugFunction, DebugInfo, DisassembleOptions, HostImport, LineInfo, LocalInfo,
-    Program, ScriptFunction, TypeMap, ValidationError, Value, ValueType, WireError,
-    builtin_call_index, decode_program, disassemble_vmbc, disassemble_vmbc_with_options,
-    encode_program, infer_local_count, validate_program, HostApiCatalog, ResourceTypeKey,
+    CallableTarget, DebugFunction, DebugInfo, DisassembleOptions, HostApiCatalog, HostImport,
+    LineInfo, LocalInfo, Program, ResourceTypeKey, ScriptFunction, TypeMap, ValidationError, Value,
+    ValueType, WireError, builtin_call_index, decode_program, disassemble_vmbc,
+    disassemble_vmbc_with_options, encode_program, infer_local_count, validate_program,
 };
 
 #[test]
@@ -801,7 +801,7 @@ fn schema_round_trip_resource_wire_nominally() {
         local_types: vec![vm::ValueType::Int],
         local_schemas: vec![Some(schema.clone())],
         callable_slots: vec![false],
-                    optional_slots: vec![false],
+        optional_slots: vec![false],
         operand_types: HashMap::new(),
     });
 
@@ -809,7 +809,10 @@ fn schema_round_trip_resource_wire_nominally() {
     let decoded = vm::decode_program(&encoded).expect("decode should succeed");
     assert_eq!(decoded.type_map, program.type_map);
     assert_eq!(
-        decoded.type_map.as_ref().and_then(|tm| tm.local_schemas[0].as_ref()),
+        decoded
+            .type_map
+            .as_ref()
+            .and_then(|tm| tm.local_schemas[0].as_ref()),
         Some(&TypeSchema::Resource(key))
     );
 }
@@ -830,4 +833,48 @@ fn malformed_resource_key_is_rejected_on_read() {
     });
     v["resources"][0]["key"] = serde_json::json!("bad key");
     assert!(serde_json::from_value::<HostApiCatalog>(v).is_err());
+}
+
+#[test]
+fn malformed_resource_key_is_rejected_by_the_wire_decoder() {
+    // A resource key that violates the key grammar must be rejected by the key's own
+    // Deserialize impl AND by the real VMBC reader when the key is embedded in a wire
+    // payload. This stops the reader treating the schema payload as opaque and letting a
+    // malformed key through to the compiler.
+    let key = vm::ResourceTypeKey::new("io.file").expect("valid key");
+    let schema = vm::compiler::TypeSchema::Resource(key.clone());
+    let program = vm::Program::new(Vec::new(), Vec::new()).with_type_map(vm::TypeMap {
+        strict_types: false,
+        local_types: vec![vm::ValueType::Int],
+        local_schemas: vec![Some(schema.clone())],
+        callable_slots: vec![false],
+        optional_slots: vec![false],
+        operand_types: HashMap::new(),
+    });
+    let wire = vm::encode_program(&program).expect("encode should succeed");
+    // The resource key is emitted via write_string: a u32 LE byte length followed by the ASCII
+    // key bytes. Pin down that exact run. (Inside the schema payload it is emitted as:
+    // Some-flag(01) -> Resource schema tag(11) -> u32 LE byte length -> ASCII key bytes.)
+    // Pin the whole exact run so the probe is unique to the resource-key payload.
+    let key_run: &[u8] = b"\x01\x11\x07\x00\x00\x00io.file";
+    let run_start = wire
+        .windows(key_run.len())
+        .position(|w| w == key_run)
+        .expect("key run must exist in wire");
+    assert_eq!(
+        run_start, 27,
+        "io.file key payload should sit at offset 0x1b"
+    );
+    assert_eq!(&wire[run_start..run_start + key_run.len()], key_run);
+    let mut tampered = wire.clone();
+    // 'bad key' has the same 7-byte length as 'io.file' and contains a space,
+    // which the resource-key grammar rejects while the byte length
+    // (and therefore the whole wire structure) stays identical.
+    let ascii_start = run_start + 6; // skip 01 11 07 00 00 00 (6 prefix bytes)
+    tampered[ascii_start..ascii_start + 7].copy_from_slice(b"bad key");
+    let restored = vm::decode_program(&tampered);
+    assert!(matches!(
+        restored,
+        Err(vm::WireError::InvalidResourceKey(_))
+    ));
 }
