@@ -647,6 +647,7 @@ pub struct Program {
     #[allow(dead_code)]
     decoded_instruction_data_cache: Arc<OnceLock<Arc<DecodedInstructionData>>>,
     operand_type_hints_cache: Arc<OnceLock<Option<Arc<[u8]>>>>,
+    owned_local_slots_cache: Arc<OnceLock<Arc<[bool]>>>,
 }
 
 impl Program {
@@ -666,6 +667,7 @@ impl Program {
             exported_callables: Vec::new(),
             decoded_instruction_data_cache: Arc::new(OnceLock::new()),
             operand_type_hints_cache: Arc::new(OnceLock::new()),
+            owned_local_slots_cache: Arc::new(OnceLock::new()),
         }
     }
 
@@ -689,6 +691,7 @@ impl Program {
             exported_callables: Vec::new(),
             decoded_instruction_data_cache: Arc::new(OnceLock::new()),
             operand_type_hints_cache: Arc::new(OnceLock::new()),
+            owned_local_slots_cache: Arc::new(OnceLock::new()),
         }
     }
 
@@ -713,6 +716,7 @@ impl Program {
             exported_callables: Vec::new(),
             decoded_instruction_data_cache: Arc::new(OnceLock::new()),
             operand_type_hints_cache: Arc::new(OnceLock::new()),
+            owned_local_slots_cache: Arc::new(OnceLock::new()),
         }
     }
 
@@ -724,6 +728,7 @@ impl Program {
     pub fn with_type_map(mut self, type_map: TypeMap) -> Self {
         self.type_map = Some(type_map);
         self.operand_type_hints_cache = Arc::new(OnceLock::new());
+        self.owned_local_slots_cache = Arc::new(OnceLock::new());
         self
     }
 
@@ -760,6 +765,35 @@ impl Program {
             .get_or_init(|| build_operand_type_hints(self.code.len(), self.type_map.as_ref()))
             .clone()
     }
+
+    /// Derived per-slot ownership projection: `true` for every local slot
+    /// whose schema contains a host resource, directly or nested at any
+    /// depth (the recursive `TypeSchema::contains_resource` walk).
+    ///
+    /// This is a NON-wire derived view: it is lazily computed from
+    /// `type_map.local_schemas` and cached behind an
+    /// `Arc<OnceLock<..>>` exactly like the decoded-instruction and
+    /// operand-hint caches, so it never participates in `Program` equality,
+    /// hashing, or wire serialization, and cloning a `Program` shares it for
+    /// free. A program without a type map owns no local slots.
+    pub fn owned_local_slots(&self) -> &[bool] {
+        self.owned_local_slots_cache
+            .get_or_init(|| build_owned_local_slots(self.type_map.as_ref()))
+    }
+}
+
+/// Computes the [`Program::owned_local_slots`] projection from the type map:
+/// one entry per `local_schemas` slot, `true` when the slot's schema contains
+/// a host resource anywhere in its shape.
+fn build_owned_local_slots(type_map: Option<&TypeMap>) -> Arc<[bool]> {
+    let Some(type_map) = type_map else {
+        return Arc::from(Vec::new().into_boxed_slice());
+    };
+    type_map
+        .local_schemas
+        .iter()
+        .map(|schema| schema.as_ref().is_some_and(TypeSchema::contains_resource))
+        .collect()
 }
 
 #[allow(dead_code)]

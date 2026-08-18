@@ -40,6 +40,80 @@ enum SlotState {
     Closing(Box<dyn HostResource>),
 }
 
+/// Explicit ownership state of one slot's raw resource copy.
+///
+/// Illegal combinations are unrepresentable: ownership is a single enum
+/// field, so a slot can never be both guest-owned and taken at once, and every
+/// transition happens under the table's single-threaded `&mut` access — there
+/// is no window between operations in which an intermediate state is visible.
+/// In particular a [`Taken`](ResourceOwnership::Taken) slot can never be
+/// remapped to [`GuestOwned`](ResourceOwnership::GuestOwned): every ownership
+/// transition validates the current state first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceOwnership {
+    /// The host (the owning table/scope) owns the resource. This is the
+    /// default for every new allocation: nothing is guest-owned implicitly.
+    HostOwned,
+    /// The resource was marked guest-owned. Only a guest release
+    /// ([`ResourceTable::release_guest_owner`]) or an ownership take
+    /// ([`ResourceTable::take_owned`]) reclaims it ahead of the fallback
+    /// scope close.
+    GuestOwned,
+    /// The concrete resource was atomically moved out by
+    /// [`ResourceTable::take_owned`]. The raw copy is stale: the slot is
+    /// retired (never reused, never closed again) and the raw handle fails
+    /// every validated use from then on.
+    Taken,
+}
+
+/// How a guest ownership release closes its resource.
+///
+/// Carries the close reason the release launches the close with; the default
+/// is [`ResourceCloseReason::OwnershipRelease`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnershipRelease {
+    reason: ResourceCloseReason,
+}
+
+impl OwnershipRelease {
+    /// A release that closes with [`ResourceCloseReason::OwnershipRelease`].
+    pub const fn close() -> Self {
+        Self {
+            reason: ResourceCloseReason::OwnershipRelease,
+        }
+    }
+
+    /// A release that closes with an explicit reason.
+    pub const fn with_reason(reason: ResourceCloseReason) -> Self {
+        Self { reason }
+    }
+
+    /// The reason the released resource is closed with.
+    pub const fn reason(self) -> ResourceCloseReason {
+        self.reason
+    }
+}
+
+impl Default for OwnershipRelease {
+    fn default() -> Self {
+        Self::close()
+    }
+}
+
+/// Outcome of [`ResourceTable::release_guest_owner`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestReleaseOutcome {
+    /// The resource was guest-owned and open: its close was launched exactly
+    /// once with the release reason. The payload is the synchronous close
+    /// progress ([`CloseProgress::Pending`] means the close is now driven to
+    /// completion by the usual poll machinery).
+    Released(CloseProgress),
+    /// Idempotent no-op: the handle named a resource that is not releasable
+    /// (never guest-owned, already released and closing, already taken,
+    /// stale, or foreign). No close was fired and no state was mutated.
+    NotGuestOwned,
+}
+
 struct ResourceSlot {
     /// Advanced on every reuse.
     generation: u32,
@@ -50,6 +124,10 @@ struct ResourceSlot {
     /// Live child handles. A child is removed only once its close is fully
     /// finished and the slot is vacant again.
     children: BTreeSet<ResourceHandle>,
+    /// Ownership of the raw resource copy. Kept separate from `state` so a
+    /// closing resource keeps its ownership marker; a `Taken` marker always
+    /// coincides with a vacant, retired slot.
+    ownership: ResourceOwnership,
     state: SlotState,
 }
 
@@ -221,37 +299,145 @@ impl ResourceTable {
         let slot_index = self.resolve_index(handle)?;
         self.check_generation(slot_index, handle)?;
         self.check_type::<T>(slot_index, handle)?;
+        self.close_open_slot(slot_index, handle, reason)
+    }
 
-        let state = std::mem::replace(&mut self.slots[slot_index].state, SlotState::Vacant);
-        match state {
-            SlotState::Open(mut resource) => {
-                if !self.slots[slot_index].children.is_empty() {
-                    self.slots[slot_index].state = SlotState::Open(resource);
-                    return Err(has_children_error(handle));
-                }
-                match resource.begin_close(reason) {
-                    Ok(CloseProgress::Ready) => {
-                        self.reclaim(slot_index);
-                        Ok(CloseProgress::Ready)
-                    }
-                    Ok(CloseProgress::Pending) => {
-                        self.slots[slot_index].state = SlotState::Closing(resource);
-                        Ok(CloseProgress::Pending)
-                    }
-                    Err(error) => {
-                        self.reclaim(slot_index);
-                        Err(error)
-                    }
-                }
-            }
-            SlotState::Closing(resource) => {
-                // Idempotent: the close is already in flight; keep holding the
-                // generation until the outer caller drives poll_close.
-                self.slots[slot_index].state = SlotState::Closing(resource);
-                Ok(CloseProgress::Pending)
-            }
-            SlotState::Vacant => Err(already_closed_error(handle)),
+    // ---- guest ownership ---------------------------------------------------------
+
+    /// The current [`ResourceOwnership`] of the slot `handle` names, or
+    /// `None` when the handle is foreign or stale (names no live slot here).
+    pub fn ownership(&self, handle: ResourceHandle) -> Option<ResourceOwnership> {
+        let slot_index = self.resolve_index(handle).ok()?;
+        Some(self.slots[slot_index].ownership)
+    }
+
+    /// Marks an open, host-owned resource as guest-owned.
+    ///
+    /// Succeeds only when `handle` names a resource in *this* table, with a
+    /// matching generation and slot key, that is still open and currently
+    /// [`ResourceOwnership::HostOwned`]. Every rejection is a structured
+    /// error and atomic: no ownership, lifecycle, generation, or link state
+    /// is mutated on failure.
+    ///
+    /// - foreign arena → [`ResourceErrorCode::ResourceHandleWrongTable`]
+    /// - stale generation → [`ResourceErrorCode::ResourceStale`]
+    /// - already taken → [`ResourceErrorCode::ResourceAlreadyTaken`]
+    /// - closing/closed → [`ResourceErrorCode::ResourceAlreadyClosed`]
+    /// - already guest-owned (duplicate mark) →
+    ///   [`ResourceErrorCode::ResourceNotHostOwned`]
+    pub fn mark_guest_owned(&mut self, handle: ResourceHandle) -> ResourceResult<()> {
+        let slot_index = self.resolve_index(handle)?;
+        let slot = &mut self.slots[slot_index];
+        if slot.ownership == ResourceOwnership::Taken {
+            return Err(already_taken_error(handle));
         }
+        if !matches!(slot.state, SlotState::Open(_)) {
+            return Err(already_closed_error(handle));
+        }
+        if slot.ownership == ResourceOwnership::GuestOwned {
+            return Err(not_host_owned_error(handle));
+        }
+        slot.ownership = ResourceOwnership::GuestOwned;
+        Ok(())
+    }
+
+    /// Releases the guest owner of a resource, launching its close exactly
+    /// once with the release's reason.
+    ///
+    /// The close is launched only for a [`ResourceOwnership::GuestOwned`]
+    /// resource that is still open. Every other situation — never guest-owned,
+    /// already released and closing, already taken, stale generation, or
+    /// foreign arena — is an idempotent no-op reported as
+    /// [`GuestReleaseOutcome::NotGuestOwned`]: never an error and never a
+    /// second `begin_close`. A failure of the close launch itself (live
+    /// children, or the resource's own `begin_close` error) is the only
+    /// structured error path, and it fires at most one `begin_close`.
+    pub fn release_guest_owner(
+        &mut self,
+        handle: ResourceHandle,
+        release: OwnershipRelease,
+    ) -> ResourceResult<GuestReleaseOutcome> {
+        // Benign no-op cases: foreign arena, stale generation, or a slot key
+        // that no longer names a live resource here.
+        let Ok(slot_index) = self.resolve_index(handle) else {
+            return Ok(GuestReleaseOutcome::NotGuestOwned);
+        };
+        let slot = &self.slots[slot_index];
+        if slot.ownership != ResourceOwnership::GuestOwned
+            || !matches!(slot.state, SlotState::Open(_))
+        {
+            return Ok(GuestReleaseOutcome::NotGuestOwned);
+        }
+        // GuestOwned + Open: launch the close exactly once.
+        let progress = self.close_open_slot(slot_index, handle, release.reason())?;
+        Ok(GuestReleaseOutcome::Released(progress))
+    }
+
+    /// Atomically takes the owned concrete resource out of the table.
+    ///
+    /// Every constraint is validated *before* any mutation, so a rejection
+    /// consumes nothing: the resource stays open and guest-owned, no close is
+    /// fired, and no ownership, generation, or link state changes. Validation
+    /// order: same table (arena) + generation + slot key + `TypeId` of `T` +
+    /// [`ResourceOwnership::GuestOwned`] + open + no live children.
+    ///
+    /// On success the concrete `T` is moved out (ownership transfers to the
+    /// caller; no `unsafe` is involved — the erased box is reconnected to `T`
+    /// through `Any` after the exact `TypeId` check) and the slot is retired
+    /// as [`ResourceOwnership::Taken`]: the raw handle is stale from then on,
+    /// the slot is never reused, and the table never closes the moved-out
+    /// value.
+    pub fn take_owned<T: HostResource>(&mut self, handle: ResourceHandle) -> ResourceResult<T> {
+        let slot_index = self.resolve_index(handle)?;
+        self.check_type::<T>(slot_index, handle)?;
+        match self.slots[slot_index].ownership {
+            ResourceOwnership::Taken => return Err(already_taken_error(handle)),
+            ResourceOwnership::HostOwned => return Err(not_guest_owned_error(handle)),
+            ResourceOwnership::GuestOwned => {}
+        }
+        if !matches!(self.slots[slot_index].state, SlotState::Open(_)) {
+            return Err(already_closed_error(handle));
+        }
+        if !self.slots[slot_index].children.is_empty() {
+            return Err(has_children_error(handle));
+        }
+        // Confirm the erased occupant really is a `T` before touching any
+        // state (the `TypeId` check above already guarantees it).
+        let SlotState::Open(resource) = &self.slots[slot_index].state else {
+            return Err(already_closed_error(handle));
+        };
+        if (resource.as_ref() as &dyn Any)
+            .downcast_ref::<T>()
+            .is_none()
+        {
+            return Err(type_mismatch(handle, TypeId::of::<T>()));
+        }
+
+        // All constraints validated: the move-out below is atomic.
+        let state = std::mem::replace(&mut self.slots[slot_index].state, SlotState::Vacant);
+        let SlotState::Open(resource) = state else {
+            unreachable!("open state validated immediately above")
+        };
+        let erased: Box<dyn Any> = resource;
+        let boxed = erased
+            .downcast::<T>()
+            .unwrap_or_else(|_| unreachable!("TypeId validated immediately above"));
+        // Retire the slot: unlink it from its parent, keep the generation so
+        // the stale raw handle still resolves here and reports `Taken`
+        // precisely, never push the slot back for reuse, and never close the
+        // moved-out value.
+        let generation = self.slots[slot_index].generation;
+        let parent = self.slots[slot_index].parent.take();
+        if let Some(parent_handle) = parent
+            && let Some(child_handle) =
+                ResourceHandle::encode(self.arena_id, slot_index, u64::from(generation))
+            && let Ok(parent_index) = self.resolve_index(parent_handle)
+        {
+            self.slots[parent_index].children.remove(&child_handle);
+        }
+        self.slots[slot_index].ownership = ResourceOwnership::Taken;
+        self.active_entries -= 1;
+        Ok(*boxed)
     }
 
     /// Polls one in-progress close to completion.
@@ -422,6 +608,50 @@ impl ResourceTable {
 
     // ---- internal close machinery -------------------------------------------------
 
+    /// Drives the close state machine of one validated slot, shared by the
+    /// typed [`begin_close`](Self::begin_close) path and the untyped guest
+    /// ownership release. Mirrors the begin-close contract exactly: a parent
+    /// with live children is rejected untouched, an already-closing slot is an
+    /// idempotent [`CloseProgress::Pending`], and a vacant slot is a precise
+    /// already-closed error.
+    fn close_open_slot(
+        &mut self,
+        slot_index: usize,
+        handle: ResourceHandle,
+        reason: ResourceCloseReason,
+    ) -> ResourceResult<CloseProgress> {
+        let state = std::mem::replace(&mut self.slots[slot_index].state, SlotState::Vacant);
+        match state {
+            SlotState::Open(mut resource) => {
+                if !self.slots[slot_index].children.is_empty() {
+                    self.slots[slot_index].state = SlotState::Open(resource);
+                    return Err(has_children_error(handle));
+                }
+                match resource.begin_close(reason) {
+                    Ok(CloseProgress::Ready) => {
+                        self.reclaim(slot_index);
+                        Ok(CloseProgress::Ready)
+                    }
+                    Ok(CloseProgress::Pending) => {
+                        self.slots[slot_index].state = SlotState::Closing(resource);
+                        Ok(CloseProgress::Pending)
+                    }
+                    Err(error) => {
+                        self.reclaim(slot_index);
+                        Err(error)
+                    }
+                }
+            }
+            SlotState::Closing(resource) => {
+                // Idempotent: the close is already in flight; keep holding the
+                // generation until the outer caller drives poll_close.
+                self.slots[slot_index].state = SlotState::Closing(resource);
+                Ok(CloseProgress::Pending)
+            }
+            SlotState::Vacant => Err(already_closed_error(handle)),
+        }
+    }
+
     fn try_begin_close(
         &mut self,
         slot_index: usize,
@@ -497,6 +727,9 @@ impl ResourceTable {
             self.slots[parent_index].children.remove(&child_handle);
         }
         self.slots[slot_index].state = SlotState::Vacant;
+        // A reclaimed slot carries no ownership; the next occupant starts out
+        // host-owned (re-applied in `allocate`).
+        self.slots[slot_index].ownership = ResourceOwnership::HostOwned;
         if u64::from(self.slots[slot_index].generation) < MAX_HANDLE_GENERATION {
             self.vacant_slots.push(slot_index);
         }
@@ -555,6 +788,7 @@ impl ResourceTable {
             self.slots[slot_index].type_id = type_id;
             self.slots[slot_index].parent = parent;
             self.slots[slot_index].children.clear();
+            self.slots[slot_index].ownership = ResourceOwnership::HostOwned;
             self.slots[slot_index].state = SlotState::Open(value);
             (slot_index, generation)
         } else {
@@ -572,6 +806,7 @@ impl ResourceTable {
                 type_id,
                 parent,
                 children: BTreeSet::new(),
+                ownership: ResourceOwnership::HostOwned,
                 state: SlotState::Open(value),
             });
             (slot_index, generation)
@@ -699,6 +934,33 @@ fn has_children_error(handle: ResourceHandle) -> ResourceError {
         ResourceErrorCode::ResourceHasChildren,
         "resource::table",
         "resource cannot close while it has live child resources",
+    )
+    .with_value(handle.raw())
+}
+
+fn not_guest_owned_error(handle: ResourceHandle) -> ResourceError {
+    ResourceError::new(
+        ResourceErrorCode::ResourceNotGuestOwned,
+        "resource::table",
+        "resource is not guest-owned",
+    )
+    .with_value(handle.raw())
+}
+
+fn not_host_owned_error(handle: ResourceHandle) -> ResourceError {
+    ResourceError::new(
+        ResourceErrorCode::ResourceNotHostOwned,
+        "resource::table",
+        "resource is already guest-owned",
+    )
+    .with_value(handle.raw())
+}
+
+fn already_taken_error(handle: ResourceHandle) -> ResourceError {
+    ResourceError::new(
+        ResourceErrorCode::ResourceAlreadyTaken,
+        "resource::table",
+        "resource ownership was already taken out of the table",
     )
     .with_value(handle.raw())
 }

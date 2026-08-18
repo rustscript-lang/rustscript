@@ -398,5 +398,8 @@ fn operation_reason(reason: ResourceCloseReason) -> OperationCancelReason {
         ResourceCloseReason::VmReset => OperationCancelReason::VmReset,
         ResourceCloseReason::Parent => OperationCancelReason::Parent,
         ResourceCloseReason::ResourceClosed => OperationCancelReason::ResourceClosed,
+        // A guest ownership release is an explicit caller-initiated close
+        // request, so dependent operations see it as a requested cancel.
+        ResourceCloseReason::OwnershipRelease => OperationCancelReason::Requested,
     }
 }

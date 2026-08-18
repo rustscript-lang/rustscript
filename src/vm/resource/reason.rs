@@ -16,6 +16,9 @@ pub enum ResourceCloseReason {
     VmReset = 3,
     Parent = 4,
     ResourceClosed = 5,
+    /// The guest released its ownership of the resource; the release launches
+    /// the close exactly once.
+    OwnershipRelease = 6,
 }
 
 impl ResourceCloseReason {
@@ -27,6 +30,7 @@ impl ResourceCloseReason {
             Self::VmReset => "vm_reset",
             Self::Parent => "parent",
             Self::ResourceClosed => "resource_closed",
+            Self::OwnershipRelease => "ownership_release",
         }
     }
 
@@ -39,6 +43,7 @@ impl ResourceCloseReason {
             3 => Some(Self::VmReset),
             4 => Some(Self::Parent),
             5 => Some(Self::ResourceClosed),
+            6 => Some(Self::OwnershipRelease),
             _ => None,
         }
     }
@@ -67,6 +72,11 @@ mod tests {
             (ResourceCloseReason::VmReset, 3, "vm_reset"),
             (ResourceCloseReason::Parent, 4, "parent"),
             (ResourceCloseReason::ResourceClosed, 5, "resource_closed"),
+            (
+                ResourceCloseReason::OwnershipRelease,
+                6,
+                "ownership_release",
+            ),
         ] {
             assert_eq!(reason.raw(), raw, "raw encoding of {reason:?}");
             assert_eq!(
@@ -84,7 +94,7 @@ mod tests {
         }
         // Unknown encodings decode to None.
         assert!(ResourceCloseReason::from_raw(0).is_none());
-        assert!(ResourceCloseReason::from_raw(6).is_none());
+        assert!(ResourceCloseReason::from_raw(7).is_none());
         assert!(ResourceCloseReason::from_raw(u8::MAX).is_none());
     }
 }

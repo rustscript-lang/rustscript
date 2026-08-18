@@ -33,4 +33,4 @@ pub use self::close::{CloseProgress, HostResource};
 pub use self::error::{ResourceError, ResourceErrorCode, ResourceResult};
 pub use self::handle::{Resource, ResourceHandle, ResourceMut, ResourceRef};
 pub use self::reason::ResourceCloseReason;
-pub use self::table::ResourceTable;
+pub use self::table::{GuestReleaseOutcome, OwnershipRelease, ResourceOwnership, ResourceTable};

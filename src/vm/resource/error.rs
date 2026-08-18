@@ -48,6 +48,15 @@ pub enum ResourceErrorCode {
     /// A best-effort synchronous close-all could not drive every resource to
     /// quiescence (at least one remains pending) and so must not claim success.
     ResourceClosePending,
+    /// A guest-ownership operation required a guest-owned resource, but the
+    /// resource is still host-owned.
+    ResourceNotGuestOwned,
+    /// A guest-ownership mark required a host-owned resource, but the
+    /// resource was already marked guest-owned (duplicate mark).
+    ResourceNotHostOwned,
+    /// The resource's concrete value was already taken out of the table by an
+    /// ownership take; the raw handle is stale.
+    ResourceAlreadyTaken,
 }
 
 impl ResourceErrorCode {
@@ -67,6 +76,9 @@ impl ResourceErrorCode {
             Self::ResourceNotClosing => "resource_not_closing",
             Self::ResourceCloseInProgress => "resource_close_in_progress",
             Self::ResourceClosePending => "resource_close_pending",
+            Self::ResourceNotGuestOwned => "resource_not_guest_owned",
+            Self::ResourceNotHostOwned => "resource_not_host_owned",
+            Self::ResourceAlreadyTaken => "resource_already_taken",
         }
     }
 }
@@ -179,6 +191,9 @@ mod tests {
             ResourceErrorCode::ResourceNotClosing,
             ResourceErrorCode::ResourceCloseInProgress,
             ResourceErrorCode::ResourceClosePending,
+            ResourceErrorCode::ResourceNotGuestOwned,
+            ResourceErrorCode::ResourceNotHostOwned,
+            ResourceErrorCode::ResourceAlreadyTaken,
         ]
     }
 
@@ -233,6 +248,18 @@ mod tests {
             (
                 ResourceErrorCode::ResourceClosePending,
                 "resource_close_pending",
+            ),
+            (
+                ResourceErrorCode::ResourceNotGuestOwned,
+                "resource_not_guest_owned",
+            ),
+            (
+                ResourceErrorCode::ResourceNotHostOwned,
+                "resource_not_host_owned",
+            ),
+            (
+                ResourceErrorCode::ResourceAlreadyTaken,
+                "resource_already_taken",
             ),
         ];
         // Exhaustive: every code has exactly one stable string mapping.
