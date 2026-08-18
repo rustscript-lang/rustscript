@@ -17,6 +17,7 @@ use crate::builtins::{
 };
 use crate::compiler::modules::{UseDecl, UsePathSegment};
 use crate::compiler::source_map::{SourceId, Span};
+use crate::host_api::{HostApiCatalog, HostFunctionSchema};
 
 pub(crate) use self::expressions::host_generic_type_arg_arity;
 use self::lexer::{Lexer, ParserFormatArg, Token, TokenKind, is_ident_continue, is_ident_start};
@@ -24,8 +25,8 @@ use self::symbols::is_virtual_host_namespace_spec;
 use super::{
     ParseError, ReplLocalBinding, STDLIB_PRINT_ARITY, STDLIB_PRINT_NAME,
     ir::{
-        AssignmentKind, ClosureExpr, Expr, FunctionDecl, FunctionImpl, FunctionParam, LocalSlot,
-        MatchPattern, MatchTypePattern, Stmt, StructDecl, TypeSchema,
+        AssignmentKind, ClosureExpr, Expr, FunctionDecl, FunctionImpl, FunctionParam,
+        HostApiIrMetadata, LocalSlot, MatchPattern, MatchTypePattern, Stmt, StructDecl, TypeSchema,
     },
 };
 
@@ -156,6 +157,29 @@ pub(super) struct Parser {
     mutable_locals: Vec<bool>,
     borrowed_map_iter_locals: Vec<LocalSlot>,
     local_schemas: HashMap<LocalSlot, TypeSchema>,
+    /// Immutable host-API catalog snapshot threaded from the compile options.
+    ///
+    /// `Some` when a [`HostApiCatalog`] was supplied on the
+    /// [`CompileSourceFileOptions`](crate::compiler::CompileSourceFileOptions)
+    /// for this parse; `None` for REPL and public dialect parses, which carry
+    /// no catalog. When present it is authoritative for any host name it
+    /// declares.
+    host_catalog: Option<std::sync::Arc<HostApiCatalog>>,
+    /// Fingerprint-bound host candidate metadata produced from
+    /// [`Parser::host_catalog`].
+    ///
+    /// `Some` exactly when a catalog is present, holding the catalog
+    /// fingerprint even when the source makes zero host calls. `None` when no
+    /// catalog was supplied.
+    host_api_metadata: Option<HostApiIrMetadata>,
+    /// Catalog-declared host function declarations, keyed by `(name, arity)`.
+    ///
+    /// Distinct arities of the same host name are distinct flat functions, so
+    /// they are kept out of the name-only [`Parser::functions`] map (which
+    /// still owns user-declared, builtin and extern identities) and tracked
+    /// here by `(name, arity)` so the same overload call reuses its index
+    /// without colliding across arities.
+    catalog_function_decls: HashMap<(String, u8), FunctionDecl>,
 }
 
 struct ClosureCaptureContext {
@@ -216,7 +240,43 @@ impl Parser {
             mutable_locals: Vec::new(),
             borrowed_map_iter_locals: Vec::new(),
             local_schemas: HashMap::new(),
+            host_catalog: None,
+            host_api_metadata: None,
+            catalog_function_decls: HashMap::new(),
         })
+    }
+
+    /// Catalog-aware constructor that additionally threads the immutable
+    /// [`HostApiCatalog`] snapshot from the compile options.
+    ///
+    /// This is the internal entry point used by RustScript file/module parses.
+    /// It performs a single `Arc` clone of the shared snapshot and a single
+    /// allocation of the fingerprint-bound [`HostApiIrMetadata`] carrier, so a
+    /// catalog-backed parse never re-allocs the snapshot. REPL and the public
+    /// [`ParserDialect`] path keep using [`Parser::new`] and thus stay
+    /// catalog-free (`host_api_metadata` `None`).
+    pub(super) fn new_with_host_catalog(
+        source: &str,
+        source_id: SourceId,
+        allow_implicit_externs: bool,
+        allow_implicit_semicolons: bool,
+        enforce_mutable_bindings: bool,
+        import_scan_mode: bool,
+        dialect: &'static dyn ParserDialect,
+        catalog: std::sync::Arc<HostApiCatalog>,
+    ) -> Result<Self, ParseError> {
+        let mut parser = Self::new(
+            source,
+            source_id,
+            allow_implicit_externs,
+            allow_implicit_semicolons,
+            enforce_mutable_bindings,
+            import_scan_mode,
+            dialect,
+        )?;
+        parser.host_api_metadata = Some(HostApiIrMetadata::new(catalog.fingerprint()));
+        parser.host_catalog = Some(catalog);
+        Ok(parser)
     }
 
     pub(super) fn new_with_predeclared_locals(
@@ -383,6 +443,16 @@ impl Parser {
 
     pub(super) fn function_impls(&self) -> HashMap<u16, FunctionImpl> {
         self.function_impls.clone()
+    }
+
+    /// Cloned host candidate metadata produced by this parse.
+    ///
+    /// `Some` (bound to the catalog fingerprint, even with zero declared host
+    /// calls) exactly when a [`HostApiCatalog`] was threaded into the parser;
+    /// `None` when parse had no catalog. The carrier holds the complete
+    /// candidate schema lists recorded per catalog-declared flat function.
+    pub(super) fn host_api_metadata(&self) -> Option<HostApiIrMetadata> {
+        self.host_api_metadata.clone()
     }
 
     pub(super) fn local_bindings(&self) -> Vec<(String, LocalSlot)> {

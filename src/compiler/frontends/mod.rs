@@ -1,8 +1,10 @@
 mod rustscript;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::compiler::source_map::{LoweredSource, SourceMap};
+use crate::host_api::HostApiCatalog;
 
 use super::{
     CompileSourceFileOptions, ParseError, ReplLocalBinding, SharedParserOptions, SourceFlavor,
@@ -75,6 +77,7 @@ fn parse_source_with_source_id_and_externs(
                 false,
                 true,
                 original_source_id,
+                options.host_api_catalog().cloned(),
             )
         }
         SourceFlavor::JavaScript | SourceFlavor::Lua => {
@@ -113,6 +116,7 @@ pub fn parse_source_with_dialect(
         options.enforce_mutable_bindings,
         options.import_scan_mode,
         dialect,
+        None,
     )
 }
 
@@ -140,16 +144,29 @@ fn parse_with_parser(
     enforce_mutable_bindings: bool,
     import_scan_mode: bool,
     dialect: &'static dyn ParserDialect,
+    host_catalog: Option<Arc<HostApiCatalog>>,
 ) -> Result<FrontendIr, ParseError> {
-    let mut parser = Parser::new(
-        source,
-        source_id,
-        allow_implicit_externs,
-        allow_implicit_semicolons,
-        enforce_mutable_bindings,
-        import_scan_mode,
-        dialect,
-    )?;
+    let mut parser = match host_catalog {
+        Some(catalog) => Parser::new_with_host_catalog(
+            source,
+            source_id,
+            allow_implicit_externs,
+            allow_implicit_semicolons,
+            enforce_mutable_bindings,
+            import_scan_mode,
+            dialect,
+            catalog,
+        )?,
+        None => Parser::new(
+            source,
+            source_id,
+            allow_implicit_externs,
+            allow_implicit_semicolons,
+            enforce_mutable_bindings,
+            import_scan_mode,
+            dialect,
+        )?,
+    };
     let stmts = parser.parse_program()?;
     Ok(FrontendIr {
         stmts,
@@ -163,7 +180,7 @@ fn parse_with_parser(
         function_sources: HashMap::new(),
         use_declarations: parser.use_declarations(),
         implicit_extern_names: parser.implicit_extern_names(),
-        host_api_metadata: None,
+        host_api_metadata: parser.host_api_metadata(),
     })
 }
 
@@ -214,6 +231,7 @@ fn parse_lowered_with_mapping(
     allow_implicit_semicolons: bool,
     enforce_mutable_bindings: bool,
     original_source_id: u32,
+    host_catalog: Option<Arc<HostApiCatalog>>,
 ) -> Result<FrontendIr, ParseError> {
     let mut source_map = SourceMap::new();
     source_map.add_source_at(original_source_id, "<source>", original_source.to_string());
@@ -227,6 +245,7 @@ fn parse_lowered_with_mapping(
         enforce_mutable_bindings,
         false,
         rustscript::parser_dialect(),
+        host_catalog,
     ) {
         Ok(mut ir) => {
             map_spans_to_original_source(
@@ -352,5 +371,113 @@ fn map_spans_to_original_source(
         {
             *span = mapped;
         }
+    }
+}
+
+#[cfg(test)]
+mod host_catalog_frontend_tests {
+    use std::sync::Arc;
+
+    use crate::compiler::CompileSourceFileOptions;
+    use crate::host_api::{
+        HostApiBuilder, HostApiCatalog, HostFunctionSchema, HostParamSchema, HostTypeSchema,
+    };
+
+    use super::{SourceFlavor, parse_source};
+
+    fn read_catalog() -> Arc<HostApiCatalog> {
+        let mut builder = HostApiBuilder::new();
+        builder.function(HostFunctionSchema::new(
+            "acme::read",
+            vec![HostParamSchema::value("path", HostTypeSchema::String)],
+        ));
+        Arc::new(builder.build().expect("test catalog must be valid"))
+    }
+
+    #[test]
+    fn empty_source_with_catalog_yields_some_matching_fingerprint_and_zero_indices() {
+        let catalog = Arc::new(HostApiCatalog::builder().build().unwrap());
+        let options =
+            CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog));
+        let ir = parse_source("", SourceFlavor::RustScript, &options).expect("parse succeeds");
+        let metadata = ir.host_api_metadata.as_ref().expect("metadata present");
+        assert_eq!(metadata.fingerprint(), catalog.fingerprint());
+        assert_eq!(metadata.function_indices().len(), 0);
+    }
+
+    #[test]
+    fn no_catalog_yields_none() {
+        let ir = parse_source(
+            "use acme; acme::read(\"x\");\n",
+            SourceFlavor::RustScript,
+            &CompileSourceFileOptions::default(),
+        )
+        .expect("parse succeeds");
+        assert!(
+            ir.host_api_metadata.is_none(),
+            "no catalog means no metadata"
+        );
+    }
+
+    #[test]
+    fn host_call_records_complete_candidate_at_its_index() {
+        let catalog = read_catalog();
+        let options =
+            CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog));
+        let ir = parse_source(
+            "use acme; acme::read(\"x\");\n",
+            SourceFlavor::RustScript,
+            &options,
+        )
+        .expect("host call parse succeeds");
+        let metadata = ir.host_api_metadata.as_ref().expect("metadata present");
+        assert_eq!(metadata.fingerprint(), catalog.fingerprint());
+        let read_decl = ir
+            .functions
+            .iter()
+            .find(|decl| decl.name == "acme::read")
+            .expect("host read decl present");
+        let candidates = metadata
+            .candidates(read_decl.index)
+            .expect("candidates recorded");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].name, "acme::read");
+        assert_eq!(candidates[0].params.len(), 1);
+        // Candidate-level: no schema preselection on the flat decl (arg
+        // schemas stay unresolved `None`, no return schema).
+        assert_eq!(
+            read_decl.arg_schemas,
+            vec![None],
+            "no candidate arg schema preselection"
+        );
+        assert_eq!(read_decl.return_type, crate::ValueType::Unknown);
+        assert!(read_decl.return_schema.is_none());
+    }
+
+    #[test]
+    fn distinct_modules_with_same_options_share_fingerprint() {
+        let catalog = read_catalog();
+        let options =
+            CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog));
+        let with_call = parse_source(
+            "use acme; acme::read(\"a\");\n",
+            SourceFlavor::RustScript,
+            &options,
+        )
+        .expect("parse succeeds");
+        let without_call = parse_source("let x = 1; x + 1;\n", SourceFlavor::RustScript, &options)
+            .expect("parse succeeds");
+        let fp1 = with_call
+            .host_api_metadata
+            .as_ref()
+            .expect("some")
+            .fingerprint();
+        let fp2 = without_call
+            .host_api_metadata
+            .as_ref()
+            .expect("some")
+            .fingerprint();
+        assert_eq!(fp1, fp2, "same options snapshot must yield one fingerprint");
+        assert_eq!(fp1, catalog.fingerprint());
     }
 }
