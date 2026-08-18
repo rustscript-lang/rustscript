@@ -129,22 +129,19 @@ impl TypeSchema {
 
     /// Whether this schema contains a host resource anywhere in its shape.
     ///
-    /// Unlike [`Self::resource_key`], which only sees a direct or single
-    /// optional resource, this walks every recursive position: optional
-    /// inners, named type arguments, array elements/tuples/rest, map values,
-    /// object field values, and callable params/result. A resource at any
-    /// depth makes the whole schema resource-containing, which callers use
-    /// for ownership / substitution decisions.
+    /// Unlike [`Self::resource_key`], which only recognizes a resource directly
+    /// or through optional wrappers, this walks every recursive position: named
+    /// type arguments, arrays/tuples/rest, map values, object field values, and
+    /// callable params/result. A resource at any depth makes the whole schema
+    /// resource-containing.
     ///
-    /// [`TypeSchema::Named`] is structural (non-nominal): the named node
-    /// itself is never a resource, but any resource-bearing type argument
-    /// makes the instantiation resource-containing. [`TypeSchema::GenericParam`]
-    /// is deliberately `false` here because whether it resolves to a resource
-    /// depends on the caller's substitution context; deferred handling belongs
-    /// to the caller.
-    // Test-only boundary surface (see compiler::typing::catalog): production
-    // is dead until the next catalog typing pass consumes it as its first
-    // resource-substitution check.
+    /// [`TypeSchema::Named`] is not itself a host resource, but any
+    /// resource-bearing type argument makes the instantiation
+    /// resource-containing. [`TypeSchema::GenericParam`] is deliberately
+    /// `false` because whether it resolves to a resource depends on the
+    /// caller's substitution context; deferred handling belongs to the caller.
+    // The catalog typing integration is the first production consumer; keep
+    // this prerequisite seam lint-clean until that pass is wired.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn contains_resource(&self) -> bool {
         match self {
