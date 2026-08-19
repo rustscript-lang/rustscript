@@ -647,3 +647,195 @@ fn close_all_reclaims_host_and_guest_owned_once_and_never_touches_taken() {
     drop(owned);
     assert_eq!(taken_drops.load(Ordering::SeqCst), 1);
 }
+
+// ---- 15. taking a guest-owned child unlinks it from its parent --------------------------
+
+#[test]
+fn take_owned_guest_owned_child_unlinks_parent_and_parent_closes() {
+    let mut table = ResourceTable::new();
+    let (parent_res, parent_begins, _parent_reasons, _parent_drops) = CountingResource::new();
+    let parent = table.push(parent_res).expect("push parent");
+    let (child_res, child_begins, _child_reasons, child_drops) = CountingResource::new();
+    let child = table.push_child(child_res, &parent).expect("push child");
+    table
+        .mark_guest_owned(child.handle())
+        .expect("mark child guest-owned");
+
+    let owned = table
+        .take_owned::<CountingResource>(child.handle())
+        .expect("take guest-owned child");
+
+    // The parent/child link was severed by the take: with no live child the
+    // parent can be closed immediately (no ResourceHasChildren).
+    assert_eq!(
+        table
+            .begin_close(parent, ResourceCloseReason::Requested)
+            .expect("parent closes after child taken"),
+        CloseProgress::Ready
+    );
+    assert_eq!(parent_begins.load(Ordering::SeqCst), 1);
+
+    // The moved-out child was never closed by the table, and drops exactly
+    // once when the transferred value is dropped.
+    assert!(table.is_empty());
+    assert_eq!(child_begins.load(Ordering::SeqCst), 0);
+    assert_eq!(child_drops.load(Ordering::SeqCst), 0);
+    drop(owned);
+    assert_eq!(child_drops.load(Ordering::SeqCst), 1);
+    assert!(table.is_empty());
+}
+
+// ---- 16. take_owned on a host-owned resource is an error and never consumes -------------
+
+#[test]
+fn take_owned_host_owned_is_not_guest_owned_and_consumes_nothing() {
+    let mut table = ResourceTable::new();
+    let (res, begins, _reasons, drops) = CountingResource::new();
+    let token = table.push(res).expect("push");
+    let handle = token.handle();
+
+    let error = table.take_owned::<CountingResource>(handle).unwrap_err();
+    assert_eq!(error.code(), ResourceErrorCode::ResourceNotGuestOwned);
+
+    // Nothing consumed: still open and still HostOwned, nothing closed or
+    // dropped.
+    assert_eq!(table.ownership(handle), Some(ResourceOwnership::HostOwned));
+    table.get(&token).expect("still open");
+    assert_eq!(table.len(), 1);
+    assert_eq!(begins.load(Ordering::SeqCst), 0);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+    // The failed take did not consume the resource: marking it guest-owned
+    // and taking again moves the value out.
+    table
+        .mark_guest_owned(handle)
+        .expect("mark after failed take");
+    let owned = table
+        .take_owned::<CountingResource>(handle)
+        .expect("take succeeds after mark");
+    assert_eq!(table.ownership(handle), Some(ResourceOwnership::Taken));
+    assert_eq!(begins.load(Ordering::SeqCst), 0);
+    drop(owned);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+// ---- 17. take after release (Pending/Closing) is already-closed; close still finishes ----
+
+#[test]
+fn take_after_release_in_closing_is_already_closed_and_close_finishes() {
+    let mut table = ResourceTable::new();
+    let (res, begins, _reasons, polls, gate) = GatedResource::new();
+    let token = table.push(res).expect("push");
+    let handle = token.handle();
+    table.mark_guest_owned(handle).expect("mark");
+
+    let outcome = table
+        .release_guest_owner(handle, OwnershipRelease::close())
+        .expect("release");
+    assert_eq!(
+        outcome,
+        GuestReleaseOutcome::Released(CloseProgress::Pending)
+    );
+    assert_eq!(begins.load(Ordering::SeqCst), 1);
+
+    // The resource is now Closing with the close pending: take is rejected as
+    // already closed and launches absolutely nothing.
+    let error = table.take_owned::<GatedResource>(handle).unwrap_err();
+    assert_eq!(error.code(), ResourceErrorCode::ResourceAlreadyClosed);
+    assert_eq!(begins.load(Ordering::SeqCst), 1);
+    assert_eq!(table.ownership(handle), Some(ResourceOwnership::GuestOwned));
+
+    // Opening the gate and continuing to poll the table finishes the pending
+    // close; the attempted take did not bork the shutdown pipeline.
+    gate.store(true, Ordering::SeqCst);
+    let mut cx = noop_context();
+    let closed = loop {
+        match table.poll_close_all(ResourceCloseReason::OwnershipRelease, &mut cx) {
+            Poll::Ready(result) => break result.expect("close finishes"),
+            Poll::Pending => {}
+        }
+    };
+    assert_eq!(closed, 1);
+    assert_eq!(begins.load(Ordering::SeqCst), 1);
+    assert!(polls.load(Ordering::SeqCst) >= 1);
+    assert!(table.is_empty());
+}
+
+// ---- 18. with_limit capacity counts live entries, not take tombstones -------------------
+
+#[test]
+fn with_limit_capacity_counts_live_entries_not_take_tombstones() {
+    let mut table = ResourceTable::with_limit(2).expect("capacity 2");
+
+    // Two push+mark+take rounds retire both slots as take tombstones. Taken
+    // slots are never reused, so their stale handles must keep reporting
+    // ResourceAlreadyTaken no matter what happens later.
+    let (res1, _begins1, _reasons1, _drops1) = CountingResource::new();
+    let token1 = table.push(res1).expect("push 1");
+    table.mark_guest_owned(token1.handle()).expect("mark 1");
+    let owned1 = table
+        .take_owned::<CountingResource>(token1.handle())
+        .expect("take 1");
+
+    let (res2, _begins2, _reasons2, _drops2) = CountingResource::new();
+    let token2 = table.push(res2).expect("push 2");
+    table.mark_guest_owned(token2.handle()).expect("mark 2");
+    let owned2 = table
+        .take_owned::<CountingResource>(token2.handle())
+        .expect("take 2");
+    assert_eq!(table.len(), 0);
+
+    // Capacity counts *live* (open/closing) entries: both taken slots are
+    // retired, so fresh pushes still succeed.
+    let (_res3, _b3, _r3, _d3) = CountingResource::new();
+    let token3 = table.push(_res3).expect("push 3 succeeds after takes");
+    let (_res4, _b4, _r4, _d4) = CountingResource::new();
+    let token4 = table.push(_res4).expect("push 4 succeeds after takes");
+    assert_eq!(table.len(), 2);
+
+    // With two live entries the capacity is exhausted: the next push fails
+    // with the structured limit error.
+    let (_res5, _b5, _r5, _d5) = CountingResource::new();
+    let error = table.push(_res5).unwrap_err();
+    assert_eq!(error.code(), ResourceErrorCode::ResourceLimitExceeded);
+    assert_eq!(table.len(), 2);
+
+    // The old taken handles never come back to life: even with the capacity
+    // pressure above, they keep reporting ResourceAlreadyTaken (the retired
+    // vs. reused distinction must not change).
+    assert_eq!(
+        table
+            .take_owned::<CountingResource>(token1.handle())
+            .unwrap_err()
+            .code(),
+        ResourceErrorCode::ResourceAlreadyTaken
+    );
+    assert_eq!(
+        table
+            .take_owned::<CountingResource>(token2.handle())
+            .unwrap_err()
+            .code(),
+        ResourceErrorCode::ResourceAlreadyTaken
+    );
+    assert_eq!(
+        table.ownership(token1.handle()),
+        Some(ResourceOwnership::Taken)
+    );
+    assert_eq!(
+        table.ownership(token2.handle()),
+        Some(ResourceOwnership::Taken)
+    );
+
+    // The two live entries still close and drain normally.
+    let closed = table
+        .close_all(ResourceCloseReason::VmReset)
+        .expect("close_all");
+    assert_eq!(closed, 2);
+    assert!(table.is_empty());
+
+    // The taken values were never closed and each dropped exactly once.
+    drop(owned1);
+    drop(owned2);
+    assert_eq!(_drops1.load(Ordering::SeqCst), 1);
+    assert_eq!(_drops2.load(Ordering::SeqCst), 1);
+}
