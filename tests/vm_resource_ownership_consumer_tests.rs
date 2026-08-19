@@ -35,8 +35,8 @@ use vm::resource::{
 };
 use vm::{
     BytecodeBuilder, CallOutcome, CallReturn, HostApiBuilder, HostFunction, HostFunctionRegistry,
-    HostFunctionSchema, HostParamPassing, HostParamSchema, HostTypeSchema, JitConfig, Program,
-    ResourceHandle, ResourceTypeKey, TypeMap, Value, Vm, VmError, VmResult, VmStatus,
+    HostFunctionSchema, HostImport, HostParamPassing, HostParamSchema, HostTypeSchema, JitConfig,
+    Program, ResourceHandle, ResourceTypeKey, TypeMap, Value, Vm, VmError, VmResult, VmStatus,
     compile_source_with_flavor_and_options,
 };
 
@@ -396,12 +396,19 @@ fn exact_host_return_marks_guest_owned() {
     assert_eq!(counters.began(), 1, "scope fallback closed it exactly once");
 }
 
-/// A structurally valid handle from a *foreign* table is rejected and the
-/// pre-call stack is untouched.
+/// A structurally valid handle from a *foreign* table is rejected by the
+/// real exact `Dynamic`/from-stack path. The call has a sentinel below its
+/// operand base, so the complete pre-call stack and frame locals must survive
+/// the ownership-transfer error.
 #[test]
-fn exact_host_return_foreign_handle_rejected_stack_unchanged() {
-    let compiled = compile_catalog_program("let r = acme::open(\"/tmp/x\"); r;\n");
-    let schema = open_import_schema(&compiled.program);
+fn exact_host_return_foreign_handle_rejected_stack_frame_unchanged() {
+    let imported = compile_catalog_program("let r = acme::open(\"/tmp/x\"); r;\n")
+        .program
+        .imports
+        .into_iter()
+        .find(|import| import.name == "acme::open")
+        .expect("open import");
+    let schema = imported.schema.clone().expect("exact schema");
     let foreign_raw = {
         let mut table = ResourceTable::new();
         let token = table.push(CountingResource {
@@ -428,7 +435,32 @@ fn exact_host_return_foreign_handle_rejected_stack_unchanged() {
         })
         .expect("register exact");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0); // observable sentinel below the host argument
+    bc.ldc(1); // host argument
+    bc.call(0, 1);
+    bc.ret();
+    let sentinel = Value::Int(0x5E71_1E3);
+    let argument = Value::Int(7);
+    let program = Program::with_imports_and_debug(
+        vec![sentinel.clone(), argument.clone()],
+        bc.finish(),
+        vec![HostImport {
+            name: imported.name,
+            arity: 1,
+            return_type: imported.return_type,
+            schema: imported.schema,
+        }],
+        None,
+    )
+    .with_local_count(1);
+    let mut vm = Vm::new(program);
+    vm.set_local(0, Value::Int(0x10_CA_11))
+        .expect("set frame local");
+    let stack_before = vec![sentinel, argument];
+    let locals_before = vm.locals().to_vec();
+    let call_depth_before = vm.call_depth();
+
     registry.bind_vm_cached(&mut vm).expect("bind");
     let error = vm
         .run()
@@ -438,7 +470,21 @@ fn exact_host_return_foreign_handle_rejected_stack_unchanged() {
         message.contains("ownership transfer failed"),
         "expected structured ownership transfer failure, got: {error}"
     );
-    assert!(vm.stack().is_empty(), "failed return must not push");
+    assert_eq!(
+        vm.stack(),
+        stack_before.as_slice(),
+        "ownership-transfer failure must restore the complete pre-call operand stack"
+    );
+    assert_eq!(
+        vm.locals(),
+        locals_before.as_slice(),
+        "ownership-transfer failure must preserve the active frame locals"
+    );
+    assert_eq!(
+        vm.call_depth(),
+        call_depth_before,
+        "ownership-transfer failure must restore the active call depth"
+    );
 }
 
 /// A legacy `schema:None` host return keeps the old behavior: no ownership

@@ -2064,7 +2064,11 @@ impl Vm {
                 // before any stack mutation. A structurally valid handle that
                 // is foreign/stale/already-guest/taken/closing is a structured
                 // error that leaves the pre-call stack untouched.
-                self.transfer_exact_host_return_ownership(&values, exact_policy)?;
+                if let Err(error) = self.transfer_exact_host_return_ownership(&values, exact_policy)
+                {
+                    self.instance.stack = saved_stack;
+                    return Err(error);
+                }
                 saved_stack.truncate(arg_start);
                 saved_stack.append(&mut host_stack);
                 values.push_onto_stack(&mut saved_stack);

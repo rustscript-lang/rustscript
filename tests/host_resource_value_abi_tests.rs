@@ -30,8 +30,7 @@ use vm::{
     BytecodeBuilder, CallOutcome, CallReturn, HostApiBuilder, HostArgsFunction, HostFunction,
     HostFunctionRegistry, HostFunctionSchema, HostImport, HostOpId, HostParamSchema,
     HostStackFunction, HostTypeSchema, JitConfig, Program, ResourceHandle, ResourceTypeKey,
-    ResourceTypeSchema, Value, ValueType, Vm, VmError, VmStatus,
-    compile_source_with_flavor_and_options,
+    ResourceTypeSchema, Value, Vm, VmError, VmStatus, compile_source_with_flavor_and_options,
 };
 
 // ---- tiny test resource ---------------------------------------------------
@@ -85,13 +84,24 @@ fn catalog() -> std::sync::Arc<vm::HostApiCatalog> {
     builder.function(HostFunctionSchema::with_return(
         "acme::maybe",
         vec![HostParamSchema::value("v", HostTypeSchema::Int)],
-        HostTypeSchema::Optional(Box::new(HostTypeSchema::Resource(file))),
+        HostTypeSchema::Optional(Box::new(HostTypeSchema::Resource(file.clone()))),
     ));
     // A non-resource exact schema (plain Int return): must keep the legacy
     // policy so exact non-resource imports do not regress.
     builder.function(HostFunctionSchema::with_return(
         "acme::ping2",
         vec![HostParamSchema::value("v", HostTypeSchema::Int)],
+        HostTypeSchema::Int,
+    ));
+    // An exact plain-Int return whose parameter carries a resource schema:
+    // this is the regression target for the JIT non-yielding filter.
+    builder.function(HostFunctionSchema::with_return(
+        "acme::resource_arg",
+        vec![HostParamSchema::with_passing(
+            "f",
+            HostTypeSchema::Resource(file),
+            vm::HostParamPassing::Borrow,
+        )],
         HostTypeSchema::Int,
     ));
     std::sync::Arc::new(builder.build().expect("catalog must build"))
@@ -124,6 +134,79 @@ fn compiled_ping_import() -> vm::HostImport {
         TypeSchema::Resource(io_file_key())
     );
     import
+}
+
+/// The compiled exact plain-Int control import.
+fn compiled_ping2_import() -> vm::HostImport {
+    let compiled = compile_catalog_program("acme::ping2(7);\n");
+    compiled
+        .program
+        .imports
+        .into_iter()
+        .find(|import| import.name == "acme::ping2")
+        .expect("ping2 import")
+}
+
+/// The compiled exact import whose parameter carries `Resource` while its
+/// return remains a plain `Int`.
+fn compiled_resource_arg_import() -> vm::HostImport {
+    let compiled = compile_catalog_program("let r = acme::ping(7);\nacme::resource_arg(&r);\n");
+    let import = compiled
+        .program
+        .imports
+        .into_iter()
+        .find(|import| import.name == "acme::resource_arg")
+        .expect("resource_arg import");
+    let schema = import.schema.as_ref().expect("exact schema");
+    assert_eq!(schema.return_type, TypeSchema::Int);
+    assert!(
+        schema
+            .params
+            .iter()
+            .any(|param| matches!(param.schema, TypeSchema::Resource(_))),
+        "resource_arg must carry a resource parameter schema"
+    );
+    import
+}
+
+/// Builds a hot loop that calls one exact one-argument import with a constant,
+/// then advances an Int-only local counter. No local has an owned-resource
+/// schema, so the global owned-local JIT gate cannot suppress the import test.
+fn exact_import_loop_program(import: &vm::HostImport, argument: i64) -> vm::Program {
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.stloc(0);
+    let root = bc.position();
+    bc.ldc(1);
+    bc.call(0, 1);
+    bc.pop();
+    bc.ldloc(0);
+    bc.ldc(2);
+    bc.add();
+    bc.stloc(0);
+    bc.ldloc(0);
+    bc.ldc(3);
+    bc.ceq();
+    bc.brfalse(root);
+    bc.ret();
+
+    Program::with_imports_and_debug(
+        vec![
+            Value::Int(0),
+            Value::Int(argument),
+            Value::Int(1),
+            Value::Int(4),
+        ],
+        bc.finish(),
+        vec![HostImport {
+            name: import.name.clone(),
+            arity: 1,
+            return_type: import.return_type,
+            schema: import.schema.clone(),
+        }],
+        None,
+    )
+    .with_local_count(1)
 }
 
 /// Pushes one real resource into the VM's execution scope and returns the raw
@@ -167,6 +250,16 @@ fn static_reject_return(args: &[Value]) -> vm::VmResult<CallOutcome> {
     Ok(CallOutcome::Return(CallReturn::One(Value::Int(
         REJECT_RETURN.load(Ordering::SeqCst),
     ))))
+}
+
+fn static_plain_int_return(_args: &[Value]) -> vm::VmResult<CallOutcome> {
+    Ok(CallOutcome::Return(CallReturn::One(Value::Int(0))))
+}
+
+fn static_resource_arg_return(_args: &[Value]) -> vm::VmResult<CallOutcome> {
+    // The exact return schema is plain Int, so no resource-return ownership
+    // transfer is involved in this filter regression.
+    Ok(CallOutcome::Return(CallReturn::One(Value::Int(0))))
 }
 
 fn bind_ping_static_non_yielding_factory(
@@ -424,52 +517,22 @@ fn native_jit_supported() -> bool {
             && (cfg!(target_os = "linux") || cfg!(target_os = "macos")))
 }
 
-/// A non-resource non-yielding host import stays native-eligible: recorded
-/// traces lower a native `host_call` op (no resource-bearing schema).
+/// A plain-Int exact non-yielding host import stays native-eligible: recorded
+/// traces lower a native `host_call` op.
 #[test]
 fn nonresource_nonyielding_import_remains_native_eligible() {
     if !native_jit_supported() {
         return;
     }
-    // Loop program calling import #0 (a plain Int-returning non-yielding host).
-    // The host's return is discarded (`pop`) so the loop counter in local 0 is
-    // independent of the RNG-free host result and the loop terminates.
-    let mut bc = BytecodeBuilder::new();
-    bc.ldc(0);
-    bc.stloc(0);
-    let root = bc.position();
-    bc.ldloc(0);
-    bc.call(0, 1);
-    bc.pop();
-    bc.ldloc(0);
-    bc.ldc(1);
-    bc.add();
-    bc.stloc(0);
-    bc.ldloc(0);
-    // constant index 2 == value 4 (constants: [0, 1, 4]).
-    bc.ldc(2);
-    bc.ceq();
-    bc.brfalse(root);
-    bc.ret();
-
-    let import = HostImport {
-        name: "acme::int_host".into(),
-        arity: 1,
-        return_type: ValueType::Int,
-        schema: None, // legacy, non-resource
-    };
-    let program = Program::with_imports_and_debug(
-        vec![Value::Int(0), Value::Int(1), Value::Int(4)],
-        bc.finish(),
-        vec![import],
-        None,
-    )
-    .with_local_count(1);
+    let import = compiled_ping2_import();
+    let schema = import.schema.clone().expect("exact schema");
+    assert_eq!(schema.return_type, TypeSchema::Int);
+    let program = exact_import_loop_program(&import, 7);
 
     let mut registry = HostFunctionRegistry::new();
-    registry.register_static_non_yielding_args("acme::int_host", 1, |args| {
-        Ok(CallOutcome::Return(CallReturn::One(args[0].clone())))
-    });
+    registry
+        .register_exact_static_non_yielding_args(&import.name, 1, schema, static_plain_int_return)
+        .expect("register exact plain-Int non-yielding import");
     let mut vm = Vm::new(program);
     registry.bind_vm_cached(&mut vm).expect("bind");
     vm.set_jit_config(JitConfig {
@@ -480,59 +543,47 @@ fn nonresource_nonyielding_import_remains_native_eligible() {
 
     let status = run_vm(&mut vm).expect("loop should run");
     assert_eq!(status, VmStatus::Halted);
+    let snapshot = vm.jit_snapshot();
     assert!(
-        vm.jit_native_trace_count() > 0,
-        "non-resource non-yielding import must stay native eligible:\n{}",
+        snapshot
+            .traces
+            .iter()
+            .any(|trace| trace.op_names().iter().any(|op| op == "host_call")),
+        "plain non-resource exact ArgsStaticNonYielding must stay native eligible:\n{}",
         vm.dump_jit_info()
     );
 }
 
-/// A resource-bearing exact host import is never marked non-yielding native
-/// eligible: the loop still exits to the interpreter and executes correctly,
-/// and no native trace lowers a `host_call` for it.
+/// An exact `ArgsStaticNonYielding` import whose parameter schema contains a
+/// resource, but whose return is plain `Int`, must stay out of the native
+/// scalar host-call set. The loop has only an Int local; a real structurally
+/// valid raw handle is supplied as the constant argument so the owned-local
+/// program gate cannot hide a broken schema filter.
 #[test]
-fn resource_import_is_not_native_eligible_and_trace_exits() {
-    // Loop program calling import #0 (an exact `Resource`-returning
-    // non-yielding host). The host's return is discarded (`pop`); only the
-    // interpreter path validates it, so the loop terminates on its own counter.
-    let mut bc = BytecodeBuilder::new();
-    bc.ldc(0);
-    bc.stloc(0);
-    let root = bc.position();
-    bc.ldloc(0);
-    bc.call(0, 1);
-    bc.pop();
-    bc.ldloc(0);
-    bc.ldc(1);
-    bc.add();
-    bc.stloc(0);
-    bc.ldloc(0);
-    // constant index 2 == value 4 (constants: [0, 1, 4]).
-    bc.ldc(2);
-    bc.ceq();
-    bc.brfalse(root);
-    bc.ret();
-
-    let imported = compiled_ping_import();
+fn resource_param_plain_int_import_is_not_native_eligible_and_trace_exits() {
+    if !native_jit_supported() {
+        return;
+    }
+    let imported = compiled_resource_arg_import();
     let schema = imported.schema.clone().expect("exact schema");
-    let program = Program::with_imports_and_debug(
-        vec![Value::Int(0), Value::Int(1), Value::Int(4)],
-        bc.finish(),
-        vec![HostImport {
-            name: imported.name.clone(),
-            arity: 1,
-            return_type: imported.return_type,
-            schema: Some(schema.clone()),
-        }],
-        None,
-    )
-    .with_local_count(1);
+    assert_eq!(schema.return_type, TypeSchema::Int);
+    assert!(
+        schema
+            .params
+            .iter()
+            .any(|param| matches!(param.schema, TypeSchema::Resource(_)))
+    );
+    let program = exact_import_loop_program(&imported, real_handle_value());
 
     let mut registry = HostFunctionRegistry::new();
-    let import_name = imported.name.clone();
     registry
-        .register_exact(&import_name, 1, schema, || Box::new(VmScopeHandleHost))
-        .expect("register resource exact dynamic");
+        .register_exact_static_non_yielding_args(
+            &imported.name,
+            1,
+            schema,
+            static_resource_arg_return,
+        )
+        .expect("register exact resource-parameter non-yielding import");
     let mut vm = Vm::new(program);
     registry.bind_vm_cached(&mut vm).expect("bind");
     vm.set_jit_config(JitConfig {
@@ -541,25 +592,17 @@ fn resource_import_is_not_native_eligible_and_trace_exits() {
         max_trace_len: 1_024,
     });
 
-    let status = run_vm(&mut vm).expect("resource loop must execute correctly");
+    let status = run_vm(&mut vm).expect("resource-parameter loop must execute correctly");
     assert_eq!(status, VmStatus::Halted);
-
-    if native_jit_supported() {
-        // The eligibility guard must prevent a native non-yielding lowering:
-        // either no native trace was recorded, or none of them inline a
-        // `host_call` (the trace exits to the interpreter at the call).
-        let snapshot = vm.jit_snapshot();
-        let host_call_traces = snapshot
+    let snapshot = vm.jit_snapshot();
+    assert!(
+        snapshot
             .traces
             .iter()
-            .filter(|trace| trace.op_names().iter().any(|op| op == "host_call"))
-            .collect::<Vec<_>>();
-        assert!(
-            host_call_traces.is_empty(),
-            "resource import must not be lowered as a native host_call:\n{}",
-            vm.dump_jit_info()
-        );
-    }
+            .all(|trace| !trace.op_names().iter().any(|op| op == "host_call")),
+        "resource-bearing exact schema must not enter the native host-call set:\n{}",
+        vm.dump_jit_info()
+    );
 }
 
 // ---- 4. async Pending completion (F1) --------------------------------------
