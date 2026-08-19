@@ -23,9 +23,11 @@ pub mod vmbc;
 
 pub use assembler::{AsmParseError, Assembler, AssemblerError, BytecodeBuilder, assemble};
 #[cfg(feature = "runtime")]
-pub use builtins::runtime::HostCallResult;
-#[cfg(feature = "runtime")]
 pub use builtins::runtime::print::{PrintHostFunction, PrintlnHostFunction, format_value};
+#[cfg(feature = "runtime")]
+pub use builtins::runtime::{
+    BorrowVmValue, FromVmValue, HostCallResult, TakeVmValue, arg, borrow_arg, take_arg,
+};
 #[cfg(feature = "http-client")]
 pub use builtins::runtime::{HttpConfig, HttpHostExt};
 #[cfg(feature = "runtime")]

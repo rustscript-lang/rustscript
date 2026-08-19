@@ -53,11 +53,15 @@ pub use io::{IoHostExt, IoPolicy};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SqliteHostExt, SqliteLimits, SqlitePolicy};
 pub use typed::HostCallResult;
+// Typed argument decoders used by `#[pd_host_function]`-generated wrappers.
+// Re-exported through `builtins::runtime` (and the crate root) so host SDK
+// adapters outside the builtin modules can decode by reference / by take.
 #[allow(unused_imports)]
 use typed::{
     AnyValue, IntoBuiltinCallOutcome, IntoHostCallOutcome, NumberValue, UnknownValue, VmArray,
-    VmBytes, VmCallable, VmMap, arg, borrow_arg, return_none, return_one, take_arg,
+    VmBytes, VmCallable, VmMap, return_none, return_one,
 };
+pub use typed::{BorrowVmValue, FromVmValue, TakeVmValue, arg, borrow_arg, take_arg};
 
 pub(crate) enum BuiltinCallOutcome {
     Return(CallReturn),

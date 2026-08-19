@@ -1,0 +1,11 @@
+error: resource type key must not be empty
+ --> tests/ui/pd_host_resource_key_empty.rs:6:66
+  |
+6 |     #[pd_host_param(passing = "take_owned", key = "")] resource: FakeResource,
+  |                                                                  ^^^^^^^^^^^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+ --> tests/ui/pd_host_resource_key_empty.rs:9:2
+  |
+9 | }
+  |  ^ consider adding a `main` function to `$DIR/tests/ui/pd_host_resource_key_empty.rs`

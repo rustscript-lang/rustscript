@@ -1,0 +1,11 @@
+error: resource type key is 129 bytes; the maximum is 128
+  --> tests/ui/pd_host_resource_key_overlong.rs:10:15
+   |
+10 |     resource: FakeResource,
+   |               ^^^^^^^^^^^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+  --> tests/ui/pd_host_resource_key_overlong.rs:13:2
+   |
+13 | }
+   |  ^ consider adding a `main` function to `$DIR/tests/ui/pd_host_resource_key_overlong.rs`

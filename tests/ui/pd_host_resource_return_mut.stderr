@@ -1,0 +1,11 @@
+error: ResourceMut cannot be a host function return; mutable resource borrows cannot cross the host boundary
+ --> tests/ui/pd_host_resource_return_mut.rs:5:21
+  |
+5 | fn f(value: i64) -> ResourceMut<'_, FakeResource> {
+  |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+ --> tests/ui/pd_host_resource_return_mut.rs:7:2
+  |
+7 | }
+  |  ^ consider adding a `main` function to `$DIR/tests/ui/pd_host_resource_return_mut.rs`

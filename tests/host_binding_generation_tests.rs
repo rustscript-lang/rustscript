@@ -423,3 +423,171 @@ fn vm_host_core_does_not_name_builtin_subsystem_policies() {
         assert!(!host.contains(forbidden), "Vm API leaked {forbidden}");
     }
 }
+
+// ---- resource catalog scanner -----------------------------------------------
+//
+// These tests run the *real* build-script scanner (`parse_callable_params`,
+// `type_label` — the same functions build.rs uses to build the published
+// catalog) over resource-bearing `pd_host_function` signatures and check that
+// the ordered label/schema/passing descriptor it computes is byte-for-byte the
+// one the shared `pd-host-schema` rules give the proc macro. The same fixtures
+// are exercised on the macro side by `pd-host-function`'s own unit tests and by
+// `tests/host_resource_macro_tests.rs`, so the two expansion paths cannot
+// drift.
+
+mod resource_catalog_scanner {
+    use super::*;
+    use build_script::{parse_callable_params, type_label};
+    use pd_host_schema::{HostPassing, RESOURCE_SCHEMA_LABEL, resource_spec};
+    use syn::FnArg;
+
+    fn canonical_inputs<'a>(function: &'a syn::ItemFn) -> impl Iterator<Item = &'a syn::PatType> {
+        function.sig.inputs.iter().filter_map(|input| match input {
+            FnArg::Typed(pat_type) => Some(pat_type),
+            FnArg::Receiver(_) => None,
+        })
+    }
+
+    #[test]
+    fn build_scanner_descriptor_matches_shared_proc_macro_resource_rules() {
+        let fixtures: Vec<syn::ItemFn> = vec![
+            parse_quote!(
+                #[pd_host_function(name = "test::a")]
+                /// A prefix ordinary argument before a borrowed resource.
+                fn f(prefix: i64, r: ResourceRef<'_, FakeResource>) -> i64 {
+                    todo!()
+                }
+            ),
+            parse_quote!(
+                #[pd_host_function(name = "test::b")]
+                /// Ordinary and resource arguments interleaved.
+                fn f(
+                    prefix: i64,
+                    r: ResourceMut<'_, FakeResource>,
+                    n: i64,
+                    m: ResourceOwned<FakeResource>,
+                ) -> i64 {
+                    todo!()
+                }
+            ),
+            parse_quote!(
+                #[pd_host_function(name = "test::c")]
+                /// An explicitly annotated resource parameter.
+                fn f(
+                    #[pd_host_param(passing = "take_owned", key = "test.fake")] r: FakeResource,
+                    n: i64,
+                ) -> i64 {
+                    todo!()
+                }
+            ),
+        ];
+
+        for fixture in &fixtures {
+            let scanned = parse_callable_params(fixture);
+            let mut scanned = scanned.iter();
+            for pat_type in canonical_inputs(fixture) {
+                let Some(build_param) = scanned.next() else {
+                    panic!("scanner produced fewer parameters than the signature");
+                };
+                match resource_spec(&pat_type.ty, &pat_type.attrs) {
+                    Ok(Some(spec)) => {
+                        assert_eq!(
+                            build_param.ty_label, RESOURCE_SCHEMA_LABEL,
+                            "resource schema label must match the proc macro"
+                        );
+                        assert_eq!(
+                            build_param.passing,
+                            spec.mode.host_passing(),
+                            "resource passing must match the proc macro for '{}'",
+                            build_param.name
+                        );
+                        assert_eq!(
+                            build_param.resource_key.as_deref(),
+                            spec.key.as_deref(),
+                            "resource key must match the proc macro"
+                        );
+                    }
+                    Ok(None) => {
+                        assert_eq!(
+                            build_param.passing,
+                            HostPassing::Value,
+                            "ordinary parameter passing must stay Value"
+                        );
+                    }
+                    Err(message) => panic!("fixture must parse cleanly: {message}"),
+                }
+            }
+            assert!(
+                scanned.next().is_none(),
+                "scanner produced more parameters than the signature"
+            );
+        }
+    }
+
+    #[test]
+    fn resource_returns_get_the_resource_label_discoverable_by_the_scanner() {
+        let owned: syn::Type = parse_quote!(Resource<FakeResource>);
+        assert_eq!(type_label(&owned), RESOURCE_SCHEMA_LABEL);
+        let borrowed: syn::Type = parse_quote!(ResourceRef<'_, FakeResource>);
+        assert_eq!(type_label(&borrowed), RESOURCE_SCHEMA_LABEL);
+        let mutable: syn::Type = parse_quote!(ResourceMut<'_, FakeResource>);
+        assert_eq!(type_label(&mutable), RESOURCE_SCHEMA_LABEL);
+
+        let result = std::panic::catch_unwind(|| {
+            let input_only: syn::Type = parse_quote!(ResourceOwned<FakeResource>);
+            type_label(&input_only)
+        });
+        assert!(
+            result.is_err(),
+            "ResourceOwned is an input-only TakeOwned wrapper"
+        );
+    }
+
+    #[test]
+    fn shared_key_validation_agrees_with_runtime_resource_type_key() {
+        use pd_host_schema::validate_resource_key;
+        let cases: &[&str] = &[
+            "io.file",
+            "file",
+            "a-b.c_0",
+            "0host",
+            "",
+            "io..file",
+            ".x",
+            "x.",
+            "A.b",
+            "bad key",
+            "very_long_namespace.",
+        ];
+        for case in cases {
+            let shared = validate_resource_key(case);
+            let runtime = vm::ResourceTypeKey::new(*case).map(|_| ());
+            match (shared, runtime) {
+                (Ok(()), Ok(())) => {}
+                (Err(_), Err(_)) => {}
+                (Ok(()), Err(error)) => {
+                    panic!("shared accepts but runtime rejects {case:?}: {error}")
+                }
+                (Err(error), Ok(())) => {
+                    panic!("runtime accepts but shared rejects {case:?}: {error}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_resource_keys_fail_the_build_scanner_at_build_time() {
+        let fixture: syn::ItemFn = parse_quote!(
+            #[pd_host_function(name = "test::bad")]
+            /// An invalid explicit key must fail the build scanner.
+            fn f(#[pd_host_param(passing = "take_owned", key = "bad key")] r: FakeResource) -> i64 {
+                todo!()
+            }
+        );
+        let result = std::panic::catch_unwind(|| parse_callable_params(&fixture));
+        assert!(
+            result.is_err(),
+            "an invalid resource key must fail at build time, not at runtime"
+        );
+    }
+}

@@ -1,0 +1,11 @@
+error: #[pd_host_function] does not support generic host functions; the adapter requires concrete parameter and return types
+ --> tests/ui/pd_host_function_generic.rs:5:5
+  |
+5 | fn f<T>(resource: ResourceOwned<T>) -> i64 {
+  |     ^^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+ --> tests/ui/pd_host_function_generic.rs:7:2
+  |
+7 | }
+  |  ^ consider adding a `main` function to `$DIR/tests/ui/pd_host_function_generic.rs`

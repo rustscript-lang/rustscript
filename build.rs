@@ -22,10 +22,16 @@ struct SourceSpec {
 }
 
 #[derive(Clone, Debug)]
-struct CallableParamDecl {
-    name: String,
-    ty_label: String,
-    optional: bool,
+pub(crate) struct CallableParamDecl {
+    pub(crate) name: String,
+    pub(crate) ty_label: String,
+    pub(crate) optional: bool,
+    /// Catalog host-parameter passing for this parameter. Ordinary parameters
+    /// are `HostPassing::Value`; resource parameters carry the passing mode the
+    /// proc macro computes from the canonical wrapper or `pd_host_param`.
+    pub(crate) passing: pd_host_schema::HostPassing,
+    /// Validated `key = "..."` literal for a resource parameter, if declared.
+    pub(crate) resource_key: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -199,6 +205,9 @@ fn main() {
     validate_known_language_builtins(&core_callables);
     validate_wrapper_shapes(&host_callables, SourceCategory::DefaultHost);
     validate_wrapper_shapes(&builtin_callables, SourceCategory::NamespacedBuiltin);
+    validate_no_coarse_resource_callables(&host_callables, SourceCategory::DefaultHost);
+    validate_no_coarse_resource_callables(&builtin_callables, SourceCategory::NamespacedBuiltin);
+    validate_no_coarse_resource_callables(&metadata_callables, SourceCategory::MetadataOnlyBuiltin);
 
     write_generated_file(
         &out_dir.join("builtin_catalog_generated.rs"),
@@ -745,6 +754,36 @@ fn validate_optional_param_layout(callable: &CallableDecl) {
                 "callable '{}' has a required parameter after an optional parameter",
                 callable.name
             );
+        }
+    }
+}
+
+/// Rejects resource parameters in any callable that reaches the *published*
+/// coarse builtin catalog.
+///
+/// The build script's coarse `CallableSignature` model carries only a schema
+/// label, not a resource key or passing mode; a resource host function can
+/// only be bound through the exact-schema (`HostFunctionRegistry`) path. Rather
+/// than emitting silently-wrong metadata (or a fake builtin) for one, any
+/// discovered resource parameter fails the build with a clear message. The
+/// descriptor parsing itself is exercised directly by the build-scanner tests,
+/// which feed real `pd_host_function` signatures through `parse_callable_params`.
+fn validate_no_coarse_resource_callables(callables: &[CallableDecl], category: SourceCategory) {
+    for callable in callables {
+        for param in &callable.params {
+            if param.passing != pd_host_schema::HostPassing::Value {
+                let key_hint = param
+                    .resource_key
+                    .as_deref()
+                    .map(|key| format!(" with key {key:?}"))
+                    .unwrap_or_default();
+                panic!(
+                    "callable '{}' ({category:?}) takes resource parameter '{}' with passing {}{key_hint}; \
+                     resource host functions cannot be represented in the published coarse builtin \
+                     catalog, bind them through exact host-function schemas instead",
+                    callable.name, param.name, param.passing
+                );
+            }
         }
     }
 }
@@ -1963,7 +2002,7 @@ fn generated_wrapper_decl(function: &ItemFn) -> WrapperDecl {
     }
 }
 
-fn parse_callable_params(function: &ItemFn) -> Vec<CallableParamDecl> {
+pub(crate) fn parse_callable_params(function: &ItemFn) -> Vec<CallableParamDecl> {
     function
         .sig
         .inputs
@@ -1985,11 +2024,34 @@ fn parse_callable_params(function: &ItemFn) -> Vec<CallableParamDecl> {
             let Pat::Ident(ident) = pat_type.pat.as_ref() else {
                 panic!("callable parameters must use identifier patterns");
             };
-            let (ty_label, optional) = param_type_label(&pat_type.ty);
+            // Resource parameters go through the same canonical rules as the
+            // proc macro (`pd-host-schema`), so the build script's label and
+            // passing descriptors can never drift from the generated adapter.
+            let (ty_label, optional, passing, resource_key) = match pd_host_schema::resource_spec(
+                &pat_type.ty,
+                &pat_type.attrs,
+            ) {
+                Ok(Some(spec)) => (
+                    pd_host_schema::RESOURCE_SCHEMA_LABEL.to_string(),
+                    false,
+                    spec.mode.host_passing(),
+                    spec.key,
+                ),
+                Ok(None) => {
+                    let (ty_label, optional) = param_type_label(&pat_type.ty);
+                    (ty_label, optional, pd_host_schema::HostPassing::Value, None)
+                }
+                Err(message) => panic!(
+                    "invalid resource parameter in #[pd_host_function] declaration '{}': {message}",
+                    function.sig.ident
+                ),
+            };
             Some(CallableParamDecl {
                 name: ident.ident.to_string(),
                 ty_label,
                 optional,
+                passing,
+                resource_key,
             })
         })
         .collect()
@@ -2134,6 +2196,15 @@ pub(crate) fn type_label(ty: &Type) -> String {
                 "Array" | "VmArray" | "VmArrayRef" | "VmArrayHandle" => "array".to_string(),
                 "Map" | "VmMap" | "VmMapRef" | "VmMapHandle" => "map".to_string(),
                 "Number" | "NumberValue" => "number".to_string(),
+                // Resource wrappers. The `Resource<T>` owned handle and the
+                // `ResourceRef`/`ResourceMut` borrows all carry the same coarse
+                // `resource` label; the passing mode distinguishes them (see
+                // `parse_callable_params`). `ResourceOwned` is input-only.
+                "Resource" => pd_host_schema::RESOURCE_SCHEMA_LABEL.to_string(),
+                "ResourceRef" | "ResourceMut" => pd_host_schema::RESOURCE_SCHEMA_LABEL.to_string(),
+                "ResourceOwned" => {
+                    panic!("ResourceOwned is an input-only TakeOwned wrapper")
+                }
                 "VmCallable" => callable_type_label(segment),
                 "Unknown" | "UnknownValue" => "unknown".to_string(),
                 "CallOutcome" => "unknown".to_string(),

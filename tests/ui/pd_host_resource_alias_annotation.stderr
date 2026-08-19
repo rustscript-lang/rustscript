@@ -1,0 +1,11 @@
+error: resource passing metadata on an alias/unqualified wrapper path is not supported; use a canonical ResourceRef, ResourceMut, or ResourceOwned wrapper or a bare concrete resource type
+ --> tests/ui/pd_host_resource_alias_annotation.rs:6:52
+  |
+6 |     #[pd_host_param(passing = "borrow")] resource: my_alias::Wrapper<'static, FakeResource>,
+  |                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+ --> tests/ui/pd_host_resource_alias_annotation.rs:9:2
+  |
+9 | }
+  |  ^ consider adding a `main` function to `$DIR/tests/ui/pd_host_resource_alias_annotation.rs`

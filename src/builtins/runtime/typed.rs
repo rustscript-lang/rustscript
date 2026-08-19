@@ -72,7 +72,7 @@ pub(super) fn missing_arg(label: &str) -> VmError {
     VmError::HostError(format!("missing argument: {label}"))
 }
 
-pub(super) trait BorrowVmValue<'a>: Sized {
+pub trait BorrowVmValue<'a>: Sized {
     fn borrow_vm_value(value: &'a Value, label: &str) -> VmResult<Self>;
 
     fn from_missing_arg(label: &str) -> VmResult<Self> {
@@ -80,7 +80,7 @@ pub(super) trait BorrowVmValue<'a>: Sized {
     }
 }
 
-pub(super) trait FromVmValue<'a>: Sized {
+pub trait FromVmValue<'a>: Sized {
     fn from_vm_value(value: &'a Value, label: &str) -> VmResult<Self>;
 
     fn from_missing_arg(label: &str) -> VmResult<Self> {
@@ -101,7 +101,7 @@ where
     }
 }
 
-pub(super) trait TakeVmValue: Sized {
+pub trait TakeVmValue: Sized {
     fn take_vm_value(slot: &mut Value, label: &str) -> VmResult<Self>;
 
     fn from_missing_arg(label: &str) -> VmResult<Self> {
@@ -109,7 +109,7 @@ pub(super) trait TakeVmValue: Sized {
     }
 }
 
-pub(super) fn borrow_arg<'a, T>(args: &'a [Value], index: usize, label: &str) -> VmResult<T>
+pub fn borrow_arg<'a, T>(args: &'a [Value], index: usize, label: &str) -> VmResult<T>
 where
     T: BorrowVmValue<'a>,
 {
@@ -119,14 +119,14 @@ where
     }
 }
 
-pub(super) fn arg<'a, T>(args: &'a [Value], index: usize, label: &str) -> VmResult<T>
+pub fn arg<'a, T>(args: &'a [Value], index: usize, label: &str) -> VmResult<T>
 where
     T: BorrowVmValue<'a>,
 {
     borrow_arg(args, index, label)
 }
 
-pub(super) fn take_arg<T>(args: &mut [Value], index: usize, label: &str) -> VmResult<T>
+pub fn take_arg<T>(args: &mut [Value], index: usize, label: &str) -> VmResult<T>
 where
     T: TakeVmValue,
 {
@@ -482,6 +482,17 @@ impl IntoVmValue for NumberValue {
             NumberValue::Int(value) => Value::Int(value),
             NumberValue::Float(value) => Value::Float(value),
         }
+    }
+}
+
+/// An owned `Resource<T>` handle token converts to its raw `Value::Int` handle.
+/// Only the owning wrapper may cross the host boundary; `ResourceRef`/`ResourceMut`
+/// borrows are rejected at the proc-macro layer precisely so a borrow can never
+/// be smuggled out of the host call. The conversion itself is a handle -> Int
+/// projection, so it needs no `HostResource` bound.
+impl<T> IntoVmValue for crate::vm::resource::Resource<T> {
+    fn into_vm_value(self) -> Value {
+        self.into_handle().as_value()
     }
 }
 

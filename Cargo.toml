@@ -5,6 +5,7 @@ members = [
     "pd-vm-nostd",
     "pd-vm-wasm",
     "crates/rustscript",
+    "crates/pd-host-schema",
 ]
 resolver = "2"
 
@@ -103,6 +104,8 @@ futures-util = "0.3"
 rcgen = "0.13"
 syn = { version = "2", features = ["full"] }
 tokio = { version = "1", features = ["macros", "rt", "time", "sync"] }
+trybuild = "1"
+pd-host-schema = { path = "./crates/pd-host-schema" }
 
 [[test]]
 name = "host_binding_generation_tests"
@@ -153,3 +156,4 @@ required-features = ["runtime"]
 
 [build-dependencies]
 syn = { version = "2", features = ["full"] }
+pd-host-schema = { path = "./crates/pd-host-schema" }
