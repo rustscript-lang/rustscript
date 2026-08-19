@@ -3,9 +3,12 @@ use std::collections::{HashMap, HashSet};
 
 use crate::builtins::BuiltinFunction;
 use crate::bytecode::CaptureBindingMode;
+use crate::host_api::HostParamPassing;
 
 use super::super::ParseError;
-use super::super::ir::{ClosureExpr, Expr, FrontendIr, FunctionImpl, LocalSlot, Stmt};
+use super::super::ir::{
+    ClosureExpr, Expr, FrontendIr, FunctionImpl, LocalSlot, ResolvedHostCall, Stmt,
+};
 use super::EntryLocalAvailability;
 use super::liveness::{LivenessRewriter, LocalSlotAllocator, persistent_capture_slots};
 mod captures;
@@ -104,7 +107,15 @@ pub(super) fn enforce_local_availability(
     entry_locals: &[EntryLocalAvailability],
     clear_dead_locals: bool,
     enable_local_move_semantics: bool,
+    owned_local_slots: &[bool],
 ) -> Result<FrontendIr, ParseError> {
+    // Pad the post-legalize ownership metadata to the analyzer's local space.
+    // Availability runs pre-compaction, so the logical slot indices align with
+    // the schemas the typing pass recorded.
+    let mut owned_slots = vec![false; ir.locals];
+    for (slot, is_owned) in owned_local_slots.iter().enumerate().take(ir.locals) {
+        owned_slots[slot] = *is_owned;
+    }
     let initial_impls = std::mem::take(&mut ir.function_impls);
 
     let bootstrap_analyzer = AvailabilityAnalyzer::new(
@@ -112,6 +123,7 @@ pub(super) fn enforce_local_availability(
         &ir.local_bindings,
         &initial_impls,
         enable_local_move_semantics,
+        &owned_slots,
     );
     let mut rewritten_impls = HashMap::with_capacity(initial_impls.len());
     for (index, function_impl) in initial_impls {
@@ -124,6 +136,7 @@ pub(super) fn enforce_local_availability(
         &ir.local_bindings,
         &rewritten_impls,
         enable_local_move_semantics,
+        &owned_slots,
     );
     let entry_state = FlowState::reachable_with_entry_locals(ir.locals, entry_locals);
     let (rewritten_stmts, _) = analyzer.analyze_block(&ir.stmts, entry_state, true)?;
@@ -131,7 +144,12 @@ pub(super) fn enforce_local_availability(
     ir.function_impls = rewritten_impls;
 
     if clear_dead_locals {
-        let liveness = LivenessRewriter::new(ir.locals, &ir.local_bindings, &ir.function_impls);
+        let liveness = LivenessRewriter::new(
+            ir.locals,
+            &ir.local_bindings,
+            &ir.function_impls,
+            &owned_slots,
+        );
         let persistent_slots = persistent_capture_slots(&ir.stmts, &ir.function_impls);
         ir.stmts = liveness.rewrite_program_block(&ir.stmts);
         for function_impl in ir.function_impls.values_mut() {
@@ -168,7 +186,7 @@ pub(crate) fn function_capture_binding_mode(
     function_impl: &FunctionImpl,
     captured_slot: LocalSlot,
 ) -> CaptureBindingMode {
-    AvailabilityAnalyzer::new(0, &[], &HashMap::new(), false)
+    AvailabilityAnalyzer::new(0, &[], &HashMap::new(), false, &[])
         .runtime_function_capture_mode_for_slot(function_impl, captured_slot)
 }
 
@@ -176,7 +194,7 @@ pub(crate) fn closure_capture_binding_mode(
     closure: &ClosureExpr,
     captured_slot: LocalSlot,
 ) -> CaptureBindingMode {
-    AvailabilityAnalyzer::new(0, &[], &HashMap::new(), false)
+    AvailabilityAnalyzer::new(0, &[], &HashMap::new(), false, &[])
         .runtime_closure_capture_mode_for_slot(closure, captured_slot)
 }
 
@@ -188,6 +206,11 @@ struct AvailabilityAnalyzer {
     function_consumed_params: HashMap<u16, HashSet<usize>>,
     next_collection_alias_id: Cell<u32>,
     enable_local_move_semantics: bool,
+    /// Per-logical-slot resource-ownership metadata (pre-compaction indices):
+    /// a slot is owned when its post-legalize schema contains a resource
+    /// anywhere. Owned slots are move-only and cannot be copied or borrowed
+    /// outside exact host-call arguments.
+    owned_local_slots: Vec<bool>,
 }
 
 impl AvailabilityAnalyzer {
@@ -196,6 +219,7 @@ impl AvailabilityAnalyzer {
         local_bindings: &[(String, LocalSlot)],
         function_impls: &HashMap<u16, FunctionImpl>,
         enable_local_move_semantics: bool,
+        owned_local_slots: &[bool],
     ) -> Self {
         let mut local_names = HashMap::with_capacity(local_bindings.len());
         for (name, index) in local_bindings {
@@ -217,6 +241,10 @@ impl AvailabilityAnalyzer {
         }
         let function_consumed_params =
             compute_function_consumed_param_positions(function_impls, enable_local_move_semantics);
+        let mut owned = vec![false; local_count];
+        for (slot, is_owned) in owned_local_slots.iter().enumerate().take(local_count) {
+            owned[slot] = *is_owned;
+        }
         Self {
             local_count,
             local_names,
@@ -225,6 +253,7 @@ impl AvailabilityAnalyzer {
             function_consumed_params,
             next_collection_alias_id: Cell::new(1),
             enable_local_move_semantics,
+            owned_local_slots: owned,
         }
     }
 
@@ -242,19 +271,50 @@ impl AvailabilityAnalyzer {
         let mut state = FlowState::reachable(self.local_count);
         for slot in &param_slots {
             self.mark_available(&mut state, *slot, 1)?;
+            // Resource-typed parameters are move-only inside the body: they
+            // can be returned (moved out), passed by ownership, or borrowed
+            // through exact host-call arguments, but never copied.
+            if self.is_owned_slot(*slot) {
+                state.copyable_locals[*slot as usize] = false;
+                state.movable_locals[*slot as usize] = true;
+            }
         }
         for (_, captured_slot) in &capture_copies {
             self.mark_available(&mut state, *captured_slot, 1)?;
         }
         let (rewritten_body, body_state) = self.analyze_block(&body_stmts, state, true)?;
+        let rewritten_body_expr = self.rewrite_function_return_expr(&body_expr, &body_state)?;
         self.analyze_expr(&body_expr, &body_state, 1)?;
         Ok(FunctionImpl {
             param_slots,
             capture_copies,
             body_stmts: rewritten_body,
-            body_expr,
+            body_expr: rewritten_body_expr,
             body_expr_line,
         })
+    }
+
+    /// Rewrites a function's tail expression for resource ownership.
+    ///
+    /// Returning a resource-owning local must move it out of the frame: the
+    /// bytecode then carries a `MoveVar` (ldloc + DetachLocal) so the frame
+    /// exit never releases the same owner again. Nested tail positions
+    /// (if/match branches, block tails) get the same treatment through the
+    /// generic ownership rewrite.
+    fn rewrite_function_return_expr(
+        &self,
+        expr: &Expr,
+        state: &FlowState,
+    ) -> Result<Expr, ParseError> {
+        if let Expr::Var(slot) = expr
+            && self.is_owned_slot(*slot)
+        {
+            self.require_available(*slot, state, 1)?;
+            self.require_local_not_moved(*slot, state, 1)?;
+            self.require_local_not_partially_moved(*slot, state, 1)?;
+            return Ok(Expr::MoveVar(*slot));
+        }
+        self.rewrite_expr_for_ownership(expr)
     }
 
     fn analyze_block(
@@ -344,7 +404,8 @@ impl AvailabilityAnalyzer {
                             *captured_slot,
                             capture_mode.0,
                             capture_mode.1,
-                        );
+                            *line,
+                        )?;
                     }
                 }
                 Ok((stmt.clone(), out))
@@ -371,12 +432,21 @@ impl AvailabilityAnalyzer {
                     self.clear_local_moved_state(&mut out, *index);
                     self.handle_local_rebind_field_moves(&mut out, *index, expr);
                     self.handle_local_rebind_collection_aliases(&mut out, *index, expr);
-                    let is_copyable = self.is_definitely_copyable_expr(expr, &out);
+                    let (is_copyable, is_movable) = if self.is_owned_slot(*index) {
+                        // Resource-owning bindings are move-only by schema,
+                        // not by the literal shape of their initializer.
+                        (false, true)
+                    } else {
+                        (
+                            self.is_definitely_copyable_expr(expr, &out),
+                            self.is_definitely_movable_local_expr(expr, &out),
+                        )
+                    };
                     self.set_local_copyable_state(&mut out, *index, is_copyable);
-                    let is_movable = self.is_definitely_movable_local_expr(expr, &out);
                     self.set_local_movable_state(&mut out, *index, is_movable);
                     rewritten_expr =
                         self.rewrite_local_source_move_on_rebind(&mut out, *index, expr);
+                    rewritten_expr = self.rewrite_expr_for_ownership(&rewritten_expr)?;
                     rewritten_expr = self.rewrite_runtime_field_move_expr(&rewritten_expr, &state);
                 }
                 Ok((
@@ -403,12 +473,19 @@ impl AvailabilityAnalyzer {
                     self.clear_local_moved_state(&mut out, *index);
                     self.handle_local_rebind_field_moves(&mut out, *index, expr);
                     self.handle_local_rebind_collection_aliases(&mut out, *index, expr);
-                    let is_copyable = self.is_definitely_copyable_expr(expr, &out);
+                    let (is_copyable, is_movable) = if self.is_owned_slot(*index) {
+                        (false, true)
+                    } else {
+                        (
+                            self.is_definitely_copyable_expr(expr, &out),
+                            self.is_definitely_movable_local_expr(expr, &out),
+                        )
+                    };
                     self.set_local_copyable_state(&mut out, *index, is_copyable);
-                    let is_movable = self.is_definitely_movable_local_expr(expr, &out);
                     self.set_local_movable_state(&mut out, *index, is_movable);
                     rewritten_expr =
                         self.rewrite_local_source_move_on_rebind(&mut out, *index, expr);
+                    rewritten_expr = self.rewrite_expr_for_ownership(&rewritten_expr)?;
                     rewritten_expr = self.rewrite_runtime_field_move_expr(&rewritten_expr, &state);
                 }
                 Ok((
@@ -435,14 +512,20 @@ impl AvailabilityAnalyzer {
                             *captured_slot,
                             capture_mode.0,
                             capture_mode.1,
-                        );
+                            *line,
+                        )?;
                     }
                 }
                 Ok((stmt.clone(), out))
             }
             Stmt::Expr { expr, line } => {
-                let out = self.analyze_expr(expr, &state, *line)?;
-                let rewritten_expr = self.rewrite_runtime_field_move_expr(expr, &state);
+                let mut out = self.analyze_expr(expr, &state, *line)?;
+                // A bare value read at statement level consumes owned locals
+                // (the value is discarded, so the handle must not stay
+                // available for a second use).
+                self.mark_owned_value_reads_moved(expr, &mut out);
+                let rewritten_expr = self.rewrite_expr_for_ownership(expr)?;
+                let rewritten_expr = self.rewrite_runtime_field_move_expr(&rewritten_expr, &state);
                 Ok((
                     Stmt::Expr {
                         expr: rewritten_expr,
@@ -740,7 +823,7 @@ impl AvailabilityAnalyzer {
             // Resolved module calls (pre-merge only) analyze their arguments;
             // interprocedural effects apply to the post-merge flat call.
             Expr::ModuleCall(_, _, args) => self.analyze_args(args, state, line),
-            Expr::Call(index, _, args, _) => {
+            Expr::Call(index, _, args, resolution) => {
                 if !self.enable_local_move_semantics {
                     if let Some(root_slot) = self.extract_collection_mutation_root(*index, args) {
                         let mut out = self.analyze_args(args, state, line)?;
@@ -751,6 +834,13 @@ impl AvailabilityAnalyzer {
                     let mut out = self.analyze_args(args, state, line)?;
                     self.apply_interprocedural_consumed_call_effects(*index, args, &mut out);
                     return Ok(out);
+                }
+                // Catalog-resolved host calls carry the exact ordered passing
+                // modes; ownership transfer (TakeOwned) moves the source
+                // local/field, while Borrow/BorrowMut produce read-only
+                // call-scoped temporaries that never consume the owner.
+                if let Some(resolution) = resolution {
+                    return self.analyze_resolved_call_args(args, resolution, state, line);
                 }
                 if let Some((root_slot, field_key)) = self.extract_moved_field_access(*index, args)
                 {
@@ -770,11 +860,18 @@ impl AvailabilityAnalyzer {
                             self.analyze_args(args, state, line)?
                         };
                     self.apply_interprocedural_consumed_call_effects(*index, args, &mut out);
+                    // Inserting an owned local into an aggregate transfers
+                    // ownership of the handle into the collection/field.
+                    self.apply_owned_aggregate_insertion_effect(*index, args, &mut out);
                     self.require_collection_mutation_permitted(root_slot, &out, line)?;
                     Ok(out)
                 } else {
                     let mut out = self.analyze_args(args, state, line)?;
                     self.apply_interprocedural_consumed_call_effects(*index, args, &mut out);
+                    // Inserting an owned local into an aggregate (array/map
+                    // literals lower to ArrayPush/Set on a fresh collection)
+                    // transfers ownership of the handle into the aggregate.
+                    self.apply_owned_aggregate_insertion_effect(*index, args, &mut out);
                     Ok(out)
                 }
             }
@@ -794,7 +891,8 @@ impl AvailabilityAnalyzer {
                         *captured_slot,
                         capture_mode.0,
                         capture_mode.1,
-                    );
+                        line,
+                    )?;
                 }
                 Ok(out)
             }
@@ -810,7 +908,8 @@ impl AvailabilityAnalyzer {
                         *captured_slot,
                         capture_mode.0,
                         capture_mode.1,
-                    );
+                        line,
+                    )?;
                 }
                 Ok(out)
             }
@@ -835,6 +934,20 @@ impl AvailabilityAnalyzer {
             }
             Expr::Neg(inner) | Expr::Not(inner) => self.analyze_expr(inner, state, line),
             Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+                // Outside an exact host-call argument a borrow wrapper is an
+                // escape: resources cannot be aliased across a statement, and
+                // the compiler never clones their underlying handle.
+                if self.expr_contains_owned_local(inner) {
+                    let display = self.display_owned_expr_local(inner);
+                    return Err(ParseError {
+                        span: None,
+                        code: Some("E_OWNERSHIP_BORROW_ESCAPE".to_string()),
+                        line: line as usize,
+                        message: format!(
+                            "borrow of resource value '{display}' must be passed directly as an argument to a host function call; resources cannot escape a call as borrows"
+                        ),
+                    });
+                }
                 self.analyze_expr_to_owned(inner, state, line)
             }
             Expr::IfElse {
@@ -845,7 +958,13 @@ impl AvailabilityAnalyzer {
                 let cond_state = self.analyze_expr(condition, state, line)?;
                 let then_state = self.analyze_expr(then_expr, &cond_state, line)?;
                 let else_state = self.analyze_expr(else_expr, &cond_state, line)?;
-                Ok(self.merge_states(then_state, else_state))
+                let mut out = self.merge_states(then_state, else_state);
+                // Branch values flow into the merged result: reading an owned
+                // local as a branch value transfers its ownership into the
+                // merged value, so the source becomes moved on every path.
+                self.mark_owned_value_reads_moved(then_expr, &mut out);
+                self.mark_owned_value_reads_moved(else_expr, &mut out);
+                Ok(out)
             }
             Expr::Match {
                 value_slot,
@@ -875,15 +994,38 @@ impl AvailabilityAnalyzer {
                 } else {
                     default_state
                 };
+                for (_, arm_expr) in arms {
+                    self.mark_owned_value_reads_moved(arm_expr, &mut out);
+                }
+                self.mark_owned_value_reads_moved(default, &mut out);
                 if out.reachable {
                     self.mark_available(&mut out, *result_slot, line)?;
                 }
                 Ok(out)
             }
-            Expr::ToOwned(inner) => self.analyze_expr_to_owned(inner, state, line),
+            Expr::ToOwned(inner) => {
+                // `.copy()` on a resource-containing value would duplicate the
+                // underlying handle; the core has no generic resource copy, so
+                // this is a structured compile error rather than a silent
+                // degradation to a plain read.
+                if self.expr_contains_owned_local(inner) {
+                    let display = self.display_owned_expr_local(inner);
+                    return Err(ParseError {
+                        span: None,
+                        code: Some("E_OWNERSHIP_COPY_RESOURCE".to_string()),
+                        line: line as usize,
+                        message: format!(
+                            "cannot copy resource value '{display}'; resources are move-only and do not support '.copy()'"
+                        ),
+                    });
+                }
+                self.analyze_expr_to_owned(inner, state, line)
+            }
             Expr::Block { stmts, expr } => {
                 let (_, block_state) = self.analyze_block(stmts, state.clone(), false)?;
-                self.analyze_expr(expr, &block_state, line)
+                let mut out = self.analyze_expr(expr, &block_state, line)?;
+                self.mark_owned_value_reads_moved(expr, &mut out);
+                Ok(out)
             }
         }
     }
@@ -911,6 +1053,627 @@ impl AvailabilityAnalyzer {
             return Ok(out);
         }
         self.analyze_expr(inner, state, line)
+    }
+
+    /// Whether a logical local slot carries a resource anywhere in its
+    /// post-legalize schema (direct or nested).
+    fn is_owned_slot(&self, index: LocalSlot) -> bool {
+        self.owned_local_slots
+            .get(index as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Analyzes the arguments of a catalog-resolved host call against its
+    /// exact ordered passing modes.
+    ///
+    /// `TakeOwned` arguments transfer ownership: the source local/field is
+    /// marked moved (definite and possible) so any later use on the same path
+    /// fails with a use-after-move diagnostic. `Borrow`/`BorrowMut` arguments
+    /// are call-scoped read-only temporaries: the owner is never consumed and
+    /// repeated borrows of the same local are fine. `Value` arguments are
+    /// plain reads.
+    fn analyze_resolved_call_args(
+        &self,
+        args: &[Expr],
+        resolution: &ResolvedHostCall,
+        state: &FlowState,
+        line: u32,
+    ) -> Result<FlowState, ParseError> {
+        let mut out = state.clone();
+        for (position, arg) in args.iter().enumerate() {
+            out = match resolution.passing.get(position).copied() {
+                Some(HostParamPassing::TakeOwned) => {
+                    self.legalize_take_owned_arg(arg, &out, line)?
+                }
+                Some(HostParamPassing::Borrow) | Some(HostParamPassing::BorrowMut) => {
+                    // The parser wraps borrowed arguments in Borrow/BorrowMut;
+                    // unwrap them here into a non-consuming read so the
+                    // generic borrow arm (which rejects resource escapes)
+                    // never sees them.
+                    match arg {
+                        Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+                            self.analyze_expr_to_owned(inner, &out, line)?
+                        }
+                        other => self.analyze_expr_to_owned(other, &out, line)?,
+                    }
+                }
+                _ => self.analyze_expr(arg, &out, line)?,
+            };
+        }
+        Ok(out)
+    }
+
+    /// Flow effect of a `TakeOwned` argument: the source local or literal-key
+    /// field is consumed (marked moved). Fresh values (nested call results,
+    /// literals) flow directly into the argument slot and have no local
+    /// ownership effect. Anything else is a structurally rejected source.
+    fn legalize_take_owned_arg(
+        &self,
+        arg: &Expr,
+        state: &FlowState,
+        line: u32,
+    ) -> Result<FlowState, ParseError> {
+        match arg {
+            Expr::Var(slot) | Expr::MoveVar(slot) => {
+                self.require_available(*slot, state, line)?;
+                self.require_local_not_moved(*slot, state, line)?;
+                self.require_local_not_partially_moved(*slot, state, line)?;
+                let mut out = state.clone();
+                self.mark_local_moved(&mut out, *slot);
+                Ok(out)
+            }
+            Expr::Call(index, _, args, _)
+                if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::Get) =>
+            {
+                let Some((root_slot, field_key)) = self.extract_moved_field_access(*index, args)
+                else {
+                    return Err(ParseError {
+                        span: None,
+                        code: Some("E_OWNERSHIP_TAKEOWNED_SOURCE".to_string()),
+                        line: line as usize,
+                        message: "TakeOwned host-call arguments must be a local, a literal-key field/index access, or a fresh call result; this argument cannot transfer ownership".to_string(),
+                    });
+                };
+                if matches!(field_key, MovedFieldKey::Dynamic | MovedFieldKey::Slice) {
+                    return Err(ParseError {
+                        span: None,
+                        code: Some("E_OWNERSHIP_TAKEOWNED_SOURCE".to_string()),
+                        line: line as usize,
+                        message: "TakeOwned host-call arguments cannot use a dynamic key or slice access; use a literal field/index to transfer ownership".to_string(),
+                    });
+                }
+                self.require_available(root_slot, state, line)?;
+                self.require_local_not_moved(root_slot, state, line)?;
+                self.require_field_available(root_slot, &field_key, state, line)?;
+                let mut out = state.clone();
+                self.mark_field_moved(&mut out, root_slot, field_key);
+                Ok(out)
+            }
+            other => self.analyze_expr(other, state, line),
+        }
+    }
+
+    /// Flow effect of inserting an owned local into an aggregate: `Set`
+    /// (field/map write) and `ArrayPush` value arguments transfer the handle
+    /// into the aggregate, so the source local becomes moved.
+    fn apply_owned_aggregate_insertion_effect(
+        &self,
+        call_index: u16,
+        args: &[Expr],
+        state: &mut FlowState,
+    ) {
+        if !self.enable_local_move_semantics {
+            return;
+        }
+        let value_position = match BuiltinFunction::from_call_index(call_index) {
+            Some(BuiltinFunction::Set) if args.len() == 3 => Some(2),
+            Some(BuiltinFunction::ArrayPush) if args.len() == 2 => Some(1),
+            _ => None,
+        };
+        let Some(position) = value_position else {
+            return;
+        };
+        let Some(Expr::Var(slot) | Expr::MoveVar(slot)) = args.get(position) else {
+            return;
+        };
+        if self.is_owned_slot(*slot) {
+            self.mark_local_moved(state, *slot);
+        }
+    }
+
+    /// Marks owned locals/fields read as the *value* of an expression as
+    /// moved. Covers direct value reads (`Var`, literal field/index access)
+    /// and nested value positions (if/match branches, block tails). Call
+    /// arguments are handled by their own passing rules and are intentionally
+    /// not walked here.
+    fn mark_owned_value_reads_moved(&self, expr: &Expr, state: &mut FlowState) {
+        match expr {
+            Expr::Var(slot) | Expr::MoveVar(slot) => {
+                if self.is_owned_slot(*slot) {
+                    self.mark_local_moved(state, *slot);
+                }
+            }
+            Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
+                let _ = root;
+            }
+            Expr::Call(index, _, args, _) => {
+                if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::Get)
+                    && let Some((root_slot, field_key)) =
+                        self.extract_moved_field_access(*index, args)
+                    && !self.is_copyable_field(root_slot, &field_key, state)
+                {
+                    self.mark_field_moved(state, root_slot, field_key);
+                }
+            }
+            Expr::IfElse {
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                self.mark_owned_value_reads_moved(then_expr, state);
+                self.mark_owned_value_reads_moved(else_expr, state);
+            }
+            Expr::Match { arms, default, .. } => {
+                for (_, arm_expr) in arms {
+                    self.mark_owned_value_reads_moved(arm_expr, state);
+                }
+                self.mark_owned_value_reads_moved(default, state);
+            }
+            Expr::Block { expr, .. } => self.mark_owned_value_reads_moved(expr, state),
+            _ => {}
+        }
+    }
+
+    /// Whether an expression reads an owned local anywhere (directly or
+    /// through projections, aggregates, or nested calls).
+    fn expr_contains_owned_local(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Var(slot) | Expr::MoveVar(slot) => self.is_owned_slot(*slot),
+            Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
+                self.is_owned_slot(*root)
+            }
+            Expr::OptionalGet {
+                container,
+                key,
+                container_slot,
+                key_slot,
+            } => {
+                self.is_owned_slot(*container_slot)
+                    || self.is_owned_slot(*key_slot)
+                    || self.expr_contains_owned_local(container)
+                    || self.expr_contains_owned_local(key)
+            }
+            Expr::OptionUnwrapOr {
+                value,
+                value_slot,
+                fallback,
+            } => {
+                self.is_owned_slot(*value_slot)
+                    || self.expr_contains_owned_local(value)
+                    || self.expr_contains_owned_local(fallback)
+            }
+            Expr::Call(_, _, args, _)
+            | Expr::LocalCall(_, _, args)
+            | Expr::ModuleCall(_, _, args) => {
+                args.iter().any(|arg| self.expr_contains_owned_local(arg))
+            }
+            Expr::Closure(closure) => {
+                closure
+                    .capture_copies
+                    .iter()
+                    .any(|(source, _)| self.is_owned_slot(*source))
+                    || self.expr_contains_owned_local(&closure.body)
+            }
+            Expr::ClosureCall(closure, args) => {
+                args.iter().any(|arg| self.expr_contains_owned_local(arg))
+                    || closure
+                        .capture_copies
+                        .iter()
+                        .any(|(source, _)| self.is_owned_slot(*source))
+                    || self.expr_contains_owned_local(&closure.body)
+            }
+            Expr::Add(lhs, rhs)
+            | Expr::Sub(lhs, rhs)
+            | Expr::Mul(lhs, rhs)
+            | Expr::Div(lhs, rhs)
+            | Expr::Mod(lhs, rhs)
+            | Expr::And(lhs, rhs)
+            | Expr::Or(lhs, rhs)
+            | Expr::Eq(lhs, rhs)
+            | Expr::Lt(lhs, rhs)
+            | Expr::Gt(lhs, rhs) => {
+                self.expr_contains_owned_local(lhs) || self.expr_contains_owned_local(rhs)
+            }
+            Expr::Neg(inner) | Expr::Not(inner) => self.expr_contains_owned_local(inner),
+            Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+                self.expr_contains_owned_local(inner)
+            }
+            Expr::IfElse {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.expr_contains_owned_local(condition)
+                    || self.expr_contains_owned_local(then_expr)
+                    || self.expr_contains_owned_local(else_expr)
+            }
+            Expr::Match {
+                value,
+                arms,
+                default,
+                ..
+            } => {
+                self.expr_contains_owned_local(value)
+                    || arms
+                        .iter()
+                        .any(|(_, arm_expr)| self.expr_contains_owned_local(arm_expr))
+                    || self.expr_contains_owned_local(default)
+            }
+            Expr::Block { stmts, expr } => {
+                stmts
+                    .iter()
+                    .any(|stmt| self.stmt_contains_owned_local(stmt))
+                    || self.expr_contains_owned_local(expr)
+            }
+            Expr::Null
+            | Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::Bool(_)
+            | Expr::Bytes(_)
+            | Expr::String(_)
+            | Expr::FunctionRef(..)
+            | Expr::ModuleFunctionRef(..)
+            | Expr::UnresolvedFunctionRef { .. } => false,
+        }
+    }
+
+    fn stmt_contains_owned_local(&self, stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Noop { .. }
+            | Stmt::FuncDecl { .. }
+            | Stmt::Break { .. }
+            | Stmt::Continue { .. }
+            | Stmt::Drop { .. } => false,
+            Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
+                self.expr_contains_owned_local(expr)
+            }
+            Stmt::ClosureLet { closure, .. } => {
+                closure
+                    .capture_copies
+                    .iter()
+                    .any(|(source, _)| self.is_owned_slot(*source))
+                    || self.expr_contains_owned_local(&closure.body)
+            }
+            Stmt::IfElse {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.expr_contains_owned_local(condition)
+                    || then_branch
+                        .iter()
+                        .any(|nested| self.stmt_contains_owned_local(nested))
+                    || else_branch
+                        .iter()
+                        .any(|nested| self.stmt_contains_owned_local(nested))
+            }
+            Stmt::For {
+                init,
+                condition,
+                post,
+                body,
+                ..
+            } => {
+                self.stmt_contains_owned_local(init)
+                    || self.expr_contains_owned_local(condition)
+                    || self.stmt_contains_owned_local(post)
+                    || body
+                        .iter()
+                        .any(|nested| self.stmt_contains_owned_local(nested))
+            }
+            Stmt::While {
+                condition, body, ..
+            } => {
+                self.expr_contains_owned_local(condition)
+                    || body
+                        .iter()
+                        .any(|nested| self.stmt_contains_owned_local(nested))
+            }
+        }
+    }
+
+    /// The named local an owned-bearing expression reads, for diagnostics.
+    fn display_owned_expr_local(&self, expr: &Expr) -> String {
+        match expr {
+            Expr::Var(slot) | Expr::MoveVar(slot) => self.display_local_name(*slot),
+            Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
+                self.display_local_name(*root)
+            }
+            Expr::Call(index, _, args, _)
+                if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::Get) =>
+            {
+                args.first()
+                    .and_then(|arg| match arg {
+                        Expr::Var(slot) => Some(self.display_local_name(*slot)),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "resource value".to_string())
+            }
+            _ => "resource value".to_string(),
+        }
+    }
+
+    /// Recursively rewrites an expression tree for resource ownership:
+    ///
+    /// * catalog-resolved host-call arguments are rewritten per their exact
+    ///   ordered passing mode (`TakeOwned` moves the source local/field,
+    ///   `Borrow`/`BorrowMut` unwrap into a plain read);
+    /// * owned locals read as value positions (if/match branches, block
+    ///   tails, statement values) become `MoveVar`;
+    /// * `Set`/`ArrayPush` value arguments that are owned locals become
+    ///   `MoveVar` (aggregate insertion transfers ownership).
+    ///
+    /// Plain (non-resource) programs are structurally preserved.
+    fn rewrite_expr_for_ownership(&self, expr: &Expr) -> Result<Expr, ParseError> {
+        self.rewrite_expr_ownership_inner(expr, false)
+    }
+
+    fn rewrite_expr_ownership_inner(
+        &self,
+        expr: &Expr,
+        in_call_arg: bool,
+    ) -> Result<Expr, ParseError> {
+        match expr {
+            Expr::Call(index, type_args, args, resolution) => {
+                let mut rewritten_args = Vec::with_capacity(args.len());
+                for arg in args {
+                    rewritten_args.push(self.rewrite_expr_ownership_inner(arg, true)?);
+                }
+                if let Some(resolution) = resolution.as_deref() {
+                    for (position, arg) in rewritten_args.iter_mut().enumerate() {
+                        match resolution.passing.get(position).copied() {
+                            Some(HostParamPassing::TakeOwned) => {
+                                *arg = self.rewrite_take_owned_arg(arg)?;
+                            }
+                            Some(HostParamPassing::Borrow) | Some(HostParamPassing::BorrowMut) => {
+                                *arg = self.rewrite_borrow_arg(arg);
+                            }
+                            _ => {}
+                        }
+                    }
+                    return Ok(Expr::Call(
+                        *index,
+                        type_args.clone(),
+                        rewritten_args,
+                        Some(Box::new(resolution.clone())),
+                    ));
+                }
+                // Legacy (non-resolved) calls keep their shape except for
+                // aggregate insertion of owned locals.
+                if let Some(builtin) = BuiltinFunction::from_call_index(*index) {
+                    let value_position = match builtin {
+                        BuiltinFunction::Set if args.len() == 3 => Some(2),
+                        BuiltinFunction::ArrayPush if args.len() == 2 => Some(1),
+                        _ => None,
+                    };
+                    if let Some(position) = value_position
+                        && let Some(Expr::Var(slot)) = rewritten_args.get(position)
+                        && self.is_owned_slot(*slot)
+                    {
+                        rewritten_args[position] = Expr::MoveVar(*slot);
+                    }
+                }
+                Ok(Expr::Call(*index, type_args.clone(), rewritten_args, None))
+            }
+            Expr::Var(slot) if !in_call_arg && self.is_owned_slot(*slot) => {
+                Ok(Expr::MoveVar(*slot))
+            }
+            Expr::Var(slot) => Ok(Expr::Var(*slot)),
+            Expr::MoveVar(slot) => Ok(Expr::MoveVar(*slot)),
+            Expr::MoveField { root, key } => Ok(Expr::MoveField {
+                root: *root,
+                key: key.clone(),
+            }),
+            Expr::MoveIndex { root, index } => Ok(Expr::MoveIndex {
+                root: *root,
+                index: *index,
+            }),
+            Expr::OptionalGet {
+                container,
+                key,
+                container_slot,
+                key_slot,
+            } => Ok(Expr::OptionalGet {
+                container: Box::new(self.rewrite_expr_ownership_inner(container, false)?),
+                key: Box::new(self.rewrite_expr_ownership_inner(key, false)?),
+                container_slot: *container_slot,
+                key_slot: *key_slot,
+            }),
+            Expr::OptionUnwrapOr {
+                value,
+                value_slot,
+                fallback,
+            } => Ok(Expr::OptionUnwrapOr {
+                value: Box::new(self.rewrite_expr_ownership_inner(value, false)?),
+                value_slot: *value_slot,
+                fallback: Box::new(self.rewrite_expr_ownership_inner(fallback, false)?),
+            }),
+            Expr::LocalCall(index, type_args, args) => Ok(Expr::LocalCall(
+                *index,
+                type_args.clone(),
+                self.rewrite_call_args(args)?,
+            )),
+            Expr::ModuleCall(index, type_args, args) => Ok(Expr::ModuleCall(
+                *index,
+                type_args.clone(),
+                self.rewrite_call_args(args)?,
+            )),
+            Expr::Closure(closure) => Ok(Expr::Closure(ClosureExpr {
+                param_slots: closure.param_slots.clone(),
+                capture_copies: closure.capture_copies.clone(),
+                body: Box::new(self.rewrite_expr_ownership_inner(&closure.body, false)?),
+            })),
+            Expr::ClosureCall(closure, args) => Ok(Expr::ClosureCall(
+                ClosureExpr {
+                    param_slots: closure.param_slots.clone(),
+                    capture_copies: closure.capture_copies.clone(),
+                    body: Box::new(self.rewrite_expr_ownership_inner(&closure.body, false)?),
+                },
+                self.rewrite_call_args(args)?,
+            )),
+            Expr::Add(lhs, rhs)
+            | Expr::Sub(lhs, rhs)
+            | Expr::Mul(lhs, rhs)
+            | Expr::Div(lhs, rhs)
+            | Expr::Mod(lhs, rhs)
+            | Expr::And(lhs, rhs)
+            | Expr::Or(lhs, rhs)
+            | Expr::Eq(lhs, rhs)
+            | Expr::Lt(lhs, rhs)
+            | Expr::Gt(lhs, rhs) => {
+                let lhs = self.rewrite_expr_ownership_inner(lhs, false)?;
+                let rhs = self.rewrite_expr_ownership_inner(rhs, false)?;
+                Ok(match expr {
+                    Expr::Add(..) => Expr::Add(Box::new(lhs), Box::new(rhs)),
+                    Expr::Sub(..) => Expr::Sub(Box::new(lhs), Box::new(rhs)),
+                    Expr::Mul(..) => Expr::Mul(Box::new(lhs), Box::new(rhs)),
+                    Expr::Div(..) => Expr::Div(Box::new(lhs), Box::new(rhs)),
+                    Expr::Mod(..) => Expr::Mod(Box::new(lhs), Box::new(rhs)),
+                    Expr::And(..) => Expr::And(Box::new(lhs), Box::new(rhs)),
+                    Expr::Or(..) => Expr::Or(Box::new(lhs), Box::new(rhs)),
+                    Expr::Eq(..) => Expr::Eq(Box::new(lhs), Box::new(rhs)),
+                    Expr::Lt(..) => Expr::Lt(Box::new(lhs), Box::new(rhs)),
+                    Expr::Gt(..) => Expr::Gt(Box::new(lhs), Box::new(rhs)),
+                    _ => unreachable!("binary operator arm"),
+                })
+            }
+            Expr::Neg(inner) | Expr::Not(inner) => {
+                let inner = self.rewrite_expr_ownership_inner(inner, false)?;
+                Ok(match expr {
+                    Expr::Neg(..) => Expr::Neg(Box::new(inner)),
+                    _ => Expr::Not(Box::new(inner)),
+                })
+            }
+            Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+                // Non-resource borrow/copy wrappers are preserved verbatim;
+                // resource-bearing ones were already rejected during analysis.
+                // The inner read keeps the call-argument context when nested
+                // inside one, so a borrow of an owned local in a host-call
+                // argument stays a plain read (never a MoveVar).
+                let inner = self.rewrite_expr_ownership_inner(inner, in_call_arg)?;
+                Ok(match expr {
+                    Expr::ToOwned(..) => Expr::ToOwned(Box::new(inner)),
+                    Expr::Borrow(..) => Expr::Borrow(Box::new(inner)),
+                    _ => Expr::BorrowMut(Box::new(inner)),
+                })
+            }
+            Expr::IfElse {
+                condition,
+                then_expr,
+                else_expr,
+            } => Ok(Expr::IfElse {
+                condition: Box::new(self.rewrite_expr_ownership_inner(condition, false)?),
+                then_expr: Box::new(self.rewrite_expr_ownership_inner(then_expr, false)?),
+                else_expr: Box::new(self.rewrite_expr_ownership_inner(else_expr, false)?),
+            }),
+            Expr::Match {
+                value_slot,
+                result_slot,
+                value,
+                arms,
+                default,
+            } => {
+                let mut rewritten_arms = Vec::with_capacity(arms.len());
+                for (pattern, arm_expr) in arms {
+                    rewritten_arms.push((
+                        pattern.clone(),
+                        self.rewrite_expr_ownership_inner(arm_expr, false)?,
+                    ));
+                }
+                Ok(Expr::Match {
+                    value_slot: *value_slot,
+                    result_slot: *result_slot,
+                    value: Box::new(self.rewrite_expr_ownership_inner(value, false)?),
+                    arms: rewritten_arms,
+                    default: Box::new(self.rewrite_expr_ownership_inner(default, false)?),
+                })
+            }
+            Expr::Block { stmts, expr } => Ok(Expr::Block {
+                // Statement-level rewrites run through the stmt handlers
+                // during analysis; inner block statements are preserved.
+                stmts: stmts.clone(),
+                expr: Box::new(self.rewrite_expr_ownership_inner(expr, false)?),
+            }),
+            Expr::Null
+            | Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::Bool(_)
+            | Expr::String(_)
+            | Expr::Bytes(_)
+            | Expr::FunctionRef(..)
+            | Expr::ModuleFunctionRef(..)
+            | Expr::UnresolvedFunctionRef { .. } => Ok(expr.clone()),
+        }
+    }
+
+    fn rewrite_call_args(&self, args: &[Expr]) -> Result<Vec<Expr>, ParseError> {
+        let mut rewritten = Vec::with_capacity(args.len());
+        for arg in args {
+            rewritten.push(self.rewrite_expr_ownership_inner(arg, true)?);
+        }
+        Ok(rewritten)
+    }
+
+    /// Rewrites a `TakeOwned` argument: a local becomes `MoveVar`, a literal
+    /// field/index access becomes `MoveField`/`MoveIndex`. Fresh call results
+    /// stay as-is. Anything else was already rejected during analysis.
+    fn rewrite_take_owned_arg(&self, arg: &Expr) -> Result<Expr, ParseError> {
+        match arg {
+            Expr::Var(slot) => Ok(Expr::MoveVar(*slot)),
+            Expr::MoveVar(slot) => Ok(Expr::MoveVar(*slot)),
+            Expr::Call(index, _, args, _)
+                if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::Get) =>
+            {
+                let Some((root_slot, field_key)) = self.extract_moved_field_access(*index, args)
+                else {
+                    return Err(ParseError {
+                        span: None,
+                        code: Some("E_OWNERSHIP_TAKEOWNED_SOURCE".to_string()),
+                        line: 1,
+                        message: "TakeOwned host-call arguments must be a local, a literal-key field/index access, or a fresh call result; this argument cannot transfer ownership".to_string(),
+                    });
+                };
+                match field_key {
+                    MovedFieldKey::String(key) => Ok(Expr::MoveField {
+                        root: root_slot,
+                        key,
+                    }),
+                    MovedFieldKey::Index(index) => Ok(Expr::MoveIndex {
+                        root: root_slot,
+                        index,
+                    }),
+                    MovedFieldKey::Dynamic | MovedFieldKey::Slice => Err(ParseError {
+                        span: None,
+                        code: Some("E_OWNERSHIP_TAKEOWNED_SOURCE".to_string()),
+                        line: 1,
+                        message: "TakeOwned host-call arguments cannot use a dynamic key or slice access; use a literal field/index to transfer ownership".to_string(),
+                    }),
+                }
+            }
+            other => Ok(other.clone()),
+        }
+    }
+
+    /// Unwraps a borrow wrapper in a host-call argument: the borrow is a
+    /// call-scoped passing intent, and the underlying read is a plain
+    /// non-consuming temporary.
+    fn rewrite_borrow_arg(&self, arg: &Expr) -> Expr {
+        match arg {
+            Expr::Borrow(inner) | Expr::BorrowMut(inner) => inner.as_ref().clone(),
+            other => other.clone(),
+        }
     }
 
     fn require_available(

@@ -45,11 +45,18 @@ pub(super) struct EntryLocalAvailability {
 
 // This module is the entry point for the lifetime pass. `availability` owns the
 // top-level transformation and depends on the lower-level liveness machinery.
+//
+// `owned_local_slots` carries the post-legalize resource-ownership metadata
+// (one entry per logical local slot, pre-compaction): a slot is owned when its
+// logical schema contains a resource anywhere. Availability treats owned slots
+// as move-only, and liveness schedules per-iteration drops for them even in
+// loop bodies where ordinary clears are suppressed.
 pub(super) fn enforce_local_availability_with_entry_locals(
     ir: FrontendIr,
     entry_locals: &[EntryLocalAvailability],
     clear_dead_locals: bool,
     enable_local_move_semantics: bool,
+    owned_local_slots: &[bool],
 ) -> Result<FrontendIr, ParseError> {
     // Only the REPL uses non-empty entry locals; regular compilation starts from an
     // empty top-level environment.
@@ -58,6 +65,7 @@ pub(super) fn enforce_local_availability_with_entry_locals(
         entry_locals,
         clear_dead_locals,
         enable_local_move_semantics,
+        owned_local_slots,
     )
 }
 

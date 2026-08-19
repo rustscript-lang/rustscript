@@ -15,6 +15,11 @@ struct DefInfo {
 pub(super) struct LivenessRewriter {
     local_count: usize,
     clearable_slots: Vec<bool>,
+    /// Resource-owned local slots (pre-compaction indices). Loop bodies
+    /// suppress ordinary clears to keep loop-carried slots alive across
+    /// iterations, but owned slots must still be dropped at their per-iteration
+    /// last death so each iteration releases the resource it created.
+    owned_local_slots: Vec<bool>,
     function_impls: HashMap<u16, FunctionImpl>,
 }
 
@@ -23,14 +28,20 @@ impl LivenessRewriter {
         local_count: usize,
         _local_bindings: &[(String, LocalSlot)],
         function_impls: &HashMap<u16, FunctionImpl>,
+        owned_local_slots: &[bool],
     ) -> Self {
         // Clear hidden and named slots alike. Hidden slots back closure captures,
         // inline-call parameters, and parser-generated temporaries, so excluding
         // them leaves stale values past their last use.
         let clearable_slots = vec![true; local_count];
+        let mut owned = vec![false; local_count];
+        for (slot, is_owned) in owned_local_slots.iter().enumerate().take(local_count) {
+            owned[slot] = *is_owned;
+        }
         Self {
             local_count,
             clearable_slots,
+            owned_local_slots: owned,
             function_impls: function_impls.clone(),
         }
     }
@@ -78,7 +89,11 @@ impl LivenessRewriter {
             let (rewritten_stmt, live_before, defs) =
                 self.rewrite_stmt(stmt, &live_after, suppress_clears);
             let clear_slots = if suppress_clears {
-                Vec::new()
+                // Loop bodies normally suppress clears so loop-carried values
+                // survive across iterations. Resource-owned locals are exempt:
+                // each iteration's last death still gets a Drop so the
+                // per-iteration resource is released exactly once per pass.
+                self.compute_owned_clear_slots(&live_before, &live_after, &defs)
             } else {
                 self.compute_clear_slots(&live_before, &live_after, &defs)
             };
@@ -662,6 +677,40 @@ impl LivenessRewriter {
             .collect()
     }
 
+    /// Clear-slot computation restricted to resource-owned locals, used in
+    /// loop bodies where ordinary clears are suppressed. Only slots whose
+    /// value dies inside the current iteration (not loop-carried) are
+    /// selected, so the per-iteration release never breaks loop-carried
+    /// ownership.
+    fn compute_owned_clear_slots(
+        &self,
+        live_before: &LiveSet,
+        live_after: &LiveSet,
+        defs: &[DefInfo],
+    ) -> Vec<LocalSlot> {
+        let mut clear = vec![false; self.local_count];
+        for slot in 0..self.local_count {
+            if self.owned_local_slots[slot] && live_before[slot] && !live_after[slot] {
+                clear[slot] = true;
+            }
+        }
+        for def in defs {
+            let slot = def.slot as usize;
+            if slot < self.local_count
+                && self.owned_local_slots[slot]
+                && !live_after[slot]
+                && !def.explicit_null
+            {
+                clear[slot] = true;
+            }
+        }
+        clear
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, should_clear)| should_clear.then_some(slot as LocalSlot))
+            .collect()
+    }
+
     fn empty_set(&self) -> LiveSet {
         vec![false; self.local_count]
     }
@@ -761,7 +810,9 @@ impl LocalSlotAllocator {
         local_bindings: &[(String, LocalSlot)],
         function_impls: &HashMap<u16, FunctionImpl>,
     ) -> Self {
-        let liveness = LivenessRewriter::new(local_count, local_bindings, function_impls);
+        // The allocator only computes live sets for interference edges; it
+        // never inserts drops, so owned-slot metadata is irrelevant here.
+        let liveness = LivenessRewriter::new(local_count, local_bindings, function_impls, &[]);
         Self {
             local_count,
             liveness,
@@ -1966,5 +2017,93 @@ mod call_resolution_carrier_tests {
         let identity: Vec<u16> = (0..12).collect();
         remap_expr_slots(&mut call, &identity).unwrap();
         assert_eq!(call.host_call_resolution().unwrap().name, "read");
+    }
+}
+
+#[cfg(test)]
+mod loop_owned_drop_tests {
+    use super::LivenessRewriter;
+    use crate::compiler::ir::{Expr, Stmt};
+    use std::collections::HashMap;
+
+    /// A resource-owned local defined and last-used inside a loop body must
+    /// get a `Stmt::Drop` at its per-iteration last death, even though loop
+    /// bodies suppress ordinary clears (loop-carried values must survive).
+    /// This drives the real `rewrite_block` pass over a hand-built loop IR
+    /// with the owned-slot metadata.
+    #[test]
+    fn loop_body_owned_local_gets_per_iteration_drop_in_ir() {
+        const COND: u16 = 0;
+        const DB: u16 = 1;
+        let stmts = vec![Stmt::While {
+            condition: Expr::Var(COND),
+            body: vec![
+                Stmt::Let {
+                    index: DB,
+                    declared_schema: None,
+                    expr: Expr::Null,
+                    line: 1,
+                },
+                Stmt::Expr {
+                    expr: Expr::Var(DB),
+                    line: 2,
+                },
+            ],
+            line: 1,
+        }];
+        let owned = vec![false, true];
+        let rewriter = LivenessRewriter::new(2, &[], &HashMap::new(), &owned);
+        let rewritten = rewriter.rewrite_program_block(&stmts);
+
+        let Stmt::While { body, .. } = rewritten.first().expect("while stmt") else {
+            panic!("expected the rewritten top-level statement to be the while loop");
+        };
+        let drops = body
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Stmt::Drop { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            drops,
+            vec![DB],
+            "the owned local must be dropped once at its per-iteration last death"
+        );
+    }
+
+    /// The same loop with a non-owned local must stay clear-suppressed: no
+    /// `Stmt::Drop` is inserted inside the body.
+    #[test]
+    fn loop_body_plain_local_keeps_suppressed_clears_in_ir() {
+        const COND: u16 = 0;
+        const PLAIN: u16 = 1;
+        let stmts = vec![Stmt::While {
+            condition: Expr::Var(COND),
+            body: vec![
+                Stmt::Let {
+                    index: PLAIN,
+                    declared_schema: None,
+                    expr: Expr::Null,
+                    line: 1,
+                },
+                Stmt::Expr {
+                    expr: Expr::Var(PLAIN),
+                    line: 2,
+                },
+            ],
+            line: 1,
+        }];
+        let owned = vec![false, false];
+        let rewriter = LivenessRewriter::new(2, &[], &HashMap::new(), &owned);
+        let rewritten = rewriter.rewrite_program_block(&stmts);
+
+        let Stmt::While { body, .. } = rewritten.first().expect("while stmt") else {
+            panic!("expected the rewritten top-level statement to be the while loop");
+        };
+        assert!(
+            body.iter().all(|stmt| !matches!(stmt, Stmt::Drop { .. })),
+            "non-owned loop body must not gain drops: {body:?}"
+        );
     }
 }

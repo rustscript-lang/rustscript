@@ -94,6 +94,11 @@ impl AvailabilityAnalyzer {
         let mut closure_state = FlowState::reachable(self.local_count);
         for slot in &closure.param_slots {
             self.mark_available(&mut closure_state, *slot, line)?;
+            // Resource-typed closure parameters are move-only inside the body.
+            if self.is_owned_slot(*slot) {
+                closure_state.copyable_locals[*slot as usize] = false;
+                closure_state.movable_locals[*slot as usize] = true;
+            }
         }
         for (source_slot, captured_slot) in &closure.capture_copies {
             self.mark_available(&mut closure_state, *captured_slot, line)?;
@@ -151,7 +156,8 @@ impl AvailabilityAnalyzer {
         captured_slot: LocalSlot,
         capture_mode: CaptureBindingMode,
         implicit_read: bool,
-    ) {
+        line: u32,
+    ) -> Result<(), ParseError> {
         let source_idx = source_slot as usize;
         let captured_idx = captured_slot as usize;
         if source_idx < self.local_count && captured_idx < self.local_count {
@@ -162,6 +168,38 @@ impl AvailabilityAnalyzer {
         }
         self.copy_local_field_moves(state, source_slot, captured_slot);
         self.copy_local_collection_aliases(state, source_slot, captured_slot);
+        // Owned (resource-containing) sources can never be aliased or cloned
+        // by a closure: a shared borrow would let the handle escape the call
+        // boundary, and the core has no generic resource clone. The only
+        // legal resource capture is a move — the source becomes unusable and
+        // the handle transfers into the closure cell.
+        if self.is_owned_slot(source_slot) {
+            match capture_mode {
+                CaptureBindingMode::Borrow | CaptureBindingMode::BorrowMut => {
+                    let display = self.display_local_name(source_slot);
+                    return Err(ParseError {
+                        span: None,
+                        code: Some("E_OWNERSHIP_BORROW_ESCAPE".to_string()),
+                        line: line as usize,
+                        message: format!(
+                            "closure capture of resource value '{display}' must move it; a shared borrow cannot escape into a closure cell"
+                        ),
+                    });
+                }
+                CaptureBindingMode::Copy => {
+                    let display = self.display_local_name(source_slot);
+                    return Err(ParseError {
+                        span: None,
+                        code: Some("E_OWNERSHIP_COPY_RESOURCE".to_string()),
+                        line: line as usize,
+                        message: format!(
+                            "closure capture of resource value '{display}' must move it; resources cannot be cloned into a closure cell"
+                        ),
+                    });
+                }
+                CaptureBindingMode::Move => {}
+            }
+        }
         // Availability and codegen consume the same capture-mode classifier.
         // Codegen only needs the mode; availability additionally applies its
         // stricter body-use model: a plain by-value use (an implicit read with
@@ -171,20 +209,24 @@ impl AvailabilityAnalyzer {
         // source binding usable so mutation can flow back through the cell.
         // `implicit_read` is consulted only when the final mode is `Copy`:
         // `Move` consumes the source regardless, and the shared-borrow modes
-        // never consume it no matter how the body reads the slot.
-        let consumes_source = match capture_mode {
-            CaptureBindingMode::Move => true,
-            CaptureBindingMode::Borrow | CaptureBindingMode::BorrowMut => false,
-            CaptureBindingMode::Copy => implicit_read,
-        };
+        // never consume it no matter how the body reads the slot. Owned
+        // sources always consume (they are move-only by schema).
+        let consumes_source = self.is_owned_slot(source_slot)
+            || match capture_mode {
+                CaptureBindingMode::Move => true,
+                CaptureBindingMode::Borrow | CaptureBindingMode::BorrowMut => false,
+                CaptureBindingMode::Copy => implicit_read,
+            };
         if consumes_source
             && self.enable_local_move_semantics
             && source_idx < self.local_count
-            && (state.movable_locals[source_idx]
+            && (self.is_owned_slot(source_slot)
+                || state.movable_locals[source_idx]
                 || !state.collection_aliases[source_idx].is_empty())
         {
             self.mark_local_moved(state, source_slot);
         }
+        Ok(())
     }
 
     /// Classifies a named-function capture for availability: returns the

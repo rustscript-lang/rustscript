@@ -378,16 +378,30 @@ fn compile_parsed_output_with_entry_locals(
         .map_err(SourceError::Compile)?;
     typing::validate_if_else_type_consistency(&parsed, typing_mode, entry_local_types)
         .map_err(SourceError::Compile)?;
+    // One strict inference run over the post-legalize IR: it feeds both the
+    // strict RustScript resolution gate and the resource-ownership metadata
+    // for the lifetime passes. Slot indices are the pre-compaction logical
+    // locals here, exactly the space availability/liveness analyze in.
+    let pre_lifetime_type_info = typing::infer_types(&parsed, typing_mode, entry_local_types);
     if typing_mode.is_strict() {
-        let strict_type_info = typing::infer_types(&parsed, typing_mode, entry_local_types);
-        enforce_strict_rustscript_type_resolution(&parsed, &strict_type_info)
+        enforce_strict_rustscript_type_resolution(&parsed, &pre_lifetime_type_info)
             .map_err(SourceError::Compile)?;
     }
+    // A local slot is resource-owned when its post-legalize logical schema
+    // contains a resource anywhere (direct or nested). These slots are the
+    // move-only contract for availability/liveness; plain programs carry no
+    // resource schemas, so their behavior is untouched.
+    let owned_local_slots = pre_lifetime_type_info
+        .local_schemas
+        .iter()
+        .map(|schema| schema.as_ref().is_some_and(TypeSchema::contains_resource))
+        .collect::<Vec<_>>();
     let parsed = lifetime::enforce_local_availability_with_entry_locals(
         parsed,
         entry_locals,
         behavior.clear_dead_locals,
         enable_local_move_semantics,
+        &owned_local_slots,
     )
     .map_err(SourceError::Parse)?;
     // Classify named callable materialization on the final merged IR
@@ -1293,22 +1307,29 @@ fn build_entry_local_availability(
         .local_bindings
         .iter()
         .filter_map(|(name, slot)| {
-            let binding = predefined_by_name.get(name.as_str())?;
+            let Some(binding) = predefined_by_name.get(name.as_str()).copied() else {
+                return None;
+            };
             let schema = binding
                 .schema
                 .as_ref()
                 .map(|schema| schema.split_optional().0);
-            let copyable = matches!(
-                schema,
-                Some(
-                    TypeSchema::Null
-                        | TypeSchema::Int
-                        | TypeSchema::Float
-                        | TypeSchema::Number
-                        | TypeSchema::Bool
-                )
-            );
-            let movable = matches!(schema, Some(TypeSchema::String | TypeSchema::Bytes));
+            // A resource-containing entry local is move-only: never copyable,
+            // always movable (ownership transfers instead of duplicating the
+            // underlying handle).
+            let owned = schema.as_ref().is_some_and(TypeSchema::contains_resource);
+            let copyable = !owned
+                && matches!(
+                    schema,
+                    Some(
+                        TypeSchema::Null
+                            | TypeSchema::Int
+                            | TypeSchema::Float
+                            | TypeSchema::Number
+                            | TypeSchema::Bool
+                    )
+                );
+            let movable = owned || matches!(schema, Some(TypeSchema::String | TypeSchema::Bytes));
             Some(lifetime::EntryLocalAvailability {
                 slot: *slot,
                 copyable,
