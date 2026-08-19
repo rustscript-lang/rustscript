@@ -410,6 +410,17 @@ impl TraceJitEngine {
         true
     }
 
+    /// The per-import non-yielding-inline eligibility vector most recently
+    /// synced by `Vm::sync_jit_non_yielding_host_imports` (index-aligned with
+    /// the program's resolved call slots). Used by the exact-contract unit
+    /// tests to assert deterministically that resource-carrying imports are
+    /// excluded from the native inline shim even when no native backend is
+    /// available.
+    #[allow(dead_code)]
+    pub(crate) fn non_yielding_host_imports(&self) -> &[bool] {
+        &self.non_yielding_host_imports
+    }
+
     pub fn observe_hot_ip(&mut self, ip: usize, program: &Program) -> Option<usize> {
         self.observe_hot_entry(ROOT_FRAME_KEY, ip, 0, program)
     }

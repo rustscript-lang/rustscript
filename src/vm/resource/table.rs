@@ -71,16 +71,22 @@ pub enum ResourceOwnership {
 
 /// Resource-parameter state used by an exact host call.
 ///
-/// `Value` and `ToOwned` remain represented here so an adapter can preserve the
-/// compiler's five-state distinction. They are deliberately rejected by the
-/// resource frame: ordinary values must use the existing Value adapter and a
-/// resource-containing `ToOwned` must never become an implicit integer copy.
+/// The adapter layer represents exactly the four host-passing modes
+/// (`Borrow`, `BorrowMut`, `TakeOwned`) plus `Value` as the non-resource
+/// placeholder that shares the request API. There is no `ToOwned` host mode:
+/// a value-carrying `to_owned` expression is ordinary `Value` passing on the
+/// guest side and is deliberately rejected by the resource frame — a
+/// resource-containing `ToOwned` frame must never become an implicit integer
+/// copy. (`ToOwned` is therefore unavailable at every public surface; trying
+/// to enter it via the old `"to_owned"` string / `pd_to_owned` attribute is an
+/// explicit "reserved" error.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResourceAccessMode {
     Borrow,
     BorrowMut,
-    ToOwned,
     TakeOwned,
+    /// A non-resource argument riding the same request list; rejected by the
+    /// resource frame with `ResourceAccessModeUnsupported`.
     Value,
 }
 
@@ -98,15 +104,14 @@ impl ResourceAccessMode {
     }
 
     /// Converts the adapter state to the catalog/compiler passing state.
-    /// `ToOwned` follows the compiler's ordinary-value `Value` contract; the
-    /// resource frame itself still rejects that mode.
+    /// `Value` remains the only non-resource placeholder; there is no `ToOwned`
+    /// host mode to alias (a `to_owned` guest expression is `Value` passing).
     pub fn host_param_passing(self) -> Option<crate::host_api::HostParamPassing> {
         match self {
             Self::Borrow => Some(crate::host_api::HostParamPassing::Borrow),
             Self::BorrowMut => Some(crate::host_api::HostParamPassing::BorrowMut),
             Self::TakeOwned => Some(crate::host_api::HostParamPassing::TakeOwned),
             Self::Value => Some(crate::host_api::HostParamPassing::Value),
-            Self::ToOwned => Some(crate::host_api::HostParamPassing::Value),
         }
     }
 }

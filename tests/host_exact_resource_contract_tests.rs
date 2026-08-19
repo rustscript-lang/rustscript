@@ -43,9 +43,10 @@ use vm::resource::{
 use vm::{
     BytecodeBuilder, CallOutcome, CallReturn, HostApiBuilder, HostApiCatalog, HostArgsFunction,
     HostFunction, HostFunctionRegistry, HostFunctionSchema, HostImport, HostImportBindingError,
-    HostImportParam, HostImportSchema, HostParamPassing, HostParamSchema, HostTypeSchema, Program,
-    Resource, ResourceAccessRequest, ResourceHandle, ResourceOwnership, ResourceTypeKey,
-    ResourceTypeSchema, Value, Vm, VmError, VmStatus, compile_source_with_flavor_and_options,
+    HostImportParam, HostImportSchema, HostParamPassing, HostParamSchema, HostTypeSchema,
+    JitConfig, Program, Resource, ResourceAccessRequest, ResourceHandle, ResourceOwnership,
+    ResourceTypeKey, ResourceTypeSchema, Value, Vm, VmError, VmStatus,
+    compile_source_with_flavor_and_options,
 };
 
 // ---- resources ------------------------------------------------------------
@@ -462,16 +463,34 @@ recording_ping!(OLD_TAKEN_PING, OldTakenPing);
 recording_ping!(DUP_TAKE_PING, DupTakePing);
 recording_ping!(TAKE_BORROW_PING, TakeBorrowPing);
 recording_block_ping!(WRONG_KEY_BLOCK_PING, WrongKeyBlockPing);
+// Per-test JIT/AOT wrong-key producers: `WRONG_KEY_BLOCK_PING` is owned by the
+// existing `wrong_key_rejected_zero_calls`, and the JIT and AOT parity tests
+// each need their own recording static to stay parallel-safe amongst
+// themselves.
+recording_block_ping!(JIT_WRONG_KEY_BLOCK_PING, JitWrongKeyBlockPing);
+recording_block_ping!(AOT_WRONG_KEY_BLOCK_PING, AotWrongKeyBlockPing);
 recording_ping_with_child!(CHILDREN_PING, ChildrenPing);
 recording_ping_with_op!(ACTIVE_OP_PING, ActiveOpPing);
 recording_ping!(CONSUMED_PING, ConsumedPing);
+// Per-test JIT/AOT consumed-ownership producers: `CONSUMED_PING` is owned by
+// `taken_owned_consumed_is_ok`, and the JIT and AOT parity tests each get
+// their own recording static to stay parallel-safe amongst themselves.
+recording_ping!(JIT_CONSUMED_PING, JitConsumedPing);
+recording_ping!(AOT_CONSUMED_PING, AotConsumedPing);
 recording_ping!(NO_TAKE_PING, NoTakePing);
 recording_ping!(ONE_OF_TWO_PING, OneOfTwoPing);
 recording_ping!(HOST_ERR_PING, HostErrPing);
 recording_ping!(PANIC_PING, PanicPing);
+recording_ping!(JIT_LOOP_PING, JitLoopPing);
 
 // Take-side closures, one static counter each.
 static TAKE_ONE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Per-test take counters for the JIT/AOT parity tests (parallel-safe: never
+/// touches `TAKE_ONE_CALLS`, which other tests assert on; JIT and AOT each get
+/// their own so the two parity tests never perturb each other).
+static JIT_TAKE_ONE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static AOT_TAKE_ONE_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 fn take_first_arg(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
     let handle = ResourceHandle::from_value(&args[0]).map_err(VmError::from)?;
@@ -490,10 +509,49 @@ fn take_first_arg_counted(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutco
     take_first_arg(vm, args)
 }
 
+/// `take_first_arg` variants with per-test counters so the parity tests never
+/// perturb `TAKE_ONE_CALLS` (JIT and AOT kept separate).
+fn jit_take_first_arg_counted(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
+    JIT_TAKE_ONE_CALLS.fetch_add(1, Ordering::SeqCst);
+    take_first_arg(vm, args)
+}
+
+fn aot_take_first_arg_counted(vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
+    AOT_TAKE_ONE_CALLS.fetch_add(1, Ordering::SeqCst);
+    take_first_arg(vm, args)
+}
+
 static NO_TAKE_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 fn no_take_counted(_vm: &mut Vm, _args: &[Value]) -> vm::VmResult<CallOutcome> {
     NO_TAKE_CALLS.fetch_add(1, Ordering::SeqCst);
+    Ok(CallOutcome::Return(CallReturn::One(Value::Int(0))))
+}
+
+/// `unconsumed_take_owned_reclaims_and_reports_not_consumed` legitimately lets
+/// its take host run (the take passes preflight and the callee simply does not
+/// consume), so it uses its own counter: the shared `NO_TAKE_CALLS` is never
+/// incremented, keeping every zero-asserting preflight test parallel-safe.
+static UNCONSUMED_NO_TAKE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+fn unconsumed_no_take_counted(_vm: &mut Vm, _args: &[Value]) -> vm::VmResult<CallOutcome> {
+    UNCONSUMED_NO_TAKE_CALLS.fetch_add(1, Ordering::SeqCst);
+    Ok(CallOutcome::Return(CallReturn::One(Value::Int(0))))
+}
+
+/// Per-test no-take counters for the JIT/AOT parity tests (parallel-safe:
+/// never touches `NO_TAKE_CALLS`, which other tests assert on; JIT and AOT
+/// kept separate).
+static JIT_NO_TAKE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static AOT_NO_TAKE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+fn jit_no_take_counted(_vm: &mut Vm, _args: &[Value]) -> vm::VmResult<CallOutcome> {
+    JIT_NO_TAKE_CALLS.fetch_add(1, Ordering::SeqCst);
+    Ok(CallOutcome::Return(CallReturn::One(Value::Int(0))))
+}
+
+fn aot_no_take_counted(_vm: &mut Vm, _args: &[Value]) -> vm::VmResult<CallOutcome> {
+    AOT_NO_TAKE_CALLS.fetch_add(1, Ordering::SeqCst);
     Ok(CallOutcome::Return(CallReturn::One(Value::Int(0))))
 }
 
@@ -803,7 +861,7 @@ fn unconsumed_take_owned_reclaims_and_reports_not_consumed() {
         &ping,
         &take,
         || Box::new(NoTakePing),
-        no_take_counted,
+        unconsumed_no_take_counted,
         ping_then_call_program(&ping, &take, 1),
     );
 
@@ -1205,6 +1263,424 @@ fn aggregate_nested_resource_rejected_at_registration() {
         ),
         "expected structured InvalidSchema, got: {error}"
     );
+}
+
+/// An aggregate-nested resource **return** (`Array<Resource>` or
+/// `Optional<Optional<... Resource ...>>`) is rejected at registration too;
+/// only `Resource(key)` and a single `Optional<Resource(key)>` may carry a
+/// resource across the boundary.
+#[test]
+fn aggregate_nested_resource_return_rejected_at_registration() {
+    let file = file_key();
+    let mut registry = HostFunctionRegistry::new();
+    let ok =
+        |_vm: &mut Vm, _args: &[Value]| Ok(CallOutcome::Return(CallReturn::One(Value::Int(0))));
+
+    // Legal: direct Resource(io.file) return.
+    let direct = HostImportSchema {
+        params: vec![],
+        return_type: TypeSchema::Resource(file.clone()),
+        fingerprint: catalog().fingerprint(),
+    };
+    registry
+        .register_exact_static("acme::direct", 0, direct, ok)
+        .expect("direct Resource return must register");
+
+    // Legal: Optional<Resource(io.file)> return.
+    let optional = HostImportSchema {
+        params: vec![],
+        return_type: TypeSchema::Optional(Box::new(TypeSchema::Resource(file.clone()))),
+        fingerprint: catalog().fingerprint(),
+    };
+    registry
+        .register_exact_static("acme::optional", 0, optional, ok)
+        .expect("Optional<Resource> return must register");
+
+    // Rejected: Array<Resource>.
+    let array = HostImportSchema {
+        params: vec![],
+        return_type: TypeSchema::Array(Box::new(TypeSchema::Resource(file.clone()))),
+        fingerprint: catalog().fingerprint(),
+    };
+    let error = registry
+        .register_exact_static("acme::array_bad", 0, array, ok)
+        .expect_err("Array<Resource> return must be rejected at registration");
+    assert!(
+        matches!(
+            error,
+            VmError::HostImportBinding(HostImportBindingError::InvalidSchema { .. })
+        ),
+        "expected structured InvalidSchema for Array<Resource> return, got: {error}"
+    );
+
+    // Rejected: Optional<Optional<Resource>> (aggregate nested).
+    let nested = HostImportSchema {
+        params: vec![],
+        return_type: TypeSchema::Optional(Box::new(TypeSchema::Optional(Box::new(
+            TypeSchema::Resource(file),
+        )))),
+        fingerprint: catalog().fingerprint(),
+    };
+    let error = registry
+        .register_exact_static("acme::nested_bad", 0, nested, ok)
+        .expect_err("nested-Optional resource return must be rejected at registration");
+    assert!(
+        matches!(
+            error,
+            VmError::HostImportBinding(HostImportBindingError::InvalidSchema { .. })
+        ),
+        "expected structured InvalidSchema for nested-Optional resource return, got: {error}"
+    );
+}
+
+// ---- review finding 4: JIT / AOT call-boundary parity -----------------------
+
+/// Matches the native-backend gate used by the JIT/AOT integration suite.
+/// When no backend is available the deterministic inline-gate tests in
+/// `src/vm/host.rs` still prove the resource imports stay off the native
+/// inline shim; the behavioral runs here are additionally gated so they never
+/// depend on a compiler that the test host cannot load.
+fn native_backend_supported() -> bool {
+    (cfg!(target_arch = "x86_64")
+        && (cfg!(target_os = "windows") || (cfg!(unix) && !cfg!(target_os = "macos"))))
+        || (cfg!(target_arch = "aarch64")
+            && (cfg!(target_os = "linux") || cfg!(target_os = "macos")))
+}
+
+fn patch_branch_target(code: &mut [u8], instr_ip: u32, target: u32) {
+    let start = instr_ip as usize + 1;
+    code[start..start + 4].copy_from_slice(&target.to_le_bytes());
+}
+
+/// A pure-arithmetic loop that reliably compiles a native trace when the
+/// backend is available; proves the JIT engine is genuinely executing natively
+/// in this test before we assert anything about resource calls on that engine.
+///
+/// Constant pool: [0, 1, 64] — `ldc(2)` pushes the loop limit 64.
+fn arithmetic_loop_program() -> Program {
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.stloc(0);
+    let loop_ip = bc.position();
+    bc.ldloc(0);
+    bc.ldc(2);
+    bc.clt();
+    let exit_branch_ip = bc.position();
+    bc.brfalse(0);
+    bc.ldloc(0);
+    bc.ldc(1);
+    bc.add();
+    bc.stloc(0);
+    bc.br(loop_ip);
+    let exit_ip = bc.position();
+    bc.ldloc(0);
+    bc.ret();
+    let mut code = bc.finish();
+    patch_branch_target(&mut code, exit_branch_ip, exit_ip);
+    Program::new(vec![Value::Int(0), Value::Int(1), Value::Int(64)], code).with_local_count(1)
+}
+
+fn with_jit(vm: &mut Vm) {
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+}
+
+/// Enabling the JIT must not change the exact contract: the resource-carrying
+/// import is never a non-yielding inline shim (deterministically proven in
+/// `src/vm/host.rs`  `jit_import_is_inline_eligible` /
+/// `jit_sync_flags_mark_resource_return_import_non_inline`), so the wrong-key
+/// rejection and TakeOwned consumption keep byte-identical outcomes when the
+/// engine is turned on.
+#[test]
+fn jit_enabled_preserves_wrong_key_and_take_owned_contract() {
+    // Wrong key stays a structured rejection with zero user calls.
+    let create_block = compiled_import("acme::create_block", "let b = acme::create_block(7);\n");
+    let take = compiled_import("acme::take", "let r = acme::ping(7); acme::take(r);\n");
+    JIT_WRONG_KEY_BLOCK_PING.lock().unwrap().clear();
+    JIT_NO_TAKE_CALLS.store(0, Ordering::SeqCst);
+    let mut registry = HostFunctionRegistry::new();
+    registry
+        .register_exact(
+            &create_block.name,
+            1,
+            create_block.schema.clone().expect("schema"),
+            || Box::new(JitWrongKeyBlockPing),
+        )
+        .expect("register create_block");
+    registry
+        .register_exact_static(
+            &take.name,
+            take.arity,
+            take.schema.clone().expect("schema"),
+            jit_no_take_counted,
+        )
+        .expect("register take");
+    let mut vm = Vm::new(ping_then_call_program(&create_block, &take, 1));
+    registry.bind_vm_cached(&mut vm).expect("bind");
+    with_jit(&mut vm);
+    let error = vm
+        .run()
+        .expect_err("wrong-key TakeOwned stays rejected under JIT");
+    assert_eq!(
+        error.resource_error_code(),
+        Some(ResourceErrorCode::ResourceKeyMismatch),
+        "wrong key must stay a structured key mismatch under JIT, got: {error}"
+    );
+    assert_eq!(JIT_NO_TAKE_CALLS.load(Ordering::SeqCst), 0);
+    let closes = JIT_WRONG_KEY_BLOCK_PING.lock().unwrap()[0].1.clone();
+    assert_eq!(
+        closes.load(Ordering::SeqCst),
+        0,
+        "no close on key preflight"
+    );
+
+    // A consumed TakeOwned stays consumed (GuestOwned -> Taken, zero closes).
+    // (Built directly, not via `bind_and_run_two_import`, because JIT must be
+    // enabled before the run.)
+    let ping = compiled_import("acme::ping", "let r = acme::ping(7);\n");
+    let take = compiled_import("acme::take", "let r = acme::ping(7); acme::take(r);\n");
+    JIT_CONSUMED_PING.lock().unwrap().clear();
+    JIT_TAKE_ONE_CALLS.store(0, Ordering::SeqCst);
+    let mut registry = HostFunctionRegistry::new();
+    registry
+        .register_exact(&ping.name, 1, ping.schema.clone().expect("schema"), || {
+            Box::new(JitConsumedPing)
+        })
+        .expect("register ping");
+    registry
+        .register_exact_static(
+            &take.name,
+            take.arity,
+            take.schema.clone().expect("schema"),
+            jit_take_first_arg_counted,
+        )
+        .expect("register take");
+    let mut vm = Vm::new(ping_then_call_program(&ping, &take, 1));
+    registry.bind_vm_cached(&mut vm).expect("bind");
+    with_jit(&mut vm);
+    let status = vm.run().expect("consumed take under JIT");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(7)]);
+    let (raw, closes) = {
+        let locked = JIT_CONSUMED_PING.lock().unwrap();
+        (locked[0].0, locked[0].1.clone())
+    };
+    assert_eq!(
+        vm.host_context()
+            .execution_scope()
+            .resources()
+            .ownership(ResourceHandle::from_raw(raw).expect("valid handle")),
+        Some(ResourceOwnership::Taken),
+        "handle must be Taken after a JIT-run consume"
+    );
+    assert_eq!(closes.load(Ordering::SeqCst), 0, "taken not closed");
+}
+
+/// When a native backend exists, prove it engages at all, and that a hot loop
+/// around a resource-producing exact call leaves every returned handle
+/// guest-owned with zero closes (the exact-return transfer happens at the
+/// interpreter boundary, never inside native code).
+#[test]
+fn jit_native_loop_preserves_exact_resource_return_ownership() {
+    if !native_backend_supported() {
+        return;
+    }
+
+    // Prove the engine really runs natively with a host-call-free loop.
+    let mut vm = Vm::new(arithmetic_loop_program());
+    with_jit(&mut vm);
+    let status = vm.run().expect("arithmetic loop under JIT");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(64)]);
+    assert!(
+        vm.jit_native_exec_count() > 0,
+        "native JIT must actually execute the hot loop, dump:\n{}",
+        vm.dump_jit_info()
+    );
+    drop(vm);
+
+    // Now the exact-return contract in the same natively-compiling loop: call
+    // `acme::ping` (exact Resource(io.file) return) 32 times; every returned
+    // handle must be structurally validated, marked guest-owned, and never
+    // closed by the native path.
+    let ping = compiled_import("acme::ping", "let r = acme::ping(7);\n");
+    JIT_LOOP_PING.lock().unwrap().clear();
+
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.stloc(0);
+    let loop_ip = bc.position();
+    bc.ldloc(0);
+    bc.ldc(2);
+    bc.clt();
+    let exit_branch_ip = bc.position();
+    bc.brfalse(0);
+    bc.ldc(0);
+    bc.call(0, 1);
+    bc.pop();
+    bc.ldloc(0);
+    bc.ldc(1);
+    bc.add();
+    bc.stloc(0);
+    bc.br(loop_ip);
+    let exit_ip = bc.position();
+    bc.ldc(0);
+    bc.ret();
+    let mut code = bc.finish();
+    patch_branch_target(&mut code, exit_branch_ip, exit_ip);
+    let program = Program::with_imports_and_debug(
+        vec![Value::Int(0), Value::Int(1), Value::Int(32)],
+        code,
+        vec![ping.clone()],
+        None,
+    )
+    .with_local_count(1);
+
+    let mut registry = HostFunctionRegistry::new();
+    registry
+        .register_exact(&ping.name, 1, ping.schema.clone().expect("schema"), || {
+            Box::new(JitLoopPing)
+        })
+        .expect("register ping");
+    let mut vm = Vm::new(program);
+    registry.bind_vm_cached(&mut vm).expect("bind");
+    with_jit(&mut vm);
+    let status = vm.run().expect("resource loop under JIT");
+    assert_eq!(status, VmStatus::Halted);
+    assert!(
+        vm.jit_native_exec_count() > 0,
+        "the non-resource loop body should have compiled and run natively,\
+         dump:\n{}",
+        vm.dump_jit_info()
+    );
+
+    let records = JIT_LOOP_PING.lock().unwrap();
+    assert_eq!(records.len(), 32, "each loop iteration produced a handle");
+    for (raw, closes) in records.iter() {
+        assert_eq!(
+            vm.host_context()
+                .execution_scope()
+                .resources()
+                .ownership(ResourceHandle::from_raw(*raw).expect("valid handle")),
+            Some(ResourceOwnership::GuestOwned),
+            "every exact-returned handle must be guest-owned"
+        );
+        assert_eq!(closes.load(Ordering::SeqCst), 0, "no close mid-run");
+    }
+    drop(records);
+
+    // Exiting the scope (explicit close + drive) closes each guest-owned
+    // handle exactly once.
+    let mut cx = vm.host_context();
+    cx.begin_close(ResourceCloseReason::Requested)
+        .expect("scope begin close");
+    let waker = std::task::Waker::from(std::sync::Arc::new(NoopWaker(0)));
+    let mut context = std::task::Context::from_waker(&waker);
+    loop {
+        match cx.poll_close(&mut context) {
+            std::task::Poll::Pending => continue,
+            std::task::Poll::Ready(Ok(_)) => break,
+            std::task::Poll::Ready(Err(error)) => panic!("scope close failed: {error}"),
+        }
+    }
+    drop(cx);
+    drop(vm);
+    let records = JIT_LOOP_PING.lock().unwrap();
+    for (_, closes) in records.iter() {
+        assert_eq!(closes.load(Ordering::SeqCst), 1, "exactly-once close");
+    }
+}
+
+struct NoopWaker(usize);
+impl std::task::Wake for NoopWaker {
+    fn wake(self: std::sync::Arc<Self>) {}
+}
+
+/// AOT-installed execution must preserve the same exact contract at every call
+/// boundary: wrong-key stays a structured rejection (zero user calls) and a
+/// consumed TakeOwned stays consumed, exactly as in the interpreter.
+#[test]
+fn aot_preserves_exact_contract_at_call_boundary() {
+    if !native_backend_supported() {
+        return;
+    }
+
+    // Wrong key under AOT.
+    let create_block = compiled_import("acme::create_block", "let b = acme::create_block(7);\n");
+    let take = compiled_import("acme::take", "let r = acme::ping(7); acme::take(r);\n");
+    AOT_WRONG_KEY_BLOCK_PING.lock().unwrap().clear();
+    AOT_NO_TAKE_CALLS.store(0, Ordering::SeqCst);
+    let mut registry = HostFunctionRegistry::new();
+    registry
+        .register_exact(
+            &create_block.name,
+            1,
+            create_block.schema.clone().expect("schema"),
+            || Box::new(AotWrongKeyBlockPing),
+        )
+        .expect("register create_block");
+    registry
+        .register_exact_static(
+            &take.name,
+            take.arity,
+            take.schema.clone().expect("schema"),
+            aot_no_take_counted,
+        )
+        .expect("register take");
+    let mut vm = Vm::new(ping_then_call_program(&create_block, &take, 1));
+    registry.bind_vm_cached(&mut vm).expect("bind");
+    vm.compile_aot().expect("aot compile");
+    let error = vm
+        .run()
+        .expect_err("wrong-key TakeOwned stays rejected under AOT");
+    assert_eq!(
+        error.resource_error_code(),
+        Some(ResourceErrorCode::ResourceKeyMismatch),
+        "wrong key must stay a structured key mismatch under AOT, got: {error}"
+    );
+    assert_eq!(AOT_NO_TAKE_CALLS.load(Ordering::SeqCst), 0);
+
+    // Consumed TakeOwned under AOT.
+    let ping = compiled_import("acme::ping", "let r = acme::ping(7);\n");
+    let take = compiled_import("acme::take", "let r = acme::ping(7); acme::take(r);\n");
+    AOT_CONSUMED_PING.lock().unwrap().clear();
+    AOT_TAKE_ONE_CALLS.store(0, Ordering::SeqCst);
+    let mut registry = HostFunctionRegistry::new();
+    registry
+        .register_exact(&ping.name, 1, ping.schema.clone().expect("schema"), || {
+            Box::new(AotConsumedPing)
+        })
+        .expect("register ping");
+    registry
+        .register_exact_static(
+            &take.name,
+            take.arity,
+            take.schema.clone().expect("schema"),
+            aot_take_first_arg_counted,
+        )
+        .expect("register take");
+    let mut vm = Vm::new(ping_then_call_program(&ping, &take, 1));
+    registry.bind_vm_cached(&mut vm).expect("bind");
+    vm.compile_aot().expect("aot compile");
+    let status = vm.run().expect("consumed take under AOT");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(7)]);
+    let (raw, closes) = {
+        let locked = AOT_CONSUMED_PING.lock().unwrap();
+        (locked[0].0, locked[0].1.clone())
+    };
+    assert_eq!(
+        vm.host_context()
+            .execution_scope()
+            .resources()
+            .ownership(ResourceHandle::from_raw(raw).expect("valid handle")),
+        Some(ResourceOwnership::Taken),
+        "handle must be Taken after an AOT-run consume"
+    );
+    assert_eq!(closes.load(Ordering::SeqCst), 0, "taken not closed");
 }
 
 // Keep `Resource` and `ResourceAccessRequest` referenced for compile-safe

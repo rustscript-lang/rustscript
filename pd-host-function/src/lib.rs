@@ -331,7 +331,6 @@ fn resource_mode_tokens(mode: ResourceMode) -> proc_macro2::TokenStream {
         ResourceMode::Borrow => quote!(super::super::ResourceAccessMode::Borrow),
         ResourceMode::BorrowMut => quote!(super::super::ResourceAccessMode::BorrowMut),
         ResourceMode::TakeOwned => quote!(super::super::ResourceAccessMode::TakeOwned),
-        ResourceMode::ToOwned => quote!(super::super::ResourceAccessMode::ToOwned),
         ResourceMode::Value => quote!(super::super::ResourceAccessMode::Value),
     }
 }
@@ -387,10 +386,8 @@ fn resource_extract_tokens(
                 taken
             }
         }
-        ResourceMode::ToOwned | ResourceMode::Value => {
-            quote!(compile_error!(
-                "resource ToOwned/Value adapters are rejected"
-            ))
+        ResourceMode::Value => {
+            quote!(compile_error!("resource Value adapters are rejected"))
         }
     };
     quote!(let #ident = #value;)

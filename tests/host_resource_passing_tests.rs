@@ -282,10 +282,17 @@ impl vm::operation::HostOperation for NoopOperation {
 }
 
 #[test]
-fn request_modes_keep_value_and_to_owned_outside_resource_adapter() {
+fn request_modes_keep_value_outside_the_resource_adapter() {
+    // Exactly the four live modes exist on the host side. `ToOwned` is not a
+    // host passing mode (a guest `to_owned()` is ordinary `Value` passing), so
+    // there is nothing to alias: every variant maps 1:1 to a `HostParamPassing`
+    // and `Value` remains the only non-resource placeholder.
     assert_eq!(ResourceAccessMode::Borrow.is_borrow(), true);
     assert_eq!(ResourceAccessMode::BorrowMut.is_mutable(), true);
     assert_eq!(ResourceAccessMode::TakeOwned.is_consuming(), true);
+    assert_eq!(ResourceAccessMode::Value.is_consuming(), false);
+    assert!(!ResourceAccessMode::Value.is_borrow());
+    assert!(!ResourceAccessMode::Value.is_mutable());
     assert_eq!(
         ResourceAccessMode::Borrow.host_param_passing(),
         Some(vm::HostParamPassing::Borrow)
@@ -299,7 +306,7 @@ fn request_modes_keep_value_and_to_owned_outside_resource_adapter() {
         Some(vm::HostParamPassing::TakeOwned)
     );
     assert_eq!(
-        ResourceAccessMode::ToOwned.host_param_passing(),
+        ResourceAccessMode::Value.host_param_passing(),
         Some(vm::HostParamPassing::Value)
     );
 }

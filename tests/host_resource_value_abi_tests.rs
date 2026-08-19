@@ -28,9 +28,10 @@ use vm::resource::{
 };
 use vm::{
     BytecodeBuilder, CallOutcome, CallReturn, HostApiBuilder, HostArgsFunction, HostFunction,
-    HostFunctionRegistry, HostFunctionSchema, HostImport, HostOpId, HostParamSchema,
-    HostStackFunction, HostTypeSchema, JitConfig, Program, ResourceHandle, ResourceTypeKey,
-    ResourceTypeSchema, Value, Vm, VmError, VmStatus, compile_source_with_flavor_and_options,
+    HostFunctionRegistry, HostFunctionSchema, HostImport, HostImportBindingError, HostOpId,
+    HostParamSchema, HostStackFunction, HostTypeSchema, JitConfig, Program, ResourceHandle,
+    ResourceTypeKey, ResourceTypeSchema, Value, Vm, VmError, VmStatus,
+    compile_source_with_flavor_and_options,
 };
 
 // ---- tiny test resource ---------------------------------------------------
@@ -519,10 +520,11 @@ fn optional_resource_host_return_null_is_legal() {
 }
 
 /// A return schema that nests a resource *inside an aggregate*
-/// (`Array<Resource>`) is still explicitly structure-rejected: the current
-/// `Value::Int` handle carrier cannot represent it, and even a `Null` must
-/// error. Only the directly-addressable `Resource` / `Optional<Resource>`
-/// returns are legal under the C4 contract.
+/// (`Array<Resource>`) is rejected **at registration**: the current
+/// `Value::Int` handle carrier cannot represent it, and ever letting such a
+/// host be registered would leave a call-time-only rejection and a false door
+/// for `Null`-returning natives. Only the directly-addressable `Resource` /
+/// `Optional<Resource>` returns are legal under the C4 contract.
 #[test]
 fn nested_resource_host_return_explicitly_rejected() {
     let compiled = compile_catalog_program("let m = acme::many(7);\n");
@@ -541,20 +543,17 @@ fn nested_resource_host_return_explicitly_rejected() {
     );
 
     let mut registry = HostFunctionRegistry::new();
-    registry
+    let error = registry
         .register_exact_static_non_yielding_args("acme::many", 1, schema, |_| {
             Ok(CallOutcome::Return(CallReturn::One(Value::Null)))
         })
-        .expect("register nested-resource exact host");
-    let mut vm = Vm::new(compiled.program);
-    registry.bind_vm_cached(&mut vm).expect("bind");
-
-    let error = vm
-        .run()
-        .expect_err("nested-resource return must be a structured rejection");
+        .expect_err("nested-resource exact host must be rejected at registration");
     assert!(
-        matches!(error, VmError::TypeMismatch(_)),
-        "expected structured type mismatch, got: {error}"
+        matches!(
+            error,
+            VmError::HostImportBinding(HostImportBindingError::InvalidSchema { .. })
+        ),
+        "expected structured InvalidSchema at registration, got: {error}"
     );
 }
 
@@ -982,9 +981,11 @@ fn optional_resource_args_dynamic_pending_completion_null_is_legal() {
 }
 
 /// A return schema that nests a resource *inside an aggregate*
-/// (`Array<Resource>`) is structure-rejected even through the async Pending
-/// path: completing the op with any value is a structured rejection and
-/// terminates the waiting op.
+/// (`Array<Resource>`) is rejected at registration, so it can never reach the
+/// async Pending completion path: no registered host can carry a
+/// `NestedResource` call-time policy. The rejection is a structured
+/// `InvalidSchema` before any registry mutation (the pending path's
+/// `NestedResource` classification remains only as defense in depth).
 #[test]
 fn nested_resource_args_dynamic_pending_completion_explicitly_rejected() {
     let compiled = compile_catalog_program("acme::many(7);\n");
@@ -1002,47 +1003,23 @@ fn nested_resource_args_dynamic_pending_completion_explicitly_rejected() {
         schema.return_type
     );
 
-    // Each value needs a fresh VM: a rejected nested-resource completion
-    // terminates the waiting op, so no second completion is possible on the
-    // same VM.
-    for value in [Value::Null, Value::Int(real_handle_value())] {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let bound_calls = Arc::clone(&calls);
-        let op_id = 0xC0_DE_00_05;
-        let mut registry = HostFunctionRegistry::new();
-        registry
-            .register_exact_args(&import.name, 1, schema.clone(), move || {
-                Box::new(PendingArgsHost {
-                    op_id,
-                    call_count: Arc::clone(&bound_calls),
-                })
+    let op_id = 0xC0_DE_00_05;
+    let mut registry = HostFunctionRegistry::new();
+    let error = registry
+        .register_exact_args(&import.name, 1, schema, move || {
+            Box::new(PendingArgsHost {
+                op_id,
+                call_count: Arc::new(AtomicUsize::new(0)),
             })
-            .expect("register nested-resource exact args");
-        let mut vm = Vm::new(compiled.program.clone());
-        registry.bind_vm_cached(&mut vm).expect("bind");
-
-        let status = vm.run().expect("first run should wait on host op");
-        assert_eq!(status, VmStatus::Waiting(op_id));
-        assert!(vm.stack().is_empty());
-
-        // Even a `Null`/valid handle (which a coarse check would have
-        // accepted) must be structure-rejected through the async completion
-        // path.
-        let error = vm
-            .complete_host_op(op_id, CallReturn::one(value))
-            .expect_err("nested-resource completion must be a structured rejection");
-        assert!(
-            matches!(error, VmError::TypeMismatch(_)),
-            "expected structured type mismatch, got: {error}"
-        );
-        assert_eq!(
-            vm.waiting_host_op_id(),
-            None,
-            "rejected completion must terminate the waiting op"
-        );
-        assert!(vm.stack().is_empty(), "no value may be pushed");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
+        })
+        .expect_err("nested-resource exact args must be rejected at registration");
+    assert!(
+        matches!(
+            error,
+            VmError::HostImportBinding(HostImportBindingError::InvalidSchema { .. })
+        ),
+        "expected structured InvalidSchema at registration, got: {error}"
+    );
 }
 
 /// `schema:None` legacy bindings keep the old coarse behavior through the

@@ -96,7 +96,13 @@ pub fn validate_resource_key(name: &str) -> Result<(), ResourceKeyError> {
     Ok(())
 }
 
-/// The five resource passing modes the adapter layer understands.
+/// The four resource passing modes the adapter layer understands.
+///
+/// `to_owned` is **not** a host passing mode: a guest-side `to_owned()`
+/// expression is ordinary `Value` passing, and asking the adapter for a
+/// resource-containing `to_owned` frame is rejected with an explicit
+/// "reserved" error instead of being silently aliased to `Value` or
+/// `TakeOwned`.
 ///
 /// This mirrors `pd_vm::vm::resource::ResourceAccessMode`; it is kept
 /// runtime-free here so both the proc macro and the build script can share the
@@ -106,7 +112,6 @@ pub enum ResourceMode {
     Borrow,
     BorrowMut,
     TakeOwned,
-    ToOwned,
     Value,
 }
 
@@ -133,29 +138,36 @@ impl fmt::Display for HostPassing {
 
 impl ResourceMode {
     /// Normalizes and parses a `passing = "..."` string literal.
+    ///
+    /// `to_owned` / `toowned` are explicitly **reserved**: they return an error
+    /// naming the reserved mode rather than silently aliasing it to `Value` or
+    /// `TakeOwned`.
     pub fn parse(value: &str) -> Result<Self, String> {
         let normalized = value.to_ascii_lowercase().replace('-', "_");
         match normalized.as_str() {
             "borrow" => Ok(Self::Borrow),
             "borrow_mut" | "borrowmut" => Ok(Self::BorrowMut),
             "take_owned" | "takeowned" | "owned" => Ok(Self::TakeOwned),
-            "to_owned" | "toowned" => Ok(Self::ToOwned),
-            "value" => Ok(Self::Value),
-            _ => Err(
-                "resource passing must be borrow, borrow_mut, to_owned, take_owned, or value"
+            "to_owned" | "toowned" => Err(
+                "to_owned passing is reserved and unsupported; use take_owned to transfer \
+                 resource ownership"
                     .to_string(),
             ),
+            "value" => Ok(Self::Value),
+            _ => {
+                Err("resource passing must be borrow, borrow_mut, take_owned, or value".to_string())
+            }
         }
     }
 
-    /// The catalog passing category. `ToOwned` follows the runtime's
-    /// ordinary-value contract (see `ResourceAccessMode::host_param_passing`).
+    /// The catalog passing category. There is no host `ToOwned` category: the
+    /// only non-resource category is `Value`.
     pub fn host_passing(self) -> HostPassing {
         match self {
             Self::Borrow => HostPassing::Borrow,
             Self::BorrowMut => HostPassing::BorrowMut,
             Self::TakeOwned => HostPassing::TakeOwned,
-            Self::ToOwned | Self::Value => HostPassing::Value,
+            Self::Value => HostPassing::Value,
         }
     }
 
@@ -241,8 +253,11 @@ pub fn parse_resource_attrs(
             continue;
         }
         if path.is_ident("pd_to_owned") {
-            mode = Some(ResourceMode::ToOwned);
-            continue;
+            return Err(
+                "pd_to_owned is reserved and unsupported; use pd_take_owned to transfer \
+                 resource ownership"
+                    .to_string(),
+            );
         }
         if path.is_ident("pd_value") {
             mode = Some(ResourceMode::Value);
@@ -289,8 +304,10 @@ pub fn parse_resource_attrs(
                         return Ok(());
                     }
                     if nested.path.is_ident("to_owned") || nested.path.is_ident("toowned") {
-                        mode = Some(ResourceMode::ToOwned);
-                        return Ok(());
+                        return Err(nested.error(
+                            "to_owned is reserved and unsupported; use take_owned to transfer \
+                             resource ownership",
+                        ));
                     }
                     if nested.path.is_ident("value") {
                         mode = Some(ResourceMode::Value);
@@ -374,9 +391,9 @@ pub fn resource_spec(ty: &Type, attrs: &[Attribute]) -> Result<Option<ResourceSp
     if explicit_mode.is_some() && inferred.is_some() && mode != inferred_mode {
         return Err("resource wrapper and passing metadata specify different modes".to_string());
     }
-    if matches!(mode, ResourceMode::ToOwned | ResourceMode::Value) {
+    if matches!(mode, ResourceMode::Value) {
         return Err(
-            "resource-containing ToOwned/Value parameters are rejected; use Borrow, BorrowMut, or TakeOwned"
+            "resource-containing Value parameters are rejected; use Borrow, BorrowMut, or TakeOwned"
                 .to_string(),
         );
     }
@@ -519,14 +536,30 @@ mod tests {
 
     #[test]
     fn to_owned_and_value_resource_modes_are_rejected() {
+        // `to_owned` / `toowned` are reserved at parse time (never aliased to
+        // Value or TakeOwned): the literal, the attribute, and the nested form
+        // all fail with an explicit "reserved" error.
+        for literal in ["to_owned", "toowned", "TO_OWNED"] {
+            let error = ResourceMode::parse(literal).expect_err("to_owned must be reserved");
+            assert!(error.contains("reserved"), "{literal}: {error}");
+        }
         let ty: Type = parse_quote!(FakeResource);
         let attrs: Vec<Attribute> = parse_quote!(#[pd_host_param(passing = "to_owned")]);
         let error = resource_spec(&ty, &attrs).unwrap_err();
-        assert!(error.contains("ToOwned/Value"), "{error}");
+        assert!(error.contains("reserved"), "{error}");
+        let attrs: Vec<Attribute> = parse_quote!(#[pd_to_owned]);
+        let error = resource_spec(&ty, &attrs).unwrap_err();
+        assert!(error.contains("reserved"), "{error}");
+        let attrs: Vec<Attribute> = parse_quote!(#[pd_host_passing(to_owned)]);
+        let error = resource_spec(&ty, &attrs).unwrap_err();
+        assert!(error.contains("reserved"), "{error}");
 
+        // `value` on a resource type is rejected by the spec (not reserved).
+        let ty: Type = parse_quote!(FakeResource);
         let attrs: Vec<Attribute> = parse_quote!(#[pd_host_param(passing = "value")]);
         let error = resource_spec(&ty, &attrs).unwrap_err();
-        assert!(error.contains("ToOwned/Value"), "{error}");
+        assert!(error.contains("Value"), "{error}");
+        assert!(error.contains("rejected"), "{error}");
     }
 
     #[test]
@@ -589,7 +622,11 @@ mod tests {
             ResourceMode::TakeOwned.host_passing(),
             HostPassing::TakeOwned
         );
-        assert_eq!(ResourceMode::ToOwned.host_passing(), HostPassing::Value);
         assert_eq!(ResourceMode::Value.host_passing(), HostPassing::Value);
+        // There is no ToOwned category to alias: the four variants map 1:1.
+        assert!(!matches!(
+            ResourceMode::Value.host_passing(),
+            HostPassing::TakeOwned
+        ));
     }
 }

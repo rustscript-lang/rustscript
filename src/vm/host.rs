@@ -248,9 +248,18 @@ fn schema_walk_has_resource(
 /// * A `Value`-passing param whose schema *contains* a resource is rejected —
 ///   value passing cannot address a resource.
 /// * A resource-passing param (`Borrow`/`BorrowMut`/`TakeOwned`) whose schema
-///   is not directly addressable by the current `Value::Int` handle ABI
-///   (a resource nested inside `Array`/`Map`/deeper `Optional`/...) is
-///   rejected at registration — it can never be extracted at call time.
+///   contains **no** resource is rejected: the declared mode has no handle to
+///   operate on, and silently dropping it would let the callee assume a
+///   taking/borrowing contract the caller never actually granted.
+/// * A resource-passing param whose schema is not directly addressable by the
+///   current `Value::Int` handle ABI (a resource nested inside
+///   `Array`/`Map`/deeper `Optional`/...) is rejected at registration — it can
+///   never be extracted at call time.
+/// * The exact return is checked the same way: a return whose schema
+///   *contains* a resource is valid only as a direct `Resource(key)` or a
+///   single `Optional<Resource(key)>`; any aggregate-nested resource return is
+///   rejected because the current handle-carrier ABI cannot represent it (the
+///   call-time `NestedResource` policy stays as defense in depth).
 /// * Any resource occurrence nested deeper than [`MAX_EXACT_SCHEMA_DEPTH`] is
 ///   rejected (the walk exits at depth 65).
 /// * For args-only (non-VM-aware) registrations, **any** resource-passing
@@ -264,6 +273,16 @@ fn validate_exact_registration_schema(
     for param in &schema.params {
         let has_resource = schema_walk_has_resource(&param.schema, 0)?;
         if !has_resource {
+            if param.passing != crate::host_api::HostParamPassing::Value {
+                return Err(HostImportBindingError::InvalidSchema {
+                    import: format!("{name}::{}", param.name),
+                    reason: format!(
+                        "parameter '{}' declares {:?} passing but its schema {:#?} contains \
+                         no resource; non-resource parameters must use Value",
+                        param.name, param.passing, param.schema,
+                    ),
+                });
+            }
             continue;
         }
         if !vm_aware {
@@ -293,6 +312,21 @@ fn validate_exact_registration_schema(
                     "resource-passing parameter '{}' schema {:#?} is not directly \
                      addressable by the handle ABI",
                     param.name, param.schema,
+                ),
+            });
+        }
+    }
+    // Exact return shape (finding: only `Resource(key)` and
+    // `Optional<Resource(key)>` may carry a resource across the boundary).
+    if schema_walk_has_resource(&schema.return_type, 0)? {
+        if addressable_resource_key(&schema.return_type).is_none() {
+            return Err(HostImportBindingError::InvalidSchema {
+                import: name.to_string(),
+                reason: format!(
+                    "exact return schema {:#?} contains a resource nested inside an \
+                     aggregate; only Resource(key) and Optional<Resource(key)> returns are \
+                     representable by the handle ABI",
+                    schema.return_type,
                 ),
             });
         }
@@ -348,7 +382,22 @@ impl ExactHostCallContract {
                 continue;
             };
             if !param.schema.contains_resource() {
-                continue;
+                // Registration already rejects a resource-passing mode on a
+                // resource-free schema. Reaching call time means the
+                // registration funnel was bypassed, so refuse to run rather
+                // than silently dropping the declared mode (which would let a
+                // callee assume a borrowing/taking contract the caller never
+                // granted).
+                return Err(VmError::HostImportBinding(
+                    HostImportBindingError::InvalidSchema {
+                        import: String::new(),
+                        reason: format!(
+                            "resource-passing parameter '{}' declares {mode:?} but its schema \
+                             {:#?} contains no resource",
+                            param.name, param.schema,
+                        ),
+                    },
+                ));
             }
             let Some((key, optional)) = addressable_resource_key(&param.schema) else {
                 return Err(VmError::HostImportBinding(
@@ -477,7 +526,7 @@ impl ExactHostCallContract {
                         });
                     }
                 }
-                ResourceAccessMode::ToOwned | ResourceAccessMode::Value => unreachable!(),
+                ResourceAccessMode::Value => unreachable!(),
             }
         }
         first_error
@@ -3119,10 +3168,14 @@ impl Vm {
             && self.host.host_function_symbols.is_empty()
             && self.host.host_functions.is_empty()
         {
+            // Only schema-less legacy imports may take the name-only default
+            // fallback; an import carrying an exact schema must resolve
+            // exclusively through the exact registry (see below).
             let import_names = self
                 .program
                 .imports
                 .iter()
+                .filter(|import| import.schema.is_none())
                 .map(|import| import.name.clone())
                 .collect::<Vec<_>>();
             for name in import_names {
@@ -3134,6 +3187,20 @@ impl Vm {
         let mut resolved = Vec::with_capacity(self.program.imports.len());
         let imports = self.program.imports.clone();
         for (index, import) in imports.iter().enumerate() {
+            // An exact-schema import can never be satisfied by a name-only or
+            // positionally-bound legacy host function: name/position binding
+            // would bypass the exact registry where wrong-key, alias, and
+            // TakeOwned enforcement live. Reject with a structured error
+            // directing the embedder to exact/registry binding
+            // (`HostFunctionRegistry::register_exact{,_static,_stack,...}`
+            // plus `bind_vm_cached` / `bind_vm_with_plan`).
+            if import.schema.is_some() {
+                return Err(VmError::HostImportBinding(
+                    HostImportBindingError::MissingExact {
+                        import: import.name.clone(),
+                    },
+                ));
+            }
             if use_legacy_order {
                 if index >= self.host.host_functions.len() {
                     return Err(VmError::InvalidCall(index as u16));
@@ -3164,6 +3231,33 @@ impl Vm {
         Ok(())
     }
 
+    /// Whether one host import may be lowered to the native non-yielding
+    /// inline shim on the JIT path.
+    ///
+    /// A host import whose exact schema carries a resource anywhere (params or
+    /// return) must never be marked native/non-yielding inline eligible: the
+    /// native non-yielding scalar/i64 shim has no resource-handle ABI, so such
+    /// calls must keep exiting to the interpreter for structure validation (C1)
+    /// and the exact ownership contract (C2/C4) that lives in the interpreter's
+    /// guarded call machinery. Only `ArgsStaticNonYielding` bindings are
+    /// eligible in the first place.
+    pub(super) fn jit_import_is_inline_eligible(
+        schema: Option<&HostImportSchema>,
+        host_fn: Option<&VmHostFunction>,
+    ) -> bool {
+        let schema_has_resource = schema.is_some_and(|schema| {
+            schema
+                .params
+                .iter()
+                .any(|param| param.schema.contains_resource())
+                || schema.return_type.contains_resource()
+        });
+        if schema_has_resource {
+            return false;
+        }
+        matches!(host_fn, Some(VmHostFunction::ArgsStaticNonYielding(_)))
+    }
+
     pub(super) fn sync_jit_non_yielding_host_imports(&mut self) {
         let imports = self
             .host
@@ -3178,25 +3272,13 @@ impl Vm {
                 // the interpreter for return-structure validation (C1). Only
                 // `ArgsStaticNonYielding` bindings are eligible in the first
                 // place.
-                let import = self
+                let schema = self
                     .program
                     .imports
                     .get(index)
                     .and_then(|import| import.schema.as_ref());
-                let schema_has_resource = import.is_some_and(|schema| {
-                    schema
-                        .params
-                        .iter()
-                        .any(|param| param.schema.contains_resource())
-                        || schema.return_type.contains_resource()
-                });
-                if schema_has_resource {
-                    return false;
-                }
-                matches!(
-                    self.host.host_functions.get(usize::from(slot)),
-                    Some(VmHostFunction::ArgsStaticNonYielding(_))
-                )
+                let host_fn = self.host.host_functions.get(usize::from(slot));
+                Self::jit_import_is_inline_eligible(schema, host_fn)
             })
             .collect();
         if self.engine.jit.set_non_yielding_host_imports(imports) {
@@ -3404,6 +3486,136 @@ mod exact_binding_registration_tests {
         assert_eq!(
             vm.host_context().resource_ownership(handle),
             Some(ResourceOwnership::HostOwned),
+        );
+    }
+
+    // ---- review finding 2: legacy name-only binding cannot satisfy an
+    // exact-schema import ------------------------------------------------
+
+    /// A base program importing `test::guard` (an exact TakeOwned resource
+    /// schema) and calling it once.
+    fn legacy_schema_import_program(import: &HostImport) -> Program {
+        let mut code = crate::BytecodeBuilder::new();
+        code.ldc(0);
+        code.call(0, 1);
+        code.ret();
+        Program::with_imports_and_debug(
+            vec![Value::Int(0)],
+            code.finish(),
+            vec![import.clone()],
+            None,
+        )
+    }
+
+    fn guard_take_import() -> HostImport {
+        HostImport {
+            name: "test::guard".into(),
+            arity: 1,
+            return_type: crate::bytecode::ValueType::Null,
+            schema: Some(take_schema(
+                crate::host_api::ResourceTypeKey::new("test.guard").unwrap(),
+            )),
+        }
+    }
+
+    fn assert_missing_exact(error: VmError, label: &str) {
+        assert!(
+            matches!(
+                &error,
+                VmError::HostImportBinding(HostImportBindingError::MissingExact { import })
+                    if import == "test::guard"
+            ),
+            "{label}: expected structured MissingExact, got: {error}"
+        );
+    }
+
+    /// An exact-schema import can never bind through the legacy name-only
+    /// `bind_*` / positional registration APIs: that path bypasses the exact
+    /// registry where wrong-key, alias, and TakeOwned enforcement live. Each
+    /// attempt is a structured `MissingExact` directing the embedder to
+    /// exact/registry binding (`register_exact*` + `bind_vm_cached`).
+    #[test]
+    fn legacy_name_only_binding_rejects_exact_schema_imports() {
+        let import = guard_take_import();
+
+        // (a) name-only: bind_static_function puts a function in the symbol
+        // table under the import's name; the import still must not resolve to
+        // it.
+        let mut named = Vm::new(legacy_schema_import_program(&import));
+        named.bind_static_function("test::guard", dummy_static);
+        assert_missing_exact(
+            named
+                .ensure_call_bindings()
+                .expect_err("name-only bind_* must not satisfy an exact-schema import"),
+            "name-only",
+        );
+
+        // (b) positional: register_static_function binds by slot order with no
+        // symbol at all; exact-schema imports are still never positionally
+        // bound.
+        let mut positional = Vm::new(legacy_schema_import_program(&import));
+        positional.register_static_function(dummy_static);
+        assert_missing_exact(
+            positional
+                .ensure_call_bindings()
+                .expect_err("positional binding must not satisfy an exact-schema import"),
+            "positional",
+        );
+
+        // (c) the default host fallback is gated off exact-schema imports: a
+        // fresh VM that would otherwise self-bind every import leaves the
+        // schema import unbound and rejects it.
+        let mut fresh = Vm::new(legacy_schema_import_program(&import));
+        assert_missing_exact(
+            fresh
+                .ensure_call_bindings()
+                .expect_err("default fallback must not satisfy an exact-schema import"),
+            "default-fallback",
+        );
+    }
+
+    /// The same guard holds across every legacy `bind_*` variant (dynamic,
+    /// stack, args) — none can satisfy an exact-schema import.
+    #[test]
+    fn every_legacy_bind_variant_rejects_exact_schema_imports() {
+        fn stack_fn(_vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+            Ok(CallOutcome::Return(CallReturn::none()))
+        }
+        fn args_fn(_args: &[Value]) -> VmResult<CallOutcome> {
+            Ok(CallOutcome::Return(CallReturn::none()))
+        }
+        struct DynFn;
+        impl HostFunction for DynFn {
+            fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+                Ok(CallOutcome::Return(CallReturn::none()))
+            }
+        }
+        let import = guard_take_import();
+
+        let mut dynamic = Vm::new(legacy_schema_import_program(&import));
+        dynamic.bind_function("test::guard", Box::new(DynFn));
+        assert_missing_exact(
+            dynamic
+                .ensure_call_bindings()
+                .expect_err("bind_function must not satisfy an exact-schema import"),
+            "bind_function",
+        );
+
+        let mut stack = Vm::new(legacy_schema_import_program(&import));
+        stack.bind_static_stack_function("test::guard", stack_fn);
+        assert_missing_exact(
+            stack
+                .ensure_call_bindings()
+                .expect_err("bind_static_stack_function must not satisfy an exact-schema import"),
+            "bind_static_stack_function",
+        );
+
+        let mut args = Vm::new(legacy_schema_import_program(&import));
+        args.bind_static_args_function("test::guard", args_fn);
+        assert_missing_exact(
+            args.ensure_call_bindings()
+                .expect_err("bind_static_args_function must not satisfy an exact-schema import"),
+            "bind_static_args_function",
         );
     }
 }
@@ -3729,5 +3941,275 @@ mod exact_contract_unit_tests {
             exact_host_return_policy(Some(&import)),
             ExactHostReturnPolicy::Legacy
         ));
+    }
+
+    // ---- review findings 1 & 3: registration/bind schema validation --------
+
+    #[test]
+    fn validate_rejects_resource_passing_mode_on_resource_free_schema() {
+        // A Borrow/TakeOwned mode on a schema that contains no resource has no
+        // handle to operate on; registration must reject it instead of
+        // silently dropping the declared mode.
+        for passing in [
+            HostParamPassing::Borrow,
+            HostParamPassing::BorrowMut,
+            HostParamPassing::TakeOwned,
+        ] {
+            let schema = schema_with_params(
+                vec![HostImportParam {
+                    name: "n".into(),
+                    schema: TypeSchema::Int,
+                    passing,
+                }],
+                TypeSchema::Null,
+            );
+            let error = validate_exact_registration_schema("x", &schema, true)
+                .expect_err("resource-passing mode on a resource-free schema must be rejected");
+            assert!(
+                matches!(error, HostImportBindingError::InvalidSchema { .. }),
+                "got: {error}"
+            );
+        }
+
+        // Value on a plain schema stays legal.
+        let ok = schema_with_params(
+            vec![HostImportParam {
+                name: "n".into(),
+                schema: TypeSchema::Int,
+                passing: HostParamPassing::Value,
+            }],
+            TypeSchema::Null,
+        );
+        validate_exact_registration_schema("x", &ok, true)
+            .expect("Value on a plain schema is legal");
+
+        // The args-only funnel rejects it too (still structured, still early).
+        let take = schema_with_params(
+            vec![HostImportParam {
+                name: "n".into(),
+                schema: TypeSchema::Int,
+                passing: HostParamPassing::TakeOwned,
+            }],
+            TypeSchema::Null,
+        );
+        assert!(validate_exact_registration_schema("x", &take, false).is_err());
+    }
+
+    #[test]
+    fn build_rejects_resource_passing_mode_on_resource_free_schema() {
+        // Defense in depth: if a guard-schema ever reached call time with a
+        // resource-passing mode on a resource-free param, it must be a
+        // structured rejection — never a silent drop that lets the callee
+        // assume a contract the caller never granted.
+        let schema = schema_with_params(
+            vec![HostImportParam {
+                name: "n".into(),
+                schema: TypeSchema::Int,
+                passing: HostParamPassing::Borrow,
+            }],
+            TypeSchema::Null,
+        );
+        no_specs(
+            ExactHostCallContract::build(&schema, &[Value::Int(1)])
+                .expect_err("resource-free Borrow must not be silently dropped"),
+            "build resource-free borrow",
+        );
+        let schema = schema_with_params(vec![take_param("n", TypeSchema::Int)], TypeSchema::Null);
+        no_specs(
+            ExactHostCallContract::build(&schema, &[Value::Int(1)])
+                .expect_err("resource-free TakeOwned must not be silently dropped"),
+            "build resource-free take",
+        );
+        // Passing a handle where a plain Int is declared still faults on the
+        // schema (the mode was dropped before the handle decode). No spec is
+        // extracted from a resource-free param under any path.
+        let contract = ExactHostCallContract::build(
+            &schema_with_params(
+                vec![HostImportParam {
+                    name: "v".into(),
+                    schema: TypeSchema::Int,
+                    passing: HostParamPassing::Value,
+                }],
+                TypeSchema::Null,
+            ),
+            &[Value::Int(7)],
+        )
+        .expect("Value param extracts no resource spec");
+        assert!(contract.specs.is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_aggregate_nested_resource_return() {
+        // Only a direct Resource(key) or single Optional<Resource(key)> may
+        // carry a resource across the boundary; any other resource-bearing
+        // return shape is rejected at registration.
+        let file = guard_key();
+
+        let array = schema_with_params(
+            vec![],
+            TypeSchema::Array(Box::new(TypeSchema::Resource(file.clone()))),
+        );
+        assert!(
+            matches!(
+                validate_exact_registration_schema("x", &array, true),
+                Err(HostImportBindingError::InvalidSchema { .. })
+            ),
+            "Array<Resource> return must be rejected"
+        );
+
+        let nested_optional = schema_with_params(
+            vec![],
+            TypeSchema::Optional(Box::new(TypeSchema::Optional(Box::new(
+                TypeSchema::Resource(file.clone()),
+            )))),
+        );
+        assert!(
+            matches!(
+                validate_exact_registration_schema("x", &nested_optional, true),
+                Err(HostImportBindingError::InvalidSchema { .. })
+            ),
+            "Optional<Optional<Resource>> return must be rejected"
+        );
+
+        // The two legal resource-bearing returns register fine.
+        let direct = schema_with_params(vec![], TypeSchema::Resource(file.clone()));
+        validate_exact_registration_schema("x", &direct, true)
+            .expect("Resource(key) return is representable");
+
+        let optional = schema_with_params(
+            vec![],
+            TypeSchema::Optional(Box::new(TypeSchema::Resource(file))),
+        );
+        validate_exact_registration_schema("x", &optional, true)
+            .expect("Optional<Resource(key)> return is representable");
+    }
+
+    // ---- review finding 4: JIT inline-shing gate determinism ----------------
+
+    fn no_yield_args(_args: &[Value]) -> VmResult<CallOutcome> {
+        Ok(CallOutcome::Return(CallReturn::None))
+    }
+
+    fn args_static(_args: &[Value]) -> VmResult<CallOutcome> {
+        Ok(CallOutcome::Return(CallReturn::None))
+    }
+
+    #[test]
+    fn jit_inline_eligibility_excludes_every_resource_carrying_import() {
+        let file = guard_key();
+        let non_yielding = VmHostFunction::ArgsStaticNonYielding(no_yield_args);
+        let plain_args = VmHostFunction::ArgsStatic(args_static);
+
+        // Resource param -> never inline-eligible, even on a non-yielding binding.
+        let resource_param = schema_with_params(
+            vec![borrow_param("r", TypeSchema::Resource(file.clone()))],
+            TypeSchema::Null,
+        );
+        assert!(!Vm::jit_import_is_inline_eligible(
+            Some(&resource_param),
+            Some(&non_yielding)
+        ));
+
+        // Resource return -> never inline-eligible.
+        let resource_return = schema_with_params(vec![], TypeSchema::Resource(file.clone()));
+        assert!(!Vm::jit_import_is_inline_eligible(
+            Some(&resource_return),
+            Some(&non_yielding)
+        ));
+
+        // Optional<Resource> return -> never inline-eligible either.
+        let optional_return = schema_with_params(
+            vec![],
+            TypeSchema::Optional(Box::new(TypeSchema::Resource(file))),
+        );
+        assert!(!Vm::jit_import_is_inline_eligible(
+            Some(&optional_return),
+            Some(&non_yielding)
+        ));
+
+        // A scalar schema on a non-yielding binding is eligible...
+        let scalar = schema_with_params(vec![], TypeSchema::Int);
+        assert!(Vm::jit_import_is_inline_eligible(
+            Some(&scalar),
+            Some(&non_yielding)
+        ));
+        // ...but only `ArgsStaticNonYielding` bindings qualify at all.
+        assert!(!Vm::jit_import_is_inline_eligible(
+            Some(&scalar),
+            Some(&plain_args)
+        ));
+        assert!(!Vm::jit_import_is_inline_eligible(None, Some(&plain_args)));
+        // A schema-less legacy binding on a non-yielding slot stays eligible.
+        assert!(Vm::jit_import_is_inline_eligible(None, Some(&non_yielding)));
+    }
+
+    #[test]
+    fn jit_sync_flags_mark_resource_return_import_non_inline() {
+        // The real sync path over a bound VM: import 0 is a scalar
+        // non-yielding args function (may inline natively), import 1 is the
+        // same non-yielding args kind but returns a Resource (must stay on the
+        // interpreter boundary — its slot is flagged not inline-eligible).
+        let file = guard_key();
+
+        macro_rules! make_import {
+            ($name:expr, $return_type:expr, $schema:expr) => {{
+                HostImport {
+                    name: $name.into(),
+                    arity: 0,
+                    return_type: $return_type,
+                    schema: Some(HostImportSchema {
+                        params: vec![],
+                        return_type: $schema,
+                        fingerprint: crate::host_api::HostApiCatalog::default().fingerprint(),
+                    }),
+                }
+            }};
+        }
+        let scalar = make_import!(
+            "acme::scalar",
+            crate::bytecode::ValueType::Int,
+            TypeSchema::Int
+        );
+        let open = make_import!(
+            "acme::open",
+            crate::bytecode::ValueType::Unknown,
+            TypeSchema::Resource(file)
+        );
+
+        let mut registry = HostFunctionRegistry::new();
+        registry
+            .register_exact_static_non_yielding_args(
+                &scalar.name,
+                0,
+                scalar.schema.clone().expect("schema"),
+                no_yield_args,
+            )
+            .expect("register scalar");
+        registry
+            .register_exact_static_non_yielding_args(
+                &open.name,
+                0,
+                open.schema.clone().expect("schema"),
+                no_yield_args,
+            )
+            .expect("register open");
+
+        let mut code = crate::BytecodeBuilder::new();
+        code.ret();
+        let program = Program::with_imports_and_debug(
+            Vec::new(),
+            code.finish(),
+            vec![scalar.clone(), open.clone()],
+            None,
+        );
+        let mut vm = Vm::new(program);
+        registry.bind_vm_cached(&mut vm).expect("bind");
+        vm.sync_jit_non_yielding_host_imports();
+        assert_eq!(
+            vm.engine.jit.non_yielding_host_imports(),
+            &[true, false],
+            "scalar import may inline; the resource-return import must not — dump:\n{}",
+            vm.dump_jit_info()
+        );
     }
 }

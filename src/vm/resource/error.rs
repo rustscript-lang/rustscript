@@ -66,7 +66,7 @@ pub enum ResourceErrorCode {
     ResourceAccessConflict,
     /// An associated operation prevents an ownership take.
     ResourceOperationActive,
-    /// A non-resource Value/ToOwned mode was supplied to the resource frame.
+    /// A non-resource Value mode was supplied to the resource frame.
     ResourceAccessModeUnsupported,
     /// A declared TakeOwned argument was not consumed by the callee and had
     /// to be reclaimed by the exact host-call contract.
