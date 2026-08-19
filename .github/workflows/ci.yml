@@ -75,9 +75,11 @@ jobs:
           # The standalone fixture consumes only the public host-extension SDK.
           # It is its own (detached) workspace, so both commands run against
           # the job-level CARGO_TARGET_DIR (gitignored) — never a nested
-          # target/ inside tests/fixtures/external-host-extension.
-          cargo check --manifest-path tests/fixtures/external-host-extension/Cargo.toml
-          cargo test --manifest-path tests/fixtures/external-host-extension/Cargo.toml
+          # target/ inside tests/fixtures/external-host-extension. --locked
+          # pins the committed fixture Cargo.lock so drift in the pd-vm
+          # dependency edge set fails CI instead of silently re-resolving.
+          cargo check --locked --manifest-path tests/fixtures/external-host-extension/Cargo.toml
+          cargo test --locked --manifest-path tests/fixtures/external-host-extension/Cargo.toml
 
   pd-vm-cli:
     name: pd-vm CLI (${{ matrix.os }})
