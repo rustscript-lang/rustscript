@@ -92,6 +92,8 @@ pub use host_api::{
     ResourceTypeKeyError, ResourceTypeSchema,
 };
 #[cfg(feature = "runtime")]
+pub use host_extension::{HostExtension, HostModuleState, catalog_import_schemas};
+#[cfg(feature = "runtime")]
 pub use jit::{
     JitAttempt, JitCallSiteProfile, JitConfig, JitExitProfile, JitMetrics, JitNyiDoc, JitNyiReason,
     JitSnapshot, JitTrace, JitTraceTerminal, TraceJitEngine,
@@ -111,7 +113,7 @@ pub use vm::{
     ResourceErrorCode, ResourceHandle, ResourceMut, ResourceOwned, ResourceOwnership, ResourceRef,
     ResourceTable, ScriptArgs, ScriptCallback, ScriptResult, StaticHostArgsFunction,
     StaticHostFunction, StaticHostStackFunction, Store, Vm, VmError, VmResetError, VmResetState,
-    VmResult, VmStatus, VmYieldReason, execution_scope, operation, resource,
+    VmResult, VmStatus, VmYieldReason, execution_scope, host_extension, operation, resource,
 };
 
 #[cfg(feature = "runtime")]

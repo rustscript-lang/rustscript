@@ -15,6 +15,7 @@ pub mod execution_scope;
 mod fuel;
 mod host;
 mod host_context;
+pub mod host_extension;
 mod host_runtime;
 #[cfg(test)]
 mod host_stream_tests;
@@ -52,6 +53,7 @@ use self::host::{HostCallExecOutcome, VmHostFunction};
 pub use self::host_context::{
     HostContext, HostContextError, HostContextErrorKind, HostContextResult, HostModule,
 };
+pub use self::host_extension::{HostExtension, HostModuleState, catalog_import_schemas};
 use self::host_runtime::HostRuntime;
 use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable};
 pub use self::invocation::{Invocation, InvocationError, InvocationItem, InvocationPoll};
@@ -852,6 +854,26 @@ impl Vm {
     /// module. The returned [`HostContext`] borrows this VM mutably.
     pub fn host_context(&mut self) -> HostContext<'_> {
         HostContext::new(&mut self.host)
+    }
+
+    /// Installs a [`HostExtension`] into this VM through its standard
+    /// register / install lifecycle.
+    ///
+    /// [`HostExtension::register`] runs against the standard host-function
+    /// registry (builtin defaults plus the extension's exact functions), that
+    /// registry is bound with
+    /// [`HostFunctionRegistry::bind_vm_cached`], and only then does
+    /// [`HostExtension::install`] install persistent per-VM module state.
+    /// Because `bind_vm_cached` requires an unbound VM, call this before the
+    /// first `run` (and before any other registry binding); controls needing a
+    /// restricted/capability-granted registry should instead call
+    /// [`HostExtension::register`] directly and bind the registry themselves.
+    pub fn install_extension(&mut self, extension: &dyn HostExtension) -> VmResult<()> {
+        let mut registry = HostFunctionRegistry::new();
+        extension.register(&mut registry)?;
+        registry.bind_vm_cached(self)?;
+        extension.install(self)?;
+        Ok(())
     }
 
     /// Begins an operation-aware resource frame and preserves resource errors

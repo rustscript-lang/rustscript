@@ -591,3 +591,258 @@ mod resource_catalog_scanner {
         );
     }
 }
+
+// ---- external host-extension SDK -------------------------------------------
+//
+// These tests exercise the public `vm::host_extension` surface exactly as an
+// external host crate would (only public API): the catalog schema identity +
+// fingerprint contract, the `HostExtension` register/install lifecycle and
+// `Vm::install_extension`, restricted-registry capability gating, and the
+// absence of raw-fingerprint / name-only-fallback escape hatches.
+
+mod external_extension_sdk {
+    use super::*;
+    use std::sync::Arc;
+    use vm::compiler::{CompileSourceFileOptions, SourceFlavor};
+    use vm::host_extension::catalog_import_schemas;
+    use vm::{
+        CallOutcome, CallReturn, HostApiBuilder, HostApiCatalog, HostExtension, HostFunctionSchema,
+        HostImportBindingError, HostParamSchema, HostTypeSchema, ResourceTypeKey,
+        ResourceTypeSchema, VmError, compile_source_with_flavor_and_options,
+    };
+
+    #[derive(Clone, Debug)]
+    struct CounterPolicy {
+        max: u64,
+    }
+
+    fn counter_catalog() -> Arc<HostApiCatalog> {
+        let key = ResourceTypeKey::new("demo.counter").expect("valid key");
+        let mut builder = HostApiBuilder::new();
+        builder.resource(ResourceTypeSchema::new(
+            key.clone(),
+            "an external counter resource",
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "demo::ping",
+            Vec::new(),
+            HostTypeSchema::Int,
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "demo::make_counter",
+            vec![HostParamSchema::value("seed", HostTypeSchema::Int)],
+            HostTypeSchema::Resource(key),
+        ));
+        Arc::new(builder.build().expect("catalog must build"))
+    }
+
+    fn compile_with_catalog(catalog: &Arc<HostApiCatalog>, source: &str) -> vm::CompiledProgram {
+        compile_source_with_flavor_and_options(
+            source,
+            SourceFlavor::RustScript,
+            CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(catalog)),
+        )
+        .expect("catalog source should compile")
+    }
+
+    fn ping_adapter(_vm: &mut vm::Vm, _args: &[Value]) -> vm::VmResult<CallOutcome> {
+        Ok(CallOutcome::Return(CallReturn::One(Value::Int(11))))
+    }
+
+    /// An external-style extension using the public `HostExtension` lifecycle.
+    struct CounterExtension;
+
+    impl vm::HostExtension for CounterExtension {
+        fn register(&self, registry: &mut HostFunctionRegistry) -> vm::VmResult<()> {
+            let catalog = counter_catalog();
+            for schema in catalog_import_schemas(&catalog, "demo::ping") {
+                registry.register_exact_static("demo::ping", 0, schema, ping_adapter)?;
+            }
+            Ok(())
+        }
+
+        fn install(&self, vm: &mut Vm) -> vm::VmResult<()> {
+            vm.host_context().set_module_state(CounterPolicy { max: 7 });
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn catalog_schema_identity_matches_the_compiler_embedded_schema() {
+        let catalog = counter_catalog();
+        // The scalar function: the public adapter's schema must be
+        // byte-for-byte the schema the compiler embeds at the call site
+        // (labels, schemas, passing, and the catalog fingerprint).
+        let compiled = compile_with_catalog(&catalog, "use demo;\ndemo::ping();\n");
+        let ping_import = compiled
+            .program
+            .imports
+            .iter()
+            .find(|import| import.name == "demo::ping")
+            .expect("ping import")
+            .schema
+            .clone()
+            .expect("exact schema");
+        let schemas = catalog_import_schemas(&catalog, "demo::ping");
+        assert_eq!(
+            schemas.len(),
+            1,
+            "one declared ping overload maps to exactly one exact schema"
+        );
+        assert_eq!(
+            schemas[0], ping_import,
+            "registration schema must be identical to the compiler-embedded schema"
+        );
+
+        // The resource-bearing function likewise preserves the resource key.
+        let compiled = compile_with_catalog(&catalog, "use demo;\ndemo::make_counter(3);\n");
+        let make_import = compiled
+            .program
+            .imports
+            .iter()
+            .find(|import| import.name == "demo::make_counter")
+            .expect("make import")
+            .schema
+            .clone()
+            .expect("exact schema");
+        let schemas = catalog_import_schemas(&catalog, "demo::make_counter");
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(
+            schemas[0], make_import,
+            "resource-returning schema must preserve the ResourceTypeKey and fingerprint"
+        );
+        assert_eq!(
+            schemas[0].return_type,
+            compile_type_schema_resource(),
+            "the catalog resource maps onto the nominal TypeSchema::Resource"
+        );
+    }
+
+    fn compile_type_schema_resource() -> vm::compiler::TypeSchema {
+        let key = ResourceTypeKey::new("demo.counter").expect("valid key");
+        vm::compiler::TypeSchema::Resource(key)
+    }
+
+    #[test]
+    fn unknown_function_produces_no_schema_and_exact_resolution_refuses_name_fallback() {
+        let catalog = counter_catalog();
+        // No overloads -> no schema: an unknown name can never be synthesized.
+        assert!(
+            catalog_import_schemas(&catalog, "demo::missing").is_empty(),
+            "an undeclared name must produce no exact schema (no name-only fallback)"
+        );
+
+        // And the registry rejects a schema-less resolution for that name with
+        // a structured MissingExact error rather than matching by name.
+        let registry = HostFunctionRegistry::new();
+        let import = vm::HostImport {
+            name: "demo::missing".into(),
+            arity: 0,
+            return_type: vm::ValueType::Int,
+            schema: Some(vm::HostImportSchema {
+                params: Vec::new(),
+                return_type: vm::compiler::TypeSchema::Int,
+                fingerprint: catalog.fingerprint(),
+            }),
+        };
+        let error = registry
+            .resolve_import(&import)
+            .expect_err("an unregistered exact import must be rejected");
+        assert!(matches!(
+            error,
+            VmError::HostImportBinding(HostImportBindingError::MissingExact { .. })
+        ));
+    }
+
+    #[test]
+    fn install_extension_registers_functions_and_persistent_module_state() {
+        let catalog = counter_catalog();
+        let compiled = compile_with_catalog(&catalog, "use demo;\ndemo::ping();\n");
+        let mut vm = Vm::new(compiled.program);
+        vm.install_extension(&CounterExtension)
+            .expect("extension should install");
+
+        let policy = {
+            let context = vm.host_context();
+            context
+                .module_state::<CounterPolicy>()
+                .expect("installed module state")
+                .max
+        };
+        assert_eq!(
+            policy, 7,
+            "module state is set through HostExtension::install"
+        );
+        assert_eq!(vm.run().expect("run"), VmStatus::Halted);
+        assert_eq!(
+            vm.stack(),
+            &[Value::Int(11)],
+            "the registered exact host function answers through the script"
+        );
+    }
+
+    #[test]
+    fn restricted_registry_requires_an_explicit_grant_for_external_exact_imports() {
+        let catalog = counter_catalog();
+        let compiled = compile_with_catalog(&catalog, "use demo;\ndemo::ping();\n");
+        let mut registry = HostFunctionRegistry::restricted();
+        CounterExtension
+            .register(&mut registry)
+            .expect("extension registration must succeed on a restricted registry");
+
+        let mut vm = Vm::new(compiled.program);
+        let error = registry
+            .bind_vm_cached(&mut vm)
+            .expect_err("ungranted external import must be rejected");
+        assert!(
+            error.to_string().contains("capability profile"),
+            "missing grant must surface the capability-profile rejection: {error}"
+        );
+
+        // Explicitly granting the import binds and runs.
+        let compiled = compile_with_catalog(&catalog, "use demo;\ndemo::ping();\n");
+        let mut granted = HostFunctionRegistry::restricted();
+        CounterExtension
+            .register(&mut granted)
+            .expect("register on restricted registry");
+        let profile = CapabilityProfile::builder()
+            .allow_host_import("demo::ping")
+            .build();
+        granted.set_capability_profile(profile);
+        let mut vm = Vm::new(compiled.program);
+        granted
+            .bind_vm_cached(&mut vm)
+            .expect("granted external import must bind");
+        assert_eq!(vm.run().expect("run"), VmStatus::Halted);
+        assert_eq!(vm.stack(), &[Value::Int(11)]);
+    }
+
+    /// The public extension surface must not leak a raw fingerprint
+    /// constructor or a name-only registration path (arch boundary).
+    #[test]
+    fn extension_surface_exposes_no_raw_fingerprint_or_name_only_fallback() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let extension = std::fs::read_to_string(manifest.join("src/vm/host_extension.rs"))
+            .expect("host_extension source");
+
+        // The only fingerprint entry point documented/exported is the catalog's
+        // own `fingerprint()`; the module must not construct one from raw bits.
+        assert!(
+            !extension.contains("HostApiFingerprint("),
+            "host_extension must not construct a raw HostApiFingerprint"
+        );
+        // The module is host-agnostic: no builtin or SQLite coupling.
+        for forbidden in [
+            "crate::builtins",
+            "rusqlite",
+            "Sqlite",
+            "HttpState",
+            "IoPolicy",
+        ] {
+            assert!(
+                !extension.contains(forbidden),
+                "host_extension leaked {forbidden}"
+            );
+        }
+    }
+}

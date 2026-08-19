@@ -30,7 +30,17 @@ fn expand_pd_host_function(
     attr: Punctuated<Meta, Token![,]>,
     mut item: ItemFn,
 ) -> Result<proc_macro2::TokenStream, Error> {
-    parse_name_arg(&attr)?;
+    let args = parse_args(&attr)?;
+    parse_name_arg_is_present(&args)?;
+    if args.crate_path.is_some() && item.sig.asyncness.is_some() {
+        return Err(Error::new_spanned(
+            &item.sig,
+            "async #[pd_host_function] with an external crate path is not supported: the async \
+             adapter (CaptureAsyncHostContext / IntoHostCallOutcome / return_one) is not part of \
+             the public SDK; use a synchronous host function, or omit crate = \"...\" inside pd-vm",
+        ));
+    }
+    let crate_path = args.crate_path;
     let is_async = item.sig.asyncness.is_some();
     let docs = doc_string(&item.attrs);
     // The generated adapter cannot instantiate a generic `T` (there is no
@@ -84,9 +94,9 @@ fn expand_pd_host_function(
         item.sig.ident = impl_name.clone();
     }
     let wrapper = if is_async {
-        generate_async_vm_wrapper(&item, &wrapper_name)?
+        generate_async_vm_wrapper(&item, &wrapper_name, &crate_path)?
     } else {
-        generate_vm_wrapper(&item, &wrapper_name)?
+        generate_vm_wrapper(&item, &wrapper_name, &crate_path)?
     };
     for input in &mut item.sig.inputs {
         if let FnArg::Typed(pat_type) = input {
@@ -204,45 +214,158 @@ fn is_async_owned_type(ty: &Type) -> bool {
     }
 }
 
-fn parse_name_arg(args: &Punctuated<Meta, Token![,]>) -> Result<LitStr, Error> {
-    let Some(Meta::NameValue(name_value)) = args.first() else {
-        return Err(Error::new(
-            proc_macro2::Span::call_site(),
-            "expected #[pd_host_function(name = \"...\")]",
-        ));
-    };
-    if args.len() != 1 {
-        let extra = args
-            .iter()
-            .nth(1)
-            .expect("a non-empty attribute with more than one argument has an extra argument");
-        return Err(Error::new_spanned(
-            extra,
-            "#[pd_host_function] only supports name = \"...\"",
-        ));
-    }
-    if !name_value.path.is_ident("name") {
-        return Err(Error::new_spanned(
-            &name_value.path,
-            "expected #[pd_host_function(name = \"...\")]",
-        ));
-    }
-    match &name_value.value {
-        syn::Expr::Lit(expr_lit) => {
-            if let syn::Lit::Str(value) = &expr_lit.lit {
-                Ok(value.clone())
-            } else {
-                Err(Error::new_spanned(
-                    &expr_lit.lit,
+/// Parsed `#[pd_host_function]` attribute arguments.
+///
+/// `name` is required. `crate = \"...\"` optionally names the crate that
+/// implements the public host SDK (normally the `pd-vm` dependency, e.g.
+/// `crate = \"vm\"`); when present, every path the generated adapter refers to
+/// is emitted as an absolute `<crate>::...` path instead of the crate-internal
+/// `super::super::` / `super::` relative paths, so an external host crate never
+/// has to mirror `pd-vm`'s internal module nesting or copy its wrappers.
+#[derive(Default)]
+struct MacroArgs {
+    name: Option<LitStr>,
+    crate_path: Option<syn::Ident>,
+}
+
+fn parse_args(args: &Punctuated<Meta, Token![,]>) -> Result<MacroArgs, Error> {
+    let mut out = MacroArgs::default();
+    for meta in args {
+        let Meta::NameValue(name_value) = meta else {
+            return Err(Error::new_spanned(
+                meta,
+                "#[pd_host_function] only supports name = \"...\" and crate = \"...\"",
+            ));
+        };
+        if name_value.path.is_ident("name") {
+            let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(value),
+                ..
+            }) = &name_value.value
+            else {
+                return Err(Error::new_spanned(
+                    &name_value.value,
                     "callable name must be a string literal",
-                ))
+                ));
+            };
+            if out.name.is_some() {
+                return Err(Error::new_spanned(
+                    &name_value.path,
+                    "duplicate name argument",
+                ));
             }
+            out.name = Some(value.clone());
+        } else if name_value.path.is_ident("crate") {
+            let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(value),
+                ..
+            }) = &name_value.value
+            else {
+                return Err(Error::new_spanned(
+                    &name_value.value,
+                    "crate must be a string literal naming the host SDK dependency (e.g. crate = \"vm\")",
+                ));
+            };
+            if out.crate_path.is_some() {
+                return Err(Error::new_spanned(
+                    &name_value.path,
+                    "duplicate crate argument",
+                ));
+            }
+            out.crate_path = Some(syn::Ident::new(value.value().trim(), value.span()));
+        } else {
+            return Err(Error::new_spanned(
+                &name_value.path,
+                "#[pd_host_function] only supports name = \"...\" and crate = \"...\"",
+            ));
         }
-        other => Err(Error::new_spanned(
-            other,
-            "callable name must be a string literal",
-        )),
     }
+    Ok(out)
+}
+
+fn parse_name_arg_is_present(args: &MacroArgs) -> Result<(), Error> {
+    if args.name.is_some() {
+        Ok(())
+    } else {
+        Err(Error::new(
+            proc_macro2::Span::call_site(),
+            "expected #[pd_host_function(name = \"...\", crate = \"...\")]",
+        ))
+    }
+}
+
+/// Internal relative SDK path (`super::...`), or an absolute `<crate>::...`
+/// path when an external `crate = \"...\"` argument is supplied.
+type CratePath = Option<syn::Ident>;
+
+/// Absolute `<crate>::<item>` path when `crate = \"...\"` is set, otherwise the
+/// `super::<item>` / `super::super::<item>` internal relative path.
+fn sdk_path(
+    crate_path: &CratePath,
+    supers: u8,
+    item: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    match crate_path {
+        Some(crate_ident) => quote!(#crate_ident::#item),
+        None => {
+            let mut path = proc_macro2::TokenStream::new();
+            for _ in 0..supers {
+                path.extend(quote!(super::));
+            }
+            path.extend(item);
+            path
+        }
+    }
+}
+
+/// Names one level up: `super::<item>` (internal) or `<crate>::<item>`.
+fn sdk_path_1(crate_path: &CratePath, item: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+    sdk_path(crate_path, 1, item)
+}
+
+/// Names two levels up: `super::super::<item>` (internal) or `<crate>::<item>`.
+fn sdk_path_2(crate_path: &CratePath, item: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+    sdk_path(crate_path, 2, item)
+}
+
+fn vm_ident(crate_path: &CratePath) -> proc_macro2::TokenStream {
+    sdk_path_2(crate_path, quote!(Vm))
+}
+
+fn value_ident(crate_path: &CratePath) -> proc_macro2::TokenStream {
+    sdk_path_2(crate_path, quote!(Value))
+}
+
+fn vm_result_ident(crate_path: &CratePath) -> proc_macro2::TokenStream {
+    sdk_path_2(crate_path, quote!(VmResult))
+}
+
+fn vm_error_ident(crate_path: &CratePath) -> proc_macro2::TokenStream {
+    sdk_path_2(crate_path, quote!(VmError))
+}
+
+fn access_mode_ident(crate_path: &CratePath) -> proc_macro2::TokenStream {
+    sdk_path_2(crate_path, quote!(ResourceAccessMode))
+}
+
+fn access_request_ident(crate_path: &CratePath) -> proc_macro2::TokenStream {
+    sdk_path_2(crate_path, quote!(ResourceAccessRequest))
+}
+
+fn resource_type_key_ident(crate_path: &CratePath) -> proc_macro2::TokenStream {
+    sdk_path_2(crate_path, quote!(ResourceTypeKey))
+}
+
+fn borrow_arg_ident(crate_path: &CratePath) -> proc_macro2::TokenStream {
+    sdk_path_1(crate_path, quote!(borrow_arg))
+}
+
+fn take_arg_ident(crate_path: &CratePath) -> proc_macro2::TokenStream {
+    sdk_path_1(crate_path, quote!(take_arg))
+}
+
+fn call_outcome_ident(crate_path: &CratePath) -> proc_macro2::TokenStream {
+    sdk_path_1(crate_path, quote!(CallOutcome))
 }
 
 fn doc_string(attrs: &[syn::Attribute]) -> String {
@@ -326,34 +449,40 @@ fn is_abi_declaration_only(item: &ItemFn) -> bool {
     expr_macro.mac.path.is_ident("unreachable")
 }
 
-fn resource_mode_tokens(mode: ResourceMode) -> proc_macro2::TokenStream {
+fn resource_mode_tokens(crate_path: &CratePath, mode: ResourceMode) -> proc_macro2::TokenStream {
+    let access_mode = access_mode_ident(crate_path);
     match mode {
-        ResourceMode::Borrow => quote!(super::super::ResourceAccessMode::Borrow),
-        ResourceMode::BorrowMut => quote!(super::super::ResourceAccessMode::BorrowMut),
-        ResourceMode::TakeOwned => quote!(super::super::ResourceAccessMode::TakeOwned),
-        ResourceMode::Value => quote!(super::super::ResourceAccessMode::Value),
+        ResourceMode::Borrow => quote!(#access_mode::Borrow),
+        ResourceMode::BorrowMut => quote!(#access_mode::BorrowMut),
+        ResourceMode::TakeOwned => quote!(#access_mode::TakeOwned),
+        ResourceMode::Value => quote!(#access_mode::Value),
     }
 }
 
 fn resource_request_tokens(
+    crate_path: &CratePath,
     info: &ResourceParamInfo,
     index: &syn::Index,
     label: &LitStr,
 ) -> proc_macro2::TokenStream {
     let inner = &info.inner;
-    let mode = resource_mode_tokens(info.mode);
+    let mode = resource_mode_tokens(crate_path, info.mode);
+    let request = access_request_ident(crate_path);
     match &info.key {
-        Some(key) => quote! {
-            super::super::ResourceAccessRequest::from_value_with_key::<#inner>(
-                &args[#index],
-                #mode,
-                super::super::ResourceTypeKey::new(#key)
-                    .expect("resource key was validated by #[pd_host_function]"),
-                #label,
-            )?
-        },
+        Some(key) => {
+            let key_of = resource_type_key_ident(crate_path);
+            quote! {
+                #request::from_value_with_key::<#inner>(
+                    &args[#index],
+                    #mode,
+                    #key_of::new(#key)
+                        .expect("resource key was validated by #[pd_host_function]"),
+                    #label,
+                )?
+            }
+        }
         None => quote! {
-            super::super::ResourceAccessRequest::from_value::<#inner>(
+            #request::from_value::<#inner>(
                 &args[#index],
                 #mode,
                 #label,
@@ -363,23 +492,25 @@ fn resource_request_tokens(
 }
 
 fn resource_extract_tokens(
+    crate_path: &CratePath,
     info: &ResourceParamInfo,
     ty: &Type,
     ident: &syn::Ident,
     index: &syn::Index,
 ) -> proc_macro2::TokenStream {
     let inner = &info.inner;
+    let vm_error = vm_error_ident(crate_path);
     let value = match info.mode {
         ResourceMode::Borrow => quote!(__pd_resource_frame
             .borrow::<#inner>(#index)
-            .map_err(super::super::VmError::from)?),
+            .map_err(#vm_error::from)?),
         ResourceMode::BorrowMut => quote!(__pd_resource_frame
             .borrow_mut::<#inner>(#index)
-            .map_err(super::super::VmError::from)?),
+            .map_err(#vm_error::from)?),
         ResourceMode::TakeOwned => {
             let taken = quote!(__pd_resource_frame
                 .take_owned::<#inner>(#index)
-                .map_err(super::super::VmError::from)?);
+                .map_err(#vm_error::from)?);
             if info.owned_wrapper {
                 quote!(<#ty>::new(#taken))
             } else {
@@ -396,8 +527,13 @@ fn resource_extract_tokens(
 fn generate_vm_wrapper(
     item: &ItemFn,
     wrapper_name: &syn::Ident,
+    crate_path: &CratePath,
 ) -> Result<proc_macro2::TokenStream, Error> {
     let impl_name = &item.sig.ident;
+    let vm_ident = vm_ident(crate_path);
+    let value_ident = value_ident(crate_path);
+    let borrow_arg_ident = borrow_arg_ident(crate_path);
+    let take_arg_ident = take_arg_ident(crate_path);
     let mut wrapper_params = Vec::<proc_macro2::TokenStream>::new();
     let mut call_args = Vec::<proc_macro2::TokenStream>::new();
     let mut imm_ordinary_decodes = Vec::<proc_macro2::TokenStream>::new();
@@ -416,19 +552,19 @@ fn generate_vm_wrapper(
         .iter()
         .any(|input| resource_param_info(input).ok().flatten().is_some());
     if has_vm || has_resource {
-        wrapper_params.push(quote!(vm: &mut super::super::Vm));
+        wrapper_params.push(quote!(vm: &mut #vm_ident));
         if has_vm {
             call_args.push(quote!(vm));
         }
     }
     let imm_wrapper_params = {
         let mut params = wrapper_params.clone();
-        params.push(quote!(args: &[super::super::Value]));
+        params.push(quote!(args: &[#value_ident]));
         params
     };
     let mut_wrapper_params = {
         let mut params = wrapper_params.clone();
-        params.push(quote!(args: &mut [super::super::Value]));
+        params.push(quote!(args: &mut [#value_ident]));
         params
     };
 
@@ -459,9 +595,14 @@ fn generate_vm_wrapper(
         );
         let args_index = syn::Index::from(arg_index);
         if let Some(info) = resource_param_info(input)? {
-            resource_requests.push(resource_request_tokens(&info, &args_index, &label));
+            resource_requests.push(resource_request_tokens(
+                crate_path,
+                &info,
+                &args_index,
+                &label,
+            ));
             let frame_index = syn::Index::from(resource_index);
-            let extraction = resource_extract_tokens(&info, ty, ident, &frame_index);
+            let extraction = resource_extract_tokens(crate_path, &info, ty, ident, &frame_index);
             imm_resource_extracts.push(extraction.clone());
             mut_resource_extracts.push(extraction);
             resource_index += 1;
@@ -470,12 +611,12 @@ fn generate_vm_wrapper(
             // resource take, so a wrong-typed trailing ordinary argument can
             // never leave an earlier TakeOwned resource half-consumed.
             imm_ordinary_decodes.push(quote! {
-                let #ident = super::borrow_arg::<#ty>(args, #args_index, #label)?;
+                let #ident = #borrow_arg_ident::<#ty>(args, #args_index, #label)?;
             });
             let extractor = if uses_taken_extractor(ty) {
-                quote!(super::take_arg::<#ty>(args, #args_index, #label)?)
+                quote!(#take_arg_ident::<#ty>(args, #args_index, #label)?)
             } else {
-                quote!(super::borrow_arg::<#ty>(&*args, #args_index, #label)?)
+                quote!(#borrow_arg_ident::<#ty>(&*args, #args_index, #label)?)
             };
             mut_ordinary_decodes.push(quote! {
                 let #ident = #extractor;
@@ -485,7 +626,7 @@ fn generate_vm_wrapper(
         arg_index += 1;
     }
 
-    let wrapper_output = wrapper_output_type(&item.sig.output)?;
+    let wrapper_output = wrapper_output_type(crate_path, &item.sig.output)?;
     let call_expr = if return_is_vm_result(&item.sig.output) {
         quote!(#impl_name(#(#call_args),*))
     } else {
@@ -522,8 +663,19 @@ fn generate_vm_wrapper(
 fn generate_async_vm_wrapper(
     item: &ItemFn,
     wrapper_name: &syn::Ident,
+    crate_path: &CratePath,
 ) -> Result<proc_macro2::TokenStream, Error> {
     let impl_name = &item.sig.ident;
+    let vm_ident = vm_ident(crate_path);
+    let value_ident = value_ident(crate_path);
+    let vm_result_ident = vm_result_ident(crate_path);
+    let vm_error_ident = vm_error_ident(crate_path);
+    let call_outcome_ident = call_outcome_ident(crate_path);
+    let borrow_arg_ident = borrow_arg_ident(crate_path);
+    let capture_async = sdk_path_1(crate_path, quote!(CaptureAsyncHostContext));
+    let host_future_output = sdk_path_1(crate_path, quote!(HostFutureOutput));
+    let into_host_call_outcome = sdk_path_1(crate_path, quote!(IntoHostCallOutcome));
+    let return_one = sdk_path_1(crate_path, quote!(return_one));
     let mutable_wrapper_name = syn::Ident::new(&format!("{wrapper_name}_mut"), wrapper_name.span());
     let mut ordinary_decodes = Vec::<proc_macro2::TokenStream>::new();
     let mut resource_extracts = Vec::<proc_macro2::TokenStream>::new();
@@ -545,7 +697,7 @@ fn generate_async_vm_wrapper(
         let ty = &pat_type.ty;
         if is_host_context_param(input) {
             ordinary_decodes.push(quote! {
-                let #ident = <#ty as super::CaptureAsyncHostContext>::capture_with_args(vm, args)?;
+                let #ident = <#ty as #capture_async>::capture_with_args(vm, args)?;
             });
             call_args.push(quote!(#ident));
             continue;
@@ -556,17 +708,28 @@ fn generate_async_vm_wrapper(
         );
         let args_index = syn::Index::from(arg_index);
         if let Some(info) = resource_param_info(input)? {
-            resource_requests.push(resource_request_tokens(&info, &args_index, &label));
+            resource_requests.push(resource_request_tokens(
+                crate_path,
+                &info,
+                &args_index,
+                &label,
+            ));
             // Async resource parameters are restricted to TakeOwned (the
             // borrows are rejected during validation), so extraction mutates
             // the table. Ordinary decodes are emitted first so a wrong-typed
             // trailing ordinary argument leaves every resource GuestOwned.
             let frame_index = syn::Index::from(resource_index);
-            resource_extracts.push(resource_extract_tokens(&info, ty, ident, &frame_index));
+            resource_extracts.push(resource_extract_tokens(
+                crate_path,
+                &info,
+                ty,
+                ident,
+                &frame_index,
+            ));
             resource_index += 1;
         } else {
             ordinary_decodes.push(quote! {
-                let #ident = super::borrow_arg::<#ty>(args, #args_index, #label)?;
+                let #ident = #borrow_arg_ident::<#ty>(args, #args_index, #label)?;
             });
         }
         call_args.push(quote!(#ident));
@@ -579,18 +742,18 @@ fn generate_async_vm_wrapper(
         quote!(#impl_name(#(#call_args),*).await)
     };
     let future_result = if return_is_host_future_output(&item.sig.output) {
-        quote!(Ok(value.map(super::return_one)))
+        quote!(Ok(value.map(#return_one)))
     } else {
         quote! {
-            match super::IntoHostCallOutcome::into_host_call_outcome(value) {
-                super::CallOutcome::Return(values) => {
-                    Ok(super::HostFutureOutput::returning(values))
+            match #into_host_call_outcome::into_host_call_outcome(value) {
+                #call_outcome_ident::Return(values) => {
+                    Ok(#host_future_output::returning(values))
                 }
-                super::CallOutcome::Pending(op_id) => Err(super::VmError::HostError(
+                #call_outcome_ident::Pending(op_id) => Err(#vm_error_ident::HostError(
                     format!("async host function returned nested pending operation {op_id}"),
                 )),
-                super::CallOutcome::Halt | super::CallOutcome::Yield => Err(
-                    super::VmError::HostError(
+                #call_outcome_ident::Halt | #call_outcome_ident::Yield => Err(
+                    #vm_error_ident::HostError(
                         "async host function returned a control-flow outcome".to_string(),
                     ),
                 ),
@@ -617,17 +780,17 @@ fn generate_async_vm_wrapper(
     Ok(quote! {
         #[allow(dead_code)]
         pub(crate) fn #wrapper_name(
-            vm: &mut super::super::Vm,
-            args: &[super::super::Value],
-        ) -> super::super::VmResult<super::CallOutcome> {
+            vm: &mut #vm_ident,
+            args: &[#value_ident],
+        ) -> #vm_result_ident<#call_outcome_ident> {
             #body
         }
 
         #[allow(dead_code)]
         pub(crate) fn #mutable_wrapper_name(
-            vm: &mut super::super::Vm,
-            args: &mut [super::super::Value],
-        ) -> super::super::VmResult<super::CallOutcome> {
+            vm: &mut #vm_ident,
+            args: &mut [#value_ident],
+        ) -> #vm_result_ident<#call_outcome_ident> {
             #body
         }
     })
@@ -647,14 +810,18 @@ fn wrapper_and_impl_names(name: &syn::Ident) -> (syn::Ident, syn::Ident) {
     }
 }
 
-fn wrapper_output_type(output: &ReturnType) -> Result<proc_macro2::TokenStream, Error> {
+fn wrapper_output_type(
+    crate_path: &CratePath,
+    output: &ReturnType,
+) -> Result<proc_macro2::TokenStream, Error> {
+    let vm_result_ident = vm_result_ident(crate_path);
     if let Some(inner) = vm_result_inner_type(output)? {
-        return Ok(quote!(super::super::VmResult<#inner>));
+        return Ok(quote!(#vm_result_ident<#inner>));
     }
 
     match output {
-        ReturnType::Default => Ok(quote!(super::super::VmResult<()>)),
-        ReturnType::Type(_, ty) => Ok(quote!(super::super::VmResult<#ty>)),
+        ReturnType::Default => Ok(quote!(#vm_result_ident<()>)),
+        ReturnType::Type(_, ty) => Ok(quote!(#vm_result_ident<#ty>)),
     }
 }
 
@@ -1300,5 +1467,71 @@ mod tests {
 
         let float_ty: Type = parse_quote!(VmCallable<fn(f64) -> f64>);
         assert_eq!(type_label(&float_ty).unwrap(), "fn(float) -> float");
+    }
+
+    #[test]
+    fn external_crate_path_emits_absolute_public_sdk_paths() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "demo::read", crate = "vm");
+        let item: ItemFn = parse_quote!(
+            /// Reads a counter resource.
+            fn read(vm: &mut Vm, handle: i64) -> VmResult<i64> {
+                todo!()
+            }
+        );
+        let expanded = expand_pd_host_function(attr, item)
+            .expect("external crate path should expand")
+            .to_string();
+        assert!(
+            expanded.contains("vm :: Vm"),
+            "the vm context parameter must be an absolute public path, got: {expanded}"
+        );
+        assert!(
+            expanded.contains("vm :: Value"),
+            "the args slice must be an absolute public path, got: {expanded}"
+        );
+        assert!(
+            !expanded.contains("super :: super"),
+            "external expansion must not emit internal super::super paths: {expanded}"
+        );
+    }
+
+    #[test]
+    fn external_crate_path_rejects_async_adapters_not_in_the_public_sdk() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "demo::suspend", crate = "vm");
+        let item: ItemFn = parse_quote!(
+            /// Async external host functions are not yet supported.
+            async fn suspend(value: String) -> VmResult<String> {
+                todo!()
+            }
+        );
+        let error = expand_pd_host_function(attr, item)
+            .expect_err("async with an external crate path must be rejected");
+        assert!(error.to_string().contains("external crate path"), "{error}");
+    }
+
+    #[test]
+    fn external_crate_path_keeps_resource_wrapper_paths_absolute() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "demo::take", crate = "vm");
+        let item: ItemFn = parse_quote!(
+            /// Takes a counter resource.
+            fn take(resource: ResourceOwned<Counter>) -> i64 {
+                todo!()
+            }
+        );
+        let expanded = expand_pd_host_function(attr, item)
+            .expect("external resource adapter should expand")
+            .to_string();
+        assert!(
+            expanded.contains("vm :: ResourceAccessRequest"),
+            "resource extraction must use the public SDK, got: {expanded}"
+        );
+        assert!(
+            expanded.contains("vm :: ResourceAccessMode"),
+            "resource mode paths must use the public SDK, got: {expanded}"
+        );
+        assert!(
+            !expanded.contains("super :: super"),
+            "external expansion must not emit internal super::super paths: {expanded}"
+        );
     }
 }

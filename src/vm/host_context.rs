@@ -246,6 +246,12 @@ impl<'a> HostContext<'a> {
             .map_err(HostContextError::from_scope)
     }
 
+    /// Alias for [`Self::push_resource`], matching the public extension SDK
+    /// naming for inserting a typed [`HostResource`] into the current scope.
+    pub fn insert_resource<T: HostResource>(&mut self, value: T) -> HostContextResult<Resource<T>> {
+        self.push_resource(value)
+    }
+
     /// Inserts a resource using the exact catalog declaration key.
     pub fn push_resource_with_key<T: HostResource>(
         &mut self,
@@ -255,6 +261,16 @@ impl<'a> HostContext<'a> {
         self.host
             .execution_scope_push_resource_with_key(value, key)
             .map_err(HostContextError::from_scope)
+    }
+
+    /// Alias for [`Self::push_resource_with_key`], matching the public
+    /// extension SDK naming for inserting a keyed resource.
+    pub fn insert_resource_with_key<T: HostResource>(
+        &mut self,
+        value: T,
+        key: crate::host_api::ResourceTypeKey,
+    ) -> HostContextResult<Resource<T>> {
+        self.push_resource_with_key(value, key)
     }
 
     /// Inserts a typed child resource linked to `parent`, so the parent cannot
