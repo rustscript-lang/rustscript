@@ -309,6 +309,34 @@ impl<T> core::ops::DerefMut for ResourceMut<'_, T> {
     }
 }
 
+/// An owned resource argument produced by an exact `TakeOwned` adapter.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ResourceOwned<T>(T);
+
+impl<T> ResourceOwned<T> {
+    pub fn new(value: T) -> Self {
+        Self(value)
+    }
+
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<T> core::ops::Deref for ResourceOwned<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> core::ops::DerefMut for ResourceOwned<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 fn invalid_handle(message: &'static str) -> ResourceError {
     ResourceError::new(
         ResourceErrorCode::InvalidResourceHandle,

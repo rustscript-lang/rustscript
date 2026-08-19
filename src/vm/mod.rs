@@ -57,12 +57,15 @@ use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable
 pub use self::invocation::{Invocation, InvocationError, InvocationItem, InvocationPoll};
 use self::resource::ResourceCloseReason;
 pub use self::resource::{
-    CloseProgress, GuestReleaseOutcome, HostResource, OwnershipRelease, Resource, ResourceError,
-    ResourceHandle, ResourceTable,
+    CloseProgress, GuestReleaseOutcome, HostResource, OwnershipRelease, Resource,
+    ResourceAccessFrame, ResourceAccessMode, ResourceAccessRequest, ResourceError, ResourceHandle,
+    ResourceMut, ResourceOwned, ResourceOwnership, ResourceRef, ResourceTable,
 };
 use self::run_context::{InterruptMode, RunContext};
 pub use crate::builtins::BuiltinFunction;
 pub use crate::builtins::runtime::cancellation::CancellationReason;
+pub use crate::host_api::HostParamPassing;
+pub use crate::host_api::ResourceTypeKey;
 
 pub use crate::bytecode::{
     CallableTarget, CallableValue, HostImport, HostImportParam, HostImportSchema, OpCode, Program,
@@ -814,6 +817,14 @@ impl Vm {
         HostContext::new(&mut self.host)
     }
 
+    pub fn begin_resource_access(
+        &mut self,
+        requests: Vec<ResourceAccessRequest>,
+    ) -> VmResult<ResourceAccessFrame<'_>> {
+        self.host
+            .execution_scope_begin_resource_access(requests)
+            .map_err(|error| VmError::HostError(error.to_string()))
+    }
     /// Returns the maximum number of simultaneously active script call frames.
     pub fn max_script_call_depth(&self) -> usize {
         self.instance.max_script_call_depth

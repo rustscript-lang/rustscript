@@ -57,6 +57,16 @@ pub enum ResourceErrorCode {
     /// The resource's concrete value was already taken out of the table by an
     /// ownership take; the raw handle is stale.
     ResourceAlreadyTaken,
+    /// The catalog/resource declaration key did not match the live slot.
+    ResourceKeyMismatch,
+    /// No key was declared for a request that requires exact resource identity.
+    ResourceKeyUnavailable,
+    /// Two resource parameters requested an illegal aliasing combination.
+    ResourceAccessConflict,
+    /// An associated operation prevents an ownership take.
+    ResourceOperationActive,
+    /// A non-resource Value/ToOwned mode was supplied to the resource frame.
+    ResourceAccessModeUnsupported,
 }
 
 impl ResourceErrorCode {
@@ -79,6 +89,11 @@ impl ResourceErrorCode {
             Self::ResourceNotGuestOwned => "resource_not_guest_owned",
             Self::ResourceNotHostOwned => "resource_not_host_owned",
             Self::ResourceAlreadyTaken => "resource_already_taken",
+            Self::ResourceKeyMismatch => "resource_key_mismatch",
+            Self::ResourceKeyUnavailable => "resource_key_unavailable",
+            Self::ResourceAccessConflict => "resource_access_conflict",
+            Self::ResourceOperationActive => "resource_operation_active",
+            Self::ResourceAccessModeUnsupported => "resource_access_mode_unsupported",
         }
     }
 }
@@ -194,6 +209,11 @@ mod tests {
             ResourceErrorCode::ResourceNotGuestOwned,
             ResourceErrorCode::ResourceNotHostOwned,
             ResourceErrorCode::ResourceAlreadyTaken,
+            ResourceErrorCode::ResourceKeyMismatch,
+            ResourceErrorCode::ResourceKeyUnavailable,
+            ResourceErrorCode::ResourceAccessConflict,
+            ResourceErrorCode::ResourceOperationActive,
+            ResourceErrorCode::ResourceAccessModeUnsupported,
         ]
     }
 
@@ -260,6 +280,26 @@ mod tests {
             (
                 ResourceErrorCode::ResourceAlreadyTaken,
                 "resource_already_taken",
+            ),
+            (
+                ResourceErrorCode::ResourceKeyMismatch,
+                "resource_key_mismatch",
+            ),
+            (
+                ResourceErrorCode::ResourceKeyUnavailable,
+                "resource_key_unavailable",
+            ),
+            (
+                ResourceErrorCode::ResourceAccessConflict,
+                "resource_access_conflict",
+            ),
+            (
+                ResourceErrorCode::ResourceOperationActive,
+                "resource_operation_active",
+            ),
+            (
+                ResourceErrorCode::ResourceAccessModeUnsupported,
+                "resource_access_mode_unsupported",
             ),
         ];
         // Exhaustive: every code has exactly one stable string mapping.

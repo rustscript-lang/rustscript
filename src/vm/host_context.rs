@@ -35,8 +35,8 @@ use super::execution_scope::{ExecutionScope, ExecutionScopeError, ScopeCloseOutc
 use super::host_runtime::HostRuntime;
 use super::operation::{OperationError, OperationId, OperationSpec, OperationStatus};
 use super::resource::{
-    HostResource, Resource, ResourceCloseReason, ResourceError, ResourceHandle, ResourceOwnership,
-    ResourceRef,
+    HostResource, Resource, ResourceAccessFrame, ResourceAccessRequest, ResourceCloseReason,
+    ResourceError, ResourceHandle, ResourceMut, ResourceOwnership, ResourceRef, ResourceTypeKey,
 };
 
 /// Marker bound for a typed chunk of per-VM host module state.
@@ -246,6 +246,17 @@ impl<'a> HostContext<'a> {
             .map_err(HostContextError::from_scope)
     }
 
+    /// Inserts a resource using the exact catalog declaration key.
+    pub fn push_resource_with_key<T: HostResource>(
+        &mut self,
+        value: T,
+        key: crate::host_api::ResourceTypeKey,
+    ) -> HostContextResult<Resource<T>> {
+        self.host
+            .execution_scope_push_resource_with_key(value, key)
+            .map_err(HostContextError::from_scope)
+    }
+
     /// Inserts a typed child resource linked to `parent`, so the parent cannot
     /// close before its children.
     pub fn push_child_resource<T: HostResource, P: HostResource>(
@@ -255,6 +266,18 @@ impl<'a> HostContext<'a> {
     ) -> HostContextResult<Resource<T>> {
         self.host
             .execution_scope_push_child_resource(value, parent)
+            .map_err(HostContextError::from_scope)
+    }
+
+    /// Inserts a typed child resource under an explicit catalog key.
+    pub fn push_child_resource_with_key<T: HostResource, P: HostResource>(
+        &mut self,
+        value: T,
+        parent: &Resource<P>,
+        key: ResourceTypeKey,
+    ) -> HostContextResult<Resource<T>> {
+        self.host
+            .execution_scope_push_child_resource_with_key(value, parent, key)
             .map_err(HostContextError::from_scope)
     }
 
@@ -283,6 +306,33 @@ impl<'a> HostContext<'a> {
             .map_err(HostContextError::from_resource)
     }
 
+    /// Mutably borrows a typed resource for the duration of this synchronous
+    /// host call. The access frame validates the key and aliases before the
+    /// mutable reference is created.
+    pub fn resource_mut<T: HostResource>(
+        &mut self,
+        token: &Resource<T>,
+    ) -> HostContextResult<ResourceMut<'_, T>> {
+        let request = ResourceAccessRequest::borrow::<T>(token.handle());
+        let mut frame = self
+            .host
+            .execution_scope_begin_resource_access(vec![request])
+            .map_err(HostContextError::from_scope)?;
+        frame.borrow_mut(0).map_err(HostContextError::from_resource)
+    }
+
+    /// Starts a multi-argument resource frame. All raw handles, concrete
+    /// `TypeId`s, declaration keys, ownership states, child links, associated
+    /// operations, and same-handle aliases are checked before any take.
+    pub fn begin_resource_access(
+        &mut self,
+        requests: Vec<ResourceAccessRequest>,
+    ) -> HostContextResult<ResourceAccessFrame<'_>> {
+        self.host
+            .execution_scope_begin_resource_access(requests)
+            .map_err(HostContextError::from_scope)
+    }
+
     /// Validates a raw [`ResourceHandle`] against the current scope and
     /// recovers a typed token (read-only).
     pub fn typed_resource<T: HostResource>(
@@ -294,6 +344,34 @@ impl<'a> HostContext<'a> {
             .resources()
             .typed(handle)
             .map_err(HostContextError::from_resource)
+    }
+
+    /// Borrow a raw handle after typed arena/generation/key validation.
+    pub fn borrow_resource<T: HostResource>(
+        &self,
+        handle: ResourceHandle,
+    ) -> HostContextResult<ResourceRef<'_, T>> {
+        let token = self.typed_resource::<T>(handle)?;
+        self.resource(&token)
+    }
+
+    /// Mutably borrow a raw handle after typed arena/generation/key validation.
+    pub fn borrow_resource_mut<T: HostResource>(
+        &mut self,
+        handle: ResourceHandle,
+    ) -> HostContextResult<ResourceMut<'_, T>> {
+        let request = ResourceAccessRequest::borrow::<T>(handle);
+        let mut frame = self
+            .host
+            .execution_scope_begin_resource_access(vec![request])
+            .map_err(HostContextError::from_scope)?;
+        frame.borrow_mut(0).map_err(HostContextError::from_resource)
+    }
+
+    /// Atomically takes a guest-owned raw handle using its concrete type and
+    /// declaration key.
+    pub fn take_owned<T: HostResource>(&mut self, handle: ResourceHandle) -> HostContextResult<T> {
+        self.take_resource::<T>(handle)
     }
 
     /// Atomically takes a guest-owned resource out of the current scope,

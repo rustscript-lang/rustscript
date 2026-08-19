@@ -7,6 +7,8 @@
 use std::any::Any;
 use std::task::{Context, Poll};
 
+use crate::host_api::ResourceTypeKey;
+
 use super::error::ResourceResult;
 use super::reason::ResourceCloseReason;
 
@@ -35,6 +37,19 @@ pub enum CloseProgress {
 /// The `Any` supertrait lets the table reconnect each erased value to its
 /// concrete `TypeId` without ever naming a concrete class.
 pub trait HostResource: Any + Send + 'static {
+    /// Stable catalog identity for this concrete resource declaration.
+    ///
+    /// New resource declarations should override this method. The default
+    /// keeps pre-existing host resources source-compatible; such resources
+    /// participate in legacy typed APIs but cannot satisfy an exact request
+    /// carrying a non-empty [`ResourceTypeKey`].
+    fn resource_type_key() -> Option<ResourceTypeKey>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
     /// Begins closing the resource, emitting a synchronous cancel/close request.
     ///
     /// The default is a synchronous no-op close.

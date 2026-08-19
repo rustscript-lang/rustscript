@@ -5,6 +5,23 @@ use syn::{
     punctuated::Punctuated,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResourceMode {
+    Borrow,
+    BorrowMut,
+    TakeOwned,
+    ToOwned,
+    Value,
+}
+
+#[derive(Clone)]
+struct ResourceParamInfo {
+    mode: ResourceMode,
+    inner: Type,
+    owned_wrapper: bool,
+    key: Option<LitStr>,
+}
+
 #[proc_macro_attribute]
 pub fn pd_host_function(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr with Punctuated::<Meta, Token![,]>::parse_terminated);
@@ -24,15 +41,25 @@ fn expand_pd_host_function(
     let is_async = item.sig.asyncness.is_some();
     let docs = doc_string(&item.attrs);
     for input in &item.sig.inputs {
+        let resource = resource_param_info(input)?;
         if is_async {
-            validate_async_param(input)?;
+            if let Some(info) = &resource {
+                if !matches!(info.mode, ResourceMode::TakeOwned) {
+                    return Err(Error::new_spanned(
+                        input,
+                        "resource borrows cannot cross async/yield; only TakeOwned may move into an owned operation",
+                    ));
+                }
+            } else {
+                validate_async_param(input)?;
+            }
         } else if is_host_context_param(input) {
             return Err(Error::new_spanned(
                 input,
                 "#[pd_host_context] is only valid on async host functions",
             ));
         }
-        if !is_host_context_param(input) {
+        if !is_host_context_param(input) && resource.is_none() {
             validate_param(input)?;
         }
     }
@@ -59,9 +86,9 @@ fn expand_pd_host_function(
     };
     for input in &mut item.sig.inputs {
         if let FnArg::Typed(pat_type) = input {
-            pat_type
-                .attrs
-                .retain(|attr| !attr.path().is_ident("pd_host_context"));
+            pat_type.attrs.retain(|attr| {
+                !attr.path().is_ident("pd_host_context") && !is_resource_attribute(attr)
+            });
         }
     }
     Ok(quote! {
@@ -70,6 +97,236 @@ fn expand_pd_host_function(
     })
 }
 
+fn parse_resource_mode(value: &str, span: proc_macro2::Span) -> Result<ResourceMode, Error> {
+    let normalized = value.to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        "borrow" => Ok(ResourceMode::Borrow),
+        "borrow_mut" | "borrowmut" => Ok(ResourceMode::BorrowMut),
+        "take_owned" | "takeowned" | "owned" => Ok(ResourceMode::TakeOwned),
+        "to_owned" | "toowned" => Ok(ResourceMode::ToOwned),
+        "value" => Ok(ResourceMode::Value),
+        _ => Err(Error::new(
+            span,
+            "resource passing must be borrow, borrow_mut, to_owned, take_owned, or value",
+        )),
+    }
+}
+
+fn parse_resource_attrs(
+    attrs: &[syn::Attribute],
+) -> Result<(Option<ResourceMode>, Option<LitStr>), Error> {
+    let mut mode = None;
+    let mut key = None;
+    for attr in attrs {
+        let path = attr.path();
+        if path.is_ident("pd_borrow") {
+            mode = Some(ResourceMode::Borrow);
+            continue;
+        }
+        if path.is_ident("pd_borrow_mut") {
+            mode = Some(ResourceMode::BorrowMut);
+            continue;
+        }
+        if path.is_ident("pd_take_owned") {
+            mode = Some(ResourceMode::TakeOwned);
+            continue;
+        }
+        if path.is_ident("pd_to_owned") {
+            mode = Some(ResourceMode::ToOwned);
+            continue;
+        }
+        if path.is_ident("pd_value") {
+            mode = Some(ResourceMode::Value);
+            continue;
+        }
+        if !(path.is_ident("pd_host_param")
+            || path.is_ident("pd_host_resource")
+            || path.is_ident("pd_host_passing"))
+        {
+            continue;
+        }
+        match &attr.meta {
+            Meta::Path(_) => {}
+            Meta::NameValue(name_value) => {
+                let syn::Expr::Lit(expr_lit) = &name_value.value else {
+                    return Err(Error::new_spanned(
+                        &name_value.value,
+                        "resource passing metadata must be a string literal",
+                    ));
+                };
+                let syn::Lit::Str(value) = &expr_lit.lit else {
+                    return Err(Error::new_spanned(
+                        &expr_lit.lit,
+                        "resource passing metadata must be a string literal",
+                    ));
+                };
+                if name_value.path.is_ident("passing") || path.is_ident("pd_host_passing") {
+                    mode = Some(parse_resource_mode(value.value().as_str(), value.span())?);
+                } else if name_value.path.is_ident("key") {
+                    key = Some(value.clone());
+                } else {
+                    return Err(Error::new_spanned(
+                        &name_value.path,
+                        "expected passing = \"...\" or key = \"...\"",
+                    ));
+                }
+            }
+            Meta::List(_) => {
+                attr.parse_nested_meta(|nested| {
+                    if nested.path.is_ident("borrow") {
+                        mode = Some(ResourceMode::Borrow);
+                        return Ok(());
+                    }
+                    if nested.path.is_ident("borrow_mut") || nested.path.is_ident("borrowmut") {
+                        mode = Some(ResourceMode::BorrowMut);
+                        return Ok(());
+                    }
+                    if nested.path.is_ident("take_owned")
+                        || nested.path.is_ident("takeowned")
+                        || nested.path.is_ident("owned")
+                    {
+                        mode = Some(ResourceMode::TakeOwned);
+                        return Ok(());
+                    }
+                    if nested.path.is_ident("to_owned") || nested.path.is_ident("toowned") {
+                        mode = Some(ResourceMode::ToOwned);
+                        return Ok(());
+                    }
+                    if nested.path.is_ident("value") {
+                        mode = Some(ResourceMode::Value);
+                        return Ok(());
+                    }
+                    if nested.path.is_ident("passing") {
+                        let value: LitStr = nested.value()?.parse()?;
+                        mode = Some(parse_resource_mode(value.value().as_str(), value.span())?);
+                        return Ok(());
+                    }
+                    if nested.path.is_ident("key") {
+                        key = Some(nested.value()?.parse()?);
+                        return Ok(());
+                    }
+                    Err(nested.error(
+                        "expected a resource passing mode, passing = \"...\", or key = \"...\"",
+                    ))
+                })?;
+            }
+        }
+    }
+    Ok((mode, key))
+}
+
+fn generic_type_argument(segment: &syn::PathSegment) -> Result<Type, Error> {
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return Err(Error::new_spanned(
+            &segment.arguments,
+            "resource wrapper requires one concrete resource type",
+        ));
+    };
+    args.args
+        .iter()
+        .rev()
+        .find_map(|arg| match arg {
+            syn::GenericArgument::Type(ty) => Some(ty.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            Error::new_spanned(args, "resource wrapper requires one concrete resource type")
+        })
+}
+
+fn resource_param_info(arg: &FnArg) -> Result<Option<ResourceParamInfo>, Error> {
+    let FnArg::Typed(pat_type) = arg else {
+        return Ok(None);
+    };
+    let (explicit_mode, key) = parse_resource_attrs(&pat_type.attrs)?;
+    let wrapper = match &*pat_type.ty {
+        Type::Group(group) => {
+            return resource_param_info(&FnArg::Typed(syn::PatType {
+                attrs: pat_type.attrs.clone(),
+                pat: pat_type.pat.clone(),
+                colon_token: pat_type.colon_token,
+                ty: group.elem.clone(),
+            }));
+        }
+        Type::Paren(paren) => {
+            return resource_param_info(&FnArg::Typed(syn::PatType {
+                attrs: pat_type.attrs.clone(),
+                pat: pat_type.pat.clone(),
+                colon_token: pat_type.colon_token,
+                ty: paren.elem.clone(),
+            }));
+        }
+        Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string()),
+        _ => None,
+    };
+    let Some(wrapper) = wrapper else {
+        return if explicit_mode.is_some() {
+            Err(Error::new_spanned(
+                &pat_type.ty,
+                "resource passing metadata requires a concrete resource type",
+            ))
+        } else {
+            Ok(None)
+        };
+    };
+    let inferred = match wrapper.as_str() {
+        "ResourceRef" => Some((ResourceMode::Borrow, true)),
+        "ResourceMut" => Some((ResourceMode::BorrowMut, true)),
+        "ResourceOwned" => Some((ResourceMode::TakeOwned, true)),
+        _ => None,
+    };
+    let Some((inferred_mode, owned_wrapper)) =
+        inferred.or_else(|| explicit_mode.map(|mode| (mode, false)))
+    else {
+        return Ok(None);
+    };
+    let mode = explicit_mode.unwrap_or(inferred_mode);
+    if explicit_mode.is_some() && inferred.is_some() && mode != inferred_mode {
+        return Err(Error::new_spanned(
+            &pat_type.ty,
+            "resource wrapper and passing metadata specify different modes",
+        ));
+    }
+    if matches!(mode, ResourceMode::ToOwned | ResourceMode::Value) {
+        return Err(Error::new_spanned(
+            &pat_type.ty,
+            "resource-containing ToOwned/Value parameters are rejected; use Borrow, BorrowMut, or TakeOwned",
+        ));
+    }
+    let inner = if inferred.is_some() {
+        let Type::Path(path) = &*pat_type.ty else {
+            unreachable!("resource wrapper path checked above")
+        };
+        generic_type_argument(path.path.segments.last().expect("resource wrapper segment"))?
+    } else {
+        (*pat_type.ty).clone()
+    };
+    Ok(Some(ResourceParamInfo {
+        mode,
+        inner,
+        owned_wrapper,
+        key,
+    }))
+}
+
+fn is_resource_attribute(attr: &syn::Attribute) -> bool {
+    [
+        "pd_host_param",
+        "pd_host_resource",
+        "pd_host_passing",
+        "pd_borrow",
+        "pd_borrow_mut",
+        "pd_take_owned",
+        "pd_to_owned",
+        "pd_value",
+    ]
+    .iter()
+    .any(|name| attr.path().is_ident(name))
+}
 fn validate_async_param(arg: &FnArg) -> Result<(), Error> {
     let FnArg::Typed(pat_type) = arg else {
         return Err(Error::new_spanned(arg, "methods are not supported"));
@@ -235,6 +492,76 @@ fn is_abi_declaration_only(item: &ItemFn) -> bool {
     expr_macro.mac.path.is_ident("unreachable")
 }
 
+fn resource_mode_tokens(mode: ResourceMode) -> proc_macro2::TokenStream {
+    match mode {
+        ResourceMode::Borrow => quote!(super::super::ResourceAccessMode::Borrow),
+        ResourceMode::BorrowMut => quote!(super::super::ResourceAccessMode::BorrowMut),
+        ResourceMode::TakeOwned => quote!(super::super::ResourceAccessMode::TakeOwned),
+        ResourceMode::ToOwned => quote!(super::super::ResourceAccessMode::ToOwned),
+        ResourceMode::Value => quote!(super::super::ResourceAccessMode::Value),
+    }
+}
+
+fn resource_request_tokens(
+    info: &ResourceParamInfo,
+    index: &syn::Index,
+    label: &LitStr,
+) -> proc_macro2::TokenStream {
+    let inner = &info.inner;
+    let mode = resource_mode_tokens(info.mode);
+    match &info.key {
+        Some(key) => quote! {
+            super::super::ResourceAccessRequest::from_value_with_key::<#inner>(
+                &args[#index],
+                #mode,
+                super::super::ResourceTypeKey::new(#key)
+                    .expect("pd_host_function resource key must be valid"),
+                #label,
+            )?
+        },
+        None => quote! {
+            super::super::ResourceAccessRequest::from_value::<#inner>(
+                &args[#index],
+                #mode,
+                #label,
+            )?
+        },
+    }
+}
+
+fn resource_extract_tokens(
+    info: &ResourceParamInfo,
+    ty: &Type,
+    ident: &syn::Ident,
+    index: &syn::Index,
+) -> proc_macro2::TokenStream {
+    let inner = &info.inner;
+    let value = match info.mode {
+        ResourceMode::Borrow => quote!(__pd_resource_frame
+            .borrow::<#inner>(#index)
+            .map_err(|error| super::super::VmError::HostError(error.to_string()))?),
+        ResourceMode::BorrowMut => quote!(__pd_resource_frame
+            .borrow_mut::<#inner>(#index)
+            .map_err(|error| super::super::VmError::HostError(error.to_string()))?),
+        ResourceMode::TakeOwned => {
+            let taken = quote!(__pd_resource_frame
+                .take_owned::<#inner>(#index)
+                .map_err(|error| super::super::VmError::HostError(error.to_string()))?);
+            if info.owned_wrapper {
+                quote!(<#ty>::new(#taken))
+            } else {
+                taken
+            }
+        }
+        ResourceMode::ToOwned | ResourceMode::Value => {
+            quote!(compile_error!(
+                "resource ToOwned/Value adapters are rejected"
+            ))
+        }
+    };
+    quote!(let #ident = #value;)
+}
+
 fn generate_vm_wrapper(
     item: &ItemFn,
     wrapper_name: &syn::Ident,
@@ -244,14 +571,22 @@ fn generate_vm_wrapper(
     let mut call_args = Vec::<proc_macro2::TokenStream>::new();
     let mut imm_extract_stmts = Vec::<proc_macro2::TokenStream>::new();
     let mut mut_extract_stmts = Vec::<proc_macro2::TokenStream>::new();
+    let mut resource_requests = Vec::<proc_macro2::TokenStream>::new();
     let mutable_wrapper_name = syn::Ident::new(&format!("{wrapper_name}_mut"), wrapper_name.span());
     let has_vm = item.sig.inputs.iter().any(|input| match input {
         FnArg::Typed(pat_type) => is_vm_context_type(&pat_type.ty),
         FnArg::Receiver(_) => false,
     });
-    if has_vm {
+    let has_resource = item
+        .sig
+        .inputs
+        .iter()
+        .any(|input| resource_param_info(input).ok().flatten().is_some());
+    if has_vm || has_resource {
         wrapper_params.push(quote!(vm: &mut super::super::Vm));
-        call_args.push(quote!(vm));
+        if has_vm {
+            call_args.push(quote!(vm));
+        }
     }
     let imm_wrapper_params = {
         let mut params = wrapper_params.clone();
@@ -284,17 +619,24 @@ fn generate_vm_wrapper(
             proc_macro2::Span::call_site(),
         );
         let index = syn::Index::from(arg_index);
-        imm_extract_stmts.push(quote! {
-            let #ident = super::borrow_arg::<#ty>(args, #index, #label)?;
-        });
-        let extractor = if uses_taken_extractor(ty) {
-            quote!(super::take_arg::<#ty>(args, #index, #label)?)
+        if let Some(info) = resource_param_info(input)? {
+            resource_requests.push(resource_request_tokens(&info, &index, &label));
+            let extraction = resource_extract_tokens(&info, ty, ident, &index);
+            imm_extract_stmts.push(extraction.clone());
+            mut_extract_stmts.push(extraction);
         } else {
-            quote!(super::borrow_arg::<#ty>(&*args, #index, #label)?)
-        };
-        mut_extract_stmts.push(quote! {
-            let #ident = #extractor;
-        });
+            imm_extract_stmts.push(quote! {
+                let #ident = super::borrow_arg::<#ty>(args, #index, #label)?;
+            });
+            let extractor = if uses_taken_extractor(ty) {
+                quote!(super::take_arg::<#ty>(args, #index, #label)?)
+            } else {
+                quote!(super::borrow_arg::<#ty>(&*args, #index, #label)?)
+            };
+            mut_extract_stmts.push(quote! {
+                let #ident = #extractor;
+            });
+        }
         call_args.push(quote!(#ident));
         arg_index += 1;
     }
@@ -305,16 +647,26 @@ fn generate_vm_wrapper(
     } else {
         quote!(Ok(#impl_name(#(#call_args),*)))
     };
+    let imm_resource_frame = if has_resource {
+        quote! {
+            let mut __pd_resource_frame = vm.begin_resource_access(vec![#(#resource_requests),*])?;
+        }
+    } else {
+        quote! {}
+    };
+    let mut_resource_frame = imm_resource_frame.clone();
 
     Ok(quote! {
         #[allow(dead_code)]
         pub(crate) fn #wrapper_name(#(#imm_wrapper_params),*) -> #wrapper_output {
+            #imm_resource_frame
             #(#imm_extract_stmts)*
             #call_expr
         }
 
         #[allow(dead_code)]
         pub(crate) fn #mutable_wrapper_name(#(#mut_wrapper_params),*) -> #wrapper_output {
+            #mut_resource_frame
             #(#mut_extract_stmts)*
             #call_expr
         }
@@ -329,6 +681,7 @@ fn generate_async_vm_wrapper(
     let mutable_wrapper_name = syn::Ident::new(&format!("{wrapper_name}_mut"), wrapper_name.span());
     let mut extract_stmts = Vec::<proc_macro2::TokenStream>::new();
     let mut call_args = Vec::<proc_macro2::TokenStream>::new();
+    let mut resource_requests = Vec::<proc_macro2::TokenStream>::new();
     let mut arg_index = 0usize;
 
     for input in &item.sig.inputs {
@@ -354,9 +707,14 @@ fn generate_async_vm_wrapper(
             proc_macro2::Span::call_site(),
         );
         let index = syn::Index::from(arg_index);
-        extract_stmts.push(quote! {
-            let #ident = super::borrow_arg::<#ty>(args, #index, #label)?;
-        });
+        if let Some(info) = resource_param_info(input)? {
+            resource_requests.push(resource_request_tokens(&info, &index, &label));
+            extract_stmts.push(resource_extract_tokens(&info, ty, ident, &index));
+        } else {
+            extract_stmts.push(quote! {
+                let #ident = super::borrow_arg::<#ty>(args, #index, #label)?;
+            });
+        }
         call_args.push(quote!(#ident));
         arg_index += 1;
     }
@@ -385,7 +743,15 @@ fn generate_async_vm_wrapper(
             }
         }
     };
+    let resource_frame = if resource_requests.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            let mut __pd_resource_frame = vm.begin_resource_access(vec![#(#resource_requests),*])?;
+        }
+    };
     let body = quote! {
+        #resource_frame
         #(#extract_stmts)*
         vm.submit_host_future(Box::pin(async move {
             let value = #await_value;
@@ -531,6 +897,12 @@ fn type_label(ty: &Type) -> Result<String, Error> {
                 "Array" | "VmArray" | "VmArrayRef" | "VmArrayHandle" => Ok("array".to_string()),
                 "Map" | "VmMap" | "VmMapRef" | "VmMapHandle" => Ok("map".to_string()),
                 "Number" | "NumberValue" => Ok("number".to_string()),
+                "Resource" => Ok("resource".to_string()),
+                "ResourceOwned" => Err(Error::new_spanned(
+                    path,
+                    "ResourceOwned is an input-only TakeOwned wrapper",
+                )),
+                "ResourceRef" | "ResourceMut" => Ok("resource".to_string()),
                 "VmCallable" => callable_type_label(segment),
                 "Unknown" | "UnknownValue" => Ok("unknown".to_string()),
                 "CallOutcome" => Ok("unknown".to_string()),
@@ -804,6 +1176,57 @@ mod tests {
                 .to_string()
                 .contains("parameters must be owned and 'static")
         );
+    }
+
+    #[test]
+    fn resource_parameters_generate_preflighted_typed_access() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "test::resource");
+        let item: ItemFn = parse_quote! {
+            /// Uses a borrowed resource and returns its guest handle.
+            fn resource(
+                #[pd_host_param(passing = "borrow", key = "test.fake")]
+                resource: ResourceRef<'_, FakeResource>,
+            ) -> Resource<FakeResource> {
+                todo!()
+            }
+        };
+        let expanded = expand_pd_host_function(attr, item)
+            .expect("resource parameter should be accepted")
+            .to_string();
+        assert!(expanded.contains("begin_resource_access"));
+        assert!(expanded.contains("ResourceAccessRequest"));
+        assert!(expanded.contains("ResourceAccessMode :: Borrow"));
+        assert!(expanded.contains("borrow :: < FakeResource >"));
+    }
+
+    #[test]
+    fn async_resource_borrow_is_rejected_but_owned_take_is_extracted_before_future() {
+        let borrow_attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "test::borrow");
+        let borrow_item: ItemFn = parse_quote! {
+            /// Borrow cannot cross a pending future.
+            async fn borrow(resource: ResourceRef<'_, FakeResource>) -> VmResult<i64> {
+                let _ = resource;
+                Ok(0)
+            }
+        };
+        let error = expand_pd_host_function(borrow_attr, borrow_item)
+            .expect_err("async resource borrow must be rejected");
+        assert!(error.to_string().contains("cannot cross async/yield"));
+
+        let take_attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "test::take");
+        let take_item: ItemFn = parse_quote! {
+            /// Moves a resource into an owned async operation.
+            async fn take(resource: ResourceOwned<FakeResource>) -> VmResult<i64> {
+                let _ = resource;
+                Ok(0)
+            }
+        };
+        let expanded = expand_pd_host_function(take_attr, take_item)
+            .expect("owned resource take should be accepted")
+            .to_string();
+        assert!(expanded.contains("begin_resource_access"));
+        assert!(expanded.contains("take_owned"));
+        assert!(expanded.contains("async move"));
     }
 
     #[test]

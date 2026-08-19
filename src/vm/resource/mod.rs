@@ -31,6 +31,10 @@ pub mod table;
 
 pub use self::close::{CloseProgress, HostResource};
 pub use self::error::{ResourceError, ResourceErrorCode, ResourceResult};
-pub use self::handle::{Resource, ResourceHandle, ResourceMut, ResourceRef};
+pub use self::handle::{Resource, ResourceHandle, ResourceMut, ResourceOwned, ResourceRef};
 pub use self::reason::ResourceCloseReason;
-pub use self::table::{GuestReleaseOutcome, OwnershipRelease, ResourceOwnership, ResourceTable};
+pub use crate::host_api::ResourceTypeKey;
+pub use table::{
+    GuestReleaseOutcome, OwnershipRelease, ResourceAccessFrame, ResourceAccessMode,
+    ResourceAccessRequest, ResourceOwnership, ResourceTable,
+};

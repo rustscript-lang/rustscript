@@ -112,6 +112,146 @@ struct RegistryEntry {
     runtime_owned_pending: bool,
 }
 
+#[derive(Clone)]
+struct ResourceTakeGuardSpec {
+    handle: ResourceHandle,
+    key: crate::host_api::ResourceTypeKey,
+}
+
+struct GuardedHostFunction {
+    inner: Box<dyn HostFunction>,
+    schema: HostImportSchema,
+}
+
+struct ResourceTakeGuard {
+    specs: Vec<ResourceTakeGuardSpec>,
+}
+
+fn collect_resource_take_specs(
+    schema: &HostImportSchema,
+    args: &[Value],
+) -> VmResult<Vec<ResourceTakeGuardSpec>> {
+    let mut specs = Vec::new();
+    for (index, param) in schema.params.iter().enumerate() {
+        if param.passing != crate::host_api::HostParamPassing::TakeOwned {
+            continue;
+        }
+        if !param.schema.contains_resource() {
+            continue;
+        }
+        let key = param.schema.resource_key().cloned().ok_or_else(|| {
+            VmError::HostError(
+                "resource_take_owned_guard requires a direct resource or optional resource parameter"
+                    .to_string(),
+            )
+        })?;
+        let value = args.get(index).ok_or_else(|| {
+            VmError::HostError(format!(
+                "resource_take_owned_guard missing argument {index}"
+            ))
+        })?;
+        let handle = ResourceHandle::from_value(value)
+            .map_err(|error| VmError::HostError(format!("resource_take_owned_guard: {error}")))?;
+        specs.push(ResourceTakeGuardSpec { handle, key });
+    }
+    Ok(specs)
+}
+
+impl ResourceTakeGuard {
+    fn cleanup_unconsumed(&self, vm: &mut Vm) -> Option<VmError> {
+        let mut first_error = None;
+        for spec in &self.specs {
+            let ownership = vm.host.execution_scope().resources().ownership(spec.handle);
+            if ownership == Some(ResourceOwnership::Taken) {
+                continue;
+            }
+            if ownership == Some(ResourceOwnership::GuestOwned) {
+                if let Err(error) = vm
+                    .host
+                    .execution_scope_release_guest_owner(spec.handle, OwnershipRelease::close())
+                {
+                    first_error.get_or_insert_with(|| VmError::HostError(error.to_string()));
+                }
+            }
+            first_error.get_or_insert_with(|| {
+                VmError::HostError(format!(
+                    "resource_take_owned_unconsumed: argument handle {} ({}) was not taken",
+                    spec.handle.raw(),
+                    spec.key
+                ))
+            });
+        }
+        first_error
+    }
+}
+
+fn run_guarded_host_call<F>(
+    vm: &mut Vm,
+    args: &[Value],
+    schema: &HostImportSchema,
+    call: F,
+) -> VmResult<CallOutcome>
+where
+    F: FnOnce(&mut Vm, &[Value]) -> VmResult<CallOutcome>,
+{
+    let guard = ResourceTakeGuard {
+        specs: collect_resource_take_specs(schema, args)?,
+    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(vm, args)));
+    match outcome {
+        Ok(result) => {
+            let guard_error = guard.cleanup_unconsumed(vm);
+            match (result, guard_error) {
+                (Err(_), Some(error)) | (Ok(_), Some(error)) => Err(error),
+                (result, None) => result,
+            }
+        }
+        Err(payload) => {
+            let _ = guard.cleanup_unconsumed(vm);
+            std::panic::resume_unwind(payload)
+        }
+    }
+}
+
+impl HostFunction for GuardedHostFunction {
+    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+        run_guarded_host_call(vm, args, &self.schema, |vm, args| self.inner.call(vm, args))
+    }
+}
+
+struct GuardedStaticHostFunction {
+    function: StaticHostFunction,
+    schema: HostImportSchema,
+}
+
+impl HostFunction for GuardedStaticHostFunction {
+    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+        run_guarded_host_call(vm, args, &self.schema, |vm, args| (self.function)(vm, args))
+    }
+}
+
+struct GuardedHostStackFunction {
+    inner: Box<dyn HostStackFunction>,
+    schema: HostImportSchema,
+}
+
+impl HostStackFunction for GuardedHostStackFunction {
+    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+        run_guarded_host_call(vm, args, &self.schema, |vm, args| self.inner.call(vm, args))
+    }
+}
+
+struct GuardedStaticHostStackFunction {
+    function: StaticHostStackFunction,
+    schema: HostImportSchema,
+}
+
+impl HostStackFunction for GuardedStaticHostStackFunction {
+    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+        run_guarded_host_call(vm, args, &self.schema, |vm, args| (self.function)(vm, args))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostBindingPlan {
     import_signature: Vec<HostImport>,
@@ -469,12 +609,24 @@ impl HostFunctionRegistry {
         factory: impl Fn() -> Box<dyn HostFunction> + Send + Sync + 'static,
     ) -> VmResult<u16> {
         let name = name.into();
-        self.push_exact(
-            name,
-            arity,
-            schema,
-            RegistryEntryKind::Factory(Arc::new(factory)),
-        )
+        let guarded = schema.params.iter().any(|param| {
+            param.passing == crate::host_api::HostParamPassing::TakeOwned
+                && param.schema.contains_resource()
+        });
+        let factory: Arc<HostFactory> = Arc::new(factory);
+        let kind = if guarded {
+            let schema_for_guard = schema.clone();
+            let factory_for_guard = Arc::clone(&factory);
+            RegistryEntryKind::Factory(Arc::new(move || {
+                Box::new(GuardedHostFunction {
+                    inner: factory_for_guard(),
+                    schema: schema_for_guard.clone(),
+                })
+            }))
+        } else {
+            RegistryEntryKind::Factory(factory)
+        };
+        self.push_exact(name, arity, schema, kind)
     }
 
     pub fn register_exact_static(
@@ -485,7 +637,26 @@ impl HostFunctionRegistry {
         function: StaticHostFunction,
     ) -> VmResult<u16> {
         let name = name.into();
-        self.push_exact(name, arity, schema, RegistryEntryKind::Static(function))
+        let guarded = schema.params.iter().any(|param| {
+            param.passing == crate::host_api::HostParamPassing::TakeOwned
+                && param.schema.contains_resource()
+        });
+        if guarded {
+            let schema_for_guard = schema.clone();
+            self.push_exact(
+                name,
+                arity,
+                schema,
+                RegistryEntryKind::Factory(Arc::new(move || {
+                    Box::new(GuardedStaticHostFunction {
+                        function,
+                        schema: schema_for_guard.clone(),
+                    })
+                })),
+            )
+        } else {
+            self.push_exact(name, arity, schema, RegistryEntryKind::Static(function))
+        }
     }
 
     pub fn register_exact_stack(
@@ -496,12 +667,24 @@ impl HostFunctionRegistry {
         factory: impl Fn() -> Box<dyn HostStackFunction> + Send + Sync + 'static,
     ) -> VmResult<u16> {
         let name = name.into();
-        self.push_exact(
-            name,
-            arity,
-            schema,
-            RegistryEntryKind::StackFactory(Arc::new(factory)),
-        )
+        let guarded = schema.params.iter().any(|param| {
+            param.passing == crate::host_api::HostParamPassing::TakeOwned
+                && param.schema.contains_resource()
+        });
+        let factory: Arc<HostStackFactory> = Arc::new(factory);
+        let kind = if guarded {
+            let schema_for_guard = schema.clone();
+            let factory_for_guard = Arc::clone(&factory);
+            RegistryEntryKind::StackFactory(Arc::new(move || {
+                Box::new(GuardedHostStackFunction {
+                    inner: factory_for_guard(),
+                    schema: schema_for_guard.clone(),
+                })
+            }))
+        } else {
+            RegistryEntryKind::StackFactory(factory)
+        };
+        self.push_exact(name, arity, schema, kind)
     }
 
     pub fn register_exact_static_stack(
@@ -512,12 +695,31 @@ impl HostFunctionRegistry {
         function: StaticHostStackFunction,
     ) -> VmResult<u16> {
         let name = name.into();
-        self.push_exact(
-            name,
-            arity,
-            schema,
-            RegistryEntryKind::StackStatic(function),
-        )
+        let guarded = schema.params.iter().any(|param| {
+            param.passing == crate::host_api::HostParamPassing::TakeOwned
+                && param.schema.contains_resource()
+        });
+        if guarded {
+            let schema_for_guard = schema.clone();
+            self.push_exact(
+                name,
+                arity,
+                schema,
+                RegistryEntryKind::StackFactory(Arc::new(move || {
+                    Box::new(GuardedStaticHostStackFunction {
+                        function,
+                        schema: schema_for_guard.clone(),
+                    })
+                })),
+            )
+        } else {
+            self.push_exact(
+                name,
+                arity,
+                schema,
+                RegistryEntryKind::StackStatic(function),
+            )
+        }
     }
 
     pub fn register_exact_args(
@@ -528,6 +730,17 @@ impl HostFunctionRegistry {
         factory: impl Fn() -> Box<dyn HostArgsFunction> + Send + Sync + 'static,
     ) -> VmResult<u16> {
         let name = name.into();
+        if schema.params.iter().any(|param| {
+            param.passing == crate::host_api::HostParamPassing::TakeOwned
+                && param.schema.contains_resource()
+        }) {
+            return Err(VmError::HostImportBinding(
+                HostImportBindingError::InvalidSchema {
+                    import: name,
+                    reason: "Args-only exact registration cannot enforce TakeOwned; use a VM-aware registration wrapper".to_string(),
+                },
+            ));
+        }
         self.push_exact(
             name,
             arity,
@@ -544,6 +757,17 @@ impl HostFunctionRegistry {
         function: StaticHostArgsFunction,
     ) -> VmResult<u16> {
         let name = name.into();
+        if schema.params.iter().any(|param| {
+            param.passing == crate::host_api::HostParamPassing::TakeOwned
+                && param.schema.contains_resource()
+        }) {
+            return Err(VmError::HostImportBinding(
+                HostImportBindingError::InvalidSchema {
+                    import: name,
+                    reason: "Args-only exact registration cannot enforce TakeOwned; use a VM-aware registration wrapper".to_string(),
+                },
+            ));
+        }
         self.push_exact(name, arity, schema, RegistryEntryKind::ArgsStatic(function))
     }
 
@@ -555,6 +779,17 @@ impl HostFunctionRegistry {
         function: StaticHostArgsFunction,
     ) -> VmResult<u16> {
         let name = name.into();
+        if schema.params.iter().any(|param| {
+            param.passing == crate::host_api::HostParamPassing::TakeOwned
+                && param.schema.contains_resource()
+        }) {
+            return Err(VmError::HostImportBinding(
+                HostImportBindingError::InvalidSchema {
+                    import: name,
+                    reason: "Args-only exact registration cannot enforce TakeOwned; use a VM-aware registration wrapper".to_string(),
+                },
+            ));
+        }
         self.push_exact(
             name,
             arity,
@@ -2788,5 +3023,74 @@ mod exact_binding_registration_tests {
             .expect("push into slot 65535 is within u16 capacity");
         assert_eq!(slot, 65535, "slot must not truncate at the u16 boundary");
         assert_eq!(registry.entries.len(), 65536);
+    }
+
+    use crate::host_api::HostParamPassing;
+    use crate::resource::ResourceResult;
+
+    struct TestResource;
+
+    impl HostResource for TestResource {
+        fn resource_type_key() -> Option<crate::host_api::ResourceTypeKey> {
+            Some(crate::host_api::ResourceTypeKey::new("test.guard").unwrap())
+        }
+
+        fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
+            Ok(CloseProgress::Ready)
+        }
+
+        fn poll_close(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<ResourceResult<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    struct NoTake;
+
+    impl HostFunction for NoTake {
+        fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+            Ok(CallOutcome::Return(CallReturn::none()))
+        }
+    }
+
+    fn take_schema(key: crate::host_api::ResourceTypeKey) -> HostImportSchema {
+        HostImportSchema {
+            params: vec![HostImportParam {
+                name: "resource".to_string(),
+                schema: TypeSchema::Resource(key),
+                passing: HostParamPassing::TakeOwned,
+            }],
+            return_type: TypeSchema::Null,
+            fingerprint: crate::host_api::HostApiCatalog::default().fingerprint(),
+        }
+    }
+
+    #[test]
+    fn manual_take_owned_registration_reclaims_unconsumed_guest_resource() {
+        let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+        let handle = vm
+            .host_context()
+            .push_resource(TestResource)
+            .unwrap()
+            .handle();
+        vm.host_context().mark_resource_guest_owned(handle).unwrap();
+
+        let mut registry = HostFunctionRegistry::new();
+        let schema = take_schema(crate::host_api::ResourceTypeKey::new("test.guard").unwrap());
+        let slot = registry
+            .register_exact("test::guard", 1, schema, || Box::new(NoTake))
+            .unwrap();
+        let mut guarded = match &registry.entries[slot as usize].kind {
+            RegistryEntryKind::Factory(factory) => factory(),
+            _ => panic!("expected guarded factory"),
+        };
+        let error = guarded.call(&mut vm, &[handle.as_value()]).unwrap_err();
+        assert!(error.to_string().contains("resource_take_owned_unconsumed"));
+        assert_eq!(
+            vm.host_context().resource_ownership(handle),
+            Some(ResourceOwnership::HostOwned),
+        );
     }
 }

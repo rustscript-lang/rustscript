@@ -14,8 +14,11 @@
 
 use std::any::{Any, TypeId};
 use std::collections::BTreeSet;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
+
+use crate::host_api::ResourceTypeKey;
 
 use super::close::{CloseProgress, HostResource};
 use super::error::{ResourceError, ResourceErrorCode, ResourceResult};
@@ -66,7 +69,247 @@ pub enum ResourceOwnership {
     Taken,
 }
 
-/// How a guest ownership release closes its resource.
+/// Resource-parameter state used by an exact host call.
+///
+/// `Value` and `ToOwned` remain represented here so an adapter can preserve the
+/// compiler's five-state distinction. They are deliberately rejected by the
+/// resource frame: ordinary values must use the existing Value adapter and a
+/// resource-containing `ToOwned` must never become an implicit integer copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceAccessMode {
+    Borrow,
+    BorrowMut,
+    ToOwned,
+    TakeOwned,
+    Value,
+}
+
+impl ResourceAccessMode {
+    pub const fn is_borrow(self) -> bool {
+        matches!(self, Self::Borrow | Self::BorrowMut)
+    }
+
+    pub const fn is_mutable(self) -> bool {
+        matches!(self, Self::BorrowMut)
+    }
+
+    pub const fn is_consuming(self) -> bool {
+        matches!(self, Self::TakeOwned)
+    }
+
+    /// Converts the adapter state to the catalog/compiler passing state.
+    /// `ToOwned` follows the compiler's ordinary-value `Value` contract; the
+    /// resource frame itself still rejects that mode.
+    pub fn host_param_passing(self) -> Option<crate::host_api::HostParamPassing> {
+        match self {
+            Self::Borrow => Some(crate::host_api::HostParamPassing::Borrow),
+            Self::BorrowMut => Some(crate::host_api::HostParamPassing::BorrowMut),
+            Self::TakeOwned => Some(crate::host_api::HostParamPassing::TakeOwned),
+            Self::Value => Some(crate::host_api::HostParamPassing::Value),
+            Self::ToOwned => Some(crate::host_api::HostParamPassing::Value),
+        }
+    }
+}
+
+/// One preflighted raw-handle request in an exact host call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceAccessRequest {
+    handle: ResourceHandle,
+    type_id: TypeId,
+    type_key: Option<ResourceTypeKey>,
+    mode: ResourceAccessMode,
+}
+
+impl ResourceAccessRequest {
+    fn for_type<T: HostResource>(handle: ResourceHandle, mode: ResourceAccessMode) -> Self {
+        Self {
+            handle,
+            type_id: TypeId::of::<T>(),
+            type_key: T::resource_type_key(),
+            mode,
+        }
+    }
+
+    pub fn from_value<T: HostResource>(
+        value: &crate::bytecode::Value,
+        mode: ResourceAccessMode,
+        label: &str,
+    ) -> crate::vm::VmResult<Self> {
+        let handle = ResourceHandle::from_value(value)
+            .map_err(|error| crate::vm::VmError::HostError(format!("{label}: {error}")))?;
+        Ok(Self::for_type::<T>(handle, mode))
+    }
+
+    pub fn from_value_with_key<T: HostResource>(
+        value: &crate::bytecode::Value,
+        mode: ResourceAccessMode,
+        key: ResourceTypeKey,
+        label: &str,
+    ) -> crate::vm::VmResult<Self> {
+        let handle = ResourceHandle::from_value(value)
+            .map_err(|error| crate::vm::VmError::HostError(format!("{label}: {error}")))?;
+        Ok(Self::for_type_with_key::<T>(handle, mode, key))
+    }
+    fn for_type_with_key<T: HostResource>(
+        handle: ResourceHandle,
+        mode: ResourceAccessMode,
+        type_key: ResourceTypeKey,
+    ) -> Self {
+        Self {
+            handle,
+            type_id: TypeId::of::<T>(),
+            type_key: Some(type_key),
+            mode,
+        }
+    }
+    pub fn borrow<T: HostResource>(handle: ResourceHandle) -> Self {
+        Self::for_type::<T>(handle, ResourceAccessMode::Borrow)
+    }
+
+    pub fn borrow_with_key<T: HostResource>(handle: ResourceHandle, key: ResourceTypeKey) -> Self {
+        Self::for_type_with_key::<T>(handle, ResourceAccessMode::Borrow, key)
+    }
+
+    pub fn borrow_mut<T: HostResource>(handle: ResourceHandle) -> Self {
+        Self::for_type::<T>(handle, ResourceAccessMode::BorrowMut)
+    }
+
+    pub fn borrow_mut_with_key<T: HostResource>(
+        handle: ResourceHandle,
+        key: ResourceTypeKey,
+    ) -> Self {
+        Self::for_type_with_key::<T>(handle, ResourceAccessMode::BorrowMut, key)
+    }
+
+    pub fn take_owned<T: HostResource>(handle: ResourceHandle) -> Self {
+        Self::for_type::<T>(handle, ResourceAccessMode::TakeOwned)
+    }
+
+    pub fn take_owned_with_key<T: HostResource>(
+        handle: ResourceHandle,
+        key: ResourceTypeKey,
+    ) -> Self {
+        Self::for_type_with_key::<T>(handle, ResourceAccessMode::TakeOwned, key)
+    }
+
+    pub fn handle(&self) -> ResourceHandle {
+        self.handle
+    }
+
+    pub fn mode(&self) -> ResourceAccessMode {
+        self.mode
+    }
+
+    pub fn type_key(&self) -> Option<&ResourceTypeKey> {
+        self.type_key.as_ref()
+    }
+}
+
+/// A single-threaded, two-phase resource access frame.
+///
+/// Construction performs a read-only validation of every request and all
+/// same-handle alias rules. Mutation is available only through the validated
+/// frame, so a later bad argument cannot occur after an earlier take. The
+/// frame holds the table mutably for its lifetime; `ResourceRef` and
+/// `ResourceMut` returned by it therefore cannot outlive the synchronous host
+/// call that owns the frame.
+#[derive(Debug)]
+pub struct ResourceAccessFrame<'a> {
+    table: *mut ResourceTable,
+    requests: Vec<ResourceAccessRequest>,
+    consumed: Vec<bool>,
+    marker: PhantomData<&'a mut ResourceTable>,
+}
+
+impl ResourceAccessFrame<'_> {
+    pub fn request_count(&self) -> usize {
+        self.requests.len()
+    }
+
+    pub fn request(&self, index: usize) -> Option<&ResourceAccessRequest> {
+        self.requests.get(index)
+    }
+
+    pub fn is_consumed(&self, index: usize) -> bool {
+        self.consumed.get(index).copied().unwrap_or(false)
+    }
+}
+
+impl<'a> ResourceAccessFrame<'a> {
+    pub fn borrow<T: HostResource>(&mut self, index: usize) -> ResourceResult<ResourceRef<'a, T>> {
+        let request = self.request_for(index, ResourceAccessMode::Borrow)?;
+        let table: &'a ResourceTable = unsafe { &*self.table };
+        let slot_index = table.validate_active::<T>(request.handle)?;
+        table.check_access_key(slot_index, request.handle, request.type_key.as_ref())?;
+        let SlotState::Open(resource) = &table.slots[slot_index].state else {
+            return Err(already_closed_error(request.handle));
+        };
+        let value = (resource.as_ref() as &dyn Any)
+            .downcast_ref::<T>()
+            .ok_or_else(|| type_mismatch(request.handle, TypeId::of::<T>()))?;
+        Ok(ResourceRef::new(request.handle, value))
+    }
+
+    pub fn borrow_mut<T: HostResource>(
+        &mut self,
+        index: usize,
+    ) -> ResourceResult<ResourceMut<'a, T>> {
+        let request = self
+            .request_for(index, ResourceAccessMode::BorrowMut)?
+            .clone();
+        let table: &'a mut ResourceTable = unsafe { &mut *self.table };
+        let slot_index = table.validate_active::<T>(request.handle)?;
+        table.check_access_key(slot_index, request.handle, request.type_key.as_ref())?;
+        let slot = &mut table.slots[slot_index];
+        let SlotState::Open(resource) = &mut slot.state else {
+            return Err(already_closed_error(request.handle));
+        };
+        let value = (resource.as_mut() as &mut dyn Any)
+            .downcast_mut::<T>()
+            .ok_or_else(|| type_mismatch(request.handle, TypeId::of::<T>()))?;
+        Ok(ResourceMut::new(request.handle, value))
+    }
+
+    pub fn take_owned<T: HostResource>(&mut self, index: usize) -> ResourceResult<T> {
+        let request = self
+            .request_for(index, ResourceAccessMode::TakeOwned)?
+            .clone();
+        let table: &mut ResourceTable = unsafe { &mut *self.table };
+        table.check_access_request(&request)?;
+        let value = table.take_owned_with_key::<T>(request.handle, request.type_key.as_ref())?;
+        self.consumed[index] = true;
+        Ok(value)
+    }
+
+    fn request_for(
+        &self,
+        index: usize,
+        expected_mode: ResourceAccessMode,
+    ) -> ResourceResult<&ResourceAccessRequest> {
+        let request = self.requests.get(index).ok_or_else(|| {
+            ResourceError::new(
+                ResourceErrorCode::InvalidResourceHandle,
+                "resource::access",
+                format!("resource access request index {index} is out of range"),
+            )
+        })?;
+        if request.mode != expected_mode {
+            return Err(ResourceError::new(
+                ResourceErrorCode::ResourceAccessModeUnsupported,
+                "resource::access",
+                format!(
+                    "request {index} has mode {:?}, expected {:?}",
+                    request.mode, expected_mode
+                ),
+            ));
+        }
+        if self.consumed[index] {
+            return Err(already_taken_error(request.handle));
+        }
+        Ok(request)
+    }
+}
+
 ///
 /// Carries the close reason the release launches the close with; the default
 /// is [`ResourceCloseReason::OwnershipRelease`].
@@ -119,6 +362,8 @@ struct ResourceSlot {
     generation: u32,
     /// Concrete type of the current occupant; borrow-time validation only.
     type_id: TypeId,
+    /// Stable catalog identity declared by the concrete resource type.
+    type_key: Option<ResourceTypeKey>,
     /// Handle of the parent, if this resource is a child.
     parent: Option<ResourceHandle>,
     /// Live child handles. A child is removed only once its close is fully
@@ -191,6 +436,10 @@ impl ResourceTable {
     }
 
     /// Number of currently live (open or closing) resources.
+    pub(crate) fn unique_mut_ptr(&self) -> *mut Self {
+        self as *const Self as *mut Self
+    }
+
     pub fn len(&self) -> usize {
         self.active_entries
     }
@@ -202,7 +451,18 @@ impl ResourceTable {
 
     /// Inserts a root resource and returns its typed token.
     pub fn push<T: HostResource>(&mut self, value: T) -> ResourceResult<Resource<T>> {
-        let handle = self.allocate(None, value)?;
+        let key = T::resource_type_key();
+        let handle = self.allocate(None, key, value)?;
+        Ok(Resource::from_handle(handle))
+    }
+
+    /// Inserts a root resource with an explicit exact catalog key.
+    pub fn push_with_key<T: HostResource>(
+        &mut self,
+        value: T,
+        key: ResourceTypeKey,
+    ) -> ResourceResult<Resource<T>> {
+        let handle = self.allocate(None, Some(key), value)?;
         Ok(Resource::from_handle(handle))
     }
 
@@ -220,7 +480,23 @@ impl ResourceTable {
         // Validate the parent before allocating, so a bad parent key leaves no
         // orphan behind.
         self.validate_open::<P>(parent_handle)?;
-        let child_handle = self.allocate(Some(parent_handle), value)?;
+        let key = T::resource_type_key();
+        let child_handle = self.allocate(Some(parent_handle), key, value)?;
+        let parent_index = self.resolve_index(parent_handle)?;
+        self.slots[parent_index].children.insert(child_handle);
+        Ok(Resource::from_handle(child_handle))
+    }
+
+    /// Inserts a typed child with an explicit exact catalog key.
+    pub fn push_child_with_key<T: HostResource, P: HostResource>(
+        &mut self,
+        value: T,
+        parent: &Resource<P>,
+        key: ResourceTypeKey,
+    ) -> Result<Resource<T>, ResourceError> {
+        let parent_handle = parent.handle();
+        self.validate_open::<P>(parent_handle)?;
+        let child_handle = self.allocate(Some(parent_handle), Some(key), value)?;
         let parent_index = self.resolve_index(parent_handle)?;
         self.slots[parent_index].children.insert(child_handle);
         Ok(Resource::from_handle(child_handle))
@@ -243,7 +519,8 @@ impl ResourceTable {
     /// type state is mutated.
     pub fn typed<T: HostResource>(&self, handle: ResourceHandle) -> ResourceResult<Resource<T>> {
         // Parentheses drop the index: validation is the sole purpose here.
-        let _slot_index = self.validate_active::<T>(handle)?;
+        let slot_index = self.validate_active::<T>(handle)?;
+        self.check_access_key(slot_index, handle, T::resource_type_key().as_ref())?;
         Ok(Resource::from_handle(handle))
     }
 
@@ -254,6 +531,7 @@ impl ResourceTable {
     ) -> ResourceResult<ResourceRef<'_, T>> {
         let handle = resource.handle();
         let slot_index = self.validate_active::<T>(handle)?;
+        self.check_access_key(slot_index, handle, T::resource_type_key().as_ref())?;
         let slot = &self.slots[slot_index];
         let SlotState::Open(resource) = &slot.state else {
             return Err(already_closed_error(handle));
@@ -271,6 +549,7 @@ impl ResourceTable {
     ) -> ResourceResult<ResourceMut<'_, T>> {
         let handle = resource.handle();
         let slot_index = self.validate_active::<T>(handle)?;
+        self.check_access_key(slot_index, handle, T::resource_type_key().as_ref())?;
         let slot = &mut self.slots[slot_index];
         let SlotState::Open(resource) = &mut slot.state else {
             return Err(already_closed_error(handle));
@@ -279,6 +558,94 @@ impl ResourceTable {
             .downcast_mut::<T>()
             .ok_or_else(|| type_mismatch(handle, TypeId::of::<T>()))?;
         Ok(ResourceMut::new(handle, value))
+    }
+
+    /// Starts a two-phase exact resource access frame.
+    ///
+    /// The complete request vector is validated read-only before the frame is
+    /// returned. In particular, no ownership take or close can happen while a
+    /// later argument is still being checked.
+    pub fn begin_resource_access(
+        &mut self,
+        requests: Vec<ResourceAccessRequest>,
+    ) -> ResourceResult<ResourceAccessFrame<'_>> {
+        self.validate_resource_access(&requests)?;
+        let consumed = vec![false; requests.len()];
+        Ok(ResourceAccessFrame {
+            table: self as *mut ResourceTable,
+            requests,
+            consumed,
+            marker: PhantomData,
+        })
+    }
+
+    fn validate_resource_access(&self, requests: &[ResourceAccessRequest]) -> ResourceResult<()> {
+        for request in requests {
+            self.check_access_request(request)?;
+        }
+        for (index, left) in requests.iter().enumerate() {
+            for right in requests.iter().skip(index + 1) {
+                if left.handle != right.handle {
+                    continue;
+                }
+                if left.mode == ResourceAccessMode::Borrow
+                    && right.mode == ResourceAccessMode::Borrow
+                {
+                    continue;
+                }
+                return Err(access_conflict_error(left.handle, left.mode, right.mode));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_access_request(&self, request: &ResourceAccessRequest) -> ResourceResult<usize> {
+        if !request.mode.is_borrow() && !request.mode.is_consuming() {
+            return Err(ResourceError::new(
+                ResourceErrorCode::ResourceAccessModeUnsupported,
+                "resource::access",
+                format!(
+                    "resource mode {:?} is not a resource operation",
+                    request.mode
+                ),
+            ));
+        }
+        let slot_index = self.resolve_index(request.handle)?;
+        if self.slots[slot_index].type_id != request.type_id {
+            return Err(type_mismatch(request.handle, request.type_id));
+        }
+        self.check_access_key(slot_index, request.handle, request.type_key.as_ref())?;
+        if self.slots[slot_index].ownership == ResourceOwnership::Taken {
+            return Err(already_taken_error(request.handle));
+        }
+        if !matches!(self.slots[slot_index].state, SlotState::Open(_)) {
+            return Err(already_closed_error(request.handle));
+        }
+        if request.mode == ResourceAccessMode::TakeOwned {
+            if self.slots[slot_index].ownership != ResourceOwnership::GuestOwned {
+                return Err(not_guest_owned_error(request.handle));
+            }
+            if !self.slots[slot_index].children.is_empty() {
+                return Err(has_children_error(request.handle));
+            }
+        }
+        Ok(slot_index)
+    }
+
+    fn check_access_key(
+        &self,
+        slot_index: usize,
+        handle: ResourceHandle,
+        expected: Option<&ResourceTypeKey>,
+    ) -> ResourceResult<()> {
+        if self.slots[slot_index].type_key.as_ref() != expected {
+            return Err(key_mismatch_error(
+                handle,
+                expected,
+                self.slots[slot_index].type_key.as_ref(),
+            ));
+        }
+        Ok(())
     }
 
     /// Begins closing a resource.
@@ -309,6 +676,12 @@ impl ResourceTable {
     pub fn ownership(&self, handle: ResourceHandle) -> Option<ResourceOwnership> {
         let slot_index = self.resolve_index(handle).ok()?;
         Some(self.slots[slot_index].ownership)
+    }
+
+    /// The declaration key stored with a live or taken slot.
+    pub fn resource_type_key(&self, handle: ResourceHandle) -> Option<ResourceTypeKey> {
+        let slot_index = self.resolve_index(handle).ok()?;
+        self.slots[slot_index].type_key.clone()
     }
 
     /// Marks an open, host-owned resource as guest-owned.
@@ -388,8 +761,19 @@ impl ResourceTable {
     /// the slot is never reused, and the table never closes the moved-out
     /// value.
     pub fn take_owned<T: HostResource>(&mut self, handle: ResourceHandle) -> ResourceResult<T> {
+        let expected = T::resource_type_key();
+        self.take_owned_with_key(handle, expected.as_ref())
+    }
+
+    /// Takes a resource after validating the caller-supplied declaration key.
+    pub fn take_owned_with_key<T: HostResource>(
+        &mut self,
+        handle: ResourceHandle,
+        expected_key: Option<&ResourceTypeKey>,
+    ) -> ResourceResult<T> {
         let slot_index = self.resolve_index(handle)?;
         self.check_type::<T>(slot_index, handle)?;
+        self.check_access_key(slot_index, handle, expected_key)?;
         match self.slots[slot_index].ownership {
             ResourceOwnership::Taken => return Err(already_taken_error(handle)),
             ResourceOwnership::HostOwned => return Err(not_guest_owned_error(handle)),
@@ -764,6 +1148,7 @@ impl ResourceTable {
     fn allocate<T: HostResource>(
         &mut self,
         parent: Option<ResourceHandle>,
+        type_key: Option<ResourceTypeKey>,
         value: T,
     ) -> Result<ResourceHandle, ResourceError> {
         if self.active_entries >= self.max_entries {
@@ -786,6 +1171,7 @@ impl ResourceTable {
                 .expect("only reusable generations enter the vacant list");
             self.slots[slot_index].generation = generation;
             self.slots[slot_index].type_id = type_id;
+            self.slots[slot_index].type_key = type_key.clone();
             self.slots[slot_index].parent = parent;
             self.slots[slot_index].children.clear();
             self.slots[slot_index].ownership = ResourceOwnership::HostOwned;
@@ -804,6 +1190,7 @@ impl ResourceTable {
             self.slots.push(ResourceSlot {
                 generation,
                 type_id,
+                type_key,
                 parent,
                 children: BTreeSet::new(),
                 ownership: ResourceOwnership::HostOwned,
@@ -865,6 +1252,9 @@ impl ResourceTable {
     fn validate_open<T: 'static>(&self, handle: ResourceHandle) -> ResourceResult<()> {
         let slot_index = self.resolve_index(handle)?;
         self.check_type::<T>(slot_index, handle)?;
+        if self.slots[slot_index].ownership == ResourceOwnership::Taken {
+            return Err(already_taken_error(handle));
+        }
         match self.slots[slot_index].state {
             SlotState::Open(_) => Ok(()),
             SlotState::Closing(_) | SlotState::Vacant => Err(already_closed_error(handle)),
@@ -961,6 +1351,32 @@ fn already_taken_error(handle: ResourceHandle) -> ResourceError {
         ResourceErrorCode::ResourceAlreadyTaken,
         "resource::table",
         "resource ownership was already taken out of the table",
+    )
+    .with_value(handle.raw())
+}
+
+fn key_mismatch_error(
+    handle: ResourceHandle,
+    expected: Option<&ResourceTypeKey>,
+    actual: Option<&ResourceTypeKey>,
+) -> ResourceError {
+    ResourceError::new(
+        ResourceErrorCode::ResourceKeyMismatch,
+        "resource::access",
+        format!("resource type key mismatch: expected {expected:?}, got {actual:?}"),
+    )
+    .with_value(handle.raw())
+}
+
+fn access_conflict_error(
+    handle: ResourceHandle,
+    left: ResourceAccessMode,
+    right: ResourceAccessMode,
+) -> ResourceError {
+    ResourceError::new(
+        ResourceErrorCode::ResourceAccessConflict,
+        "resource::access",
+        format!("same resource handle requested as {left:?} and {right:?}"),
     )
     .with_value(handle.raw())
 }
