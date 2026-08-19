@@ -18,6 +18,7 @@
 //! token: duplicating the token duplicates the name, not ownership of the
 //! underlying resource, whose lifetime is governed by the table.
 
+use std::cell::{Ref, RefMut};
 use std::marker::PhantomData;
 
 use crate::bytecode::Value;
@@ -218,18 +219,16 @@ impl<T> core::fmt::Debug for Resource<T> {
     }
 }
 
-/// An immutable borrow of one resource bound to a single host call.
-///
-/// The handle makes the association explicit and keeps the borrow alive for a
-/// controlled duration; it is `Copy` (mirroring the token) and is not meant to
-/// live across a yield or poll boundary.
+/// The handle makes the association explicit and the `Ref` guard keeps the
+/// table borrow alive for a controlled duration. It is not meant to live
+/// across a yield or poll boundary.
 pub struct ResourceRef<'a, T> {
     handle: ResourceHandle,
-    value: &'a T,
+    value: Ref<'a, T>,
 }
 
 impl<'a, T> ResourceRef<'a, T> {
-    pub(crate) fn new(handle: ResourceHandle, value: &'a T) -> Self {
+    pub(crate) fn new(handle: ResourceHandle, value: Ref<'a, T>) -> Self {
         Self { handle, value }
     }
 
@@ -237,19 +236,19 @@ impl<'a, T> ResourceRef<'a, T> {
         self.handle
     }
 
-    pub fn get(&self) -> &'a T {
-        self.value
+    pub fn get(&self) -> &T {
+        &self.value
     }
 }
 
-#[allow(clippy::non_canonical_clone_impl)]
 impl<T> Clone for ResourceRef<'_, T> {
     fn clone(&self) -> Self {
-        *self
+        Self {
+            handle: self.handle,
+            value: Ref::clone(&self.value),
+        }
     }
 }
-
-impl<T> Copy for ResourceRef<'_, T> {}
 
 impl<T> core::fmt::Debug for ResourceRef<'_, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -263,18 +262,18 @@ impl<T> core::ops::Deref for ResourceRef<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        self.value
+        &self.value
     }
 }
 
 /// A mutable borrow of a [`Resource<T>`], scoped to a single host call.
 pub struct ResourceMut<'a, T> {
     handle: ResourceHandle,
-    value: &'a mut T,
+    value: RefMut<'a, T>,
 }
 
 impl<'a, T> ResourceMut<'a, T> {
-    pub(crate) fn new(handle: ResourceHandle, value: &'a mut T) -> Self {
+    pub(crate) fn new(handle: ResourceHandle, value: RefMut<'a, T>) -> Self {
         Self { handle, value }
     }
 
@@ -283,7 +282,7 @@ impl<'a, T> ResourceMut<'a, T> {
     }
 
     pub fn get(&mut self) -> &mut T {
-        self.value
+        &mut self.value
     }
 }
 
@@ -299,13 +298,13 @@ impl<T> core::ops::Deref for ResourceMut<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        self.value
+        &self.value
     }
 }
 
 impl<T> core::ops::DerefMut for ResourceMut<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        self.value
+        &mut self.value
     }
 }
 

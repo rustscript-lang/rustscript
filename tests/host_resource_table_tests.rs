@@ -254,6 +254,7 @@ fn typed_push_get_and_mut_round_trip() {
         "shared borrow sees the concrete value"
     );
     assert_eq!(closes.load(Ordering::SeqCst), 0);
+    drop(borrow);
 
     {
         let mut mut_borrow = table.get_mut(&token).expect("get_mut");
@@ -266,6 +267,7 @@ fn typed_push_get_and_mut_round_trip() {
         0,
         "borrowing must not drop the resource"
     );
+    drop(borrow);
 
     drop(table);
     assert_eq!(

@@ -313,8 +313,23 @@ impl<'a> HostContext<'a> {
         &mut self,
         token: &Resource<T>,
     ) -> HostContextResult<ResourceMut<'_, T>> {
-        let request = ResourceAccessRequest::borrow::<T>(token.handle());
-        let mut frame = self
+        let request = ResourceAccessRequest::borrow_mut::<T>(token.handle());
+        let frame = self
+            .host
+            .execution_scope_begin_resource_access(vec![request])
+            .map_err(HostContextError::from_scope)?;
+        frame.borrow_mut(0).map_err(HostContextError::from_resource)
+    }
+
+    /// Mutably borrows a legacy resource whose exact key is supplied by the
+    /// caller. Static keyed resources are checked against the supplied key.
+    pub fn resource_mut_with_key<T: HostResource>(
+        &mut self,
+        token: &Resource<T>,
+        key: ResourceTypeKey,
+    ) -> HostContextResult<ResourceMut<'_, T>> {
+        let request = ResourceAccessRequest::borrow_mut_with_key::<T>(token.handle(), key);
+        let frame = self
             .host
             .execution_scope_begin_resource_access(vec![request])
             .map_err(HostContextError::from_scope)?;
@@ -360,8 +375,22 @@ impl<'a> HostContext<'a> {
         &mut self,
         handle: ResourceHandle,
     ) -> HostContextResult<ResourceMut<'_, T>> {
-        let request = ResourceAccessRequest::borrow::<T>(handle);
-        let mut frame = self
+        let request = ResourceAccessRequest::borrow_mut::<T>(handle);
+        let frame = self
+            .host
+            .execution_scope_begin_resource_access(vec![request])
+            .map_err(HostContextError::from_scope)?;
+        frame.borrow_mut(0).map_err(HostContextError::from_resource)
+    }
+
+    /// Mutably borrows a raw legacy handle with an explicit exact key.
+    pub fn borrow_resource_mut_with_key<T: HostResource>(
+        &mut self,
+        handle: ResourceHandle,
+        key: ResourceTypeKey,
+    ) -> HostContextResult<ResourceMut<'_, T>> {
+        let request = ResourceAccessRequest::borrow_mut_with_key::<T>(handle, key);
+        let frame = self
             .host
             .execution_scope_begin_resource_access(vec![request])
             .map_err(HostContextError::from_scope)?;
@@ -383,6 +412,18 @@ impl<'a> HostContext<'a> {
     ) -> HostContextResult<T> {
         self.host
             .execution_scope_take_resource::<T>(handle)
+            .map_err(HostContextError::from_scope)
+    }
+
+    /// Atomically takes a legacy resource with an explicit exact key through
+    /// the operation-aware access frame.
+    pub fn take_resource_with_key<T: HostResource>(
+        &mut self,
+        handle: ResourceHandle,
+        key: ResourceTypeKey,
+    ) -> HostContextResult<T> {
+        self.host
+            .execution_scope_take_resource_with_key::<T>(handle, key)
             .map_err(HostContextError::from_scope)
     }
 

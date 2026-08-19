@@ -30,7 +30,7 @@ use crate::vm::host_context::{HostModule, HostModuleStore};
 use crate::vm::operation::{OperationId, OperationSpec};
 use crate::vm::resource::{
     HostResource, Resource, ResourceAccessFrame, ResourceAccessRequest, ResourceCloseReason,
-    ResourceError, ResourceErrorCode, ResourceTable, ResourceTypeKey,
+    ResourceTypeKey,
 };
 
 /// Embedder-supplied print sink for `print`/`debug` output.
@@ -276,12 +276,7 @@ impl HostRuntime {
         value: T,
         key: ResourceTypeKey,
     ) -> ExecutionScopeResult<Resource<T>> {
-        if !self.execution_scope.is_active() {
-            return Err(ExecutionScopeError::ScopeClosing);
-        }
-        self.execution_scope_resource_table_mut()
-            .push_with_key(value, key)
-            .map_err(ExecutionScopeError::Resource)
+        self.execution_scope.push_resource_with_key(value, key)
     }
 
     /// Starts the exact resource access frame after checking operation
@@ -290,35 +285,7 @@ impl HostRuntime {
         &mut self,
         requests: Vec<ResourceAccessRequest>,
     ) -> ExecutionScopeResult<ResourceAccessFrame<'_>> {
-        if !self.execution_scope.is_active() {
-            return Err(ExecutionScopeError::ScopeClosing);
-        }
-        for request in &requests {
-            if request.mode().is_consuming()
-                && !self
-                    .execution_scope
-                    .operations()
-                    .operations_for_resource(request.handle())
-                    .is_empty()
-            {
-                return Err(ExecutionScopeError::Resource(ResourceError::new(
-                    ResourceErrorCode::ResourceOperationActive,
-                    "resource::access",
-                    "resource has an associated operation that is still active",
-                )));
-            }
-        }
-        self.execution_scope_resource_table_mut()
-            .begin_resource_access(requests)
-            .map_err(ExecutionScopeError::Resource)
-    }
-
-    fn execution_scope_resource_table_mut(&mut self) -> &mut ResourceTable {
-        let table = self.execution_scope.resources().unique_mut_ptr();
-        // `HostRuntime` owns the only mutable reference to its scope. The
-        // pointer is used solely to enter the table while that `&mut self` is
-        // held; no reference escapes this method alongside another table borrow.
-        unsafe { &mut *table }
+        self.execution_scope.begin_resource_access(requests)
     }
 
     /// Inserts a typed child resource linked to `parent` (guarded).
@@ -336,12 +303,8 @@ impl HostRuntime {
         parent: &Resource<P>,
         key: ResourceTypeKey,
     ) -> ExecutionScopeResult<Resource<T>> {
-        if !self.execution_scope.is_active() {
-            return Err(ExecutionScopeError::ScopeClosing);
-        }
-        self.execution_scope_resource_table_mut()
-            .push_child_with_key(value, parent, key)
-            .map_err(ExecutionScopeError::Resource)
+        self.execution_scope
+            .push_child_resource_with_key(value, parent, key)
     }
 
     /// Starts an operation in the owned execution scope with the full generic
@@ -390,6 +353,15 @@ impl HostRuntime {
         handle: crate::vm::resource::ResourceHandle,
     ) -> ExecutionScopeResult<T> {
         self.execution_scope.take_resource::<T>(handle)
+    }
+
+    pub(crate) fn execution_scope_take_resource_with_key<T: HostResource>(
+        &mut self,
+        handle: crate::vm::resource::ResourceHandle,
+        key: ResourceTypeKey,
+    ) -> ExecutionScopeResult<T> {
+        self.execution_scope
+            .take_resource_with_key::<T>(handle, key)
     }
 
     /// Begins scope shutdown (Active → Closing, sealing new inserts).

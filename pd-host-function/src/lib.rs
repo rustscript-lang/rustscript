@@ -539,14 +539,14 @@ fn resource_extract_tokens(
     let value = match info.mode {
         ResourceMode::Borrow => quote!(__pd_resource_frame
             .borrow::<#inner>(#index)
-            .map_err(|error| super::super::VmError::HostError(error.to_string()))?),
+            .map_err(super::super::VmError::from)?),
         ResourceMode::BorrowMut => quote!(__pd_resource_frame
             .borrow_mut::<#inner>(#index)
-            .map_err(|error| super::super::VmError::HostError(error.to_string()))?),
+            .map_err(super::super::VmError::from)?),
         ResourceMode::TakeOwned => {
             let taken = quote!(__pd_resource_frame
                 .take_owned::<#inner>(#index)
-                .map_err(|error| super::super::VmError::HostError(error.to_string()))?);
+                .map_err(super::super::VmError::from)?);
             if info.owned_wrapper {
                 quote!(<#ty>::new(#taken))
             } else {

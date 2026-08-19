@@ -17,6 +17,7 @@ pub type ResourceResult<T> = Result<T, ResourceError>;
 
 /// Stable, machine-readable categories for resource capability failures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ResourceErrorCode {
     /// The resource configuration was invalid (e.g. a zero or oversized
     /// capacity, or an invalid resource class).

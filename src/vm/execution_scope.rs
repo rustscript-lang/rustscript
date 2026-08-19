@@ -46,6 +46,8 @@
 
 use std::task::{Context, Poll};
 
+use crate::host_api::ResourceTypeKey;
+
 use super::operation::driver::OperationSpec;
 use super::operation::error::OperationError;
 use super::operation::id::OperationId;
@@ -56,7 +58,8 @@ use super::resource::error::ResourceError;
 use super::resource::handle::{Resource, ResourceHandle};
 use super::resource::reason::ResourceCloseReason;
 use super::resource::table::{
-    GuestReleaseOutcome, OwnershipRelease, ResourceOwnership, ResourceTable,
+    GuestReleaseOutcome, OwnershipRelease, ResourceAccessFrame, ResourceAccessRequest,
+    ResourceOwnership, ResourceTable,
 };
 
 /// Result alias used by the execution-scope surface.
@@ -259,6 +262,59 @@ impl ExecutionScope {
             .map_err(ExecutionScopeError::Resource)
     }
 
+    /// Inserts a typed resource with an explicit exact catalog key while the
+    /// scope is Active.
+    pub fn push_resource_with_key<T: HostResource>(
+        &mut self,
+        value: T,
+        key: ResourceTypeKey,
+    ) -> ExecutionScopeResult<Resource<T>> {
+        self.ensure_accepting()?;
+        self.resources
+            .push_with_key(value, key)
+            .map_err(ExecutionScopeError::Resource)
+    }
+
+    /// Inserts a typed child with an explicit exact catalog key while the
+    /// scope is Active.
+    pub fn push_child_resource_with_key<T: HostResource, P: HostResource>(
+        &mut self,
+        value: T,
+        parent: &Resource<P>,
+        key: ResourceTypeKey,
+    ) -> ExecutionScopeResult<Resource<T>> {
+        self.ensure_accepting()?;
+        self.resources
+            .push_child_with_key(value, parent, key)
+            .map_err(ExecutionScopeError::Resource)
+    }
+
+    /// Starts an exact resource access frame after operation association and
+    /// table preflight. Consuming requests never bypass an active operation.
+    pub fn begin_resource_access(
+        &mut self,
+        requests: Vec<ResourceAccessRequest>,
+    ) -> ExecutionScopeResult<ResourceAccessFrame<'_>> {
+        self.ensure_accepting()?;
+        for request in &requests {
+            if request.mode().is_consuming()
+                && !self
+                    .operations
+                    .operations_for_resource(request.handle())
+                    .is_empty()
+            {
+                return Err(ExecutionScopeError::Resource(ResourceError::new(
+                    super::resource::error::ResourceErrorCode::ResourceOperationActive,
+                    "resource::access",
+                    "resource has an associated operation that is still active",
+                )));
+            }
+        }
+        self.resources
+            .begin_resource_access(requests)
+            .map_err(ExecutionScopeError::Resource)
+    }
+
     /// Registers a host operation while the scope is Active.
     pub fn start_operation(&mut self, spec: OperationSpec) -> ExecutionScopeResult<OperationId> {
         self.ensure_accepting()?;
@@ -323,8 +379,22 @@ impl ExecutionScope {
         &mut self,
         handle: ResourceHandle,
     ) -> ExecutionScopeResult<T> {
-        self.resources
-            .take_owned::<T>(handle)
+        let request = ResourceAccessRequest::take_owned::<T>(handle);
+        let frame = self.begin_resource_access(vec![request])?;
+        frame.take_owned(0).map_err(ExecutionScopeError::Resource)
+    }
+
+    /// Takes a guest-owned resource using an explicit catalog key through the
+    /// same operation-aware preflight as the inferred-key path.
+    pub fn take_resource_with_key<T: HostResource>(
+        &mut self,
+        handle: ResourceHandle,
+        key: ResourceTypeKey,
+    ) -> ExecutionScopeResult<T> {
+        let request = ResourceAccessRequest::take_owned_with_key::<T>(handle, key);
+        let frame = self.begin_resource_access(vec![request])?;
+        frame
+            .take_owned::<T>(0)
             .map_err(ExecutionScopeError::Resource)
     }
 

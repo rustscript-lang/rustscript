@@ -8,8 +8,12 @@ use vm::operation::OperationSpec;
 use vm::resource::{ResourceCloseReason, ResourceErrorCode, ResourceResult};
 use vm::{
     CloseProgress, HostResource, Program, ResourceAccessMode, ResourceAccessRequest,
-    ResourceHandle, ResourceTable, ResourceTypeKey, Vm,
+    ResourceHandle, ResourceTable, ResourceTypeKey, Vm, VmError,
 };
+
+fn new_vm() -> Vm {
+    Vm::new(Program::new(Vec::new(), Vec::new()))
+}
 
 fn fake_key() -> ResourceTypeKey {
     ResourceTypeKey::new("test.fake").expect("valid key")
@@ -51,6 +55,10 @@ impl HostResource for OtherResource {
     }
 }
 
+struct LegacyResource(i64);
+
+impl HostResource for LegacyResource {}
+
 fn fake(value: i64) -> (FakeResource, Arc<AtomicUsize>) {
     let closes = Arc::new(AtomicUsize::new(0));
     (
@@ -74,25 +82,25 @@ fn raw_handle_frame_supports_borrow_mut_and_take_owned_then_rejects_old_handle()
         handle,
         fake_key(),
     )];
-    let mut frame = table
+    let frame = table
         .begin_resource_access(requests)
         .expect("borrow preflight");
     let borrowed = frame.borrow::<FakeResource>(0).expect("borrow");
     assert_eq!(borrowed.value, 7);
-    let _ = borrowed;
+    drop(borrowed);
     drop(frame);
 
     let requests = vec![ResourceAccessRequest::borrow_mut::<FakeResource>(handle)];
-    let mut frame = table
+    let frame = table
         .begin_resource_access(requests)
         .expect("mutable borrow preflight");
     let mut borrowed = frame.borrow_mut::<FakeResource>(0).expect("mutable borrow");
     borrowed.value = 11;
-    let _ = borrowed;
+    drop(borrowed);
     drop(frame);
 
     let requests = vec![ResourceAccessRequest::take_owned::<FakeResource>(handle)];
-    let mut frame = table
+    let frame = table
         .begin_resource_access(requests)
         .expect("take preflight");
     let owned = frame.take_owned::<FakeResource>(0).expect("take");
@@ -188,7 +196,7 @@ fn alias_rules_are_checked_before_any_take_and_shared_borrows_are_allowed() {
         );
     }
 
-    let mut frame = table
+    let frame = table
         .begin_resource_access(vec![
             ResourceAccessRequest::borrow::<FakeResource>(handle),
             ResourceAccessRequest::borrow::<FakeResource>(handle),
@@ -293,6 +301,200 @@ fn request_modes_keep_value_and_to_owned_outside_resource_adapter() {
     assert_eq!(
         ResourceAccessMode::ToOwned.host_param_passing(),
         Some(vm::HostParamPassing::Value)
+    );
+}
+
+#[test]
+fn resource_frame_rejects_repeated_mutable_borrow_for_one_request() {
+    let mut table = ResourceTable::new();
+    let token = table.push(fake(1).0).expect("push");
+    let frame = table
+        .begin_resource_access(vec![ResourceAccessRequest::borrow_mut::<FakeResource>(
+            token.handle(),
+        )])
+        .expect("preflight");
+
+    let first = frame
+        .borrow_mut::<FakeResource>(0)
+        .expect("first mutable borrow");
+    drop(first);
+    let error = frame
+        .borrow_mut::<FakeResource>(0)
+        .expect_err("one request cannot mint a second mutable guard");
+    assert_eq!(error.code(), ResourceErrorCode::ResourceAccessConflict);
+}
+
+#[test]
+fn distinct_resource_requests_allow_multiple_mutable_guards() {
+    let mut table = ResourceTable::new();
+    let first = table.push(fake(1).0).expect("first");
+    let second = table.push(fake(2).0).expect("second");
+    let frame = table
+        .begin_resource_access(vec![
+            ResourceAccessRequest::borrow_mut::<FakeResource>(first.handle()),
+            ResourceAccessRequest::borrow_mut::<FakeResource>(second.handle()),
+        ])
+        .expect("preflight");
+
+    let mut first_guard = frame
+        .borrow_mut::<FakeResource>(0)
+        .expect("first mutable guard");
+    let mut second_guard = frame
+        .borrow_mut::<FakeResource>(1)
+        .expect("second mutable guard");
+    first_guard.value += 10;
+    second_guard.value += 20;
+    assert_eq!(first_guard.value, 11);
+    assert_eq!(second_guard.value, 22);
+}
+
+#[test]
+fn explicit_key_mismatch_is_rejected_before_push_mutation() {
+    let mut table = ResourceTable::new();
+    let error = table
+        .push_with_key(fake(1).0, other_key())
+        .expect_err("static resource key mismatch must reject the push");
+    assert_eq!(error.code(), ResourceErrorCode::ResourceKeyMismatch);
+    assert!(table.is_empty(), "rejected push must not allocate a slot");
+}
+
+#[test]
+fn from_value_key_mismatch_stays_structured_in_vm_error() {
+    let mut table = ResourceTable::new();
+    let token = table.push(fake(2).0).expect("push");
+    let error = ResourceAccessRequest::from_value_with_key::<FakeResource>(
+        &token.handle().as_value(),
+        ResourceAccessMode::Borrow,
+        other_key(),
+        "test.arg",
+    )
+    .expect_err("request key must match the static resource key");
+    assert_eq!(
+        error.resource_error_code(),
+        Some(ResourceErrorCode::ResourceKeyMismatch)
+    );
+    assert_eq!(
+        error.resource_error().and_then(|error| error.value()),
+        Some(token.handle().raw())
+    );
+}
+
+#[test]
+fn legacy_resource_requires_an_explicit_key_for_exact_frame_access() {
+    let mut table = ResourceTable::new();
+    let key = ResourceTypeKey::new("test.legacy").expect("valid key");
+    let token = table
+        .push_with_key(LegacyResource(7), key.clone())
+        .expect("legacy resources may declare a key at insertion");
+
+    let no_key = ResourceAccessRequest::borrow::<LegacyResource>(token.handle());
+    let no_key_error = table
+        .begin_resource_access(vec![no_key])
+        .expect_err("legacy exact access without a key must be rejected");
+    assert_eq!(
+        no_key_error.code(),
+        ResourceErrorCode::ResourceKeyUnavailable
+    );
+
+    let request = ResourceAccessRequest::borrow_with_key::<LegacyResource>(token.handle(), key);
+    let frame = table
+        .begin_resource_access(vec![request])
+        .expect("explicit legacy key should pass preflight");
+    assert_eq!(frame.borrow::<LegacyResource>(0).expect("borrow").0, 7);
+}
+
+#[test]
+fn host_context_mutable_resource_apis_use_mutable_requests() {
+    let mut vm = new_vm();
+    let token = vm.host_context().push_resource(fake(3).0).expect("push");
+    {
+        let mut context = vm.host_context();
+        let mut resource = context.resource_mut(&token).expect("resource_mut");
+        resource.value += 4;
+    }
+    {
+        let mut context = vm.host_context();
+        let mut resource = context
+            .borrow_resource_mut::<FakeResource>(token.handle())
+            .expect("borrow_resource_mut");
+        resource.value += 5;
+    }
+    assert_eq!(
+        vm.host_context().resource(&token).expect("read back").value,
+        12
+    );
+}
+
+#[test]
+fn direct_host_context_take_rejects_associated_operation_without_consuming() {
+    let mut vm = new_vm();
+    let token = vm.host_context().push_resource(fake(9).0).expect("push");
+    let handle = token.handle();
+    vm.host_context()
+        .mark_resource_guest_owned(handle)
+        .expect("guest ownership");
+    vm.host_context()
+        .start_operation(OperationSpec::new(NoopOperation).with_resource(handle))
+        .expect("operation");
+
+    let error = vm
+        .host_context()
+        .take_resource::<FakeResource>(handle)
+        .expect_err("associated operation must block direct take");
+    let code = match error.kind() {
+        vm::HostContextErrorKind::Scope(ExecutionScopeError::Resource(error)) => error.code(),
+        other => panic!("expected structured resource error, got {other:?}"),
+    };
+    assert_eq!(code, ResourceErrorCode::ResourceOperationActive);
+    assert_eq!(
+        vm.host_context().resource_ownership(handle),
+        Some(vm::ResourceOwnership::GuestOwned)
+    );
+}
+
+#[test]
+fn vm_resource_errors_keep_the_machine_readable_code() {
+    let mut vm = new_vm();
+    let token = vm.host_context().push_resource(fake(1).0).expect("push");
+    let handle = token.handle();
+    vm.host_context()
+        .mark_resource_guest_owned(handle)
+        .expect("guest ownership");
+    vm.host_context()
+        .start_operation(OperationSpec::new(NoopOperation).with_resource(handle))
+        .expect("operation");
+
+    let error = vm
+        .begin_resource_access(vec![ResourceAccessRequest::take_owned::<FakeResource>(
+            handle,
+        )])
+        .expect_err("operation-aware preflight must reject the take");
+    assert!(!matches!(error, VmError::HostError(_)));
+    assert_eq!(
+        error.resource_error_code(),
+        Some(ResourceErrorCode::ResourceOperationActive)
+    );
+
+    let value_request = ResourceAccessRequest::from_value::<FakeResource>(
+        &handle.as_value(),
+        ResourceAccessMode::Value,
+        "value",
+    )
+    .expect("static-key request");
+    let mode_error = vm
+        .begin_resource_access(vec![value_request])
+        .expect_err("value mode is not a frame access mode");
+    assert_eq!(
+        mode_error.resource_error_code(),
+        Some(ResourceErrorCode::ResourceAccessModeUnsupported)
+    );
+
+    let type_error = vm
+        .begin_resource_access(vec![ResourceAccessRequest::borrow::<OtherResource>(handle)])
+        .expect_err("wrong resource type must stay structured");
+    assert_eq!(
+        type_error.resource_error_code(),
+        Some(ResourceErrorCode::ResourceTypeMismatch)
     );
 }
 

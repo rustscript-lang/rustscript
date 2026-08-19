@@ -13,8 +13,8 @@
 //! is `Send + !Sync`: it is moved under the sole mutating VM/scope owner.
 
 use std::any::{Any, TypeId};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::BTreeSet;
-use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
@@ -46,12 +46,12 @@ enum SlotState {
 /// Explicit ownership state of one slot's raw resource copy.
 ///
 /// Illegal combinations are unrepresentable: ownership is a single enum
-/// field, so a slot can never be both guest-owned and taken at once, and every
-/// transition happens under the table's single-threaded `&mut` access — there
-/// is no window between operations in which an intermediate state is visible.
-/// In particular a [`Taken`](ResourceOwnership::Taken) slot can never be
-/// remapped to [`GuestOwned`](ResourceOwnership::GuestOwned): every ownership
-/// transition validates the current state first.
+/// field, so a slot can never be both guest-owned and taken at once. Every
+/// ownership transition validates the current state first; frame takes use the
+/// slot's `Cell`/`RefCell` guards while the table remains exclusively leased by
+/// the frame. In particular a [`Taken`](ResourceOwnership::Taken) slot can
+/// never be remapped to [`GuestOwned`](ResourceOwnership::GuestOwned): every
+/// ownership transition validates the current state first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResourceOwnership {
     /// The host (the owning table/scope) owns the resource. This is the
@@ -116,16 +116,25 @@ impl ResourceAccessMode {
 pub struct ResourceAccessRequest {
     handle: ResourceHandle,
     type_id: TypeId,
+    /// Key used to validate the slot. For a request without an explicit key it
+    /// is copied from `T::resource_type_key()`.
     type_key: Option<ResourceTypeKey>,
+    /// Static declaration from `T::resource_type_key()`. Keeping this separate
+    /// lets the erased frame re-check an explicit key without retaining `T`.
+    resource_type_key: Option<ResourceTypeKey>,
+    key_explicit: bool,
     mode: ResourceAccessMode,
 }
 
 impl ResourceAccessRequest {
     fn for_type<T: HostResource>(handle: ResourceHandle, mode: ResourceAccessMode) -> Self {
+        let resource_type_key = T::resource_type_key();
         Self {
             handle,
             type_id: TypeId::of::<T>(),
-            type_key: T::resource_type_key(),
+            type_key: resource_type_key.clone(),
+            resource_type_key,
+            key_explicit: false,
             mode,
         }
     }
@@ -135,9 +144,14 @@ impl ResourceAccessRequest {
         mode: ResourceAccessMode,
         label: &str,
     ) -> crate::vm::VmResult<Self> {
-        let handle = ResourceHandle::from_value(value)
-            .map_err(|error| crate::vm::VmError::HostError(format!("{label}: {error}")))?;
-        Ok(Self::for_type::<T>(handle, mode))
+        let handle =
+            ResourceHandle::from_value(value).map_err(|error| crate::vm::VmError::from(error))?;
+        let request = Self::for_type::<T>(handle, mode);
+        if request.resource_type_key.is_none() {
+            return Err(crate::vm::VmError::from(resource_key_unavailable(handle)));
+        }
+        let _ = label;
+        Ok(request)
     }
 
     pub fn from_value_with_key<T: HostResource>(
@@ -146,10 +160,13 @@ impl ResourceAccessRequest {
         key: ResourceTypeKey,
         label: &str,
     ) -> crate::vm::VmResult<Self> {
-        let handle = ResourceHandle::from_value(value)
-            .map_err(|error| crate::vm::VmError::HostError(format!("{label}: {error}")))?;
+        let handle =
+            ResourceHandle::from_value(value).map_err(|error| crate::vm::VmError::from(error))?;
+        validate_declared_type_key::<T>(Some(&key), Some(handle))?;
+        let _ = label;
         Ok(Self::for_type_with_key::<T>(handle, mode, key))
     }
+
     fn for_type_with_key<T: HostResource>(
         handle: ResourceHandle,
         mode: ResourceAccessMode,
@@ -158,10 +175,13 @@ impl ResourceAccessRequest {
         Self {
             handle,
             type_id: TypeId::of::<T>(),
+            resource_type_key: T::resource_type_key(),
             type_key: Some(type_key),
+            key_explicit: true,
             mode,
         }
     }
+
     pub fn borrow<T: HostResource>(handle: ResourceHandle) -> Self {
         Self::for_type::<T>(handle, ResourceAccessMode::Borrow)
     }
@@ -203,22 +223,46 @@ impl ResourceAccessRequest {
     pub fn type_key(&self) -> Option<&ResourceTypeKey> {
         self.type_key.as_ref()
     }
+
+    pub fn resource_type_key(&self) -> Option<&ResourceTypeKey> {
+        self.resource_type_key.as_ref()
+    }
+
+    pub fn has_explicit_key(&self) -> bool {
+        self.key_explicit
+    }
+}
+
+/// State of one request after frame construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResourceRequestState {
+    Available,
+    Borrowed,
+    BorrowedMut,
+    Consumed,
 }
 
 /// A single-threaded, two-phase resource access frame.
 ///
 /// Construction performs a read-only validation of every request and all
 /// same-handle alias rules. Mutation is available only through the validated
-/// frame, so a later bad argument cannot occur after an earlier take. The
-/// frame holds the table mutably for its lifetime; `ResourceRef` and
-/// `ResourceMut` returned by it therefore cannot outlive the synchronous host
-/// call that owns the frame.
-#[derive(Debug)]
+/// frame, so a later bad argument cannot occur after an earlier take. Each
+/// returned guard is backed by the slot's `RefCell`; no raw pointer or unsafe
+/// reborrow is required.
 pub struct ResourceAccessFrame<'a> {
-    table: *mut ResourceTable,
+    table: &'a ResourceTable,
     requests: Vec<ResourceAccessRequest>,
-    consumed: Vec<bool>,
-    marker: PhantomData<&'a mut ResourceTable>,
+    states: RefCell<Vec<ResourceRequestState>>,
+}
+
+impl std::fmt::Debug for ResourceAccessFrame<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResourceAccessFrame")
+            .field("requests", &self.requests)
+            .field("states", &self.states)
+            .finish()
+    }
 }
 
 impl ResourceAccessFrame<'_> {
@@ -231,53 +275,37 @@ impl ResourceAccessFrame<'_> {
     }
 
     pub fn is_consumed(&self, index: usize) -> bool {
-        self.consumed.get(index).copied().unwrap_or(false)
+        self.states
+            .try_borrow()
+            .ok()
+            .and_then(|states| states.get(index).copied())
+            == Some(ResourceRequestState::Consumed)
     }
 }
 
 impl<'a> ResourceAccessFrame<'a> {
-    pub fn borrow<T: HostResource>(&mut self, index: usize) -> ResourceResult<ResourceRef<'a, T>> {
-        let request = self.request_for(index, ResourceAccessMode::Borrow)?;
-        let table: &'a ResourceTable = unsafe { &*self.table };
-        let slot_index = table.validate_active::<T>(request.handle)?;
-        table.check_access_key(slot_index, request.handle, request.type_key.as_ref())?;
-        let SlotState::Open(resource) = &table.slots[slot_index].state else {
-            return Err(already_closed_error(request.handle));
-        };
-        let value = (resource.as_ref() as &dyn Any)
-            .downcast_ref::<T>()
-            .ok_or_else(|| type_mismatch(request.handle, TypeId::of::<T>()))?;
-        Ok(ResourceRef::new(request.handle, value))
+    pub fn borrow<T: HostResource>(&self, index: usize) -> ResourceResult<ResourceRef<'a, T>> {
+        let request = self.request_for(index, ResourceAccessMode::Borrow)?.clone();
+        let value = self.table.borrow_for_request::<T>(&request)?;
+        self.set_state(index, ResourceRequestState::Borrowed)?;
+        Ok(value)
     }
 
-    pub fn borrow_mut<T: HostResource>(
-        &mut self,
-        index: usize,
-    ) -> ResourceResult<ResourceMut<'a, T>> {
+    pub fn borrow_mut<T: HostResource>(&self, index: usize) -> ResourceResult<ResourceMut<'a, T>> {
         let request = self
             .request_for(index, ResourceAccessMode::BorrowMut)?
             .clone();
-        let table: &'a mut ResourceTable = unsafe { &mut *self.table };
-        let slot_index = table.validate_active::<T>(request.handle)?;
-        table.check_access_key(slot_index, request.handle, request.type_key.as_ref())?;
-        let slot = &mut table.slots[slot_index];
-        let SlotState::Open(resource) = &mut slot.state else {
-            return Err(already_closed_error(request.handle));
-        };
-        let value = (resource.as_mut() as &mut dyn Any)
-            .downcast_mut::<T>()
-            .ok_or_else(|| type_mismatch(request.handle, TypeId::of::<T>()))?;
-        Ok(ResourceMut::new(request.handle, value))
+        let value = self.table.borrow_mut_for_request::<T>(&request)?;
+        self.set_state(index, ResourceRequestState::BorrowedMut)?;
+        Ok(value)
     }
 
-    pub fn take_owned<T: HostResource>(&mut self, index: usize) -> ResourceResult<T> {
+    pub fn take_owned<T: HostResource>(&self, index: usize) -> ResourceResult<T> {
         let request = self
             .request_for(index, ResourceAccessMode::TakeOwned)?
             .clone();
-        let table: &mut ResourceTable = unsafe { &mut *self.table };
-        table.check_access_request(&request)?;
-        let value = table.take_owned_with_key::<T>(request.handle, request.type_key.as_ref())?;
-        self.consumed[index] = true;
+        let value = self.table.take_owned_from_request::<T>(&request)?;
+        self.set_state(index, ResourceRequestState::Consumed)?;
         Ok(value)
     }
 
@@ -303,10 +331,44 @@ impl<'a> ResourceAccessFrame<'a> {
                 ),
             ));
         }
-        if self.consumed[index] {
-            return Err(already_taken_error(request.handle));
+        let states = self.states.try_borrow().map_err(|_| {
+            ResourceError::new(
+                ResourceErrorCode::ResourceAccessConflict,
+                "resource::access",
+                "resource request state is already mutably borrowed",
+            )
+        })?;
+        match states
+            .get(index)
+            .copied()
+            .unwrap_or(ResourceRequestState::Consumed)
+        {
+            ResourceRequestState::Consumed => Err(already_taken_error(request.handle)),
+            ResourceRequestState::BorrowedMut if expected_mode == ResourceAccessMode::BorrowMut => {
+                Err(request_borrow_conflict_error(request.handle))
+            }
+            _ => Ok(request),
         }
-        Ok(request)
+    }
+
+    fn set_state(&self, index: usize, state: ResourceRequestState) -> ResourceResult<()> {
+        let mut states = self.states.try_borrow_mut().map_err(|_| {
+            ResourceError::new(
+                ResourceErrorCode::ResourceAccessConflict,
+                "resource::access",
+                "resource request state is already borrowed",
+            )
+        })?;
+        if let Some(current) = states.get_mut(index) {
+            *current = state;
+            Ok(())
+        } else {
+            Err(ResourceError::new(
+                ResourceErrorCode::InvalidResourceHandle,
+                "resource::access",
+                format!("resource access request index {index} is out of range"),
+            ))
+        }
     }
 }
 
@@ -359,21 +421,21 @@ pub enum GuestReleaseOutcome {
 
 struct ResourceSlot {
     /// Advanced on every reuse.
-    generation: u32,
+    generation: Cell<u32>,
     /// Concrete type of the current occupant; borrow-time validation only.
     type_id: TypeId,
     /// Stable catalog identity declared by the concrete resource type.
     type_key: Option<ResourceTypeKey>,
     /// Handle of the parent, if this resource is a child.
-    parent: Option<ResourceHandle>,
+    parent: RefCell<Option<ResourceHandle>>,
     /// Live child handles. A child is removed only once its close is fully
     /// finished and the slot is vacant again.
-    children: BTreeSet<ResourceHandle>,
-    /// Ownership of the raw resource copy. Kept separate from `state` so a
-    /// closing resource keeps its ownership marker; a `Taken` marker always
-    /// coincides with a vacant, retired slot.
-    ownership: ResourceOwnership,
-    state: SlotState,
+    children: RefCell<BTreeSet<ResourceHandle>>,
+    /// Ownership of the raw resource copy.
+    ownership: Cell<ResourceOwnership>,
+    /// The resource state is independently guarded so distinct frame requests
+    /// may hold disjoint borrows without an aliased `&mut ResourceTable`.
+    state: RefCell<SlotState>,
 }
 
 /// Cumulative state persisted across [`ResourceTable::poll_close_all`] polls
@@ -393,7 +455,7 @@ pub struct ResourceTable {
     max_entries: usize,
     slots: Vec<ResourceSlot>,
     vacant_slots: Vec<usize>,
-    active_entries: usize,
+    active_entries: Cell<usize>,
     /// In-flight `poll_close_all` sweep, if one is active.
     close_all: Option<CloseAllState>,
 }
@@ -425,7 +487,7 @@ impl ResourceTable {
             max_entries,
             slots: Vec::new(),
             vacant_slots: Vec::new(),
-            active_entries: 0,
+            active_entries: Cell::new(0),
             close_all: None,
         })
     }
@@ -435,18 +497,13 @@ impl ResourceTable {
         Self::with_limit(DEFAULT_MAX_RESOURCES).expect("default table configuration is valid")
     }
 
-    /// Number of currently live (open or closing) resources.
-    pub(crate) fn unique_mut_ptr(&self) -> *mut Self {
-        self as *const Self as *mut Self
-    }
-
     pub fn len(&self) -> usize {
-        self.active_entries
+        self.active_entries.get()
     }
 
     /// Whether the table currently holds no live resources.
     pub fn is_empty(&self) -> bool {
-        self.active_entries == 0
+        self.active_entries.get() == 0
     }
 
     /// Inserts a root resource and returns its typed token.
@@ -483,7 +540,10 @@ impl ResourceTable {
         let key = T::resource_type_key();
         let child_handle = self.allocate(Some(parent_handle), key, value)?;
         let parent_index = self.resolve_index(parent_handle)?;
-        self.slots[parent_index].children.insert(child_handle);
+        self.slots[parent_index]
+            .children
+            .get_mut()
+            .insert(child_handle);
         Ok(Resource::from_handle(child_handle))
     }
 
@@ -498,7 +558,10 @@ impl ResourceTable {
         self.validate_open::<P>(parent_handle)?;
         let child_handle = self.allocate(Some(parent_handle), Some(key), value)?;
         let parent_index = self.resolve_index(parent_handle)?;
-        self.slots[parent_index].children.insert(child_handle);
+        self.slots[parent_index]
+            .children
+            .get_mut()
+            .insert(child_handle);
         Ok(Resource::from_handle(child_handle))
     }
 
@@ -532,14 +595,7 @@ impl ResourceTable {
         let handle = resource.handle();
         let slot_index = self.validate_active::<T>(handle)?;
         self.check_access_key(slot_index, handle, T::resource_type_key().as_ref())?;
-        let slot = &self.slots[slot_index];
-        let SlotState::Open(resource) = &slot.state else {
-            return Err(already_closed_error(handle));
-        };
-        let value = (resource.as_ref() as &dyn Any)
-            .downcast_ref::<T>()
-            .ok_or_else(|| type_mismatch(handle, TypeId::of::<T>()))?;
-        Ok(ResourceRef::new(handle, value))
+        self.borrow_open_ref(handle, slot_index)
     }
 
     /// Mutably borrows one live resource for the duration of a host call.
@@ -550,13 +606,72 @@ impl ResourceTable {
         let handle = resource.handle();
         let slot_index = self.validate_active::<T>(handle)?;
         self.check_access_key(slot_index, handle, T::resource_type_key().as_ref())?;
-        let slot = &mut self.slots[slot_index];
-        let SlotState::Open(resource) = &mut slot.state else {
-            return Err(already_closed_error(handle));
-        };
-        let value = (resource.as_mut() as &mut dyn Any)
-            .downcast_mut::<T>()
-            .ok_or_else(|| type_mismatch(handle, TypeId::of::<T>()))?;
+        self.borrow_open_mut(handle, slot_index)
+    }
+
+    fn borrow_for_request<T: HostResource>(
+        &self,
+        request: &ResourceAccessRequest,
+    ) -> ResourceResult<ResourceRef<'_, T>> {
+        validate_request_type_key(request)?;
+        if request.type_id != TypeId::of::<T>() {
+            return Err(type_mismatch(request.handle, TypeId::of::<T>()));
+        }
+        let slot_index = self.validate_active::<T>(request.handle)?;
+        self.check_access_key(slot_index, request.handle, request.type_key.as_ref())?;
+        self.borrow_open_ref(request.handle, slot_index)
+    }
+
+    fn borrow_mut_for_request<T: HostResource>(
+        &self,
+        request: &ResourceAccessRequest,
+    ) -> ResourceResult<ResourceMut<'_, T>> {
+        validate_request_type_key(request)?;
+        if request.type_id != TypeId::of::<T>() {
+            return Err(type_mismatch(request.handle, TypeId::of::<T>()));
+        }
+        let slot_index = self.validate_active::<T>(request.handle)?;
+        self.check_access_key(slot_index, request.handle, request.type_key.as_ref())?;
+        self.borrow_open_mut(request.handle, slot_index)
+    }
+
+    fn borrow_open_ref<T: HostResource>(
+        &self,
+        handle: ResourceHandle,
+        slot_index: usize,
+    ) -> ResourceResult<ResourceRef<'_, T>> {
+        let state = self.slots[slot_index]
+            .state
+            .try_borrow()
+            .map_err(|_| resource_borrow_conflict_error(handle))?;
+        let value = Ref::map(state, |state| match state {
+            SlotState::Open(resource) => (resource.as_ref() as &dyn Any)
+                .downcast_ref::<T>()
+                .expect("validated resource TypeId must match downcast type"),
+            SlotState::Closing(_) | SlotState::Vacant => {
+                unreachable!("validated open resource changed state during shared borrow")
+            }
+        });
+        Ok(ResourceRef::new(handle, value))
+    }
+
+    fn borrow_open_mut<T: HostResource>(
+        &self,
+        handle: ResourceHandle,
+        slot_index: usize,
+    ) -> ResourceResult<ResourceMut<'_, T>> {
+        let state = self.slots[slot_index]
+            .state
+            .try_borrow_mut()
+            .map_err(|_| resource_borrow_conflict_error(handle))?;
+        let value = RefMut::map(state, |state| match state {
+            SlotState::Open(resource) => (resource.as_mut() as &mut dyn Any)
+                .downcast_mut::<T>()
+                .expect("validated resource TypeId must match downcast type"),
+            SlotState::Closing(_) | SlotState::Vacant => {
+                unreachable!("validated open resource changed state during mutable borrow")
+            }
+        });
         Ok(ResourceMut::new(handle, value))
     }
 
@@ -570,12 +685,11 @@ impl ResourceTable {
         requests: Vec<ResourceAccessRequest>,
     ) -> ResourceResult<ResourceAccessFrame<'_>> {
         self.validate_resource_access(&requests)?;
-        let consumed = vec![false; requests.len()];
+        let states = vec![ResourceRequestState::Available; requests.len()];
         Ok(ResourceAccessFrame {
-            table: self as *mut ResourceTable,
+            table: self,
             requests,
-            consumed,
-            marker: PhantomData,
+            states: RefCell::new(states),
         })
     }
 
@@ -610,22 +724,32 @@ impl ResourceTable {
                 ),
             ));
         }
+        validate_request_type_key(request)?;
         let slot_index = self.resolve_index(request.handle)?;
         if self.slots[slot_index].type_id != request.type_id {
             return Err(type_mismatch(request.handle, request.type_id));
         }
         self.check_access_key(slot_index, request.handle, request.type_key.as_ref())?;
-        if self.slots[slot_index].ownership == ResourceOwnership::Taken {
+        if self.slots[slot_index].ownership.get() == ResourceOwnership::Taken {
             return Err(already_taken_error(request.handle));
         }
-        if !matches!(self.slots[slot_index].state, SlotState::Open(_)) {
+        let state = self.slots[slot_index]
+            .state
+            .try_borrow()
+            .map_err(|_| resource_borrow_conflict_error(request.handle))?;
+        if !matches!(&*state, SlotState::Open(_)) {
             return Err(already_closed_error(request.handle));
         }
+        drop(state);
         if request.mode == ResourceAccessMode::TakeOwned {
-            if self.slots[slot_index].ownership != ResourceOwnership::GuestOwned {
+            if self.slots[slot_index].ownership.get() != ResourceOwnership::GuestOwned {
                 return Err(not_guest_owned_error(request.handle));
             }
-            if !self.slots[slot_index].children.is_empty() {
+            let children = self.slots[slot_index]
+                .children
+                .try_borrow()
+                .map_err(|_| resource_borrow_conflict_error(request.handle))?;
+            if !children.is_empty() {
                 return Err(has_children_error(request.handle));
             }
         }
@@ -675,7 +799,7 @@ impl ResourceTable {
     /// `None` when the handle is foreign or stale (names no live slot here).
     pub fn ownership(&self, handle: ResourceHandle) -> Option<ResourceOwnership> {
         let slot_index = self.resolve_index(handle).ok()?;
-        Some(self.slots[slot_index].ownership)
+        Some(self.slots[slot_index].ownership.get())
     }
 
     /// The declaration key stored with a live or taken slot.
@@ -700,17 +824,22 @@ impl ResourceTable {
     ///   [`ResourceErrorCode::ResourceNotHostOwned`]
     pub fn mark_guest_owned(&mut self, handle: ResourceHandle) -> ResourceResult<()> {
         let slot_index = self.resolve_index(handle)?;
-        let slot = &mut self.slots[slot_index];
-        if slot.ownership == ResourceOwnership::Taken {
+        let slot = &self.slots[slot_index];
+        if slot.ownership.get() == ResourceOwnership::Taken {
             return Err(already_taken_error(handle));
         }
-        if !matches!(slot.state, SlotState::Open(_)) {
+        let state = slot
+            .state
+            .try_borrow()
+            .map_err(|_| resource_borrow_conflict_error(handle))?;
+        if !matches!(&*state, SlotState::Open(_)) {
             return Err(already_closed_error(handle));
         }
-        if slot.ownership == ResourceOwnership::GuestOwned {
+        drop(state);
+        if slot.ownership.get() == ResourceOwnership::GuestOwned {
             return Err(not_host_owned_error(handle));
         }
-        slot.ownership = ResourceOwnership::GuestOwned;
+        slot.ownership.set(ResourceOwnership::GuestOwned);
         Ok(())
     }
 
@@ -736,11 +865,16 @@ impl ResourceTable {
             return Ok(GuestReleaseOutcome::NotGuestOwned);
         };
         let slot = &self.slots[slot_index];
-        if slot.ownership != ResourceOwnership::GuestOwned
-            || !matches!(slot.state, SlotState::Open(_))
+        let state = slot
+            .state
+            .try_borrow()
+            .map_err(|_| resource_borrow_conflict_error(handle))?;
+        if slot.ownership.get() != ResourceOwnership::GuestOwned
+            || !matches!(&*state, SlotState::Open(_))
         {
             return Ok(GuestReleaseOutcome::NotGuestOwned);
         }
+        drop(state);
         // GuestOwned + Open: launch the close exactly once.
         let progress = self.close_open_slot(slot_index, handle, release.reason())?;
         Ok(GuestReleaseOutcome::Released(progress))
@@ -771,57 +905,104 @@ impl ResourceTable {
         handle: ResourceHandle,
         expected_key: Option<&ResourceTypeKey>,
     ) -> ResourceResult<T> {
+        self.take_owned_with_key_shared(handle, expected_key)
+    }
+
+    fn take_owned_from_request<T: HostResource>(
+        &self,
+        request: &ResourceAccessRequest,
+    ) -> ResourceResult<T> {
+        self.check_access_request(request)?;
+        if request.type_id != TypeId::of::<T>() {
+            return Err(type_mismatch(request.handle, TypeId::of::<T>()));
+        }
+        self.take_owned_with_key_shared(request.handle, request.type_key.as_ref())
+    }
+
+    fn take_owned_with_key_shared<T: HostResource>(
+        &self,
+        handle: ResourceHandle,
+        expected_key: Option<&ResourceTypeKey>,
+    ) -> ResourceResult<T> {
+        validate_declared_type_key::<T>(expected_key, Some(handle))?;
         let slot_index = self.resolve_index(handle)?;
         self.check_type::<T>(slot_index, handle)?;
         self.check_access_key(slot_index, handle, expected_key)?;
-        match self.slots[slot_index].ownership {
+        match self.slots[slot_index].ownership.get() {
             ResourceOwnership::Taken => return Err(already_taken_error(handle)),
             ResourceOwnership::HostOwned => return Err(not_guest_owned_error(handle)),
             ResourceOwnership::GuestOwned => {}
         }
-        if !matches!(self.slots[slot_index].state, SlotState::Open(_)) {
+        let state = self.slots[slot_index]
+            .state
+            .try_borrow()
+            .map_err(|_| resource_borrow_conflict_error(handle))?;
+        if !matches!(&*state, SlotState::Open(_)) {
             return Err(already_closed_error(handle));
         }
-        if !self.slots[slot_index].children.is_empty() {
-            return Err(has_children_error(handle));
-        }
-        // Confirm the erased occupant really is a `T` before touching any
-        // state (the `TypeId` check above already guarantees it).
-        let SlotState::Open(resource) = &self.slots[slot_index].state else {
-            return Err(already_closed_error(handle));
-        };
-        if (resource.as_ref() as &dyn Any)
-            .downcast_ref::<T>()
-            .is_none()
-        {
+        let type_matches = matches!(&*state, SlotState::Open(resource) if
+            (resource.as_ref() as &dyn Any).downcast_ref::<T>().is_some());
+        if !type_matches {
             return Err(type_mismatch(handle, TypeId::of::<T>()));
         }
-
-        // All constraints validated: the move-out below is atomic.
-        let state = std::mem::replace(&mut self.slots[slot_index].state, SlotState::Vacant);
-        let SlotState::Open(resource) = state else {
-            unreachable!("open state validated immediately above")
-        };
-        let erased: Box<dyn Any> = resource;
-        let boxed = erased
-            .downcast::<T>()
-            .unwrap_or_else(|_| unreachable!("TypeId validated immediately above"));
-        // Retire the slot: unlink it from its parent, keep the generation so
-        // the stale raw handle still resolves here and reports `Taken`
-        // precisely, never push the slot back for reuse, and never close the
-        // moved-out value.
-        let generation = self.slots[slot_index].generation;
-        let parent = self.slots[slot_index].parent.take();
-        if let Some(parent_handle) = parent
-            && let Some(child_handle) =
-                ResourceHandle::encode(self.arena_id, slot_index, u64::from(generation))
-            && let Ok(parent_index) = self.resolve_index(parent_handle)
-        {
-            self.slots[parent_index].children.remove(&child_handle);
+        drop(state);
+        let children = self.slots[slot_index]
+            .children
+            .try_borrow()
+            .map_err(|_| resource_borrow_conflict_error(handle))?;
+        if !children.is_empty() {
+            return Err(has_children_error(handle));
         }
-        self.slots[slot_index].ownership = ResourceOwnership::Taken;
-        self.active_entries -= 1;
+        drop(children);
+
+        let parent = self.slots[slot_index]
+            .parent
+            .try_borrow()
+            .map_err(|_| resource_borrow_conflict_error(handle))?
+            .to_owned();
+        let parent_index = parent.and_then(|parent_handle| self.resolve_index(parent_handle).ok());
+        if let Some(parent_index) = parent_index {
+            self.slots[parent_index]
+                .children
+                .try_borrow_mut()
+                .map_err(|_| resource_borrow_conflict_error(handle))?;
+        }
+
+        let state = self.replace_open_state_with_vacant(slot_index, handle)?;
+        let SlotState::Open(resource) = state else {
+            return Err(already_closed_error(handle));
+        };
+        let boxed = (resource as Box<dyn Any>)
+            .downcast::<T>()
+            .map_err(|_| type_mismatch(handle, TypeId::of::<T>()))?;
+        if let Some(parent_index) = parent_index {
+            self.slots[parent_index]
+                .children
+                .try_borrow_mut()
+                .map_err(|_| resource_borrow_conflict_error(handle))?
+                .remove(&handle);
+        }
+        *self.slots[slot_index]
+            .parent
+            .try_borrow_mut()
+            .map_err(|_| resource_borrow_conflict_error(handle))? = None;
+        self.slots[slot_index]
+            .ownership
+            .set(ResourceOwnership::Taken);
+        self.active_entries.set(self.active_entries.get() - 1);
         Ok(*boxed)
+    }
+
+    fn replace_open_state_with_vacant(
+        &self,
+        slot_index: usize,
+        handle: ResourceHandle,
+    ) -> ResourceResult<SlotState> {
+        let mut state = self.slots[slot_index]
+            .state
+            .try_borrow_mut()
+            .map_err(|_| resource_borrow_conflict_error(handle))?;
+        Ok(std::mem::replace(&mut *state, SlotState::Vacant))
     }
 
     /// Polls one in-progress close to completion.
@@ -839,7 +1020,7 @@ impl ResourceTable {
         self.check_generation(slot_index, handle)?;
         self.check_type::<T>(slot_index, handle)?;
 
-        let state = std::mem::replace(&mut self.slots[slot_index].state, SlotState::Vacant);
+        let state = self.replace_slot_state(slot_index, SlotState::Vacant);
         match state {
             SlotState::Closing(mut resource) => match resource.poll_close(cx) {
                 Poll::Ready(result) => {
@@ -847,14 +1028,14 @@ impl ResourceTable {
                     Poll::Ready(result)
                 }
                 Poll::Pending => {
-                    self.slots[slot_index].state = SlotState::Closing(resource);
+                    self.put_slot_state(slot_index, SlotState::Closing(resource));
                     Poll::Pending
                 }
             },
             SlotState::Open(resource) => {
                 // Not closing: restore the open resource and report the precise
                 // wrong-state error (distinct from an invalid handle).
-                self.slots[slot_index].state = SlotState::Open(resource);
+                self.put_slot_state(slot_index, SlotState::Open(resource));
                 Poll::Ready(Err(not_closing_error(handle)))
             }
             SlotState::Vacant => Poll::Ready(Err(already_closed_error(handle))),
@@ -898,10 +1079,13 @@ impl ResourceTable {
     ) -> Poll<ResourceResult<usize>> {
         // Deterministically reject a conflicting reason. The in-flight sweep
         // keeps the reason it started with; we do not mutate any state here.
-        if let Some(state) = self.close_all.as_ref()
-            && state.reason != reason
+        if self
+            .close_all
+            .as_ref()
+            .is_some_and(|state| state.reason != reason)
         {
-            return Poll::Ready(Err(close_in_progress_error(reason, state.reason)));
+            let in_progress = self.close_all.as_ref().expect("checked above").reason;
+            return Poll::Ready(Err(close_in_progress_error(reason, in_progress)));
         }
         if self.close_all.is_none() {
             self.close_all = Some(CloseAllState {
@@ -921,20 +1105,26 @@ impl ResourceTable {
         let mut progressed = true;
         while progressed {
             progressed = false;
-            let mut leaf_indices = self.open_leaf_indices();
+            let mut leaf_indices = match self.open_leaf_indices() {
+                Ok(indices) => indices,
+                Err(error) => return Poll::Ready(Err(error)),
+            };
             leaf_indices.sort_unstable();
             for slot_index in leaf_indices {
-                if self
+                let is_open = self
                     .slots
-                    .get(slot_index)
-                    .is_none_or(|slot| !matches!(slot.state, SlotState::Open(_)))
-                {
+                    .get_mut(slot_index)
+                    .is_some_and(|slot| matches!(slot.state.get_mut(), SlotState::Open(_)));
+                if !is_open {
                     continue;
                 }
                 progressed |=
                     self.try_begin_close(slot_index, reason, &mut closed, &mut first_error);
             }
-            let closing_indices = self.closing_indices();
+            let closing_indices = match self.closing_indices() {
+                Ok(indices) => indices,
+                Err(error) => return Poll::Ready(Err(error)),
+            };
             for slot_index in closing_indices {
                 progressed |= self.try_poll_close(slot_index, cx, &mut closed, &mut first_error);
             }
@@ -992,6 +1182,14 @@ impl ResourceTable {
 
     // ---- internal close machinery -------------------------------------------------
 
+    fn replace_slot_state(&mut self, slot_index: usize, state: SlotState) -> SlotState {
+        std::mem::replace(self.slots[slot_index].state.get_mut(), state)
+    }
+
+    fn put_slot_state(&mut self, slot_index: usize, state: SlotState) {
+        *self.slots[slot_index].state.get_mut() = state;
+    }
+
     /// Drives the close state machine of one validated slot, shared by the
     /// typed [`begin_close`](Self::begin_close) path and the untyped guest
     /// ownership release. Mirrors the begin-close contract exactly: a parent
@@ -1004,11 +1202,11 @@ impl ResourceTable {
         handle: ResourceHandle,
         reason: ResourceCloseReason,
     ) -> ResourceResult<CloseProgress> {
-        let state = std::mem::replace(&mut self.slots[slot_index].state, SlotState::Vacant);
+        let state = self.replace_slot_state(slot_index, SlotState::Vacant);
         match state {
             SlotState::Open(mut resource) => {
-                if !self.slots[slot_index].children.is_empty() {
-                    self.slots[slot_index].state = SlotState::Open(resource);
+                if !self.slots[slot_index].children.get_mut().is_empty() {
+                    self.put_slot_state(slot_index, SlotState::Open(resource));
                     return Err(has_children_error(handle));
                 }
                 match resource.begin_close(reason) {
@@ -1017,7 +1215,7 @@ impl ResourceTable {
                         Ok(CloseProgress::Ready)
                     }
                     Ok(CloseProgress::Pending) => {
-                        self.slots[slot_index].state = SlotState::Closing(resource);
+                        self.put_slot_state(slot_index, SlotState::Closing(resource));
                         Ok(CloseProgress::Pending)
                     }
                     Err(error) => {
@@ -1029,7 +1227,7 @@ impl ResourceTable {
             SlotState::Closing(resource) => {
                 // Idempotent: the close is already in flight; keep holding the
                 // generation until the outer caller drives poll_close.
-                self.slots[slot_index].state = SlotState::Closing(resource);
+                self.put_slot_state(slot_index, SlotState::Closing(resource));
                 Ok(CloseProgress::Pending)
             }
             SlotState::Vacant => Err(already_closed_error(handle)),
@@ -1043,14 +1241,14 @@ impl ResourceTable {
         closed: &mut usize,
         first_error: &mut Option<ResourceError>,
     ) -> bool {
-        let state = std::mem::replace(&mut self.slots[slot_index].state, SlotState::Vacant);
+        let state = self.replace_slot_state(slot_index, SlotState::Vacant);
         let SlotState::Open(mut resource) = state else {
             // Not open (e.g. already closing); restore and report no progress.
-            self.slots[slot_index].state = state;
+            self.put_slot_state(slot_index, state);
             return false;
         };
-        if !self.slots[slot_index].children.is_empty() {
-            self.slots[slot_index].state = SlotState::Open(resource);
+        if !self.slots[slot_index].children.get_mut().is_empty() {
+            self.put_slot_state(slot_index, SlotState::Open(resource));
             return false;
         }
         match resource.begin_close(reason) {
@@ -1060,7 +1258,7 @@ impl ResourceTable {
                 true
             }
             Ok(CloseProgress::Pending) => {
-                self.slots[slot_index].state = SlotState::Closing(resource);
+                self.put_slot_state(slot_index, SlotState::Closing(resource));
                 true
             }
             Err(error) => {
@@ -1079,9 +1277,9 @@ impl ResourceTable {
         closed: &mut usize,
         first_error: &mut Option<ResourceError>,
     ) -> bool {
-        let state = std::mem::replace(&mut self.slots[slot_index].state, SlotState::Vacant);
+        let state = self.replace_slot_state(slot_index, SlotState::Vacant);
         let SlotState::Closing(mut resource) = state else {
-            self.slots[slot_index].state = state;
+            self.put_slot_state(slot_index, state);
             return false;
         };
         match resource.poll_close(cx) {
@@ -1094,53 +1292,71 @@ impl ResourceTable {
                 true
             }
             Poll::Pending => {
-                self.slots[slot_index].state = SlotState::Closing(resource);
+                self.put_slot_state(slot_index, SlotState::Closing(resource));
                 false
             }
         }
     }
 
     fn reclaim(&mut self, slot_index: usize) {
-        let generation = self.slots[slot_index].generation;
-        let parent = self.slots[slot_index].parent.take();
-        if let Some(parent_handle) = parent
-            && let Some(child_handle) =
+        let generation = self.slots[slot_index].generation.get();
+        let parent = self.slots[slot_index].parent.get_mut().take();
+        if let Some(parent_handle) = parent {
+            if let Some(child_handle) =
                 ResourceHandle::encode(self.arena_id, slot_index, u64::from(generation))
-            && let Ok(parent_index) = self.resolve_index(parent_handle)
-        {
-            self.slots[parent_index].children.remove(&child_handle);
+            {
+                if let Ok(parent_index) = self.resolve_index(parent_handle) {
+                    self.slots[parent_index]
+                        .children
+                        .get_mut()
+                        .remove(&child_handle);
+                }
+            }
         }
-        self.slots[slot_index].state = SlotState::Vacant;
+        self.put_slot_state(slot_index, SlotState::Vacant);
         // A reclaimed slot carries no ownership; the next occupant starts out
         // host-owned (re-applied in `allocate`).
-        self.slots[slot_index].ownership = ResourceOwnership::HostOwned;
-        if u64::from(self.slots[slot_index].generation) < MAX_HANDLE_GENERATION {
+        self.slots[slot_index]
+            .ownership
+            .set(ResourceOwnership::HostOwned);
+        if u64::from(self.slots[slot_index].generation.get()) < MAX_HANDLE_GENERATION {
             self.vacant_slots.push(slot_index);
         }
-        self.active_entries -= 1;
+        self.active_entries.set(self.active_entries.get() - 1);
     }
 
     /// Indices of slots currently in [`SlotState::Open`] with no live children.
-    fn open_leaf_indices(&self) -> Vec<usize> {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(index, slot)| {
-                (matches!(slot.state, SlotState::Open(_)) && slot.children.is_empty())
-                    .then_some(index)
-            })
-            .collect()
+    fn open_leaf_indices(&self) -> ResourceResult<Vec<usize>> {
+        let mut indices = Vec::new();
+        for (index, slot) in self.slots.iter().enumerate() {
+            let state = slot
+                .state
+                .try_borrow()
+                .map_err(|_| resource_borrow_conflict_error_for_slot(slot))?;
+            let children = slot
+                .children
+                .try_borrow()
+                .map_err(|_| resource_borrow_conflict_error_for_slot(slot))?;
+            if matches!(&*state, SlotState::Open(_)) && children.is_empty() {
+                indices.push(index);
+            }
+        }
+        Ok(indices)
     }
 
     /// Indices of slots currently in [`SlotState::Closing`].
-    fn closing_indices(&self) -> Vec<usize> {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(index, slot)| {
-                matches!(slot.state, SlotState::Closing(_)).then_some(index)
-            })
-            .collect()
+    fn closing_indices(&self) -> ResourceResult<Vec<usize>> {
+        let mut indices = Vec::new();
+        for (index, slot) in self.slots.iter().enumerate() {
+            let state = slot
+                .state
+                .try_borrow()
+                .map_err(|_| resource_borrow_conflict_error_for_slot(slot))?;
+            if matches!(&*state, SlotState::Closing(_)) {
+                indices.push(index);
+            }
+        }
+        Ok(indices)
     }
 
     // ---- allocation ---------------------------------------------------------------
@@ -1151,7 +1367,8 @@ impl ResourceTable {
         type_key: Option<ResourceTypeKey>,
         value: T,
     ) -> Result<ResourceHandle, ResourceError> {
-        if self.active_entries >= self.max_entries {
+        validate_declared_type_key::<T>(type_key.as_ref(), None)?;
+        if self.active_entries.get() >= self.max_entries {
             return Err(ResourceError::new(
                 ResourceErrorCode::ResourceLimitExceeded,
                 "resource::push",
@@ -1166,16 +1383,19 @@ impl ResourceTable {
         let (slot_index, generation) = if let Some(slot_index) = self.vacant_slots.pop() {
             let generation = self.slots[slot_index]
                 .generation
+                .get()
                 .checked_add(1)
                 .filter(|generation| u64::from(*generation) <= MAX_HANDLE_GENERATION)
                 .expect("only reusable generations enter the vacant list");
-            self.slots[slot_index].generation = generation;
+            self.slots[slot_index].generation.set(generation);
             self.slots[slot_index].type_id = type_id;
             self.slots[slot_index].type_key = type_key.clone();
-            self.slots[slot_index].parent = parent;
-            self.slots[slot_index].children.clear();
-            self.slots[slot_index].ownership = ResourceOwnership::HostOwned;
-            self.slots[slot_index].state = SlotState::Open(value);
+            *self.slots[slot_index].parent.get_mut() = parent;
+            self.slots[slot_index].children.get_mut().clear();
+            self.slots[slot_index]
+                .ownership
+                .set(ResourceOwnership::HostOwned);
+            *self.slots[slot_index].state.get_mut() = SlotState::Open(value);
             (slot_index, generation)
         } else {
             if self.slots.len() >= MAX_RESOURCE_SLOTS {
@@ -1188,17 +1408,17 @@ impl ResourceTable {
             let slot_index = self.slots.len();
             let generation = 1u32;
             self.slots.push(ResourceSlot {
-                generation,
+                generation: Cell::new(generation),
                 type_id,
                 type_key,
-                parent,
-                children: BTreeSet::new(),
-                ownership: ResourceOwnership::HostOwned,
-                state: SlotState::Open(value),
+                parent: RefCell::new(parent),
+                children: RefCell::new(BTreeSet::new()),
+                ownership: Cell::new(ResourceOwnership::HostOwned),
+                state: RefCell::new(SlotState::Open(value)),
             });
             (slot_index, generation)
         };
-        self.active_entries += 1;
+        self.active_entries.set(self.active_entries.get() + 1);
         ResourceHandle::encode(self.arena_id, slot_index, u64::from(generation)).ok_or_else(|| {
             ResourceError::new(
                 ResourceErrorCode::ResourceIdExhausted,
@@ -1221,7 +1441,7 @@ impl ResourceTable {
     }
 
     fn check_generation(&self, slot_index: usize, handle: ResourceHandle) -> ResourceResult<()> {
-        if u64::from(self.slots[slot_index].generation) != handle.generation() {
+        if u64::from(self.slots[slot_index].generation.get()) != handle.generation() {
             return Err(stale_handle_error(handle));
         }
         Ok(())
@@ -1243,7 +1463,11 @@ impl ResourceTable {
     fn validate_active<T: 'static>(&self, handle: ResourceHandle) -> ResourceResult<usize> {
         let slot_index = self.resolve_index(handle)?;
         self.check_type::<T>(slot_index, handle)?;
-        if !matches!(self.slots[slot_index].state, SlotState::Open(_)) {
+        let state = self.slots[slot_index]
+            .state
+            .try_borrow()
+            .map_err(|_| resource_borrow_conflict_error(handle))?;
+        if !matches!(&*state, SlotState::Open(_)) {
             return Err(already_closed_error(handle));
         }
         Ok(slot_index)
@@ -1252,10 +1476,14 @@ impl ResourceTable {
     fn validate_open<T: 'static>(&self, handle: ResourceHandle) -> ResourceResult<()> {
         let slot_index = self.resolve_index(handle)?;
         self.check_type::<T>(slot_index, handle)?;
-        if self.slots[slot_index].ownership == ResourceOwnership::Taken {
+        if self.slots[slot_index].ownership.get() == ResourceOwnership::Taken {
             return Err(already_taken_error(handle));
         }
-        match self.slots[slot_index].state {
+        let state = self.slots[slot_index]
+            .state
+            .try_borrow()
+            .map_err(|_| resource_borrow_conflict_error(handle))?;
+        match &*state {
             SlotState::Open(_) => Ok(()),
             SlotState::Closing(_) | SlotState::Vacant => Err(already_closed_error(handle)),
         }
@@ -1282,6 +1510,85 @@ impl Drop for ResourceTable {
 }
 
 // ---- error constructors ------------------------------------------------------------
+
+fn validate_declared_type_key<T: HostResource>(
+    declared: Option<&ResourceTypeKey>,
+    handle: Option<ResourceHandle>,
+) -> ResourceResult<()> {
+    let expected = T::resource_type_key();
+    match (expected.as_ref(), declared) {
+        (Some(expected), Some(declared)) if expected != declared => Err(
+            key_declaration_mismatch_error(handle, Some(expected), Some(declared)),
+        ),
+        (Some(expected), None) => Err(key_declaration_mismatch_error(handle, Some(expected), None)),
+        _ => Ok(()),
+    }
+}
+
+fn validate_request_type_key(request: &ResourceAccessRequest) -> ResourceResult<()> {
+    match (
+        request.resource_type_key.as_ref(),
+        request.type_key.as_ref(),
+    ) {
+        (Some(expected), Some(requested)) if expected != requested => Err(
+            key_declaration_mismatch_error(Some(request.handle), Some(expected), Some(requested)),
+        ),
+        (Some(_), None) => Err(resource_key_unavailable(request.handle)),
+        (None, None) if !request.key_explicit => Err(resource_key_unavailable(request.handle)),
+        _ => Ok(()),
+    }
+}
+
+fn key_declaration_mismatch_error(
+    handle: Option<ResourceHandle>,
+    expected: Option<&ResourceTypeKey>,
+    requested: Option<&ResourceTypeKey>,
+) -> ResourceError {
+    let error = ResourceError::new(
+        ResourceErrorCode::ResourceKeyMismatch,
+        "resource::access",
+        format!("resource type key mismatch: expected {expected:?}, requested {requested:?}"),
+    );
+    match handle {
+        Some(handle) => error.with_value(handle.raw()),
+        None => error,
+    }
+}
+
+fn resource_key_unavailable(handle: ResourceHandle) -> ResourceError {
+    ResourceError::new(
+        ResourceErrorCode::ResourceKeyUnavailable,
+        "resource::access",
+        "an exact resource access requires an explicit resource type key",
+    )
+    .with_value(handle.raw())
+}
+
+fn resource_borrow_conflict_error(handle: ResourceHandle) -> ResourceError {
+    ResourceError::new(
+        ResourceErrorCode::ResourceAccessConflict,
+        "resource::access",
+        "resource slot is already borrowed",
+    )
+    .with_value(handle.raw())
+}
+
+fn resource_borrow_conflict_error_for_slot(_slot: &ResourceSlot) -> ResourceError {
+    ResourceError::new(
+        ResourceErrorCode::ResourceAccessConflict,
+        "resource::access",
+        "resource slot is already borrowed",
+    )
+}
+
+fn request_borrow_conflict_error(handle: ResourceHandle) -> ResourceError {
+    ResourceError::new(
+        ResourceErrorCode::ResourceAccessConflict,
+        "resource::access",
+        "a mutable resource request has already produced its guard",
+    )
+    .with_value(handle.raw())
+}
 
 fn wrong_arena_error(handle: ResourceHandle) -> ResourceError {
     ResourceError::new(

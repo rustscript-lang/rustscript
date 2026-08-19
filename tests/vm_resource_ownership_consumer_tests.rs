@@ -73,6 +73,10 @@ struct CountingResource {
 }
 
 impl HostResource for CountingResource {
+    fn resource_type_key() -> Option<ResourceTypeKey> {
+        Some(ResourceTypeKey::new("io.file").expect("valid test key"))
+    }
+
     fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         self.counters.record(reason);
         Ok(CloseProgress::Ready)

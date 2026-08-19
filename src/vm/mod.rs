@@ -58,8 +58,9 @@ pub use self::invocation::{Invocation, InvocationError, InvocationItem, Invocati
 use self::resource::ResourceCloseReason;
 pub use self::resource::{
     CloseProgress, GuestReleaseOutcome, HostResource, OwnershipRelease, Resource,
-    ResourceAccessFrame, ResourceAccessMode, ResourceAccessRequest, ResourceError, ResourceHandle,
-    ResourceMut, ResourceOwned, ResourceOwnership, ResourceRef, ResourceTable,
+    ResourceAccessFrame, ResourceAccessMode, ResourceAccessRequest, ResourceError,
+    ResourceErrorCode, ResourceHandle, ResourceMut, ResourceOwned, ResourceOwnership, ResourceRef,
+    ResourceTable,
 };
 use self::run_context::{InterruptMode, RunContext};
 pub use crate::builtins::BuiltinFunction;
@@ -148,6 +149,9 @@ pub enum VmError {
     InvalidOpcode(u8),
     BytecodeBounds,
     HostError(String),
+    /// A structured resource capability failure. This variant is preserved
+    /// across host-context, macro adapter, and VM boundaries.
+    Resource(ResourceError),
     /// A structured error from exact host-import binding / registration.
     HostImportBinding(HostImportBindingError),
     JitNative(String),
@@ -313,6 +317,7 @@ impl std::fmt::Display for VmError {
             VmError::InvalidOpcode(opcode) => write!(f, "invalid opcode {opcode}"),
             VmError::BytecodeBounds => write!(f, "bytecode bounds"),
             VmError::HostError(message) => write!(f, "host error: {message}"),
+            VmError::Resource(error) => write!(f, "resource error: {error}"),
             VmError::HostImportBinding(error) => write!(f, "host import binding error: {error}"),
             VmError::JitNative(message) => write!(f, "jit native error: {message}"),
             VmError::InvalidFuelCheckInterval(value) => {
@@ -340,6 +345,38 @@ impl std::fmt::Display for VmError {
 }
 
 impl std::error::Error for VmError {}
+
+impl From<ResourceError> for VmError {
+    fn from(error: ResourceError) -> Self {
+        Self::Resource(error)
+    }
+}
+
+impl From<ExecutionScopeError> for VmError {
+    fn from(error: ExecutionScopeError) -> Self {
+        match error {
+            ExecutionScopeError::Resource(error) => Self::Resource(error),
+            other => Self::HostError(other.to_string()),
+        }
+    }
+}
+
+impl VmError {
+    /// Returns the structured resource error without requiring callers to
+    /// parse the legacy `HostError` display string.
+    pub fn resource_error(&self) -> Option<&ResourceError> {
+        match self {
+            Self::Resource(error) => Some(error),
+            _ => None,
+        }
+    }
+
+    /// Returns the stable resource error category, when this is a resource
+    /// failure.
+    pub fn resource_error_code(&self) -> Option<ResourceErrorCode> {
+        self.resource_error().map(ResourceError::code)
+    }
+}
 
 pub type VmResult<T> = Result<T, VmError>;
 
@@ -817,13 +854,15 @@ impl Vm {
         HostContext::new(&mut self.host)
     }
 
+    /// Begins an operation-aware resource frame and preserves resource errors
+    /// as the structured [`VmError::Resource`] variant.
     pub fn begin_resource_access(
         &mut self,
         requests: Vec<ResourceAccessRequest>,
     ) -> VmResult<ResourceAccessFrame<'_>> {
         self.host
             .execution_scope_begin_resource_access(requests)
-            .map_err(|error| VmError::HostError(error.to_string()))
+            .map_err(VmError::from)
     }
     /// Returns the maximum number of simultaneously active script call frames.
     pub fn max_script_call_depth(&self) -> usize {
