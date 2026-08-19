@@ -169,21 +169,23 @@ fn compiled_resource_arg_import() -> vm::HostImport {
     import
 }
 
-/// Builds a hot loop that calls one exact one-argument import with a constant,
-/// then advances an Int-only local counter. No local has an owned-resource
-/// schema, so the global owned-local JIT gate cannot suppress the import test.
+/// Builds a hot loop with plain Int state update before calling one exact
+/// one-argument import with a constant. No local has an owned-resource schema,
+/// so the global owned-local JIT gate cannot suppress the import test; the
+/// arithmetic prefix also ensures a resource-filtered call has useful native
+/// work before its call boundary.
 fn exact_import_loop_program(import: &vm::HostImport, argument: i64) -> vm::Program {
     let mut bc = BytecodeBuilder::new();
     bc.ldc(0);
     bc.stloc(0);
     let root = bc.position();
-    bc.ldc(1);
-    bc.call(0, 1);
-    bc.pop();
     bc.ldloc(0);
     bc.ldc(2);
     bc.add();
     bc.stloc(0);
+    bc.ldc(1);
+    bc.call(0, 1);
+    bc.pop();
     bc.ldloc(0);
     bc.ldc(3);
     bc.ceq();
@@ -195,7 +197,7 @@ fn exact_import_loop_program(import: &vm::HostImport, argument: i64) -> vm::Prog
             Value::Int(0),
             Value::Int(argument),
             Value::Int(1),
-            Value::Int(4),
+            Value::Int(32),
         ],
         bc.finish(),
         vec![HostImport {
@@ -595,13 +597,27 @@ fn resource_param_plain_int_import_is_not_native_eligible_and_trace_exits() {
     let status = run_vm(&mut vm).expect("resource-parameter loop must execute correctly");
     assert_eq!(status, VmStatus::Halted);
     let snapshot = vm.jit_snapshot();
+    let dump = vm.dump_jit_info();
+    assert!(
+        !snapshot.traces.is_empty(),
+        "resource-bearing exact schema must still record useful native work:\n{dump}"
+    );
+    assert!(
+        snapshot.traces.iter().any(|trace| {
+            trace
+                .op_names()
+                .iter()
+                .any(|op| matches!(op.as_str(), "iadd" | "iadd_imm" | "ilocal_add_imm"))
+                || trace.ssa_text().contains("iadd ")
+        }),
+        "resource-bearing exact schema must retain a native arithmetic operation:\n{dump}"
+    );
     assert!(
         snapshot
             .traces
             .iter()
             .all(|trace| !trace.op_names().iter().any(|op| op == "host_call")),
-        "resource-bearing exact schema must not enter the native host-call set:\n{}",
-        vm.dump_jit_info()
+        "resource-bearing exact schema must not enter the native host-call set:\n{dump}"
     );
 }
 
