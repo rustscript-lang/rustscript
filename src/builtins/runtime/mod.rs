@@ -58,10 +58,13 @@ pub use typed::HostCallResult;
 // adapters outside the builtin modules can decode by reference / by take.
 #[allow(unused_imports)]
 use typed::{
-    AnyValue, IntoBuiltinCallOutcome, IntoHostCallOutcome, NumberValue, UnknownValue, VmArray,
-    VmBytes, VmCallable, VmMap, return_none, return_one,
+    AnyValue, IntoBuiltinCallOutcome, NumberValue, UnknownValue, VmArray, VmBytes, VmCallable,
+    VmMap, return_none,
 };
-pub use typed::{BorrowVmValue, FromVmValue, TakeVmValue, arg, borrow_arg, take_arg};
+pub use typed::{
+    BorrowVmValue, FromVmValue, IntoHostCallOutcome, TakeVmValue, arg, borrow_arg, return_one,
+    take_arg,
+};
 
 pub(crate) enum BuiltinCallOutcome {
     Return(CallReturn),

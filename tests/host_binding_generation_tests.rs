@@ -608,7 +608,7 @@ mod external_extension_sdk {
     use vm::{
         CallOutcome, CallReturn, HostApiBuilder, HostApiCatalog, HostExtension, HostFunctionSchema,
         HostImportBindingError, HostParamSchema, HostTypeSchema, ResourceTypeKey,
-        ResourceTypeSchema, VmError, compile_source_with_flavor_and_options,
+        ResourceTypeSchema, VmError, VmResult, compile_source_with_flavor_and_options,
     };
 
     #[derive(Clone, Debug)]
@@ -661,9 +661,8 @@ mod external_extension_sdk {
             Ok(())
         }
 
-        fn install(&self, vm: &mut Vm) -> vm::VmResult<()> {
+        fn install(&self, vm: &mut Vm) {
             vm.host_context().set_module_state(CounterPolicy { max: 7 });
-            Ok(())
         }
     }
 
@@ -814,6 +813,137 @@ mod external_extension_sdk {
             .bind_vm_cached(&mut vm)
             .expect("granted external import must bind");
         assert_eq!(vm.run().expect("run"), VmStatus::Halted);
+        assert_eq!(vm.stack(), &[Value::Int(11)]);
+    }
+
+    /// An extension whose `register` fails part-way (a duplicate exact schema)
+    /// to exercise `install_extension` transactional failure semantics.
+    struct DuplicateNameExtension;
+
+    impl HostExtension for DuplicateNameExtension {
+        fn register(&self, registry: &mut HostFunctionRegistry) -> VmResult<()> {
+            let catalog = counter_catalog();
+            // Register `demo::ping` twice with the identical exact schema and
+            // arity; the second registration is rejected as a duplicate.
+            for schema in catalog_import_schemas(&catalog, "demo::ping") {
+                registry.register_exact_static("demo::ping", 0, schema.clone(), ping_adapter)?;
+                registry.register_exact_static("demo::ping", 0, schema, ping_adapter)?;
+            }
+            Ok(())
+        }
+
+        fn install(&self, _vm: &mut Vm) {
+            // Never reached on the failing path; present to prove install is
+            // also skipped on register failure.
+            unreachable!("register failure must abort before install");
+        }
+    }
+
+    #[test]
+    fn install_extension_register_failure_is_transactional_and_retryable() {
+        let catalog = counter_catalog();
+        let compiled = compile_with_catalog(&catalog, "use demo;\ndemo::ping();\n");
+        let mut vm = Vm::new(compiled.program);
+
+        // A registration failure (duplicate exact schema) fails the whole
+        // install before any install mutation happens...
+        let error = vm
+            .install_extension(&DuplicateNameExtension)
+            .expect_err("duplicate registration must fail install_extension");
+        assert!(
+            matches!(
+                error,
+                VmError::HostImportBinding(HostImportBindingError::Duplicate { .. })
+            ),
+            "expected a structured duplicate error, got {error}"
+        );
+
+        // ...so the VM is left unbound with no module state, and a corrected
+        // extension installs cleanly on the same VM (retry/recovery).
+        assert!(
+            vm.host_context().is_module_state_empty(),
+            "a failed install must not leave module state behind"
+        );
+        vm.install_extension(&CounterExtension)
+            .expect("retrying with a valid extension must succeed on the same VM");
+        assert_eq!(
+            vm.host_context()
+                .module_state::<CounterPolicy>()
+                .map(|policy| policy.max),
+            Some(7),
+            "the retried install installs its module state"
+        );
+        assert_eq!(vm.run().expect("run"), VmStatus::Halted);
+        assert_eq!(vm.stack(), &[Value::Int(11)]);
+    }
+
+    #[derive(Debug)]
+    struct SecondPolicy {
+        // Never installed: the binding-failure test asserts this extension's
+        // state is *not* written, so the payload is intentionally unread.
+        #[allow(dead_code)]
+        max: u64,
+    }
+
+    /// A second extension that registers the same exact function as
+    /// `CounterExtension` but installs a distinct module-state type. Installing
+    /// it on an already-bound VM fails specifically at binding.
+    struct SecondPolicyExtension;
+
+    impl HostExtension for SecondPolicyExtension {
+        fn register(&self, registry: &mut HostFunctionRegistry) -> VmResult<()> {
+            let catalog = counter_catalog();
+            for schema in catalog_import_schemas(&catalog, "demo::ping") {
+                registry.register_exact_static("demo::ping", 0, schema, ping_adapter)?;
+            }
+            Ok(())
+        }
+
+        fn install(&self, vm: &mut Vm) {
+            vm.host_context().set_module_state(SecondPolicy { max: 99 });
+        }
+    }
+
+    #[test]
+    fn install_extension_binding_failure_leaves_first_extension_intact() {
+        let catalog = counter_catalog();
+        let compiled = compile_with_catalog(&catalog, "use demo;\ndemo::ping();\n");
+        let mut vm = Vm::new(compiled.program);
+
+        vm.install_extension(&CounterExtension)
+            .expect("first install binds");
+        assert_eq!(vm.run().expect("run"), VmStatus::Halted);
+        assert_eq!(vm.stack(), &[Value::Int(11)]);
+
+        // A second install on the already-bound VM fails at binding — before
+        // the second extension's module state could be installed.
+        let error = vm
+            .install_extension(&SecondPolicyExtension)
+            .expect_err("binding an already-bound VM must fail");
+        assert!(
+            error.to_string().contains("unbound vm"),
+            "expected the binding rejection, got {error}"
+        );
+
+        // The failed second install installed no module state of its own and
+        // left the first extension's binding + module state fully intact.
+        assert!(
+            vm.host_context().module_state::<SecondPolicy>().is_none(),
+            "a failure at binding must happen before the second install mutation"
+        );
+        assert_eq!(
+            vm.host_context()
+                .module_state::<CounterPolicy>()
+                .map(|policy| policy.max),
+            Some(7),
+            "the first extension's module state survives the failed second install"
+        );
+        vm.reset_for_reuse();
+        assert_eq!(
+            vm.run().expect("second run after reset"),
+            VmStatus::Halted,
+            "the first extension's binding still executes after the failed second install"
+        );
         assert_eq!(vm.stack(), &[Value::Int(11)]);
     }
 

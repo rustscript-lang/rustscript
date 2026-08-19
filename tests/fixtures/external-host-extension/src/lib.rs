@@ -16,18 +16,25 @@
 //! It is compiled by `cargo check --manifest-path tests/fixtures/external-host-extension/Cargo.toml`
 //! and its unit tests by `cargo test --manifest-path ...`.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::task::{Context, Poll};
+#[cfg(test)]
+use std::{collections::HashMap, sync::Mutex, task::{Wake, Waker}};
 
 use pd_host_function::pd_host_function;
 use vm::operation::{HostOperation, OperationSpec};
-use vm::resource::{CloseProgress, HostResource, ResourceCloseReason, ResourceResult, ResourceTypeKey};
+use vm::resource::{
+    CloseProgress, HostResource, ResourceCloseReason, ResourceResult, ResourceTypeKey,
+};
+#[cfg(test)]
 use vm::{
-    CallOutcome, CallReturn, HostApiBuilder, HostApiCatalog, HostExtension, HostFunctionRegistry,
-    HostFunctionSchema, HostParamSchema, HostTypeSchema, ResourceTypeSchema, Value, Vm, VmError,
-    VmResult,
+    HostAsyncBridge, HostFuture, HostOpId,
+};
+use vm::{
+    CallOutcome, CallReturn, CaptureAsyncHostContext, HostApiBuilder, HostApiCatalog,
+    HostExtension, HostFunctionRegistry, HostFunctionSchema, HostFutureOutput, HostParamSchema,
+    HostTypeSchema, ResourceTypeSchema, Value, Vm, VmError, VmResult,
 };
 #[cfg(test)]
 use vm::{
@@ -42,10 +49,15 @@ pub static CLOSED_COUNTERS: AtomicUsize = AtomicUsize::new(0);
 pub static CLOSED_WIDGETS: AtomicUsize = AtomicUsize::new(0);
 /// Number of times a pending operation was cancelled (reset-driven).
 pub static CANCELLED_OPS: AtomicUsize = AtomicUsize::new(0);
+/// Async completion latch shared by `echo_async` and the async tests: the
+/// generated wrapper parks a dynamic `HostOperation` until the test sets
+/// `ASYNC_READY` (then the future completes and the script resumes).
+static ASYNC_READY: AtomicBool = AtomicBool::new(false);
 
 /// Serializes tests that observe or mutate the close/cancel trackers. The
 /// test harness runs tests concurrently; without this, a close driven by one
 /// test's `Drop` can race another test's counter assertions.
+#[cfg(test)]
 static TRACKER_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
@@ -53,6 +65,7 @@ fn reset_trackers() {
     CLOSED_COUNTERS.store(0, Ordering::SeqCst);
     CLOSED_WIDGETS.store(0, Ordering::SeqCst);
     CANCELLED_OPS.store(0, Ordering::SeqCst);
+    ASYNC_READY.store(false, Ordering::SeqCst);
 }
 
 /// External resource class #1 — never enumerated by the core.
@@ -144,6 +157,11 @@ pub fn demo_catalog() -> Arc<HostApiCatalog> {
         Vec::new(),
         HostTypeSchema::Int,
     ));
+    builder.function(HostFunctionSchema::with_return(
+        "demo::echo_async",
+        vec![HostParamSchema::value("value", HostTypeSchema::Int)],
+        HostTypeSchema::Int,
+    ));
     Arc::new(builder.build().expect("catalog must build"))
 }
 
@@ -219,6 +237,128 @@ fn peek_counter(resource: vm::resource::ResourceRef<'_, Counter>) -> i64 {
     resource.0 as i64
 }
 
+/// Owned per-call state captured by the async adapter through the public
+/// `CaptureAsyncHostContext` surface (`vm::CaptureAsyncHostContext`).
+#[derive(Clone, Debug)]
+pub struct EchoContext {
+    prefix: i64,
+}
+
+impl CaptureAsyncHostContext for EchoContext {
+    fn capture(_vm: &mut Vm) -> VmResult<Self> {
+        Ok(EchoContext { prefix: 100 })
+    }
+}
+
+/// Awaits the externally-driven async latch used to park `echo_async` until
+/// the test releases it.
+async fn await_async_signal() -> VmResult<()> {
+    std::future::poll_fn(|_| {
+        if ASYNC_READY.load(Ordering::SeqCst) {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
+/// External async host function: the generated wrapper captures owned context
+/// and submits a dynamic `HostOperation` (through `vm::submit_host_future` →
+/// `CallOutcome::Pending`) using only absolute public-SDK adapters
+/// (`CaptureAsyncHostContext`, `HostFutureOutput`, `IntoHostCallOutcome`,
+/// `return_one`), then completes with `prefix + value` once the test releases
+/// the latch.
+#[pd_host_function(name = "demo::echo_async", crate = "vm")]
+async fn echo_async(
+    #[pd_host_context] context: EchoContext,
+    value: i64,
+) -> VmResult<HostFutureOutput<i64>> {
+    await_async_signal().await?;
+    Ok(HostFutureOutput::returning(context.prefix + value))
+}
+
+// ---- async bridge (test driver) ------------------------------------------
+
+/// A `HostAsyncBridge` that parks submitted futures and counts cancellations,
+/// letting the tests drive a genuinely pending external async operation.
+#[cfg(test)]
+struct FixtureAsyncBridge {
+    futures: Mutex<HashMap<HostOpId, HostFuture>>,
+    cancelled: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+impl FixtureAsyncBridge {
+    fn new(cancelled: Arc<AtomicUsize>) -> Self {
+        Self {
+            futures: Mutex::new(HashMap::new()),
+            cancelled,
+        }
+    }
+}
+
+#[cfg(test)]
+impl HostAsyncBridge for FixtureAsyncBridge {
+    fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
+        if self
+            .futures
+            .lock()
+            .expect("futures lock")
+            .insert(op_id, future)
+            .is_some()
+        {
+            return Err(VmError::HostError(format!("duplicate async op {op_id}")));
+        }
+        Ok(())
+    }
+
+    fn poll_op(&mut self, _op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
+        Poll::Pending
+    }
+
+    fn poll_submitted_op(
+        &mut self,
+        op_id: HostOpId,
+        cx: &mut Context<'_>,
+    ) -> Poll<VmResult<HostFutureOutput>> {
+        let poll = {
+            let mut guard = self.futures.lock().expect("futures lock");
+            let future = match guard.get_mut(&op_id) {
+                Some(future) => future,
+                None => {
+                    return Poll::Ready(Err(VmError::HostError(format!(
+                        "unknown async op {op_id}"
+                    ))));
+                }
+            };
+            future.as_mut().poll(cx)
+        };
+        if poll.is_ready() {
+            self.futures.lock().expect("futures lock").remove(&op_id);
+        }
+        poll
+    }
+
+    fn cancel_op(&mut self, op_id: HostOpId) {
+        self.cancelled.fetch_add(1, Ordering::SeqCst);
+        self.futures.lock().expect("futures lock").remove(&op_id);
+    }
+}
+
+#[cfg(test)]
+struct NoopWake;
+
+#[cfg(test)]
+impl Wake for NoopWake {
+    fn wake(self: Arc<Self>) {}
+}
+
+#[cfg(test)]
+fn noop_waker() -> Waker {
+    Waker::from(Arc::new(NoopWake))
+}
+
 // ---- extension ------------------------------------------------------------
 
 fn register_exact(
@@ -245,13 +385,13 @@ impl HostExtension for DemoExtension {
         register_exact(registry, &catalog, "demo::make_widget", 1, make_widget)?;
         register_exact(registry, &catalog, "demo::read_counter", 1, read_counter)?;
         register_exact(registry, &catalog, "demo::spawn_op", 0, spawn_op)?;
+        register_exact(registry, &catalog, "demo::echo_async", 1, echo_async)?;
         Ok(())
     }
 
-    fn install(&self, vm: &mut Vm) -> VmResult<()> {
+    fn install(&self, vm: &mut Vm) {
         let mut context = vm.host_context();
         context.set_module_state(DemoPolicy { max_counters: 3 });
-        Ok(())
     }
 }
 
@@ -415,4 +555,105 @@ fn module_state_survives_reset_and_never_participates_in_close() {
     // Module state is storage only — it never registers/participates in close.
     assert_eq!(CLOSED_COUNTERS.load(Ordering::SeqCst), 0);
     assert_eq!(CLOSED_WIDGETS.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn external_async_function_parks_then_completes_a_dynamic_operation() {
+    reset_trackers();
+    let _tracker_guard = TRACKER_LOCK.lock().unwrap();
+    let catalog = demo_catalog();
+    let cancelled = Arc::new(AtomicUsize::new(0));
+    let mut vm = installed_vm(
+        &catalog,
+        "use demo;\nlet r = demo::echo_async(7);\nr;\n",
+    );
+    vm.set_async_bridge(Box::new(FixtureAsyncBridge::new(Arc::clone(&cancelled))));
+
+    // The external async wrapper captures owned context and submits a dynamic
+    // HostOperation; the script parks on it.
+    let status = vm.run().expect("first run parks");
+    let VmStatus::Waiting(op_id) = status else {
+        panic!("expected a dynamic waiting op, got {status:?}");
+    };
+    assert_eq!(vm.waiting_host_op_id(), Some(op_id));
+
+    // The operation stays genuinely pending until the latch is released.
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(
+        matches!(vm.poll_waiting_host_op(&mut cx), Poll::Pending),
+        "the external async operation must stay pending until released"
+    );
+
+    // Release the latch: the parked value (context.prefix + 7 = 107) is
+    // delivered through the public SDK return path and the script resumes.
+    ASYNC_READY.store(true, Ordering::SeqCst);
+    assert!(
+        matches!(vm.poll_waiting_host_op(&mut cx), Poll::Ready(Ok(()))),
+        "the external async operation must complete once released"
+    );
+    assert_eq!(vm.resume().expect("resumed run halts"), VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[Value::Int(107)],
+        "the script receives the value returned by the async host function"
+    );
+    assert_eq!(
+        cancelled.load(Ordering::SeqCst),
+        0,
+        "completing normally must not cancel the dynamic operation"
+    );
+}
+
+#[test]
+fn external_async_function_cancels_on_reset_and_vm_stays_reusable() {
+    reset_trackers();
+    let _tracker_guard = TRACKER_LOCK.lock().unwrap();
+    let catalog = demo_catalog();
+    let cancelled = Arc::new(AtomicUsize::new(0));
+    let mut vm = installed_vm(
+        &catalog,
+        "use demo;\nlet _ = demo::echo_async(7);\n0;\n",
+    );
+    vm.set_async_bridge(Box::new(FixtureAsyncBridge::new(Arc::clone(&cancelled))));
+
+    let status = vm.run().expect("run parks");
+    let VmStatus::Waiting(op_id) = status else {
+        panic!("expected a dynamic waiting op, got {status:?}");
+    };
+    assert_eq!(vm.waiting_host_op_id(), Some(op_id));
+
+    // Reset drives the pending dynamic operation to cancellation.
+    vm.reset_for_reuse();
+    assert!(
+        vm.is_reusable(),
+        "cancelling a parked async op resets the VM to a reusable state"
+    );
+    assert_eq!(vm.waiting_host_op_id(), None);
+    assert_eq!(
+        cancelled.load(Ordering::SeqCst),
+        1,
+        "reset must cancel the bridge-owned pending operation exactly once"
+    );
+
+    // A fresh invocation on the same installed extension parks a new dynamic
+    // operation and still completes normally once released.
+    let status = vm.run().expect("second run parks again");
+    assert!(
+        matches!(status, VmStatus::Waiting(_)),
+        "the reinstalled extension must submit a fresh dynamic operation"
+    );
+    ASYNC_READY.store(true, Ordering::SeqCst);
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(matches!(
+        vm.poll_waiting_host_op(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(vm.resume().expect("final resume"), VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[Value::Int(0)],
+        "the second invocation completes normally after reset"
+    );
 }

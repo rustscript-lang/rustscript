@@ -31,8 +31,7 @@
 //! coupling to the builtin runtime modules or any concrete host library.
 
 use crate::bytecode::{HostImportParam, HostImportSchema};
-use crate::compiler::TypeSchema;
-use crate::host_api::{HostApiCatalog, HostTypeSchema};
+use crate::host_api::HostApiCatalog;
 use crate::vm::VmResult;
 
 pub use super::host_context::HostContext;
@@ -74,10 +73,19 @@ pub trait HostExtension: Send + Sync + 'static {
     /// Typed state installed here (through
     /// [`HostContext::set_module_state`]) survives
     /// [`Vm::reset_for_reuse`](super::Vm::reset_for_reuse) and scope close and
-    /// never participates in resource close. The default installs nothing.
-    fn install(&self, vm: &mut super::Vm) -> VmResult<()> {
+    /// never participates in resource close.
+    ///
+    /// **Infallible by design.** The module-state install phase performs no
+    /// fallible operations (the state store is infallible), so
+    /// [`Vm::install_extension`](super::Vm::install_extension) can guarantee
+    /// transactional failure semantics: every fallible step (registration and
+    /// registry binding) runs *before* this method, and once it runs the VM is
+    /// fully and consistently installed. Extensions that need a fallible
+    /// initialization step must perform it in [`Self::register`] instead, so
+    /// the failure surfaces before any install mutation. The default installs
+    /// nothing.
+    fn install(&self, vm: &mut super::Vm) {
         let _ = vm;
-        Ok(())
     }
 }
 
@@ -102,35 +110,12 @@ pub fn catalog_import_schemas(catalog: &HostApiCatalog, name: &str) -> Vec<HostI
                 .iter()
                 .map(|param| HostImportParam {
                     name: param.name.clone(),
-                    schema: into_type_schema(&param.ty),
+                    schema: param.ty.to_compiler_schema(),
                     passing: param.passing,
                 })
                 .collect(),
-            return_type: into_type_schema(&function.return_type),
+            return_type: function.return_type.to_compiler_schema(),
             fingerprint: catalog.fingerprint(),
         })
         .collect()
-}
-
-/// Maps a catalog type schema onto the compiler `TypeSchema` used inside an
-/// exact `HostImportSchema`. Resources map by their shared `ResourceTypeKey`.
-fn into_type_schema(ty: &HostTypeSchema) -> TypeSchema {
-    match ty {
-        HostTypeSchema::Unknown => TypeSchema::Unknown,
-        HostTypeSchema::Null => TypeSchema::Null,
-        HostTypeSchema::Int => TypeSchema::Int,
-        HostTypeSchema::Float => TypeSchema::Float,
-        HostTypeSchema::Number => TypeSchema::Number,
-        HostTypeSchema::Bool => TypeSchema::Bool,
-        HostTypeSchema::String => TypeSchema::String,
-        HostTypeSchema::Bytes => TypeSchema::Bytes,
-        HostTypeSchema::Array(inner) => TypeSchema::Array(Box::new(into_type_schema(inner))),
-        HostTypeSchema::Map(inner) => TypeSchema::Map(Box::new(into_type_schema(inner))),
-        HostTypeSchema::Optional(inner) => TypeSchema::Optional(Box::new(into_type_schema(inner))),
-        HostTypeSchema::Callable { params, result } => TypeSchema::Callable {
-            params: params.iter().map(into_type_schema).collect(),
-            result: Box::new(into_type_schema(result)),
-        },
-        HostTypeSchema::Resource(key) => TypeSchema::Resource(key.clone()),
-    }
 }

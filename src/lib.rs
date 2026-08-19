@@ -26,7 +26,8 @@ pub use assembler::{AsmParseError, Assembler, AssemblerError, BytecodeBuilder, a
 pub use builtins::runtime::print::{PrintHostFunction, PrintlnHostFunction, format_value};
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::{
-    BorrowVmValue, FromVmValue, HostCallResult, TakeVmValue, arg, borrow_arg, take_arg,
+    BorrowVmValue, FromVmValue, HostCallResult, IntoHostCallOutcome, TakeVmValue, arg, borrow_arg,
+    return_one, take_arg,
 };
 #[cfg(feature = "http-client")]
 pub use builtins::runtime::{HttpConfig, HttpHostExt};
@@ -103,12 +104,12 @@ pub use vm::diagnostics::render_vm_error;
 #[cfg(feature = "runtime")]
 pub use vm::{
     AotArtifactError, BeginResetOutcome, CallOutcome, CallReturn, CancellationReason,
-    CapabilityProfile, CapabilityProfileBuilder, CloseProgress, DEFAULT_MAX_SCRIPT_CALL_DEPTH,
-    EpochCheckpoint, EpochHandle, FuelCheckpoint, HostArgsFunction, HostAsyncBridge,
-    HostBindingPlan, HostContext, HostContextError, HostContextErrorKind, HostContextResult,
-    HostFunction, HostFunctionRegistry, HostFuture, HostFutureOutput, HostImportBindingError,
-    HostModule, HostOpId, HostResource, HostStackFunction, IntoScriptValue, Invocation,
-    InvocationError, InvocationItem, InvocationPoll, QueuedScriptInvocation, Resource,
+    CapabilityProfile, CapabilityProfileBuilder, CaptureAsyncHostContext, CloseProgress,
+    DEFAULT_MAX_SCRIPT_CALL_DEPTH, EpochCheckpoint, EpochHandle, FuelCheckpoint, HostArgsFunction,
+    HostAsyncBridge, HostBindingPlan, HostContext, HostContextError, HostContextErrorKind,
+    HostContextResult, HostFunction, HostFunctionRegistry, HostFuture, HostFutureOutput,
+    HostImportBindingError, HostModule, HostOpId, HostResource, HostStackFunction, IntoScriptValue,
+    Invocation, InvocationError, InvocationItem, InvocationPoll, QueuedScriptInvocation, Resource,
     ResourceAccessFrame, ResourceAccessMode, ResourceAccessRequest, ResourceError,
     ResourceErrorCode, ResourceHandle, ResourceMut, ResourceOwned, ResourceOwnership, ResourceRef,
     ResourceTable, ScriptArgs, ScriptCallback, ScriptResult, StaticHostArgsFunction,

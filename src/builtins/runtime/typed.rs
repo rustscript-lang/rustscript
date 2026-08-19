@@ -361,7 +361,15 @@ pub(super) fn return_none() -> CallReturn {
     CallReturn::none()
 }
 
-pub(super) fn return_one<T>(value: T) -> CallReturn
+/// Wraps one value as a single-entry [`CallReturn`].
+///
+/// Public so that a `#[pd_host_function(crate = "...")]` async wrapper in an
+/// external crate can map its awaited value onto a `CallReturn` through the
+/// public SDK root (`vm::return_one`). The `IntoVmValue` bound stays
+/// crate-private; callers only need a concrete value type whose conversion is
+/// generated inside `pd-vm`.
+#[allow(private_bounds)]
+pub fn return_one<T>(value: T) -> CallReturn
 where
     T: IntoVmValue,
 {
@@ -532,7 +540,14 @@ where
     }
 }
 
-pub(super) trait IntoHostCallOutcome {
+/// Conversion of an async host function's awaited result onto a [`CallOutcome`].
+///
+/// Public so that a `#[pd_host_function(crate = "...")]` async wrapper in an
+/// external crate can route its value onto a [`CallOutcome`] through the
+/// public SDK root (`vm::IntoHostCallOutcome`). The blanket impls use the
+/// crate-private `IntoVmValue` conversion; external callers only ever convert
+/// concrete value types, never the adapter trait itself.
+pub trait IntoHostCallOutcome {
     fn into_host_call_outcome(self) -> CallOutcome;
 }
 

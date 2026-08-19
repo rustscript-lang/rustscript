@@ -69,6 +69,15 @@ jobs:
       - name: Tests
         working-directory: rustscript
         run: cargo test --workspace
+      - name: External host-extension fixture
+        working-directory: rustscript
+        run: |
+          # The standalone fixture consumes only the public host-extension SDK.
+          # It is its own (detached) workspace, so both commands run against
+          # the job-level CARGO_TARGET_DIR (gitignored) — never a nested
+          # target/ inside tests/fixtures/external-host-extension.
+          cargo check --manifest-path tests/fixtures/external-host-extension/Cargo.toml
+          cargo test --manifest-path tests/fixtures/external-host-extension/Cargo.toml
 
   pd-vm-cli:
     name: pd-vm CLI (${{ matrix.os }})

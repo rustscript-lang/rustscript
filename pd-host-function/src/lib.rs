@@ -32,14 +32,6 @@ fn expand_pd_host_function(
 ) -> Result<proc_macro2::TokenStream, Error> {
     let args = parse_args(&attr)?;
     parse_name_arg_is_present(&args)?;
-    if args.crate_path.is_some() && item.sig.asyncness.is_some() {
-        return Err(Error::new_spanned(
-            &item.sig,
-            "async #[pd_host_function] with an external crate path is not supported: the async \
-             adapter (CaptureAsyncHostContext / IntoHostCallOutcome / return_one) is not part of \
-             the public SDK; use a synchronous host function, or omit crate = \"...\" inside pd-vm",
-        ));
-    }
     let crate_path = args.crate_path;
     let is_async = item.sig.asyncness.is_some();
     let docs = doc_string(&item.attrs);
@@ -272,7 +264,25 @@ fn parse_args(args: &Punctuated<Meta, Token![,]>) -> Result<MacroArgs, Error> {
                     "duplicate crate argument",
                 ));
             }
-            out.crate_path = Some(syn::Ident::new(value.value().trim(), value.span()));
+            // Parse the value as a single Rust identifier with `syn` so an
+            // invalid name is reported as a structured compile error instead
+            // of panicking inside `Ident::new`. Hyphens (`my-crate`), path
+            // segments (`vm::inner` or `some.path`) and empty strings are all
+            // rejected: the value must name the host SDK dependency's
+            // *package* rename used at the `use` site (e.g. `crate = "vm"`).
+            let raw = value.value();
+            let trimmed = raw.trim();
+            let parsed = syn::parse_str::<syn::Ident>(trimmed).map_err(|_| {
+                Error::new_spanned(
+                    &name_value.value,
+                    format!(
+                        "invalid crate identifier {trimmed:?}: expected a single Rust \
+                         identifier naming the host SDK dependency (e.g. crate = \"vm\"); \
+                         hyphens, paths and empty names are not allowed"
+                    ),
+                )
+            })?;
+            out.crate_path = Some(parsed);
         } else {
             return Err(Error::new_spanned(
                 &name_value.path,
@@ -1496,17 +1506,63 @@ mod tests {
     }
 
     #[test]
-    fn external_crate_path_rejects_async_adapters_not_in_the_public_sdk() {
-        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "demo::suspend", crate = "vm");
-        let item: ItemFn = parse_quote!(
-            /// Async external host functions are not yet supported.
-            async fn suspend(value: String) -> VmResult<String> {
+    fn external_crate_path_expands_async_adapters_through_the_public_sdk() {
+        // Path A: a plain value return routes through `IntoHostCallOutcome`.
+        let attr_a: Punctuated<Meta, Token![,]> =
+            parse_quote!(name = "demo::suspend", crate = "vm");
+        let item_a: ItemFn = parse_quote!(
+            /// Async external host functions submit a dynamic HostOperation
+            /// through the public SDK.
+            async fn suspend(
+                #[pd_host_context] context: TestContext,
+                value: String,
+            ) -> VmResult<String> {
+                let _ = (context, value);
                 todo!()
             }
         );
-        let error = expand_pd_host_function(attr, item)
-            .expect_err("async with an external crate path must be rejected");
-        assert!(error.to_string().contains("external crate path"), "{error}");
+        let expanded_a = expand_pd_host_function(attr_a, item_a)
+            .expect("async with an external crate path should expand")
+            .to_string();
+        for needle in [
+            "vm :: CaptureAsyncHostContext",
+            "vm :: IntoHostCallOutcome",
+            "vm :: HostFutureOutput",
+            "vm :: CallOutcome",
+            "vm :: VmError",
+            "submit_host_future",
+        ] {
+            assert!(
+                expanded_a.contains(needle),
+                "missing {needle} in: {expanded_a}"
+            );
+        }
+        assert!(
+            !expanded_a.contains("super :: super"),
+            "external async expansion must not emit internal super::super paths: {expanded_a}"
+        );
+
+        // Path B: a `HostFutureOutput<T>` return maps through `return_one`.
+        let attr_b: Punctuated<Meta, Token![,]> =
+            parse_quote!(name = "demo::completion", crate = "vm");
+        let item_b: ItemFn = parse_quote!(
+            /// Completes an owned async operation hosted by the external crate.
+            async fn completion(value: i64) -> VmResult<HostFutureOutput<i64>> {
+                let _ = value;
+                todo!()
+            }
+        );
+        let expanded_b = expand_pd_host_function(attr_b, item_b)
+            .expect("external async HostFutureOutput return should expand")
+            .to_string();
+        assert!(
+            expanded_b.contains("vm :: return_one"),
+            "missing vm :: return_one in: {expanded_b}"
+        );
+        assert!(
+            !expanded_b.contains("super :: super"),
+            "external async HostFutureOutput expansion must not use internal paths: {expanded_b}"
+        );
     }
 
     #[test]
@@ -1533,5 +1589,43 @@ mod tests {
             !expanded.contains("super :: super"),
             "external expansion must not emit internal super::super paths: {expanded}"
         );
+    }
+
+    #[test]
+    fn crate_identifier_is_validated_and_invalid_names_fail_structured() {
+        // A valid plain identifier (including an underscore) expands; block
+        // structure is covered by `external_crate_path_emits_absolute_*`.
+        let valid_attr: Punctuated<Meta, Token![,]> =
+            parse_quote!(name = "demo::read", crate = "pd_vm");
+        let valid_item: ItemFn = parse_quote!(
+            /// Reads a counter resource.
+            fn read(vm: &mut Vm, handle: i64) -> VmResult<i64> {
+                todo!()
+            }
+        );
+        assert!(
+            expand_pd_host_function(valid_attr, valid_item).is_ok(),
+            "a plain crate identifier must be accepted"
+        );
+
+        // Every invalid value produces a structured compile error — never a
+        // proc-macro panic: hyphens, path segments, dots, spaces and empty
+        // strings are all rejected as a single Rust identifier.
+        for invalid in ["my-crate", "vm::inner", "some.path", "", "with space"] {
+            let attr: Punctuated<Meta, Token![,]> =
+                parse_quote!(name = "demo::read", crate = #invalid);
+            let item: ItemFn = parse_quote!(
+                /// Reads a counter resource.
+                fn read(vm: &mut Vm, handle: i64) -> VmResult<i64> {
+                    todo!()
+                }
+            );
+            let error = expand_pd_host_function(attr, item)
+                .expect_err("invalid crate identifiers must be rejected");
+            assert!(
+                error.to_string().contains("invalid crate identifier"),
+                "expected a structured crate-identifier error for {invalid:?}, got: {error}"
+            );
+        }
     }
 }

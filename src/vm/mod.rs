@@ -860,10 +860,16 @@ impl Vm {
     /// register / install lifecycle.
     ///
     /// [`HostExtension::register`] runs against the standard host-function
-    /// registry (builtin defaults plus the extension's exact functions), that
-    /// registry is bound with
-    /// [`HostFunctionRegistry::bind_vm_cached`], and only then does
-    /// [`HostExtension::install`] install persistent per-VM module state.
+    /// registry (builtin defaults plus the extension's exact functions) and
+    /// that registry is bound with
+    /// [`HostFunctionRegistry::bind_vm_cached`]. Both are fallible; then the
+    /// now-infallible [`HostExtension::install`] installs persistent per-VM
+    /// module state. Because every fallible step runs before `install`, the
+    /// call is **transactional**: on any registration or binding failure the
+    /// VM is left exactly as it was — unbound and with no module state — so a
+    /// corrected `install_extension` can be retried on the same VM. A
+    /// successful call fully binds the VM and installs its module state.
+    ///
     /// Because `bind_vm_cached` requires an unbound VM, call this before the
     /// first `run` (and before any other registry binding); controls needing a
     /// restricted/capability-granted registry should instead call
@@ -872,7 +878,7 @@ impl Vm {
         let mut registry = HostFunctionRegistry::new();
         extension.register(&mut registry)?;
         registry.bind_vm_cached(self)?;
-        extension.install(self)?;
+        extension.install(self);
         Ok(())
     }
 
