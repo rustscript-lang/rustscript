@@ -53,9 +53,11 @@ use super::operation::reason::OperationCancelReason;
 use super::operation::registry::OperationRegistry;
 use super::resource::close::HostResource;
 use super::resource::error::ResourceError;
-use super::resource::handle::Resource;
+use super::resource::handle::{Resource, ResourceHandle};
 use super::resource::reason::ResourceCloseReason;
-use super::resource::table::ResourceTable;
+use super::resource::table::{
+    GuestReleaseOutcome, OwnershipRelease, ResourceOwnership, ResourceTable,
+};
 
 /// Result alias used by the execution-scope surface.
 pub type ExecutionScopeResult<T> = Result<T, ExecutionScopeError>;
@@ -263,6 +265,84 @@ impl ExecutionScope {
         self.operations
             .start(spec)
             .map_err(ExecutionScopeError::Operation)
+    }
+
+    /// Marks an open, host-owned resource as guest-owned (ownership transfer
+    /// from the host to the guest script). This is the exact-host-return
+    /// ownership transfer point: it succeeds only for a resource that is open,
+    /// host-owned, and in *this* scope's table; every rejection is a
+    /// structured, atomic `ResourceError` (no state mutated on failure).
+    ///
+    /// The scope is not required to be Active: a mark is a pure ownership
+    /// bookkeeping transition on a live resource and must remain possible
+    /// while the VM is executing (the scope stays Active during a run).
+    pub fn mark_resource_guest_owned(
+        &mut self,
+        handle: ResourceHandle,
+    ) -> ExecutionScopeResult<()> {
+        self.resources
+            .mark_guest_owned(handle)
+            .map_err(ExecutionScopeError::Resource)
+    }
+
+    /// Releases the guest owner of one resource, launching its close exactly
+    /// once with the release's reason.
+    ///
+    /// - `Ok(GuestReleaseOutcome::Released(progress))` — the resource was
+    ///   guest-owned and open; `begin_close` fired exactly once with
+    ///   `progress` (`Pending` means the close is now driven by the usual
+    ///   scope poll machinery).
+    /// - `Ok(GuestReleaseOutcome::NotGuestOwned)` — idempotent no-op (never
+    ///   guest-owned, already released/closing, taken, stale, or foreign).
+    /// - `Err(ResourceError)` — the close launch itself failed (e.g. live
+    ///   children); the resource stays guest-owned and open, and the error is
+    ///   returned so the caller can record it in the scope error latch.
+    ///
+    /// The scope is not required to be Active: a release is the guest-side
+    /// teardown of a local's death and can occur while the VM is executing.
+    pub fn release_guest_owner(
+        &mut self,
+        handle: ResourceHandle,
+        release: OwnershipRelease,
+    ) -> ExecutionScopeResult<GuestReleaseOutcome> {
+        self.resources
+            .release_guest_owner(handle, release)
+            .map_err(ExecutionScopeError::Resource)
+    }
+
+    /// The current [`ResourceOwnership`] of the slot `handle` names, or
+    /// `None` when the handle is foreign or stale (names no live slot here).
+    pub fn resource_ownership(&self, handle: ResourceHandle) -> Option<ResourceOwnership> {
+        self.resources.ownership(handle)
+    }
+
+    /// Atomically takes the concrete guest-owned resource out of the table,
+    /// transferring ownership to the caller. See
+    /// [`ResourceTable::take_owned`] for the exact validation contract.
+    pub fn take_resource<T: HostResource>(
+        &mut self,
+        handle: ResourceHandle,
+    ) -> ExecutionScopeResult<T> {
+        self.resources
+            .take_owned::<T>(handle)
+            .map_err(ExecutionScopeError::Resource)
+    }
+
+    /// Records a best-effort guest-release failure in the scope's first-error
+    /// latch (first-error-wins, host-agnostic). Used by the VM when a local's
+    /// ownership release hits a synchronous close error: the failure is
+    /// preserved so the terminal scope outcome reports it, while the current
+    /// execution continues without panicking.
+    pub fn record_guest_release_error(&mut self, error: ResourceError) {
+        self.first_error
+            .get_or_insert(ScopeCloseError::Resource(error));
+    }
+
+    /// The first cleanup failure recorded so far, if any. A close-failure
+    /// latch does not require the scope to be closing: a guest release error
+    /// can be recorded mid-run and is surfaced at the terminal outcome.
+    pub fn first_error(&self) -> Option<&ScopeCloseError> {
+        self.first_error.as_ref()
     }
 
     /// Begins scope shutdown: **Active → Closing**, sealing new inserts.

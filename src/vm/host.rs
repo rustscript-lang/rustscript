@@ -2059,6 +2059,12 @@ impl Vm {
                         return Err(error);
                     }
                 };
+                // Exact `Resource` returns transfer ownership: the returned
+                // handle's table entry moves HostOwned -> GuestOwned here,
+                // before any stack mutation. A structurally valid handle that
+                // is foreign/stale/already-guest/taken/closing is a structured
+                // error that leaves the pre-call stack untouched.
+                self.transfer_exact_host_return_ownership(&values, exact_policy)?;
                 saved_stack.truncate(arg_start);
                 saved_stack.append(&mut host_stack);
                 values.push_onto_stack(&mut saved_stack);
@@ -2139,6 +2145,7 @@ impl Vm {
         self.instance.call_depth = self.instance.call_depth.saturating_sub(1);
         let value = require_non_yielding_host_value(outcome?)?;
         let value = validate_exact_host_return_value(value, exact_policy, expected_return_type)?;
+        self.transfer_exact_host_return_ownership_value(&value, exact_policy)?;
         self.instance.stack.truncate(arg_start);
         self.instance.stack.push(value);
         Ok(HostCallExecOutcome::Returned)
@@ -2183,6 +2190,7 @@ impl Vm {
             let value = require_non_yielding_host_value(outcome)?;
             let value =
                 validate_exact_host_return_value(value, exact_policy, expected_return_type)?;
+            self.transfer_exact_host_return_ownership_value(&value, exact_policy)?;
             self.instance.stack.truncate(arg_start);
             self.instance.stack.push(value);
             return Ok(HostCallExecOutcome::Returned);
@@ -2193,6 +2201,7 @@ impl Vm {
                 // Validate BEFORE truncating the call operands or pushing; a
                 // bad return must leave the stack at its pre-call snapshot.
                 let values = validate_exact_host_return_values(values, exact_policy)?;
+                self.transfer_exact_host_return_ownership(&values, exact_policy)?;
                 self.instance.stack.truncate(arg_start);
                 values.push_onto_stack(&mut self.instance.stack);
                 Ok(HostCallExecOutcome::Returned)
@@ -2263,6 +2272,7 @@ impl Vm {
                 // Validate BEFORE truncating the call operands or pushing; a
                 // bad return must leave the stack at its pre-call snapshot.
                 let values = validate_exact_host_return_values(values, exact_policy)?;
+                self.transfer_exact_host_return_ownership(&values, exact_policy)?;
                 self.instance.stack.truncate(arg_start);
                 values.push_onto_stack(&mut self.instance.stack);
                 Ok(HostCallExecOutcome::Returned)
@@ -2459,9 +2469,79 @@ impl Vm {
                 return Err(error);
             }
         };
+        // Exact `Resource` async completions transfer ownership the same way
+        // a synchronous return does: the handle's table entry moves
+        // HostOwned -> GuestOwned before any stack mutation. A structurally
+        // valid handle that is foreign/stale/already-guest/taken/closing is a
+        // structured error that terminates the waiting op and leaves the
+        // stack untouched.
+        if let Err(error) = self.transfer_exact_host_return_ownership(&values, waiting.exact_policy)
+        {
+            self.instance.waiting_host_op = None;
+            return Err(error);
+        }
         self.instance.waiting_host_op = None;
         values.push_onto_stack(&mut self.instance.stack);
         Ok(())
+    }
+
+    // ---- exact host-return ownership transfer (C2-C1) ----------------------
+
+    /// Transfers ownership of a validated exact `Resource` host return from
+    /// HostOwned to GuestOwned in the current execution scope, before any
+    /// stack mutation.
+    ///
+    /// Only the `Resource` policy transfers; `Legacy` and `NestedResource`
+    /// keep their prior behavior (NestedResource is already rejected by
+    /// validation, so this is a no-op there). A structurally valid handle
+    /// that fails the mark (foreign arena, stale generation, already taken,
+    /// closing/closed, or already guest-owned) is a structured `VmError` —
+    /// the caller keeps the pre-call stack snapshot, exactly like a
+    /// validation failure.
+    fn transfer_exact_host_return_ownership(
+        &mut self,
+        values: &CallReturn,
+        policy: ExactHostReturnPolicy,
+    ) -> VmResult<()> {
+        if policy != ExactHostReturnPolicy::Resource {
+            return Ok(());
+        }
+        let Some(value) = values.as_slice().first() else {
+            return Ok(());
+        };
+        self.transfer_exact_host_return_ownership_value(value, policy)
+    }
+
+    /// Single-value variant of
+    /// [`transfer_exact_host_return_ownership`](Self::transfer_exact_host_return_ownership).
+    fn transfer_exact_host_return_ownership_value(
+        &mut self,
+        value: &Value,
+        policy: ExactHostReturnPolicy,
+    ) -> VmResult<()> {
+        if policy != ExactHostReturnPolicy::Resource {
+            return Ok(());
+        }
+        let handle = match ResourceHandle::from_value(value) {
+            Ok(handle) => handle,
+            // The value was already validated as a structurally valid handle
+            // by `validate_exact_host_return_*`; a decode failure here is a
+            // defensive inconsistency, not a runtime condition.
+            Err(_) => return Ok(()),
+        };
+        match self.host.execution_scope_mark_guest_owned(handle) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(match error {
+                crate::vm::execution_scope::ExecutionScopeError::Resource(error) => {
+                    VmError::HostError(format!(
+                        "exact host return resource ownership transfer failed: {error}"
+                    ))
+                }
+                other => VmError::HostError(format!(
+                    "exact host return resource ownership transfer failed: {other}"
+                )),
+            }),
+        }
     }
 
     pub(super) fn install_resolved_calls(&mut self, resolved_calls: Vec<u16>) -> VmResult<()> {

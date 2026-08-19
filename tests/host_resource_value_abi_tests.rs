@@ -23,7 +23,8 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use vm::compiler::{CompileSourceFileOptions, SourceFlavor, TypeSchema};
 use vm::resource::{
-    CloseProgress, HostResource, ResourceCloseReason, ResourceResult, ResourceTable,
+    CloseProgress, HostResource, ResourceCloseReason, ResourceOwnership, ResourceResult,
+    ResourceTable,
 };
 use vm::{
     BytecodeBuilder, CallOutcome, CallReturn, HostApiBuilder, HostArgsFunction, HostFunction,
@@ -125,33 +126,46 @@ fn compiled_ping_import() -> vm::HostImport {
     import
 }
 
+/// Pushes one real resource into the VM's execution scope and returns the raw
+/// handle token as an `i64` `Value` carrier. The ownership transfer now
+/// requires the handle to belong to the *current* scope's table.
+fn vm_scope_handle_value(vm: &mut Vm) -> i64 {
+    let token = vm
+        .host_context()
+        .push_resource(DummyResource)
+        .expect("push into active scope");
+    let handle: ResourceHandle = token.handle();
+    let raw = handle.raw();
+    // `raw` must decode back through the structural validator.
+    assert_eq!(
+        ResourceHandle::from_raw(raw).expect("real handle must be structurally valid"),
+        handle
+    );
+    raw as i64
+}
+
+/// Dynamic host that pushes a fresh `DummyResource` into the caller's scope
+/// and returns its raw handle (exact `Resource` return).
+struct VmScopeHandleHost;
+
+impl HostFunction for VmScopeHandleHost {
+    fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> vm::VmResult<CallOutcome> {
+        let handle = vm_scope_handle_value(vm);
+        Ok(CallOutcome::Return(CallReturn::One(Value::Int(handle))))
+    }
+}
+
 // ---- per-scenario static-args host fns ------------------------------------
 //
 // Each scenario gets its own static + fn so parallel tests never race on a
 // shared cell. All return `Value::Int`, letting the same exact non-yielding
 // static-args path serve both valid-handle and plain-Int returns.
 
-static ACCEPT_RETURN: AtomicI64 = AtomicI64::new(i64::MIN);
-fn static_accept_return(args: &[Value]) -> vm::VmResult<CallOutcome> {
-    let _ = args;
-    Ok(CallOutcome::Return(CallReturn::One(Value::Int(
-        ACCEPT_RETURN.load(Ordering::SeqCst),
-    ))))
-}
-
 static REJECT_RETURN: AtomicI64 = AtomicI64::new(0);
 fn static_reject_return(args: &[Value]) -> vm::VmResult<CallOutcome> {
     let _ = args;
     Ok(CallOutcome::Return(CallReturn::One(Value::Int(
         REJECT_RETURN.load(Ordering::SeqCst),
-    ))))
-}
-
-static LOOP_RETURN: AtomicI64 = AtomicI64::new(i64::MIN);
-fn static_loop_return(args: &[Value]) -> vm::VmResult<CallOutcome> {
-    let _ = args;
-    Ok(CallOutcome::Return(CallReturn::One(Value::Int(
-        LOOP_RETURN.load(Ordering::SeqCst),
     ))))
 }
 
@@ -271,22 +285,33 @@ fn callable_arg_plain_int_rejected_by_resource_schema() {
 
 // ---- 2. interpreter exact resource host return ----------------------------
 
-/// Exact `Resource` return with a structurally valid handle carrier: the
-/// value is validated *before* it is pushed and lands on the stack.
+/// Exact `Resource` return with a real handle: the value is validated *before*
+/// it is pushed and lands on the stack, and ownership transfers to the guest.
 #[test]
 fn exact_resource_host_return_accepts_valid_handle() {
     let compiled = compile_catalog_program("let r = acme::ping(7); r;\n");
-    let handle = real_handle_value();
-    let mut vm = bind_ping_static_non_yielding_factory(
-        compiled.program,
-        &ACCEPT_RETURN,
-        handle,
-        static_accept_return,
-    )
-    .expect("bind");
+    let import = compiled_ping_import();
+    let schema = import.schema.clone().expect("exact schema");
+    let mut registry = HostFunctionRegistry::new();
+    registry
+        .register_exact(&import.name, 1, schema, || Box::new(VmScopeHandleHost))
+        .expect("register exact dynamic");
+    let mut vm = Vm::new(compiled.program);
+    registry.bind_vm_cached(&mut vm).expect("bind");
     let status = run_vm(&mut vm).expect("valid handle return should run");
     assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(handle)]);
+    assert_eq!(vm.stack().len(), 1, "one handle returned");
+    let Value::Int(handle) = vm.stack()[0] else {
+        panic!("handle carrier must be an Int");
+    };
+    assert_eq!(
+        vm.host_context()
+            .execution_scope()
+            .resources()
+            .ownership(ResourceHandle::from_raw(handle as u64).expect("valid handle")),
+        Some(ResourceOwnership::GuestOwned),
+        "exact host return must transfer ownership to the guest"
+    );
 }
 
 /// Exact `Resource` return whose host produces an arbitrary Int (zero,
@@ -488,7 +513,6 @@ fn resource_import_is_not_native_eligible_and_trace_exits() {
     bc.brfalse(root);
     bc.ret();
 
-    let handle = real_handle_value();
     let imported = compiled_ping_import();
     let schema = imported.schema.clone().expect("exact schema");
     let program = Program::with_imports_and_debug(
@@ -504,11 +528,11 @@ fn resource_import_is_not_native_eligible_and_trace_exits() {
     )
     .with_local_count(1);
 
-    LOOP_RETURN.store(handle, Ordering::SeqCst);
     let mut registry = HostFunctionRegistry::new();
+    let import_name = imported.name.clone();
     registry
-        .register_exact_static_non_yielding_args(&imported.name, 1, schema, static_loop_return)
-        .expect("register resource exact non-yielding");
+        .register_exact(&import_name, 1, schema, || Box::new(VmScopeHandleHost))
+        .expect("register resource exact dynamic");
     let mut vm = Vm::new(program);
     registry.bind_vm_cached(&mut vm).expect("bind");
     vm.set_jit_config(JitConfig {
@@ -649,7 +673,7 @@ fn exact_resource_args_dynamic_pending_completion_accepts_valid_handle() {
         "pending args-only call consumes args"
     );
 
-    let handle = real_handle_value();
+    let handle = vm_scope_handle_value(&mut vm);
     vm.complete_host_op(op_id, vec![Value::Int(handle)])
         .expect("valid handle completion should succeed");
     assert_eq!(
@@ -972,7 +996,7 @@ fn exact_resource_dynamic_pending_completion_accepts_valid_handle() {
     assert_eq!(status, VmStatus::Waiting(op_id));
     assert!(vm.stack().is_empty());
 
-    let handle = real_handle_value();
+    let handle = vm_scope_handle_value(&mut vm);
     vm.complete_host_op(op_id, vec![Value::Int(handle)])
         .expect("valid handle completion should succeed");
     let resumed = vm.resume().expect("resume should halt");
@@ -1082,7 +1106,7 @@ fn exact_resource_stack_dynamic_pending_completion_validates_handle() {
 
     let status = vm.run().expect("first run should wait on host op");
     assert_eq!(status, VmStatus::Waiting(op_id2));
-    let handle = real_handle_value();
+    let handle = vm_scope_handle_value(&mut vm);
     vm.complete_host_op(op_id2, vec![Value::Int(handle)])
         .expect("valid handle completion should succeed");
     let resumed = vm.resume().expect("resume should halt");
@@ -1159,15 +1183,18 @@ fn exact_resource_args_dynamic_immediate_bad_return_keeps_stack_snapshot() {
 /// ArgsDynamic immediate valid handle return: validated and pushed.
 #[test]
 fn exact_resource_args_dynamic_immediate_valid_handle_pushed() {
-    let handle = real_handle_value();
-    let mut vm = bind_ping_exact_args(pending_resource_call_program(), move || {
-        Box::new(ImmediateArgsHost { returned: handle })
-    })
-    .expect("bind");
+    let import = compiled_ping_import();
+    let schema = import.schema.clone().expect("exact schema");
+    let mut registry = HostFunctionRegistry::new();
+    registry
+        .register_exact(&import.name, 1, schema, || Box::new(VmScopeHandleHost))
+        .expect("register exact dynamic");
+    let mut vm = Vm::new(pending_resource_call_program());
+    registry.bind_vm_cached(&mut vm).expect("bind");
 
     let status = vm.run().expect("valid handle immediate return should run");
     assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(handle)]);
+    assert_eq!(vm.stack().len(), 1, "one handle returned");
 }
 
 /// StackDynamic immediate bad resource return: same no-truncate-before-validate
@@ -1202,21 +1229,18 @@ fn exact_resource_stack_dynamic_immediate_bad_return_keeps_stack_snapshot() {
 /// StackDynamic immediate valid handle return: validated and pushed.
 #[test]
 fn exact_resource_stack_dynamic_immediate_valid_handle_pushed() {
-    let handle = real_handle_value();
     let import = compiled_ping_import();
     let schema = import.schema.clone().expect("exact schema");
     let mut registry = HostFunctionRegistry::new();
     registry
-        .register_exact_stack(&import.name, 1, schema, move || {
-            Box::new(ImmediateStackHost { returned: handle })
-        })
-        .expect("register exact stack");
+        .register_exact(&import.name, 1, schema, || Box::new(VmScopeHandleHost))
+        .expect("register exact dynamic");
     let mut vm = Vm::new(pending_resource_call_program());
     registry.bind_vm_cached(&mut vm).expect("bind");
 
     let status = vm.run().expect("valid handle stack return should run");
     assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(handle)]);
+    assert_eq!(vm.stack().len(), 1, "one handle returned");
 }
 
 /// Dynamic (from-stack) immediate bad resource return: validation failure

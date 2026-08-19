@@ -56,8 +56,12 @@ use self::host_runtime::HostRuntime;
 use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable};
 pub use self::invocation::{Invocation, InvocationError, InvocationItem, InvocationPoll};
 use self::resource::ResourceCloseReason;
-pub use self::resource::{CloseProgress, HostResource, Resource, ResourceHandle, ResourceTable};
+pub use self::resource::{
+    CloseProgress, GuestReleaseOutcome, HostResource, OwnershipRelease, Resource, ResourceError,
+    ResourceHandle, ResourceTable,
+};
 use self::run_context::{InterruptMode, RunContext};
+pub use crate::builtins::BuiltinFunction;
 pub use crate::builtins::runtime::cancellation::CancellationReason;
 
 pub use crate::bytecode::{
@@ -1163,6 +1167,18 @@ impl Vm {
             .map_err(VmResetError::ScopeNotQuiescent)?;
         drop(old_scope);
         self.run_ctx.reset_for_reuse();
+        // Guest-owned release of every owned local still holding a live
+        // handle (an aborted / never-halted run): the release is an idempotent
+        // no-op for already-released locals and launches exactly-once closes
+        // for any that survived without a frame-exit/Halt.
+        let base = self.active_local_base();
+        let count = self
+            .instance
+            .execution_frames
+            .last()
+            .map(|frame| frame.local_count)
+            .unwrap_or(self.program.local_count);
+        self.release_owned_locals_range(base, count);
         self.instance.reset(&self.program);
         self.engine.reset_runtime_state(&self.program);
         self.reset_state = VmResetState::Ready;
@@ -1506,6 +1522,17 @@ impl Drop for Vm {
             crate::builtins::runtime::cancellation::CancellationReason::VmReset,
         );
         self.cancel_callable_stream();
+        // Guest-owned release before the interpreter values are dropped: a
+        // `Vm` being dropped without a prior halt/reset/shutdown still owes
+        // exactly-once closes for any guest-owned local handles.
+        let base = self.active_local_base();
+        let count = self
+            .instance
+            .execution_frames
+            .last()
+            .map(|frame| frame.local_count)
+            .unwrap_or(self.program.local_count);
+        self.release_owned_locals_range(base, count);
         self.host.reset_for_reuse();
         self.instance.drop_cleanup();
     }
@@ -1903,6 +1930,11 @@ impl Vm {
         }
         if matches!(frame.continuation, FrameContinuation::Halt) {
             self.instance.call_depth = self.script_frame_depth();
+            // Root Halt: the program finished; release every guest-owned
+            // local of the root frame before the VM returns to the host (the
+            // root locals stay in `instance.locals` for host inspection, but
+            // their guest-owned resources die with the program).
+            self.release_owned_locals_range(frame.local_base, frame.local_count);
             return Ok(ExecOutcome::Halted);
         }
 
@@ -1923,6 +1955,12 @@ impl Vm {
             self.drop_value_with_contract(value);
         }
         self.instance.call_depth = self.script_frame_depth();
+
+        // Guest-owned release of every owned local in the exiting frame
+        // (script function return / `ReturnToHost` completion). The release
+        // runs BEFORE the locals are drained, so a `Pending` close stays in
+        // the table's `Closing` state and the scope poll machinery drives it.
+        self.release_owned_locals_range(frame.local_base, frame.local_count);
 
         if frame.prototype_id.is_some() {
             let frame_end = frame.local_base.saturating_add(frame.local_count);
@@ -2005,6 +2043,212 @@ impl Vm {
     pub(super) fn drop_value_with_contract(&mut self, value: Value) {
         if self.instance.drop_contract_events_enabled {
             self.count_value_drop_contract(&value);
+        }
+    }
+
+    // ---- guest-owned local release (C2-C1) ---------------------------------
+
+    /// Whether this program has any resource-containing local slot. When true,
+    /// the VM must never let a native backend bypass the interpreter's
+    /// ownership release (Stloc overwrite / Drop / frame exit): JIT tracing
+    /// and AOT native lowering are disabled for the whole run.
+    pub(super) fn program_has_owned_locals(&self) -> bool {
+        self.program.owned_local_slots().iter().any(|owned| *owned)
+    }
+
+    /// Releases every guest-owned resource reachable from one local slot by
+    /// walking the slot's runtime `Value` against the program's exact local
+    /// schema. Non-resource locals (and `schema:None` legacy programs) do
+    /// nothing, exactly like the pre-ownership VM.
+    ///
+    /// - The walk is schema-driven: a handle is only released when the schema
+    ///   says the current position contains a resource, so plain `Int`s are
+    ///   never mistaken for handles and malformed runtime shapes are skipped.
+    /// - Each handle is released at most once per walk (same-handle alias
+    ///   dedup via a `HashSet`), and cycle/depth protection bounds recursion.
+    /// - `Pending` closes are left in the table's `Closing` state; the scope
+    ///   poll machinery drives them later. Synchronous close failures are
+    ///   recorded in the scope's first-error latch (never panicked from a
+    ///   frame unwind).
+    fn release_owned_local(&mut self, local_base: usize, relative: usize) {
+        let owned = self
+            .program
+            .owned_local_slots()
+            .get(relative)
+            .copied()
+            .unwrap_or(false);
+        if !owned {
+            return;
+        }
+        let Some(absolute) = local_base.checked_add(relative) else {
+            return;
+        };
+        let Some(schema) = self
+            .program
+            .type_map
+            .as_ref()
+            .and_then(|type_map| type_map.local_schemas.get(relative))
+            .and_then(|schema| schema.as_ref())
+            .cloned()
+        else {
+            return;
+        };
+        let value = self
+            .instance
+            .locals
+            .get(absolute)
+            .cloned()
+            .unwrap_or(Value::Null);
+        if self.host.execution_scope().resources().is_empty() {
+            return;
+        }
+        let mut seen = HashSet::new();
+        let mut depth = 0usize;
+        self.release_owned_value(&schema, &value, &mut seen, &mut depth);
+    }
+
+    /// Schema-driven recursive release walk over one runtime `Value`.
+    fn release_owned_value(
+        &mut self,
+        schema: &crate::compiler::TypeSchema,
+        value: &Value,
+        seen: &mut HashSet<u64>,
+        depth: &mut usize,
+    ) {
+        const MAX_RELEASE_DEPTH: usize = 256;
+        if *depth >= MAX_RELEASE_DEPTH {
+            return;
+        }
+        *depth += 1;
+        let result = self.release_owned_value_inner(schema, value, seen, depth);
+        *depth -= 1;
+        let _ = result;
+    }
+
+    fn release_owned_value_inner(
+        &mut self,
+        schema: &crate::compiler::TypeSchema,
+        value: &Value,
+        seen: &mut HashSet<u64>,
+        depth: &mut usize,
+    ) {
+        use crate::compiler::TypeSchema;
+        match schema {
+            TypeSchema::Resource(_) => {
+                let Ok(handle) = ResourceHandle::from_value(value) else {
+                    return;
+                };
+                if !seen.insert(handle.raw()) {
+                    return;
+                }
+                let release = OwnershipRelease::close();
+                match self
+                    .host
+                    .execution_scope_release_guest_owner(handle, release)
+                {
+                    Ok(GuestReleaseOutcome::Released(_)) => {}
+                    Ok(GuestReleaseOutcome::NotGuestOwned) => {}
+                    Err(crate::vm::execution_scope::ExecutionScopeError::Resource(error)) => {
+                        self.host.execution_scope_record_release_error(error);
+                    }
+                    Err(other) => {
+                        // Defensive: a non-resource scope error during a
+                        // release is treated as a recorded first-error so it
+                        // is never silently dropped.
+                        let error = ResourceError::new(
+                            crate::vm::resource::ResourceErrorCode::ResourceCleanupFailed,
+                            "vm::release_owned_local",
+                            format!("guest ownership release failed: {other}"),
+                        );
+                        self.host.execution_scope_record_release_error(error);
+                    }
+                }
+            }
+            TypeSchema::Optional(inner) => {
+                if !matches!(value, Value::Null) {
+                    self.release_owned_value(inner, value, seen, depth);
+                }
+            }
+            TypeSchema::Array(item) | TypeSchema::ArrayTupleRest { rest: item, .. } => {
+                if let Value::Array(items) = value {
+                    for item_value in items.iter() {
+                        self.release_owned_value(item, item_value, seen, depth);
+                    }
+                }
+            }
+            TypeSchema::ArrayTuple(items) => {
+                if let Value::Array(values) = value {
+                    for (item_schema, item_value) in items.iter().zip(values.iter()) {
+                        self.release_owned_value(item_schema, item_value, seen, depth);
+                    }
+                }
+            }
+            TypeSchema::Map(item) => {
+                if let Value::Map(entries) = value {
+                    for (_, map_value) in entries.iter() {
+                        self.release_owned_value(item, map_value, seen, depth);
+                    }
+                }
+            }
+            TypeSchema::Object(fields) => {
+                if let Value::Map(entries) = value {
+                    for (key, map_value) in entries.iter() {
+                        let Value::String(key) = key else {
+                            continue;
+                        };
+                        if let Some(field_schema) = fields.get(key.as_str()) {
+                            self.release_owned_value(field_schema, map_value, seen, depth);
+                        }
+                    }
+                }
+            }
+            TypeSchema::Named(_, type_args) => {
+                // Named (struct-like) schemas carry positional type args; the
+                // runtime representation is a Map. Match by position against
+                // the sorted field order when the map keys are strings.
+                if let Value::Map(entries) = value {
+                    let mut entries = entries
+                        .iter()
+                        .filter_map(|(key, map_value)| {
+                            let Value::String(key) = key else {
+                                return None;
+                            };
+                            Some((key.clone(), map_value))
+                        })
+                        .collect::<Vec<_>>();
+                    entries.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+                    for (arg_schema, (_, map_value)) in type_args.iter().zip(entries.iter()) {
+                        self.release_owned_value(arg_schema, map_value, seen, depth);
+                    }
+                }
+            }
+            // Plain scalars, callables, and unknown/generic schemas never
+            // release anything (a resource can only appear where the schema
+            // names one).
+            TypeSchema::Unknown
+            | TypeSchema::Null
+            | TypeSchema::Int
+            | TypeSchema::Float
+            | TypeSchema::Number
+            | TypeSchema::Bool
+            | TypeSchema::String
+            | TypeSchema::Bytes
+            | TypeSchema::GenericParam(_)
+            | TypeSchema::Callable { .. } => {}
+        }
+    }
+
+    /// Release walk over every owned local of one frame's slot range. Used by
+    /// frame exit / root Halt / abort paths before the slots are drained.
+    fn release_owned_locals_range(&mut self, local_base: usize, local_count: usize) {
+        if !self.program_has_owned_locals() {
+            return;
+        }
+        let owned = self.program.owned_local_slots().to_vec();
+        for relative in 0..local_count {
+            if owned.get(relative).copied().unwrap_or(false) {
+                self.release_owned_local(local_base, relative);
+            }
         }
     }
 
@@ -2419,6 +2663,20 @@ impl Vm {
         index: u8,
         value: Value,
     ) -> VmResult<()> {
+        // Guest-owned release of the overwritten value (Stloc overwrite /
+        // liveness-scheduled Drop both land here). The same-local collection
+        // rebind (`files = push(files, r)` lowers to `ldc Null; stloc files;
+        // call Set; stloc files`) temporarily nulls the slot while the
+        // collection Arc is still live on the stack: the walker must skip
+        // that null-store so the rebind never double-releases the handles
+        // that stay inside the still-live collection.
+        if matches!(value, Value::Null) && self.is_same_local_collection_rebind(absolute) {
+            // The old value stays alive on the stack; no release.
+        } else {
+            let base = self.active_local_base();
+            let relative = absolute.saturating_sub(base);
+            self.release_owned_local(base, relative);
+        }
         if self.instance.capture_cells.is_empty() {
             let slot = self
                 .instance
@@ -2430,6 +2688,50 @@ impl Vm {
             return Ok(());
         }
         self.store_local_with_captures(absolute, index, value)
+    }
+
+    /// Detects the codegen same-local collection rebind pattern:
+    /// `ldc Null; stloc S; call <Set|ArrayPush>; stloc S` — the bytecode at
+    /// `self.instance.ip` is the `Call` and the `Stloc` that follows it
+    /// (Call occupies `[opcode][u16 index][u8 argc]`, so the trailing Stloc
+    /// is at `ip + 4`) retargets the same absolute slot. When true, the
+    /// just-nulled slot's previous value is still the live container on the
+    /// stack and must not be released.
+    fn is_same_local_collection_rebind(&self, absolute: usize) -> bool {
+        let code = &self.program.code;
+        let Some(&call_opcode) = code.get(self.instance.ip) else {
+            return false;
+        };
+        if call_opcode != OpCode::Call as u8 {
+            return false;
+        }
+        let Some(index_bytes) = code.get(self.instance.ip + 1..self.instance.ip + 3) else {
+            return false;
+        };
+        let call_index = u16::from_le_bytes([index_bytes[0], index_bytes[1]]);
+        let is_collection_mutation = matches!(
+            BuiltinFunction::from_call_index(call_index),
+            Some(BuiltinFunction::Set | BuiltinFunction::ArrayPush)
+        );
+        if !is_collection_mutation {
+            return false;
+        }
+        // The Call operand is (u16 index, u8 argc) — four bytes in total —
+        // so the following Stloc's opcode sits at ip + 4 and its operand at
+        // ip + 5; the operand must name the same absolute local.
+        let Some(&stloc_opcode) = code.get(self.instance.ip + 4) else {
+            return false;
+        };
+        if stloc_opcode != OpCode::Stloc as u8 {
+            return false;
+        }
+        let Some(&target) = code.get(self.instance.ip + 5) else {
+            return false;
+        };
+        let Some(base) = self.instance.execution_frames.last().map(|f| f.local_base) else {
+            return false;
+        };
+        base + usize::from(target) == absolute
     }
 
     #[cold]
@@ -2753,6 +3055,7 @@ impl Vm {
                 && self.has_aot_program()
                 && !self.engine.aot_interpreter_boundary_hit
                 && !self.drop_contract_events_enabled()
+                && !self.program_has_owned_locals()
             {
                 let outcome = match self.execute_aot_entry() {
                     Ok(outcome) => outcome,
@@ -2793,6 +3096,7 @@ impl Vm {
                 && self.host.allow_default_host_capabilities
                 && self.host.builtin_overrides.is_empty()
                 && !self.drop_contract_events_enabled()
+                && !self.program_has_owned_locals()
                 && !self.active_frame_has_shared_capture_cells()
             {
                 let frame_key = self.active_frame_key();
@@ -3427,6 +3731,18 @@ impl Vm {
         self.clear_stack_with_drop_contract();
         self.instance.capture_cells.clear();
         self.instance.shared_capture_slots.clear();
+        // Guest-owned release of every owned local before the interpreter
+        // values are dropped (scope shutdown falls back to closing anything
+        // still guest-owned; releasing here launches each close exactly once
+        // with the ownership-release reason).
+        let base = self.active_local_base();
+        let count = self
+            .instance
+            .execution_frames
+            .last()
+            .map(|frame| frame.local_count)
+            .unwrap_or(self.program.local_count);
+        self.release_owned_locals_range(base, count);
         self.clear_locals_with_drop_contract();
         self.instance.execution_frames.clear();
         self.instance.active_local_base_cache = 0;
@@ -3540,6 +3856,9 @@ impl Vm {
                 break;
             };
             let frame_end = frame.local_base.saturating_add(frame.local_count);
+            // Guest-owned release of every owned local in the aborted frame
+            // before its slots are drained.
+            self.release_owned_locals_range(frame.local_base, frame.local_count);
             self.instance
                 .capture_cells
                 .retain(|absolute, _| *absolute < frame.local_base || *absolute >= frame_end);

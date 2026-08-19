@@ -35,7 +35,8 @@ use super::execution_scope::{ExecutionScope, ExecutionScopeError, ScopeCloseOutc
 use super::host_runtime::HostRuntime;
 use super::operation::{OperationError, OperationId, OperationSpec, OperationStatus};
 use super::resource::{
-    HostResource, Resource, ResourceCloseReason, ResourceError, ResourceHandle, ResourceRef,
+    HostResource, Resource, ResourceCloseReason, ResourceError, ResourceHandle, ResourceOwnership,
+    ResourceRef,
 };
 
 /// Marker bound for a typed chunk of per-VM host module state.
@@ -293,6 +294,34 @@ impl<'a> HostContext<'a> {
             .resources()
             .typed(handle)
             .map_err(HostContextError::from_resource)
+    }
+
+    /// Atomically takes a guest-owned resource out of the current scope,
+    /// transferring ownership of the concrete value to the caller. See
+    /// [`ExecutionScope::take_resource`] for the validation contract.
+    pub fn take_resource<T: HostResource>(
+        &mut self,
+        handle: ResourceHandle,
+    ) -> HostContextResult<T> {
+        self.host
+            .execution_scope_take_resource::<T>(handle)
+            .map_err(HostContextError::from_scope)
+    }
+
+    /// Marks an open, host-owned resource as guest-owned in the current
+    /// scope (ownership transfer from the host to the guest script). See
+    /// [`ExecutionScope::mark_resource_guest_owned`] for the atomic
+    /// validation contract.
+    pub fn mark_resource_guest_owned(&mut self, handle: ResourceHandle) -> HostContextResult<()> {
+        self.host
+            .execution_scope_mark_guest_owned(handle)
+            .map_err(HostContextError::from_scope)
+    }
+
+    /// The current ownership state of the resource `handle` names, or `None`
+    /// when the handle is foreign or stale in this scope.
+    pub fn resource_ownership(&self, handle: ResourceHandle) -> Option<ResourceOwnership> {
+        self.host.execution_scope().resources().ownership(handle)
     }
 
     /// Observes the current status of a host operation in the current scope.

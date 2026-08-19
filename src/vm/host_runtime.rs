@@ -286,6 +286,45 @@ impl HostRuntime {
         self.execution_scope.start_operation(spec)
     }
 
+    /// Marks a resource in the owned execution scope as guest-owned (exact
+    /// host-return ownership transfer). See
+    /// [`ExecutionScope::mark_resource_guest_owned`].
+    pub(crate) fn execution_scope_mark_guest_owned(
+        &mut self,
+        handle: crate::vm::resource::ResourceHandle,
+    ) -> ExecutionScopeResult<()> {
+        self.execution_scope.mark_resource_guest_owned(handle)
+    }
+
+    /// Releases the guest owner of a resource in the owned execution scope
+    /// (guest local death). See
+    /// [`ExecutionScope::release_guest_owner`].
+    pub(crate) fn execution_scope_release_guest_owner(
+        &mut self,
+        handle: crate::vm::resource::ResourceHandle,
+        release: crate::vm::resource::OwnershipRelease,
+    ) -> ExecutionScopeResult<crate::vm::resource::GuestReleaseOutcome> {
+        self.execution_scope.release_guest_owner(handle, release)
+    }
+
+    /// Records a best-effort guest-release failure in the scope's first-error
+    /// latch. See [`ExecutionScope::record_guest_release_error`].
+    pub(crate) fn execution_scope_record_release_error(
+        &mut self,
+        error: crate::vm::resource::ResourceError,
+    ) {
+        self.execution_scope.record_guest_release_error(error);
+    }
+
+    /// Atomically takes a guest-owned resource out of the owned execution
+    /// scope. See [`ExecutionScope::take_resource`].
+    pub(crate) fn execution_scope_take_resource<T: HostResource>(
+        &mut self,
+        handle: crate::vm::resource::ResourceHandle,
+    ) -> ExecutionScopeResult<T> {
+        self.execution_scope.take_resource::<T>(handle)
+    }
+
     /// Begins scope shutdown (Active → Closing, sealing new inserts).
     pub(crate) fn execution_scope_begin_close(
         &mut self,
