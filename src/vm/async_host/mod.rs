@@ -90,7 +90,7 @@ pub trait HostAsyncBridge: Send {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct WaitingHostOp {
     pub(super) op_id: HostOpId,
     /// Exact host-return policy captured from the *actual call-site resolved
@@ -141,7 +141,7 @@ impl Vm {
     }
 
     pub fn waiting_host_op_id(&self) -> Option<HostOpId> {
-        self.instance.waiting_host_op.map(|op| op.op_id)
+        self.instance.waiting_host_op.as_ref().map(|op| op.op_id)
     }
 
     pub fn cancel_waiting_host_op(&mut self) {
@@ -188,7 +188,7 @@ impl Vm {
         op_id: HostOpId,
         values: impl Into<CallReturn>,
     ) -> VmResult<()> {
-        let waiting = self.instance.waiting_host_op.ok_or_else(|| {
+        let waiting = self.instance.waiting_host_op.clone().ok_or_else(|| {
             VmError::HostError(format!(
                 "host op {op_id} completed but vm is not waiting on any op",
             ))
@@ -224,7 +224,7 @@ impl Vm {
     }
 
     pub fn poll_waiting_host_op(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<()>> {
-        let Some(waiting) = self.instance.waiting_host_op else {
+        let Some(waiting) = self.instance.waiting_host_op.clone() else {
             return Poll::Ready(Ok(()));
         };
         if self.host.stream_drivers.contains_key(&waiting.op_id) {

@@ -112,74 +112,373 @@ struct RegistryEntry {
     runtime_owned_pending: bool,
 }
 
-#[derive(Clone)]
-struct ResourceTakeGuardSpec {
+/// Bounding depth for recursive schema walks in the exact host-call contract.
+///
+/// Schemas deeper than this are rejected at registration time (structured
+/// `HostImportBindingError`); the call-time extraction is then guaranteed to
+/// stay well within the bound.
+const MAX_EXACT_SCHEMA_DEPTH: u8 = 64;
+
+/// One resource-passing argument occurrence in an exact manual host call.
+#[derive(Clone, Debug)]
+struct ExactResourceSpec {
+    /// Parameter / raw-argument index.
+    arg_index: usize,
     handle: ResourceHandle,
-    key: crate::host_api::ResourceTypeKey,
+    key: ResourceTypeKey,
+    mode: ResourceAccessMode,
 }
 
-struct GuardedHostFunction {
-    inner: Box<dyn HostFunction>,
-    schema: HostImportSchema,
+/// The single type-erased contract for an exact manual host call with
+/// resource-passing parameters (C1/C2/C5).
+///
+/// Every manual binding kind (dynamic / static / stack / args) funnels
+/// through [`run_guarded_host_call`], which:
+///
+/// 1. **builds** the contract from `(HostImportSchema, args)` — extracting
+///    every resource-passing occurrence (bounded recursion, depth ≤
+///    [`MAX_EXACT_SCHEMA_DEPTH`]) with its expected key and rejecting illegal
+///    same-handle aliases;
+/// 2. **validates** every occurrence against the live execution scope before
+///    the user function runs (handle structure, arena/generation, slot key,
+///    not taken, open, and for `TakeOwned` guest-owned, child-free and
+///    operation-free) — read-only, zero mutation, so a bad argument never
+///    reaches the user function;
+/// 3. **commits** after the function returns: every declared `TakeOwned`
+///    must have moved GuestOwned → Taken by *this* invocation; anything still
+///    guest-owned is safely reclaimed (close launch failures latched in the
+///    scope), a consumed `Borrow`/`BorrowMut` is a structured conflict, and
+///    the user error / panic boundary keeps taken values taken.
+#[derive(Debug)]
+struct ExactHostCallContract {
+    specs: Vec<ExactResourceSpec>,
 }
 
-struct ResourceTakeGuard {
-    specs: Vec<ResourceTakeGuardSpec>,
-}
-
-fn collect_resource_take_specs(
-    schema: &HostImportSchema,
-    args: &[Value],
-) -> VmResult<Vec<ResourceTakeGuardSpec>> {
-    let mut specs = Vec::new();
-    for (index, param) in schema.params.iter().enumerate() {
-        if param.passing != crate::host_api::HostParamPassing::TakeOwned {
-            continue;
-        }
-        if !param.schema.contains_resource() {
-            continue;
-        }
-        let key = param.schema.resource_key().cloned().ok_or_else(|| {
-            VmError::HostError(
-                "resource_take_owned_guard requires a direct resource or optional resource parameter"
-                    .to_string(),
-            )
-        })?;
-        let value = args.get(index).ok_or_else(|| {
-            VmError::HostError(format!(
-                "resource_take_owned_guard missing argument {index}"
-            ))
-        })?;
-        let handle = ResourceHandle::from_value(value)
-            .map_err(|error| VmError::HostError(format!("resource_take_owned_guard: {error}")))?;
-        specs.push(ResourceTakeGuardSpec { handle, key });
+/// Maps a catalog passing mode to the resource frame mode; `Value` is not a
+/// resource operation and returns `None`.
+fn passing_to_access_mode(passing: HostParamPassing) -> Option<ResourceAccessMode> {
+    match passing {
+        HostParamPassing::Value => None,
+        HostParamPassing::Borrow => Some(ResourceAccessMode::Borrow),
+        HostParamPassing::BorrowMut => Some(ResourceAccessMode::BorrowMut),
+        HostParamPassing::TakeOwned => Some(ResourceAccessMode::TakeOwned),
     }
-    Ok(specs)
 }
 
-impl ResourceTakeGuard {
-    fn cleanup_unconsumed(&self, vm: &mut Vm) -> Option<VmError> {
+/// The expected key of a *directly addressable* resource-passing schema.
+///
+/// Only a direct `Resource(key)` or a single `Optional<Resource(key)>` is
+/// addressable by the current handle ABI (a `Null` argument legally skips the
+/// optional). A resource nested inside an aggregate has no addressable handle
+/// and is rejected at registration, so it never reaches the call-time path.
+fn addressable_resource_key(
+    schema: &crate::compiler::TypeSchema,
+) -> Option<(ResourceTypeKey, bool)> {
+    match schema {
+        crate::compiler::TypeSchema::Resource(key) => Some((key.clone(), false)),
+        crate::compiler::TypeSchema::Optional(inner) => match inner.as_ref() {
+            crate::compiler::TypeSchema::Resource(key) => Some((key.clone(), true)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Depth-bounded recursive probe for a `TypeSchema::Resource` occurrence.
+///
+/// Guards against schema-shaped denial-of-service at registration time: any
+/// nesting deeper than [`MAX_EXACT_SCHEMA_DEPTH`] is a structured rejection
+/// (the walk exits at depth 65), so the extracted call-time contract is
+/// guaranteed to stay within the bound. All resource-bearing params are
+/// probed here once at registration; scalars return `false` without
+/// recursion.
+fn schema_walk_has_resource(
+    schema: &crate::compiler::TypeSchema,
+    depth: u8,
+) -> Result<bool, HostImportBindingError> {
+    use crate::compiler::TypeSchema;
+    if depth > MAX_EXACT_SCHEMA_DEPTH {
+        return Err(HostImportBindingError::InvalidSchema {
+            import: String::new(),
+            reason: format!(
+                "resource schema is nested deeper than depth limit {}",
+                MAX_EXACT_SCHEMA_DEPTH
+            ),
+        });
+    }
+    let probe = |child: &TypeSchema| schema_walk_has_resource(child, depth + 1);
+    Ok(match schema {
+        TypeSchema::Resource(_) => true,
+        TypeSchema::Optional(inner) => probe(inner)?,
+        TypeSchema::Named(_, type_args) => type_args
+            .iter()
+            .try_fold(false, |found, arg| Ok(found || probe(arg)?))?,
+        TypeSchema::Array(element) => probe(element)?,
+        TypeSchema::ArrayTuple(items) => items
+            .iter()
+            .try_fold(false, |found, item| Ok(found || probe(item)?))?,
+        TypeSchema::ArrayTupleRest { prefix, rest } => prefix
+            .iter()
+            .try_fold(probe(rest)?, |found, item| Ok(found || probe(item)?))?,
+        TypeSchema::Map(value) => probe(value)?,
+        TypeSchema::Object(fields) => fields
+            .values()
+            .try_fold(false, |found, value| Ok(found || probe(value)?))?,
+        TypeSchema::Callable { params, result } => params
+            .iter()
+            .try_fold(probe(result)?, |found, param| Ok(found || probe(param)?))?,
+        TypeSchema::Unknown
+        | TypeSchema::Null
+        | TypeSchema::Int
+        | TypeSchema::Float
+        | TypeSchema::Number
+        | TypeSchema::Bool
+        | TypeSchema::String
+        | TypeSchema::Bytes
+        | TypeSchema::GenericParam(_) => false,
+    })
+}
+
+/// Registration-time exact-schema validation (C1 addressability).
+///
+/// Every exact binding (dynamic / static / stack / args) funnels through this
+/// before any registry mutation. Rejections are structured
+/// `HostImportBindingError`s and leave the registry untouched:
+///
+/// * A `Value`-passing param whose schema *contains* a resource is rejected —
+///   value passing cannot address a resource.
+/// * A resource-passing param (`Borrow`/`BorrowMut`/`TakeOwned`) whose schema
+///   is not directly addressable by the current `Value::Int` handle ABI
+///   (a resource nested inside `Array`/`Map`/deeper `Optional`/...) is
+///   rejected at registration — it can never be extracted at call time.
+/// * Any resource occurrence nested deeper than [`MAX_EXACT_SCHEMA_DEPTH`] is
+///   rejected (the walk exits at depth 65).
+/// * For args-only (non-VM-aware) registrations, **any** resource-passing
+///   param is rejected: such a function has no `&mut Vm`, so it cannot
+///   enforce or observe the resource contract.
+fn validate_exact_registration_schema(
+    name: &str,
+    schema: &HostImportSchema,
+    vm_aware: bool,
+) -> Result<(), HostImportBindingError> {
+    for param in &schema.params {
+        let has_resource = schema_walk_has_resource(&param.schema, 0)?;
+        if !has_resource {
+            continue;
+        }
+        if !vm_aware {
+            return Err(HostImportBindingError::InvalidSchema {
+                import: format!("{name}::{}", param.name),
+                reason: format!(
+                    "Args-only exact registration cannot enforce resource passing for '{}' \
+                     (schema {:#?}); use a VM-aware registration wrapper",
+                    param.name, param.schema,
+                ),
+            });
+        }
+        if param.passing == crate::host_api::HostParamPassing::Value {
+            return Err(HostImportBindingError::InvalidSchema {
+                import: format!("{name}::{}", param.name),
+                reason: format!(
+                    "Value-passing parameter '{}' carries a resource (schema {:#?}); \
+                     resource parameters must use Borrow/BorrowMut/TakeOwned",
+                    param.name, param.schema,
+                ),
+            });
+        }
+        if addressable_resource_key(&param.schema).is_none() {
+            return Err(HostImportBindingError::InvalidSchema {
+                import: format!("{name}::{}", param.name),
+                reason: format!(
+                    "resource-passing parameter '{}' schema {:#?} is not directly \
+                     addressable by the handle ABI",
+                    param.name, param.schema,
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Whether an exact schema contains any resource-passing parameter
+/// (`Borrow`/`BorrowMut`/`TakeOwned` on an addressable resource schema). Such
+/// registrations must be wrapped in [`ExactHostCallContract`] so the
+/// preflight + commit never run unguarded. Registration validation guarantees
+/// any resource-bearing non-`Value` param is directly addressable, so
+/// `addressable_resource_key` is a complete probe here.
+fn schema_requires_guard(schema: &HostImportSchema) -> bool {
+    schema.params.iter().any(|param| {
+        param.passing != crate::host_api::HostParamPassing::Value
+            && addressable_resource_key(&param.schema).is_some()
+    })
+}
+
+fn resource_access_conflict_error(left: &ExactResourceSpec, right: &ExactResourceSpec) -> VmError {
+    VmError::Resource(
+        ResourceError::new(
+            ResourceErrorCode::ResourceAccessConflict,
+            "resource::exact_call",
+            format!(
+                "resource argument {} and {} alias handle {} with conflicting access \
+                 modes {:?}/{:?}",
+                left.arg_index,
+                right.arg_index,
+                left.handle.raw(),
+                left.mode,
+                right.mode,
+            ),
+        )
+        .with_value(left.handle.raw()),
+    )
+}
+
+impl ExactHostCallContract {
+    /// Builds the contract from the import schema and raw arguments.
+    ///
+    /// Extracts every resource-passing occurrence (bounded recursion) with its
+    /// expected key, decodes the raw handle from each argument, and rejects
+    /// illegal same-handle aliases. Any failure is structured and consumes
+    /// nothing.
+    fn build(schema: &HostImportSchema, args: &[Value]) -> VmResult<Self> {
+        let mut specs = Vec::new();
+        for (index, param) in schema.params.iter().enumerate() {
+            let Some(mode) = passing_to_access_mode(param.passing) else {
+                // `Value` params are not resource operations; resource-bearing
+                // `Value` params are rejected at registration.
+                continue;
+            };
+            if !param.schema.contains_resource() {
+                continue;
+            }
+            let Some((key, optional)) = addressable_resource_key(&param.schema) else {
+                return Err(VmError::HostImportBinding(
+                    HostImportBindingError::InvalidSchema {
+                        import: String::new(),
+                        reason: format!(
+                            "resource-passing parameter '{}' schema {:#?} is not directly \
+                             addressable by the handle ABI",
+                            param.name, param.schema,
+                        ),
+                    },
+                ));
+            };
+            let value = args.get(index).ok_or_else(|| {
+                VmError::Resource(ResourceError::new(
+                    ResourceErrorCode::InvalidResourceHandle,
+                    "resource::exact_call",
+                    format!("exact host call is missing argument at index {index}"),
+                ))
+            })?;
+            if optional && matches!(value, Value::Null) {
+                // Legal skip for Optional(Resource).
+                continue;
+            }
+            let handle = ResourceHandle::from_value(value).map_err(VmError::Resource)?;
+            specs.push(ExactResourceSpec {
+                arg_index: index,
+                handle,
+                key,
+                mode,
+            });
+        }
+        // Alias graph: only shared `Borrow` + shared `Borrow` is legal for one
+        // handle. Duplicate TakeOwned, TakeOwned+Borrow/BorrowMut and
+        // BorrowMut+Borrow all reject here, before the user function runs.
+        for (index, left) in specs.iter().enumerate() {
+            for right in specs.iter().skip(index + 1) {
+                if left.handle != right.handle {
+                    continue;
+                }
+                if left.mode == ResourceAccessMode::Borrow
+                    && right.mode == ResourceAccessMode::Borrow
+                {
+                    continue;
+                }
+                return Err(resource_access_conflict_error(left, right));
+            }
+        }
+        Ok(Self { specs })
+    }
+
+    /// Read-only pre-call validation of every occurrence against the live
+    /// execution scope (C1). Zero mutation: any rejection leaves every
+    /// resource untouched and the user function uninvoked.
+    fn validate(&self, vm: &mut Vm) -> VmResult<()> {
+        for spec in &self.specs {
+            vm.host
+                .execution_scope_validate_exact_access(spec.handle, &spec.key, spec.mode)
+                .map_err(VmError::from)?;
+        }
+        Ok(())
+    }
+
+    /// Post-call commit / cleanup (C2). Returns the first structured error, if
+    /// any.
+    ///
+    /// - A declared `TakeOwned` that is now `Taken` was consumed by this
+    ///   invocation (old / previously-taken handles never satisfy it — they
+    ///   are rejected up front).
+    /// - A `TakeOwned` still guest-owned is safely reclaimed; a close-launch
+    ///   failure is latched in the scope's first-error state without losing
+    ///   the primary error. Wrong-key / foreign / stale / already-taken /
+    ///   closed handles are never closed.
+    /// - A `Borrow`/`BorrowMut` argument that ended up `Taken` is a
+    ///   structured conflict (the callee consumed a borrowed argument).
+    fn commit(&self, vm: &mut Vm) -> Option<VmError> {
         let mut first_error = None;
         for spec in &self.specs {
             let ownership = vm.host.execution_scope().resources().ownership(spec.handle);
-            if ownership == Some(ResourceOwnership::Taken) {
-                continue;
-            }
-            if ownership == Some(ResourceOwnership::GuestOwned) {
-                if let Err(error) = vm
-                    .host
-                    .execution_scope_release_guest_owner(spec.handle, OwnershipRelease::close())
-                {
-                    first_error.get_or_insert_with(|| VmError::HostError(error.to_string()));
+            match spec.mode {
+                ResourceAccessMode::TakeOwned => {
+                    if ownership == Some(ResourceOwnership::Taken) {
+                        continue;
+                    }
+                    first_error.get_or_insert_with(|| {
+                        VmError::Resource(
+                            ResourceError::new(
+                                ResourceErrorCode::ResourceNotConsumed,
+                                "resource::exact_call",
+                                format!(
+                                    "declared TakeOwned argument at index {} (handle {}, key {}) \
+                                     was not consumed by the host function",
+                                    spec.arg_index,
+                                    spec.handle.raw(),
+                                    spec.key,
+                                ),
+                            )
+                            .with_value(spec.handle.raw()),
+                        )
+                    });
+                    if ownership == Some(ResourceOwnership::GuestOwned) {
+                        let release = vm.host.execution_scope_release_guest_owner(
+                            spec.handle,
+                            OwnershipRelease::close(),
+                        );
+                        if let Err(ExecutionScopeError::Resource(error)) = release {
+                            vm.host.execution_scope_record_release_error(error);
+                        }
+                    }
                 }
+                ResourceAccessMode::Borrow | ResourceAccessMode::BorrowMut => {
+                    if ownership == Some(ResourceOwnership::Taken) {
+                        first_error.get_or_insert_with(|| {
+                            VmError::Resource(
+                                ResourceError::new(
+                                    ResourceErrorCode::ResourceAccessConflict,
+                                    "resource::exact_call",
+                                    format!(
+                                        "resource argument at index {} declared {:?} was consumed \
+                                         by the host function",
+                                        spec.arg_index, spec.mode,
+                                    ),
+                                )
+                                .with_value(spec.handle.raw()),
+                            )
+                        });
+                    }
+                }
+                ResourceAccessMode::ToOwned | ResourceAccessMode::Value => unreachable!(),
             }
-            first_error.get_or_insert_with(|| {
-                VmError::HostError(format!(
-                    "resource_take_owned_unconsumed: argument handle {} ({}) was not taken",
-                    spec.handle.raw(),
-                    spec.key
-                ))
-            });
         }
         first_error
     }
@@ -194,23 +493,31 @@ fn run_guarded_host_call<F>(
 where
     F: FnOnce(&mut Vm, &[Value]) -> VmResult<CallOutcome>,
 {
-    let guard = ResourceTakeGuard {
-        specs: collect_resource_take_specs(schema, args)?,
-    };
+    let contract = ExactHostCallContract::build(schema, args)?;
+    contract.validate(vm)?;
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(vm, args)));
     match outcome {
-        Ok(result) => {
-            let guard_error = guard.cleanup_unconsumed(vm);
-            match (result, guard_error) {
-                (Err(_), Some(error)) | (Ok(_), Some(error)) => Err(error),
-                (result, None) => result,
-            }
+        Ok(Ok(outcome)) => match contract.commit(vm) {
+            Some(error) => Err(error),
+            None => Ok(outcome),
+        },
+        Ok(Err(error)) => {
+            // The user function failed: the primary error is preserved; any
+            // unconsumed guest-owned resources are still reclaimed (close
+            // failures latched in the scope) and taken values stay Taken.
+            let _ = contract.commit(vm);
+            Err(error)
         }
         Err(payload) => {
-            let _ = guard.cleanup_unconsumed(vm);
+            let _ = contract.commit(vm);
             std::panic::resume_unwind(payload)
         }
     }
+}
+
+struct GuardedHostFunction {
+    inner: Box<dyn HostFunction>,
+    schema: HostImportSchema,
 }
 
 impl HostFunction for GuardedHostFunction {
@@ -609,10 +916,9 @@ impl HostFunctionRegistry {
         factory: impl Fn() -> Box<dyn HostFunction> + Send + Sync + 'static,
     ) -> VmResult<u16> {
         let name = name.into();
-        let guarded = schema.params.iter().any(|param| {
-            param.passing == crate::host_api::HostParamPassing::TakeOwned
-                && param.schema.contains_resource()
-        });
+        validate_exact_registration_schema(&name, &schema, true)
+            .map_err(VmError::HostImportBinding)?;
+        let guarded = schema_requires_guard(&schema);
         let factory: Arc<HostFactory> = Arc::new(factory);
         let kind = if guarded {
             let schema_for_guard = schema.clone();
@@ -637,10 +943,9 @@ impl HostFunctionRegistry {
         function: StaticHostFunction,
     ) -> VmResult<u16> {
         let name = name.into();
-        let guarded = schema.params.iter().any(|param| {
-            param.passing == crate::host_api::HostParamPassing::TakeOwned
-                && param.schema.contains_resource()
-        });
+        validate_exact_registration_schema(&name, &schema, true)
+            .map_err(VmError::HostImportBinding)?;
+        let guarded = schema_requires_guard(&schema);
         if guarded {
             let schema_for_guard = schema.clone();
             self.push_exact(
@@ -667,10 +972,9 @@ impl HostFunctionRegistry {
         factory: impl Fn() -> Box<dyn HostStackFunction> + Send + Sync + 'static,
     ) -> VmResult<u16> {
         let name = name.into();
-        let guarded = schema.params.iter().any(|param| {
-            param.passing == crate::host_api::HostParamPassing::TakeOwned
-                && param.schema.contains_resource()
-        });
+        validate_exact_registration_schema(&name, &schema, true)
+            .map_err(VmError::HostImportBinding)?;
+        let guarded = schema_requires_guard(&schema);
         let factory: Arc<HostStackFactory> = Arc::new(factory);
         let kind = if guarded {
             let schema_for_guard = schema.clone();
@@ -695,10 +999,9 @@ impl HostFunctionRegistry {
         function: StaticHostStackFunction,
     ) -> VmResult<u16> {
         let name = name.into();
-        let guarded = schema.params.iter().any(|param| {
-            param.passing == crate::host_api::HostParamPassing::TakeOwned
-                && param.schema.contains_resource()
-        });
+        validate_exact_registration_schema(&name, &schema, true)
+            .map_err(VmError::HostImportBinding)?;
+        let guarded = schema_requires_guard(&schema);
         if guarded {
             let schema_for_guard = schema.clone();
             self.push_exact(
@@ -730,17 +1033,8 @@ impl HostFunctionRegistry {
         factory: impl Fn() -> Box<dyn HostArgsFunction> + Send + Sync + 'static,
     ) -> VmResult<u16> {
         let name = name.into();
-        if schema.params.iter().any(|param| {
-            param.passing == crate::host_api::HostParamPassing::TakeOwned
-                && param.schema.contains_resource()
-        }) {
-            return Err(VmError::HostImportBinding(
-                HostImportBindingError::InvalidSchema {
-                    import: name,
-                    reason: "Args-only exact registration cannot enforce TakeOwned; use a VM-aware registration wrapper".to_string(),
-                },
-            ));
-        }
+        validate_exact_registration_schema(&name, &schema, false)
+            .map_err(VmError::HostImportBinding)?;
         self.push_exact(
             name,
             arity,
@@ -757,17 +1051,8 @@ impl HostFunctionRegistry {
         function: StaticHostArgsFunction,
     ) -> VmResult<u16> {
         let name = name.into();
-        if schema.params.iter().any(|param| {
-            param.passing == crate::host_api::HostParamPassing::TakeOwned
-                && param.schema.contains_resource()
-        }) {
-            return Err(VmError::HostImportBinding(
-                HostImportBindingError::InvalidSchema {
-                    import: name,
-                    reason: "Args-only exact registration cannot enforce TakeOwned; use a VM-aware registration wrapper".to_string(),
-                },
-            ));
-        }
+        validate_exact_registration_schema(&name, &schema, false)
+            .map_err(VmError::HostImportBinding)?;
         self.push_exact(name, arity, schema, RegistryEntryKind::ArgsStatic(function))
     }
 
@@ -779,17 +1064,8 @@ impl HostFunctionRegistry {
         function: StaticHostArgsFunction,
     ) -> VmResult<u16> {
         let name = name.into();
-        if schema.params.iter().any(|param| {
-            param.passing == crate::host_api::HostParamPassing::TakeOwned
-                && param.schema.contains_resource()
-        }) {
-            return Err(VmError::HostImportBinding(
-                HostImportBindingError::InvalidSchema {
-                    import: name,
-                    reason: "Args-only exact registration cannot enforce TakeOwned; use a VM-aware registration wrapper".to_string(),
-                },
-            ));
-        }
+        validate_exact_registration_schema(&name, &schema, false)
+            .map_err(VmError::HostImportBinding)?;
         self.push_exact(
             name,
             arity,
@@ -1243,21 +1519,46 @@ pub(crate) fn validate_non_yielding_host_value(
 }
 
 /// Exact-return policy for an interpreter host call, derived from the targeted
-/// `HostImport.schema` (C1 resource ABI scope).
+/// `HostImport.schema` (C1/C4 resource ABI scope).
 ///
 /// * `Legacy` — no exact schema, or a non-resource exact return: old behavior.
-/// * `Resource` — the exact return is `TypeSchema::Resource(_)`: the returned
+/// * `Resource(key)` — the exact return is `TypeSchema::Resource`: the returned
 ///   value must be an `Int` that decodes as a structurally valid resource
-///   handle, otherwise the call fails with a structured `VmError`.
+///   handle whose **live slot key** equals `key`; the handle is then marked
+///   guest-owned (ownership transfers HostOwned → GuestOwned) before any stack
+///   mutation.
+/// * `OptionalResource(key)` — the exact return is
+///   `TypeSchema::Optional(Resource)`: `Value::Null` is a legal no-resource
+///   return; a handle is validated and transferred exactly like `Resource`.
 /// * `NestedResource` — the exact return schema *nest-contains* a resource
-///   (`Optional<Resource>`, `Array<Resource>`, ...) that the current
+///   (inside an `Array`, `Map`, deeper `Optional`, ...) that the current
 ///   `Value::Int` handle-carrier ABI cannot represent: any returned value is an
 ///   explicit structured rejection; there is no silent coarse pass-through.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// The expected key rides along so every sync from-stack / static / args /
+/// async completion transfer verifies the live slot key before the ownership
+/// mark (C4 `ResourceKeyMismatch`). The policy is `Clone` (the expected key
+/// is owned), which is enough for the async waiting-op snapshot — it is
+/// moved (never copied) out of the waiting slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ExactHostReturnPolicy {
     Legacy,
-    Resource,
+    Resource(ResourceTypeKey),
+    OptionalResource(ResourceTypeKey),
     NestedResource,
+}
+
+impl ExactHostReturnPolicy {
+    fn key(&self) -> Option<&ResourceTypeKey> {
+        match self {
+            Self::Resource(key) | Self::OptionalResource(key) => Some(key),
+            Self::Legacy | Self::NestedResource => None,
+        }
+    }
+
+    fn transfers_ownership(&self) -> bool {
+        self.key().is_some()
+    }
 }
 
 /// Classifies an import's exact-return policy from its resolved exact schema.
@@ -1267,7 +1568,12 @@ pub(crate) fn exact_host_return_policy(import: Option<&HostImport>) -> ExactHost
         return ExactHostReturnPolicy::Legacy;
     };
     match &schema.return_type {
-        TypeSchema::Resource(_) => ExactHostReturnPolicy::Resource,
+        TypeSchema::Resource(key) => ExactHostReturnPolicy::Resource(key.clone()),
+        TypeSchema::Optional(inner) => match inner.as_ref() {
+            TypeSchema::Resource(key) => ExactHostReturnPolicy::OptionalResource(key.clone()),
+            other if other.contains_resource() => ExactHostReturnPolicy::NestedResource,
+            _ => ExactHostReturnPolicy::Legacy,
+        },
         other if other.contains_resource() => ExactHostReturnPolicy::NestedResource,
         _ => ExactHostReturnPolicy::Legacy,
     }
@@ -1285,8 +1591,11 @@ pub(crate) fn validate_exact_host_return_value(
 ) -> VmResult<Value> {
     match policy {
         ExactHostReturnPolicy::Legacy => validate_non_yielding_host_value(value, expected),
-        ExactHostReturnPolicy::Resource => {
-            if ResourceHandle::from_value(&value).is_ok() {
+        ExactHostReturnPolicy::Resource(_) | ExactHostReturnPolicy::OptionalResource(_) => {
+            if ResourceHandle::from_value(&value).is_ok()
+                || (matches!(value, Value::Null)
+                    && matches!(policy, ExactHostReturnPolicy::OptionalResource(_)))
+            {
                 Ok(value)
             } else {
                 Err(VmError::TypeMismatch("resource handle"))
@@ -1300,26 +1609,32 @@ pub(crate) fn validate_exact_host_return_value(
 
 /// Validates a `CallReturn` before it is pushed to the operand stack.
 ///
-/// `Legacy` pushes the values unchanged (old behavior); `Resource` requires a
-/// single structurally-valid handle; `NestedResource` rejects any return.
+/// `Legacy` pushes the values unchanged (old behavior); `Resource`/`Optional`
+/// require a single structurally-valid handle (or `Null` for the optional);
+/// `NestedResource` rejects any return.
 pub(crate) fn validate_exact_host_return_values(
     values: CallReturn,
     policy: ExactHostReturnPolicy,
 ) -> VmResult<CallReturn> {
     match policy {
         ExactHostReturnPolicy::Legacy => Ok(values),
-        ExactHostReturnPolicy::Resource => match values {
-            CallReturn::One(value) => {
-                if ResourceHandle::from_value(&value).is_ok() {
-                    Ok(CallReturn::One(value))
-                } else {
-                    Err(VmError::TypeMismatch("resource handle"))
+        ExactHostReturnPolicy::Resource(_) | ExactHostReturnPolicy::OptionalResource(_) => {
+            match values {
+                CallReturn::One(value) => {
+                    if ResourceHandle::from_value(&value).is_ok()
+                        || (matches!(value, Value::Null)
+                            && matches!(policy, ExactHostReturnPolicy::OptionalResource(_)))
+                    {
+                        Ok(CallReturn::One(value))
+                    } else {
+                        Err(VmError::TypeMismatch("resource handle"))
+                    }
                 }
+                CallReturn::None => Err(VmError::TypeMismatch(
+                    "resource-returning host produced no value",
+                )),
             }
-            CallReturn::None => Err(VmError::TypeMismatch(
-                "resource-returning host produced no value",
-            )),
-        },
+        }
         ExactHostReturnPolicy::NestedResource => Err(VmError::TypeMismatch(
             "nested resource return cannot be represented by the current ABI",
         )),
@@ -2287,7 +2602,7 @@ impl Vm {
             CallOutcome::Return(values) => {
                 // Validate BEFORE any stack mutation; on failure keep the
                 // pre-call snapshot (no half-truncated state).
-                let values = match validate_exact_host_return_values(values, exact_policy) {
+                let values = match validate_exact_host_return_values(values, exact_policy.clone()) {
                     Ok(values) => values,
                     Err(error) => {
                         self.instance.stack = saved_stack;
@@ -2299,7 +2614,8 @@ impl Vm {
                 // before any stack mutation. A structurally valid handle that
                 // is foreign/stale/already-guest/taken/closing is a structured
                 // error that leaves the pre-call stack untouched.
-                if let Err(error) = self.transfer_exact_host_return_ownership(&values, exact_policy)
+                if let Err(error) =
+                    self.transfer_exact_host_return_ownership(&values, exact_policy.clone())
                 {
                     self.instance.stack = saved_stack;
                     return Err(error);
@@ -2329,9 +2645,9 @@ impl Vm {
                 let resume_ip = self.call_resume_ip(call_ip)?;
                 self.record_callable_stream_resume_ip(op_id, resume_ip);
                 if self.host.stream_drivers.contains_key(&op_id) {
-                    self.set_waiting_operation(op_id, exact_policy)?;
+                    self.set_waiting_operation(op_id, exact_policy.clone())?;
                 } else {
-                    self.set_waiting_bound_host_op(resolved_index, op_id, exact_policy)?;
+                    self.set_waiting_bound_host_op(resolved_index, op_id, exact_policy.clone())?;
                 }
                 self.instance.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
@@ -2383,8 +2699,9 @@ impl Vm {
         let outcome = function(&self.instance.stack[arg_start..]);
         self.instance.call_depth = self.instance.call_depth.saturating_sub(1);
         let value = require_non_yielding_host_value(outcome?)?;
-        let value = validate_exact_host_return_value(value, exact_policy, expected_return_type)?;
-        self.transfer_exact_host_return_ownership_value(&value, exact_policy)?;
+        let value =
+            validate_exact_host_return_value(value, exact_policy.clone(), expected_return_type)?;
+        self.transfer_exact_host_return_ownership_value(&value, exact_policy.clone())?;
         self.instance.stack.truncate(arg_start);
         self.instance.stack.push(value);
         Ok(HostCallExecOutcome::Returned)
@@ -2427,9 +2744,12 @@ impl Vm {
         let outcome = outcome?;
         if non_yielding {
             let value = require_non_yielding_host_value(outcome)?;
-            let value =
-                validate_exact_host_return_value(value, exact_policy, expected_return_type)?;
-            self.transfer_exact_host_return_ownership_value(&value, exact_policy)?;
+            let value = validate_exact_host_return_value(
+                value,
+                exact_policy.clone(),
+                expected_return_type,
+            )?;
+            self.transfer_exact_host_return_ownership_value(&value, exact_policy.clone())?;
             self.instance.stack.truncate(arg_start);
             self.instance.stack.push(value);
             return Ok(HostCallExecOutcome::Returned);
@@ -2439,8 +2759,8 @@ impl Vm {
             CallOutcome::Return(values) => {
                 // Validate BEFORE truncating the call operands or pushing; a
                 // bad return must leave the stack at its pre-call snapshot.
-                let values = validate_exact_host_return_values(values, exact_policy)?;
-                self.transfer_exact_host_return_ownership(&values, exact_policy)?;
+                let values = validate_exact_host_return_values(values, exact_policy.clone())?;
+                self.transfer_exact_host_return_ownership(&values, exact_policy.clone())?;
                 self.instance.stack.truncate(arg_start);
                 values.push_onto_stack(&mut self.instance.stack);
                 Ok(HostCallExecOutcome::Returned)
@@ -2458,9 +2778,9 @@ impl Vm {
                 let resume_ip = self.call_resume_ip(call_ip)?;
                 self.record_callable_stream_resume_ip(op_id, resume_ip);
                 if self.host.stream_drivers.contains_key(&op_id) {
-                    self.set_waiting_operation(op_id, exact_policy)?;
+                    self.set_waiting_operation(op_id, exact_policy.clone())?;
                 } else {
-                    self.set_waiting_bound_host_op(resolved_index, op_id, exact_policy)?;
+                    self.set_waiting_bound_host_op(resolved_index, op_id, exact_policy.clone())?;
                 }
                 self.instance.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
@@ -2510,8 +2830,8 @@ impl Vm {
             CallOutcome::Return(values) => {
                 // Validate BEFORE truncating the call operands or pushing; a
                 // bad return must leave the stack at its pre-call snapshot.
-                let values = validate_exact_host_return_values(values, exact_policy)?;
-                self.transfer_exact_host_return_ownership(&values, exact_policy)?;
+                let values = validate_exact_host_return_values(values, exact_policy.clone())?;
+                self.transfer_exact_host_return_ownership(&values, exact_policy.clone())?;
                 self.instance.stack.truncate(arg_start);
                 values.push_onto_stack(&mut self.instance.stack);
                 Ok(HostCallExecOutcome::Returned)
@@ -2529,9 +2849,9 @@ impl Vm {
                 let resume_ip = self.call_resume_ip(call_ip)?;
                 self.record_callable_stream_resume_ip(op_id, resume_ip);
                 if self.host.stream_drivers.contains_key(&op_id) {
-                    self.set_waiting_operation(op_id, exact_policy)?;
+                    self.set_waiting_operation(op_id, exact_policy.clone())?;
                 } else {
-                    self.set_waiting_bound_host_op(resolved_index, op_id, exact_policy)?;
+                    self.set_waiting_bound_host_op(resolved_index, op_id, exact_policy.clone())?;
                 }
                 self.instance.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
@@ -2666,7 +2986,7 @@ impl Vm {
         op_id: HostOpId,
         exact_policy: ExactHostReturnPolicy,
     ) -> VmResult<()> {
-        if let Some(active) = self.instance.waiting_host_op
+        if let Some(active) = self.instance.waiting_host_op.clone()
             && active.op_id != op_id
         {
             return Err(VmError::HostError(format!(
@@ -2686,7 +3006,7 @@ impl Vm {
         op_id: HostOpId,
         values: CallReturn,
     ) -> VmResult<()> {
-        let waiting = self.instance.waiting_host_op.ok_or_else(|| {
+        let waiting = self.instance.waiting_host_op.take().ok_or_else(|| {
             VmError::HostError(format!(
                 "host op {op_id} completed but vm is not waiting on any op",
             ))
@@ -2697,17 +3017,10 @@ impl Vm {
                 waiting.op_id
             )));
         }
-        // Validate the completion values against the exact-return policy
-        // captured at the call site BEFORE any stack/frame mutation. A bad
-        // value terminates the waiting op (so no poll/completion can deliver
-        // it again) and leaves the stack untouched.
-        let values = match validate_exact_host_return_values(values, waiting.exact_policy) {
-            Ok(values) => values,
-            Err(error) => {
+        let values = validate_exact_host_return_values(values, waiting.exact_policy.clone())
+            .inspect_err(|_| {
                 self.instance.waiting_host_op = None;
-                return Err(error);
-            }
-        };
+            })?;
         // Exact `Resource` async completions transfer ownership the same way
         // a synchronous return does: the handle's table entry moves
         // HostOwned -> GuestOwned before any stack mutation. A structurally
@@ -2724,25 +3037,27 @@ impl Vm {
         Ok(())
     }
 
-    // ---- exact host-return ownership transfer (C2-C1) ----------------------
+    // ---- exact host-return ownership transfer (C1/C4) ----------------------
 
-    /// Transfers ownership of a validated exact `Resource` host return from
+    /// Transfers ownership of a validated exact resource host return from
     /// HostOwned to GuestOwned in the current execution scope, before any
     /// stack mutation.
     ///
-    /// Only the `Resource` policy transfers; `Legacy` and `NestedResource`
-    /// keep their prior behavior (NestedResource is already rejected by
-    /// validation, so this is a no-op there). A structurally valid handle
-    /// that fails the mark (foreign arena, stale generation, already taken,
-    /// closing/closed, or already guest-owned) is a structured `VmError` —
-    /// the caller keeps the pre-call stack snapshot, exactly like a
-    /// validation failure.
+    /// Only the `Resource`/`OptionalResource` policies transfer; `Legacy` and
+    /// `NestedResource` keep their prior behavior (NestedResource is already
+    /// rejected by validation, so this is a no-op there). The transfer first
+    /// verifies the returned handle's **live slot key** matches the schema's
+    /// expected key: a mismatch is a structured `ResourceKeyMismatch` that
+    /// leaves the resource HostOwned. Any other mark failure (foreign arena,
+    /// stale generation, already taken, closing/closed, or already
+    /// guest-owned) is also a structured `VmError` — the caller keeps the
+    /// pre-call stack snapshot, exactly like a validation failure.
     fn transfer_exact_host_return_ownership(
         &mut self,
         values: &CallReturn,
         policy: ExactHostReturnPolicy,
     ) -> VmResult<()> {
-        if policy != ExactHostReturnPolicy::Resource {
+        if !policy.transfers_ownership() {
             return Ok(());
         }
         let Some(value) = values.as_slice().first() else {
@@ -2758,29 +3073,23 @@ impl Vm {
         value: &Value,
         policy: ExactHostReturnPolicy,
     ) -> VmResult<()> {
-        if policy != ExactHostReturnPolicy::Resource {
+        if !policy.transfers_ownership() {
             return Ok(());
         }
+        let Some(key) = policy.key() else {
+            return Ok(());
+        };
         let handle = match ResourceHandle::from_value(value) {
             Ok(handle) => handle,
-            // The value was already validated as a structurally valid handle
-            // by `validate_exact_host_return_*`; a decode failure here is a
-            // defensive inconsistency, not a runtime condition.
+            // A validated `Null` optional return carries no resource; a value
+            // that was already validated as a structurally valid handle is
+            // decoded above. Any other decode failure here is a defensive
+            // inconsistency, not a runtime condition.
             Err(_) => return Ok(()),
         };
-        match self.host.execution_scope_mark_guest_owned(handle) {
-            Ok(()) => Ok(()),
-            Err(error) => Err(match error {
-                crate::vm::execution_scope::ExecutionScopeError::Resource(error) => {
-                    VmError::HostError(format!(
-                        "exact host return resource ownership transfer failed: {error}"
-                    ))
-                }
-                other => VmError::HostError(format!(
-                    "exact host return resource ownership transfer failed: {other}"
-                )),
-            }),
-        }
+        self.host
+            .execution_scope_mark_guest_owned_with_key(handle, key)
+            .map_err(VmError::from)
     }
 
     pub(super) fn install_resolved_calls(&mut self, resolved_calls: Vec<u16>) -> VmResult<()> {
@@ -3087,10 +3396,338 @@ mod exact_binding_registration_tests {
             _ => panic!("expected guarded factory"),
         };
         let error = guarded.call(&mut vm, &[handle.as_value()]).unwrap_err();
-        assert!(error.to_string().contains("resource_take_owned_unconsumed"));
+        assert_eq!(
+            error.resource_error_code(),
+            Some(ResourceErrorCode::ResourceNotConsumed),
+            "unconsumed take must be a structured resource_not_consumed, got: {error}"
+        );
         assert_eq!(
             vm.host_context().resource_ownership(handle),
             Some(ResourceOwnership::HostOwned),
         );
+    }
+}
+
+/// Internal unit tests for the private exact-contract entry points that the
+/// integration suite cannot reach: `ExactHostCallContract::build`'s alias
+/// graph / Optional-Null skip, the depth-bounded `schema_walk_has_resource`,
+/// registration-time `validate_exact_registration_schema`, and
+/// `exact_host_return_policy` classification.
+#[cfg(test)]
+mod exact_contract_unit_tests {
+    use super::*;
+    use crate::compiler::TypeSchema;
+    use crate::host_api::HostParamPassing;
+
+    fn guard_key() -> crate::host_api::ResourceTypeKey {
+        crate::host_api::ResourceTypeKey::new("test.guard").unwrap()
+    }
+
+    fn schema_with_params(
+        params: Vec<HostImportParam>,
+        return_type: TypeSchema,
+    ) -> HostImportSchema {
+        HostImportSchema {
+            params,
+            return_type,
+            fingerprint: crate::host_api::HostApiCatalog::default().fingerprint(),
+        }
+    }
+
+    fn take_param(name: &str, schema: TypeSchema) -> HostImportParam {
+        HostImportParam {
+            name: name.into(),
+            schema,
+            passing: HostParamPassing::TakeOwned,
+        }
+    }
+
+    fn borrow_param(name: &str, schema: TypeSchema) -> HostImportParam {
+        HostImportParam {
+            name: name.into(),
+            schema,
+            passing: HostParamPassing::Borrow,
+        }
+    }
+
+    fn no_specs(error: VmError, label: &str) {
+        assert!(
+            matches!(
+                error,
+                VmError::HostImportBinding(HostImportBindingError::InvalidSchema { .. })
+            ),
+            "{label}: expected structured InvalidSchema, got: {error}"
+        );
+    }
+
+    #[test]
+    fn build_skips_optional_resource_null() {
+        let schema = schema_with_params(
+            vec![take_param(
+                "f",
+                TypeSchema::Optional(Box::new(TypeSchema::Resource(guard_key()))),
+            )],
+            TypeSchema::Null,
+        );
+        let contract = ExactHostCallContract::build(&schema, &[Value::Null])
+            .expect("Null legally skips an Optional(Resource) argument");
+        assert!(
+            contract.specs.is_empty(),
+            "no resource occurrence may be extracted from a skipped Optional"
+        );
+    }
+
+    #[test]
+    fn build_missing_argument_is_structured() {
+        let schema = schema_with_params(
+            vec![take_param("f", TypeSchema::Resource(guard_key()))],
+            TypeSchema::Null,
+        );
+        let error = ExactHostCallContract::build(&schema, &[])
+            .expect_err("missing argument must be rejected");
+        assert_eq!(
+            error.resource_error_code(),
+            Some(ResourceErrorCode::InvalidResourceHandle),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn build_rejects_duplicate_take_owned_alias() {
+        let schema = schema_with_params(
+            vec![
+                take_param("a", TypeSchema::Resource(guard_key())),
+                take_param("b", TypeSchema::Resource(guard_key())),
+            ],
+            TypeSchema::Null,
+        );
+        let resource = ResourceHandle::encode(1, 0, 1).expect("valid encoding");
+        let value = resource.as_value();
+        let error = ExactHostCallContract::build(&schema, &[value.clone(), value])
+            .expect_err("duplicate TakeOwned alias must be rejected");
+        assert_eq!(
+            error.resource_error_code(),
+            Some(ResourceErrorCode::ResourceAccessConflict),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn build_rejects_take_plus_borrow_alias_but_allows_borrow_borrow() {
+        // TakeOwned + Borrow on the same handle: rejected.
+        let mixed = schema_with_params(
+            vec![
+                take_param("t", TypeSchema::Resource(guard_key())),
+                borrow_param("b", TypeSchema::Resource(guard_key())),
+            ],
+            TypeSchema::Null,
+        );
+        let resource = ResourceHandle::encode(1, 0, 1).expect("valid encoding");
+        let value = resource.as_value();
+        let error = ExactHostCallContract::build(&mixed, &[value.clone(), value.clone()])
+            .expect_err("take+borrow alias");
+        assert_eq!(
+            error.resource_error_code(),
+            Some(ResourceErrorCode::ResourceAccessConflict),
+            "got: {error}"
+        );
+
+        // Two shared Borrows on the same handle: legal.
+        let borrows = schema_with_params(
+            vec![
+                borrow_param("a", TypeSchema::Resource(guard_key())),
+                borrow_param("b", TypeSchema::Resource(guard_key())),
+            ],
+            TypeSchema::Null,
+        );
+        let contract = ExactHostCallContract::build(&borrows, &[value.clone(), value])
+            .expect("two shared borrows of one handle are legal");
+        assert_eq!(contract.specs.len(), 2);
+    }
+
+    #[test]
+    fn build_rejects_aggregate_nested_resource_at_call_time() {
+        // Defensive: a non-addressable aggregate resource schema reaches
+        // call-time only if registration validation was bypassed.
+        let schema = schema_with_params(
+            vec![take_param(
+                "f",
+                TypeSchema::Array(Box::new(TypeSchema::Resource(guard_key()))),
+            )],
+            TypeSchema::Null,
+        );
+        let resource = ResourceHandle::encode(1, 0, 1).expect("valid encoding");
+        no_specs(
+            ExactHostCallContract::build(&schema, &[resource.as_value()])
+                .expect_err("aggregate resource is not addressable"),
+            "build",
+        );
+    }
+
+    #[test]
+    fn schema_walk_bounds_depth_at_64() {
+        fn nested(depth: u8, leaf: TypeSchema) -> TypeSchema {
+            let mut schema = leaf;
+            for _ in 0..depth {
+                schema = TypeSchema::Optional(Box::new(schema));
+            }
+            schema
+        }
+        let file = guard_key();
+        // Resource at depth 63 -> present, depth within bound.
+        assert_eq!(
+            schema_walk_has_resource(&nested(63, TypeSchema::Resource(file.clone())), 0),
+            Ok(true)
+        );
+        // No-resource scalar nested exactly 64 deep -> no error, absent.
+        assert_eq!(
+            schema_walk_has_resource(&nested(64, TypeSchema::Int), 0),
+            Ok(false)
+        );
+        // Depth 65 -> structured rejection.
+        assert!(
+            matches!(
+                schema_walk_has_resource(&nested(65, TypeSchema::Int), 0),
+                Err(HostImportBindingError::InvalidSchema { .. })
+            ),
+            "depth 65 walk must reject"
+        );
+    }
+
+    #[test]
+    fn validate_registration_rejects_args_resource_and_value_resource_and_aggregate() {
+        // Args-only + resource-passing param -> rejected.
+        let args_schema = schema_with_params(
+            vec![take_param("f", TypeSchema::Resource(guard_key()))],
+            TypeSchema::Null,
+        );
+        assert!(
+            matches!(
+                validate_exact_registration_schema("x", &args_schema, false),
+                Err(HostImportBindingError::InvalidSchema { .. })
+            ),
+            "Args-only registration must reject resource passing"
+        );
+
+        // VM-aware + resource-bearing Value param -> rejected.
+        let value_schema = schema_with_params(
+            vec![HostImportParam {
+                name: "v".into(),
+                schema: TypeSchema::Resource(guard_key()),
+                passing: HostParamPassing::Value,
+            }],
+            TypeSchema::Null,
+        );
+        assert!(
+            matches!(
+                validate_exact_registration_schema("x", &value_schema, true),
+                Err(HostImportBindingError::InvalidSchema { .. })
+            ),
+            "Value-passing resource param must be rejected"
+        );
+
+        // VM-aware + aggregate-nested resource (not addressable) -> rejected.
+        let aggregate_schema = schema_with_params(
+            vec![take_param(
+                "f",
+                TypeSchema::Array(Box::new(TypeSchema::Resource(guard_key()))),
+            )],
+            TypeSchema::Null,
+        );
+        assert!(
+            matches!(
+                validate_exact_registration_schema("x", &aggregate_schema, true),
+                Err(HostImportBindingError::InvalidSchema { .. })
+            ),
+            "aggregate-nested resource must be rejected"
+        );
+
+        // VM-aware + directly-addressable TakeOwned -> accepted.
+        let ok_schema = schema_with_params(
+            vec![take_param("f", TypeSchema::Resource(guard_key()))],
+            TypeSchema::Null,
+        );
+        validate_exact_registration_schema("x", &ok_schema, true)
+            .expect("direct TakeOwned resource is addressable");
+    }
+
+    #[test]
+    fn return_policy_classifies_exact_returns() {
+        let file = guard_key();
+        // Direct Resource return -> Resource(key).
+        let import = HostImport {
+            name: "x::r".into(),
+            arity: 0,
+            return_type: crate::bytecode::ValueType::Int,
+            schema: Some(HostImportSchema {
+                params: vec![],
+                return_type: TypeSchema::Resource(file.clone()),
+                fingerprint: crate::host_api::HostApiCatalog::default().fingerprint(),
+            }),
+        };
+        assert!(matches!(
+            exact_host_return_policy(Some(&import)),
+            ExactHostReturnPolicy::Resource(ref key) if *key == file
+        ));
+
+        // Optional<Resource> return -> OptionalResource(key) (addressable, C4).
+        let import = HostImport {
+            name: "x::opt".into(),
+            arity: 0,
+            return_type: crate::bytecode::ValueType::Null,
+            schema: Some(HostImportSchema {
+                params: vec![],
+                return_type: TypeSchema::Optional(Box::new(TypeSchema::Resource(file.clone()))),
+                fingerprint: crate::host_api::HostApiCatalog::default().fingerprint(),
+            }),
+        };
+        assert!(matches!(
+            exact_host_return_policy(Some(&import)),
+            ExactHostReturnPolicy::OptionalResource(ref key) if *key == file
+        ));
+
+        // Resource nested inside an aggregate -> NestedResource (rejected).
+        let import = HostImport {
+            name: "x::deep".into(),
+            arity: 0,
+            return_type: crate::bytecode::ValueType::Array,
+            schema: Some(HostImportSchema {
+                params: vec![],
+                return_type: TypeSchema::Array(Box::new(TypeSchema::Resource(file))),
+                fingerprint: crate::host_api::HostApiCatalog::default().fingerprint(),
+            }),
+        };
+        assert!(matches!(
+            exact_host_return_policy(Some(&import)),
+            ExactHostReturnPolicy::NestedResource
+        ));
+
+        // Non-resource exact return -> Legacy.
+        let import = HostImport {
+            name: "x::plain".into(),
+            arity: 0,
+            return_type: crate::bytecode::ValueType::Int,
+            schema: Some(HostImportSchema {
+                params: vec![],
+                return_type: TypeSchema::Int,
+                fingerprint: crate::host_api::HostApiCatalog::default().fingerprint(),
+            }),
+        };
+        assert!(matches!(
+            exact_host_return_policy(Some(&import)),
+            ExactHostReturnPolicy::Legacy
+        ));
+
+        // schema:None -> Legacy.
+        let import = HostImport {
+            name: "x::none".into(),
+            arity: 0,
+            return_type: crate::bytecode::ValueType::Int,
+            schema: None,
+        };
+        assert!(matches!(
+            exact_host_return_policy(Some(&import)),
+            ExactHostReturnPolicy::Legacy
+        ));
     }
 }

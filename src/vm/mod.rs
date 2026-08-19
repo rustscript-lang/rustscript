@@ -1132,7 +1132,8 @@ impl Vm {
             VmResetState::Ready => Poll::Ready(Ok(())),
             VmResetState::Resetting => {
                 if let Some(deadline) = self.reset_deadline {
-                    if now >= deadline {
+                    let timeout = now >= deadline;
+                    if timeout {
                         // Timeout: poison without pretending cleanup ran. The
                         // old scope and error stay in place for diagnostics.
                         let error = VmResetError::Deadline { deadline, now };
@@ -2170,9 +2171,8 @@ impl Vm {
             return;
         }
         *depth += 1;
-        let result = self.release_owned_value_inner(schema, value, seen, depth);
+        self.release_owned_value_inner(schema, value, seen, depth);
         *depth -= 1;
-        let _ = result;
     }
 
     fn release_owned_value_inner(
@@ -3073,7 +3073,7 @@ impl Vm {
     ) -> VmResult<VmStatus> {
         self.ensure_call_bindings()?;
         self.sync_jit_non_yielding_host_imports();
-        if let Some(waiting) = self.instance.waiting_host_op {
+        if let Some(waiting) = self.instance.waiting_host_op.clone() {
             self.instance.last_yield_reason = None;
             let status = VmStatus::Waiting(waiting.op_id);
             self.notify_debugger_status(&mut debugger, status);

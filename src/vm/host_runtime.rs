@@ -326,6 +326,30 @@ impl HostRuntime {
         self.execution_scope.mark_resource_guest_owned(handle)
     }
 
+    /// Marks a host-owned resource guest-owned after verifying its live slot
+    /// key (C4 exact-return ownership transfer).
+    pub(crate) fn execution_scope_mark_guest_owned_with_key(
+        &mut self,
+        handle: crate::vm::resource::ResourceHandle,
+        expected_key: &crate::host_api::ResourceTypeKey,
+    ) -> ExecutionScopeResult<()> {
+        self.execution_scope
+            .mark_resource_guest_owned_with_key(handle, expected_key)
+    }
+
+    /// Read-only exact-argument preflight (arena/generation/key/open/
+    /// ownership/children/operation) used by the manual exact host-call
+    /// contract before the user function runs.
+    pub(crate) fn execution_scope_validate_exact_access(
+        &self,
+        handle: crate::vm::resource::ResourceHandle,
+        expected_key: &crate::host_api::ResourceTypeKey,
+        mode: crate::vm::resource::ResourceAccessMode,
+    ) -> ExecutionScopeResult<()> {
+        self.execution_scope
+            .validate_exact_access(handle, expected_key, mode)
+    }
+
     /// Releases the guest owner of a resource in the owned execution scope
     /// (guest local death). See
     /// [`ExecutionScope::release_guest_owner`].
@@ -407,10 +431,7 @@ impl HostRuntime {
         if !self.execution_scope.is_quiescent() {
             return Err(ExecutionScopeError::ScopeNotQuiescent);
         }
-        Ok(std::mem::replace(
-            &mut self.execution_scope,
-            ExecutionScope::new(),
-        ))
+        Ok(std::mem::take(&mut self.execution_scope))
     }
 }
 

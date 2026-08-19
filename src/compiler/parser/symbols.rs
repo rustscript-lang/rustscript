@@ -478,7 +478,7 @@ impl Parser {
             line: self.current_line(),
             message: "function index overflow".to_string(),
         })?;
-        let candidate_schemas = exact.into_iter().map(|schema| schema.clone()).collect();
+        let candidate_schemas = exact.into_iter().cloned().collect();
         self.record_host_candidate(index, candidate_schemas)?;
 
         let args = (0..arity).map(|idx| format!("arg{idx}")).collect();
@@ -747,13 +747,12 @@ mod catalog_host_definition_tests {
         let decl = parser.define_host_function("pkg::w", 3).unwrap();
         assert_eq!(parser.function_decls().len(), before_count + 1);
         assert!(
-            parser
+            !parser
                 .host_api_metadata()
                 .unwrap()
                 .candidates(decl.index)
                 .unwrap()
-                .len()
-                >= 1
+                .is_empty()
         );
     }
 

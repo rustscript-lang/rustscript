@@ -39,6 +39,17 @@ use vm::{
 struct DummyResource;
 
 impl HostResource for DummyResource {
+    fn resource_type_key() -> Option<ResourceTypeKey>
+    where
+        Self: Sized,
+    {
+        // The C4 keyed exact-return transfer verifies the returned handle's
+        // live slot key against the schema's expected key; every catalog
+        // function this test binds declares the `io.file` resource, so the
+        // concrete type must declare the matching key.
+        Some(io_file_key())
+    }
+
     fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         Ok(CloseProgress::Ready)
     }
@@ -99,10 +110,19 @@ fn catalog() -> std::sync::Arc<vm::HostApiCatalog> {
         "acme::resource_arg",
         vec![HostParamSchema::with_passing(
             "f",
-            HostTypeSchema::Resource(file),
+            HostTypeSchema::Resource(file.clone()),
             vm::HostParamPassing::Borrow,
         )],
         HostTypeSchema::Int,
+    ));
+    // A return schema that nests a resource *inside an aggregate array*
+    // (`Array<Resource>`) is still not representable by the `Value::Int`
+    // handle carrier and must stay an explicit structured rejection —
+    // `Optional<Resource>` is now addressable (C4), deeper nesting is not.
+    builder.function(HostFunctionSchema::with_return(
+        "acme::many",
+        vec![HostParamSchema::value("v", HostTypeSchema::Int)],
+        HostTypeSchema::Array(Box::new(HostTypeSchema::Resource(file))),
     ));
     std::sync::Arc::new(builder.build().expect("catalog must build"))
 }
@@ -255,12 +275,6 @@ fn static_reject_return(args: &[Value]) -> vm::VmResult<CallOutcome> {
 }
 
 fn static_plain_int_return(_args: &[Value]) -> vm::VmResult<CallOutcome> {
-    Ok(CallOutcome::Return(CallReturn::One(Value::Int(0))))
-}
-
-fn static_resource_arg_return(_args: &[Value]) -> vm::VmResult<CallOutcome> {
-    // The exact return schema is plain Int, so no resource-return ownership
-    // transfer is involved in this filter regression.
     Ok(CallOutcome::Return(CallReturn::One(Value::Int(0))))
 }
 
@@ -465,12 +479,12 @@ fn schema_none_legacy_int_return_unaffected() {
     assert_eq!(vm.stack(), &[Value::Int(42)]);
 }
 
-/// A return schema that nests a resource (`Optional<Resource>`) is explicitly
-/// structure-rejected: the current ABI cannot represent it, and even a `Null`
-/// (which a coarse `Unknown` check would have accepted) must error.
+/// An `Optional<Resource>` exact return is now directly addressable (C4): a
+/// `Null` is a legal no-resource return and is pushed, with no ownership
+/// transfer.
 #[test]
-fn nested_resource_host_return_explicitly_rejected() {
-    let compiled = compile_catalog_program("let m = acme::maybe(7);\n");
+fn optional_resource_host_return_null_is_legal() {
+    let compiled = compile_catalog_program("let m = acme::maybe(7); m;\n");
     let import = compiled
         .program
         .imports
@@ -479,14 +493,10 @@ fn nested_resource_host_return_explicitly_rejected() {
         .expect("maybe import")
         .clone();
     let schema = import.schema.clone().expect("exact schema");
-    // The return schema nests a resource (`Optional(Resource)`) rather than
-    // being a top-level `Resource(_)` — the exact predicate the runtime
-    // policy keys off.
     assert!(
         matches!(
             &schema.return_type,
-            TypeSchema::Optional(inner)
-                if matches!(inner.as_ref(), TypeSchema::Resource(_))
+            TypeSchema::Optional(inner) if matches!(inner.as_ref(), TypeSchema::Resource(_))
         ),
         "maybe return must be Optional<Resource>, got: {:?}",
         schema.return_type
@@ -495,6 +505,44 @@ fn nested_resource_host_return_explicitly_rejected() {
     let mut registry = HostFunctionRegistry::new();
     registry
         .register_exact_static_non_yielding_args("acme::maybe", 1, schema, |_| {
+            Ok(CallOutcome::Return(CallReturn::One(Value::Null)))
+        })
+        .expect("register optional-resource exact host");
+    let mut vm = Vm::new(compiled.program);
+    registry.bind_vm_cached(&mut vm).expect("bind");
+
+    let status = vm
+        .run()
+        .expect("Null optional-resource return must be legal");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Null], "Null returned unchanged");
+}
+
+/// A return schema that nests a resource *inside an aggregate*
+/// (`Array<Resource>`) is still explicitly structure-rejected: the current
+/// `Value::Int` handle carrier cannot represent it, and even a `Null` must
+/// error. Only the directly-addressable `Resource` / `Optional<Resource>`
+/// returns are legal under the C4 contract.
+#[test]
+fn nested_resource_host_return_explicitly_rejected() {
+    let compiled = compile_catalog_program("let m = acme::many(7);\n");
+    let import = compiled
+        .program
+        .imports
+        .iter()
+        .find(|import| import.name == "acme::many")
+        .expect("many import")
+        .clone();
+    let schema = import.schema.clone().expect("exact schema");
+    assert!(
+        matches!(&schema.return_type, TypeSchema::Array(_)),
+        "many return must be Array<Resource>, got: {:?}",
+        schema.return_type
+    );
+
+    let mut registry = HostFunctionRegistry::new();
+    registry
+        .register_exact_static_non_yielding_args("acme::many", 1, schema, |_| {
             Ok(CallOutcome::Return(CallReturn::One(Value::Null)))
         })
         .expect("register nested-resource exact host");
@@ -556,36 +604,73 @@ fn nonresource_nonyielding_import_remains_native_eligible() {
     );
 }
 
-/// An exact `ArgsStaticNonYielding` import whose parameter schema contains a
-/// resource, but whose return is plain `Int`, must stay out of the native
-/// scalar host-call set. The loop has only an Int local; a real structurally
-/// valid raw handle is supplied as the constant argument so the owned-local
-/// program gate cannot hide a broken schema filter.
+/// A hot loop that calls a Borrow-resource-parameter exact import with a real
+/// VM-scope handle must keep that import out of the native scalar host-call
+/// set, even though its return is a plain `Int`. Because resource-bearing
+/// imports can only be bound through VM-aware registrations now (args-only is
+/// rejected at registration), the loop first obtains the borrowable handle
+/// from `acme::ping` (which returns a real handle) and passes it to the
+/// resource-parameter import; arithmetic in the loop still JITs natively.
 #[test]
 fn resource_param_plain_int_import_is_not_native_eligible_and_trace_exits() {
     if !native_jit_supported() {
         return;
     }
-    let imported = compiled_resource_arg_import();
-    let schema = imported.schema.clone().expect("exact schema");
-    assert_eq!(schema.return_type, TypeSchema::Int);
-    assert!(
-        schema
-            .params
-            .iter()
-            .any(|param| matches!(param.schema, TypeSchema::Resource(_)))
-    );
-    let program = exact_import_loop_program(&imported, real_handle_value());
+    let resource_arg = compiled_resource_arg_import();
+    let ping = compiled_ping_import();
+    let schema_arg = resource_arg.schema.clone().expect("exact schema");
+    let schema_ping = ping.schema.clone().expect("exact schema");
+
+    // program: f = ping(7);  i = 0;  loop { i += 2; resource_arg(f); } while i != 6.
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0); // 7 (ping arg)
+    bc.call(0, 1);
+    bc.stloc(0);
+    bc.ldc(1); // 0 (initial i)
+    bc.stloc(1);
+    let root = bc.position();
+    bc.ldloc(1);
+    bc.ldc(2); // 2 (i step)
+    bc.add();
+    bc.stloc(1);
+    bc.ldloc(0);
+    bc.call(1, 1); // resource_arg(f)
+    bc.pop();
+    bc.ldloc(1);
+    bc.ldc(3); // 6 (loop bound)
+    bc.ceq();
+    bc.brfalse(root);
+    bc.ret();
+    let program = Program::with_imports_and_debug(
+        vec![Value::Int(7), Value::Int(0), Value::Int(2), Value::Int(6)],
+        bc.finish(),
+        vec![
+            HostImport {
+                name: ping.name.clone(),
+                arity: 1,
+                return_type: ping.return_type,
+                schema: Some(schema_ping.clone()),
+            },
+            HostImport {
+                name: resource_arg.name.clone(),
+                arity: 1,
+                return_type: resource_arg.return_type,
+                schema: Some(schema_arg.clone()),
+            },
+        ],
+        None,
+    )
+    .with_local_count(2);
 
     let mut registry = HostFunctionRegistry::new();
     registry
-        .register_exact_static_non_yielding_args(
-            &imported.name,
-            1,
-            schema,
-            static_resource_arg_return,
-        )
-        .expect("register exact resource-parameter non-yielding import");
+        .register_exact(&ping.name, 1, schema_ping, || Box::new(VmScopeHandleHost))
+        .expect("register ping exact dynamic");
+    registry
+        .register_exact_static(&resource_arg.name, 1, schema_arg, |_vm, _args| {
+            Ok(CallOutcome::Return(CallReturn::One(Value::Int(0))))
+        })
+        .expect("register resource-parameter import via a VM-aware static");
     let mut vm = Vm::new(program);
     registry.bind_vm_cached(&mut vm).expect("bind");
     vm.set_jit_config(JitConfig {
@@ -847,11 +932,11 @@ fn exact_resource_args_dynamic_pending_completion_rejects_plain_int() {
     );
 }
 
-/// A return schema that nests a resource (`Optional<Resource>`) is rejected
-/// even through the async Pending path: completing the op with any value is a
-/// structured rejection and terminates the waiting op.
+/// An `Optional<Resource>` exact return completed through the async Pending
+/// path with `Null` is legal (C4): the op completes, `Null` lands on the
+/// stack and no ownership transfer runs.
 #[test]
-fn nested_resource_args_dynamic_pending_completion_explicitly_rejected() {
+fn optional_resource_args_dynamic_pending_completion_null_is_legal() {
     let compiled = compile_catalog_program("acme::maybe(7);\n");
     let import = compiled
         .program
@@ -866,24 +951,55 @@ fn nested_resource_args_dynamic_pending_completion_explicitly_rejected() {
             &schema.return_type,
             TypeSchema::Optional(inner) if matches!(inner.as_ref(), TypeSchema::Resource(_))
         ),
-        "maybe return must nest a resource, got: {:?}",
+        "maybe return must be Optional<Resource>, got: {:?}",
         schema.return_type
     );
 
-    let mut bc = BytecodeBuilder::new();
-    bc.ldc(0);
-    bc.call(0, 1);
-    bc.ret();
-    let program = Program::with_imports_and_debug(
-        vec![Value::Int(7)],
-        bc.finish(),
-        vec![HostImport {
-            name: import.name.clone(),
-            arity: 1,
-            return_type: import.return_type,
-            schema: Some(schema.clone()),
-        }],
-        None,
+    let calls = Arc::new(AtomicUsize::new(0));
+    let bound_calls = Arc::clone(&calls);
+    let op_id = 0xC0_DE_00_03;
+    let mut registry = HostFunctionRegistry::new();
+    registry
+        .register_exact_args(&import.name, 1, schema, move || {
+            Box::new(PendingArgsHost {
+                op_id,
+                call_count: Arc::clone(&bound_calls),
+            })
+        })
+        .expect("register optional-resource exact args");
+    let mut vm = Vm::new(compiled.program);
+    registry.bind_vm_cached(&mut vm).expect("bind");
+
+    let status = vm.run().expect("first run should wait on host op");
+    assert_eq!(status, VmStatus::Waiting(op_id));
+    assert!(vm.stack().is_empty());
+
+    vm.complete_host_op(op_id, CallReturn::one(Value::Null))
+        .expect("Null optional-resource completion must be legal");
+    assert_eq!(vm.waiting_host_op_id(), None);
+    assert_eq!(vm.stack(), &[Value::Null], "Null must be pushed");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+/// A return schema that nests a resource *inside an aggregate*
+/// (`Array<Resource>`) is structure-rejected even through the async Pending
+/// path: completing the op with any value is a structured rejection and
+/// terminates the waiting op.
+#[test]
+fn nested_resource_args_dynamic_pending_completion_explicitly_rejected() {
+    let compiled = compile_catalog_program("acme::many(7);\n");
+    let import = compiled
+        .program
+        .imports
+        .iter()
+        .find(|import| import.name == "acme::many")
+        .expect("many import")
+        .clone();
+    let schema = import.schema.clone().expect("exact schema");
+    assert!(
+        matches!(&schema.return_type, TypeSchema::Array(_)),
+        "many return must nest a resource inside an array, got: {:?}",
+        schema.return_type
     );
 
     // Each value needs a fresh VM: a rejected nested-resource completion
@@ -892,7 +1008,7 @@ fn nested_resource_args_dynamic_pending_completion_explicitly_rejected() {
     for value in [Value::Null, Value::Int(real_handle_value())] {
         let calls = Arc::new(AtomicUsize::new(0));
         let bound_calls = Arc::clone(&calls);
-        let op_id = 0xC0_DE_00_03;
+        let op_id = 0xC0_DE_00_05;
         let mut registry = HostFunctionRegistry::new();
         registry
             .register_exact_args(&import.name, 1, schema.clone(), move || {
@@ -902,7 +1018,7 @@ fn nested_resource_args_dynamic_pending_completion_explicitly_rejected() {
                 })
             })
             .expect("register nested-resource exact args");
-        let mut vm = Vm::new(program.clone());
+        let mut vm = Vm::new(compiled.program.clone());
         registry.bind_vm_cached(&mut vm).expect("bind");
 
         let status = vm.run().expect("first run should wait on host op");

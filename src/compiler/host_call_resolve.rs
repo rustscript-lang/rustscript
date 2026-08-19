@@ -411,12 +411,11 @@ fn resolve_candidate_refs<'a, A: ActualCallArgView>(
         for (param, arg) in function.params.iter().zip(args.iter()) {
             let expected_schema = param.ty.to_compiler_schema();
             score = score.combined(score_pair(&expected_schema, arg.schema()));
-            if passing_conforms {
-                if let Some(actual_passing) = arg.passing() {
-                    if actual_passing != param.passing {
-                        passing_conforms = false;
-                    }
-                }
+            if passing_conforms
+                && let Some(actual_passing) = arg.passing()
+                && actual_passing != param.passing
+            {
+                passing_conforms = false;
             }
         }
         let viable_candidate = score.mismatches == 0 && passing_conforms;

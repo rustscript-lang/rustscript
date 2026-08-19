@@ -91,6 +91,7 @@ impl Vm {
                 let op_id = self
                     .instance
                     .waiting_host_op
+                    .as_ref()
                     .map(|op| op.op_id)
                     .ok_or_else(|| {
                         VmError::JitNative(

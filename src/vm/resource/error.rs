@@ -68,6 +68,9 @@ pub enum ResourceErrorCode {
     ResourceOperationActive,
     /// A non-resource Value/ToOwned mode was supplied to the resource frame.
     ResourceAccessModeUnsupported,
+    /// A declared TakeOwned argument was not consumed by the callee and had
+    /// to be reclaimed by the exact host-call contract.
+    ResourceNotConsumed,
 }
 
 impl ResourceErrorCode {
@@ -95,6 +98,7 @@ impl ResourceErrorCode {
             Self::ResourceAccessConflict => "resource_access_conflict",
             Self::ResourceOperationActive => "resource_operation_active",
             Self::ResourceAccessModeUnsupported => "resource_access_mode_unsupported",
+            Self::ResourceNotConsumed => "resource_not_consumed",
         }
     }
 }
@@ -215,6 +219,7 @@ mod tests {
             ResourceErrorCode::ResourceAccessConflict,
             ResourceErrorCode::ResourceOperationActive,
             ResourceErrorCode::ResourceAccessModeUnsupported,
+            ResourceErrorCode::ResourceNotConsumed,
         ]
     }
 
@@ -301,6 +306,10 @@ mod tests {
             (
                 ResourceErrorCode::ResourceAccessModeUnsupported,
                 "resource_access_mode_unsupported",
+            ),
+            (
+                ResourceErrorCode::ResourceNotConsumed,
+                "resource_not_consumed",
             ),
         ];
         // Exhaustive: every code has exactly one stable string mapping.

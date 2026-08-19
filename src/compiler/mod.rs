@@ -755,7 +755,7 @@ mod tests {
     fn default_has_no_host_api_catalog() {
         let options = CompileSourceFileOptions::default();
         assert!(options.host_api_catalog().is_none());
-        assert_eq!(options.has_host_api_catalog(), false);
+        assert!(!options.has_host_api_catalog());
     }
 
     #[test]
@@ -765,7 +765,7 @@ mod tests {
         options.set_host_api_catalog(Arc::clone(&catalog));
         let stored = options.host_api_catalog().expect("set catalog present");
         assert!(Arc::ptr_eq(&catalog, stored));
-        assert_eq!(options.has_host_api_catalog(), true);
+        assert!(options.has_host_api_catalog());
     }
 
     #[test]

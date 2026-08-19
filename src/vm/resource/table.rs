@@ -144,8 +144,7 @@ impl ResourceAccessRequest {
         mode: ResourceAccessMode,
         label: &str,
     ) -> crate::vm::VmResult<Self> {
-        let handle =
-            ResourceHandle::from_value(value).map_err(|error| crate::vm::VmError::from(error))?;
+        let handle = ResourceHandle::from_value(value).map_err(crate::vm::VmError::from)?;
         let request = Self::for_type::<T>(handle, mode);
         if request.resource_type_key.is_none() {
             return Err(crate::vm::VmError::from(resource_key_unavailable(handle)));
@@ -160,8 +159,7 @@ impl ResourceAccessRequest {
         key: ResourceTypeKey,
         label: &str,
     ) -> crate::vm::VmResult<Self> {
-        let handle =
-            ResourceHandle::from_value(value).map_err(|error| crate::vm::VmError::from(error))?;
+        let handle = ResourceHandle::from_value(value).map_err(crate::vm::VmError::from)?;
         validate_declared_type_key::<T>(Some(&key), Some(handle))?;
         let _ = label;
         Ok(Self::for_type_with_key::<T>(handle, mode, key))
@@ -772,6 +770,66 @@ impl ResourceTable {
         Ok(())
     }
 
+    /// Read-only, TypeId-free preflight used by the type-erased exact host-call
+    /// contract (C1/C2).
+    ///
+    /// Validates a raw handle + expected key against the same borrow / take
+    /// contract as a typed [`ResourceAccessRequest`], *without* a concrete
+    /// `TypeId` (the contract's identity is the catalog key). Rejections are
+    /// structurally reported and mutate nothing: no close is fired, no
+    /// ownership/generation/link state changes, so the user function is never
+    /// reached on a bad argument.
+    ///
+    /// - foreign arena → [`ResourceErrorCode::ResourceHandleWrongTable`]
+    /// - stale generation → [`ResourceErrorCode::ResourceStale`]
+    /// - wrong slot key → [`ResourceErrorCode::ResourceKeyMismatch`]
+    /// - already taken → [`ResourceErrorCode::ResourceAlreadyTaken`]
+    /// - closing/closed → [`ResourceErrorCode::ResourceAlreadyClosed`]
+    /// - `TakeOwned` on a non-guest-owned resource →
+    ///   [`ResourceErrorCode::ResourceNotGuestOwned`]
+    /// - `TakeOwned` with live children →
+    ///   [`ResourceErrorCode::ResourceHasChildren`]
+    pub fn validate_access_keyed(
+        &self,
+        handle: ResourceHandle,
+        expected_key: &ResourceTypeKey,
+        mode: ResourceAccessMode,
+    ) -> ResourceResult<()> {
+        if !mode.is_borrow() && !mode.is_consuming() {
+            return Err(ResourceError::new(
+                ResourceErrorCode::ResourceAccessModeUnsupported,
+                "resource::access",
+                format!("resource mode {mode:?} is not a resource operation",),
+            ));
+        }
+        let slot_index = self.resolve_index(handle)?;
+        self.check_access_key(slot_index, handle, Some(expected_key))?;
+        if self.slots[slot_index].ownership.get() == ResourceOwnership::Taken {
+            return Err(already_taken_error(handle));
+        }
+        let state = self.slots[slot_index]
+            .state
+            .try_borrow()
+            .map_err(|_| resource_borrow_conflict_error(handle))?;
+        if !matches!(&*state, SlotState::Open(_)) {
+            return Err(already_closed_error(handle));
+        }
+        drop(state);
+        if mode == ResourceAccessMode::TakeOwned {
+            if self.slots[slot_index].ownership.get() != ResourceOwnership::GuestOwned {
+                return Err(not_guest_owned_error(handle));
+            }
+            let children = self.slots[slot_index]
+                .children
+                .try_borrow()
+                .map_err(|_| resource_borrow_conflict_error(handle))?;
+            if !children.is_empty() {
+                return Err(has_children_error(handle));
+            }
+        }
+        Ok(())
+    }
+
     /// Begins closing a resource.
     ///
     /// Properties:
@@ -841,6 +899,24 @@ impl ResourceTable {
         }
         slot.ownership.set(ResourceOwnership::GuestOwned);
         Ok(())
+    }
+
+    /// Marks an open, host-owned resource as guest-owned after verifying the
+    /// live slot key equals `expected_key` (C4 exact-return transfer).
+    ///
+    /// Same contract as [`Self::mark_guest_owned`] plus the catalog-key check,
+    /// so a returned handle that names a live slot with a *different* key
+    /// fails as a structured [`ResourceErrorCode::ResourceKeyMismatch`] with
+    /// the resource still host-owned — no ownership, lifecycle, generation, or
+    /// link state is mutated on any rejection path.
+    pub fn mark_guest_owned_with_key(
+        &mut self,
+        handle: ResourceHandle,
+        expected_key: &ResourceTypeKey,
+    ) -> ResourceResult<()> {
+        let slot_index = self.resolve_index(handle)?;
+        self.check_access_key(slot_index, handle, Some(expected_key))?;
+        self.mark_guest_owned(handle)
     }
 
     /// Releases the guest owner of a resource, launching its close exactly
@@ -1302,15 +1378,15 @@ impl ResourceTable {
         let generation = self.slots[slot_index].generation.get();
         let parent = self.slots[slot_index].parent.get_mut().take();
         if let Some(parent_handle) = parent {
-            if let Some(child_handle) =
-                ResourceHandle::encode(self.arena_id, slot_index, u64::from(generation))
+            let child_handle =
+                ResourceHandle::encode(self.arena_id, slot_index, u64::from(generation));
+            if let (Some(child_handle), Ok(parent_index)) =
+                (child_handle, self.resolve_index(parent_handle))
             {
-                if let Ok(parent_index) = self.resolve_index(parent_handle) {
-                    self.slots[parent_index]
-                        .children
-                        .get_mut()
-                        .remove(&child_handle);
-                }
+                self.slots[parent_index]
+                    .children
+                    .get_mut()
+                    .remove(&child_handle);
             }
         }
         self.put_slot_state(slot_index, SlotState::Vacant);

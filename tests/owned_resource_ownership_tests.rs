@@ -63,6 +63,10 @@ impl CountingResource {
 }
 
 impl HostResource for CountingResource {
+    fn resource_type_key() -> Option<ResourceTypeKey> {
+        Some(ResourceTypeKey::new("io.file").expect("valid test key"))
+    }
+
     fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         self.begins.fetch_add(1, Ordering::SeqCst);
         self.reasons.lock().unwrap().push(reason);
@@ -113,6 +117,10 @@ impl GatedResource {
 }
 
 impl HostResource for GatedResource {
+    fn resource_type_key() -> Option<ResourceTypeKey> {
+        Some(ResourceTypeKey::new("io.file").expect("valid test key"))
+    }
+
     fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         self.begins.fetch_add(1, Ordering::SeqCst);
         self.reasons.lock().unwrap().push(reason);
@@ -788,9 +796,9 @@ fn with_limit_capacity_counts_live_entries_not_take_tombstones() {
     // Capacity counts *live* (open/closing) entries: both taken slots are
     // retired, so fresh pushes still succeed.
     let (_res3, _b3, _r3, _d3) = CountingResource::new();
-    let token3 = table.push(_res3).expect("push 3 succeeds after takes");
+    let _token3 = table.push(_res3).expect("push 3 succeeds after takes");
     let (_res4, _b4, _r4, _d4) = CountingResource::new();
-    let token4 = table.push(_res4).expect("push 4 succeeds after takes");
+    let _token4 = table.push(_res4).expect("push 4 succeeds after takes");
     assert_eq!(table.len(), 2);
 
     // With two live entries the capacity is exhausted: the next push fails

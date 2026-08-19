@@ -264,7 +264,7 @@ pub fn parse_resource_attrs(
                     return Err("resource passing metadata must be a string literal".to_string());
                 };
                 if name_value.path.is_ident("passing") || path.is_ident("pd_host_passing") {
-                    mode = Some(ResourceMode::parse(value.value().as_str()).map_err(|msg| msg)?);
+                    mode = Some(ResourceMode::parse(value.value().as_str())?);
                 } else if name_value.path.is_ident("key") {
                     key = Some(value.value());
                 } else {

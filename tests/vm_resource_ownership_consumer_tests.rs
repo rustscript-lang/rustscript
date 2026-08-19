@@ -91,6 +91,10 @@ struct GatedResource {
 }
 
 impl HostResource for GatedResource {
+    fn resource_type_key() -> Option<ResourceTypeKey> {
+        Some(ResourceTypeKey::new("io.file").expect("valid test key"))
+    }
+
     fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         self.counters.record(reason);
         Ok(CloseProgress::Pending)
@@ -112,6 +116,10 @@ struct FailingResource {
 }
 
 impl HostResource for FailingResource {
+    fn resource_type_key() -> Option<ResourceTypeKey> {
+        Some(ResourceTypeKey::new("io.file").expect("valid test key"))
+    }
+
     fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         self.counters.record(reason);
         Err(ResourceError::new(
@@ -306,10 +314,14 @@ fn register_open_dynamic(
         .expect("register open");
 }
 
-/// Registers `acme::peek` as an exact static non-yielding no-op returning 0.
+/// Registers `acme::peek` as an exact VM-aware static no-op returning 0.
+///
+/// `peek` carries a `Borrow` resource parameter, so it must be registered
+/// through a VM-aware wrapper (`register_exact_static`): args-only exact
+/// registrations reject any resource passing at registration time.
 fn register_peek_noop(registry: &mut HostFunctionRegistry, schema: vm::HostImportSchema) {
     registry
-        .register_exact_static_non_yielding_args("acme::peek", 1, schema, |_| {
+        .register_exact_static("acme::peek", 1, schema, |_vm, _args| {
             Ok(CallOutcome::Return(CallReturn::One(Value::Int(0))))
         })
         .expect("register peek");
@@ -469,10 +481,10 @@ fn exact_host_return_foreign_handle_rejected_stack_frame_unchanged() {
     let error = vm
         .run()
         .expect_err("foreign handle return must be rejected");
-    let message = error.to_string();
-    assert!(
-        message.contains("ownership transfer failed"),
-        "expected structured ownership transfer failure, got: {error}"
+    assert_eq!(
+        error.resource_error_code(),
+        Some(ResourceErrorCode::ResourceHandleWrongTable),
+        "foreign handle return must be a structured wrong-table rejection, got: {error}"
     );
     assert_eq!(
         vm.stack(),
@@ -610,10 +622,10 @@ fn exact_async_completion_foreign_handle_rejected() {
     let error = vm
         .complete_host_op(op_id, vec![Value::Int(foreign_raw as i64)])
         .expect_err("foreign completion must be rejected");
-    let message = error.to_string();
-    assert!(
-        message.contains("ownership transfer failed"),
-        "expected structured transfer failure, got: {error}"
+    assert_eq!(
+        error.resource_error_code(),
+        Some(ResourceErrorCode::ResourceHandleWrongTable),
+        "foreign completion must be a structured wrong-table rejection, got: {error}"
     );
     assert_eq!(vm.waiting_host_op_id(), None, "waiting op terminated");
     assert!(vm.stack().is_empty(), "no value pushed");

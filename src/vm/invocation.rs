@@ -419,6 +419,7 @@ impl Vm {
     fn capture_waiting_operation(&self) -> Option<OperationState> {
         self.instance
             .waiting_host_op
+            .as_ref()
             .and_then(|op| OperationId::from_raw(op.op_id).ok())
             .and_then(|operation_id| self.host.runtime_operations.get(operation_id).ok())
     }

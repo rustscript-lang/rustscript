@@ -58,8 +58,8 @@ use super::resource::error::ResourceError;
 use super::resource::handle::{Resource, ResourceHandle};
 use super::resource::reason::ResourceCloseReason;
 use super::resource::table::{
-    GuestReleaseOutcome, OwnershipRelease, ResourceAccessFrame, ResourceAccessRequest,
-    ResourceOwnership, ResourceTable,
+    GuestReleaseOutcome, OwnershipRelease, ResourceAccessFrame, ResourceAccessMode,
+    ResourceAccessRequest, ResourceOwnership, ResourceTable,
 };
 
 /// Result alias used by the execution-scope surface.
@@ -312,6 +312,48 @@ impl ExecutionScope {
         }
         self.resources
             .begin_resource_access(requests)
+            .map_err(ExecutionScopeError::Resource)
+    }
+
+    /// Read-only, TypeId-free argument preflight for the exact manual host-call
+    /// contract (C1/C2).
+    ///
+    /// Validates a raw handle + expected key against the borrow/take contract
+    /// (arena, generation, slot key, not taken, open, and for `TakeOwned` also
+    /// guest-owned, child-free, and free of any associated active operation).
+    /// Rejections mutate nothing, so a bad argument never reaches the user
+    /// host function.
+    pub fn validate_exact_access(
+        &self,
+        handle: ResourceHandle,
+        expected_key: &ResourceTypeKey,
+        mode: ResourceAccessMode,
+    ) -> ExecutionScopeResult<()> {
+        if mode == ResourceAccessMode::TakeOwned
+            && !self.operations.operations_for_resource(handle).is_empty()
+        {
+            return Err(ExecutionScopeError::Resource(ResourceError::new(
+                super::resource::error::ResourceErrorCode::ResourceOperationActive,
+                "resource::access",
+                "resource has an associated operation that is still active",
+            )));
+        }
+        self.resources
+            .validate_access_keyed(handle, expected_key, mode)
+            .map_err(ExecutionScopeError::Resource)
+    }
+
+    /// Marks an open, host-owned resource as guest-owned after verifying its
+    /// live slot key equals `expected_key` (C4 exact-return ownership
+    /// transfer). See [`ResourceTable::mark_guest_owned_with_key`] for the
+    /// contract.
+    pub fn mark_resource_guest_owned_with_key(
+        &mut self,
+        handle: ResourceHandle,
+        expected_key: &ResourceTypeKey,
+    ) -> ExecutionScopeResult<()> {
+        self.resources
+            .mark_guest_owned_with_key(handle, expected_key)
             .map_err(ExecutionScopeError::Resource)
     }
 

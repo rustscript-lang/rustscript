@@ -1307,9 +1307,7 @@ fn build_entry_local_availability(
         .local_bindings
         .iter()
         .filter_map(|(name, slot)| {
-            let Some(binding) = predefined_by_name.get(name.as_str()).copied() else {
-                return None;
-            };
+            let binding = predefined_by_name.get(name.as_str()).copied()?;
             let schema = binding
                 .schema
                 .as_ref()
