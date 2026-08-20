@@ -10,16 +10,12 @@ use crate::vm::{CaptureAsyncHostContext, HostFutureOutput, VmError};
 use self::cancellation::{CancellationReason, OperationId, OperationOwner, OperationState};
 use self::error::{RuntimeError, RuntimeErrorCode};
 use self::resource::ResourceHandle;
-#[cfg(feature = "sqlite")]
-use self::resource::ResourceTypeId;
 
 type RuntimeOperationPoller = fn(&mut Vm, HostOpId, &mut Context<'_>) -> Poll<VmResult<CallReturn>>;
 
 const RUNTIME_OPERATION_POLLERS: &[(OperationOwner, RuntimeOperationPoller)] = &[
     #[cfg(not(feature = "async"))]
     (OperationOwner::Io, io::poll_builtin_io_op),
-    #[cfg(feature = "sqlite")]
-    (OperationOwner::Sqlite, sqlite::poll_pending_op),
 ];
 
 mod aot;
@@ -51,7 +47,10 @@ mod typed;
 pub use http::{HttpConfig, HttpHostExt};
 pub use io::{IoHostExt, IoPolicy};
 #[cfg(feature = "sqlite")]
-pub use sqlite::{SqliteHostExt, SqliteLimits, SqlitePolicy};
+pub use sqlite::{
+    SqliteExtension, SqliteHostExt, SqliteLimits, SqlitePolicy, register_sqlite_builtin_module,
+    sqlite_host_catalog,
+};
 pub use typed::HostCallResult;
 // Typed argument decoders used by `#[pd_host_function]`-generated wrappers.
 // Re-exported through `builtins::runtime` (and the crate root) so host SDK
@@ -230,28 +229,6 @@ pub(crate) fn close_runtime_resource(
     let operations = vm.host.runtime_operations.operations_for_resource(handle);
     cancel_runtime_operations(vm, operations, reason);
     vm.host.runtime_resources.close(handle, reason)
-}
-
-#[cfg(feature = "sqlite")]
-pub(crate) fn close_resources_by_type(
-    vm: &mut Vm,
-    resource_type: ResourceTypeId,
-    reason: CancellationReason,
-) {
-    let handles = vm.host.runtime_resources.handles_of_type(resource_type);
-    for handle in handles {
-        let _ = close_runtime_resource(vm, handle, reason);
-    }
-}
-
-#[cfg(feature = "sqlite")]
-pub(crate) fn cancel_operations_by_owner(
-    vm: &mut Vm,
-    owner: OperationOwner,
-    reason: CancellationReason,
-) {
-    let operations = vm.host.runtime_operations.operations_by_owner(owner);
-    cancel_runtime_operations(vm, operations, reason);
 }
 
 pub(crate) fn poll_builtin_io_op(

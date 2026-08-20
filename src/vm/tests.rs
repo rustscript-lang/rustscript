@@ -2,8 +2,6 @@ use super::async_host::WaitingHostOp;
 use super::*;
 use crate::builtins::BuiltinFunction;
 use crate::bytecode::TypeMap;
-#[cfg(feature = "sqlite")]
-use crate::{SqliteHostExt, SqlitePolicy};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -529,69 +527,6 @@ fn worker_observed_deadline_retains_payload_until_vm_consumes_operation() {
         vm.host
             .runtime_resources
             .get::<()>(payload, ResourceTypeId::CALLBACK)
-            .is_err()
-    );
-}
-
-#[cfg(feature = "sqlite")]
-#[test]
-fn sqlite_reconfiguration_only_closes_sqlite_owned_state() {
-    use crate::builtins::runtime::cancellation::OperationOwner;
-    use crate::builtins::runtime::resource::ResourceTypeId;
-
-    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
-    let io_resource = vm
-        .host
-        .runtime_resources
-        .insert(ResourceTypeId::IO_FILE, 11_i64)
-        .expect("IO resource should be inserted");
-    let sqlite_resource = vm
-        .host
-        .runtime_resources
-        .insert(ResourceTypeId::SQLITE_CONNECTION, 22_i64)
-        .expect("SQLite resource should be inserted");
-    let io_operation = vm
-        .host
-        .runtime_operations
-        .start_owned(
-            OperationOwner::Io,
-            Some(&vm.run_ctx.cancellation),
-            None,
-            None,
-        )
-        .expect("IO operation should start");
-    io_operation.set_resource(io_resource);
-    let sqlite_operation = vm
-        .host
-        .runtime_operations
-        .start_owned(
-            OperationOwner::Sqlite,
-            Some(&vm.run_ctx.cancellation),
-            None,
-            None,
-        )
-        .expect("SQLite operation should start");
-    sqlite_operation.set_resource(sqlite_resource);
-
-    vm.configure_sqlite(SqlitePolicy::default());
-
-    assert!(
-        vm.host
-            .runtime_resources
-            .get::<i64>(io_resource, ResourceTypeId::IO_FILE)
-            .is_ok()
-    );
-    assert!(vm.host.runtime_operations.get(io_operation.id()).is_ok());
-    assert!(
-        vm.host
-            .runtime_resources
-            .get::<i64>(sqlite_resource, ResourceTypeId::SQLITE_CONNECTION)
-            .is_err()
-    );
-    assert!(
-        vm.host
-            .runtime_operations
-            .get(sqlite_operation.id())
             .is_err()
     );
 }

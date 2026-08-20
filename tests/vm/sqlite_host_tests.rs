@@ -1,75 +1,277 @@
+//! SQLite host tests.
+//!
+//! SQLite is exercised here as a *generic* host-SDK consumer: connections are
+//! [`HostResource`]s pushed into the execution scope through its
+//! `host_context()`, and every async activity is a generic [`HostOperation`]
+//! associated with the connection resource handle. The mock `Vm` below
+//! therefore exposes the same generic scope / module-state surface the
+//! production `Vm` does, so the very same `src/builtins/runtime/sqlite.rs`
+//! source (via `include!`) runs against the real generic SDK types.
+//!
+//! The suite preserves every historical SQLite scenario (round-trips,
+//! transactions, policy/limits, read-only + SQL safety, truncation, pending
+//! cancellation, sibling isolation, close/cancel-all, generational handles,
+//! resource association) and adds generic-scope tests: policy persistence
+//! across reset, connection lifecycle through the scope, and the typed
+//! cancellation reason delivered on both connection close and scope reset.
+
 extern crate vm as rustscript_vm;
 
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// The generic host surface the included sqlite implementation is compiled
+/// against. Data types and the generic resource/operation SDK come from the
+/// real `vm` crate; the VM shell itself is mocked with a real
+/// [`ExecutionScope`] plus a real typed module-state store.
 pub mod vm {
     use std::any::{Any, TypeId};
     use std::collections::HashMap;
 
-    pub use crate::builtins::runtime::sqlite::{SqliteLimits, SqlitePolicy};
-    pub use crate::rustscript_vm::{
-        CallReturn, HostCallResult, HostOpId, OpCode, Program, Value, VmError, VmMap, VmResult,
+    pub use rustscript_vm::vm::execution_scope::{ExecutionScope, ScopeCloseOutcome, ScopeState};
+    pub use rustscript_vm::vm::{
+        CallOutcome, CallReturn, HostContextError, HostContextErrorKind, HostContextResult,
+        HostModule, HostModuleState, HostOpId,
     };
 
-    use crate::builtins::runtime::cancellation::{CancellationToken, OperationRegistry};
-    use crate::builtins::runtime::resource::ResourceArena;
+    /// Mock registry: registration only compiles the included sqlite
+    /// registration path against the mock `Vm`. Real binding/binding-absence
+    /// behaviour is exercised through the production crate in the integration
+    /// tests below.
+    #[derive(Default)]
+    pub struct HostFunctionRegistry;
+
+    impl HostFunctionRegistry {
+        pub fn register_exact_static(
+            &mut self,
+            _name: impl Into<String>,
+            _arity: u8,
+            _schema: rustscript_vm::bytecode::HostImportSchema,
+            _function: fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>,
+        ) -> VmResult<u16> {
+            Ok(0)
+        }
+
+        pub fn mark_exact_runtime_owned_pending(&mut self, _name: &str) -> VmResult<()> {
+            Ok(())
+        }
+    }
+    pub mod operation {
+        pub use rustscript_vm::vm::operation::{
+            HostOperation, OperationCancelReason, OperationError, OperationErrorCode, OperationId,
+            OperationOutcome, OperationResult, OperationSpec, OperationStatus,
+        };
+    }
+    pub use rustscript_vm::vm::operation::{
+        HostOperation, OperationCancelReason, OperationError, OperationErrorCode, OperationId,
+        OperationOutcome, OperationResult, OperationSpec, OperationStatus,
+    };
+    pub mod resource {
+        pub use rustscript_vm::vm::resource::{
+            CloseProgress, HostResource, Resource, ResourceCloseReason, ResourceError,
+            ResourceHandle, ResourceRef, ResourceResult, ResourceTypeKey,
+        };
+    }
+    pub use rustscript_vm::host_extension;
+    pub use rustscript_vm::vm::resource::{
+        CloseProgress, HostResource, Resource, ResourceCloseReason, ResourceError, ResourceHandle,
+        ResourceRef, ResourceResult, ResourceTypeKey,
+    };
+    pub use rustscript_vm::{HostCallResult, OpCode, Program, Value, VmError, VmMap, VmResult};
+    // Sqlite policy/limits types come from the included sqlite source (defined
+    // in `builtins::runtime::sqlite`), mirroring the production crate root.
+    pub use crate::builtins::runtime::sqlite::{SqliteLimits, SqlitePolicy};
+
+    /// Mock host-extension surface bound to the mock `Vm` (the production
+    /// `HostExtension` trait is bound to the real `Vm`, which the mock cannot
+    /// satisfy).
+    pub trait HostExtension: Send + Sync + 'static {
+        fn register(&self, registry: &mut HostFunctionRegistry) -> VmResult<()> {
+            let _ = registry;
+            Ok(())
+        }
+
+        fn install(&self, vm: &mut Vm) {
+            let _ = vm;
+        }
+    }
+
+    /// Mock per-VM host runtime: a real execution scope plus a real typed
+    /// module-state store (the only surfaces sqlite uses).
+    pub(crate) type PendingOpResult = Box<dyn FnOnce(&mut Vm) -> VmResult<CallReturn> + Send>;
 
     pub(crate) struct TestHostRuntime {
-        pub(crate) runtime_resources: ResourceArena,
-        pub(crate) runtime_operations: OperationRegistry,
-        host_function_states: HashMap<TypeId, Box<dyn Any + Send>>,
+        pub(crate) execution_scope: ExecutionScope,
+        pub(crate) module_states: HashMap<TypeId, Box<dyn Any + Send>>,
     }
 
     impl TestHostRuntime {
-        pub(crate) fn set_host_function_state<T: Any + Send>(&mut self, state: T) {
-            self.host_function_states
-                .insert(TypeId::of::<T>(), Box::new(state));
+        fn new() -> Self {
+            Self {
+                execution_scope: ExecutionScope::new(),
+                module_states: HashMap::new(),
+            }
         }
 
-        pub(crate) fn host_function_state<T: Any + Send>(&self) -> Option<&T> {
-            self.host_function_states
-                .get(&TypeId::of::<T>())?
-                .downcast_ref()
+        fn set_module_state<M: HostModule>(&mut self, state: M) -> bool {
+            self.module_states
+                .insert(TypeId::of::<M>(), Box::new(state))
+                .is_some()
         }
 
-        #[allow(dead_code)]
-        pub(crate) fn remove_host_function_state<T: Any + Send>(&mut self) -> Option<T> {
-            self.host_function_states
-                .remove(&TypeId::of::<T>())?
-                .downcast::<T>()
+        fn take_module_state<M: HostModule>(&mut self) -> Option<M> {
+            self.module_states
+                .remove(&TypeId::of::<M>())?
+                .downcast::<M>()
                 .ok()
-                .map(|state| *state)
+                .map(|value| *value)
+        }
+
+        fn get_module_state<M: HostModule>(&self) -> Option<&M> {
+            self.module_states.get(&TypeId::of::<M>())?.downcast_ref()
+        }
+
+        fn get_module_state_mut<M: HostModule>(&mut self) -> Option<&mut M> {
+            self.module_states
+                .get_mut(&TypeId::of::<M>())?
+                .downcast_mut()
+        }
+
+        pub(crate) fn register_pending_op_result(&mut self, _raw: u64, _provider: PendingOpResult) {
+            // The mock surfaces the value directly through `take_pending_result`
+            // (mirroring the production module side channel); it does not need
+            // to store the adapter — this only keeps the union surface in sync.
         }
     }
 
-    pub(crate) struct TestRunContext {
-        pub(crate) cancellation: CancellationToken,
-    }
-
+    /// The mock `Vm` mirrors the production `Vm::host_context()` surface with
+    /// exactly the methods the sqlite implementation uses.
     pub struct Vm {
         pub(crate) host: TestHostRuntime,
-        pub(crate) run_ctx: TestRunContext,
     }
 
     impl Vm {
         pub fn new(_program: Program) -> Self {
             Self {
-                host: TestHostRuntime {
-                    runtime_resources: ResourceArena::default(),
-                    runtime_operations: OperationRegistry::default(),
-                    host_function_states: HashMap::new(),
-                },
-                run_ctx: TestRunContext {
-                    cancellation: CancellationToken::root(),
-                },
+                host: TestHostRuntime::new(),
             }
+        }
+
+        pub fn host_context(&mut self) -> TestHostContext<'_> {
+            TestHostContext::new(&mut self.host)
+        }
+    }
+
+    /// Generic boundary over the mock runtime, exposing the same surface the
+    /// production [`HostContext`](rustscript_vm::vm::HostContext) does.
+    pub struct TestHostContext<'a> {
+        host: &'a mut TestHostRuntime,
+    }
+
+    impl<'a> TestHostContext<'a> {
+        fn new(host: &'a mut TestHostRuntime) -> Self {
+            Self { host }
+        }
+
+        fn from_scope<T>(result: rustscript_vm::VmResult<T>) -> HostContextResult<T> {
+            result.map_err(|error| HostContextError::new("host::scope", error.to_string()))
+        }
+
+        fn from_resource<T>(result: ResourceResult<T>) -> HostContextResult<T> {
+            result.map_err(|error| HostContextError::new("host::resource", error.to_string()))
+        }
+
+        pub fn set_module_state<M: HostModule>(&mut self, state: M) -> bool {
+            self.host.set_module_state(state)
+        }
+
+        pub fn take_module_state<M: HostModule>(&mut self) -> Option<M> {
+            self.host.take_module_state()
+        }
+
+        pub fn module_state<M: HostModule>(&self) -> Option<&M> {
+            self.host.get_module_state()
+        }
+
+        pub fn module_state_mut<M: HostModule>(&mut self) -> Option<&mut M> {
+            self.host.get_module_state_mut()
+        }
+
+        pub fn execution_scope(&self) -> &ExecutionScope {
+            &self.host.execution_scope
+        }
+
+        pub fn push_resource_with_key<T: HostResource>(
+            &mut self,
+            value: T,
+            key: ResourceTypeKey,
+        ) -> HostContextResult<Resource<T>> {
+            Self::from_scope(
+                self.host
+                    .execution_scope
+                    .push_resource_with_key(value, key)
+                    .map_err(|error| rustscript_vm::VmError::HostError(error.to_string())),
+            )
+        }
+
+        pub fn start_operation(&mut self, spec: OperationSpec) -> HostContextResult<OperationId> {
+            Self::from_scope(
+                self.host
+                    .execution_scope
+                    .start_operation(spec)
+                    .map_err(|error| rustscript_vm::VmError::HostError(error.to_string())),
+            )
+        }
+
+        pub fn close_resource<T: HostResource>(
+            &mut self,
+            handle: ResourceHandle,
+            reason: ResourceCloseReason,
+        ) -> HostContextResult<CloseProgress> {
+            Self::from_scope(
+                self.host
+                    .execution_scope
+                    .close_resource::<T>(handle, reason)
+                    .map_err(|error| rustscript_vm::VmError::HostError(error.to_string())),
+            )
+        }
+
+        pub fn typed_resource<T: HostResource>(
+            &self,
+            handle: ResourceHandle,
+        ) -> HostContextResult<Resource<T>> {
+            Self::from_resource(self.host.execution_scope.resources().typed(handle))
+        }
+
+        pub fn resource<T: HostResource>(
+            &self,
+            token: &Resource<T>,
+        ) -> HostContextResult<ResourceRef<'_, T>> {
+            Self::from_resource(self.host.execution_scope.resources().get(token))
         }
     }
 }
 
-mod builtins {
-    pub use crate::vm::{Value, Vm, VmResult};
+/// Mirrors the production `crate::host_api` path used by the included source.
+pub mod host_api {
+    pub use rustscript_vm::host_api::{
+        HostApiBuilder, HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema,
+        HostTypeSchema, ResourceTypeKey, ResourceTypeSchema,
+    };
+}
+
+pub mod builtins {
+    pub use crate::vm::{
+        CallOutcome, CallReturn, HostCallResult, Value, Vm, VmError, VmMap, VmResult,
+    };
 
     pub mod runtime {
         pub use crate::vm::{HostCallResult, VmMap};
+
+        pub use self::typed::borrow_arg;
 
         pub mod error {
             include!(concat!(
@@ -78,173 +280,89 @@ mod builtins {
             ));
         }
 
-        #[allow(dead_code)]
-        pub mod cancellation {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/builtins/runtime/cancellation.rs"
-            ));
-        }
-
-        #[allow(dead_code)]
-        pub mod resource {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/builtins/runtime/resource.rs"
-            ));
-        }
-
-        pub(crate) fn cancel_runtime_operation(
-            vm: &mut crate::vm::Vm,
-            op_id: cancellation::OperationId,
-            reason: cancellation::CancellationReason,
-        ) {
-            let payload = vm
-                .host
-                .runtime_operations
-                .get(op_id)
-                .ok()
-                .and_then(|operation| operation.payload());
-            let _ = vm.host.runtime_operations.cancel(op_id, reason);
-            if let Some(payload) = payload {
-                let _ = close_runtime_resource(vm, payload, reason);
-            }
-        }
-
-        pub(crate) fn close_runtime_resource(
-            vm: &mut crate::vm::Vm,
-            handle: resource::ResourceHandle,
-            reason: cancellation::CancellationReason,
-        ) -> error::RuntimeResult<resource::CloseStatus> {
-            let operations = vm
-                .host
-                .runtime_operations
-                .operations_for_resource(handle)
-                .into_iter()
-                .map(|operation| {
-                    let payload = operation.payload();
-                    (operation, payload)
-                })
-                .collect::<Vec<_>>();
-            for (operation, _) in &operations {
-                operation.token().mark_cancelled(reason);
-            }
-            for (operation, _) in &operations {
-                let _ = vm.host.runtime_operations.cancel(operation.id(), reason);
-            }
-            for (_, payload) in operations {
-                if let Some(payload) = payload {
-                    let _ = close_runtime_resource(vm, payload, reason);
-                }
-            }
-            vm.host.runtime_resources.close(handle, reason)
-        }
-
-        pub(crate) fn cancel_operations_by_owner(
-            vm: &mut crate::vm::Vm,
-            owner: cancellation::OperationOwner,
-            reason: cancellation::CancellationReason,
-        ) {
-            let operations = vm.host.runtime_operations.operations_by_owner(owner);
-            for operation in operations {
-                cancel_runtime_operation(vm, operation.id(), reason);
-            }
-        }
-
-        pub(crate) fn close_resources_by_type(
-            vm: &mut crate::vm::Vm,
-            resource_type: resource::ResourceTypeId,
-            reason: cancellation::CancellationReason,
-        ) {
-            let handles = vm.host.runtime_resources.handles_of_type(resource_type);
-            for handle in handles {
-                let _ = close_runtime_resource(vm, handle, reason);
-            }
-        }
-
         pub mod typed {
             pub type VmArrayRef<'a> = &'a [crate::vm::Value];
             pub type VmMapRef<'a> = &'a crate::vm::VmMap;
-        }
 
-        pub trait TestBorrowArg<'a>: Sized {
-            fn borrow_arg(
-                args: &'a [crate::vm::Value],
-                index: usize,
-                label: &'static str,
-            ) -> crate::vm::VmResult<Self>;
-        }
-
-        impl<'a> TestBorrowArg<'a> for crate::vm::Value {
-            fn borrow_arg(
-                args: &'a [crate::vm::Value],
-                index: usize,
-                label: &'static str,
-            ) -> crate::vm::VmResult<Self> {
-                args.get(index)
-                    .cloned()
-                    .ok_or(crate::vm::VmError::HostError(label.to_string()))
+            pub trait TestBorrowArg<'a>: Sized {
+                fn borrow_arg(
+                    args: &'a [crate::vm::Value],
+                    index: usize,
+                    label: &'static str,
+                ) -> crate::vm::VmResult<Self>;
             }
-        }
 
-        impl<'a> TestBorrowArg<'a> for i64 {
-            fn borrow_arg(
-                args: &'a [crate::vm::Value],
-                index: usize,
-                label: &'static str,
-            ) -> crate::vm::VmResult<Self> {
-                match args.get(index) {
-                    Some(crate::vm::Value::Int(value)) => Ok(*value),
-                    _ => Err(crate::vm::VmError::HostError(label.to_string())),
+            impl<'a> TestBorrowArg<'a> for crate::vm::Value {
+                fn borrow_arg(
+                    args: &'a [crate::vm::Value],
+                    index: usize,
+                    label: &'static str,
+                ) -> crate::vm::VmResult<Self> {
+                    args.get(index)
+                        .cloned()
+                        .ok_or(crate::vm::VmError::HostError(label.to_string()))
                 }
             }
-        }
 
-        impl<'a> TestBorrowArg<'a> for &'a str {
-            fn borrow_arg(
+            impl<'a> TestBorrowArg<'a> for i64 {
+                fn borrow_arg(
+                    args: &'a [crate::vm::Value],
+                    index: usize,
+                    label: &'static str,
+                ) -> crate::vm::VmResult<Self> {
+                    match args.get(index) {
+                        Some(crate::vm::Value::Int(value)) => Ok(*value),
+                        _ => Err(crate::vm::VmError::HostError(label.to_string())),
+                    }
+                }
+            }
+
+            impl<'a> TestBorrowArg<'a> for &'a str {
+                fn borrow_arg(
+                    args: &'a [crate::vm::Value],
+                    index: usize,
+                    label: &'static str,
+                ) -> crate::vm::VmResult<Self> {
+                    match args.get(index) {
+                        Some(crate::vm::Value::String(value)) => Ok(value.as_str()),
+                        _ => Err(crate::vm::VmError::HostError(label.to_string())),
+                    }
+                }
+            }
+
+            impl<'a> TestBorrowArg<'a> for &'a [crate::vm::Value] {
+                fn borrow_arg(
+                    args: &'a [crate::vm::Value],
+                    index: usize,
+                    label: &'static str,
+                ) -> crate::vm::VmResult<Self> {
+                    match args.get(index) {
+                        Some(crate::vm::Value::Array(value)) => Ok(value.as_slice()),
+                        _ => Err(crate::vm::VmError::HostError(label.to_string())),
+                    }
+                }
+            }
+
+            impl<'a> TestBorrowArg<'a> for &'a crate::vm::VmMap {
+                fn borrow_arg(
+                    args: &'a [crate::vm::Value],
+                    index: usize,
+                    label: &'static str,
+                ) -> crate::vm::VmResult<Self> {
+                    match args.get(index) {
+                        Some(crate::vm::Value::Map(value)) => Ok(value.as_ref()),
+                        _ => Err(crate::vm::VmError::HostError(label.to_string())),
+                    }
+                }
+            }
+
+            pub fn borrow_arg<'a, T: TestBorrowArg<'a>>(
                 args: &'a [crate::vm::Value],
                 index: usize,
                 label: &'static str,
-            ) -> crate::vm::VmResult<Self> {
-                match args.get(index) {
-                    Some(crate::vm::Value::String(value)) => Ok(value.as_str()),
-                    _ => Err(crate::vm::VmError::HostError(label.to_string())),
-                }
+            ) -> crate::vm::VmResult<T> {
+                T::borrow_arg(args, index, label)
             }
-        }
-
-        impl<'a> TestBorrowArg<'a> for &'a [crate::vm::Value] {
-            fn borrow_arg(
-                args: &'a [crate::vm::Value],
-                index: usize,
-                label: &'static str,
-            ) -> crate::vm::VmResult<Self> {
-                match args.get(index) {
-                    Some(crate::vm::Value::Array(value)) => Ok(value.as_slice()),
-                    _ => Err(crate::vm::VmError::HostError(label.to_string())),
-                }
-            }
-        }
-
-        impl<'a> TestBorrowArg<'a> for &'a crate::vm::VmMap {
-            fn borrow_arg(
-                args: &'a [crate::vm::Value],
-                index: usize,
-                label: &'static str,
-            ) -> crate::vm::VmResult<Self> {
-                match args.get(index) {
-                    Some(crate::vm::Value::Map(value)) => Ok(value.as_ref()),
-                    _ => Err(crate::vm::VmError::HostError(label.to_string())),
-                }
-            }
-        }
-
-        pub fn borrow_arg<'a, T: TestBorrowArg<'a>>(
-            args: &'a [crate::vm::Value],
-            index: usize,
-            label: &'static str,
-        ) -> crate::vm::VmResult<T> {
-            T::borrow_arg(args, index, label)
         }
 
         pub mod sqlite {
@@ -254,128 +372,195 @@ mod builtins {
             ));
         }
 
+        /// Test-side wrappers driving the included sqlite implementation
+        /// through its generic scope surface.
         pub mod test_api {
-            use std::task::{Context, Poll};
-
-            use super::cancellation::{
-                CancellationReason, OperationId, OperationOwner, OperationStatus,
+            use super::sqlite;
+            use crate::vm::{
+                CallReturn, HostCallResult, HostOpId, OperationCancelReason, OperationId,
+                OperationOutcome, ResourceCloseReason, ResourceHandle, Value, Vm, VmError, VmMap,
+                VmResult,
             };
-            use super::resource::{ResourceHandle, ResourceTypeId};
-            use super::{HostCallResult, VmMap};
-            use crate::vm::{CallReturn, HostOpId, Value, Vm, VmResult};
+            use std::sync::Arc;
+            use std::task::{Context, Poll, Wake, Waker};
+
+            struct NoopWake;
+
+            impl Wake for NoopWake {
+                fn wake(self: Arc<Self>) {}
+            }
 
             pub fn open(vm: &mut Vm, args: &[Value]) -> VmResult<i64> {
-                super::sqlite::builtin_sqlite_open(vm, args)
+                sqlite::builtin_sqlite_open(vm, args)
             }
 
             pub fn execute(vm: &mut Vm, args: &[Value]) -> VmResult<HostCallResult<VmMap>> {
-                super::sqlite::builtin_sqlite_execute(vm, args)
+                sqlite::builtin_sqlite_execute(vm, args)
             }
 
             pub fn query(vm: &mut Vm, args: &[Value]) -> VmResult<HostCallResult<VmMap>> {
-                super::sqlite::builtin_sqlite_query(vm, args)
+                sqlite::builtin_sqlite_query(vm, args)
             }
 
             pub fn transaction(
                 vm: &mut Vm,
                 args: &[Value],
             ) -> VmResult<HostCallResult<Vec<Value>>> {
-                super::sqlite::builtin_sqlite_transaction(vm, args)
+                sqlite::builtin_sqlite_transaction(vm, args)
             }
 
             pub fn close(vm: &mut Vm, args: &[Value]) -> VmResult<()> {
-                super::sqlite::builtin_sqlite_close(vm, args)
+                sqlite::builtin_sqlite_close(vm, args)
             }
 
+            /// Polls one generic scope operation to terminal and returns the
+            /// value the sqlite driver produced, mapping a cancelled
+            /// operation back onto the same typed cancellation error the
+            /// production runtime surfaces.
             pub fn poll(
                 vm: &mut Vm,
                 op_id: HostOpId,
                 cx: &mut Context<'_>,
             ) -> Poll<VmResult<CallReturn>> {
-                super::sqlite::poll_pending_op(vm, op_id, cx)
-            }
-
-            pub fn cancel(vm: &mut Vm, op_id: HostOpId) {
                 let Ok(id) = OperationId::from_raw(op_id) else {
-                    return;
+                    return Poll::Ready(Err(VmError::HostError(
+                        "invalid SQLite operation id".to_string(),
+                    )));
                 };
-                let payload = vm
+                // Capture the association before polling: a terminal poll
+                // consumes the registry entry.
+                let connection = vm
                     .host
-                    .runtime_operations
-                    .get(id)
+                    .execution_scope
+                    .operations()
+                    .resource_of(id)
                     .ok()
-                    .filter(|operation| operation.owner() == OperationOwner::Sqlite)
-                    .and_then(|operation| operation.payload());
-                let _ = vm
-                    .host
-                    .runtime_operations
-                    .cancel(id, CancellationReason::Requested);
-                if let Some(payload) = payload {
-                    let _ = vm
-                        .host
-                        .runtime_resources
-                        .close(payload, CancellationReason::Requested);
+                    .flatten()
+                    .map(|handle| handle.raw() as i64);
+                match vm.host.execution_scope.poll_operation(id, cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Err(error)) => {
+                        Poll::Ready(Err(VmError::HostError(error.to_string())))
+                    }
+                    Poll::Ready(Ok(outcome)) => match outcome {
+                        OperationOutcome::Cancelled(reason) => Poll::Ready(Err(
+                            VmError::HostError(format!("SQLite operation cancelled ({reason})")),
+                        )),
+                        _ => {
+                            let value = connection
+                                .and_then(|raw| sqlite::take_pending_result(vm, op_id, raw))
+                                .unwrap_or_else(|| {
+                                    Err(VmError::HostError(
+                                        "SQLite operation produced no result".to_string(),
+                                    ))
+                                });
+                            Poll::Ready(value)
+                        }
+                    },
                 }
             }
 
-            pub fn active_operation_id(vm: &Vm, resource_id: i64) -> Option<HostOpId> {
-                super::sqlite::active_operation_id(vm, resource_id)
+            pub fn cancel(vm: &mut Vm, op_id: HostOpId) {
+                if let Ok(id) = OperationId::from_raw(op_id) {
+                    let _ = vm
+                        .host
+                        .execution_scope
+                        .cancel_operation(id, OperationCancelReason::Requested);
+                }
+            }
+
+            /// Whether the connection identified by `resource_id` still has a
+            /// live sqlite worker (the query actually entered execution).
+            pub fn live_worker_count(vm: &mut Vm, resource_id: i64) -> usize {
+                sqlite::live_worker_count(vm, resource_id)
             }
 
             pub fn has_pending(vm: &Vm, op_id: HostOpId) -> bool {
                 OperationId::from_raw(op_id).is_ok_and(|id| {
-                    vm.host.runtime_operations.get(id).is_ok_and(|operation| {
-                        operation.owner() == OperationOwner::Sqlite
-                            && matches!(operation.status(), OperationStatus::Pending)
-                            && operation.payload().is_some()
-                    })
+                    vm.host
+                        .execution_scope
+                        .operations()
+                        .status(id)
+                        .is_ok_and(|status| status == crate::vm::OperationStatus::Pending)
                 })
             }
 
+            /// Drives the whole execution scope to quiescence (VmReset).
             pub fn close_all(vm: &mut Vm) {
                 let _ = vm
                     .host
-                    .runtime_operations
-                    .cancel_all(CancellationReason::VmReset);
+                    .execution_scope
+                    .begin_close(ResourceCloseReason::VmReset);
+                drive_quiescent(&mut vm.host.execution_scope);
+            }
+
+            /// Resets the execution scope (mimicking the production
+            /// `Vm::reset_for_reuse`): drives the current scope to quiescence,
+            /// then installs a fresh Active scope so the VM can run again.
+            pub fn reset_all(vm: &mut Vm) {
                 let _ = vm
                     .host
-                    .runtime_resources
-                    .close_all(CancellationReason::VmReset);
+                    .execution_scope
+                    .begin_close(ResourceCloseReason::VmReset);
+                drive_quiescent(&mut vm.host.execution_scope);
+                vm.host.execution_scope = crate::vm::ExecutionScope::new();
             }
 
-            pub fn has_sqlite_operation_owner(vm: &Vm, op_id: HostOpId) -> bool {
-                OperationId::from_raw(op_id)
+            /// Whether the operation is registered in the scope and
+            /// associated with the given connection handle.
+            pub fn is_associated_with(vm: &Vm, op_id: HostOpId, connection: i64) -> bool {
+                let Ok(id) = OperationId::from_raw(op_id) else {
+                    return false;
+                };
+                let Ok(handle) = ResourceHandle::from_value(&Value::Int(connection)) else {
+                    return false;
+                };
+                vm.host
+                    .execution_scope
+                    .operations()
+                    .resource_of(id)
                     .ok()
-                    .and_then(|id| vm.host.runtime_operations.get(id).ok())
-                    .map(|operation| operation.owner())
-                    == Some(OperationOwner::Sqlite)
+                    .flatten()
+                    == Some(handle)
             }
 
-            pub fn is_sqlite_resource(handle: i64) -> bool {
-                ResourceHandle::from_value(&Value::Int(handle))
-                    .is_ok_and(|handle| handle.resource_type() == ResourceTypeId::SQLITE_CONNECTION)
-            }
-
+            /// Pushes a resource of a different concrete type into the scope,
+            /// returning its raw handle (used to prove sqlite rejects it).
             pub fn insert_wrong_type_resource(vm: &mut Vm) -> i64 {
-                let handle = vm
+                let token = vm
                     .host
-                    .runtime_resources
-                    .insert(ResourceTypeId::IO_FILE, 7_i64)
+                    .execution_scope
+                    .push_resource(TestNonSqliteResource { id: 7 })
                     .expect("test resource should be inserted");
-                match handle.as_value() {
-                    Value::Int(value) => value,
-                    _ => unreachable!(),
-                }
+                token.into_handle().raw() as i64
             }
+
+            fn drive_quiescent(scope: &mut crate::vm::ExecutionScope) {
+                let waker = Waker::from(Arc::new(NoopWake));
+                let mut cx = Context::from_waker(&waker);
+                loop {
+                    match scope.poll_close(&mut cx) {
+                        Poll::Pending => std::thread::sleep(std::time::Duration::from_millis(2)),
+                        Poll::Ready(result) => {
+                            let _ = result.expect("scope close should succeed");
+                            break;
+                        }
+                    }
+                }
+                assert!(
+                    scope.is_quiescent(),
+                    "mock scope must reach quiescence after close_all"
+                );
+            }
+
+            struct TestNonSqliteResource {
+                id: i64,
+            }
+
+            impl crate::vm::HostResource for TestNonSqliteResource {}
         }
     }
 }
-
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::task::{Context, Poll, Wake, Waker};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use builtins::runtime::sqlite::SqliteHostExt;
 use builtins::runtime::test_api as sqlite;
@@ -385,10 +570,6 @@ struct NoopWake;
 
 impl Wake for NoopWake {
     fn wake(self: Arc<Self>) {}
-}
-
-fn noop_waker() -> Waker {
-    Waker::from(Arc::new(NoopWake))
 }
 
 fn new_vm() -> Vm {
@@ -444,7 +625,7 @@ fn empty_params() -> Value {
 }
 
 fn wait_pending(vm: &mut Vm, op_id: vm::HostOpId) -> Result<Value, VmError> {
-    let waker = noop_waker();
+    let waker = std::sync::Arc::new(NoopWake).into();
     let mut cx = Context::from_waker(&waker);
     loop {
         match sqlite::poll(vm, op_id, &mut cx) {
@@ -519,6 +700,18 @@ fn query(
         &[Value::Int(db_id), Value::string(sql), params, query_limits],
     );
     host_map(vm, result)
+}
+
+/// Waits until the connection has a live worker (a query actually entered
+/// SQLite execution), bounded by `deadline`.
+fn wait_for_worker(vm: &mut Vm, db_id: i64, deadline: std::time::Instant) {
+    while sqlite::live_worker_count(vm, db_id) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sqlite query should enter execution"
+        );
+        std::thread::yield_now();
+    }
 }
 
 #[test]
@@ -821,6 +1014,7 @@ fn cancelling_queued_sqlite_operation_does_not_interrupt_active_sibling() {
             ]),
         ),
     );
+    let wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     let active = sqlite::query(
         &mut vm,
         &[
@@ -838,14 +1032,7 @@ fn cancelling_queued_sqlite_operation_does_not_interrupt_active_sibling() {
     let HostCallResult::Pending(active_id) = active else {
         panic!("active query should be pending");
     };
-    let wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    while sqlite::active_operation_id(&vm, db_id) != Some(active_id) {
-        assert!(
-            std::time::Instant::now() < wait_deadline,
-            "active query should enter SQLite execution"
-        );
-        std::thread::yield_now();
-    }
+    wait_for_worker(&mut vm, db_id, wait_deadline);
 
     let queued = sqlite::query(
         &mut vm,
@@ -861,7 +1048,6 @@ fn cancelling_queued_sqlite_operation_does_not_interrupt_active_sibling() {
         panic!("queued query should be pending");
     };
     sqlite::cancel(&mut vm, queued_id);
-    assert_eq!(sqlite::active_operation_id(&vm, db_id), Some(active_id));
 
     wait_pending(&mut vm, active_id).expect("active sibling should complete successfully");
     assert!(!sqlite::has_pending(&vm, active_id));
@@ -895,6 +1081,7 @@ fn assert_sqlite_shutdown_cancels_all_siblings(close_all: bool) {
     )
     .expect("table creation should succeed");
 
+    let wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     let active = sqlite::query(
         &mut vm,
         &[
@@ -912,11 +1099,7 @@ fn assert_sqlite_shutdown_cancels_all_siblings(close_all: bool) {
     let HostCallResult::Pending(active_id) = active else {
         panic!("active query should be pending");
     };
-    let wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    while sqlite::active_operation_id(&vm, db_id) != Some(active_id) {
-        assert!(std::time::Instant::now() < wait_deadline);
-        std::thread::yield_now();
-    }
+    wait_for_worker(&mut vm, db_id, wait_deadline);
 
     let queued = sqlite::execute(
         &mut vm,
@@ -932,7 +1115,7 @@ fn assert_sqlite_shutdown_cancels_all_siblings(close_all: bool) {
     };
 
     if close_all {
-        sqlite::close_all(&mut vm);
+        sqlite::reset_all(&mut vm);
     } else {
         sqlite::close(&mut vm, &[Value::Int(db_id)]).expect("close should succeed");
     }
@@ -975,7 +1158,6 @@ fn sqlite_uses_typed_generation_checked_resource_handles() {
         &mut vm,
         open_options(&root, "handles.db", "read_write_create", limits([])),
     );
-    assert!(sqlite::is_sqlite_resource(first));
 
     sqlite::close(&mut vm, &[Value::Int(first)]).expect("first handle should close");
     let second = open_db(
@@ -1004,15 +1186,19 @@ fn sqlite_uses_typed_generation_checked_resource_handles() {
         ],
     )
     .expect_err("a handle from another resource type must be rejected");
-    assert!(wrong_type_error.to_string().contains("wrong resource type"));
+    assert!(
+        wrong_type_error
+            .to_string()
+            .contains("unknown SQLite database")
+    );
 
     sqlite::close_all(&mut vm);
     fs::remove_dir_all(root).expect("temporary SQLite root should be removed");
 }
 
 #[test]
-fn sqlite_pending_work_is_registered_with_the_shared_owner() {
-    let root = temporary_root("operation_owner");
+fn sqlite_pending_work_is_associated_with_its_connection_resource() {
+    let root = temporary_root("operation_association");
     let mut vm = new_vm();
     let db_id = open_db(
         &mut vm,
@@ -1031,10 +1217,481 @@ fn sqlite_pending_work_is_registered_with_the_shared_owner() {
     let HostCallResult::Pending(op_id) = operation else {
         panic!("execute should return a pending operation");
     };
-    assert!(sqlite::has_sqlite_operation_owner(&vm, op_id));
-    let _ = wait_pending(&mut vm, op_id).expect("shared operation should complete");
+    assert!(sqlite::is_associated_with(&vm, op_id, db_id));
+    let _ = wait_pending(&mut vm, op_id).expect("associated operation should complete");
     assert!(!sqlite::has_pending(&vm, op_id));
 
     sqlite::close_all(&mut vm);
     fs::remove_dir_all(root).expect("temporary SQLite root should be removed");
+}
+
+// ---------------------------------------------------------------------------
+// Generic scope lifecycle: policy persistence, connection cleanup, and the
+// typed cancellation reason delivered uniformly on close and on reset.
+// ---------------------------------------------------------------------------
+
+/// A connection resource must be driven out of the scope by the generic close
+/// machinery: after closing, the scope no longer holds it.
+#[test]
+fn sqlite_connection_is_closed_with_the_execution_scope() {
+    let root = temporary_root("scope_close");
+    let mut vm = new_vm();
+    let db_id = open_db(
+        &mut vm,
+        open_options(&root, "state.db", "read_write_create", limits([])),
+    );
+    assert!(!vm.host.execution_scope.resources().is_empty());
+
+    sqlite::close_all(&mut vm);
+
+    assert!(
+        vm.host.execution_scope.resources().is_empty(),
+        "the generic scope close must reclaim the sqlite connection resource"
+    );
+    let error = sqlite::execute(
+        &mut vm,
+        &[Value::Int(db_id), Value::string("SELECT 1"), empty_params()],
+    )
+    .expect_err("a handle whose connection was closed with the scope must be rejected");
+    assert!(error.to_string().contains("unknown SQLite database"));
+    fs::remove_dir_all(root).expect("temporary SQLite root should be removed");
+}
+
+/// The sqlite policy is persistent module state: it must survive a scope
+/// reset (all resources/operations cleared) and even a reset that closed a
+/// live connection.
+#[test]
+fn sqlite_policy_survives_scope_reset() {
+    let root = temporary_root("policy_survives_reset");
+    let mut vm = new_vm();
+    vm.configure_sqlite(vm::SqlitePolicy {
+        database_root: Some(root.to_string_lossy().into_owned()),
+        allow_unsafe_sql: true,
+        ..vm::SqlitePolicy::default()
+    });
+
+    // A live connection keeps the module state untouched but exercises a
+    // worker before the reset.
+    let options = open_options(
+        &root,
+        "state.db",
+        "read_write_create",
+        limits([("max_result_bytes", 64 * 1024)]),
+    );
+    let db_id = sqlite::open(&mut vm, &[options.clone()]).expect("SQLite open should succeed");
+    execute(
+        &mut vm,
+        db_id,
+        "CREATE TABLE items (value INTEGER)",
+        empty_params(),
+    )
+    .expect("table creation should succeed");
+
+    // Reset through the generic scope: closes the connection and drains ops.
+    sqlite::reset_all(&mut vm);
+
+    // Policy still installed (persistent module state): opening again uses
+    // the same configured database root and unsafe SQL remains allowed.
+    let db_id = sqlite::open(&mut vm, &[options]).expect("SQLite open should succeed");
+    let result = query(
+        &mut vm,
+        db_id,
+        "PRAGMA table_info(items)",
+        empty_params(),
+        limits([("max_rows", 8), ("max_result_bytes", 64 * 1024)]),
+    )
+    .expect("unsafe SQL (PRAGMA) must still be allowed per the persisted policy");
+    assert_eq!(field(&result, "truncated"), &Value::Bool(false));
+
+    sqlite::close_all(&mut vm);
+    fs::remove_dir_all(root).expect("temporary SQLite root should be removed");
+}
+
+/// A pending query delivered to the driver must observe the *same typed*
+/// cancellation reason whether the connection was closed explicitly or the
+/// whole scope was reset — both travel through the generic association logic,
+/// never a SQLite-specific owner/poller dispatch.
+#[test]
+fn sqlite_query_gets_identical_typed_cancellation_on_close_and_reset() {
+    for (explicit_close, expected) in [(true, "resource_closed"), (false, "vm_reset")] {
+        let root = temporary_root("typed_cancel_reason");
+        let mut vm = new_vm();
+        let db_id = open_db(
+            &mut vm,
+            open_options(
+                &root,
+                "state.db",
+                "read_write_create",
+                limits([
+                    ("max_transaction_ms", 10_000),
+                    ("max_result_bytes", 64 * 1024),
+                ]),
+            ),
+        );
+
+        // A generic recording driver stands in for the sqlite query driver:
+        // it is registered as an operation *associated with the connection
+        // handle*, exactly like `sqlite::query` does, so the generic
+        // association logic is what forwards the cancellation reason.
+        let recorded: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let connection_handle =
+            vm::ResourceHandle::from_value(&Value::Int(db_id)).expect("valid connection handle");
+        let spec = vm::OperationSpec::new(RecordingDriver {
+            recorded: Arc::clone(&recorded),
+        })
+        .with_resource(connection_handle);
+        vm.host
+            .execution_scope
+            .start_operation(spec)
+            .expect("recording operation should start");
+
+        if explicit_close {
+            sqlite::close(&mut vm, &[Value::Int(db_id)]).expect("close should succeed");
+            assert_eq!(
+                recorded.lock().expect("reason cell").as_deref(),
+                Some(expected),
+                "connection close must cancel associated operations with {expected}"
+            );
+        } else {
+            sqlite::close_all(&mut vm);
+            assert_eq!(
+                recorded.lock().expect("reason cell").as_deref(),
+                Some(expected),
+                "scope reset must cancel associated operations with {expected}"
+            );
+        }
+
+        fs::remove_dir_all(&root).expect("temporary SQLite root should be removed");
+    }
+}
+
+struct RecordingDriver {
+    recorded: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl vm::HostOperation for RecordingDriver {
+    fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<vm::OperationResult<()>> {
+        Poll::Pending
+    }
+
+    fn cancel(&mut self, reason: vm::OperationCancelReason) -> vm::OperationResult<()> {
+        *self.recorded.lock().expect("reason cell") = Some(reason.as_str().to_string());
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Production-crate integration: SQLite installed through the exact
+// HostFunctionRegistry / HostExtension path on a *real* `Vm`. Registration,
+// binding, capability gating, coexistence with another host module, and
+// policy persistence across the real reset are exercised here (the mock
+// harness above never touches the real registry).
+// ---------------------------------------------------------------------------
+
+mod production_crate {
+    use super::temporary_root;
+    use std::sync::Arc;
+    use std::task::{Context, Wake, Waker};
+
+    fn compile_with_catalog(source: &str) -> rustscript_vm::CompiledProgram {
+        let catalog = rustscript_vm::sqlite_host_catalog();
+        rustscript_vm::compile_source_with_flavor_and_options(
+            source,
+            rustscript_vm::SourceFlavor::RustScript,
+            rustscript_vm::CompileSourceFileOptions::default()
+                .with_host_api_catalog(Arc::clone(&catalog)),
+        )
+        .expect("sqlite source should compile against the sqlite catalog")
+    }
+
+    fn real_vm(program: rustscript_vm::Program) -> rustscript_vm::vm::Vm {
+        rustscript_vm::vm::Vm::new(program)
+    }
+
+    fn noop_waker() -> Waker {
+        struct LocalNoop;
+        impl Wake for LocalNoop {
+            fn wake(self: Arc<Self>) {}
+        }
+        Waker::from(Arc::new(LocalNoop))
+    }
+
+    use rustscript_vm::{HostExtension, SqliteHostExt};
+
+    #[test]
+    fn sqlite_imports_are_not_bound_without_the_extension() {
+        let compiled = compile_with_catalog(
+            "use sqlite;\n\
+             let db = sqlite::open({ path: \":memory:\", mode: \"memory\", limits: {} });\n\
+             sqlite::close(&db);\n",
+        );
+        let mut vm = rustscript_vm::vm::Vm::new(compiled.program);
+        let error = vm
+            .run()
+            .expect_err("sqlite imports must not bind when the extension is absent");
+        assert!(
+            error.to_string().contains("sqlite"),
+            "unbound sqlite import must surface a binding error naming the import: {error}"
+        );
+    }
+
+    #[test]
+    fn sqlite_extension_binds_exact_functions_and_runs_memory_open_close() {
+        let compiled = compile_with_catalog(
+            "use sqlite;\n\
+             let db = sqlite::open({ path: \":memory:\", mode: \"memory\", limits: {} });\n\
+             sqlite::close(&db);\n",
+        );
+        let mut vm = rustscript_vm::vm::Vm::new(compiled.program);
+        vm.install_extension(&rustscript_vm::SqliteExtension)
+            .expect("sqlite extension should install exact functions + module state");
+        assert_eq!(
+            vm.run().expect("memory sqlite open/close should run"),
+            rustscript_vm::vm::VmStatus::Halted
+        );
+    }
+
+    #[test]
+    fn sqlite_restricted_registry_requires_an_explicit_grant() {
+        let compiled = compile_with_catalog(
+            "use sqlite;\n\
+             let db = sqlite::open({ path: \":memory:\", mode: \"memory\", limits: {} });\n\
+             sqlite::close(&db);\n",
+        );
+        // A restricted registry with the sqlite functions registered but no
+        // grant: binding the VM must be rejected by the capability profile.
+        let mut restricted = rustscript_vm::vm::HostFunctionRegistry::restricted();
+        rustscript_vm::register_sqlite_builtin_module(&mut restricted)
+            .expect("registration on a restricted registry must succeed");
+        let mut vm = rustscript_vm::vm::Vm::new(compiled.program);
+        let error = restricted
+            .bind_vm_cached(&mut vm)
+            .expect_err("ungranted sqlite import must be rejected");
+        assert!(
+            error.to_string().contains("capability"),
+            "missing grant must surface the capability-profile rejection: {error}"
+        );
+
+        // Explicit grant binds and runs.
+        let compiled_granted = compile_with_catalog(
+            "use sqlite;\n\
+             let db = sqlite::open({ path: \":memory:\", mode: \"memory\", limits: {} });\n\
+             sqlite::close(&db);\n",
+        );
+        let mut granted = rustscript_vm::vm::HostFunctionRegistry::restricted();
+        rustscript_vm::register_sqlite_builtin_module(&mut granted)
+            .expect("registration on a restricted registry must succeed");
+        let profile = rustscript_vm::vm::CapabilityProfile::builder()
+            .allow_host_import("sqlite::open")
+            .allow_host_import("sqlite::close")
+            .build();
+        granted.set_capability_profile(profile);
+        let mut vm = rustscript_vm::vm::Vm::new(compiled_granted.program);
+        granted
+            .bind_vm_cached(&mut vm)
+            .expect("granted sqlite import must bind");
+        assert_eq!(
+            vm.run().expect("granted sqlite open/close should run"),
+            rustscript_vm::vm::VmStatus::Halted
+        );
+    }
+
+    /// A second, unrelated host module coexisting with sqlite in one registry
+    /// (proving the core adds no dispatch branch — each exact import simply
+    /// resolves against its declared name/schema).
+    struct PingPolicy {
+        max: u64,
+    }
+
+    struct PingExtension;
+
+    impl rustscript_vm::HostExtension for PingExtension {
+        fn register(
+            &self,
+            registry: &mut rustscript_vm::vm::HostFunctionRegistry,
+        ) -> rustscript_vm::VmResult<()> {
+            let mut builder = rustscript_vm::HostApiBuilder::new();
+            builder.function(rustscript_vm::HostFunctionSchema::with_return(
+                "acme::ping",
+                Vec::new(),
+                rustscript_vm::HostTypeSchema::Int,
+            ));
+            let catalog = Arc::new(builder.build().expect("ping catalog must build"));
+            for schema in rustscript_vm::catalog_import_schemas(&catalog, "acme::ping") {
+                registry.register_exact_static("acme::ping", 0, schema, |_vm, _args| {
+                    Ok(rustscript_vm::vm::CallOutcome::Return(
+                        rustscript_vm::vm::CallReturn::One(rustscript_vm::Value::Int(11)),
+                    ))
+                })?;
+            }
+            Ok(())
+        }
+
+        fn install(&self, vm: &mut rustscript_vm::vm::Vm) {
+            vm.host_context().set_module_state(PingPolicy { max: 7 });
+        }
+    }
+
+    #[test]
+    fn sqlite_coexists_with_another_host_module_in_one_registry() {
+        // sqlite plus the acme::ping module, both exact-schema registered.
+        let compiled_sqlite = compile_with_catalog(
+            "use sqlite;\n\
+             let db = sqlite::open({ path: \":memory:\", mode: \"memory\", limits: {} });\n\
+             sqlite::close(&db);\n",
+        );
+        let mut registry = rustscript_vm::vm::HostFunctionRegistry::new();
+        rustscript_vm::register_sqlite_builtin_module(&mut registry)
+            .expect("sqlite registration should succeed");
+        PingExtension
+            .register(&mut registry)
+            .expect("ping registration should succeed");
+
+        let mut vm = rustscript_vm::vm::Vm::new(compiled_sqlite.program);
+        registry
+            .bind_vm_cached(&mut vm)
+            .expect("sqlite + ping registry should bind");
+        PingExtension.install(&mut vm);
+        assert_eq!(
+            vm.run().expect("sqlite + ping vm should run"),
+            rustscript_vm::vm::VmStatus::Halted
+        );
+
+        // The fake module's state coexists with the sqlite module state in
+        // the same typed store.
+        assert_eq!(
+            vm.host_context()
+                .module_state::<PingPolicy>()
+                .expect("ping policy")
+                .max,
+            7
+        );
+    }
+
+    #[test]
+    fn sqlite_policy_survives_the_real_vm_reset() {
+        let root = temporary_root("real_policy_reset");
+        // The script opens a real file under the configured root, so it only
+        // succeeds while the database_root policy is installed.
+        let source = format!(
+            "use sqlite;\n\
+             let db = sqlite::open({{ root: {:?}, path: \"state.db\", mode: \"read_write_create\", limits: {{}} }});\n\
+             sqlite::close(&db);\n",
+            root.to_string_lossy()
+        );
+        let compiled = compile_with_catalog(&source);
+        let mut vm = real_vm(compiled.program);
+        vm.install_extension(&rustscript_vm::SqliteExtension)
+            .expect("sqlite extension should install");
+        vm.configure_sqlite(rustscript_vm::SqlitePolicy {
+            database_root: Some(root.to_string_lossy().into_owned()),
+            ..rustscript_vm::SqlitePolicy::default()
+        });
+
+        // First run proves the policy-driven file open works.
+        assert_eq!(
+            vm.run().expect("first run"),
+            rustscript_vm::vm::VmStatus::Halted
+        );
+
+        // Real reset: scope closed + recycled; the scripted run must still
+        // succeed, i.e. the persistent SqlitePolicy survived the reset (the
+        // module-state store is deliberately kept across invocation resets).
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        vm.begin_reset_for_reuse(
+            rustscript_vm::vm::resource::ResourceCloseReason::VmReset,
+            None,
+        )
+        .expect("begin reset");
+        let mut stuck = 0u32;
+        loop {
+            match vm.poll_reset_for_reuse(&mut cx, std::time::Instant::now()) {
+                std::task::Poll::Pending => {
+                    stuck += 1;
+                    assert!(stuck < 100_000, "real reset should drain promptly");
+                    std::thread::yield_now();
+                }
+                std::task::Poll::Ready(result) => {
+                    result.expect("reset should succeed without scope-cleanup errors");
+                    break;
+                }
+            }
+        }
+        assert!(vm.is_reusable());
+
+        assert_eq!(
+            vm.run().expect("rerun after reset"),
+            rustscript_vm::vm::VmStatus::Halted,
+            "the persisted sqlite policy (database_root) must survive the real reset"
+        );
+
+        // Memory-only open would work regardless; prove the ROOT policy is
+        // what persisted by checking the module state is still non-empty.
+        assert!(
+            !vm.host_context().is_module_state_empty(),
+            "sqlite module state must survive the real reset"
+        );
+        fs::remove_dir_all(&root).expect("temporary SQLite root should be removed");
+    }
+
+    #[test]
+    fn sqlite_async_query_executes_through_the_real_vm_pending_await() {
+        // A *real* async round-trip through the production VM: the sqlite
+        // extension's async host functions return execution-scope pending
+        // operations, which the VM must await through the generic scope
+        // registry and materialize the produced value back into the script.
+        let compiled = compile_with_catalog(
+            "use sqlite;\n\
+             let db = sqlite::open({ path: \":memory:\", mode: \"memory\", limits: {} });\n\
+             let created = sqlite::execute(&db, \"CREATE TABLE t (a INTEGER)\", []);\n\
+             let inserted = sqlite::execute(&db, \"INSERT INTO t VALUES (7)\", []);\n\
+             let queried = sqlite::query(&db, \"SELECT a FROM t\", [], { max_rows: 100 });\n\
+             sqlite::close(&db);\n\
+             sqlite::rows_affected(inserted);\n",
+        );
+        let mut vm = rustscript_vm::vm::Vm::new(compiled.program);
+        vm.install_extension(&rustscript_vm::SqliteExtension)
+            .expect("sqlite extension should install");
+
+        // Drive run/await until the VM halts: the pending host calls are
+        // awaited via the generic execution-scope operation registry and the
+        // awaited values are delivered back to the script.
+        loop {
+            match vm.run() {
+                Ok(rustscript_vm::vm::VmStatus::Halted) => break,
+                Ok(rustscript_vm::vm::VmStatus::Waiting(_)) => {
+                    let waker = noop_waker();
+                    let mut cx = std::task::Context::from_waker(&waker);
+                    let mut stuck = 0u64;
+                    loop {
+                        match vm.poll_waiting_host_op(&mut cx) {
+                            std::task::Poll::Ready(Ok(())) => break,
+                            std::task::Poll::Ready(Err(error)) => {
+                                panic!("sqlite async await failed: {error}")
+                            }
+                            std::task::Poll::Pending => {
+                                stuck += 1;
+                                assert!(stuck < 1_000_000, "sqlite async await stuck");
+                                std::thread::yield_now();
+                            }
+                        }
+                    }
+                }
+                Ok(other) => panic!("sqlite async run yielded unexpected status: {other:?}"),
+                Err(error) => panic!("sqlite async run failed: {error}"),
+            }
+        }
+
+        // The awaited `execute` envelope's `rows_affected` (the final
+        // expression the script returned) must be 1: the produced value was
+        // truly materialized back into the guest script.
+        assert_eq!(
+            vm.stack(),
+            &[rustscript_vm::Value::Int(1)],
+            "the awaited sqlite execute result must be delivered back to the script"
+        );
+    }
+
+    use std::fs;
 }

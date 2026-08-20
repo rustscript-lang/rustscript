@@ -27,7 +27,9 @@ use crate::vm::execution_scope::{
 };
 use crate::vm::host::VmHostFunction;
 use crate::vm::host_context::{HostModule, HostModuleStore};
-use crate::vm::operation::{OperationId, OperationSpec};
+use crate::vm::operation::{
+    OperationCancelReason, OperationId, OperationOutcome, OperationResult, OperationSpec,
+};
 use crate::vm::resource::{
     HostResource, Resource, ResourceAccessFrame, ResourceAccessRequest, ResourceCloseReason,
     ResourceTypeKey,
@@ -35,6 +37,17 @@ use crate::vm::resource::{
 
 /// Embedder-supplied print sink for `print`/`debug` output.
 pub(crate) type RuntimePrintSink = dyn FnMut(String) + Send;
+
+/// Generic adapter that turns a completed execution-scope host operation into
+/// the guest-visible call return.
+///
+/// Host modules (e.g. the sqlite builtin) register one of these against the
+/// raw operation id when they start an async operation; the VM's pending
+/// host-call awaiting invokes it once when it observes the operation
+/// terminal. The core never inspects the concrete module value — only this
+/// module-provided closure does.
+pub(crate) type PendingOpResult =
+    Box<dyn FnOnce(&mut crate::vm::Vm) -> crate::vm::VmResult<crate::vm::CallReturn> + Send>;
 
 /// Host-owned capabilities, resources, operations, and subsystem state.
 ///
@@ -81,6 +94,10 @@ pub(crate) struct HostRuntime {
     pub(crate) submitted_host_ops: HashSet<u64>,
     pub(crate) stream_drivers: HashMap<u64, Box<dyn HostStreamDriver>>,
     pub(crate) runtime_print_sink: Option<Box<RuntimePrintSink>>,
+    /// Module-registered adapters that materialize the guest-visible return of
+    /// a completed execution-scope host operation, keyed by raw operation id.
+    /// Populated by generic host-SDK consumers and cleared on scope reset.
+    pub(crate) pending_op_results: HashMap<u64, PendingOpResult>,
 }
 
 impl HostRuntime {
@@ -110,6 +127,7 @@ impl HostRuntime {
             submitted_host_ops: HashSet::new(),
             stream_drivers: HashMap::new(),
             runtime_print_sink: None,
+            pending_op_results: HashMap::new(),
         }
     }
 
@@ -153,6 +171,11 @@ impl HostRuntime {
         }
         self.submitted_host_ops.clear();
         self.stream_drivers.clear();
+        // Drop any module-registered pending-call adapters: they belong to
+        // execution-scope operations that this reset is cancelling/closing,
+        // and the concrete value cells they reference are released by the
+        // modules' own scope-close lifecycle.
+        self.pending_op_results.clear();
     }
 
     /// Takes the first legacy reset failure recorded by the most recent
@@ -314,6 +337,50 @@ impl HostRuntime {
         spec: OperationSpec,
     ) -> ExecutionScopeResult<OperationId> {
         self.execution_scope.start_operation(spec)
+    }
+
+    /// Polls one registered execution-scope operation to its terminal state
+    /// (generic `HostOperation` driver; no domain owner/poller dispatch).
+    pub(crate) fn execution_scope_poll_operation(
+        &mut self,
+        id: OperationId,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<OperationResult<OperationOutcome>> {
+        self.execution_scope.poll_operation(id, cx)
+    }
+
+    /// Cancels one registered execution-scope operation by id, forwarding the
+    /// reason to its driver.
+    pub(crate) fn execution_scope_cancel_operation(
+        &mut self,
+        id: OperationId,
+        reason: OperationCancelReason,
+    ) -> ExecutionScopeResult<bool> {
+        self.execution_scope.cancel_operation(id, reason)
+    }
+
+    /// Registers the module-provided adapter that materializes the
+    /// guest-visible return of the execution-scope operation `raw` once it
+    /// completes. Overwrites any earlier provider for the same raw id.
+    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
+    pub(crate) fn register_pending_op_result(&mut self, raw: u64, provider: PendingOpResult) {
+        self.pending_op_results.insert(raw, provider);
+    }
+
+    /// Takes (removes and returns) the module adapter for `raw`, so the
+    /// awaiting path can materialize the operation's value exactly once.
+    pub(crate) fn take_pending_op_result(&mut self, raw: u64) -> Option<PendingOpResult> {
+        self.pending_op_results.remove(&raw)
+    }
+
+    /// Closes one resource in the owned execution scope, cancelling its
+    /// associated operations first (generic association logic).
+    pub(crate) fn execution_scope_close_resource<T: HostResource>(
+        &mut self,
+        handle: crate::vm::resource::ResourceHandle,
+        reason: crate::vm::resource::ResourceCloseReason,
+    ) -> ExecutionScopeResult<crate::vm::resource::CloseProgress> {
+        self.execution_scope.close_resource::<T>(handle, reason)
     }
 
     /// Marks a resource in the owned execution scope as guest-owned (exact

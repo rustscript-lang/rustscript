@@ -34,7 +34,10 @@ pub use builtins::runtime::{HttpConfig, HttpHostExt};
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::{IoHostExt, IoPolicy};
 #[cfg(feature = "sqlite")]
-pub use builtins::runtime::{SqliteHostExt, SqliteLimits, SqlitePolicy};
+pub use builtins::runtime::{
+    SqliteExtension, SqliteHostExt, SqliteLimits, SqlitePolicy, register_sqlite_builtin_module,
+    sqlite_host_catalog,
+};
 pub use builtins::{
     BUILTIN_CATALOG, BuiltinFunction, BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec,
     CallableDef, CallableParam, CallableParamType, CallableSignature, CallableType, HostExecution,

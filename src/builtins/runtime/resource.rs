@@ -33,9 +33,6 @@ pub struct ResourceTypeId(u16);
 
 impl ResourceTypeId {
     pub const IO_FILE: Self = Self(1);
-
-    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
-    pub const SQLITE_CONNECTION: Self = Self(5);
     #[cfg_attr(feature = "async", allow(dead_code))]
     pub const CALLBACK: Self = Self(6);
 
@@ -220,30 +217,12 @@ impl ResourceArena {
         self.allocate(resource_type, Box::new(value), Some(erased_cleanup))
     }
 
-    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
+    #[allow(dead_code)]
     pub fn count_type(&self, resource_type: ResourceTypeId) -> usize {
         self.slots
             .iter()
             .filter(|slot| slot.resource_type == resource_type && slot.value.is_some())
             .count()
-    }
-
-    #[cfg(feature = "sqlite")]
-    pub fn handles_of_type(&self, resource_type: ResourceTypeId) -> Vec<ResourceHandle> {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter(|(_, slot)| slot.resource_type == resource_type && slot.value.is_some())
-            .filter_map(|(slot_index, slot)| {
-                ResourceHandle::encode(
-                    self.arena_id,
-                    slot_index,
-                    u64::from(slot.generation),
-                    slot.resource_type,
-                )
-                .ok()
-            })
-            .collect()
     }
 
     pub fn get<T>(&self, handle: ResourceHandle, expected_type: ResourceTypeId) -> RuntimeResult<&T>

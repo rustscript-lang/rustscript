@@ -755,6 +755,28 @@ impl HostFunctionRegistry {
         entry.runtime_owned_pending = true;
     }
 
+    /// Marks every exact-registration slot bound to `name` as runtime-owned:
+    /// its pending operations are generic execution-scope `HostOperation`s
+    /// (awaited through the scope registry), not async-bridge futures.
+    /// Mirrors [`mark_runtime_owned_pending`](Self::mark_runtime_owned_pending)
+    /// for exact (schema-keyed) registrations.
+    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
+    pub(crate) fn mark_exact_runtime_owned_pending(&mut self, name: &str) -> VmResult<()> {
+        let Some(schemas) = self.by_exact.get(name) else {
+            return Err(VmError::HostError(format!(
+                "no exact host function registered under {name}"
+            )));
+        };
+        let entries = Arc::make_mut(&mut self.entries);
+        for &slot in schemas.values() {
+            entries
+                .get_mut(slot as usize)
+                .expect("exact host function slot should exist")
+                .runtime_owned_pending = true;
+        }
+        Ok(())
+    }
+
     pub fn register<F>(&mut self, name: impl Into<String>, arity: u8, factory: F)
     where
         F: Fn() -> Box<dyn HostFunction> + Send + Sync + 'static,
@@ -2929,6 +2951,20 @@ impl Vm {
     }
 
     fn set_waiting_registered_op(&mut self, op_id: HostOpId) -> VmResult<()> {
+        // Generic execution-scope operations (e.g. sqlite queries registered
+        // through the scoped host SDK) are tracked in the execution-scope
+        // registry, not the legacy owner registry: just record the waiting
+        // state; the awaiting path resolves the operation's own registry.
+        if let Ok(scope_id) = crate::vm::operation::OperationId::from_raw(op_id)
+            && self
+                .host
+                .execution_scope()
+                .operations()
+                .status(scope_id)
+                .is_ok()
+        {
+            return self.set_waiting_operation(op_id, ExactHostReturnPolicy::Legacy);
+        }
         let operation_id = crate::builtins::runtime::cancellation::OperationId::from_raw(op_id)
             .map_err(|error| VmError::HostError(error.to_string()))?;
         let operation = self

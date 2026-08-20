@@ -35,8 +35,9 @@ use super::execution_scope::{ExecutionScope, ExecutionScopeError, ScopeCloseOutc
 use super::host_runtime::HostRuntime;
 use super::operation::{OperationError, OperationId, OperationSpec, OperationStatus};
 use super::resource::{
-    HostResource, Resource, ResourceAccessFrame, ResourceAccessRequest, ResourceCloseReason,
-    ResourceError, ResourceHandle, ResourceMut, ResourceOwnership, ResourceRef, ResourceTypeKey,
+    CloseProgress, HostResource, Resource, ResourceAccessFrame, ResourceAccessRequest,
+    ResourceCloseReason, ResourceError, ResourceHandle, ResourceMut, ResourceOwnership,
+    ResourceRef, ResourceTypeKey,
 };
 
 /// Marker bound for a typed chunk of per-VM host module state.
@@ -303,6 +304,24 @@ impl<'a> HostContext<'a> {
     pub fn start_operation(&mut self, spec: OperationSpec) -> HostContextResult<OperationId> {
         self.host
             .execution_scope_start_operation(spec)
+            .map_err(HostContextError::from_scope)
+    }
+
+    /// Closes one resource in the current execution scope, first cancelling
+    /// every operation associated with it (generic association logic — the
+    /// core never dispatches on the concrete resource class).
+    ///
+    /// Maps `reason` onto the parallel operation-cancellation vocabulary
+    /// before cancelling, then launches the resource's generic close via
+    /// [`HostResource::begin_close`]. A `Pending` close is driven to
+    /// completion by the usual scope poll machinery.
+    pub fn close_resource<T: HostResource>(
+        &mut self,
+        handle: ResourceHandle,
+        reason: ResourceCloseReason,
+    ) -> HostContextResult<CloseProgress> {
+        self.host
+            .execution_scope_close_resource::<T>(handle, reason)
             .map_err(HostContextError::from_scope)
     }
 

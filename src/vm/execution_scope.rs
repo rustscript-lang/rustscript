@@ -48,12 +48,12 @@ use std::task::{Context, Poll};
 
 use crate::host_api::ResourceTypeKey;
 
-use super::operation::driver::OperationSpec;
-use super::operation::error::OperationError;
+use super::operation::driver::{OperationOutcome, OperationSpec};
+use super::operation::error::{OperationError, OperationResult};
 use super::operation::id::OperationId;
 use super::operation::reason::OperationCancelReason;
 use super::operation::registry::OperationRegistry;
-use super::resource::close::HostResource;
+use super::resource::close::{CloseProgress, HostResource};
 use super::resource::error::ResourceError;
 use super::resource::handle::{Resource, ResourceHandle};
 use super::resource::reason::ResourceCloseReason;
@@ -363,6 +363,67 @@ impl ExecutionScope {
         self.operations
             .start(spec)
             .map_err(ExecutionScopeError::Operation)
+    }
+
+    /// Polls one registered operation to its terminal state using the
+    /// caller's context.
+    ///
+    /// This is a narrowly reusable, host-agnostic adapter: the VM's pending
+    /// host-call awaiting drives an execution-scope operation (e.g. one
+    /// started by a generic host-SDK consumer via
+    /// [`start_operation`](Self::start_operation)) through its
+    /// [`HostOperation`] driver without any domain owner/poller dispatch.
+    /// The returned [`OperationOutcome`] carries only lifecycle/status; the
+    /// concrete operation value is delivered by the driver's own consumer.
+    pub fn poll_operation(
+        &mut self,
+        id: OperationId,
+        cx: &mut Context<'_>,
+    ) -> Poll<OperationResult<OperationOutcome>> {
+        self.operations.poll(id, cx)
+    }
+
+    /// Cancels one registered operation by id, forwarding the reason to its
+    /// driver. Generic and host-agnostic; returns `false` when the operation
+    /// was already terminal.
+    pub fn cancel_operation(
+        &mut self,
+        id: OperationId,
+        reason: OperationCancelReason,
+    ) -> ExecutionScopeResult<bool> {
+        self.operations
+            .cancel(id, reason)
+            .map_err(ExecutionScopeError::Operation)
+    }
+
+    /// Cancels every pending operation associated with `handle`, then begins
+    /// closing the underlying resource through the generic table contract.
+    ///
+    /// This is the generic "close one resource plus its dependent operations"
+    /// adapter (host-agnostic): closing a resource first cancels the
+    /// operations associated with it — mapping `reason` onto the parallel
+    /// operation cancellation vocabulary — then launches the resource's close
+    /// via [`HostResource::begin_close`]. A `Pending` close is driven by the
+    /// usual scope [`poll_close`](Self::poll_close) machinery, so the caller
+    /// never has to dispatch on a concrete resource class.
+    ///
+    /// Cancellation is best-effort: a failing operation cancel never prevents
+    /// the resource close request from being launched.
+    pub fn close_resource<T: HostResource>(
+        &mut self,
+        handle: ResourceHandle,
+        reason: ResourceCloseReason,
+    ) -> ExecutionScopeResult<CloseProgress> {
+        let _ = self
+            .operations
+            .cancel_for_resource(handle, operation_reason(reason));
+        let token = self
+            .resources
+            .typed::<T>(handle)
+            .map_err(ExecutionScopeError::Resource)?;
+        self.resources
+            .begin_close(token, reason)
+            .map_err(ExecutionScopeError::Resource)
     }
 
     /// Marks an open, host-owned resource as guest-owned (ownership transfer

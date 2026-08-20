@@ -178,6 +178,39 @@ impl Vm {
             }
             self.host.submitted_host_ops.remove(&waiting.op_id);
             let _ = self.host.runtime_operations.cancel(operation_id, reason);
+        } else if let Some(scope_id) = crate::vm::operation::OperationId::from_raw(waiting.op_id)
+            .ok()
+            .filter(|scope_id| {
+                self.host
+                    .execution_scope()
+                    .operations()
+                    .status(*scope_id)
+                    .is_ok()
+            })
+        {
+            // An execution-scope (generic HostOperation) waiting op, e.g. a
+            // sqlite query: cancel through its driver with the parallel
+            // operation-cancellation vocabulary.
+            let scope_reason = match reason {
+                crate::builtins::runtime::cancellation::CancellationReason::Requested => {
+                    crate::vm::operation::OperationCancelReason::Requested
+                }
+                crate::builtins::runtime::cancellation::CancellationReason::Deadline => {
+                    crate::vm::operation::OperationCancelReason::Deadline
+                }
+                crate::builtins::runtime::cancellation::CancellationReason::VmReset => {
+                    crate::vm::operation::OperationCancelReason::VmReset
+                }
+                crate::builtins::runtime::cancellation::CancellationReason::Parent => {
+                    crate::vm::operation::OperationCancelReason::Parent
+                }
+                crate::builtins::runtime::cancellation::CancellationReason::ResourceClosed => {
+                    crate::vm::operation::OperationCancelReason::ResourceClosed
+                }
+            };
+            let _ = self
+                .host
+                .execution_scope_cancel_operation(scope_id, scope_reason);
         } else {
             crate::builtins::runtime::cancel_builtin_io_op_with_reason(self, waiting.op_id, reason);
         }
@@ -237,7 +270,13 @@ impl Vm {
             };
         let operation = match self.host.runtime_operations.get(operation_id) {
             Ok(operation) => operation,
-            Err(error) => return Poll::Ready(Err(VmError::HostError(error.to_string()))),
+            Err(not_found) => {
+                // A waiting op that the legacy owner registry does not know is
+                // an execution-scope operation (a generic [`HostOperation`]
+                // registered through `HostContext::start_operation`, e.g. a
+                // sqlite query). Drive it through the generic scope registry.
+                return self.poll_execution_scope_waiting_op(waiting.op_id, cx, not_found);
+            }
         };
         let host_bridge_owned =
             operation.owner() == crate::builtins::runtime::cancellation::OperationOwner::HostBridge;
@@ -318,6 +357,78 @@ impl Vm {
 
     pub async fn await_waiting_host_op(&mut self) -> VmResult<()> {
         std::future::poll_fn(|cx| self.poll_waiting_host_op(cx)).await
+    }
+
+    /// Drives a waiting host operation that lives in the execution scope — a
+    /// generic [`HostOperation`] registered by a host-SDK consumer through
+    /// `HostContext::start_operation` (e.g. a sqlite query). This is the
+    /// generic awaiting counterpart of the legacy owner-dispatched builtin
+    /// pollers: it polls the operation through its own driver, then
+    /// materializes the guest-visible value through the module-registered
+    /// pending-result adapter for the raw operation id.
+    ///
+    /// When the execution scope does not track the operation either, it
+    /// surfaces the original legacy not-found error, preserving the
+    /// established awaiting behaviour for unknown operations.
+    fn poll_execution_scope_waiting_op(
+        &mut self,
+        op_id: HostOpId,
+        cx: &mut Context<'_>,
+        not_found: crate::builtins::runtime::error::RuntimeError,
+    ) -> Poll<VmResult<()>> {
+        let scope_operation_id = match crate::vm::operation::OperationId::from_raw(op_id) {
+            Ok(id) => id,
+            Err(error) => return Poll::Ready(Err(VmError::HostError(error.to_string()))),
+        };
+        if self
+            .host
+            .execution_scope()
+            .operations()
+            .status(scope_operation_id)
+            .is_err()
+        {
+            return Poll::Ready(Err(VmError::HostError(not_found.to_string())));
+        }
+        match self
+            .host
+            .execution_scope_poll_operation(scope_operation_id, cx)
+        {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => {
+                self.instance.waiting_host_op = None;
+                Poll::Ready(Err(VmError::HostError(error.to_string())))
+            }
+            Poll::Ready(Ok(outcome)) => match outcome {
+                crate::vm::operation::OperationOutcome::Completed => {
+                    let value = match self.host.take_pending_op_result(op_id) {
+                        Some(provider) => provider(self),
+                        None => Err(VmError::HostError(format!(
+                            "host operation {op_id} completed without a result"
+                        ))),
+                    };
+                    match value {
+                        Ok(values) => match self.complete_waiting_host_op(op_id, values) {
+                            Ok(()) => Poll::Ready(Ok(())),
+                            Err(error) => Poll::Ready(Err(error)),
+                        },
+                        Err(error) => {
+                            self.instance.waiting_host_op = None;
+                            Poll::Ready(Err(error))
+                        }
+                    }
+                }
+                crate::vm::operation::OperationOutcome::Failed(error) => {
+                    self.instance.waiting_host_op = None;
+                    Poll::Ready(Err(VmError::HostError(error.to_string())))
+                }
+                crate::vm::operation::OperationOutcome::Cancelled(reason) => {
+                    self.instance.waiting_host_op = None;
+                    Poll::Ready(Err(VmError::HostError(format!(
+                        "host operation {op_id} cancelled ({reason})"
+                    ))))
+                }
+            },
+        }
     }
 
     pub fn wait_for_host_op_blocking(&mut self) -> VmResult<()> {

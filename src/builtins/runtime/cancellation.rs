@@ -56,8 +56,6 @@ impl OperationId {
 pub enum OperationOwner {
     HostBridge,
     Io,
-    #[cfg(feature = "sqlite")]
-    Sqlite,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -439,33 +437,6 @@ impl OperationState {
             .payload = Some(payload);
     }
 
-    #[cfg(feature = "sqlite")]
-    pub(crate) fn set_cleanup(&self, cleanup: OperationCleanup) -> RuntimeResult<()> {
-        let mut inner = self
-            .core
-            .inner
-            .lock()
-            .expect("operation state lock should not be poisoned");
-        if !matches!(inner.status, OperationStatus::Pending) {
-            return Err(RuntimeError::new(
-                RuntimeErrorCode::OperationAlreadyFinished,
-                "runtime::operation",
-                "cannot attach cleanup to a terminal operation",
-            )
-            .with_value(self.id().raw()));
-        }
-        if inner.cleanup.is_some() {
-            return Err(RuntimeError::new(
-                RuntimeErrorCode::InvalidConfiguration,
-                "runtime::operation",
-                "operation cleanup is already configured",
-            )
-            .with_value(self.id().raw()));
-        }
-        inner.cleanup = Some(cleanup);
-        Ok(())
-    }
-
     pub fn payload(&self) -> Option<ResourceHandle> {
         self.core
             .inner
@@ -707,15 +678,6 @@ impl OperationRegistry {
             .get(&id)
             .cloned()
             .ok_or_else(|| operation_not_found(id))
-    }
-
-    #[cfg(feature = "sqlite")]
-    pub fn operations_by_owner(&self, owner: OperationOwner) -> Vec<OperationState> {
-        let operations = self.registered_operations();
-        operations
-            .into_iter()
-            .filter(|operation| operation.owner() == owner)
-            .collect()
     }
 
     pub fn operations_for_resource(&self, resource: ResourceHandle) -> Vec<OperationState> {

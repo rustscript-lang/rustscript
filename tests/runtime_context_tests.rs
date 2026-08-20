@@ -97,7 +97,7 @@ fn resource_handles_are_opaque_bounded_typed_and_cleanup_is_idempotent() {
         .expect_err("an altered generation must not resolve");
     assert_eq!(forged.code(), RuntimeErrorCode::ResourceStale);
     let wrong_type = arena
-        .get::<u32>(handle, ResourceTypeId::SQLITE_CONNECTION)
+        .get::<u32>(handle, ResourceTypeId::CALLBACK)
         .expect_err("wrong resource type should be rejected");
     assert_eq!(wrong_type.code(), RuntimeErrorCode::ResourceTypeMismatch);
     let limit_error = arena
