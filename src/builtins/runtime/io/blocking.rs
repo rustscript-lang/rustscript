@@ -205,6 +205,59 @@ impl IoPipeResource {
         }
     }
 
+    /// Take the reader pipe handle, replacing with `Closed`.
+    /// Used to offload the read to a worker thread.
+    fn take_reader(&mut self) -> VmResult<std::process::ChildStdout> {
+        let mut guard = self
+            .pipe
+            .lock()
+            .map_err(|_| VmError::HostError("io pipe lock was poisoned".to_string()))?;
+        let old = std::mem::replace(&mut *guard, IoPipeInner::Closed);
+        match old {
+            IoPipeInner::Read(pipe) => Ok(pipe),
+            IoPipeInner::Write(_) => Err(VmError::HostError(
+                "io_read_all requires a readable handle".to_string(),
+            )),
+            IoPipeInner::Closed => Err(VmError::HostError("io pipe is already closed".to_string())),
+        }
+    }
+
+    /// Take the writer pipe handle, replacing with `Closed`.
+    /// Used to offload the write to a worker thread.
+    fn take_writer(&mut self) -> VmResult<std::process::ChildStdin> {
+        let mut guard = self
+            .pipe
+            .lock()
+            .map_err(|_| VmError::HostError("io pipe lock was poisoned".to_string()))?;
+        let old = std::mem::replace(&mut *guard, IoPipeInner::Closed);
+        match old {
+            IoPipeInner::Write(pipe) => Ok(pipe),
+            IoPipeInner::Read(_) => Err(VmError::HostError(
+                "io_write requires a writable handle".to_string(),
+            )),
+            IoPipeInner::Closed => Err(VmError::HostError("io pipe is already closed".to_string())),
+        }
+    }
+
+    /// Restore a reader pipe handle that was taken for offloaded IO.
+    /// The pipe is replaced from `Closed` back to `Read(pipe)`.
+    fn restore_reader(&mut self, pipe: std::process::ChildStdout) {
+        let mut guard = self.pipe.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = IoPipeInner::Read(pipe);
+    }
+
+    /// Restore a writer pipe handle that was taken for offloaded IO.
+    fn restore_writer(&mut self, pipe: std::process::ChildStdin) {
+        let mut guard = self.pipe.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = IoPipeInner::Write(pipe);
+    }
+
+    /// Check if this pipe is a read-only pipe (ChildStdout).
+    fn is_read_pipe(&self) -> bool {
+        let guard = self.pipe.lock().unwrap_or_else(|e| e.into_inner());
+        matches!(&*guard, IoPipeInner::Read(_))
+    }
+
     fn with_reader<T>(
         &self,
         apply: impl FnOnce(&mut std::process::ChildStdout) -> VmResult<T>,
@@ -534,23 +587,78 @@ pub(crate) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<HostC
     let max_read_bytes = io_policy(vm).map(|policy| policy.max_read_bytes);
     let handle = resource_handle(handle_id)?;
 
-    // Read the data synchronously from the resource handle.
-    // The read is done on the VM thread; the operation lifecycle makes it
-    // appear async to the guest.
-    let out = read_all_from_resource(vm, handle, max_read_bytes)?;
-    let out_val = out;
+    // Clone the file handle (or take the pipe handle) and offload the read
+    // to a worker thread so the VM thread never blocks on IO.
+    let shared: Arc<Mutex<Option<Result<String, String>>>> = Arc::new(Mutex::new(None));
+    let shared_worker = shared.clone();
 
-    let operation = ReadyOperation;
-    let spec = OperationSpec::new(operation).with_resource(handle);
-    let op_id = vm
-        .host_context()
-        .start_operation(spec)
-        .map_err(|error| VmError::HostError(format!("io operation start failed: {error}")))?;
-    let raw = op_id.raw();
+    let (operation, tx, state) = ThreadedOperation::prepare("io::read_all");
+
+    let (cloned_file, taken_pipe) = take_file_or_pipe_handle(vm, handle)?;
+    let raw_state = state.clone();
+
+    let worker = ThreadedOperation::spawn_worker(
+        "io::read_all",
+        raw_state,
+        tx,
+        move |state, tx: Sender<ThreadedWorkerSignal>| {
+            if state.cancelled.load(Ordering::SeqCst) {
+                let _ = tx.send(Err("io::read_all was cancelled before starting".to_string()));
+                return;
+            }
+            let result = if let Some(mut file) = cloned_file {
+                let mut out = String::new();
+                let r = read_to_string_with_limit(&mut file, max_read_bytes, &mut out);
+                drop(file); // close before signalling
+                r.map(|_| out)
+            } else if let Some(mut pipe) = taken_pipe {
+                let mut out = String::new();
+                let r = read_to_string_with_limit(&mut pipe, max_read_bytes, &mut out);
+                drop(pipe);
+                r.map(|_| out)
+            } else {
+                Err(VmError::HostError(
+                    "io handle was already closed".to_string(),
+                ))
+            };
+            match result {
+                Ok(text) => {
+                    *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(text));
+                    let _ = tx.send(Ok(()));
+                }
+                Err(err) => {
+                    // Extract the inner message from VmError::HostError
+                    let msg = match &err {
+                        VmError::HostError(m) => m.clone(),
+                        _ => err.to_string(),
+                    };
+                    *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(Err(msg));
+                    let _ = tx.send(Ok(()));
+                }
+            }
+        },
+    );
+
+    let raw = register_operation_with_worker(vm, operation, worker, Some(handle))?;
+
+    let shared_provider = shared.clone();
     vm.host.register_pending_op_result(
         raw,
-        Box::new(move |_vm| Ok(CallReturn::one(Value::string(out_val)))),
+        Box::new(move |_vm| {
+            match shared_provider
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                Some(Ok(text)) => Ok(CallReturn::one(Value::string(text))),
+                Some(Err(msg)) => Err(VmError::HostError(msg)),
+                None => Err(VmError::HostError(
+                    "io::read_all worker did not produce a result".to_string(),
+                )),
+            }
+        }),
     );
+
     Ok(HostCallResult::Pending(raw))
 }
 
@@ -563,25 +671,101 @@ pub(crate) fn builtin_io_read_line(
     let max_read_bytes = io_policy(vm).map(|policy| policy.max_read_bytes);
     let handle = resource_handle(handle_id)?;
 
-    // Read the line synchronously from the resource handle.
-    let line = read_line_from_resource(vm, handle, max_read_bytes)?;
-    let line_val = line;
+    // Offload the read to a worker thread.
+    // For files we clone the handle; for pipes we take it and return it
+    // through shared state.
+    let shared: Arc<Mutex<Option<Result<String, String>>>> = Arc::new(Mutex::new(None));
+    let shared_worker = shared.clone();
+    // For pipes, the worker returns the pipe handle through this channel.
+    let pipe_shared: Arc<Mutex<Option<std::process::ChildStdout>>> = Arc::new(Mutex::new(None));
+    let pipe_shared_worker = pipe_shared.clone();
 
-    let operation = ReadyOperation;
-    let spec = OperationSpec::new(operation).with_resource(handle);
-    let op_id = vm
-        .host_context()
-        .start_operation(spec)
-        .map_err(|error| VmError::HostError(format!("io operation start failed: {error}")))?;
-    let raw = op_id.raw();
+    let (operation, tx, state) = ThreadedOperation::prepare("io::read_line");
+
+    let (cloned_file, taken_pipe) = take_file_or_pipe_handle(vm, handle)?;
+    let raw_state = state.clone();
+
+    let worker = ThreadedOperation::spawn_worker(
+        "io::read_line",
+        raw_state,
+        tx,
+        move |state, tx: Sender<ThreadedWorkerSignal>| {
+            if state.cancelled.load(Ordering::SeqCst) {
+                let _ = tx.send(Err(
+                    "io::read_line was cancelled before starting".to_string()
+                ));
+                return;
+            }
+            let result = if let Some(mut file) = cloned_file {
+                let r = read_line_from_reader(&mut file, max_read_bytes);
+                r
+            } else if let Some(mut pipe) = taken_pipe {
+                let r = read_line_from_reader(&mut pipe, max_read_bytes);
+                // Return the pipe handle for subsequent reads
+                *pipe_shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
+                r
+            } else {
+                Err(VmError::HostError(
+                    "io handle was already closed".to_string(),
+                ))
+            };
+            match result {
+                Ok(text) => {
+                    *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(text));
+                    let _ = tx.send(Ok(()));
+                }
+                Err(err) => {
+                    // Extract the inner message from VmError::HostError
+                    let msg = match &err {
+                        VmError::HostError(m) => m.clone(),
+                        _ => err.to_string(),
+                    };
+                    *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(Err(msg));
+                    let _ = tx.send(Ok(()));
+                }
+            }
+        },
+    );
+
+    let raw = register_operation_with_worker(vm, operation, worker, Some(handle))?;
+
+    let shared_provider = shared.clone();
+    let pipe_provider = pipe_shared.clone();
     vm.host.register_pending_op_result(
         raw,
-        Box::new(move |_vm| Ok(CallReturn::one(Value::string(line_val)))),
+        Box::new(move |vm: &mut Vm| {
+            // If a pipe handle was returned, put it back in the resource.
+            if let Some(pipe) = pipe_provider
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                let mut ctx = vm.host_context();
+                if let Ok(token) = ctx.typed_resource::<IoPipeResource>(handle) {
+                    if let Ok(mut resource) = ctx.resource_mut(&token) {
+                        resource.get().restore_reader(pipe);
+                    }
+                }
+            }
+            match shared_provider
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                Some(Ok(text)) => Ok(CallReturn::one(Value::string(text))),
+                Some(Err(msg)) => Err(VmError::HostError(msg)),
+                None => Err(VmError::HostError(
+                    "io::read_line worker did not produce a result".to_string(),
+                )),
+            }
+        }),
     );
+
     Ok(HostCallResult::Pending(raw))
 }
 
 /// Writes text to an I/O handle.
+/// The actual write runs on a worker thread.
 #[pd_host_function(name = "io::write")]
 pub(crate) fn builtin_io_write(
     vm: &mut Vm,
@@ -599,43 +783,207 @@ pub(crate) fn builtin_io_write(
     let bytes = text.as_bytes().to_vec();
     let handle = resource_handle(handle_id)?;
 
-    // Write synchronously to the resource handle.
-    let written = write_to_resource(vm, handle, &bytes)?;
-    let written_val = written;
+    // Offload the write to a worker thread.
+    let shared: Arc<Mutex<Option<Result<i64, String>>>> = Arc::new(Mutex::new(None));
+    let shared_worker = shared.clone();
+    // For pipes, the worker returns the pipe handle through this channel.
+    let pipe_shared: Arc<Mutex<Option<std::process::ChildStdin>>> = Arc::new(Mutex::new(None));
+    let pipe_shared_worker = pipe_shared.clone();
 
-    let operation = ReadyOperation;
-    let spec = OperationSpec::new(operation).with_resource(handle);
-    let op_id = vm
-        .host_context()
-        .start_operation(spec)
-        .map_err(|error| VmError::HostError(format!("io operation start failed: {error}")))?;
-    let raw = op_id.raw();
+    let (operation, tx, state) = ThreadedOperation::prepare("io::write");
+
+    let (cloned_file, taken_pipe) = take_file_or_write_pipe_handle(vm, handle)?;
+    let raw_state = state.clone();
+
+    let worker = ThreadedOperation::spawn_worker(
+        "io::write",
+        raw_state,
+        tx,
+        move |state, tx: Sender<ThreadedWorkerSignal>| {
+            if state.cancelled.load(Ordering::SeqCst) {
+                let _ = tx.send(Err("io::write was cancelled before starting".to_string()));
+                return;
+            }
+            let result = if let Some(mut file) = cloned_file {
+                std::io::Write::write(&mut file, &bytes)
+                    .map_err(|err| format!("io_write failed: {err}"))
+                    .map(|n| n as i64)
+            } else if let Some(mut pipe) = taken_pipe {
+                let result = std::io::Write::write(&mut pipe, &bytes)
+                    .map_err(|err| format!("io_write failed: {err}"))
+                    .map(|n| n as i64);
+                // Return the pipe handle for subsequent writes
+                *pipe_shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
+                result
+            } else {
+                Err("io handle was already closed".to_string())
+            };
+            match result {
+                Ok(written) => {
+                    *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(written));
+                    let _ = tx.send(Ok(()));
+                }
+                Err(err) => {
+                    *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(Err(err));
+                    let _ = tx.send(Ok(()));
+                }
+            }
+        },
+    );
+
+    let raw = register_operation_with_worker(vm, operation, worker, Some(handle))?;
+
+    let shared_provider = shared.clone();
+    let pipe_provider = pipe_shared.clone();
     vm.host.register_pending_op_result(
         raw,
-        Box::new(move |_vm| Ok(CallReturn::one(Value::Int(written_val)))),
+        Box::new(move |vm: &mut Vm| {
+            // If a pipe handle was returned, put it back in the resource.
+            if let Some(pipe) = pipe_provider
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                let mut ctx = vm.host_context();
+                if let Ok(token) = ctx.typed_resource::<IoPipeResource>(handle) {
+                    if let Ok(mut resource) = ctx.resource_mut(&token) {
+                        resource.get().restore_writer(pipe);
+                    }
+                }
+            }
+            match shared_provider
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                Some(Ok(written)) => Ok(CallReturn::one(Value::Int(written))),
+                Some(Err(msg)) => Err(VmError::HostError(msg)),
+                None => Err(VmError::HostError(
+                    "io::write worker did not produce a result".to_string(),
+                )),
+            }
+        }),
     );
+
     Ok(HostCallResult::Pending(raw))
 }
 
 /// Flushes buffered output for an I/O handle.
+/// The actual flush runs on a worker thread.
 #[pd_host_function(name = "io::flush")]
 pub(crate) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<HostCallResult<bool>> {
     let handle = resource_handle(handle_id)?;
 
-    // Flush synchronously.
-    flush_resource(vm, handle)?;
+    // First check if the handle is a read-only pipe — flush is a no-op.
+    let mut ctx = vm.host_context();
+    let is_read_pipe = if let Ok(token) = ctx.typed_resource::<IoPipeResource>(handle) {
+        if let Ok(mut resource) = ctx.resource_mut(&token) {
+            resource.get().is_read_pipe()
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    drop(ctx);
 
-    let operation = ReadyOperation;
-    let spec = OperationSpec::new(operation).with_resource(handle);
-    let op_id = vm
-        .host_context()
-        .start_operation(spec)
-        .map_err(|error| VmError::HostError(format!("io operation start failed: {error}")))?;
-    let raw = op_id.raw();
+    if is_read_pipe {
+        // Flush on a read pipe is a no-op. Return immediately.
+        let operation = ReadyOperation;
+        let spec = OperationSpec::new(operation).with_resource(handle);
+        let op_id = vm
+            .host_context()
+            .start_operation(spec)
+            .map_err(|error| VmError::HostError(format!("io operation start failed: {error}")))?;
+        let raw = op_id.raw();
+        vm.host.register_pending_op_result(
+            raw,
+            Box::new(move |_vm| Ok(CallReturn::one(Value::Bool(true)))),
+        );
+        return Ok(HostCallResult::Pending(raw));
+    }
+
+    // Offload the flush to a worker thread.
+    let shared: Arc<Mutex<Option<Result<(), String>>>> = Arc::new(Mutex::new(None));
+    let shared_worker = shared.clone();
+    // For pipes, the worker returns the pipe handle through this channel.
+    let pipe_shared: Arc<Mutex<Option<std::process::ChildStdin>>> = Arc::new(Mutex::new(None));
+    let pipe_shared_worker = pipe_shared.clone();
+
+    let (operation, tx, state) = ThreadedOperation::prepare("io::flush");
+
+    let (cloned_file, taken_pipe) = take_file_or_write_pipe_handle(vm, handle)?;
+    let raw_state = state.clone();
+
+    let worker = ThreadedOperation::spawn_worker(
+        "io::flush",
+        raw_state,
+        tx,
+        move |state, tx: Sender<ThreadedWorkerSignal>| {
+            if state.cancelled.load(Ordering::SeqCst) {
+                let _ = tx.send(Err("io::flush was cancelled before starting".to_string()));
+                return;
+            }
+            let result = if let Some(mut file) = cloned_file {
+                file.flush()
+                    .map_err(|err| format!("io_flush failed: {err}"))
+            } else if let Some(mut pipe) = taken_pipe {
+                let result = pipe
+                    .flush()
+                    .map_err(|err| format!("io_flush failed: {err}"));
+                // Return the pipe handle for subsequent writes
+                *pipe_shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
+                result
+            } else {
+                Err("io handle was already closed".to_string())
+            };
+            match result {
+                Ok(()) => {
+                    *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(()));
+                    let _ = tx.send(Ok(()));
+                }
+                Err(err) => {
+                    *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(Err(err));
+                    let _ = tx.send(Ok(()));
+                }
+            }
+        },
+    );
+
+    let raw = register_operation_with_worker(vm, operation, worker, Some(handle))?;
+
+    let shared_provider = shared.clone();
+    let pipe_provider = pipe_shared.clone();
     vm.host.register_pending_op_result(
         raw,
-        Box::new(move |_vm| Ok(CallReturn::one(Value::Bool(true)))),
+        Box::new(move |vm: &mut Vm| {
+            // If a pipe handle was returned, put it back in the resource.
+            if let Some(pipe) = pipe_provider
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                let mut ctx = vm.host_context();
+                if let Ok(token) = ctx.typed_resource::<IoPipeResource>(handle) {
+                    if let Ok(mut resource) = ctx.resource_mut(&token) {
+                        resource.get().restore_writer(pipe);
+                    }
+                }
+            }
+            match shared_provider
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                Some(Ok(())) => Ok(CallReturn::one(Value::Bool(true))),
+                Some(Err(msg)) => Err(VmError::HostError(msg)),
+                None => Err(VmError::HostError(
+                    "io::flush worker did not produce a result".to_string(),
+                )),
+            }
+        }),
     );
+
     Ok(HostCallResult::Pending(raw))
 }
 
@@ -724,6 +1072,66 @@ pub(crate) fn builtin_io_exists(vm: &mut Vm, path: &str) -> VmResult<HostCallRes
 }
 
 // ---- Synchronous read/write/flush helpers (run on VM thread but bounded) ----
+
+/// Clone (for files) or take (for pipes) the handle from a resource, so the
+/// actual IO work can be offloaded to a worker thread. The VM thread only
+/// validates arguments/policy and clones safe shared resource state.
+/// Returns `(Option<File>, Option<ChildStdout>)` — at most one is `Some`.
+fn take_file_or_pipe_handle(
+    vm: &mut Vm,
+    handle: ResourceHandle,
+) -> VmResult<(Option<std::fs::File>, Option<std::process::ChildStdout>)> {
+    let mut ctx = vm.host_context();
+    let token = ctx.typed_resource::<IoFileResource>(handle);
+    if let Ok(token) = token {
+        let mut resource = ctx
+            .resource_mut(&token)
+            .map_err(|error| VmError::HostError(format!("io handle lookup failed: {error}")))?;
+        let file = resource.get().with_handle_mut(|f| {
+            f.try_clone()
+                .map_err(|err| VmError::HostError(format!("io handle clone failed: {err}")))
+        })?;
+        Ok((Some(file), None))
+    } else {
+        let token = ctx
+            .typed_resource::<IoPipeResource>(handle)
+            .map_err(|error| VmError::HostError(format!("io handle lookup failed: {error}")))?;
+        let mut resource = ctx
+            .resource_mut(&token)
+            .map_err(|error| VmError::HostError(format!("io handle lookup failed: {error}")))?;
+        let pipe = resource.get().take_reader()?;
+        Ok((None, Some(pipe)))
+    }
+}
+
+/// Clone (for files) or take (for pipes) a WRITABLE handle from a resource.
+/// Returns `(Option<File>, Option<ChildStdin>)` — at most one is `Some`.
+fn take_file_or_write_pipe_handle(
+    vm: &mut Vm,
+    handle: ResourceHandle,
+) -> VmResult<(Option<std::fs::File>, Option<std::process::ChildStdin>)> {
+    let mut ctx = vm.host_context();
+    let token = ctx.typed_resource::<IoFileResource>(handle);
+    if let Ok(token) = token {
+        let mut resource = ctx
+            .resource_mut(&token)
+            .map_err(|error| VmError::HostError(format!("io handle lookup failed: {error}")))?;
+        let file = resource.get().with_handle_mut(|f| {
+            f.try_clone()
+                .map_err(|err| VmError::HostError(format!("io handle clone failed: {err}")))
+        })?;
+        Ok((Some(file), None))
+    } else {
+        let token = ctx
+            .typed_resource::<IoPipeResource>(handle)
+            .map_err(|error| VmError::HostError(format!("io handle lookup failed: {error}")))?;
+        let mut resource = ctx
+            .resource_mut(&token)
+            .map_err(|error| VmError::HostError(format!("io handle lookup failed: {error}")))?;
+        let pipe = resource.get().take_writer()?;
+        Ok((None, Some(pipe)))
+    }
+}
 
 /// Read all data from a resource handle on the VM thread.
 /// This is bounded by the max_read_bytes policy limit.

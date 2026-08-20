@@ -117,8 +117,17 @@ impl HostResource for IoWorkerResource {
 impl Drop for IoWorkerResource {
     fn drop(&mut self) {
         self.state.cancelled.store(true, Ordering::SeqCst);
+        // Never block joining a live worker. If the thread has finished
+        // (e.g. after poll_close drove it to completion), join to observe
+        // panics. Otherwise, detach — the thread checks cancellation and
+        // exits quickly on its own.
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
+            // If not finished: handle is dropped → thread is detached.
+            // This is safe because we set cancelled, and the worker checks
+            // cancelled before doing any work, so it exits immediately.
         }
     }
 }

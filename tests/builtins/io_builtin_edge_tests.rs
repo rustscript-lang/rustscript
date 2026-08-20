@@ -38,6 +38,7 @@ fn run_source_host_error(source: &str) -> String {
 
 /// Run a VM configured with a custom registry and policy, driving pending
 /// operations to completion, and return the first HostError encountered.
+/// Handles errors from both wait_for_host_op_blocking and vm.resume().
 fn run_vm_until_error(vm: &mut Vm) -> String {
     // First call must be run(); subsequent calls use resume().
     let mut status = match vm.run() {
@@ -48,8 +49,11 @@ fn run_vm_until_error(vm: &mut Vm) -> String {
     loop {
         match status {
             VmStatus::Waiting(_) => {
-                vm.wait_for_host_op_blocking()
-                    .expect("waiting for host op should succeed");
+                match vm.wait_for_host_op_blocking() {
+                    Ok(()) => {}
+                    Err(VmError::HostError(message)) => return message,
+                    Err(other) => panic!("expected host error, got: {other:?}"),
+                }
                 match vm.resume() {
                     Ok(s) => status = s,
                     Err(VmError::HostError(message)) => return message,
