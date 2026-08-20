@@ -20,7 +20,7 @@ extern crate vm as rustscript_vm;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::task::{Context, Poll, Wake};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The generic host surface the included sqlite implementation is compiled
@@ -1362,6 +1362,130 @@ fn sqlite_query_gets_identical_typed_cancellation_on_close_and_reset() {
         }
 
         fs::remove_dir_all(&root).expect("temporary SQLite root should be removed");
+    }
+}
+
+#[test]
+fn sqlite_pending_operation_is_woken_by_its_worker_completion() {
+    let root = temporary_root("waker_regression");
+    let mut vm = new_vm();
+    let db_id = open_db(
+        &mut vm,
+        open_options(
+            &root,
+            "state.db",
+            "read_write_create",
+            limits([
+                ("max_transaction_ms", 10_000),
+                ("max_result_bytes", 64 * 1024),
+            ]),
+        ),
+    );
+
+    // A slow query guarantees the worker is still executing when the first
+    // poll registers its waker, so the wake-under-test is deterministic.
+    let pending = sqlite::query(
+        &mut vm,
+        &[
+            Value::Int(db_id),
+            Value::string(
+                "WITH RECURSIVE numbers(value) AS (\
+                    SELECT 1 UNION ALL SELECT value + 1 FROM numbers LIMIT 2000000\
+                ) SELECT sum(value) FROM numbers",
+            ),
+            empty_params(),
+            limits([("max_rows", 1), ("max_result_bytes", 64 * 1024)]),
+        ],
+    )
+    .expect("query should be scheduled");
+    let HostCallResult::Pending(op_id) = pending else {
+        panic!("query should return a pending operation");
+    };
+    assert!(sqlite::has_pending(&vm, op_id));
+    wait_for_worker(
+        &mut vm,
+        db_id,
+        std::time::Instant::now() + std::time::Duration::from_secs(1),
+    );
+
+    // First poll registers a *real* (counting) waker and must report Pending:
+    // the worker is mid-query and has not published yet.
+    let wake_state = Arc::new(WakeState::default());
+    let waker = Waker::from(Arc::new(WakeOnDrop {
+        state: Arc::clone(&wake_state),
+    }));
+    let mut cx = Context::from_waker(&waker);
+    assert!(
+        matches!(sqlite::poll(&mut vm, op_id, &mut cx), Poll::Pending),
+        "an in-flight sqlite query must poll Pending"
+    );
+
+    // No busy-spin, no sleep: block until the operation's worker wakes the
+    // registered waker (the notification under test).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut guard = wake_state
+        .woken
+        .lock()
+        .expect("wake state mutex should not be poisoned");
+    while !*guard {
+        let now = std::time::Instant::now();
+        assert!(
+            now < deadline,
+            "worker completion must wake a pending sqlite operation"
+        );
+        let (new_guard, _) = wake_state
+            .condvar
+            .wait_timeout(guard, deadline - now)
+            .expect("wake condvar wait should not be poisoned");
+        guard = new_guard;
+    }
+
+    // The wake must be followed by a Ready poll carrying the published value.
+    match sqlite::poll(&mut vm, op_id, &mut cx) {
+        Poll::Ready(Ok(CallReturn::One(Value::Map(result)))) => {
+            let Value::Array(rows) = field(&result, "rows") else {
+                panic!("query rows should be an array");
+            };
+            assert_eq!(rows.len(), 1);
+            let Value::Array(cells) = &rows[0] else {
+                panic!("query row should be an array");
+            };
+            // sum(1..=2_000_000) = 2_000_001_000_000.
+            assert_eq!(cells[0], Value::Int(2_000_001_000_000));
+        }
+        Poll::Ready(Ok(other)) => panic!("query should return a map value, got {other:?}"),
+        Poll::Ready(Err(error)) => panic!("query should complete successfully: {error}"),
+        Poll::Pending => panic!("completed sqlite operation must poll Ready"),
+    }
+
+    sqlite::close_all(&mut vm);
+    fs::remove_dir_all(root).expect("temporary SQLite root should be removed");
+}
+
+/// Counting waker: records that `wake` was invoked and notifies a condvar, so
+/// the test can block on an actual wake instead of busy-spinning or sleeping.
+struct WakeState {
+    woken: std::sync::Mutex<bool>,
+    condvar: std::sync::Condvar,
+}
+
+impl Default for WakeState {
+    fn default() -> Self {
+        Self {
+            woken: std::sync::Mutex::new(false),
+            condvar: std::sync::Condvar::new(),
+        }
+    }
+}
+
+struct WakeOnDrop {
+    state: Arc<WakeState>,
+}
+
+impl Wake for WakeOnDrop {
+    fn wake(self: Arc<Self>) {
+        *self.state.woken.lock().expect("wake state mutex") = true;
+        self.state.condvar.notify_one();
     }
 }
 

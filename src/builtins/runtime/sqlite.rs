@@ -211,16 +211,42 @@ struct ConnectionSlot {
     live_workers: Arc<AtomicUsize>,
     /// Completion waker for the connection resource's poll-based close.
     close_waker: Mutex<Option<Waker>>,
-    /// Per-operation result cells, keyed by raw operation id. Owned by the
+    /// Per-operation completion cells, keyed by raw operation id. Owned by the
     /// connection resource: dropped with it on close, so nothing leaks on reset.
-    pending_results: Mutex<std::collections::HashMap<u64, ResultCell>>,
+    pending_results: Mutex<std::collections::HashMap<u64, Arc<OperationCell>>>,
     limits: SqliteLimits,
     allow_unsafe_sql: bool,
 }
 
-/// Shared cell holding the completed value of one sqlite query/execute/
-/// transaction operation.
-type ResultCell = Arc<Mutex<Option<VmResult<CallReturn>>>>;
+/// Shared per-operation completion state: the produced result value plus the
+/// poll waker.
+///
+/// The result and the waker live under a single `Mutex` so the worker's
+/// publish-then-wake step is atomic with the driver's read-then-register
+/// step. A result published between the driver's read and its waker
+/// registration is therefore never missed, so an operation polled to
+/// [`Poll::Pending`] is always woken when its worker completes.
+struct OperationCell {
+    state: Mutex<OperationCellState>,
+}
+
+struct OperationCellState {
+    /// Completed value of the sqlite query/execute/transaction operation.
+    value: Option<VmResult<CallReturn>>,
+    /// Waker registered by the latest pending [`poll`](SqliteOperationDriver::poll).
+    waker: Option<Waker>,
+}
+
+impl OperationCell {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(OperationCellState {
+                value: None,
+                waker: None,
+            }),
+        }
+    }
+}
 
 /// A SQLite connection modelled as a generic [`HostResource`].
 ///
@@ -928,23 +954,22 @@ fn execute_with_connection(
 /// Driver for one async SQLite activity (query / execute / transaction).
 ///
 /// The worker thread runs the statement on the shared connection slot and
-/// stores the completed value in the shared [`ResultCell`]; the driver's
+/// stores the completed value in the shared [`OperationCell`]; the driver's
 /// [`poll`](Self::poll) observes the cell and registers the caller's waker.
 /// [`cancel`](Self::cancel) issues the cooperative interrupt on the shared
 /// connection — the only cancellation mechanism; the core never dispatches a
 /// SQLite interrupt directly.
 struct SqliteOperationDriver {
     slot: Arc<ConnectionSlot>,
-    result: ResultCell,
+    cell: Arc<OperationCell>,
     running: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
-    op_waker: Mutex<Option<Waker>>,
 }
 
 impl HostOperation for SqliteOperationDriver {
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
-        let guard = self.result.lock().expect("sqlite result cell lock");
-        match guard.as_ref() {
+        let mut state = self.cell.state.lock().expect("sqlite operation cell lock");
+        match state.value.as_ref() {
             Some(Ok(_)) => Poll::Ready(Ok(())),
             Some(Err(error)) => Poll::Ready(Err(OperationError::new(
                 OperationErrorCode::OperationDriverFailed,
@@ -952,7 +977,11 @@ impl HostOperation for SqliteOperationDriver {
                 error.to_string(),
             ))),
             None => {
-                *self.op_waker.lock().expect("sqlite op waker lock") = Some(cx.waker().clone());
+                // Register the current waker. The worker publishes its result
+                // into this same cell and wakes this waker once the result is
+                // visible, so a pending waiter is always re-polled on
+                // completion.
+                state.waker = Some(cx.waker().clone());
                 Poll::Pending
             }
         }
@@ -1013,13 +1042,13 @@ fn schedule_operation(
         ));
     }
 
-    let result: ResultCell = Arc::new(Mutex::new(None));
+    let cell: Arc<OperationCell> = Arc::new(OperationCell::new());
     let running: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let deadline =
         Instant::now().checked_add(Duration::from_millis(slot.limits.max_transaction_ms));
 
     let worker_slot = Arc::clone(&slot);
-    let worker_result = Arc::clone(&result);
+    let worker_result = Arc::clone(&cell);
     let worker_running = Arc::clone(&running);
     let worker_cancelled = Arc::clone(&cancelled);
     thread::Builder::new()
@@ -1037,9 +1066,20 @@ fn schedule_operation(
             let result = operation(Arc::clone(&worker_slot), worker_cancelled);
             worker_running.store(false, Ordering::SeqCst);
             worker_slot.live_workers.fetch_sub(1, Ordering::SeqCst);
-            *worker_result
-                .lock()
-                .expect("SQLite result cell lock should not be poisoned") = Some(result);
+            // Publish the completed value *first*, then wake the operation's
+            // registered waker (and the connection-close waker) so a waiter
+            // that wakes observes the published result on its next poll.
+            let wake = {
+                let mut state = worker_result
+                    .state
+                    .lock()
+                    .expect("SQLite result cell lock should not be poisoned");
+                state.value = Some(result);
+                state.waker.take()
+            };
+            if let Some(waker) = wake {
+                waker.wake();
+            }
             if let Ok(mut waker) = worker_slot.close_waker.lock() {
                 if let Some(waker) = waker.take() {
                     waker.wake();
@@ -1050,10 +1090,9 @@ fn schedule_operation(
 
     let driver = SqliteOperationDriver {
         slot: Arc::clone(&slot),
-        result: Arc::clone(&result),
+        cell: Arc::clone(&cell),
         running,
         cancelled,
-        op_waker: Mutex::new(None),
     };
     let mut spec = OperationSpec::new(driver).with_resource(handle);
     if let Some(deadline) = deadline {
@@ -1067,7 +1106,7 @@ fn schedule_operation(
     slot.pending_results
         .lock()
         .expect("sqlite pending results lock")
-        .insert(raw, result);
+        .insert(raw, cell);
     // Register the module adapter that materializes this operation's
     // guest-visible return once the VM's pending host-call awaiting observes
     // the operation terminal. The adapter pulls the completed value from the
@@ -1102,7 +1141,11 @@ pub(super) fn take_pending_result(
         .lock()
         .expect("sqlite pending results lock")
         .remove(&op_raw)?;
-    cell.lock().expect("sqlite result cell lock").take()
+    cell.state
+        .lock()
+        .expect("sqlite result cell lock")
+        .value
+        .take()
 }
 
 /// Number of worker threads still alive for the connection identified by
