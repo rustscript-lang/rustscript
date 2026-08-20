@@ -1225,6 +1225,166 @@ fn sqlite_pending_work_is_associated_with_its_connection_resource() {
     fs::remove_dir_all(root).expect("temporary SQLite root should be removed");
 }
 
+/// Reconfiguring the SQLite policy must be pure configuration: it replaces
+/// the persistent module-state policy without touching any live connection
+/// resource or its in-flight operation (the production semantics that
+/// replaced the removed legacy
+/// `sqlite_reconfiguration_only_closes_sqlite_owned_state` behaviour).
+///
+/// A pending query started before the reconfiguration must keep running on
+/// the *original* connection, never be cancelled with any close/reset
+/// reason, and still complete normally; the replacement policy must be the
+/// one in force afterwards. The shared open-connection accounting must also
+/// survive the swap: while the original connection is still live, a new open
+/// is bound by the replacement policy's tightened `max_connections`, and once
+/// the original is closed a new open proceeds under the replacement policy.
+#[test]
+fn sqlite_reconfiguration_preserves_live_connection_and_its_pending_operation() {
+    let root = temporary_root("reconfiguration_preserves_connection");
+    let mut vm = new_vm();
+    vm.configure_sqlite(vm::SqlitePolicy {
+        database_root: Some(root.to_string_lossy().into_owned()),
+        allow_unsafe_sql: true,
+        // Deliberately wide: `PRAGMA` is unsafe SQL (used to prove the
+        // replacement policy is active) and the recursive query below needs a
+        // generous transaction window.
+        limits: vm::SqliteLimits {
+            max_connections: 4,
+            max_transaction_ms: 10_000,
+            max_result_bytes: 64 * 1024,
+            ..vm::SqliteLimits::default()
+        },
+    });
+
+    // Open one connection against the configured root (the counter is shared
+    // with the persistent module state).
+    let original_options = open_options(
+        &root,
+        "state.db",
+        "read_write_create",
+        limits([
+            ("max_transaction_ms", 10_000),
+            ("max_result_bytes", 64 * 1024),
+        ]),
+    );
+    let db_id = sqlite::open(&mut vm, &[original_options.clone()])
+        .expect("SQLite open should succeed under the original policy");
+
+    // A slow query guarantees a genuinely pending operation associated with
+    // the original connection when the policy is replaced below.
+    let pending = sqlite::query(
+        &mut vm,
+        &[
+            Value::Int(db_id),
+            Value::string(
+                "WITH RECURSIVE numbers(value) AS (\
+                    SELECT 1 UNION ALL SELECT value + 1 FROM numbers LIMIT 2000000\
+                ) SELECT sum(value) FROM numbers",
+            ),
+            empty_params(),
+            limits([("max_rows", 1), ("max_result_bytes", 64 * 1024)]),
+        ],
+    )
+    .expect("long SQLite query should be scheduled");
+    let HostCallResult::Pending(op_id) = pending else {
+        panic!("long SQLite query should return a pending operation");
+    };
+    assert!(sqlite::has_pending(&vm, op_id));
+    assert!(sqlite::is_associated_with(&vm, op_id, db_id));
+    wait_for_worker(
+        &mut vm,
+        db_id,
+        std::time::Instant::now() + std::time::Duration::from_secs(1),
+    );
+
+    // Replace the policy *while the query is mid-flight*. This is the
+    // regression under test: configuration must not reach into the execution
+    // scope (no resource close, no operation cancellation) — the old
+    // owner/type-dispatch reconfiguration closed exactly the sqlite-owned
+    // state, and the generic-scope replacement must not resurrect that.
+    vm.configure_sqlite(vm::SqlitePolicy {
+        database_root: Some(root.to_string_lossy().into_owned()),
+        allow_unsafe_sql: true,
+        limits: vm::SqliteLimits {
+            max_connections: 1,
+            max_transaction_ms: 10_000,
+            max_result_bytes: 64 * 1024,
+            ..vm::SqliteLimits::default()
+        },
+    });
+
+    // The pending operation is untouched: still pending, still associated
+    // with the original connection, and its completion is a normal success —
+    // not a cancellation with any close/reset reason.
+    assert!(sqlite::has_pending(&vm, op_id));
+    assert!(sqlite::is_associated_with(&vm, op_id, db_id));
+    let completed = wait_pending(&mut vm, op_id)
+        .expect("the pending query must complete normally after reconfiguration");
+    let completed = map_from_value(completed);
+    let Value::Array(rows) = field(&completed, "rows") else {
+        panic!("query rows should be an array");
+    };
+    assert_eq!(rows.len(), 1);
+    let Value::Array(cells) = &rows[0] else {
+        panic!("query row should be an array");
+    };
+    // sum(1..=2_000_000) = 2_000_001_000_000.
+    assert_eq!(cells[0], Value::Int(2_000_001_000_000));
+    assert!(!sqlite::has_pending(&vm, op_id));
+
+    // The original connection is still live and usable after the swap.
+    let result = query(
+        &mut vm,
+        db_id,
+        "PRAGMA table_info(state_db)",
+        empty_params(),
+        limits([("max_rows", 8), ("max_result_bytes", 64 * 1024)]),
+    )
+    .expect("the original connection must remain usable after reconfiguration");
+    assert_eq!(field(&result, "truncated"), &Value::Bool(false));
+
+    // Accounting under the replacement policy: with the original connection
+    // still live, a second open must be rejected — the shared counter (1)
+    // meets the replacement `max_connections` (1) — proving the tightened
+    // limit is active against the preserved accounting.
+    let second_options = open_options(
+        &root,
+        "other.db",
+        "read_write_create",
+        limits([("max_result_bytes", 64 * 1024)]),
+    );
+    let error = sqlite::open(&mut vm, &[second_options])
+        .expect_err("a second open must be rejected while the original connection is live");
+    assert!(
+        error.to_string().contains("connection limit"),
+        "rejection must name the connection limit: {error}"
+    );
+
+    // Closing the original connection releases the accounting; a new open now
+    // proceeds under the replacement policy.
+    sqlite::close(&mut vm, &[Value::Int(db_id)]).expect("close should succeed");
+    let db_id = sqlite::open(&mut vm, &[original_options])
+        .expect("a new open must proceed once the original connection is closed");
+    let result = query(
+        &mut vm,
+        db_id,
+        "SELECT 42",
+        empty_params(),
+        limits([("max_rows", 1), ("max_result_bytes", 64 * 1024)]),
+    )
+    .expect("the reopened connection should be usable");
+    let Value::Array(rows) = field(&result, "rows") else {
+        panic!("query rows should be an array");
+    };
+    let Value::Array(cells) = &rows[0] else {
+        panic!("query row should be an array");
+    };
+    assert_eq!(cells[0], Value::Int(42));
+
+    sqlite::close_all(&mut vm);
+    fs::remove_dir_all(root).expect("temporary SQLite root should be removed");
+}
+
 // ---------------------------------------------------------------------------
 // Generic scope lifecycle: policy persistence, connection cleanup, and the
 // typed cancellation reason delivered uniformly on close and on reset.
