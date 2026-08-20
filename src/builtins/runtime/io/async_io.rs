@@ -32,7 +32,9 @@ use libc;
 use pd_host_function::pd_host_function;
 
 use super::super::HostCallResult;
-use super::ops::{ReadyOperation, ThreadedOperation, ThreadedWorkerSignal};
+use super::ops::{
+    CloseCompletionOperation, ReadyOperation, ThreadedOperation, ThreadedWorkerSignal,
+};
 use super::worker::IoWorkerResource;
 use crate::host_api::ResourceTypeKey;
 use crate::vm::operation::OperationSpec;
@@ -48,6 +50,8 @@ pub(crate) struct IoFileResource {
     handle: Mutex<Option<std::fs::File>>,
     close_worker: Mutex<Option<JoinHandle<()>>>,
     closed: AtomicBool,
+    /// Shared flag set by `poll_close` when the close worker finishes.
+    close_completion: Arc<AtomicBool>,
 }
 
 impl HostResource for IoFileResource {
@@ -60,15 +64,21 @@ impl HostResource for IoFileResource {
         // Take the file handle and spawn a worker to flush/close it.
         // This ensures the VM thread never blocks on file I/O during close.
         let file = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let close_completion = self.close_completion.clone();
         if let Some(mut file) = file {
             let handle = std::thread::Builder::new()
                 .name("io-file-close".into())
                 .spawn(move || {
                     let _ = file.flush();
+                    // Signal completion before the file handle drops.
+                    close_completion.store(true, Ordering::SeqCst);
                     // file is dropped here, which closes the OS handle.
                 })
                 .expect("io file close worker must spawn");
             *self.close_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        } else {
+            // No file handle to close; signal completion immediately.
+            close_completion.store(true, Ordering::SeqCst);
         }
         Ok(CloseProgress::Pending)
     }
@@ -84,6 +94,8 @@ impl HostResource for IoFileResource {
         if let Some(handle) = guard.take() {
             let _ = handle.join();
         }
+        // Signal completion to any waiting CloseCompletionOperation.
+        self.close_completion.store(true, Ordering::SeqCst);
         Poll::Ready(Ok(()))
     }
 }
@@ -94,6 +106,7 @@ impl IoFileResource {
             handle: Mutex::new(Some(file)),
             close_worker: Mutex::new(None),
             closed: AtomicBool::new(false),
+            close_completion: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -118,6 +131,8 @@ pub(crate) struct IoProcessResource {
     close_worker: Mutex<Option<JoinHandle<()>>>,
     process_id: u32,
     closed: AtomicBool,
+    /// Shared flag set by `poll_close` when the close worker finishes.
+    close_completion: Arc<AtomicBool>,
 }
 
 impl HostResource for IoProcessResource {
@@ -131,6 +146,7 @@ impl HostResource for IoProcessResource {
         // This ensures the VM thread never blocks on process teardown.
         let child = self.child.lock().unwrap_or_else(|e| e.into_inner()).take();
         let process_id = self.process_id;
+        let close_completion = self.close_completion.clone();
         if let Some(mut child) = child {
             let handle = std::thread::Builder::new()
                 .name("io-process-close".into())
@@ -138,9 +154,13 @@ impl HostResource for IoProcessResource {
                     terminate_process_group(process_id);
                     let _ = child.kill();
                     let _ = child.wait();
+                    // Signal completion after the process is fully cleaned up.
+                    close_completion.store(true, Ordering::SeqCst);
                 })
                 .expect("io process close worker must spawn");
             *self.close_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        } else {
+            close_completion.store(true, Ordering::SeqCst);
         }
         Ok(CloseProgress::Pending)
     }
@@ -155,6 +175,8 @@ impl HostResource for IoProcessResource {
         if let Some(handle) = guard.take() {
             let _ = handle.join();
         }
+        // Signal completion to any waiting CloseCompletionOperation.
+        self.close_completion.store(true, Ordering::SeqCst);
         Poll::Ready(Ok(()))
     }
 }
@@ -167,6 +189,7 @@ impl IoProcessResource {
             close_worker: Mutex::new(None),
             process_id,
             closed: AtomicBool::new(false),
+            close_completion: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1003,32 +1026,63 @@ pub(crate) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<HostCall
 /// Closes an I/O handle.
 /// The actual close teardown (flush, process kill) is delegated to the
 /// resource's begin_close/poll_close lifecycle, which spawns a worker.
+/// The close-completion operation is registered first (before calling
+/// close_resource) to guarantee failure atomicity: if operation
+/// registration fails, the target resource remains fully live and
+/// guest-owned. The operation is deliberately NOT associated with the
+/// target resource handle (via `with_resource`) because close_resource
+/// cancels operations associated with the target, which would
+/// self-cancel the close-completion driver.
 #[pd_host_function(name = "io::close")]
 pub(crate) fn builtin_io_close(vm: &mut Vm, handle_id: i64) -> VmResult<HostCallResult<bool>> {
     let handle = resource_handle(handle_id)?;
-    // Try file resource first, then pipe resource (popen returns a pipe handle).
-    let mut ctx = vm.host_context();
-    let result = ctx.close_resource::<IoFileResource>(handle, ResourceCloseReason::Requested);
-    match result {
-        Ok(_) => {}
-        Err(ref error) if error.message().contains("resource_type_mismatch") => {
-            ctx.close_resource::<IoPipeResource>(handle, ResourceCloseReason::Requested)
-                .map_err(|error| VmError::HostError(format!("io_close failed: {error}")))?;
-        }
-        Err(error) => return Err(VmError::HostError(format!("io_close failed: {error}"))),
-    }
-    drop(ctx);
-    let operation = ReadyOperation;
-    let spec = OperationSpec::new(operation).with_resource(handle);
+
+    // Create a shared close-completion flag.
+    let close_completion = Arc::new(AtomicBool::new(false));
+
+    // Register the close-completion operation FIRST (failure-atomic).
+    // No resource association: close_resource cancels ops associated
+    // with the target handle, which would self-cancel us.
+    let operation = CloseCompletionOperation::new(close_completion.clone());
+    let spec = OperationSpec::new(operation);
     let op_id = vm
         .host_context()
         .start_operation(spec)
         .map_err(|error| VmError::HostError(format!("io operation start failed: {error}")))?;
     let raw = op_id.raw();
+
+    // Register the PendingOpResult provider before close_resource.
     vm.host.register_pending_op_result(
         raw,
         Box::new(move |_vm| Ok(CallReturn::one(Value::Bool(true)))),
     );
+
+    // Inject the close_completion flag into the target resource, then
+    // close it. Try file first, then pipe (popen returns a pipe handle).
+    let mut ctx = vm.host_context();
+    let inject_result = ctx
+        .borrow_resource_mut::<IoFileResource>(handle)
+        .map(|mut res| {
+            res.close_completion = close_completion.clone();
+        });
+    match inject_result {
+        Ok(()) => {
+            ctx.close_resource::<IoFileResource>(handle, ResourceCloseReason::Requested)
+                .map_err(|error| VmError::HostError(format!("io_close failed: {error}")))?;
+        }
+        Err(ref error) if error.message().contains("resource_type_mismatch") => {
+            // Pipe close is synchronous (begin_close returns Ready),
+            // so we signal completion immediately.
+            ctx.close_resource::<IoPipeResource>(handle, ResourceCloseReason::Requested)
+                .map_err(|error| VmError::HostError(format!("io_close failed: {error}")))?;
+            close_completion.store(true, Ordering::SeqCst);
+        }
+        Err(error) => {
+            return Err(VmError::HostError(format!("io_close failed: {error}")));
+        }
+    }
+    drop(ctx);
+
     Ok(HostCallResult::Pending(raw))
 }
 

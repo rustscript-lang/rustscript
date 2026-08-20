@@ -23,6 +23,47 @@ use crate::vm::operation::reason::OperationCancelReason;
 
 use super::worker::IoWorkerResource;
 
+/// A one-shot operation that waits for a close-completion signal (an
+/// `Arc<AtomicBool>` set by the resource's `poll_close` when the close
+/// worker finishes).
+///
+/// Unlike `ReadyOperation`, this operation returns `Pending` until the
+/// close worker actually completes, making it a true completion-driven
+/// close operation rather than a post-close notification.
+///
+/// This operation is deliberately **not** associated with the target
+/// resource handle (via `with_resource`): `close_resource` cancels every
+/// operation associated with the target, which would self-cancel the
+/// close-completion driver. Instead, the operation is registered as a
+/// freestanding operation that shares the `close_completion` flag with
+/// the resource through a shared `Arc`.
+pub(crate) struct CloseCompletionOperation {
+    close_completion: Arc<AtomicBool>,
+}
+
+impl CloseCompletionOperation {
+    pub(crate) fn new(close_completion: Arc<AtomicBool>) -> Self {
+        Self { close_completion }
+    }
+}
+
+impl HostOperation for CloseCompletionOperation {
+    fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
+        if self.close_completion.load(Ordering::SeqCst) {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn cancel(&mut self, _reason: OperationCancelReason) -> OperationResult<()> {
+        // Close is already in progress; cancellation is a no-op.
+        // The close worker will finish regardless, and the operation
+        // will complete when the close is done.
+        Ok(())
+    }
+}
+
 /// A one-shot operation that completes on the first poll.
 ///
 /// Used for operations that finished synchronously but still need to go

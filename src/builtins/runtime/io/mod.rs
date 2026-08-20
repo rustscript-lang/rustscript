@@ -28,11 +28,7 @@
 use std::sync::Arc;
 
 use super::CallOutcome;
-#[cfg(feature = "async")]
-use super::CaptureAsyncHostContext;
 use super::borrow_arg;
-#[cfg(feature = "async")]
-use super::return_one;
 use crate::host_api::{
     HostApiBuilder, HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema,
     HostTypeSchema, ResourceTypeKey, ResourceTypeSchema,
