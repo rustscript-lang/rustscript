@@ -418,8 +418,8 @@ fn installed_vm(catalog: &HostApiCatalog, source: &str) -> Vm {
 
 #[test]
 fn external_extension_registers_runs_and_returns_raw_handles() {
-    reset_trackers();
     let _tracker_guard = TRACKER_LOCK.lock().unwrap();
+    reset_trackers();
     let catalog = demo_catalog();
     let mut vm = installed_vm(
         &catalog,
@@ -438,8 +438,8 @@ fn external_extension_registers_runs_and_returns_raw_handles() {
 
 #[test]
 fn typed_wrong_resource_rejection_is_structured() {
-    reset_trackers();
     let _tracker_guard = TRACKER_LOCK.lock().unwrap();
+    reset_trackers();
     let catalog = demo_catalog();
     let mut vm = installed_vm(
         &catalog,
@@ -480,8 +480,8 @@ fn typed_wrong_resource_rejection_is_structured() {
 
 #[test]
 fn macro_typed_resource_parameter_uses_absolute_public_sdk_paths() {
-    reset_trackers();
     let _tracker_guard = TRACKER_LOCK.lock().unwrap();
+    reset_trackers();
     let catalog = demo_catalog();
     let mut vm = installed_vm(&catalog, "use demo;\nlet c = demo::make_counter(41);\nc;\n");
     assert_eq!(vm.run().expect("run"), VmStatus::Halted);
@@ -496,8 +496,8 @@ fn macro_typed_resource_parameter_uses_absolute_public_sdk_paths() {
 
 #[test]
 fn reset_driven_scope_cleanup_closes_resources_and_cancels_operations() {
-    reset_trackers();
     let _tracker_guard = TRACKER_LOCK.lock().unwrap();
+    reset_trackers();
     let catalog = demo_catalog();
     let mut vm = installed_vm(
         &catalog,
@@ -537,8 +537,8 @@ fn reset_driven_scope_cleanup_closes_resources_and_cancels_operations() {
 
 #[test]
 fn module_state_survives_reset_and_never_participates_in_close() {
-    reset_trackers();
     let _tracker_guard = TRACKER_LOCK.lock().unwrap();
+    reset_trackers();
     let catalog = demo_catalog();
     let mut vm = installed_vm(&catalog, "use demo; 0;\n");
     assert_eq!(
@@ -559,8 +559,8 @@ fn module_state_survives_reset_and_never_participates_in_close() {
 
 #[test]
 fn external_async_function_parks_then_completes_a_dynamic_operation() {
-    reset_trackers();
     let _tracker_guard = TRACKER_LOCK.lock().unwrap();
+    reset_trackers();
     let catalog = demo_catalog();
     let cancelled = Arc::new(AtomicUsize::new(0));
     let mut vm = installed_vm(
@@ -607,8 +607,8 @@ fn external_async_function_parks_then_completes_a_dynamic_operation() {
 
 #[test]
 fn external_async_function_cancels_on_reset_and_vm_stays_reusable() {
-    reset_trackers();
     let _tracker_guard = TRACKER_LOCK.lock().unwrap();
+    reset_trackers();
     let catalog = demo_catalog();
     let cancelled = Arc::new(AtomicUsize::new(0));
     let mut vm = installed_vm(
