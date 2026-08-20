@@ -45,7 +45,7 @@ mod typed;
 
 #[cfg(feature = "http-client")]
 pub use http::{HttpConfig, HttpHostExt};
-pub use io::{IoHostExt, IoPolicy};
+pub use io::{IoHostExt, IoHostState, IoPolicy};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{
     SqliteExtension, SqliteHostExt, SqliteLimits, SqlitePolicy, register_sqlite_builtin_module,

@@ -4007,3 +4007,20 @@ impl Vm {
             .collect()
     }
 }
+
+/// Reads the configured [`IoPolicy`] from the per-VM module state, if any.
+///
+/// This is the generic module-state bridge: the IO builtin calls this
+/// instead of reaching into `vm.host` directly, keeping the VM-core
+/// lifecycle aware of the IO policy while the IO module owns the concrete
+/// [`IoHostState`] type.
+pub(crate) fn io_policy_from_module(vm: &Vm) -> Option<crate::builtins::runtime::IoPolicy> {
+    use crate::builtins::runtime::IoHostState;
+    vm.host
+        .get_module_state::<IoHostState>()
+        .map(|state| state.policy().clone())
+        .or_else(|| {
+            (!vm.host.default_builtin_capabilities_enabled())
+                .then(crate::builtins::runtime::IoPolicy::default)
+        })
+}
