@@ -763,6 +763,36 @@ pub struct FrontendIr {
     pub semantic_index: Option<SemanticIndex>,
 }
 
+/// A scope identifier used in [`LexicalScope`] records.
+pub type ScopeId = u32;
+
+/// A single lexical scope record with parent link and source range.
+#[derive(Clone, Debug)]
+pub struct LexicalScope {
+    /// Parent scope, or `None` for the module-level (root) scope.
+    pub parent: Option<ScopeId>,
+    /// The source range of the scope body (the brace-delimited region or
+    /// the entire statement body for if/while/for).
+    pub range: Span,
+    /// Local slots declared directly in this scope, in declaration order.
+    pub declarations: Vec<LocalSlot>,
+    /// Function indices declared directly in this scope, in declaration order.
+    pub functions: Vec<u16>,
+}
+
+/// A recorded call-expression entry in the semantic index.
+#[derive(Clone, Debug)]
+pub struct CallExprEntry {
+    /// Span of the entire call expression (including callee, args, parens).
+    pub span: Span,
+    /// Span of just the callee name.
+    pub callee_span: Span,
+    /// The return type of the resolved call, or `Unknown` if not resolved.
+    pub return_type: TypeSchema,
+    /// The callee name (host function name or local function name).
+    pub name: String,
+}
+
 /// A semantic index built by the compiler during pipeline compilation.
 ///
 /// This sidecar holds the span, type-schema, and scope information that the
@@ -780,38 +810,90 @@ pub struct SemanticIndex {
     /// Per-local-slot inferred [`TypeSchema`], indexed by [`LocalSlot`].
     /// Populated from the type checker's `local_schemas` output.
     pub slot_schemas: Vec<Option<TypeSchema>>,
-    /// Per-local-slot declaration [`Span`] in the source text.
+    /// Per-local-slot declaration identifier [`Span`] in the source text.
     pub slot_decl_spans: HashMap<LocalSlot, Span>,
-    /// Per-function-index declaration [`Span`] in the source text.
+    /// Per-function-index declaration identifier [`Span`] in the source text.
+    /// The span covers the function name identifier, not the entire line.
     pub func_decl_spans: HashMap<u16, Span>,
     /// Per-function-index parameter names (ordered).
     pub func_params: HashMap<u16, Vec<String>>,
-    /// Call-expression spans: each entry is a `(span, return_type, name)` for
-    /// a catalog-resolved call expression, in traversal order. The semantic
-    /// model uses these to resolve `inferred_schema_at` and
-    /// `callable_signature_at` for call sites without walking `Expr` trees.
-    pub call_exprs: Vec<(Span, TypeSchema, String)>,
+    /// Call-expression entries in traversal order. Each entry records the
+    /// full expression span, callee name span, resolved return type, and
+    /// callee name. Populated by [`SemanticIndex::build`] from a walk of the
+    /// legalized IR.
+    pub call_exprs: Vec<CallExprEntry>,
+    /// Local variable reference entries: each is a `(identifier_span, slot, name)`.
+    pub local_ref_entries: Vec<(Span, LocalSlot, String)>,
+    /// Lexical scope records in traversal order. Scope 0 is always the root
+    /// (module-level) scope.
+    pub scope_records: Vec<LexicalScope>,
     /// The source text for each [`SourceId`] in the compilation.
     /// Used by the semantic model to resolve position-based queries.
     pub source_texts: HashMap<crate::compiler::source_map::SourceId, String>,
 }
 
 impl SemanticIndex {
-    /// Build a semantic index from the provided slot schemas, spans, and
-    /// source texts. Called by the pipeline after type inference.
+    /// Build a semantic index by walking the legalized IR and collecting
+    /// spans, scopes, and references from the source text.
+    ///
+    /// `slot_schemas` comes from the type checker's `local_schemas` output.
+    /// `source_map` is used to resolve line numbers to spans. `source_texts`
+    /// maps each [`SourceId`] to its source text.
     pub fn build(
         slot_schemas: Vec<Option<TypeSchema>>,
-        stmt_spans: &HashMap<usize, Span>,
-        func_decl_spans: HashMap<u16, Span>,
-        func_params: HashMap<u16, Vec<String>>,
+        ir: &FrontendIr,
+        _source_map: &crate::compiler::source_map::SourceMap,
         source_texts: HashMap<crate::compiler::source_map::SourceId, String>,
     ) -> Self {
+        use super::span_collector::SpanCollector;
+
+        let source_id = 0;
+        let source_text = source_texts.get(&source_id).map(|s| s.as_str()).unwrap_or("");
+
+        let mut slot_decl_spans: HashMap<LocalSlot, Span> = HashMap::new();
+        let mut func_decl_spans: HashMap<u16, Span> = HashMap::new();
+        let mut func_params: HashMap<u16, Vec<String>> = HashMap::new();
+        let mut call_exprs: Vec<CallExprEntry> = Vec::new();
+        let mut local_ref_entries: Vec<(Span, LocalSlot, String)> = Vec::new();
+        let mut scope_records: Vec<LexicalScope> = Vec::new();
+
+        // Populate func_params from function declarations.
+        for decl in &ir.functions {
+            func_params.insert(decl.index, decl.args.clone());
+        }
+
+        // Root scope (module-level).
+        let root_span = Span::new(source_id, 0, source_text.len());
+        scope_records.push(LexicalScope {
+            parent: None,
+            range: root_span,
+            declarations: Vec::new(),
+            functions: Vec::new(),
+        });
+
+        // Walk IR statements and expressions to collect spans.
+        let mut collector = SpanCollector::new(
+            source_id,
+            source_text,
+            &mut slot_decl_spans,
+            &mut func_decl_spans,
+            &mut call_exprs,
+            &mut local_ref_entries,
+            &mut scope_records,
+            ir,
+        );
+        for stmt in &ir.stmts {
+            collector.collect_stmt(stmt);
+        }
+
         SemanticIndex {
             slot_schemas,
-            slot_decl_spans: HashMap::new(),
+            slot_decl_spans,
             func_decl_spans,
             func_params,
-            call_exprs: Vec::new(),
+            call_exprs,
+            local_ref_entries,
+            scope_records,
             source_texts,
         }
     }

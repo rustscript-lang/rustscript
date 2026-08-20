@@ -656,3 +656,119 @@ fn analyze_source_utf16_conversion() {
         assert_eq!(col, 9, "UTF-16 column at offset 9 should be 9");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Exact span and position tests (analyze_source only)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn analyze_source_local_declaration_hover() {
+    let source = "let x = 42;";
+    let model = analyze_source(source).expect("analyze_source should succeed");
+    // Hover on 'x' (offset 4..5)
+    let schema = model.inferred_schema_at(SourcePosition::new(0, 4));
+    assert_eq!(
+        schema,
+        Some(vm::compiler::TypeSchema::Int),
+        "hover on local 'x' should show int"
+    );
+}
+
+#[test]
+fn analyze_source_local_definition_exact_span() {
+    let source = "let x = 42;\nx;";
+    let model = analyze_source(source).expect("analyze_source should succeed");
+    // Find definition at the reference on line 2 (offset 12, 'x' at "let x = 42;\n" = 11 char + 1 newline = 12)
+    let def = model.definition_at(SourcePosition::new(0, 12));
+    assert!(def.is_some(), "should find definition for 'x' reference");
+    if let Some(def) = def {
+        assert_eq!(def.label, "let x", "definition label should be 'let x'");
+        // The span should point to the declaration identifier 'x' at offset 4..5
+        assert_eq!(def.span.lo, 4, "definition span should start at offset 4");
+        assert_eq!(def.span.hi, 5, "definition span should end at offset 5");
+    }
+}
+
+#[test]
+fn analyze_source_function_declaration_definition() {
+    let source = "fn foo() -> int { 42 }";
+    let model = analyze_source(source).expect("analyze_source should succeed");
+    // Find definition at the 'foo' declaration (offset 3..6)
+    let def = model.definition_at(SourcePosition::new(0, 4));
+    assert!(def.is_some(), "should find definition for 'foo'");
+    if let Some(def) = def {
+        assert!(def.label.contains("foo"), "label should mention 'foo'");
+    }
+}
+
+#[test]
+fn analyze_source_unicode_before_target() {
+    let source = "// unicode: 你好\nlet x = 42;\n";
+    let model = analyze_source(source).expect("analyze_source should succeed");
+    // The unicode comment takes 19 bytes: "// unicode: " (12) + "你好" (6) + "\n" (1) = 19
+    // Then "let x" starts at offset 19, 'x' is at offset 23..24
+    let schema = model.inferred_schema_at(SourcePosition::new(0, 23));
+    assert_eq!(
+        schema,
+        Some(vm::compiler::TypeSchema::Int),
+        "hover on 'x' after unicode should show int"
+    );
+}
+
+#[test]
+fn analyze_source_diagnostic_error_code() {
+    let source = "let x = unknown_func();\n";
+    let model = analyze_source(source);
+    match model {
+        Ok(model) => {
+            let diags = model.diagnostics();
+            for diag in &diags {
+                if let Some(ref code) = diag.code {
+                    assert!(
+                        code.starts_with("E"),
+                        "error code should start with E: {}",
+                        code
+                    );
+                }
+            }
+        }
+        Err(_) => {
+            // Parse error is also acceptable
+        }
+    }
+}
+
+#[test]
+fn analyze_source_semantic_index_present() {
+    let source = "let x = 42;\n";
+    let model = analyze_source(source).expect("analyze_source should succeed");
+    let index = model.ir().semantic_index.as_ref();
+    assert!(index.is_some(), "analyze_source should produce a semantic index");
+    if let Some(index) = index {
+        // slot_decl_spans should contain 'x'
+        assert!(
+            !index.slot_decl_spans.is_empty(),
+            "slot_decl_spans should not be empty"
+        );
+        // There should be a root scope
+        assert!(
+            !index.scope_records.is_empty(),
+            "scope_records should not be empty"
+        );
+        // Verify root scope
+        assert_eq!(
+            index.scope_records[0].parent, None,
+            "root scope should have no parent"
+        );
+    }
+}
+
+#[test]
+fn analyze_source_local_scope_visibility() {
+    let source = "let x = 1;\nlet y = 2;\n";
+    let model = analyze_source(source).expect("analyze_source should succeed");
+    let completions = model.completions_at(SourcePosition::new(0, 0));
+    let names: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    // At position 0 (start of file), 'x' should be visible
+    assert!(names.contains(&"x"), "'x' should be visible");
+}

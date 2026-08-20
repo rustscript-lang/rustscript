@@ -898,31 +898,10 @@ fn analyze_parsed_output(
         map
     };
 
-    let func_decl_spans = {
-        let mut spans = std::collections::HashMap::new();
-        for (pos, stmt) in parsed_after_legalize.stmts.iter().enumerate() {
-            if let Stmt::FuncDecl { index, line, .. } = stmt {
-                if let Some(span) = source_map.line_span(0, *line as usize) {
-                    spans.insert(*index, span);
-                }
-            }
-        }
-        spans
-    };
-
-    let func_params = {
-        let mut params = std::collections::HashMap::new();
-        for decl in &parsed_after_legalize.functions {
-            params.insert(decl.index, decl.args.clone());
-        }
-        params
-    };
-
     let semantic_index = SemanticIndex::build(
         type_info.local_schemas.clone(),
-        &std::collections::HashMap::new(), // stmt_spans (empty for now)
-        func_decl_spans,
-        func_params,
+        &parsed_after_legalize,
+        &source_map,
         source_texts,
     );
 

@@ -52,7 +52,7 @@ use crate::host_api::{
 
 use super::CompileError;
 use super::ir::{
-    Expr, FrontendIr, HostApiIrMetadata, LocalSlot, ResolvedHostCall, SemanticIndex, Stmt,
+    Expr, FrontendIr, HostApiIrMetadata, LocalSlot, ResolvedHostCall, ScopeId, SemanticIndex, Stmt,
     TypeSchema,
 };
 use super::source_map::{SourceId, SourceMap, Span};
@@ -448,14 +448,20 @@ impl SemanticModel {
     fn inferred_schema_for_local_at(&self, position: SourcePosition) -> Option<TypeSchema> {
         // Use the semantic index to look up the slot schema.
         if let Some(index) = &self.semantic_index {
-            // Find the local variable whose declaration span contains the
-            // position, or whose name appears at the position.
-            for (name, slot) in &self.local_name_to_slot {
-                if let Some(span) = index.slot_decl_spans.get(slot) {
-                    if self.position_in_span(position, *span) {
-                        if let Some(schema) = index.slot_schema(*slot) {
-                            return Some(schema.clone());
-                        }
+            // 1. Check if the position falls within a local declaration's identifier span.
+            for (slot, span) in &index.slot_decl_spans {
+                if self.position_in_span(position, *span) {
+                    if let Some(schema) = index.slot_schema(*slot) {
+                        return Some(schema.clone());
+                    }
+                }
+            }
+
+            // 2. Check if the position falls within a local variable reference.
+            for (ref_span, slot, _name) in &index.local_ref_entries {
+                if self.position_in_span(position, *ref_span) {
+                    if let Some(schema) = index.slot_schema(*slot) {
+                        return Some(schema.clone());
                     }
                 }
             }
@@ -498,12 +504,11 @@ impl SemanticModel {
 
     /// Find the inferred schema for a function declaration at the position.
     fn inferred_schema_for_func_at(&self, position: SourcePosition) -> Option<TypeSchema> {
-        // Check each function declaration line.
-        for stmt in &self.ir.stmts {
-            if let Stmt::FuncDecl { index, line, .. } = stmt {
-                if self.position_matches_line(position, *line) {
-                    // Return the function's return schema if available.
-                    if let Some(decl) = self.ir.functions.get(*index as usize) {
+        // Use the semantic index's func_decl_spans for exact position matching.
+        if let Some(index) = &self.semantic_index {
+            for (func_idx, span) in &index.func_decl_spans {
+                if self.position_in_span(position, *span) {
+                    if let Some(decl) = self.ir.functions.get(*func_idx as usize) {
                         if let Some(ref schema) = decl.return_schema {
                             return Some(schema.clone());
                         }
@@ -866,66 +871,120 @@ impl SemanticModel {
     /// `resource<key>` for resource schemas. Legal overloads remain separate
     /// deterministic candidates; no arbitrary name-only selection is performed.
     pub fn completions_at(&self, position: SourcePosition) -> Vec<SemanticCompletion> {
-        let mut completions = Vec::new();
+            let mut completions = Vec::new();
 
-        // Determine the cursor prefix (the word being typed at the position).
-        let prefix = self.cursor_prefix(position);
+            // Determine the cursor prefix (the word being typed at the position).
+            let prefix = self.cursor_prefix(position);
 
-        // 1. Visible local variables visible in the current scope.
-        for (name, _slot) in &self.local_name_to_slot {
-            if self.is_local_visible_at(name, position) {
-                if prefix.is_empty() || name.starts_with(&prefix) {
+            // Determine which scope the cursor is in.
+            let cursor_scope_id = self.find_scope_at(position);
+
+            // Collect visible local slots from the cursor scope and its ancestors.
+            let mut visible_slots: std::collections::HashSet<LocalSlot> = std::collections::HashSet::new();
+            let mut visible_funcs: std::collections::HashSet<u16> = std::collections::HashSet::new();
+            let mut seen_scope_ids: std::collections::HashSet<ScopeId> = std::collections::HashSet::new();
+
+            if let Some(index) = &self.semantic_index {
+                if let Some(mut scope_id) = cursor_scope_id {
+                    // Walk up the scope chain.
+                    loop {
+                        if !seen_scope_ids.insert(scope_id) {
+                            break; // Prevent infinite loops.
+                        }
+                        if let Some(scope) = index.scope_records.get(scope_id as usize) {
+                            for slot in &scope.declarations {
+                                visible_slots.insert(*slot);
+                            }
+                            for func_idx in &scope.functions {
+                                visible_funcs.insert(*func_idx);
+                            }
+                            if let Some(parent) = scope.parent {
+                                scope_id = parent;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // 1. Visible local variables from scope analysis.
+            if let Some(index) = &self.semantic_index {
+                for (name, slot) in &self.local_name_to_slot {
+                    if visible_slots.contains(slot) {
+                        if prefix.is_empty() || name.starts_with(&prefix) {
+                            let detail = index.slot_schema(*slot).map(|s| format!("{}", s));
+                            completions.push(SemanticCompletion {
+                                label: name.clone(),
+                                detail,
+                                docs: None,
+                                kind: CompletionItemKind::Variable,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // 2. Function declarations from scope analysis.
+            for decl in &self.ir.functions {
+                if visible_funcs.contains(&decl.index) {
+                    if prefix.is_empty() || decl.name.starts_with(&prefix) {
+                        let detail = Some(format!("fn({})", decl.args.join(", ")));
+                        completions.push(SemanticCompletion {
+                            label: decl.name.clone(),
+                            detail,
+                            docs: None,
+                            kind: CompletionItemKind::Function,
+                        });
+                    }
+                }
+            }
+
+            // 3. Catalog functions (with full signatures).
+            for func in self.catalog.functions() {
+                if prefix.is_empty() || func.name.starts_with(&prefix) {
+                    let detail = Some(self.format_host_function_detail(func));
                     completions.push(SemanticCompletion {
-                        label: name.clone(),
-                        detail: None,
-                        docs: None,
-                        kind: CompletionItemKind::Variable,
+                        label: func.name.clone(),
+                        detail,
+                        docs: Some(func.description.clone()),
+                        kind: CompletionItemKind::Function,
                     });
                 }
             }
-        }
 
-        // 2. Function declarations.
-        for decl in &self.ir.functions {
-            if prefix.is_empty() || decl.name.starts_with(&prefix) {
-                let detail = Some(format!("fn({})", decl.args.join(", ")));
-                completions.push(SemanticCompletion {
-                    label: decl.name.clone(),
-                    detail,
-                    docs: None,
-                    kind: CompletionItemKind::Function,
-                });
+            // 4. Catalog resource types.
+            for resource in self.catalog.resources() {
+                let label = format!("resource<{}>", resource.key);
+                if prefix.is_empty() || label.starts_with(&prefix) {
+                    completions.push(SemanticCompletion {
+                        label,
+                        detail: Some(resource.description.clone()),
+                        docs: None,
+                        kind: CompletionItemKind::Resource,
+                    });
+                }
             }
+
+            completions
         }
 
-        // 3. Catalog functions (with full signatures).
-        for func in self.catalog.functions() {
-            if prefix.is_empty() || func.name.starts_with(&prefix) {
-                let detail = Some(self.format_host_function_detail(func));
-                completions.push(SemanticCompletion {
-                    label: func.name.clone(),
-                    detail,
-                    docs: Some(func.description.clone()),
-                    kind: CompletionItemKind::Function,
-                });
+        /// Find the deepest lexical scope containing the given position.
+        fn find_scope_at(&self, position: SourcePosition) -> Option<ScopeId> {
+            if let Some(index) = &self.semantic_index {
+                // Walk scopes in reverse order (deepest first, since they are pushed
+                // in traversal order and later scopes are nested deeper).
+                for (i, scope) in index.scope_records.iter().enumerate().rev() {
+                    if self.position_in_span(position, scope.range) {
+                        return Some(i as ScopeId);
+                    }
+                }
             }
+            // Default to root scope (0).
+            Some(0)
         }
-
-        // 4. Catalog resource types.
-        for resource in self.catalog.resources() {
-            let label = format!("resource<{}>", resource.key);
-            if prefix.is_empty() || label.starts_with(&prefix) {
-                completions.push(SemanticCompletion {
-                    label,
-                    detail: Some(resource.description.clone()),
-                    docs: None,
-                    kind: CompletionItemKind::Resource,
-                });
-            }
-        }
-
-        completions
-    }
 
     /// Extract the cursor prefix (the word being typed) at the position.
     fn cursor_prefix(&self, position: SourcePosition) -> String {
@@ -1041,9 +1100,18 @@ impl SemanticModel {
                     label: format!("let {}", name),
                 });
             }
+            // Fallback: check local_ref_entries for the slot.
+            for (ref_span, ref_slot, ref_name) in &index.local_ref_entries {
+                if *ref_slot == slot && ref_name == name {
+                    return Some(Definition {
+                        span: *ref_span,
+                        label: format!("let {}", name),
+                    });
+                }
+            }
         }
 
-        // Fallback: find the let-binding statement.
+        // Fallback: find the let-binding statement by line.
         for stmt in &self.ir.stmts {
             if let Stmt::Let { index, line, .. } = stmt {
                 if *index == slot {
@@ -1062,18 +1130,15 @@ impl SemanticModel {
 
     /// Find the definition of a function at the position.
     fn definition_for_func_at(&self, position: SourcePosition) -> Option<Definition> {
-        for stmt in &self.ir.stmts {
-            if let Stmt::FuncDecl {
-                name, index, line, ..
-            } = stmt
-            {
-                if self.position_matches_line(position, *line) {
-                    if let Some(span) = self.line_span(position.source_id, *line) {
-                        return Some(Definition {
-                            span,
-                            label: format!("fn {}", name),
-                        });
-                    }
+        // Use the semantic index's func_decl_spans for exact position matching.
+        if let Some(index) = &self.semantic_index {
+            for (func_idx, span) in &index.func_decl_spans {
+                if self.position_in_span(position, *span) {
+                    let name = self.ir.functions.get(*func_idx as usize).map(|f| f.name.as_str()).unwrap_or("fn");
+                    return Some(Definition {
+                        span: *span,
+                        label: format!("fn {}", name),
+                    });
                 }
             }
         }

@@ -22,6 +22,7 @@ mod modules;
 mod parser;
 mod pipeline;
 mod semantic_model;
+mod span_collector;
 mod source_loader;
 pub mod source_map;
 mod typing;
@@ -48,6 +49,7 @@ pub use self::modules::{
 pub use self::parser::ParserDialect;
 pub use self::pipeline::{
     InferredLocalTypeHint, UnknownInferredLocal, analyze_source, analyze_source_file,
+    analyze_source_file_with_options,
     collect_inferred_local_type_hints, collect_inferred_local_type_hints_at_path_with_options,
     collect_inferred_local_type_hints_with_options, compile_source,
     compile_source_at_path_with_flavor_and_options, compile_source_file,
