@@ -6,6 +6,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use pd_host_function::pd_host_function;
+use tokio::sync::Notify;
 
 use super::request::{
     HttpRequest, HttpResponseResource, OwnedResponse, ResponseReadObserver, open_stream_response,
@@ -19,7 +20,7 @@ use crate::vm::operation::{
 };
 use crate::vm::resource::{
     CloseProgress, HostResource, ResourceCloseReason, ResourceError, ResourceErrorCode,
-    ResourceHandle, ResourceResult, ResourceTypeKey,
+    ResourceResult, ResourceTypeKey,
 };
 use crate::vm::{
     CallOutcome, CallReturn, HostStreamAction, HostStreamDriver, HostStreamPoll, Value, Vm,
@@ -316,11 +317,12 @@ fn parse_stream_timeout(request: &VmMap) -> VmResult<Option<Duration>> {
 /// [`HostResource::begin_close`] and by the SSE poll operation's cancel; the
 /// worker observes it between items and stops promptly.
 pub(super) struct SseShared {
-    /// The response stream parent this reader is a child of.
-    /// Set after the resource is pushed into the scope.
-    pub(super) parent: std::sync::Mutex<Option<ResourceHandle>>,
     /// Set on close/cancel; the worker stops polling the network.
     pub(super) stopping: AtomicBool,
+    /// Notified on close/cancel so the worker can break out of a
+    /// blocking network read. Race-free: if notify_one() arrives before
+    /// the worker starts waiting, the next notified() completes immediately.
+    pub(super) cancel: Notify,
     /// Waker registered by the latest pending SSE poll.
     pub(super) waker: std::sync::Mutex<Option<std::task::Waker>>,
     /// One published item ready for the stream driver to pick up.
@@ -445,7 +447,16 @@ impl SseWorker {
             if self.shared.stopping.load(Ordering::SeqCst) {
                 return Err(VmError::HostError("SSE stream closed".to_string()));
             }
-            let frame = runtime_block_on(response.next_frame())?;
+            let cancel = &self.shared.cancel;
+            let frame = runtime_block_on(async {
+                tokio::select! {
+                    biased;
+                    _ = cancel.notified() => {
+                        Err(VmError::HostError("SSE stream cancelled".to_string()))
+                    }
+                    frame = response.next_frame() => frame,
+                }
+            })?;
             let Some(frame) = frame else {
                 break;
             };
@@ -633,7 +644,9 @@ impl HostResource for SseStreamResource {
     fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         let _ = reason;
         self.shared.stopping.store(true, Ordering::SeqCst);
-        // Wake the item waker so the worker sees the stop flag promptly.
+        self.shared.cancel.notify_one();
+        // Wake the item waker so the stream driver sees the stop flag
+        // promptly.
         if let Ok(mut waker) = self.shared.waker.lock() {
             if let Some(waker) = waker.take() {
                 waker.wake();
@@ -713,6 +726,7 @@ impl HostOperation for SseScopeOperation {
     fn cancel(&mut self, reason: OperationCancelReason) -> OperationResult<()> {
         let _ = reason;
         self.shared.stopping.store(true, Ordering::SeqCst);
+        self.shared.cancel.notify_one();
         if let Ok(mut waker) = self.shared.waker.lock() {
             if let Some(waker) = waker.take() {
                 waker.wake();
@@ -752,8 +766,8 @@ pub(super) fn builtin_http_client_sse(
     }
 
     let shared = Arc::new(SseShared {
-        parent: std::sync::Mutex::new(None),
         stopping: AtomicBool::new(false),
+        cancel: Notify::new(),
         waker: std::sync::Mutex::new(None),
         item: std::sync::Mutex::new(None),
         done: AtomicBool::new(false),
@@ -772,7 +786,6 @@ pub(super) fn builtin_http_client_sse(
         .map_err(|error| {
             VmError::HostError(format!("failed to push HTTP response resource: {error}"))
         })?;
-    let response_handle = response_token.handle();
 
     let sse_resource = SseStreamResource {
         shared: Arc::clone(&shared),
@@ -784,8 +797,6 @@ pub(super) fn builtin_http_client_sse(
             VmError::HostError(format!("failed to push SSE child resource: {error}"))
         })?;
     let sse_handle = sse_token.handle();
-    // Store the parent handle so the resource can reference it.
-    *shared.parent.lock().expect("sse parent lock") = Some(response_handle);
     let op = SseScopeOperation {
         shared: Arc::clone(&shared),
     };

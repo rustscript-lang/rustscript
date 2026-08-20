@@ -1068,3 +1068,73 @@ async fn sse_revalidates_redirects_and_strips_cross_origin_credentials() {
     source_server.join().unwrap();
     target.join().unwrap();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn sse_silent_server_reset_cancels_worker_and_releases_permit() {
+    // This test verifies that a silent server (sends headers, then stays
+    // silent on the TCP connection) does not prevent scope close from
+    // cancelling the worker. The cancellable network read via Notify +
+    // select! ensures the worker wakes promptly when the scope is closed,
+    // without waiting for the server to send another frame.
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0; 4096];
+        let read = stream.read(&mut request).unwrap();
+        assert!(read > 0, "SSE request should be received");
+        // Send SSE headers, then stay silent (no body data).
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .unwrap();
+        stream.flush().unwrap();
+        // Block on reading from the socket. When the worker is cancelled,
+        // the OwnedResponse is dropped, closing the TCP connection, and
+        // this read returns 0 (EOF) or ConnectionReset.
+        let mut buf = [0; 1024];
+        match stream.read(&mut buf) {
+            Ok(0) => {} // Connection closed by peer — expected.
+            Ok(n) => panic!("unexpected data after SSE headers: {n} bytes"),
+            Err(error) => {
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset,
+                    "unexpected read error: {error}"
+                );
+            }
+        }
+    });
+
+    let source = format!(
+        r#"use http;
+        http::client::sse(
+            {{"method":"GET","url":"http://127.0.0.1:{port}/events"}},
+            |item| {{action: "continue"}}
+        );"#
+    );
+    let compiled = compile_source(&source).unwrap();
+    let mut vm = Vm::new(compiled.program);
+    vm.set_http_max_in_flight(1);
+    vm.configure_http(config(port)).unwrap();
+    vm.set_async_bridge(Box::<TokioHostDriver>::default());
+    HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
+
+    // Start the SSE stream. It should be pending (waiting for the callback).
+    assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+
+    // Begin the reset. The scope close sets stopping and notifies the
+    // cancel Notify, which the worker observes inside the select! and
+    // stops promptly without waiting for the silent server.
+    vm.reset_for_reuse();
+
+    // Drive the reset to completion with a real waker.
+    drive_reset(&mut vm).await;
+    assert!(vm.is_reusable(), "VM should be reusable after reset");
+
+    // The server should have detected the connection close (read returned
+    // 0 or ConnectionReset), proving the worker was cancelled without
+    // waiting for another frame from the silent server.
+    server.join().expect("silent-server thread should finish");
+}
