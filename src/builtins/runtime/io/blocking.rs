@@ -14,11 +14,13 @@ use libc;
 use pd_host_function::pd_host_function;
 
 use super::super::HostCallResult;
+use super::ops::ReadyOperation;
 use crate::host_api::ResourceTypeKey;
+use crate::vm::operation::OperationSpec;
 use crate::vm::resource::{
     CloseProgress, HostResource, ResourceCloseReason, ResourceHandle, ResourceResult,
 };
-use crate::vm::{Value, Vm, VmError, VmResult};
+use crate::vm::{CallReturn, Value, Vm, VmError, VmResult};
 
 // ---- HostResource implementations for IO resources ----
 
@@ -269,7 +271,19 @@ pub(crate) fn builtin_io_open(
         .map_err(|err| VmError::HostError(format!("io_open failed: {err}")))?;
     let resource = IoFileResource::new(file);
     let handle = insert_io_file_resource(vm, resource)?;
-    Ok(HostCallResult::Return(handle))
+    let handle_val = handle;
+    let operation = ReadyOperation;
+    let spec = OperationSpec::new(operation);
+    let op_id = vm
+        .host_context()
+        .start_operation(spec)
+        .map_err(|error| VmError::HostError(format!("io operation start failed: {error}")))?;
+    let raw = op_id.raw();
+    vm.host.register_pending_op_result(
+        raw,
+        Box::new(move |_vm| Ok(CallReturn::one(Value::Int(handle_val)))),
+    );
+    Ok(HostCallResult::Pending(raw))
 }
 
 /// Starts a child process and returns a process-backed handle.
@@ -292,7 +306,7 @@ pub(crate) fn builtin_io_popen(
         }
     }
     let mut child = spawn_shell_command(command, mode)?;
-    match mode {
+    let handle = match mode {
         "r" => {
             let stdout = child.stdout.take().ok_or_else(|| {
                 VmError::HostError("io_popen('r') did not provide stdout pipe".to_string())
@@ -303,7 +317,7 @@ pub(crate) fn builtin_io_popen(
             let pipe_token = insert_io_pipe_child_resource(vm, pipe_resource, &process_token)?;
             let handle = pipe_token.handle().as_value();
             match handle {
-                Value::Int(value) => Ok(HostCallResult::Return(value)),
+                Value::Int(value) => value,
                 _ => unreachable!(),
             }
         }
@@ -317,12 +331,25 @@ pub(crate) fn builtin_io_popen(
             let pipe_token = insert_io_pipe_child_resource(vm, pipe_resource, &process_token)?;
             let handle = pipe_token.handle().as_value();
             match handle {
-                Value::Int(value) => Ok(HostCallResult::Return(value)),
+                Value::Int(value) => value,
                 _ => unreachable!(),
             }
         }
         _ => unreachable!("mode validated above"),
-    }
+    };
+    let handle_val = handle;
+    let operation = ReadyOperation;
+    let spec = OperationSpec::new(operation);
+    let op_id = vm
+        .host_context()
+        .start_operation(spec)
+        .map_err(|error| VmError::HostError(format!("io operation start failed: {error}")))?;
+    let raw = op_id.raw();
+    vm.host.register_pending_op_result(
+        raw,
+        Box::new(move |_vm| Ok(CallReturn::one(Value::Int(handle_val)))),
+    );
+    Ok(HostCallResult::Pending(raw))
 }
 
 /// Reads all remaining text from an I/O handle.
@@ -354,7 +381,21 @@ pub(crate) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<HostC
             .with_reader(|r| read_to_string_with_limit(r, max_read_bytes, &mut out))?;
         out
     };
-    Ok(HostCallResult::Return(out))
+    // Drop ctx before using vm.host.
+    drop(ctx);
+    let out_val = out;
+    let operation = ReadyOperation;
+    let spec = OperationSpec::new(operation).with_resource(handle);
+    let op_id = vm
+        .host_context()
+        .start_operation(spec)
+        .map_err(|error| VmError::HostError(format!("io operation start failed: {error}")))?;
+    let raw = op_id.raw();
+    vm.host.register_pending_op_result(
+        raw,
+        Box::new(move |_vm| Ok(CallReturn::one(Value::string(out_val)))),
+    );
+    Ok(HostCallResult::Pending(raw))
 }
 
 /// Reads a single line of text from an I/O handle.
@@ -371,7 +412,19 @@ pub(crate) fn builtin_io_read_line(
         |file| file.with_handle_mut(|f| read_line_from_reader(f, max_read_bytes)),
         |pipe| pipe.with_reader(|r| read_line_from_reader(r, max_read_bytes)),
     )?;
-    Ok(HostCallResult::Return(line))
+    let line_val = line;
+    let operation = ReadyOperation;
+    let spec = OperationSpec::new(operation).with_resource(handle);
+    let op_id = vm
+        .host_context()
+        .start_operation(spec)
+        .map_err(|error| VmError::HostError(format!("io operation start failed: {error}")))?;
+    let raw = op_id.raw();
+    vm.host.register_pending_op_result(
+        raw,
+        Box::new(move |_vm| Ok(CallReturn::one(Value::string(line_val)))),
+    );
+    Ok(HostCallResult::Pending(raw))
 }
 
 /// Writes text to an I/O handle.
@@ -409,7 +462,19 @@ pub(crate) fn builtin_io_write(
             })
         },
     )?;
-    Ok(HostCallResult::Return(written))
+    let written_val = written;
+    let operation = ReadyOperation;
+    let spec = OperationSpec::new(operation).with_resource(handle);
+    let op_id = vm
+        .host_context()
+        .start_operation(spec)
+        .map_err(|error| VmError::HostError(format!("io operation start failed: {error}")))?;
+    let raw = op_id.raw();
+    vm.host.register_pending_op_result(
+        raw,
+        Box::new(move |_vm| Ok(CallReturn::one(Value::Int(written_val)))),
+    );
+    Ok(HostCallResult::Pending(raw))
 }
 
 /// Flushes buffered output for an I/O handle.
@@ -441,7 +506,19 @@ pub(crate) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<HostCall
             Ok(true)
         });
     }
-    Ok(HostCallResult::Return(true))
+    drop(ctx);
+    let operation = ReadyOperation;
+    let spec = OperationSpec::new(operation).with_resource(handle);
+    let op_id = vm
+        .host_context()
+        .start_operation(spec)
+        .map_err(|error| VmError::HostError(format!("io operation start failed: {error}")))?;
+    let raw = op_id.raw();
+    vm.host.register_pending_op_result(
+        raw,
+        Box::new(move |_vm| Ok(CallReturn::one(Value::Bool(true)))),
+    );
+    Ok(HostCallResult::Pending(raw))
 }
 
 /// Closes an I/O handle.
@@ -452,21 +529,46 @@ pub(crate) fn builtin_io_close(vm: &mut Vm, handle_id: i64) -> VmResult<HostCall
     let mut ctx = vm.host_context();
     let result = ctx.close_resource::<IoFileResource>(handle, ResourceCloseReason::Requested);
     match result {
-        Ok(_) => Ok(HostCallResult::Return(true)),
+        Ok(_) => {}
         Err(ref error) if error.message().contains("resource_type_mismatch") => {
             ctx.close_resource::<IoPipeResource>(handle, ResourceCloseReason::Requested)
                 .map_err(|error| VmError::HostError(format!("io_close failed: {error}")))?;
-            Ok(HostCallResult::Return(true))
         }
-        Err(error) => Err(VmError::HostError(format!("io_close failed: {error}"))),
+        Err(error) => return Err(VmError::HostError(format!("io_close failed: {error}"))),
     }
+    drop(ctx);
+    let operation = ReadyOperation;
+    let spec = OperationSpec::new(operation).with_resource(handle);
+    let op_id = vm
+        .host_context()
+        .start_operation(spec)
+        .map_err(|error| VmError::HostError(format!("io operation start failed: {error}")))?;
+    let raw = op_id.raw();
+    vm.host.register_pending_op_result(
+        raw,
+        Box::new(move |_vm| Ok(CallReturn::one(Value::Bool(true)))),
+    );
+    Ok(HostCallResult::Pending(raw))
 }
 
 /// Returns whether a file system path exists.
 #[pd_host_function(name = "io::exists")]
 pub(crate) fn builtin_io_exists(vm: &mut Vm, path: &str) -> VmResult<HostCallResult<bool>> {
     let path = authorize_io_path(vm, path, false)?;
-    Ok(HostCallResult::Return(path.exists()))
+    let found = path.exists();
+    let found_val = found;
+    let operation = ReadyOperation;
+    let spec = OperationSpec::new(operation);
+    let op_id = vm
+        .host_context()
+        .start_operation(spec)
+        .map_err(|error| VmError::HostError(format!("io operation start failed: {error}")))?;
+    let raw = op_id.raw();
+    vm.host.register_pending_op_result(
+        raw,
+        Box::new(move |_vm| Ok(CallReturn::one(Value::Bool(found_val)))),
+    );
+    Ok(HostCallResult::Pending(raw))
 }
 
 // ---- Resource helpers ----

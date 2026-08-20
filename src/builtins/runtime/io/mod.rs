@@ -37,7 +37,9 @@ use crate::host_api::{
     HostApiBuilder, HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema,
     HostTypeSchema, ResourceTypeKey, ResourceTypeSchema,
 };
-use crate::vm::{CallReturn, HostFunctionRegistry, Value, Vm, VmResult};
+use crate::vm::Vm;
+#[cfg(not(feature = "async"))]
+use crate::vm::{CallReturn, HostFunctionRegistry, Value, VmResult};
 
 /// Persistent I/O host policy.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -382,10 +384,38 @@ impl crate::vm::HostExtension for IoExtension {
     }
 }
 
-#[cfg(all(feature = "async", not(target_arch = "wasm32")))]
+// ---- Process-tree termination (platform-specific) ----
+
+#[cfg(unix)]
+fn terminate_process_group(process_id: u32) {
+    if let Ok(pid) = libc::pid_t::try_from(process_id) {
+        // SAFETY: process_id is the tracked child pid; sending SIGKILL to
+        // the negated value kills the whole process group.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_process_group(process_id: u32) {
+    // On Windows, use the process-tree enumeration module.
+    #[cfg(windows)]
+    crate::builtins::runtime::io::windows_process_tree::terminate_process_tree(process_id);
+    #[cfg(not(windows))]
+    let _ = process_id;
+}
+
+// ---- Module declarations ----
+
+#[cfg(feature = "async")]
 mod async_io;
-#[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
+#[cfg(not(feature = "async"))]
 mod blocking;
+mod ops;
+#[cfg(windows)]
+mod windows_process_tree;
+mod worker;
 
 #[cfg(target_arch = "wasm32")]
 pub(super) use super::io_wasm::*;

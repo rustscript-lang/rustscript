@@ -36,6 +36,40 @@ fn run_source_host_error(source: &str) -> String {
     }
 }
 
+/// Run a VM configured with a custom registry and policy, driving pending
+/// operations to completion, and return the first HostError encountered.
+fn run_vm_until_error(vm: &mut Vm) -> String {
+    // First call must be run(); subsequent calls use resume().
+    let mut status = match vm.run() {
+        Ok(status) => status,
+        Err(VmError::HostError(message)) => return message,
+        Err(other) => panic!("expected host error, got: {other:?}"),
+    };
+    loop {
+        match status {
+            VmStatus::Waiting(_) => {
+                vm.wait_for_host_op_blocking()
+                    .expect("waiting for host op should succeed");
+                match vm.resume() {
+                    Ok(s) => status = s,
+                    Err(VmError::HostError(message)) => return message,
+                    Err(other) => panic!("expected host error, got: {other:?}"),
+                }
+            }
+            VmStatus::Halted => {
+                panic!("expected host error, got halted");
+            }
+            VmStatus::Yielded => {
+                match vm.resume() {
+                    Ok(s) => status = s,
+                    Err(VmError::HostError(message)) => return message,
+                    Err(other) => panic!("expected host error, got: {other:?}"),
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn io_policy_denies_process_launch_when_process_capability_is_disabled() {
     let compiled = compile_source(
@@ -144,8 +178,11 @@ fn io_policy_limits_write_size() {
         .bind_vm_cached(&mut vm)
         .expect("profile should bind");
 
-    let error = vm.run().expect_err("oversized write should be denied");
-    assert!(matches!(error, VmError::HostError(message) if message.contains("write limit")));
+    let error = run_vm_until_error(&mut vm);
+    assert!(
+        error.contains("write limit"),
+        "unexpected error message: {error}"
+    );
     let _ = std::fs::remove_file(path);
 }
 
@@ -181,8 +218,11 @@ fn io_policy_limits_read_all_size() {
         .bind_vm_cached(&mut vm)
         .expect("profile should bind");
 
-    let error = vm.run().expect_err("oversized read should be denied");
-    assert!(matches!(error, VmError::HostError(message) if message.contains("read limit")));
+    let error = run_vm_until_error(&mut vm);
+    assert!(
+        error.contains("read limit"),
+        "unexpected error message: {error}"
+    );
     let _ = std::fs::remove_file(path);
 }
 
@@ -218,8 +258,11 @@ fn io_policy_limits_read_line_size() {
         .bind_vm_cached(&mut vm)
         .expect("profile should bind");
 
-    let error = vm.run().expect_err("oversized line should be denied");
-    assert!(matches!(error, VmError::HostError(message) if message.contains("read limit")));
+    let error = run_vm_until_error(&mut vm);
+    assert!(
+        error.contains("read limit"),
+        "unexpected error message: {error}"
+    );
     let _ = std::fs::remove_file(path);
 }
 
