@@ -160,6 +160,10 @@ path = "tests/host_context_execution_scope_tests.rs"
 required-features = ["runtime"]
 
 [[test]]
+name = "host_resource_type_inference_tests"
+path = "tests/host_resource_type_inference_tests.rs"
+
+[[test]]
 name = "vm_resource_ownership_consumer_tests"
 path = "tests/vm_resource_ownership_consumer_tests.rs"
 required-features = ["runtime"]

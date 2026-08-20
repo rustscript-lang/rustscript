@@ -21,6 +21,7 @@ mod materialization;
 mod modules;
 mod parser;
 mod pipeline;
+mod semantic_model;
 mod source_loader;
 pub mod source_map;
 mod typing;
@@ -55,6 +56,10 @@ pub use self::pipeline::{
     compile_source_with_flavor_and_options, lint_trailing_function_return_semicolons,
     lint_unknown_inferred_local_types, lint_unknown_inferred_local_types_at_path_with_options,
     lint_unknown_inferred_local_types_with_options, lint_unknown_type_annotations,
+};
+pub use self::semantic_model::{
+    CompletionItemKind, Definition, SemanticCompletion, SemanticDiagnostic, SemanticModel,
+    SourcePosition,
 };
 pub use self::source_loader::{FrontendImportSyntax, ImportClause, ModuleImport, NamedImport};
 
