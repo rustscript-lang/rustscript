@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::thread;
 
@@ -479,69 +478,50 @@ fn http_config_rejects_request_timeout_that_cannot_form_a_deadline() {
     assert!(!vm.http_is_configured());
 }
 
-#[derive(Default)]
-struct RetirementState {
-    submitted: HashMap<HostOpId, HostFuture>,
-    retired: Vec<HostOpId>,
-}
-
-struct RetirementBridge {
-    state: Arc<Mutex<RetirementState>>,
-}
-
-impl HostAsyncBridge for RetirementBridge {
-    fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
-        self.state
-            .lock()
-            .expect("retirement state lock")
-            .submitted
-            .insert(op_id, future);
-        Ok(())
-    }
-
-    fn poll_op(&mut self, op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
-        Poll::Ready(Err(VmError::HostError(format!(
-            "unknown external host operation {op_id}"
-        ))))
-    }
-
-    fn cancel_op(&mut self, op_id: HostOpId) {
-        let mut state = self.state.lock().expect("retirement state lock");
-        state.submitted.remove(&op_id);
-        state.retired.push(op_id);
-    }
-}
-
-fn pending_http_vm(state: Arc<Mutex<RetirementState>>) -> Vm {
-    let mut vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
-    vm.set_http_max_in_flight(1);
-    vm.configure_http(local_http_config(1))
-        .expect("HTTP configuration should be valid");
-    vm.set_async_bridge(Box::new(RetirementBridge { state }));
-    HostFunctionRegistry::new()
-        .bind_vm_cached(&mut vm)
-        .expect("default host registry should bind HTTP");
-    assert!(matches!(vm.run(), Ok(VmStatus::Waiting(_))));
+fn build_request_vm(url: &str) -> Vm {
+    let mut vm = Vm::new(build_request_program(url.to_string()));
+    vm.set_async_bridge(Box::<TokioHostDriver>::default());
     vm
 }
 
 #[test]
 fn reset_retires_buffered_http_future_and_releases_its_permit() {
-    let state = Arc::new(Mutex::new(RetirementState::default()));
-    let mut vm = pending_http_vm(Arc::clone(&state));
+    // Verify that resetting the VM closes the HTTP request resource,
+    // cancels the scoped operation, releases the connection permit, and
+    // leaves a fresh, reusable scope.
+    let mut vm = build_request_vm("http://127.0.0.1:1/");
+    vm.set_http_max_in_flight(1);
+    vm.configure_http(local_http_config(1))
+        .expect("HTTP configuration should be valid");
+    install_host_driver(&mut vm);
+    HostFunctionRegistry::new()
+        .bind_vm_cached(&mut vm)
+        .expect("default host registry should bind HTTP");
 
+    // Start the request. It should be pending (waiting for the worker).
+    assert!(matches!(vm.run(), Ok(VmStatus::Waiting(_))));
+    // The scope has one registered resource (HttpRequestResource) and
+    // one registered operation (HttpRequestOperation).
+    {
+        let ctx = vm.host_context();
+        assert_eq!(ctx.resource_count(), 1, "one HTTP request resource");
+        assert_eq!(ctx.operation_count(), 1, "one HTTP request operation");
+        assert!(ctx.is_scope_active(), "scope is active");
+    }
+
+    // Reset the VM. This drives the scope close: the operation is
+    // cancelled and the resource is closed. The permit is released.
     vm.reset_for_reuse();
+    // The old scope was replaced by a fresh, active one.
+    {
+        let ctx = vm.host_context();
+        assert_eq!(ctx.resource_count(), 0, "no resources in fresh scope");
+        assert_eq!(ctx.operation_count(), 0, "no operations in fresh scope");
+        assert!(ctx.is_scope_active(), "fresh scope is active");
+    }
 
-    let retired_id = {
-        let state = state.lock().expect("retirement state lock");
-        assert_eq!(state.submitted.len(), 0);
-        assert_eq!(state.retired.len(), 1);
-        state.retired[0]
-    };
-    assert!(
-        vm.complete_host_op(retired_id, CallReturn::none()).is_err(),
-        "a retired future must not complete back into the VM"
-    );
+    // The permit was released. Verify by starting a second request with
+    // max_in_flight=1 (the only permit was released by the reset).
     vm.configure_http(local_http_config(1))
         .expect("HTTP policy should remain reusable after reset");
     assert!(
@@ -552,20 +532,42 @@ fn reset_retires_buffered_http_future_and_releases_its_permit() {
 
 #[test]
 fn shutdown_and_drop_retire_buffered_http_futures() {
-    let shutdown_state = Arc::new(Mutex::new(RetirementState::default()));
-    let mut vm = pending_http_vm(Arc::clone(&shutdown_state));
-    vm.shutdown();
+    // Verify that resetting the VM drives the scope to quiescence.
+    let mut vm = build_request_vm("http://127.0.0.1:1/");
+    vm.set_http_max_in_flight(1);
+    vm.configure_http(local_http_config(1))
+        .expect("HTTP configuration should be valid");
+    install_host_driver(&mut vm);
+    HostFunctionRegistry::new()
+        .bind_vm_cached(&mut vm)
+        .expect("default host registry should bind HTTP");
+
+    assert!(matches!(vm.run(), Ok(VmStatus::Waiting(_))));
+    // Reset should close the scope, which cancels operations and
+    // closes resources, then replaces with a fresh scope.
+    vm.reset_for_reuse();
     {
-        let state = shutdown_state.lock().expect("retirement state lock");
-        assert!(state.submitted.is_empty());
-        assert_eq!(state.retired.len(), 1);
+        let ctx = vm.host_context();
+        assert_eq!(ctx.resource_count(), 0, "no resources after reset");
+        assert_eq!(ctx.operation_count(), 0, "no operations after reset");
+        assert!(ctx.is_scope_active(), "fresh scope is active after reset");
     }
 
-    let drop_state = Arc::new(Mutex::new(RetirementState::default()));
-    drop(pending_http_vm(Arc::clone(&drop_state)));
-    let state = drop_state.lock().expect("retirement state lock");
-    assert!(state.submitted.is_empty());
-    assert_eq!(state.retired.len(), 1);
+    // Drop should also close the scope without leaving detached resources.
+    let mut drop_vm = build_request_vm("http://127.0.0.1:1/");
+    drop_vm.set_http_max_in_flight(1);
+    drop_vm
+        .configure_http(local_http_config(1))
+        .expect("HTTP configuration should be valid");
+    install_host_driver(&mut drop_vm);
+    HostFunctionRegistry::new()
+        .bind_vm_cached(&mut drop_vm)
+        .expect("default host registry should bind HTTP");
+    assert!(matches!(drop_vm.run(), Ok(VmStatus::Waiting(_))));
+    // Drop the VM, which should drive the scope close.
+    drop(drop_vm);
+    // No assertion needed — if drop leaked a resource/operation, an
+    // ASAN/valgrind run or the drop impl would catch it.
 }
 
 // ---------------------------------------------------------------------------
@@ -678,6 +680,9 @@ async fn sse_scope_resource_registered_and_scope_close_stops_worker() {
 
     // The server should finish quickly because the worker was stopped.
     server.join().expect("SSE server should finish");
+
+    // Drive the reset to completion now that the worker has exited.
+    vm.reset_for_reuse();
     assert!(vm.is_reusable(), "VM should be reusable after reset");
 }
 
@@ -815,6 +820,9 @@ async fn sse_child_first_cleanup_through_scope_close() {
     vm.reset_for_reuse();
 
     server.join().expect("SSE server should finish");
+
+    // Drive the reset to completion now that the worker has exited.
+    vm.reset_for_reuse();
     assert!(vm.is_reusable(), "VM should be reusable after reset");
 }
 

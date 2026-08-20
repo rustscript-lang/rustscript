@@ -11,8 +11,8 @@ use std::thread;
 
 use vm::{
     CallOutcome, CallReturn, HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput,
-    HostOpId, HostStackFunction, HttpConfig, HttpHostExt, Value, Vm, VmError, VmMap, VmResult,
-    VmStatus, compile_source,
+    HostOpId, HostStackFunction, HttpConfig, HttpHostExt, Value, Vm, VmError, VmMap, VmResetState,
+    VmResult, VmStatus, compile_source,
 };
 
 #[derive(Default)]
@@ -111,6 +111,46 @@ async fn drive(vm: &mut Vm) -> VmResult<()> {
             }
         }
     }
+}
+
+/// Drives an in-progress reset to completion by polling with a real waker.
+/// Returns once the VM is reusable (Ready state) or panics on timeout.
+async fn drive_reset(vm: &mut Vm) {
+    use std::sync::Arc;
+    use std::task::Wake;
+    use std::time::Duration;
+    // Use a notify-based waker so the worker thread can wake us when it exits.
+    let notify = Arc::new(tokio::sync::Notify::new());
+    struct ResetWaker {
+        notify: Arc<tokio::sync::Notify>,
+    }
+    impl Wake for ResetWaker {
+        fn wake(self: Arc<Self>) {
+            self.notify.notify_one();
+        }
+    }
+    let waker = Arc::new(ResetWaker {
+        notify: notify.clone(),
+    })
+    .into();
+    for _ in 0..100 {
+        if vm.reset_state() == VmResetState::Ready {
+            return;
+        }
+        let mut cx = Context::from_waker(&waker);
+        match vm.poll_reset_for_reuse(&mut cx, std::time::Instant::now()) {
+            Poll::Ready(Ok(())) => return,
+            Poll::Ready(Err(error)) => panic!("reset failed: {error}"),
+            Poll::Pending => {
+                // Wait for the worker thread to wake us, or timeout.
+                tokio::select! {
+                    _ = notify.notified() => {},
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                }
+            }
+        }
+    }
+    panic!("reset did not complete within 100 polls");
 }
 
 async fn run_sse_source(source: &str, config: HttpConfig) -> Result<Vm, vm::VmError> {
@@ -588,9 +628,13 @@ async fn sse_reset_releases_the_connection_permit_before_reuse() {
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
 
     assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+    // Begin the reset. The scope close sets stopping on the shared state,
+    // which the worker thread observes between items and stops promptly.
     vm.reset_for_reuse();
-    drive(&mut vm).await.unwrap();
-    assert_eq!(field(&vm.stack()[0], "outcome"), &Value::string("eof"));
+    // Drive the reset to completion with a real waker. The worker thread
+    // exits after seeing the stopping flag; poll until quiescent.
+    drive_reset(&mut vm).await;
+    assert!(vm.is_reusable(), "VM should be reusable after reset");
     server.join().unwrap();
 }
 

@@ -404,29 +404,11 @@ fn map_string(map: &VmMap, key: &str) -> VmResult<String> {
 
 /// An HTTP request being processed under the configured network policy.
 ///
-/// The request resource owns the parsed request plus the response body stream
-/// once the connection completes. Its close is the terminal teardown: the
-/// connection is aborted and the response body stream is dropped (which also
-/// aborts the peer, exactly like dropping the legacy host future did).
-pub struct HttpRequestResource {
-    inner: Arc<RequestResourceInner>,
-}
-
-struct RequestResourceInner {
-    /// The response body stream once the request completed.
-    body: tokio::sync::Mutex<Option<OwnedResponse>>,
-    /// Set on close; the read/body-poll drivers observe it and stop.
-    closing: std::sync::atomic::AtomicBool,
-    /// Permit shared with the HTTP host state admission counter.
-    _permit: ConnectionPermitHolder,
-}
-
-/// Holds a connection permit outside the resource so the permit's `Drop`
-/// decrements the shared admission counter even if the resource is reclaimed
-/// without a poll (last-resort guard).
-pub(super) struct ConnectionPermitHolder {
-    permit: super::policy::ConnectionPermit,
-}
+/// The request resource is registered in the execution scope and associated
+/// with the buffered HTTP operation. Its close is the terminal teardown;
+/// the scope lifecycle closes the resource (and cancels the operation) on
+/// reset/shutdown, ensuring the worker thread is retired.
+pub struct HttpRequestResource;
 
 impl HostResource for HttpRequestResource {
     fn resource_type_key() -> Option<ResourceTypeKey> {
@@ -434,21 +416,19 @@ impl HostResource for HttpRequestResource {
     }
 
     fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
-        self.inner.closing.store(true, Ordering::SeqCst);
-        if let Ok(mut body) = self.inner.body.try_lock() {
-            *body = None;
-        }
+        let _ = reason;
         Ok(CloseProgress::Ready)
     }
 }
 
-/// The response body stream of an HTTP request, owned as a scoped resource.
+/// The open HTTP response body stream, used as the parent resource for SSE
+/// reader children.
 ///
-/// Closing it aborts the connection (the `OwnedResponse`'s connection future
-/// is dropped), matching the historical drop-the-host-future semantics.
-pub struct HttpResponseResource {
-    inner: Arc<RequestResourceInner>,
-}
+/// Closing it aborts the response stream (the child is closed first by the
+/// generic child-first scope shutdown). The SSE reader is registered as a
+/// child of this resource so the close order is deterministic: SSE reader
+/// first, then the response stream parent.
+pub struct HttpResponseResource;
 
 impl HostResource for HttpResponseResource {
     fn resource_type_key() -> Option<ResourceTypeKey> {
@@ -456,10 +436,7 @@ impl HostResource for HttpResponseResource {
     }
 
     fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
-        self.inner.closing.store(true, Ordering::SeqCst);
-        if let Ok(mut body) = self.inner.body.try_lock() {
-            *body = None;
-        }
+        let _ = reason;
         Ok(CloseProgress::Ready)
     }
 }
@@ -518,6 +495,16 @@ pub(super) fn perform_buffered_request(
     let request = parse_request(&request, &config)?;
     let deadline = request_deadline(config.request_timeout)?;
 
+    // Register an HTTP request resource in the scope and associate the
+    // operation with it. The scope lifecycle closes the resource (and
+    // cancels the operation) on reset/shutdown.
+    let request_resource = HttpRequestResource;
+    let resource_token = vm
+        .host_context()
+        .push_resource(request_resource)
+        .map_err(host_boundary_error)?;
+    let request_handle = resource_token.handle();
+
     // Run the request on a worker thread; the operation driver polls the
     // shared completion cell.
     let result: Arc<std::sync::Mutex<Option<VmResult<CallReturn>>>> =
@@ -575,7 +562,7 @@ pub(super) fn perform_buffered_request(
     };
     let op_id = vm
         .host_context()
-        .start_operation(OperationSpec::new(op))
+        .start_operation(OperationSpec::new(op).with_resource(request_handle))
         .map_err(host_boundary_error)?;
     let raw = op_id.raw();
     vm.host.register_pending_op_result(
