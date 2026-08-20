@@ -182,6 +182,8 @@ fn parse_with_parser(
         implicit_extern_names: parser.implicit_extern_names(),
         host_api_metadata: parser.host_api_metadata(),
         semantic_index: None,
+        parsed_semantic_index: Some(parser.take_parsed_semantic_index()),
+        catalog_visibility: Some(parser.take_catalog_visibility()),
     })
 }
 
@@ -221,6 +223,8 @@ fn parse_repl_with_parser(
             implicit_extern_names: parser.implicit_extern_names(),
             host_api_metadata: None,
             semantic_index: None,
+            parsed_semantic_index: Some(parser.take_parsed_semantic_index()),
+            catalog_visibility: Some(parser.take_catalog_visibility()),
         },
         bindings,
     })

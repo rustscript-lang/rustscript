@@ -1182,6 +1182,8 @@ mod tests {
             implicit_extern_names: Vec::new(),
             host_api_metadata: None,
             semantic_index: None,
+            parsed_semantic_index: None,
+            catalog_visibility: None,
         }
     }
 

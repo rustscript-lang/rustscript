@@ -608,6 +608,12 @@ impl Parser {
     pub(super) fn parse_fn_decl(&mut self, exported: bool) -> Result<Stmt, ParseError> {
         let line = self.last_line();
         let name = self.expect_ident("expected function name after 'fn'")?;
+        // Capture the function name token span for provenance.
+        let fn_name_span = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|t| t.span)
+            .unwrap_or_else(|| self.current_span());
         let type_params = self.parse_type_params("function", &name)?;
         self.push_active_type_params(&type_params);
         self.expect(&TokenKind::LParen, "expected '(' after function name")?;
@@ -731,6 +737,9 @@ impl Parser {
             false
         };
         self.pop_active_type_params();
+
+        // Record function declaration provenance.
+        self.record_func_decl(fn_name_span, index, name.clone());
 
         Ok(Stmt::FuncDecl {
             name,
@@ -1176,6 +1185,19 @@ impl Parser {
             self.local_schemas.remove(&index);
         }
         self.apply_let_binding_mutability(index, declared_mutable, created);
+        // Record local declaration provenance.
+        if let Some(ident_token) = self.tokens.get(self.pos.saturating_sub(2)) {
+            if let TokenKind::Ident(_) = &ident_token.kind {
+                let stmt_end = self
+                    .tokens
+                    .get(self.pos.saturating_sub(1))
+                    .map(|t| t.span.hi)
+                    .unwrap_or(ident_token.span.hi);
+                let stmt_span =
+                    Span::new(ident_token.span.source_id, ident_token.span.lo, stmt_end);
+                self.record_local_decl(ident_token.span, stmt_span, index, name);
+            }
+        }
         Ok(Stmt::Let {
             index,
             declared_schema,

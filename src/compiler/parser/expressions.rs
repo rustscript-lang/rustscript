@@ -350,6 +350,12 @@ impl Parser {
             return self.parse_single_param_arrow_closure();
         }
         if let Some(name) = self.match_ident() {
+            // Capture the callee_span from the name token for provenance tracking.
+            let name_span = self
+                .tokens
+                .get(self.pos.saturating_sub(1))
+                .map(|t| t.span)
+                .unwrap_or_else(|| self.current_span());
             if self.dialect.allow_dotted_call()
                 && let Some(expr) = self.try_parse_js_dotted_call(&name)?
             {
@@ -398,6 +404,17 @@ impl Parser {
                     .get(1..)
                     .map(|tail| tail.to_vec())
                     .unwrap_or_default();
+                // Compute the callee span for the full namespace path.
+                let ns_callee_span = self
+                    .tokens
+                    .get(self.pos.saturating_sub(1))
+                    .map(|t| Span::new(name_span.source_id, name_span.lo, t.span.hi))
+                    .unwrap_or(name_span);
+                let ns_callee_name = if subpath.is_empty() {
+                    format!("{}::{}", name, member)
+                } else {
+                    format!("{}::{}::{}", name, member, subpath.join("::"))
+                };
                 let expr = if let Some((builtin_namespace, builtin_member)) =
                     self.resolve_builtins_call_path(&name, &member, &subpath)
                 {
@@ -434,7 +451,15 @@ impl Parser {
                     // which knows the exported type parameters.
                     let qualified = format!("{}::{}", name, path_segments.join("::"));
                     let decl = self.resolve_function_for_call(&qualified, args.len())?;
-                    Expr::Call(decl.index, type_args, args, None, None)
+                    self.build_call_expr_with_provenance(
+                        decl.index,
+                        type_args,
+                        args,
+                        None,
+                        ns_callee_span,
+                        ns_callee_name,
+                        true,
+                    )
                 } else {
                     return Err(ParseError {
                         span: None,
@@ -551,11 +576,15 @@ impl Parser {
                             });
                         }
                         let index = self.get_local(&name)?;
+                        // Record local variable reference.
+                        self.record_local_ref(name_span, index, name.clone());
                         Expr::Var(index)
                     } else if let Some(decl) = self.functions.get(&name).cloned() {
                         if !type_args.is_empty() {
                             self.validate_named_call_type_args(&decl, &type_args)?;
                         }
+                        // Record function value reference.
+                        self.record_func_ref(name_span, decl.index, name.clone());
                         Expr::FunctionRef(decl.index, type_args)
                     } else if let Some(index) = crate::builtin_call_index(&name) {
                         if !type_args.is_empty() {
@@ -568,6 +597,7 @@ impl Parser {
                                 ),
                             });
                         }
+                        self.record_func_ref(name_span, index, name.clone());
                         Expr::FunctionRef(index, Vec::new())
                     } else if self.allow_implicit_externs {
                         // Module mode: the name may be an imported function

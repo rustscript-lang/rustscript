@@ -25,8 +25,11 @@ use self::symbols::is_virtual_host_namespace_spec;
 use super::{
     ParseError, ReplLocalBinding, STDLIB_PRINT_ARITY, STDLIB_PRINT_NAME,
     ir::{
-        AssignmentKind, ClosureExpr, Expr, FunctionDecl, FunctionImpl, FunctionParam,
-        HostApiIrMetadata, LocalSlot, MatchPattern, MatchTypePattern, Stmt, StructDecl, TypeSchema,
+        AssignmentKind, CatalogVisibility, ClosureExpr, Expr, FunctionDecl, FunctionDeclSite,
+        FunctionImpl, FunctionParam, FunctionRefSite, HostApiIrMetadata, LocalDeclSite,
+        LocalRefSite, LocalSlot, MatchPattern, MatchTypePattern, ParsedCallSite,
+        ParsedLexicalScope, ParsedSemanticIndex, ResolvedHostCall, ScopeId, SemanticNodeId, Stmt,
+        StructDecl, TypeSchema,
     },
 };
 
@@ -180,6 +183,12 @@ pub(super) struct Parser {
     /// here by `(name, arity)` so the same overload call reuses its index
     /// without colliding across arities.
     catalog_function_decls: HashMap<(String, u8), FunctionDecl>,
+    /// Parser-produced semantic provenance index tracked during parse.
+    parsed_semantic_index: ParsedSemanticIndex,
+    /// Parser scope stack for tracking current scope during parse.
+    parser_scope_stack: Vec<ScopeId>,
+    /// Parser-built catalog visibility from alias/import maps.
+    catalog_visibility: CatalogVisibility,
 }
 
 struct ClosureCaptureContext {
@@ -243,6 +252,9 @@ impl Parser {
             host_catalog: None,
             host_api_metadata: None,
             catalog_function_decls: HashMap::new(),
+            parsed_semantic_index: ParsedSemanticIndex::default(),
+            parser_scope_stack: vec![0],
+            catalog_visibility: CatalogVisibility::default(),
         })
     }
 
@@ -311,6 +323,13 @@ impl Parser {
 
     pub(super) fn parse_program(&mut self) -> Result<Vec<Stmt>, ParseError> {
         self.predeclare_functions()?;
+        // Record root scope (first token to EOF).
+        let root_span = self
+            .tokens
+            .last()
+            .map(|t| Span::new(t.span.source_id, 0, t.span.hi))
+            .unwrap_or(Span::new(0, 0, 0));
+        self.enter_scope(root_span);
         let mut stmts = Vec::new();
         while !self.check(&TokenKind::Eof) {
             stmts.push(self.parse_stmt()?);
@@ -498,6 +517,186 @@ impl Parser {
 
     pub(super) fn is_implicit_extern(&self, name: &str) -> bool {
         self.implicit_extern_names.contains(name)
+    }
+
+    /// Take the parser's semantic provenance index.
+    pub(super) fn take_parsed_semantic_index(&mut self) -> ParsedSemanticIndex {
+        std::mem::take(&mut self.parsed_semantic_index)
+    }
+
+    /// Take the parser's catalog visibility.
+    pub(super) fn take_catalog_visibility(&mut self) -> CatalogVisibility {
+        CatalogVisibility {
+            host_namespace_aliases: self
+                .host_namespace_aliases
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            direct_host_call_aliases: self
+                .direct_host_call_aliases
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            direct_host_wildcard_imports: self
+                .direct_host_wildcard_imports
+                .iter()
+                .cloned()
+                .collect(),
+            module_namespace_aliases: self
+                .module_namespace_aliases
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            use_declarations: std::mem::take(&mut self.use_declarations),
+        }
+    }
+
+    /// Current scope id.
+    pub(super) fn current_scope_id(&self) -> ScopeId {
+        *self.parser_scope_stack.last().copied().get_or_insert(0)
+    }
+
+    /// Allocate a [`SemanticNodeId`] and record a call site in the provenance
+    /// index. Returns `Some(id)` for every source-level call; compiler-synthetic
+    /// parser helpers may return `None`.
+    pub(super) fn alloc_call_id(
+        &mut self,
+        callee_span: Span,
+        expr_span: Span,
+        function_index: u16,
+        name: String,
+        is_namespace_call: bool,
+    ) -> Option<SemanticNodeId> {
+        let id = self.parsed_semantic_index.alloc_node_id();
+        let scope_id = self.current_scope_id();
+        self.parsed_semantic_index.call_sites.push(ParsedCallSite {
+            id,
+            callee_span,
+            expr_span,
+            function_index,
+            name,
+            scope_id,
+            is_namespace_call,
+        });
+        Some(id)
+    }
+
+    /// Build an [`Expr::Call`] with provenance tracking. Returns the call
+    /// expression with the fifth field set to `Some(id)`.
+    pub(super) fn build_call_expr_with_provenance(
+        &mut self,
+        index: u16,
+        type_args: Vec<TypeSchema>,
+        args: Vec<Expr>,
+        host_resolution: Option<Box<ResolvedHostCall>>,
+        callee_span: Span,
+        name: String,
+        is_namespace_call: bool,
+    ) -> Expr {
+        // Compute expr_span from callee start through the last consumed token.
+        let expr_span = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|t| Span::new(callee_span.source_id, callee_span.lo, t.span.hi))
+            .unwrap_or(callee_span);
+        let semantic_id =
+            self.alloc_call_id(callee_span, expr_span, index, name, is_namespace_call);
+        Expr::Call(index, type_args, args, host_resolution, semantic_id)
+    }
+
+    /// Record a local declaration site.
+    pub(super) fn record_local_decl(
+        &mut self,
+        ident_span: Span,
+        stmt_span: Span,
+        slot: LocalSlot,
+        name: String,
+    ) {
+        let id = self.parsed_semantic_index.alloc_node_id();
+        let scope_id = self.current_scope_id();
+        let decl_order =
+            if let Some(scope) = self.parsed_semantic_index.scopes.get(scope_id as usize) {
+                scope.declarations.len() as u32
+            } else {
+                0
+            };
+        self.parsed_semantic_index.local_decls.push(LocalDeclSite {
+            id,
+            ident_span,
+            stmt_span,
+            slot,
+            name,
+            scope_id,
+            decl_order,
+        });
+    }
+
+    /// Record a local variable reference site.
+    pub(super) fn record_local_ref(&mut self, ident_span: Span, slot: LocalSlot, name: String) {
+        let id = self.parsed_semantic_index.alloc_node_id();
+        let scope_id = self.current_scope_id();
+        self.parsed_semantic_index.local_refs.push(LocalRefSite {
+            id,
+            ident_span,
+            slot,
+            name,
+            scope_id,
+        });
+    }
+
+    /// Record a function declaration site.
+    pub(super) fn record_func_decl(&mut self, ident_span: Span, function_index: u16, name: String) {
+        let id = self.parsed_semantic_index.alloc_node_id();
+        let scope_id = self.current_scope_id();
+        let decl_order =
+            if let Some(scope) = self.parsed_semantic_index.scopes.get(scope_id as usize) {
+                scope.functions.len() as u32
+            } else {
+                0
+            };
+        self.parsed_semantic_index
+            .func_decls
+            .push(FunctionDeclSite {
+                id,
+                ident_span,
+                function_index,
+                name,
+                scope_id,
+                decl_order,
+            });
+    }
+
+    /// Record a function value reference site.
+    pub(super) fn record_func_ref(&mut self, ident_span: Span, function_index: u16, name: String) {
+        let id = self.parsed_semantic_index.alloc_node_id();
+        let scope_id = self.current_scope_id();
+        self.parsed_semantic_index.func_refs.push(FunctionRefSite {
+            id,
+            ident_span,
+            function_index,
+            name,
+            scope_id,
+        });
+    }
+
+    /// Enter a new scope and return its id.
+    pub(super) fn enter_scope(&mut self, range: Span) -> ScopeId {
+        let id = self.parsed_semantic_index.alloc_scope_id();
+        let parent = self.parser_scope_stack.last().copied();
+        self.parsed_semantic_index.scopes.push(ParsedLexicalScope {
+            id,
+            parent,
+            range,
+            declarations: Vec::new(),
+            functions: Vec::new(),
+        });
+        self.parser_scope_stack.push(id);
+        id
+    }
+
+    /// Exit the current scope.
+    pub(super) fn exit_scope(&mut self) {
+        self.parser_scope_stack.pop();
     }
 
     /// Look up a file-module namespace alias recorded from a structured

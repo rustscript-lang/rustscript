@@ -245,6 +245,8 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
         // validated, remapped, uniformly fingerprint-bound carrier.
         host_api_metadata: merged_host_api_metadata,
         semantic_index: None,
+        parsed_semantic_index: None,
+        catalog_visibility: None,
     })
 }
 
@@ -1027,6 +1029,8 @@ mod linker_metadata_remap_tests {
                 implicit_extern_names: Vec::new(),
                 host_api_metadata: host_api_metadata,
                 semantic_index: None,
+                parsed_semantic_index: None,
+                catalog_visibility: None,
             },
             source_name: source_name.to_string(),
             scope_identity: None,

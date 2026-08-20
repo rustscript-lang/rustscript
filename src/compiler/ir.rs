@@ -776,6 +776,12 @@ pub struct FrontendIr {
     /// `None` for IR that has not been analyzed yet (parser output, REPL
     /// snippets without semantic analysis, test fixtures).
     pub semantic_index: Option<SemanticIndex>,
+    /// Parser-produced semantic provenance index with exact token spans.
+    /// Populated during parse and preserved through linking.
+    /// `None` for REPL snippets without full provenance tracking.
+    pub parsed_semantic_index: Option<ParsedSemanticIndex>,
+    /// Parser-produced visibility information from namespace aliases and imports.
+    pub catalog_visibility: Option<CatalogVisibility>,
 }
 
 /// A scope identifier used in [`LexicalScope`] records.
@@ -920,6 +926,165 @@ impl SemanticIndex {
     pub fn slot_schema(&self, slot: LocalSlot) -> Option<&TypeSchema> {
         let idx = slot as usize;
         self.slot_schemas.get(idx).and_then(|s| s.as_ref())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parser provenance types (Phase A2)
+// ---------------------------------------------------------------------------
+
+/// A single parsed call-site recorded by the parser with exact token spans.
+#[derive(Clone, Debug)]
+pub struct ParsedCallSite {
+    /// Parser-allocated stable node id that matches the `Expr::Call` fifth field.
+    pub id: SemanticNodeId,
+    /// Span of the callee identifier/path (the name token range).
+    pub callee_span: Span,
+    /// Span of the full call expression (from callee start through closing delim).
+    pub expr_span: Span,
+    /// The resolved flat function index (or builtin index).
+    pub function_index: u16,
+    /// The source-level name of the callee.
+    pub name: String,
+    /// The scope this call site belongs to.
+    pub scope_id: ScopeId,
+    /// Whether this is a namespace/dotted/multiline call.
+    pub is_namespace_call: bool,
+}
+
+/// A parsed local variable declaration site.
+#[derive(Clone, Debug)]
+pub struct LocalDeclSite {
+    /// Parser-allocated stable node id.
+    pub id: SemanticNodeId,
+    /// Exact identifier token span.
+    pub ident_span: Span,
+    /// Span of the full `let` statement.
+    pub stmt_span: Span,
+    /// The local slot assigned.
+    pub slot: LocalSlot,
+    /// The variable name.
+    pub name: String,
+    /// The scope this declaration belongs to.
+    pub scope_id: ScopeId,
+    /// Declaration order within the scope (0-based).
+    pub decl_order: u32,
+}
+
+/// A parsed local variable reference site.
+#[derive(Clone, Debug)]
+pub struct LocalRefSite {
+    /// Parser-allocated stable node id.
+    pub id: SemanticNodeId,
+    /// Exact identifier token span.
+    pub ident_span: Span,
+    /// The local slot referenced.
+    pub slot: LocalSlot,
+    /// The variable name.
+    pub name: String,
+    /// The scope this reference belongs to.
+    pub scope_id: ScopeId,
+}
+
+/// A parsed function declaration site.
+#[derive(Clone, Debug)]
+pub struct FunctionDeclSite {
+    /// Parser-allocated stable node id.
+    pub id: SemanticNodeId,
+    /// Exact identifier token span.
+    pub ident_span: Span,
+    /// The flat function index.
+    pub function_index: u16,
+    /// The function name.
+    pub name: String,
+    /// The scope this declaration belongs to.
+    pub scope_id: ScopeId,
+    /// Declaration order within the scope (0-based).
+    pub decl_order: u32,
+}
+
+/// A parsed local function reference site (function value, not a call).
+#[derive(Clone, Debug)]
+pub struct FunctionRefSite {
+    /// Parser-allocated stable node id.
+    pub id: SemanticNodeId,
+    /// Exact identifier token span.
+    pub ident_span: Span,
+    /// The flat function index.
+    pub function_index: u16,
+    /// The function name.
+    pub name: String,
+    /// The scope this reference belongs to.
+    pub scope_id: ScopeId,
+}
+
+/// A parsed lexical scope record.
+#[derive(Clone, Debug)]
+pub struct ParsedLexicalScope {
+    /// Parser-allocated scope id.
+    pub id: ScopeId,
+    /// Parent scope id, or None for the root scope.
+    pub parent: Option<ScopeId>,
+    /// Exact opening..closing token span of the scope.
+    pub range: Span,
+    /// Local slots declared in this scope, in declaration order.
+    pub declarations: Vec<LocalSlot>,
+    /// Function indices declared in this scope.
+    pub functions: Vec<u16>,
+}
+
+/// Visibility information for host/builtin/module names, populated by the
+/// parser from its own alias/import maps — never inferred from source text.
+#[derive(Clone, Debug, Default)]
+pub struct CatalogVisibility {
+    /// Host namespace aliases: `alias -> canonical_name`.
+    pub host_namespace_aliases: Vec<(String, String)>,
+    /// Direct host call aliases: `alias -> canonical_name`.
+    pub direct_host_call_aliases: Vec<(String, String)>,
+    /// Wildcard host imports: set of namespace prefixes.
+    pub direct_host_wildcard_imports: Vec<String>,
+    /// Module namespace aliases: `alias -> module_path`.
+    pub module_namespace_aliases: Vec<(String, String)>,
+    /// Structured use declarations with their visibility clauses.
+    pub use_declarations: Vec<crate::compiler::modules::UseDecl>,
+}
+
+/// Full semantic provenance index produced by the parser from exact token
+/// spans. Carried on [`FrontendIr`] through the linker, which remaps ids
+/// collision-free during unit merge.
+#[derive(Clone, Debug, Default)]
+pub struct ParsedSemanticIndex {
+    /// All parsed call sites, in allocation order.
+    pub call_sites: Vec<ParsedCallSite>,
+    /// All parsed local declarations, in allocation order.
+    pub local_decls: Vec<LocalDeclSite>,
+    /// All parsed local variable references, in allocation order.
+    pub local_refs: Vec<LocalRefSite>,
+    /// All parsed function declarations, in allocation order.
+    pub func_decls: Vec<FunctionDeclSite>,
+    /// All parsed function value references, in allocation order.
+    pub func_refs: Vec<FunctionRefSite>,
+    /// All parsed lexical scopes, in allocation order (scope 0 = root).
+    pub scopes: Vec<ParsedLexicalScope>,
+    /// Next available SemanticNodeId for the next parse.
+    pub next_node_id: u32,
+    /// Next available ScopeId for the next parse.
+    pub next_scope_id: u32,
+}
+
+impl ParsedSemanticIndex {
+    /// Allocate a new monotonic [`SemanticNodeId`].
+    pub fn alloc_node_id(&mut self) -> SemanticNodeId {
+        let id = SemanticNodeId(self.next_node_id);
+        self.next_node_id += 1;
+        id
+    }
+
+    /// Allocate a new monotonic [`ScopeId`].
+    pub fn alloc_scope_id(&mut self) -> ScopeId {
+        let id = self.next_scope_id;
+        self.next_scope_id += 1;
+        id
     }
 }
 
@@ -1083,6 +1248,8 @@ impl LocalIrBuilder {
             implicit_extern_names: Vec::new(),
             host_api_metadata: None,
             semantic_index: None,
+            parsed_semantic_index: None,
+            catalog_visibility: None,
         }
     }
 
