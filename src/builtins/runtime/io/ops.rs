@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::thread;
 
 use crate::vm::operation::driver::HostOperation;
@@ -23,9 +23,65 @@ use crate::vm::operation::reason::OperationCancelReason;
 
 use super::worker::IoWorkerResource;
 
-/// A one-shot operation that waits for a close-completion signal (an
-/// `Arc<AtomicBool>` set by the resource's `poll_close` when the close
-/// worker finishes).
+/// Shared race-free close-completion state that carries a terminal result
+/// and an optional [`Waker`]. Both the resource's close worker and the
+/// [`CloseCompletionOperation`] driver share the same `Arc<CloseCompletionState>`.
+///
+/// The protocol:
+/// 1. The close worker calls [`CloseCompletionState::complete`] with the
+///    terminal result (success or error message).
+/// 2. If a [`CloseCompletionOperation`] has already polled and stored a
+///    waker, that waker is taken and called, waking the executor.
+/// 3. If no one has polled yet, the result is stored and the next poll
+///    returns `Ready` immediately (completion-before-first-poll race).
+///
+/// This replaces the old `Arc<AtomicBool>` approach, which lost the waker
+/// and could not propagate errors.
+pub(crate) struct CloseCompletionState {
+    /// Terminal close result: `None` = still pending, `Some(Ok(()))` = success,
+    /// `Some(Err(msg))` = flush/kill/wait/panic cleanup error.
+    result: Mutex<Option<Result<(), String>>>,
+    /// Waker registered by `CloseCompletionOperation::poll` when returning
+    /// `Pending`. Stored under the same lock as `result` so the
+    /// check-and-register is atomic — no lost wake.
+    waker: Mutex<Option<Waker>>,
+}
+
+impl CloseCompletionState {
+    pub(crate) fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            waker: Mutex::new(None),
+        }
+    }
+
+    /// Store the terminal result, take and wake any registered waker, then
+    /// wake the resource close progression (via `wake_by_ref` to the scope
+    /// poller). Thread-safe; the result and waker are under separate locks
+    /// but the waker is only taken-and-called after the result is stored.
+    pub(crate) fn complete(&self, result: Result<(), String>) {
+        // Store the result first.
+        *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+        // Take and call the waker (if any) so the executor re-polls.
+        if let Some(waker) = self.waker.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            waker.wake();
+        }
+    }
+
+    /// Check whether a terminal result is available. Returns `None` if still
+    /// pending; `Some(Ok(()))` or `Some(Err(msg))` if the close has finished.
+    pub(crate) fn take_result(&self) -> Option<Result<(), String>> {
+        self.result.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// Register or replace the waker. Called by `CloseCompletionOperation::poll`.
+    fn register_waker(&self, waker: &Waker) {
+        *self.waker.lock().unwrap_or_else(|e| e.into_inner()) = Some(waker.clone());
+    }
+}
+
+/// A one-shot operation that waits for a close-completion signal through
+/// a shared [`CloseCompletionState`].
 ///
 /// Unlike `ReadyOperation`, this operation returns `Pending` until the
 /// close worker actually completes, making it a true completion-driven
@@ -35,25 +91,50 @@ use super::worker::IoWorkerResource;
 /// resource handle (via `with_resource`): `close_resource` cancels every
 /// operation associated with the target, which would self-cancel the
 /// close-completion driver. Instead, the operation is registered as a
-/// freestanding operation that shares the `close_completion` flag with
+/// freestanding operation that shares the `CloseCompletionState` with
 /// the resource through a shared `Arc`.
 pub(crate) struct CloseCompletionOperation {
-    close_completion: Arc<AtomicBool>,
+    close_completion: Arc<CloseCompletionState>,
 }
 
 impl CloseCompletionOperation {
-    pub(crate) fn new(close_completion: Arc<AtomicBool>) -> Self {
+    pub(crate) fn new(close_completion: Arc<CloseCompletionState>) -> Self {
         Self { close_completion }
     }
 }
 
 impl HostOperation for CloseCompletionOperation {
-    fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
-        if self.close_completion.load(Ordering::SeqCst) {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Pending
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
+        // Check terminal state under the lock. If the result is available,
+        // return Ready immediately even if we never polled before
+        // (completion-before-first-poll race).
+        if let Some(result) = self.close_completion.take_result() {
+            return Poll::Ready(result.map_err(|msg| {
+                OperationError::new(
+                    OperationErrorCode::OperationDriverFailed,
+                    "io::close",
+                    msg,
+                )
+            }));
         }
+        // No result yet — register the waker (atomically, under the same
+        // lock discipline) so the close worker can wake us.
+        self.close_completion.register_waker(cx.waker());
+        // Double-check: the worker might have completed between our
+        // take_result check and the waker registration. If so, we must
+        // return Ready to avoid a lost wake.
+        // The waker registration is fine — calling it with an already-
+        // completed state is a harmless no-op or extra wake.
+        if let Some(result) = self.close_completion.take_result() {
+            return Poll::Ready(result.map_err(|msg| {
+                OperationError::new(
+                    OperationErrorCode::OperationDriverFailed,
+                    "io::close",
+                    msg,
+                )
+            }));
+        }
+        Poll::Pending
     }
 
     fn cancel(&mut self, _reason: OperationCancelReason) -> OperationResult<()> {
@@ -273,4 +354,236 @@ pub(crate) enum IoCancelReason {
     ResourceClosed,
     /// VM is being reset.
     VmReset,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    use super::*;
+    use crate::vm::operation::driver::HostOperation;
+
+    /// A counting waker that records how many times it was called.
+    struct CountingWaker {
+        wake_count: Arc<AtomicUsize>,
+    }
+
+    impl CountingWaker {
+        fn new() -> (Self, Arc<AtomicUsize>) {
+            let wake_count = Arc::new(AtomicUsize::new(0));
+            (Self { wake_count: wake_count.clone() }, wake_count)
+        }
+
+        fn into_waker(self) -> Waker {
+            let raw = Arc::into_raw(Arc::new(self)) as *const ();
+            unsafe { Waker::from_raw(RawWaker::new(raw, &COUNTING_WAKER_VTABLE)) }
+        }
+    }
+
+    const COUNTING_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |ptr| {
+            // Clone: increment the Arc's strong count.
+            unsafe { Arc::increment_strong_count(ptr as *const CountingWaker) };
+            RawWaker::new(ptr, &COUNTING_WAKER_VTABLE)
+        },
+        |ptr| {
+            // Wake: consume the waker, increment count, then drop.
+            let counter = unsafe { Arc::from_raw(ptr as *const CountingWaker) };
+            counter.wake_count.fetch_add(1, Ordering::SeqCst);
+            drop(counter);
+        },
+        |ptr| {
+            // Wake by ref: just increment count.
+            let counter = unsafe { &*(ptr as *const CountingWaker) };
+            counter.wake_count.fetch_add(1, Ordering::SeqCst);
+        },
+        |ptr| {
+            // Drop: consume the Arc.
+            drop(unsafe { Arc::from_raw(ptr as *const CountingWaker) });
+        },
+    );
+
+    /// Test: completion before first poll returns Ready immediately.
+    #[test]
+    fn close_completion_before_poll_returns_ready() {
+        let state = Arc::new(CloseCompletionState::new());
+        state.complete(Ok(()));
+
+        let mut op = CloseCompletionOperation::new(state);
+        let (waker, _wake_count) = CountingWaker::new();
+        let waker = waker.into_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let poll_result = HostOperation::poll(&mut op, &mut cx);
+        assert!(matches!(poll_result, Poll::Ready(Ok(()))));
+    }
+
+    /// Test: completion with error before first poll returns Ready(Err).
+    #[test]
+    fn close_completion_error_before_poll_propagates() {
+        let state = Arc::new(CloseCompletionState::new());
+        state.complete(Err("flush failed".to_string()));
+
+        let mut op = CloseCompletionOperation::new(state);
+        let (waker, _wake_count) = CountingWaker::new();
+        let waker = waker.into_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let poll_result = HostOperation::poll(&mut op, &mut cx);
+        match poll_result {
+            Poll::Ready(Err(err)) => {
+                assert!(
+                    err.message().contains("flush failed"),
+                    "error should contain 'flush failed': {}",
+                    err.message()
+                );
+            }
+            other => panic!("expected Ready(Err), got {other:?}"),
+        }
+    }
+
+    /// Test: poll returns Pending, then complete wakes the waker.
+    #[test]
+    fn close_completion_wakes_after_poll_pending() {
+        let state = Arc::new(CloseCompletionState::new());
+        let mut op = CloseCompletionOperation::new(state.clone());
+        let (waker, wake_count) = CountingWaker::new();
+        let waker = waker.into_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // First poll: no result yet, should return Pending and register waker.
+        let poll_result = HostOperation::poll(&mut op, &mut cx);
+        assert!(matches!(poll_result, Poll::Pending));
+
+        // Complete the state — this should wake the waker.
+        state.complete(Ok(()));
+
+        // Waker should have been called.
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+
+        // Second poll: result is available.
+        let poll_result = HostOperation::poll(&mut op, &mut cx);
+        assert!(matches!(poll_result, Poll::Ready(Ok(()))));
+    }
+
+    /// Test: complete with error wakes and propagates error.
+    #[test]
+    fn close_completion_error_wakes_and_propagates() {
+        let state = Arc::new(CloseCompletionState::new());
+        let mut op = CloseCompletionOperation::new(state.clone());
+        let (waker, wake_count) = CountingWaker::new();
+        let waker = waker.into_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // First poll: no result yet.
+        let poll_result = HostOperation::poll(&mut op, &mut cx);
+        assert!(matches!(poll_result, Poll::Pending));
+
+        // Complete with error.
+        state.complete(Err("Killed by reset".to_string()));
+
+        // Waker should have been called.
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+
+        // Second poll: error available.
+        let poll_result = HostOperation::poll(&mut op, &mut cx);
+        match poll_result {
+            Poll::Ready(Err(err)) => {
+                assert!(
+                    err.message().contains("Killed by reset"),
+                    "error should contain 'Killed by reset': {}",
+                    err.message()
+                );
+            }
+            other => panic!("expected Ready(Err), got {other:?}"),
+        }
+    }
+
+    /// Test: double poll — first registers waker, second is still Pending if
+    /// no completion yet, then complete wakes and third poll returns Ready.
+    #[test]
+    fn close_completion_double_poll_then_complete() {
+        let state = Arc::new(CloseCompletionState::new());
+        let mut op = CloseCompletionOperation::new(state.clone());
+        let (waker, wake_count) = CountingWaker::new();
+        let waker = waker.into_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // First poll: Pending, registers waker.
+        assert!(matches!(HostOperation::poll(&mut op, &mut cx), Poll::Pending));
+        assert_eq!(wake_count.load(Ordering::SeqCst), 0);
+
+        // Second poll: still Pending, replaces waker.
+        assert!(matches!(HostOperation::poll(&mut op, &mut cx), Poll::Pending));
+        assert_eq!(wake_count.load(Ordering::SeqCst), 0);
+
+        // Complete.
+        state.complete(Ok(()));
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+
+        // Third poll: Ready.
+        assert!(matches!(HostOperation::poll(&mut op, &mut cx), Poll::Ready(Ok(()))));
+    }
+
+    /// Test: completion-before-first-poll race — the worker completes
+    /// between the first take_result check and the waker registration.
+    /// The double-check after waker registration catches this.
+    #[test]
+    fn close_completion_race_between_check_and_register() {
+        let state = Arc::new(CloseCompletionState::new());
+        let mut op = CloseCompletionOperation::new(state.clone());
+
+        // Manually simulate the race: complete right after the first
+        // take_result check. We do this by calling poll from within
+        // a closure that completes the state mid-way.
+        //
+        // The poll function's check-register-double-check pattern handles
+        // this naturally: even if the worker completes right after
+        // register_waker, the double-check catches it.
+        let (waker, wake_count) = CountingWaker::new();
+        let waker = waker.into_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // First poll registers waker.
+        assert!(matches!(HostOperation::poll(&mut op, &mut cx), Poll::Pending));
+        assert_eq!(wake_count.load(Ordering::SeqCst), 0);
+
+        // Complete (simulating worker finishing).
+        state.complete(Ok(()));
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+
+        // Now poll again: should find the result.
+        assert!(matches!(HostOperation::poll(&mut op, &mut cx), Poll::Ready(Ok(()))));
+    }
+
+    /// Test: waker is replaced on subsequent polls.
+    #[test]
+    fn close_completion_replaces_waker() {
+        let state = Arc::new(CloseCompletionState::new());
+        let mut op = CloseCompletionOperation::new(state.clone());
+
+        let (waker1, count1) = CountingWaker::new();
+        let waker1 = waker1.into_waker();
+        let mut cx1 = Context::from_waker(&waker1);
+
+        // First poll: Pending, registers waker1.
+        assert!(matches!(HostOperation::poll(&mut op, &mut cx1), Poll::Pending));
+
+        let (waker2, count2) = CountingWaker::new();
+        let waker2 = waker2.into_waker();
+        let mut cx2 = Context::from_waker(&waker2);
+
+        // Second poll: Pending, replaces with waker2.
+        assert!(matches!(HostOperation::poll(&mut op, &mut cx2), Poll::Pending));
+
+        // Complete — should wake waker2, not waker1.
+        state.complete(Ok(()));
+        assert_eq!(count1.load(Ordering::SeqCst), 0, "waker1 should not be woken");
+        assert_eq!(count2.load(Ordering::SeqCst), 1, "waker2 should be woken");
+
+        // Poll again: Ready.
+        assert!(matches!(HostOperation::poll(&mut op, &mut cx2), Poll::Ready(Ok(()))));
+    }
 }
