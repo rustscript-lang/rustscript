@@ -55,13 +55,15 @@ impl HostResource for IoFileResource {
 
     fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         self.closed.store(true, Ordering::SeqCst);
-        if let Some(mut file) = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = block_on(file.flush());
-        }
-        Ok(CloseProgress::Ready)
+        // Defer actual flush/close to poll_close so this never blocks.
+        Ok(CloseProgress::Pending)
     }
 
     fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
+        let mut guard = self.handle.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mut file) = guard.take() {
+            let _ = block_on(file.flush());
+        }
         Poll::Ready(Ok(()))
     }
 }
@@ -100,16 +102,17 @@ impl HostResource for IoProcessResource {
 
     fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         self.closed.store(true, Ordering::SeqCst);
+        // Defer actual process teardown to poll_close so this never blocks.
+        Ok(CloseProgress::Pending)
+    }
+
+    fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
         let mut guard = self.child.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(mut child) = guard.take() {
             super::terminate_process_group(self.process_id);
             let _ = child.start_kill();
             let _ = block_on(child.wait());
         }
-        Ok(CloseProgress::Ready)
-    }
-
-    fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
         Poll::Ready(Ok(()))
     }
 }
@@ -312,7 +315,7 @@ pub(crate) fn builtin_io_popen(
         }
     }
     let mut child = spawn_shell_command(command, mode)?;
-    match mode {
+    let handle = match mode {
         "r" => {
             let stdout = child.stdout.take().ok_or_else(|| {
                 VmError::HostError("io_popen('r') did not provide stdout pipe".to_string())

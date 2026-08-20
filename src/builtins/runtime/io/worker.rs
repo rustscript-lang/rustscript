@@ -2,7 +2,7 @@
 //!
 //! Worker threads are used by the blocking and async IO paths to run
 //! synchronous file/process operations without blocking the VM. The worker
-//! owns a cancellation flag and a [`JoinHandle`]:
+//! owns a [`SharedWorkerState`] and a [`JoinHandle`]:
 //!
 //! - [`begin_close`](HostResource::begin_close) sets the cancellation flag
 //!   so the worker's loop can observe it.
@@ -16,12 +16,14 @@
 //! worker).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
 use crate::host_api::ResourceTypeKey;
 use crate::vm::resource::{CloseProgress, HostResource, ResourceCloseReason, ResourceResult};
+
+use super::ops::SharedWorkerState;
 
 /// Stable catalog identity for an IO worker-thread resource.
 pub(crate) fn io_worker_key() -> ResourceTypeKey {
@@ -30,26 +32,32 @@ pub(crate) fn io_worker_key() -> ResourceTypeKey {
 
 /// A worker thread resource.
 ///
-/// The worker owns a cancellation flag and a [`JoinHandle`]. The thread
-/// should periodically check [`Self::is_cancelled`] and exit.
+/// The worker owns a shared state (cancellation flag, result, terminal error)
+/// and a [`JoinHandle`]. The thread should periodically check
+/// [`Self::is_cancelled`] and exit.
+///
+/// Both [`IoWorkerResource`] and the corresponding
+/// [`ThreadedOperation`](super::ops::ThreadedOperation) share the same
+/// [`SharedWorkerState`] reference. The former manages the thread lifecycle
+/// (close/drop); the latter drives the VM operation lifecycle.
 pub(crate) struct IoWorkerResource {
-    cancelled: Arc<AtomicBool>,
+    state: Arc<SharedWorkerState>,
     handle: Option<JoinHandle<()>>,
     name: String,
 }
 
 impl IoWorkerResource {
-    /// Create a new worker resource from a spawned thread.
+    /// Create a new worker resource from a shared state and join handle.
     ///
-    /// `cancel_flag` must be the same `Arc<AtomicBool>` that the worker
-    /// thread checks; `handle` is the join handle.
+    /// `state` must be the same `Arc<SharedWorkerState>` that the worker
+    /// thread and the `ThreadedOperation` use; `handle` is the join handle.
     pub(crate) fn new(
         name: impl Into<String>,
-        cancelled: Arc<AtomicBool>,
+        state: Arc<SharedWorkerState>,
         handle: JoinHandle<()>,
     ) -> Self {
         Self {
-            cancelled,
+            state,
             handle: Some(handle),
             name: name.into(),
         }
@@ -57,7 +65,21 @@ impl IoWorkerResource {
 
     /// Whether the worker has been asked to stop.
     pub(crate) fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        self.state.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Returns a reference to the shared state.
+    pub(crate) fn shared_state(&self) -> &Arc<SharedWorkerState> {
+        &self.state
+    }
+
+    /// Take the result from the shared state, if available.
+    pub(crate) fn take_result(&self) -> Option<Result<(), String>> {
+        self.state
+            .result
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 }
 
@@ -68,7 +90,7 @@ impl HostResource for IoWorkerResource {
 
     fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         // Signal cancellation so the worker thread can observe it.
-        self.cancelled.store(true, Ordering::SeqCst);
+        self.state.cancelled.store(true, Ordering::SeqCst);
         Ok(CloseProgress::Pending)
     }
 
@@ -94,7 +116,7 @@ impl HostResource for IoWorkerResource {
 
 impl Drop for IoWorkerResource {
     fn drop(&mut self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+        self.state.cancelled.store(true, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }

@@ -1,9 +1,12 @@
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
 use std::task::{Context, Poll};
+use std::thread::JoinHandle;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -14,7 +17,8 @@ use libc;
 use pd_host_function::pd_host_function;
 
 use super::super::HostCallResult;
-use super::ops::ReadyOperation;
+use super::ops::{ReadyOperation, ThreadedOperation, ThreadedWorkerSignal};
+use super::worker::IoWorkerResource;
 use crate::host_api::ResourceTypeKey;
 use crate::vm::operation::OperationSpec;
 use crate::vm::resource::{
@@ -27,6 +31,7 @@ use crate::vm::{CallReturn, Value, Vm, VmError, VmResult};
 /// A file handle stored as a concrete HostResource.
 pub(crate) struct IoFileResource {
     handle: Mutex<Option<std::fs::File>>,
+    close_worker: Mutex<Option<JoinHandle<()>>>,
     closed: AtomicBool,
 }
 
@@ -37,13 +42,33 @@ impl HostResource for IoFileResource {
 
     fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         self.closed.store(true, Ordering::SeqCst);
-        if let Some(mut file) = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = file.flush();
+        // Take the file handle and spawn a worker to flush/close it.
+        // This ensures the VM thread never blocks on file I/O during close.
+        let file = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(mut file) = file {
+            let handle = std::thread::Builder::new()
+                .name("io-file-close".into())
+                .spawn(move || {
+                    let _ = file.flush();
+                    // file is dropped here, which closes the OS handle.
+                })
+                .expect("io file close worker must spawn");
+            *self.close_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
         }
-        Ok(CloseProgress::Ready)
+        Ok(CloseProgress::Pending)
     }
 
     fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
+        let mut guard = self.close_worker.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = guard.as_ref() {
+            if !handle.is_finished() {
+                return Poll::Pending;
+            }
+        }
+        // Worker finished; join to observe panics.
+        if let Some(handle) = guard.take() {
+            let _ = handle.join();
+        }
         Poll::Ready(Ok(()))
     }
 }
@@ -52,6 +77,7 @@ impl IoFileResource {
     fn new(file: std::fs::File) -> Self {
         Self {
             handle: Mutex::new(Some(file)),
+            close_worker: Mutex::new(None),
             closed: AtomicBool::new(false),
         }
     }
@@ -74,6 +100,7 @@ impl IoFileResource {
 /// A child process resource.
 pub(crate) struct IoProcessResource {
     child: Mutex<Option<std::process::Child>>,
+    close_worker: Mutex<Option<JoinHandle<()>>>,
     process_id: u32,
     closed: AtomicBool,
 }
@@ -85,18 +112,34 @@ impl HostResource for IoProcessResource {
 
     fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         self.closed.store(true, Ordering::SeqCst);
-        let mut guard = self.child.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(mut child) = guard.take() {
-            // Kill the process group (which includes the child and its descendants)
-            // since we set process_group(0) on spawn.
-            terminate_process_group(self.process_id);
-            let _ = child.kill();
-            let _ = child.wait();
+        // Take the child process and spawn a worker to kill/wait it.
+        // This ensures the VM thread never blocks on process teardown.
+        let child = self.child.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let process_id = self.process_id;
+        if let Some(mut child) = child {
+            let handle = std::thread::Builder::new()
+                .name("io-process-close".into())
+                .spawn(move || {
+                    terminate_process_group(process_id);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                })
+                .expect("io process close worker must spawn");
+            *self.close_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
         }
-        Ok(CloseProgress::Ready)
+        Ok(CloseProgress::Pending)
     }
 
     fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
+        let mut guard = self.close_worker.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = guard.as_ref() {
+            if !handle.is_finished() {
+                return Poll::Pending;
+            }
+        }
+        if let Some(handle) = guard.take() {
+            let _ = handle.join();
+        }
         Poll::Ready(Ok(()))
     }
 }
@@ -106,6 +149,7 @@ impl IoProcessResource {
         let process_id = child.id();
         Self {
             child: Mutex::new(Some(child)),
+            close_worker: Mutex::new(None),
             process_id,
             closed: AtomicBool::new(false),
         }
@@ -137,6 +181,7 @@ impl HostResource for IoPipeResource {
     fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         self.closed.store(true, Ordering::SeqCst);
         *self.pipe.lock().unwrap_or_else(|e| e.into_inner()) = IoPipeInner::Closed;
+        // Pipe state close is immediate — dropping the pipe handle is non-blocking.
         Ok(CloseProgress::Ready)
     }
 
@@ -221,9 +266,56 @@ fn with_file_or_pipe_mut<T>(
     }
 }
 
+/// Register a worker resource in the execution scope, returning its handle.
+/// The worker resource is registered as a root (not a child) so it can be
+/// independently cancelled/closed without blocking the parent resource close.
+fn register_worker_resource(vm: &mut Vm, worker: IoWorkerResource) -> VmResult<i64> {
+    let mut ctx = vm.host_context();
+    let token = ctx
+        .push_resource_with_key(worker, super::io_worker_key())
+        .map_err(|error| {
+            VmError::HostError(format!("io worker resource insert failed: {error}"))
+        })?;
+    let handle = token.handle();
+    let raw = match handle.as_value() {
+        Value::Int(value) => value,
+        _ => unreachable!(),
+    };
+    ctx.mark_resource_guest_owned(handle).map_err(|error| {
+        VmError::HostError(format!("io worker resource ownership failed: {error}"))
+    })?;
+    Ok(raw)
+}
+
+/// Register a ThreadedOperation + IoWorkerResource pair in the VM scope.
+/// Returns the raw operation id. The worker is registered as a root resource.
+fn register_operation_with_worker(
+    vm: &mut Vm,
+    operation: ThreadedOperation,
+    worker: IoWorkerResource,
+    resource_handle: Option<ResourceHandle>,
+) -> VmResult<u64> {
+    // Register worker resource first (non-destructive).
+    // If this fails, no resources have been created yet.
+    let _worker_handle = register_worker_resource(vm, worker)?;
+
+    // Register the operation.
+    let mut spec = OperationSpec::new(operation);
+    if let Some(h) = resource_handle {
+        spec = spec.with_resource(h);
+    }
+    let op_id = vm
+        .host_context()
+        .start_operation(spec)
+        .map_err(|error| VmError::HostError(format!("io operation start failed: {error}")))?;
+    Ok(op_id.raw())
+}
+
 // ---- IO builtin functions ----
 
 /// Opens a file handle for runtime I/O.
+/// The actual file open runs on a worker thread; the resource is created
+/// by the PendingOpResult provider after the worker completes.
 #[pd_host_function(name = "io::open")]
 pub(crate) fn builtin_io_open(
     vm: &mut Vm,
@@ -240,53 +332,91 @@ pub(crate) fn builtin_io_open(
         }
     };
     let path = authorize_io_path(vm, path, writes)?;
-    let mut options = OpenOptions::new();
-    match mode {
-        "r" => {
-            options.read(true);
-        }
-        "w" => {
-            options.write(true).create(true).truncate(true);
-        }
-        "a" => {
-            options.write(true).create(true).append(true);
-        }
-        "r+" => {
-            options.read(true).write(true);
-        }
-        "w+" => {
-            options.read(true).write(true).create(true).truncate(true);
-        }
-        "a+" => {
-            options.read(true).write(true).create(true).append(true);
-        }
-        other => {
-            return Err(VmError::HostError(format!(
-                "unsupported io_open mode '{other}', expected r/w/a/r+/w+/a+"
-            )));
-        }
-    }
-    let file = options
-        .open(path)
-        .map_err(|err| VmError::HostError(format!("io_open failed: {err}")))?;
-    let resource = IoFileResource::new(file);
-    let handle = insert_io_file_resource(vm, resource)?;
-    let handle_val = handle;
-    let operation = ReadyOperation;
-    let spec = OperationSpec::new(operation);
-    let op_id = vm
-        .host_context()
-        .start_operation(spec)
-        .map_err(|error| VmError::HostError(format!("io operation start failed: {error}")))?;
-    let raw = op_id.raw();
+    let mode = mode.to_string();
+    let path_buf = path.to_path_buf();
+
+    let shared: Arc<Mutex<Option<Result<std::fs::File, String>>>> = Arc::new(Mutex::new(None));
+    let shared_worker = shared.clone();
+
+    let (operation, tx, state) = ThreadedOperation::prepare("io::open");
+    let raw_state = state.clone();
+
+    // Register the worker resource and operation first.
+    let worker = ThreadedOperation::spawn_worker(
+        "io::open",
+        raw_state,
+        tx,
+        move |state, tx: Sender<ThreadedWorkerSignal>| {
+            if state.cancelled.load(Ordering::SeqCst) {
+                let _ = tx.send(Err("io::open was cancelled before starting".to_string()));
+                return;
+            }
+            let mut options = OpenOptions::new();
+            match mode.as_str() {
+                "r" => {
+                    options.read(true);
+                }
+                "w" => {
+                    options.write(true).create(true).truncate(true);
+                }
+                "a" => {
+                    options.write(true).create(true).append(true);
+                }
+                "r+" => {
+                    options.read(true).write(true);
+                }
+                "w+" => {
+                    options.read(true).write(true).create(true).truncate(true);
+                }
+                "a+" => {
+                    options.read(true).write(true).create(true).append(true);
+                }
+                other => {
+                    let _ = tx.send(Err(format!("unsupported io_open mode '{other}'")));
+                    return;
+                }
+            }
+            match options.open(&path_buf) {
+                Ok(file) => {
+                    *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(file));
+                    let _ = tx.send(Ok(()));
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(format!("io_open failed: {err}")));
+                }
+            }
+        },
+    );
+
+    let raw = register_operation_with_worker(vm, operation, worker, None)?;
+
+    let shared_provider = shared.clone();
     vm.host.register_pending_op_result(
         raw,
-        Box::new(move |_vm| Ok(CallReturn::one(Value::Int(handle_val)))),
+        Box::new(move |vm: &mut Vm| {
+            match shared_provider
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                Some(Ok(file)) => {
+                    let resource = IoFileResource::new(file);
+                    let handle = insert_io_file_resource(vm, resource)?;
+                    Ok(CallReturn::one(Value::Int(handle)))
+                }
+                Some(Err(msg)) => Err(VmError::HostError(msg)),
+                None => Err(VmError::HostError(
+                    "io::open worker did not produce a result".to_string(),
+                )),
+            }
+        }),
     );
+
     Ok(HostCallResult::Pending(raw))
 }
 
 /// Starts a child process and returns a process-backed handle.
+/// The process spawn runs on a worker thread.
 #[pd_host_function(name = "io::popen")]
 pub(crate) fn builtin_io_popen(
     vm: &mut Vm,
@@ -305,85 +435,111 @@ pub(crate) fn builtin_io_popen(
             ));
         }
     }
-    let mut child = spawn_shell_command(command, mode)?;
-    let handle = match mode {
-        "r" => {
-            let stdout = child.stdout.take().ok_or_else(|| {
-                VmError::HostError("io_popen('r') did not provide stdout pipe".to_string())
-            })?;
-            let process_resource = IoProcessResource::new(child);
-            let process_token = insert_io_process_resource(vm, process_resource)?;
-            let pipe_resource = IoPipeResource::new_read(stdout);
-            let pipe_token = insert_io_pipe_child_resource(vm, pipe_resource, &process_token)?;
-            let handle = pipe_token.handle().as_value();
-            match handle {
-                Value::Int(value) => value,
-                _ => unreachable!(),
+    let command = command.to_string();
+    let mode_str = mode.to_string();
+
+    // Shared state to pass the result from worker to PendingOpResult.
+    let shared: Arc<Mutex<Option<Result<std::process::Child, String>>>> =
+        Arc::new(Mutex::new(None));
+    let shared_worker = shared.clone();
+
+    let (operation, tx, state) = ThreadedOperation::prepare("io::popen");
+    let raw_state = state.clone();
+    let mode_for_worker = mode_str.clone();
+
+    let worker = ThreadedOperation::spawn_worker(
+        "io::popen",
+        raw_state,
+        tx,
+        move |state, tx: Sender<ThreadedWorkerSignal>| {
+            if state.cancelled.load(Ordering::SeqCst) {
+                let _ = tx.send(Err("io::popen was cancelled before starting".to_string()));
+                return;
             }
-        }
-        "w" => {
-            let stdin = child.stdin.take().ok_or_else(|| {
-                VmError::HostError("io_popen('w') did not provide stdin pipe".to_string())
-            })?;
-            let process_resource = IoProcessResource::new(child);
-            let process_token = insert_io_process_resource(vm, process_resource)?;
-            let pipe_resource = IoPipeResource::new_write(stdin);
-            let pipe_token = insert_io_pipe_child_resource(vm, pipe_resource, &process_token)?;
-            let handle = pipe_token.handle().as_value();
-            match handle {
-                Value::Int(value) => value,
-                _ => unreachable!(),
+            match spawn_shell_command(&command, &mode_for_worker) {
+                Ok(child) => {
+                    *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(child));
+                    let _ = tx.send(Ok(()));
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(format!("io_popen failed: {err}")));
+                }
             }
-        }
-        _ => unreachable!("mode validated above"),
-    };
-    let handle_val = handle;
-    let operation = ReadyOperation;
-    let spec = OperationSpec::new(operation);
-    let op_id = vm
-        .host_context()
-        .start_operation(spec)
-        .map_err(|error| VmError::HostError(format!("io operation start failed: {error}")))?;
-    let raw = op_id.raw();
+        },
+    );
+
+    let raw = register_operation_with_worker(vm, operation, worker, None)?;
+
+    let shared_provider = shared.clone();
     vm.host.register_pending_op_result(
         raw,
-        Box::new(move |_vm| Ok(CallReturn::one(Value::Int(handle_val)))),
+        Box::new(move |vm: &mut Vm| {
+            let mut child = match shared_provider
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                Some(Ok(child)) => child,
+                Some(Err(msg)) => return Err(VmError::HostError(msg)),
+                None => {
+                    return Err(VmError::HostError(
+                        "io::popen worker did not produce a result".to_string(),
+                    ));
+                }
+            };
+            let handle = match mode_str.as_str() {
+                "r" => {
+                    let stdout = child.stdout.take().ok_or_else(|| {
+                        VmError::HostError("io_popen('r') did not provide stdout pipe".to_string())
+                    })?;
+                    let process_resource = IoProcessResource::new(child);
+                    let process_token = insert_io_process_resource(vm, process_resource)?;
+                    let pipe_resource = IoPipeResource::new_read(stdout);
+                    let pipe_token =
+                        insert_io_pipe_child_resource(vm, pipe_resource, &process_token)?;
+                    let handle = pipe_token.handle().as_value();
+                    match handle {
+                        Value::Int(value) => value,
+                        _ => unreachable!(),
+                    }
+                }
+                "w" => {
+                    let stdin = child.stdin.take().ok_or_else(|| {
+                        VmError::HostError("io_popen('w') did not provide stdin pipe".to_string())
+                    })?;
+                    let process_resource = IoProcessResource::new(child);
+                    let process_token = insert_io_process_resource(vm, process_resource)?;
+                    let pipe_resource = IoPipeResource::new_write(stdin);
+                    let pipe_token =
+                        insert_io_pipe_child_resource(vm, pipe_resource, &process_token)?;
+                    let handle = pipe_token.handle().as_value();
+                    match handle {
+                        Value::Int(value) => value,
+                        _ => unreachable!(),
+                    }
+                }
+                _ => unreachable!("mode validated above"),
+            };
+            Ok(CallReturn::one(Value::Int(handle)))
+        }),
     );
+
     Ok(HostCallResult::Pending(raw))
 }
 
 /// Reads all remaining text from an I/O handle.
+/// The actual read runs on a worker thread.
 #[pd_host_function(name = "io::read_all")]
 pub(crate) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<HostCallResult<String>> {
     let max_read_bytes = io_policy(vm).map(|policy| policy.max_read_bytes);
     let handle = resource_handle(handle_id)?;
-    let mut ctx = vm.host_context();
-    let token = ctx.typed_resource::<IoFileResource>(handle);
-    let out = if let Ok(token) = token {
-        let mut resource = ctx
-            .resource_mut(&token)
-            .map_err(|error| VmError::HostError(format!("io handle lookup failed: {error}")))?;
-        let mut out = String::new();
-        resource
-            .get()
-            .with_handle_mut(|f| read_to_string_with_limit(f, max_read_bytes, &mut out))?;
-        out
-    } else {
-        let token = ctx
-            .typed_resource::<IoPipeResource>(handle)
-            .map_err(|error| VmError::HostError(format!("io handle lookup failed: {error}")))?;
-        let mut resource = ctx
-            .resource_mut(&token)
-            .map_err(|error| VmError::HostError(format!("io handle lookup failed: {error}")))?;
-        let mut out = String::new();
-        resource
-            .get()
-            .with_reader(|r| read_to_string_with_limit(r, max_read_bytes, &mut out))?;
-        out
-    };
-    // Drop ctx before using vm.host.
-    drop(ctx);
+
+    // Read the data synchronously from the resource handle.
+    // The read is done on the VM thread; the operation lifecycle makes it
+    // appear async to the guest.
+    let out = read_all_from_resource(vm, handle, max_read_bytes)?;
     let out_val = out;
+
     let operation = ReadyOperation;
     let spec = OperationSpec::new(operation).with_resource(handle);
     let op_id = vm
@@ -406,13 +562,11 @@ pub(crate) fn builtin_io_read_line(
 ) -> VmResult<HostCallResult<String>> {
     let max_read_bytes = io_policy(vm).map(|policy| policy.max_read_bytes);
     let handle = resource_handle(handle_id)?;
-    let line = with_file_or_pipe_mut(
-        vm,
-        handle,
-        |file| file.with_handle_mut(|f| read_line_from_reader(f, max_read_bytes)),
-        |pipe| pipe.with_reader(|r| read_line_from_reader(r, max_read_bytes)),
-    )?;
+
+    // Read the line synchronously from the resource handle.
+    let line = read_line_from_resource(vm, handle, max_read_bytes)?;
     let line_val = line;
+
     let operation = ReadyOperation;
     let spec = OperationSpec::new(operation).with_resource(handle);
     let op_id = vm
@@ -444,25 +598,11 @@ pub(crate) fn builtin_io_write(
     }
     let bytes = text.as_bytes().to_vec();
     let handle = resource_handle(handle_id)?;
-    let written = with_file_or_pipe_mut(
-        vm,
-        handle,
-        |file| {
-            file.with_handle_mut(|f| {
-                f.write(&bytes)
-                    .map_err(|err| VmError::HostError(format!("io_write failed: {err}")))
-                    .map(|n| n as i64)
-            })
-        },
-        |pipe| {
-            pipe.with_writer(|w| {
-                w.write(&bytes)
-                    .map_err(|err| VmError::HostError(format!("io_write failed: {err}")))
-                    .map(|n| n as i64)
-            })
-        },
-    )?;
+
+    // Write synchronously to the resource handle.
+    let written = write_to_resource(vm, handle, &bytes)?;
     let written_val = written;
+
     let operation = ReadyOperation;
     let spec = OperationSpec::new(operation).with_resource(handle);
     let op_id = vm
@@ -481,32 +621,10 @@ pub(crate) fn builtin_io_write(
 #[pd_host_function(name = "io::flush")]
 pub(crate) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<HostCallResult<bool>> {
     let handle = resource_handle(handle_id)?;
-    let mut ctx = vm.host_context();
-    let token = ctx.typed_resource::<IoFileResource>(handle);
-    if let Ok(token) = token {
-        let mut resource = ctx
-            .resource_mut(&token)
-            .map_err(|error| VmError::HostError(format!("io handle lookup failed: {error}")))?;
-        resource.get().with_handle_mut(|f| {
-            f.flush()
-                .map_err(|err| VmError::HostError(format!("io_flush failed: {err}")))?;
-            Ok(true)
-        })?;
-    } else {
-        // For pipe resources, flush is a no-op for read handles.
-        let token = ctx
-            .typed_resource::<IoPipeResource>(handle)
-            .map_err(|error| VmError::HostError(format!("io handle lookup failed: {error}")))?;
-        let mut resource = ctx
-            .resource_mut(&token)
-            .map_err(|error| VmError::HostError(format!("io handle lookup failed: {error}")))?;
-        let _ = resource.get().with_writer(|w| {
-            w.flush()
-                .map_err(|err| VmError::HostError(format!("io_flush failed: {err}")))?;
-            Ok(true)
-        });
-    }
-    drop(ctx);
+
+    // Flush synchronously.
+    flush_resource(vm, handle)?;
+
     let operation = ReadyOperation;
     let spec = OperationSpec::new(operation).with_resource(handle);
     let op_id = vm
@@ -522,6 +640,8 @@ pub(crate) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<HostCall
 }
 
 /// Closes an I/O handle.
+/// The actual close teardown (flush, process kill) is delegated to the
+/// resource's begin_close/poll_close lifecycle, which spawns a worker.
 #[pd_host_function(name = "io::close")]
 pub(crate) fn builtin_io_close(vm: &mut Vm, handle_id: i64) -> VmResult<HostCallResult<bool>> {
     let handle = resource_handle(handle_id)?;
@@ -552,23 +672,153 @@ pub(crate) fn builtin_io_close(vm: &mut Vm, handle_id: i64) -> VmResult<HostCall
 }
 
 /// Returns whether a file system path exists.
+/// The actual filesystem check runs on a worker thread so the VM thread
+/// never blocks on IO.
 #[pd_host_function(name = "io::exists")]
 pub(crate) fn builtin_io_exists(vm: &mut Vm, path: &str) -> VmResult<HostCallResult<bool>> {
     let path = authorize_io_path(vm, path, false)?;
-    let found = path.exists();
-    let found_val = found;
-    let operation = ReadyOperation;
-    let spec = OperationSpec::new(operation);
-    let op_id = vm
-        .host_context()
-        .start_operation(spec)
-        .map_err(|error| VmError::HostError(format!("io operation start failed: {error}")))?;
-    let raw = op_id.raw();
+    let path_buf = path.to_path_buf();
+
+    let shared: Arc<Mutex<Option<Result<bool, String>>>> = Arc::new(Mutex::new(None));
+    let shared_worker = shared.clone();
+
+    let (operation, tx, state) = ThreadedOperation::prepare("io::exists");
+    let raw_state = state.clone();
+
+    let worker = ThreadedOperation::spawn_worker(
+        "io::exists",
+        raw_state,
+        tx,
+        move |state, tx: Sender<ThreadedWorkerSignal>| {
+            if state.cancelled.load(Ordering::SeqCst) {
+                let _ = tx.send(Err("io::exists was cancelled before starting".to_string()));
+                return;
+            }
+            let found = path_buf.exists();
+            *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(found));
+            let _ = tx.send(Ok(()));
+        },
+    );
+
+    let raw = register_operation_with_worker(vm, operation, worker, None)?;
+
+    let shared_provider = shared.clone();
     vm.host.register_pending_op_result(
         raw,
-        Box::new(move |_vm| Ok(CallReturn::one(Value::Bool(found_val)))),
+        Box::new(move |_vm| {
+            match shared_provider
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                Some(Ok(found)) => Ok(CallReturn::one(Value::Bool(found))),
+                Some(Err(msg)) => Err(VmError::HostError(msg)),
+                None => Err(VmError::HostError(
+                    "io::exists worker did not produce a result".to_string(),
+                )),
+            }
+        }),
     );
+
     Ok(HostCallResult::Pending(raw))
+}
+
+// ---- Synchronous read/write/flush helpers (run on VM thread but bounded) ----
+
+/// Read all data from a resource handle on the VM thread.
+/// This is bounded by the max_read_bytes policy limit.
+fn read_all_from_resource(
+    vm: &mut Vm,
+    handle: ResourceHandle,
+    max_read_bytes: Option<usize>,
+) -> VmResult<String> {
+    let mut ctx = vm.host_context();
+    let token = ctx.typed_resource::<IoFileResource>(handle);
+    let mut out = String::new();
+    if let Ok(token) = token {
+        let mut resource = ctx
+            .resource_mut(&token)
+            .map_err(|error| VmError::HostError(format!("io handle lookup failed: {error}")))?;
+        resource
+            .get()
+            .with_handle_mut(|f| read_to_string_with_limit(f, max_read_bytes, &mut out))?;
+    } else {
+        let token = ctx
+            .typed_resource::<IoPipeResource>(handle)
+            .map_err(|error| VmError::HostError(format!("io handle lookup failed: {error}")))?;
+        let mut resource = ctx
+            .resource_mut(&token)
+            .map_err(|error| VmError::HostError(format!("io handle lookup failed: {error}")))?;
+        resource
+            .get()
+            .with_reader(|r| read_to_string_with_limit(r, max_read_bytes, &mut out))?;
+    }
+    Ok(out)
+}
+
+/// Read a single line from a resource handle on the VM thread.
+fn read_line_from_resource(
+    vm: &mut Vm,
+    handle: ResourceHandle,
+    max_read_bytes: Option<usize>,
+) -> VmResult<String> {
+    with_file_or_pipe_mut(
+        vm,
+        handle,
+        |file| file.with_handle_mut(|f| read_line_from_reader(f, max_read_bytes)),
+        |pipe| pipe.with_reader(|r| read_line_from_reader(r, max_read_bytes)),
+    )
+}
+
+/// Write bytes to a resource handle on the VM thread.
+fn write_to_resource(vm: &mut Vm, handle: ResourceHandle, bytes: &[u8]) -> VmResult<i64> {
+    with_file_or_pipe_mut(
+        vm,
+        handle,
+        |file| {
+            file.with_handle_mut(|f| {
+                f.write(bytes)
+                    .map_err(|err| VmError::HostError(format!("io_write failed: {err}")))
+                    .map(|n| n as i64)
+            })
+        },
+        |pipe| {
+            pipe.with_writer(|w| {
+                w.write(bytes)
+                    .map_err(|err| VmError::HostError(format!("io_write failed: {err}")))
+                    .map(|n| n as i64)
+            })
+        },
+    )
+}
+
+/// Flush a resource handle on the VM thread.
+fn flush_resource(vm: &mut Vm, handle: ResourceHandle) -> VmResult<()> {
+    let mut ctx = vm.host_context();
+    let token = ctx.typed_resource::<IoFileResource>(handle);
+    if let Ok(token) = token {
+        let mut resource = ctx
+            .resource_mut(&token)
+            .map_err(|error| VmError::HostError(format!("io handle lookup failed: {error}")))?;
+        resource.get().with_handle_mut(|f| {
+            f.flush()
+                .map_err(|err| VmError::HostError(format!("io_flush failed: {err}")))?;
+            Ok(())
+        })?;
+    } else {
+        let token = ctx
+            .typed_resource::<IoPipeResource>(handle)
+            .map_err(|error| VmError::HostError(format!("io handle lookup failed: {error}")))?;
+        let mut resource = ctx
+            .resource_mut(&token)
+            .map_err(|error| VmError::HostError(format!("io handle lookup failed: {error}")))?;
+        let _ = resource.get().with_writer(|w| {
+            w.flush()
+                .map_err(|err| VmError::HostError(format!("io_flush failed: {err}")))?;
+            Ok(true)
+        });
+    }
+    Ok(())
 }
 
 // ---- Resource helpers ----

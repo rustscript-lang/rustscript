@@ -4,11 +4,14 @@
 //! Each driver implements [`HostOperation`] with a one-shot pending-result
 //! provider: a synchronous operation completes immediately (returns `Ready` on
 //! first poll), while an operation that runs on a worker thread stores a
-//! `oneshot::Receiver` and returns `Pending` until the worker completes.
+//! `mpsc::Receiver` and returns `Pending` until the worker completes.
 //!
 //! Cancellation uses typed [`OperationCancelReason`] and is idempotent.
+//! Workers are registered as [`IoWorkerResource`] resources in the execution
+//! scope so the generic close lifecycle handles them.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::task::{Context, Poll};
@@ -17,6 +20,8 @@ use std::thread;
 use crate::vm::operation::driver::HostOperation;
 use crate::vm::operation::error::{OperationError, OperationErrorCode, OperationResult};
 use crate::vm::operation::reason::OperationCancelReason;
+
+use super::worker::IoWorkerResource;
 
 /// A one-shot operation that completes on the first poll.
 ///
@@ -35,67 +40,140 @@ impl HostOperation for ReadyOperation {
     }
 }
 
+/// Signal sent from a worker thread back to the operation driver.
+/// The actual result data is communicated through a separate shared
+/// [`Arc`]`<`[`Mutex`]`<Option<...>>>` that the [`PendingOpResult`] closure
+/// reads from.
+pub(crate) type ThreadedWorkerSignal = Result<(), String>;
+
+/// Shared state between a [`ThreadedOperation`] and its corresponding
+/// [`IoWorkerResource`]. Both reference the same `Arc<SharedWorkerState>`.
+pub(crate) struct SharedWorkerState {
+    /// Cancellation flag — set by either operation cancel or resource close.
+    pub(crate) cancelled: AtomicBool,
+    /// One-shot result signalled by the worker thread.
+    pub(crate) result: Mutex<Option<ThreadedWorkerSignal>>,
+    /// Terminal error from the worker (beyond the signal — e.g. panic).
+    pub(crate) terminal_error: Mutex<Option<String>>,
+}
+
+impl SharedWorkerState {
+    pub(crate) fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            result: Mutex::new(None),
+            terminal_error: Mutex::new(None),
+        }
+    }
+}
+
 /// A cancellation-aware operation that runs work on a dedicated thread and
-/// reports the result via a oneshot channel.
+/// reports completion via a channel.
 ///
 /// The worker thread checks the cancellation flag before starting work.
 /// Once cancelled, the receiver returns `Cancelled` on the next poll.
+/// The actual IO result value is communicated through a separate shared
+/// state (e.g. `Arc<Mutex<Option<...>>>`) that the `PendingOpResult` closure
+/// reads from when the operation completes.
+///
+/// Both [`ThreadedOperation`] and [`IoWorkerResource`] share the same
+/// [`SharedWorkerState`] reference. The former drives the VM operation
+/// lifecycle; the latter manages the thread lifecycle (close/drop).
 pub(crate) struct ThreadedOperation {
-    cancelled: Arc<AtomicBool>,
-    receiver: Option<Receiver<ThreadedResult>>,
+    state: Arc<SharedWorkerState>,
+    /// The worker sends a completion signal through this channel.
+    receiver: Option<Receiver<ThreadedWorkerSignal>>,
     name: String,
-    handle: Option<thread::JoinHandle<()>>,
 }
 
-/// Result sent from a worker thread back to the operation driver.
-pub(crate) type ThreadedResult = Result<(), String>;
-
 impl ThreadedOperation {
-    /// Create a new threaded operation.
-    ///
-    /// The `work` closure receives the cancellation flag and a sender;
-    /// it should check `cancelled.load(Ordering::SeqCst)` before starting
-    /// and periodically during long-running work.
+    /// Create a new threaded operation from a pre-constructed shared state.
     pub(crate) fn new(
         name: impl Into<String>,
-        cancelled: Arc<AtomicBool>,
-        work: impl FnOnce(Arc<AtomicBool>, Sender<ThreadedResult>) + Send + 'static,
+        state: Arc<SharedWorkerState>,
+        receiver: Receiver<ThreadedWorkerSignal>,
     ) -> Self {
-        let (tx, rx) = mpsc::channel();
-        let name = name.into();
-        let name_clone = name.clone();
-        let cancelled_clone = cancelled.clone();
-        let handle = thread::Builder::new()
-            .name(name_clone)
-            .spawn(move || {
-                work(cancelled_clone, tx);
-            })
-            .expect("io worker thread must spawn");
         Self {
-            cancelled,
-            receiver: Some(rx),
-            name,
-            handle: Some(handle),
+            state,
+            receiver: Some(receiver),
+            name: name.into(),
         }
     }
 
-    /// Create a synchronous operation that always returns Ready on first poll.
-    pub(crate) fn ready() -> Self {
+    /// Create the channel, shared state, and operation BEFORE spawning the
+    /// worker thread. Returns `(Self, Sender, Arc<SharedWorkerState>)` so the
+    /// caller can register the operation and resource first, then spawn the
+    /// worker with `spawn_worker`.
+    pub(crate) fn prepare(
+        name: impl Into<String>,
+    ) -> (Self, Sender<ThreadedWorkerSignal>, Arc<SharedWorkerState>) {
         let (tx, rx) = mpsc::channel();
-        let _ = tx.send(Ok(()));
-        Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
+        let name: String = name.into();
+        let state = Arc::new(SharedWorkerState::new());
+        let operation = Self {
+            state: state.clone(),
             receiver: Some(rx),
-            name: String::new(),
-            handle: None,
-        }
+            name,
+        };
+        (operation, tx, state)
+    }
+
+    /// Spawn a worker thread using the sender and shared state from
+    /// [`Self::prepare`]. Returns an [`IoWorkerResource`] that manages the
+    /// thread lifecycle.
+    ///
+    /// The worker should call `work(state, tx)` and signal completion
+    /// through the sender. The `work` closure should check
+    /// `state.cancelled.load(Ordering::SeqCst)` before starting and
+    /// periodically during long-running work.
+    pub(crate) fn spawn_worker(
+        name: impl Into<String>,
+        state: Arc<SharedWorkerState>,
+        tx: Sender<ThreadedWorkerSignal>,
+        work: impl FnOnce(Arc<SharedWorkerState>, Sender<ThreadedWorkerSignal>) + Send + 'static,
+    ) -> IoWorkerResource {
+        let name: String = name.into();
+        let name_clone = name.clone();
+        let state_clone = state.clone();
+        let handle = thread::Builder::new()
+            .name(name_clone)
+            .spawn(move || {
+                work(state_clone, tx);
+            })
+            .expect("io worker thread must spawn");
+        IoWorkerResource::new(name, state, handle)
+    }
+
+    /// Create a shared worker state and channel pair, then spawn the worker
+    /// thread. Returns `(Self, IoWorkerResource)` — the operation driver and
+    /// the resource that manages the thread lifecycle.
+    ///
+    /// Convenience wrapper when deferred spawning is not needed (the thread
+    /// is spawned immediately).
+    pub(crate) fn spawn(
+        name: impl Into<String>,
+        work: impl FnOnce(Arc<SharedWorkerState>, Sender<ThreadedWorkerSignal>) + Send + 'static,
+    ) -> (Self, IoWorkerResource) {
+        let (operation, tx, state) = Self::prepare(name);
+        let worker = Self::spawn_worker(&operation.name, state, tx, work);
+        (operation, worker)
+    }
+
+    /// Returns the cancelled flag from the shared state.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.state.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Returns a reference to the shared state.
+    pub(crate) fn shared_state(&self) -> &Arc<SharedWorkerState> {
+        &self.state
     }
 }
 
 impl HostOperation for ThreadedOperation {
     fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
         // Check if cancelled.
-        if self.cancelled.load(Ordering::SeqCst) {
+        if self.state.cancelled.load(Ordering::SeqCst) {
             return Poll::Ready(Err(OperationError::new(
                 OperationErrorCode::OperationDriverFailed,
                 "io::operation",
@@ -108,13 +186,13 @@ impl HostOperation for ThreadedOperation {
         };
         match receiver.try_recv() {
             Ok(Ok(())) => {
+                // Worker completed successfully.
                 self.receiver.take();
-                self.handle.take();
                 Poll::Ready(Ok(()))
             }
             Ok(Err(msg)) => {
+                // Worker reported an error.
                 self.receiver.take();
-                self.handle.take();
                 Poll::Ready(Err(OperationError::new(
                     OperationErrorCode::OperationDriverFailed,
                     "io::operation",
@@ -125,7 +203,6 @@ impl HostOperation for ThreadedOperation {
             Err(mpsc::TryRecvError::Disconnected) => {
                 // Worker thread panicked or exited without sending a result.
                 self.receiver.take();
-                self.handle.take();
                 Poll::Ready(Err(OperationError::new(
                     OperationErrorCode::OperationDriverFailed,
                     "io::operation",
@@ -139,17 +216,20 @@ impl HostOperation for ThreadedOperation {
     }
 
     fn cancel(&mut self, reason: OperationCancelReason) -> OperationResult<()> {
-        self.cancelled.store(true, Ordering::SeqCst);
+        self.state.cancelled.store(true, Ordering::SeqCst);
         let _ = reason;
         Ok(())
     }
 }
 
-impl Drop for ThreadedOperation {
-    fn drop(&mut self) {
-        self.cancelled.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
+/// A typed cancellation reason for blocking IO operations.
+/// Carries the reason for cancellation so the close-coordination layer
+/// can determine what to do (e.g. kill the process for a pipe read).
+pub(crate) enum IoCancelReason {
+    /// Operation was cancelled by the VM (e.g. reset).
+    OperationCancelled,
+    /// Resource was closed.
+    ResourceClosed,
+    /// VM is being reset.
+    VmReset,
 }
