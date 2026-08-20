@@ -822,7 +822,7 @@ impl AvailabilityAnalyzer {
             }
             // Resolved module calls (pre-merge only) analyze their arguments;
             // interprocedural effects apply to the post-merge flat call.
-            Expr::ModuleCall(_, _, args) => self.analyze_args(args, state, line),
+            Expr::ModuleCall(_, _, args, _) => self.analyze_args(args, state, line),
             Expr::Call(index, _, args, resolution, _) => {
                 if !self.enable_local_move_semantics {
                     if let Some(root_slot) = self.extract_collection_mutation_root(*index, args) {
@@ -875,7 +875,7 @@ impl AvailabilityAnalyzer {
                     Ok(out)
                 }
             }
-            Expr::LocalCall(index, _, args) => {
+            Expr::LocalCall(index, _, args, _) => {
                 self.require_available(*index, state, line)?;
                 self.analyze_args(args, state, line)
             }
@@ -1254,8 +1254,8 @@ impl AvailabilityAnalyzer {
                     || self.expr_contains_owned_local(fallback)
             }
             Expr::Call(_, _, args, _, _)
-            | Expr::LocalCall(_, _, args)
-            | Expr::ModuleCall(_, _, args) => {
+            | Expr::LocalCall(_, _, args, _)
+            | Expr::ModuleCall(_, _, args, _) => {
                 args.iter().any(|arg| self.expr_contains_owned_local(arg))
             }
             Expr::Closure(closure) => {
@@ -1507,15 +1507,17 @@ impl AvailabilityAnalyzer {
                 value_slot: *value_slot,
                 fallback: Box::new(self.rewrite_expr_ownership_inner(fallback, false)?),
             }),
-            Expr::LocalCall(index, type_args, args) => Ok(Expr::LocalCall(
+            Expr::LocalCall(index, type_args, args, semantic_id) => Ok(Expr::LocalCall(
                 *index,
                 type_args.clone(),
                 self.rewrite_call_args(args)?,
+                *semantic_id,
             )),
-            Expr::ModuleCall(index, type_args, args) => Ok(Expr::ModuleCall(
+            Expr::ModuleCall(index, type_args, args, semantic_id) => Ok(Expr::ModuleCall(
                 *index,
                 type_args.clone(),
                 self.rewrite_call_args(args)?,
+                *semantic_id,
             )),
             Expr::Closure(closure) => Ok(Expr::Closure(ClosureExpr {
                 param_slots: closure.param_slots.clone(),

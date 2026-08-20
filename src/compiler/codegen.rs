@@ -761,7 +761,7 @@ impl Compiler {
                 self.record_closure_param_hints(prototype_id, args);
                 self.compile_callvalue_args(args, ValueType::Unknown)?;
             }
-            Expr::LocalCall(index, _, args) => {
+            Expr::LocalCall(index, _, args, _) => {
                 if let Some(prototype_id) = self.callable_prototype_bindings.get(index).copied() {
                     self.record_closure_param_hints(prototype_id, args);
                 }

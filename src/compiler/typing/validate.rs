@@ -38,7 +38,7 @@ fn observe_direct_function_call_types(
 ) -> Result<(), CompileError> {
     let function_index = match expr {
         Expr::Call(index, _, _, _, _) if context.function_impls.contains_key(index) => Some(*index),
-        Expr::LocalCall(slot, _, _) => match state.callable(*slot).cloned() {
+        Expr::LocalCall(slot, _, _, _) => match state.callable(*slot).cloned() {
             Some(InferredCallable::Function(index))
                 if context.function_impls.contains_key(&index) =>
             {
@@ -54,7 +54,7 @@ fn observe_direct_function_call_types(
     };
 
     let args = match expr {
-        Expr::Call(_, _, args, _, _) | Expr::LocalCall(_, _, args) => args,
+        Expr::Call(_, _, args, _, _) | Expr::LocalCall(_, _, args, _) => args,
         _ => return Ok(()),
     };
     if context
@@ -1029,7 +1029,7 @@ fn validate_expr_children(
     strict_function_add_types: bool,
 ) -> Result<(), CompileError> {
     match expr {
-        Expr::Call(_, _, args, _, _) | Expr::LocalCall(_, _, args) => {
+        Expr::Call(_, _, args, _, _) | Expr::LocalCall(_, _, args, _) => {
             for arg in args {
                 let _ = validate_expr(
                     arg,
@@ -1040,7 +1040,7 @@ fn validate_expr_children(
                     strict_function_add_types,
                 )?;
             }
-            if let Expr::LocalCall(slot, _, args) = expr
+            if let Expr::LocalCall(slot, _, args, _) = expr
                 && let Some(InferredCallable::Closure(closure)) = state.callable(*slot).cloned()
             {
                 let declared_callable = state.callable_schema(*slot).cloned();

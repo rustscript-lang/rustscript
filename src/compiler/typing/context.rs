@@ -642,7 +642,7 @@ impl<'a> TypeContext<'a> {
                 BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::ReFind)
                     || self.function_returns_optional(*index)
             }
-            Expr::LocalCall(slot, _, _) => match state.callable(*slot) {
+            Expr::LocalCall(slot, _, _, _) => match state.callable(*slot) {
                 Some(InferredCallable::Function(index)) => {
                     BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::ReFind)
                         || self.function_returns_optional(*index)
@@ -1051,7 +1051,7 @@ impl<'a> TypeContext<'a> {
                     self.infer_named_call_schema(*index, type_args, args, state)
                 }
             }
-            Expr::LocalCall(slot, type_args, args) => match state.callable(*slot).cloned() {
+            Expr::LocalCall(slot, type_args, args, _) => match state.callable(*slot).cloned() {
                 Some(InferredCallable::Function(index)) => {
                     self.infer_named_call_schema(index, type_args, args, state)
                 }
@@ -1285,7 +1285,7 @@ impl<'a> TypeContext<'a> {
                     }
                 }
             }
-            Expr::LocalCall(slot, type_args, args) => match state.callable(*slot).cloned() {
+            Expr::LocalCall(slot, type_args, args, _) => match state.callable(*slot).cloned() {
                 Some(InferredCallable::Function(index)) => {
                     if let Some(decl) = self.function_decls.get(&index)
                         && let inferred =
@@ -2119,7 +2119,7 @@ impl<'a> TypeContext<'a> {
                     Ok(())
                 }
             }
-            Expr::LocalCall(slot, type_args, args) => match state.callable(*slot).cloned() {
+            Expr::LocalCall(slot, type_args, args, _) => match state.callable(*slot).cloned() {
                 Some(InferredCallable::Function(index)) => {
                     if let Some(builtin) = BuiltinFunction::from_call_index(index) {
                         self.validate_builtin_argument_types(

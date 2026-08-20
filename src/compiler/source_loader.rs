@@ -594,4 +594,90 @@ mod tests {
 
         remove_module_root(&root);
     }
+
+    /// The parser-assigned semantic id of a module namespace / imported call
+    /// survives the source-loader `Expr::Call -> Expr::ModuleCall` rewrite
+    /// and the linker's `Expr::ModuleCall -> Expr::Call` lowering with the
+    /// exact same id, and the parsed call-site target is upgraded to the
+    /// resolved module symbol along the way.
+    #[test]
+    fn module_call_semantic_id_survives_loader_and_linker() {
+        use super::super::ir::{Expr, ParsedCallTarget};
+        use super::super::linker::merge_units;
+
+        let path = PathBuf::from("__pd_vm_inmemory__/main.rss");
+        let source = "use a::util as au;\nfn run() { au::helper(); }\n";
+        let options = CompileSourceFileOptions::new()
+            .with_module_override_source("a/util.rss", "pub fn helper() { 7; }\n");
+
+        let loaded = load_units_for_source_file(&path, SourceFlavor::RustScript, source, &options)
+            .expect("virtual load should succeed");
+        assert_eq!(loaded.units.len(), 2, "root plus overridden module");
+
+        let root_unit = loaded
+            .units
+            .iter()
+            .find(|unit| unit.source_name.ends_with("main.rss"))
+            .expect("root unit present");
+        let parsed = root_unit
+            .parsed
+            .parsed_semantic_index
+            .as_ref()
+            .expect("root parse carries provenance");
+        assert_eq!(
+            parsed.call_sites.len(),
+            1,
+            "one namespace call recorded by the parser"
+        );
+
+        // The loader must have rewritten the call to a ModuleCall carrying
+        // the same id the parser assigned.
+        let module_call = loaded
+            .units
+            .iter()
+            .flat_map(|unit| unit.parsed.function_impls.values())
+            .filter_map(|impl_| match &impl_.body_expr {
+                Expr::ModuleCall(symbol, _, _, semantic_id) => Some((*symbol, *semantic_id)),
+                _ => None,
+            })
+            .next()
+            .expect("loader rewrote the namespace call to a ModuleCall");
+        let (symbol, loader_id) = module_call;
+        let Some(loader_id) = loader_id else {
+            panic!("ModuleCall must carry the parser semantic id");
+        };
+
+        // The parsed call site records the same id and an upgraded module
+        // target matching the ModuleCall's symbol.
+        let site = parsed
+            .call_sites
+            .iter()
+            .find(|site| site.id == loader_id)
+            .expect("call site matches the ModuleCall id");
+        match site.target {
+            ParsedCallTarget::Module(site_symbol) => {
+                assert_eq!(site_symbol, symbol, "site target is the resolved symbol")
+            }
+            ref other => panic!("expected Module target after loader, got {other:?}"),
+        }
+
+        // The linker lowers ModuleCall -> Call and must keep the same id.
+        let merged = merge_units(loaded.units).expect("merge must succeed");
+        let final_call = merged
+            .function_impls
+            .values()
+            .filter_map(|impl_| match &impl_.body_expr {
+                Expr::Call(_, _, _, _, semantic_id) => Some(*semantic_id),
+                _ => None,
+            })
+            .next()
+            .expect("merged IR lowers the call to a flat Call");
+        assert_eq!(
+            final_call,
+            Some(loader_id),
+            "final flat Call preserves the exact parser-assigned id"
+        );
+
+        remove_module_root(&std::path::Path::new("__pd_vm_inmemory__"));
+    }
 }

@@ -632,4 +632,98 @@ mod ordinary_call_provenance_tests {
             "unicode-prefixed callee is not at byte zero"
         );
     }
+
+    /// A direct local-callable call (`name(...)` where `name` binds a local)
+    /// records exact callee + full-call slices, a distinct semantic id, and
+    /// an honest `ParsedCallTarget::Local(slot)` — never a fabricated
+    /// function index.
+    #[test]
+    fn local_callable_call_records_exact_slices_and_local_target() {
+        use crate::compiler::ir::{ParsedCallTarget, SemanticNodeId};
+
+        let source = "let twice = |x| x + x;\ntwice(21);\n";
+        let ir = parse(source);
+        let index = ir.parsed_semantic_index.as_ref().expect("index present");
+        assert_eq!(
+            index.call_sites.len(),
+            1,
+            "exactly one local call site recorded"
+        );
+
+        let site = &index.call_sites[0];
+        assert_eq!(span_slice(source, site.callee_span), "twice");
+        assert_eq!(span_slice(source, site.expr_span), "twice(21)");
+        assert_eq!(
+            site.expr_span.lo, site.callee_span.lo,
+            "expr span starts at callee start"
+        );
+        match site.target {
+            ParsedCallTarget::Local(slot) => assert_eq!(slot, 0, "first local is slot 0"),
+            ref other => panic!("expected Local target, got {other:?}"),
+        }
+        assert!(
+            !site.is_namespace_call,
+            "plain local call is not a namespace call"
+        );
+
+        // The `Expr::LocalCall` node carries the same id.
+        let local_calls: Vec<&Expr> = stmt_call_exprs(&ir)
+            .into_iter()
+            .filter(|expr| matches!(expr, Expr::LocalCall(..)))
+            .collect();
+        assert_eq!(
+            local_calls.len(),
+            1,
+            "only the call statement is a LocalCall"
+        );
+        let Expr::LocalCall(_, _, _, semantic_id) = local_calls[0] else {
+            panic!("stmt must be a LocalCall");
+        };
+        let Some(SemanticNodeId(id)) = semantic_id else {
+            panic!("local call must carry a semantic id");
+        };
+        assert_eq!(SemanticNodeId(*id), site.id, "expr and site share one id");
+    }
+
+    /// A function-value reference (`f` without parens) must NOT be recorded
+    /// as a call site, and calling through a local stays distinct from
+    /// calling a named function on the same line.
+    #[test]
+    fn local_call_is_not_confused_with_function_value_reference() {
+        use crate::compiler::ir::ParsedCallTarget;
+
+        let source = "fn g(x) { x }\nlet f = g;\nf(1); g(2);\n";
+        let ir = parse(source);
+        let index = ir.parsed_semantic_index.as_ref().expect("index present");
+        assert_eq!(
+            index.call_sites.len(),
+            2,
+            "only the two call expressions are recorded"
+        );
+
+        let f_site = index
+            .call_sites
+            .iter()
+            .find(|site| span_slice(source, site.callee_span) == "f")
+            .expect("f call site");
+        let g_site = index
+            .call_sites
+            .iter()
+            .find(|site| span_slice(source, site.callee_span) == "g")
+            .expect("g call site");
+        assert!(
+            matches!(f_site.target, ParsedCallTarget::Local(_)),
+            "f(...) resolves through the local binding"
+        );
+        assert!(
+            matches!(g_site.target, ParsedCallTarget::Function(_)),
+            "g(...) resolves through the function table"
+        );
+        assert_ne!(
+            f_site.id, g_site.id,
+            "distinct call sites keep distinct ids"
+        );
+        assert_eq!(span_slice(source, f_site.expr_span), "f(1)");
+        assert_eq!(span_slice(source, g_site.expr_span), "g(2)");
+    }
 }

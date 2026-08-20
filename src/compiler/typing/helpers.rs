@@ -1647,8 +1647,8 @@ pub(super) fn expr_contains_param_add(expr: &Expr, param_slots: &[LocalSlot]) ->
                 || expr_contains_param_add(fallback, param_slots)
         }
         Expr::Call(_, _, args, _, _)
-        | Expr::LocalCall(_, _, args)
-        | Expr::ModuleCall(_, _, args) => args
+        | Expr::LocalCall(_, _, args, _)
+        | Expr::ModuleCall(_, _, args, _) => args
             .iter()
             .any(|arg| expr_contains_param_add(arg, param_slots)),
         Expr::ClosureCall(closure, args) => {
@@ -1720,8 +1720,10 @@ pub(super) fn expr_uses_param(expr: &Expr, param_slots: &[LocalSlot]) -> bool {
             value, fallback, ..
         } => expr_uses_param(value, param_slots) || expr_uses_param(fallback, param_slots),
         Expr::Call(_, _, args, _, _)
-        | Expr::LocalCall(_, _, args)
-        | Expr::ModuleCall(_, _, args) => args.iter().any(|arg| expr_uses_param(arg, param_slots)),
+        | Expr::LocalCall(_, _, args, _)
+        | Expr::ModuleCall(_, _, args, _) => {
+            args.iter().any(|arg| expr_uses_param(arg, param_slots))
+        }
         Expr::ClosureCall(closure, args) => {
             expr_uses_param(&closure.body, param_slots)
                 || args.iter().any(|arg| expr_uses_param(arg, param_slots))
@@ -1992,12 +1994,12 @@ pub(super) fn legalize_expr_children(
             }
             host_resolution.resolve_call(expr, state, context, site);
         }
-        Expr::ModuleCall(_, _, args) => {
+        Expr::ModuleCall(_, _, args, _) => {
             for arg in args.iter_mut() {
                 let _ = legalize_expr(arg, state, context, site, host_resolution);
             }
         }
-        Expr::LocalCall(_, _, args) => {
+        Expr::LocalCall(_, _, args, _) => {
             for arg in args.iter_mut() {
                 let _ = legalize_expr(arg, state, context, site, host_resolution);
             }

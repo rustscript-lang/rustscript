@@ -27,7 +27,7 @@ use super::{
     ir::{
         AssignmentKind, CatalogVisibility, ClosureExpr, Expr, FunctionDecl, FunctionDeclSite,
         FunctionImpl, FunctionParam, FunctionRefSite, HostApiIrMetadata, LocalDeclSite,
-        LocalRefSite, LocalSlot, MatchPattern, MatchTypePattern, ParsedCallSite,
+        LocalRefSite, LocalSlot, MatchPattern, MatchTypePattern, ParsedCallSite, ParsedCallTarget,
         ParsedLexicalScope, ParsedSemanticIndex, ResolvedHostCall, ScopeId, SemanticNodeId, Stmt,
         StructDecl, TypeSchema,
     },
@@ -563,7 +563,7 @@ impl Parser {
         &mut self,
         callee_span: Span,
         expr_span: Span,
-        function_index: u16,
+        target: ParsedCallTarget,
         name: String,
         is_namespace_call: bool,
     ) -> Option<SemanticNodeId> {
@@ -573,12 +573,32 @@ impl Parser {
             id,
             callee_span,
             expr_span,
-            function_index,
+            target,
             name,
             scope_id,
             is_namespace_call,
         });
         Some(id)
+    }
+
+    /// Allocate provenance for a direct local-callable call
+    /// (`name(...)` where `name` binds a local). Records the exact callee
+    /// token span and the full call span through the closing `)`.
+    pub(super) fn alloc_local_call_id(
+        &mut self,
+        callee_span: Span,
+        rparen_span: Span,
+        slot: LocalSlot,
+        name: String,
+    ) -> Option<SemanticNodeId> {
+        let expr_span = Span::new(callee_span.source_id, callee_span.lo, rparen_span.hi);
+        self.alloc_call_id(
+            callee_span,
+            expr_span,
+            ParsedCallTarget::Local(slot),
+            name,
+            false,
+        )
     }
 
     /// Build an [`Expr::Call`] with provenance tracking. Returns the call
@@ -599,8 +619,13 @@ impl Parser {
             .get(self.pos.saturating_sub(1))
             .map(|t| Span::new(callee_span.source_id, callee_span.lo, t.span.hi))
             .unwrap_or(callee_span);
-        let semantic_id =
-            self.alloc_call_id(callee_span, expr_span, index, name, is_namespace_call);
+        let semantic_id = self.alloc_call_id(
+            callee_span,
+            expr_span,
+            ParsedCallTarget::Function(index),
+            name,
+            is_namespace_call,
+        );
         Expr::Call(index, type_args, args, host_resolution, semantic_id)
     }
 
@@ -625,7 +650,13 @@ impl Parser {
             return expr;
         };
         let expr_span = Span::new(callee_span.source_id, callee_span.lo, rparen_span.hi);
-        let semantic_id = self.alloc_call_id(callee_span, expr_span, index, name, false);
+        let semantic_id = self.alloc_call_id(
+            callee_span,
+            expr_span,
+            ParsedCallTarget::Function(index),
+            name,
+            false,
+        );
         Expr::Call(index, type_args, args, host_resolution, semantic_id)
     }
 

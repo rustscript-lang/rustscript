@@ -416,7 +416,7 @@ impl SemanticModel {
             } => self
                 .expr_call_return_schema(value, position)
                 .or_else(|| self.expr_call_return_schema(fallback, position)),
-            Expr::Call(_, _, args, _, _) | Expr::ModuleCall(_, _, args) => {
+            Expr::Call(_, _, args, _, _) | Expr::ModuleCall(_, _, args, _) => {
                 for arg in args {
                     if let Some(schema) = self.expr_call_return_schema(arg, position) {
                         return Some(schema);
@@ -424,7 +424,7 @@ impl SemanticModel {
                 }
                 None
             }
-            Expr::LocalCall(_, _, args) => {
+            Expr::LocalCall(_, _, args, _) => {
                 for arg in args {
                     if let Some(schema) = self.expr_call_return_schema(arg, position) {
                         return Some(schema);
@@ -1225,7 +1225,7 @@ impl SemanticModel {
                 .expr_catalog_def(condition, position)
                 .or_else(|| self.expr_catalog_def(then_expr, position))
                 .or_else(|| self.expr_catalog_def(else_expr, position)),
-            Expr::Call(_, _, args, _, _) | Expr::ModuleCall(_, _, args) => {
+            Expr::Call(_, _, args, _, _) | Expr::ModuleCall(_, _, args, _) => {
                 for arg in args {
                     if let Some(def) = self.expr_catalog_def(arg, position) {
                         return Some(def);

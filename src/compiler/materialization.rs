@@ -386,7 +386,7 @@ impl Classifier {
             // and `Expr::Call`; unresolved refs are rejected before this
             // point. Only argument expressions can still be visited here.
             Expr::ModuleFunctionRef(..) | Expr::UnresolvedFunctionRef { .. } => {}
-            Expr::ModuleCall(_, _, args) => {
+            Expr::ModuleCall(_, _, args, _) => {
                 for arg in args {
                     self.expr(frame, arg);
                 }
@@ -419,7 +419,7 @@ impl Classifier {
                     self.expr(frame, arg);
                 }
             }
-            Expr::LocalCall(slot, _, args) => {
+            Expr::LocalCall(slot, _, args, _) => {
                 self.frames[frame].local_calls.insert(*slot);
                 if !args.is_empty() {
                     let flows = args.iter().map(|arg| self.value_flow(arg)).collect();
@@ -1352,7 +1352,7 @@ mod tests {
             vec![
                 func_decl_stmt("helper", 0),
                 let_stmt(10, Expr::FunctionRef(0, Vec::new())),
-                expr_stmt(Expr::LocalCall(10, Vec::new(), Vec::new())),
+                expr_stmt(Expr::LocalCall(10, Vec::new(), Vec::new(), None)),
             ],
             vec![decl(0, "helper", false, None)],
             HashMap::from([(0, impl_with(Vec::new(), Vec::new(), Expr::Int(1)))]),
@@ -1493,7 +1493,12 @@ mod tests {
                     func_decl_stmt("helper", 0),
                     expr_stmt(call(0)),
                     // Imported call resolved to the sibling's `run` symbol.
-                    expr_stmt(Expr::ModuleCall(sibling_symbol_run, Vec::new(), Vec::new())),
+                    expr_stmt(Expr::ModuleCall(
+                        sibling_symbol_run,
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                    )),
                 ],
                 vec![decl(0, "helper", true, Some(root_symbol_helper))],
                 HashMap::from([(0, impl_with(Vec::new(), Vec::new(), Expr::Int(22)))]),
@@ -1625,7 +1630,7 @@ mod tests {
                 func_decl_stmt("helper", 0),
                 let_stmt(10, Expr::FunctionRef(0, Vec::new())),
                 let_stmt(11, Expr::Var(10)),
-                expr_stmt(Expr::LocalCall(11, Vec::new(), Vec::new())),
+                expr_stmt(Expr::LocalCall(11, Vec::new(), Vec::new(), None)),
             ],
             vec![decl(0, "helper", false, None)],
             HashMap::from([(0, impl_with(Vec::new(), Vec::new(), Expr::Int(1)))]),
@@ -1644,7 +1649,7 @@ mod tests {
                 func_decl_stmt("helper", 0),
                 let_stmt(10, Expr::FunctionRef(0, Vec::new())),
                 let_stmt(11, Expr::MoveVar(10)),
-                expr_stmt(Expr::LocalCall(11, Vec::new(), Vec::new())),
+                expr_stmt(Expr::LocalCall(11, Vec::new(), Vec::new(), None)),
             ],
             vec![decl(0, "helper", false, None)],
             HashMap::from([(0, impl_with(Vec::new(), Vec::new(), Expr::Int(1)))]),
@@ -1670,7 +1675,7 @@ mod tests {
                         else_expr: Box::new(Expr::FunctionRef(1, Vec::new())),
                     },
                 ),
-                expr_stmt(Expr::LocalCall(10, Vec::new(), Vec::new())),
+                expr_stmt(Expr::LocalCall(10, Vec::new(), Vec::new(), None)),
             ],
             vec![
                 decl(0, "helper", false, None),
@@ -1704,7 +1709,7 @@ mod tests {
                         default: Box::new(Expr::FunctionRef(1, Vec::new())),
                     },
                 ),
-                expr_stmt(Expr::LocalCall(10, Vec::new(), Vec::new())),
+                expr_stmt(Expr::LocalCall(10, Vec::new(), Vec::new(), None)),
             ],
             vec![
                 decl(0, "helper", false, None),
@@ -1734,7 +1739,7 @@ mod tests {
                         expr: Box::new(Expr::FunctionRef(0, Vec::new())),
                     },
                 ),
-                expr_stmt(Expr::LocalCall(10, Vec::new(), Vec::new())),
+                expr_stmt(Expr::LocalCall(10, Vec::new(), Vec::new(), None)),
             ],
             vec![decl(0, "helper", false, None)],
             HashMap::from([(0, impl_with(Vec::new(), Vec::new(), Expr::Int(1)))]),
@@ -1760,7 +1765,7 @@ mod tests {
                     line: 1,
                 },
                 let_stmt(11, Expr::Var(10)),
-                expr_stmt(Expr::LocalCall(11, Vec::new(), Vec::new())),
+                expr_stmt(Expr::LocalCall(11, Vec::new(), Vec::new(), None)),
             ],
             vec![
                 decl(0, "helper", false, None),
@@ -1790,10 +1795,10 @@ mod tests {
                     Expr::Closure(ClosureExpr {
                         param_slots: Vec::new(),
                         capture_copies: vec![(10, 30)],
-                        body: Box::new(Expr::LocalCall(30, Vec::new(), Vec::new())),
+                        body: Box::new(Expr::LocalCall(30, Vec::new(), Vec::new(), None)),
                     }),
                 ),
-                expr_stmt(Expr::LocalCall(11, Vec::new(), Vec::new())),
+                expr_stmt(Expr::LocalCall(11, Vec::new(), Vec::new(), None)),
             ],
             vec![decl(0, "helper", false, None)],
             HashMap::from([(0, impl_with(Vec::new(), Vec::new(), Expr::Int(1)))]),
@@ -1822,7 +1827,7 @@ mod tests {
                     impl_with(
                         vec![(10, 30)],
                         Vec::new(),
-                        Expr::LocalCall(30, Vec::new(), Vec::new()),
+                        Expr::LocalCall(30, Vec::new(), Vec::new(), None),
                     ),
                 ),
             ]),
@@ -1850,7 +1855,7 @@ mod tests {
                         body: Box::new(call(0)),
                     }),
                 ),
-                expr_stmt(Expr::LocalCall(10, Vec::new(), Vec::new())),
+                expr_stmt(Expr::LocalCall(10, Vec::new(), Vec::new(), None)),
             ],
             Expr::Int(1),
         );
@@ -1876,7 +1881,7 @@ mod tests {
             Vec::new(),
             vec![
                 let_stmt(10, Expr::FunctionRef(0, Vec::new())),
-                expr_stmt(Expr::LocalCall(10, Vec::new(), Vec::new())),
+                expr_stmt(Expr::LocalCall(10, Vec::new(), Vec::new(), None)),
             ],
             Expr::Int(1),
         );
@@ -1936,7 +1941,7 @@ mod tests {
             vec![10],
             Vec::new(),
             Vec::new(),
-            Expr::LocalCall(10, Vec::new(), Vec::new()),
+            Expr::LocalCall(10, Vec::new(), Vec::new(), None),
         );
         let ir = ir_with(
             vec![
@@ -1974,7 +1979,7 @@ mod tests {
             vec![10],
             Vec::new(),
             vec![let_stmt(11, Expr::Var(10))],
-            Expr::LocalCall(11, Vec::new(), Vec::new()),
+            Expr::LocalCall(11, Vec::new(), Vec::new(), None),
         );
         let ir = ir_with(
             vec![
@@ -2010,7 +2015,7 @@ mod tests {
             vec![20],
             Vec::new(),
             Vec::new(),
-            Expr::LocalCall(20, Vec::new(), Vec::new()),
+            Expr::LocalCall(20, Vec::new(), Vec::new(), None),
         );
         let apply2_impl = impl_with_params(
             vec![10],
@@ -2054,7 +2059,7 @@ mod tests {
         let closure = ClosureExpr {
             param_slots: vec![30],
             capture_copies: Vec::new(),
-            body: Box::new(Expr::LocalCall(30, Vec::new(), Vec::new())),
+            body: Box::new(Expr::LocalCall(30, Vec::new(), Vec::new(), None)),
         };
         let ir = ir_with(
             vec![
@@ -2080,7 +2085,7 @@ mod tests {
         let closure = ClosureExpr {
             param_slots: vec![30],
             capture_copies: Vec::new(),
-            body: Box::new(Expr::LocalCall(30, Vec::new(), Vec::new())),
+            body: Box::new(Expr::LocalCall(30, Vec::new(), Vec::new(), None)),
         };
         let ir = ir_with(
             vec![
@@ -2090,6 +2095,7 @@ mod tests {
                     10,
                     Vec::new(),
                     vec![Expr::FunctionRef(0, Vec::new())],
+                    None,
                 )),
             ],
             vec![decl(0, "helper", false, None)],
@@ -2125,6 +2131,7 @@ mod tests {
                     10,
                     Vec::new(),
                     vec![Expr::FunctionRef(1, Vec::new())],
+                    None,
                 )),
             ],
             vec![
@@ -2168,7 +2175,7 @@ mod tests {
                         then_expr: Box::new(Expr::Closure(ClosureExpr {
                             param_slots: vec![30],
                             capture_copies: Vec::new(),
-                            body: Box::new(Expr::LocalCall(30, Vec::new(), Vec::new())),
+                            body: Box::new(Expr::LocalCall(30, Vec::new(), Vec::new(), None)),
                         })),
                         else_expr: Box::new(Expr::FunctionRef(0, Vec::new())),
                     },
@@ -2177,6 +2184,7 @@ mod tests {
                     10,
                     Vec::new(),
                     vec![Expr::FunctionRef(1, Vec::new())],
+                    None,
                 )),
             ],
             vec![decl(0, "helper", false, None), decl(1, "cb", false, None)],
@@ -2214,6 +2222,7 @@ mod tests {
                     31,
                     Vec::new(),
                     vec![Expr::FunctionRef(1, Vec::new())],
+                    None,
                 )),
             }),
         };
@@ -2230,7 +2239,7 @@ mod tests {
                     line: 1,
                 },
                 let_stmt(11, Expr::Closure(closure)),
-                expr_stmt(Expr::LocalCall(11, Vec::new(), vec![Expr::Var(10)])),
+                expr_stmt(Expr::LocalCall(11, Vec::new(), vec![Expr::Var(10)], None)),
             ],
             vec![
                 decl(0, "helper", false, None),
@@ -2279,6 +2288,7 @@ mod tests {
                     12,
                     Vec::new(),
                     vec![Expr::FunctionRef(1, Vec::new())],
+                    None,
                 )),
             ],
             vec![
@@ -2328,6 +2338,7 @@ mod tests {
                     10,
                     Vec::new(),
                     vec![Expr::FunctionRef(2, Vec::new())],
+                    None,
                 )),
             ],
             vec![

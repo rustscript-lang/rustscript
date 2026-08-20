@@ -427,8 +427,13 @@ pub enum Expr {
     /// [`Expr::Call`]'s flat index, the symbol identity never depends on
     /// unit-local index assignment or on the source name, so same-named
     /// declarations in independent modules resolve to distinct targets.
-    ModuleCall(SymbolId, Vec<TypeSchema>, Vec<Expr>),
-    LocalCall(LocalSlot, Vec<TypeSchema>, Vec<Expr>),
+    ModuleCall(SymbolId, Vec<TypeSchema>, Vec<Expr>, Option<SemanticNodeId>),
+    LocalCall(
+        LocalSlot,
+        Vec<TypeSchema>,
+        Vec<Expr>,
+        Option<SemanticNodeId>,
+    ),
     Closure(ClosureExpr),
     ClosureCall(ClosureExpr, Vec<Expr>),
     Add(Box<Expr>, Box<Expr>),
@@ -933,6 +938,26 @@ impl SemanticIndex {
 // Parser provenance types (Phase A2)
 // ---------------------------------------------------------------------------
 
+/// The resolved target of a parsed call site. The parser records the target
+/// honestly from its own resolution tables: plain functions carry their flat
+/// index, direct local-callable calls carry the local slot, and module
+/// namespace / imported-member calls carry the resolved [`SymbolId`] once the
+/// source loader rewrites the call (or stay `Unresolved` for implicit-extern
+/// calls whose target only the loader can resolve).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParsedCallTarget {
+    /// A plain function call resolved to a flat (or builtin) index.
+    Function(u16),
+    /// A direct call of a local callable value (`name(...)` where `name`
+    /// binds a local).
+    Local(LocalSlot),
+    /// A module namespace / imported-member call whose source symbol is
+    /// known (post source-loader resolution).
+    Module(SymbolId),
+    /// An implicit-extern call the source loader has not resolved yet.
+    Unresolved,
+}
+
 /// A single parsed call-site recorded by the parser with exact token spans.
 #[derive(Clone, Debug)]
 pub struct ParsedCallSite {
@@ -942,8 +967,9 @@ pub struct ParsedCallSite {
     pub callee_span: Span,
     /// Span of the full call expression (from callee start through closing delim).
     pub expr_span: Span,
-    /// The resolved flat function index (or builtin index).
-    pub function_index: u16,
+    /// The resolved call target (flat/builtin index, local slot, or module
+    /// symbol). Never a fabricated function index for local/module calls.
+    pub target: ParsedCallTarget,
     /// The source-level name of the callee.
     pub name: String,
     /// The scope this call site belongs to.
@@ -1205,7 +1231,7 @@ impl LocalIrBuilder {
 
     pub fn resolve_call_expr(&mut self, name: &str, args: Vec<Expr>) -> Option<Expr> {
         if let Some(local_index) = self.locals.get(name).copied() {
-            return Some(Expr::LocalCall(local_index, Vec::new(), args));
+            return Some(Expr::LocalCall(local_index, Vec::new(), args, None));
         }
         let (func_index, declared_arity) = self.function_meta.get(name).copied()?;
         let call_arity = u8::try_from(args.len()).ok()?;
@@ -1462,7 +1488,7 @@ mod call_resolution_carrier_tests {
     fn accessor_is_none_for_unresolved_and_non_call() {
         let unresolved = Expr::Call(9, Vec::new(), Vec::new(), None, None);
         assert!(unresolved.host_call_resolution().is_none());
-        let local = Expr::LocalCall(0, Vec::new(), Vec::new());
+        let local = Expr::LocalCall(0, Vec::new(), Vec::new(), None);
         assert!(local.host_call_resolution().is_none());
         let literal = Expr::Int(1);
         assert!(literal.host_call_resolution().is_none());

@@ -793,7 +793,7 @@ fn remap_expr_indices(
                 remap_expr_indices(arg, local_base, function_map, flat_index_by_symbol)?;
             }
         }
-        Expr::ModuleCall(symbol, type_args, args) => {
+        Expr::ModuleCall(symbol, type_args, args, semantic_id) => {
             for arg in args.iter_mut() {
                 remap_expr_indices(arg, local_base, function_map, flat_index_by_symbol)?;
             }
@@ -812,7 +812,7 @@ fn remap_expr_indices(
                 std::mem::take(type_args),
                 std::mem::take(args),
                 None,
-                None,
+                *semantic_id,
             );
         }
         Expr::OptionalGet {
@@ -835,7 +835,7 @@ fn remap_expr_indices(
             remap_expr_indices(value, local_base, function_map, flat_index_by_symbol)?;
             remap_expr_indices(fallback, local_base, function_map, flat_index_by_symbol)?;
         }
-        Expr::LocalCall(index, _, args) => {
+        Expr::LocalCall(index, _, args, _) => {
             *index = remap_local_index(*index, local_base)?;
             for arg in args {
                 remap_expr_indices(arg, local_base, function_map, flat_index_by_symbol)?;

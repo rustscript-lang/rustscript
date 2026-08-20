@@ -505,7 +505,9 @@ impl Parser {
                             });
                         }
                         let local = self.get_local(&name)?;
-                        Expr::LocalCall(local, Vec::new(), args)
+                        let semantic_id =
+                            self.alloc_local_call_id(name_span, rparen_span, local, name.clone());
+                        Expr::LocalCall(local, Vec::new(), args, semantic_id)
                     } else if self.functions.contains_key(&name) {
                         let builtin_alias_call = if matches!(name.as_str(), "print" | "println") {
                             self.functions

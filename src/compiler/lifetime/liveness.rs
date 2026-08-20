@@ -557,12 +557,12 @@ impl LivenessRewriter {
             // Resolved module calls (pre-merge only) contribute their
             // arguments' uses; the callee lives in another unit and its
             // footprint is folded in by the post-merge call lowering.
-            Expr::ModuleCall(_, _, args) => {
+            Expr::ModuleCall(_, _, args, _) => {
                 for arg in args {
                     self.add_expr_uses_impl(arg, live, conservative);
                 }
             }
-            Expr::LocalCall(index, _, args) => {
+            Expr::LocalCall(index, _, args, _) => {
                 self.mark_live(live, *index);
                 for arg in args {
                     self.add_expr_uses_impl(arg, live, conservative);
@@ -1094,12 +1094,12 @@ impl LocalSlotAllocator {
             }
             // Resolved module calls (pre-merge only) constrain their
             // arguments; the callee's footprint is folded in post-merge.
-            Expr::ModuleCall(_, _, args) => {
+            Expr::ModuleCall(_, _, args, _) => {
                 for arg in args {
                     self.collect_expr_constraints(arg, &live_during, protected_slots)?;
                 }
             }
-            Expr::LocalCall(index, _, args) => {
+            Expr::LocalCall(index, _, args, _) => {
                 self.add_slot_live_edges(*index, &live_during);
                 for arg in args {
                     self.collect_expr_constraints(arg, &live_during, protected_slots)?;
@@ -1329,7 +1329,7 @@ impl LocalSlotAllocator {
             | Expr::FunctionRef(..)
             | Expr::ModuleFunctionRef(..)
             | Expr::UnresolvedFunctionRef { .. } => {}
-            Expr::Var(index) | Expr::MoveVar(index) | Expr::LocalCall(index, _, _) => {
+            Expr::Var(index) | Expr::MoveVar(index) | Expr::LocalCall(index, _, _, _) => {
                 self.mark_set_slot(set, *index)
             }
             Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
@@ -1363,7 +1363,7 @@ impl LocalSlotAllocator {
                     self.collect_expr_footprint(arg, set, stack);
                 }
             }
-            Expr::ModuleCall(_, _, args) => {
+            Expr::ModuleCall(_, _, args, _) => {
                 for arg in args {
                     self.collect_expr_footprint(arg, set, stack);
                 }
@@ -1733,8 +1733,8 @@ fn collect_persistent_closure_sources_from_expr(expr: &Expr, slots: &mut BTreeSe
             collect_persistent_closure_sources_from_expr(fallback, slots);
         }
         Expr::Call(_, _, args, _, _)
-        | Expr::LocalCall(_, _, args)
-        | Expr::ModuleCall(_, _, args) => {
+        | Expr::LocalCall(_, _, args, _)
+        | Expr::ModuleCall(_, _, args, _) => {
             for arg in args {
                 collect_persistent_closure_sources_from_expr(arg, slots);
             }
@@ -1875,12 +1875,12 @@ fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseE
         Expr::FunctionRef(..)
         | Expr::ModuleFunctionRef(..)
         | Expr::UnresolvedFunctionRef { .. } => {}
-        Expr::Call(_, _, args, _, _) | Expr::ModuleCall(_, _, args) => {
+        Expr::Call(_, _, args, _, _) | Expr::ModuleCall(_, _, args, _) => {
             for arg in args {
                 remap_expr_slots(arg, mapping)?;
             }
         }
-        Expr::LocalCall(index, _, args) => {
+        Expr::LocalCall(index, _, args, _) => {
             *index = remap_slot(*index, mapping)?;
             for arg in args {
                 remap_expr_slots(arg, mapping)?;

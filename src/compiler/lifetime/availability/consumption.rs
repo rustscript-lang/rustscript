@@ -193,8 +193,8 @@ pub(super) fn expr_uses_slot(expr: &Expr, slot: LocalSlot) -> bool {
             fallback,
         } => *value_slot == slot || expr_uses_slot(value, slot) || expr_uses_slot(fallback, slot),
         Expr::Call(_, _, args, _, _)
-        | Expr::LocalCall(_, _, args)
-        | Expr::ModuleCall(_, _, args) => args.iter().any(|arg| expr_uses_slot(arg, slot)),
+        | Expr::LocalCall(_, _, args, _)
+        | Expr::ModuleCall(_, _, args, _) => args.iter().any(|arg| expr_uses_slot(arg, slot)),
         Expr::Closure(closure) => {
             closure
                 .capture_copies
@@ -465,7 +465,7 @@ pub(super) fn collect_consumed_positions_from_expr(
         }
         // Resolved module calls (pre-merge only) have no per-unit consumed
         // position table; their arguments are still scanned.
-        Expr::ModuleCall(_, _, args) => {
+        Expr::ModuleCall(_, _, args, _) => {
             for arg in args {
                 collect_consumed_positions_from_expr(
                     arg,
@@ -475,7 +475,7 @@ pub(super) fn collect_consumed_positions_from_expr(
                 );
             }
         }
-        Expr::LocalCall(_, _, args) => {
+        Expr::LocalCall(_, _, args, _) => {
             for arg in args {
                 collect_consumed_positions_from_expr(
                     arg,

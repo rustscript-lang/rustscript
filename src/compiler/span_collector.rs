@@ -310,7 +310,7 @@ impl<'a> SpanCollector<'a> {
                 self.collect_expr(value);
                 self.collect_expr(fallback);
             }
-            Expr::ModuleCall(_, _, args) | Expr::LocalCall(_, _, args) => {
+            Expr::ModuleCall(_, _, args, _) | Expr::LocalCall(_, _, args, _) => {
                 for arg in args {
                     self.collect_expr(arg);
                 }
