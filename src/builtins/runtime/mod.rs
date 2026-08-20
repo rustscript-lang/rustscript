@@ -14,8 +14,8 @@ use self::resource::ResourceHandle;
 type RuntimeOperationPoller = fn(&mut Vm, HostOpId, &mut Context<'_>) -> Poll<VmResult<CallReturn>>;
 
 const RUNTIME_OPERATION_POLLERS: &[(OperationOwner, RuntimeOperationPoller)] = &[
-    #[cfg(not(feature = "async"))]
-    (OperationOwner::Io, io::poll_builtin_io_op),
+    // IO has migrated to the HostOperation/HostResource generic scope SDK.
+    // The legacy RUNTIME_OPERATION_POLLERS entry for IO has been removed.
 ];
 
 mod aot;
@@ -166,17 +166,7 @@ pub(crate) fn cancel_builtin_io_op_with_reason(
     let Ok(op_id) = OperationId::from_raw(op_id) else {
         return;
     };
-    let target_resource = vm
-        .host
-        .runtime_operations
-        .get(op_id)
-        .ok()
-        .filter(|operation| operation.owner() == OperationOwner::Io)
-        .and_then(|operation| operation.resource());
     cancel_runtime_operation(vm, op_id, reason);
-    if let Some(target_resource) = target_resource {
-        let _ = close_runtime_resource(vm, target_resource, reason);
-    }
 }
 
 pub(crate) fn cancel_runtime_operation(

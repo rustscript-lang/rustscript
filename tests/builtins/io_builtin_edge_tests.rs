@@ -119,10 +119,10 @@ fn io_policy_limits_write_size() {
     let compiled = compile_source(&format!(
         r#"
         use io;
-        let handle = io::open("{}", "w");
+        let handle = io::open("{path}", "w");
         io::write(handle, "four");
         "#,
-        path.display()
+        path = path.display()
     ))
     .expect("source should compile");
     let policy = IoPolicy {
@@ -144,13 +144,7 @@ fn io_policy_limits_write_size() {
         .bind_vm_cached(&mut vm)
         .expect("profile should bind");
 
-    assert!(matches!(
-        vm.run().expect("open should start"),
-        VmStatus::Waiting(_)
-    ));
-    vm.wait_for_host_op_blocking()
-        .expect("open should complete");
-    let error = vm.resume().expect_err("oversized write should be denied");
+    let error = vm.run().expect_err("oversized write should be denied");
     assert!(matches!(error, VmError::HostError(message) if message.contains("write limit")));
     let _ = std::fs::remove_file(path);
 }
@@ -163,10 +157,10 @@ fn io_policy_limits_read_all_size() {
     let compiled = compile_source(&format!(
         r#"
         use io;
-        let handle = io::open("{}", "r");
+        let handle = io::open("{path}", "r");
         io::read_all(handle);
         "#,
-        path.display()
+        path = path.display()
     ))
     .expect("source should compile");
     let policy = IoPolicy {
@@ -187,19 +181,7 @@ fn io_policy_limits_read_all_size() {
         .bind_vm_cached(&mut vm)
         .expect("profile should bind");
 
-    assert!(matches!(
-        vm.run().expect("open should start"),
-        VmStatus::Waiting(_)
-    ));
-    vm.wait_for_host_op_blocking()
-        .expect("open should complete");
-    assert!(matches!(
-        vm.resume().expect("read should start"),
-        VmStatus::Waiting(_)
-    ));
-    let error = vm
-        .wait_for_host_op_blocking()
-        .expect_err("oversized read should be denied");
+    let error = vm.run().expect_err("oversized read should be denied");
     assert!(matches!(error, VmError::HostError(message) if message.contains("read limit")));
     let _ = std::fs::remove_file(path);
 }
@@ -212,10 +194,10 @@ fn io_policy_limits_read_line_size() {
     let compiled = compile_source(&format!(
         r#"
         use io;
-        let handle = io::open("{}", "r");
+        let handle = io::open("{path}", "r");
         io::read_line(handle);
         "#,
-        path.display()
+        path = path.display()
     ))
     .expect("source should compile");
     let policy = IoPolicy {
@@ -236,19 +218,7 @@ fn io_policy_limits_read_line_size() {
         .bind_vm_cached(&mut vm)
         .expect("profile should bind");
 
-    assert!(matches!(
-        vm.run().expect("open should start"),
-        VmStatus::Waiting(_)
-    ));
-    vm.wait_for_host_op_blocking()
-        .expect("open should complete");
-    assert!(matches!(
-        vm.resume().expect("read should start"),
-        VmStatus::Waiting(_)
-    ));
-    let error = vm
-        .wait_for_host_op_blocking()
-        .expect_err("oversized line should be denied");
+    let error = vm.run().expect_err("oversized line should be denied");
     assert!(matches!(error, VmError::HostError(message) if message.contains("read limit")));
     let _ = std::fs::remove_file(path);
 }
@@ -270,21 +240,20 @@ fn process_exists(process_id: i32) -> bool {
 }
 
 #[test]
-fn blocking_io_runs_after_callback_registration_without_spawning_a_worker() {
+fn blocking_io_runs_synchronously_without_spawning_a_worker() {
     let source = include_str!("../../src/builtins/runtime/io/blocking.rs");
-    let schedule = source
-        .split_once("fn schedule_io_task(")
-        .expect("schedule_io_task should exist")
-        .1
-        .split_once("fn runtime_host_error(")
-        .expect("schedule_io_task should precede runtime_host_error")
-        .0;
-    let callback_registration = schedule
-        .find(".insert(ResourceTypeId::CALLBACK, receiver)")
-        .expect("schedule_io_task should register its callback receiver");
-
-    assert!(!schedule.contains(".spawn(move ||"));
-    assert!(schedule[callback_registration..].contains("task()"));
+    // The new IO implementation runs synchronously and does not use
+    // worker threads or background task spawning.
+    assert!(
+        !source.contains("std::thread::spawn"),
+        "blocking IO must not spawn worker threads"
+    );
+    // The function name spawn_shell_command is allowed; we only check for
+    // actual thread/task spawning.
+    assert!(
+        !source.contains("std::thread::Builder::new"),
+        "blocking IO must not use thread spawning"
+    );
 }
 
 #[test]
@@ -312,15 +281,13 @@ fn reset_terminates_popen_descendants() {
         r#"
         use io;
         io::popen("{command}", "r");
-        "#
+        "#,
+        command = command
     ))
     .expect("descendant popen source should compile");
     let mut vm = Vm::new(compiled.program);
 
-    let first = vm.run().expect("popen should start");
-    assert!(matches!(first, VmStatus::Waiting(_)));
-    vm.wait_for_host_op_blocking()
-        .expect("popen should complete");
+    vm.run().expect("popen should complete");
 
     let pid_deadline = Instant::now() + Duration::from_secs(2);
     while !child_pid_path.exists() && Instant::now() < pid_deadline {
@@ -389,8 +356,9 @@ fn reset_reaps_a_popen_child_before_completion_is_polled() {
     .expect("popen source should compile");
     let mut vm = Vm::new(compiled.program);
 
-    let status = vm.run().expect("popen should enter waiting state");
-    assert!(matches!(status, VmStatus::Waiting(_)));
+    let status = vm.run().expect("popen should complete");
+    // popen is now synchronous; the child is spawned and the process
+    // resource + pipe are registered before the VM returns.
     std::thread::sleep(Duration::from_millis(100));
 
     let started = Instant::now();

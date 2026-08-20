@@ -113,7 +113,10 @@ impl IoHostExt for Vm {
 /// deny-by-default fallback when the VM runs a restricted registry with no
 /// IO host state installed.
 pub(super) fn io_policy(vm: &Vm) -> Option<IoPolicy> {
-    crate::vm::io_policy_from_module(vm)
+    vm.host
+        .get_module_state::<IoHostState>()
+        .map(|state| state.policy().clone())
+        .or_else(|| (!vm.host.default_builtin_capabilities_enabled()).then(IoPolicy::default))
 }
 
 /// Stable catalog identity for an IO file resource.
