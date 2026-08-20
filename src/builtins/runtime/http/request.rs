@@ -8,10 +8,11 @@ use futures_util::task::AtomicWaker;
 use http_body_util::BodyExt;
 use hyper::body::Body as _;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::Notify;
 
 use super::HttpRequestContext;
 use super::config::HttpConfig;
-use super::policy::{SchemeFamily, request_deadline, resolve_url, with_deadline};
+use super::policy::{ConnectionPermit, SchemeFamily, request_deadline, resolve_url, with_deadline};
 use crate::HostCallResult;
 use crate::builtins::runtime::{VmMap, VmMapHandle};
 use crate::vm::operation::{
@@ -19,7 +20,8 @@ use crate::vm::operation::{
     OperationSpec,
 };
 use crate::vm::resource::{
-    CloseProgress, HostResource, ResourceCloseReason, ResourceResult, ResourceTypeKey,
+    CloseProgress, HostResource, ResourceCloseReason, ResourceError, ResourceErrorCode,
+    ResourceResult, ResourceTypeKey,
 };
 use crate::vm::{CallReturn, Value, Vm, VmError, VmResult};
 
@@ -399,6 +401,30 @@ fn map_string(map: &VmMap, key: &str) -> VmResult<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Shared state for the buffered HTTP request lifecycle
+// ---------------------------------------------------------------------------
+
+/// Shared state that coordinates the buffered HTTP request worker thread,
+/// the operation poller, and the resource close lifecycle.
+struct BufferedRequestShared {
+    /// Notified on cancel/close so the worker can break out of a blocking
+    /// network read. Race-free: if notify_one() arrives before the worker
+    /// starts waiting, the next notified() completes immediately.
+    cancel: Notify,
+    /// One-shot result from the worker thread.
+    result: std::sync::Mutex<Option<VmResult<CallReturn>>>,
+    /// Waker registered by the latest pending operation poll.
+    waker: std::sync::Mutex<Option<std::task::Waker>>,
+    /// The worker thread handle, taken during close to join.
+    join_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Waker registered by the close poll when the worker is still running.
+    close_waker: std::sync::Mutex<Option<std::task::Waker>>,
+    /// The connection permit, held until the shared state is dropped (after
+    /// the worker exits and the resource is closed).
+    _permit: ConnectionPermit,
+}
+
+// ---------------------------------------------------------------------------
 // Generic scoped host resources and operations
 // ---------------------------------------------------------------------------
 
@@ -408,7 +434,17 @@ fn map_string(map: &VmMap, key: &str) -> VmResult<String> {
 /// with the buffered HTTP operation. Its close is the terminal teardown;
 /// the scope lifecycle closes the resource (and cancels the operation) on
 /// reset/shutdown, ensuring the worker thread is retired.
-pub struct HttpRequestResource;
+pub struct HttpRequestResource {
+    shared: Option<Arc<BufferedRequestShared>>,
+}
+
+impl HttpRequestResource {
+    fn new(shared: Arc<BufferedRequestShared>) -> Self {
+        Self {
+            shared: Some(shared),
+        }
+    }
+}
 
 impl HostResource for HttpRequestResource {
     fn resource_type_key() -> Option<ResourceTypeKey> {
@@ -417,7 +453,71 @@ impl HostResource for HttpRequestResource {
 
     fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         let _ = reason;
-        Ok(CloseProgress::Ready)
+        let Some(shared) = self.shared.as_ref() else {
+            return Ok(CloseProgress::Ready);
+        };
+        // Notify the worker to stop promptly, even if it is blocked on a
+        // network read. The operation's cancel also does this, but the
+        // resource close is the authoritative teardown path.
+        shared.cancel.notify_one();
+        // Wake the operation waker so the next poll sees the result.
+        if let Ok(mut waker) = shared.waker.lock() {
+            if let Some(waker) = waker.take() {
+                waker.wake();
+            }
+        }
+        // Return Pending: the worker thread may still be running. The
+        // scope's poll_close machinery will call poll_close below.
+        Ok(CloseProgress::Pending)
+    }
+
+    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
+        let Some(shared) = self.shared.as_ref() else {
+            return Poll::Ready(Ok(()));
+        };
+        let handle = {
+            let mut guard = shared
+                .join_handle
+                .lock()
+                .expect("http request join handle lock should not be poisoned");
+            guard.take()
+        };
+        let Some(handle) = handle else {
+            // No worker thread was ever started, or already joined.
+            return Poll::Ready(Ok(()));
+        };
+        if !handle.is_finished() {
+            // Worker is still running. Store the close waker and put the
+            // handle back so we can try again next poll.
+            *shared
+                .close_waker
+                .lock()
+                .expect("http request close waker lock should not be poisoned") =
+                Some(cx.waker().clone());
+            *shared
+                .join_handle
+                .lock()
+                .expect("http request join handle lock should not be poisoned") = Some(handle);
+            return Poll::Pending;
+        }
+        // The worker thread has exited. Join to propagate any panic.
+        match handle.join() {
+            Ok(()) => Poll::Ready(Ok(())),
+            Err(panic) => {
+                let message = if let Some(message) = panic.downcast_ref::<&str>() {
+                    message.to_string()
+                } else if let Some(message) = panic.downcast_ref::<String>() {
+                    message.clone()
+                } else {
+                    "HTTP request worker thread panicked".to_string()
+                };
+                Poll::Ready(Err(ResourceError::new(
+                    ResourceErrorCode::ResourceCleanupFailed,
+                    "http::request::resource",
+                    &message,
+                )))
+            }
+        }
     }
 }
 
@@ -444,14 +544,18 @@ impl HostResource for HttpResponseResource {
 /// Driver for the *buffered* HTTP request operation: runs the request on a
 /// worker thread and publishes the response map into a shared cell.
 pub(super) struct HttpRequestOperation {
-    result: Arc<std::sync::Mutex<Option<VmResult<CallReturn>>>>,
-    waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    shared: Arc<BufferedRequestShared>,
+}
+
+impl HttpRequestOperation {
+    fn new(shared: Arc<BufferedRequestShared>) -> Self {
+        Self { shared }
+    }
 }
 
 impl HostOperation for HttpRequestOperation {
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
-        let mut state = self.result.lock().expect("http request result lock");
+        let state = self.shared.result.lock().expect("http request result lock");
         match state.as_ref() {
             Some(Ok(_)) => Poll::Ready(Ok(())),
             Some(Err(error)) => Poll::Ready(Err(OperationError::new(
@@ -460,15 +564,22 @@ impl HostOperation for HttpRequestOperation {
                 error.to_string(),
             ))),
             None => {
-                *self.waker.lock().expect("http request waker lock") = Some(cx.waker().clone());
+                *self.shared.waker.lock().expect("http request waker lock") =
+                    Some(cx.waker().clone());
                 Poll::Pending
             }
         }
     }
 
     fn cancel(&mut self, reason: OperationCancelReason) -> OperationResult<()> {
-        self.cancelled.store(true, Ordering::SeqCst);
         let _ = reason;
+        self.shared.cancel.notify_one();
+        // Wake the operation waker so the next poll sees the result.
+        if let Ok(mut waker) = self.shared.waker.lock() {
+            if let Some(waker) = waker.take() {
+                waker.wake();
+            }
+        }
         Ok(())
     }
 }
@@ -492,13 +603,26 @@ pub(super) fn perform_buffered_request(
 ) -> VmResult<HostCallResult<VmMap>> {
     let (context, _) = HttpRequestContext::capture(vm, None, "HTTP")?;
     let config = context.config.clone();
+    let permit = context.into_permit();
     let request = parse_request(&request, &config)?;
     let deadline = request_deadline(config.request_timeout)?;
+
+    // Shared state that coordinates the worker thread, operation poll, and
+    // resource close lifecycle. The permit is held here until the shared
+    // state is dropped (after the worker exits and the resource is closed).
+    let shared = Arc::new(BufferedRequestShared {
+        cancel: Notify::new(),
+        result: std::sync::Mutex::new(None),
+        waker: std::sync::Mutex::new(None),
+        join_handle: std::sync::Mutex::new(None),
+        close_waker: std::sync::Mutex::new(None),
+        _permit: permit,
+    });
 
     // Register an HTTP request resource in the scope and associate the
     // operation with it. The scope lifecycle closes the resource (and
     // cancels the operation) on reset/shutdown.
-    let request_resource = HttpRequestResource;
+    let request_resource = HttpRequestResource::new(Arc::clone(&shared));
     let resource_token = vm
         .host_context()
         .push_resource(request_resource)
@@ -506,26 +630,21 @@ pub(super) fn perform_buffered_request(
     let request_handle = resource_token.handle();
 
     // Run the request on a worker thread; the operation driver polls the
-    // shared completion cell.
-    let result: Arc<std::sync::Mutex<Option<VmResult<CallReturn>>>> =
-        Arc::new(std::sync::Mutex::new(None));
-    let waker: Arc<std::sync::Mutex<Option<std::task::Waker>>> =
-        Arc::new(std::sync::Mutex::new(None));
-    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    let worker_result = Arc::clone(&result);
-    let worker_waker = Arc::clone(&waker);
-    let worker_cancelled = Arc::clone(&cancelled);
+    // shared completion cell. The worker uses tokio::select! to respond
+    // promptly to cancellation even while blocked on network I/O.
+    let worker_shared = Arc::clone(&shared);
     let worker_config = config.clone();
     let worker_request = request.clone();
-    std::thread::Builder::new()
+    let join_handle = std::thread::Builder::new()
         .name("rustscript-http-request".to_string())
         .spawn(move || {
-            let value = if worker_cancelled.load(Ordering::SeqCst) {
-                Err(VmError::HostError("HTTP request cancelled".to_string()))
-            } else {
-                runtime_block_on(async {
-                    with_deadline(
+            let value = runtime_block_on(async {
+                tokio::select! {
+                    biased;
+                    _ = worker_shared.cancel.notified() => {
+                        Err(VmError::HostError("HTTP request cancelled".to_string()))
+                    }
+                    result = with_deadline(
                         deadline,
                         execute_request_until(
                             &worker_config,
@@ -534,32 +653,51 @@ pub(super) fn perform_buffered_request(
                             deadline,
                             None,
                         ),
-                    )
-                    .await
-                    .map(|map| CallReturn::one(Value::Map(Arc::new(map))))
-                })
-            };
+                    ) => {
+                        result.map(|map| CallReturn::one(Value::Map(Arc::new(map))))
+                    }
+                }
+            });
+            // Publish the result and wake the operation poller.
             let wake = {
-                let mut state = worker_result
+                let mut state = worker_shared
+                    .result
                     .lock()
                     .expect("http request result lock should not be poisoned");
                 *state = Some(value);
-                worker_waker.lock().expect("http request waker lock").take()
+                worker_shared
+                    .waker
+                    .lock()
+                    .expect("http request waker lock")
+                    .take()
             };
+            // Wake the close waker before the operation waker so the
+            // close poll sees the thread is finished before the operation
+            // poll processes the result.
+            let close_wake = worker_shared
+                .close_waker
+                .lock()
+                .expect("http request close waker lock should not be poisoned")
+                .take();
+            if let Some(waker) = close_wake {
+                waker.wake();
+            }
             if let Some(waker) = wake {
                 waker.wake();
             }
         })
         .map_err(|error| VmError::HostError(format!("failed to start HTTP worker: {error}")))?;
 
+    // Store the join handle so the resource can join it during close.
+    *shared
+        .join_handle
+        .lock()
+        .expect("http request join handle lock") = Some(join_handle);
+
     // Clone the result handle before moving it into the operation so the
     // pending-result closure can also access it.
-    let pending_result = Arc::clone(&result);
-    let op = HttpRequestOperation {
-        result,
-        waker,
-        cancelled,
-    };
+    let pending_result = Arc::clone(&shared);
+    let op = HttpRequestOperation::new(shared);
     let op_id = vm
         .host_context()
         .start_operation(OperationSpec::new(op).with_resource(request_handle))
@@ -569,6 +707,7 @@ pub(super) fn perform_buffered_request(
         raw,
         Box::new(move |_vm: &mut Vm| {
             pending_result
+                .result
                 .lock()
                 .expect("http request result lock should not be poisoned")
                 .take()
@@ -884,9 +1023,10 @@ pub(super) async fn open_stream_response(
                 .get(hyper::header::LOCATION)
                 .ok_or_else(|| VmError::HostError("HTTP redirect has no location".to_string()))?
                 .to_str()
-                .map_err(|_| VmError::HostError("HTTP redirect location is invalid".to_string()))?;
+                .map_err(|_| VmError::HostError("HTTP redirect location is invalid".to_string()))?
+                .to_string();
             let next_url = url
-                .join(location)
+                .join(&location)
                 .map_err(|error| VmError::HostError(format!("invalid HTTP redirect: {error}")))?;
             super::policy::validate_url_policy(config, SchemeFamily::Http, &next_url)?;
             if next_url.origin() != origin {

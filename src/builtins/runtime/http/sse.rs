@@ -337,13 +337,6 @@ pub(super) struct SseShared {
     pub(super) close_waker: std::sync::Mutex<Option<std::task::Waker>>,
 }
 
-/// One SSE event or terminal summary delivered to the guest callback.
-enum SseItem {
-    Open(Value),
-    Event(Value),
-    End(Value),
-}
-
 /// Runs the whole SSE lifecycle on a worker thread: open the response stream
 /// (following redirects), validate it, read body frames, parse events and
 /// publish each item into the shared completion channel. The guest callback
@@ -362,8 +355,6 @@ struct SseWorker {
 
 impl SseWorker {
     fn run(self: Arc<Self>) {
-        let permit_holder = None::<()>;
-        let _ = permit_holder;
         // The shared permit was moved into the SSE operation driver below;
         // this worker only publishes items.
         let result = self.run_inner();
@@ -522,6 +513,7 @@ struct SseStreamDriver {
     headers: Arc<VmMap>,
     url: String,
     items: usize,
+    bytes_received: Arc<AtomicUsize>,
     permit: super::ConnectionPermit,
 }
 
@@ -533,7 +525,10 @@ impl SseStreamDriver {
             ("headers", Value::Map(Arc::clone(&self.headers))),
             ("url", Value::string(&self.url)),
             ("items", Value::Int(self.items as i64)),
-            ("bytes_received", Value::Int(0)),
+            (
+                "bytes_received",
+                Value::Int(self.bytes_received.load(Ordering::Acquire) as i64),
+            ),
             ("bytes_sent", Value::Int(0)),
         ])
     }
@@ -804,7 +799,7 @@ pub(super) fn builtin_http_client_sse(
         .host_context()
         .start_operation(OperationSpec::new(op).with_resource(sse_handle))
         .map_err(|error| VmError::HostError(format!("failed to start SSE operation: {error}")))?;
-    let _raw = op_id.raw();
+    let _ = op_id;
 
     let worker = Arc::new(SseWorker {
         config: context.config.clone(),
@@ -817,6 +812,7 @@ pub(super) fn builtin_http_client_sse(
         headers: std::sync::Mutex::new(None),
         url: std::sync::Mutex::new(None),
     });
+    let bytes_received = worker.bytes_received.clone();
 
     let join_handle = std::thread::Builder::new()
         .name("rustscript-sse-worker".to_string())
@@ -833,6 +829,7 @@ pub(super) fn builtin_http_client_sse(
         headers: Arc::new(VmMap::default()),
         url: String::new(),
         items: 0,
+        bytes_received,
         permit,
     };
 

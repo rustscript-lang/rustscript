@@ -326,6 +326,11 @@ async fn sse_delivers_open_events_end_and_terminal_summary() {
     assert_eq!(field(result, "outcome"), &Value::string("eof"));
     assert_eq!(field(result, "status"), &Value::Int(200));
     assert_eq!(field(result, "items"), &Value::Int(4));
+    assert!(
+        matches!(field(result, "bytes_received"), Value::Int(n) if *n > 0),
+        "bytes_received must be positive when data was delivered, got: {:?}",
+        field(result, "bytes_received"),
+    );
     assert_eq!(field(result, "bytes_sent"), &Value::Int(0));
 }
 
