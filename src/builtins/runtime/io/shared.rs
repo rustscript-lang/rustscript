@@ -34,7 +34,7 @@ use libc;
 use super::super::HostCallResult;
 use super::ops::{
     CloseCompletionOperation, CloseCompletionState, PipeTransferGuard, ReadyOperation,
-    ThreadedOperation, ThreadedWorkerSignal,
+    ThreadedOperation, ThreadedWorkerSignal, restore_reader_or_drop, restore_writer_or_drop,
 };
 use super::worker::IoWorkerResource;
 use crate::host_api::ResourceTypeKey;
@@ -205,12 +205,6 @@ impl IoProcessResource {
             close_completion: Arc::new(CloseCompletionState::new()),
         }
     }
-
-    /// Expose the process id for diagnostics (used in error messages).
-    #[cfg(debug_assertions)]
-    pub(crate) fn process_id(&self) -> u32 {
-        self.process_id
-    }
 }
 
 /// A stdio pipe resource (child of a process resource).
@@ -298,6 +292,11 @@ impl IoPipeResource {
     pub(crate) fn restore_writer(&mut self, pipe: std::process::ChildStdin) {
         let mut guard = self.pipe.lock().unwrap_or_else(|e| e.into_inner());
         *guard = IoPipeInner::Write(pipe);
+    }
+
+    /// Whether the pipe resource has been closed (begin_close was called).
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 
     /// Check if this pipe is a read-only pipe (ChildStdout).
@@ -389,16 +388,17 @@ pub(crate) fn register_worker_resource(vm: &mut Vm, worker: IoWorkerResource) ->
 }
 
 /// Register a ThreadedOperation + IoWorkerResource pair in the VM scope.
-/// Returns the raw operation id. The worker is registered as a root resource.
-/// After the operation completes (success or error), the worker resource is
-/// retired via `close_resource` to ensure prompt cleanup.
+/// Returns `(operation_id, worker_handle)`. The worker is registered as a
+/// root resource. After the operation completes (success or error), the
+/// caller must call `retire_worker_resource` with the returned worker_handle
+/// to ensure prompt cleanup.
 pub(crate) fn register_operation_with_worker(
     vm: &mut Vm,
     operation: ThreadedOperation,
     worker: IoWorkerResource,
     resource_handle: Option<ResourceHandle>,
-) -> VmResult<u64> {
-    let _worker_handle = register_worker_resource(vm, worker)?;
+) -> VmResult<(u64, i64)> {
+    let worker_handle = register_worker_resource(vm, worker)?;
     let mut spec = OperationSpec::new(operation);
     if let Some(h) = resource_handle {
         spec = spec.with_resource(h);
@@ -407,7 +407,7 @@ pub(crate) fn register_operation_with_worker(
         .host_context()
         .start_operation(spec)
         .map_err(|error| VmError::HostError(format!("io operation start failed: {error}")))?;
-    Ok(op_id.raw())
+    Ok((op_id.raw(), worker_handle))
 }
 
 /// Retire (close) the worker resource identified by the handle returned from
@@ -501,13 +501,13 @@ pub(crate) fn builtin_io_open_body(
         },
     );
 
-    let raw = register_operation_with_worker(vm, operation, worker, None)?;
+    let (raw, worker_handle) = register_operation_with_worker(vm, operation, worker, None)?;
 
     let shared_provider = shared.clone();
     vm.host.register_pending_op_result(
         raw,
         Box::new(move |vm: &mut Vm| {
-            match shared_provider
+            let result = match shared_provider
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
@@ -521,7 +521,9 @@ pub(crate) fn builtin_io_open_body(
                 None => Err(VmError::HostError(
                     "io::open worker did not produce a result".to_string(),
                 )),
-            }
+            };
+            retire_worker_resource(vm, worker_handle);
+            result
         }),
     );
 
@@ -580,59 +582,67 @@ pub(crate) fn builtin_io_popen_body(
         },
     );
 
-    let raw = register_operation_with_worker(vm, operation, worker, None)?;
+    let (raw, worker_handle) = register_operation_with_worker(vm, operation, worker, None)?;
 
     let shared_provider = shared.clone();
     vm.host.register_pending_op_result(
         raw,
         Box::new(move |vm: &mut Vm| {
-            let mut child = match shared_provider
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take()
-            {
-                Some(Ok(child)) => child,
-                Some(Err(msg)) => return Err(VmError::HostError(msg)),
-                None => {
-                    return Err(VmError::HostError(
-                        "io::popen worker did not produce a result".to_string(),
-                    ));
-                }
-            };
-            let handle = match mode_str.as_str() {
-                "r" => {
-                    let stdout = child.stdout.take().ok_or_else(|| {
-                        VmError::HostError("io_popen('r') did not provide stdout pipe".to_string())
-                    })?;
-                    let process_resource = IoProcessResource::new(child);
-                    let process_token = insert_io_process_resource(vm, process_resource)?;
-                    let pipe_resource = IoPipeResource::new_read(stdout);
-                    let pipe_token =
-                        insert_io_pipe_child_resource(vm, pipe_resource, &process_token)?;
-                    let handle = pipe_token.handle().as_value();
-                    match handle {
-                        Value::Int(value) => value,
-                        _ => unreachable!(),
+            let result = (|| {
+                let mut child = match shared_provider
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                {
+                    Some(Ok(child)) => child,
+                    Some(Err(msg)) => return Err(VmError::HostError(msg)),
+                    None => {
+                        return Err(VmError::HostError(
+                            "io::popen worker did not produce a result".to_string(),
+                        ));
                     }
-                }
-                "w" => {
-                    let stdin = child.stdin.take().ok_or_else(|| {
-                        VmError::HostError("io_popen('w') did not provide stdin pipe".to_string())
-                    })?;
-                    let process_resource = IoProcessResource::new(child);
-                    let process_token = insert_io_process_resource(vm, process_resource)?;
-                    let pipe_resource = IoPipeResource::new_write(stdin);
-                    let pipe_token =
-                        insert_io_pipe_child_resource(vm, pipe_resource, &process_token)?;
-                    let handle = pipe_token.handle().as_value();
-                    match handle {
-                        Value::Int(value) => value,
-                        _ => unreachable!(),
+                };
+                let handle = match mode_str.as_str() {
+                    "r" => {
+                        let stdout = child.stdout.take().ok_or_else(|| {
+                            VmError::HostError(
+                                "io_popen('r') did not provide stdout pipe".to_string(),
+                            )
+                        })?;
+                        let process_resource = IoProcessResource::new(child);
+                        let process_token = insert_io_process_resource(vm, process_resource)?;
+                        let pipe_resource = IoPipeResource::new_read(stdout);
+                        let pipe_token =
+                            insert_io_pipe_child_resource(vm, pipe_resource, &process_token)?;
+                        let handle = pipe_token.handle().as_value();
+                        match handle {
+                            Value::Int(value) => value,
+                            _ => unreachable!(),
+                        }
                     }
-                }
-                _ => unreachable!("mode validated above"),
-            };
-            Ok(CallReturn::one(Value::Int(handle)))
+                    "w" => {
+                        let stdin = child.stdin.take().ok_or_else(|| {
+                            VmError::HostError(
+                                "io_popen('w') did not provide stdin pipe".to_string(),
+                            )
+                        })?;
+                        let process_resource = IoProcessResource::new(child);
+                        let process_token = insert_io_process_resource(vm, process_resource)?;
+                        let pipe_resource = IoPipeResource::new_write(stdin);
+                        let pipe_token =
+                            insert_io_pipe_child_resource(vm, pipe_resource, &process_token)?;
+                        let handle = pipe_token.handle().as_value();
+                        match handle {
+                            Value::Int(value) => value,
+                            _ => unreachable!(),
+                        }
+                    }
+                    _ => unreachable!("mode validated above"),
+                };
+                Ok(CallReturn::one(Value::Int(handle)))
+            })();
+            retire_worker_resource(vm, worker_handle);
+            result
         }),
     );
 
@@ -712,7 +722,7 @@ pub(crate) fn builtin_io_read_all_body(
         },
     );
 
-    let raw = register_operation_with_worker(vm, operation, worker, Some(handle))?;
+    let (raw, worker_handle) = register_operation_with_worker(vm, operation, worker, Some(handle))?;
 
     let shared_provider = shared.clone();
     vm.host.register_pending_op_result(
@@ -721,16 +731,9 @@ pub(crate) fn builtin_io_read_all_body(
             // Restore pipe handle if the worker didn't take it (cancellation
             // before start). The pipe handle is still in the guard.
             if let Some(ref guard) = pipe_guard {
-                if let Some(pipe) = guard.take() {
-                    let mut ctx = vm.host_context();
-                    if let Ok(token) = ctx.typed_resource::<IoPipeResource>(handle) {
-                        if let Ok(mut resource) = ctx.resource_mut(&token) {
-                            resource.get().restore_reader(pipe);
-                        }
-                    }
-                }
+                guard.restore_or_drop(vm, handle, |res, pipe| res.restore_reader(pipe));
             }
-            match shared_provider
+            let result = match shared_provider
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
@@ -740,7 +743,9 @@ pub(crate) fn builtin_io_read_all_body(
                 None => Err(VmError::HostError(
                     "io::read_all worker did not produce a result".to_string(),
                 )),
-            }
+            };
+            retire_worker_resource(vm, worker_handle);
+            result
         }),
     );
 
@@ -828,7 +833,7 @@ pub(crate) fn builtin_io_read_line_body(
         },
     );
 
-    let raw = register_operation_with_worker(vm, operation, worker, Some(handle))?;
+    let (raw, worker_handle) = register_operation_with_worker(vm, operation, worker, Some(handle))?;
 
     let shared_provider = shared.clone();
     let pipe_provider = pipe_shared.clone();
@@ -840,14 +845,9 @@ pub(crate) fn builtin_io_read_line_body(
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
             {
-                let mut ctx = vm.host_context();
-                if let Ok(token) = ctx.typed_resource::<IoPipeResource>(handle) {
-                    if let Ok(mut resource) = ctx.resource_mut(&token) {
-                        resource.get().restore_reader(pipe);
-                    }
-                }
+                restore_reader_or_drop(vm, handle, pipe);
             }
-            match shared_provider
+            let result = match shared_provider
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
@@ -857,7 +857,9 @@ pub(crate) fn builtin_io_read_line_body(
                 None => Err(VmError::HostError(
                     "io::read_line worker did not produce a result".to_string(),
                 )),
-            }
+            };
+            retire_worker_resource(vm, worker_handle);
+            result
         }),
     );
 
@@ -946,7 +948,7 @@ pub(crate) fn builtin_io_write_body(
         },
     );
 
-    let raw = register_operation_with_worker(vm, operation, worker, Some(handle))?;
+    let (raw, worker_handle) = register_operation_with_worker(vm, operation, worker, Some(handle))?;
 
     let shared_provider = shared.clone();
     let pipe_provider = pipe_shared.clone();
@@ -958,14 +960,9 @@ pub(crate) fn builtin_io_write_body(
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
             {
-                let mut ctx = vm.host_context();
-                if let Ok(token) = ctx.typed_resource::<IoPipeResource>(handle) {
-                    if let Ok(mut resource) = ctx.resource_mut(&token) {
-                        resource.get().restore_writer(pipe);
-                    }
-                }
+                restore_writer_or_drop(vm, handle, pipe);
             }
-            match shared_provider
+            let result = match shared_provider
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
@@ -975,7 +972,9 @@ pub(crate) fn builtin_io_write_body(
                 None => Err(VmError::HostError(
                     "io::write worker did not produce a result".to_string(),
                 )),
-            }
+            };
+            retire_worker_resource(vm, worker_handle);
+            result
         }),
     );
 
@@ -1078,7 +1077,7 @@ pub(crate) fn builtin_io_flush_body(vm: &mut Vm, handle_id: i64) -> VmResult<Hos
         },
     );
 
-    let raw = register_operation_with_worker(vm, operation, worker, Some(handle))?;
+    let (raw, worker_handle) = register_operation_with_worker(vm, operation, worker, Some(handle))?;
 
     let shared_provider = shared.clone();
     let pipe_provider = pipe_shared.clone();
@@ -1090,14 +1089,9 @@ pub(crate) fn builtin_io_flush_body(vm: &mut Vm, handle_id: i64) -> VmResult<Hos
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
             {
-                let mut ctx = vm.host_context();
-                if let Ok(token) = ctx.typed_resource::<IoPipeResource>(handle) {
-                    if let Ok(mut resource) = ctx.resource_mut(&token) {
-                        resource.get().restore_writer(pipe);
-                    }
-                }
+                restore_writer_or_drop(vm, handle, pipe);
             }
-            match shared_provider
+            let result = match shared_provider
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
@@ -1107,7 +1101,9 @@ pub(crate) fn builtin_io_flush_body(vm: &mut Vm, handle_id: i64) -> VmResult<Hos
                 None => Err(VmError::HostError(
                     "io::flush worker did not produce a result".to_string(),
                 )),
-            }
+            };
+            retire_worker_resource(vm, worker_handle);
+            result
         }),
     );
 
@@ -1255,13 +1251,13 @@ pub(crate) fn builtin_io_exists_body(vm: &mut Vm, path: &str) -> VmResult<HostCa
         },
     );
 
-    let raw = register_operation_with_worker(vm, operation, worker, None)?;
+    let (raw, worker_handle) = register_operation_with_worker(vm, operation, worker, None)?;
 
     let shared_provider = shared.clone();
     vm.host.register_pending_op_result(
         raw,
-        Box::new(move |_vm| {
-            match shared_provider
+        Box::new(move |vm: &mut Vm| {
+            let result = match shared_provider
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
@@ -1271,7 +1267,9 @@ pub(crate) fn builtin_io_exists_body(vm: &mut Vm, path: &str) -> VmResult<HostCa
                 None => Err(VmError::HostError(
                     "io::exists worker did not produce a result".to_string(),
                 )),
-            }
+            };
+            retire_worker_resource(vm, worker_handle);
+            result
         }),
     );
 

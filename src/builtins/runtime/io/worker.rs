@@ -132,8 +132,14 @@ impl Drop for IoWorkerResource {
         // Invariant: the thread must already be finished by the time Drop
         // runs. The close lifecycle (begin_close/poll_close) or the
         // ThreadedOperation completion path drives the worker to completion
-        // before Drop. We still join finished threads to observe panics.
+        // before Drop.
         if let Some(handle) = self.handle.take() {
+            debug_assert!(
+                handle.is_finished(),
+                "IoWorkerResource dropped while thread '{}' is still running — \
+                 the close lifecycle must retire the worker before Drop",
+                self.name
+            );
             if handle.is_finished() {
                 let _ = handle.join();
             }
@@ -141,7 +147,8 @@ impl Drop for IoWorkerResource {
             // wrong in the lifecycle — the handle is dropped and the thread
             // is detached. This is a last-resort fallback only; the
             // cancellation flag was set above so the thread exits promptly
-            // and retains no OS handles.
+            // and retains no OS handles. In debug builds, the assertion
+            // above will catch this.
         }
     }
 }

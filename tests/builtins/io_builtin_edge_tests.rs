@@ -806,3 +806,77 @@ fn reset_does_not_block_on_worker_teardown() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+/// Sequential IO operations stress test: 100+ open/write/close cycles
+/// without reset, verifying that worker resources are properly retired
+/// and no slot exhaustion occurs.
+#[test]
+fn sequential_io_worker_retirement_stress() {
+    let path = unique_temp_path("retirement-stress");
+    const COUNT: usize = 100;
+
+    for i in 0..COUNT {
+        let result = run_source(&format!(
+            r#"
+            let h = io::open("{path}", "w");
+            io::write(h, "hello");
+            io::flush(h);
+            io::close(h);
+            "#,
+            path = path.display()
+        ));
+        assert!(result.is_ok(), "iteration {i}/{COUNT} failed: {result:?}");
+    }
+
+    // Verify the file was written correctly (last write persists).
+    let content = std::fs::read_to_string(&path).expect("file should exist");
+    assert_eq!(content, "hello");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Sequential IO exists stress test: 100+ exists calls without reset,
+/// verifying no worker resource slot exhaustion.
+#[test]
+fn sequential_io_exists_worker_retirement_stress() {
+    let path = unique_temp_path("exists-stress");
+    std::fs::write(&path, "test").expect("fixture should be written");
+
+    for i in 0..100 {
+        let result = run_source(&format!(
+            r#"
+            io::exists("{path}");
+            "#,
+            path = path.display()
+        ));
+        assert!(result.is_ok(), "iteration {i}/100 failed: {result:?}");
+        if let Ok(stack) = result {
+            assert_eq!(stack.last(), Some(&Value::Bool(true)));
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Sequential IO read stress test: 100+ read_all calls on the same file
+/// (reopened each time), verifying no worker resource slot exhaustion.
+#[test]
+fn sequential_io_read_worker_retirement_stress() {
+    let path = unique_temp_path("read-stress");
+    std::fs::write(&path, "sequential-read-data").expect("fixture should be written");
+
+    for i in 0..100 {
+        let result = run_source(&format!(
+            r#"
+            let h = io::open("{path}", "r");
+            let content = io::read_all(h);
+            io::close(h);
+            content;
+            "#,
+            path = path.display()
+        ));
+        assert!(result.is_ok(), "iteration {i}/100 failed: {result:?}");
+        if let Ok(stack) = result {
+            assert_eq!(stack.last(), Some(&Value::string("sequential-read-data")));
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
