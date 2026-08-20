@@ -145,11 +145,45 @@ impl HostOperation for CloseCompletionOperation {
     }
 }
 
+/// A shared transfer guard that holds a pipe handle that can be taken by
+/// the worker thread or restored to the resource if the worker is cancelled
+/// before starting. This prevents the OS descriptor leak described in
+/// FINDING 1: the pipe handle is NOT taken from the resource until the
+/// worker is actually about to start work. If cancellation fires before
+/// the worker takes the handle, the PendingOpResult restores it.
+pub(crate) struct PipeTransferGuard<T> {
+    inner: Arc<Mutex<Option<T>>>,
+    key: String,
+}
+
+impl<T: Send + 'static> PipeTransferGuard<T> {
+    pub(crate) fn new(pipe: T, key: impl Into<String>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Some(pipe))),
+            key: key.into(),
+        }
+    }
+
+    /// Take the pipe handle from the guard. Returns `None` if it was already
+    /// taken (should not happen in correct usage).
+    pub(crate) fn take(&self) -> Option<T> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// Whether the pipe handle is still available (not yet taken by the worker).
+    pub(crate) fn is_available(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+}
+
 /// A one-shot operation that completes on the first poll.
-///
-/// Used for operations that finished synchronously but still need to go
-/// through the `HostOperation` lifecycle (e.g. for registered pending
-/// operations in the execution scope).
 pub(crate) struct ReadyOperation;
 
 impl HostOperation for ReadyOperation {
@@ -170,6 +204,14 @@ pub(crate) type ThreadedWorkerSignal = Result<(), String>;
 
 /// Shared state between a [`ThreadedOperation`] and its corresponding
 /// [`IoWorkerResource`]. Both reference the same `Arc<SharedWorkerState>`.
+///
+/// The waker protocol uses a two-lock check-register-double-check pattern:
+/// 1. `poll` checks the result under the result lock — if available, returns
+///    `Ready` (completion-before-poll race).
+/// 2. If no result yet, `poll` stores `cx.waker()` under the waker lock.
+/// 3. `poll` re-checks the result (completion-between-check-and-register race).
+/// 4. Worker calls `publish_result` which stores the result, then takes and
+///    wakes the waker under the waker lock.
 pub(crate) struct SharedWorkerState {
     /// Cancellation flag — set by either operation cancel or resource close.
     pub(crate) cancelled: AtomicBool,
@@ -177,6 +219,10 @@ pub(crate) struct SharedWorkerState {
     pub(crate) result: Mutex<Option<ThreadedWorkerSignal>>,
     /// Terminal error from the worker (beyond the signal — e.g. panic).
     pub(crate) terminal_error: Mutex<Option<String>>,
+    /// Waker registered by `ThreadedOperation::poll` when returning `Pending`.
+    /// Stored under a separate lock so the worker can take-and-call after
+    /// publishing the result without holding the result lock.
+    waker: Mutex<Option<Waker>>,
 }
 
 impl SharedWorkerState {
@@ -185,7 +231,23 @@ impl SharedWorkerState {
             cancelled: AtomicBool::new(false),
             result: Mutex::new(None),
             terminal_error: Mutex::new(None),
+            waker: Mutex::new(None),
         }
+    }
+
+    /// Publish the terminal result and wake any registered waker.
+    /// Called by the worker thread when it finishes.
+    pub(crate) fn publish_result(&self, signal: ThreadedWorkerSignal) {
+        *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(signal);
+        // Take and call the waker (if any) so the executor re-polls.
+        if let Some(waker) = self.waker.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            waker.wake();
+        }
+    }
+
+    /// Register or replace the waker. Called by `ThreadedOperation::poll`.
+    pub(crate) fn register_waker(&self, waker: &Waker) {
+        *self.waker.lock().unwrap_or_else(|e| e.into_inner()) = Some(waker.clone());
     }
 }
 
@@ -293,7 +355,7 @@ impl ThreadedOperation {
 }
 
 impl HostOperation for ThreadedOperation {
-    fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
         // Check if cancelled.
         if self.state.cancelled.load(Ordering::SeqCst) {
             return Poll::Ready(Err(OperationError::new(
@@ -302,18 +364,37 @@ impl HostOperation for ThreadedOperation {
                 format!("operation '{}' was cancelled", self.name),
             )));
         }
+        // Check-1: terminal result available? (completion-before-poll race)
+        {
+            let result = self.state.result.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(signal) = result.as_ref() {
+                return match signal {
+                    Ok(()) => {
+                        self.receiver.take();
+                        Poll::Ready(Ok(()))
+                    }
+                    Err(msg) => {
+                        self.receiver.take();
+                        Poll::Ready(Err(OperationError::new(
+                            OperationErrorCode::OperationDriverFailed,
+                            "io::operation",
+                            msg.clone(),
+                        )))
+                    }
+                };
+            }
+        }
+        // No result yet — check channel for disconnected/panic.
         let receiver = match self.receiver.as_ref() {
             Some(r) => r,
             None => return Poll::Ready(Ok(())),
         };
         match receiver.try_recv() {
             Ok(Ok(())) => {
-                // Worker completed successfully.
                 self.receiver.take();
                 Poll::Ready(Ok(()))
             }
             Ok(Err(msg)) => {
-                // Worker reported an error.
                 self.receiver.take();
                 Poll::Ready(Err(OperationError::new(
                     OperationErrorCode::OperationDriverFailed,
@@ -321,7 +402,30 @@ impl HostOperation for ThreadedOperation {
                     msg,
                 )))
             }
-            Err(mpsc::TryRecvError::Empty) => Poll::Pending,
+            Err(mpsc::TryRecvError::Empty) => {
+                // Register the waker so the worker can wake us.
+                self.state.register_waker(cx.waker());
+                // Double-check: the worker might have completed between our
+                // check-1 / try_recv and the waker registration.
+                let result = self.state.result.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(signal) = result.as_ref() {
+                    return match signal {
+                        Ok(()) => {
+                            self.receiver.take();
+                            Poll::Ready(Ok(()))
+                        }
+                        Err(msg) => {
+                            self.receiver.take();
+                            Poll::Ready(Err(OperationError::new(
+                                OperationErrorCode::OperationDriverFailed,
+                                "io::operation",
+                                msg.clone(),
+                            )))
+                        }
+                    };
+                }
+                Poll::Pending
+            }
             Err(mpsc::TryRecvError::Disconnected) => {
                 // Worker thread panicked or exited without sending a result.
                 self.receiver.take();
@@ -342,18 +446,6 @@ impl HostOperation for ThreadedOperation {
         let _ = reason;
         Ok(())
     }
-}
-
-/// A typed cancellation reason for blocking IO operations.
-/// Carries the reason for cancellation so the close-coordination layer
-/// can determine what to do (e.g. kill the process for a pipe read).
-pub(crate) enum IoCancelReason {
-    /// Operation was cancelled by the VM (e.g. reset).
-    OperationCancelled,
-    /// Resource was closed.
-    ResourceClosed,
-    /// VM is being reset.
-    VmReset,
 }
 
 #[cfg(test)]

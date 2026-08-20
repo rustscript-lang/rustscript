@@ -500,6 +500,7 @@ pub(crate) fn builtin_io_open(
                 Ok(file) => {
                     *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(file));
                     let _ = tx.send(Ok(()));
+            state.publish_result(Ok(()));
                 }
                 Err(err) => {
                     let _ = tx.send(Err(format!("io_open failed: {err}")));
@@ -580,6 +581,7 @@ pub(crate) fn builtin_io_popen(
                 Ok(child) => {
                     *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(child));
                     let _ = tx.send(Ok(()));
+            state.publish_result(Ok(()));
                 }
                 Err(err) => {
                     let _ = tx.send(Err(format!("io_popen failed: {err}")));
@@ -662,6 +664,13 @@ pub(crate) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<HostC
     let (operation, tx, state) = ThreadedOperation::prepare("io::read_all");
 
     let (cloned_file, taken_pipe) = take_file_or_pipe_handle(vm, handle)?;
+    // Shared pipe guard: the worker takes the pipe handle from this guard
+    // when it starts work. If the worker is cancelled before taking, the
+    // PendingOpResult restores the pipe handle to the resource.
+    let pipe_guard: Arc<Mutex<Option<std::process::ChildStdout>>> =
+        Arc::new(Mutex::new(taken_pipe));
+    let pipe_guard_worker = pipe_guard.clone();
+    let pipe_guard_provider = pipe_guard.clone();
     let raw_state = state.clone();
 
     let worker = ThreadedOperation::spawn_worker(
@@ -678,7 +687,9 @@ pub(crate) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<HostC
                 let r = read_to_string_with_limit(&mut file, max_read_bytes, &mut out);
                 drop(file); // close before signalling
                 r.map(|_| out)
-            } else if let Some(mut pipe) = taken_pipe {
+            } else if let Some(mut pipe) =
+                pipe_guard_worker.lock().unwrap_or_else(|e| e.into_inner()).take()
+            {
                 let mut out = String::new();
                 let r = read_to_string_with_limit(&mut pipe, max_read_bytes, &mut out);
                 drop(pipe);
@@ -692,6 +703,7 @@ pub(crate) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<HostC
                 Ok(text) => {
                     *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(text));
                     let _ = tx.send(Ok(()));
+            state.publish_result(Ok(()));
                 }
                 Err(err) => {
                     // Extract the inner message from VmError::HostError
@@ -701,6 +713,7 @@ pub(crate) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<HostC
                     };
                     *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(Err(msg));
                     let _ = tx.send(Ok(()));
+            state.publish_result(Ok(()));
                 }
             }
         },
@@ -709,9 +722,25 @@ pub(crate) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<HostC
     let raw = register_operation_with_worker(vm, operation, worker, Some(handle))?;
 
     let shared_provider = shared.clone();
+    let pipe_guard_provider = pipe_guard.clone();
     vm.host.register_pending_op_result(
         raw,
-        Box::new(move |_vm| {
+        Box::new(move |vm: &mut Vm| {
+            // Restore pipe handle if the worker didn't take it (cancellation
+            // before start). The pipe handle is still in the guard and must
+            // be returned to the resource so it's not lost.
+            if let Some(pipe) = pipe_guard_provider
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                let mut ctx = vm.host_context();
+                if let Ok(token) = ctx.typed_resource::<IoPipeResource>(handle) {
+                    if let Ok(mut resource) = ctx.resource_mut(&token) {
+                        resource.get().restore_reader(pipe);
+                    }
+                }
+            }
             match shared_provider
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -750,6 +779,12 @@ pub(crate) fn builtin_io_read_line(
     let (operation, tx, state) = ThreadedOperation::prepare("io::read_line");
 
     let (cloned_file, taken_pipe) = take_file_or_pipe_handle(vm, handle)?;
+    // Shared pipe guard: protects the pipe handle from being dropped on
+    // cancellation before the worker starts.
+    let pipe_guard: Arc<Mutex<Option<std::process::ChildStdout>>> =
+        Arc::new(Mutex::new(taken_pipe));
+    let pipe_guard_worker = pipe_guard.clone();
+    let pipe_guard_provider = pipe_guard.clone();
     let raw_state = state.clone();
 
     let worker = ThreadedOperation::spawn_worker(
@@ -758,6 +793,13 @@ pub(crate) fn builtin_io_read_line(
         tx,
         move |state, tx: Sender<ThreadedWorkerSignal>| {
             if state.cancelled.load(Ordering::SeqCst) {
+                // Return the pipe handle through pipe_shared so PendingOpResult
+                // can restore it — cancellation before worker start.
+                if let Some(pipe) =
+                    pipe_guard_worker.lock().unwrap_or_else(|e| e.into_inner()).take()
+                {
+                    *pipe_shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
+                }
                 let _ = tx.send(Err(
                     "io::read_line was cancelled before starting".to_string()
                 ));
@@ -766,7 +808,9 @@ pub(crate) fn builtin_io_read_line(
             let result = if let Some(mut file) = cloned_file {
                 let r = read_line_from_reader(&mut file, max_read_bytes);
                 r
-            } else if let Some(mut pipe) = taken_pipe {
+            } else if let Some(mut pipe) =
+                pipe_guard_worker.lock().unwrap_or_else(|e| e.into_inner()).take()
+            {
                 let r = read_line_from_reader(&mut pipe, max_read_bytes);
                 // Return the pipe handle for subsequent reads
                 *pipe_shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
@@ -780,6 +824,7 @@ pub(crate) fn builtin_io_read_line(
                 Ok(text) => {
                     *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(text));
                     let _ = tx.send(Ok(()));
+            state.publish_result(Ok(()));
                 }
                 Err(err) => {
                     // Extract the inner message from VmError::HostError
@@ -789,6 +834,7 @@ pub(crate) fn builtin_io_read_line(
                     };
                     *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(Err(msg));
                     let _ = tx.send(Ok(()));
+            state.publish_result(Ok(()));
                 }
             }
         },
@@ -888,10 +934,12 @@ pub(crate) fn builtin_io_write(
                 Ok(written) => {
                     *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(written));
                     let _ = tx.send(Ok(()));
+            state.publish_result(Ok(()));
                 }
                 Err(err) => {
                     *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(Err(err));
                     let _ = tx.send(Ok(()));
+            state.publish_result(Ok(()));
                 }
             }
         },
@@ -1006,10 +1054,12 @@ pub(crate) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<HostCall
                 Ok(()) => {
                     *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(()));
                     let _ = tx.send(Ok(()));
+            state.publish_result(Ok(()));
                 }
                 Err(err) => {
                     *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(Err(err));
                     let _ = tx.send(Ok(()));
+            state.publish_result(Ok(()));
                 }
             }
         },
@@ -1219,6 +1269,7 @@ pub(crate) fn builtin_io_exists(vm: &mut Vm, path: &str) -> VmResult<HostCallRes
             let found = path_buf.exists();
             *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(found));
             let _ = tx.send(Ok(()));
+            state.publish_result(Ok(()));
         },
     );
 

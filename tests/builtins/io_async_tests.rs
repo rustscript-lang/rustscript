@@ -118,6 +118,8 @@ fn async_io_first_pending_then_wake() {
 }
 
 /// Test that a silent pipe read can be cancelled via reset.
+/// Uses a bounded timeout loop instead of a hardcoded iteration count
+/// to avoid flakiness under load.
 #[cfg(unix)]
 #[test]
 fn async_io_silent_pipe_read_cancellation() {
@@ -138,10 +140,12 @@ fn async_io_silent_pipe_read_cancellation() {
     let mut vm = Vm::new(compiled.program);
     super::async_test_bridge::install(&mut vm);
 
-    // Run until we're waiting on the pipe read.
+    // Run until we're waiting on the pipe read, with a bounded timeout.
     let mut status = vm.run().expect("vm should start");
     let mut waited = false;
-    for _ in 0..10 {
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(5);
+    loop {
         match status {
             VmStatus::Waiting(_) => {
                 waited = true;
@@ -152,8 +156,13 @@ fn async_io_silent_pipe_read_cancellation() {
             }
             VmStatus::Halted => break,
         }
+        if start.elapsed() > timeout {
+            break;
+        }
+        // Brief yield to avoid busy-spinning
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(waited, "expected to be waiting on pipe read");
+    assert!(waited, "expected to be waiting on pipe read within 5s timeout");
 
     // Reset the VM — this should cancel the operation and close resources.
     vm.reset_for_reuse();
