@@ -19,7 +19,7 @@ pub(super) type VmArrayHandle = SharedArray;
 #[allow(dead_code)]
 pub(super) type VmBytesHandle = SharedBytes;
 #[allow(dead_code)]
-pub(super) type VmMapHandle = SharedMap;
+pub(crate) type VmMapHandle = SharedMap;
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]

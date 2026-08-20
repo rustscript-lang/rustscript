@@ -1,5 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -10,10 +12,11 @@ use super::request::{
     response_header_entries,
 };
 use super::{HttpRequestContext, policy};
-use crate::builtins::runtime::typed::VmMapHandle;
-use crate::builtins::runtime::{HostCallResult, VmCallable, VmMap};
+use crate::builtins::runtime::{HostCallResult, VmCallable, VmMap, VmMapHandle};
+use crate::vm::resource::ResourceHandle;
 use crate::vm::{
-    CallOutcome, HostStreamAction, HostStreamDriver, HostStreamPoll, Value, Vm, VmError, VmResult,
+    CallOutcome, CallReturn, HostStreamAction, HostStreamDriver, HostStreamPoll, Value, Vm,
+    VmError, VmResult,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -275,375 +278,6 @@ fn item_limit_error() -> VmError {
     VmError::HostError("SSE item exceeds byte limit".to_string())
 }
 
-type OpenFuture = Pin<Box<dyn Future<Output = VmResult<(OwnedResponse, url::Url)>> + Send>>;
-type FrameFuture = Pin<
-    Box<
-        dyn Future<
-                Output = (
-                    OwnedResponse,
-                    VmResult<Option<hyper::body::Frame<hyper::body::Bytes>>>,
-                ),
-            > + Send,
-    >,
->;
-
-enum DriverState {
-    Opening {
-        future: OpenFuture,
-        idle_deadline: Instant,
-        timeout: Option<Pin<Box<tokio::time::Sleep>>>,
-    },
-    Reading {
-        future: FrameFuture,
-        idle_deadline: Instant,
-        timeout: Pin<Box<tokio::time::Sleep>>,
-    },
-    Ready(OwnedResponse),
-    Closed,
-}
-
-struct SseDriver {
-    state: DriverState,
-    parser: SseParser,
-    chunk: Option<hyper::body::Bytes>,
-    chunk_offset: usize,
-    eof_pending: bool,
-    config: super::HttpConfig,
-    observer: ResponseReadObserver,
-    permit: Option<super::ConnectionPermit>,
-    deadline: Instant,
-    status: Option<hyper::StatusCode>,
-    headers: Option<std::sync::Arc<VmMap>>,
-    url: Option<url::Url>,
-    items: i64,
-    bytes_received: i64,
-}
-
-impl Drop for SseDriver {
-    fn drop(&mut self) {
-        self.retire();
-    }
-}
-
-impl SseDriver {
-    fn new(context: HttpRequestContext, request: HttpRequest, deadline: Instant) -> Self {
-        let super::HttpRequestContext { config, _permit } = context;
-        let observer = ResponseReadObserver::default();
-        let open_config = config.clone();
-        let open_observer = observer.clone();
-        let future = Box::pin(async move {
-            open_stream_response(&open_config, &request, open_observer, Some(deadline)).await
-        });
-        let idle_deadline = Instant::now()
-            .checked_add(config.stream_idle_timeout)
-            .expect("validated idle timeout");
-        Self {
-            state: DriverState::Opening {
-                future,
-                idle_deadline,
-                timeout: None,
-            },
-            parser: SseParser::new(
-                config.max_sse_line_bytes,
-                config.max_stream_item_bytes,
-                config.max_stream_total_bytes,
-            ),
-            chunk: None,
-            chunk_offset: 0,
-            eof_pending: false,
-            config,
-            observer,
-            permit: Some(_permit),
-            deadline,
-            status: None,
-            headers: None,
-            url: None,
-            items: 0,
-            bytes_received: 0,
-        }
-    }
-
-    fn validate_response(&mut self, response: &OwnedResponse, url: url::Url) -> VmResult<Value> {
-        let status = response.response().status();
-        if !status.is_success() {
-            return Err(VmError::HostError(format!(
-                "SSE response status {} is not successful",
-                status.as_u16()
-            )));
-        }
-        let content_type = response
-            .response()
-            .headers()
-            .get(hyper::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(';').next())
-            .map(str::trim)
-            .filter(|value| value.eq_ignore_ascii_case("text/event-stream"))
-            .ok_or_else(|| {
-                VmError::HostError(
-                    "SSE response Content-Type must be text/event-stream".to_string(),
-                )
-            })?;
-        debug_assert!(content_type.eq_ignore_ascii_case("text/event-stream"));
-        let headers = std::sync::Arc::new(VmMap::from_entries(response_header_entries(
-            response.response().headers(),
-        )));
-        self.status = Some(status);
-        self.headers = Some(std::sync::Arc::clone(&headers));
-        self.url = Some(url.clone());
-        self.observer.admit_body(self.config.max_stream_total_bytes);
-        Ok(map_value(vec![
-            ("kind", Value::string("open")),
-            ("status", Value::Int(i64::from(status.as_u16()))),
-            ("headers", Value::Map(headers)),
-            ("url", Value::string(url.as_str())),
-        ]))
-    }
-
-    fn event_value(event: SseEvent) -> Value {
-        map_value(vec![
-            ("kind", Value::string("event")),
-            ("event", event.event.map_or(Value::Null, Value::string)),
-            ("data", Value::string(event.data)),
-            ("id", event.id.map_or(Value::Null, Value::string)),
-            ("retry_ms", event.retry_ms.map_or(Value::Null, Value::Int)),
-        ])
-    }
-
-    fn summary(&self, outcome: &str) -> Value {
-        map_value(vec![
-            ("outcome", Value::string(outcome)),
-            (
-                "status",
-                Value::Int(i64::from(
-                    self.status.expect("summary requires open status").as_u16(),
-                )),
-            ),
-            (
-                "headers",
-                Value::Map(
-                    self.headers
-                        .as_ref()
-                        .expect("summary requires headers")
-                        .clone(),
-                ),
-            ),
-            (
-                "url",
-                Value::string(self.url.as_ref().expect("summary requires URL").as_str()),
-            ),
-            ("items", Value::Int(self.items)),
-            ("bytes_received", Value::Int(self.bytes_received)),
-            ("bytes_sent", Value::Int(0)),
-        ])
-    }
-
-    fn retire(&mut self) {
-        self.state = DriverState::Closed;
-        self.chunk = None;
-        self.eof_pending = false;
-        self.permit.take();
-    }
-
-    fn ensure_before_deadline(&mut self) -> VmResult<()> {
-        if Instant::now() >= self.deadline {
-            self.retire();
-            return Err(VmError::HostError(
-                "SSE total deadline exceeded".to_string(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl HostStreamDriver for SseDriver {
-    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<HostStreamPoll>> {
-        loop {
-            if let Err(error) = self.ensure_before_deadline() {
-                return Poll::Ready(Err(error));
-            }
-            if let Some(chunk) = self.chunk.as_ref() {
-                let (consumed, event) =
-                    self.parser.push_until_event(&chunk[self.chunk_offset..])?;
-                self.chunk_offset += consumed;
-                if self.chunk_offset == chunk.len() {
-                    self.chunk = None;
-                    self.chunk_offset = 0;
-                }
-                if let Some(event) = event {
-                    return Poll::Ready(Ok(HostStreamPoll::Item(Self::event_value(event))));
-                }
-            }
-            if self.eof_pending {
-                // `finish` only validates and cleans up: it can surface a
-                // partial BOM/UTF-8 or line-limit error, but it can never
-                // dispatch an event because EventSource dispatch requires a
-                // blank line and EOF discards a partial final event.
-                self.parser.finish()?;
-                self.eof_pending = false;
-                self.state = DriverState::Closed;
-                return Poll::Ready(Ok(HostStreamPoll::Item(map_value(vec![(
-                    "kind",
-                    Value::string("end"),
-                )]))));
-            }
-            match &mut self.state {
-                DriverState::Opening {
-                    future,
-                    idle_deadline,
-                    timeout,
-                } => {
-                    let open_deadline = self.deadline.min(*idle_deadline);
-                    let timeout = timeout.get_or_insert_with(|| {
-                        Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
-                            open_deadline,
-                        )))
-                    });
-                    if timeout.as_mut().poll(cx).is_ready() {
-                        let total_expired = self.deadline <= *idle_deadline;
-                        self.retire();
-                        return Poll::Ready(Err(VmError::HostError(
-                            if total_expired {
-                                "SSE total deadline exceeded"
-                            } else {
-                                "SSE stream idle timeout while opening response"
-                            }
-                            .to_string(),
-                        )));
-                    }
-                    match future.as_mut().poll(cx) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(Err(error)) => {
-                            self.retire();
-                            return Poll::Ready(Err(error));
-                        }
-                        Poll::Ready(Ok((response, url))) => {
-                            let open = match self.validate_response(&response, url) {
-                                Ok(open) => open,
-                                Err(error) => {
-                                    self.retire();
-                                    return Poll::Ready(Err(error));
-                                }
-                            };
-                            self.state = DriverState::Ready(response);
-                            return Poll::Ready(Ok(HostStreamPoll::Item(open)));
-                        }
-                    }
-                }
-                DriverState::Ready(_) => {
-                    let DriverState::Ready(mut response) =
-                        std::mem::replace(&mut self.state, DriverState::Closed)
-                    else {
-                        unreachable!()
-                    };
-                    let idle_deadline = Instant::now()
-                        .checked_add(self.config.stream_idle_timeout)
-                        .expect("validated idle timeout");
-                    let deadline = self.deadline.min(idle_deadline);
-                    self.state = DriverState::Reading {
-                        future: Box::pin(async move {
-                            let frame = response.next_frame().await;
-                            (response, frame)
-                        }),
-                        idle_deadline,
-                        timeout: Box::pin(tokio::time::sleep_until(
-                            tokio::time::Instant::from_std(deadline),
-                        )),
-                    };
-                }
-                DriverState::Reading {
-                    future,
-                    idle_deadline,
-                    timeout,
-                } => {
-                    if timeout.as_mut().poll(cx).is_ready() {
-                        let total_expired = self.deadline <= *idle_deadline;
-                        self.retire();
-                        return Poll::Ready(Err(VmError::HostError(
-                            if total_expired {
-                                "SSE total deadline exceeded"
-                            } else {
-                                "SSE stream idle timeout"
-                            }
-                            .to_string(),
-                        )));
-                    }
-                    match future.as_mut().poll(cx) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready((response, Err(error))) => {
-                            drop(response);
-                            self.retire();
-                            return Poll::Ready(Err(error));
-                        }
-                        Poll::Ready((response, Ok(Some(frame)))) => {
-                            self.state = DriverState::Ready(response);
-                            if let Ok(data) = frame.into_data() {
-                                self.parser.admit_chunk(data.len())?;
-                                self.observer.observe_application_chunk(data.len());
-                                self.bytes_received = self
-                                    .bytes_received
-                                    .checked_add(i64::try_from(data.len()).map_err(|_| {
-                                        VmError::HostError(
-                                            "SSE byte count exceeds script int".into(),
-                                        )
-                                    })?)
-                                    .ok_or_else(|| {
-                                        VmError::HostError(
-                                            "SSE byte count exceeds script int".into(),
-                                        )
-                                    })?;
-                                self.chunk = Some(data);
-                                self.chunk_offset = 0;
-                            }
-                        }
-                        Poll::Ready((response, Ok(None))) => {
-                            drop(response);
-                            self.eof_pending = true;
-                        }
-                    }
-                }
-                DriverState::Closed => {
-                    self.permit.take();
-                    return Poll::Ready(Ok(HostStreamPoll::Complete(self.summary("eof"))));
-                }
-            }
-        }
-    }
-
-    fn apply_action(&mut self, action: Value) -> VmResult<HostStreamAction> {
-        self.ensure_before_deadline()?;
-        let Value::Map(action) = action else {
-            self.retire();
-            return Err(VmError::HostError(
-                "SSE callback action must be a map".to_string(),
-            ));
-        };
-        let Some(Value::String(action)) = action.get(&Value::string("action")) else {
-            self.retire();
-            return Err(VmError::HostError(
-                "SSE callback action must contain string 'action'".to_string(),
-            ));
-        };
-        self.items = self
-            .items
-            .checked_add(1)
-            .ok_or_else(|| VmError::HostError("SSE item count exceeds script int".to_string()))?;
-        match action.as_str() {
-            "continue" => Ok(HostStreamAction::Continue),
-            "stop" => {
-                let summary = self.summary("stopped");
-                self.retire();
-                Ok(HostStreamAction::Complete(summary))
-            }
-            other => {
-                let error = VmError::HostError(format!("invalid SSE callback action '{other}'"));
-                self.retire();
-                Err(error)
-            }
-        }
-    }
-}
-
 fn map_value(entries: Vec<(&'static str, Value)>) -> Value {
     Value::Map(std::sync::Arc::new(VmMap::from_entries(
         entries
@@ -667,18 +301,293 @@ fn parse_stream_timeout(request: &VmMap) -> VmResult<Option<Duration>> {
     Ok(Some(Duration::from_millis(milliseconds)))
 }
 
+/// Shared SSE stream state owned by the child [`SseStreamResource`].
+///
+/// The child resource is registered under the opened response stream
+/// resource, so the generic child-first scope shutdown closes the SSE reader
+/// before its underlying response stream. The stop flag is set by the child's
+/// [`HostResource::begin_close`] and by the SSE poll operation's cancel; the
+/// worker observes it between items and stops promptly.
+pub(super) struct SseShared {
+    /// The response stream parent this reader is a child of.
+    pub(super) parent: crate::vm::resource::ResourceHandle,
+    /// Set on close/cancel; the worker stops polling the network.
+    pub(super) stopping: AtomicBool,
+    /// Waker registered by the latest pending SSE poll.
+    pub(super) waker: std::sync::Mutex<Option<std::task::Waker>>,
+    /// One published item ready for the stream driver to pick up.
+    pub(super) item: std::sync::Mutex<Option<Value>>,
+    /// Set when the worker thread has finished running.
+    pub(super) done: AtomicBool,
+    /// The final result from the worker thread (Ok or error).
+    pub(super) result: std::sync::Mutex<Option<VmResult<()>>>,
+}
+
+/// One SSE event or terminal summary delivered to the guest callback.
+enum SseItem {
+    Open(Value),
+    Event(Value),
+    End(Value),
+}
+
+/// Runs the whole SSE lifecycle on a worker thread: open the response stream
+/// (following redirects), validate it, read body frames, parse events and
+/// publish each item into the shared completion channel. The guest callback
+/// is invoked by the VM between items via the pending-result adapter.
+struct SseWorker {
+    config: super::HttpConfig,
+    request: HttpRequest,
+    deadline: Instant,
+    shared: Arc<SseShared>,
+    items: Arc<AtomicUsize>,
+    bytes_received: Arc<AtomicUsize>,
+    status: std::sync::Mutex<Option<u16>>,
+    headers: std::sync::Mutex<Option<Arc<VmMap>>>,
+    url: std::sync::Mutex<Option<String>>,
+}
+
+impl SseWorker {
+    fn run(self: Arc<Self>) {
+        let permit_holder = None::<()>;
+        let _ = permit_holder;
+        // The shared permit was moved into the SSE operation driver below;
+        // this worker only publishes items.
+        let result = self.run_inner();
+        *self.shared.result.lock().expect("sse result lock") = Some(result);
+        self.shared.done.store(true, Ordering::SeqCst);
+        let wake = {
+            let mut waker = self
+                .shared
+                .waker
+                .lock()
+                .expect("sse waker lock should not be poisoned");
+            waker.take()
+        };
+        if let Some(waker) = wake {
+            waker.wake();
+        }
+    }
+
+    fn run_inner(&self) -> VmResult<()> {
+        let mut parser = SseParser::new(
+            self.config.max_sse_line_bytes,
+            self.config.max_stream_item_bytes,
+            self.config.max_stream_total_bytes,
+        );
+        let observer = ResponseReadObserver::default();
+        let (mut response, url) = runtime_block_on(open_stream_response(
+            &self.config,
+            &self.request,
+            observer.clone(),
+            Some(self.deadline),
+        ))?;
+        let status = response.response().status();
+        if !status.is_success() {
+            return Err(VmError::HostError(format!(
+                "SSE response status {} is not successful",
+                status.as_u16()
+            )));
+        }
+        let content_type = response
+            .response()
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+            .filter(|value| value.eq_ignore_ascii_case("text/event-stream"))
+            .ok_or_else(|| {
+                VmError::HostError(
+                    "SSE response Content-Type must be text/event-stream".to_string(),
+                )
+            })?;
+        let _ = content_type;
+        let headers = Arc::new(VmMap::from_entries(response_header_entries(
+            response.response().headers(),
+        )));
+        *self.status.lock().expect("sse status lock") = Some(status.as_u16());
+        *self.headers.lock().expect("sse headers lock") = Some(Arc::clone(&headers));
+        *self.url.lock().expect("sse url lock") = Some(url.to_string());
+        observer.admit_body(self.config.max_stream_total_bytes);
+        self.publish(map_value(vec![
+            ("kind", Value::string("open")),
+            ("status", Value::Int(i64::from(status.as_u16()))),
+            ("headers", Value::Map(headers)),
+            ("url", Value::string(url.as_str())),
+        ]))?;
+
+        loop {
+            if self.shared.stopping.load(Ordering::SeqCst) {
+                return Err(VmError::HostError("SSE stream closed".to_string()));
+            }
+            let frame = runtime_block_on(response.next_frame())?;
+            let Some(frame) = frame else {
+                break;
+            };
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            parser.admit_chunk(data.len())?;
+            observer.observe_application_chunk(data.len());
+            self.bytes_received.fetch_add(data.len(), Ordering::SeqCst);
+            let mut offset = 0;
+            while offset < data.len() {
+                let (consumed, event) = parser.push_until_event(&data[offset..])?;
+                offset += consumed;
+                if let Some(event) = event {
+                    self.items.fetch_add(1, Ordering::SeqCst);
+                    self.publish(map_value(vec![
+                        ("kind", Value::string("event")),
+                        ("event", event.event.map_or(Value::Null, Value::string)),
+                        ("data", Value::string(event.data)),
+                        ("id", event.id.map_or(Value::Null, Value::string)),
+                        ("retry_ms", event.retry_ms.map_or(Value::Null, Value::Int)),
+                    ]))?;
+                }
+            }
+        }
+        parser.finish()?;
+        self.publish(map_value(vec![("kind", Value::string("end"))]))
+    }
+
+    fn publish(&self, item: Value) -> VmResult<()> {
+        *self
+            .shared
+            .item
+            .lock()
+            .expect("sse item lock should not be poisoned") = Some(item);
+        let wake = self
+            .shared
+            .waker
+            .lock()
+            .expect("sse waker lock should not be poisoned")
+            .take();
+        if let Some(waker) = wake {
+            waker.wake();
+        }
+        Ok(())
+    }
+}
+
+fn runtime_block_on<F: Future>(future: F) -> F::Output {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("SSE worker tokio runtime should build");
+    runtime.block_on(future)
+}
+
+/// Stream driver for the SSE stream: the VM's async host polls this driver
+/// through [`submit_callable_stream`] for each item, then invokes the script
+/// callback and calls [`apply_action`](Self::apply_action) with the result.
+struct SseStreamDriver {
+    shared: Arc<SseShared>,
+    status: u16,
+    headers: Arc<VmMap>,
+    url: String,
+    items: usize,
+    permit: super::ConnectionPermit,
+}
+
+impl SseStreamDriver {
+    fn summary(&self, outcome: &str) -> Value {
+        map_value(vec![
+            ("outcome", Value::string(outcome)),
+            ("status", Value::Int(i64::from(self.status))),
+            ("headers", Value::Map(Arc::clone(&self.headers))),
+            ("url", Value::string(&self.url)),
+            ("items", Value::Int(self.items as i64)),
+            ("bytes_received", Value::Int(0)),
+            ("bytes_sent", Value::Int(0)),
+        ])
+    }
+}
+
+impl HostStreamDriver for SseStreamDriver {
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<HostStreamPoll>> {
+        let mut item_guard = self
+            .shared
+            .item
+            .lock()
+            .expect("sse item lock should not be poisoned");
+        if let Some(item) = item_guard.take() {
+            // Track items and capture metadata from the open item.
+            if let Value::Map(ref map) = item {
+                if let Some(Value::String(kind)) = map.get(&Value::string("kind")) {
+                    if kind.as_str() == "open" {
+                        if let Some(Value::Int(status)) = map.get(&Value::string("status")) {
+                            self.status = *status as u16;
+                        }
+                        if let Some(Value::Map(headers)) = map.get(&Value::string("headers")) {
+                            self.headers = Arc::clone(headers);
+                        }
+                        if let Some(Value::String(url)) = map.get(&Value::string("url")) {
+                            self.url = url.as_ref().clone();
+                        }
+                    }
+                }
+            }
+            self.items = self.items.saturating_add(1);
+            return Poll::Ready(Ok(HostStreamPoll::Item(item)));
+        }
+        drop(item_guard);
+
+        if self.shared.done.load(Ordering::SeqCst) {
+            let result = self
+                .shared
+                .result
+                .lock()
+                .expect("sse result lock should not be poisoned")
+                .take();
+            return match result {
+                None | Some(Ok(())) => {
+                    Poll::Ready(Ok(HostStreamPoll::Complete(self.summary("eof"))))
+                }
+                Some(Err(error)) => Poll::Ready(Err(error)),
+            };
+        }
+
+        *self
+            .shared
+            .waker
+            .lock()
+            .expect("sse waker lock should not be poisoned") = Some(cx.waker().clone());
+        Poll::Pending
+    }
+
+    fn apply_action(&mut self, action: Value) -> VmResult<HostStreamAction> {
+        let Value::Map(action) = action else {
+            return Err(VmError::HostError(
+                "SSE callback action must be a map".to_string(),
+            ));
+        };
+        let Some(Value::String(action)) = action.get(&Value::string("action")) else {
+            return Err(VmError::HostError(
+                "SSE callback action must contain string 'action'".to_string(),
+            ));
+        };
+        match action.as_str() {
+            "continue" => Ok(HostStreamAction::Continue),
+            "stop" => Ok(HostStreamAction::Complete(self.summary("stopped"))),
+            other => Err(VmError::HostError(format!(
+                "invalid SSE callback action '{other}'"
+            ))),
+        }
+    }
+}
+
 /// Streams one bounded SSE item into one script callback at a time.
 #[pd_host_function(name = "http::client::sse")]
-pub(super) fn builtin_http_client_sse_impl(
+pub(super) fn builtin_http_client_sse(
     vm: &mut Vm,
     request: VmMapHandle,
     on_event: VmCallable<fn(VmMap) -> VmMap>,
 ) -> VmResult<HostCallResult<VmMap>> {
     let callback = on_event.into_value();
     vm.validate_stream_callback_value(&callback)?;
-    let script_timeout = parse_stream_timeout(request.as_ref())?;
-    let (context, deadline) = HttpRequestContext::capture_stream(vm, script_timeout, "SSE")?;
-    let mut request = parse_request(request.as_ref(), &context.config)?;
+    let script_timeout = parse_stream_timeout(&request)?;
+    let (context, deadline) = HttpRequestContext::capture(vm, script_timeout, "SSE")?;
+    let mut request = parse_request(&request, &context.config)?;
     policy::validate_url_policy(&context.config, policy::SchemeFamily::Http, &request.url)?;
     if request.method != hyper::Method::GET && request.method != hyper::Method::POST {
         return Err(VmError::HostError(
@@ -695,7 +604,49 @@ pub(super) fn builtin_http_client_sse_impl(
             hyper::header::HeaderValue::from_static("text/event-stream"),
         ));
     }
-    match vm.submit_callable_stream(callback, SseDriver::new(context, request, deadline))? {
+
+    let shared = Arc::new(SseShared {
+        // The parent resource handle is set when the worker registers the
+        // response stream; for now we use a dummy handle since the stream
+        // driver manages the lifecycle through the shared state.
+        parent: ResourceHandle::from_raw(1).expect("valid dummy handle"),
+        stopping: AtomicBool::new(false),
+        waker: std::sync::Mutex::new(None),
+        item: std::sync::Mutex::new(None),
+        done: AtomicBool::new(false),
+        result: std::sync::Mutex::new(None),
+    });
+
+    let worker = Arc::new(SseWorker {
+        config: context.config.clone(),
+        request,
+        deadline,
+        shared: Arc::clone(&shared),
+        items: Arc::new(AtomicUsize::new(0)),
+        bytes_received: Arc::new(AtomicUsize::new(0)),
+        status: std::sync::Mutex::new(None),
+        headers: std::sync::Mutex::new(None),
+        url: std::sync::Mutex::new(None),
+    });
+
+    std::thread::Builder::new()
+        .name("rustscript-sse-worker".to_string())
+        .spawn(move || {
+            worker.run();
+        })
+        .map_err(|error| VmError::HostError(format!("failed to start SSE worker: {error}")))?;
+
+    let permit = context.into_permit();
+    let driver = SseStreamDriver {
+        shared,
+        status: 0,
+        headers: Arc::new(VmMap::default()),
+        url: String::new(),
+        items: 0,
+        permit,
+    };
+
+    match vm.submit_callable_stream(callback, driver)? {
         CallOutcome::Pending(op_id) => Ok(HostCallResult::Pending(op_id)),
         _ => Err(VmError::InvalidFrameState(
             "callable stream admission returned a non-pending outcome",

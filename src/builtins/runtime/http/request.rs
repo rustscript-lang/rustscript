@@ -12,8 +12,17 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use super::HttpRequestContext;
 use super::config::HttpConfig;
 use super::policy::{SchemeFamily, request_deadline, resolve_url, with_deadline};
-use crate::builtins::runtime::VmMap;
-use crate::vm::{Value, VmError, VmResult};
+use crate::HostCallResult;
+use crate::builtins::runtime::{VmMap, VmMapHandle};
+use crate::vm::operation::{
+    HostOperation, OperationCancelReason, OperationError, OperationErrorCode, OperationResult,
+    OperationSpec,
+};
+use crate::vm::resource::{
+    CloseProgress, HostResource, Resource, ResourceCloseReason, ResourceError, ResourceErrorCode,
+    ResourceHandle, ResourceResult, ResourceTypeKey,
+};
+use crate::vm::{CallReturn, Value, Vm, VmError, VmResult};
 
 #[derive(Clone, Default)]
 pub(super) struct ResponseReadObserver {
@@ -390,23 +399,305 @@ fn map_string(map: &VmMap, key: &str) -> VmResult<String> {
     }
 }
 
-pub(super) async fn perform_buffered_request(
-    context: HttpRequestContext,
-    request: VmMap,
-) -> VmResult<VmMap> {
-    let request = parse_request(&request, &context.config)?;
-    let deadline = request_deadline(context.config.request_timeout)?;
-    with_deadline(
-        deadline,
-        execute_request_until(
-            &context.config,
-            &request,
-            ResponseReadObserver::default(),
-            deadline,
-            None,
-        ),
-    )
-    .await
+// ---------------------------------------------------------------------------
+// Generic scoped host resources and operations
+// ---------------------------------------------------------------------------
+
+/// An HTTP request being processed under the configured network policy.
+///
+/// The request resource owns the parsed request plus the response body stream
+/// once the connection completes. Its close is the terminal teardown: the
+/// connection is aborted and the response body stream is dropped (which also
+/// aborts the peer, exactly like dropping the legacy host future did).
+pub struct HttpRequestResource {
+    inner: Arc<RequestResourceInner>,
+}
+
+struct RequestResourceInner {
+    /// The response body stream once the request completed.
+    body: tokio::sync::Mutex<Option<OwnedResponse>>,
+    /// Set on close; the read/body-poll drivers observe it and stop.
+    closing: std::sync::atomic::AtomicBool,
+    /// Permit shared with the HTTP host state admission counter.
+    _permit: ConnectionPermitHolder,
+}
+
+/// Holds a connection permit outside the resource so the permit's `Drop`
+/// decrements the shared admission counter even if the resource is reclaimed
+/// without a poll (last-resort guard).
+pub(super) struct ConnectionPermitHolder {
+    permit: super::policy::ConnectionPermit,
+}
+
+impl HostResource for HttpRequestResource {
+    fn resource_type_key() -> Option<ResourceTypeKey> {
+        ResourceTypeKey::new("http.request").ok()
+    }
+
+    fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
+        self.inner.closing.store(true, Ordering::SeqCst);
+        if let Ok(mut body) = self.inner.body.try_lock() {
+            *body = None;
+        }
+        Ok(CloseProgress::Ready)
+    }
+}
+
+/// The response body stream of an HTTP request, owned as a scoped resource.
+///
+/// Closing it aborts the connection (the `OwnedResponse`'s connection future
+/// is dropped), matching the historical drop-the-host-future semantics.
+pub struct HttpResponseResource {
+    inner: Arc<RequestResourceInner>,
+}
+
+impl HostResource for HttpResponseResource {
+    fn resource_type_key() -> Option<ResourceTypeKey> {
+        ResourceTypeKey::new("http.response").ok()
+    }
+
+    fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
+        self.inner.closing.store(true, Ordering::SeqCst);
+        if let Ok(mut body) = self.inner.body.try_lock() {
+            *body = None;
+        }
+        Ok(CloseProgress::Ready)
+    }
+}
+
+/// An SSE stream reader, registered as a child of the underlying response
+/// stream resource. Closing the child stops the SSE polling operation; closing
+/// the parent (the response stream) closes the child first through the generic
+/// child-first scope shutdown.
+pub struct SseStreamResource {
+    inner: Arc<SseResourceInner>,
+}
+
+struct SseResourceInner {
+    /// The response stream parent this reader is a child of.
+    _parent: ResourceHandle,
+    /// Shared stop flag: set on child close (or parent close, which closes
+    /// the child first) so the SSE poll operation stops polling the network.
+    stopping: std::sync::atomic::AtomicBool,
+    /// Waker for a pending SSE poll operation.
+    waker: std::sync::Mutex<Option<std::task::Waker>>,
+}
+
+impl HostResource for SseStreamResource {
+    fn resource_type_key() -> Option<ResourceTypeKey> {
+        ResourceTypeKey::new("http.sse").ok()
+    }
+
+    fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
+        self.inner.stopping.store(true, Ordering::SeqCst);
+        if let Ok(mut waker) = self.inner.waker.lock() {
+            if let Some(waker) = waker.take() {
+                waker.wake();
+            }
+        }
+        Ok(CloseProgress::Ready)
+    }
+}
+
+/// Driver for the *buffered* HTTP request operation: runs the request on a
+/// worker thread and publishes the response map into a shared cell.
+pub(super) struct HttpRequestOperation {
+    result: Arc<std::sync::Mutex<Option<VmResult<CallReturn>>>>,
+    waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl HostOperation for HttpRequestOperation {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
+        let mut state = self.result.lock().expect("http request result lock");
+        match state.as_ref() {
+            Some(Ok(_)) => Poll::Ready(Ok(())),
+            Some(Err(error)) => Poll::Ready(Err(OperationError::new(
+                OperationErrorCode::OperationDriverFailed,
+                "http::client::request",
+                error.to_string(),
+            ))),
+            None => {
+                *self.waker.lock().expect("http request waker lock") = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+
+    fn cancel(&mut self, reason: OperationCancelReason) -> OperationResult<()> {
+        self.cancelled.store(true, Ordering::SeqCst);
+        let _ = reason;
+        Ok(())
+    }
+}
+
+/// Driver for the SSE poll operation: polls the underlying response body
+/// stream one frame at a time, parses SSE events, and publishes each
+/// guest-visible item (or the terminal summary) into a shared cell.
+pub(super) struct SsePollOperation {
+    inner: Arc<SseResourceInner>,
+    driver: Pin<Box<dyn std::future::Future<Output = VmResult<CallReturn>> + Send>>,
+    state: std::sync::Mutex<Option<VmResult<CallReturn>>>,
+}
+
+impl SsePollOperation {
+    pub(super) fn new(
+        inner: Arc<SseResourceInner>,
+        driver: Pin<Box<dyn std::future::Future<Output = VmResult<CallReturn>> + Send>>,
+    ) -> Self {
+        Self {
+            inner,
+            driver,
+            state: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl HostOperation for SsePollOperation {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
+        if self.inner.stopping.load(Ordering::SeqCst) {
+            return Poll::Ready(Err(OperationError::new(
+                OperationErrorCode::OperationDriverFailed,
+                "http::client::sse",
+                "SSE stream closed",
+            )));
+        }
+        let mut state = self.state.lock().expect("sse poll state lock");
+        match state.as_ref() {
+            Some(Ok(_)) => Poll::Ready(Ok(())),
+            Some(Err(error)) => Poll::Ready(Err(OperationError::new(
+                OperationErrorCode::OperationDriverFailed,
+                "http::client::sse",
+                error.to_string(),
+            ))),
+            None => {
+                *self.inner.waker.lock().expect("sse waker lock") = Some(cx.waker().clone());
+                let driver = &mut self.driver;
+                let cx = &mut Context::from_waker(cx.waker());
+                match std::pin::pin!(driver).as_mut().poll(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(result) => {
+                        *state = Some(result);
+                        Poll::Ready(Ok(()))
+                    }
+                }
+            }
+        }
+    }
+
+    fn cancel(&mut self, reason: OperationCancelReason) -> OperationResult<()> {
+        self.inner.stopping.store(true, Ordering::SeqCst);
+        let _ = reason;
+        Ok(())
+    }
+}
+
+pub(super) fn host_boundary_error(error: crate::vm::HostContextError) -> VmError {
+    VmError::HostError(error.to_string())
+}
+
+pub(super) fn operation_error(error: OperationError) -> VmError {
+    VmError::HostError(error.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Buffered request
+// ---------------------------------------------------------------------------
+
+/// Performs one buffered HTTP request as a generic execution-scope operation.
+pub(super) fn perform_buffered_request(
+    vm: &mut Vm,
+    request: VmMapHandle,
+) -> VmResult<HostCallResult<VmMap>> {
+    let (context, _) = HttpRequestContext::capture(vm, None, "HTTP")?;
+    let config = context.config.clone();
+    let request = parse_request(&request, &config)?;
+    let deadline = request_deadline(config.request_timeout)?;
+
+    // Run the request on a worker thread; the operation driver polls the
+    // shared completion cell.
+    let result: Arc<std::sync::Mutex<Option<VmResult<CallReturn>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let waker: Arc<std::sync::Mutex<Option<std::task::Waker>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let worker_result = Arc::clone(&result);
+    let worker_waker = Arc::clone(&waker);
+    let worker_cancelled = Arc::clone(&cancelled);
+    let worker_config = config.clone();
+    let worker_request = request.clone();
+    std::thread::Builder::new()
+        .name("rustscript-http-request".to_string())
+        .spawn(move || {
+            let value = if worker_cancelled.load(Ordering::SeqCst) {
+                Err(VmError::HostError("HTTP request cancelled".to_string()))
+            } else {
+                runtime_block_on(async {
+                    with_deadline(
+                        deadline,
+                        execute_request_until(
+                            &worker_config,
+                            &worker_request,
+                            ResponseReadObserver::default(),
+                            deadline,
+                            None,
+                        ),
+                    )
+                    .await
+                    .map(|map| CallReturn::one(Value::Map(Arc::new(map))))
+                })
+            };
+            let wake = {
+                let mut state = worker_result
+                    .lock()
+                    .expect("http request result lock should not be poisoned");
+                *state = Some(value);
+                worker_waker.lock().expect("http request waker lock").take()
+            };
+            if let Some(waker) = wake {
+                waker.wake();
+            }
+        })
+        .map_err(|error| VmError::HostError(format!("failed to start HTTP worker: {error}")))?;
+
+    // Clone the result handle before moving it into the operation so the
+    // pending-result closure can also access it.
+    let pending_result = Arc::clone(&result);
+    let op = HttpRequestOperation {
+        result,
+        waker,
+        cancelled,
+    };
+    let op_id = vm
+        .host_context()
+        .start_operation(OperationSpec::new(op))
+        .map_err(host_boundary_error)?;
+    let raw = op_id.raw();
+    vm.host.register_pending_op_result(
+        raw,
+        Box::new(move |_vm: &mut Vm| {
+            pending_result
+                .lock()
+                .expect("http request result lock should not be poisoned")
+                .take()
+                .unwrap_or_else(|| {
+                    Err(VmError::HostError(
+                        "HTTP request produced no result".to_string(),
+                    ))
+                })
+        }),
+    );
+    Ok(HostCallResult::Pending(raw))
+}
+
+/// Builds a current-thread tokio runtime to run the blocking HTTP transport.
+fn runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("HTTP worker tokio runtime should build");
+    runtime.block_on(future)
 }
 
 #[cfg(test)]

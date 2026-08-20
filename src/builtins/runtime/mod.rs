@@ -52,6 +52,7 @@ pub use sqlite::{
     sqlite_host_catalog,
 };
 pub use typed::HostCallResult;
+pub(crate) use typed::VmMapHandle;
 // Typed argument decoders used by `#[pd_host_function]`-generated wrappers.
 // Re-exported through `builtins::runtime` (and the crate root) so host SDK
 // adapters outside the builtin modules can decode by reference / by take.
