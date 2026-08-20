@@ -677,12 +677,12 @@ fn io_operations_use_real_pending_lifecycle() {
     // Verify that the ThreadedOperation-based io::open and io::exists
     // actually use a worker thread by checking that the source has
     // ThreadedOperation references.
-    let source = include_str!("../../src/builtins/runtime/io/blocking.rs");
+    let source = include_str!("../../src/builtins/runtime/io/shared.rs");
     assert!(
         source.contains("ThreadedOperation::spawn"),
-        "blocking IO must use ThreadedOperation for pending operations"
+        "shared IO must use ThreadedOperation for pending operations"
     );
-    // Worker thread spawning is in ops.rs, not blocking.rs directly
+    // Worker thread spawning is in ops.rs, not shared.rs directly
     let ops_source = include_str!("../../src/builtins/runtime/io/ops.rs");
     assert!(
         ops_source.contains("thread::Builder"),

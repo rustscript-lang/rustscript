@@ -380,28 +380,6 @@ impl crate::vm::HostExtension for IoExtension {
     }
 }
 
-// ---- Process-tree termination (platform-specific) ----
-
-#[cfg(unix)]
-fn terminate_process_group(process_id: u32) {
-    if let Ok(pid) = libc::pid_t::try_from(process_id) {
-        // SAFETY: process_id is the tracked child pid; sending SIGKILL to
-        // the negated value kills the whole process group.
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn terminate_process_group(process_id: u32) {
-    // On Windows, use the process-tree enumeration module.
-    #[cfg(windows)]
-    crate::builtins::runtime::io::windows_process_tree::terminate_process_tree(process_id);
-    #[cfg(not(windows))]
-    let _ = process_id;
-}
-
 // ---- Module declarations ----
 
 #[cfg(feature = "async")]
@@ -409,6 +387,7 @@ mod async_io;
 #[cfg(not(feature = "async"))]
 mod blocking;
 mod ops;
+mod shared;
 #[cfg(windows)]
 mod windows_process_tree;
 mod worker;

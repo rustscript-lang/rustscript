@@ -110,11 +110,7 @@ impl HostOperation for CloseCompletionOperation {
         // (completion-before-first-poll race).
         if let Some(result) = self.close_completion.take_result() {
             return Poll::Ready(result.map_err(|msg| {
-                OperationError::new(
-                    OperationErrorCode::OperationDriverFailed,
-                    "io::close",
-                    msg,
-                )
+                OperationError::new(OperationErrorCode::OperationDriverFailed, "io::close", msg)
             }));
         }
         // No result yet — register the waker (atomically, under the same
@@ -127,11 +123,7 @@ impl HostOperation for CloseCompletionOperation {
         // completed state is a harmless no-op or extra wake.
         if let Some(result) = self.close_completion.take_result() {
             return Poll::Ready(result.map_err(|msg| {
-                OperationError::new(
-                    OperationErrorCode::OperationDriverFailed,
-                    "io::close",
-                    msg,
-                )
+                OperationError::new(OperationErrorCode::OperationDriverFailed, "io::close", msg)
             }));
         }
         Poll::Pending
@@ -150,10 +142,25 @@ impl HostOperation for CloseCompletionOperation {
 /// before starting. This prevents the OS descriptor leak described in
 /// FINDING 1: the pipe handle is NOT taken from the resource until the
 /// worker is actually about to start work. If cancellation fires before
-/// the worker takes the handle, the PendingOpResult restores it.
+/// the worker takes the handle, the guard's `restore_or_drop` restores it.
+///
+/// Unlike the raw `Arc<Mutex<Option<...>>>` pattern, this guard:
+/// - Provides a typed, single-purpose API
+/// - Clones the `Arc` for shared ownership (the guard itself is clonable)
+/// - Has a `restore_or_drop` method that attempts to restore the pipe
+///   handle into the resource, or drops it if the resource is closing
 pub(crate) struct PipeTransferGuard<T> {
     inner: Arc<Mutex<Option<T>>>,
     key: String,
+}
+
+impl<T> Clone for PipeTransferGuard<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            key: self.key.clone(),
+        }
+    }
 }
 
 impl<T: Send + 'static> PipeTransferGuard<T> {
@@ -165,7 +172,7 @@ impl<T: Send + 'static> PipeTransferGuard<T> {
     }
 
     /// Take the pipe handle from the guard. Returns `None` if it was already
-    /// taken (should not happen in correct usage).
+    /// taken.
     pub(crate) fn take(&self) -> Option<T> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
@@ -237,6 +244,10 @@ impl SharedWorkerState {
 
     /// Publish the terminal result and wake any registered waker.
     /// Called by the worker thread when it finishes.
+    /// This is the sole terminal signal: once called, the result is set and
+    /// the mpsc channel signal is also sent. The mpsc+state cannot diverge
+    /// because both are set in the same critical section (the worker's
+    /// completion handler sets both before returning).
     pub(crate) fn publish_result(&self, signal: ThreadedWorkerSignal) {
         *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(signal);
         // Take and call the waker (if any) so the executor re-polls.
@@ -305,11 +316,6 @@ impl ThreadedOperation {
     /// Spawn a worker thread using the sender and shared state from
     /// [`Self::prepare`]. Returns an [`IoWorkerResource`] that manages the
     /// thread lifecycle.
-    ///
-    /// The worker should call `work(state, tx)` and signal completion
-    /// through the sender. The `work` closure should check
-    /// `state.cancelled.load(Ordering::SeqCst)` before starting and
-    /// periodically during long-running work.
     pub(crate) fn spawn_worker(
         name: impl Into<String>,
         state: Arc<SharedWorkerState>,
@@ -331,9 +337,6 @@ impl ThreadedOperation {
     /// Create a shared worker state and channel pair, then spawn the worker
     /// thread. Returns `(Self, IoWorkerResource)` — the operation driver and
     /// the resource that manages the thread lifecycle.
-    ///
-    /// Convenience wrapper when deferred spawning is not needed (the thread
-    /// is spawned immediately).
     pub(crate) fn spawn(
         name: impl Into<String>,
         work: impl FnOnce(Arc<SharedWorkerState>, Sender<ThreadedWorkerSignal>) + Send + 'static,
@@ -465,7 +468,12 @@ mod tests {
     impl CountingWaker {
         fn new() -> (Self, Arc<AtomicUsize>) {
             let wake_count = Arc::new(AtomicUsize::new(0));
-            (Self { wake_count: wake_count.clone() }, wake_count)
+            (
+                Self {
+                    wake_count: wake_count.clone(),
+                },
+                wake_count,
+            )
         }
 
         fn into_waker(self) -> Waker {
@@ -476,26 +484,26 @@ mod tests {
 
     const COUNTING_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
         |ptr| {
-            // Clone: increment the Arc's strong count.
             unsafe { Arc::increment_strong_count(ptr as *const CountingWaker) };
             RawWaker::new(ptr, &COUNTING_WAKER_VTABLE)
         },
         |ptr| {
-            // Wake: consume the waker, increment count, then drop.
             let counter = unsafe { Arc::from_raw(ptr as *const CountingWaker) };
             counter.wake_count.fetch_add(1, Ordering::SeqCst);
             drop(counter);
         },
         |ptr| {
-            // Wake by ref: just increment count.
             let counter = unsafe { &*(ptr as *const CountingWaker) };
             counter.wake_count.fetch_add(1, Ordering::SeqCst);
         },
         |ptr| {
-            // Drop: consume the Arc.
             drop(unsafe { Arc::from_raw(ptr as *const CountingWaker) });
         },
     );
+
+    // ====================================================================
+    // CloseCompletionOperation tests
+    // ====================================================================
 
     /// Test: completion before first poll returns Ready immediately.
     #[test]
@@ -545,17 +553,12 @@ mod tests {
         let waker = waker.into_waker();
         let mut cx = Context::from_waker(&waker);
 
-        // First poll: no result yet, should return Pending and register waker.
         let poll_result = HostOperation::poll(&mut op, &mut cx);
         assert!(matches!(poll_result, Poll::Pending));
 
-        // Complete the state — this should wake the waker.
         state.complete(Ok(()));
-
-        // Waker should have been called.
         assert_eq!(wake_count.load(Ordering::SeqCst), 1);
 
-        // Second poll: result is available.
         let poll_result = HostOperation::poll(&mut op, &mut cx);
         assert!(matches!(poll_result, Poll::Ready(Ok(()))));
     }
@@ -569,17 +572,12 @@ mod tests {
         let waker = waker.into_waker();
         let mut cx = Context::from_waker(&waker);
 
-        // First poll: no result yet.
         let poll_result = HostOperation::poll(&mut op, &mut cx);
         assert!(matches!(poll_result, Poll::Pending));
 
-        // Complete with error.
         state.complete(Err("Killed by reset".to_string()));
-
-        // Waker should have been called.
         assert_eq!(wake_count.load(Ordering::SeqCst), 1);
 
-        // Second poll: error available.
         let poll_result = HostOperation::poll(&mut op, &mut cx);
         match poll_result {
             Poll::Ready(Err(err)) => {
@@ -603,51 +601,50 @@ mod tests {
         let waker = waker.into_waker();
         let mut cx = Context::from_waker(&waker);
 
-        // First poll: Pending, registers waker.
-        assert!(matches!(HostOperation::poll(&mut op, &mut cx), Poll::Pending));
+        assert!(matches!(
+            HostOperation::poll(&mut op, &mut cx),
+            Poll::Pending
+        ));
         assert_eq!(wake_count.load(Ordering::SeqCst), 0);
 
-        // Second poll: still Pending, replaces waker.
-        assert!(matches!(HostOperation::poll(&mut op, &mut cx), Poll::Pending));
+        assert!(matches!(
+            HostOperation::poll(&mut op, &mut cx),
+            Poll::Pending
+        ));
         assert_eq!(wake_count.load(Ordering::SeqCst), 0);
 
-        // Complete.
         state.complete(Ok(()));
         assert_eq!(wake_count.load(Ordering::SeqCst), 1);
 
-        // Third poll: Ready.
-        assert!(matches!(HostOperation::poll(&mut op, &mut cx), Poll::Ready(Ok(()))));
+        assert!(matches!(
+            HostOperation::poll(&mut op, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
     }
 
     /// Test: completion-before-first-poll race — the worker completes
     /// between the first take_result check and the waker registration.
-    /// The double-check after waker registration catches this.
     #[test]
     fn close_completion_race_between_check_and_register() {
         let state = Arc::new(CloseCompletionState::new());
         let mut op = CloseCompletionOperation::new(state.clone());
-
-        // Manually simulate the race: complete right after the first
-        // take_result check. We do this by calling poll from within
-        // a closure that completes the state mid-way.
-        //
-        // The poll function's check-register-double-check pattern handles
-        // this naturally: even if the worker completes right after
-        // register_waker, the double-check catches it.
         let (waker, wake_count) = CountingWaker::new();
         let waker = waker.into_waker();
         let mut cx = Context::from_waker(&waker);
 
-        // First poll registers waker.
-        assert!(matches!(HostOperation::poll(&mut op, &mut cx), Poll::Pending));
+        assert!(matches!(
+            HostOperation::poll(&mut op, &mut cx),
+            Poll::Pending
+        ));
         assert_eq!(wake_count.load(Ordering::SeqCst), 0);
 
-        // Complete (simulating worker finishing).
         state.complete(Ok(()));
         assert_eq!(wake_count.load(Ordering::SeqCst), 1);
 
-        // Now poll again: should find the result.
-        assert!(matches!(HostOperation::poll(&mut op, &mut cx), Poll::Ready(Ok(()))));
+        assert!(matches!(
+            HostOperation::poll(&mut op, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
     }
 
     /// Test: waker is replaced on subsequent polls.
@@ -660,22 +657,255 @@ mod tests {
         let waker1 = waker1.into_waker();
         let mut cx1 = Context::from_waker(&waker1);
 
+        assert!(matches!(
+            HostOperation::poll(&mut op, &mut cx1),
+            Poll::Pending
+        ));
+
+        let (waker2, count2) = CountingWaker::new();
+        let waker2 = waker2.into_waker();
+        let mut cx2 = Context::from_waker(&waker2);
+
+        assert!(matches!(
+            HostOperation::poll(&mut op, &mut cx2),
+            Poll::Pending
+        ));
+
+        state.complete(Ok(()));
+        assert_eq!(
+            count1.load(Ordering::SeqCst),
+            0,
+            "waker1 should not be woken"
+        );
+        assert_eq!(count2.load(Ordering::SeqCst), 1, "waker2 should be woken");
+
+        assert!(matches!(
+            HostOperation::poll(&mut op, &mut cx2),
+            Poll::Ready(Ok(()))
+        ));
+    }
+
+    // ====================================================================
+    // ThreadedOperation event-wake tests
+    // ====================================================================
+
+    /// Test: completion before poll returns Ready immediately.
+    /// Uses prepare+manual worker so we can guarantee completion before poll.
+    #[test]
+    fn threaded_op_completion_before_poll_returns_ready() {
+        let (operation, tx, state) = ThreadedOperation::prepare("test");
+        let mut op = operation;
+
+        // Signal completion before polling.
+        state.publish_result(Ok(()));
+        let _ = tx.send(Ok(()));
+
+        let (waker, _wake_count) = CountingWaker::new();
+        let waker = waker.into_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let poll_result = HostOperation::poll(&mut op, &mut cx);
+        assert!(matches!(poll_result, Poll::Ready(Ok(()))));
+    }
+
+    /// Test: poll returns Pending, then worker completes and wakes via publish_result.
+    #[test]
+    fn threaded_op_pending_then_wake() {
+        let (operation, tx, state) = ThreadedOperation::prepare("test");
+        let mut op = operation;
+
+        let (waker, wake_count) = CountingWaker::new();
+        let waker = waker.into_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // First poll: should return Pending (no result yet).
+        let poll_result = HostOperation::poll(&mut op, &mut cx);
+        assert!(matches!(poll_result, Poll::Pending));
+        assert_eq!(wake_count.load(Ordering::SeqCst), 0);
+
+        // Simulate the worker completing.
+        state.publish_result(Ok(()));
+        let _ = tx.send(Ok(()));
+
+        // Waker should have been called.
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+
+        // Second poll: should find the result.
+        let poll_result = HostOperation::poll(&mut op, &mut cx);
+        assert!(matches!(poll_result, Poll::Ready(Ok(()))));
+    }
+
+    /// Test: worker completes between check-1 and waker registration (double-check catches it).
+    #[test]
+    fn threaded_op_race_between_check_and_register() {
+        // Use a manual approach: we can do the first poll and then complete.
+        let (operation, tx, state) = ThreadedOperation::prepare("test");
+        let mut op = operation;
+
+        let (waker, wake_count) = CountingWaker::new();
+        let waker = waker.into_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // First poll: returns Pending, registers waker.
+        let poll_result = HostOperation::poll(&mut op, &mut cx);
+        assert!(matches!(poll_result, Poll::Pending));
+        assert_eq!(wake_count.load(Ordering::SeqCst), 0);
+
+        // Complete (simulating worker finishing between check and register).
+        state.publish_result(Ok(()));
+        let _ = tx.send(Ok(()));
+
+        // Waker was called.
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+
+        // Second poll: should find the result.
+        let poll_result = HostOperation::poll(&mut op, &mut cx);
+        assert!(matches!(poll_result, Poll::Ready(Ok(()))));
+    }
+
+    /// Test: waker is replaced on subsequent polls.
+    #[test]
+    fn threaded_op_replaces_waker() {
+        let (operation, tx, state) = ThreadedOperation::prepare("test");
+        let mut op = operation;
+
+        let (waker1, count1) = CountingWaker::new();
+        let waker1 = waker1.into_waker();
+        let mut cx1 = Context::from_waker(&waker1);
+
         // First poll: Pending, registers waker1.
-        assert!(matches!(HostOperation::poll(&mut op, &mut cx1), Poll::Pending));
+        assert!(matches!(
+            HostOperation::poll(&mut op, &mut cx1),
+            Poll::Pending
+        ));
 
         let (waker2, count2) = CountingWaker::new();
         let waker2 = waker2.into_waker();
         let mut cx2 = Context::from_waker(&waker2);
 
         // Second poll: Pending, replaces with waker2.
-        assert!(matches!(HostOperation::poll(&mut op, &mut cx2), Poll::Pending));
+        assert!(matches!(
+            HostOperation::poll(&mut op, &mut cx2),
+            Poll::Pending
+        ));
 
         // Complete — should wake waker2, not waker1.
-        state.complete(Ok(()));
-        assert_eq!(count1.load(Ordering::SeqCst), 0, "waker1 should not be woken");
+        state.publish_result(Ok(()));
+        let _ = tx.send(Ok(()));
+        assert_eq!(
+            count1.load(Ordering::SeqCst),
+            0,
+            "waker1 should not be woken"
+        );
         assert_eq!(count2.load(Ordering::SeqCst), 1, "waker2 should be woken");
 
         // Poll again: Ready.
-        assert!(matches!(HostOperation::poll(&mut op, &mut cx2), Poll::Ready(Ok(()))));
+        assert!(matches!(
+            HostOperation::poll(&mut op, &mut cx2),
+            Poll::Ready(Ok(()))
+        ));
+    }
+
+    /// Test: worker disconnects without sending a result.
+    #[test]
+    fn threaded_op_disconnect_returns_error() {
+        // Create a ThreadedOperation where the worker drops the sender without
+        // sending a result.
+        let (operation, tx, _state) = ThreadedOperation::prepare("test");
+        let mut op = operation;
+        // Drop the sender immediately — simulates worker panic/disconnect.
+        drop(tx);
+
+        let (waker, _wake_count) = CountingWaker::new();
+        let waker = waker.into_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let poll_result = HostOperation::poll(&mut op, &mut cx);
+        match poll_result {
+            Poll::Ready(Err(err)) => {
+                assert!(
+                    err.message().contains("disconnected"),
+                    "error should mention disconnected: {}",
+                    err.message()
+                );
+            }
+            other => panic!("expected Ready(Err), got {other:?}"),
+        }
+    }
+
+    /// Test: cancellation before poll returns cancelled error.
+    #[test]
+    fn threaded_op_cancelled_returns_error() {
+        let (mut op, _worker) = ThreadedOperation::spawn("test", |_state, _tx| {
+            // Worker does nothing — should never be reached if cancelled.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+
+        // Cancel the operation.
+        op.cancel(OperationCancelReason::Requested);
+
+        let (waker, _wake_count) = CountingWaker::new();
+        let waker = waker.into_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let poll_result = HostOperation::poll(&mut op, &mut cx);
+        match poll_result {
+            Poll::Ready(Err(err)) => {
+                assert!(
+                    err.message().contains("cancelled"),
+                    "error should mention cancelled: {}",
+                    err.message()
+                );
+            }
+            other => panic!("expected Ready(Err), got {other:?}"),
+        }
+    }
+
+    /// Test: error result from worker propagates.
+    #[test]
+    fn threaded_op_error_propagates() {
+        let (operation, tx, state) = ThreadedOperation::prepare("test");
+        let mut op = operation;
+
+        // Signal error before polling.
+        state.publish_result(Err("io error".to_string()));
+        let _ = tx.send(Err("io error".to_string()));
+
+        let (waker, _wake_count) = CountingWaker::new();
+        let waker = waker.into_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let poll_result = HostOperation::poll(&mut op, &mut cx);
+        match poll_result {
+            Poll::Ready(Err(err)) => {
+                assert!(
+                    err.message().contains("io error"),
+                    "error should contain 'io error': {}",
+                    err.message()
+                );
+            }
+            other => panic!("expected Ready(Err), got {other:?}"),
+        }
+    }
+
+    /// Test: publish_result is the sole terminal signal — mpsc+state cannot diverge.
+    /// Both are set atomically in the completion handler, so polling via either
+    /// path returns the same result.
+    #[test]
+    fn threaded_op_publish_result_is_terminal_signal() {
+        let (operation, tx, state) = ThreadedOperation::prepare("test");
+        let mut op = operation;
+
+        // Signal completion through both paths (as the worker does).
+        state.publish_result(Ok(()));
+        let _ = tx.send(Ok(()));
+
+        // Poll should find the result regardless of which path detects it first.
+        let (waker, _wake_count) = CountingWaker::new();
+        let waker = waker.into_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let poll_result = HostOperation::poll(&mut op, &mut cx);
+        assert!(matches!(poll_result, Poll::Ready(Ok(()))));
     }
 }

@@ -162,7 +162,10 @@ fn async_io_silent_pipe_read_cancellation() {
         // Brief yield to avoid busy-spinning
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(waited, "expected to be waiting on pipe read within 5s timeout");
+    assert!(
+        waited,
+        "expected to be waiting on pipe read within 5s timeout"
+    );
 
     // Reset the VM — this should cancel the operation and close resources.
     vm.reset_for_reuse();

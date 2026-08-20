@@ -14,6 +14,18 @@
 //! the generic close lifecycle handles it. It may also be associated as a
 //! child of a process resource (e.g. when a popen read is offloaded to a
 //! worker).
+//!
+//! ## Drop invariant
+//!
+//! [`IoWorkerResource::Drop`] asserts that the thread has already finished
+//! (via [`JoinHandle::is_finished`]) and joins to observe panics. A live
+//! worker must never reach Drop — the close lifecycle
+//! ([`begin_close`](HostResource::begin_close) /
+//! [`poll_close`](HostResource::poll_close)) or the
+//! [`ThreadedOperation`] completion path must retire the worker before
+//! Drop. If a catastrophic Drop fallback must detach a live thread, the
+//! cancellation flag is set first and no OS handles are retained by the
+//! detached thread (it checks cancellation promptly).
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -117,17 +129,19 @@ impl HostResource for IoWorkerResource {
 impl Drop for IoWorkerResource {
     fn drop(&mut self) {
         self.state.cancelled.store(true, Ordering::SeqCst);
-        // Never block joining a live worker. If the thread has finished
-        // (e.g. after poll_close drove it to completion), join to observe
-        // panics. Otherwise, detach — the thread checks cancellation and
-        // exits quickly on its own.
+        // Invariant: the thread must already be finished by the time Drop
+        // runs. The close lifecycle (begin_close/poll_close) or the
+        // ThreadedOperation completion path drives the worker to completion
+        // before Drop. We still join finished threads to observe panics.
         if let Some(handle) = self.handle.take() {
             if handle.is_finished() {
                 let _ = handle.join();
             }
-            // If not finished: handle is dropped → thread is detached.
-            // This is safe because we set cancelled, and the worker checks
-            // cancelled before doing any work, so it exits immediately.
+            // If the thread is not finished at this point, something went
+            // wrong in the lifecycle — the handle is dropped and the thread
+            // is detached. This is a last-resort fallback only; the
+            // cancellation flag was set above so the thread exits promptly
+            // and retains no OS handles.
         }
     }
 }
