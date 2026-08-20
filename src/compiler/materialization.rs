@@ -1181,6 +1181,7 @@ mod tests {
             use_declarations: Vec::new(),
             implicit_extern_names: Vec::new(),
             host_api_metadata: None,
+            semantic_index: None,
         }
     }
 

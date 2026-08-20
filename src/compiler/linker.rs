@@ -244,6 +244,7 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
         // `None` when no supplied unit carried catalog metadata; otherwise the
         // validated, remapped, uniformly fingerprint-bound carrier.
         host_api_metadata: merged_host_api_metadata,
+        semantic_index: None,
     })
 }
 
@@ -1018,10 +1019,11 @@ mod linker_metadata_remap_tests {
                 function_sources: HashMap::new(),
                 use_declarations: Vec::new(),
                 implicit_extern_names: Vec::new(),
-                host_api_metadata,
+                host_api_metadata: host_api_metadata,
+                semantic_index: None,
             },
-            scope_identity: None,
             source_name: source_name.to_string(),
+            scope_identity: None,
             module: ModuleId(module),
             source_id: 0,
         }

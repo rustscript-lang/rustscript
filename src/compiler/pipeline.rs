@@ -1,14 +1,19 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::HostImport;
+use crate::host_api::HostApiCatalog;
 
 use super::ReplLocalState;
 use super::codegen::Compiler;
 use super::frontends;
-use super::ir::{Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, Stmt, TypeSchema};
+use super::ir::{
+    Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, SemanticIndex, Stmt, TypeSchema,
+};
 use super::linker::{ParsedUnit, merge_units};
 use super::modules::ModuleGraph;
+use super::semantic_model::SemanticModel;
 use super::source_loader::load_units_for_source_file;
 use super::source_map::SourceMap;
 use super::{
@@ -764,6 +769,172 @@ fn record_local_source_names(
 
 pub fn compile_source(source: &str) -> Result<CompiledProgram, SourceError> {
     compile_source_with_flavor(source, SourceFlavor::RustScript)
+}
+
+/// Analyze a source string without generating bytecode, returning a
+/// [`SemanticModel`] for language-service queries.
+///
+/// This is the primary entry point for editor tooling: it parses, legalizes,
+/// type-checks, and builds the semantic index, but does NOT produce bytecode
+/// or run the VM. The returned [`SemanticModel`] can be used for hover,
+/// signature help, completions, go-to-definition, and diagnostics.
+///
+/// Errors are returned as [`SourceError`] when the source cannot be parsed
+/// or compiled. The caller can still inspect the model's diagnostics for
+/// recoverable errors (typing, host resolution).
+pub fn analyze_source(source: &str) -> Result<SemanticModel, SourceError> {
+    analyze_source_with_flavor(source, SourceFlavor::RustScript)
+}
+
+/// Analyze a source string with a specific flavor, without generating
+/// bytecode. See [`analyze_source`] for details.
+pub fn analyze_source_with_flavor(
+    source: &str,
+    flavor: SourceFlavor,
+) -> Result<SemanticModel, SourceError> {
+    let mut source_map = SourceMap::new();
+    let source_id = source_map.add_source("<source>", source.to_string());
+    let parsed = frontends::parse_source(source, flavor, &CompileSourceFileOptions::default())
+        .map_err(|err| {
+            SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
+        })?;
+    analyze_parsed_output(source.to_string(), parsed, source_map, flavor, None)
+}
+
+/// Analyze a source file path without generating bytecode, returning a
+/// [`SemanticModel`] for language-service queries.
+///
+/// See [`analyze_source`] for details. This variant reads the source from
+/// a file path and supports module resolution and custom catalogs.
+pub fn analyze_source_file(path: impl AsRef<Path>) -> Result<SemanticModel, SourcePathError> {
+    analyze_source_file_with_options(path, CompileSourceFileOptions::default())
+}
+
+/// Analyze a source file with custom options (catalog, module overrides, etc.)
+/// without generating bytecode. See [`analyze_source`] for details.
+pub fn analyze_source_file_with_options(
+    path: impl AsRef<Path>,
+    options: CompileSourceFileOptions,
+) -> Result<SemanticModel, SourcePathError> {
+    let path = path.as_ref().to_path_buf();
+    run_with_compiler_stack(move || analyze_source_file_impl(&path, &options))
+}
+
+fn analyze_source_file_impl(
+    path: &Path,
+    options: &CompileSourceFileOptions,
+) -> Result<SemanticModel, SourcePathError> {
+    let flavor = SourceFlavor::from_path_with_options(path, options)?;
+    let source_raw = std::fs::read_to_string(path)?;
+    analyze_source_string_at_path(path, flavor, &source_raw, options)
+}
+
+fn analyze_source_string_at_path(
+    path: &Path,
+    flavor: SourceFlavor,
+    source: &str,
+    options: &CompileSourceFileOptions,
+) -> Result<SemanticModel, SourcePathError> {
+    let mut source_map = SourceMap::new();
+    let source_id = source_map.add_source(path.display().to_string(), source.to_string());
+    let parsed = frontends::parse_source(source, flavor, options).map_err(|err| {
+        SourcePathError::Source(SourceError::Parse(
+            err.with_line_span_from_source(&source_map, source_id),
+        ))
+    })?;
+
+    let catalog = options.host_api_catalog().cloned();
+    analyze_parsed_output(source.to_string(), parsed, source_map, flavor, catalog)
+        .map_err(SourcePathError::Source)
+}
+
+fn analyze_parsed_output(
+    source: String,
+    mut parsed: FrontendIr,
+    source_map: SourceMap,
+    flavor: SourceFlavor,
+    custom_catalog: Option<Arc<HostApiCatalog>>,
+) -> Result<SemanticModel, SourceError> {
+    let typing_mode = TypingMode::for_flavor(flavor);
+    let catalog = custom_catalog.unwrap_or_else(|| {
+        Arc::new(
+            crate::host_api::HostApiBuilder::new()
+                .build()
+                .expect("default catalog"),
+        )
+    });
+
+    // Run legalize and type checking.
+    let legalize_result =
+        typing::legalize_builtins_and_bind_types(parsed.clone(), typing_mode, &[]);
+    let mut errors = Vec::new();
+
+    let (mut parsed_after_legalize, type_info) = match legalize_result {
+        Ok(legalized) => {
+            let type_info = typing::infer_types(&legalized, typing_mode, &[]);
+            (legalized, type_info)
+        }
+        Err(compile_err) => {
+            errors.push(compile_err);
+            // Even on error, run type inference on the original IR for partial results.
+            let type_info = typing::infer_types(&parsed, typing_mode, &[]);
+            (parsed, type_info)
+        }
+    };
+
+    // Run validation, collecting errors.
+    if let Err(compile_err) =
+        typing::validate_if_else_type_consistency(&parsed_after_legalize, typing_mode, &[])
+    {
+        errors.push(compile_err);
+    }
+
+    // Build the semantic index.
+    let source_texts = {
+        let mut map = std::collections::HashMap::new();
+        if let Some(file) = source_map.file(0) {
+            map.insert(0, file.text.clone());
+        }
+        map
+    };
+
+    let func_decl_spans = {
+        let mut spans = std::collections::HashMap::new();
+        for (pos, stmt) in parsed_after_legalize.stmts.iter().enumerate() {
+            if let Stmt::FuncDecl { index, line, .. } = stmt {
+                if let Some(span) = source_map.line_span(0, *line as usize) {
+                    spans.insert(*index, span);
+                }
+            }
+        }
+        spans
+    };
+
+    let func_params = {
+        let mut params = std::collections::HashMap::new();
+        for decl in &parsed_after_legalize.functions {
+            params.insert(decl.index, decl.args.clone());
+        }
+        params
+    };
+
+    let semantic_index = SemanticIndex::build(
+        type_info.local_schemas.clone(),
+        &std::collections::HashMap::new(), // stmt_spans (empty for now)
+        func_decl_spans,
+        func_params,
+        source_texts,
+    );
+
+    // Attach the semantic index to the IR.
+    parsed_after_legalize.semantic_index = Some(semantic_index);
+
+    Ok(SemanticModel::new(
+        parsed_after_legalize,
+        source_map,
+        catalog,
+        errors,
+    ))
 }
 
 pub fn lint_trailing_function_return_semicolons(

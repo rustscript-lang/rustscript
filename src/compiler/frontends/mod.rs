@@ -181,6 +181,7 @@ fn parse_with_parser(
         use_declarations: parser.use_declarations(),
         implicit_extern_names: parser.implicit_extern_names(),
         host_api_metadata: parser.host_api_metadata(),
+        semantic_index: None,
     })
 }
 
@@ -219,6 +220,7 @@ fn parse_repl_with_parser(
             use_declarations: parser.use_declarations(),
             implicit_extern_names: parser.implicit_extern_names(),
             host_api_metadata: None,
+            semantic_index: None,
         },
         bindings,
     })

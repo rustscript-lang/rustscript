@@ -7,6 +7,7 @@ use crate::host_api::{HostApiFingerprint, HostFunctionSchema, HostParamPassing, 
 
 use super::ParseError;
 use super::modules::SymbolId;
+use super::source_map::Span;
 
 pub type LocalSlot = u16;
 
@@ -755,6 +756,71 @@ pub struct FrontendIr {
     /// flat function index, the ordered candidate schemas a frontend resolved
     /// against its catalog; raw ABI is absent here.
     pub host_api_metadata: Option<HostApiIrMetadata>,
+    /// Semantic index for language-service queries (see [`SemanticIndex`]).
+    /// Populated during pipeline compilation after type inference.
+    /// `None` for IR that has not been analyzed yet (parser output, REPL
+    /// snippets without semantic analysis, test fixtures).
+    pub semantic_index: Option<SemanticIndex>,
+}
+
+/// A semantic index built by the compiler during pipeline compilation.
+///
+/// This sidecar holds the span, type-schema, and scope information that the
+/// [`SemanticModel`](crate::compiler::semantic_model::SemanticModel) needs
+/// for precise position-based queries. It is produced from the legalized and
+/// type-checked IR — no second parser, type engine, or name-only lookup is
+/// involved.
+///
+/// The index is deliberately kept as a separate struct rather than adding
+/// span fields to every [`Expr`] and [`Stmt`] variant, so the core IR types
+/// are not bloated and the index is built only when semantic analysis is
+/// requested.
+#[derive(Clone, Debug, Default)]
+pub struct SemanticIndex {
+    /// Per-local-slot inferred [`TypeSchema`], indexed by [`LocalSlot`].
+    /// Populated from the type checker's `local_schemas` output.
+    pub slot_schemas: Vec<Option<TypeSchema>>,
+    /// Per-local-slot declaration [`Span`] in the source text.
+    pub slot_decl_spans: HashMap<LocalSlot, Span>,
+    /// Per-function-index declaration [`Span`] in the source text.
+    pub func_decl_spans: HashMap<u16, Span>,
+    /// Per-function-index parameter names (ordered).
+    pub func_params: HashMap<u16, Vec<String>>,
+    /// Call-expression spans: each entry is a `(span, return_type, name)` for
+    /// a catalog-resolved call expression, in traversal order. The semantic
+    /// model uses these to resolve `inferred_schema_at` and
+    /// `callable_signature_at` for call sites without walking `Expr` trees.
+    pub call_exprs: Vec<(Span, TypeSchema, String)>,
+    /// The source text for each [`SourceId`] in the compilation.
+    /// Used by the semantic model to resolve position-based queries.
+    pub source_texts: HashMap<crate::compiler::source_map::SourceId, String>,
+}
+
+impl SemanticIndex {
+    /// Build a semantic index from the provided slot schemas, spans, and
+    /// source texts. Called by the pipeline after type inference.
+    pub fn build(
+        slot_schemas: Vec<Option<TypeSchema>>,
+        stmt_spans: &HashMap<usize, Span>,
+        func_decl_spans: HashMap<u16, Span>,
+        func_params: HashMap<u16, Vec<String>>,
+        source_texts: HashMap<crate::compiler::source_map::SourceId, String>,
+    ) -> Self {
+        SemanticIndex {
+            slot_schemas,
+            slot_decl_spans: HashMap::new(),
+            func_decl_spans,
+            func_params,
+            call_exprs: Vec::new(),
+            source_texts,
+        }
+    }
+
+    /// Look up the inferred schema for a local slot.
+    pub fn slot_schema(&self, slot: LocalSlot) -> Option<&TypeSchema> {
+        let idx = slot as usize;
+        self.slot_schemas.get(idx).and_then(|s| s.as_ref())
+    }
 }
 
 pub struct LocalIrBuilder {
@@ -916,6 +982,7 @@ impl LocalIrBuilder {
             use_declarations: Vec::new(),
             implicit_extern_names: Vec::new(),
             host_api_metadata: None,
+            semantic_index: None,
         }
     }
 

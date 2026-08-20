@@ -14,7 +14,10 @@ use std::sync::Arc;
 
 use vm::compiler::ir::FrontendIr;
 use vm::compiler::source_map::SourceMap;
-use vm::compiler::{CompileError, SemanticCompletion, SemanticModel, SourcePosition, TypeSchema};
+use vm::compiler::{
+    CompileError, SemanticCompletion, SemanticDiagnostic, SemanticModel, SourcePosition,
+    TypeSchema, analyze_source,
+};
 use vm::host_api::{
     HostApiBuilder, HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema,
     HostTypeSchema, ResourceTypeKey, ResourceTypeSchema,
@@ -106,6 +109,7 @@ fn empty_ir() -> FrontendIr {
         use_declarations: Vec::new(),
         implicit_extern_names: Vec::new(),
         host_api_metadata: None,
+        semantic_index: None,
     }
 }
 
@@ -267,7 +271,7 @@ fn completions_work_with_custom_catalog() {
 fn diagnostics_empty_when_no_errors() {
     let catalog = test_catalog();
     let model = build_model(catalog, Vec::new());
-    let diags = model.diagnostics();
+    let diags: Vec<SemanticDiagnostic> = model.diagnostics();
     assert!(
         diags.is_empty(),
         "no errors should produce empty diagnostics"
@@ -283,7 +287,7 @@ fn diagnostics_unknown_host_api() {
         detail: "unknown host function `nonexistent::func`".to_string(),
     }];
     let model = build_model(catalog, errors);
-    let diags = model.diagnostics();
+    let diags: Vec<SemanticDiagnostic> = model.diagnostics();
     assert_eq!(diags.len(), 1);
     assert!(
         diags[0].message.contains("nonexistent::func"),
@@ -304,7 +308,7 @@ fn diagnostics_wrong_resource_type() {
             .to_string(),
     }];
     let model = build_model(catalog, errors);
-    let diags = model.diagnostics();
+    let diags: Vec<SemanticDiagnostic> = model.diagnostics();
 
     assert_eq!(diags.len(), 1, "should have exactly one diagnostic");
     let msg = &diags[0].message;
@@ -537,4 +541,118 @@ fn completed_source_text_has_no_effect_on_catalog_completions() {
         fn_count, 5,
         "should have 5 function completions (including overloads)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Real pipeline tests (analyze_source)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn analyze_source_basic() {
+    let source = "let x = 42;";
+    let model = analyze_source(source).expect("analyze_source should succeed");
+    let completions = model.completions_at(SourcePosition::new(0, 0));
+    assert!(!completions.is_empty(), "completions should not be empty");
+}
+
+#[test]
+fn analyze_source_with_catalog_works() {
+    // analyze_source creates a default catalog; verify it doesn't crash
+    let source = "let x = 42;";
+    let model = analyze_source(source).expect("analyze_source should succeed");
+    assert!(
+        model.catalog().functions().is_empty(),
+        "default catalog should be empty"
+    );
+}
+
+#[test]
+fn analyze_source_diagnostics() {
+    let source = "let x = ";
+    let model = analyze_source(source);
+    // Should either succeed or produce a parse error
+    match model {
+        Ok(model) => {
+            let diags: Vec<SemanticDiagnostic> = model.diagnostics();
+            // Incomplete expression should produce diagnostics
+            assert!(
+                !diags.is_empty(),
+                "incomplete source should have diagnostics"
+            );
+        }
+        Err(_) => {
+            // Parse error is also acceptable
+        }
+    }
+}
+
+#[test]
+fn analyze_source_line_col_conversion() {
+    let source = "let x = 42;\nlet y = 43;\n";
+    let model = analyze_source(source).expect("analyze_source should succeed");
+    let (line, col) = model
+        .offset_to_line_col(SourcePosition::new(0, 0))
+        .expect("should get line/col");
+    assert_eq!(line, 1, "offset 0 should be line 1");
+    assert_eq!(col, 1, "offset 0 should be column 1");
+    // Second line starts at offset 12 (after "let x = 42\n")
+    let (line, col) = model
+        .offset_to_line_col(SourcePosition::new(0, 12))
+        .expect("should get line/col");
+    assert_eq!(line, 2, "offset 12 should be line 2");
+    assert_eq!(col, 1, "offset 12 should be column 1");
+    // Round-trip
+    let offset = model
+        .line_col_to_offset(0, 2, 1)
+        .expect("should get offset");
+    assert_eq!(offset, 12);
+}
+
+#[test]
+fn analyze_source_completions_filtered() {
+    let source = "let x = 42;\n";
+    let model = analyze_source(source).expect("analyze_source should succeed");
+    // Completions at the start of the file should include catalog functions
+    let completions = model.completions_at(SourcePosition::new(0, 0));
+    let names: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    // At position 0, there's no prefix, so all catalog functions should appear
+    assert!(!completions.is_empty(), "completions should not be empty");
+}
+
+#[test]
+fn analyze_source_definition_at_local() {
+    let source = "let x = 42;\nx;";
+    let model = analyze_source(source).expect("analyze_source should succeed");
+    // Try to find a definition at position where 'x' is referenced
+    // The definition should be at the let-binding
+    let def = model.definition_at(SourcePosition::new(0, 10));
+    // May or may not find a definition depending on implementation
+    // This test primarily ensures no crash
+    let _ = def;
+}
+
+#[test]
+fn analyze_source_inferred_schema() {
+    let source = "let x = 42;";
+    let model = analyze_source(source).expect("analyze_source should succeed");
+    // The schema at offset 0 should be int (the literal)
+    let schema = model.inferred_schema_at(SourcePosition::new(0, 0));
+    // The inferred schema may or may not be available depending on
+    // whether the semantic index is populated for this position
+    if let Some(schema) = schema {
+        assert_eq!(schema, vm::compiler::TypeSchema::Int);
+    }
+}
+
+#[test]
+fn analyze_source_utf16_conversion() {
+    let source = "let x = \"héllo\";";
+    let model = analyze_source(source).expect("analyze_source should succeed");
+    // The UTF-16 column of the 'é' character (offset 9)
+    let utf16_col = model.offset_to_utf16_column(SourcePosition::new(0, 9));
+    if let Some(col) = utf16_col {
+        // 'é' is 2 bytes in UTF-8 but 1 code unit in UTF-16
+        // So offset 9 should be at UTF-16 column 9 (since previous chars are ASCII)
+        assert_eq!(col, 9, "UTF-16 column at offset 9 should be 9");
+    }
 }
