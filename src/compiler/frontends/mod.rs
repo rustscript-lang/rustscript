@@ -487,3 +487,149 @@ mod host_catalog_frontend_tests {
         assert_eq!(fp1, catalog.fingerprint());
     }
 }
+
+#[cfg(test)]
+mod ordinary_call_provenance_tests {
+    use crate::compiler::CompileSourceFileOptions;
+    use crate::compiler::ir::{Expr, Stmt};
+    use crate::compiler::source_map::Span;
+
+    use super::{SourceFlavor, parse_source};
+
+    fn parse(source: &str) -> crate::compiler::ir::FrontendIr {
+        parse_source(
+            source,
+            SourceFlavor::RustScript,
+            &CompileSourceFileOptions::default(),
+        )
+        .expect("source must parse")
+    }
+
+    fn stmt_call_exprs(ir: &crate::compiler::ir::FrontendIr) -> Vec<&Expr> {
+        ir.stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
+                    Some(expr)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// RustScript lowering is the identity, so span `.lo`/`.hi` are byte
+    /// offsets into the original source string.
+    fn span_slice(source: &str, span: Span) -> String {
+        source
+            .get(span.lo..span.hi)
+            .expect("span must slice source")
+            .to_string()
+    }
+
+    /// Two direct calls on the same source line get distinct stable ids and
+    /// exact callee + full-call slices.
+    #[test]
+    fn repeated_same_line_direct_calls_have_distinct_ids_and_exact_slices() {
+        let source = "fn twice(x) { x + x }\ntwice(1); twice(2);\n";
+        let ir = parse(source);
+        let index = ir.parsed_semantic_index.as_ref().expect("index present");
+        assert_eq!(index.call_sites.len(), 2, "two direct calls recorded");
+
+        let exprs = stmt_call_exprs(&ir);
+        assert_eq!(exprs.len(), 2);
+        let Expr::Call(_, _, _, _, first_id) = exprs[0] else {
+            panic!("first stmt must be an ordinary Call");
+        };
+        let Expr::Call(_, _, _, _, second_id) = exprs[1] else {
+            panic!("second stmt must be an ordinary Call");
+        };
+        let first_id = first_id.expect("first call has provenance id");
+        let second_id = second_id.expect("second call has provenance id");
+        assert_ne!(first_id, second_id, "distinct calls must get distinct ids");
+
+        let first_site = index
+            .call_sites
+            .iter()
+            .find(|site| site.id == first_id)
+            .expect("first call site recorded");
+        let second_site = index
+            .call_sites
+            .iter()
+            .find(|site| site.id == second_id)
+            .expect("second call site recorded");
+
+        assert_eq!(span_slice(source, first_site.callee_span), "twice");
+        assert_eq!(span_slice(source, first_site.expr_span), "twice(1)");
+        assert_eq!(span_slice(source, second_site.callee_span), "twice");
+        assert_eq!(span_slice(source, second_site.expr_span), "twice(2)");
+        assert_eq!(
+            first_site.expr_span.lo, first_site.callee_span.lo,
+            "expr span starts at callee start"
+        );
+        assert!(
+            first_site.expr_span.hi < second_site.callee_span.lo,
+            "first call ends before the second callee"
+        );
+    }
+
+    /// Nested direct calls record exact inner and outer spans; the outer expr
+    /// span covers the whole `f(g(1))` and the inner covers `g(1)`.
+    #[test]
+    fn nested_direct_calls_have_exact_inner_and_outer_slices() {
+        let source = "fn g(x) { x }\nfn f(x) { x }\nf(g(1));\n";
+        let ir = parse(source);
+        let index = ir.parsed_semantic_index.as_ref().expect("index present");
+        assert_eq!(index.call_sites.len(), 2, "inner and outer calls recorded");
+
+        let mut callees: Vec<String> = index
+            .call_sites
+            .iter()
+            .map(|site| span_slice(source, site.callee_span))
+            .collect();
+        callees.sort_unstable();
+        assert_eq!(callees, vec!["f", "g"]);
+
+        let inner = index
+            .call_sites
+            .iter()
+            .find(|site| span_slice(source, site.callee_span) == "g")
+            .expect("inner site");
+        let outer = index
+            .call_sites
+            .iter()
+            .find(|site| span_slice(source, site.callee_span) == "f")
+            .expect("outer site");
+        assert_eq!(span_slice(source, inner.expr_span), "g(1)");
+        assert_eq!(span_slice(source, outer.expr_span), "f(g(1))");
+        assert_eq!(
+            inner.callee_span.lo,
+            outer.callee_span.hi + 1,
+            "inner callee starts right after the outer callee's '('"
+        );
+        assert_eq!(
+            outer.expr_span.hi,
+            inner.expr_span.hi + 1,
+            "outer expr span extends one byte past the inner `)` to its own `)`"
+        );
+    }
+
+    /// A preceding Unicode token shifts byte offsets away from zero, but the
+    /// recorded spans still slice the exact callee and full call text.
+    #[test]
+    fn unicode_prefix_preserves_byte_offsets() {
+        let source = "fn twice(x) { x + x }\nlet msg = \"変換\";\ntwice(1);\n";
+        let ir = parse(source);
+        let index = ir.parsed_semantic_index.as_ref().expect("index present");
+        assert_eq!(index.call_sites.len(), 1);
+
+        let site = &index.call_sites[0];
+        let callee = span_slice(source, site.callee_span);
+        let expr = span_slice(source, site.expr_span);
+        assert_eq!(callee, "twice");
+        assert_eq!(expr, "twice(1)");
+        assert!(
+            site.callee_span.lo > 0,
+            "unicode-prefixed callee is not at byte zero"
+        );
+    }
+}

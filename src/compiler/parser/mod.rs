@@ -604,6 +604,31 @@ impl Parser {
         Expr::Call(index, type_args, args, host_resolution, semantic_id)
     }
 
+    /// Attach exact provenance to an ordinary source-level [`Expr::Call`]
+    /// that was built by a direct identifier/path + `(args)` branch without
+    /// its own provenance tracking.
+    ///
+    /// Only plain `Expr::Call(..., None)` expressions are annotated — local
+    /// calls, function-value references, and compiler-synthetic calls built
+    /// by helpers lacking direct source syntax pass through untouched. The
+    /// `callee_span` is the exact callee token range captured before args;
+    /// the recorded expr span runs from the callee start through the closing
+    /// `)` (`rparen_span`).
+    pub(super) fn attach_ordinary_call_provenance(
+        &mut self,
+        expr: Expr,
+        callee_span: Span,
+        rparen_span: Span,
+        name: String,
+    ) -> Expr {
+        let Expr::Call(index, type_args, args, host_resolution, None) = expr else {
+            return expr;
+        };
+        let expr_span = Span::new(callee_span.source_id, callee_span.lo, rparen_span.hi);
+        let semantic_id = self.alloc_call_id(callee_span, expr_span, index, name, false);
+        Expr::Call(index, type_args, args, host_resolution, semantic_id)
+    }
+
     /// Record a local declaration site.
     pub(super) fn record_local_decl(
         &mut self,

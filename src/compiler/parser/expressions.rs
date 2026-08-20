@@ -486,7 +486,14 @@ impl Parser {
                 let type_args = self.parse_turbofish_type_args()?;
                 if self.match_kind(&TokenKind::LParen) {
                     let args = self.parse_call_args()?;
-                    if self.has_local_binding(&name) {
+                    // The closing `)` consumed by `parse_call_args` is the
+                    // last consumed token; it bounds the full call expr span.
+                    let rparen_span = self
+                        .tokens
+                        .get(self.pos.saturating_sub(1))
+                        .map(|t| t.span)
+                        .unwrap_or(name_span);
+                    let call_expr = if self.has_local_binding(&name) {
                         if !type_args.is_empty() {
                             return Err(ParseError {
                                 span: None,
@@ -562,7 +569,22 @@ impl Parser {
                             self.validate_named_call_type_args(&decl, &type_args)?;
                         }
                         Expr::Call(decl.index, type_args, args, None, None)
-                    }
+                    };
+                    // Wire exact provenance for every ordinary source call
+                    // built by the direct identifier-path + `(args)` branch:
+                    // user functions, language builtins, direct host aliases
+                    // and implicit-extern fallbacks. `callee_span` is the
+                    // callee token range captured before args; the expr span
+                    // extends callee start through the consumed closing `)`.
+                    // Local calls, function-value references and synthetic
+                    // calls produced by helpers lacking direct source syntax
+                    // pass through untouched.
+                    self.attach_ordinary_call_provenance(
+                        call_expr,
+                        name_span,
+                        rparen_span,
+                        name.clone(),
+                    )
                 } else {
                     if self.has_local_binding(&name) {
                         if !type_args.is_empty() {
