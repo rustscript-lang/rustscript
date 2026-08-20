@@ -585,7 +585,9 @@ fn collect_expr_types(
             );
             let _ = context.infer_expr_type(expr, state);
         }
-        Expr::Call(_, _, args, _) | Expr::LocalCall(_, _, args) | Expr::ModuleCall(_, _, args) => {
+        Expr::Call(_, _, args, _, _)
+        | Expr::LocalCall(_, _, args)
+        | Expr::ModuleCall(_, _, args) => {
             for arg in args {
                 collect_expr_types(
                     arg,

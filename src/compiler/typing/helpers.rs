@@ -87,7 +87,7 @@ impl<'a> HostCallResolutionPass<'a> {
         let Some(metadata) = self.metadata else {
             return;
         };
-        let Expr::Call(index, _, args, resolution) = expr else {
+        let Expr::Call(index, _, args, resolution, _) = expr else {
             return;
         };
         if resolution.is_some() {
@@ -1646,10 +1646,11 @@ pub(super) fn expr_contains_param_add(expr: &Expr, param_slots: &[LocalSlot]) ->
             expr_contains_param_add(value, param_slots)
                 || expr_contains_param_add(fallback, param_slots)
         }
-        Expr::Call(_, _, args, _) | Expr::LocalCall(_, _, args) | Expr::ModuleCall(_, _, args) => {
-            args.iter()
-                .any(|arg| expr_contains_param_add(arg, param_slots))
-        }
+        Expr::Call(_, _, args, _, _)
+        | Expr::LocalCall(_, _, args)
+        | Expr::ModuleCall(_, _, args) => args
+            .iter()
+            .any(|arg| expr_contains_param_add(arg, param_slots)),
         Expr::ClosureCall(closure, args) => {
             expr_contains_param_add(&closure.body, param_slots)
                 || args
@@ -1718,9 +1719,9 @@ pub(super) fn expr_uses_param(expr: &Expr, param_slots: &[LocalSlot]) -> bool {
         Expr::OptionUnwrapOr {
             value, fallback, ..
         } => expr_uses_param(value, param_slots) || expr_uses_param(fallback, param_slots),
-        Expr::Call(_, _, args, _) | Expr::LocalCall(_, _, args) | Expr::ModuleCall(_, _, args) => {
-            args.iter().any(|arg| expr_uses_param(arg, param_slots))
-        }
+        Expr::Call(_, _, args, _, _)
+        | Expr::LocalCall(_, _, args)
+        | Expr::ModuleCall(_, _, args) => args.iter().any(|arg| expr_uses_param(arg, param_slots)),
         Expr::ClosureCall(closure, args) => {
             expr_uses_param(&closure.body, param_slots)
                 || args.iter().any(|arg| expr_uses_param(arg, param_slots))
@@ -1982,7 +1983,7 @@ pub(super) fn legalize_expr_children(
     host_resolution: &mut HostCallResolutionPass<'_>,
 ) {
     match expr {
-        Expr::Call(index, _, args, _) => {
+        Expr::Call(index, _, args, _, _) => {
             for arg in args.iter_mut() {
                 let _ = legalize_expr(arg, state, context, site, host_resolution);
             }
@@ -2015,7 +2016,7 @@ pub(super) fn legalize_expr_children(
 }
 
 pub(super) fn fold_builtin_call(expr: &mut Expr, builtin: BuiltinFunction, state: &LocalTypeState) {
-    let Expr::Call(_, _, args, _) = expr else {
+    let Expr::Call(_, _, args, _, _) = expr else {
         return;
     };
     match builtin {
@@ -2049,7 +2050,7 @@ pub(super) fn infer_static_len(expr: &Expr) -> Option<usize> {
     match expr {
         Expr::Bytes(bytes) => Some(bytes.len()),
         Expr::String(text) => Some(text.chars().count()),
-        Expr::Call(index, _, args, _) => {
+        Expr::Call(index, _, args, _, _) => {
             let builtin = BuiltinFunction::from_call_index(*index)?;
             match builtin {
                 BuiltinFunction::ArrayNew if args.is_empty() => Some(0),

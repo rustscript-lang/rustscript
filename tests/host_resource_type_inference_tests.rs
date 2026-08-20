@@ -743,7 +743,10 @@ fn analyze_source_semantic_index_present() {
     let source = "let x = 42;\n";
     let model = analyze_source(source).expect("analyze_source should succeed");
     let index = model.ir().semantic_index.as_ref();
-    assert!(index.is_some(), "analyze_source should produce a semantic index");
+    assert!(
+        index.is_some(),
+        "analyze_source should produce a semantic index"
+    );
     if let Some(index) = index {
         // slot_decl_spans should contain 'x'
         assert!(

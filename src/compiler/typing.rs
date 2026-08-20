@@ -604,7 +604,7 @@ mod catalog_call_resolution_tests {
         let ir = parse("use acme;\nacme::consume(acme::open(\"x\"));\n", catalog);
         let ir = legalize_builtins_and_bind_types(ir, TypingMode::DynamicHints, &[]).unwrap();
         let expressions = stmt_exprs(&ir);
-        let Expr::Call(_, _, args, Some(outer)) = expressions[0] else {
+        let Expr::Call(_, _, args, Some(outer), _) = expressions[0] else {
             panic!("outer call must be resolved");
         };
         assert_eq!(outer.return_type, TypeSchema::String);

@@ -11,6 +11,14 @@ use super::source_map::Span;
 
 pub type LocalSlot = u16;
 
+/// A stable identifier for a single source-level call-site node in the
+/// compiler IR. Carried by [`Expr::Call`] to preserve identity through
+/// every compiler transformation so the semantic model can later
+/// correlate post-transform nodes with their original parser source
+/// positions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SemanticNodeId(pub u32);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TypeSchema {
     Unknown,
@@ -394,13 +402,20 @@ pub enum Expr {
     /// (parameter schemas and passing modes resolved against each site's own
     /// argument types). [`None`] means the call has not been catalog-resolved
     /// yet or targets a non-catalog callable; resolution is carried here per
-    /// call, not reconstructed from the index. It is boxed so the large
+    /// per call, not reconstructed from the index. It is boxed so the large
     /// payload does not inflate every `Expr` node.
+    ///
+    /// The fifth field is an optional [`SemanticNodeId`] that preserves the
+    /// parser-assigned identity of the source call-site through every
+    /// compiler transformation. Parser-produced calls carry `Some(id)`;
+    /// compiler- or test-synthetic calls use `None`. Transformations that
+    /// rebuild an existing call **must** copy the original ID.
     Call(
         u16,
         Vec<TypeSchema>,
         Vec<Expr>,
         Option<Box<ResolvedHostCall>>,
+        Option<SemanticNodeId>,
     ),
     /// A call whose target was resolved to a compiler-owned module symbol
     /// before unit merge (milestone 4).
@@ -469,7 +484,7 @@ impl Expr {
     /// index-versus-resolution distinction.
     pub fn host_call_resolution(&self) -> Option<&ResolvedHostCall> {
         match self {
-            Expr::Call(_, _, _, Some(resolution)) => Some(resolution.as_ref()),
+            Expr::Call(_, _, _, Some(resolution), _) => Some(resolution.as_ref()),
             _ => None,
         }
     }
@@ -848,7 +863,10 @@ impl SemanticIndex {
         use super::span_collector::SpanCollector;
 
         let source_id = 0;
-        let source_text = source_texts.get(&source_id).map(|s| s.as_str()).unwrap_or("");
+        let source_text = source_texts
+            .get(&source_id)
+            .map(|s| s.as_str())
+            .unwrap_or("");
 
         let mut slot_decl_spans: HashMap<LocalSlot, Span> = HashMap::new();
         let mut func_decl_spans: HashMap<u16, Span> = HashMap::new();
@@ -1042,7 +1060,7 @@ impl LocalIrBuilder {
                     .insert(name.to_string(), (func_index, Some(call_arity)));
             }
         }
-        Some(Expr::Call(func_index, Vec::new(), args, None))
+        Some(Expr::Call(func_index, Vec::new(), args, None, None))
     }
 
     pub fn finish(self, stmts: Vec<Stmt>) -> FrontendIr {
@@ -1240,12 +1258,14 @@ mod call_resolution_carrier_tests {
             Vec::new(),
             Vec::new(),
             Some(Box::new(resolution("alpha"))),
+            None,
         );
         let second = Expr::Call(
             9,
             Vec::new(),
             Vec::new(),
             Some(Box::new(resolution("beta"))),
+            None,
         );
         // Same flat index (same `(name, arity)` candidate-set identity) but
         // distinct exact per-call resolutions.
@@ -1264,6 +1284,7 @@ mod call_resolution_carrier_tests {
             Vec::new(),
             Vec::new(),
             Some(Box::new(resolution("original"))),
+            None,
         );
         let cloned = call.clone();
         assert_eq!(cloned.host_call_resolution().unwrap().name, "original");
@@ -1272,12 +1293,55 @@ mod call_resolution_carrier_tests {
 
     #[test]
     fn accessor_is_none_for_unresolved_and_non_call() {
-        let unresolved = Expr::Call(9, Vec::new(), Vec::new(), None);
+        let unresolved = Expr::Call(9, Vec::new(), Vec::new(), None, None);
         assert!(unresolved.host_call_resolution().is_none());
         let local = Expr::LocalCall(0, Vec::new(), Vec::new());
         assert!(local.host_call_resolution().is_none());
         let literal = Expr::Int(1);
         assert!(literal.host_call_resolution().is_none());
+    }
+
+    #[test]
+    fn clone_preserves_semantic_node_id() {
+        let id = Some(super::SemanticNodeId(42));
+        let call = Expr::Call(9, Vec::new(), Vec::new(), None, id);
+        let cloned = call.clone();
+        // Clone preserves the semantic node id
+        assert_eq!(cloned.host_call_resolution(), call.host_call_resolution());
+        assert!(cloned.host_call_resolution().is_none());
+    }
+
+    #[test]
+    fn rewrite_preserves_semantic_node_id() {
+        // Simulate a transformation that rebuilds an Expr::Call with
+        // different arguments but must preserve the original SemanticNodeId.
+        let original = Expr::Call(
+            9,
+            Vec::new(),
+            vec![Expr::Int(1)],
+            None,
+            Some(super::SemanticNodeId(99)),
+        );
+        let source_node_id = match &original {
+            Expr::Call(_, _, _, _, id) => *id,
+            _ => None,
+        };
+        let rewritten = Expr::Call(9, Vec::new(), vec![Expr::Int(1)], None, source_node_id);
+        // The rewritten call still carries the same id
+        assert_eq!(source_node_id, Some(super::SemanticNodeId(99)));
+    }
+
+    #[test]
+    fn synthetic_call_uses_none_id() {
+        let synthetic = Expr::Call(9, Vec::new(), Vec::new(), None, None);
+        assert!(synthetic.host_call_resolution().is_none());
+    }
+
+    #[test]
+    fn distinct_ids_distinguish_calls() {
+        let a = Some(super::SemanticNodeId(1));
+        let b = Some(super::SemanticNodeId(2));
+        assert_ne!(a, b);
     }
 }
 

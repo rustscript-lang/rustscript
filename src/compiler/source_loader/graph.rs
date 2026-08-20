@@ -1049,7 +1049,7 @@ fn resolve_expr_imported_calls(
     line: u32,
 ) -> Result<(), SourcePathError> {
     match expr {
-        Expr::Call(index, type_args, args, _host_annotation) => {
+        Expr::Call(index, type_args, args, _host_annotation, _) => {
             for arg in args.iter_mut() {
                 resolve_expr_imported_calls(ctx, arg, line)?;
             }

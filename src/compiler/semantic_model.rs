@@ -349,7 +349,7 @@ impl SemanticModel {
     /// Walk an expression tree to find a call expression whose span contains
     /// the position. Falls back to containing sub-expressions.
     fn expr_call_return_schema(&self, expr: &Expr, position: SourcePosition) -> Option<TypeSchema> {
-        if let Expr::Call(_, _, _, Some(resolved)) = expr {
+        if let Expr::Call(_, _, _, Some(resolved), _) = expr {
             // Check if the position falls within any part of this call.
             // We use the line heuristic as a fallback — the semantic index
             // would provide the exact span, but we work with what we have.
@@ -416,7 +416,7 @@ impl SemanticModel {
             } => self
                 .expr_call_return_schema(value, position)
                 .or_else(|| self.expr_call_return_schema(fallback, position)),
-            Expr::Call(_, _, args, _) | Expr::ModuleCall(_, _, args) => {
+            Expr::Call(_, _, args, _, _) | Expr::ModuleCall(_, _, args) => {
                 for arg in args {
                     if let Some(schema) = self.expr_call_return_schema(arg, position) {
                         return Some(schema);
@@ -481,7 +481,7 @@ impl SemanticModel {
                 if let Stmt::Let { index, expr, .. } = stmt {
                     if *index == slot {
                         // Return the expression's inferred type.
-                        if let Expr::Call(_, _, _, Some(resolved)) = expr {
+                        if let Expr::Call(_, _, _, Some(resolved), _) = expr {
                             return Some(resolved.return_type.clone());
                         }
                         // For literals, return the known type.
@@ -639,7 +639,7 @@ impl SemanticModel {
         position: SourcePosition,
     ) -> Option<HostFunctionSchema> {
         match expr {
-            Expr::Call(_, _, _, Some(resolved)) => {
+            Expr::Call(_, _, _, Some(resolved), _) => {
                 // Convert the resolved host call to a HostFunctionSchema
                 // with description looked up from the catalog.
                 let mut schema = self.resolved_call_to_host_schema(resolved);
@@ -871,120 +871,122 @@ impl SemanticModel {
     /// `resource<key>` for resource schemas. Legal overloads remain separate
     /// deterministic candidates; no arbitrary name-only selection is performed.
     pub fn completions_at(&self, position: SourcePosition) -> Vec<SemanticCompletion> {
-            let mut completions = Vec::new();
+        let mut completions = Vec::new();
 
-            // Determine the cursor prefix (the word being typed at the position).
-            let prefix = self.cursor_prefix(position);
+        // Determine the cursor prefix (the word being typed at the position).
+        let prefix = self.cursor_prefix(position);
 
-            // Determine which scope the cursor is in.
-            let cursor_scope_id = self.find_scope_at(position);
+        // Determine which scope the cursor is in.
+        let cursor_scope_id = self.find_scope_at(position);
 
-            // Collect visible local slots from the cursor scope and its ancestors.
-            let mut visible_slots: std::collections::HashSet<LocalSlot> = std::collections::HashSet::new();
-            let mut visible_funcs: std::collections::HashSet<u16> = std::collections::HashSet::new();
-            let mut seen_scope_ids: std::collections::HashSet<ScopeId> = std::collections::HashSet::new();
+        // Collect visible local slots from the cursor scope and its ancestors.
+        let mut visible_slots: std::collections::HashSet<LocalSlot> =
+            std::collections::HashSet::new();
+        let mut visible_funcs: std::collections::HashSet<u16> = std::collections::HashSet::new();
+        let mut seen_scope_ids: std::collections::HashSet<ScopeId> =
+            std::collections::HashSet::new();
 
-            if let Some(index) = &self.semantic_index {
-                if let Some(mut scope_id) = cursor_scope_id {
-                    // Walk up the scope chain.
-                    loop {
-                        if !seen_scope_ids.insert(scope_id) {
-                            break; // Prevent infinite loops.
+        if let Some(index) = &self.semantic_index {
+            if let Some(mut scope_id) = cursor_scope_id {
+                // Walk up the scope chain.
+                loop {
+                    if !seen_scope_ids.insert(scope_id) {
+                        break; // Prevent infinite loops.
+                    }
+                    if let Some(scope) = index.scope_records.get(scope_id as usize) {
+                        for slot in &scope.declarations {
+                            visible_slots.insert(*slot);
                         }
-                        if let Some(scope) = index.scope_records.get(scope_id as usize) {
-                            for slot in &scope.declarations {
-                                visible_slots.insert(*slot);
-                            }
-                            for func_idx in &scope.functions {
-                                visible_funcs.insert(*func_idx);
-                            }
-                            if let Some(parent) = scope.parent {
-                                scope_id = parent;
-                            } else {
-                                break;
-                            }
+                        for func_idx in &scope.functions {
+                            visible_funcs.insert(*func_idx);
+                        }
+                        if let Some(parent) = scope.parent {
+                            scope_id = parent;
                         } else {
                             break;
                         }
+                    } else {
+                        break;
                     }
                 }
             }
+        }
 
-            // 1. Visible local variables from scope analysis.
-            if let Some(index) = &self.semantic_index {
-                for (name, slot) in &self.local_name_to_slot {
-                    if visible_slots.contains(slot) {
-                        if prefix.is_empty() || name.starts_with(&prefix) {
-                            let detail = index.slot_schema(*slot).map(|s| format!("{}", s));
-                            completions.push(SemanticCompletion {
-                                label: name.clone(),
-                                detail,
-                                docs: None,
-                                kind: CompletionItemKind::Variable,
-                            });
-                        }
-                    }
-                }
-            }
-
-            // 2. Function declarations from scope analysis.
-            for decl in &self.ir.functions {
-                if visible_funcs.contains(&decl.index) {
-                    if prefix.is_empty() || decl.name.starts_with(&prefix) {
-                        let detail = Some(format!("fn({})", decl.args.join(", ")));
+        // 1. Visible local variables from scope analysis.
+        if let Some(index) = &self.semantic_index {
+            for (name, slot) in &self.local_name_to_slot {
+                if visible_slots.contains(slot) {
+                    if prefix.is_empty() || name.starts_with(&prefix) {
+                        let detail = index.slot_schema(*slot).map(|s| format!("{}", s));
                         completions.push(SemanticCompletion {
-                            label: decl.name.clone(),
+                            label: name.clone(),
                             detail,
                             docs: None,
-                            kind: CompletionItemKind::Function,
+                            kind: CompletionItemKind::Variable,
                         });
                     }
                 }
             }
+        }
 
-            // 3. Catalog functions (with full signatures).
-            for func in self.catalog.functions() {
-                if prefix.is_empty() || func.name.starts_with(&prefix) {
-                    let detail = Some(self.format_host_function_detail(func));
+        // 2. Function declarations from scope analysis.
+        for decl in &self.ir.functions {
+            if visible_funcs.contains(&decl.index) {
+                if prefix.is_empty() || decl.name.starts_with(&prefix) {
+                    let detail = Some(format!("fn({})", decl.args.join(", ")));
                     completions.push(SemanticCompletion {
-                        label: func.name.clone(),
+                        label: decl.name.clone(),
                         detail,
-                        docs: Some(func.description.clone()),
+                        docs: None,
                         kind: CompletionItemKind::Function,
                     });
                 }
             }
-
-            // 4. Catalog resource types.
-            for resource in self.catalog.resources() {
-                let label = format!("resource<{}>", resource.key);
-                if prefix.is_empty() || label.starts_with(&prefix) {
-                    completions.push(SemanticCompletion {
-                        label,
-                        detail: Some(resource.description.clone()),
-                        docs: None,
-                        kind: CompletionItemKind::Resource,
-                    });
-                }
-            }
-
-            completions
         }
 
-        /// Find the deepest lexical scope containing the given position.
-        fn find_scope_at(&self, position: SourcePosition) -> Option<ScopeId> {
-            if let Some(index) = &self.semantic_index {
-                // Walk scopes in reverse order (deepest first, since they are pushed
-                // in traversal order and later scopes are nested deeper).
-                for (i, scope) in index.scope_records.iter().enumerate().rev() {
-                    if self.position_in_span(position, scope.range) {
-                        return Some(i as ScopeId);
-                    }
+        // 3. Catalog functions (with full signatures).
+        for func in self.catalog.functions() {
+            if prefix.is_empty() || func.name.starts_with(&prefix) {
+                let detail = Some(self.format_host_function_detail(func));
+                completions.push(SemanticCompletion {
+                    label: func.name.clone(),
+                    detail,
+                    docs: Some(func.description.clone()),
+                    kind: CompletionItemKind::Function,
+                });
+            }
+        }
+
+        // 4. Catalog resource types.
+        for resource in self.catalog.resources() {
+            let label = format!("resource<{}>", resource.key);
+            if prefix.is_empty() || label.starts_with(&prefix) {
+                completions.push(SemanticCompletion {
+                    label,
+                    detail: Some(resource.description.clone()),
+                    docs: None,
+                    kind: CompletionItemKind::Resource,
+                });
+            }
+        }
+
+        completions
+    }
+
+    /// Find the deepest lexical scope containing the given position.
+    fn find_scope_at(&self, position: SourcePosition) -> Option<ScopeId> {
+        if let Some(index) = &self.semantic_index {
+            // Walk scopes in reverse order (deepest first, since they are pushed
+            // in traversal order and later scopes are nested deeper).
+            for (i, scope) in index.scope_records.iter().enumerate().rev() {
+                if self.position_in_span(position, scope.range) {
+                    return Some(i as ScopeId);
                 }
             }
-            // Default to root scope (0).
-            Some(0)
         }
+        // Default to root scope (0).
+        Some(0)
+    }
 
     /// Extract the cursor prefix (the word being typed) at the position.
     fn cursor_prefix(&self, position: SourcePosition) -> String {
@@ -1134,7 +1136,12 @@ impl SemanticModel {
         if let Some(index) = &self.semantic_index {
             for (func_idx, span) in &index.func_decl_spans {
                 if self.position_in_span(position, *span) {
-                    let name = self.ir.functions.get(*func_idx as usize).map(|f| f.name.as_str()).unwrap_or("fn");
+                    let name = self
+                        .ir
+                        .functions
+                        .get(*func_idx as usize)
+                        .map(|f| f.name.as_str())
+                        .unwrap_or("fn");
                     return Some(Definition {
                         span: *span,
                         label: format!("fn {}", name),
@@ -1181,7 +1188,7 @@ impl SemanticModel {
     }
 
     fn expr_catalog_def(&self, expr: &Expr, position: SourcePosition) -> Option<Definition> {
-        if let Expr::Call(_, _, _, Some(resolved)) = expr {
+        if let Expr::Call(_, _, _, Some(resolved), _) = expr {
             // Return a virtual definition for the catalog function.
             let candidates: Vec<&HostFunctionSchema> = self
                 .catalog
@@ -1218,7 +1225,7 @@ impl SemanticModel {
                 .expr_catalog_def(condition, position)
                 .or_else(|| self.expr_catalog_def(then_expr, position))
                 .or_else(|| self.expr_catalog_def(else_expr, position)),
-            Expr::Call(_, _, args, _) | Expr::ModuleCall(_, _, args) => {
+            Expr::Call(_, _, args, _, _) | Expr::ModuleCall(_, _, args) => {
                 for arg in args {
                     if let Some(def) = self.expr_catalog_def(arg, position) {
                         return Some(def);
@@ -2001,7 +2008,7 @@ mod tests {
             fingerprint: catalog.fingerprint(),
         };
         ir.stmts.push(Stmt::Expr {
-            expr: Expr::Call(0, Vec::new(), Vec::new(), Some(Box::new(resolved))),
+            expr: Expr::Call(0, Vec::new(), Vec::new(), Some(Box::new(resolved)), None),
             line: 1,
         });
         ir.locals = 0;

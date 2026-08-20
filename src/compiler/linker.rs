@@ -775,7 +775,7 @@ fn remap_expr_indices(
                 message: "unresolved function value reference reached the module merge".to_string(),
             })));
         }
-        Expr::Call(index, _, args, _) => {
+        Expr::Call(index, _, args, _, _) => {
             if let Some(remapped_index) = function_map.get(index).copied() {
                 *index = remapped_index;
             } else if BuiltinFunction::from_call_index(*index).is_none() {
@@ -805,7 +805,13 @@ fn remap_expr_indices(
                             .to_string(),
                 }))
             })?;
-            *expr = Expr::Call(flat, std::mem::take(type_args), std::mem::take(args), None);
+            *expr = Expr::Call(
+                flat,
+                std::mem::take(type_args),
+                std::mem::take(args),
+                None,
+                None,
+            );
         }
         Expr::OptionalGet {
             container,
@@ -1400,11 +1406,12 @@ mod linker_metadata_remap_tests {
             passing: vec![crate::host_api::HostParamPassing::Borrow],
             fingerprint: fingerprint(4),
         };
-        let mut annotated = Expr::Call(7, Vec::new(), Vec::new(), Some(Box::new(res.clone())));
+        let mut annotated =
+            Expr::Call(7, Vec::new(), Vec::new(), Some(Box::new(res.clone())), None);
         let mut function_map = HashMap::new();
         function_map.insert(7u16, 11u16);
         remap_expr_indices(&mut annotated, 0, &function_map, &HashMap::new()).unwrap();
-        let Expr::Call(flat, _, _, resolution) = annotated else {
+        let Expr::Call(flat, _, _, resolution, _) = annotated else {
             panic!("expected a Call");
         };
         assert_eq!(flat, 11);

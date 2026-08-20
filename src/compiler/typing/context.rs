@@ -506,7 +506,7 @@ impl<'a> TypeContext<'a> {
             Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
                 self.expr_has_declared_schema(inner, state)
             }
-            Expr::Call(index, _, args, _) => match BuiltinFunction::from_call_index(*index) {
+            Expr::Call(index, _, args, _, _) => match BuiltinFunction::from_call_index(*index) {
                 Some(BuiltinFunction::Get)
                 | Some(BuiltinFunction::Set)
                 | Some(BuiltinFunction::Slice)
@@ -579,7 +579,7 @@ impl<'a> TypeContext<'a> {
             Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
                 self.expr_has_struct_schema_source(inner, state)
             }
-            Expr::Call(index, _, args, _) => match BuiltinFunction::from_call_index(*index) {
+            Expr::Call(index, _, args, _, _) => match BuiltinFunction::from_call_index(*index) {
                 Some(BuiltinFunction::Get)
                 | Some(BuiltinFunction::Set)
                 | Some(BuiltinFunction::Slice)
@@ -638,7 +638,7 @@ impl<'a> TypeContext<'a> {
             Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => state.is_optional(*root),
             Expr::OptionalGet { .. } => true,
             Expr::OptionUnwrapOr { .. } => false,
-            Expr::Call(index, _, _, _) => {
+            Expr::Call(index, _, _, _, _) => {
                 BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::ReFind)
                     || self.function_returns_optional(*index)
             }
@@ -1042,7 +1042,7 @@ impl<'a> TypeContext<'a> {
                 params: vec![TypeSchema::Unknown; closure.param_slots.len()],
                 result: Box::new(TypeSchema::Unknown),
             }),
-            Expr::Call(index, type_args, args, resolution) => {
+            Expr::Call(index, type_args, args, resolution, _) => {
                 if let Some(resolved) = resolution {
                     Some(resolved.return_type.clone())
                 } else if let Some(builtin) = BuiltinFunction::from_call_index(*index) {
@@ -1259,7 +1259,7 @@ impl<'a> TypeContext<'a> {
         state: &LocalTypeState,
     ) -> BoundType {
         match expr {
-            Expr::Call(index, type_args, args, resolution) => {
+            Expr::Call(index, type_args, args, resolution, _) => {
                 if let Some(resolved) = resolution {
                     return self.bound_type_for_schema(&resolved.return_type);
                 }
@@ -2074,7 +2074,7 @@ impl<'a> TypeContext<'a> {
         source_name: Option<&str>,
     ) -> Result<(), CompileError> {
         match expr {
-            Expr::Call(index, type_args, args, resolution) => {
+            Expr::Call(index, type_args, args, resolution, _) => {
                 // A catalog-resolved direct call was already validated for
                 // schema, arity, and parameter passing by the exact resolver;
                 // the child expressions are still recursively validated by the
@@ -3163,8 +3163,9 @@ mod tests {
             Vec::new(),
             vec![Expr::Int(1)],
             Some(Box::new(resolution(TypeSchema::String))),
+            None,
         );
-        let bare = Expr::Call(30, Vec::new(), vec![Expr::Int(1)], None);
+        let bare = Expr::Call(30, Vec::new(), vec![Expr::Int(1)], None, None);
 
         // Schema inference follows the annotation, not the legacy decl.
         assert_eq!(
@@ -3222,7 +3223,7 @@ mod tests {
         );
         let state = LocalTypeState::default();
 
-        let bare = Expr::Call(31, Vec::new(), vec![Expr::Int(1)], None);
+        let bare = Expr::Call(31, Vec::new(), vec![Expr::Int(1)], None, None);
         assert!(
             context
                 .validate_call_argument_types(&bare, &state, None, None)
@@ -3235,6 +3236,7 @@ mod tests {
             Vec::new(),
             vec![Expr::Int(1)],
             Some(Box::new(resolution(TypeSchema::String))),
+            None,
         );
         context
             .validate_call_argument_types(&annotated, &state, None, None)

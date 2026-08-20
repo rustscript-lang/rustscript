@@ -183,7 +183,7 @@ impl Parser {
     pub(super) fn is_mut_borrow_target(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Var(_) => true,
-            Expr::Call(index, _, args, _) => {
+            Expr::Call(index, _, args, _, _) => {
                 if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::Get)
                     || args.len() != 2
                 {
@@ -210,7 +210,7 @@ impl Parser {
     pub(super) fn extract_mut_borrow_root_slot(&self, expr: &Expr) -> Option<LocalSlot> {
         match expr {
             Expr::Var(slot) => Some(*slot),
-            Expr::Call(index, _, args, _) => {
+            Expr::Call(index, _, args, _, _) => {
                 if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::Get)
                     || args.len() != 2
                 {
@@ -434,7 +434,7 @@ impl Parser {
                     // which knows the exported type parameters.
                     let qualified = format!("{}::{}", name, path_segments.join("::"));
                     let decl = self.resolve_function_for_call(&qualified, args.len())?;
-                    Expr::Call(decl.index, type_args, args, None)
+                    Expr::Call(decl.index, type_args, args, None, None)
                 } else {
                     return Err(ParseError {
                         span: None,
@@ -501,7 +501,7 @@ impl Parser {
                             } else {
                                 let decl = self.resolve_function_for_call(&name, args.len())?;
                                 self.validate_named_call_type_args(&decl, &type_args)?;
-                                Expr::Call(decl.index, type_args, args, None)
+                                Expr::Call(decl.index, type_args, args, None, None)
                             }
                         } else {
                             let decl = self.resolve_function_for_call(&name, args.len())?;
@@ -510,7 +510,7 @@ impl Parser {
                             if !self.is_implicit_extern(&name) {
                                 self.validate_named_call_type_args(&decl, &type_args)?;
                             }
-                            Expr::Call(decl.index, type_args, args, None)
+                            Expr::Call(decl.index, type_args, args, None, None)
                         }
                     } else if let Some(expr) = self.try_build_language_builtin_call(&name, &args)? {
                         if !type_args.is_empty() {
@@ -536,7 +536,7 @@ impl Parser {
                         if !self.import_scan_mode && !self.is_implicit_extern(&name) {
                             self.validate_named_call_type_args(&decl, &type_args)?;
                         }
-                        Expr::Call(decl.index, type_args, args, None)
+                        Expr::Call(decl.index, type_args, args, None, None)
                     }
                 } else {
                     if self.has_local_binding(&name) {
@@ -1364,7 +1364,13 @@ impl Parser {
             if args.len() == usize::from(builtin.arity()) + 1
                 && Self::rewrite_regex_flags_arg_into_pattern(builtin, &mut args)
             {
-                return Ok(Expr::Call(builtin.call_index(), type_args, args, None));
+                return Ok(Expr::Call(
+                    builtin.call_index(),
+                    type_args,
+                    args,
+                    None,
+                    None,
+                ));
             }
             return Err(ParseError {
                 span: None,
@@ -1377,7 +1383,13 @@ impl Parser {
                 ),
             });
         }
-        Ok(Expr::Call(builtin.call_index(), type_args, args, None))
+        Ok(Expr::Call(
+            builtin.call_index(),
+            type_args,
+            args,
+            None,
+            None,
+        ))
     }
 
     pub(super) fn rewrite_regex_flags_arg_into_pattern(
@@ -1409,17 +1421,20 @@ impl Parser {
             Vec::new(),
             vec![Expr::String("(?".to_string()), flags],
             None,
+            None,
         );
         let prefix = Expr::Call(
             BuiltinFunction::Concat.call_index(),
             Vec::new(),
             vec![prefix, Expr::String(")".to_string())],
             None,
+            None,
         );
         Expr::Call(
             BuiltinFunction::Concat.call_index(),
             Vec::new(),
             vec![prefix, pattern],
+            None,
             None,
         )
     }
@@ -1621,7 +1636,13 @@ impl Parser {
 
     pub(super) fn build_print_call_expr(&mut self, argument: Expr) -> Result<Expr, ParseError> {
         let decl = self.resolve_function_for_call(STDLIB_PRINT_NAME, 1)?;
-        Ok(Expr::Call(decl.index, Vec::new(), vec![argument], None))
+        Ok(Expr::Call(
+            decl.index,
+            Vec::new(),
+            vec![argument],
+            None,
+            None,
+        ))
     }
 
     pub(super) fn build_to_string_expr(&mut self, value: Expr) -> Result<Expr, ParseError> {
@@ -1659,7 +1680,7 @@ impl Parser {
             message: "function arity too large".to_string(),
         })?;
         let decl = self.define_host_function(host_name, arity)?;
-        Ok(Expr::Call(decl.index, type_args, args, None))
+        Ok(Expr::Call(decl.index, type_args, args, None, None))
     }
 
     /// Whether host type arguments are validated at parse time.
@@ -1731,7 +1752,7 @@ impl Parser {
     }
 
     fn contextualize_function_call_args(&self, expr: &mut Expr) -> Result<(), ParseError> {
-        let Expr::Call(index, type_args, args, _) = expr else {
+        let Expr::Call(index, type_args, args, _, _) = expr else {
             return Ok(());
         };
         let Some(decl) = self

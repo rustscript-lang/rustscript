@@ -56,7 +56,9 @@ impl<'a> SpanCollector<'a> {
 
     pub(crate) fn collect_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Let { index, expr, line, .. } => {
+            Stmt::Let {
+                index, expr, line, ..
+            } => {
                 if let Some(name) = self
                     .ir
                     .local_bindings
@@ -78,7 +80,9 @@ impl<'a> SpanCollector<'a> {
             Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
                 self.collect_expr(expr);
             }
-            Stmt::FuncDecl { name, index, line, .. } => {
+            Stmt::FuncDecl {
+                name, index, line, ..
+            } => {
                 let span = find_identifier_span(self.source_id, self.source_text, *line, name)
                     .unwrap_or_else(|| Span::new(self.source_id, 0, 0));
                 self.func_decl_spans.insert(*index, span);
@@ -100,7 +104,11 @@ impl<'a> SpanCollector<'a> {
                 let if_span = if let Some(span) =
                     find_identifier_span(self.source_id, self.source_text, *line, "if")
                 {
-                    Span::new(self.source_id, span.lo, self.source_text.len().min(span.lo + 20))
+                    Span::new(
+                        self.source_id,
+                        span.lo,
+                        self.source_text.len().min(span.lo + 20),
+                    )
                 } else {
                     Span::new(self.source_id, 0, 0)
                 };
@@ -134,7 +142,11 @@ impl<'a> SpanCollector<'a> {
                 let for_span = if let Some(span) =
                     find_identifier_span(self.source_id, self.source_text, *line, "for")
                 {
-                    Span::new(self.source_id, span.lo, self.source_text.len().min(span.lo + 20))
+                    Span::new(
+                        self.source_id,
+                        span.lo,
+                        self.source_text.len().min(span.lo + 20),
+                    )
                 } else {
                     Span::new(self.source_id, 0, 0)
                 };
@@ -155,14 +167,21 @@ impl<'a> SpanCollector<'a> {
                 self.scope_stack.pop();
             }
             Stmt::While {
-                condition, body, line, ..
+                condition,
+                body,
+                line,
+                ..
             } => {
                 let while_scope_id = self.scope_id_counter;
                 self.scope_id_counter += 1;
                 let while_span = if let Some(span) =
                     find_identifier_span(self.source_id, self.source_text, *line, "while")
                 {
-                    Span::new(self.source_id, span.lo, self.source_text.len().min(span.lo + 20))
+                    Span::new(
+                        self.source_id,
+                        span.lo,
+                        self.source_text.len().min(span.lo + 20),
+                    )
                 } else {
                     Span::new(self.source_id, 0, 0)
                 };
@@ -189,7 +208,7 @@ impl<'a> SpanCollector<'a> {
 
     fn collect_expr(&mut self, expr: &Expr) {
         match expr {
-            Expr::Call(_, _, args, _) => {
+            Expr::Call(_, _, args, _, _) => {
                 let call_name = self.find_call_name();
                 let call_span = estimate_call_span(self.source_id, self.source_text, &call_name, 0)
                     .unwrap_or_else(|| Span::new(self.source_id, 0, 0));
@@ -241,7 +260,10 @@ impl<'a> SpanCollector<'a> {
                 self.collect_expr(else_expr);
             }
             Expr::Match {
-                value, arms, default, ..
+                value,
+                arms,
+                default,
+                ..
             } => {
                 self.collect_expr(value);
                 for (_, arm_expr) in arms {
@@ -282,7 +304,9 @@ impl<'a> SpanCollector<'a> {
                 self.collect_expr(container);
                 self.collect_expr(key);
             }
-            Expr::OptionUnwrapOr { value, fallback, .. } => {
+            Expr::OptionUnwrapOr {
+                value, fallback, ..
+            } => {
                 self.collect_expr(value);
                 self.collect_expr(fallback);
             }
@@ -324,19 +348,16 @@ impl<'a> SpanCollector<'a> {
 }
 
 /// Find the span of a variable name in the source text at a given line.
-fn find_identifier_span(
-    source_id: u32,
-    source_text: &str,
-    line: u32,
-    name: &str,
-) -> Option<Span> {
+fn find_identifier_span(source_id: u32, source_text: &str, line: u32, name: &str) -> Option<Span> {
     if line == 0 {
         return None;
     }
     let line_usize = line as usize;
     let mut line_start = 0usize;
     for _ in 1..line_usize {
-        line_start = source_text[line_start..].find('\n').map(|pos| line_start + pos + 1)?;
+        line_start = source_text[line_start..]
+            .find('\n')
+            .map(|pos| line_start + pos + 1)?;
     }
     let line_end = source_text[line_start..]
         .find('\n')
@@ -376,12 +397,7 @@ fn find_identifier_span(
 }
 
 /// Find the span of a call expression name in the source text.
-fn find_callee_span(
-    source_id: u32,
-    source_text: &str,
-    call_name: &str,
-    call_start: usize,
-) -> Span {
+fn find_callee_span(source_id: u32, source_text: &str, call_name: &str, call_start: usize) -> Span {
     let text_before = &source_text[..call_start];
     if let Some(pos) = text_before.rfind(call_name) {
         let prev_ok = if pos == 0 {

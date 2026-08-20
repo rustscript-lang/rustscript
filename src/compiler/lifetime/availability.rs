@@ -823,7 +823,7 @@ impl AvailabilityAnalyzer {
             // Resolved module calls (pre-merge only) analyze their arguments;
             // interprocedural effects apply to the post-merge flat call.
             Expr::ModuleCall(_, _, args) => self.analyze_args(args, state, line),
-            Expr::Call(index, _, args, resolution) => {
+            Expr::Call(index, _, args, resolution, _) => {
                 if !self.enable_local_move_semantics {
                     if let Some(root_slot) = self.extract_collection_mutation_root(*index, args) {
                         let mut out = self.analyze_args(args, state, line)?;
@@ -1045,7 +1045,7 @@ impl AvailabilityAnalyzer {
             self.require_local_not_partially_moved(*index, state, line)?;
             return Ok(state.clone());
         }
-        if let Expr::Call(index, _, args, _) = inner
+        if let Expr::Call(index, _, args, _, _) = inner
             && let Some((root_slot, field_key)) = self.extract_moved_field_access(*index, args)
         {
             let out = self.analyze_projection_args(args, state, line)?;
@@ -1123,7 +1123,7 @@ impl AvailabilityAnalyzer {
                 self.mark_local_moved(&mut out, *slot);
                 Ok(out)
             }
-            Expr::Call(index, _, args, _)
+            Expr::Call(index, _, args, _, _)
                 if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::Get) =>
             {
                 let Some((root_slot, field_key)) = self.extract_moved_field_access(*index, args)
@@ -1197,7 +1197,7 @@ impl AvailabilityAnalyzer {
             Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
                 let _ = root;
             }
-            Expr::Call(index, _, args, _) => {
+            Expr::Call(index, _, args, _, _) => {
                 if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::Get)
                     && let Some((root_slot, field_key)) =
                         self.extract_moved_field_access(*index, args)
@@ -1253,7 +1253,7 @@ impl AvailabilityAnalyzer {
                     || self.expr_contains_owned_local(value)
                     || self.expr_contains_owned_local(fallback)
             }
-            Expr::Call(_, _, args, _)
+            Expr::Call(_, _, args, _, _)
             | Expr::LocalCall(_, _, args)
             | Expr::ModuleCall(_, _, args) => {
                 args.iter().any(|arg| self.expr_contains_owned_local(arg))
@@ -1391,7 +1391,7 @@ impl AvailabilityAnalyzer {
             Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
                 self.display_local_name(*root)
             }
-            Expr::Call(index, _, args, _)
+            Expr::Call(index, _, args, _, _)
                 if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::Get) =>
             {
                 args.first()
@@ -1426,7 +1426,7 @@ impl AvailabilityAnalyzer {
         in_call_arg: bool,
     ) -> Result<Expr, ParseError> {
         match expr {
-            Expr::Call(index, type_args, args, resolution) => {
+            Expr::Call(index, type_args, args, resolution, source_node_id) => {
                 let mut rewritten_args = Vec::with_capacity(args.len());
                 for arg in args {
                     rewritten_args.push(self.rewrite_expr_ownership_inner(arg, true)?);
@@ -1448,6 +1448,7 @@ impl AvailabilityAnalyzer {
                         type_args.clone(),
                         rewritten_args,
                         Some(Box::new(resolution.clone())),
+                        *source_node_id,
                     ));
                 }
                 // Legacy (non-resolved) calls keep their shape except for
@@ -1465,7 +1466,13 @@ impl AvailabilityAnalyzer {
                         rewritten_args[position] = Expr::MoveVar(*slot);
                     }
                 }
-                Ok(Expr::Call(*index, type_args.clone(), rewritten_args, None))
+                Ok(Expr::Call(
+                    *index,
+                    type_args.clone(),
+                    rewritten_args,
+                    None,
+                    *source_node_id,
+                ))
             }
             Expr::Var(slot) if !in_call_arg && self.is_owned_slot(*slot) => {
                 Ok(Expr::MoveVar(*slot))
@@ -1633,7 +1640,7 @@ impl AvailabilityAnalyzer {
         match arg {
             Expr::Var(slot) => Ok(Expr::MoveVar(*slot)),
             Expr::MoveVar(slot) => Ok(Expr::MoveVar(*slot)),
-            Expr::Call(index, _, args, _)
+            Expr::Call(index, _, args, _, _)
                 if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::Get) =>
             {
                 let Some((root_slot, field_key)) = self.extract_moved_field_access(*index, args)
@@ -1856,7 +1863,7 @@ impl AvailabilityAnalyzer {
         if !self.enable_local_move_semantics {
             return expr.clone();
         }
-        let Expr::Call(index, _, args, _) = expr else {
+        let Expr::Call(index, _, args, _, _) = expr else {
             return expr.clone();
         };
         if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::Get) {
