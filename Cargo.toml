@@ -132,6 +132,11 @@ name = "http_sse_tests"
 path = "tests/vm/http_sse_tests.rs"
 required-features = ["runtime", "http-client"]
 
+[[test]]
+name = "io_http_coexistence_tests"
+path = "tests/vm/io_http_coexistence_tests.rs"
+required-features = ["runtime", "http-client"]
+
 
 
 [[test]]
