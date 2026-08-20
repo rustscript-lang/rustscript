@@ -26,7 +26,8 @@ pub(super) mod sse;
 
 pub use config::HttpConfig;
 use policy::{ConnectionAdmission, ConnectionPermit};
-pub use request::{HttpRequestResource, HttpResponseResource, SseStreamResource};
+pub use request::{HttpRequestResource, HttpResponseResource};
+pub(crate) use sse::SseStreamResource;
 
 const DEFAULT_MAX_HTTP_IN_FLIGHT: usize = 64;
 

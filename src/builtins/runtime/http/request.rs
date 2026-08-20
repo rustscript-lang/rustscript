@@ -19,8 +19,7 @@ use crate::vm::operation::{
     OperationSpec,
 };
 use crate::vm::resource::{
-    CloseProgress, HostResource, Resource, ResourceCloseReason, ResourceError, ResourceErrorCode,
-    ResourceHandle, ResourceResult, ResourceTypeKey,
+    CloseProgress, HostResource, ResourceCloseReason, ResourceResult, ResourceTypeKey,
 };
 use crate::vm::{CallReturn, Value, Vm, VmError, VmResult};
 
@@ -465,40 +464,6 @@ impl HostResource for HttpResponseResource {
     }
 }
 
-/// An SSE stream reader, registered as a child of the underlying response
-/// stream resource. Closing the child stops the SSE polling operation; closing
-/// the parent (the response stream) closes the child first through the generic
-/// child-first scope shutdown.
-pub struct SseStreamResource {
-    inner: Arc<SseResourceInner>,
-}
-
-struct SseResourceInner {
-    /// The response stream parent this reader is a child of.
-    _parent: ResourceHandle,
-    /// Shared stop flag: set on child close (or parent close, which closes
-    /// the child first) so the SSE poll operation stops polling the network.
-    stopping: std::sync::atomic::AtomicBool,
-    /// Waker for a pending SSE poll operation.
-    waker: std::sync::Mutex<Option<std::task::Waker>>,
-}
-
-impl HostResource for SseStreamResource {
-    fn resource_type_key() -> Option<ResourceTypeKey> {
-        ResourceTypeKey::new("http.sse").ok()
-    }
-
-    fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
-        self.inner.stopping.store(true, Ordering::SeqCst);
-        if let Ok(mut waker) = self.inner.waker.lock() {
-            if let Some(waker) = waker.take() {
-                waker.wake();
-            }
-        }
-        Ok(CloseProgress::Ready)
-    }
-}
-
 /// Driver for the *buffered* HTTP request operation: runs the request on a
 /// worker thread and publishes the response map into a shared cell.
 pub(super) struct HttpRequestOperation {
@@ -526,67 +491,6 @@ impl HostOperation for HttpRequestOperation {
 
     fn cancel(&mut self, reason: OperationCancelReason) -> OperationResult<()> {
         self.cancelled.store(true, Ordering::SeqCst);
-        let _ = reason;
-        Ok(())
-    }
-}
-
-/// Driver for the SSE poll operation: polls the underlying response body
-/// stream one frame at a time, parses SSE events, and publishes each
-/// guest-visible item (or the terminal summary) into a shared cell.
-pub(super) struct SsePollOperation {
-    inner: Arc<SseResourceInner>,
-    driver: Pin<Box<dyn std::future::Future<Output = VmResult<CallReturn>> + Send>>,
-    state: std::sync::Mutex<Option<VmResult<CallReturn>>>,
-}
-
-impl SsePollOperation {
-    pub(super) fn new(
-        inner: Arc<SseResourceInner>,
-        driver: Pin<Box<dyn std::future::Future<Output = VmResult<CallReturn>> + Send>>,
-    ) -> Self {
-        Self {
-            inner,
-            driver,
-            state: std::sync::Mutex::new(None),
-        }
-    }
-}
-
-impl HostOperation for SsePollOperation {
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
-        if self.inner.stopping.load(Ordering::SeqCst) {
-            return Poll::Ready(Err(OperationError::new(
-                OperationErrorCode::OperationDriverFailed,
-                "http::client::sse",
-                "SSE stream closed",
-            )));
-        }
-        let mut state = self.state.lock().expect("sse poll state lock");
-        match state.as_ref() {
-            Some(Ok(_)) => Poll::Ready(Ok(())),
-            Some(Err(error)) => Poll::Ready(Err(OperationError::new(
-                OperationErrorCode::OperationDriverFailed,
-                "http::client::sse",
-                error.to_string(),
-            ))),
-            None => {
-                *self.inner.waker.lock().expect("sse waker lock") = Some(cx.waker().clone());
-                let driver = &mut self.driver;
-                let cx = &mut Context::from_waker(cx.waker());
-                match std::pin::pin!(driver).as_mut().poll(cx) {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(result) => {
-                        *state = Some(result);
-                        Poll::Ready(Ok(()))
-                    }
-                }
-            }
-        }
-    }
-
-    fn cancel(&mut self, reason: OperationCancelReason) -> OperationResult<()> {
-        self.inner.stopping.store(true, Ordering::SeqCst);
         let _ = reason;
         Ok(())
     }

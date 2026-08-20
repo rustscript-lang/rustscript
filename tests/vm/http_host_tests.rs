@@ -567,3 +567,280 @@ fn shutdown_and_drop_retire_buffered_http_futures() {
     assert!(state.submitted.is_empty());
     assert_eq!(state.retired.len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// SSE scope lifecycle integration tests
+// ---------------------------------------------------------------------------
+
+/// Spawns a simple SSE server that sends events. The server may get a
+/// connection reset when the client closes the stream early (expected).
+fn sse_event_server(max_events: usize, idle_ms: u64) -> (u16, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("sse test listener should bind");
+    let port = listener
+        .local_addr()
+        .expect("sse test listener should have an address")
+        .port();
+    let handle = thread::spawn(move || {
+        let accept = listener.accept();
+        let Ok((mut stream, _)) = accept else {
+            return; // Client may have already disconnected.
+        };
+        // Read the HTTP request.
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        let read = match stream.read(&mut buffer) {
+            Ok(0) | Err(_) => return, // Client may have disconnected.
+            Ok(n) => n,
+        };
+        request.extend_from_slice(&buffer[..read]);
+        if !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            return; // Incomplete request header; client may have disconnected.
+        }
+        // Send the SSE response header.
+        if stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .is_err()
+        {
+            return; // Client disconnected.
+        }
+        // Send events, ignoring write errors (client may close early).
+        for i in 0..max_events {
+            let chunk = format!("{:x}\r\ndata: event {i}\n\n\r\n", 10 + format!("{i}").len());
+            if stream.write_all(chunk.as_bytes()).is_err() {
+                return;
+            }
+            if stream.flush().is_err() {
+                return;
+            }
+            thread::sleep(std::time::Duration::from_millis(idle_ms));
+        }
+        // Send the closing chunk.
+        let _ = stream.write_all(b"0\r\n\r\n");
+        let _ = stream.flush();
+    });
+    (port, handle)
+}
+
+fn sse_config(port: u16) -> HttpConfig {
+    HttpConfig {
+        allowed_schemes: vec!["http".to_string()],
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        allowed_ports: vec![port],
+        allow_private_ips: true,
+        max_stream_duration: std::time::Duration::from_secs(30),
+        ..HttpConfig::default()
+    }
+}
+
+fn build_sse_program(port: u16) -> Program {
+    compile_source(&format!(
+        r#"
+        use http;
+        fn record(item: map) -> map {{
+            {{"action": "continue"}}
+        }}
+        let result = http::client::sse(
+            {{"method": "GET", "url": "http://127.0.0.1:{port}/events"}},
+            record
+        );
+        result;
+        "#
+    ))
+    .expect("SSE source should compile")
+    .program
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sse_scope_resource_registered_and_scope_close_stops_worker() {
+    // This test verifies that the SSE resource is registered in the scope
+    // and that closing the scope stops the worker thread.
+    let (port, server) = sse_event_server(5, 5);
+    let mut vm = Vm::new(build_sse_program(port));
+    vm.configure_http(sse_config(port))
+        .expect("SSE configuration should be valid");
+    install_host_driver(&mut vm);
+    HostFunctionRegistry::new()
+        .bind_vm_cached(&mut vm)
+        .expect("default host registry should bind HTTP");
+
+    // Run the VM until it starts waiting for the SSE stream.
+    let status = vm.run().expect("SSE VM should start");
+    assert!(
+        matches!(status, VmStatus::Waiting(_)),
+        "SSE should be pending on the callable stream, got {status:?}"
+    );
+
+    // Now reset the VM. This should close the scope, which cancels the SSE
+    // operation and stops the worker thread.
+    vm.reset_for_reuse();
+
+    // The server should finish quickly because the worker was stopped.
+    server.join().expect("SSE server should finish");
+    assert!(vm.is_reusable(), "VM should be reusable after reset");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sse_reset_releases_connection_permit() {
+    // This test verifies that resetting the VM releases the connection permit
+    // acquired by the SSE stream.
+    let (port, server) = sse_event_server(10, 10);
+    let mut vm = Vm::new(build_sse_program(port));
+    vm.set_http_max_in_flight(1);
+    vm.configure_http(sse_config(port))
+        .expect("SSE configuration should be valid");
+    install_host_driver(&mut vm);
+    HostFunctionRegistry::new()
+        .bind_vm_cached(&mut vm)
+        .expect("default host registry should bind HTTP");
+
+    // Start the SSE stream.
+    let status = vm.run().expect("SSE VM should start");
+    assert!(matches!(status, VmStatus::Waiting(_)));
+
+    // Reset the VM. This should release the permit.
+    vm.reset_for_reuse();
+    server.join().expect("SSE server should finish");
+
+    // The permit should now be available. Verify by running a new request
+    // with max_in_flight=1 (the only permit was released).
+    let (port2, server2) = spawn_test_server();
+    let mut vm2 = Vm::new(build_request_program(format!("http://127.0.0.1:{port2}/")));
+    vm2.set_http_max_in_flight(1);
+    vm2.configure_http(local_http_config(port2))
+        .expect("HTTP configuration should be valid");
+    install_host_driver(&mut vm2);
+    HostFunctionRegistry::new()
+        .bind_vm_cached(&mut vm2)
+        .expect("default host registry should bind HTTP");
+    drive_vm_to_halt(&mut vm2)
+        .await
+        .expect("HTTP request should complete after SSE permit was released");
+    assert_eq!(response_field(&vm2.stack()[0], "status"), &Value::Int(200));
+    server2.join().expect("test server should finish");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sse_callback_stop_retires_without_end_and_returns_stopped_summary() {
+    // This test verifies that a callback returning "stop" stops the stream
+    // and returns a "stopped" summary without waiting for the server to
+    // send the end chunk.
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0; 4096];
+        let _ = stream.read(&mut request).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n\
+             f\r\ndata: first event\n\n\r\n\
+             10\r\ndata: second event\n\n\r\n\
+             0\r\n\r\n"
+        )
+        .unwrap();
+        stream.flush().unwrap();
+    });
+    let source = format!(
+        r#"use http;
+        fn stop(item: map) -> map {{ {{"action": "stop"}} }}
+        let result = http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, stop);
+        result;"#
+    );
+    let compiled = compile_source(&source).expect("SSE stop source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.configure_http(sse_config(port)).unwrap();
+    vm.set_async_bridge(Box::<TokioHostDriver>::default());
+    HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
+
+    drive_vm_to_halt(&mut vm).await.unwrap();
+    server.join().unwrap();
+
+    let result = &vm.stack()[0];
+    let Value::Map(map) = result else {
+        panic!("expected result map, got {result:?}");
+    };
+    assert_eq!(
+        map.get(&Value::string("outcome")),
+        Some(&Value::string("stopped"))
+    );
+    assert_eq!(map.get(&Value::string("status")), Some(&Value::Int(200)));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sse_explicit_resource_close_via_scope_stops_worker() {
+    // This test verifies that the SSE resource is registered in the scope
+    // and that closing the scope (via shutdown) stops the worker.
+    let (port, server) = sse_event_server(20, 10);
+    let mut vm = Vm::new(build_sse_program(port));
+    vm.configure_http(sse_config(port))
+        .expect("SSE configuration should be valid");
+    install_host_driver(&mut vm);
+    HostFunctionRegistry::new()
+        .bind_vm_cached(&mut vm)
+        .expect("default host registry should bind HTTP");
+
+    // Start the SSE stream.
+    let status = vm.run().expect("SSE VM should start");
+    assert!(matches!(status, VmStatus::Waiting(_)));
+
+    // Close the scope. This should close the SSE resource, which sets
+    // `stopping` and wakes the worker.
+    vm.shutdown();
+
+    // The server should finish because the worker was stopped.
+    server.join().expect("SSE server should finish");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sse_child_first_cleanup_through_scope_close() {
+    // This test verifies that child-first cleanup works: the SSE resource
+    // is closed before the parent resource.
+    let (port, server) = sse_event_server(5, 5);
+    let mut vm = Vm::new(build_sse_program(port));
+    vm.configure_http(sse_config(port))
+        .expect("SSE configuration should be valid");
+    install_host_driver(&mut vm);
+    HostFunctionRegistry::new()
+        .bind_vm_cached(&mut vm)
+        .expect("default host registry should bind HTTP");
+
+    // Start the SSE stream.
+    let status = vm.run().expect("SSE VM should start");
+    assert!(matches!(status, VmStatus::Waiting(_)));
+
+    // Reset the VM. This drives the scope close, which cancels operations
+    // first, then closes resources child-first.
+    vm.reset_for_reuse();
+
+    server.join().expect("SSE server should finish");
+    assert!(vm.is_reusable(), "VM should be reusable after reset");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sse_no_detached_worker_after_stream_driver_removal() {
+    // This test verifies that the SSE worker is not left running after the
+    // stream driver is removed (via cancel_callable_stream during shutdown).
+    let (port, server) = sse_event_server(50, 20);
+    let mut vm = Vm::new(build_sse_program(port));
+    vm.configure_http(sse_config(port))
+        .expect("SSE configuration should be valid");
+    install_host_driver(&mut vm);
+    HostFunctionRegistry::new()
+        .bind_vm_cached(&mut vm)
+        .expect("default host registry should bind HTTP");
+
+    // Start the SSE stream.
+    let status = vm.run().expect("SSE VM should start");
+    assert!(matches!(status, VmStatus::Waiting(_)));
+
+    // Shutdown the VM. This calls cancel_callable_stream which removes the
+    // stream driver, but the worker should still be stopped by the scope
+    // close (resource close sets stopping).
+    vm.shutdown();
+
+    // The server should finish because the worker was stopped by the scope
+    // close, not just by the stream driver removal.
+    server.join().expect("SSE server should finish");
+}

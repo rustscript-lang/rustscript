@@ -13,7 +13,14 @@ use super::request::{
 };
 use super::{HttpRequestContext, policy};
 use crate::builtins::runtime::{HostCallResult, VmCallable, VmMap, VmMapHandle};
-use crate::vm::resource::ResourceHandle;
+use crate::vm::operation::{
+    HostOperation, OperationCancelReason, OperationError, OperationErrorCode, OperationResult,
+    OperationSpec,
+};
+use crate::vm::resource::{
+    CloseProgress, HostResource, ResourceCloseReason, ResourceHandle, ResourceResult,
+    ResourceTypeKey,
+};
 use crate::vm::{
     CallOutcome, CallReturn, HostStreamAction, HostStreamDriver, HostStreamPoll, Value, Vm,
     VmError, VmResult,
@@ -310,7 +317,8 @@ fn parse_stream_timeout(request: &VmMap) -> VmResult<Option<Duration>> {
 /// worker observes it between items and stops promptly.
 pub(super) struct SseShared {
     /// The response stream parent this reader is a child of.
-    pub(super) parent: crate::vm::resource::ResourceHandle,
+    /// Set after the resource is pushed into the scope.
+    pub(super) parent: std::sync::Mutex<Option<ResourceHandle>>,
     /// Set on close/cancel; the worker stops polling the network.
     pub(super) stopping: AtomicBool,
     /// Waker registered by the latest pending SSE poll.
@@ -321,6 +329,8 @@ pub(super) struct SseShared {
     pub(super) done: AtomicBool,
     /// The final result from the worker thread (Ok or error).
     pub(super) result: std::sync::Mutex<Option<VmResult<()>>>,
+    /// The worker thread handle, taken during close to join.
+    pub(super) join_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// One SSE event or terminal summary delivered to the guest callback.
@@ -532,6 +542,23 @@ impl HostStreamDriver for SseStreamDriver {
         }
         drop(item_guard);
 
+        if self.shared.stopping.load(Ordering::SeqCst) {
+            // Take the result if the worker already published it, otherwise
+            // return a clean stopped summary.
+            let result = self
+                .shared
+                .result
+                .lock()
+                .expect("sse result lock should not be poisoned")
+                .take();
+            return match result {
+                None | Some(Ok(())) => {
+                    Poll::Ready(Ok(HostStreamPoll::Complete(self.summary("stopped"))))
+                }
+                Some(Err(error)) => Poll::Ready(Err(error)),
+            };
+        }
+
         if self.shared.done.load(Ordering::SeqCst) {
             let result = self
                 .shared
@@ -576,6 +603,59 @@ impl HostStreamDriver for SseStreamDriver {
     }
 }
 
+/// The SSE stream reader registered as a child resource in the execution
+/// scope. Closing it via the scope lifecycle sets `stopping` on the shared
+/// state, which the worker observes between items and stops promptly.
+pub(crate) struct SseStreamResource {
+    shared: Arc<SseShared>,
+}
+
+impl HostResource for SseStreamResource {
+    fn resource_type_key() -> Option<ResourceTypeKey> {
+        ResourceTypeKey::new("http.sse").ok()
+    }
+
+    fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
+        let _ = reason;
+        self.shared.stopping.store(true, Ordering::SeqCst);
+        if let Ok(mut waker) = self.shared.waker.lock() {
+            if let Some(waker) = waker.take() {
+                waker.wake();
+            }
+        }
+        Ok(CloseProgress::Ready)
+    }
+}
+
+/// Scope operation that tracks the pending SSE network poll. Cancel sets
+/// `stopping` on the shared state so the worker stops promptly. The actual
+/// item delivery is driven by the `SseStreamDriver` through the callable
+/// stream path; this operation exists only for scope lifecycle management.
+pub(super) struct SseScopeOperation {
+    shared: Arc<SseShared>,
+}
+
+impl HostOperation for SseScopeOperation {
+    fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
+        if self.shared.done.load(Ordering::SeqCst) {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn cancel(&mut self, reason: OperationCancelReason) -> OperationResult<()> {
+        let _ = reason;
+        self.shared.stopping.store(true, Ordering::SeqCst);
+        if let Ok(mut waker) = self.shared.waker.lock() {
+            if let Some(waker) = waker.take() {
+                waker.wake();
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Streams one bounded SSE item into one script callback at a time.
 #[pd_host_function(name = "http::client::sse")]
 pub(super) fn builtin_http_client_sse(
@@ -606,16 +686,38 @@ pub(super) fn builtin_http_client_sse(
     }
 
     let shared = Arc::new(SseShared {
-        // The parent resource handle is set when the worker registers the
-        // response stream; for now we use a dummy handle since the stream
-        // driver manages the lifecycle through the shared state.
-        parent: ResourceHandle::from_raw(1).expect("valid dummy handle"),
+        parent: std::sync::Mutex::new(None),
         stopping: AtomicBool::new(false),
         waker: std::sync::Mutex::new(None),
         item: std::sync::Mutex::new(None),
         done: AtomicBool::new(false),
         result: std::sync::Mutex::new(None),
+        join_handle: std::sync::Mutex::new(None),
     });
+
+    // Register the SSE stream as a scoped resource and start a scope
+    // operation associated with it. The scope lifecycle manages abort:
+    // closing the resource or cancelling the operation sets `stopping`,
+    // which the worker observes between items and stops promptly.
+    let sse_resource = SseStreamResource {
+        shared: Arc::clone(&shared),
+    };
+    let resource_token = vm
+        .host_context()
+        .push_resource(sse_resource)
+        .map_err(|error| VmError::HostError(format!("failed to push SSE resource: {error}")))?;
+    let handle = resource_token.handle();
+    // Update the shared parent handle to the real resource handle so the
+    // scope lifecycle can find it.
+    *shared.parent.lock().expect("sse parent lock") = Some(handle);
+    let op = SseScopeOperation {
+        shared: Arc::clone(&shared),
+    };
+    let op_id = vm
+        .host_context()
+        .start_operation(OperationSpec::new(op).with_resource(handle))
+        .map_err(|error| VmError::HostError(format!("failed to start SSE operation: {error}")))?;
+    let _raw = op_id.raw();
 
     let worker = Arc::new(SseWorker {
         config: context.config.clone(),
@@ -629,12 +731,13 @@ pub(super) fn builtin_http_client_sse(
         url: std::sync::Mutex::new(None),
     });
 
-    std::thread::Builder::new()
+    let join_handle = std::thread::Builder::new()
         .name("rustscript-sse-worker".to_string())
         .spawn(move || {
             worker.run();
         })
         .map_err(|error| VmError::HostError(format!("failed to start SSE worker: {error}")))?;
+    *shared.join_handle.lock().expect("sse join handle lock") = Some(join_handle);
 
     let permit = context.into_permit();
     let driver = SseStreamDriver {
