@@ -7,6 +7,7 @@ use super::super::TypingMode;
 use super::super::ir::{
     ClosureExpr, Expr, FunctionDecl, FunctionImpl, LocalSlot, Stmt, StructDecl, TypeSchema,
 };
+use super::super::source_map::Span;
 use super::helpers::{
     bind_expr_result_to_slot, bound_type_label, display_name_for_builtin,
     function_body_contains_param_add, infer_binary_type, infer_unary_type, is_numeric_bound_type,
@@ -117,6 +118,10 @@ pub(super) struct TypeContext<'a> {
     observed_optional_returns: HashMap<u16, bool>,
     active_observed_returns: Vec<(u16, Vec<String>)>,
     active_optional_returns: Vec<u16>,
+    /// Parser provenance used to resolve exact source spans for typed
+    /// diagnostics. `None` for hand-built test IRs and plugin frontends that
+    /// carry no parser index.
+    parsed: Option<&'a crate::compiler::ir::ParsedSemanticIndex>,
 }
 
 struct CallableBody<'a> {
@@ -136,6 +141,7 @@ impl<'a> TypeContext<'a> {
         host_import_return_types: &'a HashMap<u16, BoundType>,
         host_import_signatures: &'a HashMap<u16, HostCallableSignature>,
         typing_mode: TypingMode,
+        parsed: Option<&'a crate::compiler::ir::ParsedSemanticIndex>,
     ) -> Self {
         Self {
             function_impls,
@@ -158,11 +164,70 @@ impl<'a> TypeContext<'a> {
             observed_optional_returns: HashMap::new(),
             active_observed_returns: Vec::new(),
             active_optional_returns: Vec::new(),
+            parsed,
         }
     }
 
     pub(super) fn is_strict(&self) -> bool {
         self.typing_mode.is_strict()
+    }
+
+    /// Exact parser-origin span for a semantic node id: the call-site
+    /// expression span for calls/optional accesses, or the identifier token
+    /// span for declarations/references. `None` when the id is unknown to the
+    /// parser provenance (synthetic/test nodes).
+    pub(super) fn node_span(&self, id: crate::compiler::ir::SemanticNodeId) -> Option<Span> {
+        let parsed = self.parsed?;
+        for site in &parsed.call_sites {
+            if site.id == id {
+                return Some(site.expr_span);
+            }
+        }
+        for decl in &parsed.local_decls {
+            if decl.id == id {
+                return Some(decl.ident_span);
+            }
+        }
+        for reference in &parsed.local_refs {
+            if reference.id == id {
+                return Some(reference.ident_span);
+            }
+        }
+        for decl in &parsed.func_decls {
+            if decl.id == id {
+                return Some(decl.ident_span);
+            }
+        }
+        for reference in &parsed.func_refs {
+            if reference.id == id {
+                return Some(reference.ident_span);
+            }
+        }
+        None
+    }
+
+    /// The exact parser-origin span of the outermost statement whose first
+    /// token is on `line`, if the parser recorded one. Multiple statements on
+    /// one line each record their own independent span; when nested
+    /// statements share a line, the widest (outermost) span wins because the
+    /// diagnostic targets the statement construct being validated, not an
+    /// inner sub-statement. The parser's spans are never line-wide guesses.
+    pub(super) fn stmt_span(&self, line: u32) -> Option<Span> {
+        self.parsed?
+            .stmt_spans
+            .iter()
+            .filter(|site| site.line == line)
+            .max_by_key(|site| site.span.hi - site.span.lo)
+            .map(|site| site.span)
+    }
+
+    /// The exact parser-origin identifier span of a function declaration.
+    pub(super) fn function_decl_span(&self, function_index: u16) -> Option<Span> {
+        self.parsed?
+            .func_decls
+            .iter()
+            .find(|decl| decl.function_index == function_index)
+            .map(|decl| decl.ident_span)
     }
 
     pub(super) fn function_name(&self, index: u16) -> &str {
@@ -2073,6 +2138,12 @@ impl<'a> TypeContext<'a> {
         line_context: Option<u32>,
         source_name: Option<&str>,
     ) -> Result<(), CompileError> {
+        let expr_span = match expr {
+            Expr::Call(_, _, _, _, Some(id))
+            | Expr::ModuleCall(_, _, _, Some(id))
+            | Expr::LocalCall(_, _, _, Some(id)) => self.node_span(*id),
+            _ => self.stmt_span(line_context.unwrap_or_default()),
+        };
         match expr {
             Expr::Call(index, type_args, args, resolution, _) => {
                 // A catalog-resolved direct call was already validated for
@@ -2089,6 +2160,7 @@ impl<'a> TypeContext<'a> {
                         state,
                         line_context,
                         source_name,
+                        expr_span,
                     )
                 } else if let Some(signature) = self.host_import_signatures.get(index).cloned() {
                     self.validate_host_argument_types(
@@ -2097,6 +2169,7 @@ impl<'a> TypeContext<'a> {
                         state,
                         line_context,
                         source_name,
+                        expr_span,
                     )
                 } else if let Some(function_decl) = self.function_decls.get(index).cloned() {
                     let param_schemas = self
@@ -2112,6 +2185,7 @@ impl<'a> TypeContext<'a> {
                         DiagnosticSite {
                             line: line_context,
                             source_name,
+                            span: expr_span,
                         },
                         self,
                     )
@@ -2128,6 +2202,7 @@ impl<'a> TypeContext<'a> {
                             state,
                             line_context,
                             source_name,
+                            expr_span,
                         )
                     } else if let Some(signature) = self.host_import_signatures.get(&index).cloned()
                     {
@@ -2137,6 +2212,7 @@ impl<'a> TypeContext<'a> {
                             state,
                             line_context,
                             source_name,
+                            expr_span,
                         )
                     } else if let Some(function_decl) = self.function_decls.get(&index).cloned() {
                         let param_schemas = self
@@ -2152,6 +2228,7 @@ impl<'a> TypeContext<'a> {
                             DiagnosticSite {
                                 line: line_context,
                                 source_name,
+                                span: expr_span,
                             },
                             self,
                         )
@@ -2172,7 +2249,7 @@ impl<'a> TypeContext<'a> {
                         .map(|index| format!("arg{}", index + 1))
                         .collect::<Vec<_>>();
                     validate_function_argument_schemas(
-                        &format!("local slot {}", slot),
+                        &format!("local slot {slot}"),
                         "callable",
                         &param_names,
                         &param_schemas,
@@ -2181,6 +2258,7 @@ impl<'a> TypeContext<'a> {
                         DiagnosticSite {
                             line: line_context,
                             source_name,
+                            span: expr_span,
                         },
                         self,
                     )
@@ -2197,6 +2275,7 @@ impl<'a> TypeContext<'a> {
         state: &LocalTypeState,
         line_context: Option<u32>,
         source_name: Option<&str>,
+        span: Option<Span>,
     ) -> Result<(), CompileError> {
         if builtin == BuiltinFunction::JsonEncode {
             let arg = args.first().expect("json::encode arity is fixed");
@@ -2207,6 +2286,7 @@ impl<'a> TypeContext<'a> {
                 DiagnosticSite {
                     line: line_context,
                     source_name,
+                    span,
                 },
             );
         }
@@ -2220,6 +2300,7 @@ impl<'a> TypeContext<'a> {
             super::validate::DiagnosticSite {
                 line: line_context,
                 source_name,
+                span,
             },
         )
     }
@@ -2231,6 +2312,7 @@ impl<'a> TypeContext<'a> {
         state: &LocalTypeState,
         line_context: Option<u32>,
         source_name: Option<&str>,
+        span: Option<Span>,
     ) -> Result<(), CompileError> {
         for (index, param) in signature.params.iter().enumerate() {
             let crate::builtins::CallableParamType::Callable(callable) = param.ty else {
@@ -2256,6 +2338,7 @@ impl<'a> TypeContext<'a> {
                 super::validate::DiagnosticSite {
                     line: line_context,
                     source_name,
+                    span,
                 },
                 self,
             )?;
@@ -2304,6 +2387,7 @@ impl<'a> TypeContext<'a> {
                     "host function '{}' uses dynamically typed 'any' parameters and is not available from strict RustScript without a typed wrapper",
                     signature.name
                 ),
+                span: self.stmt_span(line_context.unwrap_or_default()),
             });
         }
         validate_host_signature(
@@ -3019,6 +3103,7 @@ mod tests {
             &empty_returns,
             &empty_signatures,
             TypingMode::StrictRustScript,
+            None,
         );
         let state = LocalTypeState::default();
         let wrong = [Expr::Closure(ClosureExpr {
@@ -3027,7 +3112,7 @@ mod tests {
             body: Box::new(Expr::Int(1)),
         })];
         let error = context
-            .validate_host_argument_types(&signature, &wrong, &state, None, None)
+            .validate_host_argument_types(&signature, &wrong, &state, None, None, None)
             .expect_err("fn(float) -> float metadata must reject an int result");
         assert!(
             error.to_string().contains("float") && error.to_string().contains("int"),
@@ -3040,7 +3125,7 @@ mod tests {
             body: Box::new(Expr::Float(1.0)),
         })];
         context
-            .validate_host_argument_types(&signature, &valid, &state, None, None)
+            .validate_host_argument_types(&signature, &valid, &state, None, None, None)
             .expect("fn(float) -> float metadata must accept a float result");
     }
 
@@ -3073,13 +3158,21 @@ mod tests {
             &empty_returns,
             &empty_signatures,
             TypingMode::StrictRustScript,
+            None,
         );
         let state = LocalTypeState::default();
         let args = [Expr::Int(1)];
 
         assert!(
             context
-                .validate_host_argument_types(&emit_signature(true), &args, &state, None, None,)
+                .validate_host_argument_types(
+                    &emit_signature(true),
+                    &args,
+                    &state,
+                    None,
+                    None,
+                    None
+                )
                 .is_ok(),
             "the authoritative stream::emit builtin must accept any payload in strict mode"
         );
@@ -3093,6 +3186,7 @@ mod tests {
                     &emit_signature(false),
                     &args,
                     &state,
+                    None,
                     None,
                     None,
                 ),
@@ -3156,6 +3250,7 @@ mod tests {
             &returns,
             &empty_signatures,
             TypingMode::StrictRustScript,
+            None,
         );
         let state = LocalTypeState::default();
         let annotated = Expr::Call(
@@ -3220,6 +3315,7 @@ mod tests {
             &empty_returns,
             &signatures,
             TypingMode::StrictRustScript,
+            None,
         );
         let state = LocalTypeState::default();
 

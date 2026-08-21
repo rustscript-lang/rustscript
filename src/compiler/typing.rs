@@ -174,6 +174,7 @@ fn run_legalize_round(
         &host_import_return_types,
         &host_import_signatures,
         typing_mode,
+        ir.parsed_semantic_index.as_ref(),
     );
     for (index, stmt) in ir.stmts.iter_mut().enumerate() {
         legalize_stmts(
@@ -246,6 +247,7 @@ pub(super) fn infer_types(
         &host_import_return_types,
         &host_import_signatures,
         typing_mode,
+        ir.parsed_semantic_index.as_ref(),
     );
     record_entry_local_types(
         entry_local_types,
@@ -329,6 +331,7 @@ pub(super) fn validate_if_else_type_consistency(
         &host_import_return_types,
         &host_import_signatures,
         typing_mode,
+        ir.parsed_semantic_index.as_ref(),
     );
     for (index, stmt) in ir.stmts.iter().enumerate() {
         validate_stmts(
@@ -393,6 +396,7 @@ pub(crate) fn infer_expr_type_with_function_impls_and_imports(
         host_import_return_types,
         host_import_signatures,
         TypingMode::DynamicHints,
+        None,
     );
     context.infer_expr_type(expr, state)
 }
@@ -415,6 +419,7 @@ pub(crate) fn infer_expr_schema_with_function_impls_and_imports(
         host_import_return_types,
         host_import_signatures,
         TypingMode::DynamicHints,
+        None,
     );
     context.infer_expr_schema(expr, state)
 }
@@ -437,6 +442,7 @@ pub(crate) fn expr_is_optional_with_function_impls_and_imports(
         host_import_return_types,
         host_import_signatures,
         TypingMode::DynamicHints,
+        None,
     );
     context.expr_is_optional(expr, state)
 }
@@ -459,6 +465,7 @@ pub(crate) fn infer_optional_expr_inner_type_with_function_impls_and_imports(
         host_import_return_types,
         host_import_signatures,
         TypingMode::DynamicHints,
+        None,
     );
     context.infer_optional_expr_inner_type(expr, state)
 }
@@ -481,6 +488,7 @@ pub(crate) fn infer_optional_expr_inner_schema_with_function_impls_and_imports(
         host_import_return_types,
         host_import_signatures,
         TypingMode::DynamicHints,
+        None,
     );
     context.infer_optional_expr_inner_schema(expr, state)
 }
@@ -503,6 +511,7 @@ pub(crate) fn apply_stmts_with_function_impls_and_imports(
         host_import_return_types,
         host_import_signatures,
         TypingMode::DynamicHints,
+        None,
     );
     context.apply_stmts(stmts, state);
 }

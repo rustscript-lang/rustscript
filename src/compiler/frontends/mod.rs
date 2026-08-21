@@ -413,6 +413,9 @@ fn remap_lowered_spans(
         for scope in &mut index.scopes {
             map(&mut scope.range);
         }
+        for site in &mut index.stmt_spans {
+            map(&mut site.span);
+        }
     }
     for span in unknown_type_spans {
         map(span);

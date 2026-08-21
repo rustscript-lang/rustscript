@@ -900,16 +900,27 @@ impl SemanticIndex {
             }
             // Walk the legalized IR and attach resolved facts by node id.
             for stmt in &ir.stmts {
-                collect_resolved_calls_in_stmt(stmt, &mut by_id, &function_return_schemas);
+                collect_resolved_calls_in_stmt(
+                    stmt,
+                    &mut by_id,
+                    &function_return_schemas,
+                    &slot_schemas,
+                );
             }
             for function_impl in ir.function_impls.values() {
                 for stmt in &function_impl.body_stmts {
-                    collect_resolved_calls_in_stmt(stmt, &mut by_id, &function_return_schemas);
+                    collect_resolved_calls_in_stmt(
+                        stmt,
+                        &mut by_id,
+                        &function_return_schemas,
+                        &slot_schemas,
+                    );
                 }
                 collect_resolved_calls_in_expr(
                     &function_impl.body_expr,
                     &mut by_id,
                     &function_return_schemas,
+                    &slot_schemas,
                 );
             }
             resolved_calls = by_id;
@@ -936,13 +947,19 @@ fn collect_resolved_calls_in_stmt(
     stmt: &Stmt,
     by_id: &mut HashMap<SemanticNodeId, ResolvedCallInfo>,
     function_return_schemas: &HashMap<u16, Option<TypeSchema>>,
+    slot_schemas: &[Option<TypeSchema>],
 ) {
     match stmt {
         Stmt::Let { expr, .. } | Stmt::Expr { expr, .. } | Stmt::Assign { expr, .. } => {
-            collect_resolved_calls_in_expr(expr, by_id, function_return_schemas);
+            collect_resolved_calls_in_expr(expr, by_id, function_return_schemas, slot_schemas);
         }
         Stmt::ClosureLet { closure, .. } => {
-            collect_resolved_calls_in_expr(&closure.body, by_id, function_return_schemas);
+            collect_resolved_calls_in_expr(
+                &closure.body,
+                by_id,
+                function_return_schemas,
+                slot_schemas,
+            );
         }
         Stmt::IfElse {
             condition,
@@ -950,9 +967,9 @@ fn collect_resolved_calls_in_stmt(
             else_branch,
             ..
         } => {
-            collect_resolved_calls_in_expr(condition, by_id, function_return_schemas);
+            collect_resolved_calls_in_expr(condition, by_id, function_return_schemas, slot_schemas);
             for s in then_branch.iter().chain(else_branch.iter()) {
-                collect_resolved_calls_in_stmt(s, by_id, function_return_schemas);
+                collect_resolved_calls_in_stmt(s, by_id, function_return_schemas, slot_schemas);
             }
         }
         Stmt::For {
@@ -962,19 +979,19 @@ fn collect_resolved_calls_in_stmt(
             body,
             ..
         } => {
-            collect_resolved_calls_in_stmt(init, by_id, function_return_schemas);
-            collect_resolved_calls_in_expr(condition, by_id, function_return_schemas);
-            collect_resolved_calls_in_stmt(post, by_id, function_return_schemas);
+            collect_resolved_calls_in_stmt(init, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(condition, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_stmt(post, by_id, function_return_schemas, slot_schemas);
             for s in body {
-                collect_resolved_calls_in_stmt(s, by_id, function_return_schemas);
+                collect_resolved_calls_in_stmt(s, by_id, function_return_schemas, slot_schemas);
             }
         }
         Stmt::While {
             condition, body, ..
         } => {
-            collect_resolved_calls_in_expr(condition, by_id, function_return_schemas);
+            collect_resolved_calls_in_expr(condition, by_id, function_return_schemas, slot_schemas);
             for s in body {
-                collect_resolved_calls_in_stmt(s, by_id, function_return_schemas);
+                collect_resolved_calls_in_stmt(s, by_id, function_return_schemas, slot_schemas);
             }
         }
         _ => {}
@@ -986,6 +1003,7 @@ fn collect_resolved_calls_in_expr(
     expr: &Expr,
     by_id: &mut HashMap<SemanticNodeId, ResolvedCallInfo>,
     function_return_schemas: &HashMap<u16, Option<TypeSchema>>,
+    slot_schemas: &[Option<TypeSchema>],
 ) {
     match expr {
         Expr::Call(index, _type_args, args, host, semantic_id) => {
@@ -1000,7 +1018,7 @@ fn collect_resolved_calls_in_expr(
                 }
             }
             for arg in args {
-                collect_resolved_calls_in_expr(arg, by_id, function_return_schemas);
+                collect_resolved_calls_in_expr(arg, by_id, function_return_schemas, slot_schemas);
             }
         }
         Expr::ModuleCall(_symbol, _type_args, args, semantic_id) => {
@@ -1014,26 +1032,36 @@ fn collect_resolved_calls_in_expr(
                 }
             }
             for arg in args {
-                collect_resolved_calls_in_expr(arg, by_id, function_return_schemas);
+                collect_resolved_calls_in_expr(arg, by_id, function_return_schemas, slot_schemas);
             }
         }
-        Expr::LocalCall(_slot, _type_args, args, semantic_id) => {
+        Expr::LocalCall(slot, _type_args, args, semantic_id) => {
             if let Some(id) = semantic_id {
                 if let Some(entry) = by_id.get_mut(id) {
-                    // Direct local-callable calls have no catalog schema;
-                    // the slot schema is resolved by the semantic model.
-                    entry.return_type = TypeSchema::Unknown;
+                    // A direct local-callable call's return is derived from
+                    // the slot's callable schema when one is known: the
+                    // callable's `result` schema is the call's return type.
+                    // Only a genuinely unknown slot schema leaves `Unknown`.
+                    let slot_index = *slot as usize;
+                    entry.return_type = slot_schemas
+                        .get(slot_index)
+                        .and_then(|schema| schema.as_ref())
+                        .and_then(|schema| match schema {
+                            TypeSchema::Callable { result, .. } => Some(result.as_ref().clone()),
+                            _ => None,
+                        })
+                        .unwrap_or(TypeSchema::Unknown);
                 }
             }
             for arg in args {
-                collect_resolved_calls_in_expr(arg, by_id, function_return_schemas);
+                collect_resolved_calls_in_expr(arg, by_id, function_return_schemas, slot_schemas);
             }
         }
         Expr::Block { stmts, expr: inner } => {
             for s in stmts {
-                collect_resolved_calls_in_stmt(s, by_id, function_return_schemas);
+                collect_resolved_calls_in_stmt(s, by_id, function_return_schemas, slot_schemas);
             }
-            collect_resolved_calls_in_expr(inner, by_id, function_return_schemas);
+            collect_resolved_calls_in_expr(inner, by_id, function_return_schemas, slot_schemas);
         }
         Expr::IfElse {
             condition,
@@ -1041,9 +1069,9 @@ fn collect_resolved_calls_in_expr(
             else_expr,
             ..
         } => {
-            collect_resolved_calls_in_expr(condition, by_id, function_return_schemas);
-            collect_resolved_calls_in_expr(then_expr, by_id, function_return_schemas);
-            collect_resolved_calls_in_expr(else_expr, by_id, function_return_schemas);
+            collect_resolved_calls_in_expr(condition, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(then_expr, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(else_expr, by_id, function_return_schemas, slot_schemas);
         }
         Expr::Match {
             value,
@@ -1051,20 +1079,35 @@ fn collect_resolved_calls_in_expr(
             default,
             ..
         } => {
-            collect_resolved_calls_in_expr(value, by_id, function_return_schemas);
+            collect_resolved_calls_in_expr(value, by_id, function_return_schemas, slot_schemas);
             for (_, arm_expr) in arms {
-                collect_resolved_calls_in_expr(arm_expr, by_id, function_return_schemas);
+                collect_resolved_calls_in_expr(
+                    arm_expr,
+                    by_id,
+                    function_return_schemas,
+                    slot_schemas,
+                );
             }
-            collect_resolved_calls_in_expr(default, by_id, function_return_schemas);
+            collect_resolved_calls_in_expr(default, by_id, function_return_schemas, slot_schemas);
         }
         Expr::Closure(closure) => {
-            collect_resolved_calls_in_expr(&closure.body, by_id, function_return_schemas);
+            collect_resolved_calls_in_expr(
+                &closure.body,
+                by_id,
+                function_return_schemas,
+                slot_schemas,
+            );
         }
         Expr::ClosureCall(closure, args) => {
             for arg in args {
-                collect_resolved_calls_in_expr(arg, by_id, function_return_schemas);
+                collect_resolved_calls_in_expr(arg, by_id, function_return_schemas, slot_schemas);
             }
-            collect_resolved_calls_in_expr(&closure.body, by_id, function_return_schemas);
+            collect_resolved_calls_in_expr(
+                &closure.body,
+                by_id,
+                function_return_schemas,
+                slot_schemas,
+            );
         }
         Expr::Add(l, r)
         | Expr::Sub(l, r)
@@ -1076,25 +1119,25 @@ fn collect_resolved_calls_in_expr(
         | Expr::Eq(l, r)
         | Expr::Lt(l, r)
         | Expr::Gt(l, r) => {
-            collect_resolved_calls_in_expr(l, by_id, function_return_schemas);
-            collect_resolved_calls_in_expr(r, by_id, function_return_schemas);
+            collect_resolved_calls_in_expr(l, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(r, by_id, function_return_schemas, slot_schemas);
         }
         Expr::Neg(inner)
         | Expr::Not(inner)
         | Expr::ToOwned(inner)
         | Expr::Borrow(inner)
         | Expr::BorrowMut(inner) => {
-            collect_resolved_calls_in_expr(inner, by_id, function_return_schemas);
+            collect_resolved_calls_in_expr(inner, by_id, function_return_schemas, slot_schemas);
         }
         Expr::OptionalGet { container, key, .. } => {
-            collect_resolved_calls_in_expr(container, by_id, function_return_schemas);
-            collect_resolved_calls_in_expr(key, by_id, function_return_schemas);
+            collect_resolved_calls_in_expr(container, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(key, by_id, function_return_schemas, slot_schemas);
         }
         Expr::OptionUnwrapOr {
             value, fallback, ..
         } => {
-            collect_resolved_calls_in_expr(value, by_id, function_return_schemas);
-            collect_resolved_calls_in_expr(fallback, by_id, function_return_schemas);
+            collect_resolved_calls_in_expr(value, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(fallback, by_id, function_return_schemas, slot_schemas);
         }
         _ => {}
     }
@@ -1307,10 +1350,28 @@ pub struct ParsedSemanticIndex {
     pub func_refs: Vec<FunctionRefSite>,
     /// All parsed lexical scopes, in allocation order (scope 0 = root).
     pub scopes: Vec<ParsedLexicalScope>,
+    /// Exact parser-origin span of every parsed statement, in parse order
+    /// (from the statement's first consumed token through its last). Used to
+    /// give typed diagnostics an exact original-source slice without any
+    /// same-line token guessing. Spans carry their owning source id and are
+    /// copied verbatim through unit merge (the source id already names the
+    /// owning compilation-wide source).
+    pub stmt_spans: Vec<StmtSpanSite>,
     /// Next available SemanticNodeId for the next parse.
     pub next_node_id: u32,
     /// Next available ScopeId for the next parse.
     pub next_scope_id: u32,
+}
+
+/// One parsed statement's exact source span.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StmtSpanSite {
+    /// The parser-reported line of the statement's first token.
+    pub line: u32,
+    /// Exact span of the statement construct (first through last consumed
+    /// token), never a line-wide guess. The same line may host many
+    /// statements; each records its own independent span.
+    pub span: Span,
 }
 
 impl ParsedSemanticIndex {

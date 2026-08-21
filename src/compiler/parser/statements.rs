@@ -12,8 +12,46 @@ fn classify_use_segment(segment: &str) -> UsePathSegment {
     }
 }
 
+/// The parser-reported line of a parsed statement (its first token's line).
+fn stmt_line_of(stmt: &Stmt) -> u32 {
+    match stmt {
+        Stmt::Noop { line }
+        | Stmt::Let { line, .. }
+        | Stmt::Assign { line, .. }
+        | Stmt::ClosureLet { line, .. }
+        | Stmt::FuncDecl { line, .. }
+        | Stmt::Expr { line, .. }
+        | Stmt::IfElse { line, .. }
+        | Stmt::For { line, .. }
+        | Stmt::While { line, .. }
+        | Stmt::Break { line, .. }
+        | Stmt::Continue { line, .. }
+        | Stmt::Drop { line, .. } => *line,
+    }
+}
+
 impl Parser {
+    /// Parse one statement and record its exact source span in the semantic
+    /// provenance index. The span runs from the statement's first consumed
+    /// token through its last, so diagnostics can slice the exact construct
+    /// (including multiline if/else statements) instead of a same-line guess.
     pub(super) fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
+        let start_span = self.current_span();
+        let stmt = self.parse_stmt_inner()?;
+        let end = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|token| token.span.hi)
+            .unwrap_or(start_span.hi);
+        let span = Span::new(start_span.source_id, start_span.lo, end.max(start_span.lo));
+        let line = stmt_line_of(&stmt);
+        self.parsed_semantic_index
+            .stmt_spans
+            .push(StmtSpanSite { line, span });
+        Ok(stmt)
+    }
+
+    fn parse_stmt_inner(&mut self) -> Result<Stmt, ParseError> {
         if self.match_kind(&TokenKind::Pub) {
             if self.match_kind(&TokenKind::Fn) {
                 return self.parse_fn_decl(true);

@@ -439,6 +439,55 @@ fn module_function_value_reference_resolves_by_symbol() {
     assert_slice(&model, def.span, "helper");
 }
 
+#[test]
+fn function_value_reference_hover_returns_callable_schema() {
+    // Hover on a function-value reference (`let f = helper;` at `helper`)
+    // must return the referenced function's callable signature schema, not
+    // `None` (L1).
+    let source = "fn helper(a: int) -> int { a }\nlet f = helper;\n";
+    let model = analyze_with_catalog(source);
+    let reference = offset_of(source, "let f = helper") + 8;
+    let schema = model.inferred_schema_at(SourcePosition::new(0, reference + 1));
+    assert_eq!(
+        schema,
+        Some(TypeSchema::Callable {
+            params: vec![TypeSchema::Int],
+            result: Box::new(TypeSchema::Int),
+        }),
+        "function-value reference hover returns the callable schema"
+    );
+}
+
+#[test]
+fn local_callable_call_hover_returns_slot_result_schema() {
+    // Hover on a direct local-callable call `f(1)` must return the slot
+    // callable's result schema (`int`), never hardcoded `unknown` (L1).
+    let source = "fn helper(a: int) -> int { a }\nlet f = helper;\nlet r = f(1);\n";
+    let model = analyze_with_catalog(source);
+    let callee = offset_of(source, "let r = f") + 8;
+    let schema = model.inferred_schema_at(SourcePosition::new(0, callee));
+    assert_eq!(
+        schema,
+        Some(TypeSchema::Int),
+        "direct local-callable call hover returns the slot callable's result"
+    );
+}
+
+#[test]
+fn local_reference_inside_call_argument_hover_resolves_to_local_type() {
+    // Hover on a local reference used as a call argument (`tag(a)`) must
+    // resolve to the local's own type, never the containing call's return
+    // type (M2).
+    let source = "fn tag(s: string) -> int { 1 }\nlet a = 42;\nlet b = tag(a);\n";
+    let model = analyze_with_catalog(source);
+    let arg = offset_of(source, "tag(a)") + 4;
+    assert_eq!(
+        model.inferred_schema_at(SourcePosition::new(0, arg)),
+        Some(TypeSchema::Int),
+        "hover on a call-argument local reference shows the local's own type"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Namespace / postfix calls
 // ---------------------------------------------------------------------------
@@ -576,4 +625,74 @@ fn provenance_queries_are_stable_across_repeated_analysis() {
         def_b.expect("definition present").span,
         "spans stable"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Exact typed diagnostic spans (H1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn if_else_branch_mismatch_diagnostic_carries_exact_statement_span() {
+    // A real if/else branch type mismatch must carry the exact parser-origin
+    // statement span, never a same-line call/declaration guess (H1).
+    let source = "let mut x = 1;\nif true { x = \"a\"; } else { x = 2; }\n";
+    let model = analyze_with_catalog(source);
+    let diags = model.diagnostics();
+    let mismatch = diags
+        .iter()
+        .find(|d| d.code.as_deref() == Some("E005"))
+        .unwrap_or_else(|| panic!("expected IfElseBranchTypeMismatch diagnostic: {diags:?}"));
+    let span = mismatch.span.expect("typed diagnostic carries exact span");
+    // The span must slice the if/else construct, not a token on the line.
+    let stmt_lo = offset_of(source, "if true");
+    assert_eq!(
+        span.lo, stmt_lo,
+        "diagnostic starts at the if/else statement, got {:?}",
+        span
+    );
+    let file = model
+        .sources()
+        .file(span.source_id)
+        .expect("source present");
+    assert!(
+        file.text[span.lo..span.hi].contains("if"),
+        "span slices the if/else construct: {:?}",
+        &file.text[span.lo..span.hi]
+    );
+    assert!(span.hi > span.lo, "statement span has positive length");
+}
+
+#[test]
+fn binary_operand_mismatch_diagnostic_carries_exact_statement_span() {
+    // A real binary operand type mismatch (in a typed function body whose
+    // parameter types are observed from a call site, where strict add-type
+    // checking fires E004 on unresolvable `+` operands) carries the exact
+    // parser-origin statement span — the containing fn-decl statement whose
+    // body hosts the failing `+` — never a same-line token guess (H1).
+    let source = "fn f(a: int, b: bool) -> int { a + b }\nlet r = f(1, true);\n";
+    let model = analyze_with_catalog(source);
+    let diags = model.diagnostics();
+    let mismatch = diags
+        .iter()
+        .find(|d| d.code.as_deref() == Some("E004"))
+        .unwrap_or_else(|| panic!("expected BinaryOperandTypeMismatch diagnostic: {diags:?}"));
+    let span = mismatch.span.expect("typed diagnostic carries exact span");
+    // The span is the exact fn-decl statement construct covering the failing
+    // `a + b` expression — never a call-site or declaration token guess.
+    let stmt_lo = offset_of(source, "fn f(a:");
+    assert_eq!(
+        span.lo, stmt_lo,
+        "diagnostic starts at the containing fn-decl statement, got {:?}",
+        span
+    );
+    let file = model
+        .sources()
+        .file(span.source_id)
+        .expect("source present");
+    assert!(
+        file.text[span.lo..span.hi].contains("a + b"),
+        "span covers the failing binary expression: {:?}",
+        &file.text[span.lo..span.hi]
+    );
+    assert!(span.hi > span.lo, "statement span has positive length");
 }

@@ -93,31 +93,53 @@ pub enum CompileError {
         line: Option<u32>,
         source_name: Option<String>,
         detail: String,
+        /// Exact parser-origin span of the failing construct (the if/else
+        /// statement or expression, or the containing statement) when the
+        /// error was produced by real analysis with parser provenance. `None`
+        /// only for synthetic/test errors that carry no position at all.
+        span: Option<crate::compiler::source_map::Span>,
     },
     CallableArgumentTypeMismatch {
         line: Option<u32>,
         source_name: Option<String>,
         detail: String,
+        /// Exact parser-origin span of the failing call/argument construct.
+        /// `None` only for synthetic/test errors that carry no position.
+        span: Option<crate::compiler::source_map::Span>,
     },
     BinaryOperandTypeMismatch {
         line: Option<u32>,
         source_name: Option<String>,
         detail: String,
+        /// Exact parser-origin span of the failing binary construct.
+        /// `None` only for synthetic/test errors that carry no position.
+        span: Option<crate::compiler::source_map::Span>,
     },
     InvalidFieldAccess {
         line: Option<u32>,
         source_name: Option<String>,
         detail: String,
+        /// Exact parser-origin span of the failing access/assignment
+        /// construct. `None` only for synthetic/test errors that carry no
+        /// position.
+        span: Option<crate::compiler::source_map::Span>,
     },
     FunctionParameterTypeConflict {
         line: Option<u32>,
         source_name: Option<String>,
         detail: String,
+        /// Exact parser-origin span of the failing call/declaration
+        /// construct. `None` only for synthetic/test errors that carry no
+        /// position.
+        span: Option<crate::compiler::source_map::Span>,
     },
     StrictTypingRequired {
         line: Option<u32>,
         source_name: Option<String>,
         detail: String,
+        /// Exact parser-origin span of the failing declaration/construct.
+        /// `None` only for synthetic/test errors that carry no position.
+        span: Option<crate::compiler::source_map::Span>,
     },
     /// Catalog host-call overload resolution failed at a call site. Carries
     /// the optional call-site line and source name plus a diagnostic detail

@@ -254,19 +254,41 @@ impl SemanticModel {
     fn inferred_schema_at_inner(&self, position: SourcePosition) -> Option<TypeSchema> {
         let index = self.semantic_index.as_ref()?;
 
-        // 1. Smallest containing call site (exact parser callee/expr span):
+        // A position on the callee identifier of a containing call resolves to
+        // the call's return schema (hover on a call callee returns the call
+        // schema), never to the callee symbol's own type. Positions in the
+        // argument region are NOT the callee and must resolve to the exact
+        // local/function identifier spans below.
+        let is_call_callee = self
+            .smallest_call_at(position)
+            .map(|info| self.position_in_span(position, info.site.callee_span))
+            .unwrap_or(false);
+
+        if !is_call_callee {
+            // 1. Local declaration or reference exact identifier span. This
+            //    beats a containing call expression span: a local reference
+            //    used as a call argument (`let a = 1; tag(a)`) must resolve
+            //    to the local's own schema, never the call's return type.
+            if let Some(slot) = self.local_slot_containing(position) {
+                return index.slot_schema(slot).cloned();
+            }
+
+            // 2. Function declaration exact identifier span.
+            if let Some(schema) = self.function_decl_return_at(position) {
+                return Some(schema);
+            }
+
+            // 2b. Function-value reference exact identifier span: resolve the
+            //     referenced function's callable signature (params -> result),
+            //     never a name-only fallback.
+            if let Some(schema) = self.function_ref_schema_at(position) {
+                return Some(schema);
+            }
+        }
+
+        // 3. Smallest containing call site (exact parser callee/expr span):
         //    return the resolved return schema.
         if let Some(schema) = self.smallest_call_return_at(position) {
-            return Some(schema);
-        }
-
-        // 2. Local declaration or reference exact identifier span.
-        if let Some(slot) = self.local_slot_containing(position) {
-            return index.slot_schema(slot).cloned();
-        }
-
-        // 3. Function declaration exact identifier span.
-        if let Some(schema) = self.function_decl_return_at(position) {
             return Some(schema);
         }
 
@@ -352,6 +374,55 @@ impl SemanticModel {
                     .flatten()
                     .or(Some(TypeSchema::Unknown));
             }
+        }
+        None
+    }
+
+    /// The callable signature schema of a function-value reference at
+    /// `position` (e.g. `let f = helper;` hovering `helper`). Resolves the
+    /// reference's target (flat function index or module symbol) to its
+    /// declaration in the flat table — never a name-only fallback — and
+    /// builds the `Callable { params, result }` schema from the declared
+    /// parameter and return schemas. `None` when the position is not a
+    /// function-value reference.
+    fn function_ref_schema_at(&self, position: SourcePosition) -> Option<TypeSchema> {
+        let index = self.semantic_index.as_ref()?;
+        for reference in &index.parsed.func_refs {
+            if !self.position_in_span(position, reference.ident_span) {
+                continue;
+            }
+            let function_index = match reference.target {
+                FunctionRefTarget::Function(index) => index,
+                FunctionRefTarget::Module(symbol) => self
+                    .ir
+                    .functions
+                    .iter()
+                    .find(|decl| decl.symbol == Some(symbol))
+                    .map(|decl| decl.index)?,
+            };
+            let decl = self
+                .ir
+                .functions
+                .iter()
+                .find(|decl| decl.index == function_index)?;
+            let params = decl
+                .arg_schemas
+                .iter()
+                .enumerate()
+                .map(|(i, schema)| {
+                    schema.clone().unwrap_or_else(|| {
+                        decl.args
+                            .get(i)
+                            .map(|_| TypeSchema::Unknown)
+                            .unwrap_or(TypeSchema::Unknown)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let result = decl.return_schema.clone().unwrap_or(TypeSchema::Unknown);
+            return Some(TypeSchema::Callable {
+                params,
+                result: Box::new(result),
+            });
         }
         None
     }
@@ -577,87 +648,29 @@ impl SemanticModel {
 
     /// Convert a `CompileError` to an optional source span.
     ///
-    /// Exact parser-origin spans carried on the error (e.g. the failing
-    /// call's callee token span) are returned verbatim. Errors that only
-    /// carry a line + source name resolve deterministically against the
-    /// parser's provenance: the smallest parsed call site whose line matches,
-    /// else the exact identifier token of a local/function declaration on
-    /// that line, else the line span. No source text is ever scanned.
+    /// Map a `CompileError` to its exact original-source span.
+    ///
+    /// Every span-capable variant carries the exact parser-origin span of the
+    /// failing construct, captured at the point of production and resolved
+    /// from parser provenance (call/optional access SemanticNodeId -> parsed
+    /// call-site span, statement line -> parsed statement span, function
+    /// index -> parsed declaration identifier span). These are returned
+    /// verbatim. Variants without a carried span (synthetic/test errors that
+    /// genuinely carry no position, or non-positioned errors such as
+    /// `CallArityOverflow`) return `None`. No source text is ever scanned and
+    /// no same-line token guessing is performed.
     fn compile_error_to_span(&self, err: &CompileError) -> Option<Span> {
-        // Prefer the exact span carried at the error's production point.
-        if let CompileError::HostCallResolve { span, .. } = err
-            && let Some(span) = span
-        {
-            return Some(*span);
-        }
-        let line = err.line()? as usize;
-        let source_name = err.source_name()?;
-        let source_id = self.sources.source_id_by_name(source_name)?;
-        let parsed = self.semantic_index.as_ref().map(|index| &index.parsed);
-
-        // Smallest parsed call site on the error's line (callee span). This
-        // gives nested/same-line call diagnostics their exact slice.
-        if let Some(parsed) = parsed {
-            let line_span = self.sources.line_span(source_id, line);
-            let mut best: Option<Span> = None;
-            for site in &parsed.call_sites {
-                if site.callee_span.source_id != source_id {
-                    continue;
-                }
-                let site_line = self
-                    .sources
-                    .line_col_for_offset(source_id, site.callee_span.lo)
-                    .map(|(l, _)| l);
-                if site_line != Some(line) {
-                    continue;
-                }
-                if let Some(span) = best {
-                    let cur_len = span.hi - span.lo;
-                    let new_len = site.callee_span.hi - site.callee_span.lo;
-                    if new_len < cur_len {
-                        best = Some(site.callee_span);
-                    }
-                } else {
-                    best = Some(site.callee_span);
-                }
-            }
-            if let Some(span) = best {
-                return Some(span);
-            }
-            // Local declaration identifier token on the error's line.
-            for decl in &parsed.local_decls {
-                if decl.ident_span.source_id != source_id {
-                    continue;
-                }
-                if self
-                    .sources
-                    .line_col_for_offset(source_id, decl.ident_span.lo)
-                    .map(|(l, _)| l)
-                    != Some(line)
-                {
-                    continue;
-                }
-                return Some(decl.ident_span);
-            }
-            // Function declaration identifier token on the error's line.
-            for decl in &parsed.func_decls {
-                if decl.ident_span.source_id != source_id {
-                    continue;
-                }
-                if self
-                    .sources
-                    .line_col_for_offset(source_id, decl.ident_span.lo)
-                    .map(|(l, _)| l)
-                    != Some(line)
-                {
-                    continue;
-                }
-                return Some(decl.ident_span);
-            }
-            let _ = line_span;
-        }
-
-        self.sources.line_span(source_id, line)
+        let carried = match err {
+            CompileError::HostCallResolve { span, .. }
+            | CompileError::IfElseBranchTypeMismatch { span, .. }
+            | CompileError::CallableArgumentTypeMismatch { span, .. }
+            | CompileError::BinaryOperandTypeMismatch { span, .. }
+            | CompileError::InvalidFieldAccess { span, .. }
+            | CompileError::FunctionParameterTypeConflict { span, .. }
+            | CompileError::StrictTypingRequired { span, .. } => *span,
+            _ => return None,
+        };
+        carried
     }
 
     /// Map a `CompileError` to a stable error code.
@@ -937,6 +950,69 @@ impl SemanticModel {
         let is_ident = |t: &crate::compiler::ir::LexerToken| t.kind == "Ident";
         let is_colon = |t: &crate::compiler::ir::LexerToken| t.kind == "Colon";
 
+        // A cursor exactly on the trailing `::` of a namespace prefix
+        // (`ns::` with nothing typed yet, cursor on the second Colon) is a
+        // namespace-member position with an empty member prefix: the walk
+        // below would start expecting an identifier at a Colon and break, so
+        // detect the trailing pair first.
+        if is_colon(&tokens[idx]) {
+            let mut cursor = idx;
+            // Consume the current and any adjacent Colon tokens forming the
+            // trailing `::` (cursor may sit on either of the two).
+            while cursor > 0 && is_colon(&tokens[cursor - 1]) {
+                cursor -= 1;
+            }
+            if is_colon(&tokens[cursor]) {
+                // Skip the whole trailing `::` pair (two Colons).
+                let mut pair_end = cursor;
+                while pair_end < tokens.len() && is_colon(&tokens[pair_end]) {
+                    pair_end += 1;
+                }
+                if pair_end - cursor >= 2 && cursor >= 1 && is_ident(&tokens[cursor - 1]) {
+                    let mut segments: Vec<String> = Vec::new();
+                    let mut walk = cursor - 1;
+                    let mut expect_ident = true;
+                    loop {
+                        let Some(token) = tokens.get(walk) else {
+                            break;
+                        };
+                        if token.span.source_id != position.source_id {
+                            break;
+                        }
+                        if expect_ident {
+                            if is_ident(token) {
+                                segments.push(token.ident.clone());
+                                if walk == 0 {
+                                    break;
+                                }
+                                walk -= 1;
+                                expect_ident = false;
+                            } else {
+                                break;
+                            }
+                        } else if is_colon(token) {
+                            if walk == 0 || !is_colon(&tokens[walk - 1]) {
+                                break;
+                            }
+                            walk -= 2;
+                            expect_ident = true;
+                        } else {
+                            break;
+                        }
+                    }
+                    segments.reverse();
+                    // `ns::` -> prefix `ns::`, namespace `ns`, empty member.
+                    let joined = segments.join("::");
+                    let namespace = if segments.len() >= 1 {
+                        Some(segments.join("::"))
+                    } else {
+                        None
+                    };
+                    return (format!("{joined}::"), namespace);
+                }
+            }
+        }
+
         // Walk left from the cursor collecting `ident (:: ident)*` segments.
         let mut segments: Vec<String> = Vec::new();
         let mut cursor = idx;
@@ -989,10 +1065,12 @@ impl SemanticModel {
     /// local alias, detail = the canonical schema), wildcard host imports
     /// (all members of the imported namespace), host namespace aliases
     /// (namespace member completion), and file-module namespace aliases
-    /// (module member completion against the merged flat functions, kept
-    /// source-isolated by owning source). The whole catalog is never
-    /// appended. IR without provenance (hand-built test models) falls back
-    /// to the legacy full-catalog surface.
+    /// (module member completion against the merged flat functions, scoped
+    /// to exactly the aliased module's exports). The whole catalog is never
+    /// appended. IR without provenance (hand-built test models, plugin
+    /// frontends that supply no structured metadata) yields the exact empty
+    /// surface: no full-catalog fallback leaks into a frontend that imported
+    /// nothing.
     fn catalog_completions(
         &self,
         source_id: SourceId,
@@ -1008,28 +1086,12 @@ impl SemanticModel {
             .unwrap_or_default();
 
         let Some(visibility) = &self.ir.catalog_visibility else {
-            // No parser provenance: legacy full-catalog surface.
-            for func in self.catalog.functions() {
-                if prefix.is_empty() || func.name.starts_with(prefix) {
-                    completions.push(SemanticCompletion {
-                        label: func.name.clone(),
-                        detail: Some(self.format_host_function_detail(func)),
-                        docs: Some(func.description.clone()),
-                        kind: CompletionItemKind::Function,
-                    });
-                }
-            }
-            for resource in self.catalog.resources() {
-                let label = format!("resource<{}>", resource.key);
-                if prefix.is_empty() || label.starts_with(prefix) {
-                    completions.push(SemanticCompletion {
-                        label,
-                        detail: Some(resource.description.clone()),
-                        docs: None,
-                        kind: CompletionItemKind::Resource,
-                    });
-                }
-            }
+            // No parser provenance: the surface is empty. A real plugin or
+            // hand-built IR that provides no structured catalog metadata must
+            // not receive a full-catalog fallback — that would leak the whole
+            // host API catalog into a frontend that imported nothing. Lexical
+            // and plugin completions also stay empty unless the plugin
+            // supplies structured metadata on its IR.
             return completions;
         };
 
@@ -1039,16 +1101,18 @@ impl SemanticModel {
             return self.namespace_member_completions(ns, prefix, visibility, &source_name);
         }
 
-        // Direct host call aliases: `use io::{read as r};` -> `r`.
+        // Direct host call aliases: `use io::{read as r};` -> `r`. A canonical
+        // name may resolve to several catalog overloads; every matching
+        // function surfaces as its own candidate with the alias label.
         for (alias, canonical) in &visibility.direct_host_call_aliases {
             if !prefix.is_empty() && !alias.starts_with(prefix) {
                 continue;
             }
-            if let Some(func) = self
+            for func in self
                 .catalog
                 .functions()
                 .iter()
-                .find(|f| f.name == *canonical)
+                .filter(|f| f.name == *canonical)
             {
                 completions.push(SemanticCompletion {
                     label: alias.clone(),
@@ -1155,45 +1219,71 @@ impl SemanticModel {
 
         // File-module namespace alias: list the merged flat functions owned
         // by the alias's module. The alias's owning source isolates it from
-        // same-named aliases in other units.
-        if visibility
+        // same-named aliases in other units, and the resolved module source
+        // (from `module_path` relative to the importing file's directory)
+        // scopes the member list to exactly the aliased module — no other
+        // imported module's exports leak into `ns::`.
+        let Some(alias) = visibility
             .module_namespace_aliases
             .iter()
-            .any(|alias| alias.alias == ns && alias.source == source_name)
-        {
-            // Module functions are the exported flat functions carrying a
-            // symbol that came from a file module — i.e. any exported flat
-            // function not owned by the query source itself. The query
-            // source's own functions are never members of an imported
-            // module's namespace.
-            for decl in &self.ir.functions {
-                if !decl.exported || decl.symbol.is_none() {
-                    continue;
-                }
-                let owned_by_query_source = self
-                    .ir
-                    .function_sources
-                    .get(&decl.index)
-                    .map(|source| source == source_name)
-                    .unwrap_or(false);
-                if owned_by_query_source {
-                    continue;
-                }
-                if !member_prefix.is_empty() && !decl.name.starts_with(&member_prefix) {
-                    continue;
-                }
-                let detail = Some(format!("fn({})", decl.args.join(", ")));
-                completions.push(SemanticCompletion {
-                    label: decl.name.clone(),
-                    detail,
-                    docs: None,
-                    kind: CompletionItemKind::Function,
-                });
-            }
+            .find(|alias| alias.alias == ns && alias.source == source_name)
+        else {
             return completions;
+        };
+        let Some(module_source) = self.resolve_module_source(&alias.module_path, source_name)
+        else {
+            return completions;
+        };
+        for decl in &self.ir.functions {
+            if !decl.exported || decl.symbol.is_none() {
+                continue;
+            }
+            let owned_by_module = self
+                .ir
+                .function_sources
+                .get(&decl.index)
+                .map(|source| source == &module_source)
+                .unwrap_or(false);
+            if !owned_by_module {
+                continue;
+            }
+            if !member_prefix.is_empty() && !decl.name.starts_with(&member_prefix) {
+                continue;
+            }
+            let detail = Some(format!("fn({})", decl.args.join(", ")));
+            completions.push(SemanticCompletion {
+                label: decl.name.clone(),
+                detail,
+                docs: None,
+                kind: CompletionItemKind::Function,
+            });
         }
-
         completions
+    }
+
+    /// Resolve a module namespace alias's `module_path` (parser-relative
+    /// spelling such as `a::util` or `self::c`) to the owning module's source
+    /// name, mirroring the source loader's path resolution: the module path
+    /// is joined to the importing source's directory, normalized, and
+    /// canonicalized when the file exists on disk (the loader records the
+    /// canonical identity for on-disk modules, and the lexical normalized
+    /// path for virtual/source-override modules). `None` when the importing
+    /// source is not a registered file path.
+    fn resolve_module_source(&self, module_path: &str, importing_source: &str) -> Option<String> {
+        let importing = std::path::Path::new(importing_source);
+        let parent = importing.parent()?;
+        let relative = module_path.replace("::", std::path::MAIN_SEPARATOR_STR);
+        let mut path = parent.join(relative);
+        if path.extension().is_none() {
+            path.set_extension("rss");
+        }
+        let normalized = normalize_module_path(path);
+        let identity = if normalized.is_file() {
+            normalized.canonicalize().unwrap_or(normalized)
+        } else {
+            normalized
+        };
+        Some(identity.display().to_string())
     }
 
     /// Format a host function's detail string for completions.
@@ -1477,11 +1567,6 @@ impl SemanticModel {
         // cursor position. Zero-length spans never match.
         position.offset >= span.lo && position.offset < span.hi
     }
-
-    /// Get the line span for a given line number.
-    fn line_span(&self, source_id: SourceId, line: u32) -> Option<Span> {
-        self.sources.line_span(source_id, line as usize)
-    }
 }
 
 /// Pick the smaller containing span between two candidates, deterministically.
@@ -1574,6 +1659,32 @@ impl std::fmt::Display for SemanticDiagnostic {
             write!(f, "{}", self.message)
         }
     }
+}
+
+/// Normalize a module path by removing `.` components and collapsing `..`
+/// lexically, mirroring the source loader's normalization so the semantic
+/// model's module-source resolution matches the recorded `function_sources`.
+fn normalize_module_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => match normalized.components().next_back() {
+                Some(std::path::Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(std::path::Component::ParentDir) | None => {
+                    normalized.push(component.as_os_str())
+                }
+                Some(std::path::Component::RootDir | std::path::Component::Prefix(_)) => {}
+                Some(std::path::Component::CurDir) => {}
+            },
+            std::path::Component::RootDir
+            | std::path::Component::Prefix(_)
+            | std::path::Component::Normal(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 // ---------------------------------------------------------------------------
@@ -1695,6 +1806,21 @@ mod tests {
         }
     }
 
+    /// `test_ir` with structured catalog provenance: wildcard host imports for
+    /// `sqlite`/`io` and a direct host call alias for `len`. This drives the
+    /// exact structured completion path (no full-catalog fallback).
+    fn test_ir_with_visibility() -> FrontendIr {
+        let mut ir = test_ir();
+        ir.catalog_visibility = Some(crate::compiler::ir::CatalogVisibility {
+            host_namespace_aliases: vec![("sqlite".to_string(), "sqlite".to_string())],
+            direct_host_call_aliases: vec![("len".to_string(), "len".to_string())],
+            direct_host_wildcard_imports: vec!["sqlite".to_string(), "io".to_string()],
+            module_namespace_aliases: Vec::new(),
+            use_declarations: Vec::new(),
+        });
+        ir
+    }
+
     // ------------------------------------------------------------------
     // Catalog fingerprint
     // ------------------------------------------------------------------
@@ -1737,30 +1863,39 @@ mod tests {
         let catalog = test_catalog();
         let mut sources = SourceMap::new();
         let sid = sources.add_source("test", "");
-        let model = SemanticModel::new(test_ir(), sources, catalog, Vec::new());
+        let model = SemanticModel::new(test_ir_with_visibility(), sources, catalog, Vec::new());
         let pos = SourcePosition::new(sid, 0);
         let completions = model.completions_at(pos);
 
-        // Should include sqlite::open, sqlite::query, io::open, len (4 overloads)
+        // Wildcard imports surface the imported namespaces' members as
+        // direct names (`open`, `query` from sqlite/io), and the direct
+        // alias surfaces `len` (4 overloads, all with the alias label).
         let names: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
         assert!(
-            names.contains(&"sqlite::open"),
-            "completions should include sqlite::open: {:?}",
+            names.contains(&"open"),
+            "completions should include the wildcard member open: {:?}",
             names
         );
         assert!(
-            names.contains(&"sqlite::query"),
-            "completions should include sqlite::query: {:?}",
-            names
-        );
-        assert!(
-            names.contains(&"io::open"),
-            "completions should include io::open: {:?}",
+            names.contains(&"query"),
+            "completions should include the wildcard member query: {:?}",
             names
         );
         assert!(
             names.contains(&"len"),
-            "completions should include len: {:?}",
+            "completions should include the direct alias len: {:?}",
+            names
+        );
+        // The canonical `sqlite::open` full name is NOT offered when the
+        // member is surfaced through the wildcard import as `open`.
+        assert!(
+            names.iter().all(|n| n != &"sqlite::open"),
+            "canonical name must not appear alongside the wildcard member: {:?}",
+            names
+        );
+        assert!(
+            names.iter().all(|n| n != &"io::open"),
+            "io::open canonical name must not leak: {:?}",
             names
         );
     }
@@ -1770,25 +1905,25 @@ mod tests {
         let catalog = test_catalog();
         let mut sources = SourceMap::new();
         let sid = sources.add_source("test", "");
-        let model = SemanticModel::new(test_ir(), sources, catalog, Vec::new());
+        let model = SemanticModel::new(test_ir_with_visibility(), sources, catalog, Vec::new());
         let pos = SourcePosition::new(sid, 0);
         let completions = model.completions_at(pos);
 
+        // The structured surface is import-driven: resources are only
+        // reachable through a namespace alias member surface, never dumped
+        // wholesale. With no `ns::` member query, no resource labels appear.
         let resource_completions: Vec<&SemanticCompletion> = completions
             .iter()
             .filter(|c| c.kind == CompletionItemKind::Resource)
             .collect();
         assert!(
-            resource_completions.len() >= 2,
-            "should have at least 2 resource completions, got {}",
-            resource_completions.len()
+            resource_completions.is_empty(),
+            "no full-catalog resource leakage: {:?}",
+            resource_completions
+                .iter()
+                .map(|c| c.label.as_str())
+                .collect::<Vec<_>>()
         );
-        let labels: Vec<&str> = resource_completions
-            .iter()
-            .map(|c| c.label.as_str())
-            .collect();
-        assert!(labels.contains(&"resource<sqlite.connection>"));
-        assert!(labels.contains(&"resource<io.file>"));
     }
 
     #[test]
@@ -1796,15 +1931,16 @@ mod tests {
         let catalog = test_catalog();
         let mut sources = SourceMap::new();
         let sid = sources.add_source("test", "");
-        let model = SemanticModel::new(test_ir(), sources, catalog, Vec::new());
+        let model = SemanticModel::new(test_ir_with_visibility(), sources, catalog, Vec::new());
         let pos = SourcePosition::new(sid, 0);
         let completions = model.completions_at(pos);
 
-        // Find the sqlite::query completion
+        // The wildcard import surfaces sqlite::query as `query`; its detail
+        // must still show the borrow resource parameter.
         let query = completions
             .iter()
-            .find(|c| c.label == "sqlite::query")
-            .expect("sqlite::query should be in completions");
+            .find(|c| c.label == "query")
+            .expect("query member should be in completions");
         let detail = query.detail.as_deref().unwrap_or("");
         // The detail should show the borrow resource parameter
         assert!(
@@ -1880,22 +2016,43 @@ mod tests {
         let catalog = test_catalog();
         let mut sources = SourceMap::new();
         let sid = sources.add_source("test.rss", "let x = sqlite::open(\"db\");\n");
+        let callee_span = Span::new(sid, 8, 20);
         let errors = vec![CompileError::HostCallResolve {
             line: Some(1),
             source_name: Some("test.rss".to_string()),
             detail: "expected resource<sqlite.connection>, found resource<io.file>".to_string(),
+            span: Some(callee_span),
+        }];
+        let model = SemanticModel::new(test_ir(), sources, catalog, errors);
+        let diags = model.diagnostics();
+        assert_eq!(diags.len(), 1);
+        let span = diags[0].span.expect("carried span returned verbatim");
+        assert_eq!(span.source_id, sid);
+        assert_eq!((span.lo, span.hi), (8, 20));
+    }
+
+    #[test]
+    fn diagnostics_spanless_error_has_no_guessed_span() {
+        // A synthetic error that carries no span must surface `None` — the
+        // compiler never guesses a same-line token span from the source.
+        let catalog = test_catalog();
+        let mut sources = SourceMap::new();
+        let sid = sources.add_source("test.rss", "let a = 1; let b = a;\n");
+        let errors = vec![CompileError::HostCallResolve {
+            line: Some(1),
+            source_name: Some("test.rss".to_string()),
+            detail: "spanless synthetic error".to_string(),
             span: None,
         }];
         let model = SemanticModel::new(test_ir(), sources, catalog, errors);
         let diags = model.diagnostics();
         assert_eq!(diags.len(), 1);
+        let _ = sid;
         assert!(
-            diags[0].span.is_some(),
-            "diagnostic should have a span when source name matches"
+            diags[0].span.is_none(),
+            "a spanless error must not receive a guessed span: {:?}",
+            diags[0].span
         );
-        let span = diags[0].span.unwrap();
-        assert_eq!(span.source_id, sid);
-        assert!(span.lo < span.hi, "span should have positive length");
     }
 
     // ------------------------------------------------------------------
@@ -2042,17 +2199,14 @@ mod tests {
         let catalog = test_catalog();
         let mut sources = SourceMap::new();
         let sid = sources.add_source("test", "");
-        let model = SemanticModel::new(test_ir(), sources, catalog, Vec::new());
+        let model = SemanticModel::new(test_ir_with_visibility(), sources, catalog, Vec::new());
         let pos = SourcePosition::new(sid, 0);
         let completions = model.completions_at(pos);
 
-        // len should appear (it's a catalog function)
+        // len is a direct host call alias; the catalog has 4 len overloads,
+        // each surfaced as a separate candidate with the alias label.
         let len_completions: Vec<&SemanticCompletion> =
             completions.iter().filter(|c| c.label == "len").collect();
-        // The catalog has 4 len overloads, but since we deduplicate by label
-        // in completions (each overload is a separate candidate), we should
-        // see multiple entries. Currently we add one per catalog function,
-        // so we see 4 separate entries all with label "len".
         assert_eq!(
             len_completions.len(),
             4,
@@ -2081,18 +2235,66 @@ mod tests {
 
         let mut sources = SourceMap::new();
         let sid = sources.add_source("test", "");
-        let model = SemanticModel::new(test_ir(), sources, catalog, Vec::new());
+        let mut ir = test_ir();
+        ir.catalog_visibility = Some(crate::compiler::ir::CatalogVisibility {
+            host_namespace_aliases: vec![("custom".to_string(), "custom".to_string())],
+            direct_host_call_aliases: Vec::new(),
+            direct_host_wildcard_imports: Vec::new(),
+            module_namespace_aliases: Vec::new(),
+            use_declarations: Vec::new(),
+        });
+        let model = SemanticModel::new(ir, sources.clone(), catalog.clone(), Vec::new());
         let pos = SourcePosition::new(sid, 0);
         let completions = model.completions_at(pos);
 
         let names: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
         assert!(
-            names.contains(&"custom::create"),
-            "custom catalog functions should appear in completions"
+            names.contains(&"custom"),
+            "custom namespace alias should appear in completions"
         );
+        let namespace = SourcePosition::new(sid, 6);
+        let _ = namespace;
+        // Member completion through the alias: cursor inside `custom::cr`.
+        let member_ir = {
+            let mut ir = test_ir();
+            ir.catalog_visibility = Some(crate::compiler::ir::CatalogVisibility {
+                host_namespace_aliases: vec![("custom".to_string(), "custom".to_string())],
+                direct_host_call_aliases: Vec::new(),
+                direct_host_wildcard_imports: Vec::new(),
+                module_namespace_aliases: Vec::new(),
+                use_declarations: Vec::new(),
+            });
+            ir.lexer_tokens = vec![
+                crate::compiler::ir::LexerToken {
+                    kind: "Ident".to_string(),
+                    ident: "custom".to_string(),
+                    span: Span::new(sid, 0, 6),
+                },
+                crate::compiler::ir::LexerToken {
+                    kind: "Colon".to_string(),
+                    ident: String::new(),
+                    span: Span::new(sid, 6, 7),
+                },
+                crate::compiler::ir::LexerToken {
+                    kind: "Colon".to_string(),
+                    ident: String::new(),
+                    span: Span::new(sid, 7, 8),
+                },
+                crate::compiler::ir::LexerToken {
+                    kind: "Ident".to_string(),
+                    ident: "cr".to_string(),
+                    span: Span::new(sid, 8, 10),
+                },
+            ];
+            ir
+        };
+        let model = SemanticModel::new(member_ir, sources, catalog, Vec::new());
+        let completions = model.completions_at(SourcePosition::new(sid, 9));
+        let names: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
         assert!(
-            names.contains(&"resource<custom.resource>"),
-            "custom resource should appear in completions"
+            names.contains(&"create"),
+            "custom::cr should resolve the create member: {:?}",
+            names
         );
     }
 
@@ -2162,34 +2364,35 @@ mod tests {
     fn completions_filter_by_prefix() {
         let catalog = test_catalog();
         let mut sources = SourceMap::new();
-        let sid = sources.add_source("test", "sql");
-        let mut ir = test_ir();
+        let sid = sources.add_source("test", "qu");
+        let mut ir = test_ir_with_visibility();
         // Carry the lexer token stream so the prefix comes from token spans.
         ir.lexer_tokens = vec![crate::compiler::ir::LexerToken {
             kind: "Ident".to_string(),
-            ident: "sql".to_string(),
-            span: Span::new(sid, 0, 3),
+            ident: "qu".to_string(),
+            span: Span::new(sid, 0, 2),
         }];
         let model = SemanticModel::new(ir, sources, catalog, Vec::new());
-        // Position at offset 3 (after "sql")
-        let pos = SourcePosition::new(sid, 3);
+        // Position at offset 2 (after "qu")
+        let pos = SourcePosition::new(sid, 2);
         let completions = model.completions_at(pos);
         let names: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
-        // Should include sqlite::open and sqlite::query
+        // The sqlite wildcard import offers member `query` (matches "qu").
         assert!(
-            names.contains(&"sqlite::open"),
-            "completions should include sqlite::open with prefix 'sql': {:?}",
+            names.contains(&"query"),
+            "completions should include sqlite::query's member with prefix 'qu': {:?}",
+            names
+        );
+        // Should NOT include open (doesn't start with "qu") nor len (doesn't
+        // match the prefix).
+        assert!(
+            !names.contains(&"open"),
+            "completions should NOT include open with prefix 'qu': {:?}",
             names
         );
         assert!(
-            names.contains(&"sqlite::query"),
-            "completions should include sqlite::query with prefix 'sql': {:?}",
-            names
-        );
-        // Should NOT include io::open (doesn't start with "sql")
-        assert!(
-            !names.contains(&"io::open"),
-            "completions should NOT include io::open with prefix 'sql': {:?}",
+            !names.contains(&"len"),
+            "completions should NOT include len with prefix 'qu': {:?}",
             names
         );
     }

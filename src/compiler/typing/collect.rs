@@ -156,6 +156,7 @@ pub(super) fn collect_function_types(
         env.host_import_return_types,
         env.host_import_signatures,
         TypingMode::DynamicHints,
+        None,
     );
     seed_function_param_state(
         &mut state,

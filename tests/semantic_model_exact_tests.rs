@@ -378,6 +378,66 @@ fn module_alias_offered_and_source_scoped() {
     );
 }
 
+#[test]
+fn module_member_completions_are_scoped_to_the_aliased_module() {
+    // Cross-module leakage guard (M1): with two distinct module aliases, each
+    // `ns::` member surface lists only the functions owned by its own module,
+    // never the other module's exports.
+    let root =
+        "use a::util;\nuse b::other;\nlet x = util::util_only();\nlet y = other::other_only();\n";
+    let model = analyze_modules(
+        root,
+        &[
+            ("a/util.rss", "pub fn util_only() -> int { 1 }\n"),
+            ("b/other.rss", "pub fn other_only() -> int { 2 }\n"),
+        ],
+    );
+    // Cursor at `util::u|` (partial member `u`).
+    let at = offset_of(root, "util::util_only") + "util::u".len();
+    let comps = labels(&model, at);
+    assert!(
+        comps.iter().any(|n| n == "util_only"),
+        "util:: member surface offers util's own export: {comps:?}"
+    );
+    assert!(
+        comps.iter().all(|n| n != "other_only"),
+        "other module exports must not leak into util:: — {comps:?}"
+    );
+
+    // And the reverse: `other::` offers only `other_only`.
+    let at = offset_of(root, "other::other_only") + "other::o".len();
+    let comps = labels(&model, at);
+    assert!(
+        comps.iter().any(|n| n == "other_only"),
+        "other:: member surface offers other's own export: {comps:?}"
+    );
+    assert!(
+        comps.iter().all(|n| n != "util_only"),
+        "util exports must not leak into other:: — {comps:?}"
+    );
+}
+
+#[test]
+fn trailing_namespace_prefix_offers_empty_member_completion() {
+    // M3: a cursor exactly at the `ns::` boundary (nothing typed yet) must
+    // still offer the namespace's members — member completion triggers on the
+    // trailing `::`, not only after a partial member token.
+    let source = "use prov;\nlet c = prov::make(\"x\");\n";
+    let model = analyze(source);
+    // Cursor on the second Colon of `prov::` (the empty-member boundary,
+    // immediately before `make`).
+    let at = offset_of(source, "prov::make") + "prov::".len();
+    let comps = labels(&model, at);
+    assert!(
+        comps.iter().any(|n| n == "make"),
+        "empty-member ns:: should offer prov members: {comps:?}"
+    );
+    assert!(
+        comps.iter().any(|n| n == "connect"),
+        "empty-member ns:: should offer all prov members: {comps:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Exact prefix derivation (lexer token stream)
 // ---------------------------------------------------------------------------

@@ -1404,6 +1404,11 @@ fn rebase_parsed_semantic_index(
         });
     }
 
+    // Statement spans carry their owning source id and are copied verbatim:
+    // the line key and exact span are both parser-origin and independent of
+    // the merged id space.
+    let stmt_spans = unit.stmt_spans.clone();
+
     Ok(ParsedSemanticIndex {
         call_sites,
         local_decls,
@@ -1411,6 +1416,7 @@ fn rebase_parsed_semantic_index(
         func_decls,
         func_refs,
         scopes,
+        stmt_spans,
         next_node_id: checked_node_total(unit.next_node_id, node_offset)?,
         next_scope_id: checked_scope_total(unit.next_scope_id, scope_offset)?,
     })
@@ -1454,6 +1460,7 @@ fn merge_parsed_semantic_index(merged: &mut ParsedSemanticIndex, unit: ParsedSem
     merged.func_decls.extend(unit.func_decls);
     merged.func_refs.extend(unit.func_refs);
     merged.scopes.extend(unit.scopes);
+    merged.stmt_spans.extend(unit.stmt_spans);
     merged.next_node_id = unit.next_node_id;
     merged.next_scope_id = unit.next_scope_id;
 }
@@ -2222,6 +2229,7 @@ mod linker_provenance_merge_tests {
                 declarations: vec![LocalSlot::try_from(0).unwrap()],
                 functions: vec![0],
             }],
+            stmt_spans: Vec::new(),
             next_node_id,
             next_scope_id,
         }
@@ -2373,6 +2381,7 @@ mod linker_provenance_merge_tests {
                 declarations: Vec::new(),
                 functions: vec![3],
             }],
+            stmt_spans: Vec::new(),
             next_node_id: 3,
             next_scope_id: 1,
         };
@@ -2396,6 +2405,7 @@ mod linker_provenance_merge_tests {
                 declarations: Vec::new(),
                 functions: vec![5],
             }],
+            stmt_spans: Vec::new(),
             next_node_id: 1,
             next_scope_id: 1,
         };
@@ -2513,6 +2523,7 @@ mod linker_provenance_merge_tests {
             func_decls: Vec::new(),
             func_refs: Vec::new(),
             scopes: Vec::new(),
+            stmt_spans: Vec::new(),
             next_node_id: 1,
             next_scope_id: 0,
         };
@@ -2531,6 +2542,7 @@ mod linker_provenance_merge_tests {
             func_decls: Vec::new(),
             func_refs: Vec::new(),
             scopes: Vec::new(),
+            stmt_spans: Vec::new(),
             next_node_id: 1,
             next_scope_id: 0,
         };
@@ -2599,6 +2611,7 @@ mod linker_provenance_merge_tests {
             func_decls: Vec::new(),
             func_refs: Vec::new(),
             scopes: Vec::new(),
+            stmt_spans: Vec::new(),
             next_node_id: 1,
             next_scope_id: 0,
         };

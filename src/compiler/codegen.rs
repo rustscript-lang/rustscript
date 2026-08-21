@@ -1404,6 +1404,7 @@ impl Compiler {
                 detail: format!(
                     "generic function value '{name}' requires explicit type arguments or an unambiguous callable context"
                 ),
+                span: None,
             });
         }
         if !type_args.is_empty()

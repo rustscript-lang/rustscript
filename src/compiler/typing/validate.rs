@@ -4,6 +4,7 @@ use crate::builtins::{BuiltinFunction, CallableParam, CallableParamType, Callabl
 
 use super::super::CompileError;
 use super::super::ir::{Expr, LocalSlot, MatchPattern, TypeSchema};
+use super::super::source_map::Span;
 use super::context::{TypeContext, infer_access_schema, render_schema_label};
 use super::helpers::{
     bind_expr_result_to_slot, bound_type_label, find_declared_schema_mismatch, infer_binary_type,
@@ -17,6 +18,25 @@ use super::state::{
 pub(super) struct DiagnosticSite<'a> {
     pub(super) line: Option<u32>,
     pub(super) source_name: Option<&'a str>,
+    /// Exact parser-origin span of the construct being diagnosed, when the
+    /// production site can resolve one from parser provenance. `None` for
+    /// sites that carry no position at all.
+    pub(super) span: Option<crate::compiler::source_map::Span>,
+}
+
+impl<'a> DiagnosticSite<'a> {
+    pub(super) fn new(line: Option<u32>, source_name: Option<&'a str>) -> Self {
+        Self {
+            line,
+            source_name,
+            span: None,
+        }
+    }
+
+    pub(super) fn with_span(mut self, span: Option<crate::compiler::source_map::Span>) -> Self {
+        self.span = span;
+        self
+    }
 }
 
 struct CallableBody<'a> {
@@ -73,6 +93,7 @@ fn observe_direct_function_call_types(
             line: line_context,
             source_name: owned_source_name(source_name),
             detail,
+            span: expr_span_of(expr, context),
         });
     }
     Ok(())
@@ -106,6 +127,7 @@ pub(super) fn validate_signature_overloads(
             format_actual_arg_types(&actual),
             format_signature_overloads(callable_name, signatures),
         ),
+        span: site.span,
     })
 }
 
@@ -135,6 +157,7 @@ pub(super) fn validate_host_signature(
             callable_name,
             format_param_types(params),
         ),
+        span: None,
     })
 }
 
@@ -146,6 +169,7 @@ fn callable_argument_mismatch(
         line: site.line,
         source_name: owned_source_name(site.source_name),
         detail,
+        span: site.span,
     })
 }
 
@@ -527,6 +551,7 @@ pub(super) fn validate_json_encode_argument(
                 line: site.line,
                 source_name: owned_source_name(site.source_name),
                 detail: format!("builtin 'json::encode' cannot encode this value: {detail}"),
+                span: site.span,
             }
         });
     }
@@ -688,6 +713,7 @@ pub(super) fn validate_expr(
                     line_context,
                     source_name,
                     "unwrap_or() requires an optional value",
+                    expr_span_of(value, context),
                 ));
             }
             ensure_expr_not_optional(
@@ -706,6 +732,7 @@ pub(super) fn validate_expr(
                 inner_ty,
                 fallback_ty,
                 context.is_strict(),
+                context.stmt_span(line_context.unwrap_or_default()),
             )?;
             context.infer_expr_type(expr, state)
         }
@@ -786,6 +813,7 @@ pub(super) fn validate_expr(
                         line_context,
                         source_name,
                         "binary operation",
+                        expr_span_of(expr, context),
                     ));
                 }
             }
@@ -802,6 +830,7 @@ pub(super) fn validate_expr(
                         bound_type_label(lhs_ty),
                         bound_type_label(rhs_ty)
                     ),
+                    span: context.stmt_span(line_context.unwrap_or_default()),
                 });
             }
             inferred
@@ -820,6 +849,7 @@ pub(super) fn validate_expr(
                     line_context,
                     source_name,
                     "unary operation",
+                    expr_span_of(inner, context),
                 ));
             }
             infer_unary_type(expr, inner_ty)
@@ -889,6 +919,7 @@ pub(super) fn validate_expr(
                 then_ty,
                 else_ty,
                 context.is_strict(),
+                context.stmt_span(line_context.unwrap_or_default()),
             )?;
             ensure_compatible_callable_schemas(
                 line_context,
@@ -896,6 +927,7 @@ pub(super) fn validate_expr(
                 "if/else expression result",
                 context.infer_expr_schema(then_expr, &then_state),
                 context.infer_expr_schema(else_expr, &else_state),
+                context.stmt_span(line_context.unwrap_or_default()),
             )?;
             if then_ty == else_ty || matches!(static_condition, Some(true)) {
                 then_ty
@@ -933,7 +965,14 @@ pub(super) fn validate_expr(
             let mut arm_type = None;
             let mut arm_schema = None;
             for (pattern, arm_expr) in arms {
-                validate_match_pattern(pattern, *value_slot, &nested, line_context, source_name)?;
+                validate_match_pattern(
+                    pattern,
+                    *value_slot,
+                    &nested,
+                    line_context,
+                    source_name,
+                    context.stmt_span(line_context.unwrap_or_default()),
+                )?;
                 let arm_state = refine_state_for_match_pattern(&nested, pattern, *value_slot);
                 let ty = validate_expr(
                     arm_expr,
@@ -950,6 +989,7 @@ pub(super) fn validate_expr(
                     "match arm result",
                     arm_schema.clone(),
                     schema.clone(),
+                    context.stmt_span(line_context.unwrap_or_default()),
                 )?;
                 arm_schema = arm_schema.or(schema);
                 arm_type = Some(match arm_type {
@@ -962,6 +1002,7 @@ pub(super) fn validate_expr(
                             current,
                             ty,
                             context.is_strict(),
+                            context.stmt_span(line_context.unwrap_or_default()),
                         )?;
                         merge_bound_types(current, ty)
                     }
@@ -987,6 +1028,7 @@ pub(super) fn validate_expr(
                     arm_type,
                     default_ty,
                     context.is_strict(),
+                    context.stmt_span(line_context.unwrap_or_default()),
                 )?;
                 ensure_compatible_callable_schemas(
                     line_context,
@@ -994,6 +1036,7 @@ pub(super) fn validate_expr(
                     "match result",
                     arm_schema,
                     default_schema,
+                    context.stmt_span(line_context.unwrap_or_default()),
                 )?;
                 merge_bound_types(arm_type, default_ty)
             }
@@ -1078,6 +1121,7 @@ fn validate_expr_children(
                     DiagnosticSite {
                         line: line_context,
                         source_name,
+                        span: context.stmt_span(line_context.unwrap_or_default()),
                     },
                     context,
                 )?;
@@ -1099,6 +1143,7 @@ fn validate_expr_children(
                     DiagnosticSite {
                         line: line_context,
                         source_name,
+                        span: context.stmt_span(line_context.unwrap_or_default()),
                     },
                     context,
                 )?;
@@ -1129,6 +1174,7 @@ fn validate_expr_children(
                 DiagnosticSite {
                     line: line_context,
                     source_name,
+                    span: context.stmt_span(line_context.unwrap_or_default()),
                 },
                 context,
             )?;
@@ -1194,7 +1240,7 @@ fn validate_schema_access(
     source_name: Option<&str>,
     context: &mut TypeContext<'_>,
 ) -> Result<(), CompileError> {
-    let Expr::Call(index, _, args, _, _) = expr else {
+    let Expr::Call(index, _, args, _, semantic_id) = expr else {
         return Ok(());
     };
     if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::Get) || args.len() != 2 {
@@ -1205,6 +1251,7 @@ fn validate_schema_access(
             line_context,
             source_name,
             "member/index access",
+            semantic_id.and_then(|id| context.node_span(id)),
         ));
     }
     let Some(container_schema) = context.infer_expr_schema(&args[0], state) else {
@@ -1219,6 +1266,7 @@ fn validate_schema_access(
             line: line_context,
             source_name: owned_source_name(source_name),
             detail,
+            span: semantic_id.and_then(|id| context.node_span(id)),
         })
 }
 
@@ -1229,14 +1277,22 @@ fn validate_optional_get_access(
     source_name: Option<&str>,
     context: &mut TypeContext<'_>,
 ) -> Result<(), CompileError> {
-    let Expr::OptionalGet { container, key, .. } = expr else {
+    let Expr::OptionalGet {
+        container,
+        key,
+        semantic_id,
+        ..
+    } = expr
+    else {
         return Ok(());
     };
+    let span = semantic_id.and_then(|id| context.node_span(id));
     if context.is_strict() && !context.expr_has_declared_schema(container, state) {
         return Err(CompileError::InvalidFieldAccess {
             line: line_context,
             source_name: owned_source_name(source_name),
             detail: "optional access requires a user-declared schema in RustScript".to_string(),
+            span,
         });
     }
     if !context.expr_has_declared_schema(container, state) {
@@ -1251,6 +1307,7 @@ fn validate_optional_get_access(
             line: line_context,
             source_name: owned_source_name(source_name),
             detail,
+            span,
         })
 }
 
@@ -1258,11 +1315,28 @@ fn optional_usage_error(
     line: Option<u32>,
     source_name: Option<&str>,
     context: &str,
+    span: Option<Span>,
 ) -> CompileError {
     CompileError::InvalidFieldAccess {
         line,
         source_name: owned_source_name(source_name),
         detail: format!("optional value must be unwrapped before {context}"),
+        span,
+    }
+}
+
+/// The exact parser-origin span of an expression, resolved from its semantic
+/// node id when the node carries one (calls, optional accesses), else the
+/// containing statement's exact span by line.
+fn expr_span_of(expr: &Expr, context: &TypeContext<'_>) -> Option<Span> {
+    match expr {
+        Expr::Call(_, _, _, _, Some(id))
+        | Expr::ModuleCall(_, _, _, Some(id))
+        | Expr::LocalCall(_, _, _, Some(id)) => context.node_span(*id),
+        Expr::OptionalGet { semantic_id, .. } | Expr::OptionUnwrapOr { semantic_id, .. } => {
+            semantic_id.and_then(|id| context.node_span(id))
+        }
+        _ => None,
     }
 }
 
@@ -1275,7 +1349,12 @@ fn ensure_expr_not_optional(
     usage: &str,
 ) -> Result<(), CompileError> {
     if context.expr_is_optional(expr, state) {
-        return Err(optional_usage_error(line_context, source_name, usage));
+        return Err(optional_usage_error(
+            line_context,
+            source_name,
+            usage,
+            expr_span_of(expr, context),
+        ));
     }
     Ok(())
 }
@@ -1290,12 +1369,14 @@ fn validate_match_pattern(
     state: &LocalTypeState,
     line_context: Option<u32>,
     source_name: Option<&str>,
+    span: Option<Span>,
 ) -> Result<(), CompileError> {
     if pattern.requires_optional_value() && !state.is_optional(value_slot) {
         return Err(CompileError::InvalidFieldAccess {
             line: line_context,
             source_name: owned_source_name(source_name),
             detail: "Some(...) and None match patterns require an optional value".to_string(),
+            span,
         });
     }
     Ok(())
@@ -1405,6 +1486,7 @@ fn ensure_compatible_if_else_types(
     lhs: BoundType,
     rhs: BoundType,
     strict: bool,
+    span: Option<Span>,
 ) -> Result<(), CompileError> {
     if are_compatible_bound_types_in_mode(lhs, rhs, strict) {
         return Ok(());
@@ -1417,6 +1499,7 @@ fn ensure_compatible_if_else_types(
             bound_type_label(lhs),
             bound_type_label(rhs)
         ),
+        span,
     })
 }
 
@@ -1426,6 +1509,7 @@ fn ensure_compatible_callable_schemas(
     context: &str,
     lhs: Option<TypeSchema>,
     rhs: Option<TypeSchema>,
+    span: Option<Span>,
 ) -> Result<(), CompileError> {
     let (Some(lhs @ TypeSchema::Callable { .. }), Some(rhs @ TypeSchema::Callable { .. })) =
         (lhs, rhs)
@@ -1443,6 +1527,7 @@ fn ensure_compatible_callable_schemas(
             render_schema_label(&lhs),
             render_schema_label(&rhs)
         ),
+        span,
     })
 }
 
@@ -1521,6 +1606,7 @@ pub(super) fn validate_branch_state_merge(
     lhs: &LocalTypeState,
     rhs: &LocalTypeState,
     strict: bool,
+    span: Option<Span>,
 ) -> Result<(), CompileError> {
     for slot in lhs.iter_slots().chain(rhs.iter_slots()) {
         let left_present = lhs.has_binding(slot);
@@ -1536,6 +1622,7 @@ pub(super) fn validate_branch_state_merge(
             "control-flow local",
             lhs.schema(slot).cloned(),
             rhs.schema(slot).cloned(),
+            span,
         )?;
         if are_compatible_bound_types_in_mode(left, right, strict) {
             continue;
@@ -1549,6 +1636,7 @@ pub(super) fn validate_branch_state_merge(
                 bound_type_label(left),
                 bound_type_label(right)
             ),
+            span,
         });
     }
     Ok(())

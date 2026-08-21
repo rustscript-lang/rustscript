@@ -564,6 +564,7 @@ fn enforce_strict_rustscript_type_resolution(
     parsed: &FrontendIr,
     type_info: &typing::TypeInferenceResult,
 ) -> Result<(), CompileError> {
+    let parsed_index = parsed.parsed_semantic_index.as_ref();
     for schema in parsed.struct_schemas.values() {
         if schema_is_fully_known(&schema.body_schema) {
             continue;
@@ -575,6 +576,7 @@ fn enforce_strict_rustscript_type_resolution(
                 "struct '{}' contains non-concrete field types; RustScript requires concrete schemas",
                 schema.name
             ),
+            span: None,
         });
     }
 
@@ -583,6 +585,13 @@ fn enforce_strict_rustscript_type_resolution(
         if let Some(schema) = decl.return_schema.as_ref()
             && !schema_is_fully_known(schema)
         {
+            let span = parsed_index.and_then(|index| {
+                index
+                    .func_decls
+                    .iter()
+                    .find(|site| site.function_index == decl.index)
+                    .map(|site| site.ident_span)
+            });
             return Err(CompileError::StrictTypingRequired {
                 line: function_decl_lines.get(&decl.index).copied(),
                 source_name: parsed.function_sources.get(&decl.index).cloned(),
@@ -590,6 +599,7 @@ fn enforce_strict_rustscript_type_resolution(
                     "function '{}' uses a non-concrete return schema; RustScript requires concrete return types",
                     decl.name
                 ),
+                span,
             });
         }
     }
@@ -598,6 +608,20 @@ fn enforce_strict_rustscript_type_resolution(
         if slot_is_fully_typed(slot, type_info) {
             continue;
         }
+        let span = parsed_index.and_then(|index| {
+            index
+                .local_decls
+                .iter()
+                .find(|decl| decl.slot == slot)
+                .map(|decl| decl.ident_span)
+                .or_else(|| {
+                    index
+                        .local_refs
+                        .iter()
+                        .find(|reference| reference.slot == slot)
+                        .map(|reference| reference.ident_span)
+                })
+        });
         return Err(CompileError::StrictTypingRequired {
             line: site.line,
             source_name: site.source_name,
@@ -605,6 +629,7 @@ fn enforce_strict_rustscript_type_resolution(
                 "{} '{}' does not resolve to a concrete compile-time type in RustScript",
                 site.kind, site.name
             ),
+            span,
         });
     }
 

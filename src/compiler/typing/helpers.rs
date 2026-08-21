@@ -255,6 +255,7 @@ pub(super) fn legalize_function_impl(
         env.host_import_return_types,
         env.host_import_signatures,
         TypingMode::DynamicHints,
+        None,
     );
     seed_function_param_state(
         &mut state,
@@ -287,6 +288,7 @@ pub(super) fn legalize_function_impl(
     let body_site = DiagnosticSite {
         line: Some(function_impl.body_expr_line),
         source_name,
+        span: context.stmt_span(function_impl.body_expr_line),
     };
     let _ = legalize_expr(
         &mut function_impl.body_expr,
@@ -312,6 +314,7 @@ pub(super) fn validate_function_impl(
             line: None,
             source_name: owned_source_name(source_name),
             detail,
+            span: context.function_decl_span(function_index),
         });
     }
     let mut state = LocalTypeState::default();
@@ -413,6 +416,7 @@ pub(super) fn validate_function_impl(
                 "function '{}' return type cannot be inferred; add a return schema or make the body type-stable",
                 function_name
             ),
+            span: context.function_decl_span(function_index),
         });
     }
     Ok(())
@@ -426,9 +430,11 @@ pub(super) fn legalize_stmts(
     host_resolution: &mut HostCallResolutionPass<'_>,
 ) {
     for stmt in stmts {
+        let stmt_line = stmt_line(stmt);
         let site = DiagnosticSite {
-            line: Some(stmt_line(stmt)),
+            line: Some(stmt_line),
             source_name,
+            span: context.stmt_span(stmt_line),
         };
         match stmt {
             Stmt::Noop { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
@@ -682,6 +688,7 @@ pub(super) fn validate_stmts(
                     DiagnosticSite {
                         line: Some(*line),
                         source_name,
+                        span: context.stmt_span(*line),
                     },
                     context,
                 )?;
@@ -750,6 +757,7 @@ pub(super) fn validate_stmts(
                     &then_state,
                     &else_state,
                     context.is_strict(),
+                    context.stmt_span(*line),
                 )?;
                 state.merge_from_branches(&then_state, &else_state);
             }
@@ -801,6 +809,7 @@ pub(super) fn validate_stmts(
                         &loop_entry,
                         iterated,
                         context.is_strict(),
+                        context.stmt_span(*line),
                     )
                 })?;
             }
@@ -834,6 +843,7 @@ pub(super) fn validate_stmts(
                         &loop_entry,
                         iterated,
                         context.is_strict(),
+                        context.stmt_span(*line),
                     )
                 })?;
             }
@@ -866,6 +876,7 @@ fn validate_declared_local_schema(
                 "local is declared as schema type '{}' but was assigned an optional value",
                 schema_type_label(schema)
             ),
+            span: context.stmt_span(line.unwrap_or_default()),
         });
     }
     if actual == BoundType::Null && !expected_optional && expected != BoundType::Null {
@@ -876,6 +887,7 @@ fn validate_declared_local_schema(
                 "local is declared as schema type '{}' but was assigned null",
                 schema_type_label(schema)
             ),
+            span: context.stmt_span(line.unwrap_or_default()),
         });
     }
     if actual == BoundType::Unknown
@@ -897,6 +909,7 @@ fn validate_declared_local_schema(
                 line,
                 source_name: owned_source_name(source_name),
                 detail,
+                span: context.stmt_span(line.unwrap_or_default()),
             });
         }
         return Ok(());
@@ -909,6 +922,7 @@ fn validate_declared_local_schema(
             schema_type_label(schema),
             bound_type_label(actual)
         ),
+        span: context.stmt_span(line.unwrap_or_default()),
     })
 }
 
@@ -934,6 +948,7 @@ fn validate_declared_return_schema(
                 "function '{function_name}' is declared to return '{}' but produced an optional value",
                 schema_type_label(schema)
             ),
+            span: context.stmt_span(line.unwrap_or_default()),
         });
     }
     if actual == BoundType::Null && !expected_optional && expected != BoundType::Null {
@@ -944,6 +959,7 @@ fn validate_declared_return_schema(
                 "function '{function_name}' is declared to return '{}' but produced null",
                 schema_type_label(schema)
             ),
+            span: context.stmt_span(line.unwrap_or_default()),
         });
     }
     if actual == BoundType::Unknown
@@ -965,6 +981,7 @@ fn validate_declared_return_schema(
                 line,
                 source_name: owned_source_name(source_name),
                 detail: format!("function '{function_name}' return type mismatch: {detail}"),
+                span: context.stmt_span(line.unwrap_or_default()),
             });
         }
         return Ok(());
@@ -977,6 +994,7 @@ fn validate_declared_return_schema(
             schema_type_label(schema),
             bound_type_label(actual)
         ),
+        span: context.stmt_span(line.unwrap_or_default()),
     })
 }
 
@@ -1003,6 +1021,7 @@ fn validate_numeric_assignment_operands(
                 kind.diagnostic_label(),
                 bound_type_label(target_ty)
             ),
+            span: site.span,
         });
     }
 
@@ -1020,6 +1039,7 @@ fn validate_numeric_assignment_operands(
                 bound_type_label(target_ty),
                 bound_type_label(rhs_ty)
             ),
+            span: site.span,
         });
     }
 
@@ -2224,6 +2244,7 @@ mod tests {
             &host_returns,
             &host_sigs,
             TypingMode::StrictRustScript,
+            None,
         );
         find_declared_schema_mismatch(expected, actual, &mut context, String::new())
     }

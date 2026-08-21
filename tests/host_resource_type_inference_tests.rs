@@ -121,6 +121,30 @@ fn build_model(catalog: Arc<HostApiCatalog>, errors: Vec<CompileError>) -> Seman
     SemanticModel::new(empty_ir(), sources, catalog, errors)
 }
 
+/// `empty_ir` with structured catalog provenance: wildcard host imports for
+/// `sqlite`/`io`, host namespace aliases, and a direct `len` alias. Mirrors
+/// the unit-test helper; drives the exact structured completion surface
+/// (never the legacy full-catalog fallback).
+fn ir_with_visibility() -> FrontendIr {
+    let mut ir = empty_ir();
+    ir.catalog_visibility = Some(vm::compiler::ir::CatalogVisibility {
+        host_namespace_aliases: vec![("sqlite".to_string(), "sqlite".to_string())],
+        direct_host_call_aliases: vec![("len".to_string(), "len".to_string())],
+        direct_host_wildcard_imports: vec!["sqlite".to_string(), "io".to_string()],
+        module_namespace_aliases: Vec::new(),
+        use_declarations: Vec::new(),
+    });
+    ir
+}
+
+fn build_model_with_visibility(
+    catalog: Arc<HostApiCatalog>,
+    errors: Vec<CompileError>,
+) -> SemanticModel {
+    let sources = SourceMap::new();
+    SemanticModel::new(ir_with_visibility(), sources, catalog, errors)
+}
+
 // ---------------------------------------------------------------------------
 // Catalog fingerprint
 // ---------------------------------------------------------------------------
@@ -140,29 +164,32 @@ fn catalog_fingerprint_is_stable() {
 #[test]
 fn completions_include_host_functions() {
     let catalog = test_catalog();
-    let model = build_model(catalog, Vec::new());
+    let model = build_model_with_visibility(catalog, Vec::new());
     let pos = SourcePosition::new(0, 0);
     let completions = model.completions_at(pos);
 
+    // The structured surface is import-driven: wildcard imports surface
+    // `open`/`query` members (never the canonical `sqlite::open` name), and
+    // the direct alias surfaces `len`.
     let names: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
-        names.contains(&"sqlite::open"),
-        "completions missing sqlite::open: {:?}",
+        names.contains(&"open"),
+        "completions missing wildcard member open: {:?}",
         names
     );
     assert!(
-        names.contains(&"sqlite::query"),
-        "completions missing sqlite::query: {:?}",
-        names
-    );
-    assert!(
-        names.contains(&"io::open"),
-        "completions missing io::open: {:?}",
+        names.contains(&"query"),
+        "completions missing wildcard member query: {:?}",
         names
     );
     assert!(
         names.contains(&"len"),
-        "completions missing len: {:?}",
+        "completions missing direct alias len: {:?}",
+        names
+    );
+    assert!(
+        names.iter().all(|n| n != &"sqlite::open"),
+        "canonical name must not appear alongside wildcard members: {:?}",
         names
     );
 }
@@ -170,28 +197,21 @@ fn completions_include_host_functions() {
 #[test]
 fn completions_include_resource_types() {
     let catalog = test_catalog();
-    let model = build_model(catalog, Vec::new());
+    let model = build_model_with_visibility(catalog, Vec::new());
     let pos = SourcePosition::new(0, 0);
     let completions = model.completions_at(pos);
 
+    // The structured surface never dumps resources wholesale. Resources are
+    // only reachable through the resource passing detail of imported
+    // functions, not as standalone completion items.
     let resource_labels: Vec<&str> = completions
         .iter()
         .filter(|c| c.kind == vm::compiler::CompletionItemKind::Resource)
         .map(|c| c.label.as_str())
         .collect();
     assert!(
-        resource_labels.contains(&"resource<sqlite.connection>"),
-        "missing sqlite resource: {:?}",
-        resource_labels
-    );
-    assert!(
-        resource_labels.contains(&"resource<io.file>"),
-        "missing io.file resource: {:?}",
-        resource_labels
-    );
-    assert!(
-        resource_labels.contains(&"resource<http.request>"),
-        "missing http.request resource: {:?}",
+        resource_labels.is_empty(),
+        "no full-catalog resource leakage in structured surface: {:?}",
         resource_labels
     );
 }
@@ -199,14 +219,14 @@ fn completions_include_resource_types() {
 #[test]
 fn completions_detail_shows_passing_modes() {
     let catalog = test_catalog();
-    let model = build_model(catalog, Vec::new());
+    let model = build_model_with_visibility(catalog, Vec::new());
     let pos = SourcePosition::new(0, 0);
     let completions = model.completions_at(pos);
 
     let query = completions
         .iter()
-        .find(|c| c.label == "sqlite::query")
-        .expect("sqlite::query should be in completions");
+        .find(|c| c.label == "query")
+        .expect("query member should be in completions");
     let detail = query.detail.as_deref().unwrap_or("");
     // The detail should show the borrow resource parameter
     assert!(
@@ -222,11 +242,12 @@ fn completions_detail_shows_passing_modes() {
 #[test]
 fn completions_include_overloads_as_separate_candidates() {
     let catalog = test_catalog();
-    let model = build_model(catalog, Vec::new());
+    let model = build_model_with_visibility(catalog, Vec::new());
     let pos = SourcePosition::new(0, 0);
     let completions = model.completions_at(pos);
 
-    // len has 2 overloads in our test catalog (string, array)
+    // len has 2 overloads in our test catalog (string, array); the direct
+    // alias surfaces every matching overload as its own candidate.
     let len_count = completions.iter().filter(|c| c.label == "len").count();
     assert_eq!(
         len_count, 2,
@@ -249,19 +270,17 @@ fn completions_work_with_custom_catalog() {
     ));
     let catalog = Arc::new(builder.build().expect("custom catalog"));
 
-    let model = build_model(catalog, Vec::new());
+    // The custom catalog has no namespace alias imported: the structured
+    // surface with no imports must be empty — the catalog is never dumped
+    // wholesale, so `custom::create` cannot appear without an import.
+    let model = build_model_with_visibility(catalog, Vec::new());
     let pos = SourcePosition::new(0, 0);
     let completions = model.completions_at(pos);
 
     let names: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(
-        names.contains(&"custom::create"),
-        "custom catalog functions should appear in completions: {:?}",
-        names
-    );
-    assert!(
-        names.contains(&"resource<custom.my_resource>"),
-        "custom resource should appear in completions: {:?}",
+        names.iter().all(|n| n != &"custom::create"),
+        "custom catalog functions must not leak without an import: {:?}",
         names
     );
 }
@@ -427,11 +446,12 @@ fn utf8_byte_position_conversion() {
 #[test]
 fn overloads_with_different_schemas_are_independent_candidates() {
     let catalog = test_catalog();
-    let model = build_model(catalog, Vec::new());
+    let model = build_model_with_visibility(catalog, Vec::new());
     let pos = SourcePosition::new(0, 0);
     let completions = model.completions_at(pos);
 
-    // len has 2 overloads: len(string) -> int and len(array) -> int
+    // len has 2 overloads: len(string) -> int and len(array) -> int; each
+    // alias resolution surfaces as its own independent candidate.
     let len_overloads: Vec<&SemanticCompletion> =
         completions.iter().filter(|c| c.label == "len").collect();
     assert_eq!(
@@ -524,27 +544,28 @@ fn model_catalog_readonly() {
 
 #[test]
 fn completed_source_text_has_no_effect_on_catalog_completions() {
-    // Ensure that completions are purely catalog-driven and not affected
+    // Ensure that completions are purely import-driven and not affected
     // by the source text (since the IR is empty in our test).
     let catalog = test_catalog();
-    let model = build_model(catalog, Vec::new());
+    let model = build_model_with_visibility(catalog, Vec::new());
     let pos = SourcePosition::new(0, 0);
     let completions = model.completions_at(pos);
 
-    // All catalog functions should be present: sqlite::open, sqlite::query, io::open, len
-    assert!(
-        completions.len() >= 6,
-        "should have at least 6 completions (4 functions + resources)"
-    );
-    // Verify specific catalog functions are present
+    // The structured surface is the union of the imported members: sqlite
+    // (open, query), io (open), and the direct len alias (2 overloads).
+    let names: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert_eq!(names.iter().filter(|n| *n == &"open").count(), 2);
+    assert!(names.contains(&"query"), "{names:?}");
+    // len's 2 overloads both carry the alias label.
+    assert_eq!(names.iter().filter(|n| *n == &"len").count(), 2);
+    // No function other than the imported surface is present.
     let fn_count = completions
         .iter()
         .filter(|c| c.kind == vm::compiler::CompletionItemKind::Function)
         .count();
-    // Our catalog has: sqlite::open, sqlite::query, io::open, len (2 overloads) = 5 functions
     assert_eq!(
         fn_count, 5,
-        "should have 5 function completions (including overloads)"
+        "should have exactly the imported surface functions (open x2, query, len x2)"
     );
 }
 
