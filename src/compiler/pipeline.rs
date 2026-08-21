@@ -854,6 +854,44 @@ pub fn analyze_source_file_with_options(
     run_with_compiler_stack(move || analyze_source_file_impl(&path, &options))
 }
 
+/// Analyze a source file whose entry text is provided explicitly (in-memory,
+/// e.g. the current editor buffer) instead of being read from disk, without
+/// generating bytecode.
+///
+/// This is the language-server analysis entry: the caller supplies the entry
+/// file's *current* text (which overrides anything on disk), while imported
+/// modules resolve from disk or via `CompileSourceFileOptions` module
+/// overrides. The returned [`SemanticModel`] is identical to what
+/// [`analyze_source_file_with_options`] produces for the same effective text.
+///
+/// The flavor is derived from the path (`.rss` -> RustScript, etc.) exactly
+/// as in [`analyze_source_file_with_options`].
+pub fn analyze_source_from_string_with_options(
+    path: impl AsRef<Path>,
+    source: &str,
+    options: CompileSourceFileOptions,
+) -> Result<SemanticModel, SourcePathError> {
+    let path = path.as_ref().to_path_buf();
+    let source_owned = source.to_string();
+    run_with_compiler_stack(move || {
+        let options_ref = options;
+        analyze_source_string_at_path(
+            &path,
+            flavor_for_path(&path, &options_ref)?,
+            &source_owned,
+            &options_ref,
+        )
+    })
+}
+
+/// Derive the source flavor for a path, honoring the options' source plugins.
+fn flavor_for_path(
+    path: &Path,
+    options: &CompileSourceFileOptions,
+) -> Result<SourceFlavor, SourcePathError> {
+    SourceFlavor::from_path_with_options(path, options)
+}
+
 fn analyze_source_file_impl(
     path: &Path,
     options: &CompileSourceFileOptions,

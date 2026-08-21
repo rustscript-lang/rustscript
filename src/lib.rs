@@ -30,9 +30,9 @@ pub use builtins::runtime::{
     return_one, take_arg,
 };
 #[cfg(feature = "http-client")]
-pub use builtins::runtime::{HttpConfig, HttpHostExt};
+pub use builtins::runtime::{HttpConfig, HttpHostExt, http_host_catalog};
 #[cfg(feature = "runtime")]
-pub use builtins::runtime::{IoHostExt, IoPolicy};
+pub use builtins::runtime::{IoHostExt, IoPolicy, io_host_catalog};
 #[cfg(feature = "sqlite")]
 pub use builtins::runtime::{
     SqliteExtension, SqliteHostExt, SqliteLimits, SqlitePolicy, register_sqlite_builtin_module,
@@ -74,7 +74,8 @@ pub use compiler::{
     ReplLocalState, ResolvedImport, SemanticCompletion, SemanticDiagnostic, SemanticModel,
     SharedParserOptions, SourceError, SourceFlavor, SourcePathError, SourcePlugin, SourcePosition,
     Stmt, SymbolId, UnknownInferredLocal, UseDecl, UsePathSegment,
-    collect_inferred_local_type_hints, collect_inferred_local_type_hints_at_path_with_options,
+    analyze_source_from_string_with_options, collect_inferred_local_type_hints,
+    collect_inferred_local_type_hints_at_path_with_options,
     collect_inferred_local_type_hints_with_options, compile_source,
     compile_source_at_path_with_flavor_and_options, compile_source_file,
     compile_source_file_with_options, compile_source_for_repl, compile_source_for_repl_with_locals,

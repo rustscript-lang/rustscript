@@ -18,6 +18,24 @@ cli = ["pd_vm_crate/cli"]
 cranelift-jit = ["pd_vm_crate/cranelift-jit"]
 http-client = ["runtime", "pd_vm_crate/http-client"]
 sqlite = ["pd_vm_crate/sqlite"]
+# The language server adapter: a resource-aware stdio LSP server backed by the
+# semantic model. Gated so default / runtime-only / no-std surfaces never gain
+# the LSP dependencies (serde_json) or the heavy host extension features.
+lsp = [
+    "runtime",
+    "sqlite",
+    "http-client",
+    "dep:serde_json",
+]
 
 [dependencies]
 pd_vm_crate = { package = "pd-vm", path = "../..", version = "=0.1.0", default-features = false }
+serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+
+[[bin]]
+name = "rustscript-lsp"
+path = "src/bin/rustscript-lsp.rs"
+required-features = ["lsp"]

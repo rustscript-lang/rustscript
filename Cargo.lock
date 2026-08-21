@@ -1134,6 +1134,7 @@ name = "rustscript"
 version = "0.1.0"
 dependencies = [
  "pd-vm",
+ "serde_json",
 ]
 
 [[package]]
