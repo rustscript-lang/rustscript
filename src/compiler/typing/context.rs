@@ -2372,6 +2372,7 @@ impl<'a> TypeContext<'a> {
                 self,
                 line_context,
                 source_name,
+                span,
             );
         }
         if self.is_strict()
@@ -2398,6 +2399,7 @@ impl<'a> TypeContext<'a> {
             self,
             line_context,
             source_name,
+            span,
         )
     }
 
@@ -3060,6 +3062,68 @@ mod tests {
     use crate::builtins::{CallableParam, CallableParamType};
     use crate::compiler::ir::{ResolvedHostCall, ResolvedHostParam};
     use crate::host_api::{HostApiFingerprint, HostParamPassing};
+
+    #[test]
+    fn host_signature_mismatch_carries_available_call_span() {
+        // L1-residual: when a host call's argument types do not match a
+        // positional (non-callable) host signature, the fallthrough into
+        // `validate_host_signature` must forward the exact available call
+        // span into `CallableArgumentTypeMismatch` — never `span: None`.
+        // The span is the callee's parsed node span, so producers hand it to
+        // `validate_host_argument_types` and it must survive the generic
+        // host-signature mismatch path.
+        let empty_impls: HashMap<u16, FunctionImpl> = HashMap::new();
+        let empty_decls: HashMap<u16, FunctionDecl> = HashMap::new();
+        let empty_structs: HashMap<String, StructDecl> = HashMap::new();
+        let empty_names: HashMap<u16, String> = HashMap::new();
+        let empty_returns: HashMap<u16, BoundType> = HashMap::new();
+        let empty_signatures: HashMap<u16, HostCallableSignature> = HashMap::new();
+        let mut context = TypeContext::new(
+            &empty_impls,
+            &empty_decls,
+            &empty_structs,
+            &empty_names,
+            &empty_returns,
+            &empty_signatures,
+            TypingMode::DynamicHints,
+            None,
+        );
+        let signature = HostCallableSignature {
+            name: "flat::consume".to_string(),
+            params: vec![CallableParam {
+                name: "count",
+                ty: CallableParamType::Int,
+                optional: false,
+            }],
+            runtime_builtin: false,
+        };
+        // A call whose argument is a float against an `int` parameter: the
+        // exact call boundary has a span available, and the diagnostic must
+        // carry it verbatim.
+        let expr_span = crate::compiler::source_map::Span::new(7, 20, 40);
+        let state = LocalTypeState::default();
+        let args = [Expr::Float(1.0)];
+        let error = context
+            .validate_host_argument_types(
+                &signature,
+                &args,
+                &state,
+                Some(3),
+                Some("main.rss"),
+                Some(expr_span),
+            )
+            .expect_err("float arg against int param must be rejected");
+        match error {
+            CompileError::CallableArgumentTypeMismatch { span, detail, .. } => {
+                assert_eq!(
+                    span,
+                    Some(expr_span),
+                    "host-signature mismatch must carry the available call span, got {span:?}: {detail}"
+                );
+            }
+            other => panic!("expected CallableArgumentTypeMismatch, got {other:?}"),
+        }
+    }
 
     #[test]
     fn generated_callable_float_schema_remains_distinct_from_number() {

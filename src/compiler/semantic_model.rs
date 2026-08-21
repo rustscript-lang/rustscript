@@ -1272,8 +1272,15 @@ impl SemanticModel {
     fn resolve_module_source(&self, module_path: &str, importing_source: &str) -> Option<String> {
         let importing = std::path::Path::new(importing_source);
         let parent = importing.parent()?;
-        let relative = module_path.replace("::", std::path::MAIN_SEPARATOR_STR);
-        let mut path = parent.join(relative);
+        // Translate leading `self`/`super` qualifiers and the `.rss`
+        // extension exactly like the source loader's `use_path_to_spec`,
+        // sharing the same routine so the semantic model and the loader
+        // cannot drift on qualified import spellings (`self::nested`,
+        // `super::shared`, `self::super::x`). The parser records the joined
+        // spelling, so the string-based helper applies the identical
+        // leading-qualifier rules as the structured loader path.
+        let spec = super::modules::use_path_string_to_spec(module_path);
+        let mut path = parent.join(spec);
         if path.extension().is_none() {
             path.set_extension("rss");
         }

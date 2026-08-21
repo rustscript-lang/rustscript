@@ -569,6 +569,13 @@ fn enforce_strict_rustscript_type_resolution(
         if schema_is_fully_known(&schema.body_schema) {
             continue;
         }
+        let span = parsed_index.and_then(|index| {
+            index
+                .struct_decls
+                .iter()
+                .find(|site| site.name == schema.name)
+                .map(|site| site.ident_span)
+        });
         return Err(CompileError::StrictTypingRequired {
             line: None,
             source_name: None,
@@ -576,7 +583,7 @@ fn enforce_strict_rustscript_type_resolution(
                 "struct '{}' contains non-concrete field types; RustScript requires concrete schemas",
                 schema.name
             ),
-            span: None,
+            span,
         });
     }
 
@@ -1993,5 +2000,68 @@ mod tests {
         let mut vm = Vm::new(compiled.program);
         let status = vm.run().expect("vm should run");
         assert_eq!(status, crate::vm::VmStatus::Halted);
+    }
+
+    #[test]
+    fn strict_non_concrete_struct_diagnostic_carries_exact_decl_span() {
+        // Strict RustScript rejects struct schemas whose fields are not fully
+        // concrete. The diagnostic must carry the exact parser-origin span of
+        // the struct declaration (its name identifier), resolved from the
+        // `StructDeclSite` provenance recorded by the parser — never a
+        // line-wide guess or source-text scan. Normal parse always yields
+        // fully-concrete struct schemas (or rejects `unknown` earlier), so a
+        // non-concrete schema models the other owner of the IR: a plugin or
+        // lowered unit that feeds a `struct_schemas` entry whose field type
+        // did not resolve. The provenance carrier and the resolver branch we
+        // exercise are the same production path.
+        let options = CompileSourceFileOptions::default();
+        let mut ir = crate::compiler::frontends::parse_source(
+            "struct Foo {\n    x: int\n}\n",
+            SourceFlavor::RustScript,
+            &options,
+        )
+        .expect("struct source parses");
+        // The parser recorded a struct declaration site with the exact ident
+        // span of the struct name token.
+        let index = ir.parsed_semantic_index.as_mut().expect("parse provenance");
+        let foo_site = index
+            .struct_decls
+            .iter()
+            .find(|site| site.name == "Foo")
+            .expect("Foo decl site recorded");
+        let ident_span = foo_site.ident_span;
+        // Pin the provenance to the real `Foo` name token in the source.
+        assert_eq!(
+            ident_span.lo,
+            "struct Foo {\n    x: int\n}\n"
+                .find("Foo")
+                .expect("Foo offset"),
+            "provenance ident span must point at the Foo name token"
+        );
+        assert_eq!(ident_span.len(), 3, "ident span covers exactly 'Foo'");
+
+        // Simulate a plugin/lowered IR where the field type did not resolve to
+        // a concrete schema, so the strict gate fires. The provenance site is
+        // unchanged and still points at the real declaration.
+        let foo_schema = ir.struct_schemas.get_mut("Foo").expect("Foo schema");
+        foo_schema.body_schema = crate::compiler::ir::TypeSchema::Object(
+            std::iter::once(("x".to_string(), crate::compiler::ir::TypeSchema::Unknown)).collect(),
+        );
+
+        let type_info = typing::infer_types(&ir, TypingMode::StrictRustScript, &[]);
+        let err = enforce_strict_rustscript_type_resolution(&ir, &type_info)
+            .expect_err("non-concrete struct schema must be rejected in strict mode");
+        match err {
+            CompileError::StrictTypingRequired { span, .. } => {
+                let span =
+                    span.expect("strict struct diagnostic must carry the exact declaration span");
+                assert_eq!(
+                    (span.lo, span.hi),
+                    (ident_span.lo, ident_span.hi),
+                    "diagnostic must slice exactly the struct name identifier"
+                );
+            }
+            other => panic!("expected StrictTypingRequired for struct, got {other:?}"),
+        }
     }
 }

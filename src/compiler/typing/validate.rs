@@ -139,6 +139,7 @@ pub(super) fn validate_host_signature(
     context: &mut TypeContext<'_>,
     line_context: Option<u32>,
     source_name: Option<&str>,
+    span: Option<Span>,
 ) -> Result<(), CompileError> {
     let actual = args
         .iter()
@@ -157,7 +158,7 @@ pub(super) fn validate_host_signature(
             callable_name,
             format_param_types(params),
         ),
-        span: None,
+        span,
     })
 }
 

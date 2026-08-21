@@ -30,7 +30,7 @@ use super::{
         LexerToken, LocalDeclSite, LocalRefSite, LocalSlot, MatchPattern, MatchTypePattern,
         ModuleNamespaceAlias, ParsedCallSite, ParsedCallTarget, ParsedLexicalScope,
         ParsedSemanticIndex, ResolvedHostCall, ScopeId, SemanticNodeId, Stmt, StmtSpanSite,
-        StructDecl, TypeSchema,
+        StructDecl, StructDeclSite, TypeSchema,
     },
 };
 
@@ -802,8 +802,26 @@ impl Parser {
         );
     }
 
-    /// Record a function value reference site with an explicit resolved
-    /// target (flat index or module symbol).
+    /// Record a struct declaration site.
+    ///
+    /// Structs have no flat function index, so the provenance site carries
+    /// the exact identifier span, the full `struct`..`}` declaration span,
+    /// and the declaring scope. Strict-mode resolution uses the declaration
+    /// span to point at the exact struct declaration in diagnostics.
+    pub(super) fn record_struct_decl(&mut self, ident_span: Span, decl_span: Span, name: String) {
+        let id = self.parsed_semantic_index.alloc_node_id();
+        let scope_id = self.current_scope_id();
+        self.parsed_semantic_index
+            .struct_decls
+            .push(StructDeclSite {
+                id,
+                ident_span,
+                decl_span,
+                name,
+                scope_id,
+            });
+    }
+
     pub(super) fn record_func_ref_target(
         &mut self,
         ident_span: Span,

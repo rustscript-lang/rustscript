@@ -9,7 +9,7 @@ use super::{
         CatalogVisibility, Expr, FrontendIr, FunctionDecl, FunctionDeclSite, FunctionImpl,
         FunctionRefSite, FunctionRefTarget, HostApiIrMetadata, LocalDeclSite, LocalRefSite,
         LocalSlot, ModuleNamespaceAlias, ParsedCallSite, ParsedCallTarget, ParsedLexicalScope,
-        ParsedSemanticIndex, ScopeId, SemanticNodeId, Stmt, StructDecl,
+        ParsedSemanticIndex, ScopeId, SemanticNodeId, Stmt, StructDecl, StructDeclSite,
     },
     modules::{ModuleId, SymbolId},
 };
@@ -1366,6 +1366,20 @@ fn rebase_parsed_semantic_index(
         });
     }
 
+    // Struct declarations carry no flat function index; only the node id and
+    // scope id are rebased, and the spans are copied verbatim (their source id
+    // already names the owning compilation-wide source).
+    let mut struct_decls = Vec::with_capacity(unit.struct_decls.len());
+    for decl in &unit.struct_decls {
+        struct_decls.push(StructDeclSite {
+            id: remap_node(decl.id),
+            ident_span: decl.ident_span,
+            decl_span: decl.decl_span,
+            name: decl.name.clone(),
+            scope_id: remap_scope(decl.scope_id),
+        });
+    }
+
     let mut func_refs = Vec::with_capacity(unit.func_refs.len());
     for reference in &unit.func_refs {
         let target = match reference.target {
@@ -1414,6 +1428,7 @@ fn rebase_parsed_semantic_index(
         local_decls,
         local_refs,
         func_decls,
+        struct_decls,
         func_refs,
         scopes,
         stmt_spans,
@@ -1458,6 +1473,7 @@ fn merge_parsed_semantic_index(merged: &mut ParsedSemanticIndex, unit: ParsedSem
     merged.local_decls.extend(unit.local_decls);
     merged.local_refs.extend(unit.local_refs);
     merged.func_decls.extend(unit.func_decls);
+    merged.struct_decls.extend(unit.struct_decls);
     merged.func_refs.extend(unit.func_refs);
     merged.scopes.extend(unit.scopes);
     merged.stmt_spans.extend(unit.stmt_spans);
@@ -2230,6 +2246,7 @@ mod linker_provenance_merge_tests {
                 functions: vec![0],
             }],
             stmt_spans: Vec::new(),
+            struct_decls: Vec::new(),
             next_node_id,
             next_scope_id,
         }
@@ -2382,6 +2399,7 @@ mod linker_provenance_merge_tests {
                 functions: vec![3],
             }],
             stmt_spans: Vec::new(),
+            struct_decls: Vec::new(),
             next_node_id: 3,
             next_scope_id: 1,
         };
@@ -2406,6 +2424,7 @@ mod linker_provenance_merge_tests {
                 functions: vec![5],
             }],
             stmt_spans: Vec::new(),
+            struct_decls: Vec::new(),
             next_node_id: 1,
             next_scope_id: 1,
         };
@@ -2521,6 +2540,7 @@ mod linker_provenance_merge_tests {
             local_decls: Vec::new(),
             local_refs: Vec::new(),
             func_decls: Vec::new(),
+            struct_decls: Vec::new(),
             func_refs: Vec::new(),
             scopes: Vec::new(),
             stmt_spans: Vec::new(),
@@ -2540,6 +2560,7 @@ mod linker_provenance_merge_tests {
             local_decls: Vec::new(),
             local_refs: Vec::new(),
             func_decls: Vec::new(),
+            struct_decls: Vec::new(),
             func_refs: Vec::new(),
             scopes: Vec::new(),
             stmt_spans: Vec::new(),
@@ -2609,6 +2630,7 @@ mod linker_provenance_merge_tests {
             local_decls: Vec::new(),
             local_refs: Vec::new(),
             func_decls: Vec::new(),
+            struct_decls: Vec::new(),
             func_refs: Vec::new(),
             scopes: Vec::new(),
             stmt_spans: Vec::new(),

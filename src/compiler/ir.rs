@@ -1238,6 +1238,27 @@ pub struct FunctionDeclSite {
     pub decl_order: u32,
 }
 
+/// A parsed struct declaration site.
+///
+/// Unlike function declarations, structs have no flat function index: they
+/// live only in [`FrontendIr::struct_schemas`], keyed by name. The site
+/// records the exact declaration provenance (identifier span plus the full
+/// `struct`..`}` declaration span and its scope) so strict-mode diagnostics
+/// can point at the exact struct declaration without scanning source text.
+#[derive(Clone, Debug)]
+pub struct StructDeclSite {
+    /// Parser-allocated stable node id.
+    pub id: SemanticNodeId,
+    /// Exact identifier token span (the struct name).
+    pub ident_span: Span,
+    /// Span of the full `struct Name { ... }` declaration.
+    pub decl_span: Span,
+    /// The struct name.
+    pub name: String,
+    /// The scope this declaration belongs to.
+    pub scope_id: ScopeId,
+}
+
 /// The resolved target of a parsed function-value reference. The parser
 /// records the target honestly from its own resolution tables: plain
 /// functions carry their flat index, and module-mode references that the
@@ -1346,6 +1367,8 @@ pub struct ParsedSemanticIndex {
     pub local_refs: Vec<LocalRefSite>,
     /// All parsed function declarations, in allocation order.
     pub func_decls: Vec<FunctionDeclSite>,
+    /// All parsed struct declarations, in parse order.
+    pub struct_decls: Vec<StructDeclSite>,
     /// All parsed function value references, in allocation order.
     pub func_refs: Vec<FunctionRefSite>,
     /// All parsed lexical scopes, in allocation order (scope 0 = root).

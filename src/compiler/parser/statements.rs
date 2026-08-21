@@ -505,13 +505,35 @@ impl Parser {
 
     pub(super) fn parse_struct_decl(&mut self) -> Result<Stmt, ParseError> {
         let line = self.last_line();
+        // The `struct` keyword was already consumed by the caller
+        // (`parse_stmt_inner` matched `TokenKind::Struct`), so the previous
+        // token is the keyword. Its span start opens the declaration; the
+        // closing `}`'s span peak closes it.
+        let decl_lo = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|token| token.span.lo)
+            .unwrap_or_else(|| self.current_span().lo);
         let name = self.expect_ident("expected struct name after 'struct'")?;
+        let name_span = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|token| token.span)
+            .unwrap_or_else(|| self.current_span());
         let type_params = self.parse_type_params("struct", &name)?;
         self.push_active_type_params(&type_params);
         self.expect(&TokenKind::LBrace, "expected '{' after struct name")?;
         let fields = self.parse_object_type_schema_fields()?;
         self.pop_active_type_params();
         self.expect(&TokenKind::RBrace, "expected '}' after struct body")?;
+        // Full declaration span: from the `struct` keyword through the close
+        // brace (the last consumed token).
+        let decl_hi = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|token| token.span.hi)
+            .unwrap_or(decl_lo);
+        let decl_span = Span::new(name_span.source_id, decl_lo, decl_hi.max(decl_lo));
         if self
             .struct_schemas
             .insert(
@@ -531,6 +553,7 @@ impl Parser {
                 message: format!("duplicate struct schema '{name}'"),
             });
         }
+        self.record_struct_decl(name_span, decl_span, name.clone());
         Ok(Stmt::Noop { line })
     }
 

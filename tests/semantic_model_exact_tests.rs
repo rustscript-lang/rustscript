@@ -125,6 +125,28 @@ fn labels(model: &SemanticModel, offset: usize) -> Vec<String> {
         .collect()
 }
 
+/// The completion labels at `offset` in the source whose file name contains
+/// `name_contains` (used when the interesting cursor lives in a nested module
+/// source rather than the root source id 0).
+fn labels_in_source(model: &SemanticModel, name_contains: &str, offset: usize) -> Vec<String> {
+    let sources = model.sources();
+    let mut id = 0u32;
+    let file = loop {
+        let Some(file) = sources.file(id) else {
+            panic!("no source file containing '{name_contains}'");
+        };
+        if file.name.contains(name_contains) {
+            break file;
+        }
+        id += 1;
+    };
+    model
+        .completions_at(SourcePosition::new(file.id, offset))
+        .iter()
+        .map(|c| c.label.clone())
+        .collect()
+}
+
 /// Byte offset of the first occurrence of `needle`.
 fn offset_of(source: &str, needle: &str) -> usize {
     source
@@ -375,6 +397,58 @@ fn module_alias_offered_and_source_scoped() {
     assert!(
         comps.iter().all(|n| n != "h"),
         "module function must only appear via its namespace: {comps:?}"
+    );
+}
+
+#[test]
+fn self_qualified_module_alias_member_completion_resolves_owning_source() {
+    // M1-residual: `use self::nested as nested;` must resolve the module
+    // member surface exactly like the loader does — the leading `self`
+    // qualifier is a no-op relative to the importing file, so `nested::`
+    // resolves to `<dir>/nested.rss` and lists that module's exports. The
+    // parser records the joined spelling `self::nested`; the semantic model
+    // must translate it through the same `use_path_to_spec` routine the
+    // loader uses (self -> `./`), never a literal `self/nested` file.
+    let root = "use self::nested as nested;\nlet x = nested::leaf();\n";
+    let model = analyze_modules(root, &[("nested.rss", "pub fn leaf() -> int { 1 }\n")]);
+    let at = offset_of(root, "nested::leaf") + "nested::l".len();
+    let comps = labels(&model, at);
+    assert!(
+        comps.iter().any(|n| n == "leaf"),
+        "self::nested member surface must resolve the aliased module: {comps:?}"
+    );
+}
+
+#[test]
+fn super_qualified_module_alias_member_completion_resolves_parent_directory() {
+    // M1-residual: `use super::shared as shared;` from a nested module must
+    // resolve the member surface to the parent directory's `shared.rss`,
+    // exactly like the loader's `super` -> `..` climb. This is the
+    // completion-side counterpart to
+    // `nested_module_super_import_resolves_parent_directory_sibling`.
+    let root = "use self::pkg::nested as nested;\nlet x = nested::run();\n";
+    let model = analyze_modules(
+        root,
+        &[
+            (
+                "pkg/nested.rss",
+                "use super::shared as shared;\npub fn run() -> int { shared::value() }\n",
+            ),
+            ("../shared.rss", "pub fn value() -> int { 13 }\n"),
+        ],
+    );
+    // Cursor inside the `value` member token of `shared::value()` in the
+    // nested module's own source. The semantic model is built from the
+    // merged IR; the nested module's source name is `<dir>/pkg/nested.rss`
+    // and the alias resolves to `<dir>/shared.rss`.
+    let nested_at = offset_of(
+        "use super::shared as shared;\npub fn run() -> int { shared::value() }\n",
+        "shared::value",
+    ) + "shared::v".len();
+    let comps = labels_in_source(&model, "nested.rss", nested_at);
+    assert!(
+        comps.iter().any(|n| n == "value"),
+        "super::shared member surface must resolve the parent sibling module: {comps:?}"
     );
 }
 
