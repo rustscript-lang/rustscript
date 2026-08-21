@@ -1004,3 +1004,312 @@ mod lexical_scope_provenance_tests {
         );
     }
 }
+
+/// Full parser provenance for every source binding and reference: function
+/// params, closure params, for/map/match bindings, assignment/increment/
+/// index-assignment targets, local-call callees, direct function callees and
+/// function-value references — each with exact identifier token spans, the
+/// resolved local slot / function index, the lexical scope id, and coherent
+/// declaration order.
+#[cfg(test)]
+mod parser_binding_provenance_tests {
+    use crate::compiler::ir::FrontendIr;
+    use crate::compiler::parser::ParserDialect;
+    use crate::compiler::source_map::Span;
+    use crate::compiler::{CompileSourceFileOptions, SharedParserOptions};
+
+    use super::{SourceFlavor, parse_source, parse_source_with_dialect};
+
+    fn parse(source: &str) -> FrontendIr {
+        parse_source(
+            source,
+            SourceFlavor::RustScript,
+            &CompileSourceFileOptions::default(),
+        )
+        .expect("source must parse")
+    }
+
+    /// RustScript lowering is the identity, so span `.lo`/`.hi` are byte
+    /// offsets into the original source string.
+    fn span_slice(source: &str, span: Span) -> String {
+        source
+            .get(span.lo..span.hi)
+            .expect("span must slice source")
+            .to_string()
+    }
+
+    /// A test dialect that additionally enables arrow-closure and increment
+    /// syntax so those binding/ref sites can be exercised under the shared
+    /// expression parser (the default RustScript dialect disables them).
+    struct MaximalDialect;
+    impl ParserDialect for MaximalDialect {
+        fn allow_let_mut_binding(&self) -> bool {
+            true
+        }
+        fn allow_plus_equal_operator(&self) -> bool {
+            true
+        }
+        fn allow_for_in_loop(&self) -> bool {
+            true
+        }
+        fn allow_arrow_closure(&self) -> bool {
+            true
+        }
+        fn allow_increment_operator(&self) -> bool {
+            true
+        }
+    }
+    static MAXIMAL_DIALECT: MaximalDialect = MaximalDialect;
+
+    fn parse_with_dialect(source: &str) -> FrontendIr {
+        parse_source_with_dialect(
+            source,
+            &MAXIMAL_DIALECT,
+            SharedParserOptions {
+                source_id: 0,
+                allow_implicit_externs: false,
+                allow_implicit_semicolons: false,
+                enforce_mutable_bindings: true,
+                import_scan_mode: false,
+            },
+        )
+        .expect("source must parse")
+    }
+
+    fn index(ir: &FrontendIr) -> &crate::compiler::ir::ParsedSemanticIndex {
+        ir.parsed_semantic_index.as_ref().expect("index present")
+    }
+
+    fn decls<'i>(
+        i: &'i crate::compiler::ir::ParsedSemanticIndex,
+        name: &str,
+    ) -> Vec<&'i crate::compiler::ir::LocalDeclSite> {
+        i.local_decls
+            .iter()
+            .filter(|d| d.name == name)
+            .collect::<Vec<_>>()
+    }
+
+    fn refs<'i>(
+        i: &'i crate::compiler::ir::ParsedSemanticIndex,
+        name: &str,
+    ) -> Vec<&'i crate::compiler::ir::LocalRefSite> {
+        i.local_refs
+            .iter()
+            .filter(|r| r.name == name)
+            .collect::<Vec<_>>()
+    }
+
+    /// Function parameters record exact local declarations (ident spans,
+    /// slot, body scope, decl order) and their uses inside the body record
+    /// local references resolving to the same slots.
+    #[test]
+    fn function_params_are_decl_sites_and_body_uses_are_refs() {
+        let source = "fn add(a, b) { a + b }\nadd(1, 2);\n";
+        let ir = parse(source);
+        let i = index(&ir);
+
+        let a = decls(i, "a");
+        let b = decls(i, "b");
+        assert_eq!(a.len(), 1, "one `a` decl");
+        assert_eq!(b.len(), 1, "one `b` decl");
+        assert_eq!(span_slice(source, a[0].ident_span), "a");
+        assert_eq!(span_slice(source, b[0].ident_span), "b");
+        assert_ne!(a[0].slot, b[0].slot, "params take distinct slots");
+        assert_eq!(a[0].scope_id, 1, "params live in the fn body scope");
+        assert_eq!(b[0].scope_id, 1);
+        assert_eq!(a[0].decl_order, 0, "a is the first body declaration");
+        assert_eq!(b[0].decl_order, 1, "b is the second body declaration");
+        assert_eq!(i.scopes[1].declarations, vec![a[0].slot, b[0].slot]);
+
+        // Body uses `a` and `b` resolve to the param slots.
+        let a_refs = refs(i, "a");
+        let b_refs = refs(i, "b");
+        assert_eq!(a_refs.len(), 1);
+        assert_eq!(b_refs.len(), 1);
+        assert_eq!(a_refs[0].slot, a[0].slot);
+        assert_eq!(b_refs[0].slot, b[0].slot);
+        assert_eq!(span_slice(source, a_refs[0].ident_span), "a");
+        assert_eq!(span_slice(source, b_refs[0].ident_span), "b");
+
+        // The direct function callee is both a call site and a function ref.
+        let callee_refs = i
+            .func_refs
+            .iter()
+            .filter(|r| r.name == "add")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            callee_refs.len(),
+            1,
+            "direct `add(1, 2)` callee is one func ref"
+        );
+        assert_eq!(span_slice(source, callee_refs[0].ident_span), "add");
+    }
+
+    /// Closure parameters record local declarations inside the closure body
+    /// scope, and uses in the body resolve to the param slot.
+    #[test]
+    fn closure_params_are_decl_sites_for_pipe_and_arrow_forms() {
+        // Pipe closure.
+        let pipe = "let f = |x| x + 1;\n";
+        let ir = parse(pipe);
+        let i = index(&ir);
+        let x = decls(i, "x");
+        assert_eq!(x.len(), 1, "one pipe-closure `x` decl");
+        assert_eq!(span_slice(pipe, x[0].ident_span), "x");
+        assert_eq!(x[0].scope_id, 1, "closure body is the child scope");
+        assert_eq!(i.scopes[1].declarations, vec![x[0].slot]);
+        let x_refs = refs(i, "x");
+        assert_eq!(x_refs.len(), 1);
+        assert_eq!(
+            x_refs[0].slot, x[0].slot,
+            "`x` use resolves to the param slot"
+        );
+
+        // Arrow closure (enabled by the maximal test dialect).
+        let arrow = "let g = a => a * 2;\n";
+        let ir = parse_with_dialect(arrow);
+        let i = index(&ir);
+        let a = decls(i, "a");
+        assert_eq!(a.len(), 1, "one arrow-closure `a` decl");
+        assert_eq!(span_slice(arrow, a[0].ident_span), "a");
+        assert_eq!(a[0].scope_id, 1);
+    }
+
+    /// The range-for iterator binding and the map iterator key/value bindings
+    /// each record a local declaration site with the exact identifier span.
+    #[test]
+    fn for_range_and_map_iterator_bindings_are_decl_sites() {
+        let source = "let mut total = 0;\nfor i in 0..3 { total = total + i; }\n";
+        let ir = parse(source);
+        let i = index(&ir);
+        let i_decl = decls(i, "i");
+        assert_eq!(i_decl.len(), 1, "one range-for `i` decl");
+        assert_eq!(span_slice(source, i_decl[0].ident_span), "i");
+        assert_eq!(i_decl[0].scope_id, 0, "iterator binds in the root scope");
+        // The iterator body use resolves to the same slot.
+        let i_refs = refs(i, "i");
+        assert_eq!(i_refs.len(), 1);
+        assert_eq!(i_refs[0].slot, i_decl[0].slot);
+
+        // Map iteration: `for (key, value) in &map`.
+        let map_src = "let m = {};\nfor (key, value) in &m { value; }\n";
+        let ir = parse(map_src);
+        let i = index(&ir);
+        let key = decls(i, "key");
+        let value = decls(i, "value");
+        assert_eq!(key.len(), 1, "one map `key` decl");
+        assert_eq!(value.len(), 1, "one map `value` decl");
+        assert_eq!(span_slice(map_src, key[0].ident_span), "key");
+        assert_eq!(span_slice(map_src, value[0].ident_span), "value");
+        assert_ne!(key[0].slot, value[0].slot);
+        assert_eq!(key[0].scope_id, 0);
+        assert_eq!(value[0].scope_id, 0);
+    }
+
+    /// A match arm binding (`Some(x) => x`) records a local declaration inside
+    /// the arm body scope, and the body use resolves to that slot.
+    #[test]
+    fn match_pattern_binding_is_a_decl_site_in_the_arm_scope() {
+        let source = "fn f(x) { match x { Some(v) => v, _ => 0 } }\n";
+        let ir = parse(source);
+        let i = index(&ir);
+        let v = decls(i, "v");
+        assert_eq!(v.len(), 1, "one match-arm `v` decl");
+        assert_eq!(span_slice(source, v[0].ident_span), "v");
+        // scope 1 = fn body, scope 2 = the Some-arm body.
+        assert_eq!(v[0].scope_id, 2, "binding lives in the arm body scope");
+        assert_eq!(i.scopes[2].declarations, vec![v[0].slot]);
+        let v_refs = refs(i, "v");
+        assert_eq!(v_refs.len(), 1);
+        assert_eq!(v_refs[0].slot, v[0].slot);
+        assert_eq!(span_slice(source, v_refs[0].ident_span), "v");
+    }
+
+    /// Assignment targets, prefix+statement increments, and index-assignment
+    /// roots are recorded as local references with exact identifier spans.
+    #[test]
+    fn mutation_targets_are_local_references() {
+        let source = "let mut x = 0;\nlet mut a = [0];\nx = 1;\n++x;\na[0] = 2;\n";
+        let ir = parse_with_dialect(source);
+        let i = index(&ir);
+
+        // `x = 1` target.
+        let x_refs = refs(i, "x");
+        assert!(
+            x_refs.len() >= 2,
+            "assignment plus increment targets both reference x"
+        );
+        assert!(
+            x_refs
+                .iter()
+                .any(|r| span_slice(source, r.ident_span) == "x"),
+            "assignment target x recorded"
+        );
+
+        // `a[0] = 2` index-assignment root.
+        let a_refs = refs(i, "a");
+        assert!(
+            a_refs
+                .iter()
+                .any(|r| span_slice(source, r.ident_span) == "a"),
+            "index-assignment root a recorded"
+        );
+    }
+
+    /// A closure parameter shadowing an outer `let` resolves to a distinct
+    /// slot; references inside the closure body point at the inner binding,
+    /// references outside point at the outer one.
+    #[test]
+    fn shadowed_names_map_to_distinct_slots_and_resolve_per_scope() {
+        let source = "let x = 1;\nlet f = |x| x;\nf(2);\nx;\n";
+        let ir = parse(source);
+        let i = index(&ir);
+
+        let x_decls = decls(i, "x");
+        assert_eq!(x_decls.len(), 2, "outer `let x` and closure param `x`");
+        let outer = x_decls.iter().find(|d| d.scope_id == 0).expect("outer x");
+        let inner = x_decls.iter().find(|d| d.scope_id == 1).expect("inner x");
+        assert_ne!(outer.slot, inner.slot, "shadowing yields a distinct slot");
+
+        // Closure-body `x` resolves to the inner slot, trailing `x;` to the
+        // outer slot.
+        let x_refs = refs(i, "x");
+        assert_eq!(x_refs.len(), 2, "body use + trailing top-level use");
+        assert!(
+            x_refs.iter().any(|r| r.slot == inner.slot),
+            "closure-body `x` resolves to the inner slot"
+        );
+        assert!(
+            x_refs.iter().any(|r| r.slot == outer.slot),
+            "top-level `x;` resolves to the outer slot"
+        );
+    }
+
+    /// A direct function callee and a bare function-value reference both
+    /// record FunctionRefSite entries with exact spans and the same index,
+    /// distinguishable from one another by source position.
+    #[test]
+    fn function_callee_and_function_value_refs_have_exact_spans() {
+        let source = "fn g(x) { x }\ng(1);\nlet h = g;\n";
+        let ir = parse(source);
+        let i = index(&ir);
+
+        let g_refs = i
+            .func_refs
+            .iter()
+            .filter(|r| r.name == "g")
+            .collect::<Vec<_>>();
+        assert_eq!(g_refs.len(), 2, "one callee ref + one value ref");
+
+        let callee = g_refs[0];
+        let value = g_refs[1];
+        assert!(
+            callee.ident_span.lo < value.ident_span.lo,
+            "callee precedes value"
+        );
+        assert_eq!(callee.function_index, value.function_index, "same function");
+        assert_eq!(span_slice(source, callee.ident_span), "g");
+        assert_eq!(span_slice(source, value.ident_span), "g");
+    }
+}

@@ -652,6 +652,9 @@ impl Parser {
             return expr;
         };
         let expr_span = Span::new(callee_span.source_id, callee_span.lo, rparen_span.hi);
+        // Record the direct function callee as a function reference site with
+        // the exact identifier token span.
+        self.record_func_ref(callee_span, index, name.clone());
         let semantic_id = self.alloc_call_id(
             callee_span,
             expr_span,

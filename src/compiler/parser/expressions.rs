@@ -1,6 +1,6 @@
 use super::*;
 
-type MatchBinding = Option<(String, LocalSlot)>;
+type MatchBinding = Option<(String, Span, LocalSlot)>;
 type ParsedMatchPattern = (Option<MatchPattern>, MatchBinding);
 type ParsedMatchConstructor = Option<(MatchPattern, MatchBinding)>;
 
@@ -142,7 +142,8 @@ impl Parser {
             return self.build_builtin_call_expr(BuiltinFunction::TypeOf, vec![inner]);
         }
         if self.dialect.allow_increment_operator() && self.match_kind(&TokenKind::PlusPlus) {
-            let name = self.expect_ident("expected identifier after '++'")?;
+            let (name, ident_span) =
+                self.expect_ident_with_span("expected identifier after '++'")?;
             let index = self.get_local(&name)?;
             self.require_local_mutable_for_operation(
                 index,
@@ -150,6 +151,8 @@ impl Parser {
                 self.current_line_u32(),
                 "increment",
             )?;
+            // Record the prefix increment target as a local reference site.
+            self.record_local_ref(ident_span, index, name);
             return self.build_increment_expr(index, true);
         }
         if self.match_kind(&TokenKind::Minus) {
@@ -505,6 +508,8 @@ impl Parser {
                             });
                         }
                         let local = self.get_local(&name)?;
+                        // Record the local callable callee as a local reference.
+                        self.record_local_ref(name_span, local, name.clone());
                         let semantic_id =
                             self.alloc_local_call_id(name_span, rparen_span, local, name.clone());
                         Expr::LocalCall(local, Vec::new(), args, semantic_id)
@@ -790,21 +795,29 @@ impl Parser {
             let pattern_token_line = self.current_line();
             let (pattern, arm_binding) = self.parse_match_pattern()?;
             self.expect(&TokenKind::FatArrow, "expected '=>' in match arm")?;
-            if let Some((name, slot)) = arm_binding {
+            let arm_expr = if let Some((name, ident_span, slot)) = arm_binding {
                 let mut scope = HashMap::new();
-                scope.insert(name, slot);
+                scope.insert(name.clone(), slot);
                 self.closure_scopes.push(scope);
-            }
-            let arm_open = self.current_span();
-            let arm_result = self.with_scope(arm_open, |parser| parser.parse_expr());
-            if pattern
-                .as_ref()
-                .and_then(MatchPattern::binding_slot)
-                .is_some()
-            {
-                self.closure_scopes.pop();
-            }
-            let arm_expr = arm_result?;
+                let arm_open = self.current_span();
+                let arm_result = self.with_scope(arm_open, |parser| {
+                    // Record the match pattern binding inside the arm body
+                    // scope, with the exact identifier token span.
+                    parser.record_local_decl(ident_span, ident_span, slot, name.clone());
+                    parser.parse_expr()
+                });
+                if pattern
+                    .as_ref()
+                    .and_then(MatchPattern::binding_slot)
+                    .is_some()
+                {
+                    self.closure_scopes.pop();
+                }
+                arm_result?
+            } else {
+                let arm_open = self.current_span();
+                self.with_scope(arm_open, |parser| parser.parse_expr())?
+            };
 
             match pattern {
                 Some(pattern) => {
@@ -931,8 +944,8 @@ impl Parser {
             &TokenKind::LParen,
             "expected '(' after Some in match type pattern",
         )?;
-        let binding_name =
-            self.expect_ident("expected type name or binding name inside Some(...)")?;
+        let (binding_name, binding_span) =
+            self.expect_ident_with_span("expected type name or binding name inside Some(...)")?;
         self.expect(
             &TokenKind::RParen,
             "expected ')' after Some(...) match pattern",
@@ -952,7 +965,7 @@ impl Parser {
         self.set_local_slot_mutable(binding_slot, false);
         Ok(Some((
             MatchPattern::SomeBinding(binding_slot),
-            Some((binding_name, binding_slot)),
+            Some((binding_name, binding_span, binding_slot)),
         )))
     }
 
@@ -2170,7 +2183,8 @@ impl Parser {
         expect_terminator: bool,
     ) -> Result<Stmt, ParseError> {
         let line = self.current_line_u32();
-        let name = self.expect_ident("expected identifier before indexed assignment")?;
+        let (name, ident_span) =
+            self.expect_ident_with_span("expected identifier before indexed assignment")?;
         let key = if self.match_kind(&TokenKind::LBracket) {
             let key = self.parse_expr()?;
             self.expect(&TokenKind::RBracket, "expected ']' after assignment index")?;
@@ -2196,6 +2210,8 @@ impl Parser {
 
         let index = self.get_local(&name)?;
         self.require_local_mutable_for_operation(index, Some(name.as_str()), line, "mutate")?;
+        // Record the indexed-assignment root as a local reference site.
+        self.record_local_ref(ident_span, index, name);
         let expr =
             self.build_builtin_call_expr(BuiltinFunction::Set, vec![Expr::Var(index), key, value])?;
         Ok(Stmt::Assign {
@@ -2312,10 +2328,10 @@ impl Parser {
 
     pub(super) fn parse_parenthesized_arrow_closure(&mut self) -> Result<Expr, ParseError> {
         self.expect(&TokenKind::LParen, "expected '(' to start arrow parameters")?;
-        let mut params = Vec::<String>::new();
+        let mut params = Vec::<(String, Span)>::new();
         if !self.check(&TokenKind::RParen) {
             loop {
-                params.push(self.expect_ident("expected arrow parameter name")?);
+                params.push(self.expect_ident_with_span("expected arrow parameter name")?);
                 if self.match_kind(&TokenKind::Comma) {
                     continue;
                 }
@@ -2337,7 +2353,7 @@ impl Parser {
     }
 
     pub(super) fn parse_single_param_arrow_closure(&mut self) -> Result<Expr, ParseError> {
-        let param = self.expect_ident("expected arrow parameter name")?;
+        let (param, span) = self.expect_ident_with_span("expected arrow parameter name")?;
         self.expect(&TokenKind::FatArrow, "expected '=>' after arrow parameter")?;
         if self.check(&TokenKind::LBrace) {
             return Err(ParseError {
@@ -2348,7 +2364,7 @@ impl Parser {
                     .to_string(),
             });
         }
-        self.parse_closure_expr_with_params(vec![param])
+        self.parse_closure_expr_with_params(vec![(param, span)])
     }
 
     pub(super) fn try_parse_js_dotted_call(
@@ -2424,10 +2440,12 @@ impl Parser {
     }
 
     pub(super) fn parse_closure_literal(&mut self) -> Result<Expr, ParseError> {
-        let mut params = Vec::<String>::new();
+        let mut params = Vec::<(String, Span)>::new();
         if !self.check(&TokenKind::Pipe) {
             loop {
-                params.push(self.expect_ident("expected closure parameter name")?);
+                let (param, span) =
+                    self.expect_ident_with_span("expected closure parameter name")?;
+                params.push((param, span));
                 if self.match_kind(&TokenKind::Comma) {
                     continue;
                 }
@@ -2440,11 +2458,11 @@ impl Parser {
 
     pub(super) fn parse_closure_expr_with_params(
         &mut self,
-        params: Vec<String>,
+        params: Vec<(String, Span)>,
     ) -> Result<Expr, ParseError> {
         let mut param_slots = Vec::new();
         let mut param_scope = HashMap::new();
-        for param_name in &params {
+        for (param_name, _) in &params {
             if param_scope.contains_key(param_name) {
                 return Err(ParseError {
                     span: None,
@@ -2464,7 +2482,19 @@ impl Parser {
             capture_copies: Vec::new(),
         });
         let body_open = self.current_span();
-        let body_result = self.with_scope(body_open, |parser| parser.parse_expr());
+        let body_result = self.with_scope(body_open, |parser| {
+            // Record each closure param binding as a local declaration site
+            // inside the closure body scope, with its exact ident span.
+            for (order, (param_name, ident_span)) in params.iter().enumerate() {
+                parser.record_local_decl(
+                    *ident_span,
+                    *ident_span,
+                    param_slots[order],
+                    param_name.clone(),
+                );
+            }
+            parser.parse_expr()
+        });
         let body = body_result?;
         let capture_context = self
             .closure_capture_contexts
