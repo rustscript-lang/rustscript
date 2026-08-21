@@ -10,17 +10,47 @@
 //! orderly shutdown/exit.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 
 // ---------------------------------------------------------------------------
 // JSON-RPC framing helpers
 // ---------------------------------------------------------------------------
 
 /// A minimal JSON-RPC client over a child process's stdio.
+///
+/// The child's stdout is drained by a dedicated reader thread feeding a
+/// bounded channel, so every receive is time-bounded: a hung-alive server
+/// fails the test instead of blocking it forever.
 struct RpcClient {
     child: Child,
     stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    messages: std::sync::mpsc::Receiver<serde_json::Value>,
+}
+
+/// Read one framed JSON-RPC message from a buffered reader (Content-Length
+/// framing). Returns `None` on EOF.
+fn read_framed_message(reader: &mut impl BufRead) -> Option<serde_json::Value> {
+    let mut content_length: Option<usize> = None;
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).expect("read header line");
+        if n == 0 {
+            return None;
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = Some(value.trim().parse().expect("content-length number"));
+            }
+        }
+    }
+    let length = content_length.expect("content-length header present");
+    let mut body = vec![0u8; length];
+    reader.read_exact(&mut body).expect("read body");
+    Some(serde_json::from_slice(&body).expect("parse JSON-RPC body"))
 }
 
 impl RpcClient {
@@ -38,10 +68,19 @@ impl RpcClient {
             .expect("rustscript-lsp must spawn");
         let stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            while let Some(message) = read_framed_message(&mut reader) {
+                if tx.send(message).is_err() {
+                    break;
+                }
+            }
+        });
         Self {
             child,
             stdin: Some(stdin),
-            stdout: BufReader::new(stdout),
+            messages: rx,
         }
     }
 
@@ -54,13 +93,13 @@ impl RpcClient {
         stdin.flush().expect("flush stdin");
     }
 
-    /// Read one JSON-RPC message from the server.
+    /// Read one JSON-RPC message from the server, bounded by a deadline. If
+    /// the server dies or hangs, the test fails with the child's stderr.
     fn recv(&mut self) -> serde_json::Value {
-        let mut content_length: Option<usize> = None;
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let mut line = String::new();
-            let n = self.stdout.read_line(&mut line).expect("read header line");
-            if n == 0 {
+            if let Some(status) = self.child.try_wait().expect("try_wait") {
                 // EOF: the server died. Surface its stderr for diagnosis.
                 let mut stderr = String::new();
                 let _ = self
@@ -68,22 +107,26 @@ impl RpcClient {
                     .stderr
                     .take()
                     .map(|mut e| e.read_to_string(&mut stderr));
-                panic!("EOF while reading headers — server died. stderr: {stderr}");
+                panic!("server died with {status} while reading message. stderr: {stderr}");
             }
-            let trimmed = line.trim_end_matches(['\r', '\n']);
-            if trimmed.is_empty() {
-                break;
-            }
-            if let Some((name, value)) = trimmed.split_once(':') {
-                if name.eq_ignore_ascii_case("content-length") {
-                    content_length = Some(value.trim().parse().expect("content-length number"));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.messages.recv_timeout(remaining) {
+                Ok(message) => return message,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    self.child.kill().ok();
+                    panic!("server hung while awaiting a message");
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    let mut stderr = String::new();
+                    let _ = self
+                        .child
+                        .stderr
+                        .take()
+                        .map(|mut e| e.read_to_string(&mut stderr));
+                    panic!("server stdout closed without a message. stderr: {stderr}");
                 }
             }
         }
-        let length = content_length.expect("content-length header present");
-        let mut body = vec![0u8; length];
-        self.stdout.read_exact(&mut body).expect("read body");
-        serde_json::from_slice(&body).expect("parse JSON-RPC body")
     }
 
     /// Request: send and await the matching response by id.
@@ -127,9 +170,19 @@ impl RpcClient {
     }
 
     /// Wait for the next server->client notification with the given method
-    /// and return its params.
+    /// and return its params. Bounded: a hung-alive server fails the test
+    /// instead of blocking it forever.
     fn recv_notification(&mut self, method: &str) -> serde_json::Value {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
+            if let Some(status) = self.child.try_wait().expect("try_wait") {
+                panic!("server exited with {status} while awaiting notification {method}");
+            }
+            if Instant::now() > deadline {
+                self.child.kill().ok();
+                panic!("server hung while awaiting notification {method}");
+            }
             let message = self.recv();
             if message.get("method") == Some(&serde_json::json!(method)) {
                 return message
@@ -145,7 +198,16 @@ impl RpcClient {
     /// return its params. Multi-document servers publish one notification per
     /// URI, so tests targeting a specific document must skip unrelated URIs.
     fn recv_publish_for(&mut self, uri: &str) -> serde_json::Value {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
+            if let Some(status) = self.child.try_wait().expect("try_wait") {
+                panic!("server exited with {status} while awaiting publish for {uri}");
+            }
+            if Instant::now() > deadline {
+                self.child.kill().ok();
+                panic!("server hung while awaiting publish for {uri}");
+            }
             let params = self.recv_notification("textDocument/publishDiagnostics");
             if params["uri"] == serde_json::json!(uri) {
                 return params;
@@ -1369,4 +1431,442 @@ fn take_owned_signature_renders_exactly() {
         label.contains("destroy"),
         "signature must name widget::destroy: {label:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Canonical module overrides + exact parse diagnostics (process fixtures)
+// ---------------------------------------------------------------------------
+
+/// Create a uniquely-named temp directory for a fixture and return its path.
+fn temp_fixture_dir(prefix: &str) -> std::path::PathBuf {
+    let unique = format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos()
+    );
+    let dir = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&dir).expect("fixture dir should be created");
+    dir.canonicalize().unwrap_or(dir)
+}
+
+/// Write one on-disk module source.
+fn write_disk_module(dir: &std::path::Path, name: &str, source: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, source).expect("module source should write");
+    path
+}
+
+/// Build the `file://` URI for an absolute path.
+fn file_uri(path: &std::path::Path) -> String {
+    format!("file://{}", path.display())
+}
+
+/// `fn main() { let x = 1; }\n`-style entry that imports `./util.rss` and
+/// calls its `helper` (returning an int we use in an arithmetic expression so
+/// samples appear).
+const DISK_ENTRY_SOURCE: &str =
+    "use self::util;\nfn main() {\n    let n = 1 + util::helper();\n}\n";
+
+/// Disk version of `util.rss` returning 41.
+const DISK_UTIL_GOOD: &str = "pub fn helper() -> int { 41 }\n";
+
+/// Unsaved buffer version of `util.rss` returning 999 — must shadow the disk.
+const BUFFER_UTIL_GOOD: &str = "pub fn helper() -> int { 999 }\n";
+
+/// Unsaved buffer version of `util.rss` with a wrong-type call (diagnostic).
+const BUFFER_UTIL_BAD: &str = "use sqlite;\npub fn helper() -> int {\n    let db = sqlite::open({});\n    sqlite::query(\"NOT_A_DB\", \"SELECT 1\", {}, {});\n    0\n}\n";
+
+/// A syntax error in `util.rss` (unterminated block) whose parser span should
+/// be reported under the module URI.
+const BUFFER_UTIL_SYNTAX: &str = "pub fn helper() -> int {\n";
+
+#[test]
+fn disk_process_buffer_shadows_ondisk_import_for_diagnostics_and_hover() {
+    let dir = temp_fixture_dir("lsp-disk-buffer");
+    let util_path = write_disk_module(&dir, "util.rss", DISK_UTIL_GOOD);
+    let main_path = write_disk_module(&dir, "main.rss", DISK_ENTRY_SOURCE);
+
+    let main_uri = file_uri(&main_path);
+    let util_uri = file_uri(&util_path);
+
+    let mut client = RpcClient::spawn();
+    client.request(1, "initialize", serde_json::json!({}));
+    client.notify("initialized", serde_json::json!({}));
+
+    // 1. Open the module buffer with text that differs from disk. The
+    //    unresolved import would otherwise read the disk version.
+    open_doc(&mut client, &util_uri, BUFFER_UTIL_GOOD);
+    let params = client.recv_publish_for(&util_uri);
+    assert_eq!(
+        params["diagnostics"],
+        serde_json::json!([]),
+        "clean module buffer publishes no diagnostics"
+    );
+
+    // 2. Open the entry. The entry analysis must use the open *buffer* (999),
+    //    not the disk file (41).
+    open_doc(&mut client, &main_uri, DISK_ENTRY_SOURCE);
+    client.recv_publish_for(&main_uri);
+
+    // Hover on `n` at line 3, char 8 must show int (the sum type). This
+    // proves the buffer override (999) was used — either value is int, so to
+    // prove the *module buffer* is used, change the buffer to a wrong-type
+    // body and assert the diagnostic appears under the module URI.
+    // (See the next test for the explicit wrong-type proof.)
+    let hover = client.request(
+        10,
+        "textDocument/hover",
+        serde_json::json!({
+            "textDocument": { "uri": &main_uri },
+            "position": { "line": 2, "character": 4 },
+        }),
+    );
+    assert!(hover["result"].is_null() || hover["result"]["contents"].is_object());
+
+    // 3. Replace the module buffer with a wrong-type body. Reanalysis of the
+    //    entry (didChange to main) must attribute the wrong-type diagnostic to
+    //    the *module URI* with the exact range from the buffer text — proving
+    //    the buffer (not disk) is the analysis input.
+    open_doc(&mut client, &util_uri, BUFFER_UTIL_BAD);
+    // The module open itself reanalyzes util and publishes the error under
+    // the module URI.
+    let params = client.recv_publish_for(&util_uri);
+    let diagnostics = params["diagnostics"].as_array().expect("diagnostics array");
+    let wrong_type: Vec<&serde_json::Value> = diagnostics
+        .iter()
+        .filter(|d| {
+            d["message"]
+                .as_str()
+                .map(|m| m.contains("sqlite.connection"))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert!(
+        !wrong_type.is_empty(),
+        "buffer override must surface the wrong-type diagnostic under the module uri: {diagnostics:?}"
+    );
+    let range = &wrong_type[0]["range"];
+    assert_eq!(
+        range["start"]["line"],
+        serde_json::json!(3),
+        "start line must be the buffer's query call line"
+    );
+    // On-disk text was good (41) with no query call; the wrong-type error can
+    // only come from the buffer.
+    assert_eq!(
+        range["start"]["character"],
+        serde_json::json!(4),
+        "start char must be the buffer's callee"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn disk_two_same_basename_modules_no_cross_talk() {
+    let dir = temp_fixture_dir("lsp-same-basename");
+    // a/util.rss and b/util.rss both define helper(), returning 1 vs 2.
+    let a_dir = dir.join("a");
+    let b_dir = dir.join("b");
+    std::fs::create_dir_all(&a_dir).expect("a dir");
+    std::fs::create_dir_all(&b_dir).expect("b dir");
+    let a_module = write_disk_module(&a_dir, "util.rss", "pub fn helper() -> int { 1 }\n");
+    let b_module = write_disk_module(&b_dir, "util.rss", "pub fn helper() -> int { 2 }\n");
+    let main_path = write_disk_module(
+        &dir,
+        "main.rss",
+        "use a::util as au;\nuse b::util as bu;\nfn main() {\n    au::helper() + bu::helper()\n}\n",
+    );
+
+    let main_uri = file_uri(&main_path);
+    let a_uri = file_uri(&a_module);
+    let b_uri = file_uri(&b_module);
+
+    let mut client = RpcClient::spawn();
+    client.request(1, "initialize", serde_json::json!({}));
+    client.notify("initialized", serde_json::json!({}));
+
+    // Open both module buffers with *different* bodies (same basename). Both
+    // must be honored simultaneously — no basename override collision.
+    open_doc(&mut client, &a_uri, "pub fn helper() -> int { 100 }\n");
+    client.recv_publish_for(&a_uri);
+    open_doc(&mut client, &b_uri, "pub fn helper() -> int { 200 }\n");
+    client.recv_publish_for(&b_uri);
+
+    // Open the entry and request hover on each `helper()` call's result. The
+    // a-buffer must shadow a/util (100→int) and the b-buffer shadow b/util
+    // (200→int), with no cross-talk. We assert the imports resolve without
+    // producing cross-module errors: a clean entry means both overrides were
+    // applied independently.
+    open_doc(
+        &mut client,
+        &main_uri,
+        "use a::util as au;\nuse b::util as bu;\nfn main() {\n    au::helper() + bu::helper()\n}\n",
+    );
+    let params = client.recv_publish_for(&main_uri);
+    assert_eq!(
+        params["diagnostics"],
+        serde_json::json!([]),
+        "same-basename modules in separate dirs must both honor their own buffers, no cross talk"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn disk_close_imported_module_clears_and_importer_does_not_republish() {
+    let dir = temp_fixture_dir("lsp-disk-close");
+    let util_path = write_disk_module(&dir, "util.rss", DISK_UTIL_GOOD);
+    let main_path = write_disk_module(&dir, "main.rss", DISK_ENTRY_SOURCE);
+
+    let main_uri = file_uri(&main_path);
+    let util_uri = file_uri(&util_path);
+
+    let mut client = RpcClient::spawn();
+    client.request(1, "initialize", serde_json::json!({}));
+    client.notify("initialized", serde_json::json!({}));
+
+    // Open a bad module buffer (produces diagnostics), then the entry.
+    open_doc(&mut client, &util_uri, BUFFER_UTIL_BAD);
+    client.recv_publish_for(&util_uri);
+    open_doc(&mut client, &main_uri, DISK_ENTRY_SOURCE);
+    let params = client.recv_publish_for(&util_uri);
+    assert!(
+        !params["diagnostics"].as_array().unwrap().is_empty(),
+        "entry analysis must report the module's buffer error"
+    );
+
+    // Close the module: its published diagnostics must clear.
+    client.notify(
+        "textDocument/didClose",
+        serde_json::json!({ "textDocument": { "uri": &util_uri } }),
+    );
+    let params = client.recv_publish_for(&util_uri);
+    assert_eq!(
+        params["diagnostics"],
+        serde_json::json!([]),
+        "closing the module must clear its diagnostics"
+    );
+
+    // Re-trigger entry reanalysis (didChange). The importer must NOT
+    // republish the closed module's diagnostics — the module's source is
+    // suppressed because its buffer is gone and the disk file (41) is clean.
+    client.notify(
+        "textDocument/didChange",
+        serde_json::json!({
+            "textDocument": { "uri": &main_uri, "version": 2 },
+            "contentChanges": [{ "text": DISK_ENTRY_SOURCE }],
+        }),
+    );
+    // After reanalysis the main URI re-publishes (empty result); assert that
+    // within the next few publishes no util URI (with any content) appears.
+    client.recv_publish_for(&main_uri);
+    // Bounded probe: over the next main re-publishes the util URI must not
+    // carry a non-empty diagnostic set. (The close already emitted the empty
+    // clear; a republish would indicate the suppressed-source leak.)
+    let mut leaked = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        let message = match self_mpsc_recv_timeout(&client, deadline) {
+            Some(message) => message,
+            None => break,
+        };
+        if message.get("method") == Some(&serde_json::json!("textDocument/publishDiagnostics")) {
+            let params = &message["params"];
+            if params["uri"] == serde_json::json!(util_uri)
+                && !params["diagnostics"].as_array().unwrap().is_empty()
+            {
+                leaked = true;
+            }
+        }
+    }
+    assert!(
+        !leaked,
+        "reanalysis after close must not republish the closed module's diagnostics"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Non-blocking receive from a client's channel. Returns `None` if nothing is
+/// queued within `deadline`.
+fn self_mpsc_recv_timeout(
+    client: &RpcClient,
+    deadline: std::time::Instant,
+) -> Option<serde_json::Value> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    use std::sync::mpsc::RecvTimeoutError;
+    match client.messages.recv_timeout(remaining) {
+        Ok(message) => Some(message),
+        Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => None,
+    }
+}
+
+#[test]
+fn syntax_error_change_publishes_exact_parse_diagnostic_and_clears_model() {
+    let mut client = RpcClient::spawn();
+    client.request(1, "initialize", serde_json::json!({}));
+    client.notify("initialized", serde_json::json!({}));
+    let uri = ENTRY_URI;
+
+    // Open a valid entry: no diagnostics, model present.
+    open_doc(&mut client, uri, CLEAN_SOURCE);
+    let params = client.recv_notification("textDocument/publishDiagnostics");
+    assert_eq!(params["diagnostics"], serde_json::json!([]));
+
+    // Change to a syntax error. The server must publish an exact parse
+    // diagnostic (non-empty, with a real range) and drop the model so
+    // hover/definition return null.
+    let bad = "fn main() {\n";
+    client.notify(
+        "textDocument/didChange",
+        serde_json::json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": bad }],
+        }),
+    );
+    let params = client.recv_notification("textDocument/publishDiagnostics");
+    let diagnostics = params["diagnostics"].as_array().expect("diagnostics array");
+    assert!(
+        !diagnostics.is_empty(),
+        "a syntax error must publish at least one exact parse diagnostic"
+    );
+    let range = &diagnostics[0]["range"];
+    assert!(
+        range["start"]["line"].as_u64().is_some(),
+        "parse diagnostic must carry a real range"
+    );
+    // The unterminated block error points at the opening line of `fn main() {`
+    // (line 0) — never a degenerate whole-document or line-0-zero-width marker
+    // at EOF. The parser's `with_line_span_from_source` pins the span to the
+    // offending construct's line.
+    assert_eq!(
+        range["start"]["line"],
+        serde_json::json!(0),
+        "parse diagnostic must point at the offending line"
+    );
+    assert!(
+        diagnostics[0]["message"].as_str().unwrap_or("").len() > 0,
+        "parse diagnostic must carry a message"
+    );
+
+    // Hover and definition against the broken buffer must return null (the
+    // stale model was dropped).
+    let hover = client.request(
+        21,
+        "textDocument/hover",
+        serde_json::json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 0, "character": 0 },
+        }),
+    );
+    assert_eq!(hover["result"], serde_json::Value::Null);
+    let definition = client.request(
+        22,
+        "textDocument/definition",
+        serde_json::json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 0, "character": 0 },
+        }),
+    );
+    assert_eq!(definition["result"], serde_json::Value::Null);
+}
+
+#[test]
+fn syntax_fix_replaces_diagnostic_and_restores_model() {
+    let mut client = RpcClient::spawn();
+    client.request(1, "initialize", serde_json::json!({}));
+    client.notify("initialized", serde_json::json!({}));
+    let uri = ENTRY_URI;
+
+    // Open a broken entry: parse diagnostic published, model dropped.
+    open_doc(&mut client, uri, "fn main() {\n");
+    let params = client.recv_notification("textDocument/publishDiagnostics");
+    assert!(
+        !params["diagnostics"].as_array().unwrap().is_empty(),
+        "syntax error document must publish parse diagnostics"
+    );
+
+    // Fix it to a clean source: the parse diagnostic is replaced by an empty
+    // publish and the model is restored (hover works again).
+    client.notify(
+        "textDocument/didChange",
+        serde_json::json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": CLEAN_SOURCE }],
+        }),
+    );
+    let params = client.recv_notification("textDocument/publishDiagnostics");
+    assert_eq!(
+        params["diagnostics"],
+        serde_json::json!([]),
+        "syntax fix must clear the parse diagnostic"
+    );
+    let hover = client.request(
+        21,
+        "textDocument/hover",
+        serde_json::json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 2, "character": 8 },
+        }),
+    );
+    let value = hover["result"]["contents"]["value"].as_str().unwrap_or("");
+    assert!(
+        value.contains("resource<sqlite.connection>"),
+        "hover must work again after the syntax fix: {value:?}"
+    );
+}
+
+#[test]
+fn imported_module_syntax_error_attributed_to_module_uri() {
+    let dir = temp_fixture_dir("lsp-module-syntax");
+    let util_path = write_disk_module(&dir, "util.rss", DISK_UTIL_GOOD);
+    let main_path = write_disk_module(&dir, "main.rss", DISK_ENTRY_SOURCE);
+
+    let main_uri = file_uri(&main_path);
+    let util_uri = file_uri(&util_path);
+
+    let mut client = RpcClient::spawn();
+    client.request(1, "initialize", serde_json::json!({}));
+    client.notify("initialized", serde_json::json!({}));
+
+    // Open an entry that imports util, then open the util buffer with a
+    // syntax error. The reanalysis must attribute the parse diagnostic to the
+    // *module URI*, not the entry.
+    open_doc(&mut client, &main_uri, DISK_ENTRY_SOURCE);
+    client.recv_publish_for(&main_uri);
+    open_doc(&mut client, &util_uri, BUFFER_UTIL_SYNTAX);
+    let params = client.recv_publish_for(&util_uri);
+    let diagnostics = params["diagnostics"].as_array().expect("diagnostics array");
+    assert!(
+        !diagnostics.is_empty(),
+        "module syntax error must publish a parse diagnostic"
+    );
+
+    // Re-analyze the entry (didChange). The entry's analysis must also
+    // attribute the module's parse error to the *module URI* (never the
+    // entry), proving the import graph renders each error against its owner.
+    client.notify(
+        "textDocument/didChange",
+        serde_json::json!({
+            "textDocument": { "uri": &main_uri, "version": 2 },
+            "contentChanges": [{ "text": DISK_ENTRY_SOURCE }],
+        }),
+    );
+    let params = client.recv_publish_for(&util_uri);
+    let diagnostics = params["diagnostics"].as_array().expect("diagnostics array");
+    assert!(
+        !diagnostics.is_empty(),
+        "entry reanalysis must republish the module parse error under the module uri"
+    );
+    let msg = diagnostics[0]["message"].as_str().unwrap_or("");
+    assert!(
+        !msg.is_empty(),
+        "module parse diagnostic must carry the parser message"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

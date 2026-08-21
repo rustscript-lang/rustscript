@@ -30,15 +30,15 @@
 //! positions and unknown URIs return `None`/empty results, and EOF/`exit`
 //! terminates orderly.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use rustscript::{
     CompileSourceFileOptions, HostApiBuilder, HostApiCatalog, HostFunctionSchema, HostParamPassing,
-    HostTypeSchema, SemanticDiagnostic, SemanticModel, SourcePosition,
-    analyze_source_from_string_with_options,
+    HostTypeSchema, ParseError, SemanticDiagnostic, SemanticModel, SourceError, SourceMap,
+    SourcePathError, SourcePosition, Span, analyze_source_from_string_with_options,
 };
 
 /// Hard cap on a single JSON-RPC message payload (LSP bodies are small; a
@@ -47,6 +47,12 @@ const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 /// Hard cap on an individual document's text (editors can send huge buffers;
 /// bound reanalysis cost).
 const MAX_DOCUMENT_CHARS: usize = 8 * 1024 * 1024;
+/// Hard cap on a single header line. LSP headers are a few hundred bytes; a
+/// pathological client must not be able to force unbounded allocation before
+/// `Content-Length` is even parsed.
+const MAX_HEADER_LINE_BYTES: usize = 16 * 1024;
+/// Hard cap on the cumulative header block of one message.
+const MAX_HEADER_TOTAL_BYTES: usize = 64 * 1024;
 /// Scheme used for virtual host-definition documents.
 const HOST_SCHEME: &str = "rustscript-host";
 
@@ -78,6 +84,7 @@ struct RpcMessage {
 
 /// The outcome of reading one message: a parsed message, or a recoverable
 /// parse error to respond with (`-32700`), or a fatal framing error.
+#[derive(Debug)]
 enum ReadOutcome {
     /// A parsed message.
     Message(RpcMessage),
@@ -97,6 +104,7 @@ enum ReadOutcome {
 /// or over-limit payloads (the stream cannot be resynced).
 fn read_message(reader: &mut impl BufRead, max_message_bytes: usize) -> ReadOutcome {
     let mut content_length: Option<usize> = None;
+    let mut header_total = 0usize;
     loop {
         let mut line = String::new();
         let n = match reader.read_line(&mut line) {
@@ -109,6 +117,16 @@ fn read_message(reader: &mut impl BufRead, max_message_bytes: usize) -> ReadOutc
                 return ReadOutcome::Fatal("unexpected EOF inside message headers".to_string());
             }
             return ReadOutcome::Eof;
+        }
+        header_total += n;
+        if header_total > MAX_HEADER_TOTAL_BYTES {
+            return ReadOutcome::Fatal("message headers exceed the size cap".to_string());
+        }
+        if n > MAX_HEADER_LINE_BYTES {
+            // One oversized line (no newline within the cap): the client is
+            // trying to force unbounded allocation before Content-Length is
+            // even parsed. The stream cannot be resynced.
+            return ReadOutcome::Fatal("header line exceeds the size cap".to_string());
         }
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
@@ -224,8 +242,7 @@ fn load_catalog_file(path: &Path) -> Result<Arc<HostApiCatalog>, String> {
 fn lsp_position_to_offset(text: &str, line: u32, character: u32) -> Option<usize> {
     let mut current_line = 0u32;
     let mut offset = 0usize;
-    for (idx, chunk) in text.split_inclusive('\n').enumerate() {
-        let _ = idx;
+    for chunk in text.split_inclusive('\n') {
         if current_line == line {
             // Walk the line's chars accumulating UTF-16 code units.
             let line_text = chunk.trim_end_matches(['\n', '\r']);
@@ -259,8 +276,7 @@ fn offset_to_lsp_position(text: &str, offset: usize) -> Option<(u32, u32)> {
     }
     let mut line = 0u32;
     let mut line_start = 0usize;
-    for (idx, chunk) in text.split_inclusive('\n').enumerate() {
-        let _ = idx;
+    for chunk in text.split_inclusive('\n') {
         if offset <= line_start + chunk.len() {
             let line_text = &text[line_start..offset.min(line_start + chunk.len())];
             let line_text = line_text.trim_end_matches(['\n', '\r']);
@@ -280,35 +296,291 @@ fn offset_to_lsp_position(text: &str, offset: usize) -> Option<(u32, u32)> {
 // Document store
 // ---------------------------------------------------------------------------
 
-/// One open document: its URI, filesystem path (derived from the URI), the
-/// current buffer text, and the last analysis result (if any).
+/// One open document: its URI, its canonical module identity (see
+/// [`canonical_identity`]), the current buffer text, and the last analysis
+/// result (if any).
 struct Document {
     uri: String,
-    path: PathBuf,
+    /// Canonical module identity — the exact path form the compiler's loader
+    /// records in the SourceMap and resolves imported modules to.
+    identity: PathBuf,
     text: String,
     model: Option<SemanticModel>,
+    /// Rendered parse/load diagnostics from a failed analysis, keyed by owning
+    /// URI. Present only when the most recent analysis failed; cleared on
+    /// success. See [`render_analysis_error`].
+    analysis_error: Option<std::collections::BTreeMap<String, Vec<serde_json::Value>>>,
 }
 
 impl Document {
-    fn new(uri: String, path: PathBuf, text: String) -> Self {
+    fn new(uri: String, identity: PathBuf, text: String) -> Self {
         Self {
             uri,
-            path,
+            identity,
             text,
             model: None,
+            analysis_error: None,
         }
     }
 }
 
-/// Convert an LSP document URI to a filesystem path. Supports `file://` URIs
-/// (percent-decoded); other schemes map to a synthetic in-memory path rooted
-/// under the host scheme so virtual host documents stay addressable.
+/// Convert an LSP document URI to a canonical module identity. Supports
+/// `file://` URIs (percent-decoded); other schemes map to a synthetic
+/// in-memory identity rooted under the host scheme so virtual host documents
+/// stay addressable.
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
     let path_str = percent_decode(rest);
-    // Strip the leading slash from the authority-less form.
-    let path_str = path_str.strip_prefix('/').unwrap_or(&path_str);
     Some(PathBuf::from(path_str))
+}
+
+/// The single canonical identity for a document/module path, shared across
+/// every path form in this server:
+///
+/// * LSP URI→path (`uri_to_path` / `Document::path`),
+/// * `compile_options` module-override keys,
+/// * `SourceMap` source-name→URI lookup (`uri_for_source_name`),
+/// * source-id resolution against an open document (`source_position`), and
+/// * closed-source suppression (`closed_doc_source`).
+///
+/// It deliberately mirrors the compiler's `module_identity` (the loader's
+/// canonical identity) so override keys registered here match the resolved
+/// path string the loader looks up: a path that exists on disk canonicalizes
+/// to its absolute canonical path, while an unsaved/nonexistent buffer keeps
+/// a normalized absolute path so virtual buffers and the importers that
+/// depend on them agree on identity deterministically. Relative path forms
+/// (e.g. percent-decoded URIs without a leading slash) are anchored to the
+/// current directory first so the resulting identity is always absolute,
+/// which is exactly the offset the loader produces for the same path.
+fn canonical_identity(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    if absolute.is_file()
+        && let Ok(canonical) = absolute.canonicalize()
+    {
+        return canonical;
+    }
+    normalize_absolute_path(&absolute)
+}
+
+/// Lexically normalize an absolute path (resolve `.` and `..`), preserving
+/// the leading root. Mirrors the loader's `normalize_module_path`.
+fn normalize_absolute_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                // Never escape the root or drop leading parent segments on an
+                // absolute path (they cannot legally exist above the root).
+                Some(Component::ParentDir)
+                | Some(Component::RootDir | Component::Prefix(_))
+                | Some(Component::CurDir)
+                | None => {}
+            },
+            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
+                out.push(component.as_os_str());
+            }
+        }
+    }
+    out
+}
+
+/// The slash-normalized string form of a canonical identity, used as the key
+/// throughout the server's path maps (backslashes to slashes so Windows-style
+/// and Unix-style names compare equal).
+fn normalized_source_name(name: &str) -> String {
+    name.replace('\\', "/")
+}
+
+// ---------------------------------------------------------------------------
+// Analysis-error rendering
+// ---------------------------------------------------------------------------
+
+/// Render a failed `analyze_source_from_string_with_options` into an LSP
+/// publishDiagnostics payload grouped by owning URI.
+///
+/// Source errors (parse/load failures) carry a [`SourceMap`] (via
+/// `SourcePathError::SourceWithMap`) that resolves every span they reference
+/// to its owning source text, and the span itself identifies the owning
+/// source id. We therefore render an exact, source-accurate diagnostic rather
+/// than dead-lettering the failure. A bare `Source(ParseError)` without a map
+/// is rendered against the entry document's own identity/text at the line the
+/// parser reported. Other path-level errors (unreadable import etc.) are
+/// rendered as a single line-1 diagnostic on the entry document.
+///
+/// The returned map is keyed by the owning client URI (canonical identity →
+/// `uri_for_source_name`), so the error renders against the module URI that
+/// actually failed — an imported module's syntax error is attributed to that
+/// module, never the importer.
+fn render_analysis_error(
+    server: &LspServer,
+    err: &SourcePathError,
+    entry_identity: &Path,
+) -> std::collections::BTreeMap<String, Vec<serde_json::Value>> {
+    let mut out = std::collections::BTreeMap::new();
+    match err {
+        SourcePathError::SourceWithMap { error, sources } => match error {
+            SourceError::Parse(parse) => {
+                push_parse_diagnostic(server, &mut out, sources, entry_identity, parse);
+            }
+            SourceError::Compile(compile) => {
+                // A compile error carried as a source-path failure (e.g. a
+                // resolving/legalize failure surfaced through the loader).
+                // Resolve its carried span against the attached map.
+                let (name, text, lo, hi) = match compile_span(compile) {
+                    Some(span) => match sources.file(span.source_id) {
+                        Some(file) => (
+                            file.name.clone(),
+                            file.text.clone(),
+                            span.lo.min(file.text.len()),
+                            span.hi.min(file.text.len()),
+                        ),
+                        None => (entry_identity.display().to_string(), String::new(), 0, 0),
+                    },
+                    None => (entry_identity.display().to_string(), String::new(), 0, 0),
+                };
+                let uri = server.uri_for_source_name(&name);
+                push_diag(
+                    &mut out,
+                    uri,
+                    &text,
+                    lo,
+                    hi,
+                    compile.diagnostic_message(),
+                    Some("E101".to_string()),
+                );
+            }
+        },
+        SourcePathError::Source(SourceError::Parse(parse)) => {
+            // No source map attached: render against the entry document using
+            // its own identity and a source map containing just the entry.
+            let mut source_map = SourceMap::new();
+            let entry_text = std::fs::read_to_string(entry_identity).unwrap_or_default();
+            let id =
+                source_map.add_source(entry_identity.display().to_string(), entry_text.clone());
+            let mut parse = parse.clone();
+            if parse.span.is_none() {
+                parse = parse.with_line_span_from_source(&source_map, id);
+            }
+            push_parse_diagnostic(server, &mut out, &source_map, entry_identity, &parse);
+        }
+        SourcePathError::Source(SourceError::Compile(compile)) => {
+            let uri = server.uri_for_source_name(&entry_identity.display().to_string());
+            push_diag(
+                &mut out,
+                uri,
+                "",
+                0,
+                0,
+                compile.diagnostic_message(),
+                Some("E101".to_string()),
+            );
+        }
+        // Path-level failure (Io, import cycle, missing extension, invalid
+        // import syntax, ...): report on the entry document's first line.
+        other => {
+            let uri = server.uri_for_source_name(&entry_identity.display().to_string());
+            push_diag(
+                &mut out,
+                uri,
+                "",
+                0,
+                0,
+                other.to_string(),
+                Some("E100".to_string()),
+            );
+        }
+    }
+    out
+}
+
+/// The compile span carried by a `CompileError`, if any.
+fn compile_span(compile: &rustscript::CompileError) -> Option<Span> {
+    match compile {
+        rustscript::CompileError::HostCallResolve { span, .. }
+        | rustscript::CompileError::IfElseBranchTypeMismatch { span, .. }
+        | rustscript::CompileError::CallableArgumentTypeMismatch { span, .. }
+        | rustscript::CompileError::BinaryOperandTypeMismatch { span, .. }
+        | rustscript::CompileError::InvalidFieldAccess { span, .. }
+        | rustscript::CompileError::FunctionParameterTypeConflict { span, .. }
+        | rustscript::CompileError::StrictTypingRequired { span, .. } => *span,
+        _ => None,
+    }
+}
+
+/// Render a [`ParseError`] diagnostic, resolving its span against the
+/// attached SourceMap and attaching it to the owning source's URI.
+fn push_parse_diagnostic(
+    server: &LspServer,
+    out: &mut std::collections::BTreeMap<String, Vec<serde_json::Value>>,
+    sources: &SourceMap,
+    entry_identity: &Path,
+    parse: &ParseError,
+) {
+    let (name, text, lo, hi) = match parse.span {
+        Some(span) => match sources.file(span.source_id) {
+            Some(file) => (
+                file.name.clone(),
+                file.text.clone(),
+                span.lo.min(file.text.len()),
+                span.hi.min(file.text.len()),
+            ),
+            None => (entry_identity.display().to_string(), String::new(), 0, 0),
+        },
+        None => (entry_identity.display().to_string(), String::new(), 0, 0),
+    };
+    let uri = server.uri_for_source_name(&name);
+    push_diag(
+        out,
+        uri,
+        &text,
+        lo,
+        hi,
+        parse.message.clone(),
+        parse.code.clone(),
+    );
+}
+
+/// Push one LSP diagnostic value into the grouped map.
+fn push_diag(
+    out: &mut std::collections::BTreeMap<String, Vec<serde_json::Value>>,
+    uri: String,
+    text: &str,
+    lo: usize,
+    hi: usize,
+    message: String,
+    code: Option<String>,
+) {
+    let (start, end) = span_to_lsp(text, lo, hi);
+    let mut diag = serde_json::json!({
+        "range": { "start": { "line": start.0, "character": start.1 },
+                   "end": { "line": end.0, "character": end.1 } },
+        "severity": 1,
+        "source": "rustscript",
+        "message": message,
+    });
+    if let Some(code) = code {
+        diag["code"] = serde_json::Value::String(code);
+    }
+    out.entry(uri).or_default().push(diag);
+}
+
+/// Convert a byte span to an LSP range against a source text.
+fn span_to_lsp(text: &str, lo: usize, hi: usize) -> ((u32, u32), (u32, u32)) {
+    let lo = lo.min(text.len());
+    let hi = hi.min(text.len());
+    let start = offset_to_lsp_position(text, lo).unwrap_or((0, 0));
+    let end = offset_to_lsp_position(text, hi).unwrap_or(start);
+    (start, end)
 }
 
 /// Minimal percent-decoding for URI paths (LSP file URIs percent-encode
@@ -379,16 +651,17 @@ fn render_host_signature(schema: &HostFunctionSchema) -> String {
 struct LspServer {
     catalog: Arc<HostApiCatalog>,
     /// uri -> open document (buffer overrides disk).
-    documents: HashMap<String, Document>,
+    documents: BTreeMap<String, Document>,
     /// Every URI we have published diagnostics for (including URIs owned by
     /// imported modules of an analyzed document). On reanalysis/change/close
     /// any URI that drops out of the fresh diagnostic set is cleared with an
     /// empty publish so the client never shows stale squiggles.
     published_uris: std::collections::HashSet<String>,
-    /// Normalized source names whose documents have been closed and must not
-    /// contribute diagnostics until reopened/reloaded from disk (the closing
-    /// document's buffer is gone, so its errors must be cleared even if a
-    /// still-open importing document's model still references them).
+    /// Canonical module identities (slash-normalized) whose documents have
+    /// been closed and must not contribute diagnostics until reopened/reloaded
+    /// from disk (the closing document's buffer is gone, so its errors must be
+    /// cleared even if a still-open importing document's model still
+    /// references them).
     closed_sources: std::collections::HashSet<String>,
     shutdown_requested: bool,
     initialized: bool,
@@ -399,7 +672,7 @@ impl LspServer {
     fn new(catalog: Arc<HostApiCatalog>, config: ServerConfig) -> Self {
         Self {
             catalog,
-            documents: HashMap::new(),
+            documents: BTreeMap::new(),
             published_uris: std::collections::HashSet::new(),
             closed_sources: std::collections::HashSet::new(),
             shutdown_requested: false,
@@ -411,56 +684,76 @@ impl LspServer {
     /// The compile options for this server: the exact catalog snapshot plus
     /// module-source overrides for every open document (so an open buffer
     /// shadows the on-disk module it corresponds to).
+    ///
+    /// Overrides are keyed by the document's canonical module identity — the
+    /// exact path form the loader resolves imported modules to and records in
+    /// the SourceMap (see [`canonical_identity`]). Bare basename aliases are
+    /// deliberately *not* registered: two open documents may share a basename
+    /// in different directories, and an unconditional basename override would
+    /// make one nondeterministically shadow the other. Ambiguous basenames
+    /// are instead left to the resolved-identity lookup, which is exact.
     fn compile_options(&self) -> CompileSourceFileOptions {
         let mut options =
             CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&self.catalog));
         for doc in self.documents.values() {
-            let spec = doc.path.to_string_lossy().replace('\\', "/");
+            let spec = normalized_source_name(&doc.identity.to_string_lossy());
             options = options.with_module_override_source(spec, doc.text.clone());
-            // Also register the import-spec form (./foo.rss) for relative
-            // imports of open documents.
-            if let Some(file_name) = doc.path.file_name().and_then(|n| n.to_str()) {
-                options =
-                    options.with_module_override_source(file_name.to_string(), doc.text.clone());
-            }
         }
         options
     }
 
     /// Analyze (or reanalyze) the document at `uri` with its current buffer
     /// text. Stale diagnostics for other documents are cleared by the caller.
+    ///
+    /// On analysis failure the previous model is dropped (never retained
+    /// against changed text) and the failure is recorded so the caller can
+    /// publish exact parse/load diagnostics from the error's attached
+    /// [`SourceMap`] instead of dead-lettering them.
     fn analyze_document(&mut self, uri: &str) {
         let options = self.compile_options();
         let Some(doc) = self.documents.get_mut(uri) else {
             return;
         };
-        let path = doc.path.clone();
+        let identity = doc.identity.clone();
         let text = doc.text.clone();
-        let result = analyze_source_from_string_with_options(&path, &text, options);
-        let model = match result {
-            Ok(model) => Some(model),
-            Err(_) => {
-                // A source-path error (unreadable import etc.) still needs a
-                // model for diagnostics. `SemanticModel` is not `Clone`, so
-                // preserve the previous model (if any) by moving it out;
-                // otherwise the entry document keeps no model and the failure
-                // surfaces through the diagnostics channel.
-                doc.model.take()
+        let result = analyze_source_from_string_with_options(&identity, &text, options);
+        match result {
+            Ok(model) => {
+                doc.model = Some(model);
+                doc.analysis_error = None;
             }
-        };
-        doc.model = model;
+            Err(err) => {
+                // Never retain a stale model against changed text: the buffer
+                // no longer parses/loads, so every query against the old model
+                // would be wrong. Render the failure as exact parse/load
+                // diagnostics from the error's attached source map (this needs
+                // an immutable borrow of `self` for URI resolution, so the
+                // entry document's mutable borrow ends before the render).
+                let rendered = {
+                    let identity = identity.clone();
+                    render_analysis_error(self, &err, &identity)
+                };
+                let Some(doc) = self.documents.get_mut(uri) else {
+                    return;
+                };
+                doc.model = None;
+                doc.analysis_error = Some(rendered);
+            }
+        }
     }
 
     /// Map a SourceMap file name back to a client URI. Open documents map to
-    /// their document URI; other real files map to a canonical `file://` URI;
-    /// host/virtual names map to the host scheme (never double-prefixed).
+    /// their document URI (matched by canonical identity); other real files
+    /// map to a canonical `file://` URI; host/virtual names map to the host
+    /// scheme (never double-prefixed).
     fn uri_for_source_name(&self, name: &str) -> String {
-        // Normalize: the compiler records the path as passed; compare with
-        // each document's path string form.
-        let normalized = name.replace('\\', "/");
+        // The SourceMap records canonical identities (the loader's path
+        // form); match each document's canonical identity string exactly.
+        let canonical = canonical_identity(Path::new(name));
+        let canonical_str = normalized_source_name(&canonical.to_string_lossy());
         for doc in self.documents.values() {
-            let doc_path = doc.path.to_string_lossy().replace('\\', "/");
-            if doc_path == normalized {
+            let doc_identity = normalized_source_name(&doc.identity.to_string_lossy());
+            if doc_identity == canonical_str {
                 return doc.uri.clone();
             }
         }
@@ -475,19 +768,26 @@ impl LspServer {
             // never stack another scheme prefix.
             return name.to_string();
         }
-        format!("file://{}", name)
+        // A real file path: emit a canonical file URI from the canonical
+        // identity so the client can navigate to disk-provided modules.
+        if canonical.is_absolute() {
+            format!("file://{}", canonical_str)
+        } else {
+            format!("file://{}", name)
+        }
     }
 
     /// Collect every diagnostic across all open documents' models, grouped by
     /// the owning URI (resolved through each diagnostic's `span.source_id`).
     /// The entry URI of every open document is always present (empty array
     /// when its analysis produced nothing), so clean documents still publish
-    /// an explicit clear.
+    /// an explicit clear. Failed analyses contribute their rendered
+    /// parse/load diagnostics (see [`render_analysis_error`]).
     fn diagnostics_grouped_by_uri(
         &self,
-    ) -> std::collections::HashMap<String, Vec<serde_json::Value>> {
-        let mut grouped: std::collections::HashMap<String, Vec<serde_json::Value>> =
-            std::collections::HashMap::new();
+    ) -> std::collections::BTreeMap<String, Vec<serde_json::Value>> {
+        let mut grouped: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
+            std::collections::BTreeMap::new();
         // Every open document owns its entry URI, even with zero diagnostics.
         for doc in self.documents.values() {
             grouped.entry(doc.uri.clone()).or_default();
@@ -518,6 +818,26 @@ impl LspServer {
                 }
             }
         }
+        // Failed analyses: their rendered diagnostics already carry exact
+        // ranges and owning URIs; fold them into the grouped set.
+        for doc in self.documents.values() {
+            if let Some(error_diags) = &doc.analysis_error {
+                for (uri, diags) in error_diags {
+                    let entry = grouped.entry(uri.clone()).or_default();
+                    for diag in diags {
+                        let key = (
+                            uri.clone(),
+                            diag["message"].as_str().unwrap_or("").to_string(),
+                            diag["code"].as_str().unwrap_or("").to_string(),
+                            diag["range"].to_string(),
+                        );
+                        if seen.insert(key) {
+                            entry.push(diag.clone());
+                        }
+                    }
+                }
+            }
+        }
         grouped
     }
 
@@ -544,8 +864,11 @@ impl LspServer {
         };
         let uri = self.uri_for_source_name(name);
         // A document that was closed must not keep contributing diagnostics
-        // through another open document's stale model.
-        if self.closed_sources.contains(&normalized_source_name(name))
+        // through another open document's stale model. The suppression key is
+        // the canonical identity, matching `closed_doc_source` exactly.
+        let name_identity =
+            normalized_source_name(&canonical_identity(Path::new(name)).to_string_lossy());
+        if self.closed_sources.contains(&name_identity)
             && !self.documents.values().any(|doc| doc.uri == uri)
         {
             return None;
@@ -625,19 +948,29 @@ impl LspServer {
         let model = doc.model.as_ref()?;
         let offset = lsp_position_to_offset(&doc.text, line, character)?;
         // Find the SourceId for this document inside the model's SourceMap.
+        // The SourceMap records canonical identities, so look up the
+        // document's canonical identity exactly; only when the document is
+        // not present in the map at all (e.g. an imported module whose buffer
+        // shadows a different on-disk file) fall back to a deterministic
+        // suffix match.
+        let identity_str = normalized_source_name(&doc.identity.to_string_lossy());
         let source_id = model
             .sources()
-            .source_id_by_name(&doc.path.to_string_lossy())
+            .source_id_by_name(&identity_str)
             .or_else(|| {
-                // Fall back to the first source whose name ends with this
-                // document's file name.
-                let file_name = doc.path.file_name()?.to_str()?;
+                // Fall back to the first source whose canonical identity ends
+                // with this document's file name.
+                let file_name = doc.identity.file_name()?.to_str()?;
+                let file_name = normalized_source_name(file_name);
                 let mut found = None;
                 for id in 0.. {
                     let Some(name) = model.sources().file_name(id) else {
                         break;
                     };
-                    if name.ends_with(file_name) {
+                    let canonical = normalized_source_name(
+                        &canonical_identity(Path::new(name)).to_string_lossy(),
+                    );
+                    if canonical.ends_with(&file_name) {
                         found = Some(id);
                         break;
                     }
@@ -685,6 +1018,16 @@ impl LspServer {
         match method {
             // ---- lifecycle ----
             "initialize" => {
+                // Per the LSP spec a second initialize (after the first
+                // succeeded) is an error: the server is already initialized.
+                // Respond InvalidRequest so clients detect the duplicate.
+                if self.initialized {
+                    return Ok(Some(error_message(
+                        msg.id.as_ref().unwrap_or(&serde_json::Value::Null),
+                        -32600,
+                        "server is already initialized",
+                    )));
+                }
                 self.initialized = true;
                 let result = self.initialize_response();
                 Ok(Some(result_message(
@@ -812,9 +1155,10 @@ impl LspServer {
         }
         let path =
             uri_to_path(&uri).unwrap_or_else(|| PathBuf::from(uri.trim_start_matches("file://")));
+        let identity = canonical_identity(&path);
         self.documents.insert(
             uri.clone(),
-            Document::new(uri.clone(), path, text.to_string()),
+            Document::new(uri.clone(), identity, text.to_string()),
         );
         self.analyze_document(&uri);
         self.publish_all_diagnostics(out)
@@ -874,14 +1218,15 @@ impl LspServer {
         self.publish_all_diagnostics(out)
     }
 
-    /// The normalized source name a document URI used, for closed-source
-    /// tracking. Mirrors `uri_to_path`'s slash handling so the name matches
-    /// what the SourceMap records for the same document.
+    /// The canonical source identity a document URI used, for closed-source
+    /// tracking. Mirrors `canonical_identity` so the key matches what the
+    /// SourceMap records for the same document and what `lsp_diagnostic`
+    /// compares against.
     fn closed_doc_source(&self, uri: &str) -> Option<String> {
         let rest = uri.strip_prefix("file://")?;
         let path_str = percent_decode(rest);
-        let path_str = path_str.strip_prefix('/').unwrap_or(&path_str);
-        Some(normalized_source_name(path_str))
+        let identity = canonical_identity(Path::new(&path_str));
+        Some(normalized_source_name(&identity.to_string_lossy()))
     }
 
     fn handle_hover(&self, params: &serde_json::Value) -> serde_json::Value {
@@ -1106,12 +1451,6 @@ fn parse_host_label(label: &str) -> (String, usize) {
     split_host_uri(rest)
 }
 
-/// Normalize a SourceMap source name for closed-source tracking (backslashes
-/// to slashes, so Windows-style and Unix-style names compare equal).
-fn normalized_source_name(name: &str) -> String {
-    name.replace('\\', "/")
-}
-
 fn split_host_uri(rest: &str) -> (String, usize) {
     match rest.rsplit_once('/') {
         Some((name, arity)) => (name.to_string(), arity.parse().unwrap_or(0)),
@@ -1307,23 +1646,114 @@ mod tests {
     fn uri_for_source_name_prefers_open_document_uri() {
         let config = ServerConfig::default();
         let mut server = LspServer::new(standard_catalog(), config);
+        // The document's canonical identity (a nonexistent buffer keeps its
+        // normalized absolute path).
+        let identity = canonical_identity(Path::new("/tmp/fixture/main.rss"));
+        let identity_str = normalized_source_name(&identity.to_string_lossy());
         server.documents.insert(
             "file:///tmp/fixture/main.rss".to_string(),
             Document::new(
                 "file:///tmp/fixture/main.rss".to_string(),
-                PathBuf::from("tmp/fixture/main.rss"),
+                identity,
                 "fn main() {}\n".to_string(),
             ),
         );
-        // The SourceMap name (path form) maps to the open document's URI.
+        // The SourceMap name (canonical identity) maps to the open document's URI.
         assert_eq!(
-            server.uri_for_source_name("tmp/fixture/main.rss"),
+            server.uri_for_source_name(&identity_str),
             "file:///tmp/fixture/main.rss"
         );
-        // Windows-style separators normalize to the same match.
+        // A source name recorded with the same canonical identity in any
+        // slash-normalized spelling maps identically.
         assert_eq!(
-            server.uri_for_source_name(r"tmp\fixture\main.rss"),
+            server.uri_for_source_name(&normalized_source_name(&identity_str)),
             "file:///tmp/fixture/main.rss"
         );
+    }
+
+    #[test]
+    fn canonical_identity_matches_loader_semantics() {
+        // A nonexistent absolute path keeps its normalized absolute form.
+        assert_eq!(
+            canonical_identity(Path::new("/no/such/dir/../virtual/nested.rss")),
+            PathBuf::from("/no/such/virtual/nested.rss")
+        );
+        // A relative nonexistent path is anchored to the current directory.
+        let anchored = canonical_identity(Path::new("virtual/nested.rss"));
+        assert!(anchored.is_absolute(), "identity must be absolute");
+        assert!(anchored.ends_with("virtual/nested.rss"));
+    }
+
+    #[test]
+    fn duplicate_initialize_is_rejected_in_handle() {
+        let config = ServerConfig::default();
+        let mut server = LspServer::new(standard_catalog(), config);
+        let msg = RpcMessage {
+            id: Some(serde_json::json!(1)),
+            method: "initialize".to_string(),
+            params: serde_json::json!({}),
+        };
+        let mut out = Vec::new();
+        let response = server
+            .handle(&msg, &mut out)
+            .expect("handle must not fail")
+            .expect("initialize must respond");
+        assert!(
+            response.get("result").is_some(),
+            "first initialize succeeds"
+        );
+        // Second initialize: rejected with InvalidRequest.
+        let response = server
+            .handle(&msg, &mut out)
+            .expect("handle must not fail")
+            .expect("second initialize must respond");
+        let error = response.get("error").expect("error object");
+        assert_eq!(
+            error["code"],
+            serde_json::json!(-32600),
+            "duplicate initialize must return InvalidRequest"
+        );
+    }
+
+    #[test]
+    fn read_message_bounds_header_line_length() {
+        // A single header line far beyond the cap must be a fatal framing
+        // error, never an unbounded allocation.
+        let bytes = format!(
+            "X-Padding: {}\r\n\r\n{{}}\r\n",
+            "a".repeat(MAX_HEADER_LINE_BYTES + 64)
+        );
+        let mut reader = std::io::BufReader::new(bytes.as_bytes());
+        let outcome = read_message(&mut reader, MAX_MESSAGE_BYTES);
+        match outcome {
+            ReadOutcome::Fatal(message) => {
+                assert!(
+                    message.contains("size cap"),
+                    "oversized header must be fatal: {message}"
+                );
+            }
+            other => panic!("oversized header line must be fatal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_message_bounds_header_total_bytes() {
+        // Many small header lines whose cumulative size exceeds the cap.
+        let mut bytes = String::new();
+        for i in 0..(MAX_HEADER_TOTAL_BYTES / 64 + 2) {
+            bytes.push_str(&format!("X-H{}-H: {}\r\n", i, "b".repeat(60)));
+        }
+        bytes.push_str("\r\n{}\r\n");
+        let mut reader = std::io::BufReader::new(bytes.as_bytes());
+        let outcome = read_message(&mut reader, MAX_MESSAGE_BYTES);
+        match outcome {
+            ReadOutcome::Fatal(message) => {
+                assert!(
+                    message.contains("size cap"),
+                    "oversized header block must be fatal: {message}"
+                );
+            }
+            other => panic!("oversized header block must be fatal, got {other:?}"),
+        }
     }
 }
