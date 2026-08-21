@@ -6,7 +6,9 @@ use crate::builtins::BuiltinFunction;
 use super::{
     ParseError, SourceError, SourcePathError,
     ir::{
-        Expr, FrontendIr, FunctionDecl, FunctionImpl, HostApiIrMetadata, LocalSlot, Stmt,
+        CatalogVisibility, Expr, FrontendIr, FunctionDecl, FunctionDeclSite, FunctionImpl,
+        FunctionRefSite, HostApiIrMetadata, LocalDeclSite, LocalRefSite, LocalSlot, ParsedCallSite,
+        ParsedCallTarget, ParsedLexicalScope, ParsedSemanticIndex, ScopeId, SemanticNodeId, Stmt,
         StructDecl,
     },
     modules::{ModuleId, SymbolId},
@@ -108,6 +110,20 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
 
     let mut local_base = 0usize;
 
+    // Merged parser provenance carrier. Every unit parsed in module mode
+    // carries a `Some` parsed semantic index whose ids start at zero; the
+    // merge rebases each unit's [`SemanticNodeId`] and [`ScopeId`] by the
+    // running totals so the merged index stays collision-free, and remaps
+    // local slots and function indices exactly like the IR statements it
+    // describes. Units without provenance (REPL fixtures, test IR) simply
+    // contribute nothing; the merged carrier is `Some` iff at least one
+    // supplied unit carried one.
+    let mut merged_parsed_index: Option<ParsedSemanticIndex> = None;
+    // Merged catalog visibility. Alias maps are merged deterministically in
+    // unit order with deduplication; a conflicting alias (same alias name
+    // mapping to different canonical targets across units) is a typed error.
+    let mut merged_catalog_visibility: Option<CatalogVisibility> = None;
+
     for unit in units {
         let source_name = unit.source_name.clone();
         let function_map = register_unit_functions(
@@ -127,9 +143,48 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
         let unit_local_base = local_base;
         let unit_local_count = unit.parsed.locals;
 
+        // Node/scope id bases for this unit: the running totals of the merged
+        // carrier. Every parser-produced id in this unit starts at zero, so
+        // rebasing by these offsets keeps the merged index collision-free
+        // while preserving each unit's internal ordering.
+        let node_offset = merged_parsed_index
+            .as_ref()
+            .map(|merged| merged.next_node_id)
+            .unwrap_or(0);
+        let scope_offset = merged_parsed_index
+            .as_ref()
+            .map(|merged| merged.next_scope_id)
+            .unwrap_or(0);
+
+        if let Some(unit_index) = &unit.parsed.parsed_semantic_index {
+            let rebased = rebase_parsed_semantic_index(
+                unit_index,
+                node_offset,
+                scope_offset,
+                unit_local_base,
+                &function_map,
+            )?;
+            match &mut merged_parsed_index {
+                Some(merged) => merge_parsed_semantic_index(merged, rebased),
+                None => merged_parsed_index = Some(rebased),
+            }
+        }
+        if let Some(visibility) = &unit.parsed.catalog_visibility {
+            match &mut merged_catalog_visibility {
+                Some(merged) => merge_catalog_visibility(merged, visibility, &source_name)?,
+                None => merged_catalog_visibility = Some(visibility.clone()),
+            }
+        }
+
         let mut remapped_stmts = unit.parsed.stmts;
         for stmt in &mut remapped_stmts {
-            remap_stmt_indices(stmt, unit_local_base, &function_map, &flat_index_by_symbol)?;
+            remap_stmt_indices(
+                stmt,
+                unit_local_base,
+                node_offset,
+                &function_map,
+                &flat_index_by_symbol,
+            )?;
         }
         merged_stmt_sources.extend(std::iter::repeat_n(
             Some(source_name.clone()),
@@ -184,11 +239,18 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
                 *captured_slot = remap_local_index(*captured_slot, unit_local_base)?;
             }
             for stmt in &mut function_impl.body_stmts {
-                remap_stmt_indices(stmt, unit_local_base, &function_map, &flat_index_by_symbol)?;
+                remap_stmt_indices(
+                    stmt,
+                    unit_local_base,
+                    node_offset,
+                    &function_map,
+                    &flat_index_by_symbol,
+                )?;
             }
             remap_expr_indices(
                 &mut function_impl.body_expr,
                 unit_local_base,
+                node_offset,
                 &function_map,
                 &flat_index_by_symbol,
             )?;
@@ -245,8 +307,8 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
         // validated, remapped, uniformly fingerprint-bound carrier.
         host_api_metadata: merged_host_api_metadata,
         semantic_index: None,
-        parsed_semantic_index: None,
-        catalog_visibility: None,
+        parsed_semantic_index: merged_parsed_index,
+        catalog_visibility: merged_catalog_visibility,
     })
 }
 
@@ -637,6 +699,7 @@ fn remap_local_index(index: LocalSlot, local_base: usize) -> Result<LocalSlot, S
 fn remap_stmt_indices(
     stmt: &mut Stmt,
     local_base: usize,
+    node_offset: u32,
     function_map: &HashMap<u16, u16>,
     flat_index_by_symbol: &HashMap<SymbolId, u16>,
 ) -> Result<(), SourcePathError> {
@@ -644,11 +707,23 @@ fn remap_stmt_indices(
         Stmt::Noop { .. } => {}
         Stmt::Let { index, expr, .. } => {
             *index = remap_local_index(*index, local_base)?;
-            remap_expr_indices(expr, local_base, function_map, flat_index_by_symbol)?;
+            remap_expr_indices(
+                expr,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
         }
         Stmt::Assign { index, expr, .. } => {
             *index = remap_local_index(*index, local_base)?;
-            remap_expr_indices(expr, local_base, function_map, flat_index_by_symbol)?;
+            remap_expr_indices(
+                expr,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
         }
         Stmt::ClosureLet { closure, .. } => {
             for (source_index, captured_slot) in &mut closure.capture_copies {
@@ -658,6 +733,7 @@ fn remap_stmt_indices(
             remap_expr_indices(
                 &mut closure.body,
                 local_base,
+                node_offset,
                 function_map,
                 flat_index_by_symbol,
             )?;
@@ -682,7 +758,13 @@ fn remap_stmt_indices(
             }
         }
         Stmt::Expr { expr, .. } => {
-            remap_expr_indices(expr, local_base, function_map, flat_index_by_symbol)?;
+            remap_expr_indices(
+                expr,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
         }
         Stmt::IfElse {
             condition,
@@ -690,12 +772,30 @@ fn remap_stmt_indices(
             else_branch,
             ..
         } => {
-            remap_expr_indices(condition, local_base, function_map, flat_index_by_symbol)?;
+            remap_expr_indices(
+                condition,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
             for stmt in then_branch {
-                remap_stmt_indices(stmt, local_base, function_map, flat_index_by_symbol)?;
+                remap_stmt_indices(
+                    stmt,
+                    local_base,
+                    node_offset,
+                    function_map,
+                    flat_index_by_symbol,
+                )?;
             }
             for stmt in else_branch {
-                remap_stmt_indices(stmt, local_base, function_map, flat_index_by_symbol)?;
+                remap_stmt_indices(
+                    stmt,
+                    local_base,
+                    node_offset,
+                    function_map,
+                    flat_index_by_symbol,
+                )?;
             }
         }
         Stmt::For {
@@ -705,19 +805,55 @@ fn remap_stmt_indices(
             body,
             ..
         } => {
-            remap_stmt_indices(init, local_base, function_map, flat_index_by_symbol)?;
-            remap_expr_indices(condition, local_base, function_map, flat_index_by_symbol)?;
-            remap_stmt_indices(post, local_base, function_map, flat_index_by_symbol)?;
+            remap_stmt_indices(
+                init,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
+            remap_expr_indices(
+                condition,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
+            remap_stmt_indices(
+                post,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
             for stmt in body {
-                remap_stmt_indices(stmt, local_base, function_map, flat_index_by_symbol)?;
+                remap_stmt_indices(
+                    stmt,
+                    local_base,
+                    node_offset,
+                    function_map,
+                    flat_index_by_symbol,
+                )?;
             }
         }
         Stmt::While {
             condition, body, ..
         } => {
-            remap_expr_indices(condition, local_base, function_map, flat_index_by_symbol)?;
+            remap_expr_indices(
+                condition,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
             for stmt in body {
-                remap_stmt_indices(stmt, local_base, function_map, flat_index_by_symbol)?;
+                remap_stmt_indices(
+                    stmt,
+                    local_base,
+                    node_offset,
+                    function_map,
+                    flat_index_by_symbol,
+                )?;
             }
         }
         Stmt::Break { .. } | Stmt::Continue { .. } => {}
@@ -731,6 +867,7 @@ fn remap_stmt_indices(
 fn remap_expr_indices(
     expr: &mut Expr,
     local_base: usize,
+    node_offset: u32,
     function_map: &HashMap<u16, u16>,
     flat_index_by_symbol: &HashMap<SymbolId, u16>,
 ) -> Result<(), SourcePathError> {
@@ -777,7 +914,7 @@ fn remap_expr_indices(
                 message: "unresolved function value reference reached the module merge".to_string(),
             })));
         }
-        Expr::Call(index, _, args, _, _) => {
+        Expr::Call(index, _, args, _, semantic_id) => {
             if let Some(remapped_index) = function_map.get(index).copied() {
                 *index = remapped_index;
             } else if BuiltinFunction::from_call_index(*index).is_none() {
@@ -789,13 +926,26 @@ fn remap_expr_indices(
                         .to_string(),
                 })));
             }
+            rebase_semantic_id(semantic_id, node_offset);
             for arg in args {
-                remap_expr_indices(arg, local_base, function_map, flat_index_by_symbol)?;
+                remap_expr_indices(
+                    arg,
+                    local_base,
+                    node_offset,
+                    function_map,
+                    flat_index_by_symbol,
+                )?;
             }
         }
         Expr::ModuleCall(symbol, type_args, args, semantic_id) => {
             for arg in args.iter_mut() {
-                remap_expr_indices(arg, local_base, function_map, flat_index_by_symbol)?;
+                remap_expr_indices(
+                    arg,
+                    local_base,
+                    node_offset,
+                    function_map,
+                    flat_index_by_symbol,
+                )?;
             }
             let flat = flat_index_by_symbol.get(symbol).copied().ok_or_else(|| {
                 SourcePathError::Source(SourceError::Parse(ParseError {
@@ -812,7 +962,7 @@ fn remap_expr_indices(
                 std::mem::take(type_args),
                 std::mem::take(args),
                 None,
-                *semantic_id,
+                rebase_optional_semantic_id(*semantic_id, node_offset),
             );
         }
         Expr::OptionalGet {
@@ -823,8 +973,20 @@ fn remap_expr_indices(
         } => {
             *container_slot = remap_local_index(*container_slot, local_base)?;
             *key_slot = remap_local_index(*key_slot, local_base)?;
-            remap_expr_indices(container, local_base, function_map, flat_index_by_symbol)?;
-            remap_expr_indices(key, local_base, function_map, flat_index_by_symbol)?;
+            remap_expr_indices(
+                container,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
+            remap_expr_indices(
+                key,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
         }
         Expr::OptionUnwrapOr {
             value,
@@ -832,13 +994,32 @@ fn remap_expr_indices(
             fallback,
         } => {
             *value_slot = remap_local_index(*value_slot, local_base)?;
-            remap_expr_indices(value, local_base, function_map, flat_index_by_symbol)?;
-            remap_expr_indices(fallback, local_base, function_map, flat_index_by_symbol)?;
+            remap_expr_indices(
+                value,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
+            remap_expr_indices(
+                fallback,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
         }
-        Expr::LocalCall(index, _, args, _) => {
+        Expr::LocalCall(index, _, args, semantic_id) => {
             *index = remap_local_index(*index, local_base)?;
+            rebase_semantic_id(semantic_id, node_offset);
             for arg in args {
-                remap_expr_indices(arg, local_base, function_map, flat_index_by_symbol)?;
+                remap_expr_indices(
+                    arg,
+                    local_base,
+                    node_offset,
+                    function_map,
+                    flat_index_by_symbol,
+                )?;
             }
         }
         Expr::Closure(closure) => {
@@ -852,6 +1033,7 @@ fn remap_expr_indices(
             remap_expr_indices(
                 &mut closure.body,
                 local_base,
+                node_offset,
                 function_map,
                 flat_index_by_symbol,
             )?;
@@ -867,11 +1049,18 @@ fn remap_expr_indices(
             remap_expr_indices(
                 &mut closure.body,
                 local_base,
+                node_offset,
                 function_map,
                 flat_index_by_symbol,
             )?;
             for arg in args {
-                remap_expr_indices(arg, local_base, function_map, flat_index_by_symbol)?;
+                remap_expr_indices(
+                    arg,
+                    local_base,
+                    node_offset,
+                    function_map,
+                    flat_index_by_symbol,
+                )?;
             }
         }
         Expr::Add(lhs, rhs)
@@ -884,15 +1073,33 @@ fn remap_expr_indices(
         | Expr::Eq(lhs, rhs)
         | Expr::Lt(lhs, rhs)
         | Expr::Gt(lhs, rhs) => {
-            remap_expr_indices(lhs, local_base, function_map, flat_index_by_symbol)?;
-            remap_expr_indices(rhs, local_base, function_map, flat_index_by_symbol)?;
+            remap_expr_indices(
+                lhs,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
+            remap_expr_indices(
+                rhs,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
         }
         Expr::Neg(inner)
         | Expr::Not(inner)
         | Expr::ToOwned(inner)
         | Expr::Borrow(inner)
         | Expr::BorrowMut(inner) => {
-            remap_expr_indices(inner, local_base, function_map, flat_index_by_symbol)?;
+            remap_expr_indices(
+                inner,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
         }
         Expr::Var(index) | Expr::MoveVar(index) => {
             *index = remap_local_index(*index, local_base)?;
@@ -905,9 +1112,27 @@ fn remap_expr_indices(
             then_expr,
             else_expr,
         } => {
-            remap_expr_indices(condition, local_base, function_map, flat_index_by_symbol)?;
-            remap_expr_indices(then_expr, local_base, function_map, flat_index_by_symbol)?;
-            remap_expr_indices(else_expr, local_base, function_map, flat_index_by_symbol)?;
+            remap_expr_indices(
+                condition,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
+            remap_expr_indices(
+                then_expr,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
+            remap_expr_indices(
+                else_expr,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
         }
         Expr::Match {
             value_slot,
@@ -918,23 +1143,75 @@ fn remap_expr_indices(
         } => {
             *value_slot = remap_local_index(*value_slot, local_base)?;
             *result_slot = remap_local_index(*result_slot, local_base)?;
-            remap_expr_indices(value, local_base, function_map, flat_index_by_symbol)?;
+            remap_expr_indices(
+                value,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
             for (pattern, arm_expr) in arms {
                 if let crate::compiler::ir::MatchPattern::SomeBinding(binding_slot) = pattern {
                     *binding_slot = remap_local_index(*binding_slot, local_base)?;
                 }
-                remap_expr_indices(arm_expr, local_base, function_map, flat_index_by_symbol)?;
+                remap_expr_indices(
+                    arm_expr,
+                    local_base,
+                    node_offset,
+                    function_map,
+                    flat_index_by_symbol,
+                )?;
             }
-            remap_expr_indices(default, local_base, function_map, flat_index_by_symbol)?;
+            remap_expr_indices(
+                default,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
         }
         Expr::Block { stmts, expr } => {
             for stmt in stmts {
-                remap_stmt_indices(stmt, local_base, function_map, flat_index_by_symbol)?;
+                remap_stmt_indices(
+                    stmt,
+                    local_base,
+                    node_offset,
+                    function_map,
+                    flat_index_by_symbol,
+                )?;
             }
-            remap_expr_indices(expr, local_base, function_map, flat_index_by_symbol)?;
+            remap_expr_indices(
+                expr,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
         }
     }
     Ok(())
+}
+
+/// Rebase a parser-assigned call-site [`SemanticNodeId`] by the unit's node
+/// offset so merged IR from multiple units stays collision-free.
+fn rebase_semantic_id(semantic_id: &mut Option<SemanticNodeId>, node_offset: u32) {
+    if let Some(id) = semantic_id.as_mut() {
+        id.0 =
+            id.0.checked_add(node_offset)
+                .expect("semantic node id overflow");
+    }
+}
+
+fn rebase_optional_semantic_id(
+    semantic_id: Option<SemanticNodeId>,
+    node_offset: u32,
+) -> Option<SemanticNodeId> {
+    semantic_id.map(|mut id| {
+        id.0 =
+            id.0.checked_add(node_offset)
+                .expect("semantic node id overflow");
+        id
+    })
 }
 
 /// Borrow the type arguments of a resolved function-value node.
@@ -945,6 +1222,293 @@ fn expr_type_args(expr: &mut Expr) -> Vec<super::ir::TypeSchema> {
     match expr {
         Expr::ModuleFunctionRef(_, type_args) => std::mem::take(type_args),
         _ => Vec::new(),
+    }
+}
+
+/// Rebase one unit's parser provenance onto the merged id space.
+///
+/// Every parser-produced [`SemanticNodeId`] and [`ScopeId`] starts at zero
+/// per unit; adding the running merged totals yields a collision-free merged
+/// index that preserves each unit's internal ordering. Local slots are
+/// remapped by the unit's `local_base` and function indices through the
+/// unit's `function_map` exactly like the IR statements they describe, so
+/// the merged index stays consistent with the merged `Expr`/`Stmt` trees.
+/// Spans are copied verbatim — their `source_id` already names the owning
+/// compilation-wide source and must never be rewritten.
+fn rebase_parsed_semantic_index(
+    unit: &ParsedSemanticIndex,
+    node_offset: u32,
+    scope_offset: u32,
+    local_base: usize,
+    function_map: &HashMap<u16, u16>,
+) -> Result<ParsedSemanticIndex, SourcePathError> {
+    let remap_node = |id: SemanticNodeId| -> SemanticNodeId {
+        SemanticNodeId(
+            id.0.checked_add(node_offset)
+                .expect("semantic node id overflow"),
+        )
+    };
+    let remap_scope = |id: ScopeId| id.checked_add(scope_offset).expect("scope id overflow");
+    let remap_slot = |slot: LocalSlot| remap_local_index(slot, local_base);
+    // Remap a recorded unit-local function index through the unit's flat
+    // `function_map`. Indices the map does not cover are either builtins
+    // (which keep their reserved index space) or implicit-extern indices from
+    // loader-resolved module calls. The latter are never rewritten by the
+    // loader — the call-site *target* is upgraded to `Module(symbol)` for the
+    // actual call, while an orphaned `func_ref`/`func_decl` for the resolved
+    // decl keeps its unit-local index. Those are preserved verbatim: the
+    // merged flat index is unknowable for a symbol-less decl, and the merged
+    // IR carries the correct flat target on the lowered `Expr::Call` node.
+    let remap_function = |index: u16| -> u16 {
+        if let Some(remapped) = function_map.get(&index).copied() {
+            return remapped;
+        }
+        index
+    };
+
+    let mut call_sites = Vec::with_capacity(unit.call_sites.len());
+    for site in &unit.call_sites {
+        let target = match site.target {
+            ParsedCallTarget::Function(index) => ParsedCallTarget::Function(remap_function(index)),
+            ParsedCallTarget::Local(slot) => ParsedCallTarget::Local(remap_slot(slot)?),
+            // Module targets carry a compilation-wide [`SymbolId`]; the
+            // merged IR keeps the symbol identity, so no remap applies.
+            ParsedCallTarget::Module(symbol) => ParsedCallTarget::Module(symbol),
+            ParsedCallTarget::Unresolved => ParsedCallTarget::Unresolved,
+        };
+        call_sites.push(ParsedCallSite {
+            id: remap_node(site.id),
+            callee_span: site.callee_span,
+            expr_span: site.expr_span,
+            target,
+            name: site.name.clone(),
+            scope_id: remap_scope(site.scope_id),
+            is_namespace_call: site.is_namespace_call,
+        });
+    }
+
+    let mut local_decls = Vec::with_capacity(unit.local_decls.len());
+    for decl in &unit.local_decls {
+        local_decls.push(LocalDeclSite {
+            id: remap_node(decl.id),
+            ident_span: decl.ident_span,
+            stmt_span: decl.stmt_span,
+            slot: remap_slot(decl.slot)?,
+            name: decl.name.clone(),
+            scope_id: remap_scope(decl.scope_id),
+            decl_order: decl.decl_order,
+        });
+    }
+
+    let mut local_refs = Vec::with_capacity(unit.local_refs.len());
+    for reference in &unit.local_refs {
+        local_refs.push(LocalRefSite {
+            id: remap_node(reference.id),
+            ident_span: reference.ident_span,
+            slot: remap_slot(reference.slot)?,
+            name: reference.name.clone(),
+            scope_id: remap_scope(reference.scope_id),
+        });
+    }
+
+    let mut func_decls = Vec::with_capacity(unit.func_decls.len());
+    for decl in &unit.func_decls {
+        func_decls.push(FunctionDeclSite {
+            id: remap_node(decl.id),
+            ident_span: decl.ident_span,
+            function_index: remap_function(decl.function_index),
+            name: decl.name.clone(),
+            scope_id: remap_scope(decl.scope_id),
+            decl_order: decl.decl_order,
+        });
+    }
+
+    let mut func_refs = Vec::with_capacity(unit.func_refs.len());
+    for reference in &unit.func_refs {
+        func_refs.push(FunctionRefSite {
+            id: remap_node(reference.id),
+            ident_span: reference.ident_span,
+            function_index: remap_function(reference.function_index),
+            name: reference.name.clone(),
+            scope_id: remap_scope(reference.scope_id),
+        });
+    }
+
+    let mut scopes = Vec::with_capacity(unit.scopes.len());
+    for scope in &unit.scopes {
+        let mut declarations = Vec::with_capacity(scope.declarations.len());
+        for slot in &scope.declarations {
+            declarations.push(remap_slot(*slot)?);
+        }
+        let mut functions = Vec::with_capacity(scope.functions.len());
+        for index in &scope.functions {
+            functions.push(remap_function(*index));
+        }
+        scopes.push(ParsedLexicalScope {
+            id: remap_scope(scope.id),
+            parent: scope.parent.map(remap_scope),
+            range: scope.range,
+            declarations,
+            functions,
+        });
+    }
+
+    Ok(ParsedSemanticIndex {
+        call_sites,
+        local_decls,
+        local_refs,
+        func_decls,
+        func_refs,
+        scopes,
+        next_node_id: unit.next_node_id + node_offset,
+        next_scope_id: unit.next_scope_id + scope_offset,
+    })
+}
+
+/// Append one rebased unit index onto the merged carrier. The rebased unit's
+/// ids occupy the contiguous range starting at the previous merged totals, so
+/// appending preserves collision-freedom and the running `next_*` counters.
+fn merge_parsed_semantic_index(merged: &mut ParsedSemanticIndex, unit: ParsedSemanticIndex) {
+    debug_assert!(merged.next_node_id <= unit.next_node_id);
+    debug_assert!(merged.next_scope_id <= unit.next_scope_id);
+    merged.call_sites.extend(unit.call_sites);
+    merged.local_decls.extend(unit.local_decls);
+    merged.local_refs.extend(unit.local_refs);
+    merged.func_decls.extend(unit.func_decls);
+    merged.func_refs.extend(unit.func_refs);
+    merged.scopes.extend(unit.scopes);
+    merged.next_node_id = unit.next_node_id;
+    merged.next_scope_id = unit.next_scope_id;
+}
+
+/// Merge one unit's parser visibility onto the compilation-wide carrier.
+///
+/// Host namespace and direct host call aliases map to global canonical host
+/// names, so an alias present in two units must map to the identical target
+/// (deduplicated) or the merge fails with a typed [`SourcePathError`].
+/// Module namespace aliases are different: their canonical values are
+/// module-relative import paths (`c` vs `self::c` name the same module from
+/// different importers), so the same alias legitimately carries different
+/// spellings across units. They merge by alias-name deduplication only —
+/// the first spelling wins and later identical entries collapse; differing
+/// spellings are not a conflict. Wildcard import sets are deduplicated
+/// unions. Structured `use` declarations are appended with exact (path,
+/// clause) duplicates dropped; spans are never compared, so identical
+/// directives from different sources collapse to one entry.
+fn merge_catalog_visibility(
+    merged: &mut CatalogVisibility,
+    unit: &CatalogVisibility,
+    source_name: &str,
+) -> Result<(), SourcePathError> {
+    merge_alias_vec(
+        &mut merged.host_namespace_aliases,
+        &unit.host_namespace_aliases,
+        source_name,
+        "host namespace",
+    )?;
+    merge_alias_vec(
+        &mut merged.direct_host_call_aliases,
+        &unit.direct_host_call_aliases,
+        source_name,
+        "direct host call",
+    )?;
+    // Module namespace aliases are module-relative; dedupe by alias name
+    // only (first spelling wins) so valid multi-unit programs never fail.
+    for (alias, canonical) in &unit.module_namespace_aliases {
+        if !merged
+            .module_namespace_aliases
+            .iter()
+            .any(|(name, _)| name == alias)
+        {
+            merged
+                .module_namespace_aliases
+                .push((alias.clone(), canonical.clone()));
+        }
+    }
+    for prefix in &unit.direct_host_wildcard_imports {
+        if !merged.direct_host_wildcard_imports.contains(prefix) {
+            merged.direct_host_wildcard_imports.push(prefix.clone());
+        }
+    }
+    for decl in &unit.use_declarations {
+        if !merged
+            .use_declarations
+            .iter()
+            .any(|existing| use_decl_semantic_eq(existing, decl))
+        {
+            merged.use_declarations.push(decl.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Deterministically merge one alias vector: identical entries deduplicate,
+/// conflicting aliases (same name, different canonical target) error.
+fn merge_alias_vec(
+    merged: &mut Vec<(String, String)>,
+    unit: &[(String, String)],
+    source_name: &str,
+    kind: &str,
+) -> Result<(), SourcePathError> {
+    for (alias, canonical) in unit {
+        if let Some((_, existing)) = merged.iter().find(|(name, _)| name == alias) {
+            if existing != canonical {
+                return Err(SourcePathError::Source(SourceError::Parse(ParseError {
+                    span: None,
+                    code: None,
+                    line: 1,
+                    message: format!(
+                        "catalog alias conflict ({source_name}): {kind} alias '{alias}' maps to both '{existing}' and '{canonical}'"
+                    ),
+                })));
+            }
+            continue;
+        }
+        merged.push((alias.clone(), canonical.clone()));
+    }
+    Ok(())
+}
+
+/// Semantic equality of two `use` directives: identical path and clause.
+/// Spans and lines are per-source and never compared.
+fn use_decl_semantic_eq(
+    lhs: &crate::compiler::modules::UseDecl,
+    rhs: &crate::compiler::modules::UseDecl,
+) -> bool {
+    use crate::compiler::source_loader::ImportClause;
+    let path_eq = lhs.path.len() == rhs.path.len()
+        && lhs
+            .path
+            .iter()
+            .zip(rhs.path.iter())
+            .all(|(a, b)| use_path_segment_eq(a, b));
+    if !path_eq {
+        return false;
+    }
+    match (&lhs.clause, &rhs.clause) {
+        (ImportClause::AllPublic, ImportClause::AllPublic) => true,
+        (ImportClause::Namespace(a), ImportClause::Namespace(b)) => a == b,
+        (ImportClause::Prefix(a), ImportClause::Prefix(b)) => a == b,
+        (ImportClause::Named(a), ImportClause::Named(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(x, y)| x.imported == y.imported && x.local == y.local)
+        }
+        _ => false,
+    }
+}
+
+fn use_path_segment_eq(
+    lhs: &crate::compiler::modules::UsePathSegment,
+    rhs: &crate::compiler::modules::UsePathSegment,
+) -> bool {
+    use crate::compiler::modules::UsePathSegment;
+    match (lhs, rhs) {
+        (UsePathSegment::Self_, UsePathSegment::Self_) => true,
+        (UsePathSegment::Super, UsePathSegment::Super) => true,
+        (UsePathSegment::Ident(a), UsePathSegment::Ident(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -1414,7 +1978,7 @@ mod linker_metadata_remap_tests {
             Expr::Call(7, Vec::new(), Vec::new(), Some(Box::new(res.clone())), None);
         let mut function_map = HashMap::new();
         function_map.insert(7u16, 11u16);
-        remap_expr_indices(&mut annotated, 0, &function_map, &HashMap::new()).unwrap();
+        remap_expr_indices(&mut annotated, 0, 0, &function_map, &HashMap::new()).unwrap();
         let Expr::Call(flat, _, _, resolution, _) = annotated else {
             panic!("expected a Call");
         };
@@ -1422,5 +1986,846 @@ mod linker_metadata_remap_tests {
         // The remap rewrote the flat index but must carry the resolution.
         assert_eq!(resolution.as_deref().unwrap().name, "read");
         assert_eq!(resolution, Some(Box::new(res)));
+    }
+}
+
+#[cfg(test)]
+mod linker_provenance_merge_tests {
+    use super::super::ir::{ParsedCallTarget, ParsedLexicalScope, ParsedSemanticIndex};
+    use super::super::modules::{ModuleId, SymbolId};
+    use super::*;
+
+    fn symbol(module: u32, index: u32) -> SymbolId {
+        SymbolId {
+            module: ModuleId(module),
+            index,
+        }
+    }
+
+    fn decl(index: u16, name: &str, module: u32) -> FunctionDecl {
+        FunctionDecl {
+            name: name.to_string(),
+            arity: 0,
+            index,
+            args: Vec::new(),
+            arg_schemas: Vec::new(),
+            return_schema: None,
+            type_params: Vec::new(),
+            exported: false,
+            return_type: crate::ValueType::Int,
+            symbol: Some(symbol(module, index as u32)),
+        }
+    }
+
+    fn simple_impl() -> FunctionImpl {
+        FunctionImpl {
+            param_slots: Vec::new(),
+            capture_copies: Vec::new(),
+            body_stmts: Vec::new(),
+            body_expr: Expr::Int(1),
+            body_expr_line: 1,
+        }
+    }
+
+    fn unit_with_semantic(
+        source_name: &str,
+        module: u32,
+        source_id: u32,
+        locals: usize,
+        functions: Vec<FunctionDecl>,
+        function_impls: HashMap<u16, FunctionImpl>,
+        parsed: ParsedSemanticIndex,
+        visibility: CatalogVisibility,
+    ) -> ParsedUnit {
+        ParsedUnit {
+            parsed: FrontendIr {
+                stmts: Vec::new(),
+                locals,
+                local_bindings: Vec::new(),
+                struct_schemas: HashMap::new(),
+                unknown_type_spans: Vec::new(),
+                functions,
+                function_impls,
+                stmt_sources: Vec::new(),
+                function_sources: HashMap::new(),
+                use_declarations: Vec::new(),
+                implicit_extern_names: Vec::new(),
+                host_api_metadata: None,
+                semantic_index: None,
+                parsed_semantic_index: Some(parsed),
+                catalog_visibility: Some(visibility),
+            },
+            source_name: source_name.to_string(),
+            scope_identity: None,
+            module: ModuleId(module),
+            source_id,
+        }
+    }
+
+    fn span(source_id: u32, lo: usize, hi: usize) -> crate::compiler::source_map::Span {
+        crate::compiler::source_map::Span::new(source_id, lo, hi)
+    }
+
+    /// A parsed index whose call sites, decls, refs, and scopes all start at
+    /// id 0 — the shape every real parser-produced unit has. The call-site
+    /// target and function refs reference unit function index 0 (the single
+    /// declared function), which the unit's `function_map` covers. Spans are
+    /// written against `source_id`, mirroring a unit parsed with that id.
+    fn two_node_index(
+        source_id: u32,
+        next_node_id: u32,
+        next_scope_id: u32,
+    ) -> ParsedSemanticIndex {
+        ParsedSemanticIndex {
+            call_sites: vec![ParsedCallSite {
+                id: SemanticNodeId(0),
+                callee_span: span(source_id, 0, 3),
+                expr_span: span(source_id, 0, 6),
+                target: ParsedCallTarget::Function(0),
+                name: "f".to_string(),
+                scope_id: 0,
+                is_namespace_call: false,
+            }],
+            local_decls: vec![LocalDeclSite {
+                id: SemanticNodeId(1),
+                ident_span: span(source_id, 10, 11),
+                stmt_span: span(source_id, 8, 20),
+                slot: LocalSlot::try_from(0).unwrap(),
+                name: "x".to_string(),
+                scope_id: 0,
+                decl_order: 0,
+            }],
+            local_refs: vec![LocalRefSite {
+                id: SemanticNodeId(2),
+                ident_span: span(source_id, 15, 16),
+                slot: LocalSlot::try_from(0).unwrap(),
+                name: "x".to_string(),
+                scope_id: 0,
+            }],
+            func_decls: vec![FunctionDeclSite {
+                id: SemanticNodeId(3),
+                ident_span: span(source_id, 0, 1),
+                function_index: 0,
+                name: "f".to_string(),
+                scope_id: 0,
+                decl_order: 0,
+            }],
+            func_refs: vec![FunctionRefSite {
+                id: SemanticNodeId(4),
+                ident_span: span(source_id, 0, 1),
+                function_index: 0,
+                name: "f".to_string(),
+                scope_id: 0,
+            }],
+            scopes: vec![ParsedLexicalScope {
+                id: 0,
+                parent: None,
+                range: span(source_id, 0, 30),
+                declarations: vec![LocalSlot::try_from(0).unwrap()],
+                functions: vec![0],
+            }],
+            next_node_id,
+            next_scope_id,
+        }
+    }
+
+    #[test]
+    fn two_units_rebase_node_and_scope_ids_collision_free() {
+        // Both units start their SemanticNodeId/ScopeId sequences at 0; the
+        // merged index must rebase the second unit so no id collides.
+        let f0 = decl(0, "f", 1);
+        let g0 = decl(0, "g", 2);
+        let a = unit_with_semantic(
+            "a.rss",
+            1,
+            1,
+            1,
+            vec![f0],
+            HashMap::from([(0u16, simple_impl())]),
+            two_node_index(1, 5, 1),
+            CatalogVisibility::default(),
+        );
+        let b = unit_with_semantic(
+            "b.rss",
+            2,
+            2,
+            1,
+            vec![g0],
+            HashMap::from([(0u16, simple_impl())]),
+            two_node_index(1, 5, 1),
+            CatalogVisibility::default(),
+        );
+
+        let merged = merge_units(vec![a, b]).expect("two-unit merge must succeed");
+        let index = merged
+            .parsed_semantic_index
+            .as_ref()
+            .expect("merged index present");
+        assert_eq!(index.next_node_id, 10, "two 5-id units");
+        assert_eq!(index.next_scope_id, 2, "two single-scope units");
+        assert_eq!(index.call_sites.len(), 2);
+        assert_eq!(index.local_decls.len(), 2);
+        assert_eq!(index.local_refs.len(), 2);
+        assert_eq!(index.func_decls.len(), 2);
+        assert_eq!(index.func_refs.len(), 2);
+        assert_eq!(index.scopes.len(), 2);
+
+        // First unit keeps its ids; the second unit is rebased by the first
+        // unit's totals (5 nodes, 1 scope).
+        assert_eq!(index.call_sites[0].id, SemanticNodeId(0));
+        assert_eq!(index.call_sites[1].id, SemanticNodeId(5));
+        assert_eq!(index.local_decls[1].id, SemanticNodeId(6));
+        assert_eq!(index.local_refs[1].id, SemanticNodeId(7));
+        assert_eq!(index.func_decls[1].id, SemanticNodeId(8));
+        assert_eq!(index.func_refs[1].id, SemanticNodeId(9));
+        assert_eq!(index.scopes[0].id, 0);
+        assert_eq!(index.scopes[1].id, 1);
+        assert_eq!(index.scopes[1].parent, None);
+    }
+
+    #[test]
+    fn two_units_remap_local_slots_by_unit_base() {
+        // Unit b's local slot 0 is rebased onto merged slot 1 (after unit a's
+        // single local). Call targets and scope declaration lists follow.
+        let a = unit_with_semantic(
+            "a.rss",
+            1,
+            1,
+            1,
+            vec![decl(0, "f", 1)],
+            HashMap::from([(0u16, simple_impl())]),
+            two_node_index(1, 5, 1),
+            CatalogVisibility::default(),
+        );
+        let b = unit_with_semantic(
+            "b.rss",
+            2,
+            2,
+            1,
+            vec![decl(0, "g", 2)],
+            HashMap::from([(0u16, simple_impl())]),
+            two_node_index(1, 5, 1),
+            CatalogVisibility::default(),
+        );
+
+        let merged = merge_units(vec![a, b]).expect("two-unit merge must succeed");
+        let index = merged
+            .parsed_semantic_index
+            .as_ref()
+            .expect("merged index present");
+        // Unit a's decl/ref slot 0 stays 0; unit b's becomes 1.
+        assert_eq!(index.local_decls[0].slot, LocalSlot::try_from(0).unwrap());
+        assert_eq!(index.local_decls[1].slot, LocalSlot::try_from(1).unwrap());
+        assert_eq!(index.local_refs[0].slot, LocalSlot::try_from(0).unwrap());
+        assert_eq!(index.local_refs[1].slot, LocalSlot::try_from(1).unwrap());
+        assert_eq!(
+            index.scopes[0].declarations[0],
+            LocalSlot::try_from(0).unwrap()
+        );
+        assert_eq!(
+            index.scopes[1].declarations[0],
+            LocalSlot::try_from(1).unwrap()
+        );
+        // The second unit's call target Function(1) maps to its merged flat
+        // index 1 (unit b's only function becomes flat index 1).
+        match index.call_sites[1].target {
+            ParsedCallTarget::Function(flat) => assert_eq!(flat, 1),
+            ref other => panic!("expected Function target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_units_remap_function_indices_through_function_map() {
+        // Unit a declares f at unit index 3, unit b declares g at unit index
+        // 5. The merged flat table assigns 0 and 1; decl sites, ref sites,
+        // call targets, and scope function lists all follow the map.
+        let f3 = decl(3, "f", 1);
+        let g5 = decl(5, "g", 2);
+        let index_a = ParsedSemanticIndex {
+            call_sites: vec![ParsedCallSite {
+                id: SemanticNodeId(0),
+                callee_span: span(1, 0, 3),
+                expr_span: span(1, 0, 6),
+                target: ParsedCallTarget::Function(3),
+                name: "f".to_string(),
+                scope_id: 0,
+                is_namespace_call: false,
+            }],
+            local_decls: Vec::new(),
+            local_refs: Vec::new(),
+            func_decls: vec![FunctionDeclSite {
+                id: SemanticNodeId(1),
+                ident_span: span(1, 0, 1),
+                function_index: 3,
+                name: "f".to_string(),
+                scope_id: 0,
+                decl_order: 0,
+            }],
+            func_refs: vec![FunctionRefSite {
+                id: SemanticNodeId(2),
+                ident_span: span(1, 0, 1),
+                function_index: 3,
+                name: "f".to_string(),
+                scope_id: 0,
+            }],
+            scopes: vec![ParsedLexicalScope {
+                id: 0,
+                parent: None,
+                range: span(1, 0, 10),
+                declarations: Vec::new(),
+                functions: vec![3],
+            }],
+            next_node_id: 3,
+            next_scope_id: 1,
+        };
+        let index_b = ParsedSemanticIndex {
+            call_sites: Vec::new(),
+            local_decls: Vec::new(),
+            local_refs: Vec::new(),
+            func_decls: vec![FunctionDeclSite {
+                id: SemanticNodeId(0),
+                ident_span: span(2, 0, 1),
+                function_index: 5,
+                name: "g".to_string(),
+                scope_id: 0,
+                decl_order: 0,
+            }],
+            func_refs: Vec::new(),
+            scopes: vec![ParsedLexicalScope {
+                id: 0,
+                parent: None,
+                range: span(2, 0, 10),
+                declarations: Vec::new(),
+                functions: vec![5],
+            }],
+            next_node_id: 1,
+            next_scope_id: 1,
+        };
+        let a = unit_with_semantic(
+            "a.rss",
+            1,
+            1,
+            0,
+            vec![f3],
+            HashMap::from([(3u16, simple_impl())]),
+            index_a,
+            CatalogVisibility::default(),
+        );
+        let b = unit_with_semantic(
+            "b.rss",
+            2,
+            2,
+            0,
+            vec![g5],
+            HashMap::from([(5u16, simple_impl())]),
+            index_b,
+            CatalogVisibility::default(),
+        );
+
+        let merged = merge_units(vec![a, b]).expect("two-unit merge must succeed");
+        let index = merged
+            .parsed_semantic_index
+            .as_ref()
+            .expect("merged index present");
+        assert_eq!(merged.functions.len(), 2);
+        assert_eq!(index.func_decls[0].function_index, 0, "a's f -> flat 0");
+        assert_eq!(index.func_decls[1].function_index, 1, "b's g -> flat 1");
+        assert_eq!(index.func_refs[0].function_index, 0);
+        match index.call_sites[0].target {
+            ParsedCallTarget::Function(flat) => assert_eq!(flat, 0),
+            ref other => panic!("expected Function target, got {other:?}"),
+        }
+        assert_eq!(index.scopes[0].functions, vec![0]);
+        assert_eq!(index.scopes[1].functions, vec![1]);
+    }
+
+    #[test]
+    fn two_units_preserve_span_source_ids() {
+        // Every span keeps the source_id it was parsed with; the merge never
+        // rewrites span provenance.
+        let a = unit_with_semantic(
+            "a.rss",
+            1,
+            7,
+            1,
+            vec![decl(0, "f", 1)],
+            HashMap::from([(0u16, simple_impl())]),
+            two_node_index(7, 5, 1),
+            CatalogVisibility::default(),
+        );
+        let b = unit_with_semantic(
+            "b.rss",
+            2,
+            9,
+            1,
+            vec![decl(0, "g", 2)],
+            HashMap::from([(0u16, simple_impl())]),
+            two_node_index(9, 5, 1),
+            CatalogVisibility::default(),
+        );
+
+        let merged = merge_units(vec![a, b]).expect("two-unit merge must succeed");
+        let index = merged
+            .parsed_semantic_index
+            .as_ref()
+            .expect("merged index present");
+        assert_eq!(index.call_sites[0].callee_span.source_id, 7);
+        assert_eq!(index.call_sites[1].callee_span.source_id, 9);
+        assert_eq!(index.local_decls[0].ident_span.source_id, 7);
+        assert_eq!(index.local_decls[1].ident_span.source_id, 9);
+        assert_eq!(index.scopes[0].range.source_id, 7);
+        assert_eq!(index.scopes[1].range.source_id, 9);
+        assert_eq!(index.func_decls[1].ident_span.source_id, 9);
+    }
+
+    #[test]
+    fn merged_expression_semantic_ids_match_rebased_index() {
+        // A call in each unit's function body carries the parser's id; the
+        // merge rebases both the Expr node and the parsed index identically.
+        let f_impl = FunctionImpl {
+            param_slots: Vec::new(),
+            capture_copies: Vec::new(),
+            body_stmts: Vec::new(),
+            body_expr: Expr::Call(0, Vec::new(), Vec::new(), None, Some(SemanticNodeId(0))),
+            body_expr_line: 1,
+        };
+        let g_impl = FunctionImpl {
+            param_slots: Vec::new(),
+            capture_copies: Vec::new(),
+            body_stmts: Vec::new(),
+            body_expr: Expr::Call(0, Vec::new(), Vec::new(), None, Some(SemanticNodeId(0))),
+            body_expr_line: 1,
+        };
+        let index_a = ParsedSemanticIndex {
+            call_sites: vec![ParsedCallSite {
+                id: SemanticNodeId(0),
+                callee_span: span(1, 0, 3),
+                expr_span: span(1, 0, 6),
+                target: ParsedCallTarget::Function(0),
+                name: "f".to_string(),
+                scope_id: 0,
+                is_namespace_call: false,
+            }],
+            local_decls: Vec::new(),
+            local_refs: Vec::new(),
+            func_decls: Vec::new(),
+            func_refs: Vec::new(),
+            scopes: Vec::new(),
+            next_node_id: 1,
+            next_scope_id: 0,
+        };
+        let index_b = ParsedSemanticIndex {
+            call_sites: vec![ParsedCallSite {
+                id: SemanticNodeId(0),
+                callee_span: span(2, 0, 3),
+                expr_span: span(2, 0, 6),
+                target: ParsedCallTarget::Function(0),
+                name: "g".to_string(),
+                scope_id: 0,
+                is_namespace_call: false,
+            }],
+            local_decls: Vec::new(),
+            local_refs: Vec::new(),
+            func_decls: Vec::new(),
+            func_refs: Vec::new(),
+            scopes: Vec::new(),
+            next_node_id: 1,
+            next_scope_id: 0,
+        };
+        let a = unit_with_semantic(
+            "a.rss",
+            1,
+            1,
+            0,
+            vec![decl(0, "f", 1)],
+            HashMap::from([(0u16, f_impl)]),
+            index_a,
+            CatalogVisibility::default(),
+        );
+        let b = unit_with_semantic(
+            "b.rss",
+            2,
+            2,
+            0,
+            vec![decl(0, "g", 2)],
+            HashMap::from([(0u16, g_impl)]),
+            index_b,
+            CatalogVisibility::default(),
+        );
+
+        let merged = merge_units(vec![a, b]).expect("two-unit merge must succeed");
+        let index = merged
+            .parsed_semantic_index
+            .as_ref()
+            .expect("merged index present");
+        assert_eq!(index.call_sites[0].id, SemanticNodeId(0));
+        assert_eq!(index.call_sites[1].id, SemanticNodeId(1));
+        // The Expr node in unit b's merged function body carries the rebased
+        // id, matching the rebased index entry.
+        let g_flat = merged
+            .functions
+            .iter()
+            .find(|function| function.name == "g")
+            .expect("g flat entry")
+            .index;
+        let merged_impl = &merged.function_impls[&g_flat];
+        match &merged_impl.body_expr {
+            Expr::Call(_, _, _, _, semantic_id) => {
+                assert_eq!(*semantic_id, Some(SemanticNodeId(1)));
+            }
+            other => panic!("expected Call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn module_call_target_symbols_survive_merge() {
+        // ParsedCallTarget::Module carries a compilation-wide SymbolId that
+        // needs no rebase; the merged index preserves it verbatim.
+        let target = symbol(3, 7);
+        let index_a = ParsedSemanticIndex {
+            call_sites: vec![ParsedCallSite {
+                id: SemanticNodeId(0),
+                callee_span: span(1, 0, 10),
+                expr_span: span(1, 0, 14),
+                target: ParsedCallTarget::Module(target),
+                name: "au::helper".to_string(),
+                scope_id: 0,
+                is_namespace_call: true,
+            }],
+            local_decls: Vec::new(),
+            local_refs: Vec::new(),
+            func_decls: Vec::new(),
+            func_refs: Vec::new(),
+            scopes: Vec::new(),
+            next_node_id: 1,
+            next_scope_id: 0,
+        };
+        let a = unit_with_semantic(
+            "a.rss",
+            1,
+            1,
+            0,
+            vec![decl(0, "f", 1)],
+            HashMap::from([(0u16, simple_impl())]),
+            index_a,
+            CatalogVisibility::default(),
+        );
+        let b = unit_with_semantic(
+            "b.rss",
+            2,
+            2,
+            0,
+            vec![decl(0, "g", 2)],
+            HashMap::from([(0u16, simple_impl())]),
+            two_node_index(1, 5, 1),
+            CatalogVisibility::default(),
+        );
+
+        let merged = merge_units(vec![a, b]).expect("two-unit merge must succeed");
+        let index = merged
+            .parsed_semantic_index
+            .as_ref()
+            .expect("merged index present");
+        assert_eq!(index.call_sites[0].target, ParsedCallTarget::Module(target));
+        // The second unit's site rebased normally.
+        assert_eq!(index.call_sites[1].id, SemanticNodeId(1));
+    }
+
+    #[test]
+    fn catalog_alias_vectors_dedupe_identically() {
+        let visibility_a = CatalogVisibility {
+            host_namespace_aliases: vec![("io".to_string(), "std::io".to_string())],
+            direct_host_call_aliases: vec![("read".to_string(), "io::read".to_string())],
+            direct_host_wildcard_imports: vec!["std::io".to_string()],
+            module_namespace_aliases: vec![("au".to_string(), "a/util".to_string())],
+            use_declarations: Vec::new(),
+        };
+        // Unit b repeats the identical aliases and wildcard import; the merge
+        // must collapse them, not duplicate or error.
+        let visibility_b = visibility_a.clone();
+        let a = unit_with_semantic(
+            "a.rss",
+            1,
+            1,
+            0,
+            vec![decl(0, "f", 1)],
+            HashMap::from([(0u16, simple_impl())]),
+            two_node_index(1, 5, 1),
+            visibility_a,
+        );
+        let b = unit_with_semantic(
+            "b.rss",
+            2,
+            2,
+            0,
+            vec![decl(0, "g", 2)],
+            HashMap::from([(0u16, simple_impl())]),
+            two_node_index(1, 5, 1),
+            visibility_b,
+        );
+
+        let merged = merge_units(vec![a, b]).expect("dedup merge must succeed");
+        let visibility = merged
+            .catalog_visibility
+            .as_ref()
+            .expect("merged visibility present");
+        assert_eq!(
+            visibility.host_namespace_aliases,
+            vec![("io".to_string(), "std::io".to_string())]
+        );
+        assert_eq!(visibility.direct_host_call_aliases.len(), 1);
+        assert_eq!(visibility.direct_host_wildcard_imports, vec!["std::io"]);
+        assert_eq!(visibility.module_namespace_aliases.len(), 1);
+    }
+
+    #[test]
+    fn catalog_alias_conflicts_error() {
+        let visibility_a = CatalogVisibility {
+            host_namespace_aliases: vec![("io".to_string(), "std::io".to_string())],
+            direct_host_call_aliases: Vec::new(),
+            direct_host_wildcard_imports: Vec::new(),
+            module_namespace_aliases: Vec::new(),
+            use_declarations: Vec::new(),
+        };
+        let visibility_b = CatalogVisibility {
+            host_namespace_aliases: vec![("io".to_string(), "other::io".to_string())],
+            direct_host_call_aliases: Vec::new(),
+            direct_host_wildcard_imports: Vec::new(),
+            module_namespace_aliases: Vec::new(),
+            use_declarations: Vec::new(),
+        };
+        let a = unit_with_semantic(
+            "a.rss",
+            1,
+            1,
+            0,
+            vec![decl(0, "f", 1)],
+            HashMap::from([(0u16, simple_impl())]),
+            two_node_index(1, 5, 1),
+            visibility_a,
+        );
+        let b = unit_with_semantic(
+            "b.rss",
+            2,
+            2,
+            0,
+            vec![decl(0, "g", 2)],
+            HashMap::from([(0u16, simple_impl())]),
+            two_node_index(1, 5, 1),
+            visibility_b,
+        );
+
+        let err = merge_units(vec![a, b]).expect_err("conflicting aliases must fail");
+        assert!(
+            err.to_string().contains("alias conflict"),
+            "unexpected: {err}"
+        );
+        assert!(
+            err.to_string().contains("host namespace alias 'io'"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn mixed_direct_alias_conflict_across_vectors() {
+        // Same alias name in a different vector is not a conflict: vectors
+        // are merged independently.
+        let visibility_a = CatalogVisibility {
+            host_namespace_aliases: vec![("io".to_string(), "std::io".to_string())],
+            direct_host_call_aliases: Vec::new(),
+            direct_host_wildcard_imports: Vec::new(),
+            module_namespace_aliases: Vec::new(),
+            use_declarations: Vec::new(),
+        };
+        let visibility_b = CatalogVisibility {
+            host_namespace_aliases: Vec::new(),
+            direct_host_call_aliases: vec![("io".to_string(), "io::open".to_string())],
+            direct_host_wildcard_imports: Vec::new(),
+            module_namespace_aliases: Vec::new(),
+            use_declarations: Vec::new(),
+        };
+        let a = unit_with_semantic(
+            "a.rss",
+            1,
+            1,
+            0,
+            vec![decl(0, "f", 1)],
+            HashMap::from([(0u16, simple_impl())]),
+            two_node_index(1, 5, 1),
+            visibility_a,
+        );
+        let b = unit_with_semantic(
+            "b.rss",
+            2,
+            2,
+            0,
+            vec![decl(0, "g", 2)],
+            HashMap::from([(0u16, simple_impl())]),
+            two_node_index(1, 5, 1),
+            visibility_b,
+        );
+
+        let merged = merge_units(vec![a, b]).expect("independent vectors must merge");
+        let visibility = merged
+            .catalog_visibility
+            .as_ref()
+            .expect("merged visibility present");
+        assert_eq!(visibility.host_namespace_aliases.len(), 1);
+        assert_eq!(visibility.direct_host_call_aliases.len(), 1);
+    }
+
+    #[test]
+    fn use_declarations_dedupe_by_path_and_clause() {
+        use crate::compiler::modules::{UseDecl, UsePathSegment};
+        use crate::compiler::source_loader::{ImportClause, NamedImport};
+        let make_decl = |source_id: u32, line: usize| UseDecl {
+            path: vec![
+                UsePathSegment::Ident("a".to_string()),
+                UsePathSegment::Ident("util".to_string()),
+            ],
+            clause: ImportClause::Named(vec![NamedImport {
+                imported: "helper".to_string(),
+                local: "h".to_string(),
+            }]),
+            span: span(source_id, 0, 20),
+            line,
+        };
+        let visibility_a = CatalogVisibility {
+            host_namespace_aliases: Vec::new(),
+            direct_host_call_aliases: Vec::new(),
+            direct_host_wildcard_imports: Vec::new(),
+            module_namespace_aliases: Vec::new(),
+            use_declarations: vec![make_decl(1, 2)],
+        };
+        let visibility_b = CatalogVisibility {
+            host_namespace_aliases: Vec::new(),
+            direct_host_call_aliases: Vec::new(),
+            direct_host_wildcard_imports: Vec::new(),
+            module_namespace_aliases: Vec::new(),
+            // Same path+clause, different span/line: must collapse.
+            use_declarations: vec![make_decl(2, 9)],
+        };
+        let a = unit_with_semantic(
+            "a.rss",
+            1,
+            1,
+            0,
+            vec![decl(0, "f", 1)],
+            HashMap::from([(0u16, simple_impl())]),
+            two_node_index(1, 5, 1),
+            visibility_a,
+        );
+        let b = unit_with_semantic(
+            "b.rss",
+            2,
+            2,
+            0,
+            vec![decl(0, "g", 2)],
+            HashMap::from([(0u16, simple_impl())]),
+            two_node_index(1, 5, 1),
+            visibility_b,
+        );
+
+        let merged = merge_units(vec![a, b]).expect("dedup merge must succeed");
+        let visibility = merged
+            .catalog_visibility
+            .as_ref()
+            .expect("merged visibility present");
+        assert_eq!(
+            visibility.use_declarations.len(),
+            1,
+            "identical directives collapse to one entry"
+        );
+    }
+
+    #[test]
+    fn distinct_use_declarations_are_both_kept() {
+        use crate::compiler::modules::{UseDecl, UsePathSegment};
+        use crate::compiler::source_loader::ImportClause;
+        let a_decl = UseDecl {
+            path: vec![UsePathSegment::Ident("a".to_string())],
+            clause: ImportClause::Namespace("au".to_string()),
+            span: span(1, 0, 20),
+            line: 2,
+        };
+        let b_decl = UseDecl {
+            path: vec![UsePathSegment::Ident("b".to_string())],
+            clause: ImportClause::Namespace("bu".to_string()),
+            span: span(2, 0, 20),
+            line: 3,
+        };
+        let visibility_a = CatalogVisibility {
+            host_namespace_aliases: Vec::new(),
+            direct_host_call_aliases: Vec::new(),
+            direct_host_wildcard_imports: Vec::new(),
+            module_namespace_aliases: Vec::new(),
+            use_declarations: vec![a_decl],
+        };
+        let visibility_b = CatalogVisibility {
+            host_namespace_aliases: Vec::new(),
+            direct_host_call_aliases: Vec::new(),
+            direct_host_wildcard_imports: Vec::new(),
+            module_namespace_aliases: Vec::new(),
+            use_declarations: vec![b_decl],
+        };
+        let a = unit_with_semantic(
+            "a.rss",
+            1,
+            1,
+            0,
+            vec![decl(0, "f", 1)],
+            HashMap::from([(0u16, simple_impl())]),
+            two_node_index(1, 5, 1),
+            visibility_a,
+        );
+        let b = unit_with_semantic(
+            "b.rss",
+            2,
+            2,
+            0,
+            vec![decl(0, "g", 2)],
+            HashMap::from([(0u16, simple_impl())]),
+            two_node_index(1, 5, 1),
+            visibility_b,
+        );
+
+        let merged = merge_units(vec![a, b]).expect("distinct directives must merge");
+        let visibility = merged
+            .catalog_visibility
+            .as_ref()
+            .expect("merged visibility present");
+        assert_eq!(visibility.use_declarations.len(), 2);
+    }
+
+    #[test]
+    fn units_without_provenance_leave_merged_carrier_none() {
+        // REPL/test fixtures carry no provenance; the merged IR must stay
+        // `None` for both carriers.
+        let a = ParsedUnit {
+            parsed: FrontendIr {
+                stmts: Vec::new(),
+                locals: 0,
+                local_bindings: Vec::new(),
+                struct_schemas: HashMap::new(),
+                unknown_type_spans: Vec::new(),
+                functions: vec![decl(0, "f", 1)],
+                function_impls: HashMap::from([(0u16, simple_impl())]),
+                stmt_sources: Vec::new(),
+                function_sources: HashMap::new(),
+                use_declarations: Vec::new(),
+                implicit_extern_names: Vec::new(),
+                host_api_metadata: None,
+                semantic_index: None,
+                parsed_semantic_index: None,
+                catalog_visibility: None,
+            },
+            source_name: "a.rss".to_string(),
+            scope_identity: None,
+            module: ModuleId(1),
+            source_id: 1,
+        };
+        let merged = merge_units(vec![a]).expect("provenance-less unit must merge");
+        assert!(merged.parsed_semantic_index.is_none());
+        assert!(merged.catalog_visibility.is_none());
     }
 }

@@ -597,9 +597,12 @@ mod tests {
 
     /// The parser-assigned semantic id of a module namespace / imported call
     /// survives the source-loader `Expr::Call -> Expr::ModuleCall` rewrite
-    /// and the linker's `Expr::ModuleCall -> Expr::Call` lowering with the
-    /// exact same id, and the parsed call-site target is upgraded to the
-    /// resolved module symbol along the way.
+    /// and the linker's `Expr::ModuleCall -> Expr::Call` lowering, and the
+    /// parsed call-site target is upgraded to the resolved module symbol
+    /// along the way. When the linker merges several units, every id is
+    /// rebased onto a collision-free merged id space; the invariant is that
+    /// the final flat `Call` node and the merged parsed index record the
+    /// *same* (rebased) id for the same source call.
     #[test]
     fn module_call_semantic_id_survives_loader_and_linker() {
         use super::super::ir::{Expr, ParsedCallTarget};
@@ -661,7 +664,11 @@ mod tests {
             ref other => panic!("expected Module target after loader, got {other:?}"),
         }
 
-        // The linker lowers ModuleCall -> Call and must keep the same id.
+        // The linker lowers ModuleCall -> Call and rebases the id onto the
+        // merged collision-free space. The invariant is consistency: the
+        // final flat Call id equals the merged parsed index's call-site id
+        // for the same source call (the unit-local parser id may be rebased
+        // when an earlier-merged unit consumed leading node ids).
         let merged = merge_units(loaded.units).expect("merge must succeed");
         let final_call = merged
             .function_impls
@@ -671,11 +678,20 @@ mod tests {
                 _ => None,
             })
             .next()
-            .expect("merged IR lowers the call to a flat Call");
+            .expect("merged IR lowers the call to a flat Call")
+            .expect("final flat Call carries a semantic id");
+        let merged_index = merged
+            .parsed_semantic_index
+            .as_ref()
+            .expect("merged index present");
+        let merged_site = merged_index
+            .call_sites
+            .iter()
+            .find(|site| site.name == "au::helper")
+            .expect("merged index records the namespace call");
         assert_eq!(
-            final_call,
-            Some(loader_id),
-            "final flat Call preserves the exact parser-assigned id"
+            final_call, merged_site.id,
+            "final flat Call id matches the merged index entry"
         );
 
         remove_module_root(&std::path::Path::new("__pd_vm_inmemory__"));
