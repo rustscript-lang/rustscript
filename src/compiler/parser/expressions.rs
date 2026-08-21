@@ -360,7 +360,7 @@ impl Parser {
                 .map(|t| t.span)
                 .unwrap_or_else(|| self.current_span());
             if self.dialect.allow_dotted_call()
-                && let Some(expr) = self.try_parse_js_dotted_call(&name)?
+                && let Some(expr) = self.try_parse_js_dotted_call(&name, name_span)?
             {
                 return Ok(expr);
             }
@@ -388,6 +388,17 @@ impl Parser {
                     path_segments
                         .push(self.expect_namespace_segment("expected function name after '::'")?);
                 }
+                // The last consumed token before turbofish/`(` parsing is the
+                // final path segment; it bounds the exact callee span of the
+                // full namespace path `name_span.lo .. last_segment.hi`
+                // (e.g. `au::helper`), so callee_span stays the name token
+                // range and never extends over the arguments.
+                let path_hi = self
+                    .tokens
+                    .get(self.pos.saturating_sub(1))
+                    .map(|t| t.span.hi)
+                    .unwrap_or(name_span.hi);
+                let ns_callee_span = Span::new(name_span.source_id, name_span.lo, path_hi);
                 let type_args = self.parse_turbofish_type_args()?;
                 self.expect(
                     &TokenKind::LParen,
@@ -407,12 +418,6 @@ impl Parser {
                     .get(1..)
                     .map(|tail| tail.to_vec())
                     .unwrap_or_default();
-                // Compute the callee span for the full namespace path.
-                let ns_callee_span = self
-                    .tokens
-                    .get(self.pos.saturating_sub(1))
-                    .map(|t| Span::new(name_span.source_id, name_span.lo, t.span.hi))
-                    .unwrap_or(name_span);
                 let ns_callee_name = if subpath.is_empty() {
                     format!("{}::{}", name, member)
                 } else {
@@ -426,7 +431,9 @@ impl Parser {
                     if let Some(builtin) =
                         resolve_builtin_namespace_call(&builtin_namespace, &builtin_member)
                     {
-                        self.build_builtin_call_expr_with_type_args(builtin, args, type_args)?
+                        let base =
+                            self.build_builtin_call_expr_with_type_args(builtin, args, type_args)?;
+                        self.attach_namespace_call_provenance(base, ns_callee_span, ns_callee_name)
                     } else {
                         return Err(ParseError {
                             span: None,
@@ -441,7 +448,9 @@ impl Parser {
                 } else if let Some(host_name) =
                     self.resolve_host_namespace_call_target(&name, &member, &subpath)
                 {
-                    self.build_host_call_expr_with_type_args(&host_name, args, type_args)?
+                    let base =
+                        self.build_host_call_expr_with_type_args(&host_name, args, type_args)?;
+                    self.attach_namespace_call_provenance(base, ns_callee_span, ns_callee_name)
                 } else if self.allow_implicit_externs
                     && self.module_namespace_alias(&name).is_some()
                 {
@@ -478,7 +487,7 @@ impl Parser {
                 };
                 // Namespace calls participate in postfix access like any
                 // other call (`iter::range(n)[0]`, `json::decode::<T>(s).x`).
-                let expr = self.parse_postfix_access(expr)?;
+                let expr = self.parse_postfix_access(expr, ns_callee_span)?;
                 return Ok(expr);
             }
 
@@ -631,7 +640,18 @@ impl Parser {
                     } else if self.allow_implicit_externs {
                         // Module mode: the name may be an imported function
                         // binding the loader resolves to a module symbol
-                        // (`Expr::ModuleFunctionRef`) before unit merge.
+                        // (`Expr::ModuleFunctionRef`) before unit merge. The
+                        // function-value reference is recorded with a
+                        // placeholder flat target; the loader upgrades the
+                        // matching site to `Module(symbol)` when it resolves
+                        // the reference, so the merged carrier never keeps a
+                        // stale unit-local index.
+                        let index = self
+                            .functions
+                            .get(&name)
+                            .map(|decl| decl.index)
+                            .unwrap_or(u16::MAX);
+                        self.record_func_ref(name_span, index, name.clone());
                         Expr::UnresolvedFunctionRef { name, type_args }
                     } else {
                         return Err(ParseError {
@@ -644,23 +664,38 @@ impl Parser {
                 }
             };
             self.contextualize_function_call_args(&mut expr)?;
-            expr = self.parse_postfix_access(expr)?;
+            expr = self.parse_postfix_access(expr, name_span)?;
             return Ok(expr);
         }
         if self.match_kind(&TokenKind::LParen) {
+            let open_span = self
+                .tokens
+                .get(self.pos.saturating_sub(1))
+                .map(|t| t.span)
+                .unwrap_or_else(|| self.current_span());
             let mut expr = self.parse_expr()?;
             self.expect(&TokenKind::RParen, "expected ')' after expression")?;
-            expr = self.parse_postfix_access(expr)?;
+            expr = self.parse_postfix_access(expr, open_span)?;
             return Ok(expr);
         }
         if self.match_kind(&TokenKind::LBracket) {
+            let open_span = self
+                .tokens
+                .get(self.pos.saturating_sub(1))
+                .map(|t| t.span)
+                .unwrap_or_else(|| self.current_span());
             let mut expr = self.parse_array_literal()?;
-            expr = self.parse_postfix_access(expr)?;
+            expr = self.parse_postfix_access(expr, open_span)?;
             return Ok(expr);
         }
         if self.match_kind(&TokenKind::LBrace) {
+            let open_span = self
+                .tokens
+                .get(self.pos.saturating_sub(1))
+                .map(|t| t.span)
+                .unwrap_or_else(|| self.current_span());
             let mut expr = self.parse_brace_literal()?;
-            expr = self.parse_postfix_access(expr)?;
+            expr = self.parse_postfix_access(expr, open_span)?;
             return Ok(expr);
         }
 
@@ -969,9 +1004,20 @@ impl Parser {
         )))
     }
 
-    pub(super) fn parse_postfix_access(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
+    pub(super) fn parse_postfix_access(
+        &mut self,
+        mut expr: Expr,
+        chain_start: Span,
+    ) -> Result<Expr, ParseError> {
         loop {
             if self.match_kind(&TokenKind::LBracket) {
+                // The `[` token just consumed bounds the callee span of the
+                // subscript operation; the closing `]` bounds its end.
+                let bracket_open = self
+                    .tokens
+                    .get(self.pos.saturating_sub(1))
+                    .map(|t| t.span)
+                    .unwrap_or(chain_start);
                 if self.match_kind(&TokenKind::Colon) {
                     let end = if self.check(&TokenKind::RBracket) {
                         None
@@ -979,7 +1025,21 @@ impl Parser {
                         Some(self.parse_expr()?)
                     };
                     self.expect(&TokenKind::RBracket, "expected ']' after slice expression")?;
-                    expr = self.build_slice_access_expr(expr, None, end)?;
+                    let callee_span = Span::new(
+                        chain_start.source_id,
+                        bracket_open.lo,
+                        self.tokens[self.pos - 1].span.hi,
+                    );
+                    let expr_span =
+                        Span::new(chain_start.source_id, chain_start.lo, callee_span.hi);
+                    let slice_id = self.alloc_call_id(
+                        callee_span,
+                        expr_span,
+                        ParsedCallTarget::Function(BuiltinFunction::Slice.call_index()),
+                        "slice".to_string(),
+                        false,
+                    );
+                    expr = self.build_slice_access_expr(expr, None, end, slice_id)?;
                     continue;
                 }
 
@@ -991,16 +1051,47 @@ impl Parser {
                         Some(self.parse_expr()?)
                     };
                     self.expect(&TokenKind::RBracket, "expected ']' after slice expression")?;
-                    expr = self.build_slice_access_expr(expr, Some(first), end)?;
+                    let callee_span = Span::new(
+                        chain_start.source_id,
+                        bracket_open.lo,
+                        self.tokens[self.pos - 1].span.hi,
+                    );
+                    let expr_span =
+                        Span::new(chain_start.source_id, chain_start.lo, callee_span.hi);
+                    let slice_id = self.alloc_call_id(
+                        callee_span,
+                        expr_span,
+                        ParsedCallTarget::Function(BuiltinFunction::Slice.call_index()),
+                        "slice".to_string(),
+                        false,
+                    );
+                    expr = self.build_slice_access_expr(expr, Some(first), end, slice_id)?;
                     continue;
                 }
 
                 self.expect(&TokenKind::RBracket, "expected ']' after index expression")?;
-                expr = self.build_builtin_call_expr(BuiltinFunction::Get, vec![expr, first])?;
+                let callee_span = Span::new(
+                    chain_start.source_id,
+                    bracket_open.lo,
+                    self.tokens[self.pos - 1].span.hi,
+                );
+                let expr_span = Span::new(chain_start.source_id, chain_start.lo, callee_span.hi);
+                expr = self.build_postfix_builtin_call(
+                    BuiltinFunction::Get,
+                    vec![expr, first],
+                    callee_span,
+                    expr_span,
+                    "get".to_string(),
+                )?;
                 continue;
             }
             if self.match_kind(&TokenKind::Dot) {
                 let member = self.expect_namespace_segment("expected member name after '.'")?;
+                let member_span = self
+                    .tokens
+                    .get(self.pos.saturating_sub(1))
+                    .map(|t| t.span)
+                    .unwrap_or(chain_start);
                 if member == "copy" {
                     self.expect(
                         &TokenKind::LParen,
@@ -1027,20 +1118,63 @@ impl Parser {
                         &TokenKind::RParen,
                         "expected ')' after unwrap_or fallback expression",
                     )?;
-                    expr = self.build_option_unwrap_or_expr(expr, fallback)?;
+                    let expr_span = Span::new(
+                        chain_start.source_id,
+                        chain_start.lo,
+                        self.tokens[self.pos - 1].span.hi,
+                    );
+                    expr = self.build_option_unwrap_or_expr(
+                        expr,
+                        fallback,
+                        member_span,
+                        expr_span,
+                        "unwrap_or".to_string(),
+                    )?;
                 } else if member == "length" {
-                    expr = self.build_builtin_call_expr(BuiltinFunction::Len, vec![expr])?;
+                    let expr_span =
+                        Span::new(chain_start.source_id, chain_start.lo, member_span.hi);
+                    expr = self.build_postfix_builtin_call(
+                        BuiltinFunction::Len,
+                        vec![expr],
+                        member_span,
+                        expr_span,
+                        "length".to_string(),
+                    )?;
                 } else if member == "has" && self.check(&TokenKind::LParen) {
                     self.expect(&TokenKind::LParen, "expected '(' after '.has'")?;
                     let mut args = vec![expr];
                     args.extend(self.parse_call_args()?);
-                    expr = self.build_builtin_call_expr(BuiltinFunction::Has, args)?;
+                    let expr_span = Span::new(
+                        chain_start.source_id,
+                        chain_start.lo,
+                        self.tokens[self.pos - 1].span.hi,
+                    );
+                    expr = self.build_postfix_builtin_call(
+                        BuiltinFunction::Has,
+                        args,
+                        member_span,
+                        expr_span,
+                        "has".to_string(),
+                    )?;
                 } else if member == "keys" {
-                    expr = self.build_builtin_call_expr(BuiltinFunction::Keys, vec![expr])?;
+                    let expr_span =
+                        Span::new(chain_start.source_id, chain_start.lo, member_span.hi);
+                    expr = self.build_postfix_builtin_call(
+                        BuiltinFunction::Keys,
+                        vec![expr],
+                        member_span,
+                        expr_span,
+                        "keys".to_string(),
+                    )?;
                 } else {
-                    expr = self.build_builtin_call_expr(
+                    let expr_span =
+                        Span::new(chain_start.source_id, chain_start.lo, member_span.hi);
+                    expr = self.build_postfix_builtin_call(
                         BuiltinFunction::Get,
-                        vec![expr, Expr::String(member)],
+                        vec![expr, Expr::String(member.clone())],
+                        member_span,
+                        expr_span,
+                        member,
                     )?;
                 }
                 continue;
@@ -1048,16 +1182,46 @@ impl Parser {
             if self.match_kind(&TokenKind::Question) {
                 self.expect(&TokenKind::Dot, "expected '.' after '?' in optional access")?;
                 if self.match_kind(&TokenKind::LBracket) {
+                    let bracket_open = self
+                        .tokens
+                        .get(self.pos.saturating_sub(1))
+                        .map(|t| t.span)
+                        .unwrap_or(chain_start);
                     let key = self.parse_expr()?;
                     self.expect(
                         &TokenKind::RBracket,
                         "expected ']' after optional index expression",
                     )?;
-                    expr = self.build_optional_get_expr(expr, key)?;
+                    let callee_span = Span::new(
+                        chain_start.source_id,
+                        bracket_open.lo,
+                        self.tokens[self.pos - 1].span.hi,
+                    );
+                    let expr_span =
+                        Span::new(chain_start.source_id, chain_start.lo, callee_span.hi);
+                    expr = self.build_optional_get_expr(
+                        expr,
+                        key,
+                        callee_span,
+                        expr_span,
+                        "get".to_string(),
+                    )?;
                     continue;
                 }
                 let member = self.expect_namespace_segment("expected member name after '?.'")?;
-                expr = self.build_optional_member_get_expr(expr, member)?;
+                let member_span = self
+                    .tokens
+                    .get(self.pos.saturating_sub(1))
+                    .map(|t| t.span)
+                    .unwrap_or(chain_start);
+                let expr_span = Span::new(chain_start.source_id, chain_start.lo, member_span.hi);
+                expr = self.build_optional_member_get_expr(
+                    expr,
+                    member,
+                    member_span,
+                    expr_span,
+                    "get".to_string(),
+                )?;
                 continue;
             }
             if self.dialect.allow_increment_operator() && self.match_kind(&TokenKind::PlusPlus) {
@@ -1067,6 +1231,40 @@ impl Parser {
             break;
         }
         Ok(expr)
+    }
+
+    /// Build a postfix-source builtin call (index get, `.length`, `.has`,
+    /// `.keys`, member get) with a recorded provenance site. The callee span
+    /// is the operator/member token range and the expr span is the full
+    /// postfix chain from its base through this step. Compiler-synthetic
+    /// builtin lowering (array/map literals, slice helper calls) keeps
+    /// `None` ids by going through `build_builtin_call_expr` directly.
+    fn build_postfix_builtin_call(
+        &mut self,
+        builtin: BuiltinFunction,
+        args: Vec<Expr>,
+        callee_span: Span,
+        expr_span: Span,
+        name: String,
+    ) -> Result<Expr, ParseError> {
+        let base = self.build_builtin_call_expr_with_type_args(builtin, args, Vec::new())?;
+        let Expr::Call(index, type_args, args, host_resolution, None) = base else {
+            return Ok(base);
+        };
+        let semantic_id = self.alloc_call_id(
+            callee_span,
+            expr_span,
+            ParsedCallTarget::Function(index),
+            name,
+            false,
+        );
+        Ok(Expr::Call(
+            index,
+            type_args,
+            args,
+            host_resolution,
+            semantic_id,
+        ))
     }
 
     pub(super) fn build_numeric_addition_expr(&self, index: LocalSlot, rhs: Expr) -> Expr {
@@ -1132,6 +1330,7 @@ impl Parser {
         container: Expr,
         start: Option<Expr>,
         end: Option<Expr>,
+        slice_id: Option<SemanticNodeId>,
     ) -> Result<Expr, ParseError> {
         let (container_slot, container_bind) = match container {
             Expr::Var(slot) => (slot, None),
@@ -1152,9 +1351,9 @@ impl Parser {
                 else_expr: Box::new(end_var),
             };
             let slice_len = Expr::Sub(Box::new(adjusted_end), Box::new(Expr::Var(start_slot)));
-            let slice_expr = self.build_builtin_call_expr(
-                BuiltinFunction::Slice,
+            let slice_expr = self.build_slice_expr_with_id(
                 vec![Expr::Var(container_slot), Expr::Var(start_slot), slice_len],
+                slice_id,
             )?;
             let with_end = self.bind_hidden_local_expr(end_slot, end_expr, slice_expr)?;
             self.bind_hidden_local_expr(start_slot, start_expr, with_end)?
@@ -1162,9 +1361,9 @@ impl Parser {
             let end_expr = self
                 .build_builtin_call_expr(BuiltinFunction::Len, vec![Expr::Var(container_slot)])?;
             let slice_len = Expr::Sub(Box::new(end_expr), Box::new(Expr::Var(start_slot)));
-            let slice_expr = self.build_builtin_call_expr(
-                BuiltinFunction::Slice,
+            let slice_expr = self.build_slice_expr_with_id(
                 vec![Expr::Var(container_slot), Expr::Var(start_slot), slice_len],
+                slice_id,
             )?;
             self.bind_hidden_local_expr(start_slot, start_expr, slice_expr)?
         };
@@ -1175,16 +1374,46 @@ impl Parser {
         }
     }
 
+    /// Build the `Slice` builtin call that records the parser-assigned slice
+    /// access id. The slice is a direct source expression, so its operative
+    /// `Slice` call carries the id; the surrounding hidden-local `Len` and
+    /// `Match` lowering stays synthetic (`None`).
+    fn build_slice_expr_with_id(
+        &mut self,
+        args: Vec<Expr>,
+        slice_id: Option<SemanticNodeId>,
+    ) -> Result<Expr, ParseError> {
+        let mut expr =
+            self.build_builtin_call_expr_with_type_args(BuiltinFunction::Slice, args, Vec::new())?;
+        if let Some(id) = slice_id {
+            if let Expr::Call(_, _, _, _, slot) = &mut expr {
+                *slot = Some(id);
+            }
+        }
+        Ok(expr)
+    }
+
     pub(super) fn build_optional_get_expr(
         &mut self,
         container: Expr,
         key: Expr,
+        callee_span: Span,
+        expr_span: Span,
+        name: String,
     ) -> Result<Expr, ParseError> {
+        let semantic_id = self.alloc_call_id(
+            callee_span,
+            expr_span,
+            ParsedCallTarget::Unresolved,
+            name,
+            false,
+        );
         Ok(Expr::OptionalGet {
             container: Box::new(container),
             key: Box::new(key),
             container_slot: self.allocate_hidden_local()?,
             key_slot: self.allocate_hidden_local()?,
+            semantic_id,
         })
     }
 
@@ -1192,19 +1421,39 @@ impl Parser {
         &mut self,
         container: Expr,
         member: String,
+        callee_span: Span,
+        expr_span: Span,
+        name: String,
     ) -> Result<Expr, ParseError> {
-        self.build_optional_get_expr(container, Expr::String(member))
+        self.build_optional_get_expr(
+            container,
+            Expr::String(member),
+            callee_span,
+            expr_span,
+            name,
+        )
     }
 
     pub(super) fn build_option_unwrap_or_expr(
         &mut self,
         value: Expr,
         fallback: Expr,
+        callee_span: Span,
+        expr_span: Span,
+        name: String,
     ) -> Result<Expr, ParseError> {
+        let semantic_id = self.alloc_call_id(
+            callee_span,
+            expr_span,
+            ParsedCallTarget::Unresolved,
+            name,
+            false,
+        );
         Ok(Expr::OptionUnwrapOr {
             value: Box::new(value),
             value_slot: self.allocate_hidden_local()?,
             fallback: Box::new(fallback),
+            semantic_id,
         })
     }
 
@@ -2370,6 +2619,7 @@ impl Parser {
     pub(super) fn try_parse_js_dotted_call(
         &mut self,
         base: &str,
+        base_span: Span,
     ) -> Result<Option<Expr>, ParseError> {
         let save_pos = self.pos;
         if !self.match_kind(&TokenKind::Dot) {
@@ -2385,6 +2635,19 @@ impl Parser {
             }
             break;
         }
+        // The last consumed segment bounds the exact dotted-path callee span
+        // (`console.log`), captured before the argument list is consumed.
+        let path_hi = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|t| t.span.hi)
+            .unwrap_or(base_span.hi);
+        let callee_span = Span::new(base_span.source_id, base_span.lo, path_hi);
+        let callee_name = if segments.is_empty() {
+            base.to_string()
+        } else {
+            format!("{}.{}", base, segments.join("."))
+        };
 
         if !self.match_kind(&TokenKind::LParen) {
             self.pos = save_pos;
@@ -2393,9 +2656,12 @@ impl Parser {
         let mut args = self.parse_call_args()?;
 
         if base == "console" && segments.len() == 1 && segments[0] == "log" {
-            return Ok(Some(
-                self.lower_plain_print_call(std::mem::take(&mut args))?,
-            ));
+            let expr = self.lower_plain_print_call(std::mem::take(&mut args))?;
+            return Ok(Some(self.attach_namespace_call_provenance(
+                expr,
+                callee_span,
+                callee_name,
+            )));
         }
 
         if segments.is_empty() {
@@ -2419,7 +2685,12 @@ impl Parser {
             }
             let member = segments[0].as_str();
             if let Some(builtin) = resolve_builtin_namespace_call(&imported_root, member) {
-                return Ok(Some(self.build_builtin_call_expr(builtin, args)?));
+                let expr = self.build_builtin_call_expr(builtin, args)?;
+                return Ok(Some(self.attach_namespace_call_provenance(
+                    expr,
+                    callee_span,
+                    callee_name,
+                )));
             }
             return Err(ParseError {
                 span: None,
@@ -2432,7 +2703,12 @@ impl Parser {
         let member = segments[0].clone();
         let subpath = segments.into_iter().skip(1).collect::<Vec<_>>();
         if let Some(host_name) = self.resolve_host_namespace_call_target(base, &member, &subpath) {
-            return Ok(Some(self.build_host_call_expr(&host_name, args)?));
+            let expr = self.build_host_call_expr(&host_name, args)?;
+            return Ok(Some(self.attach_namespace_call_provenance(
+                expr,
+                callee_span,
+                callee_name,
+            )));
         }
 
         self.pos = save_pos;

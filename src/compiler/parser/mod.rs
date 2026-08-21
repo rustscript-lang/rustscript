@@ -26,10 +26,11 @@ use super::{
     ParseError, ReplLocalBinding, STDLIB_PRINT_ARITY, STDLIB_PRINT_NAME,
     ir::{
         AssignmentKind, CatalogVisibility, ClosureExpr, Expr, FunctionDecl, FunctionDeclSite,
-        FunctionImpl, FunctionParam, FunctionRefSite, HostApiIrMetadata, LocalDeclSite,
-        LocalRefSite, LocalSlot, MatchPattern, MatchTypePattern, ParsedCallSite, ParsedCallTarget,
-        ParsedLexicalScope, ParsedSemanticIndex, ResolvedHostCall, ScopeId, SemanticNodeId, Stmt,
-        StructDecl, TypeSchema,
+        FunctionImpl, FunctionParam, FunctionRefSite, FunctionRefTarget, HostApiIrMetadata,
+        LocalDeclSite, LocalRefSite, LocalSlot, MatchPattern, MatchTypePattern,
+        ModuleNamespaceAlias, ParsedCallSite, ParsedCallTarget, ParsedLexicalScope,
+        ParsedSemanticIndex, ResolvedHostCall, ScopeId, SemanticNodeId, Stmt, StructDecl,
+        TypeSchema,
     },
 };
 
@@ -547,7 +548,11 @@ impl Parser {
             module_namespace_aliases: self
                 .module_namespace_aliases
                 .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .map(|(alias, module_path)| ModuleNamespaceAlias {
+                    alias: alias.clone(),
+                    module_path: module_path.clone(),
+                    source: String::new(),
+                })
                 .collect(),
             use_declarations: std::mem::take(&mut self.use_declarations),
         }
@@ -559,8 +564,10 @@ impl Parser {
     }
 
     /// Allocate a [`SemanticNodeId`] and record a call site in the provenance
-    /// index. Returns `Some(id)` for every source-level call; compiler-synthetic
-    /// parser helpers may return `None`.
+    /// index. Returns `Some(id)` for every recorded call; the [`Option`]
+    /// return type keeps the signature symmetric with node builders that may
+    /// fall back to a synthetic call without a site. Every parser caller
+    /// passes a real source expression and receives `Some`.
     pub(super) fn alloc_call_id(
         &mut self,
         callee_span: Span,
@@ -665,6 +672,41 @@ impl Parser {
         Expr::Call(index, type_args, args, host_resolution, semantic_id)
     }
 
+    /// Attach exact provenance to a builtin/host namespace call
+    /// (`json::encode(...)`, `math::abs(...)`) or a dotted JS call
+    /// (`console.log(...)`) that was built by a path-based branch without its
+    /// own provenance tracking.
+    ///
+    /// Only plain `Expr::Call(..., None)` expressions are annotated. The
+    /// `callee_span` is the exact full namespace path token range
+    /// (`json::encode`); the recorded expr span runs from the path start
+    /// through the closing `)` of the consumed argument list. The call is
+    /// marked as a namespace call so downstream consumers can distinguish
+    /// path-based calls from plain direct calls.
+    pub(super) fn attach_namespace_call_provenance(
+        &mut self,
+        expr: Expr,
+        callee_span: Span,
+        name: String,
+    ) -> Expr {
+        let Expr::Call(index, type_args, args, host_resolution, None) = expr else {
+            return expr;
+        };
+        let expr_span = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|t| Span::new(callee_span.source_id, callee_span.lo, t.span.hi))
+            .unwrap_or(callee_span);
+        let semantic_id = self.alloc_call_id(
+            callee_span,
+            expr_span,
+            ParsedCallTarget::Function(index),
+            name,
+            true,
+        );
+        Expr::Call(index, type_args, args, host_resolution, semantic_id)
+    }
+
     /// Record a local declaration site.
     pub(super) fn record_local_decl(
         &mut self,
@@ -733,12 +775,27 @@ impl Parser {
 
     /// Record a function value reference site.
     pub(super) fn record_func_ref(&mut self, ident_span: Span, function_index: u16, name: String) {
+        self.record_func_ref_target(
+            ident_span,
+            FunctionRefTarget::Function(function_index),
+            name,
+        );
+    }
+
+    /// Record a function value reference site with an explicit resolved
+    /// target (flat index or module symbol).
+    pub(super) fn record_func_ref_target(
+        &mut self,
+        ident_span: Span,
+        target: FunctionRefTarget,
+        name: String,
+    ) {
         let id = self.parsed_semantic_index.alloc_node_id();
         let scope_id = self.current_scope_id();
         self.parsed_semantic_index.func_refs.push(FunctionRefSite {
             id,
             ident_span,
-            function_index,
+            target,
             name,
             scope_id,
         });

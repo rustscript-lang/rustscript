@@ -5,7 +5,10 @@ use crate::compiler::source_map::SourceMap;
 
 use super::super::{
     CompileSourceFileOptions, ParseError, SourceError, SourceFlavor, SourcePathError, frontends,
-    ir::{Expr, FrontendIr, FunctionDecl, ParsedCallTarget, ParsedSemanticIndex, Stmt, TypeSchema},
+    ir::{
+        Expr, FrontendIr, FunctionDecl, FunctionRefTarget, ParsedCallTarget, ParsedSemanticIndex,
+        Stmt, TypeSchema,
+    },
     linker::{ParsedUnit, module_scope_prefix},
     modules::{ImportTargetKind, ImportedBinding, ModuleGraph, ModuleId, ResolvedImport, SymbolId},
 };
@@ -1103,6 +1106,18 @@ fn resolve_expr_imported_calls(
                         {
                             site.target = ParsedCallTarget::Module(symbol);
                         }
+                        // The parser recorded the implicit-extern callee as a
+                        // function-value reference with the unit-local flat
+                        // index (in `attach_ordinary_call_provenance`, the
+                        // func_ref gets its own id distinct from the call
+                        // site); upgrade every reference to this resolved
+                        // name to the module symbol so the merged carrier
+                        // never aliases an unrelated flat function.
+                        for reference in parsed.func_refs.iter_mut() {
+                            if reference.name == name {
+                                reference.target = FunctionRefTarget::Module(symbol);
+                            }
+                        }
                     }
                 }
                 *expr = Expr::ModuleCall(
@@ -1137,6 +1152,15 @@ fn resolve_expr_imported_calls(
         }
         Expr::UnresolvedFunctionRef { name, type_args } => {
             if let Some(symbol) = ctx.target_for_function_ref(name, line)? {
+                // Upgrade the parser-recorded function-value reference from
+                // its placeholder flat index to the resolved module symbol.
+                if let Some(parsed) = parsed_semantic_index {
+                    for reference in parsed.func_refs.iter_mut() {
+                        if reference.name == *name {
+                            reference.target = FunctionRefTarget::Module(symbol);
+                        }
+                    }
+                }
                 *expr = Expr::ModuleFunctionRef(symbol, std::mem::take(type_args));
             } else {
                 return Err(unknown_function_error(
@@ -1165,6 +1189,7 @@ fn resolve_expr_imported_calls(
             key,
             container_slot: _,
             key_slot: _,
+            semantic_id: _,
         } => {
             resolve_expr_imported_calls(
                 ctx,
@@ -1178,6 +1203,7 @@ fn resolve_expr_imported_calls(
             value,
             value_slot: _,
             fallback,
+            semantic_id: _,
         } => {
             resolve_expr_imported_calls(ctx, value, line, parsed_semantic_index.as_deref_mut())?;
             resolve_expr_imported_calls(ctx, fallback, line, parsed_semantic_index.as_deref_mut())?;

@@ -728,6 +728,7 @@ impl Compiler {
                 key,
                 container_slot,
                 key_slot,
+                semantic_id: _,
             } => {
                 self.compile_optional_get_expr(container, key, *container_slot, *key_slot)?;
             }
@@ -735,6 +736,7 @@ impl Compiler {
                 value,
                 value_slot,
                 fallback,
+                semantic_id: _,
             } => {
                 self.compile_option_unwrap_or_expr(value, *value_slot, fallback)?;
             }

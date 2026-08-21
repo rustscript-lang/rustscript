@@ -7,9 +7,9 @@ use super::{
     ParseError, SourceError, SourcePathError,
     ir::{
         CatalogVisibility, Expr, FrontendIr, FunctionDecl, FunctionDeclSite, FunctionImpl,
-        FunctionRefSite, HostApiIrMetadata, LocalDeclSite, LocalRefSite, LocalSlot, ParsedCallSite,
-        ParsedCallTarget, ParsedLexicalScope, ParsedSemanticIndex, ScopeId, SemanticNodeId, Stmt,
-        StructDecl,
+        FunctionRefSite, FunctionRefTarget, HostApiIrMetadata, LocalDeclSite, LocalRefSite,
+        LocalSlot, ModuleNamespaceAlias, ParsedCallSite, ParsedCallTarget, ParsedLexicalScope,
+        ParsedSemanticIndex, ScopeId, SemanticNodeId, Stmt, StructDecl,
     },
     modules::{ModuleId, SymbolId},
 };
@@ -172,7 +172,37 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
         if let Some(visibility) = &unit.parsed.catalog_visibility {
             match &mut merged_catalog_visibility {
                 Some(merged) => merge_catalog_visibility(merged, visibility, &source_name)?,
-                None => merged_catalog_visibility = Some(visibility.clone()),
+                None => {
+                    // Tag the first unit's module namespace aliases with their
+                    // owning source so the merged carrier is uniformly
+                    // source-keyed from the start, and reject any genuine
+                    // same-source conflict (same alias, different module).
+                    let mut owned = visibility.clone();
+                    for alias in &mut owned.module_namespace_aliases {
+                        if alias.source.is_empty() {
+                            alias.source = source_name.clone();
+                        }
+                    }
+                    for alias in &owned.module_namespace_aliases {
+                        if let Some(existing) =
+                            owned.module_namespace_aliases.iter().find(|existing| {
+                                existing.alias == alias.alias
+                                    && existing.module_path != alias.module_path
+                            })
+                        {
+                            return Err(SourcePathError::Source(SourceError::Parse(ParseError {
+                                span: None,
+                                code: None,
+                                line: 1,
+                                message: format!(
+                                    "module namespace alias conflict ({source_name}): alias '{}' maps to both '{}' and '{}'",
+                                    alias.alias, existing.module_path, alias.module_path
+                                ),
+                            })));
+                        }
+                    }
+                    merged_catalog_visibility = Some(owned);
+                }
             }
         }
 
@@ -970,9 +1000,11 @@ fn remap_expr_indices(
             key,
             container_slot,
             key_slot,
+            semantic_id,
         } => {
             *container_slot = remap_local_index(*container_slot, local_base)?;
             *key_slot = remap_local_index(*key_slot, local_base)?;
+            rebase_semantic_id(semantic_id, node_offset);
             remap_expr_indices(
                 container,
                 local_base,
@@ -992,8 +1024,10 @@ fn remap_expr_indices(
             value,
             value_slot,
             fallback,
+            semantic_id,
         } => {
             *value_slot = remap_local_index(*value_slot, local_base)?;
+            rebase_semantic_id(semantic_id, node_offset);
             remap_expr_indices(
                 value,
                 local_base,
@@ -1325,10 +1359,18 @@ fn rebase_parsed_semantic_index(
 
     let mut func_refs = Vec::with_capacity(unit.func_refs.len());
     for reference in &unit.func_refs {
+        let target = match reference.target {
+            FunctionRefTarget::Function(index) => {
+                FunctionRefTarget::Function(remap_function(index))
+            }
+            // Module targets carry a compilation-wide [`SymbolId`]; the
+            // merged IR keeps the symbol identity, so no remap applies.
+            FunctionRefTarget::Module(symbol) => FunctionRefTarget::Module(symbol),
+        };
         func_refs.push(FunctionRefSite {
             id: remap_node(reference.id),
             ident_span: reference.ident_span,
-            function_index: remap_function(reference.function_index),
+            target,
             name: reference.name.clone(),
             scope_id: remap_scope(reference.scope_id),
         });
@@ -1360,8 +1402,34 @@ fn rebase_parsed_semantic_index(
         func_decls,
         func_refs,
         scopes,
-        next_node_id: unit.next_node_id + node_offset,
-        next_scope_id: unit.next_scope_id + scope_offset,
+        next_node_id: checked_node_total(unit.next_node_id, node_offset)?,
+        next_scope_id: checked_scope_total(unit.next_scope_id, scope_offset)?,
+    })
+}
+
+/// Checked addition for the merged node-id running total. Linking failure is
+/// reported as a typed [`SourcePathError`] instead of wrapping.
+fn checked_node_total(unit_total: u32, node_offset: u32) -> Result<u32, SourcePathError> {
+    unit_total.checked_add(node_offset).ok_or_else(|| {
+        SourcePathError::Source(SourceError::Parse(ParseError {
+            span: None,
+            code: None,
+            line: 1,
+            message: "merged semantic node id space exhausted (u32 overflow)".to_string(),
+        }))
+    })
+}
+
+/// Checked addition for the merged scope-id running total. Linking failure is
+/// reported as a typed [`SourcePathError`] instead of wrapping.
+fn checked_scope_total(unit_total: u32, scope_offset: u32) -> Result<u32, SourcePathError> {
+    unit_total.checked_add(scope_offset).ok_or_else(|| {
+        SourcePathError::Source(SourceError::Parse(ParseError {
+            span: None,
+            code: None,
+            line: 1,
+            message: "merged scope id space exhausted (u32 overflow)".to_string(),
+        }))
     })
 }
 
@@ -1386,15 +1454,17 @@ fn merge_parsed_semantic_index(merged: &mut ParsedSemanticIndex, unit: ParsedSem
 /// Host namespace and direct host call aliases map to global canonical host
 /// names, so an alias present in two units must map to the identical target
 /// (deduplicated) or the merge fails with a typed [`SourcePathError`].
-/// Module namespace aliases are different: their canonical values are
-/// module-relative import paths (`c` vs `self::c` name the same module from
-/// different importers), so the same alias legitimately carries different
-/// spellings across units. They merge by alias-name deduplication only —
-/// the first spelling wins and later identical entries collapse; differing
-/// spellings are not a conflict. Wildcard import sets are deduplicated
-/// unions. Structured `use` declarations are appended with exact (path,
-/// clause) duplicates dropped; spans are never compared, so identical
-/// directives from different sources collapse to one entry.
+/// Module namespace aliases are different: they are unit-local bindings whose
+/// canonical values are module-relative import paths (`c` vs `self::c` name
+/// the same module from different importers), so the same alias legitimately
+/// names different modules in different sources. They merge keyed by owning
+/// source: entries from the same source deduplicate on identical
+/// (alias, path) and error on a genuine same-source conflict, while entries
+/// from different sources are all retained so per-module query context never
+/// collapses. Wildcard import sets are deduplicated unions. Structured `use`
+/// declarations are appended with exact (path, clause) duplicates dropped;
+/// spans are never compared, so identical directives from different sources
+/// collapse to one entry.
 fn merge_catalog_visibility(
     merged: &mut CatalogVisibility,
     unit: &CatalogVisibility,
@@ -1412,18 +1482,35 @@ fn merge_catalog_visibility(
         source_name,
         "direct host call",
     )?;
-    // Module namespace aliases are module-relative; dedupe by alias name
-    // only (first spelling wins) so valid multi-unit programs never fail.
-    for (alias, canonical) in &unit.module_namespace_aliases {
-        if !merged
+    // Module namespace aliases are unit-local: dedupe within the owning
+    // source, retain across sources, and reject a genuine same-source
+    // conflict (which the parser's own alias map already prevents, but the
+    // merge defends against mixed hand-built carriers).
+    for alias in &unit.module_namespace_aliases {
+        let same_source = merged
             .module_namespace_aliases
             .iter()
-            .any(|(name, _)| name == alias)
-        {
-            merged
-                .module_namespace_aliases
-                .push((alias.clone(), canonical.clone()));
+            .filter(|existing| existing.source == source_name && existing.alias == alias.alias)
+            .collect::<Vec<_>>();
+        if let Some(existing) = same_source.first() {
+            if existing.module_path != alias.module_path {
+                return Err(SourcePathError::Source(SourceError::Parse(ParseError {
+                    span: None,
+                    code: None,
+                    line: 1,
+                    message: format!(
+                        "module namespace alias conflict ({source_name}): alias '{}' maps to both '{}' and '{}'",
+                        alias.alias, existing.module_path, alias.module_path
+                    ),
+                })));
+            }
+            continue;
         }
+        merged.module_namespace_aliases.push(ModuleNamespaceAlias {
+            alias: alias.alias.clone(),
+            module_path: alias.module_path.clone(),
+            source: source_name.to_string(),
+        });
     }
     for prefix in &unit.direct_host_wildcard_imports {
         if !merged.direct_host_wildcard_imports.contains(prefix) {
@@ -2113,7 +2200,7 @@ mod linker_provenance_merge_tests {
             func_refs: vec![FunctionRefSite {
                 id: SemanticNodeId(4),
                 ident_span: span(source_id, 0, 1),
-                function_index: 0,
+                target: FunctionRefTarget::Function(0),
                 name: "f".to_string(),
                 scope_id: 0,
             }],
@@ -2264,7 +2351,7 @@ mod linker_provenance_merge_tests {
             func_refs: vec![FunctionRefSite {
                 id: SemanticNodeId(2),
                 ident_span: span(1, 0, 1),
-                function_index: 3,
+                target: FunctionRefTarget::Function(3),
                 name: "f".to_string(),
                 scope_id: 0,
             }],
@@ -2330,7 +2417,11 @@ mod linker_provenance_merge_tests {
         assert_eq!(merged.functions.len(), 2);
         assert_eq!(index.func_decls[0].function_index, 0, "a's f -> flat 0");
         assert_eq!(index.func_decls[1].function_index, 1, "b's g -> flat 1");
-        assert_eq!(index.func_refs[0].function_index, 0);
+        assert_eq!(
+            index.func_refs[0].target,
+            FunctionRefTarget::Function(0),
+            "a's func ref -> flat 0"
+        );
         match index.call_sites[0].target {
             ParsedCallTarget::Function(flat) => assert_eq!(flat, 0),
             ref other => panic!("expected Function target, got {other:?}"),
@@ -2537,7 +2628,11 @@ mod linker_provenance_merge_tests {
             host_namespace_aliases: vec![("io".to_string(), "std::io".to_string())],
             direct_host_call_aliases: vec![("read".to_string(), "io::read".to_string())],
             direct_host_wildcard_imports: vec!["std::io".to_string()],
-            module_namespace_aliases: vec![("au".to_string(), "a/util".to_string())],
+            module_namespace_aliases: vec![ModuleNamespaceAlias {
+                alias: "au".to_string(),
+                module_path: "a/util".to_string(),
+                source: String::new(),
+            }],
             use_declarations: Vec::new(),
         };
         // Unit b repeats the identical aliases and wildcard import; the merge
@@ -2575,7 +2670,21 @@ mod linker_provenance_merge_tests {
         );
         assert_eq!(visibility.direct_host_call_aliases.len(), 1);
         assert_eq!(visibility.direct_host_wildcard_imports, vec!["std::io"]);
-        assert_eq!(visibility.module_namespace_aliases.len(), 1);
+        // Module namespace aliases are unit-local: the identical alias from
+        // two different sources is retained for each owner, not collapsed.
+        assert_eq!(
+            visibility.module_namespace_aliases.len(),
+            2,
+            "module aliases stay per owning source"
+        );
+        assert_eq!(
+            visibility.module_namespace_aliases[0].source, "a.rss",
+            "first entry owned by a.rss"
+        );
+        assert_eq!(
+            visibility.module_namespace_aliases[1].source, "b.rss",
+            "second entry owned by b.rss"
+        );
     }
 
     #[test]
@@ -2623,6 +2732,128 @@ mod linker_provenance_merge_tests {
         assert!(
             err.to_string().contains("host namespace alias 'io'"),
             "unexpected: {err}"
+        );
+    }
+
+    /// A genuine same-source module namespace alias conflict (same alias,
+    /// different module path within one unit) is a typed error — the merge
+    /// must never silently pick the first spelling.
+    #[test]
+    fn same_source_module_alias_conflict_errors() {
+        let visibility_a = CatalogVisibility {
+            host_namespace_aliases: Vec::new(),
+            direct_host_call_aliases: Vec::new(),
+            direct_host_wildcard_imports: Vec::new(),
+            module_namespace_aliases: vec![
+                ModuleNamespaceAlias {
+                    alias: "x".to_string(),
+                    module_path: "a".to_string(),
+                    source: String::new(),
+                },
+                ModuleNamespaceAlias {
+                    alias: "x".to_string(),
+                    module_path: "b".to_string(),
+                    source: String::new(),
+                },
+            ],
+            use_declarations: Vec::new(),
+        };
+        let a = unit_with_semantic(
+            "a.rss",
+            1,
+            1,
+            0,
+            vec![decl(0, "f", 1)],
+            HashMap::from([(0u16, simple_impl())]),
+            two_node_index(1, 5, 1),
+            visibility_a,
+        );
+
+        let err = merge_units(vec![a]).expect_err("conflicting aliases must fail");
+        assert!(
+            err.to_string().contains("module namespace alias conflict"),
+            "unexpected: {err}"
+        );
+        assert!(
+            err.to_string().contains("alias 'x' maps to both"),
+            "unexpected: {err}"
+        );
+        assert!(
+            err.to_string().contains("'b' and 'a'") || err.to_string().contains("'a' and 'b'"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// Independent units that use the *same alias name for different modules*
+    /// merge cleanly with per-source ownership retained: neither unit's
+    /// alias collapses into the other's.
+    #[test]
+    fn independent_unit_module_aliases_do_not_collapse() {
+        let visibility_a = CatalogVisibility {
+            host_namespace_aliases: Vec::new(),
+            direct_host_call_aliases: Vec::new(),
+            direct_host_wildcard_imports: Vec::new(),
+            module_namespace_aliases: vec![ModuleNamespaceAlias {
+                alias: "x".to_string(),
+                module_path: "a".to_string(),
+                source: String::new(),
+            }],
+            use_declarations: Vec::new(),
+        };
+        let visibility_b = CatalogVisibility {
+            host_namespace_aliases: Vec::new(),
+            direct_host_call_aliases: Vec::new(),
+            direct_host_wildcard_imports: Vec::new(),
+            module_namespace_aliases: vec![ModuleNamespaceAlias {
+                alias: "x".to_string(),
+                module_path: "b".to_string(),
+                source: String::new(),
+            }],
+            use_declarations: Vec::new(),
+        };
+        let a = unit_with_semantic(
+            "a.rss",
+            1,
+            1,
+            0,
+            vec![decl(0, "f", 1)],
+            HashMap::from([(0u16, simple_impl())]),
+            two_node_index(1, 5, 1),
+            visibility_a,
+        );
+        let b = unit_with_semantic(
+            "b.rss",
+            2,
+            2,
+            0,
+            vec![decl(0, "g", 2)],
+            HashMap::from([(0u16, simple_impl())]),
+            two_node_index(1, 5, 1),
+            visibility_b,
+        );
+
+        let merged = merge_units(vec![a, b]).expect("independent aliases must merge");
+        let visibility = merged
+            .catalog_visibility
+            .as_ref()
+            .expect("merged visibility present");
+        assert_eq!(visibility.module_namespace_aliases.len(), 2);
+        let by_source = |source: &str| {
+            visibility
+                .module_namespace_aliases
+                .iter()
+                .find(|alias| alias.source == source)
+                .expect("alias for source")
+        };
+        let a_alias = by_source("a.rss");
+        let b_alias = by_source("b.rss");
+        assert_eq!(a_alias.alias, "x");
+        assert_eq!(a_alias.module_path, "a", "a's `x` names module a");
+        assert_eq!(b_alias.alias, "x");
+        assert_eq!(b_alias.module_path, "b", "b's `x` names module b");
+        assert_ne!(
+            a_alias.module_path, b_alias.module_path,
+            "same alias in different units keeps distinct module targets"
         );
     }
 

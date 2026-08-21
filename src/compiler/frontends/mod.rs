@@ -1342,7 +1342,7 @@ mod parser_binding_provenance_tests {
             callee.ident_span.lo < value.ident_span.lo,
             "callee precedes value"
         );
-        assert_eq!(callee.function_index, value.function_index, "same function");
+        assert_eq!(callee.target, value.target, "same function target");
         assert_eq!(span_slice(source, callee.ident_span), "g");
         assert_eq!(span_slice(source, value.ident_span), "g");
     }
@@ -1610,5 +1610,461 @@ mod lowered_provenance_remap_tests {
         assert_eq!(x_ref.ident_span.source_id, 0);
         assert_eq!(span_slice(source, x_ref.ident_span), "x");
         assert_eq!(index.scopes[0].range.source_id, 0);
+    }
+}
+
+/// Provenance for every direct postfix source form: index get, member get,
+/// `.length`, `.has`/`.keys`, slices, `.unwrap_or`, and `?.` optional access.
+/// Each form records a `Some` semantic id plus a call site with a truthful
+/// callee span (operator/member/key token range) and the full postfix
+/// expression span; compiler-synthetic lowering (array/map literal builtins,
+/// slice helper `Len` calls) keeps `None` ids.
+#[cfg(test)]
+mod postfix_provenance_tests {
+    use crate::compiler::ir::{Expr, ParsedCallTarget, SemanticNodeId, Stmt};
+    use crate::compiler::source_map::Span;
+    use crate::compiler::{CompileSourceFileOptions, SharedParserOptions};
+
+    use super::{SourceFlavor, parse_source, parse_source_with_dialect};
+
+    fn parse(source: &str) -> crate::compiler::ir::FrontendIr {
+        parse_source(
+            source,
+            SourceFlavor::RustScript,
+            &CompileSourceFileOptions::default(),
+        )
+        .expect("source must parse")
+    }
+
+    fn span_slice(source: &str, span: Span) -> String {
+        source
+            .get(span.lo..span.hi)
+            .expect("span must slice source")
+            .to_string()
+    }
+
+    fn site<'i>(
+        index: &'i crate::compiler::ir::ParsedSemanticIndex,
+        name: &str,
+    ) -> &'i crate::compiler::ir::ParsedCallSite {
+        index
+            .call_sites
+            .iter()
+            .find(|site| site.name == name)
+            .unwrap_or_else(|| panic!("no call site named {name:?}"))
+    }
+
+    /// Index get (`arr[0]`) records the `[0]` operator range as callee, the
+    /// full `arr[0]` as expr span, a distinct id, and a builtin `Get` target;
+    /// the array literal's synthetic `ArrayNew`/`ArrayPush` calls stay `None`.
+    #[test]
+    fn index_get_records_exact_operator_and_expr_slices() {
+        let source = "let arr = [1, 2];\narr[0];\n";
+        let ir = parse(source);
+        let index = ir.parsed_semantic_index.as_ref().expect("index present");
+
+        let get = site(index, "get");
+        assert_eq!(span_slice(source, get.callee_span), "[0]", "operator range");
+        assert_eq!(span_slice(source, get.expr_span), "arr[0]", "full expr");
+        assert!(
+            get.expr_span.lo < get.callee_span.lo,
+            "expr starts at `arr`"
+        );
+        match get.target {
+            ParsedCallTarget::Function(i) => {
+                assert_eq!(i, crate::builtins::BuiltinFunction::Get.call_index())
+            }
+            ref other => panic!("expected builtin Get target, got {other:?}"),
+        }
+
+        // The `Expr::Call` node for the get carries the same id; the array
+        // literal synthetic calls carry `None`.
+        let mut synthetic_none = 0usize;
+        let mut get_node: Option<SemanticNodeId> = None;
+        for stmt in &ir.stmts {
+            if let Stmt::Let { expr, .. } = stmt {
+                for (_, id) in collect_call_ids(expr) {
+                    if id.is_none() {
+                        synthetic_none += 1;
+                    }
+                }
+            }
+            if let Stmt::Expr { expr, .. } = stmt {
+                if let Expr::Call(_, _, _, _, id) = expr {
+                    get_node = *id;
+                }
+            }
+        }
+        assert_eq!(get_node, Some(get.id), "get node shares the site id");
+        assert_eq!(
+            synthetic_none, 3,
+            "ArrayNew + two ArrayPush calls stay None"
+        );
+    }
+
+    /// A chained postfix (`arr[0].length`) records one site per step with
+    /// exact slices: the inner index covers `arr[0]` and the outer `.length`
+    /// covers `arr[0].length`.
+    #[test]
+    fn chained_index_and_length_record_exact_steps() {
+        let source = "let arr = [1, 2];\narr[0].length;\n";
+        let ir = parse(source);
+        let index = ir.parsed_semantic_index.as_ref().expect("index present");
+
+        let get = site(index, "get");
+        let length = site(index, "length");
+        assert_eq!(span_slice(source, get.callee_span), "[0]");
+        assert_eq!(span_slice(source, get.expr_span), "arr[0]");
+        assert_eq!(span_slice(source, length.callee_span), "length");
+        assert_eq!(span_slice(source, length.expr_span), "arr[0].length");
+        assert_ne!(get.id, length.id, "each step gets a distinct id");
+        assert_eq!(
+            get.expr_span.lo, length.expr_span.lo,
+            "both steps start at the chain base"
+        );
+        assert!(
+            get.expr_span.hi < length.callee_span.lo,
+            "inner expr ends before the outer member"
+        );
+        match length.target {
+            ParsedCallTarget::Function(i) => {
+                assert_eq!(i, crate::builtins::BuiltinFunction::Len.call_index())
+            }
+            ref other => panic!("expected Len target, got {other:?}"),
+        }
+    }
+
+    /// `.has(k)` and `.keys` record the member token as callee and the full
+    /// postfix expression as expr span.
+    #[test]
+    fn has_and_keys_record_member_callee_and_full_expr() {
+        let source = "let m = {}; let k = 1;\nm.has(k);\nm.keys;\n";
+        let ir = parse(source);
+        let index = ir.parsed_semantic_index.as_ref().expect("index present");
+
+        let has = site(index, "has");
+        assert_eq!(span_slice(source, has.callee_span), "has");
+        assert_eq!(span_slice(source, has.expr_span), "m.has(k)");
+        match has.target {
+            ParsedCallTarget::Function(i) => {
+                assert_eq!(i, crate::builtins::BuiltinFunction::Has.call_index())
+            }
+            ref other => panic!("expected Has target, got {other:?}"),
+        }
+
+        let keys = site(index, "keys");
+        assert_eq!(span_slice(source, keys.callee_span), "keys");
+        assert_eq!(span_slice(source, keys.expr_span), "m.keys");
+        match keys.target {
+            ParsedCallTarget::Function(i) => {
+                assert_eq!(i, crate::builtins::BuiltinFunction::Keys.call_index())
+            }
+            ref other => panic!("expected Keys target, got {other:?}"),
+        }
+    }
+
+    /// A slice (`s[1:3]`) records the `[1:3]` bracket range and the full
+    /// `s[1:3]` expr span, and the operative `Slice` call carries the id
+    /// while the lowering's synthetic `Len` helper stays `None`.
+    #[test]
+    fn slice_records_bracket_callee_and_operative_call_id() {
+        let source = "let s = [1, 2, 3];\ns[1:3];\n";
+        let ir = parse(source);
+        let index = ir.parsed_semantic_index.as_ref().expect("index present");
+
+        let slice = site(index, "slice");
+        assert_eq!(span_slice(source, slice.callee_span), "[1:3]");
+        assert_eq!(span_slice(source, slice.expr_span), "s[1:3]");
+        match slice.target {
+            ParsedCallTarget::Function(i) => {
+                assert_eq!(i, crate::builtins::BuiltinFunction::Slice.call_index())
+            }
+            ref other => panic!("expected Slice target, got {other:?}"),
+        }
+
+        // Find the operative Slice call inside the lowered Match chain and
+        // assert it carries the site id; the synthetic Len call stays None.
+        let expr = ir
+            .stmts
+            .iter()
+            .find_map(|stmt| match stmt {
+                Stmt::Expr { expr, .. } => Some(expr),
+                _ => None,
+            })
+            .expect("expr stmt");
+        let slice_calls = collect_call_ids(expr)
+            .into_iter()
+            .filter(|(index, _)| *index == crate::builtins::BuiltinFunction::Slice.call_index())
+            .collect::<Vec<_>>();
+        assert!(!slice_calls.is_empty(), "slice call present in lowered IR");
+        assert!(
+            slice_calls.iter().any(|(_, id)| *id == Some(slice.id)),
+            "operative Slice call carries the site id"
+        );
+        let len_calls = collect_call_ids(expr)
+            .into_iter()
+            .filter(|(index, _)| *index == crate::builtins::BuiltinFunction::Len.call_index())
+            .collect::<Vec<_>>();
+        assert!(!len_calls.is_empty(), "synthetic Len call present");
+        for (_, id) in &len_calls {
+            assert_eq!(*id, None, "synthetic Len helper stays None");
+        }
+    }
+
+    /// `.unwrap_or(d)` records the member token as callee, the full
+    /// `o.unwrap_or(5)` expr span, an `Unresolved` target, and the
+    /// `OptionUnwrapOr` node carries the same id.
+    #[test]
+    fn unwrap_or_records_member_callee_and_node_id() {
+        let source = "let o = null;\no.unwrap_or(5);\n";
+        let ir = parse(source);
+        let index = ir.parsed_semantic_index.as_ref().expect("index present");
+
+        let unwrap = site(index, "unwrap_or");
+        assert_eq!(span_slice(source, unwrap.callee_span), "unwrap_or");
+        assert_eq!(span_slice(source, unwrap.expr_span), "o.unwrap_or(5)");
+        assert!(matches!(unwrap.target, ParsedCallTarget::Unresolved));
+
+        let expr = ir
+            .stmts
+            .iter()
+            .find_map(|stmt| match stmt {
+                Stmt::Expr { expr, .. } => Some(expr),
+                _ => None,
+            })
+            .expect("expr stmt");
+        match expr {
+            Expr::OptionUnwrapOr { semantic_id, .. } => {
+                assert_eq!(*semantic_id, Some(unwrap.id), "node shares site id")
+            }
+            other => panic!("expected OptionUnwrapOr, got {other:?}"),
+        }
+    }
+
+    /// Optional access (`x?.y` and `x?.[k]`) records the member/key range as
+    /// callee, the full postfix expr span, and the `OptionalGet` node carries
+    /// the same id.
+    #[test]
+    fn optional_access_records_member_callee_and_node_id() {
+        let source = "let x = null; let k = 1;\nx?.y;\nx?.[k];\n";
+        let ir = parse(source);
+        let index = ir.parsed_semantic_index.as_ref().expect("index present");
+
+        let member_sites = index
+            .call_sites
+            .iter()
+            .filter(|site| span_slice(source, site.callee_span) == "y")
+            .collect::<Vec<_>>();
+        assert_eq!(member_sites.len(), 1, "one member access site");
+        let member_site = member_sites[0];
+        assert_eq!(span_slice(source, member_site.expr_span), "x?.y");
+
+        let index_sites = index
+            .call_sites
+            .iter()
+            .filter(|site| span_slice(source, site.callee_span) == "[k]")
+            .collect::<Vec<_>>();
+        assert_eq!(index_sites.len(), 1, "one optional index site");
+        let index_site = index_sites[0];
+        assert_eq!(span_slice(source, index_site.expr_span), "x?.[k]");
+        assert_ne!(member_site.id, index_site.id);
+
+        let exprs = ir
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Stmt::Expr { expr, .. } => Some(expr),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        match exprs[0] {
+            Expr::OptionalGet { semantic_id, .. } => {
+                assert_eq!(*semantic_id, Some(member_site.id))
+            }
+            other => panic!("expected OptionalGet, got {other:?}"),
+        }
+        match exprs[1] {
+            Expr::OptionalGet { semantic_id, .. } => {
+                assert_eq!(*semantic_id, Some(index_site.id))
+            }
+            other => panic!("expected OptionalGet, got {other:?}"),
+        }
+    }
+
+    /// Member get (`m.foo`) is a direct source expression: it records the
+    /// member token as callee and the full chain as expr span.
+    #[test]
+    fn member_get_records_exact_callee_and_expr() {
+        let source = "let m = {};\nm.foo;\n";
+        let ir = parse(source);
+        let index = ir.parsed_semantic_index.as_ref().expect("index present");
+
+        let foo = site(index, "foo");
+        assert_eq!(span_slice(source, foo.callee_span), "foo");
+        assert_eq!(span_slice(source, foo.expr_span), "m.foo");
+        match foo.target {
+            ParsedCallTarget::Function(i) => {
+                assert_eq!(i, crate::builtins::BuiltinFunction::Get.call_index())
+            }
+            ref other => panic!("expected Get target, got {other:?}"),
+        }
+    }
+
+    /// Collect every `(call index, semantic id)` pair under an expression,
+    /// including nested calls inside `Match`/`IfElse`/arithmetic wrappers.
+    fn collect_call_ids(expr: &Expr) -> Vec<(u16, Option<SemanticNodeId>)> {
+        let mut out = Vec::new();
+        fn walk(expr: &Expr, out: &mut Vec<(u16, Option<SemanticNodeId>)>) {
+            match expr {
+                Expr::Call(index, _, args, _, id) => {
+                    out.push((*index, *id));
+                    for arg in args {
+                        walk(arg, out);
+                    }
+                }
+                Expr::LocalCall(_, _, args, _) | Expr::ModuleCall(_, _, args, _) => {
+                    for arg in args {
+                        walk(arg, out);
+                    }
+                }
+                Expr::OptionalGet { container, key, .. } => {
+                    walk(container, out);
+                    walk(key, out);
+                }
+                Expr::OptionUnwrapOr {
+                    value, fallback, ..
+                } => {
+                    walk(value, out);
+                    walk(fallback, out);
+                }
+                Expr::IfElse {
+                    condition,
+                    then_expr,
+                    else_expr,
+                } => {
+                    walk(condition, out);
+                    walk(then_expr, out);
+                    walk(else_expr, out);
+                }
+                Expr::Match {
+                    value,
+                    arms,
+                    default,
+                    ..
+                } => {
+                    walk(value, out);
+                    for (_, arm) in arms {
+                        walk(arm, out);
+                    }
+                    walk(default, out);
+                }
+                Expr::Add(lhs, rhs)
+                | Expr::Sub(lhs, rhs)
+                | Expr::Mul(lhs, rhs)
+                | Expr::Div(lhs, rhs)
+                | Expr::Mod(lhs, rhs)
+                | Expr::And(lhs, rhs)
+                | Expr::Or(lhs, rhs)
+                | Expr::Eq(lhs, rhs)
+                | Expr::Lt(lhs, rhs)
+                | Expr::Gt(lhs, rhs) => {
+                    walk(lhs, out);
+                    walk(rhs, out);
+                }
+                Expr::Neg(inner) | Expr::Not(inner) | Expr::ToOwned(inner) => walk(inner, out),
+                Expr::Block { stmts, expr } => {
+                    for stmt in stmts {
+                        if let Stmt::Let { expr, .. } = stmt {
+                            walk(expr, out);
+                        }
+                        if let Stmt::Expr { expr, .. } = stmt {
+                            walk(expr, out);
+                        }
+                    }
+                    walk(expr, out);
+                }
+                _ => {}
+            }
+        }
+        walk(expr, &mut out);
+        out
+    }
+
+    /// A test dialect that enables dotted JS-style calls so the
+    /// `console.log(...)` / builtin-dotted provenance path is exercised.
+    struct DottedDialect;
+    impl crate::compiler::parser::ParserDialect for DottedDialect {
+        fn allow_dotted_call(&self) -> bool {
+            true
+        }
+    }
+    static DOTTED_DIALECT: DottedDialect = DottedDialect;
+
+    /// Builtin namespace calls (`json::encode(...)`, `math::abs(...)`) record
+    /// the exact path callee and the full call expr span.
+    #[test]
+    fn builtin_namespace_calls_record_exact_path_provenance() {
+        let source = "use json;\nuse math;\nlet s = \"{}\";\njson::encode(s);\nmath::abs(-1);\n";
+        let ir = parse(source);
+        let index = ir.parsed_semantic_index.as_ref().expect("index present");
+
+        let encode = index
+            .call_sites
+            .iter()
+            .find(|site| site.name == "json::encode")
+            .expect("json::encode site");
+        assert_eq!(span_slice(source, encode.callee_span), "json::encode");
+        assert_eq!(span_slice(source, encode.expr_span), "json::encode(s)");
+        assert!(encode.is_namespace_call, "namespace call flagged");
+        match encode.target {
+            ParsedCallTarget::Function(i) => {
+                assert_eq!(i, crate::builtins::BuiltinFunction::JsonEncode.call_index())
+            }
+            ref other => panic!("expected builtin target, got {other:?}"),
+        }
+
+        let abs = index
+            .call_sites
+            .iter()
+            .find(|site| site.name == "math::abs")
+            .expect("math::abs site");
+        assert_eq!(span_slice(source, abs.callee_span), "math::abs");
+        assert_eq!(span_slice(source, abs.expr_span), "math::abs(-1)");
+        assert!(abs.is_namespace_call);
+        match abs.target {
+            ParsedCallTarget::Function(i) => {
+                assert_eq!(i, crate::builtins::BuiltinFunction::MathAbs.call_index())
+            }
+            ref other => panic!("expected builtin target, got {other:?}"),
+        }
+    }
+
+    /// Dotted JS calls (`console.log(...)`) record the dotted path callee and
+    /// the full call expr span under a dialect that enables them.
+    #[test]
+    fn dotted_js_call_records_exact_path_provenance() {
+        let source = "console.log(\"hi\");\n";
+        let ir = parse_source_with_dialect(
+            source,
+            &DOTTED_DIALECT,
+            SharedParserOptions {
+                source_id: 0,
+                allow_implicit_externs: false,
+                allow_implicit_semicolons: false,
+                enforce_mutable_bindings: true,
+                import_scan_mode: false,
+            },
+        )
+        .expect("dotted call must parse");
+        let index = ir.parsed_semantic_index.as_ref().expect("index present");
+
+        let log = index
+            .call_sites
+            .iter()
+            .find(|site| site.name == "console.log")
+            .expect("console.log site");
+        assert_eq!(span_slice(source, log.callee_span), "console.log");
+        assert_eq!(span_slice(source, log.expr_span), "console.log(\"hi\")");
+        assert!(log.is_namespace_call, "dotted call flagged as namespace");
     }
 }

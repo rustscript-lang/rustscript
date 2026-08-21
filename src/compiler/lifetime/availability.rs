@@ -803,6 +803,7 @@ impl AvailabilityAnalyzer {
                 key,
                 container_slot,
                 key_slot,
+                semantic_id: _,
             } => {
                 let container_state = self.analyze_expr(container, state, line)?;
                 let mut out = self.analyze_expr(key, &container_state, line)?;
@@ -814,6 +815,7 @@ impl AvailabilityAnalyzer {
                 value,
                 value_slot,
                 fallback,
+                semantic_id: _,
             } => {
                 let mut value_state = self.analyze_expr(value, state, line)?;
                 self.mark_available(&mut value_state, *value_slot, line)?;
@@ -1238,6 +1240,7 @@ impl AvailabilityAnalyzer {
                 key,
                 container_slot,
                 key_slot,
+                semantic_id: _,
             } => {
                 self.is_owned_slot(*container_slot)
                     || self.is_owned_slot(*key_slot)
@@ -1248,6 +1251,7 @@ impl AvailabilityAnalyzer {
                 value,
                 value_slot,
                 fallback,
+                semantic_id: _,
             } => {
                 self.is_owned_slot(*value_slot)
                     || self.expr_contains_owned_local(value)
@@ -1492,20 +1496,24 @@ impl AvailabilityAnalyzer {
                 key,
                 container_slot,
                 key_slot,
+                semantic_id,
             } => Ok(Expr::OptionalGet {
                 container: Box::new(self.rewrite_expr_ownership_inner(container, false)?),
                 key: Box::new(self.rewrite_expr_ownership_inner(key, false)?),
                 container_slot: *container_slot,
                 key_slot: *key_slot,
+                semantic_id: *semantic_id,
             }),
             Expr::OptionUnwrapOr {
                 value,
                 value_slot,
                 fallback,
+                semantic_id,
             } => Ok(Expr::OptionUnwrapOr {
                 value: Box::new(self.rewrite_expr_ownership_inner(value, false)?),
                 value_slot: *value_slot,
                 fallback: Box::new(self.rewrite_expr_ownership_inner(fallback, false)?),
+                semantic_id: *semantic_id,
             }),
             Expr::LocalCall(index, type_args, args, semantic_id) => Ok(Expr::LocalCall(
                 *index,

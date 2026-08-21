@@ -605,7 +605,7 @@ mod tests {
     /// *same* (rebased) id for the same source call.
     #[test]
     fn module_call_semantic_id_survives_loader_and_linker() {
-        use super::super::ir::{Expr, ParsedCallTarget};
+        use super::super::ir::{Expr, FunctionRefTarget, ParsedCallTarget};
         use super::super::linker::merge_units;
 
         let path = PathBuf::from("__pd_vm_inmemory__/main.rss");
@@ -663,6 +663,36 @@ mod tests {
             }
             ref other => panic!("expected Module target after loader, got {other:?}"),
         }
+        // N1: the callee span is the exact namespace path token range
+        // (`au::helper`), never the whole call including arguments, and the
+        // expr span covers the full call through the closing `)`.
+        let callee_slice = &source[site.callee_span.lo..site.callee_span.hi];
+        let expr_slice = &source[site.expr_span.lo..site.expr_span.hi];
+        assert_eq!(
+            callee_slice, "au::helper",
+            "exact namespace path callee slice"
+        );
+        assert_eq!(expr_slice, "au::helper()", "exact full call slice");
+        assert!(
+            site.expr_span.hi > site.callee_span.hi,
+            "expr span extends past the callee over the argument list"
+        );
+        // N4: the parser-recorded function-value reference for the
+        // implicit-extern callee must be upgraded to the resolved module
+        // symbol, never left with a stale unit-local flat index. (Namespace
+        // calls record no function-value ref — only direct imported calls
+        // do, covered by the dedicated test below.)
+        assert!(
+            parsed
+                .func_refs
+                .iter()
+                .all(|reference| reference.name != "au::helper"),
+            "namespace call records no func_ref"
+        );
+        assert_eq!(
+            site.callee_span.lo, site.expr_span.lo,
+            "expr span starts at the callee start"
+        );
 
         // The linker lowers ModuleCall -> Call and rebases the id onto the
         // merged collision-free space. The invariant is consistency: the
@@ -692,6 +722,169 @@ mod tests {
         assert_eq!(
             final_call, merged_site.id,
             "final flat Call id matches the merged index entry"
+        );
+
+        remove_module_root(&std::path::Path::new("__pd_vm_inmemory__"));
+    }
+
+    /// Loader-resolved module function-value references (`let f = helper;`
+    /// in module mode) must not leave stale unit-local flat indices in the
+    /// merged carrier. The parser records a placeholder flat target; the
+    /// loader upgrades the matching `func_ref` to `Module(symbol)` and the
+    /// linker preserves that module target verbatim through the merge.
+    #[test]
+    fn module_function_value_refs_upgrade_to_symbol_and_survive_merge() {
+        use super::super::ir::{Expr, FunctionRefTarget};
+        use super::super::linker::merge_units;
+
+        let path = PathBuf::from("__pd_vm_inmemory__/main.rss");
+        let source = "use a::util::{helper};\nfn run() { let f = helper; f; }\n";
+        let options = CompileSourceFileOptions::new()
+            .with_module_override_source("a/util.rss", "pub fn helper() { 7; }\n");
+
+        let loaded = load_units_for_source_file(&path, SourceFlavor::RustScript, source, &options)
+            .expect("virtual load should succeed");
+        assert_eq!(loaded.units.len(), 2, "root plus overridden module");
+
+        let root_unit = loaded
+            .units
+            .iter()
+            .find(|unit| unit.source_name.ends_with("main.rss"))
+            .expect("root unit present");
+        let parsed = root_unit
+            .parsed
+            .parsed_semantic_index
+            .as_ref()
+            .expect("root parse carries provenance");
+
+        // The function-value reference's placeholder flat target must have
+        // been upgraded to the resolved module symbol by the loader.
+        let reference = parsed
+            .func_refs
+            .iter()
+            .find(|reference| reference.name == "helper")
+            .expect("helper function value ref recorded");
+        let symbol = match reference.target {
+            FunctionRefTarget::Module(symbol) => symbol,
+            ref other => panic!("expected Module target after loader, got {other:?}"),
+        };
+
+        // The loader also rewrote the Expr to a ModuleFunctionRef carrying
+        // the same symbol.
+        let module_ref = root_unit
+            .parsed
+            .function_impls
+            .values()
+            .find_map(|impl_| match &impl_.body_expr {
+                Expr::ModuleFunctionRef(s, _) => Some(*s),
+                _ => impl_.body_stmts.iter().find_map(|stmt| match stmt {
+                    crate::compiler::ir::Stmt::Let { expr, .. } => match expr {
+                        Expr::ModuleFunctionRef(s, _) => Some(*s),
+                        _ => None,
+                    },
+                    _ => None,
+                }),
+            })
+            .expect("loader rewrote the function value ref to ModuleFunctionRef");
+        assert_eq!(module_ref, symbol, "Expr and func_ref share the symbol");
+
+        // After the merge, the func_ref keeps its Module target (no flat
+        // index rebase applies) and the lowered FunctionRef carries the
+        // merged flat index.
+        let merged = merge_units(loaded.units).expect("merge must succeed");
+        let merged_index = merged
+            .parsed_semantic_index
+            .as_ref()
+            .expect("merged index present");
+        let merged_ref = merged_index
+            .func_refs
+            .iter()
+            .find(|reference| reference.name == "helper")
+            .expect("merged func_ref present");
+        assert_eq!(
+            merged_ref.target,
+            FunctionRefTarget::Module(symbol),
+            "module target survives merge verbatim"
+        );
+
+        remove_module_root(&std::path::Path::new("__pd_vm_inmemory__"));
+    }
+
+    /// A direct imported call (`helper()` where `helper` is a named import)
+    /// records a function-value reference via `attach_ordinary_call_provenance`
+    /// with a unit-local flat index; the loader must upgrade that reference
+    /// to `Module(symbol)` so the merged carrier never aliases an unrelated
+    /// flat function.
+    #[test]
+    fn direct_imported_call_func_ref_upgrades_to_symbol() {
+        use super::super::ir::{Expr, FunctionRefTarget};
+        use super::super::linker::merge_units;
+
+        let path = PathBuf::from("__pd_vm_inmemory__/main.rss");
+        let source = "use a::util::{helper};\nfn run() { helper(); }\n";
+        let options = CompileSourceFileOptions::new()
+            .with_module_override_source("a/util.rss", "pub fn helper() { 7; }\n");
+
+        let loaded = load_units_for_source_file(&path, SourceFlavor::RustScript, source, &options)
+            .expect("virtual load should succeed");
+        assert_eq!(loaded.units.len(), 2, "root plus overridden module");
+
+        let root_unit = loaded
+            .units
+            .iter()
+            .find(|unit| unit.source_name.ends_with("main.rss"))
+            .expect("root unit present");
+        let parsed = root_unit
+            .parsed
+            .parsed_semantic_index
+            .as_ref()
+            .expect("root parse carries provenance");
+
+        // The direct call records one func_ref for the implicit-extern
+        // callee; the loader must have upgraded it to the module symbol.
+        let helper_refs = parsed
+            .func_refs
+            .iter()
+            .filter(|reference| reference.name == "helper")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            helper_refs.len(),
+            1,
+            "direct imported call records one callee func ref"
+        );
+        let symbol = match helper_refs[0].target {
+            FunctionRefTarget::Module(symbol) => symbol,
+            ref other => panic!("expected Module target after loader, got {other:?}"),
+        };
+
+        // The call itself was rewritten to ModuleCall with the same symbol.
+        let module_call = root_unit
+            .parsed
+            .function_impls
+            .values()
+            .find_map(|impl_| match &impl_.body_expr {
+                Expr::ModuleCall(s, _, _, _) => Some(*s),
+                _ => None,
+            })
+            .expect("loader rewrote the call to ModuleCall");
+        assert_eq!(module_call, symbol, "call and func ref share the symbol");
+
+        // The merged carrier keeps the Module target (never a stale flat
+        // index in the merged function space).
+        let merged = merge_units(loaded.units).expect("merge must succeed");
+        let merged_index = merged
+            .parsed_semantic_index
+            .as_ref()
+            .expect("merged index present");
+        let merged_ref = merged_index
+            .func_refs
+            .iter()
+            .find(|reference| reference.name == "helper")
+            .expect("merged func_ref present");
+        assert_eq!(
+            merged_ref.target,
+            FunctionRefTarget::Module(symbol),
+            "module target survives merge verbatim"
         );
 
         remove_module_root(&std::path::Path::new("__pd_vm_inmemory__"));

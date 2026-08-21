@@ -529,6 +529,7 @@ impl LivenessRewriter {
                 key,
                 container_slot,
                 key_slot,
+                semantic_id: _,
             } => {
                 self.mark_live(live, *container_slot);
                 self.mark_live(live, *key_slot);
@@ -539,6 +540,7 @@ impl LivenessRewriter {
                 value,
                 value_slot,
                 fallback,
+                semantic_id: _,
             } => {
                 self.mark_live(live, *value_slot);
                 self.add_expr_uses_impl(value, live, conservative);
@@ -1067,6 +1069,7 @@ impl LocalSlotAllocator {
                 key,
                 container_slot,
                 key_slot,
+                semantic_id: _,
             } => {
                 self.add_slot_live_edges(*container_slot, &live_during);
                 self.add_slot_live_edges(*key_slot, &live_during);
@@ -1077,6 +1080,7 @@ impl LocalSlotAllocator {
                 value,
                 value_slot,
                 fallback,
+                semantic_id: _,
             } => {
                 self.add_slot_live_edges(*value_slot, &live_during);
                 self.collect_expr_constraints(value, &live_during, protected_slots)?;
@@ -1340,6 +1344,7 @@ impl LocalSlotAllocator {
                 key,
                 container_slot,
                 key_slot,
+                semantic_id: _,
             } => {
                 self.mark_set_slot(set, *container_slot);
                 self.mark_set_slot(set, *key_slot);
@@ -1350,6 +1355,7 @@ impl LocalSlotAllocator {
                 value,
                 value_slot,
                 fallback,
+                semantic_id: _,
             } => {
                 self.mark_set_slot(set, *value_slot);
                 self.collect_expr_footprint(value, set, stack);
@@ -1932,6 +1938,7 @@ fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseE
             key,
             container_slot,
             key_slot,
+            semantic_id: _,
         } => {
             *container_slot = remap_slot(*container_slot, mapping)?;
             *key_slot = remap_slot(*key_slot, mapping)?;
@@ -1942,6 +1949,7 @@ fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseE
             value,
             value_slot,
             fallback,
+            semantic_id: _,
         } => {
             *value_slot = remap_slot(*value_slot, mapping)?;
             remap_expr_slots(value, mapping)?;

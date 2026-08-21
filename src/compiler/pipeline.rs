@@ -193,6 +193,7 @@ fn record_expr_local_debug_ranges(
             key,
             container_slot,
             key_slot,
+            semantic_id: _,
         } => {
             note_local_use(ranges, *container_slot, line);
             note_local_use(ranges, *key_slot, line);
@@ -203,6 +204,7 @@ fn record_expr_local_debug_ranges(
             value,
             value_slot,
             fallback,
+            semantic_id: _,
         } => {
             note_local_use(ranges, *value_slot, line);
             record_expr_local_debug_ranges(value, line, ranges);

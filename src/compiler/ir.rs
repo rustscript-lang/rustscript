@@ -382,11 +382,23 @@ pub enum Expr {
         key: Box<Expr>,
         container_slot: LocalSlot,
         key_slot: LocalSlot,
+        /// Parser-assigned [`SemanticNodeId`] of the source `?.[...]` access,
+        /// preserved through every compiler transformation. Parser-produced
+        /// accesses carry `Some(id)`; compiler- or test-synthetic ones use
+        /// `None`. Transformations that rebuild the node **must** copy the
+        /// original ID.
+        semantic_id: Option<SemanticNodeId>,
     },
     OptionUnwrapOr {
         value: Box<Expr>,
         value_slot: LocalSlot,
         fallback: Box<Expr>,
+        /// Parser-assigned [`SemanticNodeId`] of the source `.unwrap_or(...)`
+        /// access, preserved through every compiler transformation.
+        /// Parser-produced accesses carry `Some(id)`; compiler- or
+        /// test-synthetic ones use `None`. Transformations that rebuild the
+        /// node **must** copy the original ID.
+        semantic_id: Option<SemanticNodeId>,
     },
     /// A call to a flat function-table index as a normalized `(name, arity)`
     /// candidate-set identity.
@@ -782,8 +794,10 @@ pub struct FrontendIr {
     /// snippets without semantic analysis, test fixtures).
     pub semantic_index: Option<SemanticIndex>,
     /// Parser-produced semantic provenance index with exact token spans.
-    /// Populated during parse and preserved through linking.
-    /// `None` for REPL snippets without full provenance tracking.
+    /// Populated during parse and preserved through linking. Every real
+    /// parse path — module-mode, plain compile, lowered, and REPL — sets
+    /// `Some`; only IR built directly in tests or by plugin authors without
+    /// a parser pass leaves `None`.
     pub parsed_semantic_index: Option<ParsedSemanticIndex>,
     /// Parser-produced visibility information from namespace aliases and imports.
     pub catalog_visibility: Option<CatalogVisibility>,
@@ -1029,6 +1043,22 @@ pub struct FunctionDeclSite {
     pub decl_order: u32,
 }
 
+/// The resolved target of a parsed function-value reference. The parser
+/// records the target honestly from its own resolution tables: plain
+/// functions carry their flat index, and module-mode references that the
+/// source loader resolves to an imported function carry the [`SymbolId`] of
+/// the source module's declaration. Module targets are upgraded by the
+/// loader during `resolve_imported_call_sites`; a reference that kept its
+/// stale unit-local flat index after that pass would alias an unrelated
+/// merged flat function.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FunctionRefTarget {
+    /// A plain function value reference resolved to a flat (or builtin) index.
+    Function(u16),
+    /// A loader-resolved module function value reference.
+    Module(SymbolId),
+}
+
 /// A parsed local function reference site (function value, not a call).
 #[derive(Clone, Debug)]
 pub struct FunctionRefSite {
@@ -1036,8 +1066,8 @@ pub struct FunctionRefSite {
     pub id: SemanticNodeId,
     /// Exact identifier token span.
     pub ident_span: Span,
-    /// The flat function index.
-    pub function_index: u16,
+    /// The resolved function target (flat index or module symbol).
+    pub target: FunctionRefTarget,
     /// The function name.
     pub name: String,
     /// The scope this reference belongs to.
@@ -1059,6 +1089,23 @@ pub struct ParsedLexicalScope {
     pub functions: Vec<u16>,
 }
 
+/// One file-module namespace alias recorded by the parser for a specific
+/// owning source. Module namespace aliases are unit-local: the same alias
+/// name may name different modules in different sources (`use a as x;` in one
+/// unit and `use b as x;` in another), so the merged carrier keeps ownership
+/// per source instead of collapsing by alias name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleNamespaceAlias {
+    /// The local alias name (`use a::util as au;` records alias `au`).
+    pub alias: String,
+    /// The module path the alias names (parser-relative spelling, e.g.
+    /// `self::c` or `a::util`).
+    pub module_path: String,
+    /// The owning source name (unit identity). Empty until the linker tags
+    /// entries with their unit's source during merge.
+    pub source: String,
+}
+
 /// Visibility information for host/builtin/module names, populated by the
 /// parser from its own alias/import maps — never inferred from source text.
 #[derive(Clone, Debug, Default)]
@@ -1069,8 +1116,8 @@ pub struct CatalogVisibility {
     pub direct_host_call_aliases: Vec<(String, String)>,
     /// Wildcard host imports: set of namespace prefixes.
     pub direct_host_wildcard_imports: Vec<String>,
-    /// Module namespace aliases: `alias -> module_path`.
-    pub module_namespace_aliases: Vec<(String, String)>,
+    /// Module namespace aliases, keyed by owning source after merge.
+    pub module_namespace_aliases: Vec<ModuleNamespaceAlias>,
     /// Structured use declarations with their visibility clauses.
     pub use_declarations: Vec<crate::compiler::modules::UseDecl>,
 }
@@ -1099,17 +1146,27 @@ pub struct ParsedSemanticIndex {
 }
 
 impl ParsedSemanticIndex {
-    /// Allocate a new monotonic [`SemanticNodeId`].
+    /// Allocate a new monotonic [`SemanticNodeId`]. Exhaustion of the u32 id
+    /// space is a parser-level resource failure: it is asserted explicitly
+    /// rather than silently wrapping.
     pub fn alloc_node_id(&mut self) -> SemanticNodeId {
         let id = SemanticNodeId(self.next_node_id);
-        self.next_node_id += 1;
+        self.next_node_id = self
+            .next_node_id
+            .checked_add(1)
+            .expect("parser semantic node id space exhausted (u32 overflow)");
         id
     }
 
-    /// Allocate a new monotonic [`ScopeId`].
+    /// Allocate a new monotonic [`ScopeId`]. Exhaustion of the u32 id space
+    /// is a parser-level resource failure: it is asserted explicitly rather
+    /// than silently wrapping.
     pub fn alloc_scope_id(&mut self) -> ScopeId {
         let id = self.next_scope_id;
-        self.next_scope_id += 1;
+        self.next_scope_id = self
+            .next_scope_id
+            .checked_add(1)
+            .expect("parser scope id space exhausted (u32 overflow)");
         id
     }
 }

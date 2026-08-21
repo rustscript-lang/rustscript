@@ -181,6 +181,7 @@ pub(super) fn expr_uses_slot(expr: &Expr, slot: LocalSlot) -> bool {
             key,
             container_slot,
             key_slot,
+            semantic_id: _,
         } => {
             *container_slot == slot
                 || *key_slot == slot
@@ -191,6 +192,7 @@ pub(super) fn expr_uses_slot(expr: &Expr, slot: LocalSlot) -> bool {
             value,
             value_slot,
             fallback,
+            semantic_id: _,
         } => *value_slot == slot || expr_uses_slot(value, slot) || expr_uses_slot(fallback, slot),
         Expr::Call(_, _, args, _, _)
         | Expr::LocalCall(_, _, args, _)
