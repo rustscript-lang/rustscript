@@ -5,6 +5,13 @@
 //! These tests exercise the combined feature matrix
 //! `runtime + http-client` (which implies `async`) so that both IO
 //! (async path) and HTTP share the same VM.
+//!
+//! The exact combined-binding tests at the bottom compile against the
+//! authoritative standard catalog snapshot ([`standard_host_catalog`]),
+//! register the standard extensions against that same snapshot, and prove
+//! that a combined sqlite+io+http surface exact-binds and executes without
+//! legacy name-only fallback — and that a subcatalog-fingerprint
+//! registration is rejected.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -18,9 +25,11 @@ use std::thread;
 use std::time::Duration;
 
 use vm::{
-    CallOutcome, CallReturn, HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput,
-    HostOpId, HostStackFunction, HttpConfig, HttpHostExt, IoHostExt, IoPolicy, Program, Value, Vm,
-    VmError, VmMap, VmResetState, VmResult, VmStatus, compile_source,
+    CallOutcome, CallReturn, CompileSourceFileOptions, HostApiCatalog, HostAsyncBridge,
+    HostFunctionRegistry, HostFuture, HostFutureOutput, HostImportBindingError, HostOpId,
+    HostStackFunction, HttpConfig, HttpHostExt, IoHostExt, IoPolicy, Program, SourceFlavor, Value,
+    Vm, VmError, VmMap, VmResetState, VmResult, VmStatus, compile_source,
+    compile_source_with_flavor_and_options,
 };
 
 // ---------------------------------------------------------------------------
@@ -526,4 +535,242 @@ fn io_and_http_module_states_are_independent() {
         "expected Ready after reset, got {:?}",
         vm.reset_state()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Exact combined-binding tests: the standard catalog snapshot is the single
+// fingerprint for both compile and runtime registration. These replace the
+// legacy configure_* only assertions with real exact-bound execution.
+// ---------------------------------------------------------------------------
+
+/// The authoritative combined standard catalog: sqlite + io + http.
+///
+/// This is the same snapshot the compiler/LSP standard entry uses; the
+/// extensions register against it so compile-time and runtime fingerprints
+/// match byte-for-byte. SQLite-dependent (the sqlite surface is enabled only
+/// under the `sqlite` feature); the IO+HTTP-only combined behavior is
+/// covered by [`standard_compile_options_default_to_combined_exact_schemas`].
+#[cfg(feature = "sqlite")]
+fn combined_standard_catalog() -> Arc<HostApiCatalog> {
+    let mut builder = vm::HostApiBuilder::new();
+    for catalog in [
+        vm::sqlite_host_catalog(),
+        vm::io_host_catalog(),
+        vm::http_host_catalog(),
+    ] {
+        for resource in catalog.resources() {
+            builder.resource(resource.clone());
+        }
+        for function in catalog.functions() {
+            builder.function(function.clone());
+        }
+    }
+    Arc::new(builder.build().expect("standard catalog must be valid"))
+}
+
+/// Compile against the combined standard catalog: standard host calls must
+/// carry exact V13 HostImport schemas (resources + passing modes +
+/// fingerprint), never a name-only fallback.
+#[cfg(feature = "sqlite")]
+#[test]
+fn combined_standard_compile_produces_exact_import_schemas() {
+    let catalog = combined_standard_catalog();
+    let compiled = compile_source_with_flavor_and_options(
+        r#"
+        use sqlite;
+        use http;
+        let db = sqlite::open({ path: ":memory:", mode: "memory", limits: {} });
+        let _ = http::client::request({"method": "GET", "url": "http://127.0.0.1:1/x"});
+        sqlite::close(&db);
+        "#,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog)),
+    )
+    .expect("combined standard source should compile");
+
+    let sqlite_open = compiled
+        .program
+        .imports
+        .iter()
+        .find(|i| i.name == "sqlite::open")
+        .expect("sqlite::open must be a host import")
+        .schema
+        .as_ref()
+        .expect("sqlite::open must carry an exact schema, no name-only fallback");
+    assert_eq!(
+        sqlite_open.fingerprint,
+        catalog.fingerprint(),
+        "compiled sqlite::open schema must carry the combined catalog fingerprint"
+    );
+
+    // The resource-aware `sqlite::close(&db)` import must carry the exact
+    // borrow passing mode for its resource<sqlite.connection> parameter.
+    let sqlite_close = compiled
+        .program
+        .imports
+        .iter()
+        .find(|i| i.name == "sqlite::close")
+        .expect("sqlite::close must be a host import")
+        .schema
+        .as_ref()
+        .expect("sqlite::close must carry an exact schema");
+    assert_eq!(
+        sqlite_close.fingerprint,
+        catalog.fingerprint(),
+        "compiled sqlite::close schema must carry the combined catalog fingerprint"
+    );
+    assert!(
+        sqlite_close
+            .params
+            .iter()
+            .any(|p| p.passing != vm::HostParamPassing::Value),
+        "sqlite::close resource parameter must use an explicit borrow passing mode: {:?}",
+        sqlite_close.params
+    );
+
+    let http_request = compiled
+        .program
+        .imports
+        .iter()
+        .find(|i| i.name == "http::client::request")
+        .expect("http::client::request must be a host import")
+        .schema
+        .as_ref()
+        .expect("http::client::request must carry an exact schema");
+    assert_eq!(
+        http_request.fingerprint,
+        catalog.fingerprint(),
+        "compiled http::client::request schema must carry the combined catalog fingerprint"
+    );
+}
+
+/// End-to-end: compile against the combined catalog, register the standard
+/// extensions against that same combined snapshot, exact-bind, and execute a
+/// resource-aware call without legacy fallback.
+#[cfg(feature = "sqlite")]
+#[test]
+fn combined_standard_catalog_exact_binds_and_executes() {
+    let catalog = combined_standard_catalog();
+    let compiled = compile_source_with_flavor_and_options(
+        r#"
+        use sqlite;
+        let db = sqlite::open({ path: ":memory:", mode: "memory", limits: {} });
+        sqlite::close(&db);
+        "#,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog)),
+    )
+    .expect("combined standard source should compile");
+
+    // All imports must be exact (schema present) — no name-only fallback.
+    assert!(
+        compiled.program.imports.iter().all(|i| i.schema.is_some()),
+        "every standard host import must carry an exact schema"
+    );
+
+    let mut registry = HostFunctionRegistry::new();
+    vm::register_sqlite_builtin_module(&mut registry)
+        .expect("sqlite registration against combined catalog should succeed");
+    let mut vm = Vm::new(compiled.program);
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("combined-catalog exact bind should succeed");
+    assert_eq!(
+        vm.run().expect("sqlite open/close should run"),
+        VmStatus::Halted
+    );
+}
+
+/// The standard compile-options entry (no explicit custom catalog) must
+/// default to the authoritative standard catalog snapshot, producing exact
+/// V13 HostImport schemas with the combined fingerprint — never a name-only
+/// fallback. This is the same snapshot the LSP and the standard extension
+/// registration consume.
+#[cfg(feature = "sqlite")]
+#[test]
+fn standard_compile_options_default_to_combined_exact_schemas() {
+    let compiled = compile_source_with_flavor_and_options(
+        r#"
+        use sqlite;
+        use http;
+        let db = sqlite::open({ path: ":memory:", mode: "memory", limits: {} });
+        let _ = http::client::request({"method": "GET", "url": "http://127.0.0.1:1/x"});
+        sqlite::close(&db);
+        "#,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::default(),
+    )
+    .expect("standard compile options should compile");
+
+    // Every standard host import must carry an exact schema (no name-only
+    // fallback) bound to the authoritative combined snapshot.
+    let expected = vm::standard_host_catalog().fingerprint();
+    for name in ["sqlite::open", "sqlite::close", "http::client::request"] {
+        let import = compiled
+            .program
+            .imports
+            .iter()
+            .find(|i| i.name == name)
+            .unwrap_or_else(|| panic!("{name} must be a host import"));
+        let schema = import
+            .schema
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name} must carry an exact schema"));
+        assert_eq!(
+            schema.fingerprint, expected,
+            "{name} schema must carry the standard catalog fingerprint"
+        );
+    }
+}
+
+/// A subcatalog-fingerprint registration (the historical per-extension
+/// behavior) must NOT satisfy a combined-catalog compile: the whole-catalog
+/// fingerprint is part of the exact identity, so the bind is rejected with a
+/// structured MissingExact — never a silent name-only fallback.
+#[cfg(feature = "sqlite")]
+#[test]
+fn combined_compile_rejects_subcatalog_fingerprint_registration() {
+    let catalog = combined_standard_catalog();
+    let compiled = compile_source_with_flavor_and_options(
+        r#"
+        use sqlite;
+        let db = sqlite::open({ path: ":memory:", mode: "memory", limits: {} });
+        sqlite::close(&db);
+        "#,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog)),
+    )
+    .expect("combined standard source should compile");
+
+    // Register sqlite through its *subcatalog* fingerprint, as the
+    // pre-repair extension path did.
+    let mut registry = HostFunctionRegistry::new();
+    let subcatalog = vm::sqlite_host_catalog();
+    for schema in vm::catalog_import_schemas(&subcatalog, "sqlite::open") {
+        registry
+            .register_exact_static("sqlite::open", 1, schema, sqlite_open_adapter_stub())
+            .expect("subcatalog registration should succeed");
+    }
+    let mut vm = Vm::new(compiled.program);
+    let error = registry
+        .bind_vm_cached(&mut vm)
+        .expect_err("subcatalog-fingerprint registration must not bind a combined compile");
+    assert!(
+        matches!(
+            error,
+            VmError::HostImportBinding(HostImportBindingError::MissingExact { .. })
+        ),
+        "expected structured MissingExact, got: {error}"
+    );
+}
+
+/// A stub sqlite::open adapter used only to prove fingerprint rejection;
+/// never executed.
+#[cfg(feature = "sqlite")]
+fn sqlite_open_adapter_stub() -> vm::vm::StaticHostFunction {
+    |_vm, _args| {
+        Ok(vm::vm::CallOutcome::Return(vm::vm::CallReturn::one(
+            vm::Value::Int(0),
+        )))
+    }
 }

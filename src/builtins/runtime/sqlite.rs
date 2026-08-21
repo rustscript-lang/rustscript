@@ -1460,7 +1460,7 @@ fn borrow_connection(key: &ResourceTypeKey) -> HostParamSchema {
 /// Registers every SQLite host function into `registry` using the exact
 /// catalog schema path.
 pub fn register_sqlite_builtin_module(registry: &mut HostFunctionRegistry) -> VmResult<()> {
-    let catalog = sqlite_host_catalog();
+    let catalog = crate::builtins::runtime::standard_host_catalog();
     for schema in crate::vm::host_extension::catalog_import_schemas(&catalog, "sqlite::open") {
         registry.register_exact_static("sqlite::open", 1, schema, open_adapter)?;
     }

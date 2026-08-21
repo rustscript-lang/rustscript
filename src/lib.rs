@@ -30,9 +30,11 @@ pub use builtins::runtime::{
     return_one, take_arg,
 };
 #[cfg(feature = "http-client")]
-pub use builtins::runtime::{HttpConfig, HttpHostExt, http_host_catalog};
+pub use builtins::runtime::{
+    HttpConfig, HttpHostExt, http_host_catalog, register_http_builtin_module,
+};
 #[cfg(feature = "runtime")]
-pub use builtins::runtime::{IoHostExt, IoPolicy, io_host_catalog};
+pub use builtins::runtime::{IoHostExt, IoPolicy, io_host_catalog, standard_host_catalog};
 #[cfg(feature = "sqlite")]
 pub use builtins::runtime::{
     SqliteExtension, SqliteHostExt, SqliteLimits, SqlitePolicy, register_sqlite_builtin_module,

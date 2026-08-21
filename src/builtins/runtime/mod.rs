@@ -1,8 +1,10 @@
 // VM-side builtin execution entrypoints.
 // Builtin metadata and call-index mapping live in crate::builtins.
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::builtins::BuiltinFunction;
+use crate::host_api::HostApiCatalog;
 use crate::vm::{CallOutcome, CallReturn, HostOpId, Value, Vm, VmResult};
 #[cfg(feature = "async")]
 use crate::vm::{CaptureAsyncHostContext, HostFutureOutput, VmError};
@@ -44,13 +46,57 @@ mod sqlite;
 mod typed;
 
 #[cfg(feature = "http-client")]
-pub use http::{HttpConfig, HttpHostExt, http_host_catalog};
+pub use http::{HttpConfig, HttpHostExt, http_host_catalog, register_http_builtin_module};
 pub use io::{IoHostExt, IoHostState, IoPolicy, io_host_catalog};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{
     SqliteExtension, SqliteHostExt, SqliteLimits, SqlitePolicy, register_sqlite_builtin_module,
     sqlite_host_catalog,
 };
+
+/// The authoritative standard host API catalog snapshot for this build.
+///
+/// This is the single combined snapshot of every *enabled* standard host
+/// surface (SQLite, IO, HTTP), composed into one validated
+/// [`HostApiCatalog`]. The compiler's standard compile entry and the LSP
+/// consume this same snapshot, and the standard extensions register their
+/// exact imports against it — so the whole-catalog fingerprint embedded in a
+/// compiled `HostImport` matches the fingerprint carried by the registered
+/// exact schema byte-for-byte, for any combination of enabled features.
+///
+/// Composition is feature-gated per member:
+///
+/// * `sqlite` feature → the SQLite surface is included;
+/// * `runtime` feature → the IO surface is included;
+/// * `http-client` feature → the HTTP surface is included.
+///
+/// When only one surface is enabled, this equals that surface's own
+/// subcatalog; when several are enabled, it is their combined snapshot. The
+/// resulting fingerprint therefore always matches what the standard compile
+/// entry and the standard extension registration produce for the same build.
+pub fn standard_host_catalog() -> Arc<HostApiCatalog> {
+    use crate::host_api::HostApiBuilder;
+
+    let mut builder = HostApiBuilder::new();
+    let mut push = |builder: &mut HostApiBuilder, catalog: &Arc<HostApiCatalog>| {
+        for resource in catalog.resources() {
+            builder.resource(resource.clone());
+        }
+        for function in catalog.functions() {
+            builder.function(function.clone());
+        }
+    };
+    #[cfg(feature = "sqlite")]
+    push(&mut builder, &sqlite_host_catalog());
+    push(&mut builder, &io_host_catalog());
+    #[cfg(feature = "http-client")]
+    push(&mut builder, &http_host_catalog());
+    Arc::new(
+        builder
+            .build()
+            .expect("standard host catalog must be valid"),
+    )
+}
 pub use typed::HostCallResult;
 pub(crate) use typed::VmMapHandle;
 // Typed argument decoders used by `#[pd_host_function]`-generated wrappers.

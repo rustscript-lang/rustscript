@@ -271,6 +271,8 @@ pub mod builtins {
     pub mod runtime {
         pub use crate::vm::{HostCallResult, VmMap};
 
+        pub use rustscript_vm::standard_host_catalog;
+
         pub use self::typed::borrow_arg;
 
         pub mod error {
@@ -1678,14 +1680,14 @@ mod production_crate {
     use std::task::{Context, Wake, Waker};
 
     fn compile_with_catalog(source: &str) -> rustscript_vm::CompiledProgram {
-        let catalog = rustscript_vm::sqlite_host_catalog();
+        let catalog = rustscript_vm::standard_host_catalog();
         rustscript_vm::compile_source_with_flavor_and_options(
             source,
             rustscript_vm::SourceFlavor::RustScript,
             rustscript_vm::CompileSourceFileOptions::default()
                 .with_host_api_catalog(Arc::clone(&catalog)),
         )
-        .expect("sqlite source should compile against the sqlite catalog")
+        .expect("sqlite source should compile against the standard catalog")
     }
 
     fn real_vm(program: rustscript_vm::Program) -> rustscript_vm::vm::Vm {

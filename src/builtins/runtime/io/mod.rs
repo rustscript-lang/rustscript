@@ -231,7 +231,7 @@ fn borrow_handle() -> HostParamSchema {
 /// generic execution-scope await path.
 #[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
 pub fn register_io_builtin_module(registry: &mut HostFunctionRegistry) -> VmResult<()> {
-    let catalog = io_host_catalog();
+    let catalog = crate::builtins::runtime::standard_host_catalog();
     for schema in crate::vm::host_extension::catalog_import_schemas(&catalog, "io::open") {
         registry.register_exact_static("io::open", 2, schema, open_adapter)?;
     }

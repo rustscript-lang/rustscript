@@ -36,9 +36,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use rustscript::{
-    CompileSourceFileOptions, HostApiBuilder, HostApiCatalog, HostFunctionSchema, HostParamPassing,
-    HostTypeSchema, ParseError, SemanticDiagnostic, SemanticModel, SourceError, SourceMap,
-    SourcePathError, SourcePosition, Span, analyze_source_from_string_with_options,
+    CompileSourceFileOptions, HostApiCatalog, HostFunctionSchema, HostParamPassing, HostTypeSchema,
+    ParseError, SemanticDiagnostic, SemanticModel, SourceError, SourceMap, SourcePathError,
+    SourcePosition, Span, analyze_source_from_string_with_options,
 };
 
 /// Hard cap on a single JSON-RPC message payload (LSP bodies are small; a
@@ -205,21 +205,12 @@ const RPC_METHOD_NOT_FOUND: i64 = -32601;
 /// The standard host API catalog for this build: sqlite + io + http
 /// extension catalogs composed into one validated snapshot, exactly like the
 /// compiler's host surface.
+///
+/// This delegates to the crate's single authoritative
+/// [`standard_host_catalog`](rustscript::standard_host_catalog) snapshot, so
+/// the LSP and the standard compile/registration paths share one fingerprint.
 fn standard_catalog() -> Arc<HostApiCatalog> {
-    let mut builder = HostApiBuilder::new();
-    for catalog in [
-        rustscript::sqlite_host_catalog(),
-        rustscript::io_host_catalog(),
-        rustscript::http_host_catalog(),
-    ] {
-        for resource in catalog.resources() {
-            builder.resource(resource.clone());
-        }
-        for function in catalog.functions() {
-            builder.function(function.clone());
-        }
-    }
-    Arc::new(builder.build().expect("standard catalog must be valid"))
+    rustscript::standard_host_catalog()
 }
 
 /// Load a custom catalog from a JSON file (the `HostApiCatalog` serde shape).

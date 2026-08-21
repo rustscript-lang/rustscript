@@ -256,7 +256,7 @@ pub fn http_host_catalog() -> Arc<HostApiCatalog> {
 /// Registers every HTTP host function into `registry` using the exact
 /// catalog schema path.
 pub fn register_http_builtin_module(registry: &mut HostFunctionRegistry) -> VmResult<()> {
-    let catalog = http_host_catalog();
+    let catalog = crate::builtins::runtime::standard_host_catalog();
     for schema in
         crate::vm::host_extension::catalog_import_schemas(&catalog, "http::client::request")
     {

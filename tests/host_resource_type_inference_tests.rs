@@ -596,12 +596,26 @@ fn analyze_source_basic() {
 
 #[test]
 fn analyze_source_with_catalog_works() {
-    // analyze_source creates a default catalog; verify it doesn't crash
+    // analyze_source creates the authoritative standard catalog snapshot on
+    // runtime builds; verify it doesn't crash.
     let source = "let x = 42;";
     let model = analyze_source(source).expect("analyze_source should succeed");
+    let catalog = model.catalog();
+    #[cfg(feature = "runtime")]
     assert!(
-        model.catalog().functions().is_empty(),
-        "default catalog should be empty"
+        !catalog.functions().is_empty(),
+        "default catalog must carry the standard host surface"
+    );
+    #[cfg(feature = "runtime")]
+    assert_eq!(
+        catalog.fingerprint(),
+        vm::standard_host_catalog().fingerprint(),
+        "default catalog must be the authoritative standard snapshot"
+    );
+    #[cfg(not(feature = "runtime"))]
+    assert!(
+        catalog.functions().is_empty(),
+        "default catalog is empty without the standard runtime surface"
     );
 }
 

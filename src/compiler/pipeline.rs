@@ -959,13 +959,7 @@ fn analyze_parsed_output(
     custom_catalog: Option<Arc<HostApiCatalog>>,
 ) -> Result<SemanticModel, SourceError> {
     let typing_mode = TypingMode::for_flavor(flavor);
-    let catalog = custom_catalog.unwrap_or_else(|| {
-        Arc::new(
-            crate::host_api::HostApiBuilder::new()
-                .build()
-                .expect("default catalog"),
-        )
-    });
+    let catalog = custom_catalog.unwrap_or_else(default_analyze_catalog);
 
     // Run legalize and type checking.
     let legalize_result =
@@ -1678,14 +1672,42 @@ fn compile_source_with_flavor_and_options_impl(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    if !options.has_module_overrides()
-        && !options.has_source_plugins()
-        && options.host_api_catalog().is_none()
-    {
-        return compile_source_with_flavor_impl(source, flavor, CompileBehavior::DEFAULT)
-            .map_err(SourcePathError::Source);
+    if !options.has_module_overrides() && !options.has_source_plugins() {
+        // No module/source overrides: the standard compile-options path. When
+        // no explicit custom catalog is supplied, fall back to the single
+        // authoritative [`crate::builtins::runtime::standard_host_catalog`]
+        // snapshot (gated on the runtime surface), so standard host calls
+        // compile to exact V13 `HostImport` schemas with the combined
+        // fingerprint — never a name-only fallback. Custom-catalog callers
+        // keep their explicit catalog. Builds without the runtime surface
+        // (no-default feature matrices) keep the legacy no-catalog path.
+        #[cfg(feature = "runtime")]
+        {
+            if options.host_api_catalog().is_none() {
+                let effective = default_standard_catalog_options(options);
+                return compile_source_with_flavor_and_options_pipeline(source, flavor, &effective);
+            }
+        }
+        #[cfg(not(feature = "runtime"))]
+        {
+            if options.host_api_catalog().is_none() {
+                return compile_source_with_flavor_impl(source, flavor, CompileBehavior::DEFAULT)
+                    .map_err(SourcePathError::Source);
+            }
+        }
+        // An explicit custom catalog supplied: fall through to the pipeline.
     }
 
+    compile_source_with_flavor_and_options_pipeline(source, flavor, options)
+}
+
+/// Runs the module-loading compile pipeline for a source string with the
+/// given options (already carrying an effective catalog).
+fn compile_source_with_flavor_and_options_pipeline(
+    source: &str,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+) -> Result<CompiledProgram, SourcePathError> {
     let path = virtual_inmemory_entry_path(flavor);
     let loaded = load_units_for_source_file(&path, flavor, source, options)?;
     compile_loaded_units(
@@ -1697,13 +1719,49 @@ fn compile_source_with_flavor_and_options_impl(
     )
 }
 
+/// Returns `options` with the authoritative standard host catalog attached,
+/// when the runtime surface is enabled.
+#[cfg(feature = "runtime")]
+fn default_standard_catalog_options(
+    options: &CompileSourceFileOptions,
+) -> CompileSourceFileOptions {
+    let mut effective = options.clone();
+    // Prefer an explicit custom catalog; otherwise attach the standard snapshot.
+    if effective.host_api_catalog().is_none() {
+        effective.set_host_api_catalog(crate::builtins::runtime::standard_host_catalog());
+    }
+    effective
+}
+
+/// The default catalog for semantic analysis when no custom catalog is
+/// supplied: the authoritative standard combined snapshot on runtime builds,
+/// and an empty catalog (no standard host surface) otherwise.
+fn default_analyze_catalog() -> Arc<HostApiCatalog> {
+    #[cfg(feature = "runtime")]
+    {
+        crate::builtins::runtime::standard_host_catalog()
+    }
+    #[cfg(not(feature = "runtime"))]
+    {
+        Arc::new(
+            crate::host_api::HostApiBuilder::new()
+                .build()
+                .expect("default catalog"),
+        )
+    }
+}
+
 fn compile_source_at_path_with_flavor_and_options_impl(
     path: &Path,
     source: &str,
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    let loaded = load_units_for_source_file(path, flavor, source, options)?;
+    #[cfg(feature = "runtime")]
+    let effective = default_standard_catalog_options(options);
+    #[cfg(not(feature = "runtime"))]
+    let effective = options.clone();
+    let loaded = load_units_for_source_file(path, flavor, source, &effective)?;
     compile_loaded_units(
         source.to_string(),
         loaded.units,
@@ -1738,9 +1796,13 @@ fn compile_source_file_impl(
     path: &Path,
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    let flavor = SourceFlavor::from_path_with_options(path, options)?;
+    #[cfg(feature = "runtime")]
+    let effective = default_standard_catalog_options(options);
+    #[cfg(not(feature = "runtime"))]
+    let effective = options.clone();
+    let flavor = SourceFlavor::from_path_with_options(path, &effective)?;
     let source_raw = std::fs::read_to_string(path)?;
-    let loaded = load_units_for_source_file(path, flavor, &source_raw, options)?;
+    let loaded = load_units_for_source_file(path, flavor, &source_raw, &effective)?;
     compile_loaded_units(
         source_raw,
         loaded.units,
