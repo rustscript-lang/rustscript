@@ -182,8 +182,6 @@ pub struct SemanticModel {
     errors: Vec<CompileError>,
     /// The semantic index built during pipeline compilation.
     semantic_index: Option<SemanticIndex>,
-    /// A name-to-slot mapping for quick local variable resolution.
-    pub local_name_to_slot: Vec<(String, LocalSlot)>,
 }
 
 impl SemanticModel {
@@ -199,14 +197,12 @@ impl SemanticModel {
         errors: Vec<CompileError>,
     ) -> Self {
         let semantic_index = ir.semantic_index.clone();
-        let local_name_to_slot = ir.local_bindings.clone();
         Self {
             ir,
             sources,
             catalog,
             errors,
             semantic_index,
-            local_name_to_slot,
         }
     }
 
