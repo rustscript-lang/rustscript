@@ -692,77 +692,80 @@ impl Parser {
     }
 
     pub(super) fn parse_if_expr_branch(&mut self) -> Result<Expr, ParseError> {
+        let open_span = self.current_span();
         self.expect(
             &TokenKind::LBrace,
             "expected '{' after '=>' in if expression branch",
         )?;
+        let expr = self.with_scope(open_span, |parser| {
+            let mut stmts = Vec::<Stmt>::new();
+            let mut trailing_expr: Option<Expr> = None;
+            while !parser.check(&TokenKind::RBrace) {
+                if parser.check(&TokenKind::Eof) {
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line: parser.current_line(),
+                        message: "unexpected end of input in if expression branch".to_string(),
+                    });
+                }
 
-        let mut stmts = Vec::<Stmt>::new();
-        let mut trailing_expr: Option<Expr> = None;
-        while !self.check(&TokenKind::RBrace) {
-            if self.check(&TokenKind::Eof) {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line: self.current_line(),
-                    message: "unexpected end of input in if expression branch".to_string(),
-                });
+                if parser.starts_trailing_expr_block_statement() {
+                    stmts.push(parser.parse_stmt()?);
+                    continue;
+                }
+
+                let line = parser.current_line_u32();
+                let expr = parser.parse_expr()?;
+                if parser.check(&TokenKind::RBrace) {
+                    trailing_expr = Some(expr);
+                    break;
+                }
+                parser.expect(
+                    &TokenKind::Semicolon,
+                    "expected ';' after expression in if expression branch",
+                )?;
+                stmts.push(Stmt::Expr { expr, line });
             }
 
-            if self.starts_trailing_expr_block_statement() {
-                stmts.push(self.parse_stmt()?);
-                continue;
-            }
-
-            let line = self.current_line_u32();
-            let expr = self.parse_expr()?;
-            if self.check(&TokenKind::RBrace) {
-                trailing_expr = Some(expr);
-                break;
-            }
-            self.expect(
-                &TokenKind::Semicolon,
-                "expected ';' after expression in if expression branch",
+            parser.expect(
+                &TokenKind::RBrace,
+                "expected '}' to close if expression branch",
             )?;
-            stmts.push(Stmt::Expr { expr, line });
-        }
 
-        self.expect(
-            &TokenKind::RBrace,
-            "expected '}' to close if expression branch",
-        )?;
-
-        let expr = if let Some(expr) = trailing_expr {
-            expr
-        } else {
-            let Some(last_stmt) = stmts.pop() else {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line: self.current_line(),
-                    message: "if expression branch must end with an expression".to_string(),
-                });
-            };
-            if let Stmt::Expr { expr, .. } = last_stmt {
+            let expr = if let Some(expr) = trailing_expr {
                 expr
             } else {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line: self.current_line(),
-                    message: "if expression branch must end with an expression".to_string(),
-                });
-            }
-        };
+                let Some(last_stmt) = stmts.pop() else {
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line: parser.current_line(),
+                        message: "if expression branch must end with an expression".to_string(),
+                    });
+                };
+                if let Stmt::Expr { expr, .. } = last_stmt {
+                    expr
+                } else {
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line: parser.current_line(),
+                        message: "if expression branch must end with an expression".to_string(),
+                    });
+                }
+            };
 
-        if stmts.is_empty() {
-            Ok(expr)
-        } else {
-            Ok(Expr::Block {
-                stmts,
-                expr: Box::new(expr),
-            })
-        }
+            if stmts.is_empty() {
+                Ok(expr)
+            } else {
+                Ok(Expr::Block {
+                    stmts,
+                    expr: Box::new(expr),
+                })
+            }
+        })?;
+        Ok(expr)
     }
 
     pub(super) fn parse_match_expr(&mut self) -> Result<Expr, ParseError> {
@@ -792,7 +795,8 @@ impl Parser {
                 scope.insert(name, slot);
                 self.closure_scopes.push(scope);
             }
-            let arm_expr = self.parse_expr();
+            let arm_open = self.current_span();
+            let arm_result = self.with_scope(arm_open, |parser| parser.parse_expr());
             if pattern
                 .as_ref()
                 .and_then(MatchPattern::binding_slot)
@@ -800,7 +804,7 @@ impl Parser {
             {
                 self.closure_scopes.pop();
             }
-            let arm_expr = arm_expr?;
+            let arm_expr = arm_result?;
 
             match pattern {
                 Some(pattern) => {
@@ -2459,7 +2463,9 @@ impl Parser {
             by_name: HashMap::new(),
             capture_copies: Vec::new(),
         });
-        let body = self.parse_expr()?;
+        let body_open = self.current_span();
+        let body_result = self.with_scope(body_open, |parser| parser.parse_expr());
+        let body = body_result?;
         let capture_context = self
             .closure_capture_contexts
             .pop()

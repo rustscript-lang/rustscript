@@ -323,12 +323,14 @@ impl Parser {
 
     pub(super) fn parse_program(&mut self) -> Result<Vec<Stmt>, ParseError> {
         self.predeclare_functions()?;
-        // Record root scope (first token to EOF).
+        // Record root scope (first token to EOF). The root scope has no
+        // parent; clear the sentinel so the first real scope gets `None`.
         let root_span = self
             .tokens
             .last()
             .map(|t| Span::new(t.span.source_id, 0, t.span.hi))
             .unwrap_or(Span::new(0, 0, 0));
+        self.parser_scope_stack.clear();
         self.enter_scope(root_span);
         let mut stmts = Vec::new();
         while !self.check(&TokenKind::Eof) {
@@ -671,8 +673,10 @@ impl Parser {
         let id = self.parsed_semantic_index.alloc_node_id();
         let scope_id = self.current_scope_id();
         let decl_order =
-            if let Some(scope) = self.parsed_semantic_index.scopes.get(scope_id as usize) {
-                scope.declarations.len() as u32
+            if let Some(scope) = self.parsed_semantic_index.scopes.get_mut(scope_id as usize) {
+                let order = scope.declarations.len() as u32;
+                scope.declarations.push(slot);
+                order
             } else {
                 0
             };
@@ -705,8 +709,10 @@ impl Parser {
         let id = self.parsed_semantic_index.alloc_node_id();
         let scope_id = self.current_scope_id();
         let decl_order =
-            if let Some(scope) = self.parsed_semantic_index.scopes.get(scope_id as usize) {
-                scope.functions.len() as u32
+            if let Some(scope) = self.parsed_semantic_index.scopes.get_mut(scope_id as usize) {
+                let order = scope.functions.len() as u32;
+                scope.functions.push(function_index);
+                order
             } else {
                 0
             };
@@ -753,6 +759,30 @@ impl Parser {
     /// Exit the current scope.
     pub(super) fn exit_scope(&mut self) {
         self.parser_scope_stack.pop();
+    }
+
+    /// Run `f` inside a fresh child scope and exit on every path (success or
+    /// error), keeping the parser scope stack balanced. The scope's recorded
+    /// range spans `open_span.lo` through the last token consumed by `f` (the
+    /// closing `}` of a brace block, or the final token of an expression
+    /// production). Returns the scope id so callers can assert on it.
+    pub(super) fn with_scope<T>(
+        &mut self,
+        open_span: Span,
+        f: impl FnOnce(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        let scope_id = self.enter_scope(open_span);
+        let result = f(self);
+        let close_hi = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|token| token.span.hi)
+            .unwrap_or(open_span.hi);
+        if let Some(scope) = self.parsed_semantic_index.scopes.get_mut(scope_id as usize) {
+            scope.range.hi = close_hi.max(open_span.hi);
+        }
+        self.exit_scope();
+        result
     }
 
     /// Look up a file-module namespace alias recorded from a structured

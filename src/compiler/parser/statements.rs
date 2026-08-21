@@ -715,16 +715,18 @@ impl Parser {
 
         self.push_active_type_params(&type_params);
         let has_impl = if self.match_kind(&TokenKind::Equal) {
-            let function_impl = self.parse_function_impl_expr(&params)?;
+            let body_open = self.current_span();
+            let function_impl = self.parse_function_impl_expr(&params, body_open)?;
             self.expect(
                 &TokenKind::Semicolon,
                 "expected ';' after function definition",
             )?;
             self.function_impls.insert(index, function_impl);
             true
-        } else if self.match_kind(&TokenKind::LBrace) {
-            let function_impl = self.parse_function_impl_block(&params)?;
-            self.expect(&TokenKind::RBrace, "expected '}' after function body")?;
+        } else if self.check(&TokenKind::LBrace) {
+            let body_open = self.current_span();
+            self.match_kind(&TokenKind::LBrace);
+            let function_impl = self.parse_function_impl_block(&params, body_open)?;
             self.function_impls.insert(index, function_impl);
             // Optional trailing semicolon for compatibility.
             self.match_kind(&TokenKind::Semicolon);
@@ -755,8 +757,9 @@ impl Parser {
     pub(super) fn parse_function_impl_expr(
         &mut self,
         params: &[crate::compiler::ir::FunctionParam],
+        body_open: Span,
     ) -> Result<FunctionImpl, ParseError> {
-        self.parse_function_impl(params, |parser| {
+        self.parse_function_impl(params, body_open, |parser| {
             let body_expr_line = parser.current_line_u32();
             Ok((Vec::new(), parser.parse_expr()?, body_expr_line))
         })
@@ -977,8 +980,9 @@ impl Parser {
     pub(super) fn parse_function_impl_block(
         &mut self,
         params: &[crate::compiler::ir::FunctionParam],
+        body_open: Span,
     ) -> Result<FunctionImpl, ParseError> {
-        self.parse_function_impl(params, |parser| {
+        self.parse_function_impl(params, body_open, |parser| {
             let mut body_stmts = Vec::new();
             let mut trailing_expr: Option<Expr> = None;
             let mut trailing_expr_line: Option<u32> = None;
@@ -1034,6 +1038,8 @@ impl Parser {
                 }
             };
 
+            parser.expect(&TokenKind::RBrace, "expected '}' after function body")?;
+
             Ok((body_stmts, body_expr, body_expr_line))
         })
     }
@@ -1041,6 +1047,7 @@ impl Parser {
     pub(super) fn parse_function_impl<F>(
         &mut self,
         params: &[crate::compiler::ir::FunctionParam],
+        body_open: Span,
         parse_body: F,
     ) -> Result<FunctionImpl, ParseError>
     where
@@ -1070,8 +1077,9 @@ impl Parser {
             capture_copies: Vec::new(),
         });
         self.function_body_depth += 1;
-        let (body_stmts, body_expr, body_expr_line) = parse_body(self)?;
+        let body_result = self.with_scope(body_open, |parser| parse_body(parser));
         self.function_body_depth = self.function_body_depth.saturating_sub(1);
+        let (body_stmts, body_expr, body_expr_line) = body_result?;
         let capture_context = self
             .closure_capture_contexts
             .pop()
@@ -1106,6 +1114,12 @@ impl Parser {
         } else {
             self.expect_ident("expected identifier after 'let'")?
         };
+        // Capture the exact identifier token span for declaration provenance.
+        let ident_span = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|token| token.span)
+            .unwrap_or_else(|| Span::new(0, 0, 0));
         let declared_schema = if self.match_kind(&TokenKind::Colon) {
             Some(self.parse_declared_type_schema()?)
         } else {
@@ -1185,19 +1199,15 @@ impl Parser {
             self.local_schemas.remove(&index);
         }
         self.apply_let_binding_mutability(index, declared_mutable, created);
-        // Record local declaration provenance.
-        if let Some(ident_token) = self.tokens.get(self.pos.saturating_sub(2)) {
-            if let TokenKind::Ident(_) = &ident_token.kind {
-                let stmt_end = self
-                    .tokens
-                    .get(self.pos.saturating_sub(1))
-                    .map(|t| t.span.hi)
-                    .unwrap_or(ident_token.span.hi);
-                let stmt_span =
-                    Span::new(ident_token.span.source_id, ident_token.span.lo, stmt_end);
-                self.record_local_decl(ident_token.span, stmt_span, index, name);
-            }
-        }
+        // Record local declaration provenance with the exact identifier token
+        // captured at the start of the statement.
+        let stmt_end = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|t| t.span.hi)
+            .unwrap_or(ident_span.hi);
+        let stmt_span = Span::new(ident_span.source_id, ident_span.lo, stmt_end);
+        self.record_local_decl(ident_span, stmt_span, index, name);
         Ok(Stmt::Let {
             index,
             declared_schema,
@@ -1730,20 +1740,24 @@ impl Parser {
     }
 
     pub(super) fn parse_block(&mut self, message: &str) -> Result<Vec<Stmt>, ParseError> {
+        let open_span = self.current_span();
         self.expect(&TokenKind::LBrace, message)?;
-        let mut stmts = Vec::new();
-        while !self.check(&TokenKind::RBrace) {
-            if self.check(&TokenKind::Eof) {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line: self.current_line(),
-                    message: "unexpected end of input in block".to_string(),
-                });
+        let stmts = self.with_scope(open_span, |parser| {
+            let mut stmts = Vec::new();
+            while !parser.check(&TokenKind::RBrace) {
+                if parser.check(&TokenKind::Eof) {
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line: parser.current_line(),
+                        message: "unexpected end of input in block".to_string(),
+                    });
+                }
+                stmts.push(parser.parse_stmt()?);
             }
-            stmts.push(self.parse_stmt()?);
-        }
-        self.expect(&TokenKind::RBrace, "expected '}' to close block")?;
+            parser.expect(&TokenKind::RBrace, "expected '}' to close block")?;
+            Ok(stmts)
+        })?;
         Ok(stmts)
     }
 

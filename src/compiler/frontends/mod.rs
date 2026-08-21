@@ -727,3 +727,280 @@ mod ordinary_call_provenance_tests {
         assert_eq!(span_slice(source, g_site.expr_span), "g(2)");
     }
 }
+
+#[cfg(test)]
+mod lexical_scope_provenance_tests {
+    use crate::compiler::CompileSourceFileOptions;
+    use crate::compiler::source_map::Span;
+
+    use super::{SourceFlavor, parse_source};
+
+    fn parse(source: &str) -> crate::compiler::ir::FrontendIr {
+        parse_source(
+            source,
+            SourceFlavor::RustScript,
+            &CompileSourceFileOptions::default(),
+        )
+        .expect("source must parse")
+    }
+
+    /// RustScript lowering is the identity, so span `.lo`/`.hi` are byte
+    /// offsets into the original source string.
+    fn span_slice(source: &str, span: Span) -> String {
+        source
+            .get(span.lo..span.hi)
+            .expect("span must slice source")
+            .to_string()
+    }
+
+    fn scopes_of(
+        ir: &crate::compiler::ir::FrontendIr,
+    ) -> &crate::compiler::ir::ParsedSemanticIndex {
+        ir.parsed_semantic_index.as_ref().expect("index present")
+    }
+    /// Nested ordinary blocks (function body containing an if-block
+    /// containing a while-block) produce a child scope for each `{...}`, with
+    /// exact parent ids and `{...}` ranges, and declarations attach to the
+    /// scope that lexically contains them in source order.
+    #[test]
+    fn nested_block_scopes_have_exact_parents_ranges_and_declaration_order() {
+        let source = "fn f() {\n    let a = 0;\n    if a > 0 {\n        let b = 1;\n        while b < 2 {\n            let c = 2;\n        }\n    }\n    a;\n}\n";
+        let ir = parse(source);
+        let index = scopes_of(&ir);
+
+        // scope 0 is the root (first token .. EOF).
+        assert_eq!(
+            index.scopes.len(),
+            4,
+            "root + fn body + if block + while block"
+        );
+        let root = &index.scopes[0];
+        assert_eq!(root.parent, None, "root has no parent");
+        assert_eq!(root.range.lo, 0, "root starts at first token");
+        assert_eq!(root.range.hi, source.len(), "root ends at EOF");
+
+        let fn_body = &index.scopes[1];
+        let if_block = &index.scopes[2];
+        let while_block = &index.scopes[3];
+        assert_eq!(fn_body.parent, Some(0), "fn body parent is root");
+        assert_eq!(if_block.parent, Some(1), "if block parent is fn body");
+        assert_eq!(
+            while_block.parent,
+            Some(2),
+            "while block parent is if block"
+        );
+        assert_eq!(
+            span_slice(source, fn_body.range),
+            "{\n    let a = 0;\n    if a > 0 {\n        let b = 1;\n        while b < 2 {\n            let c = 2;\n        }\n    }\n    a;\n}",
+            "fn body range covers exact braces"
+        );
+        assert_eq!(
+            span_slice(source, if_block.range),
+            "{\n        let b = 1;\n        while b < 2 {\n            let c = 2;\n        }\n    }",
+            "if block range covers exact braces"
+        );
+        assert_eq!(
+            span_slice(source, while_block.range),
+            "{\n            let c = 2;\n        }",
+            "while block range covers exact braces"
+        );
+        assert!(
+            fn_body.range.lo < if_block.range.lo && if_block.range.hi < fn_body.range.hi,
+            "if block is nested inside the fn body"
+        );
+        assert!(
+            if_block.range.lo < while_block.range.lo && while_block.range.hi < if_block.range.hi,
+            "while block is nested inside the if block"
+        );
+
+        // Declarations: a in fn body; b in if block; c in while block.
+        let a = index
+            .local_decls
+            .iter()
+            .find(|decl| decl.name == "a")
+            .expect("a");
+        let b = index
+            .local_decls
+            .iter()
+            .find(|decl| decl.name == "b")
+            .expect("b");
+        let c = index
+            .local_decls
+            .iter()
+            .find(|decl| decl.name == "c")
+            .expect("c");
+        assert_eq!(a.scope_id, 1);
+        assert_eq!(b.scope_id, 2);
+        assert_eq!(c.scope_id, 3);
+        assert_eq!(a.decl_order, 0, "a is the first fn-body declaration");
+        assert_eq!(b.decl_order, 0, "b is the first if-block declaration");
+        assert_eq!(c.decl_order, 0, "c is the first while-block declaration");
+
+        // The scope's own declaration vectors carry the recorded slots in
+        // declaration order.
+        assert_eq!(index.scopes[1].declarations.len(), 1);
+        assert_eq!(index.scopes[2].declarations.len(), 1);
+        assert_eq!(index.scopes[3].declarations.len(), 1);
+    }
+
+    /// Statement-form if/else arms are sibling scopes under the containing
+    /// scope; a declaration in each arm lands in that arm's scope.
+    #[test]
+    fn if_else_arms_are_sibling_scopes() {
+        let source = "fn f(x) {\n    if x > 0 {\n        let a = 1;\n    } else {\n        let b = 2;\n    }\n    x;\n}\n";
+        let ir = parse(source);
+        let index = scopes_of(&ir);
+
+        // scope 1 = function body, scope 2 = then arm, scope 3 = else arm.
+        assert_eq!(index.scopes.len(), 4, "root + fn body + two arms");
+        let body = &index.scopes[1];
+        let then_scope = &index.scopes[2];
+        let else_scope = &index.scopes[3];
+        assert_eq!(body.parent, Some(0), "fn body parent is root");
+        assert_eq!(then_scope.parent, Some(1), "then arm parent is fn body");
+        assert_eq!(else_scope.parent, Some(1), "else arm parent is fn body");
+        assert_eq!(then_scope.id, 2);
+        assert_eq!(else_scope.id, 3);
+        assert_ne!(then_scope.id, else_scope.id, "arms are distinct scopes");
+        assert_eq!(
+            span_slice(source, then_scope.range),
+            "{\n        let a = 1;\n    }",
+            "then arm exact braces"
+        );
+        assert_eq!(
+            span_slice(source, else_scope.range),
+            "{\n        let b = 2;\n    }",
+            "else arm exact braces"
+        );
+        assert!(
+            then_scope.range.hi < else_scope.range.lo,
+            "then arm text precedes else arm text"
+        );
+
+        let a = index
+            .local_decls
+            .iter()
+            .find(|decl| decl.name == "a")
+            .expect("a");
+        let b = index
+            .local_decls
+            .iter()
+            .find(|decl| decl.name == "b")
+            .expect("b");
+        assert_eq!(a.scope_id, 2, "a belongs to the then-arm scope");
+        assert_eq!(b.scope_id, 3, "b belongs to the else-arm scope");
+        assert_eq!(a.decl_order, 0);
+        assert_eq!(b.decl_order, 0);
+    }
+
+    /// A while loop body is a child scope of the enclosing scope, and a
+    /// declaration inside the body lands there.
+    #[test]
+    fn while_loop_body_is_a_child_scope() {
+        let source = "let x = 0;\nwhile x < 10 {\n    let y = 5;\n}\n";
+        let ir = parse(source);
+        let index = scopes_of(&ir);
+
+        assert_eq!(index.scopes.len(), 2, "root + loop body");
+        let body = &index.scopes[1];
+        assert_eq!(body.parent, Some(0), "loop body parent is root");
+        assert_eq!(
+            span_slice(source, body.range),
+            "{\n    let y = 5;\n}",
+            "loop body exact braces"
+        );
+
+        let y = index
+            .local_decls
+            .iter()
+            .find(|decl| decl.name == "y")
+            .expect("y");
+        assert_eq!(y.scope_id, 1, "y belongs to the loop body scope");
+        assert_eq!(y.decl_order, 0);
+    }
+
+    /// Each match arm body is a sibling scope under the enclosing scope.
+    #[test]
+    fn match_arms_are_sibling_scopes() {
+        let source = "fn f(x) {\n    match x {\n        1 => 10,\n        _ => 20,\n    }\n}\n";
+        let ir = parse(source);
+        let index = scopes_of(&ir);
+
+        // scope 1 = fn body; scopes 2 and 3 = the two arm bodies.
+        assert_eq!(index.scopes.len(), 4, "root + fn body + two match arms");
+        let body = &index.scopes[1];
+        let first_arm = &index.scopes[2];
+        let second_arm = &index.scopes[3];
+        assert_eq!(body.parent, Some(0));
+        assert_eq!(first_arm.parent, Some(1), "first arm parent is fn body");
+        assert_eq!(second_arm.parent, Some(1), "second arm parent is fn body");
+        assert_ne!(first_arm.id, second_arm.id, "arms are distinct scopes");
+        assert_eq!(
+            span_slice(source, first_arm.range),
+            "10",
+            "first arm body exact expression span"
+        );
+        assert_eq!(
+            span_slice(source, second_arm.range),
+            "20",
+            "second arm body exact expression span"
+        );
+        assert!(
+            first_arm.range.hi <= second_arm.range.lo,
+            "first arm text precedes second arm text"
+        );
+    }
+
+    /// A closure body is a nested child scope of the enclosing scope.
+    #[test]
+    fn closure_body_is_a_nested_child_scope() {
+        let source = "let f = |x| x + 1;\n";
+        let ir = parse(source);
+        let index = scopes_of(&ir);
+
+        assert_eq!(index.scopes.len(), 2, "root + closure body");
+        let closure_scope = &index.scopes[1];
+        assert_eq!(closure_scope.parent, Some(0), "closure body parent is root");
+        assert_eq!(
+            span_slice(source, closure_scope.range),
+            "x + 1",
+            "closure body exact expression span"
+        );
+    }
+
+    /// Function declarations recorded at the enclosing scope keep real
+    /// declaration order in the scope's `functions` vector and in
+    /// `decl_order` on each site.
+    #[test]
+    fn top_level_function_declarations_are_recorded_in_order() {
+        let source = "fn a() { 1 }\nfn b() { 2 }\n";
+        let ir = parse(source);
+        let index = scopes_of(&ir);
+
+        // scope 1 = fn a body, scope 2 = fn b body; both parent root.
+        assert_eq!(index.scopes.len(), 3, "root + two fn bodies");
+        assert_eq!(index.scopes[1].parent, Some(0));
+        assert_eq!(index.scopes[2].parent, Some(0));
+
+        let a_decl = index
+            .func_decls
+            .iter()
+            .find(|decl| decl.name == "a")
+            .expect("a decl");
+        let b_decl = index
+            .func_decls
+            .iter()
+            .find(|decl| decl.name == "b")
+            .expect("b decl");
+        assert_eq!(a_decl.scope_id, 0, "fn a declared at root");
+        assert_eq!(b_decl.scope_id, 0, "fn b declared at root");
+        assert_eq!(a_decl.decl_order, 0, "fn a is the first root function");
+        assert_eq!(b_decl.decl_order, 1, "fn b is the second root function");
+
+        assert_eq!(
+            index.scopes[0].functions,
+            vec![a_decl.function_index, b_decl.function_index],
+            "root functions vector is in declaration order"
+        );
+    }
+}
