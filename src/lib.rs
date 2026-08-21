@@ -61,7 +61,10 @@ pub use builtins::runtime::error::{RuntimeError, RuntimeErrorCode, RuntimeResult
 pub use compiler::diagnostics::{
     render_compile_error, render_source_error, render_source_path_error,
 };
-pub use compiler::source_map::{LineSpanMapping, LoweredSource, SourceId, SourceMap, Span};
+pub use compiler::source_map::{
+    ByteSegment, ByteSpanMapping, LineSpanMapping, LoweredSource, LoweringBuilder, SourceId,
+    SourceMap, Span,
+};
 pub use compiler::{
     AssignmentKind, ClosureExpr, CompileError, CompileSourceFileOptions, CompiledProgram,
     CompiledReplProgram, Compiler, CompletionItemKind, DeclSymbol, Definition, ExportEntry, Expr,

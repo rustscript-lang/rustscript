@@ -3,7 +3,7 @@ mod rustscript;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::compiler::source_map::{LoweredSource, SourceMap};
+use crate::compiler::source_map::{LoweredSource, SourceMap, Span};
 use crate::host_api::HostApiCatalog;
 
 use super::{
@@ -254,10 +254,10 @@ fn parse_lowered_with_mapping(
         host_catalog,
     ) {
         Ok(mut ir) => {
-            map_spans_to_original_source(
+            remap_lowered_spans(
+                ir.parsed_semantic_index.as_mut(),
                 &mut ir.unknown_type_spans,
                 &lowered,
-                &source_map,
                 lowered_source_id,
                 original_source_id,
             );
@@ -319,10 +319,10 @@ fn parse_lowered_repl_with_mapping(
         rustscript::parser_dialect(),
     ) {
         Ok(mut parsed) => {
-            map_spans_to_original_source(
+            remap_lowered_spans(
+                parsed.ir.parsed_semantic_index.as_mut(),
                 &mut parsed.ir.unknown_type_spans,
                 &lowered,
-                &source_map,
                 lowered_source_id,
                 original_source_id,
             );
@@ -362,21 +362,55 @@ fn parse_lowered_repl_with_mapping(
     }
 }
 
-fn map_spans_to_original_source(
-    spans: &mut [crate::compiler::source_map::Span],
+/// Remap every parser-produced span from the lowered text back to the
+/// original source using the exact byte mapping recorded during lowering.
+///
+/// Both the parsed semantic index (call sites, local decls/refs, function
+/// decls/refs, lexical scopes) and the unknown-type spans are remapped so
+/// every span slices the original source exactly. The mapping comes from
+/// `lowered.byte_mapping`, which is generated during lowering — never from
+/// searching the source text afterwards.
+fn remap_lowered_spans(
+    parsed_index: Option<&mut crate::compiler::ir::ParsedSemanticIndex>,
+    unknown_type_spans: &mut [Span],
     lowered: &LoweredSource,
-    source_map: &SourceMap,
     lowered_source_id: u32,
     original_source_id: u32,
 ) {
-    for span in spans {
+    let map = |span: &mut Span| {
         if let Some(mapped) =
             lowered
-                .mapping
-                .map_span(source_map, lowered_source_id, original_source_id, *span)
+                .byte_mapping
+                .map_span(original_source_id, *span, lowered_source_id)
         {
             *span = mapped;
         }
+    };
+
+    if let Some(index) = parsed_index {
+        for site in &mut index.call_sites {
+            map(&mut site.callee_span);
+            map(&mut site.expr_span);
+        }
+        for decl in &mut index.local_decls {
+            map(&mut decl.ident_span);
+            map(&mut decl.stmt_span);
+        }
+        for reference in &mut index.local_refs {
+            map(&mut reference.ident_span);
+        }
+        for decl in &mut index.func_decls {
+            map(&mut decl.ident_span);
+        }
+        for reference in &mut index.func_refs {
+            map(&mut reference.ident_span);
+        }
+        for scope in &mut index.scopes {
+            map(&mut scope.range);
+        }
+    }
+    for span in unknown_type_spans {
+        map(span);
     }
 }
 
@@ -1311,5 +1345,270 @@ mod parser_binding_provenance_tests {
         assert_eq!(callee.function_index, value.function_index, "same function");
         assert_eq!(span_slice(source, callee.ident_span), "g");
         assert_eq!(span_slice(source, value.ident_span), "g");
+    }
+}
+
+/// Exact provenance-span remapping from lowered RustScript back to the
+/// original source.
+///
+/// The RustScript frontend lowers through [`LoweringBuilder`], which records
+/// a byte-for-byte mapping while the lowered text is produced. Every span in
+/// the parsed semantic index must reference the original source id and slice
+/// the intended original call/local/function/scope text — never the lowered
+/// text, never a guessed offset.
+#[cfg(test)]
+mod lowered_provenance_remap_tests {
+    use crate::compiler::frontends::rustscript;
+    use crate::compiler::source_map::{LoweredSource, LoweringBuilder, Span};
+    use crate::compiler::{CompileSourceFileOptions, ReplLocalBinding, SourceFlavor};
+
+    use super::{parse_lowered_with_mapping, parse_rustscript_repl_source, parse_source};
+
+    fn span_slice(source: &str, span: Span) -> String {
+        source
+            .get(span.lo..span.hi)
+            .expect("span must slice source")
+            .to_string()
+    }
+
+    /// Identity lowering: every provenance span carries the original source
+    /// id and slices the exact original call/local/function/scope text.
+    #[test]
+    fn identity_lowering_maps_every_provenance_span_to_original() {
+        let source = "fn add(a, b) { a + b }\nlet msg = \"変換\";\nadd(msg, 2);\n";
+        let ir = parse_source(
+            source,
+            SourceFlavor::RustScript,
+            &CompileSourceFileOptions::default(),
+        )
+        .expect("source must parse");
+        let index = ir.parsed_semantic_index.as_ref().expect("index present");
+
+        // Every call site references the original source and slices exactly.
+        for site in &index.call_sites {
+            assert_eq!(site.callee_span.source_id, 0, "callee span is original");
+            assert_eq!(site.expr_span.source_id, 0, "expr span is original");
+        }
+        let add_site = index
+            .call_sites
+            .iter()
+            .find(|site| site.name == "add")
+            .expect("add call site");
+        assert_eq!(span_slice(source, add_site.callee_span), "add");
+        assert_eq!(span_slice(source, add_site.expr_span), "add(msg, 2)");
+
+        // Local declarations and references slice the original identifier.
+        for decl in &index.local_decls {
+            assert_eq!(decl.ident_span.source_id, 0, "decl ident is original");
+            assert_eq!(decl.stmt_span.source_id, 0, "decl stmt is original");
+            assert_eq!(span_slice(source, decl.ident_span), decl.name);
+        }
+        for reference in &index.local_refs {
+            assert_eq!(reference.ident_span.source_id, 0, "ref ident is original");
+            assert_eq!(span_slice(source, reference.ident_span), reference.name);
+        }
+
+        // Function declarations and value references slice the original name.
+        for decl in &index.func_decls {
+            assert_eq!(decl.ident_span.source_id, 0, "func decl is original");
+            assert_eq!(span_slice(source, decl.ident_span), decl.name);
+        }
+        for reference in &index.func_refs {
+            assert_eq!(reference.ident_span.source_id, 0, "func ref is original");
+            assert_eq!(span_slice(source, reference.ident_span), reference.name);
+        }
+
+        // Lexical scopes slice original braces/expression ranges.
+        for scope in &index.scopes {
+            assert_eq!(scope.range.source_id, 0, "scope range is original");
+        }
+        assert_eq!(span_slice(source, index.scopes[0].range), source);
+        let body = &index.scopes[1];
+        assert_eq!(
+            span_slice(source, body.range),
+            "{ a + b }",
+            "fn body range covers exact original braces"
+        );
+    }
+
+    /// Unicode bytes before a target do not disturb the exact remap: spans
+    /// still reference the original source and slice the intended text.
+    #[test]
+    fn unicode_prefix_maps_to_exact_original_slices() {
+        let source = "let msg = \"変換\";\nprint(msg);\n";
+        let ir = parse_source(
+            source,
+            SourceFlavor::RustScript,
+            &CompileSourceFileOptions::default(),
+        )
+        .expect("source must parse");
+        let index = ir.parsed_semantic_index.as_ref().expect("index present");
+
+        let site = index
+            .call_sites
+            .iter()
+            .find(|site| site.name == "print")
+            .expect("print call site");
+        assert_eq!(site.callee_span.source_id, 0);
+        assert_eq!(span_slice(source, site.callee_span), "print");
+        assert_eq!(span_slice(source, site.expr_span), "print(msg)");
+
+        let msg_decl = index
+            .local_decls
+            .iter()
+            .find(|decl| decl.name == "msg")
+            .expect("msg decl");
+        assert_eq!(msg_decl.ident_span.source_id, 0);
+        assert_eq!(span_slice(source, msg_decl.ident_span), "msg");
+
+        let msg_ref = index
+            .local_refs
+            .iter()
+            .find(|reference| reference.name == "msg")
+            .expect("msg ref");
+        assert_eq!(span_slice(source, msg_ref.ident_span), "msg");
+        assert!(
+            msg_ref.ident_span.lo > 0,
+            "unicode-prefixed ref is not at byte zero"
+        );
+    }
+
+    /// Build a `LoweredSource` through [`LoweringBuilder`] with a real
+    /// transformation (a prefix comment inserted before a `let` statement and
+    /// a multi-byte Unicode string kept verbatim), then parse the lowered
+    /// text through the same `parse_lowered_with_mapping` path the frontend
+    /// uses. Every provenance span must map to the exact original slice,
+    /// including the offset shift caused by the inserted text.
+    #[test]
+    fn transformed_lowering_maps_provenance_to_exact_original_slices() {
+        let original = "let msg = \"変換\";\nprint(msg);\n";
+        let mut builder = LoweringBuilder::new(original);
+        // Insert lowered-only comment text before the original first token.
+        builder.insert("// lowered prefix\n");
+        builder.copy_rest();
+        let lowered = builder.finish();
+        assert_eq!(
+            lowered.text,
+            "// lowered prefix\nlet msg = \"変換\";\nprint(msg);\n"
+        );
+        assert!(
+            lowered.byte_mapping.map_offset(lowered.text.len()).unwrap() == original.len(),
+            "trailing offset maps to original EOF"
+        );
+
+        let ir = parse_lowered_with_mapping(original, lowered, false, false, true, 7, None)
+            .expect("lowered source must parse");
+        let index = ir.parsed_semantic_index.as_ref().expect("index present");
+        assert!(
+            index.call_sites.len() == 1 && index.local_decls.len() == 1,
+            "lowered parse records the call and the decl"
+        );
+
+        // The call site is at a shifted lowered offset; it must remap to the
+        // exact original `print(msg)` slice with the original source id.
+        let site = &index.call_sites[0];
+        assert_eq!(site.callee_span.source_id, 7, "original source id kept");
+        assert_eq!(site.expr_span.source_id, 7, "original source id kept");
+        assert_eq!(span_slice(original, site.callee_span), "print");
+        assert_eq!(span_slice(original, site.expr_span), "print(msg)");
+
+        let decl = &index.local_decls[0];
+        assert_eq!(decl.ident_span.source_id, 7);
+        assert_eq!(span_slice(original, decl.ident_span), "msg");
+        assert_eq!(
+            span_slice(original, decl.stmt_span),
+            "msg = \"変換\";",
+            "stmt span starts at the ident and slices the original statement tail"
+        );
+
+        let reference = &index.local_refs[0];
+        assert_eq!(reference.ident_span.source_id, 7);
+        assert_eq!(span_slice(original, reference.ident_span), "msg");
+
+        // The scope tree maps the root and fn-body ranges onto the original.
+        for scope in &index.scopes {
+            assert_eq!(scope.range.source_id, 7, "scope range is original");
+        }
+        assert_eq!(span_slice(original, index.scopes[0].range), original);
+    }
+
+    /// The REPL parse path uses the same exact byte remap: provenance spans
+    /// reference the original snippet, not the lowered copy.
+    #[test]
+    fn repl_lowered_parse_maps_provenance_to_original_snippet() {
+        let source = "let x = 1;\nx + 1;\n";
+        let parsed = parse_rustscript_repl_source(source, &[]).expect("repl source must parse");
+        let index = parsed
+            .ir
+            .parsed_semantic_index
+            .as_ref()
+            .expect("repl index present");
+
+        let x_decl = index
+            .local_decls
+            .iter()
+            .find(|decl| decl.name == "x")
+            .expect("x decl");
+        assert_eq!(x_decl.ident_span.source_id, 0, "repl decl is original");
+        assert_eq!(span_slice(source, x_decl.ident_span), "x");
+        assert_eq!(span_slice(source, x_decl.stmt_span), "x = 1;");
+
+        let x_ref = index
+            .local_refs
+            .iter()
+            .find(|reference| reference.name == "x")
+            .expect("x ref");
+        assert_eq!(x_ref.ident_span.source_id, 0, "repl ref is original");
+        assert_eq!(span_slice(source, x_ref.ident_span), "x");
+
+        for scope in &index.scopes {
+            assert_eq!(scope.range.source_id, 0, "repl scope is original");
+        }
+        assert_eq!(span_slice(source, index.scopes[0].range), source);
+    }
+
+    /// The frontend `lower` entry produces a byte-exact identity mapping: the
+    /// lowered text equals the input and every byte offset maps to itself,
+    /// including offsets inside multi-byte UTF-8 sequences (never splitting a
+    /// code point's bytes).
+    #[test]
+    fn frontend_lower_produces_byte_exact_identity_mapping() {
+        let source = "fn 変換(x) { x }\n変換(1);\n";
+        let lowered: LoweredSource = rustscript::lower(source).expect("lower succeeds");
+        assert_eq!(lowered.text, source, "identity lowering is byte-exact");
+        for offset in 0..=source.len() {
+            assert_eq!(
+                lowered.byte_mapping.map_offset(offset),
+                Some(offset),
+                "identity maps byte offset {offset} to itself"
+            );
+        }
+    }
+
+    /// Predeclared REPL locals do not disturb the exact remap of the snippet's
+    /// own provenance spans.
+    #[test]
+    fn repl_with_predeclared_locals_still_maps_exactly() {
+        let source = "x + 1;\n";
+        let predefined = vec![ReplLocalBinding {
+            name: "x".to_string(),
+            mutable: false,
+            schema: None,
+            optional: false,
+        }];
+        let parsed = parse_rustscript_repl_source(source, &predefined).expect("repl parse ok");
+        let index = parsed
+            .ir
+            .parsed_semantic_index
+            .as_ref()
+            .expect("repl index present");
+        let x_ref = index
+            .local_refs
+            .iter()
+            .find(|reference| reference.name == "x")
+            .expect("x ref");
+        assert_eq!(x_ref.ident_span.source_id, 0);
+        assert_eq!(span_slice(source, x_ref.ident_span), "x");
+        assert_eq!(index.scopes[0].range.source_id, 0);
     }
 }
