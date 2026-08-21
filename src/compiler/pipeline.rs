@@ -837,6 +837,22 @@ fn analyze_source_string_at_path(
     source: &str,
     options: &CompileSourceFileOptions,
 ) -> Result<SemanticModel, SourcePathError> {
+    // Module-graph, plugin, and custom-catalog compilations share the same
+    // frontend pipeline as the compile path: the loader parses every unit
+    // verbatim (no second parser), the linker merges the provenance carrier,
+    // and analysis builds the semantic index from the merged IR.
+    if options.has_module_overrides() || options.has_source_plugins() {
+        let loaded = load_units_for_source_file(path, flavor, source, options)?;
+        let catalog = options.host_api_catalog().cloned();
+        return analyze_loaded_units(
+            source.to_string(),
+            loaded.units,
+            flavor,
+            loaded.sources,
+            catalog,
+        );
+    }
+
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source(path.display().to_string(), source.to_string());
     let parsed = frontends::parse_source(source, flavor, options).map_err(|err| {
@@ -850,9 +866,24 @@ fn analyze_source_string_at_path(
         .map_err(SourcePathError::Source)
 }
 
-fn analyze_parsed_output(
+/// Analyze the merged output of the module loader through the shared
+/// frontend pipeline: merge units, then legalize + type-check + build the
+/// provenance-driven semantic index. No second parser is involved.
+fn analyze_loaded_units(
     source: String,
-    mut parsed: FrontendIr,
+    units: Vec<ParsedUnit>,
+    flavor: SourceFlavor,
+    sources: SourceMap,
+    custom_catalog: Option<Arc<HostApiCatalog>>,
+) -> Result<SemanticModel, SourcePathError> {
+    let merged = merge_units(units)?;
+    analyze_parsed_output(source, merged, sources, flavor, custom_catalog)
+        .map_err(SourcePathError::Source)
+}
+
+fn analyze_parsed_output(
+    _source: String,
+    parsed: FrontendIr,
     source_map: SourceMap,
     flavor: SourceFlavor,
     custom_catalog: Option<Arc<HostApiCatalog>>,
@@ -891,21 +922,11 @@ fn analyze_parsed_output(
         errors.push(compile_err);
     }
 
-    // Build the semantic index.
-    let source_texts = {
-        let mut map = std::collections::HashMap::new();
-        if let Some(file) = source_map.file(0) {
-            map.insert(0, file.text.clone());
-        }
-        map
-    };
-
-    let semantic_index = SemanticIndex::build(
-        type_info.local_schemas.clone(),
-        &parsed_after_legalize,
-        &source_map,
-        source_texts,
-    );
+    // Build the semantic index directly from the parser provenance carried
+    // on the legalized IR plus the typed/resolved IR keyed by SemanticNodeId.
+    // No source-text reconstruction is involved.
+    let semantic_index =
+        SemanticIndex::build(type_info.local_schemas.clone(), &parsed_after_legalize);
 
     // Attach the semantic index to the IR.
     parsed_after_legalize.semantic_index = Some(semantic_index);

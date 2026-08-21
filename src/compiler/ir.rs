@@ -803,141 +803,119 @@ pub struct FrontendIr {
     pub catalog_visibility: Option<CatalogVisibility>,
 }
 
-/// A scope identifier used in [`LexicalScope`] records.
+/// A scope identifier used in [`ParsedLexicalScope`] records.
 pub type ScopeId = u32;
 
-/// A single lexical scope record with parent link and source range.
+/// Per-call-site resolved semantic facts keyed by the parser-assigned
+/// [`SemanticNodeId`] carried on the typed/resolved [`Expr`] node.
+///
+/// The [`SemanticIndex`] resolves every [`ParsedCallSite`] to the exact
+/// [`Expr`] node sharing its node id, so hover, signature help, and
+/// definition queries consume parser-origin spans and typed/resolved
+/// schemas — never source-text reconstruction or IR-order pairing.
 #[derive(Clone, Debug)]
-pub struct LexicalScope {
-    /// Parent scope, or `None` for the module-level (root) scope.
-    pub parent: Option<ScopeId>,
-    /// The source range of the scope body (the brace-delimited region or
-    /// the entire statement body for if/while/for).
-    pub range: Span,
-    /// Local slots declared directly in this scope, in declaration order.
-    pub declarations: Vec<LocalSlot>,
-    /// Function indices declared directly in this scope, in declaration order.
-    pub functions: Vec<u16>,
-}
-
-/// A recorded call-expression entry in the semantic index.
-#[derive(Clone, Debug)]
-pub struct CallExprEntry {
-    /// Span of the entire call expression (including callee, args, parens).
-    pub span: Span,
-    /// Span of just the callee name.
-    pub callee_span: Span,
-    /// The return type of the resolved call, or `Unknown` if not resolved.
+pub struct ResolvedCallInfo {
+    /// The parser-recorded call site with exact callee and expression spans.
+    pub site: ParsedCallSite,
+    /// The resolved return schema of the call, taken from the typed IR node
+    /// (the [`ResolvedHostCall`] carrier or the declared return schema).
     pub return_type: TypeSchema,
-    /// The callee name (host function name or local function name).
-    pub name: String,
+    /// The exact per-call host resolution carried by the typed IR node, when
+    /// the call was catalog-resolved.
+    pub host: Option<ResolvedHostCall>,
 }
 
 /// A semantic index built by the compiler during pipeline compilation.
 ///
 /// This sidecar holds the span, type-schema, and scope information that the
 /// [`SemanticModel`](crate::compiler::semantic_model::SemanticModel) needs
-/// for precise position-based queries. It is produced from the legalized and
-/// type-checked IR — no second parser, type engine, or name-only lookup is
-/// involved.
+/// for precise position-based queries. It is built **directly** from the
+/// parser's [`ParsedSemanticIndex`] provenance (exact token spans, resolved
+/// targets, lexical scopes) plus the legalized and type-checked IR keyed by
+/// [`SemanticNodeId`] — no second parser, source-text scanning, name-only
+/// lookup, or IR-order pairing is involved.
 ///
 /// The index is deliberately kept as a separate struct rather than adding
 /// span fields to every [`Expr`] and [`Stmt`] variant, so the core IR types
 /// are not bloated and the index is built only when semantic analysis is
 /// requested.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct SemanticIndex {
     /// Per-local-slot inferred [`TypeSchema`], indexed by [`LocalSlot`].
     /// Populated from the type checker's `local_schemas` output.
     pub slot_schemas: Vec<Option<TypeSchema>>,
-    /// Per-local-slot declaration identifier [`Span`] in the source text.
-    pub slot_decl_spans: HashMap<LocalSlot, Span>,
-    /// Per-function-index declaration identifier [`Span`] in the source text.
-    /// The span covers the function name identifier, not the entire line.
-    pub func_decl_spans: HashMap<u16, Span>,
+    /// Parser-produced semantic provenance with exact token spans.
+    pub parsed: ParsedSemanticIndex,
+    /// Resolved call facts keyed by [`SemanticNodeId`], built by pairing each
+    /// parsed call site with the typed/resolved [`Expr`] node carrying the
+    /// same id. Synthetic calls without provenance never appear here.
+    pub resolved_calls: HashMap<SemanticNodeId, ResolvedCallInfo>,
+    /// Per-function-index declaration return schema.
+    pub function_return_schemas: HashMap<u16, Option<TypeSchema>>,
     /// Per-function-index parameter names (ordered).
     pub func_params: HashMap<u16, Vec<String>>,
-    /// Call-expression entries in traversal order. Each entry records the
-    /// full expression span, callee name span, resolved return type, and
-    /// callee name. Populated by [`SemanticIndex::build`] from a walk of the
-    /// legalized IR.
-    pub call_exprs: Vec<CallExprEntry>,
-    /// Local variable reference entries: each is a `(identifier_span, slot, name)`.
-    pub local_ref_entries: Vec<(Span, LocalSlot, String)>,
-    /// Lexical scope records in traversal order. Scope 0 is always the root
-    /// (module-level) scope.
-    pub scope_records: Vec<LexicalScope>,
-    /// The source text for each [`SourceId`] in the compilation.
-    /// Used by the semantic model to resolve position-based queries.
-    pub source_texts: HashMap<crate::compiler::source_map::SourceId, String>,
 }
 
 impl SemanticIndex {
-    /// Build a semantic index by walking the legalized IR and collecting
-    /// spans, scopes, and references from the source text.
+    /// Build a semantic index from the parser provenance carried on `ir`
+    /// plus the typed/resolved IR keyed by [`SemanticNodeId`].
     ///
     /// `slot_schemas` comes from the type checker's `local_schemas` output.
-    /// `source_map` is used to resolve line numbers to spans. `source_texts`
-    /// maps each [`SourceId`] to its source text.
-    pub fn build(
-        slot_schemas: Vec<Option<TypeSchema>>,
-        ir: &FrontendIr,
-        _source_map: &crate::compiler::source_map::SourceMap,
-        source_texts: HashMap<crate::compiler::source_map::SourceId, String>,
-    ) -> Self {
-        use super::span_collector::SpanCollector;
+    ///
+    /// The parsed index is required: every real parse path (module-mode,
+    /// plain compile, lowered, REPL) carries [`Some`] provenance; only IR
+    /// built directly in tests or by plugin authors without a parser pass
+    /// leaves [`None`]. In that case the caller gets a minimal index with no
+    /// provenance records.
+    pub fn build(slot_schemas: Vec<Option<TypeSchema>>, ir: &FrontendIr) -> Self {
+        let mut resolved_calls = HashMap::new();
+        let mut function_return_schemas = HashMap::new();
+        let mut func_params = HashMap::new();
 
-        let source_id = 0;
-        let source_text = source_texts
-            .get(&source_id)
-            .map(|s| s.as_str())
-            .unwrap_or("");
-
-        let mut slot_decl_spans: HashMap<LocalSlot, Span> = HashMap::new();
-        let mut func_decl_spans: HashMap<u16, Span> = HashMap::new();
-        let mut func_params: HashMap<u16, Vec<String>> = HashMap::new();
-        let mut call_exprs: Vec<CallExprEntry> = Vec::new();
-        let mut local_ref_entries: Vec<(Span, LocalSlot, String)> = Vec::new();
-        let mut scope_records: Vec<LexicalScope> = Vec::new();
-
-        // Populate func_params from function declarations.
+        // Per-function declaration metadata from the flat function table.
         for decl in &ir.functions {
             func_params.insert(decl.index, decl.args.clone());
+            function_return_schemas.insert(decl.index, decl.return_schema.clone());
         }
 
-        // Root scope (module-level).
-        let root_span = Span::new(source_id, 0, source_text.len());
-        scope_records.push(LexicalScope {
-            parent: None,
-            range: root_span,
-            declarations: Vec::new(),
-            functions: Vec::new(),
-        });
-
-        // Walk IR statements and expressions to collect spans.
-        let mut collector = SpanCollector::new(
-            source_id,
-            source_text,
-            &mut slot_decl_spans,
-            &mut func_decl_spans,
-            &mut call_exprs,
-            &mut local_ref_entries,
-            &mut scope_records,
-            ir,
-        );
-        for stmt in &ir.stmts {
-            collector.collect_stmt(stmt);
+        // Pair every parsed call site with the typed/resolved Expr node that
+        // carries the same SemanticNodeId. Synthetic calls with None ids do
+        // not appear as source sites.
+        if let Some(parsed) = &ir.parsed_semantic_index {
+            let mut by_id = HashMap::<SemanticNodeId, ResolvedCallInfo>::new();
+            for site in &parsed.call_sites {
+                by_id.insert(
+                    site.id,
+                    ResolvedCallInfo {
+                        site: site.clone(),
+                        return_type: TypeSchema::Unknown,
+                        host: None,
+                    },
+                );
+            }
+            // Walk the legalized IR and attach resolved facts by node id.
+            for stmt in &ir.stmts {
+                collect_resolved_calls_in_stmt(stmt, &mut by_id, &function_return_schemas);
+            }
+            for function_impl in ir.function_impls.values() {
+                for stmt in &function_impl.body_stmts {
+                    collect_resolved_calls_in_stmt(stmt, &mut by_id, &function_return_schemas);
+                }
+                collect_resolved_calls_in_expr(
+                    &function_impl.body_expr,
+                    &mut by_id,
+                    &function_return_schemas,
+                );
+            }
+            resolved_calls = by_id;
         }
 
         SemanticIndex {
             slot_schemas,
-            slot_decl_spans,
-            func_decl_spans,
+            parsed: ir.parsed_semantic_index.clone().unwrap_or_default(),
+            resolved_calls,
+            function_return_schemas,
             func_params,
-            call_exprs,
-            local_ref_entries,
-            scope_records,
-            source_texts,
         }
     }
 
@@ -945,6 +923,175 @@ impl SemanticIndex {
     pub fn slot_schema(&self, slot: LocalSlot) -> Option<&TypeSchema> {
         let idx = slot as usize;
         self.slot_schemas.get(idx).and_then(|s| s.as_ref())
+    }
+}
+
+/// Walk a statement tree and attach resolved call facts to `by_id`.
+fn collect_resolved_calls_in_stmt(
+    stmt: &Stmt,
+    by_id: &mut HashMap<SemanticNodeId, ResolvedCallInfo>,
+    function_return_schemas: &HashMap<u16, Option<TypeSchema>>,
+) {
+    match stmt {
+        Stmt::Let { expr, .. } | Stmt::Expr { expr, .. } | Stmt::Assign { expr, .. } => {
+            collect_resolved_calls_in_expr(expr, by_id, function_return_schemas);
+        }
+        Stmt::ClosureLet { closure, .. } => {
+            collect_resolved_calls_in_expr(&closure.body, by_id, function_return_schemas);
+        }
+        Stmt::IfElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_resolved_calls_in_expr(condition, by_id, function_return_schemas);
+            for s in then_branch.iter().chain(else_branch.iter()) {
+                collect_resolved_calls_in_stmt(s, by_id, function_return_schemas);
+            }
+        }
+        Stmt::For {
+            init,
+            condition,
+            post,
+            body,
+            ..
+        } => {
+            collect_resolved_calls_in_stmt(init, by_id, function_return_schemas);
+            collect_resolved_calls_in_expr(condition, by_id, function_return_schemas);
+            collect_resolved_calls_in_stmt(post, by_id, function_return_schemas);
+            for s in body {
+                collect_resolved_calls_in_stmt(s, by_id, function_return_schemas);
+            }
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            collect_resolved_calls_in_expr(condition, by_id, function_return_schemas);
+            for s in body {
+                collect_resolved_calls_in_stmt(s, by_id, function_return_schemas);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Walk an expression tree and attach resolved call facts to `by_id`.
+fn collect_resolved_calls_in_expr(
+    expr: &Expr,
+    by_id: &mut HashMap<SemanticNodeId, ResolvedCallInfo>,
+    function_return_schemas: &HashMap<u16, Option<TypeSchema>>,
+) {
+    match expr {
+        Expr::Call(index, _type_args, args, host, semantic_id) => {
+            if let Some(id) = semantic_id {
+                if let Some(entry) = by_id.get_mut(id) {
+                    if let Some(resolved) = host {
+                        entry.return_type = resolved.return_type.clone();
+                        entry.host = Some((**resolved).clone());
+                    } else if let Some(schema) = function_return_schemas.get(index).cloned() {
+                        entry.return_type = schema.unwrap_or(TypeSchema::Unknown);
+                    }
+                }
+            }
+            for arg in args {
+                collect_resolved_calls_in_expr(arg, by_id, function_return_schemas);
+            }
+        }
+        Expr::ModuleCall(_symbol, _type_args, args, semantic_id) => {
+            if let Some(id) = semantic_id {
+                if let Some(entry) = by_id.get_mut(id) {
+                    // Module calls resolve to a compiler-owned symbol whose
+                    // flat function is only known after merge; the semantic
+                    // model resolves the return schema through the flat
+                    // function table by symbol identity.
+                    entry.return_type = TypeSchema::Unknown;
+                }
+            }
+            for arg in args {
+                collect_resolved_calls_in_expr(arg, by_id, function_return_schemas);
+            }
+        }
+        Expr::LocalCall(_slot, _type_args, args, semantic_id) => {
+            if let Some(id) = semantic_id {
+                if let Some(entry) = by_id.get_mut(id) {
+                    // Direct local-callable calls have no catalog schema;
+                    // the slot schema is resolved by the semantic model.
+                    entry.return_type = TypeSchema::Unknown;
+                }
+            }
+            for arg in args {
+                collect_resolved_calls_in_expr(arg, by_id, function_return_schemas);
+            }
+        }
+        Expr::Block { stmts, expr: inner } => {
+            for s in stmts {
+                collect_resolved_calls_in_stmt(s, by_id, function_return_schemas);
+            }
+            collect_resolved_calls_in_expr(inner, by_id, function_return_schemas);
+        }
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            collect_resolved_calls_in_expr(condition, by_id, function_return_schemas);
+            collect_resolved_calls_in_expr(then_expr, by_id, function_return_schemas);
+            collect_resolved_calls_in_expr(else_expr, by_id, function_return_schemas);
+        }
+        Expr::Match {
+            value,
+            arms,
+            default,
+            ..
+        } => {
+            collect_resolved_calls_in_expr(value, by_id, function_return_schemas);
+            for (_, arm_expr) in arms {
+                collect_resolved_calls_in_expr(arm_expr, by_id, function_return_schemas);
+            }
+            collect_resolved_calls_in_expr(default, by_id, function_return_schemas);
+        }
+        Expr::Closure(closure) => {
+            collect_resolved_calls_in_expr(&closure.body, by_id, function_return_schemas);
+        }
+        Expr::ClosureCall(closure, args) => {
+            for arg in args {
+                collect_resolved_calls_in_expr(arg, by_id, function_return_schemas);
+            }
+            collect_resolved_calls_in_expr(&closure.body, by_id, function_return_schemas);
+        }
+        Expr::Add(l, r)
+        | Expr::Sub(l, r)
+        | Expr::Mul(l, r)
+        | Expr::Div(l, r)
+        | Expr::Mod(l, r)
+        | Expr::And(l, r)
+        | Expr::Or(l, r)
+        | Expr::Eq(l, r)
+        | Expr::Lt(l, r)
+        | Expr::Gt(l, r) => {
+            collect_resolved_calls_in_expr(l, by_id, function_return_schemas);
+            collect_resolved_calls_in_expr(r, by_id, function_return_schemas);
+        }
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => {
+            collect_resolved_calls_in_expr(inner, by_id, function_return_schemas);
+        }
+        Expr::OptionalGet { container, key, .. } => {
+            collect_resolved_calls_in_expr(container, by_id, function_return_schemas);
+            collect_resolved_calls_in_expr(key, by_id, function_return_schemas);
+        }
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => {
+            collect_resolved_calls_in_expr(value, by_id, function_return_schemas);
+            collect_resolved_calls_in_expr(fallback, by_id, function_return_schemas);
+        }
+        _ => {}
     }
 }
 

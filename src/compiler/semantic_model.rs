@@ -52,8 +52,8 @@ use crate::host_api::{
 
 use super::CompileError;
 use super::ir::{
-    Expr, FrontendIr, HostApiIrMetadata, LocalSlot, ResolvedHostCall, ScopeId, SemanticIndex, Stmt,
-    TypeSchema,
+    FrontendIr, FunctionRefTarget, LocalSlot, ParsedCallTarget, ResolvedHostCall, ScopeId,
+    SemanticIndex, TypeSchema,
 };
 use super::source_map::{SourceId, SourceMap, Span};
 
@@ -180,8 +180,6 @@ pub struct SemanticModel {
     catalog: Arc<HostApiCatalog>,
     /// Compile errors encountered during compilation.
     errors: Vec<CompileError>,
-    /// The host API metadata (candidate sets) carried on the IR.
-    host_metadata: Option<HostApiIrMetadata>,
     /// The semantic index built during pipeline compilation.
     semantic_index: Option<SemanticIndex>,
     /// A name-to-slot mapping for quick local variable resolution.
@@ -200,7 +198,6 @@ impl SemanticModel {
         catalog: Arc<HostApiCatalog>,
         errors: Vec<CompileError>,
     ) -> Self {
-        let host_metadata = ir.host_api_metadata.clone();
         let semantic_index = ir.semantic_index.clone();
         let local_name_to_slot = ir.local_bindings.clone();
         Self {
@@ -208,7 +205,6 @@ impl SemanticModel {
             sources,
             catalog,
             errors,
-            host_metadata,
             semantic_index,
             local_name_to_slot,
         }
@@ -252,298 +248,212 @@ impl SemanticModel {
     ///
     /// Returns `None` when no semantic item is found at the position.
     pub fn inferred_schema_at(&self, position: SourcePosition) -> Option<TypeSchema> {
-        // 1. Check if the position falls within a call expression's span.
-        if let Some(schema) = self.inferred_schema_for_call_at(position) {
+        self.inferred_schema_at_inner(position)
+    }
+
+    fn inferred_schema_at_inner(&self, position: SourcePosition) -> Option<TypeSchema> {
+        let index = self.semantic_index.as_ref()?;
+
+        // 1. Smallest containing call site (exact parser callee/expr span):
+        //    return the resolved return schema.
+        if let Some(schema) = self.smallest_call_return_at(position) {
             return Some(schema);
         }
 
-        // 2. Check if the position is within a local variable declaration
-        //    or references a known local variable.
-        if let Some(schema) = self.inferred_schema_for_local_at(position) {
-            return Some(schema);
+        // 2. Local declaration or reference exact identifier span.
+        if let Some(slot) = self.local_slot_containing(position) {
+            return index.slot_schema(slot).cloned();
         }
 
-        // 3. Check if the position is within a function declaration.
-        if let Some(schema) = self.inferred_schema_for_func_at(position) {
+        // 3. Function declaration exact identifier span.
+        if let Some(schema) = self.function_decl_return_at(position) {
             return Some(schema);
         }
 
         None
     }
 
-    /// Find a catalog-resolved call expression whose span contains the
-    /// position and return its return type.
-    fn inferred_schema_for_call_at(&self, position: SourcePosition) -> Option<TypeSchema> {
-        // Walk the IR's statements looking for call expressions with
-        // resolved host calls whose span contains the position.
-        for stmt in &self.ir.stmts {
-            if let Some(schema) = self.stmt_inferred_call_schema(stmt, position) {
-                return Some(schema);
-            }
-        }
-        None
+    /// The resolved return schema of the smallest containing call site, using
+    /// exact parser-origin exp/callee spans. Empty/zero-length spans never
+    /// match so the position is not spuriously claimed.
+    fn smallest_call_return_at(&self, position: SourcePosition) -> Option<TypeSchema> {
+        let info = self.smallest_call_at(position)?;
+        Some(info.return_type.clone())
     }
 
-    /// Walk a statement for a call expression whose span contains the position.
-    fn stmt_inferred_call_schema(
+    /// The smallest containing [`ResolvedCallInfo`] at `position`, using only
+    /// the parser-recorded callee/expr spans. Ties resolve deterministically by
+    /// the shorter expression span, then the earlier start offset.
+    fn smallest_call_at(
         &self,
-        stmt: &Stmt,
         position: SourcePosition,
-    ) -> Option<TypeSchema> {
-        match stmt {
-            Stmt::Let { expr, .. } | Stmt::Expr { expr, .. } | Stmt::Assign { expr, .. } => {
-                self.expr_call_return_schema(expr, position)
+    ) -> Option<&crate::compiler::ir::ResolvedCallInfo> {
+        let index = self.semantic_index.as_ref()?;
+        let mut best: Option<&crate::compiler::ir::ResolvedCallInfo> = None;
+        for info in index.resolved_calls.values() {
+            let site = &info.site;
+            if !self.position_in_span(position, site.callee_span)
+                && !self.position_in_span(position, site.expr_span)
+            {
+                continue;
             }
-            Stmt::IfElse {
-                condition,
-                then_branch,
-                else_branch,
-                ..
-            } => self
-                .expr_call_return_schema(condition, position)
-                .or_else(|| {
-                    for s in then_branch.iter().chain(else_branch.iter()) {
-                        if let Some(schema) = self.stmt_inferred_call_schema(s, position) {
-                            return Some(schema);
-                        }
-                    }
-                    None
-                }),
-            Stmt::For {
-                init,
-                condition,
-                post,
-                body,
-                ..
-            } => self
-                .stmt_inferred_call_schema(init, position)
-                .or_else(|| self.expr_call_return_schema(condition, position))
-                .or_else(|| self.stmt_inferred_call_schema(post, position))
-                .or_else(|| {
-                    for s in body {
-                        if let Some(schema) = self.stmt_inferred_call_schema(s, position) {
-                            return Some(schema);
-                        }
-                    }
-                    None
-                }),
-            Stmt::While {
-                condition, body, ..
-            } => self
-                .expr_call_return_schema(condition, position)
-                .or_else(|| {
-                    for s in body {
-                        if let Some(schema) = self.stmt_inferred_call_schema(s, position) {
-                            return Some(schema);
-                        }
-                    }
-                    None
-                }),
-            Stmt::ClosureLet { closure, .. } => {
-                self.expr_call_return_schema(&closure.body, position)
+            let better = match best {
+                None => true,
+                Some(cur) => {
+                    let cur_len = cur.site.expr_span.hi - cur.site.expr_span.lo;
+                    let new_len = site.expr_span.hi - site.expr_span.lo;
+                    // Smaller containing span wins; ties by earlier start.
+                    new_len < cur_len
+                        || (new_len == cur_len && site.expr_span.lo < cur.site.expr_span.lo)
+                }
+            };
+            if better {
+                best = Some(info);
             }
-            _ => None,
         }
+        best
     }
 
-    /// Walk an expression tree to find a call expression whose span contains
-    /// the position. Falls back to containing sub-expressions.
-    fn expr_call_return_schema(&self, expr: &Expr, position: SourcePosition) -> Option<TypeSchema> {
-        if let Expr::Call(_, _, _, Some(resolved), _) = expr {
-            // Check if the position falls within any part of this call.
-            // We use the line heuristic as a fallback — the semantic index
-            // would provide the exact span, but we work with what we have.
-            return Some(resolved.return_type.clone());
+    /// The local slot whose declaration or a reference exact identifier span
+    /// contains the position. Exact parser token spans only.
+    fn local_slot_containing(&self, position: SourcePosition) -> Option<LocalSlot> {
+        let index = self.semantic_index.as_ref()?;
+        let parsed = &index.parsed;
+
+        // Smallest containing exact identifier span wins; ties by earlier lo.
+        let mut best: Option<(Option<ScopeId>, LocalSlot, Span)> = None;
+        for reference in &parsed.local_refs {
+            if self.position_in_span(position, reference.ident_span) {
+                let candidate: (Option<ScopeId>, LocalSlot, Span) =
+                    (None, reference.slot, reference.ident_span);
+                best = Some(pick_smaller_span(&best, &candidate).clone());
+            }
         }
-        // Recurse into sub-expressions.
-        match expr {
-            Expr::Block { stmts, expr: inner } => {
-                for s in stmts {
-                    if let Some(schema) = self.stmt_inferred_call_schema(s, position) {
-                        return Some(schema);
-                    }
-                }
-                self.expr_call_return_schema(inner, position)
+        for decl in &parsed.local_decls {
+            if self.position_in_span(position, decl.ident_span) {
+                let candidate: (Option<ScopeId>, LocalSlot, Span) =
+                    (Some(decl.scope_id), decl.slot, decl.ident_span);
+                best = Some(pick_smaller_span(&best, &candidate).clone());
             }
-            Expr::IfElse {
-                condition,
-                then_expr,
-                else_expr,
-                ..
-            } => self
-                .expr_call_return_schema(condition, position)
-                .or_else(|| self.expr_call_return_schema(then_expr, position))
-                .or_else(|| self.expr_call_return_schema(else_expr, position)),
-            Expr::Match {
-                value,
-                arms,
-                default,
-                ..
-            } => self
-                .expr_call_return_schema(value, position)
-                .or_else(|| {
-                    for (_, arm_expr) in arms {
-                        if let Some(schema) = self.expr_call_return_schema(arm_expr, position) {
-                            return Some(schema);
-                        }
-                    }
-                    None
-                })
-                .or_else(|| self.expr_call_return_schema(default, position)),
-            Expr::Closure(closure) => self.expr_call_return_schema(&closure.body, position),
-            Expr::Add(l, r)
-            | Expr::Sub(l, r)
-            | Expr::Mul(l, r)
-            | Expr::Div(l, r)
-            | Expr::Mod(l, r)
-            | Expr::And(l, r)
-            | Expr::Or(l, r)
-            | Expr::Eq(l, r)
-            | Expr::Lt(l, r)
-            | Expr::Gt(l, r) => self
-                .expr_call_return_schema(l, position)
-                .or_else(|| self.expr_call_return_schema(r, position)),
-            Expr::Neg(inner)
-            | Expr::Not(inner)
-            | Expr::ToOwned(inner)
-            | Expr::Borrow(inner)
-            | Expr::BorrowMut(inner) => self.expr_call_return_schema(inner, position),
-            Expr::OptionalGet { container, key, .. } => self
-                .expr_call_return_schema(container, position)
-                .or_else(|| self.expr_call_return_schema(key, position)),
-            Expr::OptionUnwrapOr {
-                value, fallback, ..
-            } => self
-                .expr_call_return_schema(value, position)
-                .or_else(|| self.expr_call_return_schema(fallback, position)),
-            Expr::Call(_, _, args, _, _) | Expr::ModuleCall(_, _, args, _) => {
-                for arg in args {
-                    if let Some(schema) = self.expr_call_return_schema(arg, position) {
-                        return Some(schema);
-                    }
-                }
-                None
-            }
-            Expr::LocalCall(_, _, args, _) => {
-                for arg in args {
-                    if let Some(schema) = self.expr_call_return_schema(arg, position) {
-                        return Some(schema);
-                    }
-                }
-                None
-            }
-            Expr::ClosureCall(closure, args) => {
-                for arg in args {
-                    if let Some(schema) = self.expr_call_return_schema(arg, position) {
-                        return Some(schema);
-                    }
-                }
-                self.expr_call_return_schema(&closure.body, position)
-            }
-            _ => None,
         }
+        best.map(|(_, slot, _)| slot)
     }
 
-    /// Find the inferred schema for a local variable at the position.
-    fn inferred_schema_for_local_at(&self, position: SourcePosition) -> Option<TypeSchema> {
-        // Use the semantic index to look up the slot schema.
-        if let Some(index) = &self.semantic_index {
-            // 1. Check if the position falls within a local declaration's identifier span.
-            for (slot, span) in &index.slot_decl_spans {
-                if self.position_in_span(position, *span) {
-                    if let Some(schema) = index.slot_schema(*slot) {
-                        return Some(schema.clone());
-                    }
-                }
-            }
-
-            // 2. Check if the position falls within a local variable reference.
-            for (ref_span, slot, _name) in &index.local_ref_entries {
-                if self.position_in_span(position, *ref_span) {
-                    if let Some(schema) = index.slot_schema(*slot) {
-                        return Some(schema.clone());
-                    }
-                }
-            }
-        }
-
-        // Fallback: find the variable reference by name at the position.
-        if let Some((name, _slot)) = self.find_local_at_position(position) {
-            let slot = self.slot_for_name(name)?;
-            // Try the semantic index first.
-            if let Some(index) = &self.semantic_index {
-                if let Some(schema) = index.slot_schema(slot) {
-                    return Some(schema.clone());
-                }
-            }
-            // Fallback to checking the let-binding's expression.
-            for stmt in &self.ir.stmts {
-                if let Stmt::Let { index, expr, .. } = stmt {
-                    if *index == slot {
-                        // Return the expression's inferred type.
-                        if let Expr::Call(_, _, _, Some(resolved), _) = expr {
-                            return Some(resolved.return_type.clone());
-                        }
-                        // For literals, return the known type.
-                        return match expr {
-                            Expr::Null => Some(TypeSchema::Null),
-                            Expr::Int(_) => Some(TypeSchema::Int),
-                            Expr::Float(_) => Some(TypeSchema::Float),
-                            Expr::Bool(_) => Some(TypeSchema::Bool),
-                            Expr::String(_) => Some(TypeSchema::String),
-                            Expr::Bytes(_) => Some(TypeSchema::Bytes),
-                            _ => None,
-                        };
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Find the inferred schema for a function declaration at the position.
-    fn inferred_schema_for_func_at(&self, position: SourcePosition) -> Option<TypeSchema> {
-        // Use the semantic index's func_decl_spans for exact position matching.
-        if let Some(index) = &self.semantic_index {
-            for (func_idx, span) in &index.func_decl_spans {
-                if self.position_in_span(position, *span) {
-                    if let Some(decl) = self.ir.functions.get(*func_idx as usize) {
-                        if let Some(ref schema) = decl.return_schema {
-                            return Some(schema.clone());
-                        }
-                    }
-                }
+    /// Infer a local slot's schema by resolving a referencing decl through the
+    /// parser's scope chain when multiple declarations share a slot.
+    fn function_decl_return_at(&self, position: SourcePosition) -> Option<TypeSchema> {
+        let index = self.semantic_index.as_ref()?;
+        for decl in &index.parsed.func_decls {
+            if self.position_in_span(position, decl.ident_span) {
+                return index
+                    .function_return_schemas
+                    .get(&decl.function_index)
+                    .cloned()
+                    .flatten()
+                    .or(Some(TypeSchema::Unknown));
             }
         }
         None
     }
 
-    /// Find the name of a local variable at the given position.
-    fn find_local_at_position(&self, position: SourcePosition) -> Option<(&str, LocalSlot)> {
-        for (name, slot) in &self.local_name_to_slot {
-            // Check if the name appears at the position in the source text.
-            if let Some(file) = self.sources.file(position.source_id) {
-                if position.offset < file.text.len() {
-                    // Check if the text at this offset matches the name.
-                    let text = &file.text;
-                    if let Some(slice) = text.get(position.offset..position.offset + name.len()) {
-                        if slice == name.as_str() {
-                            return Some((name.as_str(), *slot));
-                        }
+    /// The declaration for a local slot that is visible from `from_scope`,
+    /// resolving shadowing through the parser's lexical scope chain. Returns
+    /// the deepest declaration whose scope is an ancestor (or equal) of
+    /// `from_scope`, deterministically.
+    fn local_decl_visible_from(
+        &self,
+        slot: LocalSlot,
+        from_scope: ScopeId,
+    ) -> Option<crate::compiler::ir::LocalDeclSite> {
+        let index = self.semantic_index.as_ref()?;
+        let parsed = &index.parsed;
+        // Collect ancestor scope ids of `from_scope` (including itself).
+        let mut ancestors = Vec::new();
+        let mut current = Some(from_scope);
+        let mut seen = std::collections::HashSet::new();
+        while let Some(scope_id) = current {
+            if !seen.insert(scope_id) {
+                break;
+            }
+            ancestors.push(scope_id);
+            current = parsed
+                .scopes
+                .get(scope_id as usize)
+                .and_then(|scope| scope.parent);
+        }
+        // Among declarations for `slot`, pick the one whose scope is deepest in
+        // `ancestors` (closest to `from_scope`). Ties by smallest decl_order.
+        let mut best: Option<crate::compiler::ir::LocalDeclSite> = None;
+        for decl in &parsed.local_decls {
+            if decl.slot != slot {
+                continue;
+            }
+            if let Some(depth) = ancestors.iter().position(|&s| s == decl.scope_id) {
+                let better = match &best {
+                    None => true,
+                    Some(cur) => {
+                        let cur_depth = ancestors
+                            .iter()
+                            .position(|&s| s == cur.scope_id)
+                            .unwrap_or(usize::MAX);
+                        depth < cur_depth
+                            || (depth == cur_depth && decl.decl_order < cur.decl_order)
                     }
+                };
+                if better {
+                    best = Some(decl.clone());
                 }
             }
         }
-        None
+        best
     }
 
-    /// Look up a slot by name.
-    fn slot_for_name(&self, name: &str) -> Option<LocalSlot> {
-        self.local_name_to_slot
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, slot)| *slot)
+    /// The exact declaration span for a function index, resolving through the
+    /// parser scope chain from `from_scope` so shadowing declarations resolve
+    /// to the innermost visible one (no name search).
+    fn function_decl_visible_from(
+        &self,
+        function_index: u16,
+        from_scope: ScopeId,
+    ) -> Option<crate::compiler::ir::FunctionDeclSite> {
+        let index = self.semantic_index.as_ref()?;
+        let parsed = &index.parsed;
+        let mut ancestors = Vec::new();
+        let mut current = Some(from_scope);
+        let mut seen = std::collections::HashSet::new();
+        while let Some(scope_id) = current {
+            if !seen.insert(scope_id) {
+                break;
+            }
+            ancestors.push(scope_id);
+            current = parsed
+                .scopes
+                .get(scope_id as usize)
+                .and_then(|scope| scope.parent);
+        }
+        let mut best: Option<crate::compiler::ir::FunctionDeclSite> = None;
+        for decl in &parsed.func_decls {
+            if decl.function_index != function_index {
+                continue;
+            }
+            if let Some(depth) = ancestors.iter().position(|&s| s == decl.scope_id) {
+                let better = match &best {
+                    None => true,
+                    Some(cur) => {
+                        let cur_depth = ancestors
+                            .iter()
+                            .position(|&s| s == cur.scope_id)
+                            .unwrap_or(usize::MAX);
+                        depth < cur_depth
+                            || (depth == cur_depth && decl.decl_order < cur.decl_order)
+                    }
+                };
+                if better {
+                    best = Some(decl.clone());
+                }
+            }
+        }
+        best
     }
 
     // ------------------------------------------------------------------
@@ -560,165 +470,9 @@ impl SemanticModel {
     ///
     /// Returns `None` when the position is not within a catalog-resolved call.
     pub fn callable_signature_at(&self, position: SourcePosition) -> Option<HostFunctionSchema> {
-        for stmt in &self.ir.stmts {
-            if let Some(schema) = self.stmt_callable_signature_at(stmt, position) {
-                return Some(schema);
-            }
-        }
-        None
-    }
-
-    fn stmt_callable_signature_at(
-        &self,
-        stmt: &Stmt,
-        position: SourcePosition,
-    ) -> Option<HostFunctionSchema> {
-        match stmt {
-            Stmt::Let { expr, .. } | Stmt::Expr { expr, .. } | Stmt::Assign { expr, .. } => {
-                self.expr_callable_signature_at(expr, position)
-            }
-            Stmt::IfElse {
-                condition,
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                if let Some(schema) = self.expr_callable_signature_at(condition, position) {
-                    return Some(schema);
-                }
-                for s in then_branch.iter().chain(else_branch.iter()) {
-                    if let Some(schema) = self.stmt_callable_signature_at(s, position) {
-                        return Some(schema);
-                    }
-                }
-                None
-            }
-            Stmt::For {
-                init,
-                condition,
-                post,
-                body,
-                ..
-            } => {
-                if let Some(schema) = self.stmt_callable_signature_at(init, position) {
-                    return Some(schema);
-                }
-                if let Some(schema) = self.expr_callable_signature_at(condition, position) {
-                    return Some(schema);
-                }
-                if let Some(schema) = self.stmt_callable_signature_at(post, position) {
-                    return Some(schema);
-                }
-                for s in body {
-                    if let Some(schema) = self.stmt_callable_signature_at(s, position) {
-                        return Some(schema);
-                    }
-                }
-                None
-            }
-            Stmt::While {
-                condition, body, ..
-            } => {
-                if let Some(schema) = self.expr_callable_signature_at(condition, position) {
-                    return Some(schema);
-                }
-                for s in body {
-                    if let Some(schema) = self.stmt_callable_signature_at(s, position) {
-                        return Some(schema);
-                    }
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-
-    fn expr_callable_signature_at(
-        &self,
-        expr: &Expr,
-        position: SourcePosition,
-    ) -> Option<HostFunctionSchema> {
-        match expr {
-            Expr::Call(_, _, _, Some(resolved), _) => {
-                // Convert the resolved host call to a HostFunctionSchema
-                // with description looked up from the catalog.
-                let mut schema = self.resolved_call_to_host_schema(resolved);
-
-                // Look up the description from the catalog.
-                let candidates: Vec<&HostFunctionSchema> = self
-                    .catalog
-                    .functions()
-                    .iter()
-                    .filter(|f| f.name == resolved.name)
-                    .collect();
-                if let Some(first) = candidates.first() {
-                    schema.description = first.description.clone();
-                }
-
-                Some(schema)
-            }
-            // Recurse into compound expressions.
-            Expr::Block { stmts, expr: inner } => {
-                for s in stmts {
-                    if let Some(schema) = self.stmt_callable_signature_at(s, position) {
-                        return Some(schema);
-                    }
-                }
-                self.expr_callable_signature_at(inner, position)
-            }
-            Expr::IfElse {
-                condition,
-                then_expr,
-                else_expr,
-                ..
-            } => self
-                .expr_callable_signature_at(condition, position)
-                .or_else(|| self.expr_callable_signature_at(then_expr, position))
-                .or_else(|| self.expr_callable_signature_at(else_expr, position)),
-            Expr::Match {
-                value,
-                arms,
-                default,
-                ..
-            } => {
-                if let Some(schema) = self.expr_callable_signature_at(value, position) {
-                    return Some(schema);
-                }
-                for (_, arm_expr) in arms {
-                    if let Some(schema) = self.expr_callable_signature_at(arm_expr, position) {
-                        return Some(schema);
-                    }
-                }
-                self.expr_callable_signature_at(default, position)
-            }
-            Expr::Closure(closure) => self.expr_callable_signature_at(&closure.body, position),
-            Expr::Add(l, r)
-            | Expr::Sub(l, r)
-            | Expr::Mul(l, r)
-            | Expr::Div(l, r)
-            | Expr::Mod(l, r)
-            | Expr::And(l, r)
-            | Expr::Or(l, r)
-            | Expr::Eq(l, r)
-            | Expr::Lt(l, r)
-            | Expr::Gt(l, r) => self
-                .expr_callable_signature_at(l, position)
-                .or_else(|| self.expr_callable_signature_at(r, position)),
-            Expr::Neg(inner)
-            | Expr::Not(inner)
-            | Expr::ToOwned(inner)
-            | Expr::Borrow(inner)
-            | Expr::BorrowMut(inner) => self.expr_callable_signature_at(inner, position),
-            Expr::OptionalGet { container, key, .. } => self
-                .expr_callable_signature_at(container, position)
-                .or_else(|| self.expr_callable_signature_at(key, position)),
-            Expr::OptionUnwrapOr {
-                value, fallback, ..
-            } => self
-                .expr_callable_signature_at(value, position)
-                .or_else(|| self.expr_callable_signature_at(fallback, position)),
-            _ => None,
-        }
+        let info = self.smallest_call_at(position)?;
+        let resolved = info.host.as_ref()?;
+        Some(self.resolved_call_to_host_schema(resolved))
     }
 
     /// Convert a [`ResolvedHostCall`] back into a [`HostFunctionSchema`] for
@@ -893,7 +647,7 @@ impl SemanticModel {
                     if !seen_scope_ids.insert(scope_id) {
                         break; // Prevent infinite loops.
                     }
-                    if let Some(scope) = index.scope_records.get(scope_id as usize) {
+                    if let Some(scope) = index.parsed.scopes.get(scope_id as usize) {
                         for slot in &scope.declarations {
                             visible_slots.insert(*slot);
                         }
@@ -978,7 +732,7 @@ impl SemanticModel {
         if let Some(index) = &self.semantic_index {
             // Walk scopes in reverse order (deepest first, since they are pushed
             // in traversal order and later scopes are nested deeper).
-            for (i, scope) in index.scope_records.iter().enumerate().rev() {
+            for (i, scope) in index.parsed.scopes.iter().enumerate().rev() {
                 if self.position_in_span(position, scope.range) {
                     return Some(i as ScopeId);
                 }
@@ -1003,39 +757,6 @@ impl SemanticModel {
             .map(|pos| pos + 1)
             .unwrap_or(0);
         text[start..].to_string()
-    }
-
-    /// Check if a local variable is visible at the given position.
-    fn is_local_visible_at(&self, name: &str, position: SourcePosition) -> bool {
-        // Find the declaration line for this local.
-        for stmt in &self.ir.stmts {
-            if let Stmt::Let { index, line, .. } = stmt {
-                if let Some((n, _)) = self.local_name_to_slot.iter().find(|(_, s)| *s == *index) {
-                    if n == name {
-                        // A local is visible at positions at or after its declaration line.
-                        return self.position_line_or_after(position, *line);
-                    }
-                }
-            }
-        }
-        // If not found in stmts, check function param slots.
-        for decl in &self.ir.functions {
-            if decl.args.contains(&name.to_string()) {
-                return true; // Parameters are visible throughout their function.
-            }
-        }
-        false
-    }
-
-    /// Check if the position is at or after the given line.
-    fn position_line_or_after(&self, position: SourcePosition, line: u32) -> bool {
-        let Some(file) = self.sources.file(position.source_id) else {
-            return false;
-        };
-        let Some((pos_line, _)) = file.line_col_for_offset(position.offset) else {
-            return false;
-        };
-        pos_line >= line as usize
     }
 
     /// Format a host function's detail string for completions.
@@ -1064,194 +785,207 @@ impl SemanticModel {
 
     /// Returns the definition location for a symbol at the given position.
     ///
-    /// For local variables, this returns the span of their `let` binding.
-    /// For function declarations, this returns the span of the function
-    /// declaration. For host function calls, this returns a virtual
-    /// declaration entry from the catalog.
+    /// For local variables, this returns the exact identifier span of their
+    /// `let` binding (resolved through the parser's scope chain, so shadowed
+    /// declarations resolve to the innermost visible one). For function
+    /// declarations and function-value references, this returns the exact
+    /// identifier span of the declared function (by resolved function target
+    /// or module symbol — never by name search). For host function calls,
+    /// this returns a virtual declaration entry from the catalog, keyed by
+    /// the resolved schema identity carried on the call.
     ///
     /// Returns `None` when no definition can be determined.
     pub fn definition_at(&self, position: SourcePosition) -> Option<Definition> {
-        // 1. Check if the position is within a local variable reference.
+        // 1. Exact local declaration/reference identifier spans.
         if let Some(def) = self.definition_for_local_at(position) {
             return Some(def);
         }
 
-        // 2. Check if the position is within a function call or reference.
+        // 2. Function declaration/reference exact identifier spans and call
+        //    targets (function index, local slot, module symbol, host schema).
         if let Some(def) = self.definition_for_func_at(position) {
             return Some(def);
         }
 
-        // 3. Check if the position is within a catalog function call.
-        if let Some(def) = self.definition_for_catalog_call_at(position) {
-            return Some(def);
-        }
-
         None
     }
 
-    /// Find the definition of a local variable at the position.
+    /// Find the definition of a local variable at the position using the
+    /// parser's local declaration/reference sites only.
     fn definition_for_local_at(&self, position: SourcePosition) -> Option<Definition> {
-        // Find the local variable name at this position.
-        let (name, slot) = self.find_local_at_position(position)?;
+        let index = self.semantic_index.as_ref()?;
+        let parsed = &index.parsed;
 
-        // Look up the declaration span from the semantic index.
-        if let Some(index) = &self.semantic_index {
-            if let Some(span) = index.slot_decl_spans.get(&slot) {
+        // If the position is on a declaration identifier, return itself.
+        for decl in &parsed.local_decls {
+            if self.position_in_span(position, decl.ident_span) {
                 return Some(Definition {
-                    span: *span,
-                    label: format!("let {}", name),
+                    span: decl.ident_span,
+                    label: format!("let {}", decl.name),
                 });
             }
-            // Fallback: check local_ref_entries for the slot.
-            for (ref_span, ref_slot, ref_name) in &index.local_ref_entries {
-                if *ref_slot == slot && ref_name == name {
-                    return Some(Definition {
-                        span: *ref_span,
-                        label: format!("let {}", name),
-                    });
-                }
-            }
         }
 
-        // Fallback: find the let-binding statement by line.
-        for stmt in &self.ir.stmts {
-            if let Stmt::Let { index, line, .. } = stmt {
-                if *index == slot {
-                    if let Some(span) = self.line_span(position.source_id, *line) {
-                        return Some(Definition {
-                            span,
-                            label: format!("let {}", name),
-                        });
-                    }
-                }
+        // If the position is on a reference identifier, resolve the visible
+        // declaration through the parser scope chain (shadowing-aware).
+        for reference in &parsed.local_refs {
+            if self.position_in_span(position, reference.ident_span) {
+                let decl = self
+                    .local_decl_visible_from(reference.slot, reference.scope_id)
+                    .or_else(|| {
+                        // A captured/param slot may have no matching scope
+                        // ancestor decl; fall back to any decl for the slot
+                        // (params and captures record a decl site in their
+                        // own scope, so this is a rare residual case).
+                        parsed
+                            .local_decls
+                            .iter()
+                            .find(|d| d.slot == reference.slot)
+                            .cloned()
+                    })?;
+                return Some(Definition {
+                    span: decl.ident_span,
+                    label: format!("let {}", decl.name),
+                });
             }
         }
 
         None
     }
 
-    /// Find the definition of a function at the position.
+    /// Find the definition of a function at the position using the parser's
+    /// function declaration/reference sites and call targets.
     fn definition_for_func_at(&self, position: SourcePosition) -> Option<Definition> {
-        // Use the semantic index's func_decl_spans for exact position matching.
-        if let Some(index) = &self.semantic_index {
-            for (func_idx, span) in &index.func_decl_spans {
-                if self.position_in_span(position, *span) {
-                    let name = self
-                        .ir
-                        .functions
-                        .get(*func_idx as usize)
-                        .map(|f| f.name.as_str())
-                        .unwrap_or("fn");
+        let index = self.semantic_index.as_ref()?;
+        let parsed = &index.parsed;
+
+        // If the position is on a function declaration identifier, return it.
+        for decl in &parsed.func_decls {
+            if self.position_in_span(position, decl.ident_span) {
+                return Some(Definition {
+                    span: decl.ident_span,
+                    label: format!("fn {}", decl.name),
+                });
+            }
+        }
+
+        // If the position is on a function-value reference identifier, resolve
+        // the target (flat function index or module symbol) to its visible
+        // declaration — never a name search.
+        for reference in &parsed.func_refs {
+            if self.position_in_span(position, reference.ident_span) {
+                return self.function_definition_for_target(&reference.target, reference.scope_id);
+            }
+        }
+
+        // If the position is within a call site, resolve the call target.
+        let info = self.smallest_call_at(position)?;
+        let site = &info.site;
+        match &site.target {
+            ParsedCallTarget::Function(function_index) => {
+                // Resolve through the scope chain first; a host/builtin call
+                // (no visible decl) falls back to the resolved schema identity.
+                if let Some(decl) = self.function_decl_visible_from(*function_index, site.scope_id)
+                {
                     return Some(Definition {
-                        span: *span,
-                        label: format!("fn {}", name),
+                        span: decl.ident_span,
+                        label: format!("fn {}", decl.name),
                     });
                 }
+                self.host_definition_for_call(info)
+            }
+            ParsedCallTarget::Local(slot) => {
+                let decl = self.local_decl_visible_from(*slot, site.scope_id)?;
+                Some(Definition {
+                    span: decl.ident_span,
+                    label: format!("let {}", decl.name),
+                })
+            }
+            ParsedCallTarget::Module(symbol) => self
+                .function_definition_for_target(&FunctionRefTarget::Module(*symbol), site.scope_id),
+            ParsedCallTarget::Unresolved => None,
+        }
+    }
+
+    /// Resolve a [`FunctionRefTarget`] to its visible declaration span. Module
+    /// targets resolve through the flat function table by symbol identity —
+    /// never by name search.
+    fn function_definition_for_target(
+        &self,
+        target: &FunctionRefTarget,
+        from_scope: ScopeId,
+    ) -> Option<Definition> {
+        match target {
+            FunctionRefTarget::Function(function_index) => {
+                let decl = self.function_decl_visible_from(*function_index, from_scope)?;
+                Some(Definition {
+                    span: decl.ident_span,
+                    label: format!("fn {}", decl.name),
+                })
+            }
+            FunctionRefTarget::Module(symbol) => {
+                // Find the flat function whose declaration owns this symbol.
+                let function_index = self
+                    .ir
+                    .functions
+                    .iter()
+                    .find(|decl| decl.symbol == Some(*symbol))
+                    .map(|decl| decl.index)?;
+                // The merged flat index is unique to the module's declaration;
+                // its scope lives in a different source tree, so resolve by
+                // index without scope filtering (the symbol already names the
+                // exact declaration).
+                let decl = self
+                    .semantic_index
+                    .as_ref()?
+                    .parsed
+                    .func_decls
+                    .iter()
+                    .find(|decl| decl.function_index == function_index)?;
+                Some(Definition {
+                    span: decl.ident_span,
+                    label: format!("fn {}", decl.name),
+                })
             }
         }
-        None
     }
 
-    /// Find the definition for a catalog function call at the position.
-    fn definition_for_catalog_call_at(&self, position: SourcePosition) -> Option<Definition> {
-        // Walk the IR to find a call expression containing the position.
-        for stmt in &self.ir.stmts {
-            if let Some(def) = self.stmt_catalog_def(stmt, position) {
-                return Some(def);
-            }
-        }
-        None
-    }
-
-    fn stmt_catalog_def(&self, stmt: &Stmt, position: SourcePosition) -> Option<Definition> {
-        let expr = match stmt {
-            Stmt::Let { expr, .. } | Stmt::Expr { expr, .. } | Stmt::Assign { expr, .. } => expr,
-            Stmt::IfElse {
-                condition,
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                if let Some(def) = self.expr_catalog_def(condition, position) {
-                    return Some(def);
-                }
-                for s in then_branch.iter().chain(else_branch.iter()) {
-                    if let Some(def) = self.stmt_catalog_def(s, position) {
-                        return Some(def);
-                    }
-                }
-                return None;
-            }
-            _ => return None,
-        };
-        self.expr_catalog_def(expr, position)
-    }
-
-    fn expr_catalog_def(&self, expr: &Expr, position: SourcePosition) -> Option<Definition> {
-        if let Expr::Call(_, _, _, Some(resolved), _) = expr {
-            // Return a virtual definition for the catalog function.
-            let candidates: Vec<&HostFunctionSchema> = self
+    /// A virtual definition for a catalog-resolved call, keyed by the resolved
+    /// schema identity carried on the call (name + arity), not a name-only
+    /// catalog scan.
+    fn host_definition_for_call(
+        &self,
+        info: &crate::compiler::ir::ResolvedCallInfo,
+    ) -> Option<Definition> {
+        let resolved = info.host.as_ref()?;
+        // The resolved call carries the exact catalog schema identity.
+        let schema = crate::host_api::HostFunctionSchema {
+            name: resolved.name.clone(),
+            params: resolved
+                .params
+                .iter()
+                .zip(resolved.passing.iter())
+                .map(|(param, passing)| crate::host_api::HostParamSchema {
+                    name: param.name.clone(),
+                    ty: self.compiler_schema_to_host_schema(&param.schema),
+                    passing: *passing,
+                })
+                .collect(),
+            return_type: self.compiler_schema_to_host_schema(&resolved.return_type),
+            description: self
                 .catalog
                 .functions()
                 .iter()
-                .filter(|f| f.name == resolved.name)
-                .collect();
-            if let Some(schema) = candidates.first() {
-                // Create a virtual "documentation" definition.
-                let key = format!("host://{}/{}", resolved.name, schema.params.len());
-                let span = Span::new(position.source_id, position.offset, position.offset);
-                return Some(Definition {
-                    span,
-                    label: format!("{} — {}", resolved.name, schema.description),
-                });
-            }
-        }
-        // Recurse.
-        match expr {
-            Expr::Block { stmts, expr: inner } => {
-                for s in stmts {
-                    if let Some(def) = self.stmt_catalog_def(s, position) {
-                        return Some(def);
-                    }
-                }
-                self.expr_catalog_def(inner, position)
-            }
-            Expr::IfElse {
-                condition,
-                then_expr,
-                else_expr,
-                ..
-            } => self
-                .expr_catalog_def(condition, position)
-                .or_else(|| self.expr_catalog_def(then_expr, position))
-                .or_else(|| self.expr_catalog_def(else_expr, position)),
-            Expr::Call(_, _, args, _, _) | Expr::ModuleCall(_, _, args, _) => {
-                for arg in args {
-                    if let Some(def) = self.expr_catalog_def(arg, position) {
-                        return Some(def);
-                    }
-                }
-                None
-            }
-            Expr::Add(l, r)
-            | Expr::Sub(l, r)
-            | Expr::Mul(l, r)
-            | Expr::Div(l, r)
-            | Expr::Mod(l, r)
-            | Expr::And(l, r)
-            | Expr::Or(l, r)
-            | Expr::Eq(l, r)
-            | Expr::Lt(l, r)
-            | Expr::Gt(l, r) => self
-                .expr_catalog_def(l, position)
-                .or_else(|| self.expr_catalog_def(r, position)),
-            Expr::Neg(inner)
-            | Expr::Not(inner)
-            | Expr::ToOwned(inner)
-            | Expr::Borrow(inner)
-            | Expr::BorrowMut(inner) => self.expr_catalog_def(inner, position),
-            _ => None,
-        }
+                .find(|f| f.name == resolved.name)
+                .map(|f| f.description.clone())
+                .unwrap_or_default(),
+        };
+        let key = format!("host://{}/{}", schema.name, schema.params.len());
+        let span = info.site.callee_span;
+        Some(Definition {
+            span,
+            label: format!("{key} — {}", schema.description),
+        })
     }
 
     // ------------------------------------------------------------------
@@ -1296,32 +1030,41 @@ impl SemanticModel {
     // Internal helpers
     // ------------------------------------------------------------------
 
-    /// Check if a position approximately matches a source line.
-    fn position_matches_line(&self, position: SourcePosition, line: u32) -> bool {
-        let line_usize = line as usize;
-        if line_usize == 0 {
-            return false;
-        }
-        let Some(file) = self.sources.file(position.source_id) else {
-            return false;
-        };
-        let Some(line_span) = file.line_span(line_usize) else {
-            return false;
-        };
-        position.offset >= line_span.start && position.offset <= line_span.end
-    }
-
     /// Check if a position falls within a span.
     fn position_in_span(&self, position: SourcePosition, span: Span) -> bool {
         if position.source_id != span.source_id {
             return false;
         }
-        position.offset >= span.lo && position.offset <= span.hi
+        // Half-open containment: an offset at `hi` (one past the identifier)
+        // does not belong to the span, so adjacent tokens never both claim a
+        // cursor position. Zero-length spans never match.
+        position.offset >= span.lo && position.offset < span.hi
     }
 
     /// Get the line span for a given line number.
     fn line_span(&self, source_id: SourceId, line: u32) -> Option<Span> {
         self.sources.line_span(source_id, line as usize)
+    }
+}
+
+/// Pick the smaller containing span between two candidates, deterministically.
+/// `best` is `None` on the first candidate. Ties resolve by the shorter span
+/// length, then the earlier start offset, then the later end offset.
+fn pick_smaller_span<'a, T>(
+    best: &'a Option<(T, LocalSlot, Span)>,
+    candidate: &'a (T, LocalSlot, Span),
+) -> &'a (T, LocalSlot, Span) {
+    match best {
+        None => candidate,
+        Some(cur) => {
+            let cur_len = cur.2.hi - cur.2.lo;
+            let new_len = candidate.2.hi - candidate.2.lo;
+            if new_len < cur_len || (new_len == cur_len && candidate.2.lo < cur.2.lo) {
+                candidate
+            } else {
+                cur
+            }
+        }
     }
 }
 
@@ -1403,6 +1146,10 @@ impl std::fmt::Display for SemanticDiagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compiler::ir::{
+        Expr, LocalDeclSite, ParsedCallSite, ParsedCallTarget, ParsedLexicalScope,
+        ParsedSemanticIndex, SemanticNodeId, Stmt,
+    };
 
     use crate::host_api::{
         HostApiBuilder, HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema,
@@ -1775,21 +1522,40 @@ mod tests {
         });
         ir.local_bindings.push(("x".to_string(), 0));
         ir.locals = 1;
+        // Build parser provenance: one root scope and a declaration site for
+        // 'x' at the exact identifier span 4..5.
+        let mut parsed = ParsedSemanticIndex::default();
+        parsed.scopes.push(ParsedLexicalScope {
+            id: 0,
+            parent: None,
+            range: Span::new(sid, 0, 11),
+            declarations: vec![0],
+            functions: Vec::new(),
+        });
+        parsed.local_decls.push(LocalDeclSite {
+            id: SemanticNodeId(0),
+            ident_span: Span::new(sid, 4, 5),
+            stmt_span: Span::new(sid, 0, 11),
+            slot: 0,
+            name: "x".to_string(),
+            scope_id: 0,
+            decl_order: 0,
+        });
+        ir.parsed_semantic_index = Some(parsed);
+        ir.semantic_index = Some(SemanticIndex::build(vec![Some(TypeSchema::Int)], &ir));
         let model = SemanticModel::new(ir, sources, catalog, Vec::new());
         let pos = SourcePosition::new(sid, 4); // cursor on 'x'
         let def = model.definition_at(pos);
-        // Currently we can't resolve 'x' at offset 4 since we don't have
-        // the span index. The definition should come from the let-binding.
-        // In the current implementation, definition_at falls back to
-        // line-based lookup for the let-binding.
         assert!(def.is_some(), "should find definition for 'x'");
-        if let Some(def) = def {
-            assert!(
-                def.label.contains("x"),
-                "label should mention 'x': {}",
-                def.label
-            );
-        }
+        let def = def.expect("definition for 'x'");
+        assert!(
+            def.label.contains("x"),
+            "label should mention 'x': {}",
+            def.label
+        );
+        assert_eq!(def.span.lo, 4, "definition span starts at offset 4");
+        assert_eq!(def.span.hi, 5, "definition span ends at offset 5");
+        assert_eq!(def.span.source_id, sid, "definition span names the source");
     }
 
     // ------------------------------------------------------------------
@@ -1997,7 +1763,9 @@ mod tests {
         builder.function(func);
         let catalog = Arc::new(builder.build().expect("test catalog"));
 
-        // Build an IR with a call to test::open
+        // Build an IR with a call to test::open carrying parser provenance
+        // (SemanticNodeId(0)) so the semantic index can pair the typed node
+        // with its parsed call site.
         let mut ir = test_ir();
         let resolved = ResolvedHostCall {
             name: "test::open".to_string(),
@@ -2010,26 +1778,52 @@ mod tests {
             fingerprint: catalog.fingerprint(),
         };
         ir.stmts.push(Stmt::Expr {
-            expr: Expr::Call(0, Vec::new(), Vec::new(), Some(Box::new(resolved)), None),
+            expr: Expr::Call(
+                0,
+                Vec::new(),
+                Vec::new(),
+                Some(Box::new(resolved)),
+                Some(SemanticNodeId(0)),
+            ),
             line: 1,
         });
         ir.locals = 0;
 
         let mut sources = SourceMap::new();
         let sid = sources.add_source("test", "test::open(\"test\");\n");
+        // Parser provenance for the call site: callee span 0..9, expr 0..17.
+        let mut parsed = ParsedSemanticIndex::default();
+        parsed.scopes.push(ParsedLexicalScope {
+            id: 0,
+            parent: None,
+            range: Span::new(sid, 0, 17),
+            declarations: Vec::new(),
+            functions: Vec::new(),
+        });
+        parsed.call_sites.push(ParsedCallSite {
+            id: SemanticNodeId(0),
+            callee_span: Span::new(sid, 0, 9),
+            expr_span: Span::new(sid, 0, 17),
+            target: ParsedCallTarget::Function(0),
+            name: "test::open".to_string(),
+            scope_id: 0,
+            is_namespace_call: true,
+        });
+        ir.parsed_semantic_index = Some(parsed);
+        ir.semantic_index = Some(SemanticIndex::build(Vec::new(), &ir));
+
         let model = SemanticModel::new(ir, sources, catalog, Vec::new());
-        let pos = SourcePosition::new(sid, 0);
+        let pos = SourcePosition::new(sid, 4);
         let signature = model.callable_signature_at(pos);
         assert!(
             signature.is_some(),
             "should find a signature for test::open"
         );
-        if let Some(sig) = signature {
-            assert!(
-                !sig.description.is_empty(),
-                "description should not be empty: got '{}'",
-                sig.description
-            );
-        }
+        let sig = signature.expect("signature for test::open");
+        assert!(
+            !sig.description.is_empty(),
+            "description should not be empty: got '{}'",
+            sig.description
+        );
     }
 }

@@ -750,19 +750,23 @@ fn analyze_source_semantic_index_present() {
         "analyze_source should produce a semantic index"
     );
     if let Some(index) = index {
-        // slot_decl_spans should contain 'x'
+        // Parser provenance should carry the local declaration for 'x'.
         assert!(
-            !index.slot_decl_spans.is_empty(),
-            "slot_decl_spans should not be empty"
+            !index.parsed.local_decls.is_empty(),
+            "parsed local_decls should not be empty"
         );
-        // There should be a root scope
         assert!(
-            !index.scope_records.is_empty(),
-            "scope_records should not be empty"
+            index.parsed.local_decls.iter().any(|d| d.name == "x"),
+            "parsed local_decls should contain 'x'"
         );
-        // Verify root scope
+        // There should be a root scope.
+        assert!(
+            !index.parsed.scopes.is_empty(),
+            "parsed scopes should not be empty"
+        );
+        // Verify root scope.
         assert_eq!(
-            index.scope_records[0].parent, None,
+            index.parsed.scopes[0].parent, None,
             "root scope should have no parent"
         );
     }
