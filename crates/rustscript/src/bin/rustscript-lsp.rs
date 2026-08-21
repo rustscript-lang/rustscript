@@ -50,6 +50,24 @@ const MAX_DOCUMENT_CHARS: usize = 8 * 1024 * 1024;
 /// Scheme used for virtual host-definition documents.
 const HOST_SCHEME: &str = "rustscript-host";
 
+/// Runtime-tunable robustness caps. Production defaults are the constants
+/// above; tests may lower them via CLI flags to exercise the guard paths
+/// without transferring multi-megabyte payloads.
+#[derive(Clone, Copy, Debug)]
+struct ServerConfig {
+    max_message_bytes: usize,
+    max_document_chars: usize,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            max_message_bytes: MAX_MESSAGE_BYTES,
+            max_document_chars: MAX_DOCUMENT_CHARS,
+        }
+    }
+}
+
 /// A JSON-RPC message with an optional id (notifications omit it).
 #[derive(Debug, Clone)]
 struct RpcMessage {
@@ -77,7 +95,7 @@ enum ReadOutcome {
 /// clean EOF before any header, [`ReadOutcome::ParseError`] for malformed
 /// JSON bodies (recoverable), and [`ReadOutcome::Fatal`] for broken framing
 /// or over-limit payloads (the stream cannot be resynced).
-fn read_message(reader: &mut impl BufRead) -> ReadOutcome {
+fn read_message(reader: &mut impl BufRead, max_message_bytes: usize) -> ReadOutcome {
     let mut content_length: Option<usize> = None;
     loop {
         let mut line = String::new();
@@ -104,7 +122,7 @@ fn read_message(reader: &mut impl BufRead) -> ReadOutcome {
                 Ok(parsed) => parsed,
                 Err(_) => return ReadOutcome::Fatal(format!("invalid Content-Length: {value:?}")),
             };
-            if parsed > MAX_MESSAGE_BYTES {
+            if parsed > max_message_bytes {
                 return ReadOutcome::Fatal(format!("message too large: {parsed} bytes"));
             }
             content_length = Some(parsed);
@@ -362,19 +380,31 @@ struct LspServer {
     catalog: Arc<HostApiCatalog>,
     /// uri -> open document (buffer overrides disk).
     documents: HashMap<String, Document>,
-    /// Map from a source file name (as recorded in the SourceMap) to the URI
-    /// that should be reported for diagnostics/locations in that source.
-    source_name_to_uri: HashMap<String, String>,
+    /// Every URI we have published diagnostics for (including URIs owned by
+    /// imported modules of an analyzed document). On reanalysis/change/close
+    /// any URI that drops out of the fresh diagnostic set is cleared with an
+    /// empty publish so the client never shows stale squiggles.
+    published_uris: std::collections::HashSet<String>,
+    /// Normalized source names whose documents have been closed and must not
+    /// contribute diagnostics until reopened/reloaded from disk (the closing
+    /// document's buffer is gone, so its errors must be cleared even if a
+    /// still-open importing document's model still references them).
+    closed_sources: std::collections::HashSet<String>,
     shutdown_requested: bool,
+    initialized: bool,
+    config: ServerConfig,
 }
 
 impl LspServer {
-    fn new(catalog: Arc<HostApiCatalog>) -> Self {
+    fn new(catalog: Arc<HostApiCatalog>, config: ServerConfig) -> Self {
         Self {
             catalog,
             documents: HashMap::new(),
-            source_name_to_uri: HashMap::new(),
+            published_uris: std::collections::HashSet::new(),
+            closed_sources: std::collections::HashSet::new(),
             shutdown_requested: false,
+            initialized: false,
+            config,
         }
     }
 
@@ -419,40 +449,12 @@ impl LspServer {
             }
         };
         doc.model = model;
-        // Rebuild source-name -> uri mapping from the model's SourceMap.
-        // Collect the source names first (the doc borrow must end before the
-        // immutable `self` borrow in `uri_for_source_name`).
-        let source_names: Vec<String> = match &doc.model {
-            Some(model) => {
-                let mut names = Vec::new();
-                for source_id in 0.. {
-                    let Some(name) = model.sources().file_name(source_id) else {
-                        break;
-                    };
-                    names.push(name.to_string());
-                }
-                names
-            }
-            None => Vec::new(),
-        };
-        self.source_name_to_uri.clear();
-        for name in source_names {
-            let mapped = self.uri_for_source_name(&name);
-            self.source_name_to_uri.insert(name, mapped);
-        }
     }
 
-    /// Map a SourceMap file name back to a client URI. Files that are open
-    /// documents map to their document URI; other real files map to a
-    /// `file://` URI; host/virtual names map to the host scheme.
+    /// Map a SourceMap file name back to a client URI. Open documents map to
+    /// their document URI; other real files map to a canonical `file://` URI;
+    /// host/virtual names map to the host scheme (never double-prefixed).
     fn uri_for_source_name(&self, name: &str) -> String {
-        if let Some(doc) = self
-            .documents
-            .values()
-            .find(|doc| doc.path.to_string_lossy() == name)
-        {
-            return doc.uri.clone();
-        }
         // Normalize: the compiler records the path as passed; compare with
         // each document's path string form.
         let normalized = name.replace('\\', "/");
@@ -462,38 +464,92 @@ impl LspServer {
                 return doc.uri.clone();
             }
         }
-        if name.starts_with("host://") || name.starts_with(HOST_SCHEME) {
-            return format!("{HOST_SCHEME}://{}", name.trim_start_matches("host://"));
+        if let Some(rest) = name.strip_prefix("host://") {
+            return format!("{HOST_SCHEME}://{rest}");
+        }
+        if let Some(rest) = name.strip_prefix(&format!("{HOST_SCHEME}://")) {
+            return format!("{HOST_SCHEME}://{rest}");
+        }
+        if name.starts_with(HOST_SCHEME) {
+            // Already a host-scheme URI (e.g. `rustscript-host://foo/1`);
+            // never stack another scheme prefix.
+            return name.to_string();
         }
         format!("file://{}", name)
     }
 
-    /// All diagnostics for the document at `uri` (from its model), as an LSP
-    /// `Diagnostic[]`.
-    fn lsp_diagnostics(&self, uri: &str) -> Vec<serde_json::Value> {
-        let Some(doc) = self.documents.get(uri) else {
-            return Vec::new();
-        };
-        let Some(model) = &doc.model else {
-            return Vec::new();
-        };
-        let text = &doc.text;
-        let mut out = Vec::new();
-        for diag in model.diagnostics() {
-            if let Some(value) = self.lsp_diagnostic(model, text, &diag) {
-                out.push(value);
+    /// Collect every diagnostic across all open documents' models, grouped by
+    /// the owning URI (resolved through each diagnostic's `span.source_id`).
+    /// The entry URI of every open document is always present (empty array
+    /// when its analysis produced nothing), so clean documents still publish
+    /// an explicit clear.
+    fn diagnostics_grouped_by_uri(
+        &self,
+    ) -> std::collections::HashMap<String, Vec<serde_json::Value>> {
+        let mut grouped: std::collections::HashMap<String, Vec<serde_json::Value>> =
+            std::collections::HashMap::new();
+        // Every open document owns its entry URI, even with zero diagnostics.
+        for doc in self.documents.values() {
+            grouped.entry(doc.uri.clone()).or_default();
+        }
+        // A module owned by several open documents' models (its own model and
+        // every graph that imports it) surfaces the same diagnostic more than
+        // once; deduplicate by URI + rendered range + message + code so the
+        // client sees each squiggle exactly once (the source_id is
+        // model-relative, so it cannot be part of the key).
+        let mut seen: std::collections::HashSet<(String, String, String, String)> =
+            std::collections::HashSet::new();
+        for doc in self.documents.values() {
+            let Some(model) = &doc.model else {
+                continue;
+            };
+            for diag in model.diagnostics() {
+                let Some((uri, value)) = self.lsp_diagnostic(model, &diag) else {
+                    continue;
+                };
+                let key = (
+                    uri.clone(),
+                    diag.message.clone(),
+                    diag.code.clone().unwrap_or_default(),
+                    value["range"].to_string(),
+                );
+                if seen.insert(key) {
+                    grouped.entry(uri).or_default().push(value);
+                }
             }
         }
-        out
+        grouped
     }
 
     fn lsp_diagnostic(
         &self,
         model: &SemanticModel,
-        text: &str,
         diag: &SemanticDiagnostic,
-    ) -> Option<serde_json::Value> {
+    ) -> Option<(String, serde_json::Value)> {
         let span = diag.span?;
+        // Resolve the diagnostic's owning source through the SourceMap. Every
+        // span the linker carries references its own module's graph SourceId,
+        // so offsets are only meaningful against the owning source's text.
+        let owning = model.sources().file(span.source_id);
+        let (name, text) = match owning {
+            Some(file) => (file.name.as_str(), file.text.as_str()),
+            None => {
+                // Unknown source id: fall back to the entry document's URI
+                // and text so a diagnostic is still surfaced.
+                match self.documents.values().find(|doc| doc.model.is_some()) {
+                    Some(entry) => (entry.uri.as_str(), entry.text.as_str()),
+                    None => return None,
+                }
+            }
+        };
+        let uri = self.uri_for_source_name(name);
+        // A document that was closed must not keep contributing diagnostics
+        // through another open document's stale model.
+        if self.closed_sources.contains(&normalized_source_name(name))
+            && !self.documents.values().any(|doc| doc.uri == uri)
+        {
+            return None;
+        }
         let (lo, hi) = (span.lo.min(text.len()), span.hi.min(text.len()));
         let start = offset_to_lsp_position(text, lo)?;
         let end = offset_to_lsp_position(text, hi)?;
@@ -507,16 +563,25 @@ impl LspServer {
         if let Some(code) = &diag.code {
             value["code"] = serde_json::Value::String(code.clone());
         }
-        let _ = model;
-        Some(value)
+        Some((uri, value))
     }
 
-    /// Publish diagnostics for every open document (with an empty array for
-    /// documents whose analysis produced none).
-    fn publish_all_diagnostics(&self, out: &mut impl Write) -> std::io::Result<()> {
-        let uris: Vec<String> = self.documents.keys().cloned().collect();
-        for uri in uris {
-            let diagnostics = self.lsp_diagnostics(&uri);
+    /// Publish diagnostics for every open document (grouped by owning URI),
+    /// clearing any previously published URI that no longer owns diagnostics.
+    /// After publishing, the tracked published set is the fresh URI set, so
+    /// the next publish clears anything that drops out.
+    fn publish_all_diagnostics(&mut self, out: &mut impl Write) -> std::io::Result<()> {
+        let grouped = self.diagnostics_grouped_by_uri();
+        // Clear stale: every URI we have ever published for that is not part
+        // of the fresh set (e.g. an imported module that no longer produces
+        // diagnostics, or a closed document) gets an empty publish.
+        let fresh: std::collections::HashSet<String> = grouped.keys().cloned().collect();
+        let mut to_publish: Vec<(String, Vec<serde_json::Value>)> = grouped.into_iter().collect();
+        for stale in self.published_uris.difference(&fresh) {
+            to_publish.push((stale.clone(), Vec::new()));
+        }
+        to_publish.sort_by(|a, b| a.0.cmp(&b.0));
+        for (uri, diagnostics) in to_publish {
             let params = serde_json::json!({
                 "uri": uri,
                 "diagnostics": diagnostics,
@@ -526,11 +591,19 @@ impl LspServer {
                 &serde_json::json!({ "jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": params }),
             )?;
         }
+        self.published_uris = fresh;
         Ok(())
     }
 
-    /// Clear diagnostics for a single document (on close).
-    fn clear_diagnostics(&self, out: &mut impl Write, uri: &str) -> std::io::Result<()> {
+    /// Drop an oversized document and publish an explicit empty diagnostic
+    /// array for its URI so the client clears any previously shown squiggles.
+    fn reject_oversized_document(
+        &mut self,
+        out: &mut impl Write,
+        uri: &str,
+    ) -> std::io::Result<()> {
+        self.documents.remove(uri);
+        self.published_uris.insert(uri.to_string());
         let params = serde_json::json!({
             "uri": uri,
             "diagnostics": [],
@@ -588,9 +661,31 @@ impl LspServer {
         out: &mut impl Write,
     ) -> std::io::Result<Option<serde_json::Value>> {
         let method = msg.method.as_str();
+        // ---- lifecycle enforcement ----
+        if self.shutdown_requested {
+            // After shutdown only `exit` is serviced; every other request is
+            // rejected with InvalidRequest per the LSP spec.
+            if method == "exit" {
+                return Ok(None);
+            }
+            if let Some(id) = msg.id.as_ref() {
+                return Ok(Some(error_message(id, -32600, "server is shutting down")));
+            }
+            // Notifications after shutdown are dropped per spec.
+            return Ok(None);
+        }
+        if !self.initialized && method != "initialize" {
+            // Requests before initialize are rejected with
+            // ServerNotInitialized; notifications are dropped.
+            if let Some(id) = msg.id.as_ref() {
+                return Ok(Some(error_message(id, -32002, "server not initialized")));
+            }
+            return Ok(None);
+        }
         match method {
             // ---- lifecycle ----
             "initialize" => {
+                self.initialized = true;
                 let result = self.initialize_response();
                 Ok(Some(result_message(
                     msg.id.as_ref().unwrap_or(&serde_json::Value::Null),
@@ -705,10 +800,15 @@ impl LspServer {
             return Ok(());
         };
         let uri = uri.to_string();
-        if text.chars().count() > MAX_DOCUMENT_CHARS {
-            // Oversized buffer: drop the document (do not analyze).
-            self.documents.remove(&uri);
-            return Ok(());
+        if text.chars().count() > self.config.max_document_chars {
+            // Oversized buffer: drop the document (do not analyze). Clear any
+            // diagnostics that were previously published for it.
+            return self.reject_oversized_document(out, &uri);
+        }
+        if let Some(doc) = self.closed_doc_source(&uri) {
+            // Reopened: the buffer is live again, so its source may
+            // contribute diagnostics.
+            self.closed_sources.remove(&doc);
         }
         let path =
             uri_to_path(&uri).unwrap_or_else(|| PathBuf::from(uri.trim_start_matches("file://")));
@@ -740,9 +840,10 @@ impl LspServer {
         let Some(text) = last["text"].as_str() else {
             return Ok(());
         };
-        if text.chars().count() > MAX_DOCUMENT_CHARS {
-            self.documents.remove(&uri);
-            return self.clear_diagnostics(out, &uri);
+        if text.chars().count() > self.config.max_document_chars {
+            // Oversized replacement: drop the document and clear its
+            // diagnostics (the buffer cannot be analyzed).
+            return self.reject_oversized_document(out, &uri);
         }
         let Some(doc) = self.documents.get_mut(&uri) else {
             return Ok(());
@@ -762,8 +863,25 @@ impl LspServer {
         };
         let uri = uri.to_string();
         self.documents.remove(&uri);
-        self.source_name_to_uri.remove(&uri);
-        self.clear_diagnostics(out, &uri)
+        // Remember this source as closed so stale diagnostics from still-open
+        // importing documents' models are not reported for it.
+        if let Some(doc) = self.closed_doc_source(&uri) {
+            self.closed_sources.insert(doc);
+        }
+        // The closed document's URI (and any module URIs it published for)
+        // drops out of the fresh diagnostic set and is cleared by
+        // `publish_all_diagnostics`.
+        self.publish_all_diagnostics(out)
+    }
+
+    /// The normalized source name a document URI used, for closed-source
+    /// tracking. Mirrors `uri_to_path`'s slash handling so the name matches
+    /// what the SourceMap records for the same document.
+    fn closed_doc_source(&self, uri: &str) -> Option<String> {
+        let rest = uri.strip_prefix("file://")?;
+        let path_str = percent_decode(rest);
+        let path_str = path_str.strip_prefix('/').unwrap_or(&path_str);
+        Some(normalized_source_name(path_str))
     }
 
     fn handle_hover(&self, params: &serde_json::Value) -> serde_json::Value {
@@ -865,14 +983,14 @@ impl LspServer {
                     // and arity so the location is stable.
                     let (name, arity) = parse_host_label(&def.label);
                     let host_uri = format!("{HOST_SCHEME}://{name}/{arity}");
-                    // The virtual document has a single line; the definition
-                    // spans the whole function entry.
+                    // The location must identify the actual rendered function
+                    // entry (the signature line) in the virtual document, not
+                    // a zero-width placeholder. When several catalog entries
+                    // share name+arity the line is deterministic per function.
+                    let range = self.host_entry_range(&name, arity);
                     return serde_json::json!([{
                         "uri": host_uri,
-                        "range": {
-                            "start": { "line": 0, "character": 0 },
-                            "end": { "line": 0, "character": 0 },
-                        }
+                        "range": range,
                     }]);
                 }
                 // Real source location.
@@ -941,6 +1059,40 @@ impl LspServer {
         };
         serde_json::json!({ "uri": uri, "content": content })
     }
+
+    /// The LSP range of the rendered function entry for the catalog function
+    /// `name`/`arity` inside its virtual host document. The document layout
+    /// is deterministic (see [`Self::handle_host_document_content`]): each
+    /// matching catalog entry renders one signature line, optionally followed
+    /// by a `// description` line. The definition points at the signature
+    /// line of the *first* matching entry — the one `documentContent`
+    /// renders as the entry — so a client that opens the virtual document
+    /// lands exactly on the function.
+    fn host_entry_range(&self, name: &str, arity: usize) -> serde_json::Value {
+        let matches: Vec<&HostFunctionSchema> = self
+            .catalog
+            .functions()
+            .iter()
+            .filter(|f| f.name == name)
+            .filter(|f| f.params.len() == arity)
+            .collect();
+        let (line, length) = if let Some(first) = matches.first() {
+            let signature = render_host_signature(first);
+            (0, signature.chars().count())
+        } else {
+            // Unknown function: the virtual document renders a comment line.
+            (
+                0,
+                format!("// Unknown host function: {name} (arity {arity})")
+                    .chars()
+                    .count(),
+            )
+        };
+        serde_json::json!({
+            "start": { "line": line, "character": 0 },
+            "end": { "line": line, "character": length },
+        })
+    }
 }
 
 /// Parse a host definition label (`host://<name>/<arity> — <desc>`) into its
@@ -952,6 +1104,12 @@ fn parse_host_label(label: &str) -> (String, usize) {
         .unwrap_or(label);
     let rest = rest.split(" — ").next().unwrap_or(rest);
     split_host_uri(rest)
+}
+
+/// Normalize a SourceMap source name for closed-source tracking (backslashes
+/// to slashes, so Windows-style and Unix-style names compare equal).
+fn normalized_source_name(name: &str) -> String {
+    name.replace('\\', "/")
 }
 
 fn split_host_uri(rest: &str) -> (String, usize) {
@@ -968,6 +1126,7 @@ fn split_host_uri(rest: &str) -> (String, usize) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut catalog_path: Option<PathBuf> = None;
+    let mut config = ServerConfig::default();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -979,13 +1138,47 @@ fn main() {
                 }
                 catalog_path = Some(PathBuf::from(&args[i]));
             }
+            "--max-message-bytes" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("rustscript-lsp: --max-message-bytes requires a byte count");
+                    std::process::exit(2);
+                }
+                match args[i].parse::<usize>() {
+                    Ok(value) if value > 0 => config.max_message_bytes = value,
+                    _ => {
+                        eprintln!("rustscript-lsp: --max-message-bytes must be a positive integer");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--max-document-chars" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("rustscript-lsp: --max-document-chars requires a char count");
+                    std::process::exit(2);
+                }
+                match args[i].parse::<usize>() {
+                    Ok(value) if value > 0 => config.max_document_chars = value,
+                    _ => {
+                        eprintln!(
+                            "rustscript-lsp: --max-document-chars must be a positive integer"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--help" | "-h" => {
                 println!(
                     "rustscript-lsp — resource-aware RustScript language server (LSP over stdio)\n\n\
-                     USAGE:\n    rustscript-lsp [--catalog <host-api-catalog.json>]\n\n\
+                     USAGE:\n    rustscript-lsp [OPTIONS]\n\n\
                      Reads JSON-RPC messages from stdin, writes responses to stdout.\n\
-                     --catalog loads a custom HostApiCatalog JSON snapshot (same serde shape the\n\
-                     compiler validates); without it the standard sqlite+io+http catalog is used.\n"
+                     OPTIONS:\n\
+                     \x20 --catalog <host-api-catalog.json>   custom HostApiCatalog snapshot (same serde\n\
+                     \x20                                   shape the compiler validates); defaults to the\n\
+                     \x20                                   standard sqlite+io+http catalog.\n\
+                     \x20 --max-message-bytes <n>            per-message payload cap (default 16 MiB).\n\
+                     \x20 --max-document-chars <n>           per-document text cap (default 8 Mi chars).\n"
                 );
                 return;
             }
@@ -1015,14 +1208,14 @@ fn main() {
         catalog.functions().len()
     );
 
-    let mut server = LspServer::new(catalog);
+    let mut server = LspServer::new(catalog, config);
     let stdin = std::io::stdin();
     let mut reader = std::io::BufReader::new(stdin.lock());
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
     loop {
-        let msg = match read_message(&mut reader) {
+        let msg = match read_message(&mut reader, config.max_message_bytes) {
             ReadOutcome::Message(msg) => msg,
             ReadOutcome::Eof => {
                 // Clean EOF: orderly exit. Per LSP, exiting without shutdown
@@ -1078,5 +1271,59 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Finding #5: `uri_for_source_name` must never double the host scheme and
+    /// must map both legacy `host://` and canonical `rustscript-host://`
+    /// names to the canonical scheme, and open documents to their URIs.
+    #[test]
+    fn uri_for_source_name_maps_host_schemes_without_double_prefix() {
+        let config = ServerConfig::default();
+        let server = LspServer::new(standard_catalog(), config);
+
+        // Canonical host-scheme names pass through untouched.
+        assert_eq!(
+            server.uri_for_source_name("rustscript-host://sqlite::open/1"),
+            "rustscript-host://sqlite::open/1"
+        );
+        // Legacy `host://` names are upgraded to the canonical scheme once.
+        assert_eq!(
+            server.uri_for_source_name("host://sqlite::query/4"),
+            "rustscript-host://sqlite::query/4"
+        );
+        // Plain file names map to canonical file URIs.
+        assert_eq!(
+            server.uri_for_source_name("/tmp/foo.rss"),
+            "file:///tmp/foo.rss"
+        );
+    }
+
+    #[test]
+    fn uri_for_source_name_prefers_open_document_uri() {
+        let config = ServerConfig::default();
+        let mut server = LspServer::new(standard_catalog(), config);
+        server.documents.insert(
+            "file:///tmp/fixture/main.rss".to_string(),
+            Document::new(
+                "file:///tmp/fixture/main.rss".to_string(),
+                PathBuf::from("tmp/fixture/main.rss"),
+                "fn main() {}\n".to_string(),
+            ),
+        );
+        // The SourceMap name (path form) maps to the open document's URI.
+        assert_eq!(
+            server.uri_for_source_name("tmp/fixture/main.rss"),
+            "file:///tmp/fixture/main.rss"
+        );
+        // Windows-style separators normalize to the same match.
+        assert_eq!(
+            server.uri_for_source_name(r"tmp\fixture\main.rss"),
+            "file:///tmp/fixture/main.rss"
+        );
     }
 }

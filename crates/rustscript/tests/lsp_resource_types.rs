@@ -19,7 +19,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 /// A minimal JSON-RPC client over a child process's stdio.
 struct RpcClient {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
 }
 
@@ -40,7 +40,7 @@ impl RpcClient {
         let stdout = child.stdout.take().expect("stdout");
         Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             stdout: BufReader::new(stdout),
         }
     }
@@ -48,9 +48,10 @@ impl RpcClient {
     /// Send one JSON-RPC message (request or notification).
     fn send(&mut self, message: &serde_json::Value) {
         let body = serde_json::to_vec(message).expect("serialize message");
-        write!(self.stdin, "Content-Length: {}\r\n\r\n", body.len()).expect("write header");
-        self.stdin.write_all(&body).expect("write body");
-        self.stdin.flush().expect("flush stdin");
+        let stdin = self.stdin.as_mut().expect("stdin open");
+        write!(stdin, "Content-Length: {}\r\n\r\n", body.len()).expect("write header");
+        stdin.write_all(&body).expect("write body");
+        stdin.flush().expect("flush stdin");
     }
 
     /// Read one JSON-RPC message from the server.
@@ -139,6 +140,37 @@ impl RpcClient {
             // Requests (shouldn't normally arrive unsolicited) are skipped.
         }
     }
+
+    /// Drain publishDiagnostics notifications until one for `uri` arrives and
+    /// return its params. Multi-document servers publish one notification per
+    /// URI, so tests targeting a specific document must skip unrelated URIs.
+    fn recv_publish_for(&mut self, uri: &str) -> serde_json::Value {
+        loop {
+            let params = self.recv_notification("textDocument/publishDiagnostics");
+            if params["uri"] == serde_json::json!(uri) {
+                return params;
+            }
+        }
+    }
+
+    /// Write raw bytes to stdin and close it (EOF). Used by framing-robustness
+    /// tests: after the server reads EOF it must exit, so this never blocks.
+    fn send_raw_then_close(&mut self, bytes: &[u8]) {
+        use std::io::Write;
+        let stdin = self.stdin.as_mut().expect("stdin open");
+        stdin.write_all(bytes).expect("write raw bytes");
+        stdin.flush().expect("flush raw bytes");
+        // Drop stdin to signal EOF; the server's read loop terminates.
+        self.stdin.take();
+    }
+
+    /// Wait for the child to exit and return its status. The child's stdin is
+    /// closed first so a server blocked reading can never deadlock the test.
+    fn wait_exit(&mut self) -> std::process::ExitStatus {
+        self.stdin.take();
+        let status = self.child.wait().expect("wait for server exit");
+        status
+    }
 }
 
 impl Drop for RpcClient {
@@ -169,13 +201,6 @@ fn main() {
     let db = sqlite::open({});
     sqlite::query("NOT_A_DB", "SELECT 1", {}, {});
 }
-"#;
-
-/// A program with non-ASCII text before the target so UTF-16 conversion is
-/// exercised (each CJK char is 3 UTF-8 bytes but 1 UTF-16 unit).
-const UNICODE_SOURCE: &str = r#"use sqlite;
-// 你好世界
-let db = sqlite::open({});
 "#;
 
 fn open_doc(client: &mut RpcClient, uri: &str, text: &str) {
@@ -612,11 +637,190 @@ fn definition_for_host_call_returns_deterministic_virtual_location() {
         text.contains("sqlite::open"),
         "virtual host document must render the function: {text}"
     );
+    // Finding #4: the definition range must identify the actual rendered
+    // function entry — the first signature line of the virtual document,
+    // spanning its full width (never a zero-width placeholder).
+    let first_line = text.lines().next().unwrap_or("");
+    let expected_len = first_line.chars().count();
+    let range = &locations[0]["range"];
+    assert_eq!(
+        range["start"],
+        serde_json::json!({ "line": 0, "character": 0 })
+    );
+    assert_eq!(
+        range["end"],
+        serde_json::json!({ "line": 0, "character": expected_len }),
+        "host definition range must cover the rendered function entry line"
+    );
+    // The virtual document's first line must be the rendered signature
+    // (a real function entry, not a comment).
+    assert!(
+        first_line.contains("sqlite::open") && !first_line.starts_with("//"),
+        "virtual document entry line must be the rendered signature: {first_line:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Multi-source diagnostics (module graph)
+// ---------------------------------------------------------------------------
+
+const MODULE_ENTRY_URI: &str = "file:///tmp/rustscript-lsp-modules/main.rss";
+const MODULE_UTIL_URI: &str = "file:///tmp/rustscript-lsp-modules/util.rss";
+
+/// Entry that imports `util.rss` (via `self::util`) and calls its helper.
+const MODULE_ENTRY_SOURCE: &str = r#"use self::util;
+fn run() {
+    util::helper();
+}
+"#;
+
+/// Imported module whose `helper` body has a wrong-resource-type call. The
+/// diagnostic span lives in *this* source, so it must be reported under
+/// MODULE_UTIL_URI with ranges into this text, never the entry's.
+const MODULE_BAD_UTIL_SOURCE: &str = r#"use sqlite;
+pub fn helper() {
+    let db = sqlite::open({});
+    sqlite::query("NOT_A_DB", "SELECT 1", {}, {});
+}
+"#;
+
+/// Imported module whose `helper` body is clean.
+const MODULE_CLEAN_UTIL_SOURCE: &str = r#"use sqlite;
+pub fn helper() {
+    let db = sqlite::open({});
+    sqlite::query(&db, "SELECT 1", {}, {});
+}
+"#;
+
+/// Open the module buffer first (so it is already an override the entry sees),
+/// then the entry. Returns the module URI's publish params from the entry
+/// analysis (the diagnostics the entry's graph reports for the module).
+fn open_module_pair(client: &mut RpcClient, entry: &str, module: &str) -> serde_json::Value {
+    open_doc(client, MODULE_UTIL_URI, module);
+    client.recv_publish_for(MODULE_UTIL_URI);
+    open_doc(client, MODULE_ENTRY_URI, entry);
+    // The entry open publishes for both documents (sorted: main then util).
+    client.recv_publish_for(MODULE_UTIL_URI)
+}
+
+#[test]
+fn imported_module_error_publishes_under_module_uri_with_exact_range() {
+    let mut client = RpcClient::spawn();
+    client.request(1, "initialize", serde_json::json!({}));
+    client.notify("initialized", serde_json::json!({}));
+    // The entry's analysis publishes diagnostics for the *module* URI (the
+    // wrong-type call lives in util.rss).
+    let params = open_module_pair(&mut client, MODULE_ENTRY_SOURCE, MODULE_BAD_UTIL_SOURCE);
+    let diagnostics = params["diagnostics"].as_array().expect("diagnostics array");
+    let wrong_type: Vec<&serde_json::Value> = diagnostics
+        .iter()
+        .filter(|d| {
+            d["message"]
+                .as_str()
+                .map(|m| m.contains("sqlite.connection"))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert!(
+        !wrong_type.is_empty(),
+        "imported module error must produce a diagnostic naming sqlite.connection: {diagnostics:?}"
+    );
+    // The range points into util.rss line 3 (`sqlite::query("NOT_A_DB", ...)`),
+    // exactly like the single-file fixture (callee `sqlite::query` at 4..17).
+    let range = &wrong_type[0]["range"];
+    assert_eq!(
+        range["start"]["line"],
+        serde_json::json!(3),
+        "start line must be the module's query call line"
+    );
+    assert_eq!(
+        range["start"]["character"],
+        serde_json::json!(4),
+        "start character must be at the module's callee"
+    );
+    assert_eq!(
+        range["end"]["line"],
+        serde_json::json!(3),
+        "end line must be the module's query call line"
+    );
+    assert!(
+        range["end"]["character"].as_u64().unwrap() > 4,
+        "module diagnostic range must be non-empty"
+    );
+}
+
+#[test]
+fn second_open_buffer_override_wins_for_imported_module() {
+    let mut client = RpcClient::spawn();
+    client.request(1, "initialize", serde_json::json!({}));
+    client.notify("initialized", serde_json::json!({}));
+    // First module buffer has the wrong-type error.
+    open_doc(&mut client, MODULE_UTIL_URI, MODULE_BAD_UTIL_SOURCE);
+    let params = client.recv_publish_for(MODULE_UTIL_URI);
+    assert!(
+        !params["diagnostics"].as_array().unwrap().is_empty(),
+        "first buffer override must surface the module error"
+    );
+    open_doc(&mut client, MODULE_ENTRY_URI, MODULE_ENTRY_SOURCE);
+    let params = client.recv_publish_for(MODULE_UTIL_URI);
+    assert!(
+        !params["diagnostics"].as_array().unwrap().is_empty(),
+        "entry analysis must surface the imported module error under the module uri"
+    );
+
+    // Second open of the same module URI (clean) replaces the buffer, then
+    // the entry reanalysis (didChange) must use the *new* text (override
+    // wins) and clear the previously published diagnostics for the module URI.
+    open_doc(&mut client, MODULE_UTIL_URI, MODULE_CLEAN_UTIL_SOURCE);
+    client.recv_publish_for(MODULE_UTIL_URI);
+    client.notify(
+        "textDocument/didChange",
+        serde_json::json!({
+            "textDocument": { "uri": MODULE_ENTRY_URI, "version": 2 },
+            "contentChanges": [{ "text": MODULE_ENTRY_SOURCE }],
+        }),
+    );
+    let params = client.recv_publish_for(MODULE_UTIL_URI);
+    assert_eq!(
+        params["diagnostics"],
+        serde_json::json!([]),
+        "second (clean) buffer override must win and clear the stale error"
+    );
+}
+
+#[test]
+fn closing_imported_module_clears_its_published_diagnostics() {
+    let mut client = RpcClient::spawn();
+    client.request(1, "initialize", serde_json::json!({}));
+    client.notify("initialized", serde_json::json!({}));
+    let params = open_module_pair(&mut client, MODULE_ENTRY_SOURCE, MODULE_BAD_UTIL_SOURCE);
+    assert!(!params["diagnostics"].as_array().unwrap().is_empty());
+
+    // Close the module buffer: its URI must be cleared with an empty publish.
+    client.notify(
+        "textDocument/didClose",
+        serde_json::json!({ "textDocument": { "uri": MODULE_UTIL_URI } }),
+    );
+    let params = client.recv_publish_for(MODULE_UTIL_URI);
+    assert_eq!(
+        params["diagnostics"],
+        serde_json::json!([]),
+        "closing the module must clear its published diagnostics"
+    );
 }
 
 // ---------------------------------------------------------------------------
 // UTF-16 conversion
 // ---------------------------------------------------------------------------
+
+/// BMP and astral characters on the *same line* before the queried target
+/// (inside a string literal, since identifiers are ASCII-only), so UTF-16
+/// column conversion is genuinely exercised: each CJK char is 3 UTF-8 bytes
+/// but 1 UTF-16 unit; the emoji is 4 UTF-8 bytes and 2 UTF-16 units (a
+/// surrogate pair). A byte-based converter would mis-locate `db`.
+/// Line 1: `let s = "你好😀"; let db = sqlite::open({});`
+const UNICODE_SOURCE: &str =
+    "use sqlite;\nlet s = \"\u{4f60}\u{597d}\u{1f600}\"; let db = sqlite::open({});\n";
 
 #[test]
 fn unicode_source_utf16_positions_resolve_correctly() {
@@ -625,16 +829,17 @@ fn unicode_source_utf16_positions_resolve_correctly() {
     client.notify("initialized", serde_json::json!({}));
     open_doc(&mut client, ENTRY_URI, UNICODE_SOURCE);
     client.recv_notification("textDocument/publishDiagnostics");
-    // Line 1 is the comment `// 你好世界`; line 2 is `let db = sqlite::open({});`.
-    // Hover on `db` at line 2, char 4 (UTF-16 columns; the comment's CJK
-    // chars are 1 UTF-16 unit each but 3 UTF-8 bytes, so a byte-based
-    // conversion would mis-locate the target).
+    // Line 1 UTF-16 columns:
+    //   `let s = "` = 9, 你 = 1, 好 = 1, 😀 = 2, `"` = 1, `;` = 1, ` ` = 1,
+    //   `let ` = 4 → `db` starts at UTF-16 column 9+1+1+2+1+1+1+4 = 20.
+    // A byte-based converter would count 9+3+3+4+1+1+1+4 = 26 bytes → column
+    // 26, which is inside `sqlite::open` and would hover the call, not `db`.
     let response = client.request(
         20,
         "textDocument/hover",
         serde_json::json!({
             "textDocument": { "uri": ENTRY_URI },
-            "position": { "line": 2, "character": 4 },
+            "position": { "line": 1, "character": 20 },
         }),
     );
     let result = response.get("result").expect("hover result");
@@ -643,6 +848,44 @@ fn unicode_source_utf16_positions_resolve_correctly() {
     assert!(
         value.contains("resource<sqlite.connection>"),
         "UTF-16 position must resolve to db's resource schema: {value:?}"
+    );
+}
+
+#[test]
+fn unicode_source_outbound_diagnostic_range_uses_utf16_columns() {
+    let mut client = RpcClient::spawn();
+    client.request(1, "initialize", serde_json::json!({}));
+    client.notify("initialized", serde_json::json!({}));
+    // Same-line multibyte prefix, then a wrong-type call on the *same line*.
+    // `let s = "你好😀"; sqlite::query("NOT_A_DB", "SELECT 1", {}, {});`
+    // The wrong-argument diagnostic must be reported with UTF-16 columns, so
+    // a client re-navigating from the range lands on the callee.
+    let source = "use sqlite;\nlet s = \"\u{4f60}\u{597d}\u{1f600}\"; sqlite::query(\"NOT_A_DB\", \"SELECT 1\", {}, {});\n";
+    open_doc(&mut client, ENTRY_URI, source);
+    let params = client.recv_notification("textDocument/publishDiagnostics");
+    let diagnostics = params["diagnostics"].as_array().expect("diagnostics array");
+    let wrong_type: Vec<&serde_json::Value> = diagnostics
+        .iter()
+        .filter(|d| {
+            d["message"]
+                .as_str()
+                .map(|m| m.contains("sqlite.connection"))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert!(
+        !wrong_type.is_empty(),
+        "same-line unicode wrong-type call must produce a diagnostic: {diagnostics:?}"
+    );
+    // Prefix `let s = "你好😀"; ` in UTF-16 units:
+    //   `let s = "`=9, 你=1, 好=1, 😀=2, `"`=1, `;`=1, ` `=1 → 16
+    // then `sqlite::query` starts at UTF-16 column 16 (byte column would be 22).
+    let range = &wrong_type[0]["range"];
+    assert_eq!(range["start"]["line"], serde_json::json!(1));
+    assert_eq!(
+        range["start"]["character"],
+        serde_json::json!(16),
+        "diagnostic start must use UTF-16 columns after a multibyte prefix"
     );
 }
 
@@ -713,9 +956,19 @@ fn malformed_json_body_gets_parse_error_and_server_survives() {
     client.request(1, "initialize", serde_json::json!({}));
     // Send a body that is not valid JSON (frame it correctly).
     let body = b"{ this is not json";
-    write!(client.stdin, "Content-Length: {}\r\n\r\n", body.len()).expect("write header");
-    client.stdin.write_all(body).expect("write body");
-    client.stdin.flush().expect("flush stdin");
+    write!(
+        client.stdin.as_mut().unwrap(),
+        "Content-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .expect("write header");
+    client
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(body)
+        .expect("write body");
+    client.stdin.as_mut().unwrap().flush().expect("flush stdin");
     let response = client.recv();
     let error = response.get("error").expect("parse error object");
     assert_eq!(error["code"], serde_json::json!(-32700), "parse error code");
@@ -883,5 +1136,237 @@ fn custom_catalog_rejects_invalid_schema_at_startup() {
     assert!(
         !output.status.success(),
         "an invalid catalog must be rejected at startup"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle enforcement (LSP spec)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn request_before_initialize_returns_server_not_initialized() {
+    let mut client = RpcClient::spawn();
+    // No initialize sent: requests must be rejected with -32002.
+    let response = client.request(1, "textDocument/hover", serde_json::json!({}));
+    let error = response.get("error").expect("error object");
+    assert_eq!(
+        error["code"],
+        serde_json::json!(-32002),
+        "request before initialize must return ServerNotInitialized"
+    );
+    // The server must still accept the later initialize.
+    let init = client.request(2, "initialize", serde_json::json!({}));
+    assert!(
+        init.get("result").is_some(),
+        "server must recover and handle initialize"
+    );
+    let shutdown = client.request(3, "shutdown", serde_json::json!({}));
+    assert_eq!(shutdown["result"], serde_json::Value::Null);
+    client.notify("exit", serde_json::json!({}));
+    let status = client.child.wait().expect("wait for exit");
+    assert!(
+        status.success(),
+        "orderly shutdown after pre-init rejection"
+    );
+}
+
+#[test]
+fn request_after_shutdown_returns_invalid_request_except_exit() {
+    let mut client = RpcClient::spawn();
+    client.request(1, "initialize", serde_json::json!({}));
+    let shutdown = client.request(2, "shutdown", serde_json::json!({}));
+    assert_eq!(shutdown["result"], serde_json::Value::Null);
+    // After shutdown, a request must be rejected with InvalidRequest.
+    let response = client.request(3, "textDocument/hover", serde_json::json!({}));
+    let error = response.get("error").expect("error object");
+    assert_eq!(
+        error["code"],
+        serde_json::json!(-32600),
+        "request after shutdown must return InvalidRequest"
+    );
+    // exit is still allowed and exits orderly.
+    client.notify("exit", serde_json::json!({}));
+    let status = client.child.wait().expect("wait for exit");
+    assert!(status.success(), "exit after shutdown is orderly");
+}
+
+// ---------------------------------------------------------------------------
+// Framing / robustness
+// ---------------------------------------------------------------------------
+
+/// Spawn with a tiny message cap so the over-limit path is exercised without
+/// transferring 16 MiB.
+fn spawn_tiny_cap() -> RpcClient {
+    RpcClient::spawn_with_args(&["--max-message-bytes", "100"])
+}
+
+/// Spawn with a tiny document cap so the oversized-document path is exercised
+/// without transferring 8 Mi chars. The cap is generous enough that the
+/// normal fixtures (which are all < 200 chars) pass.
+fn spawn_tiny_doc_cap() -> RpcClient {
+    RpcClient::spawn_with_args(&["--max-document-chars", "200"])
+}
+
+#[test]
+fn oversized_message_is_rejected_fatally() {
+    let mut client = spawn_tiny_cap();
+    // A Content-Length above the 100-byte cap must be a fatal framing error
+    // (the stream cannot be resynced) and the server must exit nonzero.
+    client.send_raw_then_close(b"Content-Length: 200\r\n\r\n{}");
+    let status = client.wait_exit();
+    assert!(
+        !status.success(),
+        "over-limit message must terminate the server abnormally"
+    );
+}
+
+#[test]
+fn missing_content_length_is_fatal() {
+    let mut client = RpcClient::spawn();
+    // A message with headers but no Content-Length header is a fatal framing
+    // error; the server must exit nonzero.
+    client.send_raw_then_close(b"Content-Type: application/json\r\n\r\n{}");
+    let status = client.wait_exit();
+    assert!(
+        !status.success(),
+        "missing Content-Length must terminate the server abnormally"
+    );
+}
+
+#[test]
+fn truncated_body_is_fatal() {
+    let mut client = RpcClient::spawn();
+    // Declare 100 bytes but send only a few: read_exact hits EOF → fatal.
+    client.send_raw_then_close(b"Content-Length: 100\r\n\r\n{");
+    let status = client.wait_exit();
+    assert!(
+        !status.success(),
+        "truncated body must terminate the server abnormally"
+    );
+}
+
+#[test]
+fn eof_before_shutdown_exits_nonzero() {
+    let mut client = RpcClient::spawn();
+    client.request(1, "initialize", serde_json::json!({}));
+    // Closing stdin (EOF) without shutdown must exit nonzero per LSP.
+    let status = client.wait_exit();
+    assert!(
+        !status.success(),
+        "EOF before shutdown must be a nonzero exit"
+    );
+}
+
+#[test]
+fn eof_after_shutdown_exits_zero() {
+    let mut client = RpcClient::spawn();
+    client.request(1, "initialize", serde_json::json!({}));
+    client.request(2, "shutdown", serde_json::json!({}));
+    // Closing stdin (EOF) after shutdown must exit zero.
+    let status = client.wait_exit();
+    assert!(
+        status.success(),
+        "EOF after shutdown must be an orderly exit"
+    );
+}
+
+#[test]
+fn oversized_document_is_rejected_and_cleared() {
+    let mut client = spawn_tiny_doc_cap();
+    client.request(1, "initialize", serde_json::json!({}));
+    client.notify("initialized", serde_json::json!({}));
+    // Open a valid (small) wrong-type document so diagnostics exist, then an
+    // oversized replacement must drop the doc and clear its diagnostics.
+    open_doc(&mut client, ENTRY_URI, WRONG_TYPE_SOURCE);
+    let params = client.recv_notification("textDocument/publishDiagnostics");
+    assert!(
+        !params["diagnostics"].as_array().unwrap().is_empty(),
+        "wrong-type source must publish diagnostics first"
+    );
+    let oversized = "x".repeat(300);
+    client.notify(
+        "textDocument/didChange",
+        serde_json::json!({
+            "textDocument": { "uri": ENTRY_URI, "version": 2 },
+            "contentChanges": [{ "text": oversized }],
+        }),
+    );
+    let params = client.recv_notification("textDocument/publishDiagnostics");
+    assert_eq!(
+        params["diagnostics"],
+        serde_json::json!([]),
+        "oversized replacement must clear its diagnostics"
+    );
+    // An oversized didOpen must also be rejected with an empty clear.
+    let huge = "x".repeat(300);
+    open_doc(
+        &mut client,
+        "file:///tmp/rustscript-lsp-oversized.rss",
+        &huge,
+    );
+    let params = client.recv_notification("textDocument/publishDiagnostics");
+    assert_eq!(
+        params["diagnostics"],
+        serde_json::json!([]),
+        "oversized didOpen must publish an empty clear"
+    );
+}
+
+#[test]
+fn take_owned_signature_renders_exactly() {
+    let dir = std::env::temp_dir().join("rustscript-lsp-take-owned-test");
+    std::fs::create_dir_all(&dir).ok();
+    let path = dir.join("catalog.json");
+    let json = serde_json::json!({
+        "resources": [
+            { "key": "custom.widget", "description": "A widget" }
+        ],
+        "functions": [
+            {
+                "name": "widget::open",
+                "params": [ { "name": "label", "ty": "String", "passing": "Value" } ],
+                "return_type": { "Resource": "custom.widget" },
+                "description": "Opens a widget"
+            },
+            {
+                "name": "widget::destroy",
+                "params": [
+                    { "name": "w", "ty": { "Resource": "custom.widget" }, "passing": "TakeOwned" }
+                ],
+                "return_type": "Int",
+                "description": "Destroys a widget"
+            }
+        ]
+    });
+    std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).expect("write catalog");
+    let arg = path.to_str().expect("utf8");
+
+    let mut client = RpcClient::spawn_with_args(&["--catalog", arg]);
+    client.request(1, "initialize", serde_json::json!({}));
+    client.notify("initialized", serde_json::json!({}));
+    let uri = "file:///tmp/take-owned.rss";
+    let source =
+        "use widget;\nfn main() {\n    let w = widget::open(\"a\");\n    widget::destroy(w);\n}\n";
+    open_doc(&mut client, uri, source);
+    client.recv_notification("textDocument/publishDiagnostics");
+    // Signature help inside the destroy(...) call must render `take_owned`.
+    let sig = client.request(
+        2,
+        "textDocument/signatureHelp",
+        serde_json::json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 3, "character": 18 },
+        }),
+    );
+    let label = sig["result"]["signatures"][0]["label"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        label.contains("take_owned resource<custom.widget>"),
+        "take_owned passing must render in the signature: {label:?}"
+    );
+    assert!(
+        label.contains("destroy"),
+        "signature must name widget::destroy: {label:?}"
     );
 }

@@ -39,3 +39,12 @@ serde_json = "1"
 name = "rustscript-lsp"
 path = "src/bin/rustscript-lsp.rs"
 required-features = ["lsp"]
+
+# The LSP protocol fixture drives the real rustscript-lsp binary (which
+# requires the `lsp` feature). Gate the integration test so default /
+# runtime-only / no-default builds never compile the fixture or pull in the
+# LSP bin and its heavy host-extension dependencies.
+[[test]]
+name = "lsp_resource_types"
+path = "tests/lsp_resource_types.rs"
+required-features = ["lsp"]
