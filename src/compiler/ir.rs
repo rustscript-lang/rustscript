@@ -801,6 +801,11 @@ pub struct FrontendIr {
     pub parsed_semantic_index: Option<ParsedSemanticIndex>,
     /// Parser-produced visibility information from namespace aliases and imports.
     pub catalog_visibility: Option<CatalogVisibility>,
+    /// The parser's full lexer token stream, preserved for exact
+    /// cursor-position queries (completion prefix derivation). Span-bearing
+    /// [`LexerToken`]s survive unit merge unchanged; the vector is the
+    /// concatenation of every unit's tokens in merge order.
+    pub lexer_tokens: Vec<LexerToken>,
 }
 
 /// A scope identifier used in [`ParsedLexicalScope`] records.
@@ -1269,6 +1274,22 @@ pub struct CatalogVisibility {
     pub use_declarations: Vec<crate::compiler::modules::UseDecl>,
 }
 
+/// A structured lexer token retained as frontend metadata for exact
+/// cursor-position queries (completion prefix derivation, token-at-offset
+/// resolution). The parser's full token stream is preserved verbatim so the
+/// language service never re-lexes or scans source text; spans carry their
+/// owning [`SourceId`] and survive unit merge unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LexerToken {
+    /// The lexer token kind, as a stable string tag (e.g. `Ident`, `Colon`,
+    /// `LParen`). Identifiers carry their text.
+    pub kind: String,
+    /// The identifier text for `Ident` tokens; empty for all other kinds.
+    pub ident: String,
+    /// Exact source span of the token (including the owning source id).
+    pub span: Span,
+}
+
 /// Full semantic provenance index produced by the parser from exact token
 /// spans. Carried on [`FrontendIr`] through the linker, which remaps ids
 /// collision-free during unit merge.
@@ -1480,6 +1501,7 @@ impl LocalIrBuilder {
             semantic_index: None,
             parsed_semantic_index: None,
             catalog_visibility: None,
+            lexer_tokens: Vec::new(),
         }
     }
 

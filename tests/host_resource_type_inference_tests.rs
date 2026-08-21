@@ -112,6 +112,7 @@ fn empty_ir() -> FrontendIr {
         semantic_index: None,
         parsed_semantic_index: None,
         catalog_visibility: None,
+        lexer_tokens: Vec::new(),
     }
 }
 
@@ -287,6 +288,7 @@ fn diagnostics_unknown_host_api() {
         line: Some(3),
         source_name: Some("test.rss".to_string()),
         detail: "unknown host function `nonexistent::func`".to_string(),
+        span: None,
     }];
     let model = build_model(catalog, errors);
     let diags: Vec<SemanticDiagnostic> = model.diagnostics();
@@ -308,6 +310,7 @@ fn diagnostics_wrong_resource_type() {
                  expected resource<sqlite.connection> for parameter `connection`, \
                  found resource<io.file>"
             .to_string(),
+        span: None,
     }];
     let model = build_model(catalog, errors);
     let diags: Vec<SemanticDiagnostic> = model.diagnostics();
@@ -554,7 +557,20 @@ fn analyze_source_basic() {
     let source = "let x = 42;";
     let model = analyze_source(source).expect("analyze_source should succeed");
     let completions = model.completions_at(SourcePosition::new(0, 0));
-    assert!(!completions.is_empty(), "completions should not be empty");
+    // Cursor before any declaration: no locals visible, no structured
+    // imports in the default pipeline, and the catalog is never appended
+    // wholesale. Exactness means an empty surface here.
+    assert!(
+        completions.is_empty(),
+        "no visible declarations or imports should yield no completions: {completions:?}"
+    );
+    // At the `x` identifier, the local is visible.
+    let completions = model.completions_at(SourcePosition::new(0, 4));
+    let names: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        names.contains(&"x"),
+        "'x' should be visible at its declaration: {names:?}"
+    );
 }
 
 #[test]
@@ -614,11 +630,16 @@ fn analyze_source_line_col_conversion() {
 fn analyze_source_completions_filtered() {
     let source = "let x = 42;\n";
     let model = analyze_source(source).expect("analyze_source should succeed");
-    // Completions at the start of the file should include catalog functions
-    let completions = model.completions_at(SourcePosition::new(0, 0));
+    // Cursor at offset 8 (after `let x = `): the only visible local is `x`.
+    let completions = model.completions_at(SourcePosition::new(0, 8));
     let names: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
-    // At position 0, there's no prefix, so all catalog functions should appear
-    assert!(!completions.is_empty(), "completions should not be empty");
+    assert!(names.contains(&"x"), "'x' should be visible: {names:?}");
+    // No catalog function leaks because the default pipeline declares no
+    // imports and the catalog is never appended wholesale.
+    assert!(
+        !names.iter().any(|n| n.contains("::")),
+        "no catalog/namespace completions without imports: {names:?}"
+    );
 }
 
 #[test]
@@ -776,8 +797,17 @@ fn analyze_source_semantic_index_present() {
 fn analyze_source_local_scope_visibility() {
     let source = "let x = 1;\nlet y = 2;\n";
     let model = analyze_source(source).expect("analyze_source should succeed");
-    let completions = model.completions_at(SourcePosition::new(0, 0));
+    // Cursor after `let y = ` (offset 19): both x and y are visible in the
+    // root scope, in declaration order.
+    let completions = model.completions_at(SourcePosition::new(0, 19));
     let names: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
-    // At position 0 (start of file), 'x' should be visible
-    assert!(names.contains(&"x"), "'x' should be visible");
+    assert!(names.contains(&"x"), "'x' should be visible: {names:?}");
+    assert!(names.contains(&"y"), "'y' should be visible: {names:?}");
+    // Declaration order: x before y.
+    let x_pos = names.iter().position(|n| *n == "x").expect("x present");
+    let y_pos = names.iter().position(|n| *n == "y").expect("y present");
+    assert!(
+        x_pos < y_pos,
+        "x must precede y in declaration order: {names:?}"
+    );
 }

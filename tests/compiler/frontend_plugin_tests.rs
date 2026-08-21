@@ -42,6 +42,7 @@ impl SourcePlugin for ConstantPlugin {
             semantic_index: None,
             parsed_semantic_index: None,
             catalog_visibility: None,
+            lexer_tokens: Vec::new(),
         })
     }
 }

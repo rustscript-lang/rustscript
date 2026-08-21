@@ -121,11 +121,14 @@ pub enum CompileError {
     },
     /// Catalog host-call overload resolution failed at a call site. Carries
     /// the optional call-site line and source name plus a diagnostic detail
-    /// describing the failed overload selection.
+    /// describing the failed overload selection. When the failing call
+    /// carried parser provenance, `span` is the exact callee token span of
+    /// the failing call site (never a line-wide guess).
     HostCallResolve {
         line: Option<u32>,
         source_name: Option<String>,
         detail: String,
+        span: Option<crate::compiler::source_map::Span>,
     },
     /// Internal error: a symbol-resolved module call or function value
     /// survived unit merge and reached codegen, where flat function indices
@@ -818,6 +821,7 @@ mod tests {
             line: Some(42),
             source_name: Some("main.rss".to_string()),
             detail: "no overload of 'fetch' matches (Int)".to_string(),
+            span: None,
         };
         assert_eq!(with_meta.line(), Some(42));
         assert_eq!(with_meta.source_name(), Some("main.rss"));
@@ -830,6 +834,7 @@ mod tests {
             line: None,
             source_name: None,
             detail: "catalog resolution failed".to_string(),
+            span: None,
         };
         assert_eq!(without_meta.line(), None);
         assert_eq!(without_meta.source_name(), None);

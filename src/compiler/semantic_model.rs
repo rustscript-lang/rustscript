@@ -52,8 +52,8 @@ use crate::host_api::{
 
 use super::CompileError;
 use super::ir::{
-    FrontendIr, FunctionRefTarget, LocalSlot, ParsedCallTarget, ResolvedHostCall, ScopeId,
-    SemanticIndex, TypeSchema,
+    CatalogVisibility, FrontendIr, FunctionRefTarget, LocalSlot, ParsedCallTarget,
+    ResolvedHostCall, ScopeId, SemanticIndex, TypeSchema,
 };
 use super::source_map::{SourceId, SourceMap, Span};
 
@@ -576,11 +576,88 @@ impl SemanticModel {
     }
 
     /// Convert a `CompileError` to an optional source span.
+    ///
+    /// Exact parser-origin spans carried on the error (e.g. the failing
+    /// call's callee token span) are returned verbatim. Errors that only
+    /// carry a line + source name resolve deterministically against the
+    /// parser's provenance: the smallest parsed call site whose line matches,
+    /// else the exact identifier token of a local/function declaration on
+    /// that line, else the line span. No source text is ever scanned.
     fn compile_error_to_span(&self, err: &CompileError) -> Option<Span> {
-        let line = err.line()? as u32;
+        // Prefer the exact span carried at the error's production point.
+        if let CompileError::HostCallResolve { span, .. } = err
+            && let Some(span) = span
+        {
+            return Some(*span);
+        }
+        let line = err.line()? as usize;
         let source_name = err.source_name()?;
         let source_id = self.sources.source_id_by_name(source_name)?;
-        self.sources.line_span(source_id, line as usize)
+        let parsed = self.semantic_index.as_ref().map(|index| &index.parsed);
+
+        // Smallest parsed call site on the error's line (callee span). This
+        // gives nested/same-line call diagnostics their exact slice.
+        if let Some(parsed) = parsed {
+            let line_span = self.sources.line_span(source_id, line);
+            let mut best: Option<Span> = None;
+            for site in &parsed.call_sites {
+                if site.callee_span.source_id != source_id {
+                    continue;
+                }
+                let site_line = self
+                    .sources
+                    .line_col_for_offset(source_id, site.callee_span.lo)
+                    .map(|(l, _)| l);
+                if site_line != Some(line) {
+                    continue;
+                }
+                if let Some(span) = best {
+                    let cur_len = span.hi - span.lo;
+                    let new_len = site.callee_span.hi - site.callee_span.lo;
+                    if new_len < cur_len {
+                        best = Some(site.callee_span);
+                    }
+                } else {
+                    best = Some(site.callee_span);
+                }
+            }
+            if let Some(span) = best {
+                return Some(span);
+            }
+            // Local declaration identifier token on the error's line.
+            for decl in &parsed.local_decls {
+                if decl.ident_span.source_id != source_id {
+                    continue;
+                }
+                if self
+                    .sources
+                    .line_col_for_offset(source_id, decl.ident_span.lo)
+                    .map(|(l, _)| l)
+                    != Some(line)
+                {
+                    continue;
+                }
+                return Some(decl.ident_span);
+            }
+            // Function declaration identifier token on the error's line.
+            for decl in &parsed.func_decls {
+                if decl.ident_span.source_id != source_id {
+                    continue;
+                }
+                if self
+                    .sources
+                    .line_col_for_offset(source_id, decl.ident_span.lo)
+                    .map(|(l, _)| l)
+                    != Some(line)
+                {
+                    continue;
+                }
+                return Some(decl.ident_span);
+            }
+            let _ = line_span;
+        }
+
+        self.sources.line_span(source_id, line)
     }
 
     /// Map a `CompileError` to a stable error code.
@@ -627,136 +704,496 @@ impl SemanticModel {
     pub fn completions_at(&self, position: SourcePosition) -> Vec<SemanticCompletion> {
         let mut completions = Vec::new();
 
-        // Determine the cursor prefix (the word being typed at the position).
-        let prefix = self.cursor_prefix(position);
+        // The cursor prefix and the namespace it is being typed inside come
+        // exclusively from the lexer token stream carried on the frontend IR —
+        // never from scanning source text.
+        let (prefix, namespace) = self.cursor_context(position);
 
-        // Determine which scope the cursor is in.
-        let cursor_scope_id = self.find_scope_at(position);
+        // Visible local slots and functions from the smallest containing
+        // lexical scope, walking current -> parents.
+        let Some(parsed) = self.semantic_index.as_ref().map(|index| &index.parsed) else {
+            return self.catalog_completions(
+                position.source_id,
+                prefix.as_str(),
+                namespace.as_deref(),
+            );
+        };
+        let Some(cursor_scope) = self.smallest_scope_at(position, parsed) else {
+            return self.catalog_completions(
+                position.source_id,
+                prefix.as_str(),
+                namespace.as_deref(),
+            );
+        };
 
-        // Collect visible local slots from the cursor scope and its ancestors.
-        let mut visible_slots: std::collections::HashSet<LocalSlot> =
-            std::collections::HashSet::new();
-        let mut visible_funcs: std::collections::HashSet<u16> = std::collections::HashSet::new();
-        let mut seen_scope_ids: std::collections::HashSet<ScopeId> =
-            std::collections::HashSet::new();
+        let scope_chain = self.scope_chain(cursor_scope, parsed);
+        let (visible_locals, visible_funcs) = self.visible_bindings(position, &scope_chain, parsed);
 
+        // 1. Visible local variables, ordered by scope depth then declaration
+        //    order, deduplicated by name with the innermost binding winning.
         if let Some(index) = &self.semantic_index {
-            if let Some(mut scope_id) = cursor_scope_id {
-                // Walk up the scope chain.
-                loop {
-                    if !seen_scope_ids.insert(scope_id) {
-                        break; // Prevent infinite loops.
+            for (name, (slot, depth, decl_order)) in &visible_locals {
+                if !prefix.is_empty() && !name.starts_with(prefix.as_str()) {
+                    continue;
+                }
+                let detail = index.slot_schema(*slot).map(|s| format!("{s}"));
+                completions.push(SemanticCompletion {
+                    label: name.clone(),
+                    detail,
+                    docs: None,
+                    kind: CompletionItemKind::Variable,
+                });
+                let _ = (depth, decl_order);
+            }
+        }
+
+        // 2. Function declarations from the scope chain (functions are
+        //    hoisted, so every declaration in the chain is visible).
+        for (name, index) in &visible_funcs {
+            if !prefix.is_empty() && !name.starts_with(prefix.as_str()) {
+                continue;
+            }
+            let decl = self.ir.functions.iter().find(|decl| decl.index == *index);
+            let detail = decl.map(|decl| format!("fn({})", decl.args.join(", ")));
+            completions.push(SemanticCompletion {
+                label: name.clone(),
+                detail,
+                docs: None,
+                kind: CompletionItemKind::Function,
+            });
+        }
+
+        completions.extend(self.catalog_completions(
+            position.source_id,
+            prefix.as_str(),
+            namespace.as_deref(),
+        ));
+
+        completions
+    }
+
+    /// The visible local bindings at `position`, walking the containing
+    /// scope chain. Returns `(name, (slot, scope_depth, decl_order))` in
+    /// deterministic order and a `(name, function_index)` map for hoisted
+    /// functions.
+    ///
+    /// Shadowing rules:
+    /// * Within the cursor's own scope, only declarations whose identifier
+    ///   token ends at or before the cursor are visible; a later
+    ///   re-declaration of the same name (same slot) replaces the earlier
+    ///   one.
+    /// * In ancestor scopes, every declaration whose identifier token ends
+    ///   at or before the cursor is visible; the innermost scope wins on
+    ///   name collisions.
+    /// * Functions are predeclared (hoisted), so every function declaration
+    ///   in the chain is visible regardless of position.
+    fn visible_bindings(
+        &self,
+        position: SourcePosition,
+        scope_chain: &[ScopeId],
+        parsed: &crate::compiler::ir::ParsedSemanticIndex,
+    ) -> (Vec<(String, (LocalSlot, usize, u32))>, Vec<(String, u16)>) {
+        let mut locals: Vec<(String, (LocalSlot, usize, u32))> = Vec::new();
+        let mut funcs: Vec<(String, u16)> = Vec::new();
+        let mut seen_local_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut seen_func_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut seen_slots: std::collections::HashSet<LocalSlot> = std::collections::HashSet::new();
+
+        for (depth, &scope_id) in scope_chain.iter().enumerate() {
+            // Same-scope declarations: only those whose identifier starts at
+            // or before the cursor are visible, with later re-declarations of
+            // a name replacing earlier ones.
+            let mut same_scope_by_name: std::collections::BTreeMap<String, (LocalSlot, u32)> =
+                std::collections::BTreeMap::new();
+            for decl in &parsed.local_decls {
+                if decl.scope_id != scope_id {
+                    continue;
+                }
+                // A declaration after the cursor (in this scope) is not yet
+                // visible; the cursor on its own identifier is visible.
+                if decl.ident_span.lo > position.offset {
+                    continue;
+                }
+                same_scope_by_name.insert(decl.name.clone(), (decl.slot, decl.decl_order));
+            }
+            for (name, (slot, decl_order)) in same_scope_by_name {
+                if seen_slots.insert(slot) || !seen_local_names.contains(&name) {
+                    if seen_local_names.insert(name.clone()) {
+                        locals.push((name, (slot, depth, decl_order)));
                     }
-                    if let Some(scope) = index.parsed.scopes.get(scope_id as usize) {
-                        for slot in &scope.declarations {
-                            visible_slots.insert(*slot);
-                        }
-                        for func_idx in &scope.functions {
-                            visible_funcs.insert(*func_idx);
-                        }
-                        if let Some(parent) = scope.parent {
-                            scope_id = parent;
-                        } else {
-                            break;
-                        }
+                }
+            }
+
+            // Functions: hoisted, all visible.
+            let scope_functions = parsed
+                .scopes
+                .get(scope_id as usize)
+                .map(|scope| scope.functions.clone())
+                .unwrap_or_default();
+            for function_index in scope_functions {
+                let Some(decl) = parsed
+                    .func_decls
+                    .iter()
+                    .find(|decl| decl.function_index == function_index)
+                else {
+                    continue;
+                };
+                if seen_func_names.insert(decl.name.clone()) {
+                    funcs.push((decl.name.clone(), function_index));
+                }
+            }
+        }
+
+        locals.sort_by(|a, b| {
+            let (_, (_, depth_a, order_a)) = a;
+            let (_, (_, depth_b, order_b)) = b;
+            depth_a.cmp(depth_b).then(order_a.cmp(order_b))
+        });
+        funcs.sort_by(|a, b| a.0.cmp(&b.0));
+        (locals, funcs)
+    }
+
+    /// The smallest containing lexical scope at `position`: the scope with
+    /// the smallest range containing the position, deterministic on ties by
+    /// the earlier start offset.
+    fn smallest_scope_at(
+        &self,
+        position: SourcePosition,
+        parsed: &crate::compiler::ir::ParsedSemanticIndex,
+    ) -> Option<ScopeId> {
+        let mut best: Option<(usize, Span)> = None;
+        for (id, scope) in parsed.scopes.iter().enumerate() {
+            if !self.position_in_span(position, scope.range) {
+                continue;
+            }
+            let candidate = (id, scope.range);
+            best = Some(match best {
+                None => candidate,
+                Some((cur_id, cur_range)) => {
+                    let cur_len = cur_range.hi - cur_range.lo;
+                    let new_len = scope.range.hi - scope.range.lo;
+                    if new_len < cur_len || (new_len == cur_len && scope.range.lo < cur_range.lo) {
+                        candidate
                     } else {
+                        (cur_id, cur_range)
+                    }
+                }
+            });
+        }
+        best.map(|(id, _)| id as ScopeId)
+    }
+
+    /// The scope chain from `scope_id` to the root, inclusive, ordered
+    /// innermost-first.
+    fn scope_chain(
+        &self,
+        scope_id: ScopeId,
+        parsed: &crate::compiler::ir::ParsedSemanticIndex,
+    ) -> Vec<ScopeId> {
+        let mut chain = Vec::new();
+        let mut current = Some(scope_id);
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = current {
+            if !seen.insert(id) {
+                break;
+            }
+            chain.push(id);
+            current = parsed
+                .scopes
+                .get(id as usize)
+                .and_then(|scope| scope.parent);
+        }
+        chain
+    }
+
+    /// The cursor prefix and, when the cursor is typing a namespace member
+    /// (`ns::mem` or `ns::`), the namespace alias being completed — derived
+    /// exclusively from the lexer token stream.
+    ///
+    /// Returns `(prefix, namespace)` where `prefix` is the full typed text
+    /// (including any `ns::` qualifier) and `namespace` is `Some(ns)` when
+    /// the prefix is (or ends in) a namespace-member position. A cursor in
+    /// whitespace yields an empty prefix.
+    fn cursor_context(&self, position: SourcePosition) -> (String, Option<String>) {
+        let tokens = &self.ir.lexer_tokens;
+        // The token at or immediately before the cursor.
+        let mut idx = tokens.len();
+        for (i, token) in tokens.iter().enumerate() {
+            if token.span.source_id != position.source_id {
+                continue;
+            }
+            if token.span.lo <= position.offset && position.offset <= token.span.hi {
+                idx = i;
+                break;
+            }
+        }
+        if idx == tokens.len() {
+            // No token touches the cursor (whitespace): empty prefix.
+            return (String::new(), None);
+        }
+
+        let is_ident = |t: &crate::compiler::ir::LexerToken| t.kind == "Ident";
+        let is_colon = |t: &crate::compiler::ir::LexerToken| t.kind == "Colon";
+
+        // Walk left from the cursor collecting `ident (:: ident)*` segments.
+        let mut segments: Vec<String> = Vec::new();
+        let mut cursor = idx;
+        let mut expect_ident = true;
+        loop {
+            let Some(token) = tokens.get(cursor) else {
+                break;
+            };
+            if token.span.source_id != position.source_id {
+                break;
+            }
+            if expect_ident {
+                if is_ident(token) {
+                    segments.push(token.ident.clone());
+                    if cursor == 0 {
                         break;
                     }
+                    cursor -= 1;
+                    expect_ident = false;
+                } else {
+                    break;
                 }
+            } else if is_colon(token) {
+                // `::` is two Colon tokens; require the pair.
+                if cursor == 0 || !is_colon(&tokens[cursor - 1]) {
+                    break;
+                }
+                cursor -= 2;
+                expect_ident = true;
+            } else {
+                break;
             }
         }
+        segments.reverse();
+        let joined = segments.join("::");
+        // The namespace being completed is everything before the final
+        // segment: for `a::b::c` that is `a::b`; for `ns::member` it is `ns`.
+        let namespace = if segments.len() >= 2 {
+            Some(segments[..segments.len() - 1].join("::"))
+        } else {
+            None
+        };
+        (joined, namespace)
+    }
 
-        // 1. Visible local variables from scope analysis.
-        if let Some(index) = &self.semantic_index {
-            for (name, slot) in &self.local_name_to_slot {
-                if visible_slots.contains(slot) {
-                    if prefix.is_empty() || name.starts_with(&prefix) {
-                        let detail = index.slot_schema(*slot).map(|s| format!("{}", s));
-                        completions.push(SemanticCompletion {
-                            label: name.clone(),
-                            detail,
-                            docs: None,
-                            kind: CompletionItemKind::Variable,
-                        });
-                    }
-                }
-            }
-        }
+    /// Catalog completions visible at the query source.
+    ///
+    /// When the IR carries parser provenance (`CatalogVisibility`), only the
+    /// structured imports are offered: direct host call aliases (label = the
+    /// local alias, detail = the canonical schema), wildcard host imports
+    /// (all members of the imported namespace), host namespace aliases
+    /// (namespace member completion), and file-module namespace aliases
+    /// (module member completion against the merged flat functions, kept
+    /// source-isolated by owning source). The whole catalog is never
+    /// appended. IR without provenance (hand-built test models) falls back
+    /// to the legacy full-catalog surface.
+    fn catalog_completions(
+        &self,
+        source_id: SourceId,
+        prefix: &str,
+        namespace: Option<&str>,
+    ) -> Vec<SemanticCompletion> {
+        let prefix = prefix;
+        let mut completions = Vec::new();
+        let source_name = self
+            .sources
+            .file(source_id)
+            .map(|file| file.name.clone())
+            .unwrap_or_default();
 
-        // 2. Function declarations from scope analysis.
-        for decl in &self.ir.functions {
-            if visible_funcs.contains(&decl.index) {
-                if prefix.is_empty() || decl.name.starts_with(&prefix) {
-                    let detail = Some(format!("fn({})", decl.args.join(", ")));
+        let Some(visibility) = &self.ir.catalog_visibility else {
+            // No parser provenance: legacy full-catalog surface.
+            for func in self.catalog.functions() {
+                if prefix.is_empty() || func.name.starts_with(prefix) {
                     completions.push(SemanticCompletion {
-                        label: decl.name.clone(),
-                        detail,
-                        docs: None,
+                        label: func.name.clone(),
+                        detail: Some(self.format_host_function_detail(func)),
+                        docs: Some(func.description.clone()),
                         kind: CompletionItemKind::Function,
                     });
                 }
             }
+            for resource in self.catalog.resources() {
+                let label = format!("resource<{}>", resource.key);
+                if prefix.is_empty() || label.starts_with(prefix) {
+                    completions.push(SemanticCompletion {
+                        label,
+                        detail: Some(resource.description.clone()),
+                        docs: None,
+                        kind: CompletionItemKind::Resource,
+                    });
+                }
+            }
+            return completions;
+        };
+
+        // Namespace member completion: `ns::member` — resolve the canonical
+        // namespace identity and list its members.
+        if let Some(ns) = namespace {
+            return self.namespace_member_completions(ns, prefix, visibility, &source_name);
         }
 
-        // 3. Catalog functions (with full signatures).
-        for func in self.catalog.functions() {
-            if prefix.is_empty() || func.name.starts_with(&prefix) {
-                let detail = Some(self.format_host_function_detail(func));
+        // Direct host call aliases: `use io::{read as r};` -> `r`.
+        for (alias, canonical) in &visibility.direct_host_call_aliases {
+            if !prefix.is_empty() && !alias.starts_with(prefix) {
+                continue;
+            }
+            if let Some(func) = self
+                .catalog
+                .functions()
+                .iter()
+                .find(|f| f.name == *canonical)
+            {
                 completions.push(SemanticCompletion {
-                    label: func.name.clone(),
-                    detail,
+                    label: alias.clone(),
+                    // Canonical detail: the resolved schema prefixed with the
+                    // canonical name so the alias's target is unambiguous.
+                    detail: Some(format!(
+                        "{canonical} — {}",
+                        self.format_host_function_detail(func)
+                    )),
                     docs: Some(func.description.clone()),
                     kind: CompletionItemKind::Function,
                 });
             }
         }
 
-        // 4. Catalog resource types.
-        for resource in self.catalog.resources() {
-            let label = format!("resource<{}>", resource.key);
-            if prefix.is_empty() || label.starts_with(&prefix) {
-                completions.push(SemanticCompletion {
-                    label,
-                    detail: Some(resource.description.clone()),
-                    docs: None,
-                    kind: CompletionItemKind::Resource,
-                });
+        // Wildcard host imports: `use io::*;` -> every `io::*` member as a
+        // direct name.
+        for ns in &visibility.direct_host_wildcard_imports {
+            for func in self.catalog.functions() {
+                if let Some(member) = func.name.strip_prefix(&format!("{ns}::")) {
+                    if !prefix.is_empty() && !member.starts_with(prefix) {
+                        continue;
+                    }
+                    completions.push(SemanticCompletion {
+                        label: member.to_string(),
+                        detail: Some(self.format_host_function_detail(func)),
+                        docs: Some(func.description.clone()),
+                        kind: CompletionItemKind::Function,
+                    });
+                }
             }
+        }
+
+        // Host namespace aliases: `use prov as p;` -> the alias itself so the
+        // user can continue typing `p::`.
+        for (alias, canonical) in &visibility.host_namespace_aliases {
+            if !prefix.is_empty() && !alias.starts_with(prefix) {
+                continue;
+            }
+            completions.push(SemanticCompletion {
+                label: alias.clone(),
+                detail: Some(format!("namespace {canonical}")),
+                docs: None,
+                kind: CompletionItemKind::Keyword,
+            });
+        }
+
+        // File-module namespace aliases, source-isolated by owning source.
+        for alias in &visibility.module_namespace_aliases {
+            if alias.source != source_name {
+                continue;
+            }
+            if !prefix.is_empty() && !alias.alias.starts_with(prefix) {
+                continue;
+            }
+            completions.push(SemanticCompletion {
+                label: alias.alias.clone(),
+                detail: Some(format!("module {}", alias.module_path)),
+                docs: None,
+                kind: CompletionItemKind::Keyword,
+            });
         }
 
         completions
     }
 
-    /// Find the deepest lexical scope containing the given position.
-    fn find_scope_at(&self, position: SourcePosition) -> Option<ScopeId> {
-        if let Some(index) = &self.semantic_index {
-            // Walk scopes in reverse order (deepest first, since they are pushed
-            // in traversal order and later scopes are nested deeper).
-            for (i, scope) in index.parsed.scopes.iter().enumerate().rev() {
-                if self.position_in_span(position, scope.range) {
-                    return Some(i as ScopeId);
+    /// Member completions for `ns::member` where `ns` is a host namespace
+    /// alias or a file-module namespace alias visible at the query source.
+    fn namespace_member_completions(
+        &self,
+        ns: &str,
+        prefix: &str,
+        visibility: &CatalogVisibility,
+        source_name: &str,
+    ) -> Vec<SemanticCompletion> {
+        let member_prefix = prefix
+            .strip_prefix(&format!("{ns}::"))
+            .unwrap_or(prefix)
+            .to_string();
+        let mut completions = Vec::new();
+
+        // Host namespace alias: resolve the canonical namespace and list its
+        // catalog members with their canonical schema detail.
+        if let Some((_, canonical)) = visibility
+            .host_namespace_aliases
+            .iter()
+            .find(|(alias, _)| alias == ns)
+        {
+            for func in self.catalog.functions() {
+                if let Some(member) = func.name.strip_prefix(&format!("{canonical}::")) {
+                    if !member_prefix.is_empty() && !member.starts_with(&member_prefix) {
+                        continue;
+                    }
+                    completions.push(SemanticCompletion {
+                        label: member.to_string(),
+                        detail: Some(self.format_host_function_detail(func)),
+                        docs: Some(func.description.clone()),
+                        kind: CompletionItemKind::Function,
+                    });
                 }
             }
+            return completions;
         }
-        // Default to root scope (0).
-        Some(0)
-    }
 
-    /// Extract the cursor prefix (the word being typed) at the position.
-    fn cursor_prefix(&self, position: SourcePosition) -> String {
-        let Some(file) = self.sources.file(position.source_id) else {
-            return String::new();
-        };
-        if position.offset == 0 || position.offset > file.text.len() {
-            return String::new();
+        // File-module namespace alias: list the merged flat functions owned
+        // by the alias's module. The alias's owning source isolates it from
+        // same-named aliases in other units.
+        if visibility
+            .module_namespace_aliases
+            .iter()
+            .any(|alias| alias.alias == ns && alias.source == source_name)
+        {
+            // Module functions are the exported flat functions carrying a
+            // symbol that came from a file module — i.e. any exported flat
+            // function not owned by the query source itself. The query
+            // source's own functions are never members of an imported
+            // module's namespace.
+            for decl in &self.ir.functions {
+                if !decl.exported || decl.symbol.is_none() {
+                    continue;
+                }
+                let owned_by_query_source = self
+                    .ir
+                    .function_sources
+                    .get(&decl.index)
+                    .map(|source| source == source_name)
+                    .unwrap_or(false);
+                if owned_by_query_source {
+                    continue;
+                }
+                if !member_prefix.is_empty() && !decl.name.starts_with(&member_prefix) {
+                    continue;
+                }
+                let detail = Some(format!("fn({})", decl.args.join(", ")));
+                completions.push(SemanticCompletion {
+                    label: decl.name.clone(),
+                    detail,
+                    docs: None,
+                    kind: CompletionItemKind::Function,
+                });
+            }
+            return completions;
         }
-        // Walk backward from the cursor to find the start of the word.
-        let text = &file.text[..position.offset];
-        let start = text
-            .rfind(|c: char| !c.is_alphanumeric() && c != '_' && c != ':')
-            .map(|pos| pos + 1)
-            .unwrap_or(0);
-        text[start..].to_string()
+
+        completions
     }
 
     /// Format a host function's detail string for completions.
@@ -1254,6 +1691,7 @@ mod tests {
             semantic_index: None,
             parsed_semantic_index: None,
             catalog_visibility: None,
+            lexer_tokens: Vec::new(),
         }
     }
 
@@ -1401,6 +1839,7 @@ mod tests {
             line: Some(1),
             source_name: Some("test".to_string()),
             detail: "expected resource<sqlite.connection>, found resource<io.file>".to_string(),
+            span: None,
         }];
         let model = SemanticModel::new(test_ir(), SourceMap::new(), catalog, errors);
         let diags = model.diagnostics();
@@ -1424,6 +1863,7 @@ mod tests {
             line: Some(1),
             source_name: Some("test".to_string()),
             detail: "unknown host function".to_string(),
+            span: None,
         }];
         let model = SemanticModel::new(test_ir(), SourceMap::new(), catalog, errors);
         let diags = model.diagnostics();
@@ -1444,6 +1884,7 @@ mod tests {
             line: Some(1),
             source_name: Some("test.rss".to_string()),
             detail: "expected resource<sqlite.connection>, found resource<io.file>".to_string(),
+            span: None,
         }];
         let model = SemanticModel::new(test_ir(), sources, catalog, errors);
         let diags = model.diagnostics();
@@ -1669,6 +2110,7 @@ mod tests {
                          expected resource<sqlite.connection> for parameter `connection`, \
                          found resource<io.file>"
                 .to_string(),
+            span: None,
         }];
         let model = SemanticModel::new(test_ir(), SourceMap::new(), catalog, errors);
         let diags = model.diagnostics();
@@ -1695,6 +2137,7 @@ mod tests {
             line: Some(3),
             source_name: Some("test.rss".to_string()),
             detail: "unknown host function `nonexistent::func`".to_string(),
+            span: None,
         }];
         let model = SemanticModel::new(test_ir(), SourceMap::new(), catalog, errors);
         let diags = model.diagnostics();
@@ -1720,7 +2163,14 @@ mod tests {
         let catalog = test_catalog();
         let mut sources = SourceMap::new();
         let sid = sources.add_source("test", "sql");
-        let model = SemanticModel::new(test_ir(), sources, catalog, Vec::new());
+        let mut ir = test_ir();
+        // Carry the lexer token stream so the prefix comes from token spans.
+        ir.lexer_tokens = vec![crate::compiler::ir::LexerToken {
+            kind: "Ident".to_string(),
+            ident: "sql".to_string(),
+            span: Span::new(sid, 0, 3),
+        }];
+        let model = SemanticModel::new(ir, sources, catalog, Vec::new());
         // Position at offset 3 (after "sql")
         let pos = SourcePosition::new(sid, 3);
         let completions = model.completions_at(pos);

@@ -102,15 +102,33 @@ pub(super) fn legalize_builtins_and_bind_types(
     typing_mode: TypingMode,
     entry_local_types: &[EntryLocalType],
 ) -> Result<FrontendIr, CompileError> {
+    // Exact callee spans for every parsed call site, keyed by the
+    // [`SemanticNodeId`] carried on the typed [`Expr::Call`] nodes. The
+    // host-call resolver attaches these to its failure diagnostic so the
+    // semantic model surfaces the precise failing call span.
+    let call_site_spans = ir
+        .parsed_semantic_index
+        .as_ref()
+        .map(|parsed| {
+            parsed
+                .call_sites
+                .iter()
+                .map(|site| (site.id, site.callee_span))
+                .collect::<std::collections::HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+
     let Some(metadata) = ir.host_api_metadata.clone() else {
-        let mut pass = HostCallResolutionPass::new(None, HostCallResolutionPhase::Disabled);
+        let mut pass = HostCallResolutionPass::new(None, HostCallResolutionPhase::Disabled)
+            .with_call_site_spans(&call_site_spans);
         run_legalize_round(&mut ir, typing_mode, entry_local_types, &mut pass);
         return Ok(ir);
     };
 
     loop {
         let mut refine =
-            HostCallResolutionPass::new(Some(&metadata), HostCallResolutionPhase::Refine);
+            HostCallResolutionPass::new(Some(&metadata), HostCallResolutionPhase::Refine)
+                .with_call_site_spans(&call_site_spans);
         run_legalize_round(&mut ir, typing_mode, entry_local_types, &mut refine);
         if refine.changed() > 0 {
             continue;
@@ -120,7 +138,8 @@ pub(super) fn legalize_builtins_and_bind_types(
         }
 
         let mut final_pass =
-            HostCallResolutionPass::new(Some(&metadata), HostCallResolutionPhase::Final);
+            HostCallResolutionPass::new(Some(&metadata), HostCallResolutionPhase::Final)
+                .with_call_site_spans(&call_site_spans);
         run_legalize_round(&mut ir, typing_mode, entry_local_types, &mut final_pass);
         if final_pass.changed() > 0 {
             continue;
@@ -821,6 +840,7 @@ mod catalog_call_resolution_tests {
             line,
             source_name,
             detail,
+            span,
         } = error
         else {
             panic!("expected HostCallResolve");
@@ -829,5 +849,12 @@ mod catalog_call_resolution_tests {
         assert_eq!(source_name.as_deref(), Some("unit.rss"));
         assert!(detail.contains("value"), "{detail}");
         assert!(detail.contains("take_owned"), "{detail}");
+        // The failing call `acme::consume(...)` carries parser provenance, so
+        // the diagnostic must carry the exact callee span (not a line guess).
+        let span = span.expect("failing call must carry its callee span");
+        let source = "use acme;\nlet file = acme::open(\"x\");\nacme::consume(file.copy());\n";
+        let callee = source.find("acme::consume").expect("callee present");
+        assert_eq!(span.source_id, 0, "callee span lives in source 0");
+        assert_eq!((span.lo, span.hi), (callee, callee + "acme::consume".len()));
     }
 }

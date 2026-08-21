@@ -184,6 +184,7 @@ fn parse_with_parser(
         semantic_index: None,
         parsed_semantic_index: Some(parser.take_parsed_semantic_index()),
         catalog_visibility: Some(parser.take_catalog_visibility()),
+        lexer_tokens: parser.take_lexer_tokens(),
     })
 }
 
@@ -225,6 +226,7 @@ fn parse_repl_with_parser(
             semantic_index: None,
             parsed_semantic_index: Some(parser.take_parsed_semantic_index()),
             catalog_visibility: Some(parser.take_catalog_visibility()),
+            lexer_tokens: parser.take_lexer_tokens(),
         },
         bindings,
     })
@@ -257,6 +259,7 @@ fn parse_lowered_with_mapping(
             remap_lowered_spans(
                 ir.parsed_semantic_index.as_mut(),
                 &mut ir.unknown_type_spans,
+                &mut ir.lexer_tokens,
                 &lowered,
                 lowered_source_id,
                 original_source_id,
@@ -322,6 +325,7 @@ fn parse_lowered_repl_with_mapping(
             remap_lowered_spans(
                 parsed.ir.parsed_semantic_index.as_mut(),
                 &mut parsed.ir.unknown_type_spans,
+                &mut parsed.ir.lexer_tokens,
                 &lowered,
                 lowered_source_id,
                 original_source_id,
@@ -373,6 +377,7 @@ fn parse_lowered_repl_with_mapping(
 fn remap_lowered_spans(
     parsed_index: Option<&mut crate::compiler::ir::ParsedSemanticIndex>,
     unknown_type_spans: &mut [Span],
+    lexer_tokens: &mut [crate::compiler::ir::LexerToken],
     lowered: &LoweredSource,
     lowered_source_id: u32,
     original_source_id: u32,
@@ -411,6 +416,9 @@ fn remap_lowered_spans(
     }
     for span in unknown_type_spans {
         map(span);
+    }
+    for token in lexer_tokens {
+        map(&mut token.span);
     }
 }
 

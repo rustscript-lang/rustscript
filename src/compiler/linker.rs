@@ -123,6 +123,10 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
     // unit order with deduplication; a conflicting alias (same alias name
     // mapping to different canonical targets across units) is a typed error.
     let mut merged_catalog_visibility: Option<CatalogVisibility> = None;
+    // Merged lexer token stream: the concatenation of every unit's tokens in
+    // unit order. Token spans carry their owning source ids, so no rebasing
+    // is required.
+    let mut merged_lexer_tokens: Vec<crate::compiler::ir::LexerToken> = Vec::new();
 
     for unit in units {
         let source_name = unit.source_name.clone();
@@ -205,6 +209,8 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
                 }
             }
         }
+
+        merged_lexer_tokens.extend(unit.parsed.lexer_tokens.iter().cloned());
 
         let mut remapped_stmts = unit.parsed.stmts;
         for stmt in &mut remapped_stmts {
@@ -339,6 +345,9 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
         semantic_index: None,
         parsed_semantic_index: merged_parsed_index,
         catalog_visibility: merged_catalog_visibility,
+        // Lexer token streams concatenate in unit order; token spans carry
+        // their owning source ids and need no rebasing.
+        lexer_tokens: merged_lexer_tokens,
     })
 }
 
@@ -1682,6 +1691,7 @@ mod linker_metadata_remap_tests {
                 semantic_index: None,
                 parsed_semantic_index: None,
                 catalog_visibility: None,
+                lexer_tokens: Vec::new(),
             },
             source_name: source_name.to_string(),
             scope_identity: None,
@@ -2141,6 +2151,7 @@ mod linker_provenance_merge_tests {
                 semantic_index: None,
                 parsed_semantic_index: Some(parsed),
                 catalog_visibility: Some(visibility),
+                lexer_tokens: Vec::new(),
             },
             source_name: source_name.to_string(),
             scope_identity: None,
@@ -3049,6 +3060,7 @@ mod linker_provenance_merge_tests {
                 semantic_index: None,
                 parsed_semantic_index: None,
                 catalog_visibility: None,
+                lexer_tokens: Vec::new(),
             },
             source_name: "a.rss".to_string(),
             scope_identity: None,

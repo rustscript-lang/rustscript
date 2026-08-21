@@ -10,8 +10,9 @@ use super::super::TypingMode;
 use super::super::host_call_resolve::{ActualCallArg, resolve_candidate_slice_with_passing};
 use super::super::ir::{
     AssignmentKind, Expr, FunctionDecl, FunctionImpl, HostApiIrMetadata, LocalSlot, MatchPattern,
-    Stmt, StructDecl, TypeSchema,
+    SemanticNodeId, Stmt, StructDecl, TypeSchema,
 };
+use super::super::source_map::Span;
 use super::collect::{
     observed_function_param_schema_slice, observed_function_param_slice,
     seed_function_capture_state, seed_function_param_state,
@@ -41,6 +42,9 @@ pub(super) struct HostCallResolutionPass<'a> {
     changed: usize,
     unresolved: usize,
     first_error: Option<CompileError>,
+    /// Exact callee span of the failing call site, recorded when the call
+    /// carried parser provenance ([`SemanticNodeId`] -> callee span).
+    call_site_spans: Option<&'a std::collections::HashMap<SemanticNodeId, Span>>,
 }
 
 impl<'a> HostCallResolutionPass<'a> {
@@ -55,7 +59,19 @@ impl<'a> HostCallResolutionPass<'a> {
             changed: 0,
             unresolved: 0,
             first_error: None,
+            call_site_spans: None,
         }
+    }
+
+    /// Attach the parser's call-site span map (`SemanticNodeId` -> exact
+    /// callee span) so the failure diagnostic can carry the precise span of
+    /// the failing call instead of a line-wide guess.
+    pub(super) fn with_call_site_spans(
+        mut self,
+        spans: &'a std::collections::HashMap<SemanticNodeId, Span>,
+    ) -> Self {
+        self.call_site_spans = Some(spans);
+        self
     }
 
     pub(super) fn changed(&self) -> usize {
@@ -127,10 +143,24 @@ impl<'a> HostCallResolutionPass<'a> {
             Err(error) => {
                 self.unresolved += 1;
                 if self.phase == HostCallResolutionPhase::Final && self.first_error.is_none() {
+                    // Record the exact callee span of the failing call site
+                    // when the call carried parser provenance; the semantic
+                    // diagnostics surface it verbatim instead of a line-wide
+                    // guess.
+                    let span = match expr {
+                        Expr::Call(_, _, _, _, Some(id)) => self
+                            .call_site_spans
+                            .and_then(|spans| spans.get(id).copied()),
+                        Expr::LocalCall(_, _, _, Some(id)) => self
+                            .call_site_spans
+                            .and_then(|spans| spans.get(id).copied()),
+                        _ => None,
+                    };
                     self.first_error = Some(CompileError::HostCallResolve {
                         line: site.line,
                         source_name: owned_source_name(site.source_name),
                         detail: error.to_string(),
+                        span,
                     });
                 }
             }

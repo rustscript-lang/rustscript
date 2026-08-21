@@ -27,7 +27,7 @@ use super::{
     ir::{
         AssignmentKind, CatalogVisibility, ClosureExpr, Expr, FunctionDecl, FunctionDeclSite,
         FunctionImpl, FunctionParam, FunctionRefSite, FunctionRefTarget, HostApiIrMetadata,
-        LocalDeclSite, LocalRefSite, LocalSlot, MatchPattern, MatchTypePattern,
+        LexerToken, LocalDeclSite, LocalRefSite, LocalSlot, MatchPattern, MatchTypePattern,
         ModuleNamespaceAlias, ParsedCallSite, ParsedCallTarget, ParsedLexicalScope,
         ParsedSemanticIndex, ResolvedHostCall, ScopeId, SemanticNodeId, Stmt, StructDecl,
         TypeSchema,
@@ -527,6 +527,26 @@ impl Parser {
         std::mem::take(&mut self.parsed_semantic_index)
     }
 
+    /// Take the parser's full lexer token stream as structured metadata.
+    ///
+    /// The raw lexer token spans are narrowed to their exact range and
+    /// translated into language-service oriented [`LexerToken`] records; the
+    /// trailing EOF token is dropped. Identifiers carry their text.
+    pub(super) fn take_lexer_tokens(&mut self) -> Vec<LexerToken> {
+        self.tokens
+            .iter()
+            .filter(|token| !matches!(token.kind, TokenKind::Eof))
+            .map(|token| LexerToken {
+                kind: lexer_token_kind_tag(&token.kind),
+                ident: match &token.kind {
+                    TokenKind::Ident(name) => name.clone(),
+                    _ => String::new(),
+                },
+                span: token.span,
+            })
+            .collect()
+    }
+
     /// Take the parser's catalog visibility.
     pub(super) fn take_catalog_visibility(&mut self) -> CatalogVisibility {
         CatalogVisibility {
@@ -953,5 +973,72 @@ impl Parser {
 
     fn function_param_names(params: &[FunctionParam]) -> Vec<String> {
         params.iter().map(|param| param.name.clone()).collect()
+    }
+}
+
+/// A stable string tag for a lexer token kind, used by the language-service
+/// token metadata. The tag is the [`TokenKind`] variant name; identifier
+/// tokens keep the `Ident` tag with their text carried separately.
+fn lexer_token_kind_tag(kind: &TokenKind) -> String {
+    match kind {
+        TokenKind::Ident(_) => "Ident".to_string(),
+        TokenKind::Int(_) => "Int".to_string(),
+        TokenKind::IntMinMagnitude(_) => "IntMinMagnitude".to_string(),
+        TokenKind::Float(_) => "Float".to_string(),
+        TokenKind::String(_) => "String".to_string(),
+        TokenKind::Bytes(_) => "Bytes".to_string(),
+        TokenKind::True => "True".to_string(),
+        TokenKind::False => "False".to_string(),
+        TokenKind::Null => "Null".to_string(),
+        TokenKind::Pub => "Pub".to_string(),
+        TokenKind::Use => "Use".to_string(),
+        TokenKind::Import => "Import".to_string(),
+        TokenKind::From => "From".to_string(),
+        TokenKind::As => "As".to_string(),
+        TokenKind::Fn => "Fn".to_string(),
+        TokenKind::Struct => "Struct".to_string(),
+        TokenKind::Let => "Let".to_string(),
+        TokenKind::For => "For".to_string(),
+        TokenKind::If => "If".to_string(),
+        TokenKind::Else => "Else".to_string(),
+        TokenKind::Match => "Match".to_string(),
+        TokenKind::While => "While".to_string(),
+        TokenKind::Break => "Break".to_string(),
+        TokenKind::Continue => "Continue".to_string(),
+        TokenKind::Bang => "Bang".to_string(),
+        TokenKind::BangEqual => "BangEqual".to_string(),
+        TokenKind::Plus => "Plus".to_string(),
+        TokenKind::PlusPlus => "PlusPlus".to_string(),
+        TokenKind::PlusEqual => "PlusEqual".to_string(),
+        TokenKind::Minus => "Minus".to_string(),
+        TokenKind::Star => "Star".to_string(),
+        TokenKind::Slash => "Slash".to_string(),
+        TokenKind::Percent => "Percent".to_string(),
+        TokenKind::Ampersand => "Ampersand".to_string(),
+        TokenKind::AmpersandAmpersand => "AmpersandAmpersand".to_string(),
+        TokenKind::PipePipe => "PipePipe".to_string(),
+        TokenKind::Pipe => "Pipe".to_string(),
+        TokenKind::LParen => "LParen".to_string(),
+        TokenKind::RParen => "RParen".to_string(),
+        TokenKind::LBracket => "LBracket".to_string(),
+        TokenKind::RBracket => "RBracket".to_string(),
+        TokenKind::LBrace => "LBrace".to_string(),
+        TokenKind::RBrace => "RBrace".to_string(),
+        TokenKind::Comma => "Comma".to_string(),
+        TokenKind::Colon => "Colon".to_string(),
+        TokenKind::Question => "Question".to_string(),
+        TokenKind::Dot => "Dot".to_string(),
+        TokenKind::DotDot => "DotDot".to_string(),
+        TokenKind::DotDotEqual => "DotDotEqual".to_string(),
+        TokenKind::Ellipsis => "Ellipsis".to_string(),
+        TokenKind::Semicolon => "Semicolon".to_string(),
+        TokenKind::Equal => "Equal".to_string(),
+        TokenKind::EqualEqual => "EqualEqual".to_string(),
+        TokenKind::FatArrow => "FatArrow".to_string(),
+        TokenKind::Less => "Less".to_string(),
+        TokenKind::LessEqual => "LessEqual".to_string(),
+        TokenKind::Greater => "Greater".to_string(),
+        TokenKind::GreaterEqual => "GreaterEqual".to_string(),
+        TokenKind::Eof => "Eof".to_string(),
     }
 }
