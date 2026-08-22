@@ -674,6 +674,45 @@ impl SseStreamDriver {
     }
 }
 
+impl SseStreamDriver {
+    /// Returns the terminal poll when the stream is stopping or done, or
+    /// `None` when neither has been reached.
+    ///
+    /// Callers drain queued FIFO items first so queued events are delivered
+    /// before the terminal state is surfaced (queue-before-terminal ordering).
+    ///
+    /// ## Happens-before handshake
+    ///
+    /// The worker publishes its final `result` under the shared result Mutex,
+    /// then sets `done` with a `SeqCst` store, then takes and wakes the waker
+    /// slot ([`SseWorker::run`]). A `SeqCst` load of `stopping`/`done` here
+    /// therefore happens-after every earlier result write, and the same Mutex
+    /// guard that observed `done` guarantees the paired result is visible. The
+    /// only arm that removes the result is this one (`.take()`), so at most one
+    /// `poll_next` call can ever receive it — the driver never double-consumes
+    /// the terminal result.
+    fn take_terminal(&mut self) -> Option<Poll<VmResult<HostStreamPoll>>> {
+        let stopping = self.shared.stopping.load(Ordering::SeqCst);
+        let done = self.shared.done.load(Ordering::SeqCst);
+        if !stopping && !done {
+            return None;
+        }
+        let result = self
+            .shared
+            .result
+            .lock()
+            .expect("sse result lock should not be poisoned")
+            .take();
+        let outcome = if stopping { "stopped" } else { "eof" };
+        Some(match result {
+            None | Some(Ok(())) => {
+                Poll::Ready(Ok(HostStreamPoll::Complete(self.summary(outcome))))
+            }
+            Some(Err(error)) => Poll::Ready(Err(error)),
+        })
+    }
+}
+
 impl HostStreamDriver for SseStreamDriver {
     fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<HostStreamPoll>> {
         // Drain one published item, tracking metadata. Returns Some when the
@@ -699,40 +738,14 @@ impl HostStreamDriver for SseStreamDriver {
             driver.items = driver.items.saturating_add(1);
             Some(HostStreamPoll::Item(item))
         };
+        // Queue first, terminal second: drain any published items before
+        // surfacing the stopping/EOF state, so a worker that published events
+        // and then terminated delivers those events before the terminal.
         if let Some(poll) = drain_item(self) {
             return Poll::Ready(Ok(poll));
         }
-
-        if self.shared.stopping.load(Ordering::SeqCst) {
-            // Take the result if the worker already published it, otherwise
-            // return a clean stopped summary.
-            let result = self
-                .shared
-                .result
-                .lock()
-                .expect("sse result lock should not be poisoned")
-                .take();
-            return match result {
-                None | Some(Ok(())) => {
-                    Poll::Ready(Ok(HostStreamPoll::Complete(self.summary("stopped"))))
-                }
-                Some(Err(error)) => Poll::Ready(Err(error)),
-            };
-        }
-
-        if self.shared.done.load(Ordering::SeqCst) {
-            let result = self
-                .shared
-                .result
-                .lock()
-                .expect("sse result lock should not be poisoned")
-                .take();
-            return match result {
-                None | Some(Ok(())) => {
-                    Poll::Ready(Ok(HostStreamPoll::Complete(self.summary("eof"))))
-                }
-                Some(Err(error)) => Poll::Ready(Err(error)),
-            };
+        if let Some(poll) = self.take_terminal() {
+            return poll;
         }
 
         // Register this poll's waker, then re-check the FIFO. The worker's
@@ -749,6 +762,17 @@ impl HostStreamDriver for SseStreamDriver {
             .expect("sse waker lock should not be poisoned") = Some(cx.waker().clone());
         if let Some(poll) = drain_item(self) {
             return Poll::Ready(Ok(poll));
+        }
+        // Re-check the terminal state after registration. This closes the
+        // *completion* lost-wakeup: the worker's terminal epilogue (store the
+        // result, set `done`, take+wake the empty waker slot) can land between
+        // the first terminal check above and this waker registration, waking
+        // nobody. If the worker completes there the driver would otherwise park
+        // at Pending forever with `done == true`. Re-checking `stopping`/`done`
+        // here (with the same queue-before-terminal ordering) catches that
+        // completion deterministically before Pending is returned.
+        if let Some(poll) = self.take_terminal() {
+            return poll;
         }
         Poll::Pending
     }
@@ -1010,7 +1034,15 @@ pub(super) fn builtin_http_client_sse(
 
 #[cfg(test)]
 mod tests {
-    use super::{SseEvent, SseParser};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker};
+
+    use super::{
+        SSE_CHANNEL_CAPACITY, SseEvent, SseParser, SseShared, SseStreamDriver, VmMap,
+    };
+    use crate::vm::{HostStreamDriver, HostStreamPoll, Value};
+    use tokio::sync::{Notify, mpsc};
 
     fn event(data: &str, event: Option<&str>, id: Option<&str>, retry_ms: Option<i64>) -> SseEvent {
         SseEvent {
@@ -1019,6 +1051,237 @@ mod tests {
             id: id.map(str::to_string),
             retry_ms,
         }
+    }
+
+    fn test_shared() -> (Arc<SseShared>, mpsc::Receiver<Value>) {
+        let (items, receiver) = mpsc::channel(SSE_CHANNEL_CAPACITY);
+        let shared = Arc::new(SseShared {
+            stopping: AtomicBool::new(false),
+            cancel: Notify::new(),
+            waker: std::sync::Mutex::new(None),
+            items,
+            done: AtomicBool::new(false),
+            result: std::sync::Mutex::new(None),
+            join_handle: std::sync::Mutex::new(None),
+            close_waker: std::sync::Mutex::new(None),
+        });
+        (shared, receiver)
+    }
+
+    fn test_driver(shared: Arc<SseShared>, receiver: mpsc::Receiver<Value>) -> SseStreamDriver {
+        SseStreamDriver {
+            shared,
+            receiver,
+            status: 0,
+            headers: Arc::new(VmMap::default()),
+            url: String::new(),
+            items: 0,
+            bytes_received: Arc::new(AtomicUsize::new(0)),
+            deadline: std::time::Instant::now(),
+            permit: super::super::policy::ConnectionAdmission::new(1)
+                .acquire()
+                .expect("test connection permit"),
+        }
+    }
+
+    /// A `Wake`-based waker that counts how many times it was woken.
+    #[derive(Default)]
+    struct WakeCounter(Arc<AtomicUsize>);
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Simulates the worker's terminal epilogue (store result, set `done`,
+    /// take+wake the waker slot) landing *exactly between* the driver's first
+    /// terminal check and its waker registration.
+    ///
+    /// The hook runs from a custom `RawWaker` vtable's `clone`, which the
+    /// driver invokes at `cx.waker().clone()` during registration — i.e.
+    /// precisely inside the lost-wakeup window. The state is intentionally
+    /// leaked (`Box::leak`) so the raw waker never needs refcount bookkeeping:
+    /// it is a tiny fixed-size test struct, bounded and test-local, not a
+    /// production global hook.
+    struct TerminalRaceState {
+        shared: Arc<SseShared>,
+        woke: AtomicBool,
+    }
+
+    unsafe fn race_raw_waker(data: *const ()) -> RawWaker {
+        RawWaker::new(data, &RACE_WAKER_VTABLE)
+    }
+
+    unsafe fn race_clone(data: *const ()) -> RawWaker {
+        // SAFETY: `data` is the leaked `TerminalRaceState` pointer passed by
+        // `race_waker`, valid for the whole test (see `race_drop`).
+        let state = unsafe { &*(data as *const TerminalRaceState) };
+        // Worker terminal completion landing between the first terminal check
+        // and registration: publish the result, set done, then wake the (still
+        // empty) waker slot. Pre-fix this wake is lost and the driver parks at
+        // Pending with `done == true`; the post-registration re-check in
+        // `poll_next` is what makes this return Complete instead.
+        *state
+            .shared
+            .result
+            .lock()
+            .expect("sse result lock should not be poisoned") = Some(Ok(()));
+        state.shared.done.store(true, Ordering::SeqCst);
+        if let Some(waker) = state
+            .shared
+            .waker
+            .lock()
+            .expect("sse waker lock should not be poisoned")
+            .take()
+        {
+            state.woke.store(true, Ordering::SeqCst);
+            waker.wake();
+        }
+        // SAFETY: `data` is the same leaked `TerminalRaceState` pointer.
+        unsafe { race_raw_waker(data) }
+    }
+
+    unsafe fn race_wake(data: *const ()) {
+        // SAFETY: `data` is the leaked `TerminalRaceState` pointer; see
+        // `race_clone`.
+        let state = unsafe { &*(data as *const TerminalRaceState) };
+        state.woke.store(true, Ordering::SeqCst);
+    }
+
+    unsafe fn race_wake_by_ref(data: *const ()) {
+        // SAFETY: `data` is the leaked `TerminalRaceState` pointer; see
+        // `race_clone`.
+        unsafe { race_wake(data) };
+    }
+
+    unsafe fn race_drop(_data: *const ()) {
+        // Intentionally leaked: the test owns the `TerminalRaceState` via
+        // `Box::leak`; nothing to free here.
+    }
+
+    static RACE_WAKER_VTABLE: RawWakerVTable =
+        RawWakerVTable::new(race_clone, race_wake, race_wake_by_ref, race_drop);
+
+    fn race_waker(state: &'static TerminalRaceState) -> Waker {
+        unsafe { Waker::from_raw(race_raw_waker(std::ptr::from_ref(state).cast())) }
+    }
+
+    /// A worker completion that lands *after* waker registration must wake the
+    /// registered waker and drive the next poll to `Complete` — no timer, no
+    /// self-poll, exactly what the async host's `await_waiting_host_op`
+    /// `poll_fn` relies on.
+    #[test]
+    fn driver_completes_from_worker_wake_without_timer() {
+        let (shared, receiver) = test_shared();
+        let mut driver = test_driver(Arc::clone(&shared), receiver);
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(WakeCounter(Arc::clone(&wakes))));
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(driver.poll_next(&mut cx), Poll::Pending));
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+
+        // Worker epilogue: publish the terminal result, set done, then wake
+        // the waker slot the driver just registered.
+        *shared.result.lock().expect("sse result lock") = Some(Ok(()));
+        shared.done.store(true, Ordering::SeqCst);
+        let registered = shared
+            .waker
+            .lock()
+            .expect("sse waker lock")
+            .take()
+            .expect("a pending poll must have registered its waker");
+        registered.wake();
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+
+        // The executor re-polls after the wake; the terminal is now visible.
+        match driver.poll_next(&mut cx) {
+            Poll::Ready(Ok(HostStreamPoll::Complete(summary))) => {
+                let Value::Map(map) = summary else {
+                    panic!("expected summary map, got {summary:?}");
+                };
+                assert_eq!(
+                    map.get(&Value::string("outcome")),
+                    Some(&Value::string("eof"))
+                );
+            }
+            other => panic!("expected wake-driven Complete, got {other:?}"),
+        }
+    }
+
+    /// Deterministic regression for the completion lost-wakeup: the worker's
+    /// whole terminal epilogue lands *between* the driver's first terminal
+    /// check and its waker registration, waking an empty slot. The driver must
+    /// re-check the terminal state after registration and return `Complete`
+    /// instead of parking at `Pending` forever with `done == true`.
+    #[test]
+    fn driver_rechecks_terminal_after_waker_registration() {
+        let (shared, receiver) = test_shared();
+        let mut driver = test_driver(Arc::clone(&shared), receiver);
+        let state: &'static TerminalRaceState = Box::leak(Box::new(TerminalRaceState {
+            shared: Arc::clone(&shared),
+            woke: AtomicBool::new(false),
+        }));
+        let waker = race_waker(state);
+        let mut cx = Context::from_waker(&waker);
+
+        // The single poll_next call must observe the terminal completion that
+        // its own waker registration triggered, and return Complete.
+        match driver.poll_next(&mut cx) {
+            Poll::Ready(Ok(HostStreamPoll::Complete(summary))) => {
+                let Value::Map(map) = summary else {
+                    panic!("expected summary map, got {summary:?}");
+                };
+                assert_eq!(
+                    map.get(&Value::string("outcome")),
+                    Some(&Value::string("eof"))
+                );
+            }
+            other => panic!(
+                "terminal completion during waker registration must be observed, got {other:?}"
+            ),
+        }
+        // The completion landed before registration, so the epilogue's wake
+        // found an empty slot (the bug: the wake is lost but must not matter).
+        assert!(!state.woke.load(Ordering::SeqCst));
+        assert!(shared.done.load(Ordering::SeqCst));
+    }
+
+    /// Queue-before-terminal ordering: events published before the worker
+    /// terminates are delivered as items before the terminal `Complete`.
+    #[test]
+    fn driver_drains_queued_items_before_terminal() {
+        let (shared, receiver) = test_shared();
+        let mut driver = test_driver(Arc::clone(&shared), receiver);
+        let waker = Waker::from(Arc::new(WakeCounter::default()));
+        let mut cx = Context::from_waker(&waker);
+
+        // Two items are already queued before the terminal is published.
+        shared
+            .items
+            .try_send(Value::Int(1))
+            .expect("test send");
+        shared
+            .items
+            .try_send(Value::Int(2))
+            .expect("test send");
+        *shared.result.lock().expect("sse result lock") = Some(Ok(()));
+        shared.done.store(true, Ordering::SeqCst);
+
+        assert!(matches!(
+            driver.poll_next(&mut cx),
+            Poll::Ready(Ok(HostStreamPoll::Item(Value::Int(1))))
+        ));
+        assert!(matches!(
+            driver.poll_next(&mut cx),
+            Poll::Ready(Ok(HostStreamPoll::Item(Value::Int(2))))
+        ));
+        assert!(matches!(
+            driver.poll_next(&mut cx),
+            Poll::Ready(Ok(HostStreamPoll::Complete(_)))
+        ));
+        assert!(driver.items == 2);
     }
 
     fn parse_fragments(
