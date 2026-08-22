@@ -16,8 +16,7 @@ use crate::vm::resource::{
     ResourceResult, ResourceTypeKey,
 };
 use crate::vm::{
-    CallOutcome, CallReturn, HostContextError, HostFunctionRegistry, HostImportSchema, Value, Vm,
-    VmError, VmResult,
+    CallOutcome, CallReturn, HostContextError, HostFunctionRegistry, Value, Vm, VmError, VmResult,
 };
 
 mod config;
@@ -276,39 +275,40 @@ pub fn register_http_builtin_module(registry: &mut HostFunctionRegistry) -> VmRe
 /// compile against an HTTP subcatalog (or their own composite) rather than
 /// the standard combined snapshot: the schemas are extracted from the
 /// supplied `catalog`, so the registered exact fingerprint matches what the
-/// matching compile emitted. Missing/incompatible schemas are rejected
-/// deterministically (`MissingExact` at bind time; fingerprint mismatch at
-/// compile time).
+/// matching compile emitted. Every required request/SSE member is preflighted
+/// against its adapter contract (including labels, passing modes, resource keys
+/// and return schema), and all mutations are published atomically. Missing or
+/// incompatible members return a typed
+/// [`crate::vm::HostImportBindingError`] before registry state changes.
 pub fn register_http_builtin_module_from_catalog(
     registry: &mut HostFunctionRegistry,
     catalog: &HostApiCatalog,
 ) -> VmResult<()> {
-    for schema in catalog_http_request_schemas(catalog) {
-        registry.register_exact_static("http::client::request", 1, schema, request_adapter)?;
+    let contract = http_host_catalog();
+    let request = crate::vm::host_extension::validate_catalog_import_schemas(
+        catalog,
+        &contract,
+        "http::client::request",
+    )?;
+    let sse = crate::vm::host_extension::validate_catalog_import_schemas(
+        catalog,
+        &contract,
+        "http::client::sse",
+    )?;
+
+    let mut staged = registry.transaction_clone();
+    for schema in request {
+        staged.register_exact_static("http::client::request", 1, schema, request_adapter)?;
     }
-    for schema in catalog_http_sse_schemas(catalog) {
-        registry.register_exact_static("http::client::sse", 2, schema, sse_adapter)?;
+    for schema in sse {
+        staged.register_exact_static("http::client::sse", 2, schema, sse_adapter)?;
     }
-    // The async host functions return *generic execution-scope* pending
-    // operations (registered through `HostContext::start_operation`), so the
-    // VM awaits them through the scope registry rather than the async
-    // bridge. Marking the exact slots runtime-owned keeps
-    // `http::client::request` / `http::client::sse` on the scope-await path
-    // (no shadow host-bridge operation is created for them).
     for name in ["http::client::request", "http::client::sse"] {
-        registry.mark_exact_runtime_owned_pending(name)?;
+        staged.authorize_registered_builtin_import(name);
+        staged.mark_exact_runtime_owned_pending(name)?;
     }
+    registry.commit_transaction(staged);
     Ok(())
-}
-
-/// The exact imports for `http::client::request` in `catalog`.
-fn catalog_http_request_schemas(catalog: &HostApiCatalog) -> Vec<HostImportSchema> {
-    crate::vm::host_extension::catalog_import_schemas(catalog, "http::client::request")
-}
-
-/// The exact imports for `http::client::sse` in `catalog`.
-fn catalog_http_sse_schemas(catalog: &HostApiCatalog) -> Vec<HostImportSchema> {
-    crate::vm::host_extension::catalog_import_schemas(catalog, "http::client::sse")
 }
 
 /// Standard [`HostExtension`] registering HTTP through the exact catalog

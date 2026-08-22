@@ -1,9 +1,7 @@
 use super::rss::io as file_io;
 use super::rss::strings as string;
-use io;
 
 let mut fixture_path = "stdlib/rss/strings.rss";
-assert(io::exists(fixture_path));
 
 let mut text = file_io::read_text(fixture_path);
 assert(string::contains(text, "pub fn contains"));

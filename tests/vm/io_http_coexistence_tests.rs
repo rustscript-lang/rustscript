@@ -193,14 +193,32 @@ fn http_config_persists_independently_of_io_config() {
         let _ = stream.write_all(response);
     });
 
+    let io_path =
+        std::env::temp_dir().join(format!("pd-vm-io-http-exact-{}.txt", std::process::id()));
     let source = format!(
         r#"
         use io;
         use http;
+        let handle = io::open("{io_path}", "w");
+        io::write(&handle, "io-http-exact");
+        io::close(&handle);
         http::client::request({{"method": "GET", "url": "http://127.0.0.1:{port}/test"}});
-        "#
+        "#,
+        io_path = io_path.display(),
+        port = port,
     );
     let compiled = compile_source(&source).expect("source should compile");
+    let standard = standard_host_catalog();
+    for import in &compiled.program.imports {
+        assert_eq!(
+            import
+                .schema
+                .as_ref()
+                .expect("combined imports must be exact")
+                .fingerprint,
+            standard.fingerprint()
+        );
+    }
     let mut vm = Vm::new(compiled.program);
 
     // Exact standard registration: the standard compile entry emits exact V13
@@ -209,7 +227,11 @@ fn http_config_persists_independently_of_io_config() {
     bind_standard_io_http(&mut vm);
 
     // Configure IO (should not interfere with HTTP)
-    vm.configure_io(IoPolicy::default());
+    vm.configure_io(IoPolicy {
+        allowed_roots: vec![std::env::temp_dir().display().to_string()],
+        allow_write: true,
+        ..IoPolicy::default()
+    });
 
     // Configure HTTP
     vm.configure_http(HttpConfig {
@@ -249,6 +271,11 @@ fn http_config_persists_independently_of_io_config() {
         }
     }
     let _ = http_server.join();
+    assert_eq!(
+        std::fs::read_to_string(&io_path).expect("combined IO output"),
+        "io-http-exact"
+    );
+    let _ = std::fs::remove_file(io_path);
 }
 
 fn driver_poll_submitted(op_id: HostOpId, cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {

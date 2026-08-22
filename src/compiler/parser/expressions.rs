@@ -423,7 +423,31 @@ impl Parser {
                 } else {
                     format!("{}::{}::{}", name, member, subpath.join("::"))
                 };
-                let expr = if let Some((builtin_namespace, builtin_member)) =
+                let catalog_host_name = self
+                    .resolve_host_namespace_call_target(&name, &member, &subpath)
+                    .or_else(|| {
+                        let qualified = std::iter::once(name.as_str())
+                            .chain(subpath.iter().map(String::as_str))
+                            .chain(std::iter::once(member.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("::");
+                        self.host_catalog.as_ref().and_then(|catalog| {
+                            (!catalog.functions_named(&qualified).is_empty()).then_some(qualified)
+                        })
+                    });
+                let catalog_declares_host = catalog_host_name.as_deref().is_some_and(|host_name| {
+                    self.host_catalog
+                        .as_ref()
+                        .is_some_and(|catalog| !catalog.functions_named(host_name).is_empty())
+                });
+                let expr = if catalog_declares_host {
+                    let host_name = catalog_host_name
+                        .as_deref()
+                        .expect("catalog host name checked above");
+                    let base =
+                        self.build_host_call_expr_with_type_args(host_name, args, type_args)?;
+                    self.attach_namespace_call_provenance(base, ns_callee_span, ns_callee_name)
+                } else if let Some((builtin_namespace, builtin_member)) =
                     self.resolve_builtins_call_path(&name, &member, &subpath)
                 {
                     let builtin_namespace = builtin_namespace.to_string();
@@ -445,9 +469,7 @@ impl Parser {
                             ),
                         });
                     }
-                } else if let Some(host_name) =
-                    self.resolve_host_namespace_call_target(&name, &member, &subpath)
-                {
+                } else if let Some(host_name) = catalog_host_name {
                     let base =
                         self.build_host_call_expr_with_type_args(&host_name, args, type_args)?;
                     self.attach_namespace_call_provenance(base, ns_callee_span, ns_callee_name)

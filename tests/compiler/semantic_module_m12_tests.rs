@@ -187,21 +187,26 @@ fn same_stem_modules_in_different_directories_compile_and_run() {
 
 #[test]
 fn host_namespace_imports_keep_dedicated_resolution_path() {
-    struct ExistsOverride;
-
-    impl HostFunction for ExistsOverride {
-        fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> vm::VmResult<CallOutcome> {
-            Ok(CallOutcome::Return(vec![Value::Bool(false)].into()))
-        }
-    }
-
-    let source = "use io;\nio::exists(\"request_body\");\n";
+    let source = "use io;\nio::exists(\".\");\n";
     let compiled = compile_source(source).expect("host namespace import should compile");
     let mut vm = Vm::new(compiled.program);
-    vm.bind_function("io::exists", Box::new(ExistsOverride));
-    let status = vm.run().expect("vm should run");
-    assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Bool(false)]);
+    let mut registry = HostFunctionRegistry::empty();
+    vm::register_io_builtin_module(&mut registry).expect("standard IO registration should succeed");
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("standard exact host imports should bind");
+    #[cfg(feature = "async")]
+    super::async_test_bridge::install(&mut vm);
+    loop {
+        match vm.run().expect("vm should run") {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => continue,
+            VmStatus::Waiting(_) => vm
+                .wait_for_host_op_blocking()
+                .expect("exact IO operation should complete"),
+        }
+    }
+    assert_eq!(vm.stack(), &[Value::Bool(true)]);
 }
 
 #[test]

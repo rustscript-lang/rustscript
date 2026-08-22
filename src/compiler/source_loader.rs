@@ -68,12 +68,29 @@ pub(super) struct LoadedSourceUnits {
     pub(super) sources: SourceMap,
 }
 
+fn effective_source_options(options: &CompileSourceFileOptions) -> CompileSourceFileOptions {
+    if options.host_api_catalog().is_some() {
+        return options.clone();
+    }
+    #[cfg(feature = "runtime")]
+    {
+        return options
+            .clone()
+            .with_host_api_catalog(crate::builtins::runtime::standard_host_catalog());
+    }
+    #[cfg(not(feature = "runtime"))]
+    {
+        options.clone()
+    }
+}
+
 pub(super) fn load_units_for_source_file(
     path: &Path,
     flavor: SourceFlavor,
     source_raw: &str,
     options: &CompileSourceFileOptions,
 ) -> Result<LoadedSourceUnits, SourcePathError> {
+    let effective_options = effective_source_options(options);
     // The root participates in the same identity scheme as every module:
     // canonical disk identity when the file exists, normalized virtual
     // identity otherwise. This keeps `seen`/`visiting`/exports/overrides
@@ -91,24 +108,32 @@ pub(super) fn load_units_for_source_file(
         .add_source_at(0, path.display().to_string(), source_raw.to_string());
     collect_state.visiting.push(path.to_path_buf());
 
-    let root_imports = parse_module_imports(source_raw, flavor, path, options).map_err(|err| {
-        // The root's own scan/parse diagnostics attach their span against
-        // the pre-registered root source and carry the compilation-wide map,
-        // so they render from the root's text.
-        match err {
-            SourcePathError::Source(SourceError::Parse(mut parse)) => {
-                parse.span = None;
-                parse = parse.with_line_span_from_source(&collect_state.sources, 0);
-                SourcePathError::SourceWithMap {
-                    error: SourceError::Parse(parse),
-                    sources: collect_state.sources.clone(),
+    let root_imports =
+        parse_module_imports(source_raw, flavor, path, &effective_options).map_err(|err| {
+            // The root's own scan/parse diagnostics attach their span against
+            // the pre-registered root source and carry the compilation-wide map,
+            // so they render from the root's text.
+            match err {
+                SourcePathError::Source(SourceError::Parse(mut parse)) => {
+                    parse.span = None;
+                    parse = parse.with_line_span_from_source(&collect_state.sources, 0);
+                    SourcePathError::SourceWithMap {
+                        error: SourceError::Parse(parse),
+                        sources: collect_state.sources.clone(),
+                    }
                 }
+                other => other,
             }
-            other => other,
-        }
-    })?;
+        })?;
 
-    collect_module_units(path, source_raw, flavor, options, &mut collect_state).map_err(|err| {
+    collect_module_units(
+        path,
+        source_raw,
+        flavor,
+        &effective_options,
+        &mut collect_state,
+    )
+    .map_err(|err| {
         // Load-time source diagnostics (nested scan/parse errors, symbol
         // resolution, imported-call resolution) already carry spans keyed to
         // the compilation-wide map; attach the map so they render from the
@@ -130,12 +155,12 @@ pub(super) fn load_units_for_source_file(
         .node(root_module)
         .map(|node| node.source.0)
         .unwrap_or(0);
-    let root_parse_source = strip_import_directives(source_raw, flavor, options)?;
+    let root_parse_source = strip_import_directives(source_raw, flavor, &effective_options)?;
 
     let mut root_parsed = frontends::parse_module_source_with_source_id(
         &root_parse_source,
         flavor,
-        options,
+        &effective_options,
         root_source_id,
     )
     .map_err(|mut err| {
@@ -156,7 +181,7 @@ pub(super) fn load_units_for_source_file(
         path,
         &root_imports,
         &mut root_parsed,
-        options,
+        &effective_options,
     )
     .map_err(|err| match err {
         // Root resolution diagnostics (unknown/ambiguous imported calls,

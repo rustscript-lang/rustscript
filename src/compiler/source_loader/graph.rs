@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::compiler::source_map::SourceMap;
+use crate::host_api::HostApiCatalog;
 
 use super::super::{
     CompileSourceFileOptions, ParseError, SourceError, SourceFlavor, SourcePathError, frontends,
@@ -584,6 +585,7 @@ pub(super) fn record_module_symbols(
         &signatures,
         &extern_names,
         parsed,
+        options.host_api_catalog().map(|catalog| &**catalog),
     )
 }
 
@@ -637,6 +639,7 @@ struct CallResolutionContext<'a> {
     graph: &'a ModuleGraph,
     sources: &'a SourceMap,
     source_id: u32,
+    host_catalog: Option<&'a HostApiCatalog>,
 }
 
 impl<'a> CallResolutionContext<'a> {
@@ -689,6 +692,12 @@ impl<'a> CallResolutionContext<'a> {
         type_args: &[TypeSchema],
         line: u32,
     ) -> Result<Option<SymbolId>, SourcePathError> {
+        if self
+            .host_catalog
+            .is_some_and(|catalog| !catalog.functions_named(qualified).is_empty())
+        {
+            return Ok(None);
+        }
         if member.contains("::") {
             // Multi-level module member paths are not supported; the legacy
             // pipeline reported the same call as an unknown namespace call.
@@ -851,6 +860,7 @@ fn resolve_imported_call_sites(
     signatures: &HashMap<SymbolId, ExportedFunctionSignature>,
     extern_names: &HashSet<String>,
     parsed: &mut FrontendIr,
+    host_catalog: Option<&HostApiCatalog>,
 ) -> Result<(), SourcePathError> {
     let source_id = graph.node(module).map(|node| node.source.0).unwrap_or(0);
     let mut plain_symbols = HashMap::<String, SymbolId>::new();
@@ -888,6 +898,7 @@ fn resolve_imported_call_sites(
         graph,
         sources,
         source_id,
+        host_catalog,
     };
 
     for stmt in &mut parsed.stmts {

@@ -826,13 +826,19 @@ pub fn analyze_source_with_flavor(
     source: &str,
     flavor: SourceFlavor,
 ) -> Result<SemanticModel, SourceError> {
+    let effective = default_standard_catalog_options(&CompileSourceFileOptions::default());
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source("<source>", source.to_string());
-    let parsed = frontends::parse_source(source, flavor, &CompileSourceFileOptions::default())
-        .map_err(|err| {
-            SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
-        })?;
-    analyze_parsed_output(source.to_string(), parsed, source_map, flavor, None)
+    let parsed = frontends::parse_source(source, flavor, &effective).map_err(|err| {
+        SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
+    })?;
+    analyze_parsed_output(
+        source.to_string(),
+        parsed,
+        source_map,
+        flavor,
+        effective.host_api_catalog().cloned(),
+    )
 }
 
 /// Analyze a source file path without generating bytecode, returning a
@@ -907,13 +913,14 @@ fn analyze_source_string_at_path(
     source: &str,
     options: &CompileSourceFileOptions,
 ) -> Result<SemanticModel, SourcePathError> {
+    let effective = default_standard_catalog_options(options);
     // Module-graph, plugin, and custom-catalog compilations share the same
     // frontend pipeline as the compile path: the loader parses every unit
     // verbatim (no second parser), the linker merges the provenance carrier,
     // and analysis builds the semantic index from the merged IR.
-    if options.has_module_overrides() || options.has_source_plugins() {
-        let loaded = load_units_for_source_file(path, flavor, source, options)?;
-        let catalog = options.host_api_catalog().cloned();
+    if effective.has_module_overrides() || effective.has_source_plugins() {
+        let loaded = load_units_for_source_file(path, flavor, source, &effective)?;
+        let catalog = effective.host_api_catalog().cloned();
         return analyze_loaded_units(
             source.to_string(),
             loaded.units,
@@ -925,13 +932,13 @@ fn analyze_source_string_at_path(
 
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source(path.display().to_string(), source.to_string());
-    let parsed = frontends::parse_source(source, flavor, options).map_err(|err| {
+    let parsed = frontends::parse_source(source, flavor, &effective).map_err(|err| {
         SourcePathError::Source(SourceError::Parse(
             err.with_line_span_from_source(&source_map, source_id),
         ))
     })?;
 
-    let catalog = options.host_api_catalog().cloned();
+    let catalog = effective.host_api_catalog().cloned();
     analyze_parsed_output(source.to_string(), parsed, source_map, flavor, catalog)
         .map_err(SourcePathError::Source)
 }
@@ -1699,7 +1706,10 @@ fn compile_source_with_flavor_and_options_impl(
     let effective = default_standard_catalog_options(options);
     #[cfg(not(feature = "runtime"))]
     let effective = {
-        if !options.has_module_overrides() && !options.has_source_plugins() {
+        if !options.has_module_overrides()
+            && !options.has_source_plugins()
+            && options.host_api_catalog().is_none()
+        {
             return compile_source_with_flavor_impl(source, flavor, CompileBehavior::DEFAULT)
                 .map_err(SourcePathError::Source);
         }
@@ -1727,18 +1737,25 @@ fn compile_source_with_flavor_and_options_pipeline(
     )
 }
 
-/// Returns `options` with the authoritative standard host catalog attached,
-/// when the runtime surface is enabled.
-#[cfg(feature = "runtime")]
+/// Returns `options` with the authoritative standard host catalog attached
+/// when the runtime surface is enabled. Explicit catalogs remain untouched;
+/// builds without the runtime surface retain the caller's options verbatim.
 fn default_standard_catalog_options(
     options: &CompileSourceFileOptions,
 ) -> CompileSourceFileOptions {
-    let mut effective = options.clone();
-    // Prefer an explicit custom catalog; otherwise attach the standard snapshot.
-    if effective.host_api_catalog().is_none() {
-        effective.set_host_api_catalog(crate::builtins::runtime::standard_host_catalog());
+    #[cfg(feature = "runtime")]
+    {
+        let mut effective = options.clone();
+        // Prefer an explicit custom catalog; otherwise attach the standard snapshot.
+        if effective.host_api_catalog().is_none() {
+            effective.set_host_api_catalog(crate::builtins::runtime::standard_host_catalog());
+        }
+        effective
     }
-    effective
+    #[cfg(not(feature = "runtime"))]
+    {
+        options.clone()
+    }
 }
 
 /// The default catalog for semantic analysis when no custom catalog is

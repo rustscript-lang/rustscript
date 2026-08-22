@@ -184,40 +184,53 @@ pub fn io_host_catalog() -> Arc<HostApiCatalog> {
             HostParamSchema::value("command", HostTypeSchema::String),
             HostParamSchema::value("mode", HostTypeSchema::String),
         ],
-        HostTypeSchema::Resource(io_process_key()),
+        HostTypeSchema::Resource(io_pipe_key()),
     ));
     for (name, result) in [
         ("io::read_all", HostTypeSchema::String),
         ("io::read_line", HostTypeSchema::String),
-        ("io::write", HostTypeSchema::Int),
         ("io::flush", HostTypeSchema::Bool),
+        ("io::close", HostTypeSchema::Bool),
     ] {
+        for key in [io_file_key(), io_pipe_key()] {
+            builder.function(HostFunctionSchema::with_return(
+                name,
+                vec![resource_handle(key, HostParamPassing::Borrow)],
+                result.clone(),
+            ));
+        }
+    }
+    for key in [io_file_key(), io_pipe_key()] {
         builder.function(HostFunctionSchema::with_return(
-            name,
-            vec![borrow_handle()],
-            result,
+            "io::write",
+            vec![
+                resource_handle(key, HostParamPassing::Borrow),
+                HostParamSchema::value("text", HostTypeSchema::String),
+            ],
+            HostTypeSchema::Int,
         ));
     }
     builder.function(HostFunctionSchema::with_return(
-        "io::close",
-        vec![borrow_handle()],
+        "io::exists",
+        vec![HostParamSchema::value("path", HostTypeSchema::String)],
         HostTypeSchema::Bool,
     ));
     builder.function(HostFunctionSchema::with_return(
-        "io::exists",
-        vec![HostParamSchema::value("path", HostTypeSchema::String)],
+        "io::read_all",
+        vec![HostParamSchema::value("handle", HostTypeSchema::Int)],
+        HostTypeSchema::String,
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        "io::close",
+        vec![HostParamSchema::value("handle", HostTypeSchema::Int)],
         HostTypeSchema::Bool,
     ));
 
     Arc::new(builder.build().expect("io catalog must build"))
 }
 
-fn borrow_handle() -> HostParamSchema {
-    HostParamSchema::with_passing(
-        "handle",
-        HostTypeSchema::Resource(io_file_key()),
-        HostParamPassing::Borrow,
-    )
+fn resource_handle(key: ResourceTypeKey, passing: HostParamPassing) -> HostParamSchema {
+    HostParamSchema::with_passing("handle", HostTypeSchema::Resource(key), passing)
 }
 
 /// Registers every IO host function into `registry` using the exact catalog
@@ -245,44 +258,79 @@ pub fn register_io_builtin_module(registry: &mut HostFunctionRegistry) -> VmResu
 /// This is the public register-forwarding API for custom embedders who
 /// compile against an IO subcatalog (or their own composite) rather than the
 /// standard combined snapshot: the schemas are extracted from the supplied
-/// `catalog`, so the registered exact fingerprint matches what the matching
-/// compile emitted. Missing/incompatible schemas are rejected
-/// deterministically (`MissingExact` at bind time; fingerprint mismatch at
-/// compile time).
+/// supplied `catalog`, so the registered exact fingerprint matches what the
+/// matching compile emitted. Every required member is preflighted against its
+/// adapter contract (including labels, passing modes, resource keys and return
+/// schema), and all mutations are published atomically. Missing or incompatible
+/// members return a typed [`HostImportBindingError`] before registry state
+/// changes.
 pub fn register_io_builtin_module_from_catalog(
     registry: &mut HostFunctionRegistry,
     catalog: &HostApiCatalog,
 ) -> VmResult<()> {
-    for schema in crate::vm::host_extension::catalog_import_schemas(catalog, "io::open") {
-        registry.register_exact_static("io::open", 2, schema, open_adapter)?;
+    let contract = io_host_catalog();
+    let open =
+        crate::vm::host_extension::validate_catalog_import_schemas(catalog, &contract, "io::open")?;
+    let popen = crate::vm::host_extension::validate_catalog_import_schemas(
+        catalog,
+        &contract,
+        "io::popen",
+    )?;
+    let read_all = crate::vm::host_extension::validate_catalog_import_schemas(
+        catalog,
+        &contract,
+        "io::read_all",
+    )?;
+    let read_line = crate::vm::host_extension::validate_catalog_import_schemas(
+        catalog,
+        &contract,
+        "io::read_line",
+    )?;
+    let write = crate::vm::host_extension::validate_catalog_import_schemas(
+        catalog,
+        &contract,
+        "io::write",
+    )?;
+    let flush = crate::vm::host_extension::validate_catalog_import_schemas(
+        catalog,
+        &contract,
+        "io::flush",
+    )?;
+    let close = crate::vm::host_extension::validate_catalog_import_schemas(
+        catalog,
+        &contract,
+        "io::close",
+    )?;
+    let exists = crate::vm::host_extension::validate_catalog_import_schemas(
+        catalog,
+        &contract,
+        "io::exists",
+    )?;
+
+    let mut staged = registry.transaction_clone();
+    for schema in open {
+        staged.register_exact_static("io::open", 2, schema, open_adapter)?;
     }
-    for schema in crate::vm::host_extension::catalog_import_schemas(catalog, "io::popen") {
-        registry.register_exact_static("io::popen", 2, schema, popen_adapter)?;
+    for schema in popen {
+        staged.register_exact_static("io::popen", 2, schema, popen_adapter)?;
     }
-    for (name, adapter) in [
-        (
-            "io::read_all",
-            read_all_adapter as crate::vm::StaticHostFunction,
-        ),
-        (
-            "io::read_line",
-            read_line_adapter as crate::vm::StaticHostFunction,
-        ),
-        ("io::write", write_adapter as crate::vm::StaticHostFunction),
-        ("io::flush", flush_adapter as crate::vm::StaticHostFunction),
-        ("io::close", close_adapter as crate::vm::StaticHostFunction),
-    ] {
-        for schema in crate::vm::host_extension::catalog_import_schemas(catalog, name) {
-            registry.register_exact_static(name, 1, schema, adapter)?;
-        }
+    for schema in read_all {
+        staged.register_exact_static("io::read_all", 1, schema, read_all_adapter)?;
     }
-    for schema in crate::vm::host_extension::catalog_import_schemas(catalog, "io::exists") {
-        registry.register_exact_static(
-            "io::exists",
-            1,
-            schema,
-            exists_adapter as crate::vm::StaticHostFunction,
-        )?;
+    for schema in read_line {
+        staged.register_exact_static("io::read_line", 1, schema, read_line_adapter)?;
+    }
+    for schema in write {
+        staged.register_exact_static("io::write", 2, schema, write_adapter)?;
+    }
+    for schema in flush {
+        staged.register_exact_static("io::flush", 1, schema, flush_adapter)?;
+    }
+    for schema in close {
+        staged.register_exact_static("io::close", 1, schema, close_adapter)?;
+    }
+    for schema in exists {
+        staged.register_exact_static("io::exists", 1, schema, exists_adapter)?;
     }
     for name in [
         "io::open",
@@ -294,8 +342,10 @@ pub fn register_io_builtin_module_from_catalog(
         "io::close",
         "io::exists",
     ] {
-        registry.mark_exact_runtime_owned_pending(name)?;
+        staged.authorize_registered_builtin_import(name);
+        staged.mark_exact_runtime_owned_pending(name)?;
     }
+    registry.commit_transaction(staged);
     Ok(())
 }
 

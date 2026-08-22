@@ -119,3 +119,45 @@ pub fn catalog_import_schemas(catalog: &HostApiCatalog, name: &str) -> Vec<HostI
         })
         .collect()
 }
+
+/// Validates the adapter ABI for one required catalog member before registry
+/// mutation. The member must exist and match one of the canonical adapter
+/// overloads in parameter labels, passing modes, parameter schemas and return
+/// schema. Catalog fingerprints are deliberately ignored so custom and
+/// combined catalogs remain usable.
+pub fn validate_catalog_import_schemas(
+    catalog: &HostApiCatalog,
+    contract: &HostApiCatalog,
+    name: &str,
+) -> VmResult<Vec<HostImportSchema>> {
+    let expected = catalog_import_schemas(contract, name);
+    let got = catalog_import_schemas(catalog, name);
+    if got.is_empty() {
+        return Err(crate::vm::VmError::HostImportBinding(
+            crate::vm::HostImportBindingError::MissingCatalogMember {
+                import: name.to_string(),
+                expected,
+            },
+        ));
+    }
+
+    let compatible = |expected: &HostImportSchema, got: &HostImportSchema| {
+        expected.params == got.params && expected.return_type == got.return_type
+    };
+    let all_expected_match = expected
+        .iter()
+        .all(|expected| got.iter().any(|got| compatible(expected, got)));
+    let all_got_match = got
+        .iter()
+        .all(|got| expected.iter().any(|expected| compatible(expected, got)));
+    if expected.len() != got.len() || !all_expected_match || !all_got_match {
+        return Err(crate::vm::VmError::HostImportBinding(
+            crate::vm::HostImportBindingError::IncompatibleCatalogSchema {
+                import: name.to_string(),
+                expected,
+                got,
+            },
+        ));
+    }
+    Ok(got)
+}

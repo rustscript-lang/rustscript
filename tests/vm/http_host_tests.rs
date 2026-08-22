@@ -230,7 +230,12 @@ io::open("/tmp/rustscript-capability-test", "r");"#,
     let error = registry
         .bind_vm_cached(&mut vm)
         .expect_err("ungranted namespaced builtin must fail during preflight");
-    assert!(error.to_string().contains("io_open"));
+    assert!(
+        error
+            .to_string()
+            .contains("capability profile does not allow host import 'io::open'"),
+        "restricted exact IO import must be denied by the host-import capability: {error:?}"
+    );
 }
 
 #[test]

@@ -1,16 +1,22 @@
 use std::path::Path;
 
-use vm::{Value, Vm, VmStatus, compile_source_file};
+use vm::{
+    CompileSourceFileOptions, Value, Vm, VmStatus, compile_source_file_with_options,
+    standard_host_catalog,
+};
 
 fn run_rustscript_spec(path: &Path) -> Vec<Value> {
-    let compiled = compile_source_file(path).expect("spec should compile");
+    let catalog = standard_host_catalog();
+    let options = CompileSourceFileOptions::default().with_host_api_catalog(catalog.clone());
+    let compiled = compile_source_file_with_options(path, options).expect("spec should compile");
     assert!(
-        compiled.functions.is_empty(),
-        "stdlib RustScript specs should not require host imports"
-    );
-    assert!(
-        compiled.program.imports.is_empty(),
-        "stdlib RustScript specs should not emit host imports for builtins"
+        compiled
+            .program
+            .imports
+            .iter()
+            .filter_map(|import| import.schema.as_ref())
+            .all(|schema| schema.fingerprint == catalog.fingerprint()),
+        "stdlib host imports must use the exact standard catalog fingerprint"
     );
 
     let mut vm = Vm::new(compiled.program);

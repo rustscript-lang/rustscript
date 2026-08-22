@@ -461,8 +461,24 @@ fn namespaced_builtin_io_call_can_be_overridden_by_host_binding() {
     "#,
     )
     .expect("source should compile");
+    // The standard compile entry emits an exact `io::exists` import, so the
+    // embedder override must be registered as an exact binding (by-name
+    // `bind_function` cannot satisfy a schema-carrying import).
+    let standard = vm::standard_host_catalog();
+    let schema = vm::catalog_import_schemas(&standard, "io::exists")
+        .pop()
+        .expect("standard io::exists schema");
+    let mut registry = HostFunctionRegistry::empty();
+    registry
+        .register_exact_static("io::exists", 1, schema, |_vm: &mut Vm, args: &[Value]| {
+            assert_eq!(args, &[Value::string("request_body")]);
+            Ok(CallOutcome::Return(vm::CallReturn::one(Value::Bool(false))))
+        })
+        .expect("exact io::exists override should register");
     let mut vm = Vm::new(compiled.program);
-    vm.bind_function("io::exists", Box::new(ExistsOverride));
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("exact override registry should bind");
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -495,14 +511,26 @@ fn builtin_override_does_not_bypass_restricted_capability_profile() {
     assert!(error.to_string().contains("capability"));
 
     let mut allowed_registry = HostFunctionRegistry::restricted();
+    let standard = vm::standard_host_catalog();
+    let schema = vm::catalog_import_schemas(&standard, "io::exists")
+        .pop()
+        .expect("standard io::exists schema");
     allowed_registry
-        .allow_builtin("io::exists")
-        .expect("IO builtin should be known");
+        .register_exact_static("io::exists", 1, schema, |_vm: &mut Vm, _args: &[Value]| {
+            Ok(CallOutcome::Return(vm::CallReturn::one(Value::Bool(false))))
+        })
+        .expect("exact io::exists override should register");
+    // Grant the exact host import through the capability profile (the same
+    // grant surface the exact-registration path uses); the restricted profile
+    // then permits only the explicitly approved import.
+    let profile = CapabilityProfile::builder()
+        .allow_host_import("io::exists")
+        .build();
+    allowed_registry.set_capability_profile(profile);
     let mut allowed = Vm::new(program);
     allowed_registry
         .bind_vm_cached(&mut allowed)
         .expect("allowlisted registry should bind");
-    allowed.bind_function("io::exists", Box::new(ExistsOverride));
     assert_eq!(
         allowed.run().expect("override should run"),
         VmStatus::Halted

@@ -1,6 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use vm::{Value, Vm, VmError, VmResetState, VmStatus, compile_source};
+use vm::{
+    HostFunctionRegistry, IoHostExt, IoPolicy, Value, Vm, VmError, VmResetState, VmStatus,
+    compile_source,
+};
 
 fn run_source(source: &str) -> Result<Vec<Value>, VmError> {
     let compiled =
@@ -541,4 +544,59 @@ fn async_io_flush_cancellation() {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
+}
+
+#[test]
+fn async_io_exact_catalog_compile_bind_execute_round_trip() {
+    let path = temp_path("exact-catalog-e2e");
+    let source = format!(
+        r#"
+        use io;
+        let handle = io::open("{}", "w");
+        io::write(&handle, "async-catalog-exact");
+        io::flush(&handle);
+        io::close(&handle);
+        "#,
+        path.display()
+    );
+    let compiled = compile_source(&source).expect("async exact IO source should compile");
+    let standard = vm::standard_host_catalog();
+    assert!(!compiled.program.imports.is_empty());
+    for import in &compiled.program.imports {
+        let schema = import
+            .schema
+            .as_ref()
+            .expect("async IO import must be schema-exact");
+        assert_eq!(schema.fingerprint, standard.fingerprint());
+    }
+
+    let mut registry = HostFunctionRegistry::empty();
+    vm::register_io_builtin_module(&mut registry).expect("async exact IO registration");
+    let mut vm = Vm::new(compiled.program);
+    super::async_test_bridge::install(&mut vm);
+    vm.configure_io(IoPolicy {
+        allowed_roots: vec![std::env::temp_dir().display().to_string()],
+        allow_write: true,
+        ..IoPolicy::default()
+    });
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("async exact IO imports must bind");
+    let mut status = vm.run().expect("async exact IO VM should start");
+    loop {
+        match status {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => status = vm.resume().expect("resume async exact IO VM"),
+            VmStatus::Waiting(_) => {
+                vm.wait_for_host_op_blocking()
+                    .expect("wait async exact IO VM");
+                status = vm.resume().expect("resume async exact IO VM");
+            }
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("async exact IO output"),
+        "async-catalog-exact"
+    );
+    let _ = std::fs::remove_file(path);
 }

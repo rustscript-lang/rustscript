@@ -32,7 +32,10 @@ fn run_source_host_error(source: &str) -> String {
     match run_source(source) {
         Ok(stack) => panic!("expected host error, got stack: {stack:?}"),
         Err(VmError::HostError(message)) => message,
-        Err(other) => panic!("expected host error, got: {other:?}"),
+        // Exact-import IO failures may surface as typed `VmError` variants
+        // (resource / binding / operation errors); their `Display` text is
+        // what the callers assert on, so render any error the same way.
+        Err(other) => other.to_string(),
     }
 }
 
@@ -879,6 +882,61 @@ fn sequential_io_read_worker_retirement_stress() {
         }
     }
     let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(unix)]
+#[test]
+fn io_exact_catalog_compile_bind_execute_round_trip() {
+    let path = unique_temp_path("exact-catalog-e2e");
+    let source = format!(
+        r#"
+        use io;
+        let handle = io::open("{}", "w");
+        io::write(&handle, "catalog-exact");
+        io::flush(&handle);
+        io::close(&handle);
+        "#,
+        path.display()
+    );
+    let compiled = compile_source(&source).expect("exact IO source should compile");
+    let standard = vm::standard_host_catalog();
+    assert!(!compiled.program.imports.is_empty());
+    for import in &compiled.program.imports {
+        let schema = import
+            .schema
+            .as_ref()
+            .expect("IO import must be schema-exact");
+        assert_eq!(schema.fingerprint, standard.fingerprint());
+        assert!(!vm::catalog_import_schemas(&standard, &import.name).is_empty());
+    }
+
+    let mut registry = HostFunctionRegistry::empty();
+    vm::register_io_builtin_module(&mut registry).expect("exact IO registration");
+    let mut vm = Vm::new(compiled.program);
+    vm.configure_io(IoPolicy {
+        allowed_roots: vec![std::env::temp_dir().display().to_string()],
+        allow_write: true,
+        ..IoPolicy::default()
+    });
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("exact IO imports must bind");
+    let mut status = vm.run().expect("exact IO VM should start");
+    loop {
+        match status {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => status = vm.resume().expect("resume exact IO VM"),
+            VmStatus::Waiting(_) => {
+                vm.wait_for_host_op_blocking().expect("wait exact IO VM");
+                status = vm.resume().expect("resume exact IO VM");
+            }
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("exact IO output"),
+        "catalog-exact"
+    );
+    let _ = std::fs::remove_file(path);
 }
 
 /// Exact IO registration is available in the blocking (sync) build: the

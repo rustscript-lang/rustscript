@@ -1484,57 +1484,104 @@ pub fn register_sqlite_builtin_module(registry: &mut HostFunctionRegistry) -> Vm
 /// compile against a SQLite subcatalog (or their own composite) rather than
 /// the standard combined snapshot: the schemas are extracted from the
 /// supplied `catalog`, so the registered exact fingerprint matches what the
-/// matching compile emitted. Supplying a catalog that does not contain the
-/// SQLite surface (or carries incompatible schemas) is rejected
-/// deterministically through `catalog_import_schemas` (no matching schema →
-/// `MissingExact` at bind time; missing/extra members surface as a compile
-/// fingerprint mismatch).
+/// matching compile emitted. Every static and pending member is preflighted
+/// against its adapter contract (including labels, passing modes, resource keys
+/// and return schema), and all mutations are published atomically. Missing or
+/// incompatible members return a typed
+/// [`crate::vm::HostImportBindingError`] before registry state changes.
 pub fn register_sqlite_builtin_module_from_catalog(
     registry: &mut HostFunctionRegistry,
     catalog: &HostApiCatalog,
 ) -> VmResult<()> {
-    for schema in crate::vm::host_extension::catalog_import_schemas(catalog, "sqlite::open") {
-        registry.register_exact_static("sqlite::open", 1, schema, open_adapter)?;
-    }
-    for schema in crate::vm::host_extension::catalog_import_schemas(catalog, "sqlite::execute") {
-        registry.register_exact_static("sqlite::execute", 3, schema, execute_adapter)?;
-    }
-    for schema in crate::vm::host_extension::catalog_import_schemas(catalog, "sqlite::query") {
-        registry.register_exact_static("sqlite::query", 4, schema, query_adapter)?;
-    }
-    for schema in crate::vm::host_extension::catalog_import_schemas(catalog, "sqlite::transaction")
-    {
-        registry.register_exact_static("sqlite::transaction", 2, schema, transaction_adapter)?;
-    }
-    for schema in crate::vm::host_extension::catalog_import_schemas(catalog, "sqlite::close") {
-        registry.register_exact_static("sqlite::close", 1, schema, close_adapter)?;
-    }
-    for schema in
-        crate::vm::host_extension::catalog_import_schemas(catalog, "sqlite::rows_affected")
-    {
-        registry.register_exact_static(
+    let contract = sqlite_host_catalog();
+    let open = crate::vm::host_extension::validate_catalog_import_schemas(
+        catalog,
+        &contract,
+        "sqlite::open",
+    )?;
+    let execute = crate::vm::host_extension::validate_catalog_import_schemas(
+        catalog,
+        &contract,
+        "sqlite::execute",
+    )?;
+    let query = crate::vm::host_extension::validate_catalog_import_schemas(
+        catalog,
+        &contract,
+        "sqlite::query",
+    )?;
+    let transaction = crate::vm::host_extension::validate_catalog_import_schemas(
+        catalog,
+        &contract,
+        "sqlite::transaction",
+    )?;
+    let close = crate::vm::host_extension::validate_catalog_import_schemas(
+        catalog,
+        &contract,
+        "sqlite::close",
+    )?;
+    let rows_affected = crate::vm::host_extension::validate_catalog_import_schemas(
+        catalog,
+        &contract,
+        "sqlite::rows_affected",
+    )?;
+    let truncated = crate::vm::host_extension::validate_catalog_import_schemas(
+        catalog,
+        &contract,
+        "sqlite::truncated",
+    )?;
+    let next_cursor = crate::vm::host_extension::validate_catalog_import_schemas(
+        catalog,
+        &contract,
+        "sqlite::next_cursor",
+    )?;
+
+    registry.transactionally(|staged| {
+        for schema in open {
+            staged.register_exact_static("sqlite::open", 1, schema, open_adapter)?;
+        }
+        for schema in execute {
+            staged.register_exact_static("sqlite::execute", 3, schema, execute_adapter)?;
+        }
+        for schema in query {
+            staged.register_exact_static("sqlite::query", 4, schema, query_adapter)?;
+        }
+        for schema in transaction {
+            staged.register_exact_static("sqlite::transaction", 2, schema, transaction_adapter)?;
+        }
+        for schema in close {
+            staged.register_exact_static("sqlite::close", 1, schema, close_adapter)?;
+        }
+        for schema in rows_affected {
+            staged.register_exact_static(
+                "sqlite::rows_affected",
+                1,
+                schema,
+                rows_affected_adapter,
+            )?;
+        }
+        for schema in truncated {
+            staged.register_exact_static("sqlite::truncated", 1, schema, truncated_adapter)?;
+        }
+        for schema in next_cursor {
+            staged.register_exact_static("sqlite::next_cursor", 1, schema, next_cursor_adapter)?;
+        }
+        for name in [
+            "sqlite::open",
+            "sqlite::execute",
+            "sqlite::query",
+            "sqlite::transaction",
+            "sqlite::close",
             "sqlite::rows_affected",
-            1,
-            schema,
-            rows_affected_adapter,
-        )?;
-    }
-    for schema in crate::vm::host_extension::catalog_import_schemas(catalog, "sqlite::truncated") {
-        registry.register_exact_static("sqlite::truncated", 1, schema, truncated_adapter)?;
-    }
-    for schema in crate::vm::host_extension::catalog_import_schemas(catalog, "sqlite::next_cursor")
-    {
-        registry.register_exact_static("sqlite::next_cursor", 1, schema, next_cursor_adapter)?;
-    }
-    // The async host functions return *generic execution-scope* pending
-    // operations (registered through `HostContext::start_operation`), so the
-    // VM awaits them through the scope registry rather than the async
-    // bridge. Marking the exact slots runtime-owned keeps `sqlite::execute` /
-    // `sqlite::query` / `sqlite::transaction` on the scope-await path (no
-    // shadow host-bridge operation is created for them).
-    for name in ["sqlite::execute", "sqlite::query", "sqlite::transaction"] {
-        registry.mark_exact_runtime_owned_pending(name)?;
-    }
+            "sqlite::truncated",
+            "sqlite::next_cursor",
+        ] {
+            staged.authorize_registered_builtin_import(name);
+        }
+        for name in ["sqlite::execute", "sqlite::query", "sqlite::transaction"] {
+            staged.mark_exact_runtime_owned_pending(name)?;
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 

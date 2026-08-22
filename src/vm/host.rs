@@ -676,7 +676,7 @@ impl HostFunctionRegistry {
     pub fn new() -> Self {
         static DEFAULT_REGISTRY: OnceLock<HostFunctionRegistry> = OnceLock::new();
 
-        let mut registry = DEFAULT_REGISTRY
+        DEFAULT_REGISTRY
             .get_or_init(|| {
                 let mut registry = Self::empty();
                 crate::builtins::runtime::register_default_host_functions(&mut registry);
@@ -684,13 +684,7 @@ impl HostFunctionRegistry {
                 registry.allow_default_host_capabilities = true;
                 registry
             })
-            .clone();
-        registry.plan_cache = Arc::new(RwLock::new(HashMap::new()));
-        registry.capability_profile = Arc::new(CapabilityProfile::allow_all());
-        registry.registry_state = Arc::new(());
-        registry.registry_generation_token = Arc::new(());
-        registry.registry_generation = Arc::new(AtomicU64::new(0));
-        registry
+            .transaction_clone()
     }
 
     /// Returns the standard host registry with every registered host function present but
@@ -714,6 +708,21 @@ impl HostFunctionRegistry {
         self.allow_default_host_capabilities = profile.allows_all_host_imports();
         self.capability_profile = Arc::new(profile);
         self.invalidate_plan_cache();
+    }
+
+    /// Associate a registered namespaced standard adapter with the matching
+    /// builtin capability when the caller has granted that builtin. This keeps
+    /// restricted exact imports governed by the same capability profile as the
+    /// legacy adapter path without granting unrelated host names.
+    pub(crate) fn authorize_registered_builtin_import(&mut self, name: &str) {
+        let Some(builtin) = BuiltinFunction::from_namespaced_name(name) else {
+            return;
+        };
+        if !self.capability_profile.allows_host_import(name)
+            && self.capability_profile.allows_builtin(builtin)
+        {
+            self.set_capability_profile(self.capability_profile.with_host_import(name));
+        }
     }
 
     /// Explicitly permits a namespaced builtin when this registry is used as a capability plan.
@@ -742,6 +751,72 @@ impl HostFunctionRegistry {
         self.plan_cache = Arc::new(RwLock::new(HashMap::new()));
     }
 
+    /// Creates an isolated staging registry for a registration transaction.
+    ///
+    /// The staged registry shares the Arc-backed entries / maps / capability
+    /// profile with the caller — safe because every mutation goes through
+    /// `Arc::make_mut`, which detaches before writing when the reference count
+    /// is shared — while the coherence-sensitive fields (plan cache, registry
+    /// state / generation token identity and the generation counter) are
+    /// *re-isolated* so staging is fully detached from the caller. A failed or
+    /// abandoned staging therefore cannot affect the caller's slots, plans,
+    /// capabilities or revision.
+    ///
+    /// This differs from the derived `Clone`, which preserves the shared
+    /// coherence identity (plan cache, state / generation tokens and the
+    /// generation counter) so sibling forks observe each other's mutations —
+    /// the correct semantics for capability branching, but wrong for staging,
+    /// where a failed registration must leave the caller observationally
+    /// unchanged. Registration transactions must use this method (or
+    /// [`transactionally`](Self::transactionally)), never `Clone`.
+    pub fn transaction_clone(&self) -> Self {
+        let mut staged = Self {
+            entries: Arc::clone(&self.entries),
+            by_name: Arc::clone(&self.by_name),
+            by_exact: Arc::clone(&self.by_exact),
+            plan_cache: Arc::new(RwLock::new(HashMap::new())),
+            allowed_builtin_calls: Arc::clone(&self.allowed_builtin_calls),
+            allow_default_builtin_capabilities: self.allow_default_builtin_capabilities,
+            allow_default_host_capabilities: self.allow_default_host_capabilities,
+            capability_profile: Arc::clone(&self.capability_profile),
+            registry_state: Arc::new(()),
+            registry_generation_token: Arc::new(()),
+            registry_generation: Arc::new(AtomicU64::new(
+                self.registry_generation.load(Ordering::Relaxed),
+            )),
+        };
+        staged
+    }
+
+    /// Publishes a fully staged registry after every fallible registration
+    /// operation has succeeded. The staged state replaces the caller's state
+    /// exactly once, and the plan cache is invalidated so any subsequently
+    /// cached binding plan is recomputed against the published registry.
+    ///
+    /// Callers must obtain `staged` via [`transaction_clone`](Self::transaction_clone)
+    /// and must not modify `self` while staging.
+    pub fn commit_transaction(&mut self, staged: Self) {
+        *self = staged;
+        self.invalidate_plan_cache();
+    }
+
+    /// Applies a fallible staging closure transactionally.
+    ///
+    /// The closure receives an isolated staging registry produced by
+    /// [`transaction_clone`](Self::transaction_clone). If it returns an error,
+    /// the caller's registry is left observationally unchanged (slots, plans,
+    /// capability profile and revision). On success the staged state is
+    /// published exactly once via [`commit_transaction`](Self::commit_transaction).
+    pub fn transactionally<F>(&mut self, stage: F) -> VmResult<()>
+    where
+        F: FnOnce(&mut HostFunctionRegistry) -> VmResult<()>,
+    {
+        let mut staged = self.transaction_clone();
+        stage(&mut staged)?;
+        self.commit_transaction(staged);
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub(crate) fn mark_runtime_owned_pending(&mut self, name: &str) {
         let slot = self
@@ -763,9 +838,11 @@ impl HostFunctionRegistry {
     #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
     pub(crate) fn mark_exact_runtime_owned_pending(&mut self, name: &str) -> VmResult<()> {
         let Some(schemas) = self.by_exact.get(name) else {
-            return Err(VmError::HostError(format!(
-                "no exact host function registered under {name}"
-            )));
+            return Err(VmError::HostImportBinding(
+                HostImportBindingError::MissingExact {
+                    import: name.to_string(),
+                },
+            ));
         };
         let entries = Arc::make_mut(&mut self.entries);
         for &slot in schemas.values() {
@@ -1258,8 +1335,34 @@ impl HostFunctionRegistry {
 
     pub fn bind_vm_cached(&self, vm: &mut Vm) -> VmResult<()> {
         self.validate_program_capabilities(&vm.program)?;
+        #[cfg(feature = "runtime")]
+        if self.should_stage_standard_exact_imports(&vm.program.imports) {
+            let mut staged = self.transaction_clone();
+            crate::builtins::runtime::register_io_builtin_module(&mut staged)?;
+            #[cfg(feature = "http-client")]
+            crate::builtins::runtime::register_http_builtin_module(&mut staged)?;
+            #[cfg(feature = "sqlite")]
+            crate::builtins::runtime::register_sqlite_builtin_module(&mut staged)?;
+            let plan = staged.prepare_shared_plan(&vm.program.imports)?;
+            return staged.bind_vm_with_plan(vm, &plan);
+        }
         let plan = self.prepare_shared_plan(&vm.program.imports)?;
         self.bind_vm_with_plan(vm, &plan)
+    }
+
+    #[cfg(feature = "runtime")]
+    fn should_stage_standard_exact_imports(&self, imports: &[HostImport]) -> bool {
+        if imports.is_empty() || self.by_exact.values().any(|schemas| !schemas.is_empty()) {
+            return false;
+        }
+        let standard = crate::builtins::runtime::standard_host_catalog();
+        let fingerprint = standard.fingerprint();
+        imports.iter().all(|import| {
+            let Some(schema) = import.schema.as_ref() else {
+                return false;
+            };
+            schema.fingerprint == fingerprint && !standard.functions_named(&import.name).is_empty()
+        })
     }
 
     pub fn prepare_plan(&self, imports: &[HostImport]) -> VmResult<HostBindingPlan> {
@@ -1347,6 +1450,11 @@ impl HostFunctionRegistry {
     /// which embeds each import's schema, so exact schemas are plan-cache-partitioned.
     pub fn plan_cache_len(&self) -> usize {
         self.plan_cache.read().expect("plan cache read lock").len()
+    }
+
+    /// Current registry revision used to invalidate cached binding plans.
+    pub fn registry_generation(&self) -> u64 {
+        self.registry_generation.load(Ordering::Relaxed)
     }
 
     fn plan_for_imports(&self, imports: &[HostImport]) -> VmResult<Arc<HostBindingPlan>> {
@@ -3204,6 +3312,28 @@ impl Vm {
             && self.host.host_function_symbols.is_empty()
             && self.host.host_functions.is_empty()
         {
+            let has_exact_import = self
+                .program
+                .imports
+                .iter()
+                .any(|import| import.schema.is_some());
+            let has_legacy_import = self
+                .program
+                .imports
+                .iter()
+                .any(|import| import.schema.is_none());
+            if has_exact_import && !has_legacy_import {
+                let mut registry = HostFunctionRegistry::empty();
+                #[cfg(feature = "runtime")]
+                crate::builtins::runtime::register_io_builtin_module(&mut registry)?;
+                #[cfg(feature = "http-client")]
+                crate::builtins::runtime::register_http_builtin_module(&mut registry)?;
+                #[cfg(feature = "sqlite")]
+                crate::builtins::runtime::register_sqlite_builtin_module(&mut registry)?;
+                registry.bind_vm_cached(self)?;
+                return Ok(());
+            }
+
             // Only schema-less legacy imports may take the name-only default
             // fallback; an import carrying an exact schema must resolve
             // exclusively through the exact registry (see below).

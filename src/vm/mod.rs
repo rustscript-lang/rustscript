@@ -13,7 +13,7 @@ mod engine;
 mod epoch;
 pub mod execution_scope;
 mod fuel;
-mod host;
+pub(crate) mod host;
 mod host_context;
 pub mod host_extension;
 mod host_runtime;
@@ -185,7 +185,21 @@ pub enum VmError {
 /// and stays fully compatible.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostImportBindingError {
-    /// Registering the same exact name + schema twice (no silent replacement).
+    /// The supplied catalog does not declare an adapter-required member.
+    MissingCatalogMember {
+        import: String,
+        expected: Vec<HostImportSchema>,
+    },
+    /// The supplied catalog declares a member, but none of its overloads has
+    /// the adapter-compatible parameter labels, passing modes, parameter
+    /// schemas and return schema. Catalog fingerprints are intentionally not
+    /// compared here: custom and combined catalogs may have their own identity.
+    IncompatibleCatalogSchema {
+        import: String,
+        expected: Vec<HostImportSchema>,
+        got: Vec<HostImportSchema>,
+    },
+    /// A registered exact name + schema conflicts with an existing binding.
     Duplicate { import: String },
     /// A program import carrying an exact schema has no matching registered
     /// exact binding; it never falls back to a legacy by-name slot.
@@ -212,6 +226,18 @@ pub enum HostImportBindingError {
 impl std::fmt::Display for HostImportBindingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MissingCatalogMember { import, expected } => write!(
+                f,
+                "catalog is missing required host member '{import}' (expected schemas: {expected:?})"
+            ),
+            Self::IncompatibleCatalogSchema {
+                import,
+                expected,
+                got,
+            } => write!(
+                f,
+                "catalog schema for '{import}' is incompatible with its adapter (expected: {expected:?}, got: {got:?})"
+            ),
             Self::Duplicate { import } => {
                 write!(
                     f,

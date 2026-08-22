@@ -163,6 +163,11 @@ fn rustscript_io_namespace_builtin_calls_are_supported() {
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
+    let mut registry = HostFunctionRegistry::empty();
+    vm::register_io_builtin_module(&mut registry).expect("standard IO registration should succeed");
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("standard exact host imports should bind");
     #[cfg(feature = "async")]
     super::async_test_bridge::install(&mut vm);
 
@@ -537,20 +542,22 @@ fn compile_source_file_with_rustscript_complex_fixture() {
     #[cfg(feature = "async")]
     super::async_test_bridge::install(&mut vm);
 
+    let mut registry = HostFunctionRegistry::empty();
+    vm::register_io_builtin_module(&mut registry).expect("standard IO registration should succeed");
     for func in &compiled.functions {
         match func.name.as_str() {
-            "print" => {
-                vm.register_function(Box::new(PrintBuiltin));
-            }
-            "add_one" => {
-                vm.register_function(Box::new(AddOne));
-            }
+            "print" => registry.register("print", func.arity, || Box::new(PrintBuiltin)),
+            "add_one" => registry.register("add_one", func.arity, || Box::new(AddOne)),
             "runtime::sleep" => {
-                vm.register_function(Box::new(RuntimeSleep));
+                registry.register("runtime::sleep", func.arity, || Box::new(RuntimeSleep));
             }
+            "io::exists" => {}
             _ => panic!("unexpected function {}", func.name),
         };
     }
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("standard exact host imports should bind");
 
     loop {
         match vm.run().expect("vm should run") {

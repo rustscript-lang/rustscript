@@ -18,6 +18,20 @@ pub(super) struct ParsedRustScriptReplSource {
     pub bindings: Vec<ReplLocalBinding>,
 }
 
+fn effective_host_api_catalog(options: &CompileSourceFileOptions) -> Option<Arc<HostApiCatalog>> {
+    if let Some(catalog) = options.host_api_catalog() {
+        return Some(Arc::clone(catalog));
+    }
+    #[cfg(feature = "runtime")]
+    {
+        return Some(crate::builtins::runtime::standard_host_catalog());
+    }
+    #[cfg(not(feature = "runtime"))]
+    {
+        None
+    }
+}
+
 pub(super) fn parse_source(
     source: &str,
     flavor: SourceFlavor,
@@ -60,7 +74,7 @@ pub(super) fn parse_module_source_with_source_id(
     parse_source_with_source_id_and_externs(source, flavor, options, original_source_id, true)
 }
 
-fn parse_source_with_source_id_and_externs(
+pub(super) fn parse_source_with_source_id_and_externs(
     source: &str,
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
@@ -77,7 +91,8 @@ fn parse_source_with_source_id_and_externs(
                 false,
                 true,
                 original_source_id,
-                options.host_api_catalog().cloned(),
+                false,
+                effective_host_api_catalog(options),
             )
         }
         SourceFlavor::JavaScript | SourceFlavor::Lua => {
@@ -264,6 +279,23 @@ fn parse_repl_with_parser(
     })
 }
 
+pub(super) fn parse_source_for_import_scan(
+    source: &str,
+    options: &CompileSourceFileOptions,
+) -> Result<FrontendIr, ParseError> {
+    let lowered = rustscript::lower(source)?;
+    parse_lowered_with_mapping(
+        source,
+        lowered,
+        true,
+        false,
+        true,
+        0,
+        true,
+        effective_host_api_catalog(options),
+    )
+}
+
 fn parse_lowered_with_mapping(
     original_source: &str,
     lowered: LoweredSource,
@@ -271,6 +303,7 @@ fn parse_lowered_with_mapping(
     allow_implicit_semicolons: bool,
     enforce_mutable_bindings: bool,
     original_source_id: u32,
+    import_scan_mode: bool,
     host_catalog: Option<Arc<HostApiCatalog>>,
 ) -> Result<FrontendIr, ParseError> {
     let mut source_map = SourceMap::new();
@@ -283,7 +316,7 @@ fn parse_lowered_with_mapping(
         allow_implicit_externs,
         allow_implicit_semicolons,
         enforce_mutable_bindings,
-        false,
+        import_scan_mode,
         rustscript::parser_dialect(),
         host_catalog,
     ) {
@@ -492,16 +525,43 @@ mod host_catalog_frontend_tests {
 
     #[test]
     fn no_catalog_yields_none() {
-        let ir = parse_source(
-            "use acme; acme::read(\"x\");\n",
-            SourceFlavor::RustScript,
-            &CompileSourceFileOptions::default(),
-        )
-        .expect("parse succeeds");
-        assert!(
-            ir.host_api_metadata.is_none(),
-            "no catalog means no metadata"
-        );
+        // With the runtime surface enabled, the default semantic-analysis and
+        // parse entry points thread the authoritative standard catalog, so a
+        // default-options parse carries the standard fingerprint even without
+        // an explicit catalog. This is finding-1 behavior: the standard
+        // catalog is the default for all frontend entry points.
+        #[cfg(feature = "runtime")]
+        {
+            let ir = parse_source(
+                "use acme; acme::read(\"x\");\n",
+                SourceFlavor::RustScript,
+                &CompileSourceFileOptions::default(),
+            )
+            .expect("parse succeeds");
+            let metadata = ir
+                .host_api_metadata
+                .as_ref()
+                .expect("default options must thread the standard catalog");
+            assert_eq!(
+                metadata.fingerprint(),
+                crate::builtins::runtime::standard_host_catalog().fingerprint()
+            );
+        }
+        // Without the runtime surface there is no standard catalog to thread;
+        // default options then yield no host metadata.
+        #[cfg(not(feature = "runtime"))]
+        {
+            let ir = parse_source(
+                "use acme; acme::read(\"x\");\n",
+                SourceFlavor::RustScript,
+                &CompileSourceFileOptions::default(),
+            )
+            .expect("parse succeeds");
+            assert!(
+                ir.host_api_metadata.is_none(),
+                "no catalog means no metadata"
+            );
+        }
     }
 
     #[test]
@@ -1541,7 +1601,7 @@ mod lowered_provenance_remap_tests {
             "trailing offset maps to original EOF"
         );
 
-        let ir = parse_lowered_with_mapping(original, lowered, false, false, true, 7, None)
+        let ir = parse_lowered_with_mapping(original, lowered, false, false, true, 7, false, None)
             .expect("lowered source must parse");
         let index = ir.parsed_semantic_index.as_ref().expect("index present");
         assert!(

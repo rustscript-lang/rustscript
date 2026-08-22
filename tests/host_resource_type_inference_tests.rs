@@ -15,8 +15,8 @@ use std::sync::Arc;
 use vm::compiler::ir::FrontendIr;
 use vm::compiler::source_map::SourceMap;
 use vm::compiler::{
-    CompileError, SemanticCompletion, SemanticDiagnostic, SemanticModel, SourcePosition,
-    TypeSchema, analyze_source,
+    CompileError, CompileSourceFileOptions, SemanticCompletion, SemanticDiagnostic, SemanticModel,
+    SourcePosition, TypeSchema, analyze_source, analyze_source_from_string_with_options,
 };
 use vm::host_api::{
     HostApiBuilder, HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema,
@@ -616,6 +616,90 @@ fn analyze_source_with_catalog_works() {
     assert!(
         catalog.functions().is_empty(),
         "default catalog is empty without the standard runtime surface"
+    );
+}
+
+#[cfg(feature = "runtime")]
+#[test]
+fn default_analysis_resolves_standard_catalog_calls_and_annotations() {
+    let source = "use io;\nlet present = io::exists(\".\");\npresent;\n";
+    let model = analyze_source(source).expect("default analysis should succeed");
+    let standard = vm::standard_host_catalog();
+
+    assert_eq!(
+        model.catalog_fingerprint(),
+        standard.fingerprint(),
+        "default analysis must expose the standard catalog snapshot"
+    );
+    let metadata = model
+        .ir()
+        .host_api_metadata
+        .as_ref()
+        .expect("default analysis parse must carry host metadata");
+    assert_eq!(metadata.fingerprint(), standard.fingerprint());
+
+    let call = model
+        .ir()
+        .semantic_index
+        .as_ref()
+        .expect("semantic index")
+        .resolved_calls
+        .values()
+        .find(|info| info.site.name == "io::exists")
+        .expect("standard io call should be indexed");
+    let host = call.host.as_ref().expect("standard io call should resolve");
+    assert_eq!(host.name, "io::exists");
+    assert_eq!(host.return_type, TypeSchema::Bool);
+
+    let call_offset = source.find("io::exists").expect("call offset");
+    let signature = model
+        .callable_signature_at(SourcePosition::new(0, call_offset))
+        .expect("standard host signature should be available");
+    assert_eq!(signature.name, "io::exists");
+    assert_eq!(signature.params.len(), 1);
+    assert_eq!(signature.params[0].name, "path");
+    assert_eq!(
+        model.inferred_schema_at(SourcePosition::new(0, call_offset)),
+        Some(TypeSchema::Bool),
+        "host return annotation should use the catalog schema"
+    );
+
+    let invalid = analyze_source("use io; io::exists(1);\n").expect("invalid call still analyzes");
+    assert!(
+        invalid
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("io::exists")),
+        "catalog argument validation should produce a host diagnostic"
+    );
+}
+
+#[cfg(feature = "runtime")]
+#[test]
+fn explicit_analysis_catalog_is_not_augmented_by_standard_catalog() {
+    let custom = test_catalog();
+    let model = analyze_source_from_string_with_options(
+        "main.rss",
+        "use io; io::open(\"file.txt\");\n",
+        CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&custom)),
+    )
+    .expect("custom catalog analysis should succeed");
+
+    assert_eq!(
+        model.catalog_fingerprint(),
+        custom.fingerprint(),
+        "explicit analysis catalog must remain authoritative"
+    );
+    let metadata = model
+        .ir()
+        .host_api_metadata
+        .as_ref()
+        .expect("custom analysis parse must carry host metadata");
+    assert_eq!(metadata.fingerprint(), custom.fingerprint());
+    assert_ne!(
+        metadata.fingerprint(),
+        vm::standard_host_catalog().fingerprint(),
+        "custom analysis must not be replaced by the standard catalog"
     );
 }
 

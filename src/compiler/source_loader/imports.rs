@@ -5,8 +5,7 @@ use crate::builtins::is_builtin_namespace;
 use super::super::frontends::{is_ident_continue, is_ident_start};
 use super::super::modules::{UseDecl, use_path_to_spec};
 use super::super::{
-    CompileSourceFileOptions, SharedParserOptions, SourceError, SourceFlavor, SourcePathError,
-    frontends,
+    CompileSourceFileOptions, SourceError, SourceFlavor, SourcePathError, frontends,
 };
 use super::model::ModuleImport;
 
@@ -36,7 +35,7 @@ pub(super) fn scan_module_imports(
 ) -> Result<(Vec<ModuleImport>, Vec<UseDecl>), SourcePathError> {
     match flavor {
         SourceFlavor::RustScript => {
-            let decls = parse_rustscript_use_declarations(source, path)?;
+            let decls = parse_rustscript_use_declarations(source, path, options)?;
             let imports = use_declarations_to_module_imports(path, &decls)?;
             Ok((imports, decls))
         }
@@ -59,6 +58,7 @@ pub(super) fn scan_module_imports(
 fn parse_rustscript_use_declarations(
     source: &str,
     path: &Path,
+    options: &CompileSourceFileOptions,
 ) -> Result<Vec<UseDecl>, SourcePathError> {
     for (idx, raw_line) in source.lines().enumerate() {
         let line = raw_line.trim();
@@ -71,21 +71,19 @@ fn parse_rustscript_use_declarations(
         }
     }
 
-    let options = CompileSourceFileOptions::default();
-    let dialect = frontends::parser_dialect_for_flavor(SourceFlavor::RustScript, &options)
-        .expect("RustScript parser dialect is always registered");
-    let ir = frontends::parse_source_with_dialect(
-        source,
-        dialect,
-        SharedParserOptions {
-            source_id: 0,
-            allow_implicit_externs: true,
-            allow_implicit_semicolons: false,
-            enforce_mutable_bindings: true,
-            import_scan_mode: true,
-        },
-    )
-    .map_err(|err| SourcePathError::Source(SourceError::Parse(err)))?;
+    let scan_source = source
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("use ") {
+                line
+            } else {
+                ""
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let ir = frontends::parse_source_for_import_scan(&scan_source, options)
+        .map_err(|err| SourcePathError::Source(SourceError::Parse(err)))?;
     Ok(ir.use_declarations)
 }
 

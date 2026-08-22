@@ -58,6 +58,18 @@ pub mod vm {
         pub fn mark_exact_runtime_owned_pending(&mut self, _name: &str) -> VmResult<()> {
             Ok(())
         }
+
+        pub fn authorize_registered_builtin_import(&mut self, _name: &str) {}
+
+        /// Mock transaction surface: the included registration path compiles
+        /// against this stub; every registration method is a no-op, so the
+        /// staging closure can run against the mock directly.
+        pub fn transactionally<F>(&mut self, stage: F) -> VmResult<()>
+        where
+            F: FnOnce(&mut HostFunctionRegistry) -> VmResult<()>,
+        {
+            stage(self)
+        }
     }
     pub mod operation {
         pub use rustscript_vm::vm::operation::{
@@ -1690,6 +1702,42 @@ mod production_crate {
         .expect("sqlite source should compile against the standard catalog")
     }
 
+    /// The standard combined catalog augmented with a custom marker function,
+    /// so its fingerprint differs from the standard snapshot. Exact imports
+    /// compiled against this catalog are carried under the custom fingerprint
+    /// and are therefore *not* auto-bound by the fresh-VM default path (which
+    /// only stages the standard snapshot). This lets the tests below assert
+    /// that a caller-supplied catalog's imports require an explicit
+    /// registration / extension to bind.
+    fn compile_with_custom_catalog(source: &str) -> rustscript_vm::CompiledProgram {
+        let standard = rustscript_vm::standard_host_catalog();
+        let mut builder = rustscript_vm::HostApiBuilder::new();
+        for resource in standard.resources() {
+            builder.resource(resource.clone());
+        }
+        for function in standard.functions() {
+            builder.function(function.clone());
+        }
+        builder.function(rustscript_vm::HostFunctionSchema::with_return(
+            "custom::marker",
+            Vec::new(),
+            rustscript_vm::HostTypeSchema::Int,
+        ));
+        let custom = Arc::new(builder.build().expect("custom catalog must build"));
+        assert_ne!(
+            custom.fingerprint(),
+            standard.fingerprint(),
+            "custom catalog must have a distinct fingerprint"
+        );
+        rustscript_vm::compile_source_with_flavor_and_options(
+            source,
+            rustscript_vm::SourceFlavor::RustScript,
+            rustscript_vm::CompileSourceFileOptions::default()
+                .with_host_api_catalog(Arc::clone(&custom)),
+        )
+        .expect("sqlite source should compile against the custom catalog")
+    }
+
     fn real_vm(program: rustscript_vm::Program) -> rustscript_vm::vm::Vm {
         rustscript_vm::vm::Vm::new(program)
     }
@@ -1706,7 +1754,12 @@ mod production_crate {
 
     #[test]
     fn sqlite_imports_are_not_bound_without_the_extension() {
-        let compiled = compile_with_catalog(
+        // Compiled against a custom (non-standard) catalog: the exact sqlite
+        // imports carry the custom fingerprint, so the fresh-VM default path
+        // (which only stages the standard snapshot) must not auto-bind them.
+        // Without the extension, running must surface a structured binding
+        // error naming the sqlite import.
+        let compiled = compile_with_custom_catalog(
             "use sqlite;\n\
              let db = sqlite::open({ path: \":memory:\", mode: \"memory\", limits: {} });\n\
              sqlite::close(&db);\n",

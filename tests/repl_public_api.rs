@@ -1,7 +1,8 @@
 use vm::compiler::TypeSchema;
-use vm::{
-    ReplLocalBinding, ReplLocalState, compile_source_for_repl_with_state, standard_host_catalog,
-};
+use vm::{ReplLocalBinding, ReplLocalState, compile_source_for_repl_with_state};
+
+#[cfg(feature = "http-client")]
+use vm::standard_host_catalog;
 
 #[test]
 fn public_repl_state_api_preserves_moved_local_semantics() {
