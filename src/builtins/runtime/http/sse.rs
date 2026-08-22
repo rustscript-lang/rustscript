@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use pd_host_function::pd_host_function;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
 
 use super::request::{
     HttpRequest, HttpResponseResource, OwnedResponse, ResponseReadObserver, open_stream_response,
@@ -26,6 +26,19 @@ use crate::vm::{
     CallOutcome, CallReturn, HostStreamAction, HostStreamDriver, HostStreamPoll, Value, Vm,
     VmError, VmResult,
 };
+
+/// Maximum number of SSE items buffered between the worker and the stream
+/// driver before publishing applies backpressure. A small bounded queue
+/// preserves ordering without letting the worker run arbitrarily far ahead of
+/// the per-item callback, and without unbounded memory growth on a slow or
+/// stalled callback. The worker blocks on an under-capacity send, which keeps
+/// it in sync with the driver and prevents both event loss and runaway queue
+/// growth.
+const SSE_CHANNEL_CAPACITY: usize = 8;
+
+/// The error surfaced when the absolute stream deadline (the minimum of the
+/// host maximum stream duration and the script `timeout_ms`) is exceeded.
+const SSE_TOTAL_DEADLINE_ERROR: &str = "SSE total deadline exceeded";
 
 #[derive(Debug, PartialEq, Eq)]
 struct SseEvent {
@@ -325,8 +338,11 @@ pub(super) struct SseShared {
     pub(super) cancel: Notify,
     /// Waker registered by the latest pending SSE poll.
     pub(super) waker: std::sync::Mutex<Option<std::task::Waker>>,
-    /// One published item ready for the stream driver to pick up.
-    pub(super) item: std::sync::Mutex<Option<Value>>,
+    /// Bounded FIFO of published items awaiting the stream driver.
+    /// The worker `send`s with backpressure; the driver `try_recv`s.
+    /// This preserves item ordering and never drops events, unlike a
+    /// single-slot overwrite slot.
+    pub(super) items: mpsc::Sender<Value>,
     /// Set when the worker thread has finished running.
     pub(super) done: AtomicBool,
     /// The final result from the worker thread (Ok or error).
@@ -344,7 +360,11 @@ pub(super) struct SseShared {
 struct SseWorker {
     config: super::HttpConfig,
     request: HttpRequest,
-    deadline: Instant,
+    /// The absolute stream duration (min of host max and script timeout). The
+    /// absolute deadline is derived from this when the worker begins stream
+    /// I/O, so OS thread-spawn/scheduling latency before the first network
+    /// operation does not count against the stream duration.
+    total_duration: Duration,
     shared: Arc<SseShared>,
     items: Arc<AtomicUsize>,
     bytes_received: Arc<AtomicUsize>,
@@ -387,18 +407,39 @@ impl SseWorker {
     }
 
     fn run_inner(&self) -> VmResult<()> {
+        // The entire SSE network lifecycle (open the response stream, then
+        // read every body frame) MUST run inside a single Tokio runtime. The
+        // owned response ties the hyper connection future and body receiver to
+        // one I/O driver; recreating a fresh current-thread runtime per frame
+        // moves a live socket across reactors and corrupts the body framing,
+        // surfacing hyper errors like "error reading a body from connection".
+        runtime_block_on(self.stream_lifecycle())
+    }
+
+    async fn stream_lifecycle(self: &SseWorker) -> VmResult<()> {
         let mut parser = SseParser::new(
             self.config.max_sse_line_bytes,
             self.config.max_stream_item_bytes,
             self.config.max_stream_total_bytes,
         );
         let observer = ResponseReadObserver::default();
-        let (mut response, url) = runtime_block_on(open_stream_response(
-            &self.config,
-            &self.request,
-            observer.clone(),
-            Some(self.deadline),
-        ))?;
+
+        // The absolute total deadline is derived once, when the worker begins
+        // stream I/O: OS thread-spawn and scheduling latency before the first
+        // network operation is not part of the stream duration. It is never
+        // reset by progress.
+        let deadline = Instant::now() + self.total_duration;
+
+        // Opening phase: the response headers must arrive before both the
+        // opening idle deadline and the absolute total deadline. Whichever
+        // boundary is closer wins; when both expire at the same instant the
+        // total deadline takes priority. Connection establishment is bounded
+        // by the connect timeout inside `open_stream_response`, so slow
+        // connects never count against either deadline.
+        let opening_idle_deadline = Instant::now() + self.config.stream_idle_timeout;
+        let (mut response, url) = self
+            .open_response(observer.clone(), opening_idle_deadline)
+            .await?;
         let status = response.response().status();
         if !status.is_success() {
             return Err(VmError::HostError(format!(
@@ -427,33 +468,37 @@ impl SseWorker {
         *self.headers.lock().expect("sse headers lock") = Some(Arc::clone(&headers));
         *self.url.lock().expect("sse url lock") = Some(url.to_string());
         observer.admit_body(self.config.max_stream_total_bytes);
-        self.publish(map_value(vec![
-            ("kind", Value::string("open")),
-            ("status", Value::Int(i64::from(status.as_u16()))),
-            ("headers", Value::Map(headers)),
-            ("url", Value::string(url.as_str())),
-        ]))?;
+        self.publish(
+            map_value(vec![
+                ("kind", Value::string("open")),
+                ("status", Value::Int(i64::from(status.as_u16()))),
+                ("headers", Value::Map(headers)),
+                ("url", Value::string(url.as_str())),
+            ]),
+            deadline,
+        )
+        .await?;
 
+        // Body phase: every delivered frame resets the idle deadline, while
+        // the absolute total deadline is computed once and never reset by
+        // progress.
+        let mut idle_deadline = Instant::now() + self.config.stream_idle_timeout;
         loop {
             if self.shared.stopping.load(Ordering::SeqCst) {
                 return Err(VmError::HostError("SSE stream closed".to_string()));
             }
-            let cancel = &self.shared.cancel;
-            let frame = runtime_block_on(async {
-                tokio::select! {
-                    biased;
-                    _ = cancel.notified() => {
-                        Err(VmError::HostError("SSE stream cancelled".to_string()))
-                    }
-                    frame = response.next_frame() => frame,
-                }
-            })?;
+            let frame = self
+                .next_frame(&mut response, idle_deadline, deadline)
+                .await?;
             let Some(frame) = frame else {
                 break;
             };
             let Ok(data) = frame.into_data() else {
                 continue;
             };
+            // Any delivered body bytes count as progress: reset the idle
+            // deadline, but never touch the absolute total deadline.
+            idle_deadline = Instant::now() + self.config.stream_idle_timeout;
             parser.admit_chunk(data.len())?;
             observer.observe_application_chunk(data.len());
             self.bytes_received.fetch_add(data.len(), Ordering::SeqCst);
@@ -463,36 +508,125 @@ impl SseWorker {
                 offset += consumed;
                 if let Some(event) = event {
                     self.items.fetch_add(1, Ordering::SeqCst);
-                    self.publish(map_value(vec![
-                        ("kind", Value::string("event")),
-                        ("event", event.event.map_or(Value::Null, Value::string)),
-                        ("data", Value::string(event.data)),
-                        ("id", event.id.map_or(Value::Null, Value::string)),
-                        ("retry_ms", event.retry_ms.map_or(Value::Null, Value::Int)),
-                    ]))?;
+                    self.publish(
+                        map_value(vec![
+                            ("kind", Value::string("event")),
+                            ("event", event.event.map_or(Value::Null, Value::string)),
+                            ("data", Value::string(event.data)),
+                            ("id", event.id.map_or(Value::Null, Value::string)),
+                            ("retry_ms", event.retry_ms.map_or(Value::Null, Value::Int)),
+                        ]),
+                        deadline,
+                    )
+                    .await?;
                 }
             }
         }
         parser.finish()?;
-        self.publish(map_value(vec![("kind", Value::string("end"))]))
+        self.publish(map_value(vec![("kind", Value::string("end"))]), deadline)
+            .await
     }
 
-    fn publish(&self, item: Value) -> VmResult<()> {
-        *self
-            .shared
-            .item
-            .lock()
-            .expect("sse item lock should not be poisoned") = Some(item);
-        let wake = self
-            .shared
-            .waker
-            .lock()
-            .expect("sse waker lock should not be poisoned")
-            .take();
-        if let Some(waker) = wake {
-            waker.wake();
+    /// Opens the response stream bounded by the opening idle deadline and the
+    /// absolute total deadline. Connection establishment is bounded by the
+    /// connect timeout inside [`open_stream_response`]; the total deadline is
+    /// enforced there from when the request is actually sent (so connect
+    /// latency never eats into the stream budget), while this outer select
+    /// bounds the opening idle deadline and maps the total-deadline expiry to
+    /// the SSE error.
+    ///
+    /// Cancellation is deliberately NOT a branch here: the worker must always
+    /// attempt the connection so a peer waiting on `accept()` is not stranded.
+    /// A cancel that arrives during opening is consumed at the next checkpoint
+    /// (the body-loop `stopping` check or the publish/next-frame cancel
+    /// branches), which is race-free because [`Notify`] retains one
+    /// notification until it is awaited.
+    async fn open_response(
+        &self,
+        observer: ResponseReadObserver,
+        opening_idle_deadline: Instant,
+    ) -> VmResult<(OwnedResponse, url::Url)> {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(opening_idle_deadline)) => {
+                Err(VmError::HostError(
+                    "SSE stream idle timeout while opening response".to_string(),
+                ))
+            }
+            opened = open_stream_response(
+                &self.config,
+                &self.request,
+                observer,
+                Some(self.total_duration),
+            ) => {
+                opened.map_err(|error| {
+                    if error.to_string().contains("HTTP request deadline exceeded") {
+                        // The streaming response budget expired while waiting
+                        // for the response headers. Connection setup is
+                        // bounded separately, so this is the total deadline.
+                        VmError::HostError(SSE_TOTAL_DEADLINE_ERROR.to_string())
+                    } else {
+                        error
+                    }
+                })
+            }
         }
-        Ok(())
+    }
+
+    /// Reads one body frame bounded by cancel, the absolute total deadline and
+    /// the current idle deadline. Simultaneous boundary expiry is resolved
+    /// deterministically in favour of the total deadline.
+    async fn next_frame(
+        &self,
+        response: &mut OwnedResponse,
+        idle_deadline: Instant,
+        deadline: Instant,
+    ) -> VmResult<Option<hyper::body::Frame<hyper::body::Bytes>>> {
+        let boundary = deadline.min(idle_deadline);
+        tokio::select! {
+            biased;
+            _ = self.shared.cancel.notified() => {
+                Err(VmError::HostError("SSE stream cancelled".to_string()))
+            }
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(boundary)) => {
+                if deadline <= idle_deadline {
+                    Err(VmError::HostError(SSE_TOTAL_DEADLINE_ERROR.to_string()))
+                } else {
+                    Err(VmError::HostError("SSE stream idle timeout".to_string()))
+                }
+            }
+            frame = response.next_frame() => frame,
+        }
+    }
+
+    /// Publishes one item into the bounded FIFO with backpressure. The send is
+    /// bounded by cancel and the absolute total deadline, so a stalled
+    /// callback or full queue cannot extend the stream past its deadline.
+    /// Wakes the stream driver's waker so the VM re-polls and drains the item.
+    async fn publish(&self, item: Value, deadline: Instant) -> VmResult<()> {
+        let sender = &self.shared.items;
+        tokio::select! {
+            biased;
+            _ = self.shared.cancel.notified() => {
+                Err(VmError::HostError("SSE stream cancelled".to_string()))
+            }
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                Err(VmError::HostError(SSE_TOTAL_DEADLINE_ERROR.to_string()))
+            }
+            sent = sender.send(item) => {
+                sent.map_err(|_| VmError::HostError("SSE stream closed".to_string()))?;
+                let wake = self
+                    .shared
+                    .waker
+                    .lock()
+                    .expect("sse waker lock should not be poisoned")
+                    .take();
+                if let Some(waker) = wake {
+                    waker.wake();
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -509,11 +643,17 @@ fn runtime_block_on<F: Future>(future: F) -> F::Output {
 /// callback and calls [`apply_action`](Self::apply_action) with the result.
 struct SseStreamDriver {
     shared: Arc<SseShared>,
+    /// Bounded FIFO receiver for items published by the worker.
+    receiver: mpsc::Receiver<Value>,
     status: u16,
     headers: Arc<VmMap>,
     url: String,
     items: usize,
     bytes_received: Arc<AtomicUsize>,
+    /// The absolute total deadline; the driver enforces it in
+    /// [`apply_action`](Self::apply_action) so a slow callback cannot extend
+    /// the stream past its deadline.
+    deadline: Instant,
     permit: super::ConnectionPermit,
 }
 
@@ -536,12 +676,7 @@ impl SseStreamDriver {
 
 impl HostStreamDriver for SseStreamDriver {
     fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<HostStreamPoll>> {
-        let mut item_guard = self
-            .shared
-            .item
-            .lock()
-            .expect("sse item lock should not be poisoned");
-        if let Some(item) = item_guard.take() {
+        if let Ok(item) = self.receiver.try_recv() {
             // Track items and capture metadata from the open item.
             if let Value::Map(ref map) = item {
                 if let Some(Value::String(kind)) = map.get(&Value::string("kind")) {
@@ -561,7 +696,6 @@ impl HostStreamDriver for SseStreamDriver {
             self.items = self.items.saturating_add(1);
             return Poll::Ready(Ok(HostStreamPoll::Item(item)));
         }
-        drop(item_guard);
 
         if self.shared.stopping.load(Ordering::SeqCst) {
             // Take the result if the worker already published it, otherwise
@@ -604,6 +738,13 @@ impl HostStreamDriver for SseStreamDriver {
     }
 
     fn apply_action(&mut self, action: Value) -> VmResult<HostStreamAction> {
+        // The absolute total deadline is enforced here too: a slow callback
+        // (e.g. one awaiting a host future) must not extend the stream past
+        // its deadline. Once the deadline has passed, every callback action
+        // fails deterministically.
+        if Instant::now() >= self.deadline {
+            return Err(VmError::HostError(SSE_TOTAL_DEADLINE_ERROR.to_string()));
+        }
         let Value::Map(action) = action else {
             return Err(VmError::HostError(
                 "SSE callback action must be a map".to_string(),
@@ -760,11 +901,12 @@ pub(super) fn builtin_http_client_sse(
         ));
     }
 
+    let (items, receiver) = mpsc::channel(SSE_CHANNEL_CAPACITY);
     let shared = Arc::new(SseShared {
         stopping: AtomicBool::new(false),
         cancel: Notify::new(),
         waker: std::sync::Mutex::new(None),
-        item: std::sync::Mutex::new(None),
+        items,
         done: AtomicBool::new(false),
         result: std::sync::Mutex::new(None),
         join_handle: std::sync::Mutex::new(None),
@@ -801,10 +943,17 @@ pub(super) fn builtin_http_client_sse(
         .map_err(|error| VmError::HostError(format!("failed to start SSE operation: {error}")))?;
     let _ = op_id;
 
+    // The absolute stream duration mirrors `HttpRequestContext::capture`:
+    // the script `timeout_ms` caps the host maximum stream duration. The
+    // worker derives its absolute deadline from this when it begins stream
+    // I/O (see `SseWorker::stream_lifecycle`).
+    let total_duration = script_timeout.map_or(context.config.max_stream_duration, |timeout| {
+        timeout.min(context.config.max_stream_duration)
+    });
     let worker = Arc::new(SseWorker {
         config: context.config.clone(),
         request,
-        deadline,
+        total_duration,
         shared: Arc::clone(&shared),
         items: Arc::new(AtomicUsize::new(0)),
         bytes_received: Arc::new(AtomicUsize::new(0)),
@@ -825,11 +974,13 @@ pub(super) fn builtin_http_client_sse(
     let permit = context.into_permit();
     let driver = SseStreamDriver {
         shared,
+        receiver,
         status: 0,
         headers: Arc::new(VmMap::default()),
         url: String::new(),
         items: 0,
         bytes_received,
+        deadline,
         permit,
     };
 

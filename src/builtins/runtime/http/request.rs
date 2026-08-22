@@ -2,7 +2,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures_util::task::AtomicWaker;
 use http_body_util::BodyExt;
@@ -810,6 +810,7 @@ async fn execute_request_until(
             ConnectionStage {
                 observer: observer.clone(),
                 deadline: connect_deadline,
+                response_duration: None,
                 tls_config: tls_config.clone(),
             },
         )
@@ -977,21 +978,22 @@ pub(super) async fn open_stream_response(
     config: &HttpConfig,
     request: &HttpRequest,
     observer: ResponseReadObserver,
-    deadline: Option<Instant>,
+    response_duration: Option<Duration>,
 ) -> VmResult<(OwnedResponse, url::Url)> {
     let mut method = request.method.clone();
     let mut url = request.url.clone();
     let mut body = request.body.clone();
     let mut headers = request.headers.clone();
     for redirect_index in 0..=config.max_redirects {
-        let mut connect_deadline = Instant::now()
+        // Connection establishment (TCP connect, TLS, request write) is
+        // bounded by the connect timeout only; the streaming response budget
+        // applies to the response header/body wait, so slow connects or
+        // scheduling delays never eat into the stream duration.
+        let connect_deadline = Instant::now()
             .checked_add(config.connect_timeout)
             .ok_or_else(|| {
                 VmError::HostError("HTTP connect_timeout cannot form a deadline".to_string())
             })?;
-        if let Some(deadline) = deadline {
-            connect_deadline = connect_deadline.min(deadline);
-        }
         let resolved = with_deadline(
             connect_deadline,
             resolve_url(config, SchemeFamily::Http, &url),
@@ -1007,6 +1009,7 @@ pub(super) async fn open_stream_response(
             ConnectionStage {
                 observer: observer.clone(),
                 deadline: connect_deadline,
+                response_duration,
                 tls_config: None,
             },
         )
@@ -1097,6 +1100,12 @@ fn reject_declared_oversize(
 struct ConnectionStage {
     observer: ResponseReadObserver,
     deadline: Instant,
+    /// Bounds only the response-header wait after the request is written.
+    /// `None` leaves the header wait bounded solely by `deadline` (the
+    /// buffered-request behaviour). Streaming adapters pass a duration so the
+    /// stream deadline starts when the request is actually sent, keeping the
+    /// connect + request write outside the stream budget.
+    response_duration: Option<Duration>,
     tls_config: Option<Arc<rustls::ClientConfig>>,
 }
 
@@ -1111,6 +1120,7 @@ async fn send_request(
     let ConnectionStage {
         observer,
         deadline: connect_deadline,
+        response_duration,
         tls_config,
     } = stage;
     let stream = with_deadline(connect_deadline, async {
@@ -1145,9 +1155,25 @@ async fn send_request(
                 .map_err(|error| VmError::HostError(format!("HTTP request failed: {error}")))
         })
         .await?;
-        send_over_io(method, url, headers, body, ReadCapIo::new(stream, observer)).await
+        send_over_io(
+            method,
+            url,
+            headers,
+            body,
+            ReadCapIo::new(stream, observer),
+            response_duration,
+        )
+        .await
     } else {
-        send_over_io(method, url, headers, body, ReadCapIo::new(raw, observer)).await
+        send_over_io(
+            method,
+            url,
+            headers,
+            body,
+            ReadCapIo::new(raw, observer),
+            response_duration,
+        )
+        .await
     }
 }
 
@@ -1176,6 +1202,7 @@ pub(super) fn pending_connection_test(
                 &request.headers,
                 None,
                 ReadCapIo::new(RawReadCapIo::new(io, observer.clone()), observer.clone()),
+                None,
             )
             .await?;
             observer.admit_body(1024);
@@ -1191,6 +1218,7 @@ async fn send_over_io<T>(
     headers: &[(hyper::header::HeaderName, hyper::header::HeaderValue)],
     body: Option<&[u8]>,
     io: ReadCapIo<T>,
+    response_duration: Option<Duration>,
 ) -> VmResult<OwnedResponse>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1226,35 +1254,54 @@ where
         .body(request_body)
         .map_err(|error| VmError::HostError(format!("HTTP request setup failed: {error}")))?;
     let mut connection: BoxConnection = Box::pin(connection);
-    let (response, connection) = {
+    // The response header wait (and the request write) is bounded by the
+    // streaming response budget when one is supplied. The budget starts when
+    // the request is actually sent, so connection establishment (bounded by
+    // the connect deadline) never eats into the stream duration.
+    let send_response = async {
         let response = sender.send_request(request);
         tokio::pin!(response);
-        tokio::select! {
-            biased;
-            response = &mut response => (
-                response.map_err(|error| {
-                    VmError::HostError(format!("HTTP request failed: {error}"))
-                })?,
-                Some(connection),
-            ),
-            connection_result = connection.as_mut() => {
-                let response_result = response.await;
-                let response = match (connection_result, response_result) {
-                    (_, Ok(response)) => response,
-                    (Ok(()), Err(error)) => {
-                        return Err(VmError::HostError(format!(
-                            "HTTP request failed: {error}"
-                        )));
-                    }
-                    (Err(connection_error), Err(request_error)) => {
-                        return Err(VmError::HostError(format!(
-                            "HTTP connection failed before the response: {connection_error}; request failed: {request_error}"
-                        )));
-                    }
-                };
-                (response, None)
+        let (response, connection) = {
+            tokio::select! {
+                biased;
+                response = &mut response => (
+                    response.map_err(|error| {
+                        VmError::HostError(format!("HTTP request failed: {error}"))
+                    })?,
+                    Some(connection),
+                ),
+                connection_result = connection.as_mut() => {
+                    let response_result = response.await;
+                    let response = match (connection_result, response_result) {
+                        (_, Ok(response)) => response,
+                        (Ok(()), Err(error)) => {
+                            return Err(VmError::HostError(format!(
+                                "HTTP request failed: {error}"
+                            )));
+                        }
+                        (Err(connection_error), Err(request_error)) => {
+                            return Err(VmError::HostError(format!(
+                                "HTTP connection failed before the response: {connection_error}; request failed: {request_error}"
+                            )));
+                        }
+                    };
+                    (response, None)
+                }
             }
+        };
+        Ok::<_, VmError>((response, connection))
+    };
+    let (response, connection) = match response_duration {
+        Some(duration) => {
+            with_deadline(
+                Instant::now().checked_add(duration).ok_or_else(|| {
+                    VmError::HostError("HTTP response deadline cannot form a deadline".to_string())
+                })?,
+                send_response,
+            )
+            .await?
         }
+        None => send_response.await?,
     };
     Ok(OwnedResponse {
         connection,
