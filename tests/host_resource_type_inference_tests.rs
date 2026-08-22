@@ -602,16 +602,28 @@ fn analyze_source_with_catalog_works() {
     let model = analyze_source(source).expect("analyze_source should succeed");
     let catalog = model.catalog();
     #[cfg(feature = "runtime")]
-    assert!(
-        !catalog.functions().is_empty(),
-        "default catalog must carry the standard host surface"
-    );
-    #[cfg(feature = "runtime")]
-    assert_eq!(
-        catalog.fingerprint(),
-        vm::standard_host_catalog().fingerprint(),
-        "default catalog must be the authoritative standard snapshot"
-    );
+    {
+        assert!(
+            !catalog.functions().is_empty(),
+            "default catalog must carry the standard host surface"
+        );
+        let first = vm::standard_host_catalog();
+        let second = vm::standard_host_catalog();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "standard catalog snapshot must be cached"
+        );
+        assert_eq!(
+            vm::standard_host_catalog_fingerprint(),
+            first.fingerprint(),
+            "cached standard fingerprint must match the immutable snapshot"
+        );
+        assert_eq!(
+            catalog.fingerprint(),
+            first.fingerprint(),
+            "default catalog must be the authoritative standard snapshot"
+        );
+    }
     #[cfg(not(feature = "runtime"))]
     assert!(
         catalog.functions().is_empty(),

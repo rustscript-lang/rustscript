@@ -648,6 +648,27 @@ pub struct HostFunctionRegistry {
     registry_state: Arc<()>,
     registry_generation_token: Arc<()>,
     registry_generation: Arc<AtomicU64>,
+    /// Shared by ordinary `Clone` siblings; transaction staging keeps the
+    /// origin and publishes only through its typed transaction handle.
+    transaction_origin: Arc<()>,
+}
+
+/// A private, single-use publication capability for one registry origin.
+///
+/// Keeping the staged registry and origin token together prevents a caller
+/// from committing an arbitrary clone or committing the same staging twice.
+/// The public API exposes only [`HostFunctionRegistry::transactionally`].
+struct RegistryTransaction {
+    origin: Arc<()>,
+    staged: Option<HostFunctionRegistry>,
+}
+
+impl RegistryTransaction {
+    fn registry_mut(&mut self) -> &mut HostFunctionRegistry {
+        self.staged
+            .as_mut()
+            .expect("registry transaction must be live while staging")
+    }
 }
 
 impl Default for HostFunctionRegistry {
@@ -670,13 +691,14 @@ impl HostFunctionRegistry {
             registry_state: Arc::new(()),
             registry_generation_token: Arc::new(()),
             registry_generation: Arc::new(AtomicU64::new(0)),
+            transaction_origin: Arc::new(()),
         }
     }
 
     pub fn new() -> Self {
         static DEFAULT_REGISTRY: OnceLock<HostFunctionRegistry> = OnceLock::new();
 
-        DEFAULT_REGISTRY
+        let mut registry = DEFAULT_REGISTRY
             .get_or_init(|| {
                 let mut registry = Self::empty();
                 crate::builtins::runtime::register_default_host_functions(&mut registry);
@@ -684,7 +706,12 @@ impl HostFunctionRegistry {
                 registry.allow_default_host_capabilities = true;
                 registry
             })
-            .transaction_clone()
+            .transaction_clone();
+        // The immutable default snapshot is a template; every public `new`
+        // call starts a distinct registry origin so its private transaction
+        // handles cannot publish into another fresh registry.
+        registry.transaction_origin = Arc::new(());
+        registry
     }
 
     /// Returns the standard host registry with every registered host function present but
@@ -753,24 +780,11 @@ impl HostFunctionRegistry {
 
     /// Creates an isolated staging registry for a registration transaction.
     ///
-    /// The staged registry shares the Arc-backed entries / maps / capability
-    /// profile with the caller — safe because every mutation goes through
-    /// `Arc::make_mut`, which detaches before writing when the reference count
-    /// is shared — while the coherence-sensitive fields (plan cache, registry
-    /// state / generation token identity and the generation counter) are
-    /// *re-isolated* so staging is fully detached from the caller. A failed or
-    /// abandoned staging therefore cannot affect the caller's slots, plans,
-    /// capabilities or revision.
-    ///
-    /// This differs from the derived `Clone`, which preserves the shared
-    /// coherence identity (plan cache, state / generation tokens and the
-    /// generation counter) so sibling forks observe each other's mutations —
-    /// the correct semantics for capability branching, but wrong for staging,
-    /// where a failed registration must leave the caller observationally
-    /// unchanged. Registration transactions must use this method (or
-    /// [`transactionally`](Self::transactionally)), never `Clone`.
-    pub fn transaction_clone(&self) -> Self {
-        let mut staged = Self {
+    /// This helper is private so callers cannot publish an arbitrary clone.
+    /// The public [`transactionally`](Self::transactionally) API owns the
+    /// origin token and single-use publication handle.
+    fn transaction_clone(&self) -> Self {
+        Self {
             entries: Arc::clone(&self.entries),
             by_name: Arc::clone(&self.by_name),
             by_exact: Arc::clone(&self.by_exact),
@@ -784,37 +798,50 @@ impl HostFunctionRegistry {
             registry_generation: Arc::new(AtomicU64::new(
                 self.registry_generation.load(Ordering::Relaxed),
             )),
-        };
-        staged
+            transaction_origin: Arc::clone(&self.transaction_origin),
+        }
     }
 
-    /// Publishes a fully staged registry after every fallible registration
-    /// operation has succeeded. The staged state replaces the caller's state
-    /// exactly once, and the plan cache is invalidated so any subsequently
-    /// cached binding plan is recomputed against the published registry.
+    fn begin_transaction(&self) -> RegistryTransaction {
+        RegistryTransaction {
+            origin: Arc::clone(&self.transaction_origin),
+            staged: Some(self.transaction_clone()),
+        }
+    }
+
+    /// Publishes a transaction produced by this registry exactly once.
     ///
-    /// Callers must obtain `staged` via [`transaction_clone`](Self::transaction_clone)
-    /// and must not modify `self` while staging.
-    pub fn commit_transaction(&mut self, staged: Self) {
+    /// The origin check is defensive even though the transaction type is
+    /// private: it keeps future internal call sites from publishing staging
+    /// from an unrelated registry lineage.
+    fn commit_transaction(&mut self, transaction: &mut RegistryTransaction) -> VmResult<()> {
+        if !Arc::ptr_eq(&self.transaction_origin, &transaction.origin) {
+            return Err(VmError::HostError(
+                "registry transaction belongs to a different registry".to_string(),
+            ));
+        }
+        let staged = transaction.staged.take().ok_or_else(|| {
+            VmError::HostError("registry transaction was already committed".to_string())
+        })?;
         *self = staged;
         self.invalidate_plan_cache();
+        Ok(())
     }
 
     /// Applies a fallible staging closure transactionally.
     ///
-    /// The closure receives an isolated staging registry produced by
-    /// [`transaction_clone`](Self::transaction_clone). If it returns an error,
-    /// the caller's registry is left observationally unchanged (slots, plans,
-    /// capability profile and revision). On success the staged state is
-    /// published exactly once via [`commit_transaction`](Self::commit_transaction).
+    /// The closure receives an isolated staging registry produced by a private
+    /// transaction handle. If it returns an error, the caller's registry is
+    /// left observationally unchanged (slots, plans, capability profile and
+    /// revision). A panic also drops the staging handle before publication.
+    /// On success the staged state is published exactly once.
     pub fn transactionally<F>(&mut self, stage: F) -> VmResult<()>
     where
         F: FnOnce(&mut HostFunctionRegistry) -> VmResult<()>,
     {
-        let mut staged = self.transaction_clone();
-        stage(&mut staged)?;
-        self.commit_transaction(staged);
-        Ok(())
+        let mut transaction = self.begin_transaction();
+        stage(transaction.registry_mut())?;
+        self.commit_transaction(&mut transaction)
     }
 
     #[allow(dead_code)]
@@ -1338,11 +1365,19 @@ impl HostFunctionRegistry {
         #[cfg(feature = "runtime")]
         if self.should_stage_standard_exact_imports(&vm.program.imports) {
             let mut staged = self.transaction_clone();
-            crate::builtins::runtime::register_io_builtin_module(&mut staged)?;
+            let (requires_io, requires_http, requires_database) =
+                crate::builtins::runtime::standard_exact_surface_requirements(&vm.program.imports);
+            if requires_io {
+                crate::builtins::runtime::register_io_builtin_module(&mut staged)?;
+            }
             #[cfg(feature = "http-client")]
-            crate::builtins::runtime::register_http_builtin_module(&mut staged)?;
+            if requires_http {
+                crate::builtins::runtime::register_http_builtin_module(&mut staged)?;
+            }
             #[cfg(feature = "sqlite")]
-            crate::builtins::runtime::register_sqlite_builtin_module(&mut staged)?;
+            if requires_database {
+                crate::builtins::runtime::register_sqlite_builtin_module(&mut staged)?;
+            }
             let plan = staged.prepare_shared_plan(&vm.program.imports)?;
             return staged.bind_vm_with_plan(vm, &plan);
         }
@@ -1356,7 +1391,7 @@ impl HostFunctionRegistry {
             return false;
         }
         let standard = crate::builtins::runtime::standard_host_catalog();
-        let fingerprint = standard.fingerprint();
+        let fingerprint = crate::builtins::runtime::standard_host_catalog_fingerprint();
         imports.iter().all(|import| {
             let Some(schema) = import.schema.as_ref() else {
                 return false;
@@ -4377,5 +4412,149 @@ mod exact_contract_unit_tests {
             "scalar import may inline; the resource-return import must not — dump:\n{}",
             vm.dump_jit_info()
         );
+    }
+}
+
+#[cfg(test)]
+mod registry_transaction_tests {
+    use super::*;
+
+    fn dummy(_vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+        Ok(CallOutcome::Return(CallReturn::none()))
+    }
+
+    fn import(name: &str) -> HostImport {
+        HostImport {
+            name: name.to_string(),
+            arity: 0,
+            return_type: crate::bytecode::ValueType::Unknown,
+            schema: None,
+        }
+    }
+
+    #[test]
+    fn closure_error_rolls_back_slots_generation_and_plan_cache() {
+        let mut registry = HostFunctionRegistry::empty();
+        registry.register_static("baseline", 0, dummy);
+        registry.prepare_plan(&[]).expect("baseline plan");
+        let generation = registry.registry_generation();
+        let cache_len = registry.plan_cache_len();
+
+        let error = registry
+            .transactionally(|staged| {
+                staged.register_static("staged", 0, dummy);
+                Err(VmError::HostError("abort".to_string()))
+            })
+            .expect_err("closure error must abort publication");
+        assert!(matches!(error, VmError::HostError(message) if message == "abort"));
+        assert!(matches!(
+            registry.resolve_import(&import("baseline")),
+            Ok(0)
+        ));
+        assert!(matches!(
+            registry.resolve_import(&import("staged")),
+            Err(VmError::UnboundImport(name)) if name == "staged"
+        ));
+        assert_eq!(registry.registry_generation(), generation);
+        assert_eq!(registry.plan_cache_len(), cache_len);
+    }
+
+    #[test]
+    fn panic_unwind_drops_staging_without_mutating_the_original() {
+        let mut registry = HostFunctionRegistry::empty();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = registry.transactionally(|staged| {
+                staged.register_static("panic_only", 0, dummy);
+                panic!("abort staging");
+            });
+        }));
+        assert!(result.is_err());
+        assert!(matches!(
+            registry.resolve_import(&import("panic_only")),
+            Err(VmError::UnboundImport(name)) if name == "panic_only"
+        ));
+    }
+
+    #[test]
+    fn staging_is_deeply_isolated_until_one_successful_publication() {
+        let mut registry = HostFunctionRegistry::empty();
+        let original = registry.clone();
+        let generation = registry.registry_generation();
+        let cache_len = registry.plan_cache_len();
+        registry
+            .transactionally(|staged| {
+                staged.register_static("published", 0, dummy);
+                assert!(staged.resolve_import(&import("published")).is_ok());
+                assert!(original.resolve_import(&import("published")).is_err());
+                assert_eq!(original.registry_generation(), generation);
+                assert_eq!(original.plan_cache_len(), cache_len);
+                Ok(())
+            })
+            .expect("successful transaction should publish once");
+        assert!(registry.resolve_import(&import("published")).is_ok());
+        assert!(registry.registry_generation() > generation);
+        assert_eq!(registry.plan_cache_len(), 0);
+    }
+
+    #[test]
+    fn ordinary_clones_share_coherence_identity_but_staging_does_not() {
+        let registry = HostFunctionRegistry::empty();
+        let sibling = registry.clone();
+        assert!(Arc::ptr_eq(
+            &registry.registry_state,
+            &sibling.registry_state
+        ));
+        assert!(Arc::ptr_eq(
+            &registry.registry_generation_token,
+            &sibling.registry_generation_token
+        ));
+        assert!(Arc::ptr_eq(
+            &registry.registry_generation,
+            &sibling.registry_generation
+        ));
+
+        let transaction = registry.begin_transaction();
+        let staged = transaction.staged.as_ref().expect("live staging");
+        assert!(!Arc::ptr_eq(
+            &registry.registry_state,
+            &staged.registry_state
+        ));
+        assert!(!Arc::ptr_eq(
+            &registry.registry_generation_token,
+            &staged.registry_generation_token
+        ));
+        assert!(!Arc::ptr_eq(
+            &registry.registry_generation,
+            &staged.registry_generation
+        ));
+    }
+
+    #[test]
+    fn unrelated_and_double_publications_are_rejected_by_the_private_handle() {
+        let mut first = HostFunctionRegistry::empty();
+        let mut second = HostFunctionRegistry::empty();
+        let fresh_a = HostFunctionRegistry::new();
+        let fresh_b = HostFunctionRegistry::new();
+        assert!(!Arc::ptr_eq(
+            &fresh_a.transaction_origin,
+            &fresh_b.transaction_origin
+        ));
+        let mut transaction = second.begin_transaction();
+
+        let unrelated = first
+            .commit_transaction(&mut transaction)
+            .expect_err("unrelated registry must not publish staging");
+        assert!(matches!(unrelated, VmError::HostError(message) if message.contains("different")));
+        first
+            .resolve_import(&import("anything"))
+            .expect_err("unrelated commit must leave first unchanged");
+
+        second
+            .commit_transaction(&mut transaction)
+            .expect("origin registry may publish its own transaction");
+        let double = second
+            .commit_transaction(&mut transaction)
+            .expect_err("the same transaction cannot publish twice");
+        assert!(matches!(double, VmError::HostError(message) if message.contains("already")));
     }
 }

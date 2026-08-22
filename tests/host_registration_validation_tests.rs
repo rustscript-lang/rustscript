@@ -6,9 +6,27 @@ use vm::compiler::{
     CompileSourceFileOptions, SourceFlavor, compile_source_with_flavor_and_options,
 };
 use vm::{
-    HostApiBuilder, HostApiCatalog, HostFunctionRegistry, HostFunctionSchema,
-    HostImportBindingError, HostTypeSchema, VmError, catalog_import_schemas,
+    HostApiBuilder, HostApiCatalog, HostFunctionRegistry, HostFunctionSchema, HostImport,
+    HostImportBindingError, HostTypeSchema, ValueType, VmError, catalog_import_schemas,
 };
+
+fn coarse_return_type(schema: &HostTypeSchema) -> ValueType {
+    match schema {
+        HostTypeSchema::Null => ValueType::Null,
+        HostTypeSchema::Int => ValueType::Int,
+        HostTypeSchema::Float => ValueType::Float,
+        HostTypeSchema::Bool => ValueType::Bool,
+        HostTypeSchema::String => ValueType::String,
+        HostTypeSchema::Bytes => ValueType::Bytes,
+        HostTypeSchema::Array(_) => ValueType::Array,
+        HostTypeSchema::Map(_) => ValueType::Map,
+        HostTypeSchema::Optional(inner) => coarse_return_type(inner),
+        HostTypeSchema::Callable { .. } => ValueType::Callable,
+        HostTypeSchema::Unknown | HostTypeSchema::Number | HostTypeSchema::Resource(_) => {
+            ValueType::Unknown
+        }
+    }
+}
 
 fn without_function(base: &HostApiCatalog, removed: &str) -> Arc<HostApiCatalog> {
     let mut builder = HostApiBuilder::new();
@@ -98,7 +116,6 @@ fn assert_io_probe_not_partially_registered(catalog: &HostApiCatalog, probe: &st
         matches!(
             error,
             VmError::HostImportBinding(HostImportBindingError::MissingExact { .. })
-                | VmError::HostError(_)
         ),
         "partial-registration probe should report a typed binding miss: {error:?}"
     );
@@ -149,6 +166,35 @@ fn io_registration_retry_with_corrected_catalog_publishes_all_exact_members() {
     assert!(vm::register_io_builtin_module_from_catalog(&mut registry, &reduced).is_err());
     vm::register_io_builtin_module_from_catalog(&mut registry, &catalog)
         .expect("corrected catalog should retry successfully");
+
+    let probe_options =
+        CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog));
+    let probe = compile_source_with_flavor_and_options(
+        "use io; io::exists(\".\");",
+        SourceFlavor::RustScript,
+        probe_options,
+    )
+    .expect("corrected catalog probe should compile");
+    registry
+        .prepare_plan(&probe.program.imports)
+        .expect("corrected catalog exact probe should prepare");
+
+    let mut all_exact_imports = Vec::new();
+    for function in catalog.functions() {
+        let return_type = coarse_return_type(&function.return_type);
+        for schema in catalog_import_schemas(&catalog, &function.name) {
+            all_exact_imports.push(HostImport {
+                name: function.name.clone(),
+                arity: schema.params.len() as u8,
+                return_type,
+                schema: Some(schema),
+            });
+        }
+    }
+    registry
+        .prepare_plan(&all_exact_imports)
+        .expect("every corrected IO catalog schema should bind exactly");
+
     for name in [
         "io::open",
         "io::popen",

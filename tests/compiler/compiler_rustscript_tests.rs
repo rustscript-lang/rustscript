@@ -3225,11 +3225,18 @@ fn compile_source_file_rustscript_rejects_import_keyword() {
     };
     assert!(
         matches!(
-            err,
-            vm::SourcePathError::InvalidImportSyntax { ref message, .. }
-            if message.contains("uses 'use', not 'import'")
+            &err,
+            vm::SourcePathError::SourceWithMap {
+                error: vm::SourceError::Parse(_),
+                ..
+            }
         ),
-        "expected use-keyword guidance, got {err:?}"
+        "expected parser-level import diagnostic, got {err:?}"
+    );
+    assert!(err.to_string().contains("expected ';' after expression"));
+    assert_eq!(
+        err.sources().unwrap().file(0).unwrap().name,
+        main_path.to_string_lossy()
     );
 
     let _ = std::fs::remove_file(main_path);

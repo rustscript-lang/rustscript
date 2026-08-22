@@ -30,6 +30,70 @@ fn remove_module_root(root: &Path) {
 }
 
 #[test]
+fn import_scan_ignores_comments_and_keeps_multiline_aliases_before_body_errors() {
+    let root = temp_module_root("vm_rustscript_import_scan_parser_test");
+    write_source(
+        &root.join("module.rss"),
+        "pub fn value() -> int { 41 }",
+        "module source",
+    );
+    let main_path = root.join("main.rss");
+    write_source(
+        &main_path,
+        r#"
+        /*
+           use self::missing;
+           // use self::also_missing;
+        */
+	use /* comments between tokens */ self::module::{
+            value /* trailing parameter comment */ as answer,
+        }; // an inline comment must not affect the declaration
+        answer();
+        unknown_body_function();
+    "#,
+        "main source",
+    );
+
+    let error = match compile_source_file(&main_path) {
+        Ok(_) => panic!("the intentionally invalid body should fail after import discovery"),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{error:?}").contains("unknown_body_function"),
+        "body diagnostics should be reached after the real import is discovered: {error:?}"
+    );
+
+    remove_module_root(&root);
+}
+
+#[test]
+fn malformed_import_reports_the_original_source_path_and_line() {
+    let root = temp_module_root("vm_rustscript_import_scan_diagnostic_test");
+    let main_path = root.join("main.rss");
+    write_source(
+        &main_path,
+        "\n\n\tuse module::{ value as };\n",
+        "main source",
+    );
+
+    let error = match compile_source_file(&main_path) {
+        Ok(_) => panic!("malformed import should fail during parser-level discovery"),
+        Err(error) => error,
+    };
+    let rendered = format!("{error:?}");
+    assert!(
+        rendered.contains(&main_path.display().to_string()),
+        "diagnostic should retain the importing source path: {rendered}"
+    );
+    assert!(
+        rendered.contains("line: 3") || rendered.contains("line 3"),
+        "diagnostic should retain the malformed import line: {rendered}"
+    );
+
+    remove_module_root(&root);
+}
+
+#[test]
 fn compile_source_file_module_override_path_redirects_import_spec() {
     let root = temp_module_root("vm_rustscript_module_override_test");
 

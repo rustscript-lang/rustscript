@@ -35,7 +35,7 @@ pub(super) fn scan_module_imports(
 ) -> Result<(Vec<ModuleImport>, Vec<UseDecl>), SourcePathError> {
     match flavor {
         SourceFlavor::RustScript => {
-            let decls = parse_rustscript_use_declarations(source, path, options)?;
+            let decls = parse_rustscript_use_declarations(source, options)?;
             let imports = use_declarations_to_module_imports(path, &decls)?;
             Ok((imports, decls))
         }
@@ -57,32 +57,9 @@ pub(super) fn scan_module_imports(
 /// loader's semantic resolution pass resolves later.
 fn parse_rustscript_use_declarations(
     source: &str,
-    path: &Path,
     options: &CompileSourceFileOptions,
 ) -> Result<Vec<UseDecl>, SourcePathError> {
-    for (idx, raw_line) in source.lines().enumerate() {
-        let line = raw_line.trim();
-        if line.starts_with("import ") {
-            return Err(SourcePathError::InvalidImportSyntax {
-                path: path.to_path_buf(),
-                line: idx + 1,
-                message: "RustScript uses 'use', not 'import'".to_string(),
-            });
-        }
-    }
-
-    let scan_source = source
-        .lines()
-        .map(|line| {
-            if line.trim_start().starts_with("use ") {
-                line
-            } else {
-                ""
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let ir = frontends::parse_source_for_import_scan(&scan_source, options)
+    let ir = frontends::parse_source_for_import_scan(source, options)
         .map_err(|err| SourcePathError::Source(SourceError::Parse(err)))?;
     Ok(ir.use_declarations)
 }
@@ -389,6 +366,24 @@ mod tests {
     }
 
     #[test]
+    fn structured_scan_ignores_comment_text_and_parses_multiline_aliases() {
+        let source = "/*\nuse self::missing;\n*/\n\tuse self::module::{\n    value /* comment */ as answer,\n}; // trailing comment\n";
+        let path = PathBuf::from("/root/main.rss");
+        let (imports, decls) =
+            scan_module_imports(source, SourceFlavor::RustScript, &path, &Default::default())
+                .expect("comment and multiline syntax should scan");
+
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].spec, "./module.rss");
+        assert_eq!(imports[0].line, 4);
+        assert!(matches!(&imports[0].clause, ImportClause::Named(named)
+            if named.len() == 1
+                && named[0].imported == "value"
+                && named[0].local == "answer"));
+        assert_eq!(decls.len(), 1);
+    }
+
+    #[test]
     fn structured_scan_rejects_import_keyword() {
         let source = "import \"./module.rss\";\n";
         let path = PathBuf::from("/root/main.rss");
@@ -396,8 +391,8 @@ mod tests {
             parse_module_imports(source, SourceFlavor::RustScript, &path, &Default::default())
                 .expect_err("import keyword should be rejected");
         assert!(
-            err.to_string().contains("uses 'use', not 'import'"),
-            "unexpected error: {err}"
+            err.to_string().contains("expected ';' after expression"),
+            "unexpected parser diagnostic: {err}"
         );
     }
 

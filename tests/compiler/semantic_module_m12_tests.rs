@@ -305,8 +305,12 @@ fn structured_import_syntax_rejects_import_keyword() {
     };
     let message = err.to_string();
     assert!(
-        message.contains("uses 'use', not 'import'"),
-        "unexpected error: {message}"
+        message.contains("expected ';' after expression"),
+        "unexpected parser diagnostic: {message}"
+    );
+    assert_eq!(
+        err.sources().unwrap().file(0).unwrap().name,
+        main_path.to_string_lossy()
     );
     remove_module_root(&root);
 }

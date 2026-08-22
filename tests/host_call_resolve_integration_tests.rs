@@ -9,10 +9,13 @@
 //! ambiguity/fallback, diagnostics, nested resource schemas and fingerprint
 //! propagation.
 
-use vm::compiler::TypeSchema;
+use std::sync::Arc;
+
+use vm::compiler::{CompileSourceFileOptions, SourceFlavor, TypeSchema};
 use vm::{
     HostApiBuilder, HostApiCatalog, HostCallResolveError, HostCallResolver, HostFunctionSchema,
     HostParamPassing, HostParamSchema, HostTypeSchema, ResourceTypeKey, ResourceTypeSchema,
+    compile_source_with_flavor_and_options,
 };
 
 fn io_file() -> ResourceTypeKey {
@@ -193,6 +196,103 @@ fn borrow_take_ownership_modes_are_preserved() {
             .expect("reap resolves")
             .passing,
         vec![HostParamPassing::TakeOwned]
+    );
+}
+
+#[test]
+fn compiler_uses_declared_passing_for_custom_io_namespaces() {
+    let key = io_file();
+    let mut builder = HostApiBuilder::new();
+    builder.resource(ResourceTypeSchema::new(key.clone(), "An open file"));
+    builder.function(HostFunctionSchema::with_return(
+        "io::open_custom",
+        vec![value("path", HostTypeSchema::String)],
+        resource(key.clone()),
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        "io::take_owned_custom",
+        vec![HostParamSchema::with_passing(
+            "handle",
+            resource(key.clone()),
+            HostParamPassing::TakeOwned,
+        )],
+        HostTypeSchema::Int,
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        "io::borrow_mut_custom",
+        vec![HostParamSchema::with_passing(
+            "handle",
+            resource(key),
+            HostParamPassing::BorrowMut,
+        )],
+        HostTypeSchema::Int,
+    ));
+    let catalog = Arc::new(builder.build().expect("custom catalog must build"));
+
+    let compiled = compile_source_with_flavor_and_options(
+        r#"
+        use io;
+        let owned = io::open_custom("owned");
+        io::take_owned_custom(owned);
+        let mut borrowed = io::open_custom("borrowed");
+        io::borrow_mut_custom(&mut borrowed);
+        "#,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::default().with_host_api_catalog(catalog),
+    )
+    .expect("custom IO-prefixed catalog should compile");
+
+    let passing = compiled
+        .program
+        .imports
+        .iter()
+        .filter(|import| import.name.ends_with("_custom"))
+        .map(|import| {
+            (
+                import.name.as_str(),
+                import
+                    .schema
+                    .as_ref()
+                    .expect("custom import should have exact schema")
+                    .params
+                    .iter()
+                    .map(|param| param.passing)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(passing.contains(&("io::take_owned_custom", vec![HostParamPassing::TakeOwned])));
+    assert!(passing.contains(&("io::borrow_mut_custom", vec![HostParamPassing::BorrowMut])));
+}
+
+#[cfg(feature = "runtime")]
+#[test]
+fn standard_io_bare_resource_handle_stays_borrowed() {
+    let compiled = compile_source_with_flavor_and_options(
+        r#"
+        use io;
+        let handle = io::open("file", "r");
+        io::read_all(handle);
+        "#,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::default().with_host_api_catalog(vm::standard_host_catalog()),
+    )
+    .expect("standard IO read_all should accept a bare legacy handle");
+
+    let import = compiled
+        .program
+        .imports
+        .iter()
+        .find(|import| import.name == "io::read_all" && import.arity == 1)
+        .expect("read_all import");
+    assert_eq!(
+        import
+            .schema
+            .as_ref()
+            .expect("exact read_all schema")
+            .params[0]
+            .passing,
+        HostParamPassing::Borrow
     );
 }
 

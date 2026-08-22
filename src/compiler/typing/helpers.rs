@@ -151,7 +151,7 @@ impl<'a> HostCallResolutionPass<'a> {
         let actuals = args
             .iter()
             .zip(&schemas)
-            .map(|(arg, schema)| ActualCallArg::new(schema, actual_passing(&name, arg, schema)))
+            .map(|(arg, schema)| ActualCallArg::new(schema, actual_passing(arg, schema)))
             .collect::<Vec<_>>();
         let result =
             resolve_candidate_slice_with_passing(&name, resolver_candidates, &actuals, fingerprint);
@@ -254,18 +254,17 @@ impl<'a> HostCallResolutionPass<'a> {
     }
 }
 
-fn actual_passing(name: &str, arg: &Expr, schema: &TypeSchema) -> Option<HostParamPassing> {
+fn actual_passing(arg: &Expr, schema: &TypeSchema) -> Option<HostParamPassing> {
     match arg {
         Expr::Borrow(_) => Some(HostParamPassing::Borrow),
         Expr::BorrowMut(_) => Some(HostParamPassing::BorrowMut),
         Expr::ToOwned(_) => Some(HostParamPassing::Value),
-        // The migrated IO surface historically accepted a bare handle as a
-        // borrowed argument. Preserve that source behavior while keeping
-        // resource passing strict for every other catalog namespace.
-        _ if name.starts_with("io::") && schema.contains_resource() => {
-            Some(HostParamPassing::Borrow)
-        }
-        _ if schema.contains_resource() => Some(HostParamPassing::TakeOwned),
+        // A bare resource handle carries no source-level ownership intent.
+        // Defer that decision to the catalog candidate so its declared
+        // `HostParamPassing` remains authoritative. This preserves the
+        // standard IO adapter's legacy bare-handle Borrow contract without
+        // baking a namespace prefix into compiler typing.
+        _ if schema.contains_resource() => None,
         _ if schema_contains_unresolved(schema) => None,
         _ => Some(HostParamPassing::Value),
     }

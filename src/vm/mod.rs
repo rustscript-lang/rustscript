@@ -183,7 +183,11 @@ pub enum VmError {
 /// values, capacity limit) instead of parsing messages. The legacy
 /// [`VmError::HostError`] variant remains for pre-existing string-based errors
 /// and stays fully compatible.
+///
+/// This public enum is `non_exhaustive` so adding structured binding
+/// diagnostics remains source-compatible for downstream embedders.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HostImportBindingError {
     /// The supplied catalog does not declare an adapter-required member.
     MissingCatalogMember {

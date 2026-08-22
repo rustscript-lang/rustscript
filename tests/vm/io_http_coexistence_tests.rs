@@ -129,7 +129,7 @@ fn io_and_http_both_register_via_shared_vm() {
 
     // Run — the error should be from IO (path outside allowed roots)
     let err = match vm.run() {
-        Ok(_) => return, // Unexpected success, but not a crash
+        Ok(_) => panic!("IO policy unexpectedly allowed a forbidden path"),
         Err(VmError::HostError(msg)) => msg,
         Err(other) => panic!("expected host error, got: {other:?}"),
     };

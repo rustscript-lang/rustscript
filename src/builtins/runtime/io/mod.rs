@@ -25,7 +25,7 @@
 //! published coarse catalog working with the same RSS names, signatures,
 //! errors and capability grants as before.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::CallOutcome;
 use super::borrow_arg;
@@ -148,6 +148,12 @@ pub(crate) fn io_pipe_key() -> ResourceTypeKey {
 /// fingerprints embedded in compiled `HostImport`s match the schemas
 /// registered by [`IoExtension`] byte-for-byte.
 pub fn io_host_catalog() -> Arc<HostApiCatalog> {
+    Arc::clone(IO_HOST_CATALOG.get_or_init(build_io_host_catalog))
+}
+
+static IO_HOST_CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
+
+fn build_io_host_catalog() -> Arc<HostApiCatalog> {
     let mut builder = HostApiBuilder::new();
     builder.resource(ResourceTypeSchema::new(
         io_file_key(),
@@ -233,6 +239,64 @@ fn resource_handle(key: ResourceTypeKey, passing: HostParamPassing) -> HostParam
     HostParamSchema::with_passing("handle", HostTypeSchema::Resource(key), passing)
 }
 
+struct IoAdapterContract {
+    name: &'static str,
+    arity: u8,
+    adapter: fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>,
+    runtime_owned_pending: bool,
+}
+
+const IO_ADAPTER_CONTRACTS: &[IoAdapterContract] = &[
+    IoAdapterContract {
+        name: "io::open",
+        arity: 2,
+        adapter: open_adapter,
+        runtime_owned_pending: true,
+    },
+    IoAdapterContract {
+        name: "io::popen",
+        arity: 2,
+        adapter: popen_adapter,
+        runtime_owned_pending: true,
+    },
+    IoAdapterContract {
+        name: "io::read_all",
+        arity: 1,
+        adapter: read_all_adapter,
+        runtime_owned_pending: true,
+    },
+    IoAdapterContract {
+        name: "io::read_line",
+        arity: 1,
+        adapter: read_line_adapter,
+        runtime_owned_pending: true,
+    },
+    IoAdapterContract {
+        name: "io::write",
+        arity: 2,
+        adapter: write_adapter,
+        runtime_owned_pending: true,
+    },
+    IoAdapterContract {
+        name: "io::flush",
+        arity: 1,
+        adapter: flush_adapter,
+        runtime_owned_pending: true,
+    },
+    IoAdapterContract {
+        name: "io::close",
+        arity: 1,
+        adapter: close_adapter,
+        runtime_owned_pending: true,
+    },
+    IoAdapterContract {
+        name: "io::exists",
+        arity: 1,
+        adapter: exists_adapter,
+        runtime_owned_pending: true,
+    },
+];
+
 /// Registers every IO host function into `registry` using the exact catalog
 /// schema path and the authoritative [`standard_host_catalog`] snapshot.
 ///
@@ -269,84 +333,34 @@ pub fn register_io_builtin_module_from_catalog(
     catalog: &HostApiCatalog,
 ) -> VmResult<()> {
     let contract = io_host_catalog();
-    let open =
-        crate::vm::host_extension::validate_catalog_import_schemas(catalog, &contract, "io::open")?;
-    let popen = crate::vm::host_extension::validate_catalog_import_schemas(
-        catalog,
-        &contract,
-        "io::popen",
-    )?;
-    let read_all = crate::vm::host_extension::validate_catalog_import_schemas(
-        catalog,
-        &contract,
-        "io::read_all",
-    )?;
-    let read_line = crate::vm::host_extension::validate_catalog_import_schemas(
-        catalog,
-        &contract,
-        "io::read_line",
-    )?;
-    let write = crate::vm::host_extension::validate_catalog_import_schemas(
-        catalog,
-        &contract,
-        "io::write",
-    )?;
-    let flush = crate::vm::host_extension::validate_catalog_import_schemas(
-        catalog,
-        &contract,
-        "io::flush",
-    )?;
-    let close = crate::vm::host_extension::validate_catalog_import_schemas(
-        catalog,
-        &contract,
-        "io::close",
-    )?;
-    let exists = crate::vm::host_extension::validate_catalog_import_schemas(
-        catalog,
-        &contract,
-        "io::exists",
-    )?;
+    let catalog_fingerprint = catalog.fingerprint();
+    let contract_fingerprint = contract.fingerprint();
+    let schemas = IO_ADAPTER_CONTRACTS
+        .iter()
+        .map(|entry| {
+            crate::vm::host_extension::validate_catalog_import_schemas_with_fingerprints(
+                catalog,
+                &contract,
+                entry.name,
+                catalog_fingerprint,
+                contract_fingerprint,
+            )
+            .map(|schemas| (entry, schemas))
+        })
+        .collect::<VmResult<Vec<_>>>()?;
 
-    let mut staged = registry.transaction_clone();
-    for schema in open {
-        staged.register_exact_static("io::open", 2, schema, open_adapter)?;
-    }
-    for schema in popen {
-        staged.register_exact_static("io::popen", 2, schema, popen_adapter)?;
-    }
-    for schema in read_all {
-        staged.register_exact_static("io::read_all", 1, schema, read_all_adapter)?;
-    }
-    for schema in read_line {
-        staged.register_exact_static("io::read_line", 1, schema, read_line_adapter)?;
-    }
-    for schema in write {
-        staged.register_exact_static("io::write", 2, schema, write_adapter)?;
-    }
-    for schema in flush {
-        staged.register_exact_static("io::flush", 1, schema, flush_adapter)?;
-    }
-    for schema in close {
-        staged.register_exact_static("io::close", 1, schema, close_adapter)?;
-    }
-    for schema in exists {
-        staged.register_exact_static("io::exists", 1, schema, exists_adapter)?;
-    }
-    for name in [
-        "io::open",
-        "io::popen",
-        "io::read_all",
-        "io::read_line",
-        "io::write",
-        "io::flush",
-        "io::close",
-        "io::exists",
-    ] {
-        staged.authorize_registered_builtin_import(name);
-        staged.mark_exact_runtime_owned_pending(name)?;
-    }
-    registry.commit_transaction(staged);
-    Ok(())
+    registry.transactionally(|staged| {
+        for (entry, schemas) in &schemas {
+            for schema in schemas.iter().cloned() {
+                staged.register_exact_static(entry.name, entry.arity, schema, entry.adapter)?;
+            }
+            staged.authorize_registered_builtin_import(entry.name);
+            if entry.runtime_owned_pending {
+                staged.mark_exact_runtime_owned_pending(entry.name)?;
+            }
+        }
+        Ok(())
+    })
 }
 
 // ---- Adapter functions (shared across blocking, async and wasm dispatch) ----
@@ -487,3 +501,38 @@ pub(super) use super::io_wasm::*;
 pub(super) use async_io::*;
 #[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
 pub(super) use blocking::*;
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use crate::bytecode::HostImport;
+
+    #[test]
+    fn adapter_contract_covers_catalog_and_every_registered_schema() {
+        let catalog = io_host_catalog();
+        let contract_names: std::collections::BTreeSet<&str> = IO_ADAPTER_CONTRACTS
+            .iter()
+            .map(|entry| entry.name)
+            .collect();
+        let catalog_names: std::collections::BTreeSet<&str> = catalog
+            .functions()
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(contract_names, catalog_names);
+
+        let mut registry = HostFunctionRegistry::empty();
+        register_io_builtin_module_from_catalog(&mut registry, &catalog).expect("register IO");
+        for entry in IO_ADAPTER_CONTRACTS {
+            for schema in crate::vm::host_extension::catalog_import_schemas(&catalog, entry.name) {
+                let import = HostImport {
+                    name: entry.name.to_string(),
+                    arity: schema.params.len() as u8,
+                    return_type: schema.return_type.coarse_value_type(),
+                    schema: Some(schema),
+                };
+                assert!(registry.resolve_import(&import).is_ok(), "{}", entry.name);
+            }
+        }
+    }
+}

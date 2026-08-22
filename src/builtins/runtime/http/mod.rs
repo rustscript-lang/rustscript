@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use pd_host_function::pd_host_function;
@@ -204,6 +204,12 @@ fn resource_error(error: ResourceError) -> VmError {
 /// fingerprints embedded in compiled `HostImport`s match the schemas
 /// registered by [`HttpExtension`] byte-for-byte.
 pub fn http_host_catalog() -> Arc<HostApiCatalog> {
+    Arc::clone(HTTP_HOST_CATALOG.get_or_init(build_http_host_catalog))
+}
+
+static HTTP_HOST_CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
+
+fn build_http_host_catalog() -> Arc<HostApiCatalog> {
     let request_key = HttpRequestResource::resource_type_key()
         .expect("http.request resource type key must be valid");
     let response_key = HttpResponseResource::resource_type_key()
@@ -253,6 +259,27 @@ pub fn http_host_catalog() -> Arc<HostApiCatalog> {
     Arc::new(builder.build().expect("http catalog must build"))
 }
 
+struct HttpAdapterContract {
+    name: &'static str,
+    arity: u8,
+    adapter: fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>,
+    runtime_owned_pending: bool,
+}
+
+const HTTP_ADAPTER_CONTRACTS: &[HttpAdapterContract] = &[
+    HttpAdapterContract {
+        name: "http::client::request",
+        arity: 1,
+        adapter: request_adapter,
+        runtime_owned_pending: true,
+    },
+    HttpAdapterContract {
+        name: "http::client::sse",
+        arity: 2,
+        adapter: sse_adapter,
+        runtime_owned_pending: true,
+    },
+];
 /// Registers every HTTP host function into `registry` using the exact
 /// catalog schema path and the authoritative [`standard_host_catalog`]
 /// snapshot.
@@ -285,30 +312,34 @@ pub fn register_http_builtin_module_from_catalog(
     catalog: &HostApiCatalog,
 ) -> VmResult<()> {
     let contract = http_host_catalog();
-    let request = crate::vm::host_extension::validate_catalog_import_schemas(
-        catalog,
-        &contract,
-        "http::client::request",
-    )?;
-    let sse = crate::vm::host_extension::validate_catalog_import_schemas(
-        catalog,
-        &contract,
-        "http::client::sse",
-    )?;
+    let catalog_fingerprint = catalog.fingerprint();
+    let contract_fingerprint = contract.fingerprint();
+    let schemas = HTTP_ADAPTER_CONTRACTS
+        .iter()
+        .map(|entry| {
+            crate::vm::host_extension::validate_catalog_import_schemas_with_fingerprints(
+                catalog,
+                &contract,
+                entry.name,
+                catalog_fingerprint,
+                contract_fingerprint,
+            )
+            .map(|schemas| (entry, schemas))
+        })
+        .collect::<VmResult<Vec<_>>>()?;
 
-    let mut staged = registry.transaction_clone();
-    for schema in request {
-        staged.register_exact_static("http::client::request", 1, schema, request_adapter)?;
-    }
-    for schema in sse {
-        staged.register_exact_static("http::client::sse", 2, schema, sse_adapter)?;
-    }
-    for name in ["http::client::request", "http::client::sse"] {
-        staged.authorize_registered_builtin_import(name);
-        staged.mark_exact_runtime_owned_pending(name)?;
-    }
-    registry.commit_transaction(staged);
-    Ok(())
+    registry.transactionally(|staged| {
+        for (entry, schemas) in &schemas {
+            for schema in schemas.iter().cloned() {
+                staged.register_exact_static(entry.name, entry.arity, schema, entry.adapter)?;
+            }
+            staged.authorize_registered_builtin_import(entry.name);
+            if entry.runtime_owned_pending {
+                staged.mark_exact_runtime_owned_pending(entry.name)?;
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Standard [`HostExtension`] registering HTTP through the exact catalog
@@ -514,5 +545,40 @@ mod tests {
         vm.clear_http_configuration();
         assert!(!vm.http_is_configured());
         // A VM that never runs keeps working after config removal.
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use crate::bytecode::HostImport;
+
+    #[test]
+    fn adapter_contract_covers_catalog_and_every_registered_schema() {
+        let catalog = http_host_catalog();
+        let contract_names: std::collections::BTreeSet<&str> = HTTP_ADAPTER_CONTRACTS
+            .iter()
+            .map(|entry| entry.name)
+            .collect();
+        let catalog_names: std::collections::BTreeSet<&str> = catalog
+            .functions()
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(contract_names, catalog_names);
+
+        let mut registry = HostFunctionRegistry::empty();
+        register_http_builtin_module_from_catalog(&mut registry, &catalog).expect("register HTTP");
+        for entry in HTTP_ADAPTER_CONTRACTS {
+            for schema in crate::vm::host_extension::catalog_import_schemas(&catalog, entry.name) {
+                let import = HostImport {
+                    name: entry.name.to_string(),
+                    arity: schema.params.len() as u8,
+                    return_type: schema.return_type.coarse_value_type(),
+                    schema: Some(schema),
+                };
+                assert!(registry.resolve_import(&import).is_ok(), "{}", entry.name);
+            }
+        }
     }
 }

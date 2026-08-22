@@ -101,6 +101,15 @@ pub trait HostExtension: Send + Sync + 'static {
 /// the exact-schema registry lookup with no drift and no raw fingerprint
 /// construction on the host side.
 pub fn catalog_import_schemas(catalog: &HostApiCatalog, name: &str) -> Vec<HostImportSchema> {
+    let fingerprint = catalog.fingerprint();
+    catalog_import_schemas_with_fingerprint(catalog, name, fingerprint)
+}
+
+fn catalog_import_schemas_with_fingerprint(
+    catalog: &HostApiCatalog,
+    name: &str,
+    fingerprint: crate::host_api::HostApiFingerprint,
+) -> Vec<HostImportSchema> {
     catalog
         .functions_named(name)
         .into_iter()
@@ -115,7 +124,7 @@ pub fn catalog_import_schemas(catalog: &HostApiCatalog, name: &str) -> Vec<HostI
                 })
                 .collect(),
             return_type: function.return_type.to_compiler_schema(),
-            fingerprint: catalog.fingerprint(),
+            fingerprint,
         })
         .collect()
 }
@@ -130,8 +139,27 @@ pub fn validate_catalog_import_schemas(
     contract: &HostApiCatalog,
     name: &str,
 ) -> VmResult<Vec<HostImportSchema>> {
-    let expected = catalog_import_schemas(contract, name);
-    let got = catalog_import_schemas(catalog, name);
+    validate_catalog_import_schemas_with_fingerprints(
+        catalog,
+        contract,
+        name,
+        catalog.fingerprint(),
+        contract.fingerprint(),
+    )
+}
+
+/// Validates one adapter member using fingerprints computed once by a
+/// registration pass. Adapter contract tables use this to avoid recomputing a
+/// catalog fingerprint for every overload/member.
+pub fn validate_catalog_import_schemas_with_fingerprints(
+    catalog: &HostApiCatalog,
+    contract: &HostApiCatalog,
+    name: &str,
+    catalog_fingerprint: crate::host_api::HostApiFingerprint,
+    contract_fingerprint: crate::host_api::HostApiFingerprint,
+) -> VmResult<Vec<HostImportSchema>> {
+    let expected = catalog_import_schemas_with_fingerprint(contract, name, contract_fingerprint);
+    let got = catalog_import_schemas_with_fingerprint(catalog, name, catalog_fingerprint);
     if got.is_empty() {
         return Err(crate::vm::VmError::HostImportBinding(
             crate::vm::HostImportBindingError::MissingCatalogMember {

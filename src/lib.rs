@@ -38,6 +38,7 @@ pub use builtins::runtime::{
 pub use builtins::runtime::{
     IoExtension, IoHostExt, IoPolicy, io_host_catalog, register_io_builtin_module,
     register_io_builtin_module_from_catalog, standard_host_catalog,
+    standard_host_catalog_fingerprint,
 };
 #[cfg(feature = "sqlite")]
 pub use builtins::runtime::{
@@ -107,7 +108,10 @@ pub use host_api::{
     ResourceTypeKeyError, ResourceTypeSchema,
 };
 #[cfg(feature = "runtime")]
-pub use host_extension::{HostExtension, HostModuleState, catalog_import_schemas};
+pub use host_extension::{
+    HostExtension, HostModuleState, catalog_import_schemas,
+    validate_catalog_import_schemas_with_fingerprints,
+};
 #[cfg(feature = "runtime")]
 pub use jit::{
     JitAttempt, JitCallSiteProfile, JitConfig, JitExitProfile, JitMetrics, JitNyiDoc, JitNyiReason,
