@@ -169,14 +169,257 @@ async fn run_sse_source(source: &str, config: HttpConfig) -> Result<Vm, vm::VmEr
     vm.configure_http(config).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default());
     standard_http_registry().bind_vm_cached(&mut vm).unwrap();
-    drive(&mut vm).await.map(|()| vm)
+    // Bound the client-side VM drive so a rare lost producer/completion signal
+    // can never strand the test thread indefinitely; it surfaces as a bounded,
+    // diagnosable error instead. This pairs with the bounded server I/O and
+    // bounded recv/join helpers so every test-side await is bounded.
+    tokio::time::timeout(SERVER_IO_WATCHDOG, drive(&mut vm))
+        .await
+        .map_err(|_| {
+            VmError::HostError(format!(
+                "client-side SSE drive exceeded the {SERVER_IO_WATCHDOG:?} watchdog"
+            ))
+        })?
+        .map(|()| vm)
+}
+
+// ----------------------------------------------------------------------
+// Shared bounded I/O for HTTP/SSE test servers.
+//
+// Every server connection and every server cross-thread completion wait is
+// bounded by a single watchdog so that a dropped/stalled/partial peer cannot
+// hang the whole test binary indefinitely. The watchdog is sized for a loaded
+// CI host and acts only as a liveness guard that converts an unbounded hang
+// into a deterministic, diagnosable panic — never as a semantic timing
+// tolerance (protocol assertions are unchanged).
+// ----------------------------------------------------------------------
+
+/// Shared liveness watchdog for all HTTP/SSE test-server socket I/O, request
+/// receives, and thread joins.
+const SERVER_IO_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Absolute cap on an HTTP request head read in tests. Larger heads are
+/// reported as malformed/oversized rather than buffered without bound.
+const MAX_REQUEST_HEAD_BYTES: usize = 64 * 1024;
+
+/// Accept a connection and arm the shared read/write watchdog on the socket
+/// BEFORE any blocking read/write, so a stalled/dropped peer can never strand
+/// a server thread beyond `SERVER_IO_WATCHDOG` on a single system call.
+fn accept_with_timeout(
+    listener: &TcpListener,
+) -> std::io::Result<(std::net::TcpStream, std::net::SocketAddr)> {
+    let (stream, addr) = listener.accept()?;
+    stream.set_read_timeout(Some(SERVER_IO_WATCHDOG))?;
+    stream.set_write_timeout(Some(SERVER_IO_WATCHDOG))?;
+    Ok((stream, addr))
+}
+
+/// Absolute deadline for reading a single server-side request (head + body).
+/// Composed as now + watchdog; a slow-loris peer that dribbles bytes under the
+/// per-call read timeout still terminates by this overall bound.
+fn request_deadline() -> std::time::Instant {
+    std::time::Instant::now()
+        .checked_add(SERVER_IO_WATCHDOG)
+        .expect("server request watchdog deadline must be representable")
+}
+
+/// Bounded read of an HTTP request head until the terminating blank line.
+/// Terminates (with a diagnostic panic) on EOF, on the header-size cap, or on
+/// the absolute `deadline`. Returns the raw head bytes, never lowercased, for
+/// exact recording. The per-socket read timeout already bounds each `read`; the
+/// absolute deadline additionally stops a slow-loris peer that dribbles bytes
+/// under the per-call timeout. The caller must already have armed a socket read
+/// timeout (see `accept_with_timeout`).
+fn read_request_head_impl(
+    stream: &mut std::net::TcpStream,
+    deadline: std::time::Instant,
+    context: &str,
+) -> Vec<u8> {
+    let mut head = Vec::with_capacity(128);
+    let mut scratch = [0_u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if head.len() >= MAX_REQUEST_HEAD_BYTES {
+            panic!(
+                "{context}: request head exceeded {MAX_REQUEST_HEAD_BYTES} bytes \
+                 (got {}); malformed/oversized peer",
+                head.len()
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "{context}: request head read exceeded watchdog at {} bytes; \
+                 peer stalled on a partial head:\n{:?}",
+                head.len(),
+                String::from_utf8_lossy(&head)
+            );
+        }
+        match stream.read(&mut scratch) {
+            Ok(0) => panic!(
+                "{context}: EOF while reading request head at {} bytes:\n{:?}",
+                head.len(),
+                String::from_utf8_lossy(&head)
+            ),
+            Ok(n) => head.extend_from_slice(&scratch[..n]),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // Nothing available yet; the deadline check above terminates us.
+            }
+            Err(error) => panic!("{context}: request head read failed: {error}"),
+        }
+    }
+    head
+}
+
+/// Read a request head under the shared `SERVER_IO_WATCHDOG` deadline.
+fn read_request_head(stream: &mut std::net::TcpStream, context: &str) -> Vec<u8> {
+    read_request_head_impl(stream, request_deadline(), context)
+}
+
+/// Parse the `Content-Length` declared in a raw request head, defaulting to 0.
+fn declared_content_length(head: &str) -> usize {
+    head.lines()
+        .find_map(|line| {
+            line.split_once(':').and_then(|(name, value)| {
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+        })
+        .unwrap_or(0)
+}
+
+/// Bounded exact read of exactly `expected` bytes. Panics — never silently
+/// truncates — if the peer closes before `expected` bytes arrive or the
+/// absolute `deadline` elapses, reporting received/expected progress. The
+/// per-socket read timeout already bounds each individual `read`; the absolute
+/// deadline stops a peer that dribbles bytes under the per-call timeout.
+fn read_exact_body_impl(
+    stream: &mut std::net::TcpStream,
+    expected: usize,
+    deadline: std::time::Instant,
+    context: &str,
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(expected);
+    let mut chunk = [0_u8; 4096];
+    while body.len() < expected {
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "{context}: body read exceeded watchdog; \
+                 received {} of {expected} bytes; peer stalled mid-body",
+                body.len()
+            );
+        }
+        let want = (expected - body.len()).min(chunk.len());
+        match stream.read(&mut chunk[..want]) {
+            Ok(0) => panic!(
+                "{context}: UnexpectedEof mid-body; received {} of {expected} bytes",
+                body.len()
+            ),
+            Ok(n) => body.extend_from_slice(&chunk[..n]),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // Nothing available yet; the deadline check above terminates us.
+            }
+            Err(error) => panic!("{context}: body read failed: {error}"),
+        }
+    }
+    body
+}
+
+/// Read a request body under the shared `SERVER_IO_WATCHDOG` deadline.
+fn read_exact_body(stream: &mut std::net::TcpStream, expected: usize, context: &str) -> Vec<u8> {
+    read_exact_body_impl(stream, expected, request_deadline(), context)
+}
+
+/// Receive the next recorded server request, waiting at most the shared
+/// watchdog. On timeout or disconnect, panic with server/test context instead
+/// of hanging the test binary forever.
+fn recv_with_timeout<T>(receiver: &mpsc::Receiver<T>, context: &str) -> T {
+    match receiver.recv_timeout(SERVER_IO_WATCHDOG) {
+        Ok(value) => value,
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+            "{context}: timed out waiting for a server request after {SERVER_IO_WATCHDOG:?} \
+             watchdog (server thread did not send)"
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
+            "{context}: server request channel disconnected; the server thread closed \
+             or panicked before recording the request"
+        ),
+    }
+}
+
+/// Join a server thread, polling `is_finished` against an absolute `deadline`.
+/// The socket read/write timeout guarantees that a server blocked on I/O exits
+/// shortly after the peek deadline, so a timeout panic never leaves a permanent
+/// leak. On success the thread is always actually joined (no detach).
+fn join_with_timeout_impl(
+    handle: thread::JoinHandle<()>,
+    deadline: std::time::Instant,
+    context: &str,
+) {
+    while std::time::Instant::now() < deadline {
+        if handle.is_finished() {
+            handle.join().unwrap_or_else(|error| {
+                let detail = error
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| error.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "no panic message".to_string());
+                panic!("{context}: server thread panicked: {detail}");
+            });
+            return;
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("{context}: server thread did not finish within the join watchdog");
+}
+
+/// Join a server thread under the shared `SERVER_IO_WATCHDOG` (+1s grace).
+fn join_with_timeout(handle: thread::JoinHandle<()>, context: &str) {
+    let deadline =
+        std::time::Instant::now() + SERVER_IO_WATCHDOG + std::time::Duration::from_secs(1);
+    join_with_timeout_impl(handle, deadline, context);
+}
+
+/// Probe that the peer closed a connection: read until the socket reports EOF
+/// (Ok(0)) or ConnectionReset. Bounded by the socket read timeout armed in
+/// `accept_with_timeout`; on any other outcome (data, stall past watchdog,
+/// unrelated error) panic with server/test context. This is the focused
+/// regression probe for production teardown: after a redirect response is
+/// dropped unread by the client, the client must close the socket, and this
+/// helper observes exactly that.
+fn expect_peer_close(stream: &mut std::net::TcpStream, context: &str) {
+    let mut buf = [0_u8; 1024];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => return, // EOF — peer closed.
+            Ok(n) => panic!(
+                "{context}: expected peer close but received {n} bytes: {:?}",
+                String::from_utf8_lossy(&buf[..n])
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => return,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                panic!(
+                    "{context}: expected peer close but the socket stayed open past the \
+                     {SERVER_IO_WATCHDOG:?} watchdog"
+                );
+            }
+            Err(error) => panic!("{context}: unexpected read error while probing close: {error}"),
+        }
+    }
 }
 
 fn server(response_parts: Vec<&'static [u8]>) -> (u16, thread::JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let handle = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = accept_with_timeout(&listener).unwrap();
         let mut request = [0_u8; 4096];
         let read = stream.read(&mut request).unwrap();
         let request = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
@@ -197,28 +440,18 @@ fn recording_server(
     let port = listener.local_addr().unwrap().port();
     let (sender, receiver) = mpsc::channel();
     let handle = thread::spawn(move || {
-        for response_parts in responses {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut byte = [0_u8; 1];
-            while !request.ends_with(b"\r\n\r\n") {
-                stream.read_exact(&mut byte).unwrap();
-                request.push(byte[0]);
-            }
-            let head = String::from_utf8(request).unwrap();
-            let content_length = head
-                .lines()
-                .find_map(|line| {
-                    line.split_once(':').and_then(|(name, value)| {
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().unwrap())
-                    })
-                })
-                .unwrap_or(0);
-            let mut body = vec![0; content_length];
-            stream.read_exact(&mut body).unwrap();
+        for (index, response_parts) in responses.into_iter().enumerate() {
+            let context = format!("recording_server connection {index}");
+            let (mut stream, _) = accept_with_timeout(&listener).unwrap();
+            let head = read_request_head(&mut stream, &context);
+            let content_length = declared_content_length(&String::from_utf8_lossy(&head));
+            let body = read_exact_body(&mut stream, content_length, &context);
             sender
-                .send(format!("{head}{}", String::from_utf8_lossy(&body)))
+                .send(format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&head),
+                    String::from_utf8_lossy(&body)
+                ))
                 .unwrap();
             for part in response_parts {
                 stream.write_all(part).unwrap();
@@ -266,14 +499,9 @@ fn rejecting_redirect_server(
     let location = location(port);
     let (sender, receiver) = mpsc::channel();
     let handle = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut request = Vec::new();
-        let mut byte = [0_u8; 1];
-        while !request.ends_with(b"\r\n\r\n") {
-            stream.read_exact(&mut byte).unwrap();
-            request.push(byte[0]);
-        }
-        sender.send(String::from_utf8(request).unwrap()).unwrap();
+        let (mut stream, _) = accept_with_timeout(&listener).unwrap();
+        let head = read_request_head(&mut stream, "rejecting_redirect_server");
+        sender.send(String::from_utf8(head).unwrap()).unwrap();
         write!(
             stream,
             "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
@@ -330,7 +558,10 @@ async fn sse_delivers_open_events_end_and_terminal_summary() {
     standard_http_registry().bind_vm_cached(&mut vm).unwrap();
 
     drive(&mut vm).await.unwrap();
-    server.join().unwrap();
+    join_with_timeout(
+        server,
+        "sse_delivers_open_events_end_and_terminal_summary server",
+    );
 
     let result = &vm.stack()[0];
     assert_eq!(field(result, "outcome"), &Value::string("eof"));
@@ -450,10 +681,10 @@ async fn sse_accepts_post_with_body() {
     );
     let vm = run_sse_source(&source, config(port)).await.unwrap();
     assert_eq!(field(&vm.stack()[0], "outcome"), &Value::string("eof"));
-    let request = requests.recv().unwrap().to_ascii_lowercase();
+    let request = recv_with_timeout(&requests, "sse_accepts_post_with_body").to_ascii_lowercase();
     assert!(request.starts_with("post /events http/1.1"));
     assert!(request.ends_with("payload"));
-    server.join().unwrap();
+    join_with_timeout(server, "sse_accepts_post_with_body server");
 }
 
 fn redirect_server(status: u16) -> (u16, mpsc::Receiver<String>, thread::JoinHandle<()>) {
@@ -462,27 +693,17 @@ fn redirect_server(status: u16) -> (u16, mpsc::Receiver<String>, thread::JoinHan
     let (sender, receiver) = mpsc::channel();
     let handle = thread::spawn(move || {
         for index in 0..2 {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut byte = [0_u8; 1];
-            while !request.ends_with(b"\r\n\r\n") {
-                stream.read_exact(&mut byte).unwrap();
-                request.push(byte[0]);
-            }
-            let head = String::from_utf8(request).unwrap();
-            let length = head
-                .lines()
-                .find_map(|line| {
-                    line.split_once(':').and_then(|(name, value)| {
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().unwrap())
-                    })
-                })
-                .unwrap_or(0);
-            let mut body = vec![0; length];
-            stream.read_exact(&mut body).unwrap();
+            let context = format!("redirect_server({status}) hop {index}");
+            let (mut stream, _) = accept_with_timeout(&listener).unwrap();
+            let head = read_request_head(&mut stream, &context);
+            let content_length = declared_content_length(&String::from_utf8_lossy(&head));
+            let body = read_exact_body(&mut stream, content_length, &context);
             sender
-                .send(format!("{head}{}", String::from_utf8_lossy(&body)))
+                .send(format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&head),
+                    String::from_utf8_lossy(&body)
+                ))
                 .unwrap();
             if index == 0 {
                 write!(
@@ -490,6 +711,13 @@ fn redirect_server(status: u16) -> (u16, mpsc::Receiver<String>, thread::JoinHan
                     "HTTP/1.1 {status} Redirect\r\nLocation: http://127.0.0.1:{port}/final\r\nContent-Length: 0\r\n\r\n"
                 )
                 .unwrap();
+                // Focused teardown regression: after the client reads this
+                // redirect response and drops it unread (production
+                // `open_stream_response` `continue`), the client must close the
+                // socket before connecting the next hop. Observe that close
+                // directly; a hang/stall here would fail bounded instead of
+                // stranding the server thread.
+                expect_peer_close(&mut stream, &context);
             } else {
                 stream
                     .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\n\r\n")
@@ -516,8 +744,10 @@ async fn sse_post_redirect_method_and_body_follow_http_rules() {
             http::client::sse({{method:"POST", url:"http://127.0.0.1:{port}/start", body:"payload"}}, callback);"#
         );
         run_sse_source(&source, config(port)).await.unwrap();
-        let first = requests.recv().unwrap().to_ascii_lowercase();
-        let second = requests.recv().unwrap().to_ascii_lowercase();
+        let first = recv_with_timeout(&requests, &format!("redirect status {status} first hop"))
+            .to_ascii_lowercase();
+        let second = recv_with_timeout(&requests, &format!("redirect status {status} second hop"))
+            .to_ascii_lowercase();
         assert!(first.starts_with("post /start http/1.1"));
         if preserves_post {
             assert!(
@@ -532,7 +762,7 @@ async fn sse_post_redirect_method_and_body_follow_http_rules() {
             );
             assert!(!second.ends_with("payload"), "status {status}: {second}");
         }
-        server.join().unwrap();
+        join_with_timeout(server, &format!("redirect status {status} server"));
     }
 }
 
@@ -557,12 +787,19 @@ async fn sse_rejects_redirect_userinfo_before_reconnecting() {
         error.to_string().contains("URL userinfo is not allowed"),
         "{error}"
     );
-    let request = requests.recv().unwrap().to_ascii_lowercase();
+    let request = recv_with_timeout(
+        &requests,
+        "sse_rejects_redirect_userinfo_before_reconnecting",
+    )
+    .to_ascii_lowercase();
     assert!(request.contains("authorization:"));
     assert!(request.contains("cookie: a=b"));
     assert!(!request.contains("redirect-user"));
     assert!(!request.contains("redirect-password"));
-    server.join().unwrap();
+    join_with_timeout(
+        server,
+        "sse_rejects_redirect_userinfo_before_reconnecting server",
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -597,11 +834,18 @@ async fn sse_rejects_disallowed_redirect_targets_before_connecting() {
             Err(error) => error,
         };
         assert!(error.to_string().contains(expected), "{error}");
-        let request = requests.recv().unwrap().to_ascii_lowercase();
+        let request = recv_with_timeout(&requests, "sse_rejects_disallowed_redirect_targets")
+            .to_ascii_lowercase();
         assert!(request.contains("authorization:"));
         assert!(request.contains("cookie: a=b"));
-        source_server.join().unwrap();
-        no_target_connection.join().unwrap();
+        join_with_timeout(
+            source_server,
+            "sse_rejects_disallowed_redirect_targets source server",
+        );
+        join_with_timeout(
+            no_target_connection,
+            "sse_rejects_disallowed_redirect_targets no-target probe",
+        );
     }
 }
 
@@ -618,7 +862,10 @@ async fn sse_stop_retires_without_end_and_returns_stopped_summary() {
         http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, stop);"#
     );
     let vm = run_sse_source(&source, config(port)).await.unwrap();
-    server.join().unwrap();
+    join_with_timeout(
+        server,
+        "sse_stop_retires_without_end_and_returns_stopped_summary server",
+    );
     assert_eq!(field(&vm.stack()[0], "outcome"), &Value::string("stopped"));
     assert_eq!(field(&vm.stack()[0], "items"), &Value::Int(1));
 }
@@ -650,7 +897,10 @@ async fn sse_reset_releases_the_connection_permit_before_reuse() {
     // exits after seeing the stopping flag; poll until quiescent.
     drive_reset(&mut vm).await;
     assert!(vm.is_reusable(), "VM should be reusable after reset");
-    server.join().unwrap();
+    join_with_timeout(
+        server,
+        "sse_reset_releases_the_connection_permit_before_reuse server",
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -668,13 +918,16 @@ async fn sse_rejects_status_content_type_and_idle_peer() {
             Err(error) => error,
         };
         assert!(error.to_string().contains(expected), "{error}");
-        server.join().unwrap();
+        join_with_timeout(
+            server,
+            "sse_rejects_status_content_type_and_idle_peer status loop",
+        );
     }
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = thread::spawn(move || {
-        let (mut socket, _) = listener.accept().unwrap();
+        let (mut socket, _) = accept_with_timeout(&listener).unwrap();
         let mut request = [0; 1024];
         let read = socket.read(&mut request).unwrap();
         assert!(read > 0, "SSE request should be received");
@@ -692,12 +945,15 @@ async fn sse_rejects_status_content_type_and_idle_peer() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("idle timeout"), "{error}");
-    server.join().unwrap();
+    join_with_timeout(
+        server,
+        "sse_rejects_status_content_type_and_idle_peer idle server",
+    );
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = thread::spawn(move || {
-        let (mut socket, _) = listener.accept().unwrap();
+        let (mut socket, _) = accept_with_timeout(&listener).unwrap();
         let mut request = [0; 1024];
         let read = socket.read(&mut request).unwrap();
         assert!(read > 0, "SSE request should be received");
@@ -716,7 +972,10 @@ async fn sse_rejects_status_content_type_and_idle_peer() {
         error.to_string().contains("idle timeout while opening"),
         "{error}"
     );
-    server.join().unwrap();
+    join_with_timeout(
+        server,
+        "sse_rejects_status_content_type_and_idle_peer opening server",
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -724,7 +983,7 @@ async fn sse_script_timeout_shortens_the_host_stream_duration() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = thread::spawn(move || {
-        let (mut socket, _) = listener.accept().unwrap();
+        let (mut socket, _) = accept_with_timeout(&listener).unwrap();
         let mut request = [0; 1024];
         assert!(socket.read(&mut request).unwrap() > 0);
         thread::sleep(std::time::Duration::from_millis(80));
@@ -740,7 +999,10 @@ async fn sse_script_timeout_shortens_the_host_stream_duration() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("total deadline"), "{error}");
-    server.join().unwrap();
+    join_with_timeout(
+        server,
+        "sse_script_timeout_shortens_the_host_stream_duration server",
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -748,7 +1010,7 @@ async fn sse_host_stream_duration_caps_script_timeout_while_opening() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = thread::spawn(move || {
-        let (mut socket, _) = listener.accept().unwrap();
+        let (mut socket, _) = accept_with_timeout(&listener).unwrap();
         let mut request = [0; 1024];
         assert!(socket.read(&mut request).unwrap() > 0);
         thread::sleep(std::time::Duration::from_millis(80));
@@ -764,7 +1026,10 @@ async fn sse_host_stream_duration_caps_script_timeout_while_opening() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("total deadline"), "{error}");
-    server.join().unwrap();
+    join_with_timeout(
+        server,
+        "sse_host_stream_duration_caps_script_timeout_while_opening server",
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -772,7 +1037,7 @@ async fn sse_total_deadline_expires_despite_periodic_progress_below_idle_timeout
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = thread::spawn(move || {
-        let (mut socket, _) = listener.accept().unwrap();
+        let (mut socket, _) = accept_with_timeout(&listener).unwrap();
         let mut request = [0; 1024];
         assert!(socket.read(&mut request).unwrap() > 0);
         socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
@@ -817,7 +1082,10 @@ async fn sse_total_deadline_expires_despite_periodic_progress_below_idle_timeout
         .await
         .expect_err("periodic progress must not extend the total deadline");
     assert!(error.to_string().contains("total deadline"), "{error}");
-    server.join().unwrap();
+    join_with_timeout(
+        server,
+        "sse_total_deadline_expires_despite_periodic_progress_below_idle_timeout server",
+    );
     assert!(
         callbacks.load(Ordering::SeqCst) >= 4,
         "multiple progress events must reach callbacks inside the idle bound"
@@ -829,7 +1097,7 @@ async fn sse_total_deadline_releases_the_connection_permit_for_reuse() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = thread::spawn(move || {
-        let (mut first, _) = listener.accept().unwrap();
+        let (mut first, _) = accept_with_timeout(&listener).unwrap();
         let mut request = [0; 1024];
         assert!(first.read(&mut request).unwrap() > 0);
         let first = thread::spawn(move || {
@@ -837,7 +1105,7 @@ async fn sse_total_deadline_releases_the_connection_permit_for_reuse() {
             drop(first);
         });
 
-        let (mut second, _) = listener.accept().unwrap();
+        let (mut second, _) = accept_with_timeout(&listener).unwrap();
         let mut request = [0; 1024];
         assert!(second.read(&mut request).unwrap() > 0);
         second
@@ -845,7 +1113,7 @@ async fn sse_total_deadline_releases_the_connection_permit_for_reuse() {
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\n\r\n",
             )
             .unwrap();
-        first.join().unwrap();
+        join_with_timeout(first, "sse_total_deadline_releases first drop-thread");
     });
     let source = format!(
         r#"use http; http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, |item| {{action:"continue"}});"#
@@ -864,12 +1132,26 @@ async fn sse_total_deadline_releases_the_connection_permit_for_reuse() {
         .await
         .expect_err("the first stream should reach its total deadline");
     assert!(error.to_string().contains("total deadline"), "{error}");
+    // The reset is asynchronous (the worker tears down and releases the
+    // connection permit on a separate thread); drive it to completion before
+    // reusing the VM so the second stream deterministically acquires the
+    // released permit even under scheduler pressure.
     vm.reset_for_reuse();
+    drive_reset(&mut vm).await;
+    assert!(vm.is_reusable(), "VM should be reusable after reset");
+    // The second stream's purpose is only to prove the released permit allows
+    // a fresh stream; give it a generous budget so a loaded CI (server OS
+    // thread contending with parallel tests) is not penalised by the tight
+    // 20ms total deadline the first stream deliberately trips.
+    vm.configure_http(config(port)).unwrap();
     drive(&mut vm)
         .await
         .expect("the second stream should acquire the released permit");
     assert_eq!(field(&vm.stack()[0], "outcome"), &Value::string("eof"));
-    server.join().unwrap();
+    join_with_timeout(
+        server,
+        "sse_total_deadline_releases_the_connection_permit_for_reuse server",
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -877,7 +1159,7 @@ async fn sse_callback_stop_after_deadline_fails_and_releases_permit_without_anot
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = thread::spawn(move || {
-        let (mut first, _) = listener.accept().unwrap();
+        let (mut first, _) = accept_with_timeout(&listener).unwrap();
         let mut request = [0; 1024];
         assert!(first.read(&mut request).unwrap() > 0);
         first
@@ -891,7 +1173,7 @@ async fn sse_callback_stop_after_deadline_fails_and_releases_permit_without_anot
             drop(first);
         });
 
-        let (mut second, _) = listener.accept().unwrap();
+        let (mut second, _) = accept_with_timeout(&listener).unwrap();
         let mut request = [0; 1024];
         assert!(second.read(&mut request).unwrap() > 0);
         second
@@ -899,7 +1181,7 @@ async fn sse_callback_stop_after_deadline_fails_and_releases_permit_without_anot
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\n\r\n",
             )
             .unwrap();
-        first.join().unwrap();
+        join_with_timeout(first, "sse_callback_stop first drop-thread");
     });
     let source = format!(
         r#"
@@ -949,12 +1231,23 @@ async fn sse_callback_stop_after_deadline_fails_and_releases_permit_without_anot
     }));
 
     vm.reset_for_reuse();
+    // Drive the reset to completion (the worker tears down and releases the
+    // connection permit asynchronously) so the next stream deterministically
+    // acquires the released permit even under scheduler pressure.
+    drive_reset(&mut vm).await;
+    assert!(vm.is_reusable(), "VM should be reusable after reset");
+    // The second stream's purpose is only to prove the released permit allows
+    // a fresh stream; give it a generous budget so a loaded CI (server OS
+    // thread contending with parallel tests) is not penalised by the tight
+    // 100ms total deadline the first stream deliberately trips.
+    let second_config = config(port);
+    vm.configure_http(second_config).unwrap();
     drive(&mut vm)
         .await
         .expect("the next stream should acquire the released permit");
     assert_eq!(wait_calls.load(Ordering::SeqCst), 2);
     assert_eq!(field(&vm.stack()[0], "outcome"), &Value::string("stopped"));
-    server.join().unwrap();
+    join_with_timeout(server, "sse_callback_stop_after_deadline_fails server");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -962,7 +1255,7 @@ async fn sse_callback_continue_after_deadline_fails_before_another_network_poll(
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = thread::spawn(move || {
-        let (mut socket, _) = listener.accept().unwrap();
+        let (mut socket, _) = accept_with_timeout(&listener).unwrap();
         let mut request = [0; 1024];
         assert!(socket.read(&mut request).unwrap() > 0);
         socket
@@ -1012,7 +1305,7 @@ async fn sse_callback_continue_after_deadline_fails_before_another_network_poll(
         "{error}"
     );
     assert_eq!(wait_calls.load(Ordering::SeqCst), 1);
-    server.join().unwrap();
+    join_with_timeout(server, "sse_callback_continue_after_deadline_fails server");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1070,18 +1363,20 @@ async fn sse_revalidates_redirects_and_strips_cross_origin_credentials() {
             ("bytes_sent", Value::Int(0)),
         ])
     );
-    let first = source_requests.recv().unwrap().to_ascii_lowercase();
+    let first = recv_with_timeout(&source_requests, "sse_revalidates_redirects source hop")
+        .to_ascii_lowercase();
     assert!(first.starts_with("post /start http/1.1"));
     assert!(first.ends_with("payload"));
     assert!(first.contains("authorization: bearer secret"));
     assert!(first.contains("cookie: a=b"));
-    let second = target_requests.recv().unwrap().to_ascii_lowercase();
+    let second = recv_with_timeout(&target_requests, "sse_revalidates_redirects target hop")
+        .to_ascii_lowercase();
     assert!(second.starts_with("post /final http/1.1"));
     assert!(second.ends_with("payload"));
     assert!(!second.contains("authorization:"));
     assert!(!second.contains("cookie:"));
-    source_server.join().unwrap();
-    target.join().unwrap();
+    join_with_timeout(source_server, "sse_revalidates_redirects source server");
+    join_with_timeout(target, "sse_revalidates_redirects target server");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1094,7 +1389,7 @@ async fn sse_silent_server_reset_cancels_worker_and_releases_permit() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = accept_with_timeout(&listener).unwrap();
         let mut request = [0; 4096];
         let read = stream.read(&mut request).unwrap();
         assert!(read > 0, "SSE request should be received");
@@ -1151,5 +1446,174 @@ async fn sse_silent_server_reset_cancels_worker_and_releases_permit() {
     // The server should have detected the connection close (read returned
     // 0 or ConnectionReset), proving the worker was cancelled without
     // waiting for another frame from the silent server.
-    server.join().expect("silent-server thread should finish");
+    join_with_timeout(server, "sse_silent_server_reset_cancels_worker server");
+}
+
+// ----------------------------------------------------------------------
+// Helper watchdog unit tests.
+//
+// These prove that the bounded server I/O helpers convert what would be an
+// unbounded hang (a peer that stalls mid-head or mid-body) into a
+// deterministic, diagnosable panic, and that the cross-thread waits
+// (`recv_with_timeout`, `join_with_timeout`) terminate bounded. They use a
+// short synthetic deadline so they run in milliseconds, not the 10s shared
+// watchdog.
+// ----------------------------------------------------------------------
+
+#[test]
+fn watchdog_converts_partial_head_stall_into_bounded_panic() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let peer = thread::spawn(move || {
+        let (mut socket, _) = accept_with_timeout(&listener).unwrap();
+        // Send only a partial head (no terminating blank line), then stall.
+        socket
+            .write_all(b"POST /start HTTP/1.1\r\nContent-Length: 7\r\nHost: x\r\n")
+            .unwrap();
+        // Hold the connection open without sending the blank line or any more
+        // bytes, so an unbounded reader would block forever. Outlasts the
+        // client deadline so the stall is what terminates the read, yet
+        // finishes within the bounded join window.
+        thread::sleep(std::time::Duration::from_secs(8));
+    });
+    let mut client = std::net::TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+        .unwrap();
+    // A few seconds: large enough not to spurious-fire under heavy parallel
+    // test load, small enough to fail fast when the helper is correct.
+    let short_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_request_head_impl(&mut client, short_deadline, "partial-head stall test")
+    }));
+    join_with_timeout(peer, "partial-head stall peer");
+    let message = match result {
+        Err(payload) => payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_default(),
+        Ok(_) => panic!("partial-head stall must panic via the watchdog, not hang or return"),
+    };
+    assert!(
+        message.contains("watchdog") && message.contains("partial head"),
+        "expected a watchdog diagnostic, got: {message}"
+    );
+}
+
+#[test]
+fn watchdog_converts_partial_body_stall_into_bounded_panic() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let peer = thread::spawn(move || {
+        let (mut socket, _) = accept_with_timeout(&listener).unwrap();
+        // Send only 3 of the 7 declared body bytes, then stall with the
+        // connection still open.
+        socket.write_all(b"pay").unwrap();
+        // Hold the connection open so an unbounded reader would block forever;
+        // outlasts the client deadline so the stall is what terminates the
+        // read, yet finishes within the bounded join window.
+        thread::sleep(std::time::Duration::from_secs(8));
+    });
+    let mut client = std::net::TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+        .unwrap();
+    let short_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_exact_body_impl(&mut client, 7, short_deadline, "partial-body stall test")
+    }));
+    join_with_timeout(peer, "partial-body stall peer");
+    let message = match result {
+        Err(payload) => payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_default(),
+        Ok(_) => panic!("partial-body stall must panic via the watchdog, not hang or return"),
+    };
+    assert!(
+        message.contains("watchdog") && message.contains("received 3 of 7 bytes"),
+        "expected received/expected progress in the diagnostic, got: {message}"
+    );
+}
+
+#[test]
+fn watchdog_converts_truncated_body_eof_into_bounded_panic() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let peer = thread::spawn(move || {
+        let (mut socket, _) = accept_with_timeout(&listener).unwrap();
+        // Send fewer bytes than declared, then close (EOF mid-body).
+        socket.write_all(b"pay").unwrap();
+    });
+    let mut client = std::net::TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+        .unwrap();
+    let short_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_exact_body_impl(&mut client, 7, short_deadline, "truncated-body test")
+    }));
+    join_with_timeout(peer, "truncated-body peer");
+    let message = match result {
+        Err(payload) => payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_default(),
+        Ok(_) => panic!("truncated body must panic, never silently truncate"),
+    };
+    assert!(
+        message.contains("UnexpectedEof mid-body") && message.contains("received 3 of 7 bytes"),
+        "expected an EOF diagnostic with received/expected progress, got: {message}"
+    );
+}
+
+#[test]
+fn recv_with_timeout_panics_bounded_on_disconnect() {
+    let (sender, receiver) = mpsc::channel::<String>();
+    drop(sender); // Disconnect immediately: recv must panic, not hang.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        recv_with_timeout(&receiver, "disconnect test")
+    }));
+    let message = match result {
+        Err(payload) => payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_default(),
+        Ok(_) => panic!("disconnected recv must panic"),
+    };
+    assert!(
+        message.contains("disconnected"),
+        "expected a disconnected diagnostic, got: {message}"
+    );
+}
+
+#[test]
+fn join_with_timeout_panics_bounded_on_stuck_thread() {
+    // A thread that does not finish by the deadline must be reported by the
+    // bounded join instead of hanging the test binary. Use a short synthetic
+    // deadline so the unit test is fast; the thread is a bounded sleeper that
+    // finishes on its own shortly after (no permanent leak).
+    let stuck = thread::spawn(|| {
+        thread::sleep(std::time::Duration::from_millis(2000));
+    });
+    let short_deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        join_with_timeout_impl(stuck, short_deadline, "stuck thread test")
+    }));
+    let message = match result {
+        Err(payload) => payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_default(),
+        Ok(_) => panic!("a stuck thread must produce a bounded join panic"),
+    };
+    assert!(
+        message.contains("did not finish"),
+        "expected a bounded join diagnostic, got: {message}"
+    );
 }

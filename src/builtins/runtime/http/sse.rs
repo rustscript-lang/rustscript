@@ -676,25 +676,31 @@ impl SseStreamDriver {
 
 impl HostStreamDriver for SseStreamDriver {
     fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<HostStreamPoll>> {
-        if let Ok(item) = self.receiver.try_recv() {
+        // Drain one published item, tracking metadata. Returns Some when the
+        // FIFO has an item, None when it is empty.
+        let drain_item = |driver: &mut Self| -> Option<HostStreamPoll> {
+            let item = driver.receiver.try_recv().ok()?;
             // Track items and capture metadata from the open item.
             if let Value::Map(ref map) = item {
                 if let Some(Value::String(kind)) = map.get(&Value::string("kind")) {
                     if kind.as_str() == "open" {
                         if let Some(Value::Int(status)) = map.get(&Value::string("status")) {
-                            self.status = *status as u16;
+                            driver.status = *status as u16;
                         }
                         if let Some(Value::Map(headers)) = map.get(&Value::string("headers")) {
-                            self.headers = Arc::clone(headers);
+                            driver.headers = Arc::clone(headers);
                         }
                         if let Some(Value::String(url)) = map.get(&Value::string("url")) {
-                            self.url = url.as_ref().clone();
+                            driver.url = url.as_ref().clone();
                         }
                     }
                 }
             }
-            self.items = self.items.saturating_add(1);
-            return Poll::Ready(Ok(HostStreamPoll::Item(item)));
+            driver.items = driver.items.saturating_add(1);
+            Some(HostStreamPoll::Item(item))
+        };
+        if let Some(poll) = drain_item(self) {
+            return Poll::Ready(Ok(poll));
         }
 
         if self.shared.stopping.load(Ordering::SeqCst) {
@@ -729,11 +735,21 @@ impl HostStreamDriver for SseStreamDriver {
             };
         }
 
+        // Register this poll's waker, then re-check the FIFO. The worker's
+        // publish does `send` then wakes the waker slot; if the send landed
+        // between the first drain and this registration the wake would be
+        // delivered to a stale/absent waker and lost. The re-check closes that
+        // window: an item that arrived after the first drain is observed here,
+        // so a publish can never be stranded in the FIFO with the driver
+        // parked. The registered waker is simply replaced on the next poll.
         *self
             .shared
             .waker
             .lock()
             .expect("sse waker lock should not be poisoned") = Some(cx.waker().clone());
+        if let Some(poll) = drain_item(self) {
+            return Poll::Ready(Ok(poll));
+        }
         Poll::Pending
     }
 

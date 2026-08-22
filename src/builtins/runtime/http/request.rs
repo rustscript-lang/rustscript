@@ -847,6 +847,10 @@ async fn execute_request_until(
                 body = None;
             }
             url = next_url;
+            // Drop the unread redirect response before the next hop's
+            // connection work; owning the hyper connection future, this
+            // synchronously closes the socket.
+            drop(response);
             continue;
         }
 
@@ -1046,6 +1050,11 @@ pub(super) async fn open_stream_response(
                 body = None;
             }
             url = next_url;
+            // Drop the unread redirect response explicitly and *before* the
+            // next hop's connection work. Owning the hyper connection future,
+            // this synchronously closes the socket, so a redirect peer reliably
+            // observes connection teardown (probed by the SSE redirect tests).
+            drop(response);
             continue;
         }
         return Ok((response, url));
