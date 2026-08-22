@@ -48,24 +48,25 @@ pub(super) fn collect_module_units(
         path.display().to_string(),
         source.to_string(),
     );
-    let (imports, decls) = scan_module_imports(source, flavor, path, options).map_err(|err| {
-        // Nested module sources surface their parse errors through the same
-        // path-prefixed diagnostic shape the compile parse uses. The root is
-        // scanned (and fails, if at all) in `load_units_for_source_file`
-        // before this point, so it never receives a prefix here. The scan
-        // parser numbers spans with its own local source id 0, so the span
-        // is always rebuilt against the owning module's graph source id —
-        // offsets from one module must never be interpreted in another.
-        match err {
-            SourcePathError::Source(SourceError::Parse(mut parse)) => {
-                parse.message = format!("{}: {}", path.display(), parse.message);
-                parse.span = None;
-                parse = parse.with_line_span_from_source(&state.sources, current_source_id.0);
-                SourcePathError::Source(SourceError::Parse(parse))
+    let (imports, decls) = scan_module_imports(source, flavor, path, options, current_source_id.0)
+        .map_err(|err| {
+            // Nested module sources surface their parse errors through the same
+            // path-prefixed diagnostic shape the compile parse uses. The root is
+            // scanned (and fails, if at all) in `load_units_for_source_file`
+            // before this point, so it never receives a prefix here. The scan
+            // parser numbers spans with its own local source id 0, so the span
+            // is always rebuilt against the owning module's graph source id —
+            // offsets from one module must never be interpreted in another.
+            match err {
+                SourcePathError::Source(SourceError::Parse(mut parse)) => {
+                    parse.message = format!("{}: {}", path.display(), parse.message);
+                    parse.span = None;
+                    parse = parse.with_line_span_from_source(&state.sources, current_source_id.0);
+                    SourcePathError::Source(SourceError::Parse(parse))
+                }
+                other => other,
             }
-            other => other,
-        }
-    })?;
+        })?;
     for (import_index, import) in imports.iter().enumerate() {
         let spec = import.spec.clone();
         let span = decls
@@ -176,18 +177,19 @@ pub(super) fn collect_module_units(
         )?;
         state.visiting.pop();
 
-        let module_imports = parse_module_imports(
-            &module_source_raw,
-            SourceFlavor::RustScript,
-            &resolved,
-            options,
-        )?;
         let module_source_id = state
             .module_graph
             .module_id_for_identity(&key)
             .and_then(|module| state.module_graph.node(module))
             .map(|node| node.source.0)
             .unwrap_or(0);
+        let module_imports = parse_module_imports(
+            &module_source_raw,
+            SourceFlavor::RustScript,
+            &resolved,
+            options,
+            module_source_id,
+        )?;
         let mut parsed = frontends::parse_module_source_with_source_id(
             &module_source_raw,
             SourceFlavor::RustScript,

@@ -622,3 +622,126 @@ fn passing_mode_only_overloads_are_ambiguous() {
         Err(HostCallResolveError::Ambiguous { name, .. }) if name == "consume"
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Finding: strict BorrowMut — `&mut` required for catalog `BorrowMut` params
+// ---------------------------------------------------------------------------
+
+/// A catalog exposing `io::open_custom` (returns a file handle) and
+/// `io::borrow_mut_custom(handle: borrow_mut resource<io.file>) -> int`.
+fn borrow_mut_catalog() -> Arc<HostApiCatalog> {
+    let key = io_file();
+    let mut builder = HostApiBuilder::new();
+    builder.resource(ResourceTypeSchema::new(key.clone(), "An open file"));
+    builder.function(HostFunctionSchema::with_return(
+        "io::open_custom",
+        vec![value("path", HostTypeSchema::String)],
+        resource(key.clone()),
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        "io::borrow_mut_custom",
+        vec![HostParamSchema::with_passing(
+            "handle",
+            resource(key),
+            HostParamPassing::BorrowMut,
+        )],
+        HostTypeSchema::Int,
+    ));
+    Arc::new(builder.build().expect("custom catalog must build"))
+}
+
+fn compile_borrow_mut(source: &str) -> Result<vm::CompiledProgram, vm::SourcePathError> {
+    compile_source_with_flavor_and_options(
+        source,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::default().with_host_api_catalog(borrow_mut_catalog()),
+    )
+}
+
+/// Asserts a failed compile returns a source error whose text contains
+/// `needle`, and returns that text.
+fn expect_borrow_mut_error(
+    result: Result<vm::CompiledProgram, vm::SourcePathError>,
+    needle: &str,
+) -> String {
+    match result {
+        Ok(_) => panic!("expected compile error containing `{needle}`, got success"),
+        Err(err) => {
+            let message = err.to_string();
+            assert!(
+                message.contains(needle),
+                "expected compile error containing `{needle}`, got: {message}"
+            );
+            message
+        }
+    }
+}
+
+#[test]
+fn borrow_mut_requires_explicit_mut_borrow_of_a_mutable_binding() {
+    let compiled = compile_borrow_mut(
+        r#"
+        use io;
+        let mut borrowed = io::open_custom("borrowed");
+        io::borrow_mut_custom(&mut borrowed);
+        "#,
+    )
+    .expect("explicit &mut of a mutable binding must compile");
+
+    let import = compiled
+        .program
+        .imports
+        .iter()
+        .find(|import| import.name == "io::borrow_mut_custom")
+        .expect("borrow_mut_custom import");
+    assert_eq!(
+        import.schema.as_ref().expect("exact schema").params[0].passing,
+        HostParamPassing::BorrowMut
+    );
+}
+
+#[test]
+fn borrow_mut_rejects_bare_resource_handle() {
+    let message = expect_borrow_mut_error(
+        compile_borrow_mut(
+            r#"
+        use io;
+        let handle = io::open_custom("bare");
+        io::borrow_mut_custom(handle);
+        "#,
+        ),
+        "io::borrow_mut_custom",
+    );
+    assert!(
+        !message.contains("immutable local"),
+        "bare handle failure is a resolution rejection, not a mutability error: {message}"
+    );
+}
+
+#[test]
+fn borrow_mut_rejects_immutable_borrow() {
+    expect_borrow_mut_error(
+        compile_borrow_mut(
+            r#"
+        use io;
+        let handle = io::open_custom("shared");
+        io::borrow_mut_custom(&handle);
+        "#,
+        ),
+        "io::borrow_mut_custom",
+    );
+}
+
+#[test]
+fn borrow_mut_rejects_immutable_binding_even_with_mut_borrow_syntax() {
+    expect_borrow_mut_error(
+        compile_borrow_mut(
+            r#"
+        use io;
+        let handle = io::open_custom("immutable");
+        io::borrow_mut_custom(&mut handle);
+        "#,
+        ),
+        "immutable local",
+    );
+}

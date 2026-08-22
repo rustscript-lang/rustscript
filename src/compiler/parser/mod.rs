@@ -368,7 +368,13 @@ impl Parser {
         while !self.check(&TokenKind::Eof) {
             stmts.push(self.parse_stmt()?);
         }
-        self.validate_schema_reference_sites()?;
+        // Import-scan parses exist only to discover `use` directives; body
+        // semantic validation (unknown struct schemas, callable contracts,
+        // mutability) is deferred to the real compile parse so an unrelated
+        // body error can never hide a valid import.
+        if !self.import_scan_mode {
+            self.validate_schema_reference_sites()?;
+        }
         Ok(stmts)
     }
 

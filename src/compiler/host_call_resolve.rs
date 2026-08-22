@@ -197,6 +197,14 @@ pub(crate) trait ActualCallArgView {
     /// The exact call-site passing intent, or [`None`] to defer it (no
     /// preference, so any candidate passing mode stays viable).
     fn passing(&self) -> Option<HostParamPassing>;
+    /// Whether this call-site argument satisfies `param_passing`.
+    ///
+    /// Default: any actual intent satisfies any parameter. Schema-only callers
+    /// (which always defer passing) therefore never gate on passing, matching
+    /// the legacy resolver behavior.
+    fn passing_matches_param(&self, _param_passing: HostParamPassing) -> bool {
+        true
+    }
 }
 
 impl ActualCallArgView for TypeSchema {
@@ -237,6 +245,23 @@ impl ActualCallArgView for ActualCallArg<'_> {
     }
     fn passing(&self) -> Option<HostParamPassing> {
         self.passing
+    }
+    /// Passing-aware gating: a `Some` intent must equal the parameter's mode
+    /// exactly, and a deferred (`None`) intent is acceptable for
+    /// `Value`/`Borrow`/`TakeOwned` parameters but **not** for `BorrowMut`.
+    /// This makes `BorrowMut` declare an explicit `&mut` contract: a bare
+    /// resource handle or an immutable `&arg` never satisfies it, while the
+    /// standard IO `Borrow` and legacy `TakeOwned` bare-handle calls stay
+    /// acceptable.
+    fn passing_matches_param(&self, param_passing: HostParamPassing) -> bool {
+        match self.passing {
+            Some(actual) => actual == param_passing,
+            // Deferred intent: no source-level borrow keyword was written. A
+            // bare resource handle legitimately flows to `Borrow` (legacy IO)
+            // and `TakeOwned` (ownership transfer) parameters, so only the
+            // mutable-borrow contract stays unsatisfied.
+            None => param_passing != HostParamPassing::BorrowMut,
+        }
     }
 }
 
@@ -401,8 +426,9 @@ fn resolve_candidate_refs<'a, A: ActualCallArgView>(
     // Classify every arity-matching candidate against the actual args in
     // lock-step. Schema scoring never allocates a parallel expected-schema
     // array; each pair is scored and dropped immediately. A candidate is
-    // viable only when its schema has zero mismatches and every `Some`
-    // call-site passing intent equals its parameter's passing mode.
+    // viable only when its schema has zero mismatches and the call-site
+    // passing intent satisfies the parameter's passing mode (see
+    // [`ActualCallArgView::passing_matches_param`]).
     let mut viable: Vec<(CandidateKey, &'a HostFunctionSchema)> = Vec::new();
     let mut non_viable: Vec<(CandidateKey, &'a HostFunctionSchema)> = Vec::new();
     for function in &arity_matching {
@@ -411,10 +437,7 @@ fn resolve_candidate_refs<'a, A: ActualCallArgView>(
         for (param, arg) in function.params.iter().zip(args.iter()) {
             let expected_schema = param.ty.to_compiler_schema();
             score = score.combined(score_pair(&expected_schema, arg.schema()));
-            if passing_conforms
-                && let Some(actual_passing) = arg.passing()
-                && actual_passing != param.passing
-            {
+            if passing_conforms && !arg.passing_matches_param(param.passing) {
                 passing_conforms = false;
             }
         }

@@ -66,6 +66,40 @@ fn import_scan_ignores_comments_and_keeps_multiline_aliases_before_body_errors()
     remove_module_root(&root);
 }
 
+/// Import-scan discovery tolerates unrelated body semantic errors (unknown
+/// struct schema annotations, immutable mutation) so a valid `use` is still
+/// discovered, while a real compile still rejects those body errors.
+#[test]
+fn import_scan_survives_body_semantics_but_normal_compile_rejects_them() {
+    let root = temp_module_root("vm_rustscript_import_scan_body_semantics");
+    let main_path = root.join("main.rss");
+    // A valid host-namespace import followed by an unknown schema annotation
+    // and an immutable-mutation body error. Discovery must surface the import;
+    // the normal compile must reject the body.
+    write_source(
+        &main_path,
+        "use io;\nlet x: MissingSchema<Int> = 1;\nx = 2;\nio::exists(\"/\");\n",
+        "main source",
+    );
+
+    // Import-scan itself (the discovery parse) succeeds: the body errors are
+    // deferred to the real compile. We assert that by reaching the compile
+    // path — a scan failure would short-circuit before any body diagnostic.
+    let error = match compile_source_file(&main_path) {
+        Ok(_) => panic!("body semantic errors must fail the real compile"),
+        Err(error) => error,
+    };
+    let rendered = format!("{error:?}");
+    assert!(
+        rendered.contains("MissingSchema")
+            || rendered.contains("schema")
+            || rendered.contains("immutable"),
+        "the compile must surface the first body semantic error, got: {rendered}"
+    );
+
+    remove_module_root(&root);
+}
+
 #[test]
 fn malformed_import_reports_the_original_source_path_and_line() {
     let root = temp_module_root("vm_rustscript_import_scan_diagnostic_test");

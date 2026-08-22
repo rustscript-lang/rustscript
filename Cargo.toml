@@ -145,6 +145,11 @@ path = "tests/vm/sqlite_host_tests.rs"
 required-features = ["sqlite"]
 
 [[test]]
+name = "standard_staging_tests"
+path = "tests/vm/standard_staging_tests.rs"
+required-features = ["runtime", "http-client", "sqlite"]
+
+[[test]]
 name = "core_host_boundary_tests"
 path = "tests/core_host_boundary_tests.rs"
 required-features = ["runtime"]

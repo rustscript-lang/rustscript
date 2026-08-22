@@ -14,8 +14,10 @@ pub(super) fn parse_module_imports(
     flavor: SourceFlavor,
     path: &Path,
     options: &CompileSourceFileOptions,
+    original_source_id: u32,
 ) -> Result<Vec<ModuleImport>, SourcePathError> {
-    scan_module_imports(source, flavor, path, options).map(|(imports, _)| imports)
+    scan_module_imports(source, flavor, path, options, original_source_id)
+        .map(|(imports, _)| imports)
 }
 
 /// Scan the module imports of one source.
@@ -32,10 +34,11 @@ pub(super) fn scan_module_imports(
     flavor: SourceFlavor,
     path: &Path,
     options: &CompileSourceFileOptions,
+    original_source_id: u32,
 ) -> Result<(Vec<ModuleImport>, Vec<UseDecl>), SourcePathError> {
     match flavor {
         SourceFlavor::RustScript => {
-            let decls = parse_rustscript_use_declarations(source, options)?;
+            let decls = parse_rustscript_use_declarations(source, options, original_source_id)?;
             let imports = use_declarations_to_module_imports(path, &decls)?;
             Ok((imports, decls))
         }
@@ -58,8 +61,9 @@ pub(super) fn scan_module_imports(
 fn parse_rustscript_use_declarations(
     source: &str,
     options: &CompileSourceFileOptions,
+    original_source_id: u32,
 ) -> Result<Vec<UseDecl>, SourcePathError> {
-    let ir = frontends::parse_source_for_import_scan(source, options)
+    let ir = frontends::parse_source_for_import_scan(source, options, original_source_id)
         .map_err(|err| SourcePathError::Source(SourceError::Parse(err)))?;
     Ok(ir.use_declarations)
 }
@@ -319,9 +323,14 @@ mod tests {
     fn structured_scan_preserves_spans_clauses_and_lines() {
         let source = "use self::nested as nested;\nuse sibling::{value as v, other};\nuse super::shared;\nuse io;\n";
         let path = PathBuf::from("/root/pkg/main.rss");
-        let (imports, decls) =
-            scan_module_imports(source, SourceFlavor::RustScript, &path, &Default::default())
-                .expect("scan should succeed");
+        let (imports, decls) = scan_module_imports(
+            source,
+            SourceFlavor::RustScript,
+            &path,
+            &Default::default(),
+            0,
+        )
+        .expect("scan should succeed");
 
         assert_eq!(imports.len(), 4);
         assert_eq!(imports[0].spec, "./nested.rss");
@@ -352,9 +361,14 @@ mod tests {
     fn structured_scan_handles_wildcard_and_alias_forms() {
         let source = "use a::b::*;\nuse c::d::{x};\nuse e as f;\n";
         let path = PathBuf::from("/root/main.rss");
-        let (imports, decls) =
-            scan_module_imports(source, SourceFlavor::RustScript, &path, &Default::default())
-                .expect("scan should succeed");
+        let (imports, decls) = scan_module_imports(
+            source,
+            SourceFlavor::RustScript,
+            &path,
+            &Default::default(),
+            0,
+        )
+        .expect("scan should succeed");
 
         assert_eq!(imports[0].spec, "a/b.rss");
         assert!(matches!(imports[0].clause, ImportClause::AllPublic));
@@ -369,9 +383,14 @@ mod tests {
     fn structured_scan_ignores_comment_text_and_parses_multiline_aliases() {
         let source = "/*\nuse self::missing;\n*/\n\tuse self::module::{\n    value /* comment */ as answer,\n}; // trailing comment\n";
         let path = PathBuf::from("/root/main.rss");
-        let (imports, decls) =
-            scan_module_imports(source, SourceFlavor::RustScript, &path, &Default::default())
-                .expect("comment and multiline syntax should scan");
+        let (imports, decls) = scan_module_imports(
+            source,
+            SourceFlavor::RustScript,
+            &path,
+            &Default::default(),
+            0,
+        )
+        .expect("comment and multiline syntax should scan");
 
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].spec, "./module.rss");
@@ -387,9 +406,14 @@ mod tests {
     fn structured_scan_rejects_import_keyword() {
         let source = "import \"./module.rss\";\n";
         let path = PathBuf::from("/root/main.rss");
-        let err =
-            parse_module_imports(source, SourceFlavor::RustScript, &path, &Default::default())
-                .expect_err("import keyword should be rejected");
+        let err = parse_module_imports(
+            source,
+            SourceFlavor::RustScript,
+            &path,
+            &Default::default(),
+            0,
+        )
+        .expect_err("import keyword should be rejected");
         assert!(
             err.to_string().contains("expected ';' after expression"),
             "unexpected parser diagnostic: {err}"
@@ -400,12 +424,99 @@ mod tests {
     fn structured_scan_rejects_crate_paths() {
         let source = "use crate::x;\n";
         let path = PathBuf::from("/root/main.rss");
-        let err =
-            parse_module_imports(source, SourceFlavor::RustScript, &path, &Default::default())
-                .expect_err("crate:: paths should be rejected");
+        let err = parse_module_imports(
+            source,
+            SourceFlavor::RustScript,
+            &path,
+            &Default::default(),
+            0,
+        )
+        .expect_err("crate:: paths should be rejected");
         assert!(
             err.to_string().contains("crate:: paths are not supported"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// The import-scan parse attributes every `UseDecl` span to the caller's
+    /// graph source id — root (0) and nested (>0) — never to a temporary
+    /// lowered id. Offsets are exact byte offsets into the original source,
+    /// including after multi-byte Unicode prefixes.
+    #[test]
+    fn structured_scan_attributes_spans_to_the_owning_graph_source() {
+        let source = "// 変換\nuse self::nested as nested;\nuse io;\n";
+        let path = PathBuf::from("/root/pkg/main.rss");
+        for source_id in [0u32, 1, 7] {
+            let (_, decls) = scan_module_imports(
+                source,
+                SourceFlavor::RustScript,
+                &path,
+                &Default::default(),
+                source_id,
+            )
+            .expect("scan should succeed");
+            assert_eq!(decls.len(), 2);
+            for decl in &decls {
+                assert_eq!(
+                    decl.span.source_id, source_id,
+                    "every use decl span must be owned by the graph source {source_id}, got {:?}",
+                    decl.span
+                );
+                let text = &source[decl.span.lo..decl.span.hi];
+                assert!(
+                    text.starts_with("use ") && text.ends_with(';'),
+                    "span must slice the directive exactly, got {text:?}"
+                );
+                assert!(
+                    decl.span.lo > 6,
+                    "unicode prefix must shift byte offsets away from zero: {:?}",
+                    decl.span
+                );
+            }
+            // Root's `self::nested` directive starts after the comment line.
+            assert_eq!(
+                &source[decls[0].span.lo..decls[0].span.hi],
+                "use self::nested as nested;"
+            );
+            assert_eq!(&source[decls[1].span.lo..decls[1].span.hi], "use io;");
+        }
+    }
+
+    /// Import-scan discovery must ignore unrelated body semantic errors
+    /// (unknown schema annotations, immutable mutation) while still failing
+    /// on malformed `use` grammar at the exact span.
+    #[test]
+    fn structured_scan_isolates_discovery_from_body_semantics() {
+        let path = PathBuf::from("/root/main.rss");
+        // Unknown struct schema annotation, immutable mutation, and an
+        // unresolved body call must not hide the valid `use io;`.
+        let source = "use io;\nlet x: Missing<Int> = 1;\nx = 2;\nhelper(1);\n";
+        let (imports, decls) = scan_module_imports(
+            source,
+            SourceFlavor::RustScript,
+            &path,
+            &Default::default(),
+            0,
+        )
+        .expect("body semantic errors must not block import discovery");
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].spec, "io.rss");
+        assert_eq!(decls.len(), 1);
+        assert_eq!(&source[decls[0].span.lo..decls[0].span.hi], "use io;");
+
+        // Malformed use grammar still fails at the exact directive span.
+        let malformed = "use self::;\n";
+        let err = parse_module_imports(
+            malformed,
+            SourceFlavor::RustScript,
+            &path,
+            &Default::default(),
+            0,
+        )
+        .expect_err("malformed use must fail");
+        assert!(
+            err.to_string().contains("expected module path segment"),
+            "unexpected diagnostic: {err}"
         );
     }
 }

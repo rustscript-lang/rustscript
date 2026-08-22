@@ -108,8 +108,8 @@ pub(super) fn load_units_for_source_file(
         .add_source_at(0, path.display().to_string(), source_raw.to_string());
     collect_state.visiting.push(path.to_path_buf());
 
-    let root_imports =
-        parse_module_imports(source_raw, flavor, path, &effective_options).map_err(|err| {
+    let root_imports = parse_module_imports(source_raw, flavor, path, &effective_options, 0)
+        .map_err(|err| {
             // The root's own scan/parse diagnostics attach their span against
             // the pre-registered root source and carry the compilation-wide map,
             // so they render from the root's text.

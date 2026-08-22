@@ -282,6 +282,7 @@ fn parse_repl_with_parser(
 pub(super) fn parse_source_for_import_scan(
     source: &str,
     options: &CompileSourceFileOptions,
+    original_source_id: u32,
 ) -> Result<FrontendIr, ParseError> {
     let lowered = rustscript::lower(source)?;
     parse_lowered_with_mapping(
@@ -289,8 +290,8 @@ pub(super) fn parse_source_for_import_scan(
         lowered,
         true,
         false,
-        true,
-        0,
+        false,
+        original_source_id,
         true,
         effective_host_api_catalog(options),
     )
@@ -325,6 +326,7 @@ fn parse_lowered_with_mapping(
                 ir.parsed_semantic_index.as_mut(),
                 &mut ir.unknown_type_spans,
                 &mut ir.lexer_tokens,
+                &mut ir.use_declarations,
                 &lowered,
                 lowered_source_id,
                 original_source_id,
@@ -393,6 +395,7 @@ fn parse_lowered_repl_with_mapping(
                 parsed.ir.parsed_semantic_index.as_mut(),
                 &mut parsed.ir.unknown_type_spans,
                 &mut parsed.ir.lexer_tokens,
+                &mut parsed.ir.use_declarations,
                 &lowered,
                 lowered_source_id,
                 original_source_id,
@@ -445,6 +448,7 @@ fn remap_lowered_spans(
     parsed_index: Option<&mut crate::compiler::ir::ParsedSemanticIndex>,
     unknown_type_spans: &mut [Span],
     lexer_tokens: &mut [crate::compiler::ir::LexerToken],
+    use_declarations: &mut [crate::compiler::modules::UseDecl],
     lowered: &LoweredSource,
     lowered_source_id: u32,
     original_source_id: u32,
@@ -489,6 +493,9 @@ fn remap_lowered_spans(
     }
     for token in lexer_tokens {
         map(&mut token.span);
+    }
+    for decl in use_declarations {
+        map(&mut decl.span);
     }
 }
 

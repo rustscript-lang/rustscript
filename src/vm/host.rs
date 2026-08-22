@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::builtins::BuiltinFunction;
+use crate::host_api::HostApiFingerprint;
 
 use super::async_host::WaitingHostOp;
 use super::*;
@@ -632,6 +633,30 @@ impl HostBindingPlan {
     }
 }
 
+/// The standard adapter surfaces a program's exact imports require.
+#[cfg(feature = "runtime")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StandardSurfaces {
+    io: bool,
+    http: bool,
+    database: bool,
+}
+
+#[cfg(feature = "runtime")]
+impl StandardSurfaces {
+    fn none(&self) -> bool {
+        !self.io && !self.http && !self.database
+    }
+}
+
+/// The registry a [`HostFunctionRegistry::bind_vm_cached`] should bind from:
+/// either the current registry (all surfaces present) or a freshly staged /
+/// memoized snapshot that already carries every required standard surface.
+#[cfg(feature = "runtime")]
+struct StandardStageResult {
+    registry: Arc<HostFunctionRegistry>,
+}
+
 #[derive(Clone)]
 pub struct HostFunctionRegistry {
     entries: Arc<Vec<RegistryEntry>>,
@@ -651,6 +676,27 @@ pub struct HostFunctionRegistry {
     /// Shared by ordinary `Clone` siblings; transaction staging keeps the
     /// origin and publishes only through its typed transaction handle.
     transaction_origin: Arc<()>,
+    /// Memoized fully-staged standard snapshot (per registry lineage). After a
+    /// successful auto-stage of missing standard adapter surfaces, the staged
+    /// registry is cached here so subsequent binds reuse it without
+    /// re-registering, re-validating, or bumping the generation counter. The
+    /// guard records the source registry's generation at publish time; a
+    /// later mutation of the source registry invalidates the snapshot.
+    standard_staging_snapshot: Arc<RwLock<Option<StandardStagingSnapshot>>>,
+    /// Deterministic count of standard-surface registration rounds performed
+    /// by this registry lineage through [`bind_vm_cached`].
+    standard_staging_registrations: Arc<AtomicU64>,
+}
+
+/// A memoized fully-staged standard snapshot plus the source-registry
+/// generation it was published against. The snapshot is only reused while the
+/// source registry's generation is unchanged, so later custom registrations or
+/// capability changes invalidate it.
+#[cfg(feature = "runtime")]
+#[derive(Clone)]
+struct StandardStagingSnapshot {
+    registry: Arc<HostFunctionRegistry>,
+    source_generation: u64,
 }
 
 /// A private, single-use publication capability for one registry origin.
@@ -692,6 +738,8 @@ impl HostFunctionRegistry {
             registry_generation_token: Arc::new(()),
             registry_generation: Arc::new(AtomicU64::new(0)),
             transaction_origin: Arc::new(()),
+            standard_staging_snapshot: Arc::new(RwLock::new(None)),
+            standard_staging_registrations: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -799,6 +847,12 @@ impl HostFunctionRegistry {
                 self.registry_generation.load(Ordering::Relaxed),
             )),
             transaction_origin: Arc::clone(&self.transaction_origin),
+            // A staging clone starts with no memoized standard snapshot: its
+            // published state is what `bind_vm_cached` caches after a
+            // successful stage. Sharing the origin's snapshot here would leak
+            // another registry lineage's staged adapters into this one.
+            standard_staging_snapshot: Arc::new(RwLock::new(None)),
+            standard_staging_registrations: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1363,41 +1417,166 @@ impl HostFunctionRegistry {
     pub fn bind_vm_cached(&self, vm: &mut Vm) -> VmResult<()> {
         self.validate_program_capabilities(&vm.program)?;
         #[cfg(feature = "runtime")]
-        if self.should_stage_standard_exact_imports(&vm.program.imports) {
-            let mut staged = self.transaction_clone();
-            let (requires_io, requires_http, requires_database) =
-                crate::builtins::runtime::standard_exact_surface_requirements(&vm.program.imports);
-            if requires_io {
-                crate::builtins::runtime::register_io_builtin_module(&mut staged)?;
-            }
-            #[cfg(feature = "http-client")]
-            if requires_http {
-                crate::builtins::runtime::register_http_builtin_module(&mut staged)?;
-            }
-            #[cfg(feature = "sqlite")]
-            if requires_database {
-                crate::builtins::runtime::register_sqlite_builtin_module(&mut staged)?;
-            }
-            let plan = staged.prepare_shared_plan(&vm.program.imports)?;
-            return staged.bind_vm_with_plan(vm, &plan);
+        if let Some(decision) = self.standard_stage_decision(&vm.program.imports)? {
+            // `registry` is either the memoized snapshot or the freshly staged
+            // clone; both already carry every required standard surface, so
+            // the bind resolves without re-registering anything.
+            let plan = decision.registry.prepare_shared_plan(&vm.program.imports)?;
+            return decision.registry.bind_vm_with_plan(vm, &plan);
         }
         let plan = self.prepare_shared_plan(&vm.program.imports)?;
         self.bind_vm_with_plan(vm, &plan)
     }
 
+    /// A memoized or freshly staged registry that already satisfies every
+    /// required standard adapter surface for `imports`, or `None` when no
+    /// standard auto-stage is warranted.
+    ///
+    /// * `None` — don't auto-stage: there are no exact imports, a required
+    ///   import is not from the standard catalog, or the registry already
+    ///   carries a custom / mixed-fingerprint exact entry that must not be
+    ///   silently combined with the standard snapshot. The caller falls back
+    ///   to its normal (non-staging) resolution path.
+    /// * `Some` — the returned registry already covers every required
+    ///   standard surface: either the memoized snapshot (reused with zero
+    ///   re-registration), the current registry (all surfaces present), or a
+    ///   freshly staged clone (only the missing surfaces were added and the
+    ///   snapshot memoized for later binds).
     #[cfg(feature = "runtime")]
-    fn should_stage_standard_exact_imports(&self, imports: &[HostImport]) -> bool {
-        if imports.is_empty() || self.by_exact.values().any(|schemas| !schemas.is_empty()) {
-            return false;
-        }
+    fn standard_stage_decision(
+        &self,
+        imports: &[HostImport],
+    ) -> VmResult<Option<StandardStageResult>> {
+        use crate::builtins::runtime::standard_host_catalog_fingerprint;
+
         let standard = crate::builtins::runtime::standard_host_catalog();
-        let fingerprint = crate::builtins::runtime::standard_host_catalog_fingerprint();
-        imports.iter().all(|import| {
-            let Some(schema) = import.schema.as_ref() else {
-                return false;
-            };
-            schema.fingerprint == fingerprint && !standard.functions_named(&import.name).is_empty()
+        let fingerprint = standard_host_catalog_fingerprint();
+        if imports.is_empty()
+            || imports.iter().any(|import| {
+                let Some(schema) = import.schema.as_ref() else {
+                    return true;
+                };
+                schema.fingerprint != fingerprint
+                    || standard.functions_named(&import.name).is_empty()
+            })
+        {
+            return Ok(None);
+        }
+
+        // Memoized snapshot reuse: when self hasn't changed since the snapshot
+        // was published, it already covers every standard surface, so bind from
+        // it directly (zero registration / generation change). A later source
+        // mutation (custom registration, capability change) bumps self's
+        // generation and invalidates the snapshot.
+        let snapshot_guard = self
+            .standard_staging_snapshot
+            .read()
+            .expect("poisoned lock");
+        if let Some(snapshot) = snapshot_guard.as_ref()
+            && snapshot.source_generation == self.registry_generation.load(Ordering::Relaxed)
+        {
+            let snapshot = Arc::clone(&snapshot.registry);
+            drop(snapshot_guard);
+            return Ok(Some(StandardStageResult { registry: snapshot }));
+        }
+        drop(snapshot_guard);
+
+        let required = crate::builtins::runtime::standard_exact_surface_requirements(imports);
+        // Reject custom / mixed fingerprints in the registry: an existing
+        // exact entry that is not standard-fingerprint compatible must never
+        // be combined with the standard snapshot. Restricted registries keep
+        // their capability policy; we simply don't auto-stage.
+        for schemas in self.by_exact.values() {
+            if schemas
+                .keys()
+                .any(|schema| schema.fingerprint != fingerprint)
+            {
+                return Ok(None);
+            }
+        }
+        let missing = StandardSurfaces {
+            io: required.0 && !self.has_standard_surface("io::", fingerprint),
+            http: required.1 && !self.has_standard_surface("http::", fingerprint),
+            database: required.2 && !self.has_standard_surface("sqlite::", fingerprint),
+        };
+        if missing.none() {
+            // All required surfaces are already present on the current
+            // registry; nothing to stage.
+            return Ok(Some(StandardStageResult {
+                registry: Arc::new(self.clone()),
+            }));
+        }
+
+        let mut staged = self.transaction_clone();
+        self.stage_missing_standard_surfaces(&mut staged, missing)?;
+        self.standard_staging_registrations
+            .fetch_add(1, Ordering::Relaxed);
+        let staged = Arc::new(staged);
+        // Publish the staged snapshot so subsequent binds reuse it without
+        // re-registering: the fully-staged registry is the immutable template,
+        // guarded by the source registry's current generation.
+        *self
+            .standard_staging_snapshot
+            .write()
+            .expect("poisoned lock") = Some(StandardStagingSnapshot {
+            registry: Arc::clone(&staged),
+            source_generation: self.registry_generation.load(Ordering::Relaxed),
+        });
+        Ok(Some(StandardStageResult { registry: staged }))
+    }
+
+    /// Whether the registry already carries at least one exact entry under the
+    /// given namespace prefix registered against the authoritative standard
+    /// fingerprint. Presence means that surface is considered "completed" and
+    /// is not re-registered (duplicates are rejected by the registry).
+    #[cfg(feature = "runtime")]
+    fn has_standard_surface(&self, prefix: &str, fingerprint: HostApiFingerprint) -> bool {
+        self.by_exact.keys().any(|name| {
+            name.starts_with(prefix)
+                && self.by_exact.get(name).is_some_and(|schemas| {
+                    schemas
+                        .keys()
+                        .any(|schema| schema.fingerprint == fingerprint)
+                })
         })
+    }
+
+    /// Registers only the missing standard adapter surfaces on `staged`,
+    /// leaving every already-present surface untouched.
+    #[cfg(feature = "runtime")]
+    fn stage_missing_standard_surfaces(
+        &self,
+        staged: &mut HostFunctionRegistry,
+        missing: StandardSurfaces,
+    ) -> VmResult<()> {
+        if missing.io {
+            crate::builtins::runtime::register_io_builtin_module(staged)?;
+        }
+        #[cfg(feature = "http-client")]
+        if missing.http {
+            crate::builtins::runtime::register_http_builtin_module(staged)?;
+        }
+        #[cfg(feature = "sqlite")]
+        if missing.database {
+            crate::builtins::runtime::register_sqlite_builtin_module(staged)?;
+        }
+        Ok(())
+    }
+
+    /// Deterministic count of standard auto-stage registration rounds performed
+    /// by this registry lineage through [`bind_vm_cached`]. A second bind that
+    /// reuses the memoized snapshot does not increment it.
+    pub fn standard_staging_registrations(&self) -> u64 {
+        self.standard_staging_registrations.load(Ordering::Relaxed)
+    }
+
+    /// The memoized fully-staged standard snapshot, if one was published.
+    pub fn standard_staging_snapshot(&self) -> Option<Arc<HostFunctionRegistry>> {
+        self.standard_staging_snapshot
+            .read()
+            .expect("poisoned lock")
+            .as_ref()
+            .map(|snapshot| Arc::clone(&snapshot.registry))
     }
 
     pub fn prepare_plan(&self, imports: &[HostImport]) -> VmResult<HostBindingPlan> {
