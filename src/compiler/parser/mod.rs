@@ -303,6 +303,33 @@ impl Parser {
         dialect: &'static dyn ParserDialect,
         predeclared_locals: &[ReplLocalBinding],
     ) -> Result<Self, ParseError> {
+        let mut parser = Self::new_with_predeclared_locals_and_host_catalog(
+            source,
+            source_id,
+            allow_implicit_externs,
+            allow_implicit_semicolons,
+            enforce_mutable_bindings,
+            dialect,
+            predeclared_locals,
+            None,
+        )?;
+        Ok(parser)
+    }
+
+    /// Catalog-aware REPL constructor: combines the predeclared-locals path
+    /// with an optional [`HostApiCatalog`] snapshot so REPL compiles emit
+    /// exact V13 `HostImport` schemas against the standard snapshot (when a
+    /// catalog is supplied) instead of name-only imports.
+    pub(super) fn new_with_predeclared_locals_and_host_catalog(
+        source: &str,
+        source_id: SourceId,
+        allow_implicit_externs: bool,
+        allow_implicit_semicolons: bool,
+        enforce_mutable_bindings: bool,
+        dialect: &'static dyn ParserDialect,
+        predeclared_locals: &[ReplLocalBinding],
+        host_catalog: Option<std::sync::Arc<HostApiCatalog>>,
+    ) -> Result<Self, ParseError> {
         let mut parser = Self::new(
             source,
             source_id,
@@ -312,6 +339,10 @@ impl Parser {
             false,
             dialect,
         )?;
+        if let Some(catalog) = host_catalog {
+            parser.host_api_metadata = Some(HostApiIrMetadata::new(catalog.fingerprint()));
+            parser.host_catalog = Some(catalog);
+        }
         for binding in predeclared_locals {
             parser.predeclare_local(binding)?;
         }

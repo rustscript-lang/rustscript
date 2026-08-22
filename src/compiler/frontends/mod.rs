@@ -124,8 +124,27 @@ pub(super) fn parse_rustscript_repl_source(
     source: &str,
     predefined_locals: &[ReplLocalBinding],
 ) -> Result<ParsedRustScriptReplSource, ParseError> {
+    parse_rustscript_repl_source_with_catalog(source, predefined_locals, None)
+}
+
+/// REPL parse with an optional catalog snapshot: when `Some`, the parsed IR
+/// carries `host_api_metadata` so standard host calls compile to exact V13
+/// `HostImport` schemas (never a name-only fallback).
+pub(super) fn parse_rustscript_repl_source_with_catalog(
+    source: &str,
+    predefined_locals: &[ReplLocalBinding],
+    host_catalog: Option<Arc<HostApiCatalog>>,
+) -> Result<ParsedRustScriptReplSource, ParseError> {
     let lowered = rustscript::lower(source)?;
-    parse_lowered_repl_with_mapping(source, lowered, predefined_locals, false, false, true)
+    parse_lowered_repl_with_mapping(
+        source,
+        lowered,
+        predefined_locals,
+        false,
+        false,
+        true,
+        host_catalog,
+    )
 }
 
 pub fn is_ident_start(ch: char) -> bool {
@@ -196,16 +215,29 @@ fn parse_repl_with_parser(
     allow_implicit_semicolons: bool,
     enforce_mutable_bindings: bool,
     dialect: &'static dyn ParserDialect,
+    host_catalog: Option<Arc<HostApiCatalog>>,
 ) -> Result<ParsedRustScriptReplSource, ParseError> {
-    let mut parser = Parser::new_with_predeclared_locals(
-        source,
-        source_id,
-        allow_implicit_externs,
-        allow_implicit_semicolons,
-        enforce_mutable_bindings,
-        dialect,
-        predefined_locals,
-    )?;
+    let mut parser = match host_catalog {
+        Some(catalog) => Parser::new_with_predeclared_locals_and_host_catalog(
+            source,
+            source_id,
+            allow_implicit_externs,
+            allow_implicit_semicolons,
+            enforce_mutable_bindings,
+            dialect,
+            predefined_locals,
+            Some(catalog),
+        )?,
+        None => Parser::new_with_predeclared_locals(
+            source,
+            source_id,
+            allow_implicit_externs,
+            allow_implicit_semicolons,
+            enforce_mutable_bindings,
+            dialect,
+            predefined_locals,
+        )?,
+    };
     let stmts = parser.parse_program()?;
     let bindings = parser.local_bindings_with_mutability();
 
@@ -222,7 +254,7 @@ fn parse_repl_with_parser(
             function_sources: HashMap::new(),
             use_declarations: parser.use_declarations(),
             implicit_extern_names: parser.implicit_extern_names(),
-            host_api_metadata: None,
+            host_api_metadata: parser.host_api_metadata(),
             semantic_index: None,
             parsed_semantic_index: Some(parser.take_parsed_semantic_index()),
             catalog_visibility: Some(parser.take_catalog_visibility()),
@@ -307,6 +339,7 @@ fn parse_lowered_repl_with_mapping(
     allow_implicit_externs: bool,
     allow_implicit_semicolons: bool,
     enforce_mutable_bindings: bool,
+    host_catalog: Option<Arc<HostApiCatalog>>,
 ) -> Result<ParsedRustScriptReplSource, ParseError> {
     let mut source_map = SourceMap::new();
     let original_source_id = source_map.add_source("<source>", original_source.to_string());
@@ -320,6 +353,7 @@ fn parse_lowered_repl_with_mapping(
         allow_implicit_semicolons,
         enforce_mutable_bindings,
         rustscript::parser_dialect(),
+        host_catalog,
     ) {
         Ok(mut parsed) => {
             remap_lowered_spans(

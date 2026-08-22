@@ -1380,9 +1380,14 @@ pub(super) fn builtin_sqlite_close_impl(vm: &mut Vm, db_id: i64) -> VmResult<()>
 
 /// The shared [`HostApiCatalog`] describing every SQLite host function.
 ///
-/// The compiler and the runtime registry consume this same catalog, so the
-/// fingerprints embedded in compiled `HostImport`s match the schemas
-/// registered by [`SqliteExtension`] byte-for-byte.
+/// This is the SQLite *subcatalog* surface. The standard extensions and the
+/// standard compile entry use the combined [`standard_host_catalog`]
+/// snapshot, not this subcatalog, so a standard compile does NOT match
+/// [`SqliteExtension`]'s default registration. Custom embedders who compile
+/// against this subcatalog must register with
+/// [`register_sqlite_builtin_module_from_catalog`] (or
+/// [`SqliteExtension`] against the combined snapshot) so the registered
+/// fingerprint matches the compiled imports.
 pub fn sqlite_host_catalog() -> Arc<HostApiCatalog> {
     let key = sqlite_connection_key();
     let mut builder = HostApiBuilder::new();
@@ -1458,27 +1463,54 @@ fn borrow_connection(key: &ResourceTypeKey) -> HostParamSchema {
 }
 
 /// Registers every SQLite host function into `registry` using the exact
-/// catalog schema path.
+/// catalog schema path and the authoritative [`standard_host_catalog`]
+/// snapshot.
+///
+/// The standard extensions all register against this single combined
+/// snapshot, so a standard combined-catalog compile exact-binds the standard
+/// SQLite surface byte-for-byte. Callers that compose their own custom
+/// catalog or a SQLite *subcatalog* snapshot must use
+/// [`register_sqlite_builtin_module_from_catalog`] instead.
 pub fn register_sqlite_builtin_module(registry: &mut HostFunctionRegistry) -> VmResult<()> {
     let catalog = crate::builtins::runtime::standard_host_catalog();
-    for schema in crate::vm::host_extension::catalog_import_schemas(&catalog, "sqlite::open") {
+    register_sqlite_builtin_module_from_catalog(registry, &catalog)
+}
+
+/// Registers every SQLite host function into `registry` using the exact
+/// schema path derived from a caller-supplied, validated
+/// [`HostApiCatalog`] snapshot.
+///
+/// This is the public register-forwarding API for custom embedders who
+/// compile against a SQLite subcatalog (or their own composite) rather than
+/// the standard combined snapshot: the schemas are extracted from the
+/// supplied `catalog`, so the registered exact fingerprint matches what the
+/// matching compile emitted. Supplying a catalog that does not contain the
+/// SQLite surface (or carries incompatible schemas) is rejected
+/// deterministically through `catalog_import_schemas` (no matching schema →
+/// `MissingExact` at bind time; missing/extra members surface as a compile
+/// fingerprint mismatch).
+pub fn register_sqlite_builtin_module_from_catalog(
+    registry: &mut HostFunctionRegistry,
+    catalog: &HostApiCatalog,
+) -> VmResult<()> {
+    for schema in crate::vm::host_extension::catalog_import_schemas(catalog, "sqlite::open") {
         registry.register_exact_static("sqlite::open", 1, schema, open_adapter)?;
     }
-    for schema in crate::vm::host_extension::catalog_import_schemas(&catalog, "sqlite::execute") {
+    for schema in crate::vm::host_extension::catalog_import_schemas(catalog, "sqlite::execute") {
         registry.register_exact_static("sqlite::execute", 3, schema, execute_adapter)?;
     }
-    for schema in crate::vm::host_extension::catalog_import_schemas(&catalog, "sqlite::query") {
+    for schema in crate::vm::host_extension::catalog_import_schemas(catalog, "sqlite::query") {
         registry.register_exact_static("sqlite::query", 4, schema, query_adapter)?;
     }
-    for schema in crate::vm::host_extension::catalog_import_schemas(&catalog, "sqlite::transaction")
+    for schema in crate::vm::host_extension::catalog_import_schemas(catalog, "sqlite::transaction")
     {
         registry.register_exact_static("sqlite::transaction", 2, schema, transaction_adapter)?;
     }
-    for schema in crate::vm::host_extension::catalog_import_schemas(&catalog, "sqlite::close") {
+    for schema in crate::vm::host_extension::catalog_import_schemas(catalog, "sqlite::close") {
         registry.register_exact_static("sqlite::close", 1, schema, close_adapter)?;
     }
     for schema in
-        crate::vm::host_extension::catalog_import_schemas(&catalog, "sqlite::rows_affected")
+        crate::vm::host_extension::catalog_import_schemas(catalog, "sqlite::rows_affected")
     {
         registry.register_exact_static(
             "sqlite::rows_affected",
@@ -1487,10 +1519,10 @@ pub fn register_sqlite_builtin_module(registry: &mut HostFunctionRegistry) -> Vm
             rows_affected_adapter,
         )?;
     }
-    for schema in crate::vm::host_extension::catalog_import_schemas(&catalog, "sqlite::truncated") {
+    for schema in crate::vm::host_extension::catalog_import_schemas(catalog, "sqlite::truncated") {
         registry.register_exact_static("sqlite::truncated", 1, schema, truncated_adapter)?;
     }
-    for schema in crate::vm::host_extension::catalog_import_schemas(&catalog, "sqlite::next_cursor")
+    for schema in crate::vm::host_extension::catalog_import_schemas(catalog, "sqlite::next_cursor")
     {
         registry.register_exact_static("sqlite::next_cursor", 1, schema, next_cursor_adapter)?;
     }

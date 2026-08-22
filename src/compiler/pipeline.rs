@@ -1504,10 +1504,16 @@ fn compile_source_for_repl_with_locals_impl(
     let source_id = source_map.add_source("<source>", source.to_string());
     // REPL parsing/compiler entry state is separate from normal program compilation so
     // persisted locals do not leak into the generic frontend or IR surface.
-    let parsed =
-        frontends::parse_rustscript_repl_source(source, predefined_locals).map_err(|err| {
-            SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
-        })?;
+    #[cfg(feature = "runtime")]
+    let repl_catalog = Some(crate::builtins::runtime::standard_host_catalog());
+    #[cfg(not(feature = "runtime"))]
+    let repl_catalog = None;
+    let parsed = frontends::parse_rustscript_repl_source_with_catalog(
+        source,
+        predefined_locals,
+        repl_catalog,
+    )
+    .map_err(|err| SourceError::Parse(err.with_line_span_from_source(&source_map, source_id)))?;
     let entry_local_types = build_entry_local_types(&parsed.ir, predefined_locals);
     let entry_availability =
         build_entry_local_availability(&parsed.ir, predefined_locals, moved_names);
@@ -1610,10 +1616,17 @@ fn compile_source_with_flavor_impl(
 ) -> Result<CompiledProgram, SourceError> {
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source("<source>", source.to_string());
-    let parsed = frontends::parse_source(source, flavor, &CompileSourceFileOptions::default())
-        .map_err(|err| {
-            SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
-        })?;
+    // Standard compile entry: attach the authoritative standard host catalog
+    // (when the runtime surface is enabled) so standard host calls compile to
+    // exact V13 HostImport schemas — never a name-only fallback. Builds
+    // without the runtime surface keep the legacy no-catalog path.
+    #[cfg(feature = "runtime")]
+    let effective = default_standard_catalog_options(&CompileSourceFileOptions::default());
+    #[cfg(not(feature = "runtime"))]
+    let effective = CompileSourceFileOptions::default();
+    let parsed = frontends::parse_source(source, flavor, &effective).map_err(|err| {
+        SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
+    })?;
     match compile_parsed_output(
         source.to_string(),
         parsed,
@@ -1672,33 +1685,28 @@ fn compile_source_with_flavor_and_options_impl(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    if !options.has_module_overrides() && !options.has_source_plugins() {
-        // No module/source overrides: the standard compile-options path. When
-        // no explicit custom catalog is supplied, fall back to the single
-        // authoritative [`crate::builtins::runtime::standard_host_catalog`]
-        // snapshot (gated on the runtime surface), so standard host calls
-        // compile to exact V13 `HostImport` schemas with the combined
-        // fingerprint — never a name-only fallback. Custom-catalog callers
-        // keep their explicit catalog. Builds without the runtime surface
-        // (no-default feature matrices) keep the legacy no-catalog path.
-        #[cfg(feature = "runtime")]
-        {
-            if options.host_api_catalog().is_none() {
-                let effective = default_standard_catalog_options(options);
-                return compile_source_with_flavor_and_options_pipeline(source, flavor, &effective);
-            }
+    // When no explicit custom catalog is supplied, attach the single
+    // authoritative [`crate::builtins::runtime::standard_host_catalog`]
+    // snapshot (gated on the runtime surface), so standard host calls
+    // compile to exact V13 `HostImport` schemas with the combined
+    // fingerprint — never a name-only fallback. This applies uniformly to
+    // the fast path (no overrides/plugins) and to the module-loaded path
+    // (module/source overrides and source plugins), matching the file/at-path
+    // entries exactly. Custom-catalog callers keep their explicit catalog.
+    // Builds without the runtime surface (no-default feature matrices) keep
+    // the legacy no-catalog path.
+    #[cfg(feature = "runtime")]
+    let effective = default_standard_catalog_options(options);
+    #[cfg(not(feature = "runtime"))]
+    let effective = {
+        if !options.has_module_overrides() && !options.has_source_plugins() {
+            return compile_source_with_flavor_impl(source, flavor, CompileBehavior::DEFAULT)
+                .map_err(SourcePathError::Source);
         }
-        #[cfg(not(feature = "runtime"))]
-        {
-            if options.host_api_catalog().is_none() {
-                return compile_source_with_flavor_impl(source, flavor, CompileBehavior::DEFAULT)
-                    .map_err(SourcePathError::Source);
-            }
-        }
-        // An explicit custom catalog supplied: fall through to the pipeline.
-    }
+        options.clone()
+    };
 
-    compile_source_with_flavor_and_options_pipeline(source, flavor, options)
+    compile_source_with_flavor_and_options_pipeline(source, flavor, &effective)
 }
 
 /// Runs the module-loading compile pipeline for a source string with the

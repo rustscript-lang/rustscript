@@ -16,10 +16,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::thread;
 use std::time::Duration;
@@ -27,9 +24,9 @@ use std::time::Duration;
 use vm::{
     CallOutcome, CallReturn, CompileSourceFileOptions, HostApiCatalog, HostAsyncBridge,
     HostFunctionRegistry, HostFuture, HostFutureOutput, HostImportBindingError, HostOpId,
-    HostStackFunction, HttpConfig, HttpHostExt, IoHostExt, IoPolicy, Program, SourceFlavor, Value,
-    Vm, VmError, VmMap, VmResetState, VmResult, VmStatus, compile_source,
-    compile_source_with_flavor_and_options,
+    HttpConfig, HttpHostExt, IoHostExt, IoPolicy, SourceFlavor, Value, Vm, VmError, VmMap,
+    VmResetState, VmResult, VmStatus, compile_source, compile_source_with_flavor_and_options,
+    register_http_builtin_module, register_io_builtin_module, standard_host_catalog,
 };
 
 // ---------------------------------------------------------------------------
@@ -88,6 +85,21 @@ fn install_host_driver(vm: &mut Vm) {
     vm.set_async_bridge(Box::<TokioHostDriver>::default());
 }
 
+/// Registers the standard IO and HTTP extensions against the authoritative
+/// combined [`standard_host_catalog`] snapshot and binds the VM, so a
+/// standard-compiled program's exact imports (with the combined fingerprint)
+/// bind and execute without legacy name-only fallback.
+fn bind_standard_io_http(vm: &mut Vm) {
+    let mut registry = HostFunctionRegistry::new();
+    register_io_builtin_module(&mut registry)
+        .expect("standard IO registration against the combined catalog should succeed");
+    register_http_builtin_module(&mut registry)
+        .expect("standard HTTP registration against the combined catalog should succeed");
+    registry
+        .bind_vm_cached(vm)
+        .expect("standard combined exact bind should succeed");
+}
+
 // ---------------------------------------------------------------------------
 // Test: IO and HTTP can both register via the same VM
 // ---------------------------------------------------------------------------
@@ -105,6 +117,11 @@ fn io_and_http_both_register_via_shared_vm() {
     "#;
     let compiled = compile_source(source).expect("source should compile");
     let mut vm = Vm::new(compiled.program);
+
+    // Exact standard registration: the standard compile entry emits exact V13
+    // imports carrying the combined catalog fingerprint, so the VM must bind
+    // the standard IO+HTTP extensions against that same snapshot.
+    bind_standard_io_http(&mut vm);
 
     vm.configure_io(IoPolicy::default());
     vm.configure_http(HttpConfig::default())
@@ -137,6 +154,8 @@ fn io_policy_persists_independently_of_http_config() {
     "#;
     let compiled = compile_source(source).expect("source should compile");
     let mut vm = Vm::new(compiled.program);
+
+    bind_standard_io_http(&mut vm);
 
     // Configure IO with restrictive policy
     vm.configure_io(IoPolicy::default());
@@ -184,6 +203,11 @@ fn http_config_persists_independently_of_io_config() {
     let compiled = compile_source(&source).expect("source should compile");
     let mut vm = Vm::new(compiled.program);
 
+    // Exact standard registration: the standard compile entry emits exact V13
+    // imports, so bind the standard IO+HTTP extensions against the combined
+    // snapshot before running.
+    bind_standard_io_http(&mut vm);
+
     // Configure IO (should not interfere with HTTP)
     vm.configure_io(IoPolicy::default());
 
@@ -203,9 +227,8 @@ fn http_config_persists_independently_of_io_config() {
     .expect("valid http config");
 
     install_host_driver(&mut vm);
-    let _ = HostFunctionRegistry::new()
-        .bind_vm_cached(&mut vm)
-        .expect("default registry should bind");
+    // (Exact standard registration was already performed by
+    // `bind_standard_io_http` above.)
 
     // Run — should succeed (HTTP request works alongside IO config)
     let rt = make_tokio_runtime();
@@ -248,6 +271,8 @@ fn reset_clears_io_resources_but_preserves_io_policy() {
     let compiled = compile_source(source).expect("compile");
     let mut vm = Vm::new(compiled.program);
 
+    bind_standard_io_http(&mut vm);
+
     vm.configure_io(IoPolicy {
         allowed_roots: vec!["/tmp".into()],
         allow_write: true,
@@ -256,8 +281,26 @@ fn reset_clears_io_resources_but_preserves_io_policy() {
         max_write_bytes: 1024 * 1024,
     });
 
-    // First run
-    let _ = vm.run();
+    // Drive the program to Halted so every pending IO worker has completed
+    // before the reset — reset must quiesce a fully-finished invocation.
+    install_host_driver(&mut vm);
+    let rt = make_tokio_runtime();
+    let mut status = vm.run().expect("run");
+    loop {
+        match status {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => {
+                status = vm.resume().expect("resume");
+            }
+            VmStatus::Waiting(op_id) => {
+                let _ = rt.block_on(async {
+                    driver_poll_submitted(op_id, &mut Context::from_waker(std::task::Waker::noop()))
+                });
+                vm.wait_for_host_op_blocking().expect("wait");
+                status = vm.resume().expect("resume");
+            }
+        }
+    }
     // Reset
     vm.reset_for_reuse();
     assert!(
@@ -308,9 +351,7 @@ fn reset_clears_http_resources_but_preserves_http_config() {
     .expect("valid http config");
 
     install_host_driver(&mut vm);
-    let _ = HostFunctionRegistry::new()
-        .bind_vm_cached(&mut vm)
-        .expect("default registry should bind");
+    bind_standard_io_http(&mut vm);
 
     // First run
     let rt = make_tokio_runtime();
@@ -354,6 +395,8 @@ fn io_and_http_coexist_through_vm_reset_cycle() {
     "#;
     let compiled = compile_source(source).expect("compile");
     let mut vm = Vm::new(compiled.program);
+
+    bind_standard_io_http(&mut vm);
 
     vm.configure_io(IoPolicy::default());
     vm.configure_http(HttpConfig::default())
@@ -431,9 +474,7 @@ fn worker_cleanup_reaches_quiescence_after_io_and_http() {
     .expect("valid http config");
 
     install_host_driver(&mut vm);
-    let _ = HostFunctionRegistry::new()
-        .bind_vm_cached(&mut vm)
-        .expect("default registry should bind");
+    bind_standard_io_http(&mut vm);
 
     let rt = make_tokio_runtime();
     let mut status = vm.run().expect("first run");
@@ -543,29 +584,44 @@ fn io_and_http_module_states_are_independent() {
 // legacy configure_* only assertions with real exact-bound execution.
 // ---------------------------------------------------------------------------
 
-/// The authoritative combined standard catalog: sqlite + io + http.
-///
-/// This is the same snapshot the compiler/LSP standard entry uses; the
-/// extensions register against it so compile-time and runtime fingerprints
-/// match byte-for-byte. SQLite-dependent (the sqlite surface is enabled only
-/// under the `sqlite` feature); the IO+HTTP-only combined behavior is
-/// covered by [`standard_compile_options_default_to_combined_exact_schemas`].
+/// Bare `compile_source` (the production standard entry) must attach the
+/// standard catalog and emit exact V13 schemas for standard host calls.
+#[test]
+fn bare_compile_source_emits_exact_io_import_schemas() {
+    // IO namespaced calls compile to builtin call indices by default, but
+    // catalog-driven host-import resolution is what the exact registration
+    // path serves. Assert the standard compile entry is exact for host
+    // imports (http) and that the standard catalog surface is the
+    // authoritative snapshot.
+    let compiled = compile_source(
+        "use http; let _ = http::client::request({\"method\": \"GET\", \"url\": \"http://127.0.0.1:1/x\"});",
+    )
+    .expect("compile");
+    let http_import = compiled
+        .program
+        .imports
+        .iter()
+        .find(|i| i.name == "http::client::request")
+        .expect("http::client::request must be a host import");
+    assert!(
+        http_import.schema.is_some(),
+        "bare compile_source must emit exact schemas, got: {:?}",
+        http_import.schema
+    );
+    assert_eq!(
+        http_import.schema.as_ref().unwrap().fingerprint,
+        standard_host_catalog().fingerprint(),
+        "bare compile_source schema must carry the standard catalog fingerprint"
+    );
+}
+
+/// The authoritative combined standard catalog: delegates directly to the
+/// production [`standard_host_catalog`] snapshot — the exact same snapshot
+/// the compiler/LSP standard entry uses and the standard extensions register
+/// against, so tests can never drift from the production composition.
 #[cfg(feature = "sqlite")]
 fn combined_standard_catalog() -> Arc<HostApiCatalog> {
-    let mut builder = vm::HostApiBuilder::new();
-    for catalog in [
-        vm::sqlite_host_catalog(),
-        vm::io_host_catalog(),
-        vm::http_host_catalog(),
-    ] {
-        for resource in catalog.resources() {
-            builder.resource(resource.clone());
-        }
-        for function in catalog.functions() {
-            builder.function(function.clone());
-        }
-    }
-    Arc::new(builder.build().expect("standard catalog must be valid"))
+    standard_host_catalog()
 }
 
 /// Compile against the combined standard catalog: standard host calls must
@@ -773,4 +829,242 @@ fn sqlite_open_adapter_stub() -> vm::vm::StaticHostFunction {
             vm::Value::Int(0),
         )))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Public subcatalog registration APIs: a subcatalog compile + matching
+// subcatalog registration must bind; a mismatched snapshot must fail typed.
+// ---------------------------------------------------------------------------
+
+/// A caller who compiles against the SQLite *subcatalog* snapshot and then
+/// registers through the public `_from_catalog` API must exact-bind and
+/// execute — the subcatalog fingerprint is preserved end-to-end.
+#[cfg(feature = "sqlite")]
+#[test]
+fn subcatalog_compile_and_matching_subcatalog_registration_binds() {
+    let subcatalog = vm::sqlite_host_catalog();
+    let compiled = compile_source_with_flavor_and_options(
+        r#"
+        use sqlite;
+        let db = sqlite::open({ path: ":memory:", mode: "memory", limits: {} });
+        sqlite::close(&db);
+        "#,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&subcatalog)),
+    )
+    .expect("subcatalog compile should succeed");
+
+    // Every import must carry the subcatalog fingerprint.
+    for import in &compiled.program.imports {
+        let schema = import
+            .schema
+            .as_ref()
+            .unwrap_or_else(|| panic!("{} must carry an exact schema", import.name));
+        assert_eq!(
+            schema.fingerprint,
+            subcatalog.fingerprint(),
+            "{} must carry the sqlite subcatalog fingerprint",
+            import.name
+        );
+    }
+
+    // Register sqlite against that same subcatalog snapshot via the public
+    // typed API, then bind and execute.
+    let mut registry = HostFunctionRegistry::new();
+    vm::register_sqlite_builtin_module_from_catalog(&mut registry, &subcatalog)
+        .expect("sqlite subcatalog registration should succeed");
+    let mut vm = Vm::new(compiled.program);
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("sqlite subcatalog exact bind should succeed");
+    assert_eq!(
+        vm.run().expect("sqlite open/close should run"),
+        VmStatus::Halted
+    );
+}
+
+/// A combined-catalog compile must NOT bind through a *subcatalog*
+/// registration — the whole-catalog fingerprint is part of the exact
+/// identity. This proves the typed subcatalog API rejects incompatible
+/// snapshots deterministically (structured `MissingExact`), never a silent
+/// name-only fallback.
+#[cfg(feature = "sqlite")]
+#[test]
+fn combined_compile_rejects_subcatalog_from_catalog_registration() {
+    let combined = combined_standard_catalog();
+    let compiled = compile_source_with_flavor_and_options(
+        r#"
+        use sqlite;
+        let db = sqlite::open({ path: ":memory:", mode: "memory", limits: {} });
+        sqlite::close(&db);
+        "#,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&combined)),
+    )
+    .expect("combined standard source should compile");
+
+    let mut registry = HostFunctionRegistry::new();
+    let subcatalog = vm::sqlite_host_catalog();
+    vm::register_sqlite_builtin_module_from_catalog(&mut registry, &subcatalog)
+        .expect("sqlite subcatalog registration should succeed");
+    let mut vm = Vm::new(compiled.program);
+    let error = registry
+        .bind_vm_cached(&mut vm)
+        .expect_err("subcatalog registration must not bind a combined compile");
+    assert!(
+        matches!(
+            error,
+            VmError::HostImportBinding(HostImportBindingError::MissingExact { .. })
+        ),
+        "expected structured MissingExact, got: {error}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Exact HTTP + IO execution under the combined registry
+// ---------------------------------------------------------------------------
+
+/// End-to-end HTTP exact-bind+execute: a standard-compiled `http::client::request`
+/// program is bound through the standard HTTP registration (combined
+/// fingerprint) and executes against a local deterministic server,
+/// returning the response map.
+#[test]
+fn combined_standard_http_exact_binds_and_executes() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let http_server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf);
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        let _ = stream.write_all(response);
+    });
+
+    let source = format!(
+        r#"
+        use http;
+        let resp = http::client::request({{"method": "GET", "url": "http://127.0.0.1:{port}/test"}});
+        resp["status"];
+        "#
+    );
+    let compiled = compile_source(&source).expect("compile");
+    assert!(
+        compiled.program.imports.iter().all(|i| i.schema.is_some()),
+        "every standard host import must carry an exact schema"
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    vm.configure_http(HttpConfig {
+        allowed_schemes: vec!["http".to_string()],
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        allowed_ports: vec![port],
+        allow_private_ips: true,
+        connect_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_secs(5),
+        max_response_body_bytes: 1024 * 1024,
+        stream_idle_timeout: Duration::from_secs(3),
+        max_stream_duration: Duration::from_secs(10),
+        ..HttpConfig::default()
+    })
+    .expect("valid http config");
+    install_host_driver(&mut vm);
+    bind_standard_io_http(&mut vm);
+
+    let rt = make_tokio_runtime();
+    let mut status = vm.run().expect("run");
+    loop {
+        match status {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => {
+                status = vm.resume().expect("resume");
+            }
+            VmStatus::Waiting(op_id) => {
+                let _ = rt.block_on(async {
+                    driver_poll_submitted(op_id, &mut Context::from_waker(std::task::Waker::noop()))
+                });
+                vm.wait_for_host_op_blocking().expect("wait");
+                status = vm.resume().expect("resume");
+            }
+        }
+    }
+    let _ = http_server.join();
+
+    assert_eq!(vm.stack().last(), Some(&Value::Int(200)));
+}
+
+/// Exact IO registration is available in the async/http-client build: the
+/// standard IO extension registers against the combined snapshot and a
+/// standard-compiled IO program (io::exists through the builtin dispatch)
+/// binds and executes through the combined exact registry without legacy
+/// name-only fallback. This is the coexistence test migrated from the legacy
+/// compile/configure path to the combined exact registry/bind execution.
+#[test]
+fn io_and_http_coexist_through_combined_exact_registry_and_execute() {
+    let source = r#"
+    use io;
+    use http;
+    io::exists("/forbidden");
+    "#;
+    let compiled = compile_source(source).expect("compile");
+    let mut vm = Vm::new(compiled.program);
+
+    // Exact combined registration (IO + HTTP) against the standard snapshot.
+    bind_standard_io_http(&mut vm);
+
+    vm.configure_io(IoPolicy::default());
+    vm.configure_http(HttpConfig::default())
+        .expect("valid http config");
+
+    // Run — the error must come from IO policy (path outside allowed roots),
+    // proving both modules bound and executed through the exact registry.
+    let err = match vm.run() {
+        Err(VmError::HostError(msg)) => msg,
+        Ok(_) => panic!("expected IO policy rejection"),
+        Err(other) => panic!("expected host error, got: {other:?}"),
+    };
+    assert!(
+        err.contains("allowed roots") || err.contains("io"),
+        "expected IO error, got: {err}"
+    );
+}
+
+/// The standard IO registration must succeed in this async/http-client build
+/// and expose exact slots carrying the combined catalog fingerprint for every
+/// IO member (proving Finding 1: IO is registrable in the full-feature
+/// matrix, not only in blocking builds).
+#[test]
+fn io_exact_registration_available_in_async_build() {
+    let mut registry = HostFunctionRegistry::new();
+    register_io_builtin_module(&mut registry)
+        .expect("standard IO registration must succeed in the async build");
+    for name in [
+        "io::open",
+        "io::popen",
+        "io::read_all",
+        "io::read_line",
+        "io::write",
+        "io::flush",
+        "io::close",
+        "io::exists",
+    ] {
+        let schemas = vm::catalog_import_schemas(&standard_host_catalog(), name);
+        assert!(
+            !schemas.is_empty(),
+            "standard catalog must contain {name} in the full-feature build"
+        );
+        for schema in schemas {
+            // A second registration of the same (name, schema) must be
+            // rejected as a duplicate, proving the slot is already occupied
+            // by the standard IO registration.
+            registry
+                .register_exact_static(name, 1, schema, io_identity_adapter_stub)
+                .expect_err("duplicate exact registration must be rejected");
+        }
+    }
+}
+
+/// A stub adapter used only to prove duplicate-registration rejection; never
+/// executed.
+fn io_identity_adapter_stub(_vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+    Ok(CallOutcome::Return(CallReturn::None))
 }

@@ -34,7 +34,6 @@ use crate::host_api::{
     HostTypeSchema, ResourceTypeKey, ResourceTypeSchema,
 };
 use crate::vm::Vm;
-#[cfg(not(feature = "async"))]
 use crate::vm::{CallReturn, HostFunctionRegistry, Value, VmResult};
 
 /// Persistent I/O host policy.
@@ -222,20 +221,42 @@ fn borrow_handle() -> HostParamSchema {
 }
 
 /// Registers every IO host function into `registry` using the exact catalog
-/// schema path.
+/// schema path and the authoritative [`standard_host_catalog`] snapshot.
 ///
 /// The exact path is the catalog-driven host-import surface (like sqlite):
 /// it binds the same `#[pd_host_function]`-generated adapter functions the
 /// namespaced-builtin dispatch uses, so behavior is identical across both
 /// compile paths. `mark_exact_runtime_owned_pending` keeps pending IO on the
-/// generic execution-scope await path.
-#[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
+/// generic execution-scope await path. Available in every build matrix:
+/// blocking, async (tokio), and wasm32 (structured unsupported errors) —
+/// the adapters always dispatch to the actually-enabled implementation.
+///
+/// Callers that compose their own custom catalog or an IO *subcatalog*
+/// snapshot must use [`register_io_builtin_module_from_catalog`] instead.
 pub fn register_io_builtin_module(registry: &mut HostFunctionRegistry) -> VmResult<()> {
     let catalog = crate::builtins::runtime::standard_host_catalog();
-    for schema in crate::vm::host_extension::catalog_import_schemas(&catalog, "io::open") {
+    register_io_builtin_module_from_catalog(registry, &catalog)
+}
+
+/// Registers every IO host function into `registry` using the exact schema
+/// path derived from a caller-supplied, validated [`HostApiCatalog`]
+/// snapshot.
+///
+/// This is the public register-forwarding API for custom embedders who
+/// compile against an IO subcatalog (or their own composite) rather than the
+/// standard combined snapshot: the schemas are extracted from the supplied
+/// `catalog`, so the registered exact fingerprint matches what the matching
+/// compile emitted. Missing/incompatible schemas are rejected
+/// deterministically (`MissingExact` at bind time; fingerprint mismatch at
+/// compile time).
+pub fn register_io_builtin_module_from_catalog(
+    registry: &mut HostFunctionRegistry,
+    catalog: &HostApiCatalog,
+) -> VmResult<()> {
+    for schema in crate::vm::host_extension::catalog_import_schemas(catalog, "io::open") {
         registry.register_exact_static("io::open", 2, schema, open_adapter)?;
     }
-    for schema in crate::vm::host_extension::catalog_import_schemas(&catalog, "io::popen") {
+    for schema in crate::vm::host_extension::catalog_import_schemas(catalog, "io::popen") {
         registry.register_exact_static("io::popen", 2, schema, popen_adapter)?;
     }
     for (name, adapter) in [
@@ -251,11 +272,11 @@ pub fn register_io_builtin_module(registry: &mut HostFunctionRegistry) -> VmResu
         ("io::flush", flush_adapter as crate::vm::StaticHostFunction),
         ("io::close", close_adapter as crate::vm::StaticHostFunction),
     ] {
-        for schema in crate::vm::host_extension::catalog_import_schemas(&catalog, name) {
+        for schema in crate::vm::host_extension::catalog_import_schemas(catalog, name) {
             registry.register_exact_static(name, 1, schema, adapter)?;
         }
     }
-    for schema in crate::vm::host_extension::catalog_import_schemas(&catalog, "io::exists") {
+    for schema in crate::vm::host_extension::catalog_import_schemas(catalog, "io::exists") {
         registry.register_exact_static(
             "io::exists",
             1,
@@ -278,12 +299,19 @@ pub fn register_io_builtin_module(registry: &mut HostFunctionRegistry) -> VmResu
     Ok(())
 }
 
-// ---- Adapter functions (blocking only, async uses #[pd_host_function] dispatch) --
+// ---- Adapter functions (shared across blocking, async and wasm dispatch) ----
+//
+// Each adapter decodes the incoming `#[pd_host_function]`-generated wrapper
+// result (`VmResult<HostCallResult<T>>`) into a VM `CallOutcome`, exactly as
+// the blocking path does. The `io_impl` module is the feature-appropriate
+// implementation (blocking / async / wasm), all of which expose the same
+// generated wrapper names and signatures, so a single adapter set is used for
+// every build matrix. Pending ops are kept on the generic execution-scope
+// await path via [`mark_exact_runtime_owned_pending`].
 
-#[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
 fn open_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     use super::HostCallResult;
-    match blocking::builtin_io_open(vm, args)? {
+    match io_impl::builtin_io_open(vm, args)? {
         HostCallResult::Return(handle) => {
             Ok(CallOutcome::Return(CallReturn::one(Value::Int(handle))))
         }
@@ -291,10 +319,9 @@ fn open_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     }
 }
 
-#[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
 fn popen_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     use super::HostCallResult;
-    match blocking::builtin_io_popen(vm, args)? {
+    match io_impl::builtin_io_popen(vm, args)? {
         HostCallResult::Return(handle) => {
             Ok(CallOutcome::Return(CallReturn::one(Value::Int(handle))))
         }
@@ -302,10 +329,9 @@ fn popen_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     }
 }
 
-#[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
 fn read_all_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     use super::HostCallResult;
-    match blocking::builtin_io_read_all(vm, args)? {
+    match io_impl::builtin_io_read_all(vm, args)? {
         HostCallResult::Return(text) => {
             Ok(CallOutcome::Return(CallReturn::one(Value::string(text))))
         }
@@ -313,10 +339,9 @@ fn read_all_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     }
 }
 
-#[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
 fn read_line_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     use super::HostCallResult;
-    match blocking::builtin_io_read_line(vm, args)? {
+    match io_impl::builtin_io_read_line(vm, args)? {
         HostCallResult::Return(text) => {
             Ok(CallOutcome::Return(CallReturn::one(Value::string(text))))
         }
@@ -324,10 +349,9 @@ fn read_line_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     }
 }
 
-#[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
 fn write_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     use super::HostCallResult;
-    match blocking::builtin_io_write(vm, args)? {
+    match io_impl::builtin_io_write(vm, args)? {
         HostCallResult::Return(written) => {
             Ok(CallOutcome::Return(CallReturn::one(Value::Int(written))))
         }
@@ -335,28 +359,25 @@ fn write_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     }
 }
 
-#[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
 fn flush_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     use super::HostCallResult;
-    match blocking::builtin_io_flush(vm, args)? {
+    match io_impl::builtin_io_flush(vm, args)? {
         HostCallResult::Return(ok) => Ok(CallOutcome::Return(CallReturn::one(Value::Bool(ok)))),
         HostCallResult::Pending(op_id) => Ok(CallOutcome::Pending(op_id)),
     }
 }
 
-#[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
 fn close_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     use super::HostCallResult;
-    match blocking::builtin_io_close(vm, args)? {
+    match io_impl::builtin_io_close(vm, args)? {
         HostCallResult::Return(ok) => Ok(CallOutcome::Return(CallReturn::one(Value::Bool(ok)))),
         HostCallResult::Pending(op_id) => Ok(CallOutcome::Pending(op_id)),
     }
 }
 
-#[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
 fn exists_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     use super::HostCallResult;
-    match blocking::builtin_io_exists(vm, args)? {
+    match io_impl::builtin_io_exists(vm, args)? {
         HostCallResult::Return(found) => {
             Ok(CallOutcome::Return(CallReturn::one(Value::Bool(found))))
         }
@@ -366,10 +387,8 @@ fn exists_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
 
 /// Standard [`HostExtension`] registering IO through the exact catalog path
 /// and installing the persistent policy module state.
-#[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
 pub struct IoExtension;
 
-#[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
 impl crate::vm::HostExtension for IoExtension {
     fn register(&self, registry: &mut HostFunctionRegistry) -> VmResult<()> {
         register_io_builtin_module(registry)
@@ -381,6 +400,26 @@ impl crate::vm::HostExtension for IoExtension {
 }
 
 // ---- Module declarations ----
+
+/// Feature-appropriate IO implementation module, selected by the build
+/// matrix so the exact adapters (and the namespaced dispatch) always bind the
+/// actually-available implementation:
+///
+/// * wasm32 → `io_wasm` (structured "unsupported on wasm32" errors);
+/// * `async` → `async_io` (tokio-based worker path);
+/// * otherwise → `blocking` (thread-based worker path).
+#[cfg(target_arch = "wasm32")]
+pub(super) mod io_impl {
+    pub(super) use super::super::super::io_wasm::*;
+}
+#[cfg(all(not(target_arch = "wasm32"), feature = "async"))]
+mod io_impl {
+    pub(super) use super::async_io::*;
+}
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "async")))]
+mod io_impl {
+    pub(super) use super::blocking::*;
+}
 
 #[cfg(feature = "async")]
 mod async_io;

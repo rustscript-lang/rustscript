@@ -46,12 +46,18 @@ mod sqlite;
 mod typed;
 
 #[cfg(feature = "http-client")]
-pub use http::{HttpConfig, HttpHostExt, http_host_catalog, register_http_builtin_module};
-pub use io::{IoHostExt, IoHostState, IoPolicy, io_host_catalog};
+pub use http::{
+    HttpConfig, HttpHostExt, http_host_catalog, register_http_builtin_module,
+    register_http_builtin_module_from_catalog,
+};
+pub use io::{
+    IoExtension, IoHostExt, IoHostState, IoPolicy, io_host_catalog, register_io_builtin_module,
+    register_io_builtin_module_from_catalog,
+};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{
     SqliteExtension, SqliteHostExt, SqliteLimits, SqlitePolicy, register_sqlite_builtin_module,
-    sqlite_host_catalog,
+    register_sqlite_builtin_module_from_catalog, sqlite_host_catalog,
 };
 
 /// The authoritative standard host API catalog snapshot for this build.

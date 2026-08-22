@@ -16,7 +16,8 @@ use crate::vm::resource::{
     ResourceResult, ResourceTypeKey,
 };
 use crate::vm::{
-    CallOutcome, CallReturn, HostContextError, HostFunctionRegistry, Value, Vm, VmError, VmResult,
+    CallOutcome, CallReturn, HostContextError, HostFunctionRegistry, HostImportSchema, Value, Vm,
+    VmError, VmResult,
 };
 
 mod config;
@@ -254,15 +255,38 @@ pub fn http_host_catalog() -> Arc<HostApiCatalog> {
 }
 
 /// Registers every HTTP host function into `registry` using the exact
-/// catalog schema path.
+/// catalog schema path and the authoritative [`standard_host_catalog`]
+/// snapshot.
+///
+/// The standard extensions all register against this single combined
+/// snapshot, so a standard combined-catalog compile exact-binds the standard
+/// HTTP surface byte-for-byte. Callers that compose their own custom catalog
+/// or an HTTP *subcatalog* snapshot must use
+/// [`register_http_builtin_module_from_catalog`] instead.
 pub fn register_http_builtin_module(registry: &mut HostFunctionRegistry) -> VmResult<()> {
     let catalog = crate::builtins::runtime::standard_host_catalog();
-    for schema in
-        crate::vm::host_extension::catalog_import_schemas(&catalog, "http::client::request")
-    {
+    register_http_builtin_module_from_catalog(registry, &catalog)
+}
+
+/// Registers every HTTP host function into `registry` using the exact
+/// schema path derived from a caller-supplied, validated [`HostApiCatalog`]
+/// snapshot.
+///
+/// This is the public register-forwarding API for custom embedders who
+/// compile against an HTTP subcatalog (or their own composite) rather than
+/// the standard combined snapshot: the schemas are extracted from the
+/// supplied `catalog`, so the registered exact fingerprint matches what the
+/// matching compile emitted. Missing/incompatible schemas are rejected
+/// deterministically (`MissingExact` at bind time; fingerprint mismatch at
+/// compile time).
+pub fn register_http_builtin_module_from_catalog(
+    registry: &mut HostFunctionRegistry,
+    catalog: &HostApiCatalog,
+) -> VmResult<()> {
+    for schema in catalog_http_request_schemas(catalog) {
         registry.register_exact_static("http::client::request", 1, schema, request_adapter)?;
     }
-    for schema in crate::vm::host_extension::catalog_import_schemas(&catalog, "http::client::sse") {
+    for schema in catalog_http_sse_schemas(catalog) {
         registry.register_exact_static("http::client::sse", 2, schema, sse_adapter)?;
     }
     // The async host functions return *generic execution-scope* pending
@@ -275,6 +299,16 @@ pub fn register_http_builtin_module(registry: &mut HostFunctionRegistry) -> VmRe
         registry.mark_exact_runtime_owned_pending(name)?;
     }
     Ok(())
+}
+
+/// The exact imports for `http::client::request` in `catalog`.
+fn catalog_http_request_schemas(catalog: &HostApiCatalog) -> Vec<HostImportSchema> {
+    crate::vm::host_extension::catalog_import_schemas(catalog, "http::client::request")
+}
+
+/// The exact imports for `http::client::sse` in `catalog`.
+fn catalog_http_sse_schemas(catalog: &HostApiCatalog) -> Vec<HostImportSchema> {
+    crate::vm::host_extension::catalog_import_schemas(catalog, "http::client::sse")
 }
 
 /// Standard [`HostExtension`] registering HTTP through the exact catalog

@@ -880,3 +880,30 @@ fn sequential_io_read_worker_retirement_stress() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+/// Exact IO registration is available in the blocking (sync) build: the
+/// standard IO extension registers against the combined snapshot and the
+/// standard catalog contains every IO member. This mirrors the async-path
+/// coverage so the full feature matrix is proven registrable.
+#[test]
+fn io_exact_registration_available_in_sync_build() {
+    let mut registry = HostFunctionRegistry::new();
+    vm::register_io_builtin_module(&mut registry)
+        .expect("standard IO registration must succeed in the sync build");
+    let catalog = vm::standard_host_catalog();
+    for name in [
+        "io::open",
+        "io::popen",
+        "io::read_all",
+        "io::read_line",
+        "io::write",
+        "io::flush",
+        "io::close",
+        "io::exists",
+    ] {
+        assert!(
+            !vm::catalog_import_schemas(&catalog, name).is_empty(),
+            "standard catalog must contain {name} in the sync build"
+        );
+    }
+}
