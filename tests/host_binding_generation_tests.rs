@@ -356,6 +356,11 @@ fn generated_http_imports_are_unique_typed_and_independently_capability_gated() 
         let compiled = compile_source(source).expect("HTTP imports should compile");
         let mut vm = Vm::new(compiled.program);
         let mut registry = HostFunctionRegistry::new();
+        // The standard compile entry emits exact V13 imports, so register the
+        // standard HTTP extension against the combined snapshot — the
+        // capability profile gate is orthogonal to exact registration.
+        vm::register_http_builtin_module(&mut registry)
+            .expect("standard HTTP registration should succeed");
         registry.set_capability_profile(profile);
         let result = registry.bind_vm_cached(&mut vm);
         if mask == 0b11 {

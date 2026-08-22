@@ -7,7 +7,7 @@ use std::thread;
 use vm::{
     CallOutcome, CallReturn, HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput,
     HostOpId, HttpConfig, HttpHostExt, Program, Value, Vm, VmError, VmResetState, VmResult,
-    VmStatus, compile_source,
+    VmStatus, compile_source, register_http_builtin_module, register_io_builtin_module,
 };
 
 #[derive(Default)]
@@ -53,6 +53,27 @@ impl HostAsyncBridge for TokioHostDriver {
 
 fn install_host_driver(vm: &mut Vm) {
     vm.set_async_bridge(Box::<TokioHostDriver>::default());
+}
+
+/// Creates a registry with the standard HTTP extension registered against the
+/// authoritative combined snapshot, so exact V13 imports from the standard
+/// compile entry bind and execute without legacy name-only fallback.
+fn standard_http_registry() -> HostFunctionRegistry {
+    let mut registry = HostFunctionRegistry::new();
+    register_http_builtin_module(&mut registry)
+        .expect("standard HTTP registration against the combined snapshot should succeed");
+    registry
+}
+
+/// A restricted registry that still carries the standard HTTP exact slots, so
+/// `prepare_plan`/`resolve_import` resolve the exact imports and the
+/// capability profile gate is reached (denial by default) instead of failing
+/// with `MissingExact` first.
+fn standard_http_restricted_registry() -> HostFunctionRegistry {
+    let mut registry = HostFunctionRegistry::restricted();
+    register_http_builtin_module(&mut registry)
+        .expect("standard HTTP registration against a restricted snapshot should succeed");
+    registry
 }
 
 fn build_request_program(url: String) -> Program {
@@ -135,7 +156,7 @@ async fn http_host_executes_a_bounded_request_and_returns_a_response_map() {
     vm.configure_http(local_http_config(port))
         .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
-    HostFunctionRegistry::new()
+    standard_http_registry()
         .bind_vm_cached(&mut vm)
         .expect("default host registry should bind HTTP");
 
@@ -154,7 +175,7 @@ async fn http_host_executes_a_bounded_request_and_returns_a_response_map() {
 #[test]
 fn http_host_rejects_targets_until_an_explicit_policy_allows_them() {
     let mut vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
-    HostFunctionRegistry::new()
+    standard_http_registry()
         .bind_vm_cached(&mut vm)
         .expect("default host registry should bind HTTP");
     let error = vm
@@ -185,7 +206,7 @@ fn empty_registry_keeps_language_builtins_but_rejects_http_capability() {
     );
 
     let mut http_vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
-    let error = HostFunctionRegistry::restricted()
+    let error = standard_http_restricted_registry()
         .bind_vm_cached(&mut http_vm)
         .expect_err("unapproved HTTP capability must fail during preflight");
     assert!(error.to_string().contains("http::client::request"));
@@ -199,7 +220,14 @@ io::open("/tmp/rustscript-capability-test", "r");"#,
     )
     .expect("namespaced host builtin should compile");
     let mut vm = Vm::new(compiled.program);
-    let error = HostFunctionRegistry::restricted()
+    // The standard compile entry emits exact V13 io imports, so register the
+    // standard IO extension against the combined snapshot; the restricted
+    // profile then denies the unapproved capability instead of failing with
+    // `MissingExact` first.
+    let mut registry = HostFunctionRegistry::restricted();
+    register_io_builtin_module(&mut registry)
+        .expect("standard IO registration against a restricted snapshot should succeed");
+    let error = registry
         .bind_vm_cached(&mut vm)
         .expect_err("ungranted namespaced builtin must fail during preflight");
     assert!(error.to_string().contains("io_open"));
@@ -208,12 +236,12 @@ io::open("/tmp/rustscript-capability-test", "r");"#,
 #[test]
 fn capability_binding_plan_cannot_cross_registry_profiles() {
     let program = build_request_program("http://127.0.0.1:1/".to_string());
-    let unrestricted = HostFunctionRegistry::new();
+    let unrestricted = standard_http_registry();
     let plan = unrestricted
         .prepare_plan(&program.imports)
         .expect("unrestricted registry should prepare HTTP plan");
     let mut vm = Vm::new(program);
-    let error = HostFunctionRegistry::restricted()
+    let error = standard_http_restricted_registry()
         .bind_vm_with_plan(&mut vm, &plan)
         .expect_err("capability plan must not cross registry profiles");
     assert!(error.to_string().contains("different capability profile"));
@@ -222,7 +250,7 @@ fn capability_binding_plan_cannot_cross_registry_profiles() {
 #[test]
 fn capability_binding_plan_cannot_outlive_registry_mutation() {
     let program = build_request_program("http://127.0.0.1:1/".to_string());
-    let mut registry = HostFunctionRegistry::new();
+    let mut registry = standard_http_registry();
     let plan = registry
         .prepare_plan(&program.imports)
         .expect("registry should prepare HTTP plan");
@@ -239,7 +267,7 @@ fn capability_binding_plan_cannot_outlive_registry_mutation() {
 #[test]
 fn capability_binding_plan_detects_divergent_registry_clone_mutations() {
     let unchanged_program = build_request_program("http://127.0.0.1:1/".to_string());
-    let mut unchanged_registry = HostFunctionRegistry::restricted();
+    let mut unchanged_registry = standard_http_restricted_registry();
     unchanged_registry
         .allow_builtin("http::client::request")
         .expect("HTTP capability should be known");
@@ -253,7 +281,7 @@ fn capability_binding_plan_detects_divergent_registry_clone_mutations() {
         .expect("an unchanged registry clone should reuse the plan");
 
     let branch_program = build_request_program("http://127.0.0.1:1/".to_string());
-    let branch_registry = HostFunctionRegistry::restricted();
+    let branch_registry = standard_http_restricted_registry();
     let mut first_mutation = branch_registry.clone();
     let mut second_mutation = branch_registry;
     first_mutation
@@ -275,7 +303,7 @@ fn capability_binding_plan_detects_divergent_registry_clone_mutations() {
 #[test]
 fn registry_state_rejects_structural_sibling_mutations() {
     let program = build_request_program("http://127.0.0.1:1/".to_string());
-    let registry = HostFunctionRegistry::new();
+    let registry = standard_http_registry();
     let mut source = registry.clone();
     let destination = registry;
     source.register_static_args("test::structural", 0, |_args| {
@@ -294,7 +322,7 @@ fn registry_state_rejects_structural_sibling_mutations() {
 #[test]
 fn cached_plan_refreshes_after_a_sibling_registry_mutation() {
     let program = build_request_program("http://127.0.0.1:1/".to_string());
-    let registry = HostFunctionRegistry::new();
+    let registry = standard_http_registry();
     let mut mutating_sibling = registry.clone();
     let destination = registry;
 
@@ -331,7 +359,7 @@ async fn max_stream_duration_does_not_shorten_buffered_requests() {
     buffered_config.request_timeout = std::time::Duration::from_millis(200);
     vm.configure_http(buffered_config).unwrap();
     install_host_driver(&mut vm);
-    HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
+    standard_http_registry().bind_vm_cached(&mut vm).unwrap();
     drive_vm_to_halt(&mut vm).await.unwrap();
     assert_eq!(response_field(&vm.stack()[0], "status"), &Value::Int(200));
     server.join().unwrap();
@@ -349,7 +377,7 @@ async fn explicitly_allowed_http_capability_reaches_http_policy() {
     })
     .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
-    let mut registry = HostFunctionRegistry::restricted();
+    let mut registry = standard_http_restricted_registry();
     registry
         .allow_builtin("http::client::request")
         .expect("HTTP builtin should be explicitly allowlisted");
@@ -375,7 +403,7 @@ fn http_in_flight_limit_rejects_before_starting_a_request() {
         ..HttpConfig::default()
     })
     .expect("HTTP configuration should be valid");
-    HostFunctionRegistry::new()
+    standard_http_registry()
         .bind_vm_cached(&mut vm)
         .expect("default host registry should bind HTTP");
     let error = vm
@@ -577,7 +605,7 @@ async fn sse_scope_resource_registered_and_scope_close_stops_worker() {
     vm.configure_http(sse_config(port))
         .expect("SSE configuration should be valid");
     install_host_driver(&mut vm);
-    HostFunctionRegistry::new()
+    standard_http_registry()
         .bind_vm_cached(&mut vm)
         .expect("default host registry should bind HTTP");
 
@@ -610,7 +638,7 @@ async fn sse_reset_releases_connection_permit() {
     vm.configure_http(sse_config(port))
         .expect("SSE configuration should be valid");
     install_host_driver(&mut vm);
-    HostFunctionRegistry::new()
+    standard_http_registry()
         .bind_vm_cached(&mut vm)
         .expect("default host registry should bind HTTP");
 
@@ -630,7 +658,7 @@ async fn sse_reset_releases_connection_permit() {
     vm2.configure_http(local_http_config(port2))
         .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm2);
-    HostFunctionRegistry::new()
+    standard_http_registry()
         .bind_vm_cached(&mut vm2)
         .expect("default host registry should bind HTTP");
     drive_vm_to_halt(&mut vm2)
@@ -671,7 +699,7 @@ async fn sse_callback_stop_retires_without_end_and_returns_stopped_summary() {
     let mut vm = Vm::new(compiled.program);
     vm.configure_http(sse_config(port)).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default());
-    HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
+    standard_http_registry().bind_vm_cached(&mut vm).unwrap();
 
     drive_vm_to_halt(&mut vm).await.unwrap();
     server.join().unwrap();
@@ -696,7 +724,7 @@ async fn sse_explicit_resource_close_via_scope_stops_worker() {
     vm.configure_http(sse_config(port))
         .expect("SSE configuration should be valid");
     install_host_driver(&mut vm);
-    HostFunctionRegistry::new()
+    standard_http_registry()
         .bind_vm_cached(&mut vm)
         .expect("default host registry should bind HTTP");
 
@@ -721,7 +749,7 @@ async fn sse_child_first_cleanup_through_scope_close() {
     vm.configure_http(sse_config(port))
         .expect("SSE configuration should be valid");
     install_host_driver(&mut vm);
-    HostFunctionRegistry::new()
+    standard_http_registry()
         .bind_vm_cached(&mut vm)
         .expect("default host registry should bind HTTP");
 
@@ -749,7 +777,7 @@ async fn sse_no_detached_worker_after_stream_driver_removal() {
     vm.configure_http(sse_config(port))
         .expect("SSE configuration should be valid");
     install_host_driver(&mut vm);
-    HostFunctionRegistry::new()
+    standard_http_registry()
         .bind_vm_cached(&mut vm)
         .expect("default host registry should bind HTTP");
 
@@ -831,7 +859,7 @@ async fn reset_retires_buffered_http_future_and_releases_its_permit() {
     vm.configure_http(local_http_config(1))
         .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
-    HostFunctionRegistry::new()
+    standard_http_registry()
         .bind_vm_cached(&mut vm)
         .expect("default host registry should bind HTTP");
 
@@ -881,7 +909,7 @@ async fn shutdown_and_drop_retire_buffered_http_futures() {
     vm.configure_http(local_http_config(1))
         .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
-    HostFunctionRegistry::new()
+    standard_http_registry()
         .bind_vm_cached(&mut vm)
         .expect("default host registry should bind HTTP");
 
@@ -904,7 +932,7 @@ async fn shutdown_and_drop_retire_buffered_http_futures() {
         .configure_http(local_http_config(1))
         .expect("HTTP configuration should be valid");
     install_host_driver(&mut drop_vm);
-    HostFunctionRegistry::new()
+    standard_http_registry()
         .bind_vm_cached(&mut drop_vm)
         .expect("default host registry should bind HTTP");
     assert!(matches!(drop_vm.run(), Ok(VmStatus::Waiting(_))));
@@ -925,7 +953,7 @@ async fn buffered_request_reset_while_blocked_on_silent_server() {
     vm.configure_http(local_http_config(port))
         .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
-    HostFunctionRegistry::new()
+    standard_http_registry()
         .bind_vm_cached(&mut vm)
         .expect("default host registry should bind HTTP");
 
@@ -981,7 +1009,7 @@ async fn max_connections_rejects_second_buffered_request_while_first_in_flight()
     vm.configure_http(local_http_config(port))
         .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
-    HostFunctionRegistry::new()
+    standard_http_registry()
         .bind_vm_cached(&mut vm)
         .expect("default host registry should bind HTTP");
 

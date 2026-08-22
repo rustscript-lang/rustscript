@@ -12,7 +12,7 @@ use std::thread;
 use vm::{
     CallOutcome, CallReturn, HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput,
     HostOpId, HostStackFunction, HttpConfig, HttpHostExt, Value, Vm, VmError, VmMap, VmResetState,
-    VmResult, VmStatus, compile_source,
+    VmResult, VmStatus, compile_source, register_http_builtin_module,
 };
 
 #[derive(Default)]
@@ -153,12 +153,22 @@ async fn drive_reset(vm: &mut Vm) {
     panic!("reset did not complete within 100 polls");
 }
 
+/// Creates a registry with the standard HTTP extension registered against the
+/// authoritative combined snapshot, so exact V13 `http::*` imports from the
+/// standard compile entry bind and execute without legacy name-only fallback.
+fn standard_http_registry() -> HostFunctionRegistry {
+    let mut registry = HostFunctionRegistry::new();
+    register_http_builtin_module(&mut registry)
+        .expect("standard HTTP registration against the combined snapshot should succeed");
+    registry
+}
+
 async fn run_sse_source(source: &str, config: HttpConfig) -> Result<Vm, vm::VmError> {
     let compiled = compile_source(source).expect("SSE source should compile");
     let mut vm = Vm::new(compiled.program);
     vm.configure_http(config).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default());
-    HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
+    standard_http_registry().bind_vm_cached(&mut vm).unwrap();
     drive(&mut vm).await.map(|()| vm)
 }
 
@@ -317,7 +327,7 @@ async fn sse_delivers_open_events_end_and_terminal_summary() {
     let mut vm = Vm::new(compiled.program);
     vm.configure_http(config(port)).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default());
-    HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
+    standard_http_registry().bind_vm_cached(&mut vm).unwrap();
 
     drive(&mut vm).await.unwrap();
     server.join().unwrap();
@@ -360,7 +370,7 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
         let mut vm = Vm::new(compiled.program);
         vm.set_http_max_in_flight(0);
         vm.configure_http(config(1)).unwrap();
-        HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
+        standard_http_registry().bind_vm_cached(&mut vm).unwrap();
         let error = vm.run().unwrap_err();
         assert!(error.to_string().contains(expected), "{timeout}: {error}");
         assert!(
@@ -381,7 +391,7 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
     let mut vm = Vm::new(compiled.program);
     vm.set_http_max_in_flight(0);
     vm.configure_http(config(1)).unwrap();
-    HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
+    standard_http_registry().bind_vm_cached(&mut vm).unwrap();
     let error = vm.run().unwrap_err();
     assert!(
         error.to_string().contains("in-flight request limit"),
@@ -399,7 +409,7 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
     let compiled = compile_source(source).unwrap();
     let mut vm = Vm::new(compiled.program);
     vm.configure_http(config(1)).unwrap();
-    HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
+    standard_http_registry().bind_vm_cached(&mut vm).unwrap();
     let error = vm.run().unwrap_err();
     assert!(error.to_string().contains("GET or POST"), "{error}");
 }
@@ -418,7 +428,7 @@ fn sse_admission_does_not_require_a_tokio_reactor() {
     let mut vm = Vm::new(compiled.program);
     vm.configure_http(config(1)).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default());
-    HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
+    standard_http_registry().bind_vm_cached(&mut vm).unwrap();
     assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
     vm.reset_for_reuse();
 }
@@ -630,7 +640,7 @@ async fn sse_reset_releases_the_connection_permit_before_reuse() {
     vm.set_http_max_in_flight(1);
     vm.configure_http(config(port)).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default());
-    HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
+    standard_http_registry().bind_vm_cached(&mut vm).unwrap();
 
     assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
     // Begin the reset. The scope close sets stopping on the shared state,
@@ -793,7 +803,7 @@ async fn sse_total_deadline_expires_despite_periodic_progress_below_idle_timeout
     let mut vm = Vm::new(compiled.program);
     vm.configure_http(deadline_config).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default());
-    let mut registry = HostFunctionRegistry::new();
+    let mut registry = standard_http_registry();
     registry.register_stack("count_call", 0, {
         let callbacks = Arc::clone(&callbacks);
         move || {
@@ -848,7 +858,7 @@ async fn sse_total_deadline_releases_the_connection_permit_for_reuse() {
     deadline_config.stream_idle_timeout = std::time::Duration::from_millis(200);
     vm.configure_http(deadline_config).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default());
-    HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
+    standard_http_registry().bind_vm_cached(&mut vm).unwrap();
 
     let error = drive(&mut vm)
         .await
@@ -912,7 +922,7 @@ async fn sse_callback_stop_after_deadline_fails_and_releases_permit_without_anot
     vm.configure_http(deadline_config).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default());
     let wait_calls = Arc::new(AtomicUsize::new(0));
-    let mut registry = HostFunctionRegistry::new();
+    let mut registry = standard_http_registry();
     registry.register_stack("async_wait", 0, {
         let wait_calls = Arc::clone(&wait_calls);
         move || {
@@ -983,7 +993,7 @@ async fn sse_callback_continue_after_deadline_fails_before_another_network_poll(
     vm.configure_http(deadline_config).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default());
     let wait_calls = Arc::new(AtomicUsize::new(0));
-    let mut registry = HostFunctionRegistry::new();
+    let mut registry = standard_http_registry();
     registry.register_stack("async_wait", 0, {
         let wait_calls = Arc::clone(&wait_calls);
         move || {
@@ -1124,7 +1134,7 @@ async fn sse_silent_server_reset_cancels_worker_and_releases_permit() {
     vm.set_http_max_in_flight(1);
     vm.configure_http(config(port)).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default());
-    HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
+    standard_http_registry().bind_vm_cached(&mut vm).unwrap();
 
     // Start the SSE stream. It should be pending (waiting for the callback).
     assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
