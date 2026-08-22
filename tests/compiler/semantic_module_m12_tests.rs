@@ -210,6 +210,53 @@ fn host_namespace_imports_keep_dedicated_resolution_path() {
 }
 
 #[test]
+fn aliased_file_module_stem_does_not_shadow_exact_host_namespace() {
+    let root = temp_module_root("semantic_m12_alias_host_namespace");
+    let fixtures = root.join("fixtures");
+    std::fs::create_dir_all(&fixtures).expect("fixtures directory should be created");
+    write_source(
+        &fixtures.join("io.rss"),
+        "pub fn marker() { 7; }\n",
+        "aliased io module source",
+    );
+
+    let main_path = root.join("main.rss");
+    let source = "use self::fixtures::io as file_io;\nuse io;\nlet present = io::exists(\".\");\nfile_io::marker();\npresent;\n";
+    write_source(&main_path, source, "aliased host namespace source");
+
+    let compiled = compile_source_file(&main_path)
+        .expect("an aliased file module must not hide exact host io::exists");
+    let standard = vm::standard_host_catalog();
+    let import = compiled
+        .program
+        .imports
+        .iter()
+        .find(|import| import.name == "io::exists")
+        .expect("exact host io::exists import should be emitted");
+    let schema = import
+        .schema
+        .as_ref()
+        .expect("host import should carry the V13 schema");
+    assert_eq!(
+        schema.fingerprint,
+        standard.fingerprint(),
+        "host import must carry the standard catalog fingerprint"
+    );
+    assert_eq!(schema.params.len(), 1);
+    assert_eq!(schema.return_type, vm::compiler::TypeSchema::Bool);
+    assert!(
+        compiled
+            .program
+            .imports
+            .iter()
+            .all(|import| import.name != "file_io::marker"),
+        "file-module calls must remain module calls, not host imports"
+    );
+
+    remove_module_root(&root);
+}
+
+#[test]
 fn named_import_with_alias_through_self_resolves_structurally() {
     let root = temp_module_root("semantic_m12_named_alias");
     let module_path = root.join("module.rss");

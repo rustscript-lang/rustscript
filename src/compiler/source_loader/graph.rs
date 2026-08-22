@@ -314,10 +314,11 @@ fn namespace_alias_for_import(import: &ResolvedImport) -> Option<String> {
     }
 }
 
-/// File-module import targets that bind `namespace`, either through a clause
-/// alias (`use a::util as au;` binds `au`) or through the spec stem
-/// (host-form single-segment imports such as `use module;` whose namespace
-/// the parser resolved as a host root).
+/// File-module import targets that bind `namespace`, using the structured
+/// clause metadata already recorded on the graph edge. An explicit namespace
+/// alias owns only that alias; an all-public import owns the source stem.
+/// Single-segment named/prefix forms retain their source stem as an internal
+/// lookup key because the parser records their direct host aliases that way.
 fn file_module_targets_for_namespace(
     graph: &ModuleGraph,
     module: ModuleId,
@@ -334,12 +335,17 @@ fn file_module_targets_for_namespace(
         let Some(target) = import.target else {
             continue;
         };
-        let stem = Path::new(&import.spec)
-            .file_stem()
-            .and_then(|stem| stem.to_str());
-        if (namespace_alias_for_import(import).as_deref() == Some(namespace)
-            || stem == Some(namespace))
-            && !targets.contains(&target)
+        let binds_visible_namespace =
+            namespace_alias_for_import(import).as_deref() == Some(namespace);
+        let binds_single_segment_host_key = matches!(
+            &import.clause,
+            ImportClause::Named(_) | ImportClause::Prefix(_)
+        ) && Path::new(&import.spec).components().count() == 1
+            && Path::new(&import.spec)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                == Some(namespace);
+        if (binds_visible_namespace || binds_single_segment_host_key) && !targets.contains(&target)
         {
             targets.push(target);
         }
