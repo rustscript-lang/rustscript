@@ -351,6 +351,13 @@ pub(super) struct SseShared {
     pub(super) join_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Waker registered by the close poll when the worker is still running.
     pub(super) close_waker: std::sync::Mutex<Option<std::task::Waker>>,
+    /// The single authoritative absolute stream deadline, derived once when the
+    /// worker begins stream I/O (see [`SseWorker::stream_lifecycle`]) and
+    /// shared with the stream driver so the callback path enforces the exact
+    /// same clock as the network path. Initialized before the first `open`
+    /// publish, which is the earliest point the driver can deliver a callback;
+    /// a read before initialization is an internal error, never a panic.
+    pub(super) deadline: std::sync::OnceLock<Instant>,
 }
 
 /// Runs the whole SSE lifecycle on a worker thread: open the response stream
@@ -427,8 +434,11 @@ impl SseWorker {
         // The absolute total deadline is derived once, when the worker begins
         // stream I/O: OS thread-spawn and scheduling latency before the first
         // network operation is not part of the stream duration. It is never
-        // reset by progress.
+        // reset by progress. The derived instant is stored in the shared state
+        // so the stream driver's callback path enforces the exact same clock;
+        // every subsequent read/publish uses this same value.
         let deadline = Instant::now() + self.total_duration;
+        let _ = self.shared.deadline.set(deadline);
 
         // Opening phase: the response headers must arrive before both the
         // opening idle deadline and the absolute total deadline. Whichever
@@ -644,10 +654,6 @@ struct SseStreamDriver {
     url: String,
     items: usize,
     bytes_received: Arc<AtomicUsize>,
-    /// The absolute total deadline; the driver enforces it in
-    /// [`apply_action`](Self::apply_action) so a slow callback cannot extend
-    /// the stream past its deadline.
-    deadline: Instant,
     permit: super::ConnectionPermit,
 }
 
@@ -775,8 +781,19 @@ impl HostStreamDriver for SseStreamDriver {
         // The absolute total deadline is enforced here too: a slow callback
         // (e.g. one awaiting a host future) must not extend the stream past
         // its deadline. Once the deadline has passed, every callback action
-        // fails deterministically.
-        if Instant::now() >= self.deadline {
+        // fails deterministically. The deadline is the same single authoritative
+        // instant the worker derived when it began stream I/O and stored in the
+        // shared state, so the network and callback paths share one clock. A
+        // read before initialization is a driver-state invariant violation (the
+        // driver only delivers a callback after the worker has published
+        // `open`, which follows deadline initialization), so it is surfaced as
+        // a typed internal error rather than an unwrap panic.
+        let deadline = self
+            .shared
+            .deadline
+            .get()
+            .ok_or_else(|| VmError::HostError("SSE stream deadline not initialized".to_string()))?;
+        if Instant::now() >= *deadline {
             return Err(VmError::HostError(SSE_TOTAL_DEADLINE_ERROR.to_string()));
         }
         let Value::Map(action) = action else {
@@ -916,7 +933,7 @@ pub(super) fn builtin_http_client_sse(
     let callback = on_event.into_value();
     vm.validate_stream_callback_value(&callback)?;
     let script_timeout = parse_stream_timeout(&request)?;
-    let (context, deadline) = HttpRequestContext::capture(vm, script_timeout, "SSE")?;
+    let (context, _capture_deadline) = HttpRequestContext::capture(vm, script_timeout, "SSE")?;
     let mut request = parse_request(&request, &context.config)?;
     policy::validate_url_policy(&context.config, policy::SchemeFamily::Http, &request.url)?;
     if request.method != hyper::Method::GET && request.method != hyper::Method::POST {
@@ -945,6 +962,7 @@ pub(super) fn builtin_http_client_sse(
         result: std::sync::Mutex::new(None),
         join_handle: std::sync::Mutex::new(None),
         close_waker: std::sync::Mutex::new(None),
+        deadline: std::sync::OnceLock::new(),
     });
 
     // Register the HTTP response stream as a root resource, then register
@@ -1014,7 +1032,6 @@ pub(super) fn builtin_http_client_sse(
         url: String::new(),
         items: 0,
         bytes_received,
-        deadline,
         permit,
     };
 
@@ -1035,7 +1052,7 @@ mod tests {
     use super::{
         SSE_CHANNEL_CAPACITY, SseEvent, SseParser, SseShared, SseStreamDriver, VmMap,
     };
-    use crate::vm::{HostStreamDriver, HostStreamPoll, Value};
+    use crate::vm::{HostStreamAction, HostStreamDriver, HostStreamPoll, Value, VmError};
     use tokio::sync::{Notify, mpsc};
 
     fn event(data: &str, event: Option<&str>, id: Option<&str>, retry_ms: Option<i64>) -> SseEvent {
@@ -1058,6 +1075,7 @@ mod tests {
             result: std::sync::Mutex::new(None),
             join_handle: std::sync::Mutex::new(None),
             close_waker: std::sync::Mutex::new(None),
+            deadline: std::sync::OnceLock::new(),
         });
         (shared, receiver)
     }
@@ -1071,7 +1089,6 @@ mod tests {
             url: String::new(),
             items: 0,
             bytes_received: Arc::new(AtomicUsize::new(0)),
-            deadline: std::time::Instant::now(),
             permit: super::super::policy::ConnectionAdmission::new(1)
                 .acquire()
                 .expect("test connection permit"),
@@ -1276,6 +1293,65 @@ mod tests {
             Poll::Ready(Ok(HostStreamPoll::Complete(_)))
         ));
         assert!(driver.items == 2);
+    }
+
+    /// The driver's `apply_action` must enforce the *shared* deadline the
+    /// worker stored when it began stream I/O — the same single authoritative
+    /// clock as the network reads/publishes. Injecting a known deadline proves
+    /// the callback path uses exactly that value (not a separately captured
+    /// admission-time instant), and that an uninitialized read is a typed
+    /// internal error rather than an unwrap panic.
+    #[test]
+    fn driver_apply_action_enforces_the_shared_deadline() {
+        // A deadline far in the future: the callback continues.
+        let (shared, receiver) = test_shared();
+        let mut driver = test_driver(Arc::clone(&shared), receiver);
+        let known = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        shared
+            .deadline
+            .set(known)
+            .expect("first deadline set must succeed");
+        let action = super::map_value(vec![("action", Value::string("continue"))]);
+        assert!(matches!(
+            driver.apply_action(action),
+            Ok(HostStreamAction::Continue)
+        ));
+
+        // A deadline in the past: the callback is rejected with the SSE total
+        // deadline, deterministically, regardless of when this test runs.
+        let (shared, receiver) = test_shared();
+        let mut driver = test_driver(Arc::clone(&shared), receiver);
+        shared
+            .deadline
+            .set(std::time::Instant::now() - std::time::Duration::from_secs(1))
+            .expect("first deadline set must succeed");
+        let action = super::map_value(vec![("action", Value::string("continue"))]);
+        assert!(matches!(
+            driver.apply_action(action),
+            Err(VmError::HostError(ref message)) if message == super::SSE_TOTAL_DEADLINE_ERROR
+        ));
+
+        // Uninitialized deadline: a typed internal error, never a panic.
+        let (shared, receiver) = test_shared();
+        let mut driver = test_driver(Arc::clone(&shared), receiver);
+        let action = super::map_value(vec![("action", Value::string("continue"))]);
+        assert!(matches!(
+            driver.apply_action(action),
+            Err(VmError::HostError(ref message)) if message == "SSE stream deadline not initialized"
+        ));
+    }
+
+    /// The deadline cell is derived exactly once: the worker's first `set`
+    /// succeeds and a second `set` is rejected, so the driver can never observe
+    /// a different deadline than the one the network path used.
+    #[test]
+    fn shared_deadline_is_derived_exactly_once() {
+        let (shared, _receiver) = test_shared();
+        let first = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        assert!(shared.deadline.set(first).is_ok());
+        let second = first + std::time::Duration::from_secs(10);
+        assert!(shared.deadline.set(second).is_err());
+        assert_eq!(shared.deadline.get(), Some(&first));
     }
 
     fn parse_fragments(
