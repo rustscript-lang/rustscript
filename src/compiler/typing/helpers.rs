@@ -3,14 +3,14 @@ use std::collections::{HashMap, HashSet};
 use crate::builtins::BuiltinFunction;
 #[cfg(feature = "edge-abi")]
 use crate::builtins::{CallableParam, CallableParamType};
-use crate::host_api::HostParamPassing;
+use crate::host_api::{HostFunctionSchema, HostParamPassing};
 
 use super::super::CompileError;
 use super::super::TypingMode;
 use super::super::host_call_resolve::{ActualCallArg, resolve_candidate_slice_with_passing};
 use super::super::ir::{
     AssignmentKind, Expr, FunctionDecl, FunctionImpl, HostApiIrMetadata, LocalSlot, MatchPattern,
-    SemanticNodeId, Stmt, StructDecl, TypeSchema,
+    ResolvedHostCall, SemanticNodeId, Stmt, StructDecl, TypeSchema,
 };
 use super::super::source_map::Span;
 use super::collect::{
@@ -25,7 +25,7 @@ use super::state::{
 };
 use super::validate::{
     DiagnosticSite, owned_source_name, refine_state_for_condition, validate_branch_state_merge,
-    validate_expr,
+    validate_callable_expr_against_schema, validate_expr,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,8 +112,32 @@ impl<'a> HostCallResolutionPass<'a> {
         let Some(candidates) = metadata.candidates(*index) else {
             return;
         };
-        let Some(name) = candidates.first().map(|candidate| candidate.name.as_str()) else {
+        let Some(name) = candidates.first().map(|candidate| candidate.name.clone()) else {
             return;
+        };
+        let fingerprint = metadata.fingerprint();
+        let candidates = candidates.to_vec();
+
+        // A bare closure has no source-level parameter annotations, so its
+        // inferred schema deliberately leaves the parameters dynamic. The
+        // catalog's callable result/parameter schema still has to constrain
+        // the closure body before the generic overload resolver sees it.
+        // Filter candidates through the authoritative callable schema first;
+        // this also lets overloads that differ only by callback result type
+        // resolve from an inline closure without treating an invalid
+        // callback as a deferred `Unknown` match.
+        let compatible_candidates = candidates
+            .iter()
+            .filter(|candidate| {
+                self.validate_catalog_callable_arguments(candidate, args, state, context, site)
+                    .is_ok()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let resolver_candidates = if compatible_candidates.is_empty() {
+            &candidates
+        } else {
+            &compatible_candidates
         };
 
         let schemas = args
@@ -129,14 +153,16 @@ impl<'a> HostCallResolutionPass<'a> {
             .zip(&schemas)
             .map(|(arg, schema)| ActualCallArg::new(schema, actual_passing(arg, schema)))
             .collect::<Vec<_>>();
-        let result = resolve_candidate_slice_with_passing(
-            name,
-            candidates,
-            &actuals,
-            metadata.fingerprint(),
-        );
+        let result =
+            resolve_candidate_slice_with_passing(&name, resolver_candidates, &actuals, fingerprint);
         match result {
             Ok(resolved) => {
+                if let Err(error) =
+                    self.validate_resolved_callable_arguments(&resolved, args, state, context, site)
+                {
+                    self.record_validation_error(error);
+                    return;
+                }
                 *resolution = Some(Box::new(resolved));
                 self.changed += 1;
             }
@@ -164,6 +190,66 @@ impl<'a> HostCallResolutionPass<'a> {
                     });
                 }
             }
+        }
+    }
+
+    fn validate_catalog_callable_arguments(
+        &self,
+        candidate: &HostFunctionSchema,
+        args: &[Expr],
+        state: &LocalTypeState,
+        context: &mut TypeContext<'_>,
+        site: DiagnosticSite<'_>,
+    ) -> Result<(), CompileError> {
+        for (param, arg) in candidate.params.iter().zip(args) {
+            let schema = param.ty.to_compiler_schema();
+            if matches!(schema, TypeSchema::Callable { .. }) {
+                validate_callable_expr_against_schema(
+                    &format!(
+                        "host function '{}' argument '{}'",
+                        candidate.name, param.name
+                    ),
+                    &schema,
+                    arg,
+                    state,
+                    site,
+                    context,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_resolved_callable_arguments(
+        &self,
+        resolved: &ResolvedHostCall,
+        args: &[Expr],
+        state: &LocalTypeState,
+        context: &mut TypeContext<'_>,
+        site: DiagnosticSite<'_>,
+    ) -> Result<(), CompileError> {
+        for (param, arg) in resolved.params.iter().zip(args) {
+            if matches!(param.schema, TypeSchema::Callable { .. }) {
+                validate_callable_expr_against_schema(
+                    &format!(
+                        "host function '{}' argument '{}'",
+                        resolved.name, param.name
+                    ),
+                    &param.schema,
+                    arg,
+                    state,
+                    site,
+                    context,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn record_validation_error(&mut self, error: CompileError) {
+        self.unresolved += 1;
+        if self.phase == HostCallResolutionPhase::Final && self.first_error.is_none() {
+            self.first_error = Some(error);
         }
     }
 }

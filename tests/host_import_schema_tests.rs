@@ -141,3 +141,142 @@ fn type_schema_hash_is_independent_of_object_insertion_order() {
     assert_eq!(lhs, rhs);
     assert_eq!(digest(&lhs), digest(&rhs));
 }
+
+fn callable_catalog() -> Arc<vm::HostApiCatalog> {
+    let map = || HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown));
+    let callback = HostTypeSchema::Callable {
+        params: vec![map()],
+        result: Box::new(map()),
+    };
+    let mut builder = HostApiBuilder::new();
+    builder.function(HostFunctionSchema::with_return(
+        "acme::consume",
+        vec![HostParamSchema::value("callback", callback)],
+        HostTypeSchema::Int,
+    ));
+    Arc::new(builder.build().expect("callable catalog must build"))
+}
+
+fn compile_with_catalog(
+    source: &str,
+    catalog: Arc<vm::HostApiCatalog>,
+) -> Result<vm::CompiledProgram, vm::SourcePathError> {
+    compile_source_with_flavor_and_options(
+        source,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::default().with_host_api_catalog(catalog),
+    )
+}
+
+fn compile_callable_catalog(source: &str) -> Result<vm::CompiledProgram, vm::SourcePathError> {
+    compile_with_catalog(source, callable_catalog())
+}
+
+#[test]
+fn catalog_callable_schema_rejects_wrong_inline_callback_return() {
+    let error = match compile_callable_catalog(r#"use acme; acme::consume(|item| 1);"#) {
+        Ok(_) => panic!("catalog callable result schema must reject an int-returning closure"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("callable body result"),
+        "diagnostic should identify the callback return mismatch: {error}"
+    );
+}
+
+#[test]
+fn catalog_callable_schema_validates_inline_and_named_callbacks() {
+    if let Err(error) =
+        compile_callable_catalog(r#"use acme; acme::consume(|item| { action: "continue" });"#)
+    {
+        panic!("a map-returning inline callback should compile: {error}");
+    }
+
+    if let Err(error) = compile_callable_catalog(
+        r#"
+        use acme;
+        fn callback(item: map) -> map { { action: "continue" } }
+        acme::consume(callback);
+        "#,
+    ) {
+        panic!("a map-returning named callback should compile: {error}");
+    }
+
+    let error = match compile_callable_catalog(
+        r#"
+        use acme;
+        fn callback(item: map) -> int { 1 }
+        acme::consume(callback);
+        "#,
+    ) {
+        Ok(_) => panic!("a named int-returning callback must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("found fn(map") && error.to_string().contains("-> int"),
+        "diagnostic should identify the incompatible named callback: {error}"
+    );
+
+    let error = match compile_callable_catalog(
+        r#"
+        use acme;
+        fn callback(item: int) -> map { { action: "continue" } }
+        acme::consume(callback);
+        "#,
+    ) {
+        Ok(_) => panic!("a named int-parameter callback must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("found fn(int") && error.to_string().contains("-> map"),
+        "diagnostic should identify the incompatible callback parameter: {error}"
+    );
+}
+
+fn overloaded_callable_catalog() -> Arc<vm::HostApiCatalog> {
+    let map = || HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown));
+    let mut builder = HostApiBuilder::new();
+    builder.function(HostFunctionSchema::with_return(
+        "acme::choose",
+        vec![HostParamSchema::value(
+            "callback",
+            HostTypeSchema::Callable {
+                params: vec![map()],
+                result: Box::new(map()),
+            },
+        )],
+        HostTypeSchema::Int,
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        "acme::choose",
+        vec![HostParamSchema::value(
+            "callback",
+            HostTypeSchema::Callable {
+                params: vec![map()],
+                result: Box::new(HostTypeSchema::Int),
+            },
+        )],
+        HostTypeSchema::Int,
+    ));
+    Arc::new(
+        builder
+            .build()
+            .expect("overloaded callable catalog must build"),
+    )
+}
+
+#[test]
+fn catalog_callable_schema_drives_overload_selection() {
+    if let Err(error) = compile_with_catalog(
+        r#"use acme; acme::choose(|item| { action: "continue" });"#,
+        overloaded_callable_catalog(),
+    ) {
+        panic!("the map-returning overload should be selected: {error}");
+    }
+    if let Err(error) = compile_with_catalog(
+        r#"use acme; acme::choose(|item| 1);"#,
+        overloaded_callable_catalog(),
+    ) {
+        panic!("the int-returning overload should be selected: {error}");
+    }
+}
