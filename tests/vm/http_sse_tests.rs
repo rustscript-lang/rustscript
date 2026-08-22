@@ -1032,6 +1032,103 @@ async fn sse_host_stream_duration_caps_script_timeout_while_opening() {
     );
 }
 
+/// A stalled TLS handshake (the server accepts the TCP connection but never
+/// speaks TLS) must surface the *connect-phase* error, never the SSE total
+/// deadline. Connection establishment is bounded by `connect_timeout` only, so
+/// a connect that never completes reports `HTTP connect deadline exceeded`
+/// regardless of how long the stream budget is.
+#[tokio::test(flavor = "current_thread")]
+async fn sse_stalled_tls_connect_reports_connect_deadline_not_total() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        // Accept the TCP connection and then hold the socket open without
+        // reading or writing: the client's TLS connect future stays pending
+        // waiting for a ServerHello until its connect deadline fires. The
+        // bounded sleep keeps the accept thread from outliving the test.
+        let (mut socket, _) = accept_with_timeout(&listener).unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .unwrap();
+        let mut buf = [0_u8; 1024];
+        // Read the ClientHello if the client sends one; never reply. A read
+        // timeout (client sent nothing yet) is fine; a successful read just
+        // means the ClientHello arrived. Either way we never write a
+        // ServerHello, so the TLS handshake stalls until the connect deadline.
+        let _ = socket.read(&mut buf);
+        thread::sleep(std::time::Duration::from_millis(300));
+    });
+    let mut connect_config = config(port);
+    connect_config.allowed_schemes = vec!["https".into()];
+    connect_config.connect_timeout = std::time::Duration::from_millis(200);
+    // The stream budget and idle timeout are far longer than the connect
+    // timeout, so only the connect deadline can expire.
+    connect_config.max_stream_duration = std::time::Duration::from_secs(5);
+    connect_config.stream_idle_timeout = std::time::Duration::from_secs(5);
+    let source = format!(
+        r#"use http; fn go(item: map) -> map {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"https://127.0.0.1:{port}/events"}}, go);"#
+    );
+    let error = match run_sse_source(&source, connect_config).await {
+        Ok(_) => panic!("a stalled TLS connect must time out"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            &error,
+            VmError::HostError(message) if message == "HTTP connect deadline exceeded"
+        ),
+        "stalled connect must report the connect deadline, got {error}"
+    );
+    assert!(
+        !error.to_string().contains("SSE total deadline exceeded"),
+        "a connect timeout must not be mislabelled as the SSE total deadline: {error}"
+    );
+    join_with_timeout(server, "sse_stalled_tls_connect_reports_connect_deadline server");
+}
+
+/// A server that accepts the connection and reads the request but withholds the
+/// response headers must expire the *response* budget and surface the SSE total
+/// deadline, distinct from the connect-phase error. The response budget starts
+/// when the request is actually written, so only the stream duration can fire.
+#[tokio::test(flavor = "current_thread")]
+async fn sse_withheld_headers_reports_total_deadline_not_connect() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut socket, _) = accept_with_timeout(&listener).unwrap();
+        let mut request = [0_u8; 1024];
+        // Read the request so the client's request write completes, then never
+        // write any response: the response-header wait stalls.
+        assert!(socket.read(&mut request).unwrap() > 0);
+        thread::sleep(std::time::Duration::from_millis(500));
+    });
+    let mut deadline_config = config(port);
+    // The response budget (stream duration) is short, while the connect
+    // timeout and idle timeout are long, so only the response budget can fire.
+    deadline_config.max_stream_duration = std::time::Duration::from_millis(200);
+    deadline_config.connect_timeout = std::time::Duration::from_secs(5);
+    deadline_config.stream_idle_timeout = std::time::Duration::from_secs(5);
+    let source = format!(
+        r#"use http; fn go(item: map) -> map {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
+    );
+    let error = match run_sse_source(&source, deadline_config).await {
+        Ok(_) => panic!("withheld response headers must time out"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            &error,
+            VmError::HostError(message) if message == "SSE total deadline exceeded"
+        ),
+        "withheld headers must report the SSE total deadline, got {error}"
+    );
+    assert!(
+        !error.to_string().contains("HTTP connect deadline exceeded"),
+        "a response-budget expiry must not be mislabelled as a connect timeout: {error}"
+    );
+    join_with_timeout(server, "sse_withheld_headers_reports_total_deadline server");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn sse_total_deadline_expires_despite_periodic_progress_below_idle_timeout() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();

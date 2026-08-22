@@ -215,13 +215,25 @@ pub(super) fn is_restricted_ip(ip: IpAddr) -> bool {
     }
 }
 
+/// Error surfaced when the connection-establishment budget (DNS resolve, TCP
+/// connect, TLS handshake) expires. This is distinct from the response-budget
+/// timeout ([`HTTP_REQUEST_DEADLINE_EXCEEDED`]) so streaming adapters and
+/// callers can classify the expired phase without substring parsing.
+pub(super) const HTTP_CONNECT_DEADLINE_EXCEEDED: &str = "HTTP connect deadline exceeded";
+
+/// Error surfaced when the response budget (buffered response headers/body, or
+/// the streaming response-header wait) expires. Kept for public-compatibility
+/// with buffered HTTP request behaviour.
+pub(super) const HTTP_REQUEST_DEADLINE_EXCEEDED: &str = "HTTP request deadline exceeded";
+
 pub(super) async fn with_deadline<T>(
     deadline: Instant,
+    deadline_error: &'static str,
     future: impl std::future::Future<Output = VmResult<T>>,
 ) -> VmResult<T> {
     tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), future)
         .await
-        .map_err(|_| VmError::HostError("HTTP request deadline exceeded".to_string()))?
+        .map_err(|_| VmError::HostError(deadline_error.to_string()))?
 }
 
 pub(super) fn request_deadline(timeout: std::time::Duration) -> VmResult<Instant> {

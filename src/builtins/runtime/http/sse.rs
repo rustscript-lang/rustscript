@@ -532,8 +532,10 @@ impl SseWorker {
     /// connect timeout inside [`open_stream_response`]; the total deadline is
     /// enforced there from when the request is actually sent (so connect
     /// latency never eats into the stream budget), while this outer select
-    /// bounds the opening idle deadline and maps the total-deadline expiry to
-    /// the SSE error.
+    /// bounds the opening idle deadline. The response-budget expiry carries the
+    /// SSE total-deadline error structurally (via the typed
+    /// [`ResponseBudget`](super::request::ResponseBudget)), so a connect
+    /// timeout (a distinct error) is never mislabelled as a total deadline.
     ///
     /// Cancellation is deliberately NOT a branch here: the worker must always
     /// attempt the connection so a peer waiting on `accept()` is not stranded.
@@ -557,19 +559,11 @@ impl SseWorker {
                 &self.config,
                 &self.request,
                 observer,
-                Some(self.total_duration),
-            ) => {
-                opened.map_err(|error| {
-                    if error.to_string().contains("HTTP request deadline exceeded") {
-                        // The streaming response budget expired while waiting
-                        // for the response headers. Connection setup is
-                        // bounded separately, so this is the total deadline.
-                        VmError::HostError(SSE_TOTAL_DEADLINE_ERROR.to_string())
-                    } else {
-                        error
-                    }
-                })
-            }
+                Some(super::request::ResponseBudget {
+                    duration: self.total_duration,
+                    deadline_error: SSE_TOTAL_DEADLINE_ERROR,
+                }),
+            ) => opened,
         }
     }
 

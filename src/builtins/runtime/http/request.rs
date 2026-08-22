@@ -12,7 +12,10 @@ use tokio::sync::Notify;
 
 use super::HttpRequestContext;
 use super::config::HttpConfig;
-use super::policy::{ConnectionPermit, SchemeFamily, request_deadline, resolve_url, with_deadline};
+use super::policy::{
+    ConnectionPermit, HTTP_CONNECT_DEADLINE_EXCEEDED, HTTP_REQUEST_DEADLINE_EXCEEDED, SchemeFamily,
+    request_deadline, resolve_url, with_deadline,
+};
 use crate::HostCallResult;
 use crate::builtins::runtime::{VmMap, VmMapHandle};
 use crate::vm::operation::{
@@ -646,6 +649,7 @@ pub(super) fn perform_buffered_request(
                     }
                     result = with_deadline(
                         deadline,
+                        HTTP_REQUEST_DEADLINE_EXCEEDED,
                         execute_request_until(
                             &worker_config,
                             &worker_request,
@@ -735,6 +739,7 @@ pub(super) async fn execute_request(config: &HttpConfig, request: &HttpRequest) 
     let deadline = request_deadline(config.request_timeout)?;
     with_deadline(
         deadline,
+        HTTP_REQUEST_DEADLINE_EXCEEDED,
         execute_request_until(
             config,
             request,
@@ -755,6 +760,7 @@ pub(super) async fn execute_request_with_observer(
     let deadline = request_deadline(config.request_timeout)?;
     with_deadline(
         deadline,
+        HTTP_REQUEST_DEADLINE_EXCEEDED,
         execute_request_until(config, request, observer, deadline, None),
     )
     .await
@@ -770,6 +776,7 @@ pub(super) async fn execute_request_with_tls_config(
     let deadline = request_deadline(config.request_timeout)?;
     with_deadline(
         deadline,
+        HTTP_REQUEST_DEADLINE_EXCEEDED,
         execute_request_until(config, request, observer, deadline, Some(tls_config)),
     )
     .await
@@ -797,6 +804,7 @@ async fn execute_request_until(
         );
         let resolved = with_deadline(
             connect_deadline,
+            HTTP_CONNECT_DEADLINE_EXCEEDED,
             resolve_url(config, SchemeFamily::Http, &url),
         )
         .await?;
@@ -810,7 +818,7 @@ async fn execute_request_until(
             ConnectionStage {
                 observer: observer.clone(),
                 deadline: connect_deadline,
-                response_duration: None,
+                response_budget: None,
                 tls_config: tls_config.clone(),
             },
         )
@@ -982,7 +990,7 @@ pub(super) async fn open_stream_response(
     config: &HttpConfig,
     request: &HttpRequest,
     observer: ResponseReadObserver,
-    response_duration: Option<Duration>,
+    response_budget: Option<ResponseBudget>,
 ) -> VmResult<(OwnedResponse, url::Url)> {
     let mut method = request.method.clone();
     let mut url = request.url.clone();
@@ -1000,6 +1008,7 @@ pub(super) async fn open_stream_response(
             })?;
         let resolved = with_deadline(
             connect_deadline,
+            HTTP_CONNECT_DEADLINE_EXCEEDED,
             resolve_url(config, SchemeFamily::Http, &url),
         )
         .await?;
@@ -1013,7 +1022,7 @@ pub(super) async fn open_stream_response(
             ConnectionStage {
                 observer: observer.clone(),
                 deadline: connect_deadline,
-                response_duration,
+                response_budget: response_budget.clone(),
                 tls_config: None,
             },
         )
@@ -1106,15 +1115,26 @@ fn reject_declared_oversize(
     Ok(())
 }
 
+/// A streaming response-header budget that starts when the request is actually
+/// written (after connection establishment), so connect latency never eats into
+/// the stream budget. Carries the phase-labelled timeout error so the caller
+/// (e.g. the SSE adapter) can classify an expired response budget structurally,
+/// without substring parsing.
+#[derive(Clone)]
+pub(super) struct ResponseBudget {
+    pub(super) duration: Duration,
+    pub(super) deadline_error: &'static str,
+}
+
 struct ConnectionStage {
     observer: ResponseReadObserver,
     deadline: Instant,
     /// Bounds only the response-header wait after the request is written.
     /// `None` leaves the header wait bounded solely by `deadline` (the
-    /// buffered-request behaviour). Streaming adapters pass a duration so the
+    /// buffered-request behaviour). Streaming adapters pass a budget so the
     /// stream deadline starts when the request is actually sent, keeping the
     /// connect + request write outside the stream budget.
-    response_duration: Option<Duration>,
+    response_budget: Option<ResponseBudget>,
     tls_config: Option<Arc<rustls::ClientConfig>>,
 }
 
@@ -1129,10 +1149,10 @@ async fn send_request(
     let ConnectionStage {
         observer,
         deadline: connect_deadline,
-        response_duration,
+        response_budget,
         tls_config,
     } = stage;
-    let stream = with_deadline(connect_deadline, async {
+    let stream = with_deadline(connect_deadline, HTTP_CONNECT_DEADLINE_EXCEEDED, async {
         tokio::net::TcpStream::connect(resolved.address)
             .await
             .map_err(|error| VmError::HostError(format!("HTTP request failed: {error}")))
@@ -1157,12 +1177,18 @@ async fn send_request(
         tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
         let server_name = rustls::pki_types::ServerName::try_from(resolved.host.clone())
             .map_err(|_| VmError::HostError("HTTP TLS server name is invalid".to_string()))?;
-        let stream = with_deadline(connect_deadline, async {
-            tokio_rustls::TlsConnector::from(Arc::new(tls_config))
-                .connect(server_name, raw)
-                .await
-                .map_err(|error| VmError::HostError(format!("HTTP request failed: {error}")))
-        })
+        let stream = with_deadline(
+            connect_deadline,
+            HTTP_CONNECT_DEADLINE_EXCEEDED,
+            async {
+                tokio_rustls::TlsConnector::from(Arc::new(tls_config))
+                    .connect(server_name, raw)
+                    .await
+                    .map_err(|error| {
+                        VmError::HostError(format!("HTTP request failed: {error}"))
+                    })
+            },
+        )
         .await?;
         send_over_io(
             method,
@@ -1170,7 +1196,7 @@ async fn send_request(
             headers,
             body,
             ReadCapIo::new(stream, observer),
-            response_duration,
+            response_budget,
         )
         .await
     } else {
@@ -1180,7 +1206,7 @@ async fn send_request(
             headers,
             body,
             ReadCapIo::new(raw, observer),
-            response_duration,
+            response_budget,
         )
         .await
     }
@@ -1227,7 +1253,7 @@ async fn send_over_io<T>(
     headers: &[(hyper::header::HeaderName, hyper::header::HeaderValue)],
     body: Option<&[u8]>,
     io: ReadCapIo<T>,
-    response_duration: Option<Duration>,
+    response_budget: Option<ResponseBudget>,
 ) -> VmResult<OwnedResponse>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1300,12 +1326,15 @@ where
         };
         Ok::<_, VmError>((response, connection))
     };
-    let (response, connection) = match response_duration {
-        Some(duration) => {
+    let (response, connection) = match response_budget {
+        Some(budget) => {
             with_deadline(
-                Instant::now().checked_add(duration).ok_or_else(|| {
-                    VmError::HostError("HTTP response deadline cannot form a deadline".to_string())
-                })?,
+                Instant::now()
+                    .checked_add(budget.duration)
+                    .ok_or_else(|| {
+                        VmError::HostError("HTTP response deadline cannot form a deadline".to_string())
+                    })?,
+                budget.deadline_error,
                 send_response,
             )
             .await?
