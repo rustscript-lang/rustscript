@@ -65,7 +65,7 @@ fn partial_io_registry_completes_missing_http_and_sqlite_surfaces() {
     register_io_builtin_module(&mut registry).expect("standard IO registration should succeed");
 
     let compiled = compile_standard(IO_HTTP_SQLITE_SOURCE);
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     registry
         .bind_vm_cached(&mut vm)
@@ -112,7 +112,7 @@ fn custom_mixed_partial_registry_rejects_and_stays_unchanged() {
     let generation_before = registry.registry_generation();
 
     let compiled = compile_standard(IO_ONLY_SOURCE);
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     let err = registry
         .bind_vm_cached(&mut vm)
@@ -155,7 +155,8 @@ fn second_bind_reuses_memoized_snapshot_with_zero_registration_change() {
     let compiled = compile_standard(IO_ONLY_SOURCE);
 
     // First bind stages the IO surface.
-    let mut vm1 = Vm::new(compiled.program.clone());
+    let mut vm1 =
+        Vm::try_new(compiled.program.clone()).expect("test VM construction must not fail");
     registry
         .bind_vm_cached(&mut vm1)
         .expect("first bind should auto-stage the IO surface");
@@ -167,7 +168,8 @@ fn second_bind_reuses_memoized_snapshot_with_zero_registration_change() {
 
     // Second bind reuses the memoized snapshot: no new registration, no
     // generation change on the cached template.
-    let mut vm2 = Vm::new(compiled.program.clone());
+    let mut vm2 =
+        Vm::try_new(compiled.program.clone()).expect("test VM construction must not fail");
     registry
         .bind_vm_cached(&mut vm2)
         .expect("second bind should reuse the memoized snapshot");
@@ -195,7 +197,7 @@ fn pre_registered_surface_needs_no_auto_stage() {
     register_io_builtin_module(&mut registry).expect("standard IO registration");
 
     let compiled = compile_standard(IO_ONLY_SOURCE);
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry
         .bind_vm_cached(&mut vm)
         .expect("pre-registered IO surface should bind");

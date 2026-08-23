@@ -754,7 +754,7 @@ fn combined_standard_catalog_exact_binds_and_executes() {
     let mut registry = HostFunctionRegistry::new();
     vm::register_sqlite_builtin_module(&mut registry)
         .expect("sqlite registration against combined catalog should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry
         .bind_vm_cached(&mut vm)
         .expect("combined-catalog exact bind should succeed");
@@ -834,7 +834,7 @@ fn combined_compile_rejects_subcatalog_fingerprint_registration() {
             .register_exact_static("sqlite::open", 1, schema, sqlite_open_adapter_stub())
             .expect("subcatalog registration should succeed");
     }
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let error = registry
         .bind_vm_cached(&mut vm)
         .expect_err("subcatalog-fingerprint registration must not bind a combined compile");
@@ -900,7 +900,7 @@ fn subcatalog_compile_and_matching_subcatalog_registration_binds() {
     let mut registry = HostFunctionRegistry::new();
     vm::register_sqlite_builtin_module_from_catalog(&mut registry, &subcatalog)
         .expect("sqlite subcatalog registration should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry
         .bind_vm_cached(&mut vm)
         .expect("sqlite subcatalog exact bind should succeed");
@@ -934,7 +934,7 @@ fn combined_compile_rejects_subcatalog_from_catalog_registration() {
     let subcatalog = vm::sqlite_host_catalog();
     vm::register_sqlite_builtin_module_from_catalog(&mut registry, &subcatalog)
         .expect("sqlite subcatalog registration should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let error = registry
         .bind_vm_cached(&mut vm)
         .expect_err("subcatalog registration must not bind a combined compile");
@@ -980,7 +980,7 @@ fn combined_standard_http_exact_binds_and_executes() {
         "every standard host import must carry an exact schema"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.configure_http(HttpConfig {
         allowed_schemes: vec!["http".to_string()],
         allowed_hosts: vec!["127.0.0.1".to_string()],
@@ -1033,7 +1033,7 @@ fn io_and_http_coexist_through_combined_exact_registry_and_execute() {
     io::exists("/forbidden");
     "#;
     let compiled = compile_source(source).expect("compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     // Exact combined registration (IO + HTTP) against the standard snapshot.
     bind_standard_io_http(&mut vm);

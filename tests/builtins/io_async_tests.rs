@@ -572,7 +572,7 @@ fn async_io_exact_catalog_compile_bind_execute_round_trip() {
 
     let mut registry = HostFunctionRegistry::empty();
     vm::register_io_builtin_module(&mut registry).expect("async exact IO registration");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     super::async_test_bridge::install(&mut vm);
     vm.configure_io(IoPolicy {
         allowed_roots: vec![std::env::temp_dir().display().to_string()],
