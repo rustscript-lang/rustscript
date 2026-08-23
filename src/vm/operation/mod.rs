@@ -117,9 +117,7 @@ mod architecture_gate {
         }
         let base = if b[i] == b'r' {
             1
-        } else if b[i] == b'b' && b.get(i + 1) == Some(&b'r') {
-            2
-        } else if b[i] == b'c' && b.get(i + 1) == Some(&b'r') {
+        } else if matches!(b[i], b'b' | b'c') && b.get(i + 1) == Some(&b'r') {
             2
         } else {
             return None;
@@ -271,9 +269,7 @@ mod architecture_gate {
                 }
                 _ => {
                     if let Some((prefix_len, hashes)) = raw_string_prefix(b, i) {
-                        for _ in 0..prefix_len {
-                            out.push(b' ');
-                        }
+                        out.extend(std::iter::repeat_n(b' ', prefix_len));
                         i += prefix_len;
                         let close = find_raw_close(b, i, hashes);
                         while i < close && i < b.len() {

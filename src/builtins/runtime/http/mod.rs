@@ -345,7 +345,6 @@ mod tests {
         validate_url_policy,
     };
     use super::{HttpConfig, HttpHostExt};
-    use crate::vm::{Value, VmStatus};
 
     #[test]
     fn default_http_policy_denies_all_hosts() {

@@ -184,6 +184,9 @@ pub struct SemanticModel {
     semantic_index: Option<SemanticIndex>,
 }
 
+type VisibleLocalBinding = (String, (LocalSlot, usize, u32));
+type VisibleFunctionBinding = (String, u16);
+
 impl SemanticModel {
     /// Build a semantic model from the compilation results.
     ///
@@ -344,14 +347,14 @@ impl SemanticModel {
             if self.position_in_span(position, reference.ident_span) {
                 let candidate: (Option<ScopeId>, LocalSlot, Span) =
                     (None, reference.slot, reference.ident_span);
-                best = Some(pick_smaller_span(&best, &candidate).clone());
+                best = Some(*pick_smaller_span(&best, &candidate));
             }
         }
         for decl in &parsed.local_decls {
             if self.position_in_span(position, decl.ident_span) {
                 let candidate: (Option<ScopeId>, LocalSlot, Span) =
                     (Some(decl.scope_id), decl.slot, decl.ident_span);
-                best = Some(pick_smaller_span(&best, &candidate).clone());
+                best = Some(*pick_smaller_span(&best, &candidate));
             }
         }
         best.map(|(_, slot, _)| slot)
@@ -656,7 +659,7 @@ impl SemanticModel {
     /// `CallArityOverflow`) return `None`. No source text is ever scanned and
     /// no same-line token guessing is performed.
     fn compile_error_to_span(&self, err: &CompileError) -> Option<Span> {
-        let carried = match err {
+        match err {
             CompileError::HostCallResolve { span, .. }
             | CompileError::IfElseBranchTypeMismatch { span, .. }
             | CompileError::CallableArgumentTypeMismatch { span, .. }
@@ -664,9 +667,8 @@ impl SemanticModel {
             | CompileError::InvalidFieldAccess { span, .. }
             | CompileError::FunctionParameterTypeConflict { span, .. }
             | CompileError::StrictTypingRequired { span, .. } => *span,
-            _ => return None,
-        };
-        carried
+            _ => None,
+        }
     }
 
     /// Map a `CompileError` to a stable error code.
@@ -801,7 +803,7 @@ impl SemanticModel {
         position: SourcePosition,
         scope_chain: &[ScopeId],
         parsed: &crate::compiler::ir::ParsedSemanticIndex,
-    ) -> (Vec<(String, (LocalSlot, usize, u32))>, Vec<(String, u16)>) {
+    ) -> (Vec<VisibleLocalBinding>, Vec<VisibleFunctionBinding>) {
         let mut locals: Vec<(String, (LocalSlot, usize, u32))> = Vec::new();
         let mut funcs: Vec<(String, u16)> = Vec::new();
         let mut seen_local_names: std::collections::HashSet<String> =
@@ -828,10 +830,10 @@ impl SemanticModel {
                 same_scope_by_name.insert(decl.name.clone(), (decl.slot, decl.decl_order));
             }
             for (name, (slot, decl_order)) in same_scope_by_name {
-                if seen_slots.insert(slot) || !seen_local_names.contains(&name) {
-                    if seen_local_names.insert(name.clone()) {
-                        locals.push((name, (slot, depth, decl_order)));
-                    }
+                if (seen_slots.insert(slot) || !seen_local_names.contains(&name))
+                    && seen_local_names.insert(name.clone())
+                {
+                    locals.push((name, (slot, depth, decl_order)));
                 }
             }
 
@@ -999,7 +1001,7 @@ impl SemanticModel {
                     segments.reverse();
                     // `ns::` -> prefix `ns::`, namespace `ns`, empty member.
                     let joined = segments.join("::");
-                    let namespace = if segments.len() >= 1 {
+                    let namespace = if !segments.is_empty() {
                         Some(segments.join("::"))
                     } else {
                         None
@@ -1073,7 +1075,6 @@ impl SemanticModel {
         prefix: &str,
         namespace: Option<&str>,
     ) -> Vec<SemanticCompletion> {
-        let prefix = prefix;
         let mut completions = Vec::new();
         let source_name = self
             .sources

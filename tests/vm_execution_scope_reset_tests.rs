@@ -433,7 +433,7 @@ fn deadline_poisons_without_claiming_cleanup() {
     // force-cleared), i.e. cleanup was not faked.
     assert_eq!(vm.host_context().scope_state(), ScopeState::Closing);
     assert!(
-        vm.host_context().execution_scope().resources().len() >= 1,
+        !vm.host_context().execution_scope().resources().is_empty(),
         "the pending resource must still be registered (cleanup was not faked)"
     );
 
@@ -804,7 +804,7 @@ fn never_completing_close_hits_typed_recycle_deadline_and_discards() {
     // The old scope stays in place (Closing), resources were NOT force-clean.
     assert_eq!(vm.host_context().scope_state(), ScopeState::Closing);
     assert!(
-        vm.host_context().execution_scope().resources().len() >= 1,
+        !vm.host_context().execution_scope().resources().is_empty(),
         "the never-completing resource is still registered (no fake cleanup)"
     );
 

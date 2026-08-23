@@ -1582,19 +1582,20 @@ fn jit_native_loop_preserves_exact_resource_return_ownership() {
 
     // Exiting the scope (explicit close + drive) closes each guest-owned
     // handle exactly once.
-    let mut cx = vm.host_context();
-    cx.begin_close(ResourceCloseReason::Requested)
-        .expect("scope begin close");
-    let waker = std::task::Waker::from(std::sync::Arc::new(NoopWaker(0)));
-    let mut context = std::task::Context::from_waker(&waker);
-    loop {
-        match cx.poll_close(&mut context) {
-            std::task::Poll::Pending => continue,
-            std::task::Poll::Ready(Ok(_)) => break,
-            std::task::Poll::Ready(Err(error)) => panic!("scope close failed: {error}"),
+    {
+        let mut cx = vm.host_context();
+        cx.begin_close(ResourceCloseReason::Requested)
+            .expect("scope begin close");
+        let waker = std::task::Waker::from(std::sync::Arc::new(NoopWaker));
+        let mut context = std::task::Context::from_waker(&waker);
+        loop {
+            match cx.poll_close(&mut context) {
+                std::task::Poll::Pending => continue,
+                std::task::Poll::Ready(Ok(_)) => break,
+                std::task::Poll::Ready(Err(error)) => panic!("scope close failed: {error}"),
+            }
         }
     }
-    drop(cx);
     drop(vm);
     let records = JIT_LOOP_PING.lock().unwrap();
     for (_, closes) in records.iter() {
@@ -1602,7 +1603,7 @@ fn jit_native_loop_preserves_exact_resource_return_ownership() {
     }
 }
 
-struct NoopWaker(usize);
+struct NoopWaker;
 impl std::task::Wake for NoopWaker {
     fn wake(self: std::sync::Arc<Self>) {}
 }

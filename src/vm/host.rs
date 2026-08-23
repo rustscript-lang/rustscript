@@ -319,18 +319,18 @@ fn validate_exact_registration_schema(
     }
     // Exact return shape (finding: only `Resource(key)` and
     // `Optional<Resource(key)>` may carry a resource across the boundary).
-    if schema_walk_has_resource(&schema.return_type, 0)? {
-        if addressable_resource_key(&schema.return_type).is_none() {
-            return Err(HostImportBindingError::InvalidSchema {
-                import: name.to_string(),
-                reason: format!(
-                    "exact return schema {:#?} contains a resource nested inside an \
+    if schema_walk_has_resource(&schema.return_type, 0)?
+        && addressable_resource_key(&schema.return_type).is_none()
+    {
+        return Err(HostImportBindingError::InvalidSchema {
+            import: name.to_string(),
+            reason: format!(
+                "exact return schema {:#?} contains a resource nested inside an \
                      aggregate; only Resource(key) and Optional<Resource(key)> returns are \
                      representable by the handle ABI",
-                    schema.return_type,
-                ),
-            });
-        }
+                schema.return_type,
+            ),
+        });
     }
     Ok(())
 }

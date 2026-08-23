@@ -1,0 +1,7 @@
+# RustScript's public host boundary intentionally carries rich typed errors,
+# and several compiler plumbing functions pass one cohesive eight-field context.
+# Keep Clippy's structural lints active while setting thresholds to the shapes
+# already required by these APIs.
+too-many-arguments-threshold = 8
+large-error-threshold = 256
+type-complexity-threshold = 350

@@ -1,9 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use vm::{
-    HostFunctionRegistry, IoHostExt, IoPolicy, Value, Vm, VmError, VmResetState, VmStatus,
-    compile_source,
-};
+use vm::{HostFunctionRegistry, IoHostExt, IoPolicy, Value, Vm, VmError, VmStatus, compile_source};
 
 fn run_source(source: &str) -> Result<Vec<Value>, VmError> {
     let compiled =

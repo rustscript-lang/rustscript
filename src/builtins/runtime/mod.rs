@@ -26,6 +26,7 @@ mod map_iter;
 mod math;
 pub(crate) mod print;
 pub(crate) mod regex;
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) mod resource;
 #[cfg(feature = "sqlite")]
 mod sqlite;

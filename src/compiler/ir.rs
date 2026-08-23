@@ -1007,14 +1007,14 @@ fn collect_resolved_calls_in_expr(
 ) {
     match expr {
         Expr::Call(index, _type_args, args, host, semantic_id) => {
-            if let Some(id) = semantic_id {
-                if let Some(entry) = by_id.get_mut(id) {
-                    if let Some(resolved) = host {
-                        entry.return_type = resolved.return_type.clone();
-                        entry.host = Some((**resolved).clone());
-                    } else if let Some(schema) = function_return_schemas.get(index).cloned() {
-                        entry.return_type = schema.unwrap_or(TypeSchema::Unknown);
-                    }
+            if let Some(id) = semantic_id
+                && let Some(entry) = by_id.get_mut(id)
+            {
+                if let Some(resolved) = host {
+                    entry.return_type = resolved.return_type.clone();
+                    entry.host = Some((**resolved).clone());
+                } else if let Some(schema) = function_return_schemas.get(index).cloned() {
+                    entry.return_type = schema.unwrap_or(TypeSchema::Unknown);
                 }
             }
             for arg in args {
@@ -1022,36 +1022,36 @@ fn collect_resolved_calls_in_expr(
             }
         }
         Expr::ModuleCall(_symbol, _type_args, args, semantic_id) => {
-            if let Some(id) = semantic_id {
-                if let Some(entry) = by_id.get_mut(id) {
-                    // Module calls resolve to a compiler-owned symbol whose
-                    // flat function is only known after merge; the semantic
-                    // model resolves the return schema through the flat
-                    // function table by symbol identity.
-                    entry.return_type = TypeSchema::Unknown;
-                }
+            if let Some(id) = semantic_id
+                && let Some(entry) = by_id.get_mut(id)
+            {
+                // Module calls resolve to a compiler-owned symbol whose
+                // flat function is only known after merge; the semantic
+                // model resolves the return schema through the flat
+                // function table by symbol identity.
+                entry.return_type = TypeSchema::Unknown;
             }
             for arg in args {
                 collect_resolved_calls_in_expr(arg, by_id, function_return_schemas, slot_schemas);
             }
         }
         Expr::LocalCall(slot, _type_args, args, semantic_id) => {
-            if let Some(id) = semantic_id {
-                if let Some(entry) = by_id.get_mut(id) {
-                    // A direct local-callable call's return is derived from
-                    // the slot's callable schema when one is known: the
-                    // callable's `result` schema is the call's return type.
-                    // Only a genuinely unknown slot schema leaves `Unknown`.
-                    let slot_index = *slot as usize;
-                    entry.return_type = slot_schemas
-                        .get(slot_index)
-                        .and_then(|schema| schema.as_ref())
-                        .and_then(|schema| match schema {
-                            TypeSchema::Callable { result, .. } => Some(result.as_ref().clone()),
-                            _ => None,
-                        })
-                        .unwrap_or(TypeSchema::Unknown);
-                }
+            if let Some(id) = semantic_id
+                && let Some(entry) = by_id.get_mut(id)
+            {
+                // A direct local-callable call's return is derived from
+                // the slot's callable schema when one is known: the
+                // callable's `result` schema is the call's return type.
+                // Only a genuinely unknown slot schema leaves `Unknown`.
+                let slot_index = *slot as usize;
+                entry.return_type = slot_schemas
+                    .get(slot_index)
+                    .and_then(|schema| schema.as_ref())
+                    .and_then(|schema| match schema {
+                        TypeSchema::Callable { result, .. } => Some(result.as_ref().clone()),
+                        _ => None,
+                    })
+                    .unwrap_or(TypeSchema::Unknown);
             }
             for arg in args {
                 collect_resolved_calls_in_expr(arg, by_id, function_return_schemas, slot_schemas);
@@ -1829,7 +1829,7 @@ mod call_resolution_carrier_tests {
             Expr::Call(_, _, _, _, id) => *id,
             _ => None,
         };
-        let rewritten = Expr::Call(9, Vec::new(), vec![Expr::Int(1)], None, source_node_id);
+        let _rewritten = Expr::Call(9, Vec::new(), vec![Expr::Int(1)], None, source_node_id);
         // The rewritten call still carries the same id
         assert_eq!(source_node_id, Some(super::SemanticNodeId(99)));
     }

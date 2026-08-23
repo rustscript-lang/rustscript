@@ -432,16 +432,15 @@ impl Vm {
         {
             return InvocationError::Capability(runtime_error);
         }
-        if let Some(op_id) = waiting_operation {
-            if let Ok(scope_id) = crate::vm::operation::OperationId::from_raw(op_id)
-                && let Ok(status) = self.host.execution_scope().operations().status(scope_id)
-                && let crate::vm::operation::OperationStatus::Failed(operation_error) = status
-            {
-                return InvocationError::Capability(runtime_error_from_operation(
-                    op_id,
-                    operation_error,
-                ));
-            }
+        if let Some(op_id) = waiting_operation
+            && let Ok(scope_id) = crate::vm::operation::OperationId::from_raw(op_id)
+            && let Ok(status) = self.host.execution_scope().operations().status(scope_id)
+            && let crate::vm::operation::OperationStatus::Failed(operation_error) = status
+        {
+            return InvocationError::Capability(runtime_error_from_operation(
+                op_id,
+                operation_error,
+            ));
         }
         match error {
             VmError::OutOfFuel { needed, remaining } => {

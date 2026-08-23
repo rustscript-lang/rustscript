@@ -24,7 +24,7 @@ fn effective_host_api_catalog(options: &CompileSourceFileOptions) -> Option<Arc<
     }
     #[cfg(feature = "runtime")]
     {
-        return Some(crate::builtins::runtime::standard_host_catalog());
+        Some(crate::builtins::runtime::standard_host_catalog())
     }
     #[cfg(not(feature = "runtime"))]
     {
@@ -1802,10 +1802,10 @@ mod postfix_provenance_tests {
                     }
                 }
             }
-            if let Stmt::Expr { expr, .. } = stmt {
-                if let Expr::Call(_, _, _, _, id) = expr {
-                    get_node = *id;
-                }
+            if let Stmt::Expr { expr, .. } = stmt
+                && let Expr::Call(_, _, _, _, id) = expr
+            {
+                get_node = *id;
             }
         }
         assert_eq!(get_node, Some(get.id), "get node shares the site id");

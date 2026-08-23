@@ -446,7 +446,7 @@ mod resource_catalog_scanner {
     use pd_host_schema::{HostPassing, RESOURCE_SCHEMA_LABEL, resource_spec};
     use syn::FnArg;
 
-    fn canonical_inputs<'a>(function: &'a syn::ItemFn) -> impl Iterator<Item = &'a syn::PatType> {
+    fn canonical_inputs(function: &syn::ItemFn) -> impl Iterator<Item = &syn::PatType> {
         function.sig.inputs.iter().filter_map(|input| match input {
             FnArg::Typed(pat_type) => Some(pat_type),
             FnArg::Receiver(_) => None,

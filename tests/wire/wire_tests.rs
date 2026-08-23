@@ -587,7 +587,7 @@ fn wire_rejects_host_import_schema_beyond_depth_limit() {
     encoded.push(1);
     encoded.extend_from_slice(&test_host_api_fingerprint().as_u64().to_le_bytes());
     encoded.extend_from_slice(&0u32.to_le_bytes());
-    encoded.extend(std::iter::repeat(16).take(64));
+    encoded.extend(std::iter::repeat_n(16, 64));
     encoded.push(1);
     encoded.push(0);
     encoded.push(0);

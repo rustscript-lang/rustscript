@@ -1407,10 +1407,10 @@ impl Parser {
     ) -> Result<Expr, ParseError> {
         let mut expr =
             self.build_builtin_call_expr_with_type_args(BuiltinFunction::Slice, args, Vec::new())?;
-        if let Some(id) = slice_id {
-            if let Expr::Call(_, _, _, _, slot) = &mut expr {
-                *slot = Some(id);
-            }
+        if let Some(id) = slice_id
+            && let Expr::Call(_, _, _, _, slot) = &mut expr
+        {
+            *slot = Some(id);
         }
         Ok(expr)
     }

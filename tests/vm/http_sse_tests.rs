@@ -393,25 +393,23 @@ fn join_with_timeout(handle: thread::JoinHandle<()>, context: &str) {
 /// helper observes exactly that.
 fn expect_peer_close(stream: &mut std::net::TcpStream, context: &str) {
     let mut buf = [0_u8; 1024];
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => return, // EOF — peer closed.
-            Ok(n) => panic!(
-                "{context}: expected peer close but received {n} bytes: {:?}",
-                String::from_utf8_lossy(&buf[..n])
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => return,
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    || error.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                panic!(
-                    "{context}: expected peer close but the socket stayed open past the \
-                     {SERVER_IO_WATCHDOG:?} watchdog"
-                );
-            }
-            Err(error) => panic!("{context}: unexpected read error while probing close: {error}"),
+    match stream.read(&mut buf) {
+        Ok(0) => {} // EOF — peer closed.
+        Ok(n) => panic!(
+            "{context}: expected peer close but received {n} bytes: {:?}",
+            String::from_utf8_lossy(&buf[..n])
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            panic!(
+                "{context}: expected peer close but the socket stayed open past the \
+                 {SERVER_IO_WATCHDOG:?} watchdog"
+            );
         }
+        Err(error) => panic!("{context}: unexpected read error while probing close: {error}"),
     }
 }
 

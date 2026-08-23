@@ -211,13 +211,12 @@ impl<T: Send + 'static> PipeTransferGuard<T> {
             None => return,
         };
         let mut ctx = vm.host_context();
-        if let Ok(token) = ctx.typed_resource::<IoPipeResource>(handle) {
-            if let Ok(mut resource) = ctx.resource_mut::<IoPipeResource>(&token) {
-                if !resource.get().is_closed() {
-                    restore(resource.get(), pipe);
-                    return;
-                }
-            }
+        if let Ok(token) = ctx.typed_resource::<IoPipeResource>(handle)
+            && let Ok(mut resource) = ctx.resource_mut::<IoPipeResource>(&token)
+            && !resource.get().is_closed()
+        {
+            restore(resource.get(), pipe);
+            return;
         }
         // Resource is closing or gone — drop the pipe handle (OS descriptor
         // is closed by Drop). This is safe: the worker never took it.
@@ -237,13 +236,12 @@ pub(crate) fn restore_reader_or_drop(
     pipe: std::process::ChildStdout,
 ) {
     let mut ctx = vm.host_context();
-    if let Ok(token) = ctx.typed_resource::<IoPipeResource>(handle) {
-        if let Ok(mut resource) = ctx.resource_mut::<IoPipeResource>(&token) {
-            if !resource.get().is_closed() {
-                resource.get().restore_reader(pipe);
-                return;
-            }
-        }
+    if let Ok(token) = ctx.typed_resource::<IoPipeResource>(handle)
+        && let Ok(mut resource) = ctx.resource_mut::<IoPipeResource>(&token)
+        && !resource.get().is_closed()
+    {
+        resource.get().restore_reader(pipe);
+        return;
     }
     drop(pipe);
 }
@@ -257,13 +255,12 @@ pub(crate) fn restore_writer_or_drop(
     pipe: std::process::ChildStdin,
 ) {
     let mut ctx = vm.host_context();
-    if let Ok(token) = ctx.typed_resource::<IoPipeResource>(handle) {
-        if let Ok(mut resource) = ctx.resource_mut::<IoPipeResource>(&token) {
-            if !resource.get().is_closed() {
-                resource.get().restore_writer(pipe);
-                return;
-            }
-        }
+    if let Ok(token) = ctx.typed_resource::<IoPipeResource>(handle)
+        && let Ok(mut resource) = ctx.resource_mut::<IoPipeResource>(&token)
+        && !resource.get().is_closed()
+    {
+        resource.get().restore_writer(pipe);
+        return;
     }
     drop(pipe);
 }

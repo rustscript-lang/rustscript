@@ -29,8 +29,6 @@ use std::thread::JoinHandle;
 use std::os::unix::process::CommandExt;
 
 #[cfg(unix)]
-use libc;
-
 use super::super::HostCallResult;
 use super::ops::{
     CloseCompletionOperation, CloseCompletionState, PipeTransferGuard, ReadyOperation,
@@ -88,10 +86,10 @@ impl HostResource for IoFileResource {
 
     fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
         let mut guard = self.close_worker.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(handle) = guard.as_ref() {
-            if !handle.is_finished() {
-                return Poll::Pending;
-            }
+        if let Some(handle) = guard.as_ref()
+            && !handle.is_finished()
+        {
+            return Poll::Pending;
         }
         if let Some(handle) = guard.take() {
             let join_result = handle.join();
@@ -175,10 +173,10 @@ impl HostResource for IoProcessResource {
 
     fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
         let mut guard = self.close_worker.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(handle) = guard.as_ref() {
-            if !handle.is_finished() {
-                return Poll::Pending;
-            }
+        if let Some(handle) = guard.as_ref()
+            && !handle.is_finished()
+        {
+            return Poll::Pending;
         }
         if let Some(handle) = guard.take() {
             let join_result = handle.join();
@@ -480,12 +478,12 @@ pub(crate) fn builtin_io_popen_body(
             "unsupported io_popen mode '{mode}', expected r or w"
         )));
     }
-    if let Some(policy) = super::io_policy(vm) {
-        if !policy.allow_process {
-            return Err(VmError::HostError(
-                "io_popen requires the process capability".to_string(),
-            ));
-        }
+    if let Some(policy) = super::io_policy(vm)
+        && !policy.allow_process
+    {
+        return Err(VmError::HostError(
+            "io_popen requires the process capability".to_string(),
+        ));
     }
     let command = command.to_string();
     let mode_str = mode.to_string();
@@ -723,10 +721,10 @@ pub(crate) fn builtin_io_read_line_body(
             if state.cancelled.load(Ordering::SeqCst) {
                 // Return the pipe handle through pipe_shared so PendingOpResult
                 // can restore it — cancellation before worker start.
-                if let Some(ref guard) = pipe_guard_worker {
-                    if let Some(pipe) = guard.take() {
-                        *pipe_shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
-                    }
+                if let Some(ref guard) = pipe_guard_worker
+                    && let Some(pipe) = guard.take()
+                {
+                    *pipe_shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
                 }
                 let _ = tx.send(Err(
                     "io::read_line was cancelled before starting".to_string()
@@ -734,8 +732,7 @@ pub(crate) fn builtin_io_read_line_body(
                 return;
             }
             let result = if let Some(mut file) = cloned_file {
-                let r = read_line_from_reader(&mut file, max_read_bytes);
-                r
+                read_line_from_reader(&mut file, max_read_bytes)
             } else if let Some(ref guard) = pipe_guard_worker {
                 let mut pipe = match guard.take() {
                     Some(p) => p,
@@ -810,13 +807,13 @@ pub(crate) fn builtin_io_write_body(
     handle_id: i64,
     text: &str,
 ) -> VmResult<HostCallResult<i64>> {
-    if let Some(policy) = super::io_policy(vm) {
-        if text.len() > policy.max_write_bytes {
-            return Err(VmError::HostError(format!(
-                "io_write exceeds the configured write limit of {} bytes",
-                policy.max_write_bytes
-            )));
-        }
+    if let Some(policy) = super::io_policy(vm)
+        && text.len() > policy.max_write_bytes
+    {
+        return Err(VmError::HostError(format!(
+            "io_write exceeds the configured write limit of {} bytes",
+            policy.max_write_bytes
+        )));
     }
     let bytes = text.as_bytes().to_vec();
     let handle = resource_handle(handle_id)?;
@@ -843,10 +840,10 @@ pub(crate) fn builtin_io_write_body(
         tx,
         move |state, tx: Sender<ThreadedWorkerSignal>| {
             if state.cancelled.load(Ordering::SeqCst) {
-                if let Some(ref guard) = pipe_guard_worker {
-                    if let Some(pipe) = guard.take() {
-                        *pipe_shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
-                    }
+                if let Some(ref guard) = pipe_guard_worker
+                    && let Some(pipe) = guard.take()
+                {
+                    *pipe_shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
                 }
                 let _ = tx.send(Err("io::write was cancelled before starting".to_string()));
                 return;
@@ -925,17 +922,18 @@ pub(crate) fn builtin_io_flush_body(vm: &mut Vm, handle_id: i64) -> VmResult<Hos
     let handle = resource_handle(handle_id)?;
 
     // First check if the handle is a read-only pipe — flush is a no-op.
-    let mut ctx = vm.host_context();
-    let is_read_pipe = if let Ok(token) = ctx.typed_resource::<IoPipeResource>(handle) {
-        if let Ok(mut resource) = ctx.resource_mut(&token) {
-            resource.get().is_read_pipe()
+    let is_read_pipe = {
+        let mut ctx = vm.host_context();
+        if let Ok(token) = ctx.typed_resource::<IoPipeResource>(handle) {
+            if let Ok(mut resource) = ctx.resource_mut(&token) {
+                resource.get().is_read_pipe()
+            } else {
+                false
+            }
         } else {
             false
         }
-    } else {
-        false
     };
-    drop(ctx);
 
     if is_read_pipe {
         let operation = ReadyOperation;
@@ -973,10 +971,10 @@ pub(crate) fn builtin_io_flush_body(vm: &mut Vm, handle_id: i64) -> VmResult<Hos
         tx,
         move |state, tx: Sender<ThreadedWorkerSignal>| {
             if state.cancelled.load(Ordering::SeqCst) {
-                if let Some(ref guard) = pipe_guard_worker {
-                    if let Some(pipe) = guard.take() {
-                        *pipe_shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
-                    }
+                if let Some(ref guard) = pipe_guard_worker
+                    && let Some(pipe) = guard.take()
+                {
+                    *pipe_shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
                 }
                 let _ = tx.send(Err("io::flush was cancelled before starting".to_string()));
                 return;
@@ -1059,34 +1057,35 @@ enum ResourceKind {
 pub(crate) fn builtin_io_close_body(vm: &mut Vm, handle_id: i64) -> VmResult<HostCallResult<bool>> {
     let handle = resource_handle(handle_id)?;
 
-    let ctx = vm.host_context();
-    let resource_kind = if ctx.typed_resource::<IoFileResource>(handle).is_ok() {
-        ResourceKind::File
-    } else if let Err(err) = ctx.typed_resource::<IoFileResource>(handle) {
-        if !err.message().contains("resource_type_mismatch") {
-            return Err(VmError::HostError(format!("io_close failed: {err}")));
-        }
-        if ctx.typed_resource::<IoPipeResource>(handle).is_ok() {
-            ResourceKind::Pipe
-        } else if let Err(err) = ctx.typed_resource::<IoPipeResource>(handle) {
+    let resource_kind = {
+        let ctx = vm.host_context();
+        if ctx.typed_resource::<IoFileResource>(handle).is_ok() {
+            ResourceKind::File
+        } else if let Err(err) = ctx.typed_resource::<IoFileResource>(handle) {
             if !err.message().contains("resource_type_mismatch") {
                 return Err(VmError::HostError(format!("io_close failed: {err}")));
             }
-            if ctx.typed_resource::<IoProcessResource>(handle).is_ok() {
-                ResourceKind::Process
+            if ctx.typed_resource::<IoPipeResource>(handle).is_ok() {
+                ResourceKind::Pipe
+            } else if let Err(err) = ctx.typed_resource::<IoPipeResource>(handle) {
+                if !err.message().contains("resource_type_mismatch") {
+                    return Err(VmError::HostError(format!("io_close failed: {err}")));
+                }
+                if ctx.typed_resource::<IoProcessResource>(handle).is_ok() {
+                    ResourceKind::Process
+                } else {
+                    return Err(VmError::HostError(format!(
+                        "io_close failed: unknown resource type for handle {}",
+                        handle_id
+                    )));
+                }
             } else {
-                return Err(VmError::HostError(format!(
-                    "io_close failed: unknown resource type for handle {}",
-                    handle_id
-                )));
+                unreachable!()
             }
         } else {
             unreachable!()
         }
-    } else {
-        unreachable!()
     };
-    drop(ctx);
 
     let close_completion = Arc::new(CloseCompletionState::new());
 
@@ -1115,43 +1114,44 @@ pub(crate) fn builtin_io_close_body(vm: &mut Vm, handle_id: i64) -> VmResult<Hos
         }),
     );
 
-    let mut ctx = vm.host_context();
-    let close_result = match resource_kind {
-        ResourceKind::File => {
-            let inject_result = ctx
-                .borrow_resource_mut::<IoFileResource>(handle)
-                .map(|mut res| {
-                    res.close_completion = close_completion.clone();
-                });
-            match inject_result {
-                Ok(()) => ctx
-                    .close_resource::<IoFileResource>(handle, ResourceCloseReason::Requested)
-                    .map_err(|error| VmError::HostError(format!("io_close failed: {error}"))),
-                Err(error) => Err(VmError::HostError(format!("io_close failed: {error}"))),
+    let close_result = {
+        let mut ctx = vm.host_context();
+        match resource_kind {
+            ResourceKind::File => {
+                let inject_result =
+                    ctx.borrow_resource_mut::<IoFileResource>(handle)
+                        .map(|mut res| {
+                            res.close_completion = close_completion.clone();
+                        });
+                match inject_result {
+                    Ok(()) => ctx
+                        .close_resource::<IoFileResource>(handle, ResourceCloseReason::Requested)
+                        .map_err(|error| VmError::HostError(format!("io_close failed: {error}"))),
+                    Err(error) => Err(VmError::HostError(format!("io_close failed: {error}"))),
+                }
             }
-        }
-        ResourceKind::Pipe => {
-            let result = ctx
-                .close_resource::<IoPipeResource>(handle, ResourceCloseReason::Requested)
-                .map_err(|error| VmError::HostError(format!("io_close failed: {error}")));
-            close_completion.complete(Ok(()));
-            result
-        }
-        ResourceKind::Process => {
-            let inject_result =
-                ctx.borrow_resource_mut::<IoProcessResource>(handle)
-                    .map(|mut res| {
-                        res.close_completion = close_completion.clone();
-                    });
-            match inject_result {
-                Ok(()) => ctx
-                    .close_resource::<IoProcessResource>(handle, ResourceCloseReason::Requested)
-                    .map_err(|error| VmError::HostError(format!("io_close failed: {error}"))),
-                Err(error) => Err(VmError::HostError(format!("io_close failed: {error}"))),
+            ResourceKind::Pipe => {
+                let result = ctx
+                    .close_resource::<IoPipeResource>(handle, ResourceCloseReason::Requested)
+                    .map_err(|error| VmError::HostError(format!("io_close failed: {error}")));
+                close_completion.complete(Ok(()));
+                result
+            }
+            ResourceKind::Process => {
+                let inject_result =
+                    ctx.borrow_resource_mut::<IoProcessResource>(handle)
+                        .map(|mut res| {
+                            res.close_completion = close_completion.clone();
+                        });
+                match inject_result {
+                    Ok(()) => ctx
+                        .close_resource::<IoProcessResource>(handle, ResourceCloseReason::Requested)
+                        .map_err(|error| VmError::HostError(format!("io_close failed: {error}"))),
+                    Err(error) => Err(VmError::HostError(format!("io_close failed: {error}"))),
+                }
             }
         }
     };
-    drop(ctx);
 
     if let Err(e) = close_result {
         close_completion.complete(Err(format!("{e}")));
@@ -1482,13 +1482,13 @@ pub(crate) fn read_line_from_reader(
             break;
         }
         bytes.push(one[0]);
-        if let Some(limit) = max_read_bytes {
-            if bytes.len() > limit {
-                return Err(VmError::HostError(format!(
-                    "io_read_line exceeds the configured read limit of {} bytes",
-                    limit
-                )));
-            }
+        if let Some(limit) = max_read_bytes
+            && bytes.len() > limit
+        {
+            return Err(VmError::HostError(format!(
+                "io_read_line exceeds the configured read limit of {} bytes",
+                limit
+            )));
         }
         if one[0] == b'\n' {
             break;

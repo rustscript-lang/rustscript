@@ -456,7 +456,7 @@ fn exact_host_return_foreign_handle_rejected_stack_frame_unchanged() {
     bc.ldc(1); // host argument
     bc.call(0, 1);
     bc.ret();
-    let sentinel = Value::Int(0x5E71_1E3);
+    let sentinel = Value::Int(0x05E7_11E3);
     let argument = Value::Int(7);
     let program = Program::with_imports_and_debug(
         vec![sentinel.clone(), argument.clone()],

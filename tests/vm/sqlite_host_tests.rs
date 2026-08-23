@@ -544,7 +544,7 @@ pub mod builtins {
                 let token = vm
                     .host
                     .execution_scope
-                    .push_resource(TestNonSqliteResource { id: 7 })
+                    .push_resource(TestNonSqliteResource)
                     .expect("test resource should be inserted");
                 token.into_handle().raw() as i64
             }
@@ -567,9 +567,7 @@ pub mod builtins {
                 );
             }
 
-            struct TestNonSqliteResource {
-                id: i64,
-            }
+            struct TestNonSqliteResource;
 
             impl crate::vm::HostResource for TestNonSqliteResource {}
         }
@@ -1284,7 +1282,7 @@ fn sqlite_reconfiguration_preserves_live_connection_and_its_pending_operation() 
             ("max_result_bytes", 64 * 1024),
         ]),
     );
-    let db_id = sqlite::open(&mut vm, &[original_options.clone()])
+    let db_id = sqlite::open(&mut vm, std::slice::from_ref(&original_options))
         .expect("SQLite open should succeed under the original policy");
 
     // A slow query guarantees a genuinely pending operation associated with
@@ -1455,7 +1453,8 @@ fn sqlite_policy_survives_scope_reset() {
         "read_write_create",
         limits([("max_result_bytes", 64 * 1024)]),
     );
-    let db_id = sqlite::open(&mut vm, &[options.clone()]).expect("SQLite open should succeed");
+    let db_id =
+        sqlite::open(&mut vm, std::slice::from_ref(&options)).expect("SQLite open should succeed");
     execute(
         &mut vm,
         db_id,

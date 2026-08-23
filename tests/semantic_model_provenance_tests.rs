@@ -154,23 +154,6 @@ fn ident_offset(source: &str, name: &str) -> usize {
     }
 }
 
-/// Find the offset of the Nth occurrence of `needle` (0-based).
-fn nth_offset(source: &str, needle: &str, n: usize) -> usize {
-    let mut at = 0;
-    for _ in 0..=n {
-        let rest = &source[at..];
-        let rel = rest
-            .find(needle)
-            .unwrap_or_else(|| panic!("occurrence {n} of '{needle}' not found"));
-        at += rel;
-        if n == 0 {
-            return at;
-        }
-        at += needle.len();
-    }
-    at
-}
-
 // ---------------------------------------------------------------------------
 // Repeated same-line calls
 // ---------------------------------------------------------------------------

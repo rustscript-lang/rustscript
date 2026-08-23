@@ -87,10 +87,10 @@ impl HostResource for IoWorkerResource {
     }
 
     fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
-        if let Some(handle) = self.handle.as_ref() {
-            if !handle.is_finished() {
-                return Poll::Pending;
-            }
+        if let Some(handle) = self.handle.as_ref()
+            && !handle.is_finished()
+        {
+            return Poll::Pending;
         }
         // Thread has finished; join to observe panics.
         if let Some(handle) = self.handle.take() {

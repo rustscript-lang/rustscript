@@ -1080,10 +1080,10 @@ fn schedule_operation(
             if let Some(waker) = wake {
                 waker.wake();
             }
-            if let Ok(mut waker) = worker_slot.close_waker.lock() {
-                if let Some(waker) = waker.take() {
-                    waker.wake();
-                }
+            if let Ok(mut waker) = worker_slot.close_waker.lock()
+                && let Some(waker) = waker.take()
+            {
+                waker.wake();
             }
         })
         .map_err(|error| VmError::HostError(format!("failed to start SQLite worker: {error}")))?;

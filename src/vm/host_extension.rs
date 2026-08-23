@@ -47,7 +47,7 @@ pub use super::host_context::HostModule as HostModuleState;
 /// per-`Vm`, deliberately survives
 /// [`Vm::reset_for_reuse`](super::Vm::reset_for_reuse) and execution-scope
 /// close, and never participates in resource close.
-
+///
 /// Registers a host extension against the standard host-function registry and
 /// installs its persistent module state.
 ///

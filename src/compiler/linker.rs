@@ -412,7 +412,7 @@ fn merge_host_api_metadata_for_unit(
     let Some(metadata) = &unit.parsed.host_api_metadata else {
         if merged.is_some() {
             return Err(metadata_error(
-                &source_name,
+                source_name,
                 "this module carries no host catalog metadata while another imported module does"
                     .to_string(),
             ));
@@ -422,7 +422,7 @@ fn merge_host_api_metadata_for_unit(
     };
     if *rejected_missing_metadata {
         return Err(metadata_error(
-            &source_name,
+            source_name,
             "this module carries host catalog metadata while another imported module does not"
                 .to_string(),
         ));
@@ -432,7 +432,7 @@ fn merge_host_api_metadata_for_unit(
         Some(existing) => {
             if existing.fingerprint() != metadata.fingerprint() {
                 return Err(metadata_error(
-                    &source_name,
+                    source_name,
                     format!(
                         "host catalog fingerprint mismatch ({} vs {})",
                         existing.fingerprint(),
@@ -449,7 +449,7 @@ fn merge_host_api_metadata_for_unit(
     for unit_index in metadata.function_indices() {
         let merged_index = function_map.get(&unit_index).copied().ok_or_else(|| {
             metadata_error(
-                &source_name,
+                source_name,
                 format!(
                     "host metadata references function index {unit_index} with no merged entry"
                 ),
@@ -462,13 +462,13 @@ fn merge_host_api_metadata_for_unit(
             .find(|function| function.index == unit_index)
             .ok_or_else(|| {
                 metadata_error(
-                    &source_name,
+                    source_name,
                     format!("host metadata references missing function index {unit_index}"),
                 )
             })?;
         if unit.parsed.function_impls.contains_key(&unit_index) {
             return Err(metadata_error(
-                &source_name,
+                source_name,
                 format!(
                     "host metadata recorded for function index {unit_index} which has an implementation; metadata is only valid for host imports"
                 ),
@@ -476,7 +476,7 @@ fn merge_host_api_metadata_for_unit(
         }
         let candidates = metadata.candidates(unit_index).ok_or_else(|| {
             metadata_error(
-                &source_name,
+                source_name,
                 format!(
                     "host metadata records no candidate schemas for function index {unit_index}"
                 ),
@@ -485,7 +485,7 @@ fn merge_host_api_metadata_for_unit(
         for candidate in candidates {
             if candidate.name != declaration.name {
                 return Err(metadata_error(
-                    &source_name,
+                    source_name,
                     format!(
                         "host candidate '{}' name does not match declaration '{}' for function index {unit_index}",
                         candidate.name, declaration.name
@@ -494,7 +494,7 @@ fn merge_host_api_metadata_for_unit(
             }
             if candidate.params.len() != usize::from(declaration.arity) {
                 return Err(metadata_error(
-                    &source_name,
+                    source_name,
                     format!(
                         "host candidate '{}' arity {} does not match declaration arity {} for function index {unit_index}",
                         candidate.name,
@@ -513,7 +513,7 @@ fn merge_host_api_metadata_for_unit(
                 .map_err(|error| SourcePathError::Source(SourceError::Parse(error)))?;
         } else if target.candidates(merged_index) != Some(candidates) {
             return Err(metadata_error(
-                &source_name,
+                source_name,
                 format!(
                     "host candidate conflict for merged function index {merged_index} (host '{}')",
                     declaration.name
@@ -1710,7 +1710,7 @@ mod linker_metadata_remap_tests {
                 function_sources: HashMap::new(),
                 use_declarations: Vec::new(),
                 implicit_extern_names: Vec::new(),
-                host_api_metadata: host_api_metadata,
+                host_api_metadata,
                 semantic_index: None,
                 parsed_semantic_index: None,
                 catalog_visibility: None,

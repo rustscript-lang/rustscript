@@ -1119,23 +1119,22 @@ fn resolve_expr_imported_calls(
                 // no host resolution. The parser-assigned semantic id (and
                 // the parsed call-site target) survives the rewrite so the
                 // same source call keeps one identity end-to-end.
-                if let Some(parsed) = parsed_semantic_index {
-                    if let Some(id) = semantic_id {
-                        if let Some(site) = parsed.call_sites.iter_mut().find(|site| site.id == *id)
-                        {
-                            site.target = ParsedCallTarget::Module(symbol);
-                        }
-                        // The parser recorded the implicit-extern callee as a
-                        // function-value reference with the unit-local flat
-                        // index (in `attach_ordinary_call_provenance`, the
-                        // func_ref gets its own id distinct from the call
-                        // site); upgrade every reference to this resolved
-                        // name to the module symbol so the merged carrier
-                        // never aliases an unrelated flat function.
-                        for reference in parsed.func_refs.iter_mut() {
-                            if reference.name == name {
-                                reference.target = FunctionRefTarget::Module(symbol);
-                            }
+                if let Some(parsed) = parsed_semantic_index
+                    && let Some(id) = semantic_id
+                {
+                    if let Some(site) = parsed.call_sites.iter_mut().find(|site| site.id == *id) {
+                        site.target = ParsedCallTarget::Module(symbol);
+                    }
+                    // The parser recorded the implicit-extern callee as a
+                    // function-value reference with the unit-local flat
+                    // index (in `attach_ordinary_call_provenance`, the
+                    // func_ref gets its own id distinct from the call
+                    // site); upgrade every reference to this resolved
+                    // name to the module symbol so the merged carrier
+                    // never aliases an unrelated flat function.
+                    for reference in parsed.func_refs.iter_mut() {
+                        if reference.name == name {
+                            reference.target = FunctionRefTarget::Module(symbol);
                         }
                     }
                 }
@@ -1317,7 +1316,7 @@ fn resolve_expr_imported_calls(
             for stmt in stmts.iter_mut() {
                 resolve_stmt_imported_calls(ctx, stmt, parsed_semantic_index.as_deref_mut())?;
             }
-            resolve_expr_imported_calls(ctx, expr, line, parsed_semantic_index.as_deref_mut())?;
+            resolve_expr_imported_calls(ctx, expr, line, parsed_semantic_index)?;
         }
     }
     Ok(())

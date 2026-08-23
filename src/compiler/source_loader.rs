@@ -74,9 +74,9 @@ fn effective_source_options(options: &CompileSourceFileOptions) -> CompileSource
     }
     #[cfg(feature = "runtime")]
     {
-        return options
+        options
             .clone()
-            .with_host_api_catalog(crate::builtins::runtime::standard_host_catalog());
+            .with_host_api_catalog(crate::builtins::runtime::standard_host_catalog())
     }
     #[cfg(not(feature = "runtime"))]
     {
@@ -630,7 +630,7 @@ mod tests {
     /// *same* (rebased) id for the same source call.
     #[test]
     fn module_call_semantic_id_survives_loader_and_linker() {
-        use super::super::ir::{Expr, FunctionRefTarget, ParsedCallTarget};
+        use super::super::ir::{Expr, ParsedCallTarget};
         use super::super::linker::merge_units;
 
         let path = PathBuf::from("__pd_vm_inmemory__/main.rss");
@@ -749,7 +749,7 @@ mod tests {
             "final flat Call id matches the merged index entry"
         );
 
-        remove_module_root(&std::path::Path::new("__pd_vm_inmemory__"));
+        remove_module_root(std::path::Path::new("__pd_vm_inmemory__"));
     }
 
     /// Loader-resolved module function-value references (`let f = helper;`
@@ -803,10 +803,10 @@ mod tests {
             .find_map(|impl_| match &impl_.body_expr {
                 Expr::ModuleFunctionRef(s, _) => Some(*s),
                 _ => impl_.body_stmts.iter().find_map(|stmt| match stmt {
-                    crate::compiler::ir::Stmt::Let { expr, .. } => match expr {
-                        Expr::ModuleFunctionRef(s, _) => Some(*s),
-                        _ => None,
-                    },
+                    crate::compiler::ir::Stmt::Let {
+                        expr: Expr::ModuleFunctionRef(s, _),
+                        ..
+                    } => Some(*s),
                     _ => None,
                 }),
             })
@@ -832,7 +832,7 @@ mod tests {
             "module target survives merge verbatim"
         );
 
-        remove_module_root(&std::path::Path::new("__pd_vm_inmemory__"));
+        remove_module_root(std::path::Path::new("__pd_vm_inmemory__"));
     }
 
     /// A direct imported call (`helper()` where `helper` is a named import)
@@ -912,6 +912,6 @@ mod tests {
             "module target survives merge verbatim"
         );
 
-        remove_module_root(&std::path::Path::new("__pd_vm_inmemory__"));
+        remove_module_root(std::path::Path::new("__pd_vm_inmemory__"));
     }
 }

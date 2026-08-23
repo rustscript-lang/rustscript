@@ -763,19 +763,18 @@ impl HostStreamDriver for SseStreamDriver {
         let drain_item = |driver: &mut Self| -> Option<HostStreamPoll> {
             let item = driver.receiver.try_recv().ok()?;
             // Track items and capture metadata from the open item.
-            if let Value::Map(ref map) = item {
-                if let Some(Value::String(kind)) = map.get(&Value::string("kind")) {
-                    if kind.as_str() == "open" {
-                        if let Some(Value::Int(status)) = map.get(&Value::string("status")) {
-                            driver.status = *status as u16;
-                        }
-                        if let Some(Value::Map(headers)) = map.get(&Value::string("headers")) {
-                            driver.headers = Arc::clone(headers);
-                        }
-                        if let Some(Value::String(url)) = map.get(&Value::string("url")) {
-                            driver.url = url.as_ref().clone();
-                        }
-                    }
+            if let Value::Map(ref map) = item
+                && let Some(Value::String(kind)) = map.get(&Value::string("kind"))
+                && kind.as_str() == "open"
+            {
+                if let Some(Value::Int(status)) = map.get(&Value::string("status")) {
+                    driver.status = *status as u16;
+                }
+                if let Some(Value::Map(headers)) = map.get(&Value::string("headers")) {
+                    driver.headers = Arc::clone(headers);
+                }
+                if let Some(Value::String(url)) = map.get(&Value::string("url")) {
+                    driver.url = url.as_ref().clone();
                 }
             }
             driver.items = driver.items.saturating_add(1);
@@ -876,10 +875,10 @@ impl HostResource for SseStreamResource {
         self.shared.cancel.notify_one();
         // Wake the item waker so the stream driver sees the stop flag
         // promptly.
-        if let Ok(mut waker) = self.shared.waker.lock() {
-            if let Some(waker) = waker.take() {
-                waker.wake();
-            }
+        if let Ok(mut waker) = self.shared.waker.lock()
+            && let Some(waker) = waker.take()
+        {
+            waker.wake();
         }
         // Return Pending: the worker thread may still be running. The
         // scope's poll_close machinery will call poll_close below.
@@ -956,10 +955,10 @@ impl HostOperation for SseScopeOperation {
         let _ = reason;
         self.shared.stopping.store(true, Ordering::SeqCst);
         self.shared.cancel.notify_one();
-        if let Ok(mut waker) = self.shared.waker.lock() {
-            if let Some(waker) = waker.take() {
-                waker.wake();
-            }
+        if let Ok(mut waker) = self.shared.waker.lock()
+            && let Some(waker) = waker.take()
+        {
+            waker.wake();
         }
         Ok(())
     }

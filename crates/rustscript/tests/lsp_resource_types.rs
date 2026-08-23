@@ -41,10 +41,10 @@ fn read_framed_message(reader: &mut impl BufRead) -> Option<serde_json::Value> {
         if trimmed.is_empty() {
             break;
         }
-        if let Some((name, value)) = trimmed.split_once(':') {
-            if name.eq_ignore_ascii_case("content-length") {
-                content_length = Some(value.trim().parse().expect("content-length number"));
-            }
+        if let Some((name, value)) = trimmed.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = Some(value.trim().parse().expect("content-length number"));
         }
     }
     let length = content_length.expect("content-length header present");
@@ -98,33 +98,31 @@ impl RpcClient {
     fn recv(&mut self) -> serde_json::Value {
         use std::time::{Duration, Instant};
         let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if let Some(status) = self.child.try_wait().expect("try_wait") {
-                // EOF: the server died. Surface its stderr for diagnosis.
+        if let Some(status) = self.child.try_wait().expect("try_wait") {
+            // EOF: the server died. Surface its stderr for diagnosis.
+            let mut stderr = String::new();
+            let _ = self
+                .child
+                .stderr
+                .take()
+                .map(|mut e| e.read_to_string(&mut stderr));
+            panic!("server died with {status} while reading message. stderr: {stderr}");
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match self.messages.recv_timeout(remaining) {
+            Ok(message) => message,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.child.kill().ok();
+                panic!("server hung while awaiting a message");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 let mut stderr = String::new();
                 let _ = self
                     .child
                     .stderr
                     .take()
                     .map(|mut e| e.read_to_string(&mut stderr));
-                panic!("server died with {status} while reading message. stderr: {stderr}");
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            match self.messages.recv_timeout(remaining) {
-                Ok(message) => return message,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    self.child.kill().ok();
-                    panic!("server hung while awaiting a message");
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    let mut stderr = String::new();
-                    let _ = self
-                        .child
-                        .stderr
-                        .take()
-                        .map(|mut e| e.read_to_string(&mut stderr));
-                    panic!("server stdout closed without a message. stderr: {stderr}");
-                }
+                panic!("server stdout closed without a message. stderr: {stderr}");
             }
         }
     }
@@ -230,8 +228,8 @@ impl RpcClient {
     /// closed first so a server blocked reading can never deadlock the test.
     fn wait_exit(&mut self) -> std::process::ExitStatus {
         self.stdin.take();
-        let status = self.child.wait().expect("wait for server exit");
-        status
+
+        self.child.wait().expect("wait for server exit")
     }
 }
 
@@ -569,11 +567,11 @@ fn completion_surfaces_host_members_with_resource_detail_after_import() {
     let items = result["items"].as_array().expect("completion items");
     let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
     assert!(
-        labels.iter().any(|l| *l == "query"),
+        labels.contains(&"query"),
         "completion after sqlite:: must include query member: {labels:?}"
     );
     assert!(
-        labels.iter().any(|l| *l == "open"),
+        labels.contains(&"open"),
         "completion after sqlite:: must include open member: {labels:?}"
     );
     // The `query` completion detail must carry the resource-aware signature.
@@ -1749,7 +1747,7 @@ fn syntax_error_change_publishes_exact_parse_diagnostic_and_clears_model() {
         "parse diagnostic must point at the offending line"
     );
     assert!(
-        diagnostics[0]["message"].as_str().unwrap_or("").len() > 0,
+        !diagnostics[0]["message"].as_str().unwrap_or("").is_empty(),
         "parse diagnostic must carry a message"
     );
 

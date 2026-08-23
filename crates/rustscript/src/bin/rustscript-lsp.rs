@@ -581,12 +581,13 @@ fn percent_decode(input: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                out.push((hi << 4) | lo);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -1093,9 +1094,9 @@ impl LspServer {
                 Ok(Some(result_message(id, serde_json::Value::Null)))
             }
             _ => {
-                if msg.id.is_some() {
+                if let Some(id) = msg.id.as_ref() {
                     Ok(Some(error_message(
-                        msg.id.as_ref().unwrap(),
+                        id,
                         RPC_METHOD_NOT_FOUND,
                         &format!("method not found: {method}"),
                     )))
@@ -1588,11 +1589,11 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        if let Some(response) = response {
-            if let Err(err) = write_message(&mut out, &response) {
-                eprintln!("rustscript-lsp: failed writing response: {err}");
-                std::process::exit(1);
-            }
+        if let Some(response) = response
+            && let Err(err) = write_message(&mut out, &response)
+        {
+            eprintln!("rustscript-lsp: failed writing response: {err}");
+            std::process::exit(1);
         }
         if is_exit {
             if server.shutdown_requested {

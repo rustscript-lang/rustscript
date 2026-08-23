@@ -102,26 +102,6 @@ impl ResponseReadObserver {
             })
             .expect("response body remaining-byte update cannot fail");
     }
-
-    #[cfg(test)]
-    pub(super) fn body_read_calls(&self) -> usize {
-        self.inner.body_read_calls.load(Ordering::Acquire)
-    }
-
-    #[cfg(test)]
-    pub(super) fn max_body_transport_read(&self) -> usize {
-        self.inner.max_body_transport_read.load(Ordering::Acquire)
-    }
-
-    #[cfg(test)]
-    pub(super) fn max_raw_transport_read(&self) -> usize {
-        self.inner.max_raw_transport_read.load(Ordering::Acquire)
-    }
-
-    #[cfg(test)]
-    pub(super) fn max_application_chunk(&self) -> usize {
-        self.inner.max_application_chunk.load(Ordering::Acquire)
-    }
 }
 
 // Rustls accepts a 16 KiB TLS fragment plus at most 2 KiB of protocol
@@ -464,10 +444,10 @@ impl HostResource for HttpRequestResource {
         // resource close is the authoritative teardown path.
         shared.cancel.notify_one();
         // Wake the operation waker so the next poll sees the result.
-        if let Ok(mut waker) = shared.waker.lock() {
-            if let Some(waker) = waker.take() {
-                waker.wake();
-            }
+        if let Ok(mut waker) = shared.waker.lock()
+            && let Some(waker) = waker.take()
+        {
+            waker.wake();
         }
         // Return Pending: the worker thread may still be running. The
         // scope's poll_close machinery will call poll_close below.
@@ -578,10 +558,10 @@ impl HostOperation for HttpRequestOperation {
         let _ = reason;
         self.shared.cancel.notify_one();
         // Wake the operation waker so the next poll sees the result.
-        if let Ok(mut waker) = self.shared.waker.lock() {
-            if let Some(waker) = waker.take() {
-                waker.wake();
-            }
+        if let Ok(mut waker) = self.shared.waker.lock()
+            && let Some(waker) = waker.take()
+        {
+            waker.wake();
         }
         Ok(())
     }
@@ -728,54 +708,6 @@ fn runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
         .build()
         .expect("HTTP worker tokio runtime should build");
     runtime.block_on(future)
-}
-
-#[cfg(test)]
-pub(super) async fn execute_request(config: &HttpConfig, request: &HttpRequest) -> VmResult<VmMap> {
-    let deadline = request_deadline(config.request_timeout)?;
-    with_deadline(
-        deadline,
-        HTTP_REQUEST_DEADLINE_EXCEEDED,
-        execute_request_until(
-            config,
-            request,
-            ResponseReadObserver::default(),
-            deadline,
-            None,
-        ),
-    )
-    .await
-}
-
-#[cfg(test)]
-pub(super) async fn execute_request_with_observer(
-    config: &HttpConfig,
-    request: &HttpRequest,
-    observer: ResponseReadObserver,
-) -> VmResult<VmMap> {
-    let deadline = request_deadline(config.request_timeout)?;
-    with_deadline(
-        deadline,
-        HTTP_REQUEST_DEADLINE_EXCEEDED,
-        execute_request_until(config, request, observer, deadline, None),
-    )
-    .await
-}
-
-#[cfg(test)]
-pub(super) async fn execute_request_with_tls_config(
-    config: &HttpConfig,
-    request: &HttpRequest,
-    observer: ResponseReadObserver,
-    tls_config: Arc<rustls::ClientConfig>,
-) -> VmResult<VmMap> {
-    let deadline = request_deadline(config.request_timeout)?;
-    with_deadline(
-        deadline,
-        HTTP_REQUEST_DEADLINE_EXCEEDED,
-        execute_request_until(config, request, observer, deadline, Some(tls_config)),
-    )
-    .await
 }
 
 async fn execute_request_until(
@@ -1199,41 +1131,6 @@ async fn send_request(
             response_budget,
         )
         .await
-    }
-}
-
-#[cfg(test)]
-pub(super) struct PendingConnectionTest {
-    pub(super) future: Pin<Box<dyn std::future::Future<Output = VmResult<VmMap>>>>,
-}
-
-#[cfg(test)]
-pub(super) fn pending_connection_test(
-    io: tokio::io::DuplexStream,
-    url: url::Url,
-) -> PendingConnectionTest {
-    let request = HttpRequest {
-        method: hyper::Method::GET,
-        url,
-        headers: Vec::new(),
-        body: None,
-    };
-    let observer = ResponseReadObserver::default();
-    PendingConnectionTest {
-        future: Box::pin(async move {
-            let mut response = send_over_io(
-                &request.method,
-                &request.url,
-                &request.headers,
-                None,
-                ReadCapIo::new(RawReadCapIo::new(io, observer.clone()), observer.clone()),
-                None,
-            )
-            .await?;
-            observer.admit_body(1024);
-            while response.next_frame().await?.is_some() {}
-            Ok(VmMap::default())
-        }),
     }
 }
 

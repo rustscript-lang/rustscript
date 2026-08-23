@@ -24,8 +24,8 @@ use std::time::Duration;
 use vm::{
     CallOutcome, CallReturn, CompileSourceFileOptions, HostApiCatalog, HostAsyncBridge,
     HostFunctionRegistry, HostFuture, HostFutureOutput, HostImportBindingError, HostOpId,
-    HttpConfig, HttpHostExt, IoHostExt, IoPolicy, SourceFlavor, Value, Vm, VmError, VmMap,
-    VmResetState, VmResult, VmStatus, compile_source, compile_source_with_flavor_and_options,
+    HttpConfig, HttpHostExt, IoHostExt, IoPolicy, SourceFlavor, Value, Vm, VmError, VmResetState,
+    VmResult, VmStatus, compile_source, compile_source_with_flavor_and_options,
     register_http_builtin_module, register_io_builtin_module, standard_host_catalog,
 };
 
@@ -278,7 +278,7 @@ fn http_config_persists_independently_of_io_config() {
     let _ = std::fs::remove_file(io_path);
 }
 
-fn driver_poll_submitted(op_id: HostOpId, cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
+fn driver_poll_submitted(op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
     Poll::Ready(Err(VmError::HostError(format!(
         "unknown external host operation {op_id}"
     ))))
