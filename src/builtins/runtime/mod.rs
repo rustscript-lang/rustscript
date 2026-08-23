@@ -27,7 +27,7 @@ mod math;
 pub(crate) mod print;
 pub(crate) mod regex;
 mod standard_composition;
-pub(crate) use standard_composition::ensure_standard_composition_installed;
+pub use standard_composition::standard_composition;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 mod typed;
@@ -86,11 +86,6 @@ static STANDARD_HOST_CATALOG: OnceLock<StandardHostCatalogSnapshot> = OnceLock::
 fn standard_host_catalog_snapshot() -> &'static StandardHostCatalogSnapshot {
     STANDARD_HOST_CATALOG.get_or_init(|| {
         use crate::host_api::HostApiBuilder;
-
-        // Install the concrete standard-surface composition into the VM core's
-        // generic default slot (idempotent). Any first access to the standard
-        // catalog therefore arms the host-agnostic registry/VM fallback paths.
-        standard_composition::ensure_standard_composition_installed();
 
         let mut builder = HostApiBuilder::new();
         let push = |builder: &mut HostApiBuilder, catalog: &Arc<HostApiCatalog>| {

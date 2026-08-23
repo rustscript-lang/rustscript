@@ -9,7 +9,7 @@ use build_script::{
 use syn::parse_quote;
 use vm::{
     BuiltinFunction, CapabilityProfile, HostFunctionRegistry, JitConfig, JitTraceTerminal, Value,
-    Vm, VmStatus, compile_source,
+    Vm, VmStatus, compile_source, standard_composition,
 };
 #[cfg(feature = "http-client")]
 use vm::{HostExecution, default_host_callables};
@@ -191,6 +191,7 @@ fn assert_runtime_sleep_loop_uses_native_host_call(bind_cached_registry: bool) {
     )
     .expect("runtime::sleep loop should compile");
     let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+    vm.set_standard_composition(standard_composition());
     vm.set_jit_config(JitConfig {
         enabled: native_jit_supported(),
         hot_loop_threshold: 1,
@@ -290,6 +291,7 @@ fn runtime_exit_still_halts_for_direct_and_cached_default_bindings() {
         )
         .expect("runtime::exit program should compile");
         let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+        vm.set_standard_composition(standard_composition());
         if bind_cached_registry {
             HostFunctionRegistry::new()
                 .bind_vm_cached(&mut vm)

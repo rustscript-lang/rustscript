@@ -2,7 +2,7 @@ use std::path::Path;
 
 use vm::{
     CompileSourceFileOptions, Value, Vm, VmStatus, compile_source_file_with_options,
-    standard_host_catalog,
+    standard_composition, standard_host_catalog,
 };
 
 fn run_rustscript_spec(path: &Path) -> Vec<Value> {
@@ -20,6 +20,7 @@ fn run_rustscript_spec(path: &Path) -> Vec<Value> {
     );
 
     let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+    vm.set_standard_composition(standard_composition());
     #[cfg(feature = "async")]
     super::async_test_bridge::install(&mut vm);
     loop {

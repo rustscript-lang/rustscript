@@ -1,11 +1,15 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use vm::{HostFunctionRegistry, IoHostExt, IoPolicy, Value, Vm, VmError, VmStatus, compile_source};
+use vm::{
+    HostFunctionRegistry, IoHostExt, IoPolicy, Value, Vm, VmError, VmStatus, compile_source,
+    standard_composition,
+};
 
 fn run_source(source: &str) -> Result<Vec<Value>, VmError> {
     let compiled =
         compile_source(&format!("use io;\n{source}")).expect("async io source should compile");
     let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+    vm.set_standard_composition(standard_composition());
     super::async_test_bridge::install(&mut vm);
 
     let mut status = vm.run()?;
@@ -138,6 +142,7 @@ fn async_io_silent_pipe_read_cancellation() {
     .expect("source should compile");
 
     let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+    vm.set_standard_composition(standard_composition());
     super::async_test_bridge::install(&mut vm);
 
     // Run until we're waiting on the pipe read, with a bounded timeout.
@@ -449,6 +454,7 @@ fn async_io_blocked_write_cancellation() {
     .expect("source should compile");
 
     let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+    vm.set_standard_composition(standard_composition());
     super::async_test_bridge::install(&mut vm);
 
     let mut status = vm.run().expect("vm should start");
@@ -505,6 +511,7 @@ fn async_io_flush_cancellation() {
     .expect("source should compile");
 
     let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+    vm.set_standard_composition(standard_composition());
     super::async_test_bridge::install(&mut vm);
 
     let mut status = vm.run().expect("vm should start");
@@ -570,6 +577,7 @@ fn async_io_exact_catalog_compile_bind_execute_round_trip() {
     let mut registry = HostFunctionRegistry::empty();
     vm::register_io_builtin_module(&mut registry).expect("async exact IO registration");
     let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+    vm.set_standard_composition(standard_composition());
     super::async_test_bridge::install(&mut vm);
     vm.configure_io(IoPolicy {
         allowed_roots: vec![std::env::temp_dir().display().to_string()],

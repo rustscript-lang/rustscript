@@ -6,17 +6,16 @@
 //! modules implement them. `src/vm` consumes it through the generic trait and
 //! never names a domain, namespace prefix, or feature.
 //!
-//! The implementation is installed into the VM core's process-wide default
-//! composition slot on first standard-catalog access (see
-//! [`crate::vm::standard_composition::install_default_composition`]).
+//! The implementation is *caller-provided per-instance state*: the outer
+//! standard-runtime constructor installs one instance on the standard
+//! `HostFunctionRegistry` (and on the `Vm` for the legacy fallback paths)
+//! through [`standard_composition`]. There is no process-global slot and no
+//! hidden installation from `HostRuntime::new()`.
 
 use std::sync::Arc;
 
 use crate::bytecode::HostImport;
-use crate::vm::standard_composition::{
-    SURFACE_BIT_DATABASE, SURFACE_BIT_HTTP, SURFACE_BIT_IO, StandardSurfaceComposition,
-    StandardSurfaceMask,
-};
+use crate::vm::standard_composition::StandardSurfaceComposition;
 use crate::vm::{HostFunctionRegistry, Vm, VmResult};
 
 use super::{
@@ -28,8 +27,8 @@ use super::{
 ///
 /// Feature-gated composition happens through the existing standard builtin
 /// helpers: IO is always present under `runtime`, HTTP under `http-client`,
-/// SQLite under `sqlite`. The mask bits are private to this module; the VM
-/// core only passes them around opaquely.
+/// SQLite under `sqlite`. Required/present/stage is one opaque operation;
+/// the VM core never sees a surface mask or count.
 #[derive(Debug)]
 pub(crate) struct StandardSurfaceCompositionImpl;
 
@@ -48,51 +47,38 @@ impl StandardSurfaceComposition for StandardSurfaceCompositionImpl {
                 .is_empty()
     }
 
-    fn required_surface_mask(&self, imports: &[HostImport]) -> StandardSurfaceMask {
+    fn ensure_surfaces(
+        &self,
+        imports: &[HostImport],
+        registry: &mut HostFunctionRegistry,
+    ) -> VmResult<bool> {
         let (io, http, database) = standard_exact_surface_requirements(imports);
-        let mut mask = StandardSurfaceMask::empty();
-        if io {
-            mask = mask.union(StandardSurfaceMask::from_bit(SURFACE_BIT_IO));
-        }
-        if http {
-            mask = mask.union(StandardSurfaceMask::from_bit(SURFACE_BIT_HTTP));
-        }
-        if database {
-            mask = mask.union(StandardSurfaceMask::from_bit(SURFACE_BIT_DATABASE));
-        }
-        mask
-    }
-
-    fn present_surface_mask(&self, registry: &HostFunctionRegistry) -> StandardSurfaceMask {
         let fingerprint = standard_host_catalog_fingerprint();
-        let mut mask = StandardSurfaceMask::empty();
+        // Present-surface computation: which standard surfaces does `registry`
+        // already carry? Only standard-fingerprint exact entries count.
+        let mut present = StandardSurfaces::default();
         for (name, fingerprints) in registry.exact_entries() {
-            let is_standard = fingerprints.contains(&fingerprint);
-            if !is_standard {
+            if !fingerprints.contains(&fingerprint) {
                 continue;
             }
             if name.starts_with("io::") {
-                mask = mask.union(StandardSurfaceMask::from_bit(SURFACE_BIT_IO));
+                present.io = true;
             } else if name.starts_with("http::") {
-                mask = mask.union(StandardSurfaceMask::from_bit(SURFACE_BIT_HTTP));
+                present.http = true;
             } else if name.starts_with("sqlite::") {
-                mask = mask.union(StandardSurfaceMask::from_bit(SURFACE_BIT_DATABASE));
+                present.database = true;
             }
         }
-        mask
-    }
-
-    fn stage_missing(
-        &self,
-        registry: &mut HostFunctionRegistry,
-        missing: StandardSurfaceMask,
-    ) -> VmResult<()> {
-        let surfaces = StandardSurfaces {
-            io: missing.contains(SURFACE_BIT_IO),
-            http: missing.contains(SURFACE_BIT_HTTP),
-            database: missing.contains(SURFACE_BIT_DATABASE),
+        let missing = StandardSurfaces {
+            io: io && !present.io,
+            http: http && !present.http,
+            database: database && !present.database,
         };
-        stage_missing_standard_surfaces(registry, surfaces)
+        if missing == StandardSurfaces::default() {
+            return Ok(false);
+        }
+        stage_missing_standard_surfaces(registry, missing)?;
+        Ok(true)
     }
 
     fn build_default_registry(&self) -> VmResult<HostFunctionRegistry> {
@@ -104,9 +90,11 @@ impl StandardSurfaceComposition for StandardSurfaceCompositionImpl {
     }
 }
 
-/// Lazily constructs and installs the concrete standard composition into the
-/// VM core's process-wide default slot. Idempotent (first install wins).
-pub(crate) fn ensure_standard_composition_installed() {
-    use crate::vm::standard_composition::install_default_composition;
-    install_default_composition(Arc::new(StandardSurfaceCompositionImpl));
+/// Returns a fresh concrete standard-surface composition instance.
+///
+/// The outer standard-runtime constructor installs this on the standard
+/// registry and on a `Vm` when it wants default standard composition
+/// behavior. Each call returns a new instance; there is no shared global.
+pub fn standard_composition() -> Arc<dyn StandardSurfaceComposition> {
+    Arc::new(StandardSurfaceCompositionImpl)
 }

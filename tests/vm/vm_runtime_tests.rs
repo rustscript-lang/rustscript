@@ -2,6 +2,7 @@
 mod common;
 use common::*;
 use vm::OpCode;
+use vm::standard_composition;
 
 fn non_yielding_returns_none(_: &[Value]) -> Result<CallOutcome, vm::VmError> {
     Ok(CallOutcome::Return(vm::CallReturn::none()))
@@ -585,6 +586,7 @@ fn runtime_sleep_host_import_is_available_by_default() {
     )
     .expect("source should compile");
     let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+    vm.set_standard_composition(standard_composition());
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -602,6 +604,7 @@ fn runtime_exit_host_import_halts_before_later_code_runs() {
     )
     .expect("source should compile");
     let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+    vm.set_standard_composition(standard_composition());
 
     let status = vm.run().expect("vm should halt");
     assert_eq!(status, VmStatus::Halted);

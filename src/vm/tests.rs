@@ -115,6 +115,7 @@ fn failed_dynamic_builtin_override_preserves_runtime_owned_pending_binding() {
     let compiled = crate::compile_source("use runtime; runtime::sleep(0);")
         .expect("runtime sleep program should compile");
     let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+    vm.set_standard_composition(crate::builtins::runtime::standard_composition());
     vm.ensure_call_bindings()
         .expect("default fallback should bind runtime sleep");
     let slot = vm.host.host_function_symbols["runtime::sleep"];
@@ -136,6 +137,7 @@ fn failed_static_builtin_override_preserves_runtime_owned_pending_binding() {
     let compiled = crate::compile_source("use runtime; runtime::sleep(0);")
         .expect("runtime sleep program should compile");
     let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+    vm.set_standard_composition(crate::builtins::runtime::standard_composition());
     vm.ensure_call_bindings()
         .expect("default fallback should bind runtime sleep");
     let slot = vm.host.host_function_symbols["runtime::sleep"];

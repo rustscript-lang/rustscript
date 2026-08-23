@@ -37,7 +37,7 @@ pub use builtins::runtime::{
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::{
     IoExtension, IoHostExt, IoPolicy, io_host_catalog, register_io_builtin_module,
-    register_io_builtin_module_from_catalog, standard_host_catalog,
+    register_io_builtin_module_from_catalog, standard_composition, standard_host_catalog,
     standard_host_catalog_fingerprint,
 };
 #[cfg(feature = "sqlite")]
@@ -130,9 +130,10 @@ pub use vm::{
     Invocation, InvocationError, InvocationItem, InvocationPoll, QueuedScriptInvocation, Resource,
     ResourceAccessFrame, ResourceAccessMode, ResourceAccessRequest, ResourceError,
     ResourceErrorCode, ResourceHandle, ResourceMut, ResourceOwned, ResourceOwnership, ResourceRef,
-    ResourceTable, ScriptArgs, ScriptCallback, ScriptResult, StaticHostArgsFunction,
-    StaticHostFunction, StaticHostStackFunction, Store, Vm, VmError, VmResetError, VmResetState,
-    VmResult, VmStatus, VmYieldReason, execution_scope, host_extension, operation, resource,
+    ResourceTable, ScriptArgs, ScriptCallback, ScriptResult, StandardSurfaceComposition,
+    StaticHostArgsFunction, StaticHostFunction, StaticHostStackFunction, Store, Vm, VmError,
+    VmResetError, VmResetState, VmResult, VmStatus, VmYieldReason, execution_scope, host_extension,
+    operation, resource,
 };
 
 #[cfg(feature = "runtime")]

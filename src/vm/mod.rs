@@ -28,7 +28,7 @@ pub mod operation;
 pub mod program;
 pub mod resource;
 mod run_context;
-pub(crate) mod standard_composition;
+pub mod standard_composition;
 mod store;
 mod superinstructions;
 #[cfg(test)]
@@ -55,6 +55,7 @@ pub use self::host_context::{
     HostContext, HostContextError, HostContextErrorKind, HostContextResult, HostModule,
 };
 pub use self::host_extension::{HostExtension, HostModuleState, catalog_import_schemas};
+pub use self::standard_composition::StandardSurfaceComposition;
 use self::host_runtime::HostRuntime;
 use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable};
 pub use self::invocation::{Invocation, InvocationError, InvocationItem, InvocationPoll};
@@ -1001,6 +1002,24 @@ impl Vm {
     /// module. The returned [`HostContext`] borrows this VM mutably.
     pub fn host_context(&mut self) -> HostContext<'_> {
         HostContext::new(&mut self.host)
+    }
+
+    /// Installs the caller-provided standard-surface composition on this VM
+    /// (explicit per-instance state, never a process global).
+    ///
+    /// The outer standard-runtime constructor calls this so the VM's
+    /// default-fallback paths can compose the standard surfaces (auto-stage,
+    /// default-registry construction, legacy by-name default binding) without
+    /// the core knowing concrete domains. A VM bound by a registry that
+    /// carries a composition also receives it automatically through
+    /// [`HostFunctionRegistry::bind_vm_with_plan`]; this setter is for
+    /// bare VMs constructed outside a registry bind.
+    #[cfg(feature = "runtime")]
+    pub fn set_standard_composition(
+        &mut self,
+        composition: std::sync::Arc<dyn StandardSurfaceComposition>,
+    ) {
+        self.host.standard_composition = Some(composition);
     }
 
     /// Installs a [`HostExtension`] into this VM through its standard

@@ -512,6 +512,102 @@ fn resource_core_and_operation_core_are_domain_free() {
     }
 }
 
+/// The host-agnostic VM core must not own a process-global standard-composition
+/// slot, install it, or read it through a hidden installer. Composition is
+/// caller-provided per-instance state (a registry / VM carries it); it must
+/// never be reached through a process-wide `OnceLock` first-wins global.
+/// Concrete surface bit assignments/masks must also not live in `src/vm` —
+/// the composition implementation alone names surfaces.
+#[test]
+fn vm_core_never_owns_process_global_standard_composition() {
+    let sources = scanned_core();
+    assert!(
+        !sources.is_empty(),
+        "the core boundary scan must find production sources"
+    );
+    for (path, code) in &sources {
+        for needle in [
+            "install_default_composition",
+            "default_composition",
+            "SURFACE_BIT_IO",
+            "SURFACE_BIT_HTTP",
+            "SURFACE_BIT_DATABASE",
+        ] {
+            assert!(
+                !contains_token(code, needle),
+                "{} must not define/read the process-global composition or concrete surface bits `{needle}`; \
+                 composition is explicit caller-provided per-instance state, not a process global",
+                path.display(),
+            );
+        }
+        assert!(
+            !contains_substring(code, "OnceLock<Arc<dyn StandardSurfaceComposition>>"),
+            "{} must not hold a process-global composition slot",
+            path.display(),
+        );
+    }
+}
+
+/// The host-agnostic VM core must never call into the builtin composition
+/// installer (`ensure_standard_composition_installed`) from any `HostRuntime`
+/// constructor or arbitrary code path. Default standard behavior is preserved
+/// through an outer standard-runtime constructor/registry path, never a hidden
+/// installation call rooted in the core.
+#[test]
+fn vm_core_never_calls_builtin_composition_installer() {
+    let sources = scanned_core();
+    assert!(
+        !sources.is_empty(),
+        "the core boundary scan must find production sources"
+    );
+    for (path, code) in &sources {
+        assert!(
+            !contains_token(code, "ensure_standard_composition_installed"),
+            "{} must not invoke the builtin standard-composition installer",
+            path.display(),
+        );
+        assert!(
+            !contains_substring(code, "builtins::runtime::standard_composition"),
+            "{} must not reach into the builtin composition layer",
+            path.display(),
+        );
+    }
+}
+
+/// The host-agnostic VM core must not allocate small external operation ids from
+/// a separate per-VM counter. Every production pending host operation lives in
+/// the current `ExecutionScope` operation registry and uses its packed raw
+/// `OperationId`. The `next_host_op_id` allocator and `allocate_host_op_id`
+/// host op helpers are retired.
+#[test]
+fn vm_core_has_no_external_operation_id_allocator() {
+    let mut files = Vec::new();
+    for dir in ["src/vm"] {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(dir);
+        collect(&root, &mut files);
+    }
+    files.retain(|path| {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        name != "tests.rs" && name != "host_stream_tests.rs"
+    });
+    files.sort();
+    assert!(!files.is_empty(), "production sources must be scanned");
+    for path in files {
+        let source = fs::read_to_string(&path).expect("read production source");
+        let code = sanitize(&source);
+        for needle in ["next_host_op_id", "allocate_host_op_id"] {
+            assert!(
+                !contains_token(&code, needle),
+                "{} must not use the retired external operation-id allocator `{needle}`",
+                path.display(),
+            );
+        }
+    }
+}
+
 /// Guest-facing raw handles crossing the host boundary are generic integer
 /// tokens owned by the scope; the core never needs to name a sqlite
 /// connection class. This proves the only "sqlite" spellings in the core are

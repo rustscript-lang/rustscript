@@ -127,6 +127,7 @@ mod tests {
         let sink_lines = Arc::clone(&lines);
         let mut vm =
             Vm::try_new(host_call_program(PRINT_NAME)).expect("test VM construction must not fail");
+        vm.set_standard_composition(crate::builtins::runtime::standard_composition());
         vm.set_runtime_print_sink(move |rendered| {
             sink_lines
                 .lock()
@@ -173,6 +174,7 @@ mod tests {
         let sink_lines = Arc::clone(&lines);
         let mut vm = Vm::try_new(host_call_program(PRINTLN_NAME))
             .expect("test VM construction must not fail");
+        vm.set_standard_composition(crate::builtins::runtime::standard_composition());
         vm.set_runtime_print_sink(move |rendered| {
             sink_lines
                 .lock()

@@ -1122,3 +1122,49 @@ fn native_jit_supported() -> bool {
         || (cfg!(target_arch = "aarch64")
             && (cfg!(target_os = "linux") || cfg!(target_os = "macos")))
 }
+
+/// Every production pending path must register a real `HostOperation` in the
+/// current `ExecutionScope` operation registry and return its *packed* scope
+/// `OperationId` — never a small external id from a separate counter. This pins
+/// the callable-stream admission path: submitting a stream increments the scope
+/// operation count and the returned pending id decodes as a packed scope id.
+#[test]
+fn callable_stream_pending_id_is_packed_and_increments_scope_registry() {
+    use crate::vm::operation::OperationId;
+
+    let (mut vm, callback) =
+        direct_callback_vm(r#"pub fn callback(item: map) -> map { item }"#, "callback");
+    let before = vm.host.execution_scope_operation_count();
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let CallOutcome::Pending(op_id) = vm
+        .submit_callable_stream(
+            callback,
+            DropOnlyDriver {
+                stopped: Arc::clone(&stopped),
+            },
+        )
+        .unwrap()
+    else {
+        panic!("stream admission must return pending");
+    };
+    // The id must be a valid packed scope OperationId.
+    let scope_id = OperationId::from_raw(op_id).expect("stream pending id must be a packed scope id");
+    assert!(
+        vm.host.execution_scope().operations().status(scope_id).is_ok(),
+        "the stream operation must be registered in the execution scope"
+    );
+    assert_eq!(
+        vm.host.execution_scope_operation_count(),
+        before + 1,
+        "submitting a callable stream must increment the scope operation registry"
+    );
+
+    // Reset/drop cancellation must reach the stream through its registered
+    // operation driver: cancel the scope operation and observe the producer.
+    vm.reset_for_reuse();
+    assert_eq!(
+        stopped.load(Ordering::SeqCst),
+        1,
+        "scope reset must cancel the stream operation so its driver releases the producer"
+    );
+}

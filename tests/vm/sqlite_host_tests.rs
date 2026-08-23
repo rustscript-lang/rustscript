@@ -1768,6 +1768,7 @@ mod production_crate {
         );
         let mut vm = rustscript_vm::vm::Vm::try_new(compiled.program)
             .expect("test VM construction must not fail");
+        vm.set_standard_composition(rustscript_vm::standard_composition());
         let error = vm
             .run()
             .expect_err("sqlite imports must not bind when the extension is absent");

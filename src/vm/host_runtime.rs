@@ -29,6 +29,7 @@ use crate::vm::resource::{
     HostResource, Resource, ResourceAccessFrame, ResourceAccessRequest, ResourceCloseReason,
     ResourceTypeKey,
 };
+use crate::vm::standard_composition::StandardSurfaceComposition;
 
 /// Embedder-supplied print sink for `print`/`debug` output.
 pub(crate) type RuntimePrintSink = dyn FnMut(String) + Send;
@@ -139,6 +140,11 @@ pub(crate) struct HostRuntime {
     /// a completed execution-scope host operation, keyed by raw operation id.
     /// Populated by generic host-SDK consumers and cleared on scope reset.
     pub(crate) pending_op_results: HashMap<u64, PendingOpResult>,
+    /// Caller-provided standard-surface composition for this runtime instance
+    /// (explicit per-instance state, never a process global). The outer
+    /// standard-runtime constructor installs it so the VM's default-fallback
+    /// paths can compose standard surfaces without the core knowing them.
+    pub(crate) standard_composition: Option<Arc<dyn StandardSurfaceComposition>>,
 }
 
 impl HostRuntime {
@@ -149,14 +155,12 @@ impl HostRuntime {
     /// the operation-registry tag space) can be exhausted. Callers must
     /// propagate the typed [`HostRuntimeInitError`]; there is no infallible
     /// construction path that can panic on exhaustion.
+    ///
+    /// No standard surface composition is installed here: default standard
+    /// behavior is configured explicitly through the outer standard-runtime
+    /// constructor/registry path ([`set_standard_composition`](Self::set_standard_composition)),
+    /// never hidden behind `HostRuntime::new()`.
     pub(crate) fn new() -> Result<Self, HostRuntimeInitError> {
-        // Arm the host-agnostic default composition (idempotent): the standard
-        // builtin layer installs its concrete implementation into the VM
-        // core's generic slot so the VM's name-only / exact-import default
-        // fallback paths can bind standard functions. Without this, a fresh
-        // VM's `ensure_call_bindings` legacy/default path would have no
-        // standard surface to fall back onto.
-        crate::builtins::runtime::ensure_standard_composition_installed();
         Ok(Self {
             host_functions: Vec::new(),
             host_function_symbols: HashMap::new(),
@@ -176,6 +180,7 @@ impl HostRuntime {
             stream_drivers: HashMap::new(),
             runtime_print_sink: None,
             pending_op_results: HashMap::new(),
+            standard_composition: None,
         })
     }
 

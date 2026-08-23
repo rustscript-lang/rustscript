@@ -670,6 +670,11 @@ pub struct HostFunctionRegistry {
     /// Deterministic count of standard-surface registration rounds performed
     /// by this registry lineage through [`bind_vm_cached`].
     standard_staging_registrations: Arc<AtomicU64>,
+    /// Caller-provided standard-surface composition for this registry
+    /// instance (explicit per-instance state, never a process global).
+    /// `Some` enables the standard auto-stage / fallback paths; `None` means
+    /// this registry has no standard composition (e.g. `HostFunctionRegistry::empty`).
+    composition: Option<Arc<dyn super::standard_composition::StandardSurfaceComposition>>,
 }
 
 /// A memoized fully-staged standard snapshot plus the source-registry
@@ -724,6 +729,7 @@ impl HostFunctionRegistry {
             transaction_origin: Arc::new(()),
             standard_staging_snapshot: Arc::new(RwLock::new(None)),
             standard_staging_registrations: Arc::new(AtomicU64::new(0)),
+            composition: None,
         }
     }
 
@@ -837,6 +843,10 @@ impl HostFunctionRegistry {
             // another registry lineage's staged adapters into this one.
             standard_staging_snapshot: Arc::new(RwLock::new(None)),
             standard_staging_registrations: Arc::new(AtomicU64::new(0)),
+            // The staging clone keeps the origin's caller-provided composition
+            // (per-instance state), so `bind_vm_cached` on the staged registry
+            // can still auto-stage missing surfaces.
+            composition: self.composition.clone(),
         }
     }
 
@@ -1431,10 +1441,10 @@ impl HostFunctionRegistry {
         &self,
         imports: &[HostImport],
     ) -> VmResult<Option<StandardStageResult>> {
-        let Some(composition) = super::standard_composition::default_composition() else {
-            // No standard composition installed (e.g. a build without the
-            // standard builtins): the registry has nothing standard to stage,
-            // so fall through to the ordinary (non-staging) resolution path.
+        let Some(composition) = self.composition.as_ref() else {
+            // No caller-provided composition on this registry instance: the
+            // registry has nothing standard to stage, so fall through to the
+            // ordinary (non-staging) resolution path.
             return Ok(None);
         };
         let fingerprint = composition.standard_catalog_fingerprint();
@@ -1476,19 +1486,18 @@ impl HostFunctionRegistry {
                 return Ok(None);
             }
         }
-        let required = composition.required_surface_mask(imports);
-        let present = composition.present_surface_mask(self);
-        let missing = required.missing(present);
-        if missing.none() {
-            // All required surfaces are already present on the current
-            // registry; nothing to stage.
+        let mut staged = self.transaction_clone();
+        // One opaque required/present/stage call: the composition
+        // implementation computes which surfaces `imports` requires and which
+        // `staged` already carries, and registers exactly the missing ones.
+        // The core never sees a surface mask or count.
+        if !composition.ensure_surfaces(imports, &mut staged)? {
+            // Every required surface is already present; bind from the current
+            // registry directly (no staging, no snapshot, no counter bump).
             return Ok(Some(StandardStageResult {
                 registry: Arc::new(self.clone()),
             }));
         }
-
-        let mut staged = self.transaction_clone();
-        composition.stage_missing(&mut staged, missing)?;
         self.standard_staging_registrations
             .fetch_add(1, Ordering::Relaxed);
         let staged = Arc::new(staged);
@@ -1510,6 +1519,18 @@ impl HostFunctionRegistry {
     /// reuses the memoized snapshot does not increment it.
     pub fn standard_staging_registrations(&self) -> u64 {
         self.standard_staging_registrations.load(Ordering::Relaxed)
+    }
+
+    /// Installs the caller-provided standard-surface composition on this
+    /// registry instance (explicit per-instance state). The outer
+    /// standard-runtime constructor calls this so the registry's
+    /// `bind_vm_cached` auto-stage path can compose the standard surfaces
+    /// without the core knowing them.
+    pub fn set_standard_composition(
+        &mut self,
+        composition: Arc<dyn super::standard_composition::StandardSurfaceComposition>,
+    ) {
+        self.composition = Some(composition);
     }
 
     /// The memoized fully-staged standard snapshot, if one was published.
@@ -1796,6 +1817,14 @@ impl HostFunctionRegistry {
         vm.host.runtime_owned_pending_host_slots =
             plan.runtime_owned_pending_slots.iter().copied().collect();
         vm.install_resolved_calls(plan.resolved_calls.clone())?;
+        // Propagate the registry's caller-provided standard-surface composition
+        // to the VM (explicit per-instance state): a VM bound by a standard
+        // registry carries that composition forward for its default-fallback
+        // paths. This is the outer standard-runtime constructor path — never a
+        // hidden installation inside `HostRuntime::new()`.
+        if let Some(composition) = self.composition.clone() {
+            vm.host.standard_composition = Some(composition);
+        }
         Ok(())
     }
 }
@@ -3460,7 +3489,7 @@ impl Vm {
                 // composition layer (IO under `runtime`, HTTP under
                 // `http-client`, SQLite under `sqlite`). The VM core never
                 // names a concrete builtin module or feature.
-                let Some(composition) = super::standard_composition::default_composition() else {
+                let Some(composition) = self.host.standard_composition.clone() else {
                     return Err(VmError::UnboundImport(
                         "exact import requires a standard composition".to_string(),
                     ));
@@ -3480,7 +3509,7 @@ impl Vm {
                 .filter(|import| import.schema.is_none())
                 .map(|import| import.name.clone())
                 .collect::<Vec<_>>();
-            let composition = super::standard_composition::default_composition();
+            let composition = self.host.standard_composition.clone();
             for name in import_names {
                 if let Some(composition) = composition.as_ref() {
                     let _ = composition.bind_default_name(self, &name);
@@ -3519,7 +3548,10 @@ impl Vm {
             {
                 bound
             } else if self.host.allow_default_host_fallback
-                && super::standard_composition::default_composition()
+                && self
+                    .host
+                    .standard_composition
+                    .clone()
                     .is_some_and(|composition| composition.bind_default_name(self, &import.name))
             {
                 self.host
@@ -3877,6 +3909,7 @@ mod exact_binding_registration_tests {
         // schema import unbound and rejects it.
         let mut fresh = Vm::try_new(legacy_schema_import_program(&import))
             .expect("test VM construction must not fail");
+        fresh.set_standard_composition(crate::builtins::runtime::standard_composition());
         assert_missing_exact(
             fresh
                 .ensure_call_bindings()
