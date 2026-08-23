@@ -109,10 +109,6 @@ pub(crate) struct HostRuntime {
     pub(crate) runtime_owned_pending_host_slots: HashSet<u16>,
     pub(crate) resolved_calls: Vec<u16>,
     pub(crate) resolved_calls_dirty: bool,
-    /// Monotonic allocator for bridge-external host-operation ids (small
-    /// values that can never collide with the packed ids of the single
-    /// execution-scope operation registry). Survives VM resets.
-    next_host_op_id: u64,
     /// The host-agnostic execution scope of this runtime, created Active.
     ///
     /// One host runtime always owns exactly one live scope. Scope close
@@ -134,7 +130,14 @@ pub(crate) struct HostRuntime {
     /// `BridgePtr` lifetime coupling (no raw pointer can outlive its bridge
     /// allocation under the public APIs).
     pub(crate) async_bridge: Option<Arc<Mutex<Box<dyn HostAsyncBridge>>>>,
-    pub(crate) stream_drivers: HashMap<u64, Box<dyn HostStreamDriver>>,
+    /// Current callable-stream producer drivers, keyed by the *packed* scope
+    /// `OperationId` raw. Each value is a shared slot jointly owned with the
+    /// stream's registered `HostOperation` driver (`StreamScopeOperation`): the
+    /// VM polls the producer through the slot, and scope cancellation/release
+    /// takes (drops) the driver out of the same slot, so the producer resource
+    /// is always released exactly once through the operation driver. Keys are
+    /// scope operation ids — never small external ids from a separate counter.
+    pub(crate) stream_drivers: HashMap<u64, Arc<Mutex<Option<Box<dyn HostStreamDriver>>>>>,
     pub(crate) runtime_print_sink: Option<Box<RuntimePrintSink>>,
     /// Module-registered adapters that materialize the guest-visible return of
     /// a completed execution-scope host operation, keyed by raw operation id.
@@ -173,7 +176,6 @@ impl HostRuntime {
             runtime_owned_pending_host_slots: HashSet::new(),
             resolved_calls: Vec::new(),
             resolved_calls_dirty: true,
-            next_host_op_id: 1,
             execution_scope: ExecutionScope::new().map_err(HostRuntimeInitError::Scope)?,
             module_state: HostModuleStore::new(),
             async_bridge: None,
@@ -372,19 +374,6 @@ impl HostRuntime {
     /// Removes (discards) the module adapter for `raw` without running it.
     pub(crate) fn remove_pending_op_result(&mut self, raw: u64) {
         self.pending_op_results.remove(&raw);
-    }
-
-    /// Allocates the next bridge-external host-operation id.
-    ///
-    /// The counter is deliberately independent of the execution-scope
-    /// registry: bridge-external ids are small, monotonic values that never
-    /// collide with the packed modern operation ids (a valid modern id
-    /// requires a nonzero registry-tag field). The counter survives resets
-    /// and saturates instead of wrapping on exhaustion.
-    pub(crate) fn allocate_host_op_id(&mut self) -> u64 {
-        let id = self.next_host_op_id;
-        self.next_host_op_id = self.next_host_op_id.saturating_add(1);
-        id
     }
 
     /// Closes one resource in the owned execution scope, cancelling its

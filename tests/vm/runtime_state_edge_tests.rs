@@ -133,20 +133,19 @@ fn poll_waiting_host_op_reports_missing_async_bridge() {
 
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
+    // Every pending host operation must be a packed execution-scope operation
+    // id; a manually-fabricated non-scope id is not a valid pending operation
+    // and polling it reports a typed error (there is no external owner map).
     match vm.poll_waiting_host_op(&mut cx) {
         Poll::Ready(Err(err)) => {
-            assert!(
-                err.to_string()
-                    .contains("vm waiting on host op 321 without an async bridge"),
-                "unexpected error: {err}"
-            );
+            assert!(err.to_string().contains("321"), "unexpected error: {err}");
         }
-        other => panic!("expected missing bridge error, got {other:?}"),
+        other => panic!("expected pending-poll error, got {other:?}"),
     }
     assert_eq!(
         vm.waiting_host_op_id(),
         Some(321),
-        "missing bridge poll should keep waiting state intact"
+        "failed poll should keep waiting state intact"
     );
 }
 

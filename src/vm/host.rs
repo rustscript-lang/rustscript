@@ -3299,38 +3299,19 @@ impl Vm {
     /// Registers a waiting host op carrying the exact-return policy captured at
     /// the actual call-site resolved import.
     ///
-    /// A modern execution-scope operation (bridge-submitted future or a
-    /// generic `HostOperation` registered by a host-SDK consumer) is recorded
-    /// as a scope wait. Any other non-zero id is a bridge-external operation
-    /// (the bridge's own map, addressed by an arbitrary host-chosen raw id)
-    /// and is recorded directly; there is no second owner registry.
+    /// Every production pending host operation is a real execution-scope
+    /// operation with a packed scope id; there is no bridge-external owner
+    /// registry.
     fn set_waiting_host_op_with_policy(
         &mut self,
         op_id: HostOpId,
         exact_policy: ExactHostReturnPolicy,
     ) -> VmResult<()> {
         if op_id == 0 {
-            // A zero id can never be a valid operation: reject it and cancel
-            // any bridge work that was started under it.
-            let reason = crate::builtins::runtime::cancellation::CancellationReason::ResourceClosed;
-            if let Some(bridge) = self.host.async_bridge.clone() {
-                let _ = crate::vm::async_host::with_bridge(&bridge, |current| {
-                    current.cancel_op_with_reason(op_id, reason)
-                });
-            }
+            // A zero id can never be a valid packed operation id: reject it.
             return Err(VmError::HostError(
                 "zero host operation id is invalid".to_string(),
             ));
-        }
-        if let Ok(scope_id) = crate::vm::operation::OperationId::from_raw(op_id)
-            && self
-                .host
-                .execution_scope()
-                .operations()
-                .status(scope_id)
-                .is_ok()
-        {
-            return self.set_waiting_operation(op_id, exact_policy);
         }
         self.set_waiting_operation(op_id, exact_policy)
     }

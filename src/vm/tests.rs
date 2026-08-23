@@ -170,15 +170,6 @@ fn root_ret_completes_explicit_halt_frame() {
 }
 
 #[test]
-fn reset_for_reuse_keeps_host_operation_ids_monotonic() {
-    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
-        .expect("test VM construction must not fail");
-    assert_eq!(vm.allocate_host_op_id(), 1);
-    vm.reset_for_reuse();
-    assert_eq!(vm.allocate_host_op_id(), 2);
-}
-
-#[test]
 fn async_host_future_is_submitted_to_the_host_bridge() {
     use std::sync::{Arc, Mutex};
 
@@ -244,7 +235,6 @@ fn async_host_submission_without_driver_fails_without_allocating() {
     );
     // The id space is untouched by a rejected submission: no bridge was
     // present, so no operation (scope or bridge-external) was created.
-    assert_eq!(vm.allocate_host_op_id(), 1);
     assert_eq!(vm.host.execution_scope_operation_count(), 0);
 }
 
@@ -864,17 +854,6 @@ fn output_semantics_preserved_across_swap_and_poisoned_lock_is_typed() {
 }
 
 #[test]
-fn unused_host_operation_ids_do_not_consume_registry_capacity() {
-    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
-        .expect("test VM construction must not fail");
-    for _ in 0..128 {
-        vm.allocate_host_op_id();
-    }
-    // Bridge-external ids never consume execution-scope registry capacity.
-    assert_eq!(vm.host.execution_scope_operation_count(), 0);
-}
-
-#[test]
 fn poisoned_bridge_submit_failure_is_atomic_and_releases_capacity() {
     use std::sync::{Arc, Mutex};
 
@@ -1052,74 +1031,6 @@ impl HostAsyncBridge for PendingBridgeForRollback {
     fn cancel_op(&mut self, op_id: HostOpId) {
         self.futures.remove(&op_id);
     }
-}
-
-#[test]
-fn external_host_operations_join_the_shared_registry_without_id_collisions() {
-    use crate::vm::operation::{
-        HostOperation, OperationCancelReason, OperationResult, OperationSpec,
-    };
-    use std::task::Poll;
-
-    struct PendingOp;
-    impl HostOperation for PendingOp {
-        fn poll(&mut self, _cx: &mut std::task::Context<'_>) -> Poll<OperationResult<()>> {
-            Poll::Pending
-        }
-        fn cancel(&mut self, _reason: OperationCancelReason) -> OperationResult<()> {
-            Ok(())
-        }
-    }
-
-    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
-        .expect("test VM construction must not fail");
-    // A modern execution-scope operation and a bridge-external raw id live in
-    // different identity spaces (packed modern ids vs. arbitrary raw ids), so
-    // waiting on both never collides and never requires an owner registry.
-    let scope_op = vm
-        .host
-        .execution_scope_start_operation(OperationSpec::new(PendingOp))
-        .expect("scope operation should start");
-    let scope_raw = scope_op.raw();
-
-    vm.set_waiting_host_op(scope_raw)
-        .expect("a scope operation id waits through the scope registry");
-    assert_eq!(vm.waiting_host_op_id(), Some(scope_raw));
-    vm.complete_host_op(scope_raw, CallReturn::none())
-        .expect("the scope operation completes externally");
-    assert_eq!(vm.waiting_host_op_id(), None);
-
-    vm.set_waiting_host_op(99)
-        .expect("a bridge-external host operation should register as a wait");
-    assert_eq!(vm.waiting_host_op_id(), Some(99));
-    assert_eq!(
-        vm.host.execution_scope_operation_count(),
-        1,
-        "the scope op completed; only its terminal slot remains until consumed"
-    );
-    vm.complete_host_op(99, CallReturn::none())
-        .expect("the bridge-external operation completes externally");
-}
-
-#[test]
-fn invalid_host_completion_preserves_the_waiting_operation() {
-    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
-        .expect("test VM construction must not fail");
-    vm.set_waiting_host_op(101)
-        .expect("external host operation should register");
-
-    vm.complete_host_op(102, CallReturn::none())
-        .expect_err("completion for a different operation should fail");
-    assert_eq!(
-        vm.waiting_host_op_id(),
-        Some(101),
-        "a rejected completion must preserve the waiting operation"
-    );
-
-    // Zero is never a valid host-operation id.
-    vm.complete_host_op(0, CallReturn::none())
-        .expect_err("zero host operation id must be rejected");
-    assert_eq!(vm.waiting_host_op_id(), Some(101));
 }
 
 #[test]

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::compiler::TypeSchema;
@@ -85,6 +86,13 @@ impl Vm {
     /// then owns the callback and driver until completion, cancellation, reset,
     /// or error; removing the driver drops it to release producer resources.
     ///
+    /// The driver is registered as a [`HostOperation`] in the current
+    /// `ExecutionScope` (a [`StreamScopeOperation`]), so the returned pending id
+    /// is a *packed* scope id and scope reset/drop cancellation reaches the
+    /// producer through the operation driver. The VM polls the producer through
+    /// a shared driver slot; scope cancellation releases the producer through the
+    /// operation driver's `cancel`.
+    ///
     /// The driver contract is documented on [`HostStreamDriver`]. In
     /// particular, producer polling and callback action application stay
     /// serialized and neither driver method may re-enter the VM.
@@ -100,8 +108,23 @@ impl Vm {
                 "vm already owns an active callable stream".to_string(),
             ));
         }
-        let op_id = self.allocate_host_op_id();
-        self.host.stream_drivers.insert(op_id, Box::new(driver));
+        // Shared producer slot: the VM polls through it, and the registered
+        // StreamScopeOperation takes (drops) the driver out of it on cancel so
+        // the producer resource is released exactly once through the operation
+        // driver.
+        let slot: Arc<std::sync::Mutex<Option<Box<dyn HostStreamDriver>>>> =
+            Arc::new(std::sync::Mutex::new(Some(Box::new(driver))));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let scope_op = StreamScopeOperation {
+            slot: Arc::clone(&slot),
+            cancelled: Arc::clone(&cancelled),
+        };
+        let scope_id = self
+            .host
+            .execution_scope_start_operation(crate::vm::operation::OperationSpec::new(scope_op))
+            .map_err(|error| VmError::HostError(error.to_string()))?;
+        let op_id = scope_id.raw();
+        self.host.stream_drivers.insert(op_id, Arc::clone(&slot));
         self.instance.host_stream = Some(HostStreamContinuation {
             op_id,
             callback,
@@ -152,7 +175,18 @@ impl Vm {
 
     pub(crate) fn cancel_callable_stream(&mut self) {
         if let Some(stream) = self.instance.host_stream.take() {
-            self.host.stream_drivers.remove(&stream.op_id);
+            if let Some(slot) = self.host.stream_drivers.remove(&stream.op_id)
+                && let Ok(mut guard) = slot.lock()
+            {
+                // Release the producer through the operation driver path: taking
+                // the driver out of the shared slot drops it (producer cleanup).
+                guard.take();
+            }
+            let _ = self.host.execution_scope_abort_operation(
+                crate::vm::operation::OperationId::from_raw(stream.op_id)
+                    .expect("callable stream op id is a packed scope id"),
+                crate::vm::operation::OperationCancelReason::Requested,
+            );
             if let Some(item) = stream.item {
                 self.drop_value_with_contract(item);
             }
@@ -176,8 +210,22 @@ impl Vm {
                 "callable stream producer polled during callback",
             )));
         }
-        let polled = match self.host.stream_drivers.get_mut(&op_id) {
-            Some(driver) => driver.poll_next(cx),
+        let polled = match self.host.stream_drivers.get(&op_id) {
+            Some(slot) => match slot.lock() {
+                Ok(mut guard) => match guard.as_mut() {
+                    Some(driver) => driver.poll_next(cx),
+                    None => {
+                        return Poll::Ready(Err(VmError::HostError(format!(
+                            "callable stream driver {op_id} was already released"
+                        ))));
+                    }
+                },
+                Err(_) => {
+                    return Poll::Ready(Err(VmError::HostError(format!(
+                        "callable stream driver slot {op_id} is poisoned"
+                    ))));
+                }
+            },
             None => {
                 return Poll::Ready(Err(VmError::HostError(format!(
                     "missing callable stream driver {op_id}"
@@ -302,12 +350,20 @@ impl Vm {
         if let Some(stream) = self.instance.host_stream.as_ref() {
             self.instance.ip = stream.parent_ip;
         }
-        let applied = self
-            .host
-            .stream_drivers
-            .get_mut(&op_id)
-            .ok_or_else(|| VmError::HostError(format!("missing callable stream driver {op_id}")))?
-            .apply_action(action);
+        let applied = {
+            let slot = self.host.stream_drivers.get(&op_id).ok_or_else(|| {
+                VmError::HostError(format!("missing callable stream driver {op_id}"))
+            })?;
+            let mut guard = slot.lock().map_err(|_| {
+                VmError::HostError(format!("callable stream driver slot {op_id} is poisoned"))
+            })?;
+            let driver = guard.as_mut().ok_or_else(|| {
+                VmError::HostError(format!(
+                    "callable stream driver {op_id} was already released"
+                ))
+            })?;
+            driver.apply_action(action)
+        };
         match applied {
             Ok(HostStreamAction::Continue) => {
                 if let Some(stream) = self.instance.host_stream.as_mut() {
@@ -337,7 +393,16 @@ impl Vm {
         let Some(stream) = self.instance.host_stream.take() else {
             return;
         };
-        self.host.stream_drivers.remove(&stream.op_id);
+        if let Some(slot) = self.host.stream_drivers.remove(&stream.op_id)
+            && let Ok(mut guard) = slot.lock()
+        {
+            guard.take();
+        }
+        let _ = self.host.execution_scope_abort_operation(
+            crate::vm::operation::OperationId::from_raw(stream.op_id)
+                .expect("callable stream op id is a packed scope id"),
+            crate::vm::operation::OperationCancelReason::Requested,
+        );
         self.instance.waiting_host_op = None;
         self.drop_value_with_contract(stream.callback);
         if let Some(item) = stream.item {
@@ -350,12 +415,66 @@ impl Vm {
         let Some(stream) = self.instance.host_stream.take() else {
             return;
         };
-        self.host.stream_drivers.remove(&stream.op_id);
+        if let Some(slot) = self.host.stream_drivers.remove(&stream.op_id)
+            && let Ok(mut guard) = slot.lock()
+        {
+            guard.take();
+        }
+        let _ = self.host.execution_scope_abort_operation(
+            crate::vm::operation::OperationId::from_raw(stream.op_id)
+                .expect("callable stream op id is a packed scope id"),
+            crate::vm::operation::OperationCancelReason::Requested,
+        );
         self.instance.waiting_host_op = None;
         self.abort_host_invocation(stream.parent_stack_base, stream.parent_frame_count);
         self.drop_value_with_contract(stream.callback);
         if let Some(item) = stream.item {
             self.drop_value_with_contract(item);
         }
+    }
+}
+
+/// The `HostOperation` driver that keeps a callable stream registered in the
+/// current `ExecutionScope`.
+///
+/// The producer driver lives in a shared slot jointly owned with the VM's
+/// `stream_drivers` map. The VM polls the producer through the slot (never
+/// through this operation's poll); this operation exists so the stream is a
+/// first-class pending operation with a packed scope `OperationId` and so
+/// scope reset/drop cancellation reaches the producer. `poll` stays pending
+/// (the operation is released explicitly by the VM on stream finish/cancel/
+/// abort), and `cancel` takes (drops) the producer driver out of the shared
+/// slot so the producer resource is released exactly once through the
+/// operation driver.
+struct StreamScopeOperation {
+    slot: std::sync::Arc<std::sync::Mutex<Option<Box<dyn HostStreamDriver>>>>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl crate::vm::operation::HostOperation for StreamScopeOperation {
+    fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<crate::vm::operation::OperationResult<()>> {
+        if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            Poll::Ready(Err(crate::vm::operation::OperationError::new(
+                crate::vm::operation::OperationErrorCode::OperationDriverFailed,
+                "vm::stream",
+                "callable stream was cancelled",
+            )))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn cancel(
+        &mut self,
+        _reason: crate::vm::operation::OperationCancelReason,
+    ) -> crate::vm::operation::OperationResult<()> {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Release the producer driver now: dropping it releases producer
+        // resources without requiring another poll.
+        if let Ok(mut guard) = self.slot.lock() {
+            guard.take();
+        }
+        Ok(())
     }
 }

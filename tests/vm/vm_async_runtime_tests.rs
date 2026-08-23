@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    future::Future,
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -10,10 +9,9 @@ use std::{
     time::Duration,
 };
 
-use tokio::sync::oneshot;
 use vm::{
-    BytecodeBuilder, CallOutcome, CancellationReason, HostAsyncBridge, HostFunction, HostImport,
-    HostOpId, Program, Value, ValueType, Vm, VmError, VmStatus,
+    BytecodeBuilder, CallOutcome, CancellationReason, HostAsyncBridge, HostFunction, HostFuture,
+    HostImport, HostOpId, Program, Value, ValueType, Vm, VmError, VmResult, VmStatus,
 };
 
 type AsyncHostResult = Result<vm::CallReturn, VmError>;
@@ -21,48 +19,35 @@ type SharedAsyncOps = Arc<Mutex<TestAsyncOps>>;
 
 #[derive(Default)]
 struct TestAsyncOps {
-    pending: HashMap<HostOpId, oneshot::Receiver<AsyncHostResult>>,
+    pending: HashMap<HostOpId, HostFuture>,
     cancellations: Vec<(HostOpId, CancellationReason)>,
 }
 
 impl TestAsyncOps {
-    fn schedule_future<F>(&mut self, vm: &mut Vm, future: F) -> Result<HostOpId, VmError>
-    where
-        F: Future<Output = AsyncHostResult> + Send + 'static,
-    {
-        let op_id = vm.allocate_host_op_id();
-        let (sender, receiver) = oneshot::channel();
-        self.pending.insert(op_id, receiver);
-        tokio::spawn(async move {
-            let _ = sender.send(future.await);
-        });
-        Ok(op_id)
-    }
-
-    fn poll_op(&mut self, op_id: HostOpId, cx: &mut Context<'_>) -> Poll<AsyncHostResult> {
-        let poll_state = {
-            let receiver = match self.pending.get_mut(&op_id) {
-                Some(receiver) => receiver,
-                None => {
-                    return Poll::Ready(Err(VmError::HostError(format!(
-                        "unknown async host op {op_id}",
-                    ))));
-                }
-            };
-            Pin::new(receiver).poll(cx)
+    fn poll_submitted(&mut self, op_id: HostOpId, cx: &mut Context<'_>) -> Poll<AsyncHostResult> {
+        let Some(future) = self.pending.get_mut(&op_id) else {
+            return Poll::Ready(Err(VmError::HostError(format!(
+                "unknown async host op {op_id}",
+            ))));
         };
-
-        match poll_state {
+        match Pin::new(future).poll(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(result)) => {
+            Poll::Ready(result) => {
                 self.pending.remove(&op_id);
-                Poll::Ready(result)
-            }
-            Poll::Ready(Err(_)) => {
-                self.pending.remove(&op_id);
-                Poll::Ready(Err(VmError::HostError(format!(
-                    "async host op {op_id} was cancelled",
-                ))))
+                Poll::Ready(match result {
+                    Ok(output) => match output {
+                        vm::HostFutureOutput::Return(value) => Ok(value),
+                        vm::HostFutureOutput::VmCompletion(completion) => {
+                            // A submitted-future completion runs later through
+                            // the VM; for these tests all futures return a
+                            // plain value, so this arm is only reached if an
+                            // embedder submits a VmCompletion (unsupported here).
+                            let _ = completion;
+                            Ok(vm::CallReturn::none())
+                        }
+                    },
+                    Err(error) => Err(error),
+                })
             }
         }
     }
@@ -79,23 +64,50 @@ impl TestAsyncBridge {
 }
 
 impl HostAsyncBridge for TestAsyncBridge {
+    fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
+        let Ok(mut ops) = self.ops.lock() else {
+            return Err(VmError::HostError(
+                "test async ops lock poisoned".to_string(),
+            ));
+        };
+        ops.pending.insert(op_id, future);
+        Ok(())
+    }
+
     fn poll_op(
         &mut self,
         op_id: HostOpId,
-        cx: &mut Context<'_>,
+        _cx: &mut Context<'_>,
     ) -> Poll<Result<vm::CallReturn, VmError>> {
-        self.ops
+        let ops = self.ops.lock().expect("test async ops lock poisoned");
+        if ops.pending.contains_key(&op_id) {
+            Poll::Pending
+        } else {
+            Poll::Ready(Err(VmError::HostError(format!(
+                "unknown async host op {op_id}",
+            ))))
+        }
+    }
+
+    fn poll_submitted_op(
+        &mut self,
+        op_id: HostOpId,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<vm::HostFutureOutput, VmError>> {
+        let polled = self
+            .ops
             .lock()
             .expect("test async ops lock poisoned")
-            .poll_op(op_id, cx)
+            .poll_submitted(op_id, cx);
+        match polled {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => Poll::Ready(result.map(vm::HostFutureOutput::Return)),
+        }
     }
 
     fn cancel_op(&mut self, op_id: HostOpId) {
-        self.ops
-            .lock()
-            .expect("test async ops lock poisoned")
-            .pending
-            .remove(&op_id);
+        let mut ops = self.ops.lock().expect("test async ops lock poisoned");
+        ops.pending.remove(&op_id);
     }
 
     fn cancel_op_with_reason(&mut self, op_id: HostOpId, reason: CancellationReason) {
@@ -106,14 +118,13 @@ impl HostAsyncBridge for TestAsyncBridge {
 }
 
 struct AsyncAddOneFunction {
-    ops: SharedAsyncOps,
     calls: Arc<AtomicUsize>,
     delay: Duration,
 }
 
 impl AsyncAddOneFunction {
-    fn new(ops: SharedAsyncOps, calls: Arc<AtomicUsize>, delay: Duration) -> Self {
-        Self { ops, calls, delay }
+    fn new(calls: Arc<AtomicUsize>, delay: Duration) -> Self {
+        Self { calls, delay }
     }
 }
 
@@ -132,20 +143,17 @@ impl HostFunction for AsyncAddOneFunction {
         }
 
         let delay = self.delay;
-        let mut ops = self.ops.lock().expect("test async ops lock poisoned");
-        let op_id = ops.schedule_future(vm, async move {
+        // Submit a real HostFuture through the modern scope-operation path:
+        // `submit_host_future` registers a HostFutureOperation in the current
+        // ExecutionScope and returns its packed scope id. The future waits on
+        // the tokio timer, then resolves to the incremented value.
+        let future = async move {
             tokio::time::sleep(delay).await;
-            Ok(vec![Value::Int(value + 1)].into())
-        })?;
-        Ok(CallOutcome::Pending(op_id))
-    }
-}
-
-struct InvalidPendingFunction;
-
-impl HostFunction for InvalidPendingFunction {
-    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, VmError> {
-        Ok(CallOutcome::Pending(0))
+            Ok(vm::HostFutureOutput::returning(
+                vec![Value::Int(value + 1)].into(),
+            ))
+        };
+        vm.submit_host_future(Box::pin(future))
     }
 }
 
@@ -190,7 +198,6 @@ async fn async_host_call_waits_and_resumes_via_tokio_runtime() {
     vm.bind_function(
         "edge::async_add_one",
         Box::new(AsyncAddOneFunction::new(
-            ops.clone(),
             calls.clone(),
             Duration::from_millis(25),
         )),
@@ -202,7 +209,16 @@ async fn async_host_call_waits_and_resumes_via_tokio_runtime() {
         VmStatus::Waiting(op_id) => op_id,
         other => panic!("expected waiting status, got {other:?}"),
     };
-    assert_eq!(op_id, 1);
+    // Every pending host operation is a packed execution-scope operation id.
+    assert!(
+        vm::operation::OperationId::from_raw(op_id).is_ok(),
+        "waiting op id must be a packed scope id, got {op_id}"
+    );
+    assert_eq!(vm.host_context().operation_count(), 1);
+    assert!(
+        op_id > u16::MAX as u64,
+        "packed scope ids are far larger than the retired small external ids"
+    );
 
     tokio::time::timeout(Duration::from_secs(1), vm.await_waiting_host_op())
         .await
@@ -230,11 +246,7 @@ async fn reset_cancels_pending_host_bridge_operation() {
         Vm::try_new(build_async_import_program(41)).expect("test VM construction must not fail");
     vm.bind_function(
         "edge::async_add_one",
-        Box::new(AsyncAddOneFunction::new(
-            ops.clone(),
-            calls,
-            Duration::from_secs(60),
-        )),
+        Box::new(AsyncAddOneFunction::new(calls, Duration::from_secs(60))),
     );
     vm.set_async_bridge(Box::new(TestAsyncBridge::new(ops.clone())));
 
@@ -252,23 +264,6 @@ async fn reset_cancels_pending_host_bridge_operation() {
     assert_eq!(vm.waiting_host_op_id(), None);
 }
 
-#[test]
-fn rejected_pending_result_cancels_bridge_owned_work() {
-    let ops = Arc::new(Mutex::new(TestAsyncOps::default()));
-    let mut vm =
-        Vm::try_new(build_async_import_program(41)).expect("test VM construction must not fail");
-    vm.bind_function("edge::async_add_one", Box::new(InvalidPendingFunction));
-    vm.set_async_bridge(Box::new(TestAsyncBridge::new(ops.clone())));
-
-    vm.run()
-        .expect_err("zero host operation id should be rejected");
-    assert_eq!(
-        ops.lock().unwrap().cancellations,
-        vec![(0, CancellationReason::ResourceClosed)]
-    );
-    assert_eq!(vm.waiting_host_op_id(), None);
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn user_cancellation_reaches_host_bridge_and_clears_waiting_state() {
     let ops = Arc::new(Mutex::new(TestAsyncOps::default()));
@@ -277,11 +272,7 @@ async fn user_cancellation_reaches_host_bridge_and_clears_waiting_state() {
         Vm::try_new(build_async_import_program(41)).expect("test VM construction must not fail");
     vm.bind_function(
         "edge::async_add_one",
-        Box::new(AsyncAddOneFunction::new(
-            ops.clone(),
-            calls,
-            Duration::from_secs(60),
-        )),
+        Box::new(AsyncAddOneFunction::new(calls, Duration::from_secs(60))),
     );
     vm.set_async_bridge(Box::new(TestAsyncBridge::new(ops.clone())));
 
@@ -313,7 +304,6 @@ async fn vm_waiting_on_async_host_op_does_not_block_tokio_tasks() {
     vm.bind_function(
         "edge::async_add_one",
         Box::new(AsyncAddOneFunction::new(
-            ops.clone(),
             calls.clone(),
             Duration::from_millis(40),
         )),

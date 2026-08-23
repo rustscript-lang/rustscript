@@ -55,7 +55,6 @@ pub use self::host_context::{
     HostContext, HostContextError, HostContextErrorKind, HostContextResult, HostModule,
 };
 pub use self::host_extension::{HostExtension, HostModuleState, catalog_import_schemas};
-pub use self::standard_composition::StandardSurfaceComposition;
 use self::host_runtime::HostRuntime;
 use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable};
 pub use self::invocation::{Invocation, InvocationError, InvocationItem, InvocationPoll};
@@ -68,6 +67,7 @@ pub use self::resource::{
     ResourceTable,
 };
 use self::run_context::{InterruptMode, RunContext};
+pub use self::standard_composition::StandardSurfaceComposition;
 pub use crate::builtins::BuiltinFunction;
 pub use crate::builtins::runtime::cancellation::CancellationReason;
 pub use crate::builtins::runtime::error::{RuntimeError, RuntimeErrorCode};

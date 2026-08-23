@@ -582,10 +582,8 @@ fn vm_core_never_calls_builtin_composition_installer() {
 #[test]
 fn vm_core_has_no_external_operation_id_allocator() {
     let mut files = Vec::new();
-    for dir in ["src/vm"] {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(dir);
-        collect(&root, &mut files);
-    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/vm");
+    collect(&root, &mut files);
     files.retain(|path| {
         let name = path
             .file_name()

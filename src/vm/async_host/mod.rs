@@ -142,18 +142,6 @@ impl Vm {
         self.host.async_bridge = None;
     }
 
-    /// Allocates the next host-operation id for a bridge-external operation.
-    ///
-    /// Bridge-external ids are small, monotonically increasing values that can
-    /// never collide with the packed ids of the single execution-scope
-    /// operation registry (a valid modern id requires a nonzero registry-tag
-    /// field, so small values always route to the bridge). The counter lives
-    /// in [`HostRuntime`](super::host_runtime::HostRuntime) and survives VM
-    /// resets.
-    pub fn allocate_host_op_id(&mut self) -> HostOpId {
-        self.host.allocate_host_op_id()
-    }
-
     pub fn submit_host_future(&mut self, future: HostFuture) -> VmResult<CallOutcome> {
         // The future is handed to the bridge (which owns the runtime context
         // needed to poll it) under the id the modern registry allocates. The
@@ -269,34 +257,27 @@ impl Vm {
         let Some(waiting) = self.instance.waiting_host_op.take() else {
             return;
         };
-        if self.host.stream_drivers.contains_key(&waiting.op_id) {
+        // A callable stream is cancelled through its VM-side continuation
+        // (callback cleanup + operation release through its driver).
+        if self
+            .instance
+            .host_stream
+            .as_ref()
+            .is_some_and(|stream| stream.op_id == waiting.op_id)
+        {
             self.cancel_callable_stream();
             return;
         }
         let scope_reason = scope_reason(reason);
-        // A modern execution-scope operation (bridge-submitted future or a
-        // generic HostOperation such as a sqlite query) is cancelled through
-        // its own driver with the parallel operation-cancellation vocabulary.
-        if let Ok(scope_id) = crate::vm::operation::OperationId::from_raw(waiting.op_id)
-            && self
-                .host
-                .execution_scope()
-                .operations()
-                .status(scope_id)
-                .is_ok()
-        {
+        // Every production pending host operation is a real execution-scope
+        // operation with a packed id; cancel it through its own driver with
+        // the parallel operation-cancellation vocabulary. A manually-fabricated
+        // wait id (test-only) has no scope entry to cancel in the single modern
+        // lifecycle.
+        if let Ok(scope_id) = crate::vm::operation::OperationId::from_raw(waiting.op_id) {
             let _ = self
                 .host
                 .execution_scope_cancel_operation(scope_id, scope_reason);
-            return;
-        }
-        // A bridge-external operation (the bridge's own map, addressed by an
-        // arbitrary host-chosen raw id) is cancelled through the current
-        // bridge generation.
-        if let Some(bridge) = self.host.async_bridge.clone() {
-            let _ = with_bridge(&bridge, |current| {
-                current.cancel_op_with_reason(waiting.op_id, reason)
-            });
         }
     }
 
@@ -316,9 +297,11 @@ impl Vm {
                 waiting.op_id
             )));
         }
-        // A modern execution-scope operation (e.g. a bridge-submitted future)
-        // is driven terminal through its own driver: external completion
-        // cancels the driver so its bridge work stops exactly once.
+        // Every production pending host operation is a real execution-scope
+        // operation with a packed id: external completion cancels its driver so
+        // its bridge work stops exactly once. If the id is not a registered
+        // scope operation (a manually-fabricated wait in tests), there is no
+        // external work to cancel in the single modern lifecycle.
         if let Ok(scope_id) = crate::vm::operation::OperationId::from_raw(op_id)
             && self
                 .host
@@ -340,52 +323,21 @@ impl Vm {
         let Some(waiting) = self.instance.waiting_host_op.clone() else {
             return Poll::Ready(Ok(()));
         };
-        if self.host.stream_drivers.contains_key(&waiting.op_id) {
+        // A callable stream is driven through its VM-side continuation, which
+        // polls the producer through the shared driver slot.
+        if self
+            .instance
+            .host_stream
+            .as_ref()
+            .is_some_and(|stream| stream.op_id == waiting.op_id)
+        {
             return self.poll_callable_stream(waiting.op_id, cx);
         }
-        // A modern execution-scope operation (bridge-submitted future or a
-        // generic HostOperation registered by a host-SDK consumer) is driven
-        // through the single scope registry.
-        if let Ok(scope_id) = crate::vm::operation::OperationId::from_raw(waiting.op_id)
-            && self
-                .host
-                .execution_scope()
-                .operations()
-                .status(scope_id)
-                .is_ok()
-        {
-            return self.poll_execution_scope_waiting_op(waiting.op_id, cx);
-        }
-        // A bridge-external operation: the current bridge generation owns the
-        // poll. The generation is cloned so the poll does not hold a borrow
-        // of the host runtime across the bridge callback.
-        let bridge = match self.host.async_bridge.clone() {
-            Some(bridge) => bridge,
-            None => {
-                return Poll::Ready(Err(VmError::HostError(format!(
-                    "vm waiting on host op {} without an async bridge",
-                    waiting.op_id
-                ))));
-            }
-        };
-        let polled = match with_bridge(&bridge, |current| current.poll_op(waiting.op_id, cx)) {
-            Ok(polled) => polled,
-            Err(error) => {
-                self.instance.waiting_host_op = None;
-                return Poll::Ready(Err(error));
-            }
-        };
-        match polled {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(values)) => {
-                self.complete_waiting_host_op(waiting.op_id, values)?;
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(error)) => {
-                self.instance.waiting_host_op = None;
-                Poll::Ready(Err(error))
-            }
-        }
+        // Every other pending host operation is a real execution-scope
+        // operation (bridge-submitted future or a generic HostOperation
+        // registered by a host-SDK consumer) driven through the single scope
+        // registry.
+        self.poll_execution_scope_waiting_op(waiting.op_id, cx)
     }
 
     pub async fn await_waiting_host_op(&mut self) -> VmResult<()> {

@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
@@ -11,9 +12,10 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use vm::{
-    CallOutcome, CallReturn, FunctionDecl, HostAsyncBridge, HostFunction, HostOpId, LocalInfo,
-    SourceFlavor, SourcePathError, Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
-    compile_source_with_flavor_and_options, format_value, render_vm_error,
+    CallOutcome, CallReturn, CancellationReason, FunctionDecl, HostAsyncBridge, HostFunction,
+    HostFuture, HostFutureOutput, HostOpId, LocalInfo, SourceFlavor, SourcePathError, Value, Vm,
+    VmError, VmResult, VmStatus, VmYieldReason, compile_source_with_flavor_and_options,
+    format_value, render_vm_error, standard_composition,
 };
 
 use crate::analyzer::{LintDiagnostic, lint_source_with_flavor, lint_success_diagnostics};
@@ -383,7 +385,7 @@ thread_local! {
 
 #[derive(Default)]
 struct BrowserAsyncState {
-    deadlines_ms: HashMap<HostOpId, f64>,
+    futures: HashMap<HostOpId, HostFuture>,
 }
 
 struct BrowserAsyncBridge {
@@ -397,48 +399,79 @@ impl BrowserAsyncBridge {
 }
 
 impl HostAsyncBridge for BrowserAsyncBridge {
+    fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
+        let Ok(mut state) = self.state.lock() else {
+            return Err(VmError::HostError(
+                "browser async bridge state is unavailable".to_string(),
+            ));
+        };
+        state.futures.insert(op_id, future);
+        Ok(())
+    }
+
     fn poll_op(&mut self, op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
+        let Ok(state) = self.state.lock() else {
+            return Poll::Ready(Err(VmError::HostError(
+                "browser async bridge state is unavailable".to_string(),
+            )));
+        };
+        if state.futures.contains_key(&op_id) {
+            Poll::Pending
+        } else {
+            Poll::Ready(Err(VmError::HostError(format!(
+                "unknown browser async op {op_id}"
+            ))))
+        }
+    }
+
+    fn poll_submitted_op(
+        &mut self,
+        op_id: HostOpId,
+        cx: &mut Context<'_>,
+    ) -> Poll<VmResult<HostFutureOutput>> {
         let Ok(mut state) = self.state.lock() else {
             return Poll::Ready(Err(VmError::HostError(
                 "browser async bridge state is unavailable".to_string(),
             )));
         };
-        let Some(deadline_ms) = state.deadlines_ms.get(&op_id).copied() else {
+        let Some(future) = state.futures.get_mut(&op_id) else {
             return Poll::Ready(Err(VmError::HostError(format!(
                 "unknown browser async op {op_id}"
             ))));
         };
-        if current_time_ms() >= deadline_ms {
-            state.deadlines_ms.remove(&op_id);
-            Poll::Ready(Ok(CallReturn::one(Value::Bool(true))))
-        } else {
-            Poll::Pending
-        }
+        Pin::new(future).poll(cx)
+    }
+
+    fn cancel_op_with_reason(&mut self, op_id: HostOpId, _reason: CancellationReason) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.futures.remove(&op_id);
     }
 }
 
-struct PlaygroundRuntimeSleepHostFunction {
-    async_state: Arc<Mutex<BrowserAsyncState>>,
-}
-
-impl PlaygroundRuntimeSleepHostFunction {
-    fn new(async_state: Arc<Mutex<BrowserAsyncState>>) -> Self {
-        Self { async_state }
-    }
-}
+struct PlaygroundRuntimeSleepHostFunction;
 
 impl HostFunction for PlaygroundRuntimeSleepHostFunction {
     fn call(&mut self, vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         let millis = sleep_millis(args)?;
-        let op_id = vm.allocate_host_op_id();
         let deadline_ms = current_time_ms() + millis as f64;
-        let Ok(mut state) = self.async_state.lock() else {
-            return Err(VmError::HostError(
-                "browser async bridge state is unavailable".to_string(),
-            ));
-        };
-        state.deadlines_ms.insert(op_id, deadline_ms);
-        Ok(CallOutcome::Pending(op_id))
+        // Submit a real HostFuture through the modern scope-operation path
+        // (`submit_host_future` registers a HostFutureOperation in the current
+        // ExecutionScope and returns its packed scope id). The bridge is the
+        // runtime context that polls the future; after the deadline it
+        // resolves true.
+        let sleep = std::future::poll_fn(move |cx| {
+            if current_time_ms() >= deadline_ms {
+                Poll::Ready(Ok(HostFutureOutput::returning(CallReturn::one(
+                    Value::Bool(true),
+                ))))
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        });
+        vm.submit_host_future(Box::pin(sleep))
     }
 }
 
@@ -1152,6 +1185,7 @@ pub(crate) fn run_source_with_flavor(source: &str, flavor: SourceFlavor) -> RunR
     let output_lines = Arc::new(Mutex::new(Vec::<String>::new()));
     let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
         .expect("test VM construction must not fail");
+    vm.set_standard_composition(standard_composition());
     if let Err(err) = register_functions(&mut vm, &compiled.functions, &output_lines) {
         return RunReport::runtime_error(err, Vec::new(), Vec::new(), capture_fuel_state(&vm));
     }
@@ -1262,6 +1296,7 @@ pub fn start_run_source_with_flavor(
             );
         }
     };
+    vm.set_standard_composition(standard_composition());
     if let Err(err) = register_functions(&mut vm, &compiled.functions, &output_lines) {
         RUN_SESSION.with(|state| {
             *state.borrow_mut() = None;
@@ -1403,6 +1438,7 @@ pub fn start_debug_source_with_flavor(
             return DebugReport::inactive(Some(err.to_string()), "debugger initialization failed");
         }
     };
+    vm.set_standard_composition(standard_composition());
     if let Err(err) = register_functions(&mut vm, &compiled.functions, &output_lines) {
         DEBUG_SESSION.with(|state| {
             *state.borrow_mut() = None;
@@ -1500,12 +1536,12 @@ fn register_named_function(
     match name {
         "print" | "println" => {}
         "runtime::sleep" => {
-            let Some(state) = async_state else {
+            let Some(_state) = async_state else {
                 return Err("runtime::sleep async bridge not initialized".to_string());
             };
             vm.bind_function(
                 "runtime::sleep",
-                Box::new(PlaygroundRuntimeSleepHostFunction::new(Arc::clone(state))),
+                Box::new(PlaygroundRuntimeSleepHostFunction),
             );
         }
         "runtime::exit" => {}

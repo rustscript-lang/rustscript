@@ -1176,11 +1176,7 @@ fn render_builtin_runtime_dispatch(
     // process global): the outer standard-runtime registry path carries the
     // caller-provided composition forward so `bind_vm_cached` auto-stage can
     // compose the standard surfaces without the core knowing them.
-    writeln!(
-        &mut out,
-        "    #[cfg(feature = \"runtime\")]"
-    )
-    .unwrap();
+    writeln!(&mut out, "    #[cfg(feature = \"runtime\")]").unwrap();
     writeln!(
         &mut out,
         "    registry.set_standard_composition(crate::builtins::runtime::standard_composition::standard_composition());"

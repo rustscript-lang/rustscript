@@ -1130,7 +1130,7 @@ mod runtime_tests {
     use crate::stdlib::embedded_stdlib_compile_options;
     use vm::{
         CallOutcome, FunctionDecl, HostFunction, SourceFlavor, Value, Vm, VmStatus,
-        compile_source_with_flavor_and_options,
+        compile_source_with_flavor_and_options, standard_composition,
     };
 
     fn rss_playground_examples() -> [(&'static str, &'static str); 6] {
@@ -1198,6 +1198,7 @@ mod runtime_tests {
         .expect("playground example should compile for runtime verification");
         let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
             .expect("fixture VM construction must not fail");
+        vm.set_standard_composition(standard_composition());
         let mut jit_config = *vm.jit_config();
         jit_config.enabled = false;
         vm.set_jit_config(jit_config);

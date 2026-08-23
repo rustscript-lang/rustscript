@@ -1148,9 +1148,14 @@ fn callable_stream_pending_id_is_packed_and_increments_scope_registry() {
         panic!("stream admission must return pending");
     };
     // The id must be a valid packed scope OperationId.
-    let scope_id = OperationId::from_raw(op_id).expect("stream pending id must be a packed scope id");
+    let scope_id =
+        OperationId::from_raw(op_id).expect("stream pending id must be a packed scope id");
     assert!(
-        vm.host.execution_scope().operations().status(scope_id).is_ok(),
+        vm.host
+            .execution_scope()
+            .operations()
+            .status(scope_id)
+            .is_ok(),
         "the stream operation must be registered in the execution scope"
     );
     assert_eq!(
