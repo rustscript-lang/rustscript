@@ -933,7 +933,12 @@ async fn sse_rejects_status_content_type_and_idle_peer() {
         assert!(read > 0, "SSE request should be received");
         socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
         socket.flush().unwrap();
-        thread::sleep(std::time::Duration::from_millis(80));
+        // Send nothing more and hold the socket open without closing: a close
+        // would let hyper surface a connection-closed error that races and
+        // masks the 20ms idle deadline under worker starvation (the body read
+        // is polled before the idle timer). Holding the connection open leaves
+        // only the idle able to fire, so the assertion is schedule-independent.
+        thread::sleep(std::time::Duration::from_millis(500));
     });
     let mut idle_config = config(port);
     idle_config.stream_idle_timeout = std::time::Duration::from_millis(20);
@@ -957,7 +962,13 @@ async fn sse_rejects_status_content_type_and_idle_peer() {
         let mut request = [0; 1024];
         let read = socket.read(&mut request).unwrap();
         assert!(read > 0, "SSE request should be received");
-        thread::sleep(std::time::Duration::from_millis(80));
+        // Read the request then hold the socket open WITHOUT writing a response
+        // or closing it: a close at 80ms would surface a connection error that
+        // races the 20ms opening idle deadline under worker starvation and,
+        // because the response arm is polled before the idle arm, would mask
+        // the idle timeout. Holding the connection open leaves only the
+        // opening idle able to fire, so the assertion is schedule-independent.
+        thread::sleep(std::time::Duration::from_millis(500));
     });
     let mut opening_config = config(port);
     opening_config.stream_idle_timeout = std::time::Duration::from_millis(20);
@@ -985,8 +996,18 @@ async fn sse_script_timeout_shortens_the_host_stream_duration() {
     let server = thread::spawn(move || {
         let (mut socket, _) = accept_with_timeout(&listener).unwrap();
         let mut request = [0; 1024];
+        // Read the request so the client's request write completes, then hold
+        // the socket open WITHOUT writing a response or closing it. A close
+        // would race the 20ms client budget: under worker starvation the
+        // hyper connection-close error and the elapsed budget are both ready
+        // when the client resumes, and `timeout_at` polls the inner future
+        // first, masking the deadline with a spurious connection-closed error.
+        // Holding the connection open leaves only the budget able to fire, so
+        // the assertion is schedule-independent. The bounded sleep keeps the
+        // accept thread from outliving the test (socket timeouts already
+        // armed by `accept_with_timeout`).
         assert!(socket.read(&mut request).unwrap() > 0);
-        thread::sleep(std::time::Duration::from_millis(80));
+        thread::sleep(std::time::Duration::from_millis(500));
     });
     let mut deadline_config = config(port);
     deadline_config.max_stream_duration = std::time::Duration::from_millis(200);
@@ -1012,8 +1033,12 @@ async fn sse_host_stream_duration_caps_script_timeout_while_opening() {
     let server = thread::spawn(move || {
         let (mut socket, _) = accept_with_timeout(&listener).unwrap();
         let mut request = [0; 1024];
+        // Read the request then hold the socket open without a response or
+        // close (see `sse_script_timeout_shortens_the_host_stream_duration`):
+        // the 20ms host budget must be the only thing able to fire during
+        // opening, never a connection-closed error racing it under starvation.
         assert!(socket.read(&mut request).unwrap() > 0);
-        thread::sleep(std::time::Duration::from_millis(80));
+        thread::sleep(std::time::Duration::from_millis(500));
     });
     let mut deadline_config = config(port);
     deadline_config.max_stream_duration = std::time::Duration::from_millis(20);
