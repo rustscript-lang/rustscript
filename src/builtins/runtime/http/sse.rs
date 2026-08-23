@@ -547,10 +547,16 @@ impl SseWorker {
     /// [`ResponseBudget`](super::request::ResponseBudget)), so a connect
     /// timeout (a distinct error) is never mislabelled as a total deadline.
     ///
+    /// Priority is consistent with the body phase ([`Self::next_frame`]): a
+    /// ready response must win over an elapsed opening idle deadline, so the
+    /// response arm is polled before the idle arm. The hard absolute total is
+    /// enforced inside [`open_stream_response`] independently of this idle
+    /// select, so it always wins.
+    ///
     /// Cancellation is deliberately NOT a branch here: the worker must always
     /// attempt the connection so a peer waiting on `accept()` is not stranded.
     /// A cancel that arrives during opening is consumed at the next checkpoint
-    /// (the body-loop `stopping` check or the publish/next-frame cancel
+    /// (the body-loop `stopping` check or the publish/next_frame cancel
     /// branches), which is race-free because [`Notify`] retains one
     /// notification until it is awaited.
     async fn open_response(
@@ -560,11 +566,6 @@ impl SseWorker {
     ) -> VmResult<(OwnedResponse, url::Url)> {
         tokio::select! {
             biased;
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(opening_idle_deadline)) => {
-                Err(VmError::HostError(
-                    "SSE stream idle timeout while opening response".to_string(),
-                ))
-            }
             opened = open_stream_response(
                 &self.config,
                 &self.request,
@@ -574,32 +575,79 @@ impl SseWorker {
                     deadline_error: SSE_TOTAL_DEADLINE_ERROR,
                 }),
             ) => opened,
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(opening_idle_deadline)) => {
+                Err(VmError::HostError(
+                    "SSE stream idle timeout while opening response".to_string(),
+                ))
+            }
         }
     }
 
     /// Reads one body frame bounded by cancel, the absolute total deadline and
-    /// the current idle deadline. Simultaneous boundary expiry is resolved
-    /// deterministically in favour of the total deadline.
+    /// the current idle deadline, with deterministic priority.
+    ///
+    /// The four boundaries are polled in a fixed order via `select! { biased }`:
+    /// cancellation first (the stream was requested to stop), then the hard
+    /// absolute total deadline (the stream must end no later than this instant),
+    /// then the readiness of a buffered/pending body frame, and finally the idle
+    /// deadline. This ordering is what makes each collision resolve correctly:
+    ///
+    /// - The **total deadline always wins** even when a body frame is already
+    ///   ready at or after the absolute total instant. A frame polled after the
+    ///   total arm fires would otherwise let periodic data extend the stream
+    ///   past its deadline.
+    /// - A **ready frame always wins over an elapsed idle deadline**: the worker
+    ///   thread may resume from starvation with both the idle boundary in the
+    ///   past (the timer would have fired mid-sleep) and a frame already read
+    ///   into hyper's buffer. Polling the frame before the idle timer ensures
+    ///   the buffered data is delivered and the idle clock resets from *actual*
+    ///   frame delivery, instead of emitting a spurious idle timeout.
+    /// - The **idle deadline is the lowest priority**: it only fires when no
+    ///   frame is ready, i.e. the peer genuinely went quiet.
+    ///
+    /// Because total, idle and frame each have their own arm, the timeout
+    /// classification is structurally distinct per arm (no shared `min`
+    /// boundary that must be re-derived). Both boundary instants are passed
+    /// directly to `sleep_until`, which saturates a far-future instant and
+    /// returns `Ready` immediately for an already-expired one, so no panic
+    /// occurs with either an unrepresentably far or a past deadline.
     async fn next_frame(
         &self,
         response: &mut OwnedResponse,
         idle_deadline: Instant,
         deadline: Instant,
     ) -> VmResult<Option<hyper::body::Frame<hyper::body::Bytes>>> {
-        let boundary = deadline.min(idle_deadline);
+        self.read_frame_bounded(idle_deadline, deadline, response.next_frame())
+            .await
+    }
+
+    /// Core body-frame read bounded by cancel, the absolute total deadline and
+    /// the current idle deadline, with the deterministic priority documented on
+    /// [`Self::next_frame`]. The frame source is supplied as a future so the
+    /// priority ordering can be exercised directly in unit tests with
+    /// controllable futures and already-elapsed/far-future `Instant`s — no
+    /// probabilistic sleeps, no dependence on scheduler timing.
+    async fn read_frame_bounded<F>(
+        &self,
+        idle_deadline: Instant,
+        deadline: Instant,
+        frame: F,
+    ) -> VmResult<Option<hyper::body::Frame<hyper::body::Bytes>>>
+    where
+        F: Future<Output = VmResult<Option<hyper::body::Frame<hyper::body::Bytes>>>>,
+    {
         tokio::select! {
             biased;
             _ = self.shared.cancel.notified() => {
                 Err(VmError::HostError("SSE stream cancelled".to_string()))
             }
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(boundary)) => {
-                if deadline <= idle_deadline {
-                    Err(VmError::HostError(SSE_TOTAL_DEADLINE_ERROR.to_string()))
-                } else {
-                    Err(VmError::HostError("SSE stream idle timeout".to_string()))
-                }
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                Err(VmError::HostError(SSE_TOTAL_DEADLINE_ERROR.to_string()))
             }
-            frame = response.next_frame() => frame,
+            frame = frame => frame,
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(idle_deadline)) => {
+                Err(VmError::HostError("SSE stream idle timeout".to_string()))
+            }
         }
     }
 
@@ -1046,8 +1094,11 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker};
 
-    use super::{SSE_CHANNEL_CAPACITY, SseEvent, SseParser, SseShared, SseStreamDriver, VmMap};
-    use crate::vm::{HostStreamAction, HostStreamDriver, HostStreamPoll, Value, VmError};
+    use super::super::request::HttpRequest;
+    use super::{
+        SSE_CHANNEL_CAPACITY, SseEvent, SseParser, SseShared, SseStreamDriver, SseWorker, VmMap,
+    };
+    use crate::vm::{HostStreamAction, HostStreamDriver, HostStreamPoll, Value, VmError, VmResult};
     use tokio::sync::{Notify, mpsc};
 
     fn event(data: &str, event: Option<&str>, id: Option<&str>, retry_ms: Option<i64>) -> SseEvent {
@@ -1088,6 +1139,197 @@ mod tests {
                 .acquire()
                 .expect("test connection permit"),
         }
+    }
+
+    /// A worker whose only live state is the shared cancel `Notify`: enough to
+    /// exercise the deterministic body-frame priority (`read_frame_bounded`)
+    /// without any network I/O. The request/config values are inert — the
+    /// bounded-read path never touches them.
+    fn test_worker() -> Arc<SseWorker> {
+        let (shared, _receiver) = test_shared();
+        Arc::new(SseWorker {
+            config: super::super::HttpConfig::default(),
+            request: HttpRequest {
+                method: hyper::Method::GET,
+                url: url::Url::parse("http://127.0.0.1:1/events").expect("test url"),
+                headers: Vec::new(),
+                body: None,
+            },
+            total_duration: std::time::Duration::from_secs(60),
+            shared,
+            items: Arc::new(AtomicUsize::new(0)),
+            bytes_received: Arc::new(AtomicUsize::new(0)),
+            status: std::sync::Mutex::new(None),
+            headers: std::sync::Mutex::new(None),
+            url: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// A body frame future that resolves to a ready data frame on its first
+    /// poll, mirroring hyper surfacing a frame that was already buffered when
+    /// the worker resumed from starvation.
+    fn ready_frame_future()
+    -> impl std::future::Future<Output = VmResult<Option<hyper::body::Frame<hyper::body::Bytes>>>>
+    + Unpin {
+        std::future::ready(Ok(Some(hyper::body::Frame::data(
+            hyper::body::Bytes::from_static(b"data: tick\n\n"),
+        ))))
+    }
+
+    /// A body frame future that stays pending forever (no data available).
+    fn pending_frame_future()
+    -> impl std::future::Future<Output = VmResult<Option<hyper::body::Frame<hyper::body::Bytes>>>>
+    + Unpin {
+        std::future::pending()
+    }
+
+    /// Deterministic priority regression for the body-frame read: a frame that
+    /// is ready at the same poll as an *elapsed idle deadline* must win — the
+    /// idle timer must never fire ahead of data that is already available
+    /// (the false-idle flake: after worker starvation both the idle boundary
+    /// and a buffered frame may be ready, and the timer must not mask the
+    /// frame). The idle deadline is deliberately in the past (10s ago) so its
+    /// `sleep_until` is ready on the first poll; the total deadline is 10s in
+    /// the future so it can never interfere. No wall-clock sleeps.
+    #[tokio::test(flavor = "current_thread")]
+    async fn body_frame_wins_over_elapsed_idle_deadline() {
+        let worker = test_worker();
+        let now = std::time::Instant::now();
+        let idle_deadline = now - std::time::Duration::from_secs(10);
+        let total_deadline = now + std::time::Duration::from_secs(10);
+        let frame = worker
+            .read_frame_bounded(idle_deadline, total_deadline, ready_frame_future())
+            .await
+            .expect("a ready frame must win over an elapsed idle deadline");
+        let frame = frame.expect("frame must be present");
+        let data = frame.into_data().expect("frame must carry data");
+        assert_eq!(&data[..], b"data: tick\n\n");
+    }
+
+    /// The absolute total deadline must win even when a body frame is already
+    /// ready at/after the total instant: periodic data must never extend the
+    /// stream past its hard cap. Both the total deadline (10s ago) and the
+    /// frame are ready on the first poll; the total arm is polled first.
+    #[tokio::test(flavor = "current_thread")]
+    async fn total_deadline_wins_over_ready_frame_at_or_after_total() {
+        let worker = test_worker();
+        let now = std::time::Instant::now();
+        let idle_deadline = now + std::time::Duration::from_secs(10);
+        let total_deadline = now - std::time::Duration::from_secs(10);
+        let error = worker
+            .read_frame_bounded(idle_deadline, total_deadline, ready_frame_future())
+            .await
+            .expect_err("an elapsed total deadline must win over a ready frame");
+        assert!(
+            matches!(
+                error,
+                VmError::HostError(ref message) if message == super::SSE_TOTAL_DEADLINE_ERROR
+            ),
+            "{error}"
+        );
+    }
+
+    /// When the total deadline, the idle deadline and a ready frame all collide
+    /// on the same poll, the absolute total must win (highest priority after
+    /// cancellation). This is the degenerate starvation case: everything is
+    /// ready at once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn total_deadline_wins_when_total_idle_and_frame_all_ready() {
+        let worker = test_worker();
+        let now = std::time::Instant::now();
+        let idle_deadline = now - std::time::Duration::from_secs(10);
+        let total_deadline = now - std::time::Duration::from_secs(10);
+        let error = worker
+            .read_frame_bounded(idle_deadline, total_deadline, ready_frame_future())
+            .await
+            .expect_err("an elapsed total deadline must win over idle and frame");
+        assert!(
+            matches!(
+                error,
+                VmError::HostError(ref message) if message == super::SSE_TOTAL_DEADLINE_ERROR
+            ),
+            "{error}"
+        );
+    }
+
+    /// With no frame available (the peer is genuinely quiet) and the idle
+    /// deadline elapsed, the idle timeout must fire — the lowest-priority arm
+    /// still works when nothing higher-priority is ready.
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_timeout_fires_when_no_frame_is_ready() {
+        let worker = test_worker();
+        let now = std::time::Instant::now();
+        let idle_deadline = now - std::time::Duration::from_secs(10);
+        let total_deadline = now + std::time::Duration::from_secs(10);
+        let error = worker
+            .read_frame_bounded(idle_deadline, total_deadline, pending_frame_future())
+            .await
+            .expect_err("an elapsed idle deadline with no frame must time out");
+        assert!(
+            matches!(
+                error,
+                VmError::HostError(ref message) if message == "SSE stream idle timeout"
+            ),
+            "{error}"
+        );
+    }
+
+    /// Cancellation is the highest priority: a notified cancel wins over an
+    /// elapsed total, an elapsed idle and a ready frame simultaneously.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_wins_over_total_idle_and_ready_frame() {
+        let worker = test_worker();
+        worker.shared.cancel.notify_one();
+        let now = std::time::Instant::now();
+        let idle_deadline = now - std::time::Duration::from_secs(10);
+        let total_deadline = now - std::time::Duration::from_secs(10);
+        let error = worker
+            .read_frame_bounded(idle_deadline, total_deadline, ready_frame_future())
+            .await
+            .expect_err("cancellation must win over every deadline and frame");
+        assert!(
+            matches!(
+                error,
+                VmError::HostError(ref message) if message == "SSE stream cancelled"
+            ),
+            "{error}"
+        );
+    }
+
+    /// Far-future and expired instants must never panic: `sleep_until`
+    /// saturates an unrepresentably far deadline and immediately reports an
+    /// already-expired one. Exercised here with an extreme pair on the idle
+    /// path (the total stays comfortably future).
+    #[tokio::test(flavor = "current_thread")]
+    async fn extreme_idle_instants_do_not_panic() {
+        let worker = test_worker();
+        let now = std::time::Instant::now();
+        // Far-future idle: no timeout, frame wins.
+        let frame = worker
+            .read_frame_bounded(
+                now + std::time::Duration::from_secs(86400 * 365 * 30),
+                now + std::time::Duration::from_secs(86400 * 365 * 30 + 1),
+                ready_frame_future(),
+            )
+            .await
+            .expect("a far-future idle must not panic or fire");
+        assert!(frame.is_some());
+        // Expired idle: idle timeout fires, no panic.
+        let error = worker
+            .read_frame_bounded(
+                now - std::time::Duration::from_secs(86400 * 365 * 30),
+                now + std::time::Duration::from_secs(10),
+                pending_frame_future(),
+            )
+            .await
+            .expect_err("an extremely expired idle must time out, not panic");
+        assert!(
+            matches!(
+                error,
+                VmError::HostError(ref message) if message == "SSE stream idle timeout"
+            ),
+            "{error}"
+        );
     }
 
     /// A `Wake`-based waker that counts how many times it was woken.
