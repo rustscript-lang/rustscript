@@ -45,6 +45,40 @@ fn encoded_scalar_program() -> (Vec<u8>, u64) {
     )
 }
 
+fn scalar_import_field_offsets(bytes: &[u8]) -> (usize, usize) {
+    let import_name = b"serial::write";
+    let name_offset = bytes
+        .windows(import_name.len())
+        .position(|window| window == import_name)
+        .expect("encoded fixture should contain the host import name");
+    let name_length_offset = name_offset
+        .checked_sub(4)
+        .expect("host import name should have a length prefix");
+    assert_eq!(
+        u32::from_le_bytes(
+            bytes[name_length_offset..name_offset]
+                .try_into()
+                .expect("host import name length should be four bytes"),
+        ),
+        import_name.len() as u32
+    );
+
+    let arity_offset = name_offset + import_name.len();
+    let return_type_offset = arity_offset + 1;
+    assert_eq!(bytes[arity_offset], 1);
+    assert_eq!(bytes[return_type_offset], ValueType::Null as u8);
+    assert_eq!(bytes[return_type_offset + 1], 1);
+    (arity_offset, return_type_offset)
+}
+
+fn assert_invalid_host_import_schema(bytes: &[u8]) {
+    let error = decode_program(bytes).expect_err("malformed host import schema must be rejected");
+    assert!(
+        matches!(error, WireError::InvalidHostImportSchema(_)),
+        "expected typed InvalidHostImportSchema, got {error:?}"
+    );
+}
+
 #[test]
 fn embedded_decoder_reads_host_generated_v13() {
     let (bytes, fingerprint) = encoded_scalar_program();
@@ -187,6 +221,28 @@ fn embedded_decoder_rejects_invalid_magic() {
         decode_program(&bytes),
         Err(WireError::InvalidMagic(_))
     ));
+}
+
+#[test]
+fn embedded_decoder_rejects_malformed_host_import_arity() {
+    let (mut bytes, _) = encoded_scalar_program();
+    let (arity_offset, _) = scalar_import_field_offsets(&bytes);
+
+    // The std encoder rejects this inconsistency before serialization. Mutating
+    // a valid V13 payload exercises the no_std decoder's wire-level check.
+    bytes[arity_offset] = 2;
+    assert_invalid_host_import_schema(&bytes);
+}
+
+#[test]
+fn embedded_decoder_rejects_malformed_host_import_coarse_return_type() {
+    let (mut bytes, _) = encoded_scalar_program();
+    let (_, return_type_offset) = scalar_import_field_offsets(&bytes);
+
+    // Keep the exact schema's `null` return and mutate only the coarse wire
+    // type, producing a malformed V13 import that the decoder must reject.
+    bytes[return_type_offset] = ValueType::Int as u8;
+    assert_invalid_host_import_schema(&bytes);
 }
 
 #[test]

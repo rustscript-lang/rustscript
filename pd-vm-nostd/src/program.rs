@@ -96,7 +96,14 @@ pub struct ExportedCallable {
 pub struct ResourceTypeKey(String);
 
 impl ResourceTypeKey {
-    pub(crate) fn from_wire(name: String) -> Option<Self> {
+    /// Reconstructs a resource type key from its wire (VMBC) representation.
+    ///
+    /// The canonical source of a key is a decoded `HostImportSchema`; embedders
+    /// that build exact bindings from a decoded program should clone that
+    /// schema instead. This constructor exists so a key read from the wire (or
+    /// a test fixture) can be compared or carried into a binding; it validates
+    /// the same constraints the decoder enforces.
+    pub fn from_wire(name: String) -> Option<Self> {
         if name.is_empty()
             || name.len() > 128
             || name.split('.').any(str::is_empty)
@@ -179,7 +186,14 @@ pub enum HostParamPassing {
 pub struct HostApiFingerprint(u64);
 
 impl HostApiFingerprint {
-    pub(crate) const fn from_wire(value: u64) -> Self {
+    /// Reconstructs the fingerprint from its wire (VMBC) representation.
+    ///
+    /// The canonical source of a fingerprint is a decoded `HostImportSchema`;
+    /// embedders that build exact bindings from a decoded program should clone
+    /// that schema instead of constructing a raw fingerprint. This constructor
+    /// exists so a fingerprint read from the wire (or a test fixture) can be
+    /// compared or carried into a binding.
+    pub const fn from_wire(value: u64) -> Self {
         Self(value)
     }
 

@@ -15,7 +15,7 @@ mod value;
 mod vm;
 mod vmbc;
 
-pub use error::{VmError, WireError};
+pub use error::{HostImportBindingError, VmError, WireError};
 pub use host::{HostBinding, HostDispatcher, HostError, HostFunction};
 pub use program::{
     CallablePrototype, CallableTarget, CaptureBindingMode, ExportedCallable, FunctionRegion,

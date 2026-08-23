@@ -2,6 +2,8 @@ use core::fmt;
 
 use alloc::string::String;
 
+use super::ValueType;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmError {
     StackUnderflow,
@@ -31,6 +33,8 @@ pub enum VmError {
     HostCallsUnavailable(u16),
     HostError(&'static str),
     HostBindingCapacity,
+    /// An exact-schema host import failed to bind to a registered binding.
+    HostImportBinding(HostImportBindingError),
     InvalidOpcode(u8),
     BytecodeBounds,
     InvalidJump(u32),
@@ -39,6 +43,43 @@ pub enum VmError {
         needed: u64,
         remaining: u64,
     },
+}
+
+/// Structured bind-time failures for exact-schema host imports.
+///
+/// A `HostImport` carrying `Some(schema)` can only resolve to a
+/// [`super::HostBinding`] whose exact schema (parameter labels, type schemas,
+/// passing modes, return schema) and catalog fingerprint are identical; there
+/// is intentionally no name-only fallback. Schema-less (`None`) imports bind
+/// by name and arity and never surface the exact-binding errors, but they
+/// still reject duplicate registrations through [`Self::Duplicate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostImportBindingError {
+    /// The program import carries an exact schema for which no registered
+    /// binding has an identical schema and fingerprint.
+    MissingExact { import: String },
+    /// The import's coarse return type disagrees with the exact schema's
+    /// coarse return type at bind time.
+    ReturnTypeMismatch {
+        import: String,
+        expected: ValueType,
+        got: ValueType,
+    },
+    /// More than one registered binding satisfies an import (identical name
+    /// and, for exact imports, identical schema). The embedder must register a
+    /// single binding per exact key instead of relying on registration order.
+    Duplicate { import: String },
+    /// An exact [`super::HostBinding`] was constructed with an `arity` that
+    /// does not equal its schema's parameter count.
+    SchemaArityMismatch {
+        import: String,
+        expected: u8,
+        got: u8,
+    },
+    /// The exact schema cannot be supported: its parameter count exceeds the
+    /// `u8` arity that a `HostImport` can address, or the schema is otherwise
+    /// structurally invalid.
+    InvalidSchema { import: String, reason: String },
 }
 
 impl fmt::Display for VmError {
@@ -84,12 +125,47 @@ impl fmt::Display for VmError {
             }
             Self::HostError(message) => write!(f, "host error: {message}"),
             Self::HostBindingCapacity => f.write_str("host binding table is too large"),
+            Self::HostImportBinding(error) => write!(f, "host import binding error: {error}"),
             Self::InvalidOpcode(opcode) => write!(f, "invalid opcode: {opcode:#04x}"),
             Self::BytecodeBounds => f.write_str("bytecode operand is out of bounds"),
             Self::InvalidJump(target) => write!(f, "invalid jump target: {target}"),
             Self::FuelOverflow => f.write_str("fuel arithmetic overflow"),
             Self::OutOfFuel { needed, remaining } => {
                 write!(f, "out of fuel: needed {needed}, remaining {remaining}")
+            }
+        }
+    }
+}
+
+impl fmt::Display for HostImportBindingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingExact { import } => write!(
+                f,
+                "host import '{import}' has no exact binding matching its import schema"
+            ),
+            Self::ReturnTypeMismatch {
+                import,
+                expected,
+                got,
+            } => write!(
+                f,
+                "exact host binding '{import}' return schema mismatch: expected {expected:?}, got {got:?}"
+            ),
+            Self::Duplicate { import } => write!(
+                f,
+                "host import '{import}' matches more than one registered binding; register a single binding per exact key"
+            ),
+            Self::SchemaArityMismatch {
+                import,
+                expected,
+                got,
+            } => write!(
+                f,
+                "exact host binding '{import}' arity {got} does not match its schema parameter count {expected}"
+            ),
+            Self::InvalidSchema { import, reason } => {
+                write!(f, "invalid exact host schema for '{import}': {reason}")
             }
         }
     }
