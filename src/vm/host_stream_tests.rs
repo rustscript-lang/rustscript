@@ -925,6 +925,200 @@ fn reset_and_shutdown_release_a_waiting_stream_driver() {
     assert!(shutdown_vm.waiting_host_op_id().is_none());
 }
 
+/// Every terminal stream path must leave *zero* entries in the VM's
+/// `stream_drivers` map and *zero* occupied slots in the execution-scope
+/// operation registry: the producer is released exactly once through the
+/// registered operation driver and neither the map nor the scope retains a
+/// stale entry.
+#[test]
+fn terminal_paths_leave_zero_map_and_scope_entries() {
+    // (a) Normal producer completion (the producer itself signals EOF).
+    let (mut complete_vm, ..) = setup(
+        r#"
+        fn synthetic_stream(callback: fn(map) -> map) -> map;
+        synthetic_stream(|item| item);
+    "#,
+    );
+    assert!(matches!(complete_vm.run().unwrap(), VmStatus::Waiting(_)));
+    while matches!(poll_once(&mut complete_vm), Poll::Pending) {
+        assert!(matches!(complete_vm.run().unwrap(), VmStatus::Waiting(_)));
+    }
+    assert_eq!(complete_vm.run().unwrap(), VmStatus::Halted);
+    assert!(
+        complete_vm.host.stream_drivers.is_empty(),
+        "normal completion must clear the stream driver map"
+    );
+    assert_eq!(
+        complete_vm.host.execution_scope().operations().len(),
+        0,
+        "normal completion must release the scope operation"
+    );
+
+    // (b) Callback-driven completion (the callback returns a stop action).
+    let (mut callback_vm, ..) = setup(
+        r#"
+        fn synthetic_stream(callback: fn(map) -> map) -> map;
+        synthetic_stream(|_item| { action: "stop" });
+    "#,
+    );
+    assert!(matches!(callback_vm.run().unwrap(), VmStatus::Waiting(_)));
+    assert!(matches!(poll_once(&mut callback_vm), Poll::Ready(Ok(()))));
+    assert_eq!(callback_vm.run().unwrap(), VmStatus::Halted);
+    assert!(
+        callback_vm.host.stream_drivers.is_empty(),
+        "callback completion must clear the stream driver map"
+    );
+    assert_eq!(
+        callback_vm.host.execution_scope().operations().len(),
+        0,
+        "callback completion must release the scope operation"
+    );
+
+    // (c) Producer error aborts the stream.
+    let (mut error_vm, ..) = setup(
+        r#"
+        fn synthetic_error(callback: fn(map) -> map) -> map;
+        synthetic_error(|item| item);
+    "#,
+    );
+    assert!(matches!(error_vm.run().unwrap(), VmStatus::Waiting(_)));
+    assert!(matches!(poll_once(&mut error_vm), Poll::Ready(Err(_))));
+    assert!(
+        error_vm.host.stream_drivers.is_empty(),
+        "producer error must clear the stream driver map"
+    );
+    assert_eq!(
+        error_vm.host.execution_scope().operations().len(),
+        0,
+        "producer error must release the scope operation"
+    );
+
+    // (d) Explicit cancellation while waiting for the first producer item.
+    let (mut cancel_vm, ..) = setup(
+        r#"
+        fn synthetic_stream(callback: fn(map) -> map) -> map;
+        synthetic_stream(|item| item);
+    "#,
+    );
+    assert!(matches!(cancel_vm.run().unwrap(), VmStatus::Waiting(_)));
+    cancel_vm.cancel_waiting_host_op();
+    assert!(
+        cancel_vm.host.stream_drivers.is_empty(),
+        "explicit cancellation must clear the stream driver map"
+    );
+    assert_eq!(
+        cancel_vm.host.execution_scope().operations().len(),
+        0,
+        "explicit cancellation must release the scope operation"
+    );
+    assert!(cancel_vm.waiting_host_op_id().is_none());
+}
+
+/// Producer release is exactly-once across every terminal path: the
+/// operation driver is the sole release owner, so the drop counter is 1 (not
+/// 0, not 2) after normal completion, callback completion, producer error,
+/// explicit cancellation, reset, and shutdown.
+#[test]
+fn producer_is_dropped_exactly_once_across_every_terminal_path() {
+    fn run_to_halted(vm: &mut Vm) {
+        assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+        while matches!(poll_once(vm), Poll::Pending) {
+            assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+        }
+        assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    }
+
+    fn run_to_callback_halted(vm: &mut Vm) {
+        assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+        assert!(matches!(poll_once(vm), Poll::Ready(Ok(()))));
+        assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    }
+
+    fn run_to_producer_error(vm: &mut Vm) {
+        assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+        assert!(matches!(poll_once(vm), Poll::Ready(Err(_))));
+    }
+
+    fn run_to_waiting_then_cancel(vm: &mut Vm) {
+        assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+        vm.cancel_waiting_host_op();
+    }
+
+    fn run_to_waiting_then_reset(vm: &mut Vm) {
+        assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+        vm.reset_for_reuse();
+    }
+
+    fn run_to_waiting_then_shutdown(vm: &mut Vm) {
+        assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+        vm.shutdown();
+    }
+
+    let paths: &[(&str, &str, fn(&mut Vm))] = &[
+        (
+            "normal completion",
+            r#"
+                fn synthetic_stream(callback: fn(map) -> map) -> map;
+                synthetic_stream(|item| item);
+            "#,
+            run_to_halted,
+        ),
+        (
+            "callback completion",
+            r#"
+                fn synthetic_stream(callback: fn(map) -> map) -> map;
+                synthetic_stream(|_item| { action: "stop" });
+            "#,
+            run_to_callback_halted,
+        ),
+        (
+            "producer error",
+            r#"
+                fn synthetic_error(callback: fn(map) -> map) -> map;
+                synthetic_error(|item| item);
+            "#,
+            run_to_producer_error,
+        ),
+        (
+            "explicit cancellation",
+            r#"
+                fn synthetic_stream(callback: fn(map) -> map) -> map;
+                synthetic_stream(|item| item);
+            "#,
+            run_to_waiting_then_cancel,
+        ),
+        (
+            "reset",
+            r#"
+                fn synthetic_stream(callback: fn(map) -> map) -> map;
+                synthetic_stream(|item| item);
+            "#,
+            run_to_waiting_then_reset,
+        ),
+        (
+            "shutdown",
+            r#"
+                fn synthetic_stream(callback: fn(map) -> map) -> map;
+                synthetic_stream(|item| item);
+            "#,
+            run_to_waiting_then_shutdown,
+        ),
+    ];
+    for (label, source, terminal) in paths {
+        let (mut vm, _, _, stopped) = setup(source);
+        terminal(&mut vm);
+        assert_eq!(
+            stopped.load(Ordering::SeqCst),
+            1,
+            "{label}: producer must be dropped exactly once"
+        );
+        assert!(
+            vm.host.stream_drivers.is_empty(),
+            "{label}: stream driver map must be empty"
+        );
+    }
+}
+
 fn enter_callback_wait(vm: &mut Vm) {
     assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
     assert!(matches!(poll_once(vm), Poll::Ready(Ok(()))));

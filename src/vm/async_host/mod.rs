@@ -271,9 +271,7 @@ impl Vm {
         let scope_reason = scope_reason(reason);
         // Every production pending host operation is a real execution-scope
         // operation with a packed id; cancel it through its own driver with
-        // the parallel operation-cancellation vocabulary. A manually-fabricated
-        // wait id (test-only) has no scope entry to cancel in the single modern
-        // lifecycle.
+        // the parallel operation-cancellation vocabulary.
         if let Ok(scope_id) = crate::vm::operation::OperationId::from_raw(waiting.op_id) {
             let _ = self
                 .host
@@ -299,10 +297,21 @@ impl Vm {
         }
         // Every production pending host operation is a real execution-scope
         // operation with a packed id: external completion cancels its driver so
-        // its bridge work stops exactly once. If the id is not a registered
-        // scope operation (a manually-fabricated wait in tests), there is no
-        // external work to cancel in the single modern lifecycle.
-        if let Ok(scope_id) = crate::vm::operation::OperationId::from_raw(op_id)
+        // its bridge work stops exactly once. A legacy host-callable `Pending`
+        // id (a plain host function returning `CallOutcome::Pending`) is a
+        // distinct by-name contract that carries no scope driver to cancel; an
+        // invalid packed id is rejected with a typed error, and a stale/unset
+        // driver is simply skipped (nothing to cancel). No fabricated lifecycle
+        // is created here.
+        let scope_id = match crate::vm::operation::OperationId::from_raw(op_id) {
+            Ok(scope_id) => Some(scope_id),
+            Err(_) => {
+                // A non-packed (legacy host-callable) id carries no scope
+                // driver; complete the waiting state directly below.
+                return self.complete_waiting_host_op(op_id, values.into());
+            }
+        };
+        if let Some(scope_id) = scope_id
             && self
                 .host
                 .execution_scope()

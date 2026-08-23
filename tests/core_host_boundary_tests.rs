@@ -574,6 +574,41 @@ fn vm_core_never_calls_builtin_composition_installer() {
     }
 }
 
+/// The host-agnostic VM core must not construct or own the *default* registry
+/// composition. Default-standard-builtin registry construction and its
+/// memoized template live in the outer builtin/runtime layer
+/// (`builtins::runtime`), exposed through an explicit factory. The core's
+/// primitive constructor is `HostFunctionRegistry::empty()`; `new()` /
+/// `Default` / `restricted()` (the standard-composed compatibility surface)
+/// physically live in the builtin layer. Therefore `src/vm` must never call
+/// `register_default_host_functions` (the generated builtin registrar) nor
+/// own a builtin-composed process-global `DEFAULT_REGISTRY` template.
+#[test]
+fn vm_core_never_constructs_builtin_composed_default_registry() {
+    let sources = scanned_core();
+    assert!(
+        !sources.is_empty(),
+        "the core boundary scan must find production sources"
+    );
+    for (path, code) in &sources {
+        assert!(
+            !contains_token(code, "register_default_host_functions"),
+            "{} must not invoke the generated builtin registrar \\\n             `register_default_host_functions`; default standards registry \\\n             construction belongs in the builtin composition layer",
+            path.display(),
+        );
+        assert!(
+            !contains_substring(code, "OnceLock<HostFunctionRegistry>"),
+            "{} must not own a process-global standard registry template",
+            path.display(),
+        );
+        assert!(
+            !contains_substring(code, "DEFAULT_REGISTRY"),
+            "{} must not own a builtin-composed DEFAULT_REGISTRY global",
+            path.display(),
+        );
+    }
+}
+
 /// The host-agnostic VM core must not allocate small external operation ids from
 /// a separate per-VM counter. Every production pending host operation lives in
 /// the current `ExecutionScope` operation registry and uses its packed raw

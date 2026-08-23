@@ -439,7 +439,15 @@ impl HostAsyncBridge for BrowserAsyncBridge {
                 "unknown browser async op {op_id}"
             ))));
         };
-        Pin::new(future).poll(cx)
+        let polled = Pin::new(future).poll(cx);
+        // Release the completed future the moment its poll returns `Ready`
+        // (success or failure): the entry is retained only while `Pending`, so
+        // repeated sequential operations never accumulate completed futures in
+        // the bridge map.
+        if polled.is_ready() {
+            state.futures.remove(&op_id);
+        }
+        polled
     }
 
     fn cancel_op_with_reason(&mut self, op_id: HostOpId, _reason: CancellationReason) {
@@ -1561,9 +1569,18 @@ fn push_output_line(lines: &Arc<Mutex<Vec<String>>>, rendered: String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{FuelState, RunReport, vm_error_info};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+
+    use super::{
+        BrowserAsyncBridge, BrowserAsyncState, FuelState, RunReport, noop_waker, vm_error_info,
+    };
     use vm::operation::{OperationError, OperationErrorCode};
     use vm::resource::{ResourceError, ResourceErrorCode};
+    use vm::{
+        CallReturn, CancellationReason, HostAsyncBridge, HostFuture, HostFutureOutput, HostOpId,
+        Value,
+    };
     use vm::{RuntimeError, RuntimeErrorCode, VmError};
 
     fn fuel() -> FuelState {
@@ -1682,6 +1699,82 @@ mod tests {
                 .as_ref()
                 .map(|details| details.message.as_str()),
             Some("runtime error with user-facing wording")
+        );
+    }
+
+    /// The browser async bridge must release a completed future the moment its
+    /// poll returns `Ready` (success or failure), retaining it only while
+    /// `Pending`. Repeated sequential sleeps therefore return the bridge futures
+    /// map to zero after each completion instead of accumulating leaked entries.
+    #[test]
+    fn browser_async_bridge_releases_completed_futures_instead_of_leaking() {
+        let state = Arc::new(Mutex::new(BrowserAsyncState::default()));
+        let mut bridge = BrowserAsyncBridge::new(Arc::clone(&state));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // A future that resolves Ready immediately on the first poll.
+        let ready_future: HostFuture = Box::pin(std::future::ready(Ok(
+            HostFutureOutput::returning(CallReturn::one(Value::Bool(true))),
+        )));
+        let op_id: HostOpId = 1;
+        bridge.submit_op(op_id, ready_future).expect("submit");
+        assert_eq!(
+            state.lock().expect("lock").futures.len(),
+            1,
+            "pending future is retained"
+        );
+        match bridge.poll_submitted_op(op_id, &mut cx) {
+            Poll::Ready(Ok(_)) => {}
+            _ => panic!("expected ready success from the submitted future"),
+        }
+        assert_eq!(
+            state.lock().expect("lock").futures.len(),
+            0,
+            "a completed future must be removed from the bridge map"
+        );
+        // The id is now stale: a subsequent poll reports an unknown op rather
+        // than re-polling a retained completed future.
+        assert!(
+            bridge.poll_submitted_op(op_id, &mut cx).is_ready(),
+            "a removed op id must immediately resolve as ready/error"
+        );
+
+        // Multiple sequential sleeps each return the map to zero after their
+        // completion; no completed entry accumulates across sleeps.
+        for id in [2u64, 3, 4, 5] {
+            let future: HostFuture = Box::pin(std::future::ready(Ok(HostFutureOutput::returning(
+                CallReturn::one(Value::Bool(true)),
+            ))));
+            bridge.submit_op(id, future).expect("submit");
+            assert_eq!(state.lock().expect("lock").futures.len(), 1);
+            assert!(
+                bridge.poll_submitted_op(id, &mut cx).is_ready(),
+                "ready future completes on first poll"
+            );
+            assert_eq!(
+                state.lock().expect("lock").futures.len(),
+                0,
+                "map returns to zero after each completion"
+            );
+        }
+    }
+
+    /// Cancellation also removes the bridge future entry, so the map stays
+    /// drained once the operation is cancelled.
+    #[test]
+    fn browser_async_bridge_cancellation_removes_future_entry() {
+        let state = Arc::new(Mutex::new(BrowserAsyncState::default()));
+        let mut bridge = BrowserAsyncBridge::new(Arc::clone(&state));
+        let op_id: HostOpId = 42;
+        let future: HostFuture = Box::pin(std::future::pending());
+        bridge.submit_op(op_id, future).expect("submit");
+        assert_eq!(state.lock().expect("lock").futures.len(), 1);
+        bridge.cancel_op_with_reason(op_id, CancellationReason::Requested);
+        assert_eq!(
+            state.lock().expect("lock").futures.len(),
+            0,
+            "cancellation must remove the future entry"
         );
     }
 }

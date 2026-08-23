@@ -1019,7 +1019,12 @@ impl Vm {
         &mut self,
         composition: std::sync::Arc<dyn StandardSurfaceComposition>,
     ) {
+        // Changing the VM's composition is a resolved-binding mutation: mark
+        // the resolved-call cache dirty so the next `ensure_call_bindings`
+        // re-resolves under the new composition with deterministic semantics
+        // rather than reusing a resolution made under a previous strategy.
         self.host.standard_composition = Some(composition);
+        self.host.resolved_calls_dirty = true;
     }
 
     /// Installs a [`HostExtension`] into this VM through its standard

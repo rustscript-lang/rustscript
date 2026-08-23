@@ -4,7 +4,9 @@ use std::sync::{Arc, OnceLock};
 
 use crate::builtins::BuiltinFunction;
 use crate::host_api::{HostApiCatalog, HostApiFingerprint};
-use crate::vm::{CallOutcome, CallReturn, HostFunctionRegistry, HostOpId, Value, Vm, VmResult};
+use crate::vm::{
+    CallOutcome, CallReturn, CapabilityProfile, HostFunctionRegistry, HostOpId, Value, Vm, VmResult,
+};
 
 mod aot;
 mod bytes;
@@ -184,6 +186,63 @@ pub(crate) fn standard_host_registry() -> VmResult<HostFunctionRegistry> {
     #[cfg(feature = "sqlite")]
     register_sqlite_builtin_module(&mut registry)?;
     Ok(registry)
+}
+
+// ---------------------------------------------------------------------------
+// Default-standard registry construction (host-agnostic core boundary)
+// ---------------------------------------------------------------------------
+//
+// The VM core's primitive constructor is `HostFunctionRegistry::empty()`. The
+// *standard-composed* compatibility surface (`new()`, `Default`,
+// `restricted()`) physically lives here in the outer builtin/runtime layer,
+// because building it requires the generated builtin registrar
+// (`register_default_host_functions`) and each public call must start from a
+// memoized immutable default template rather than a process-global owned by
+// the core. Rust permits inherent impl blocks for a type to be written in any
+// module of the same crate, so the public call shape is preserved unchanged.
+
+/// The memoized immutable default-standard registry template, built once per
+/// process by this outer builtin layer. Every `HostFunctionRegistry::new()` /
+/// `Default` call derives a fresh isolated registry origin from it. The VM
+/// core never owns this template.
+static DEFAULT_REGISTRY: OnceLock<HostFunctionRegistry> = OnceLock::new();
+
+/// Builds (or returns the memoized) immutable default-standard registry
+/// template, then hands back a fresh per-instance registry origin.
+fn default_host_registry() -> HostFunctionRegistry {
+    DEFAULT_REGISTRY
+        .get_or_init(|| {
+            let mut registry = HostFunctionRegistry::empty();
+            register_default_host_functions(&mut registry);
+            registry
+        })
+        .fresh_origin_clone()
+}
+
+impl HostFunctionRegistry {
+    /// Returns the standard host registry with every registered default host
+    /// function present (standard surfaces composed under the callable
+    /// catalog).
+    ///
+    /// This constructor is implemented in the outer builtin/runtime layer: the
+    /// host-agnostic VM core keeps only [`HostFunctionRegistry::empty`].
+    pub fn new() -> Self {
+        default_host_registry()
+    }
+
+    /// Returns the standard host registry with every registered host function
+    /// present but requiring an explicit capability grant before execution.
+    pub fn restricted() -> Self {
+        let mut registry = Self::new();
+        registry.set_capability_profile(CapabilityProfile::deny_all());
+        registry
+    }
+}
+
+impl Default for HostFunctionRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub use typed::HostCallResult;

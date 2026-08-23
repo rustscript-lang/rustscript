@@ -114,10 +114,8 @@ impl Vm {
         // driver.
         let slot: Arc<std::sync::Mutex<Option<Box<dyn HostStreamDriver>>>> =
             Arc::new(std::sync::Mutex::new(Some(Box::new(driver))));
-        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let scope_op = StreamScopeOperation {
             slot: Arc::clone(&slot),
-            cancelled: Arc::clone(&cancelled),
         };
         let scope_id = self
             .host
@@ -175,22 +173,7 @@ impl Vm {
 
     pub(crate) fn cancel_callable_stream(&mut self) {
         if let Some(stream) = self.instance.host_stream.take() {
-            if let Some(slot) = self.host.stream_drivers.remove(&stream.op_id)
-                && let Ok(mut guard) = slot.lock()
-            {
-                // Release the producer through the operation driver path: taking
-                // the driver out of the shared slot drops it (producer cleanup).
-                guard.take();
-            }
-            let _ = self.host.execution_scope_abort_operation(
-                crate::vm::operation::OperationId::from_raw(stream.op_id)
-                    .expect("callable stream op id is a packed scope id"),
-                crate::vm::operation::OperationCancelReason::Requested,
-            );
-            if let Some(item) = stream.item {
-                self.drop_value_with_contract(item);
-            }
-            self.drop_value_with_contract(stream.callback);
+            self.retire_callable_stream(stream);
         }
     }
 
@@ -393,21 +376,7 @@ impl Vm {
         let Some(stream) = self.instance.host_stream.take() else {
             return;
         };
-        if let Some(slot) = self.host.stream_drivers.remove(&stream.op_id)
-            && let Ok(mut guard) = slot.lock()
-        {
-            guard.take();
-        }
-        let _ = self.host.execution_scope_abort_operation(
-            crate::vm::operation::OperationId::from_raw(stream.op_id)
-                .expect("callable stream op id is a packed scope id"),
-            crate::vm::operation::OperationCancelReason::Requested,
-        );
-        self.instance.waiting_host_op = None;
-        self.drop_value_with_contract(stream.callback);
-        if let Some(item) = stream.item {
-            self.drop_value_with_contract(item);
-        }
+        self.retire_callable_stream(stream);
         self.instance.stack.push(summary);
     }
 
@@ -415,18 +384,29 @@ impl Vm {
         let Some(stream) = self.instance.host_stream.take() else {
             return;
         };
-        if let Some(slot) = self.host.stream_drivers.remove(&stream.op_id)
-            && let Ok(mut guard) = slot.lock()
-        {
-            guard.take();
-        }
+        let parent_stack_base = stream.parent_stack_base;
+        let parent_frame_count = stream.parent_frame_count;
+        self.retire_callable_stream(stream);
+        self.abort_host_invocation(parent_stack_base, parent_frame_count);
+    }
+
+    /// Central terminal teardown for a callable stream.
+    ///
+    /// The registered `StreamScopeOperation` is the *sole* producer-release
+    /// owner: aborting the scope operation first cancels the operation driver,
+    /// which takes (drops) the producer out of the shared slot exactly once.
+    /// The VM then removes only its own `stream_drivers` map reference and
+    /// clears the waiting/continuation state. Every terminal path (finish,
+    /// abort, explicit cancel) funnels through this helper so producer release
+    /// is never duplicated in a parallel VM-side path.
+    fn retire_callable_stream(&mut self, stream: HostStreamContinuation) {
         let _ = self.host.execution_scope_abort_operation(
             crate::vm::operation::OperationId::from_raw(stream.op_id)
                 .expect("callable stream op id is a packed scope id"),
             crate::vm::operation::OperationCancelReason::Requested,
         );
+        self.host.stream_drivers.remove(&stream.op_id);
         self.instance.waiting_host_op = None;
-        self.abort_host_invocation(stream.parent_stack_base, stream.parent_frame_count);
         self.drop_value_with_contract(stream.callback);
         if let Some(item) = stream.item {
             self.drop_value_with_contract(item);
@@ -445,33 +425,29 @@ impl Vm {
 /// (the operation is released explicitly by the VM on stream finish/cancel/
 /// abort), and `cancel` takes (drops) the producer driver out of the shared
 /// slot so the producer resource is released exactly once through the
-/// operation driver.
+/// operation driver — the *sole* release owner. The VM's terminal paths abort
+/// this operation first (releasing the producer here) and only then remove
+/// their own map reference; no parallel VM-side path drops the driver.
 struct StreamScopeOperation {
     slot: std::sync::Arc<std::sync::Mutex<Option<Box<dyn HostStreamDriver>>>>,
-    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl crate::vm::operation::HostOperation for StreamScopeOperation {
     fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<crate::vm::operation::OperationResult<()>> {
-        if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
-            Poll::Ready(Err(crate::vm::operation::OperationError::new(
-                crate::vm::operation::OperationErrorCode::OperationDriverFailed,
-                "vm::stream",
-                "callable stream was cancelled",
-            )))
-        } else {
-            Poll::Pending
-        }
+        // The VM never polls the producer through this operation: it polls the
+        // shared driver slot directly. The operation is released explicitly by
+        // the VM (finish/cancel/abort) or by scope shutdown, so poll stays
+        // pending until the terminal path consumes the slot.
+        Poll::Pending
     }
 
     fn cancel(
         &mut self,
         _reason: crate::vm::operation::OperationCancelReason,
     ) -> crate::vm::operation::OperationResult<()> {
-        self.cancelled
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        // Release the producer driver now: dropping it releases producer
-        // resources without requiring another poll.
+        // Release the producer driver now — the sole producer-release owner:
+        // dropping it releases producer resources without requiring another
+        // poll. The VM removes only its map reference afterward.
         if let Ok(mut guard) = self.slot.lock() {
             guard.take();
         }

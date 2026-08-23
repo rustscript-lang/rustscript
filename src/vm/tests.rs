@@ -11,6 +11,26 @@ fn native_cache_test_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// A host async bridge that accepts submitted futures and never completes
+/// them: used to register real execution-scope operations in tests that
+/// exercise the wait/complete contract without a fabricated pending id.
+struct NoopPendingBridge;
+
+impl HostAsyncBridge for NoopPendingBridge {
+    fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
+        let _ = (op_id, future);
+        Ok(())
+    }
+
+    fn poll_op(
+        &mut self,
+        _op_id: HostOpId,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<VmResult<CallReturn>> {
+        std::task::Poll::Pending
+    }
+}
+
 #[test]
 fn vm_try_new_preserves_operation_registry_tag_exhaustion() {
     static COUNTER: std::sync::atomic::AtomicU64 =
@@ -1492,8 +1512,11 @@ fn aot_host_callable_value_waits_and_resumes_without_interpreter_boundary() {
     struct PendingAotHost;
 
     impl HostFunction for PendingAotHost {
-        fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
-            Ok(CallOutcome::Pending(812))
+        fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+            // A real execution-scope operation (bridge-submitted future)
+            // rather than a fabricated id: every production pending host
+            // operation lives in the scope registry.
+            vm.submit_host_future(Box::pin(std::future::pending()))
         }
     }
 
@@ -1507,14 +1530,17 @@ fn aot_host_callable_value_waits_and_resumes_without_interpreter_boundary() {
     .expect("host callable source should compile");
     let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
         .expect("test VM construction must not fail");
+    vm.set_async_bridge(Box::new(NoopPendingBridge));
     vm.register_function(Box::new(PendingAotHost));
     vm.compile_aot().expect("aot compilation should succeed");
-    assert_eq!(
-        vm.run().expect("pending host callable should wait"),
-        VmStatus::Waiting(812)
-    );
+    let VmStatus::Waiting(op_id) = vm
+        .run()
+        .expect("pending host callable should wait through the scope registry")
+    else {
+        panic!("pending host callable should wait");
+    };
     assert!(!vm.engine.aot_interpreter_boundary_hit);
-    vm.complete_host_op(812, vec![Value::Int(42)])
+    vm.complete_host_op(op_id, vec![Value::Int(42)])
         .expect("host operation should complete");
     assert_eq!(
         vm.resume().expect("aot host callable should resume"),
@@ -1845,8 +1871,11 @@ fn typed_script_callback_can_wait_resume_and_return_to_host() {
     struct PendingCallbackHost;
 
     impl HostFunction for PendingCallbackHost {
-        fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
-            Ok(CallOutcome::Pending(811))
+        fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+            // A real execution-scope operation (bridge-submitted future)
+            // rather than a fabricated id: every production pending host
+            // operation lives in the scope registry.
+            vm.submit_host_future(Box::pin(std::future::pending()))
         }
     }
 
@@ -1863,6 +1892,7 @@ fn typed_script_callback_can_wait_resume_and_return_to_host() {
     .expect("callback source should compile");
     let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
         .expect("test VM construction must not fail");
+    vm.set_async_bridge(Box::new(NoopPendingBridge));
     vm.register_function(Box::new(PendingCallbackHost));
     assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
     let callable = vm.stack().last().cloned().expect("callable result");
@@ -1871,16 +1901,16 @@ fn typed_script_callback_can_wait_resume_and_return_to_host() {
         .script_callback(callable)
         .expect("typed callback should bind");
 
-    assert_eq!(
-        callback
-            .start(&mut store, ())
-            .expect("callback should start"),
-        VmStatus::Waiting(811)
-    );
+    let VmStatus::Waiting(op_id) = callback
+        .start(&mut store, ())
+        .expect("callback should start through the scope registry")
+    else {
+        panic!("callback should wait on a real scope operation");
+    };
     assert_eq!(store.vm().call_depth(), 1);
     store
         .vm_mut()
-        .complete_host_op(811, Vec::new())
+        .complete_host_op(op_id, Vec::new())
         .expect("host completion should succeed");
     assert_eq!(
         store.resume().expect("callback should resume"),

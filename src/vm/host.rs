@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 
 use crate::builtins::BuiltinFunction;
 use crate::host_api::HostApiFingerprint;
@@ -706,12 +706,6 @@ impl RegistryTransaction {
     }
 }
 
-impl Default for HostFunctionRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl HostFunctionRegistry {
     pub fn empty() -> Self {
         Self {
@@ -733,37 +727,19 @@ impl HostFunctionRegistry {
         }
     }
 
-    pub fn new() -> Self {
-        static DEFAULT_REGISTRY: OnceLock<HostFunctionRegistry> = OnceLock::new();
-
-        let mut registry = DEFAULT_REGISTRY
-            .get_or_init(|| {
-                let mut registry = Self::empty();
-                crate::builtins::runtime::register_default_host_functions(&mut registry);
-                registry.allow_default_builtin_capabilities = true;
-                registry.allow_default_host_capabilities = true;
-                registry
-            })
-            .transaction_clone();
-        // The immutable default snapshot is a template; every public `new`
-        // call starts a distinct registry origin so its private transaction
-        // handles cannot publish into another fresh registry.
-        registry.transaction_origin = Arc::new(());
-        registry
-    }
-
-    /// Returns the standard host registry with every registered host function present but
-    /// requiring an explicit capability grant before execution.
-    pub fn restricted() -> Self {
-        let mut registry = Self::new();
-        registry.allow_default_builtin_capabilities = false;
-        registry.allow_default_host_capabilities = false;
-        registry.capability_profile = Arc::new(CapabilityProfile::deny_all());
-        registry.registry_state = Arc::new(());
-        registry.registry_generation_token = Arc::new(());
-        registry.registry_generation = Arc::new(AtomicU64::new(0));
-        registry.invalidate_plan_cache();
-        registry
+    /// Derives a fresh, isolated registry origin from an immutable registry
+    /// template.
+    ///
+    /// The outer standard-runtime layer memoizes the builtin-composed default
+    /// registry template and derives every public `HostFunctionRegistry::new()`
+    /// from it through this helper. The result shares the template's immutable
+    /// entries/capability state but starts a *new* origin: its private
+    /// transaction handle cannot publish into another registry, and its
+    /// memoized staging snapshot / plan cache start empty.
+    pub(crate) fn fresh_origin_clone(&self) -> Self {
+        let mut clone = self.transaction_clone();
+        clone.transaction_origin = Arc::new(());
+        clone
     }
 
     /// Replaces the registry's immutable capability profile.
@@ -1526,11 +1502,21 @@ impl HostFunctionRegistry {
     /// standard-runtime constructor calls this so the registry's
     /// `bind_vm_cached` auto-stage path can compose the standard surfaces
     /// without the core knowing them.
+    ///
+    /// Replacing the composition is a *registry mutation*: it invalidates the
+    /// memoized staging snapshot and the plan cache/generation so a bind under
+    /// the new composition can never reuse a snapshot staged under a previous
+    /// composition.
     pub fn set_standard_composition(
         &mut self,
         composition: Arc<dyn super::standard_composition::StandardSurfaceComposition>,
     ) {
         self.composition = Some(composition);
+        self.invalidate_plan_cache();
+        *self
+            .standard_staging_snapshot
+            .write()
+            .expect("poisoned lock") = None;
     }
 
     /// The memoized fully-staged standard snapshot, if one was published.
@@ -3289,9 +3275,13 @@ impl Vm {
         }
     }
 
-    /// Registers a waiting host op under the legacy policy. Used by call sites
-    /// that are not bound-host-import call sites (builtin pending ops, tests).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Registers a waiting host op under the legacy policy.
+    ///
+    /// Test-only: production call sites that are not bound-host-import sites
+    /// (builtin pending ops) use [`Self::set_waiting_host_op_with_policy`]
+    /// directly, so this isolated waiting-state helper ships only under
+    /// `#[cfg(test)]` and never forms a second production lifecycle.
+    #[cfg(test)]
     pub(super) fn set_waiting_host_op(&mut self, op_id: HostOpId) -> VmResult<()> {
         self.set_waiting_host_op_with_policy(op_id, ExactHostReturnPolicy::Legacy)
     }
