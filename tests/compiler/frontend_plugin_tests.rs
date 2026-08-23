@@ -56,7 +56,7 @@ fn registered_compat_frontend_plugin_compiles_source() {
         compile_source_with_flavor_and_options("ignored();", SourceFlavor::JavaScript, options)
             .expect("registered plugin should compile JavaScript flavor");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("compiled plugin program should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(7)]);

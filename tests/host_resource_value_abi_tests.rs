@@ -59,7 +59,7 @@ impl HostResource for DummyResource {
 /// Pushes one real resource into a real table and returns the raw handle token
 /// as an `i64` `Value` carrier.
 fn real_handle_value() -> i64 {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let token = table
         .push(DummyResource)
         .expect("table push should produce a handle");
@@ -292,7 +292,7 @@ fn bind_ping_static_non_yielding_factory(
     registry
         .register_exact_static_non_yielding_args("acme::ping", 1, schema, function)
         .expect("register exact non-yielding");
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm)?;
     Ok(vm)
 }
@@ -370,7 +370,7 @@ fn resource_callable_program(argument: i64) -> vm::Program {
 fn callable_arg_structurally_valid_resource_handle_enters_frame() {
     let handle = real_handle_value();
     let program = resource_callable_program(handle);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let status = run_vm(&mut vm).expect("valid handle carrier should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(handle)]);
@@ -382,7 +382,7 @@ fn callable_arg_structurally_valid_resource_handle_enters_frame() {
 fn callable_arg_plain_int_rejected_by_resource_schema() {
     for bad in [0i64, -1, 7, 12345] {
         let program = resource_callable_program(bad);
-        let mut vm = Vm::new(program);
+        let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
         let error = vm
             .run()
             .expect_err("plain int must be rejected by a resource parameter schema");
@@ -406,7 +406,7 @@ fn exact_resource_host_return_accepts_valid_handle() {
     registry
         .register_exact(&import.name, 1, schema, || Box::new(VmScopeHandleHost))
         .expect("register exact dynamic");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     let status = run_vm(&mut vm).expect("valid handle return should run");
     assert_eq!(status, VmStatus::Halted);
@@ -473,7 +473,7 @@ fn schema_none_legacy_int_return_unaffected() {
     registry.register_static_non_yielding_args("legacy", 1, |_| {
         Ok(CallOutcome::Return(CallReturn::One(Value::Int(42))))
     });
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("legacy bind");
     let status = run_vm(&mut vm).expect("legacy Int return must still run");
     assert_eq!(status, VmStatus::Halted);
@@ -509,7 +509,7 @@ fn optional_resource_host_return_null_is_legal() {
             Ok(CallOutcome::Return(CallReturn::One(Value::Null)))
         })
         .expect("register optional-resource exact host");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
 
     let status = vm
@@ -582,7 +582,7 @@ fn nonresource_nonyielding_import_remains_native_eligible() {
     registry
         .register_exact_static_non_yielding_args(&import.name, 1, schema, static_plain_int_return)
         .expect("register exact plain-Int non-yielding import");
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -670,7 +670,7 @@ fn resource_param_plain_int_import_is_not_native_eligible_and_trace_exits() {
             Ok(CallOutcome::Return(CallReturn::One(Value::Int(0))))
         })
         .expect("register resource-parameter import via a VM-aware static");
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -786,7 +786,7 @@ fn bind_ping_exact_args(
     registry
         .register_exact_args(&import.name, 1, schema, factory)
         .expect("register exact args");
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm)?;
     Ok(vm)
 }
@@ -966,7 +966,7 @@ fn optional_resource_args_dynamic_pending_completion_null_is_legal() {
             })
         })
         .expect("register optional-resource exact args");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
 
     let status = vm.run().expect("first run should wait on host op");
@@ -1033,7 +1033,8 @@ fn schema_none_args_dynamic_pending_completion_keeps_legacy_behavior() {
     bc.ldc(0);
     bc.call(0, 1);
     bc.ret();
-    let mut vm = Vm::new(Program::new(vec![Value::Int(4)], bc.finish()));
+    let mut vm = Vm::try_new(Program::new(vec![Value::Int(4)], bc.finish()))
+        .expect("test VM construction must not fail");
     vm.register_args_function(Box::new(PendingArgsHost { op_id, call_count }));
 
     let status = vm.run().expect("first run should wait on host op");
@@ -1104,7 +1105,7 @@ fn nonresource_exact_args_dynamic_pending_completion_unaffected() {
             })
         })
         .expect("register exact non-resource args");
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
 
     let status = vm.run().expect("first run should wait on host op");
@@ -1141,7 +1142,8 @@ fn exact_resource_dynamic_pending_completion_accepts_valid_handle() {
             })
         })
         .expect("register exact dynamic");
-    let mut vm = Vm::new(pending_resource_call_program());
+    let mut vm =
+        Vm::try_new(pending_resource_call_program()).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
 
     let status = vm.run().expect("first run should wait on host op");
@@ -1173,7 +1175,8 @@ fn exact_resource_dynamic_pending_completion_rejects_plain_int() {
             })
         })
         .expect("register exact dynamic");
-    let mut vm = Vm::new(pending_resource_call_program());
+    let mut vm =
+        Vm::try_new(pending_resource_call_program()).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
 
     let status = vm.run().expect("first run should wait on host op");
@@ -1215,7 +1218,8 @@ fn exact_resource_stack_dynamic_pending_completion_validates_handle() {
             })
         })
         .expect("register exact stack");
-    let mut vm = Vm::new(pending_resource_call_program());
+    let mut vm =
+        Vm::try_new(pending_resource_call_program()).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
 
     let status = vm.run().expect("first run should wait on host op");
@@ -1253,7 +1257,8 @@ fn exact_resource_stack_dynamic_pending_completion_validates_handle() {
             })
         })
         .expect("register exact stack");
-    let mut vm = Vm::new(pending_resource_call_program());
+    let mut vm =
+        Vm::try_new(pending_resource_call_program()).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
 
     let status = vm.run().expect("first run should wait on host op");
@@ -1341,7 +1346,8 @@ fn exact_resource_args_dynamic_immediate_valid_handle_pushed() {
     registry
         .register_exact(&import.name, 1, schema, || Box::new(VmScopeHandleHost))
         .expect("register exact dynamic");
-    let mut vm = Vm::new(pending_resource_call_program());
+    let mut vm =
+        Vm::try_new(pending_resource_call_program()).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
 
     let status = vm.run().expect("valid handle immediate return should run");
@@ -1361,7 +1367,8 @@ fn exact_resource_stack_dynamic_immediate_bad_return_keeps_stack_snapshot() {
             Box::new(ImmediateStackHost { returned: 7 })
         })
         .expect("register exact stack");
-    let mut vm = Vm::new(pending_resource_call_program());
+    let mut vm =
+        Vm::try_new(pending_resource_call_program()).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
 
     let error = vm
@@ -1387,7 +1394,8 @@ fn exact_resource_stack_dynamic_immediate_valid_handle_pushed() {
     registry
         .register_exact(&import.name, 1, schema, || Box::new(VmScopeHandleHost))
         .expect("register exact dynamic");
-    let mut vm = Vm::new(pending_resource_call_program());
+    let mut vm =
+        Vm::try_new(pending_resource_call_program()).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
 
     let status = vm.run().expect("valid handle stack return should run");
@@ -1407,7 +1415,8 @@ fn exact_resource_dynamic_immediate_bad_return_keeps_stack_snapshot() {
             Box::new(ImmediateDynamicHost { returned: 7 })
         })
         .expect("register exact dynamic");
-    let mut vm = Vm::new(pending_resource_call_program());
+    let mut vm =
+        Vm::try_new(pending_resource_call_program()).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
 
     let error = vm

@@ -95,6 +95,15 @@ pub struct OperationRegistry {
 }
 
 impl OperationRegistry {
+    /// Creates an empty registry with the default pending-operation ceiling.
+    ///
+    /// Tag allocation is process-unique and fallible; callers must propagate
+    /// [`OperationErrorCode::OperationRegistryTagExhausted`] rather than rely
+    /// on an infallible default constructor.
+    pub fn new() -> OperationResult<Self> {
+        Self::with_limit(DEFAULT_MAX_PENDING_OPERATIONS)
+    }
+
     /// Creates an empty sealed-less registry with the given pending-operation
     /// ceiling, allocating a process-unique registry tag.
     pub fn with_limit(max_pending: usize) -> OperationResult<Self> {
@@ -377,6 +386,53 @@ impl OperationRegistry {
                 Err(first)
             }
         }
+    }
+
+    /// Aborts a started operation that must never produce a guest-visible
+    /// result: cancels the driver exactly once if it is still pending, then
+    /// consumes/immediately releases the slot so the id becomes stale and
+    /// full registry capacity is restored (the same "cancel then consume"
+    /// sequence the batch drain helpers use).
+    ///
+    /// This is the rollback counterpart to [`start`](Self::start), for call
+    /// sites that register an operation and then hit a fallible handoff (for
+    /// example a bridge submission) before installing the pending-result
+    /// adapter. Without it, a failed handoff would leave a registered
+    /// terminal or pending entry occupying registry capacity until some later
+    /// `poll`/`take_outcome`/reset.
+    ///
+    /// - **Pending** — the driver is cancelled exactly once with `reason`
+    ///   (first-reason-wins), the resulting terminal outcome is consumed and
+    ///   the slot released, and `Ok(true)` is returned. If the driver's
+    ///   ``cancel`` itself fails, that failure is recorded as the first
+    ///   `Failed` status (possibly `Failed(OperationDriverFailed)` when the
+    ///   driver surfaces a typed poison/error), the cleanup runs once, the
+    ///   slot is still released, and the driver error is returned so the
+    ///   caller can preserve it as the first reason — the slot is never left
+    ///   occupied regardless of the cancel outcome.
+    /// - **Already terminal** — the terminal outcome is consumed, the slot
+    ///   released, and `Ok(false)` returned (the driver is not invoked again).
+    /// - **Stale / foreign / out-of-range** — rejected with the usual typed
+    ///   error and **no** registry mutation.
+    ///
+    /// After a successful abort the id is stale under an incremented slot
+    /// generation, so a later `poll`, `status`, `take_outcome`, `remove` or
+    /// second `abort` on it all report `OperationStale`.
+    pub fn abort(
+        &mut self,
+        id: OperationId,
+        reason: OperationCancelReason,
+    ) -> OperationResult<bool> {
+        // Validate fully before any mutation; an unresolvable id is rejected
+        // without touching cancel/consume state.
+        let _ = self.location(id)?;
+        let cancel_result = self.cancel(id, reason);
+        // Whether the driver cancelled cleanly, the driver's cancel failed
+        // (the entry is now terminal `Failed`), or the entry was already
+        // terminal before this call, consuming the outcome releases the slot
+        // and makes the id stale exactly once.
+        let _ = self.take_outcome(id);
+        cancel_result
     }
 
     /// Cancels every pending operation associated with `resource` and drains
@@ -691,13 +747,6 @@ impl OperationRegistry {
     }
 }
 
-impl Default for OperationRegistry {
-    fn default() -> Self {
-        Self::with_limit(DEFAULT_MAX_PENDING_OPERATIONS)
-            .expect("default operation registry configuration should be valid")
-    }
-}
-
 impl Drop for OperationRegistry {
     fn drop(&mut self) {
         // Best-effort teardown: cancel pending operations so the owning
@@ -824,9 +873,32 @@ mod tests {
         HostOperation, OperationCleanup, OperationOutcome, OperationSpec,
     };
     use crate::vm::operation::error::{OperationError, OperationErrorCode, OperationResult};
-    use crate::vm::operation::id::encode;
+    use crate::vm::operation::id::{MAX_REGISTRY_TAG, encode};
     use crate::vm::operation::reason::OperationCancelReason;
     use crate::vm::resource::ResourceHandle;
+
+    #[test]
+    fn default_capacity_registry_reports_tag_exhaustion_without_panicking() {
+        static COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(MAX_REGISTRY_TAG + 1);
+        let _source =
+            crate::vm::operation::id::test_seam::ScopedRegistryTagSource::install(&COUNTER);
+
+        let error = match OperationRegistry::new() {
+            Ok(_) => panic!("tag exhaustion must be fallible"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.code(),
+            OperationErrorCode::OperationRegistryTagExhausted
+        );
+        assert_eq!(error.limit(), Some(MAX_REGISTRY_TAG));
+        assert_eq!(
+            COUNTER.load(Ordering::SeqCst),
+            MAX_REGISTRY_TAG + 1,
+            "failed construction must not advance the exhausted source"
+        );
+    }
 
     struct TestWake(Arc<AtomicUsize>);
     impl std::task::Wake for TestWake {
@@ -1338,6 +1410,149 @@ mod tests {
         );
         assert_eq!(registry.active_count(), 0);
         let _ = (a, b);
+    }
+
+    #[test]
+    fn abort_cancels_driver_once_releases_slot_and_frees_capacity() {
+        let mut registry = OperationRegistry::with_limit(4).expect("registry should be valid");
+        let cancels = Arc::new(Mutex::new(Vec::new()));
+        let id = registry
+            .start(OperationSpec::new(PendingDriver::pending(Arc::clone(
+                &cancels,
+            ))))
+            .expect("start");
+
+        let id_slot = id.slot_index();
+        let id_gen = id.generation();
+        let cancelled = registry
+            .abort(id, OperationCancelReason::Requested)
+            .expect("abort of a pending op should succeed");
+        assert!(cancelled, "a pending op must be cancelled by abort");
+
+        // The driver was cancelled exactly once with the given reason.
+        assert_eq!(
+            cancels.lock().unwrap()[..],
+            [OperationCancelReason::Requested]
+        );
+        // The slot is released immediately: the id is stale, no occupant is
+        // left, active_count and len are both zero, and full capacity is back.
+        assert_eq!(
+            registry
+                .status(id)
+                .expect_err("aborted id must be stale")
+                .code(),
+            OperationErrorCode::OperationStale
+        );
+        assert_eq!(
+            registry
+                .take_outcome(id)
+                .expect_err("aborted id must be stale")
+                .code(),
+            OperationErrorCode::OperationStale
+        );
+        assert_eq!(registry.active_count(), 0);
+        assert_eq!(registry.len(), 0);
+        assert!(registry.is_empty());
+
+        // The freed slot is reusable under an incremented generation.
+        let replacement = registry
+            .start(OperationSpec::new(RecordingDriver::completed()))
+            .expect("aborted slot must be reusable immediately");
+        assert_eq!(
+            replacement.slot_index(),
+            id_slot,
+            "slot identity preserved on reuse after abort"
+        );
+        assert!(
+            replacement.generation() > id_gen,
+            "generation increments on reuse after abort"
+        );
+    }
+
+    #[test]
+    fn abort_releases_slot_even_when_driver_cancel_fails() {
+        let mut registry = OperationRegistry::with_limit(2).expect("registry should be valid");
+        let driver_error = OperationError::new(
+            OperationErrorCode::OperationDriverFailed,
+            "test",
+            "cancel boom",
+        );
+        let id = registry
+            .start(OperationSpec::new(CancelFailDriver::failing(driver_error)))
+            .expect("start");
+        // The driver cancel failure is preserved as the first reason, but the
+        // abort still consumes and releases the slot so capacity is restored.
+        let error = registry
+            .abort(id, OperationCancelReason::Requested)
+            .expect_err("driver cancel failure must be surfaced");
+        assert_eq!(error.code(), OperationErrorCode::OperationDriverFailed);
+        assert_eq!(registry.active_count(), 0);
+        assert_eq!(registry.len(), 0);
+        assert!(registry.is_empty());
+        // Capacity is fully restored despite the failed cancel.
+        registry
+            .start(OperationSpec::new(RecordingDriver::completed()))
+            .expect("abort must free capacity even on a failed cancel");
+        registry
+            .start(OperationSpec::new(RecordingDriver::completed()))
+            .expect("second op must fit the two-slot ceiling");
+    }
+
+    #[test]
+    fn abort_on_already_terminal_removes_without_cancelling_again() {
+        let mut registry = OperationRegistry::with_limit(2).expect("registry should be valid");
+        let cancels = Arc::new(Mutex::new(Vec::new()));
+        let id = registry
+            .start(OperationSpec::new(PendingDriver::pending(Arc::clone(
+                &cancels,
+            ))))
+            .expect("start");
+        assert!(registry.complete(id).expect("out-of-band complete"));
+        assert_eq!(cancels.lock().unwrap().len(), 0, "driver not cancelled yet");
+
+        // Aborting an already-terminal operation removes/discards the terminal
+        // entry without invoking the driver a second time.
+        let cancelled = registry
+            .abort(id, OperationCancelReason::VmReset)
+            .expect("abort of a terminal op must succeed");
+        assert!(
+            !cancelled,
+            "already-terminal abort must not report cancelled"
+        );
+        assert_eq!(
+            cancels.lock().unwrap().len(),
+            0,
+            "driver must not be re-cancelled"
+        );
+        assert_eq!(registry.active_count(), 0);
+        assert_eq!(registry.len(), 0);
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn abort_on_stale_id_is_rejected_without_mutation() {
+        let mut registry = OperationRegistry::with_limit(2).expect("registry should be valid");
+        let id = registry
+            .start(OperationSpec::new(RecordingDriver::completed()))
+            .expect("start");
+        // Drive to terminal, then remove it so the id becomes stale.
+        assert!(matches!(
+            registry.poll(id, &mut cx()),
+            Poll::Ready(Ok(OperationOutcome::Completed))
+        ));
+        registry
+            .status(id)
+            .expect_err("polling must consume the outcome and stale the id");
+
+        // A stale id is rejected with the typed code and the registry stays
+        // quiescent.
+        let error = registry
+            .abort(id, OperationCancelReason::Requested)
+            .expect_err("stale abort must fail");
+        assert_eq!(error.code(), OperationErrorCode::OperationStale);
+        assert_eq!(registry.active_count(), 0);
+        assert_eq!(registry.len(), 0);
+        assert!(registry.is_empty());
     }
 
     #[test]

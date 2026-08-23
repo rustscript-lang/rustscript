@@ -410,7 +410,7 @@ fn compiled(catalog: &HostApiCatalog, source: &str) -> vm::compiler::CompiledPro
 #[cfg(test)]
 fn installed_vm(catalog: &HostApiCatalog, source: &str) -> Vm {
     let compiled = compiled(catalog, source);
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.install_extension(&DemoExtension)
         .expect("extension should install");
     vm

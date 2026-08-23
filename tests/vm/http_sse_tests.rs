@@ -165,7 +165,7 @@ fn standard_http_registry() -> HostFunctionRegistry {
 
 async fn run_sse_source(source: &str, config: HttpConfig) -> Result<Vm, vm::VmError> {
     let compiled = compile_source(source).expect("SSE source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.configure_http(config).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default());
     standard_http_registry().bind_vm_cached(&mut vm).unwrap();
@@ -552,7 +552,7 @@ async fn sse_delivers_open_events_end_and_terminal_summary() {
         "#
     );
     let compiled = compile_source(&source).expect("SSE source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.configure_http(config(port)).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default());
     standard_http_registry().bind_vm_cached(&mut vm).unwrap();
@@ -598,7 +598,7 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
             "#
         );
         let compiled = compile_source(&source).unwrap();
-        let mut vm = Vm::new(compiled.program);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
         vm.set_http_max_in_flight(0);
         vm.configure_http(config(1)).unwrap();
         standard_http_registry().bind_vm_cached(&mut vm).unwrap();
@@ -619,7 +619,7 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
         );
     "#;
     let compiled = compile_source(source).unwrap();
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_http_max_in_flight(0);
     vm.configure_http(config(1)).unwrap();
     standard_http_registry().bind_vm_cached(&mut vm).unwrap();
@@ -638,7 +638,7 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
         );
     "#;
     let compiled = compile_source(source).unwrap();
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.configure_http(config(1)).unwrap();
     standard_http_registry().bind_vm_cached(&mut vm).unwrap();
     let error = vm.run().unwrap_err();
@@ -656,7 +656,7 @@ fn sse_admission_does_not_require_a_tokio_reactor() {
         );
     "#;
     let compiled = compile_source(source).unwrap();
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.configure_http(config(1)).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default());
     standard_http_registry().bind_vm_cached(&mut vm).unwrap();
@@ -883,7 +883,7 @@ async fn sse_reset_releases_the_connection_permit_before_reuse() {
         );"#
     );
     let compiled = compile_source(&source).unwrap();
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_http_max_in_flight(1);
     vm.configure_http(config(port)).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default());
@@ -1190,7 +1190,7 @@ async fn sse_total_deadline_expires_despite_periodic_progress_below_idle_timeout
         http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
     );
     let compiled = compile_source(&source).unwrap();
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.configure_http(deadline_config).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default());
     let mut registry = standard_http_registry();
@@ -1244,7 +1244,7 @@ async fn sse_total_deadline_releases_the_connection_permit_for_reuse() {
         r#"use http; http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, |item| {{action:"continue"}});"#
     );
     let compiled = compile_source(&source).unwrap();
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_http_max_in_flight(1);
     let mut deadline_config = config(port);
     deadline_config.max_stream_duration = std::time::Duration::from_millis(20);
@@ -1321,7 +1321,7 @@ async fn sse_callback_stop_after_deadline_fails_and_releases_permit_without_anot
         "#
     );
     let compiled = compile_source(&source).unwrap();
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_http_max_in_flight(1);
     let mut deadline_config = config(port);
     deadline_config.max_stream_duration = std::time::Duration::from_millis(100);
@@ -1404,7 +1404,7 @@ async fn sse_callback_continue_after_deadline_fails_before_another_network_poll(
         "#
     );
     let compiled = compile_source(&source).unwrap();
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let mut deadline_config = config(port);
     deadline_config.max_stream_duration = std::time::Duration::from_millis(100);
     deadline_config.stream_idle_timeout = std::time::Duration::from_secs(1);
@@ -1550,7 +1550,7 @@ async fn sse_silent_server_reset_cancels_worker_and_releases_permit() {
         );"#
     );
     let compiled = compile_source(&source).unwrap();
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_http_max_in_flight(1);
     vm.configure_http(config(port)).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default());

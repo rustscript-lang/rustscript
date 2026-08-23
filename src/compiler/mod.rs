@@ -561,8 +561,16 @@ pub struct CompiledProgram {
 
 impl CompiledProgram {
     #[cfg(feature = "runtime")]
-    pub fn into_vm(self) -> Vm {
-        Vm::new(self.program)
+    /// Consumes the compiled program and produces a fresh [`Vm`].
+    ///
+    /// Fallible: VM construction allocates one id from the process-unique
+    /// execution-scope arena (and the legacy runtime arena) in lockstep; when
+    /// that identity space is exhausted the construction fails with a typed
+    /// [`VmError`](crate::vm::VmError) instead of panicking. Long-lived or
+    /// pooled construction must propagate this result; there is no infallible
+    /// `into_vm` that can panic on arena exhaustion.
+    pub fn into_vm(self) -> crate::vm::VmResult<Vm> {
+        Vm::try_new(self.program)
     }
 }
 

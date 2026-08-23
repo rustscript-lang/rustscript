@@ -122,7 +122,7 @@ pub mod adapter {
 }
 
 fn new_vm() -> Vm {
-    Vm::new(Program::new(Vec::new(), Vec::new()))
+    Vm::try_new(Program::new(Vec::new(), Vec::new())).expect("test VM construction must not fail")
 }
 
 /// Pushes a resource and marks it guest-owned, returning its raw handle.
@@ -304,7 +304,7 @@ fn macro_generated_owned_resource_return_is_exactly_marked_guest_owned() {
     registry
         .register_exact_static_stack("acme::make", 1, schema, make_adapter)
         .expect("register exact make");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
 
     assert_eq!(vm.run().expect("run"), VmStatus::Halted);

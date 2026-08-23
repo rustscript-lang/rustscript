@@ -9,7 +9,7 @@ use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use vm::{
     CallOutcome, CallReturn, FunctionDecl, HostAsyncBridge, HostFunction, HostOpId, LocalInfo,
     SourceFlavor, SourcePathError, Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
@@ -70,12 +70,28 @@ impl FuelState {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RunErrorDetails {
+    /// The VM/domain operation that reported the failure.
+    pub operation: String,
+    /// Structured human-readable detail retained alongside the stable code.
+    pub message: String,
+    /// Optional configured capacity associated with the failure.
+    pub limit: Option<u64>,
+    /// Optional offending/observed value associated with the failure.
+    pub value: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunReport {
     pub diagnostics: Vec<LintDiagnostic>,
     pub output: Vec<String>,
     pub stack: Vec<String>,
     pub error: Option<String>,
+    /// Stable machine-readable classification for JavaScript consumers.
+    pub error_code: Option<String>,
+    /// Structured detail payload; callers must not parse `error` to classify it.
+    pub error_details: Option<RunErrorDetails>,
     pub halted: bool,
     pub yielded: bool,
     pub fuel: FuelState,
@@ -90,6 +106,13 @@ impl RunReport {
             output: Vec::new(),
             stack: Vec::new(),
             error: Some(err.to_string()),
+            error_code: Some("source_error".to_string()),
+            error_details: Some(RunErrorDetails {
+                operation: "source".to_string(),
+                message: err.to_string(),
+                limit: None,
+                value: None,
+            }),
             halted: true,
             yielded: false,
             fuel: FuelState::disabled(1),
@@ -103,11 +126,44 @@ impl RunReport {
         stack: Vec<String>,
         fuel: FuelState,
     ) -> Self {
+        let error_details = RunErrorDetails {
+            operation: "runtime".to_string(),
+            message: message.clone(),
+            limit: None,
+            value: None,
+        };
         Self {
             diagnostics: Vec::new(),
             output,
             stack,
             error: Some(message),
+            error_code: Some("runtime_error".to_string()),
+            error_details: Some(error_details),
+            halted: true,
+            yielded: false,
+            fuel,
+            command_output: String::new(),
+        }
+    }
+
+    fn runtime_vm_error(
+        vm: Option<&Vm>,
+        error: &VmError,
+        output: Vec<String>,
+        stack: Vec<String>,
+        fuel: FuelState,
+    ) -> Self {
+        let (error_code, error_details) = vm_error_info(error);
+        Self {
+            diagnostics: Vec::new(),
+            output,
+            stack,
+            error: Some(
+                vm.map(|vm| render_vm_error(vm, error))
+                    .unwrap_or_else(|| error.to_string()),
+            ),
+            error_code: Some(error_code),
+            error_details: Some(error_details),
             halted: true,
             yielded: false,
             fuel,
@@ -116,16 +172,79 @@ impl RunReport {
     }
 
     fn inactive(error: Option<String>, command_output: impl Into<String>) -> Self {
+        let error_details = error.as_ref().map(|message| RunErrorDetails {
+            operation: "wasm::command".to_string(),
+            message: message.clone(),
+            limit: None,
+            value: None,
+        });
         Self {
             diagnostics: Vec::new(),
             output: Vec::new(),
             stack: Vec::new(),
             error,
+            error_code: error_details.as_ref().map(|_| "command_error".to_string()),
+            error_details,
             halted: true,
             yielded: false,
             fuel: FuelState::disabled(1),
             command_output: command_output.into(),
         }
+    }
+}
+
+fn vm_error_info(error: &VmError) -> (String, RunErrorDetails) {
+    match error {
+        VmError::Resource(error) => (
+            // ResourceTable arena-ID identity exhaustion carries a dedicated
+            // typed variant (`ResourceTableArenaExhausted`), so the stable
+            // JS-facing code is derived purely from the enum — never from the
+            // free-form operation string. Ordinary resource slot/id push
+            // exhaustion keeps `ResourceIdExhausted` (-> `resource_id_exhausted`).
+            error.code().as_str().to_string(),
+            RunErrorDetails {
+                operation: error.operation().to_string(),
+                message: error.message().to_string(),
+                limit: error.limit().map(|value| value as u64),
+                value: error.value(),
+            },
+        ),
+        VmError::Operation(error) => (
+            error.code().as_str().to_string(),
+            RunErrorDetails {
+                operation: error.operation().to_string(),
+                message: error.message().to_string(),
+                limit: error.limit(),
+                value: error.value(),
+            },
+        ),
+        VmError::LegacyRuntime(error) => (
+            format!("legacy_runtime_{}", error.code().as_str()),
+            RunErrorDetails {
+                operation: error.operation().to_string(),
+                message: error.message().to_string(),
+                limit: error.limit().map(|value| value as u64),
+                value: error.value(),
+            },
+        ),
+        VmError::ExecutionScope(error) => (
+            "execution_scope_error".to_string(),
+            RunErrorDetails {
+                operation: "vm::execution_scope".to_string(),
+                message: error.to_string(),
+                limit: None,
+                value: None,
+            },
+        ),
+        _ => (
+            "vm_error".to_string(),
+            RunErrorDetails {
+                operation: "vm".to_string(),
+                message: error.to_string(),
+                limit: None,
+                value: None,
+            },
+        ),
     }
 }
 
@@ -243,6 +362,8 @@ struct RunSession {
     diagnostics: Vec<LintDiagnostic>,
     halted: bool,
     error: Option<String>,
+    error_code: Option<String>,
+    error_details: Option<RunErrorDetails>,
 }
 
 struct DebugSession {
@@ -390,6 +511,8 @@ impl RunSession {
             diagnostics,
             halted: false,
             error: None,
+            error_code: None,
+            error_details: None,
         }
     }
 
@@ -399,6 +522,8 @@ impl RunSession {
             output: drain_output(&self.output_lines),
             stack: self.vm.stack().iter().map(format_value).collect(),
             error: self.error.clone(),
+            error_code: self.error_code.clone(),
+            error_details: self.error_details.clone(),
             halted: self.halted,
             yielded,
             fuel: capture_fuel_state(&self.vm),
@@ -424,7 +549,10 @@ impl RunSession {
                     Poll::Ready(Err(err)) => {
                         self.halted = true;
                         let message = render_vm_error(&self.vm, &err);
+                        let (code, details) = vm_error_info(&err);
                         self.error = Some(message.clone());
+                        self.error_code = Some(code);
+                        self.error_details = Some(details);
                         return (message, RunProgress::Halted);
                     }
                     Poll::Pending => return (wait_message(op_id), RunProgress::Running),
@@ -451,7 +579,10 @@ impl RunSession {
                 Err(err) => {
                     self.halted = true;
                     let message = render_vm_error(&self.vm, &err);
+                    let (code, details) = vm_error_info(&err);
                     self.error = Some(message.clone());
+                    self.error_code = Some(code);
+                    self.error_details = Some(details);
                     return (message, RunProgress::Halted);
                 }
             }
@@ -1019,7 +1150,8 @@ pub(crate) fn run_source_with_flavor(source: &str, flavor: SourceFlavor) -> RunR
     let diagnostics = lint_success_diagnostics(source, flavor, &compiled, None, &options);
 
     let output_lines = Arc::new(Mutex::new(Vec::<String>::new()));
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     if let Err(err) = register_functions(&mut vm, &compiled.functions, &output_lines) {
         return RunReport::runtime_error(err, Vec::new(), Vec::new(), capture_fuel_state(&vm));
     }
@@ -1081,6 +1213,8 @@ pub(crate) fn run_source_with_flavor(source: &str, flavor: SourceFlavor) -> RunR
                     output,
                     stack,
                     error: None,
+                    error_code: None,
+                    error_details: None,
                     halted: true,
                     yielded: false,
                     fuel: capture_fuel_state(&vm),
@@ -1111,7 +1245,23 @@ pub fn start_run_source_with_flavor(
     let diagnostics = lint_success_diagnostics(source, flavor, &compiled, None, &options);
 
     let output_lines = Arc::new(Mutex::new(Vec::<String>::new()));
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = match Vm::try_new(compiled.program.with_local_count(compiled.locals)) {
+        Ok(vm) => vm,
+        Err(err) => {
+            // Arena-space exhaustion is terminal for the playground embedding:
+            // report the typed error instead of panicking.
+            RUN_SESSION.with(|state| {
+                *state.borrow_mut() = None;
+            });
+            return RunReport::runtime_vm_error(
+                None,
+                &err,
+                Vec::new(),
+                Vec::new(),
+                FuelState::disabled(1),
+            );
+        }
+    };
     if let Err(err) = register_functions(&mut vm, &compiled.functions, &output_lines) {
         RUN_SESSION.with(|state| {
             *state.borrow_mut() = None;
@@ -1242,7 +1392,17 @@ pub fn start_debug_source_with_flavor(
     let diagnostics = lint_success_diagnostics(source, flavor, &compiled, None, &options);
 
     let output_lines = Arc::new(Mutex::new(Vec::<String>::new()));
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = match Vm::try_new(compiled.program.with_local_count(compiled.locals)) {
+        Ok(vm) => vm,
+        Err(err) => {
+            // Arena-space exhaustion is terminal for the playground embedding:
+            // report the typed error instead of panicking.
+            DEBUG_SESSION.with(|state| {
+                *state.borrow_mut() = None;
+            });
+            return DebugReport::inactive(Some(err.to_string()), "debugger initialization failed");
+        }
+    };
     if let Err(err) = register_functions(&mut vm, &compiled.functions, &output_lines) {
         DEBUG_SESSION.with(|state| {
             *state.borrow_mut() = None;
@@ -1360,5 +1520,132 @@ fn push_output_line(lines: &Arc<Mutex<Vec<String>>>, rendered: String) {
     let normalized = rendered.trim_end_matches('\n').to_string();
     if let Ok(mut guard) = lines.lock() {
         guard.push(normalized);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FuelState, RunReport, vm_error_info};
+    use vm::operation::{OperationError, OperationErrorCode};
+    use vm::resource::{ResourceError, ResourceErrorCode};
+    use vm::{RuntimeError, RuntimeErrorCode, VmError};
+
+    fn fuel() -> FuelState {
+        FuelState::disabled(1)
+    }
+
+    #[test]
+    fn run_report_retains_structured_operation_exhaustion_for_json_consumers() {
+        let error = OperationError::new(
+            OperationErrorCode::OperationRegistryTagExhausted,
+            "vm::operation_registry",
+            "operation registry tag identity space is exhausted",
+        )
+        .with_limit(0x00ff_ffff)
+        .with_value(0x0100_0000);
+        let vm_error = VmError::Operation(error);
+        let report = RunReport::runtime_vm_error(None, &vm_error, Vec::new(), Vec::new(), fuel());
+
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("operation_registry_tag_exhausted")
+        );
+        let details = report.error_details.as_ref().expect("structured details");
+        assert_eq!(details.operation, "vm::operation_registry");
+        assert_eq!(details.limit, Some(0x00ff_ffff));
+        assert_eq!(details.value, Some(0x0100_0000));
+        let json = serde_json::to_value(details).expect("details serialize");
+        assert_eq!(json["operation"], "vm::operation_registry");
+        assert_eq!(json["limit"], 0x00ff_ffffu64);
+    }
+
+    #[test]
+    fn vm_exhaustion_domains_have_distinct_stable_codes() {
+        // Arena-ID identity exhaustion of a ResourceTable: dedicated typed
+        // variant, classified purely by the enum (never by operation string).
+        let arena = VmError::Resource(ResourceError::new(
+            ResourceErrorCode::ResourceTableArenaExhausted,
+            "resource::table",
+            "resource table arena identity space is exhausted",
+        ));
+        // Ordinary resource slot/id push exhaustion inside an existing table
+        // keeps the legacy shared `ResourceIdExhausted` code.
+        let resource = VmError::Resource(ResourceError::new(
+            ResourceErrorCode::ResourceIdExhausted,
+            "resource::push",
+            "resource slot identity space is exhausted",
+        ));
+        let legacy = VmError::LegacyRuntime(RuntimeError::new(
+            RuntimeErrorCode::ResourceIdExhausted,
+            "legacy::resource_arena",
+            "legacy resource identity space is exhausted",
+        ));
+        let operation = VmError::Operation(OperationError::new(
+            OperationErrorCode::OperationIdExhausted,
+            "vm::operation_registry",
+            "operation identity space is exhausted",
+        ));
+
+        assert_eq!(vm_error_info(&arena).0, "resource_arena_id_exhausted");
+        assert_eq!(vm_error_info(&resource).0, "resource_id_exhausted");
+        assert_eq!(
+            vm_error_info(&legacy).0,
+            "legacy_runtime_resource_id_exhausted"
+        );
+        assert_eq!(vm_error_info(&operation).0, "operation_id_exhausted");
+        assert_ne!(vm_error_info(&resource).0, vm_error_info(&legacy).0);
+
+        // The arena code is derived from the typed variant, not from the
+        // operation string: a `ResourceTableArenaExhausted` error is
+        // classified identically regardless of the free-form operation scope,
+        // and no operation-string comparison drives the mapping.
+        let arena_renamed_operation = VmError::Resource(ResourceError::new(
+            ResourceErrorCode::ResourceTableArenaExhausted,
+            "some::other::scope",
+            "resource table arena identity space is exhausted",
+        ));
+        assert_eq!(
+            vm_error_info(&arena_renamed_operation).0,
+            "resource_arena_id_exhausted",
+            "arena classification must depend only on the typed variant"
+        );
+        // And a plain `ResourceIdExhausted` never yields the arena code, even
+        // if its operation string happens to look like the arena scope.
+        let push_like_table = VmError::Resource(ResourceError::new(
+            ResourceErrorCode::ResourceIdExhausted,
+            "resource::table",
+            "slot identity space is exhausted",
+        ));
+        assert_eq!(
+            vm_error_info(&push_like_table).0,
+            "resource_id_exhausted",
+            "slot/id exhaustion must not be misclassified as arena exhaustion"
+        );
+        // The three resource identity-exhaustion domains stay pairwise
+        // distinct in their stable codes.
+        assert_ne!(vm_error_info(&arena).0, vm_error_info(&resource).0);
+        assert_ne!(vm_error_info(&arena).0, vm_error_info(&legacy).0);
+    }
+
+    #[test]
+    fn source_and_presentation_messages_keep_machine_fields_separate() {
+        let report = RunReport::runtime_error(
+            "runtime error with user-facing wording".to_string(),
+            Vec::new(),
+            Vec::new(),
+            fuel(),
+        );
+        assert_eq!(
+            report.error.as_deref(),
+            Some("runtime error with user-facing wording")
+        );
+        assert_eq!(report.error_code.as_deref(), Some("runtime_error"));
+        assert_eq!(
+            report
+                .error_details
+                .as_ref()
+                .map(|details| details.message.as_str()),
+            Some("runtime error with user-facing wording")
+        );
     }
 }

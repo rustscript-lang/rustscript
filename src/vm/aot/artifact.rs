@@ -155,7 +155,8 @@ impl Vm {
         jit_config: JitConfig,
     ) -> Result<Self, AotArtifactError> {
         let decoded = decode_artifact(bytes, None)?;
-        let mut vm = Vm::new_with_jit_config(decoded.program, jit_config);
+        let mut vm = Vm::try_new_with_jit_config(decoded.program, jit_config)
+            .map_err(AotArtifactError::Vm)?;
         let compiled = if decoded.interpreter_boundary_only {
             CompiledProgram::from_interpreter_boundary_code(decoded.code, decoded.resume_ips)?
         } else {
@@ -463,7 +464,8 @@ mod tests {
     fn aot_artifact_preserves_interpreter_boundary_mode() {
         let mut bc = BytecodeBuilder::new();
         bc.ret();
-        let mut vm = Vm::new(Program::new(Vec::new(), bc.finish()));
+        let mut vm = Vm::try_new(Program::new(Vec::new(), bc.finish()))
+            .expect("test VM construction must not fail");
         vm.compile_aot().expect("aot compile should succeed");
         vm.engine
             .aot_program
@@ -500,7 +502,8 @@ mod tests {
     fn aot_artifact_decode_rejects_invalid_magic_and_trailing_bytes() {
         let mut bc = BytecodeBuilder::new();
         bc.ret();
-        let mut vm = Vm::new(Program::new(vec![Value::Int(1)], bc.finish()));
+        let mut vm = Vm::try_new(Program::new(vec![Value::Int(1)], bc.finish()))
+            .expect("test VM construction must not fail");
         vm.compile_aot().expect("aot compile should succeed");
 
         let encoded = vm
@@ -526,7 +529,8 @@ mod tests {
     fn aot_artifact_decode_rejects_previous_native_layout_abi() {
         let mut bc = BytecodeBuilder::new();
         bc.ret();
-        let mut vm = Vm::new(Program::new(Vec::new(), bc.finish()));
+        let mut vm = Vm::try_new(Program::new(Vec::new(), bc.finish()))
+            .expect("test VM construction must not fail");
         vm.compile_aot().expect("aot compile should succeed");
         let mut encoded = vm
             .encode_aot_artifact()
@@ -543,7 +547,8 @@ mod tests {
     fn aot_artifact_records_complete_native_layout_fingerprint() {
         let mut bc = BytecodeBuilder::new();
         bc.ret();
-        let mut vm = Vm::new(Program::new(Vec::new(), bc.finish()));
+        let mut vm = Vm::try_new(Program::new(Vec::new(), bc.finish()))
+            .expect("test VM construction must not fail");
         vm.compile_aot().expect("aot compile should succeed");
         let encoded = vm
             .encode_aot_artifact()
@@ -567,7 +572,8 @@ mod tests {
     fn aot_artifact_rejects_native_layout_fingerprint_mismatch() {
         let mut bc = BytecodeBuilder::new();
         bc.ret();
-        let mut vm = Vm::new(Program::new(Vec::new(), bc.finish()));
+        let mut vm = Vm::try_new(Program::new(Vec::new(), bc.finish()))
+            .expect("test VM construction must not fail");
         vm.compile_aot().expect("aot compile should succeed");
         let mut encoded = vm
             .encode_aot_artifact()
@@ -595,7 +601,8 @@ mod tests {
         let mut first_bc = BytecodeBuilder::new();
         first_bc.ldc(0);
         first_bc.ret();
-        let mut first_vm = Vm::new(Program::new(vec![Value::Int(1)], first_bc.finish()));
+        let mut first_vm = Vm::try_new(Program::new(vec![Value::Int(1)], first_bc.finish()))
+            .expect("test VM construction must not fail");
         first_vm
             .compile_aot()
             .expect("first aot compile should succeed");
@@ -608,10 +615,11 @@ mod tests {
         second_bc.ldc(1);
         second_bc.add();
         second_bc.ret();
-        let mut second_vm = Vm::new(Program::new(
+        let mut second_vm = Vm::try_new(Program::new(
             vec![Value::Int(1), Value::Int(2)],
             second_bc.finish(),
-        ));
+        ))
+        .expect("test VM construction must not fail");
 
         assert!(matches!(
             second_vm.load_aot_artifact(&encoded),
@@ -641,7 +649,7 @@ mod tests {
             None,
         )
         .with_local_count(8);
-        let mut vm = Vm::new(program.clone());
+        let mut vm = Vm::try_new(program.clone()).expect("test VM construction must not fail");
         vm.compile_aot().expect("aot compile should succeed");
 
         let encoded = vm
@@ -665,7 +673,8 @@ mod tests {
         let compiled =
             crate::compile_source_for_repl("pub fn add_one(value: int) -> int { value + 1 }")
                 .expect("callable program should compile");
-        let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+        let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+            .expect("test VM construction must not fail");
         vm.compile_aot().expect("aot compile should succeed");
         let encoded = vm
             .encode_aot_artifact()
@@ -730,7 +739,8 @@ mod tests {
             "expected the root body to embed CallScript bytecode"
         );
 
-        let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+        let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+            .expect("test VM construction must not fail");
         vm.compile_aot().expect("aot compile should succeed");
         let encoded = vm
             .encode_aot_artifact()

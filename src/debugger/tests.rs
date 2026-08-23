@@ -48,7 +48,8 @@ fn vm_with_named_local(name: &str, value: Value) -> Vm {
             }],
         }),
     );
-    let mut vm = Vm::new(program.with_local_count(1));
+    let mut vm =
+        Vm::try_new(program.with_local_count(1)).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, crate::vm::VmStatus::Halted);
     vm
@@ -70,7 +71,7 @@ fn vm_with_named_unassigned_local(name: &str) -> Vm {
             }],
         }),
     );
-    Vm::new(program.with_local_count(1))
+    Vm::try_new(program.with_local_count(1)).expect("test VM construction must not fail")
 }
 
 fn vm_with_scoped_named_locals() -> Vm {
@@ -106,7 +107,8 @@ fn vm_with_scoped_named_locals() -> Vm {
             ],
         }),
     );
-    let mut vm = Vm::new(program.with_local_count(1));
+    let mut vm =
+        Vm::try_new(program.with_local_count(1)).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, crate::vm::VmStatus::Halted);
     vm
@@ -268,7 +270,7 @@ fn recording_encode_decode_roundtrip() {
 #[test]
 fn recording_debugger_captures_initial_and_terminal_frames() {
     let program = Program::new(vec![], vec![crate::vm::OpCode::Ret as u8]);
-    let mut vm = Vm::new(program.clone());
+    let mut vm = Vm::try_new(program.clone()).expect("test VM construction must not fail");
     let mut debugger = Debugger::with_recording(program);
 
     let status = vm
@@ -760,7 +762,8 @@ fn bridge_continue_stops_again_at_line_breakpoint() {
     debugger.stop_on_entry();
 
     let join = std::thread::spawn(move || {
-        let mut vm = Vm::new(program.with_local_count(3));
+        let mut vm =
+            Vm::try_new(program.with_local_count(3)).expect("test VM construction must not fail");
         vm.run_with_debugger(&mut debugger)
             .expect("debugged vm run should succeed")
     });
@@ -844,7 +847,8 @@ fn public_replay_api_updates_cursor_and_reports_line() {
 
 #[test]
 fn handle_command_next_and_out_set_expected_step_modes() {
-    let mut vm = Vm::new(Program::new(vec![], vec![crate::vm::OpCode::Ret as u8]));
+    let mut vm = Vm::try_new(Program::new(vec![], vec![crate::vm::OpCode::Ret as u8]))
+        .expect("test VM construction must not fail");
     let mut out = Vec::<u8>::new();
     let mut breakpoints = HashSet::new();
     let mut line_breakpoints = HashSet::new();
@@ -881,7 +885,7 @@ fn handle_command_next_and_out_set_expected_step_modes() {
 
 #[test]
 fn break_line_on_non_executable_source_line_resolves_forward() {
-    let mut vm = Vm::new(Program::with_debug(
+    let mut vm = Vm::try_new(Program::with_debug(
         vec![],
         vec![crate::vm::OpCode::Nop as u8, crate::vm::OpCode::Ret as u8],
         Some(DebugInfo {
@@ -896,7 +900,8 @@ fn break_line_on_non_executable_source_line_resolves_forward() {
             functions: vec![],
             locals: vec![],
         }),
-    ));
+    ))
+    .expect("test VM construction must not fail");
     let mut out = Vec::<u8>::new();
     let mut breakpoints = HashSet::new();
     let mut line_breakpoints = HashSet::new();
@@ -928,7 +933,8 @@ fn break_line_on_non_executable_source_line_resolves_forward() {
 
 #[test]
 fn handle_command_fuel_queries_and_updates_budget() {
-    let mut vm = Vm::new(Program::new(vec![], vec![crate::vm::OpCode::Ret as u8]));
+    let mut vm = Vm::try_new(Program::new(vec![], vec![crate::vm::OpCode::Ret as u8]))
+        .expect("test VM construction must not fail");
     vm.set_fuel(9);
     let mut out = Vec::<u8>::new();
     let mut breakpoints = HashSet::new();
@@ -974,7 +980,8 @@ fn handle_command_fuel_queries_and_updates_budget() {
 
 #[test]
 fn handle_command_epoch_queries_and_updates_deadline() {
-    let mut vm = Vm::new(Program::new(vec![], vec![crate::vm::OpCode::Ret as u8]));
+    let mut vm = Vm::try_new(Program::new(vec![], vec![crate::vm::OpCode::Ret as u8]))
+        .expect("test VM construction must not fail");
     vm.set_epoch_deadline(2)
         .expect("setting epoch deadline should succeed");
     let mut out = Vec::<u8>::new();
@@ -1048,7 +1055,7 @@ fn debugger_bridge_can_recover_from_out_of_fuel_by_adding_fuel() {
     let mut debugger = Debugger::with_command_bridge(bridge.clone());
 
     let join = std::thread::spawn(move || {
-        let mut vm = Vm::new(program);
+        let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
         vm.set_fuel(1);
         vm.run_with_debugger(&mut debugger)
             .expect("debugged vm run should recover and succeed")
@@ -1098,7 +1105,7 @@ fn debugger_bridge_can_recover_from_epoch_deadline_with_auto_rearm() {
     let mut debugger = Debugger::with_command_bridge(bridge.clone());
 
     let join = std::thread::spawn(move || {
-        let mut vm = Vm::new(program);
+        let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
         vm.set_epoch_deadline(1)
             .expect("setting epoch deadline should succeed");
         assert_eq!(vm.increment_epoch(), 1);

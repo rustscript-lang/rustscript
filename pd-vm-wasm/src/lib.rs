@@ -19,9 +19,9 @@ use crate::analyzer::{
 use crate::completions::{CompletionCatalog, build_completion_catalog};
 #[cfg(feature = "runtime")]
 use crate::runtime::{
-    DebugCommand, DebugReport, FuelConfig, FuelState, InterruptModeState, RunCommand, RunReport,
-    debug_state, run_command, run_debug_command, start_debug_source_with_flavor,
-    start_run_source_with_flavor,
+    DebugCommand, DebugReport, FuelConfig, FuelState, InterruptModeState, RunCommand,
+    RunErrorDetails, RunReport, debug_state, run_command, run_debug_command,
+    start_debug_source_with_flavor, start_run_source_with_flavor,
 };
 
 #[derive(Serialize)]
@@ -74,6 +74,8 @@ struct RunResponse {
     output: Vec<String>,
     stack: Vec<String>,
     error: Option<String>,
+    error_code: Option<String>,
+    error_details: Option<RunErrorDetails>,
     halted: bool,
     yielded: bool,
     command_output: String,
@@ -213,6 +215,142 @@ fn local_type_hints_with_flavor_at_path(
 }
 
 #[cfg(feature = "runtime")]
+fn lint_diagnostic_json_to_value(diagnostic: &LintDiagnosticJson) -> serde_json::Value {
+    serde_json::json!({
+        "line": diagnostic.line,
+        "severity": diagnostic.severity,
+        "message": diagnostic.message,
+        "span": diagnostic.span.as_ref().map(|span| serde_json::json!({
+            "start_line": span.start_line,
+            "start_col": span.start_col,
+            "end_line": span.end_line,
+            "end_col": span.end_col,
+        })),
+        "rendered": diagnostic.rendered,
+    })
+}
+
+/// Total serialization fallback dedicated to [`RunResponse`].
+///
+/// The normal path serialises the response struct; if that ever fails (e.g.
+/// under allocation pressure) this builds the same JSON payload directly from
+/// the primitive fields via `serde_json::json!`, bypassing the failing struct
+/// serialiser entirely. It never drops the structured error surface, so a JS
+/// consumer can still match `error`, stable `error_code`, and structured
+/// `error_details` even on the fallback path. No sub-serialisation is routed
+/// back through [`RunResponse`], so this cannot fail recursively and can never
+/// yield `null` for the error fields that were present in the response.
+#[cfg(feature = "runtime")]
+fn run_response_fallback(response: &RunResponse) -> Vec<u8> {
+    let error_details = response.error_details.as_ref().map(|details| {
+        serde_json::json!({
+            "operation": details.operation,
+            "message": details.message,
+            "limit": details.limit,
+            "value": details.value,
+        })
+    });
+    let diagnostics = response
+        .diagnostics
+        .iter()
+        .map(lint_diagnostic_json_to_value)
+        .collect::<Vec<_>>();
+    let fuel = serde_json::json!({
+        "enabled": response.fuel.enabled,
+        "mode": response.fuel.mode,
+        "remaining": response.fuel.remaining,
+        "check_interval": response.fuel.check_interval,
+        "epoch_current": response.fuel.epoch_current,
+        "epoch_deadline": response.fuel.epoch_deadline,
+        "epoch_slice": response.fuel.epoch_slice,
+    });
+    let payload = serde_json::json!({
+        "ok": response.ok,
+        "diagnostics": diagnostics,
+        "output": response.output,
+        "stack": response.stack,
+        "error": response.error,
+        "error_code": response.error_code,
+        "error_details": error_details,
+        "halted": response.halted,
+        "yielded": response.yielded,
+        "command_output": response.command_output,
+        "fuel": fuel,
+    });
+    serde_json::to_vec(&payload).unwrap_or_else(|_| {
+        // The payload is constructed exclusively from plain JSON data (strings,
+        // numbers, booleans, optionals), so serialization cannot fail; this
+        // arm exists only to satisfy the fallible API and must never surface
+        // null error fields. Keep the error surface alive regardless.
+        build_error_only_fallback(response)
+    })
+}
+
+/// Last-resort error-only payload for the pathological case where even the
+/// plain-data fallback serialization fails. Preserves the compatibility
+/// message, stable code, and structured details via manual JSON escaping so
+/// the structured error surface can never be dropped.
+#[cfg(feature = "runtime")]
+fn build_error_only_fallback(response: &RunResponse) -> Vec<u8> {
+    fn escape_json_string(value: &str) -> String {
+        let mut out = String::with_capacity(value.len() + 2);
+        out.push('"');
+        for ch in value.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    let error = response.error.as_deref().unwrap_or("");
+    let error_code = response.error_code.as_deref().unwrap_or("vm_error");
+    let details = response.error_details.as_ref();
+    let operation = details.map(|d| d.operation.as_str()).unwrap_or("vm");
+    let message = details.map(|d| d.message.as_str()).unwrap_or(error);
+    let limit = details.and_then(|d| d.limit);
+    let value = details.and_then(|d| d.value);
+
+    let mut body = String::new();
+    body.push_str("{\"ok\":false,\"error\":");
+    body.push_str(&escape_json_string(error));
+    body.push_str(",\"error_code\":");
+    body.push_str(&escape_json_string(error_code));
+    body.push_str(",\"error_details\":{\"operation\":");
+    body.push_str(&escape_json_string(operation));
+    body.push_str(",\"message\":");
+    body.push_str(&escape_json_string(message));
+    body.push_str(",\"limit\":");
+    body.push_str(
+        &limit
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "null".to_string()),
+    );
+    body.push_str(",\"value\":");
+    body.push_str(
+        &value
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "null".to_string()),
+    );
+    body.push_str("}}");
+    body.into_bytes()
+}
+
+/// Serialise a [`RunResponse`] for the JS boundary, falling back to a total,
+/// structured-error-preserving JSON builder if struct serialisation fails.
+#[cfg(feature = "runtime")]
+fn serialize_run_response(response: &RunResponse) -> Vec<u8> {
+    serde_json::to_vec(response).unwrap_or_else(|_| run_response_fallback(response))
+}
+
+#[cfg(feature = "runtime")]
 fn run_response_to_json(report: RunReport) -> Vec<u8> {
     let ok = report.error.is_none();
     let response = RunResponse {
@@ -225,14 +363,14 @@ fn run_response_to_json(report: RunReport) -> Vec<u8> {
         output: report.output,
         stack: report.stack,
         error: report.error,
+        error_code: report.error_code,
+        error_details: report.error_details,
         halted: report.halted,
         yielded: report.yielded,
         command_output: report.command_output,
         fuel: fuel_state_to_json(report.fuel),
     };
-    serde_json::to_vec(&response).unwrap_or_else(|_| {
-        b"{\"ok\":false,\"diagnostics\":[],\"output\":[],\"stack\":[],\"halted\":true,\"yielded\":false,\"command_output\":\"\",\"fuel\":{\"enabled\":false,\"remaining\":null,\"check_interval\":1}}".to_vec()
-    })
+    serialize_run_response(&response)
 }
 
 #[cfg(feature = "runtime")]
@@ -344,6 +482,13 @@ fn invalid_utf8_run_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8> 
         output: Vec::new(),
         stack: Vec::new(),
         error: Some(format!("invalid utf-8 {label}: {err}")),
+        error_code: Some("input_error".to_string()),
+        error_details: Some(RunErrorDetails {
+            operation: "wasm::input".to_string(),
+            message: format!("invalid utf-8 {label}: {err}"),
+            limit: None,
+            value: None,
+        }),
         halted: true,
         yielded: false,
         command_output: String::new(),
@@ -357,9 +502,7 @@ fn invalid_utf8_run_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8> 
             epoch_slice: None,
         }),
     };
-    serde_json::to_vec(&response).unwrap_or_else(|_| {
-        b"{\"ok\":false,\"diagnostics\":[],\"output\":[],\"stack\":[],\"halted\":true,\"yielded\":false,\"command_output\":\"\",\"fuel\":{\"enabled\":false,\"remaining\":null,\"check_interval\":1}}".to_vec()
-    })
+    serialize_run_response(&response)
 }
 
 #[cfg(feature = "runtime")]
@@ -404,6 +547,13 @@ fn invalid_run_command_response(command_json: &str, error: &str) -> Vec<u8> {
         error: Some(format!(
             "invalid run command: {error}; payload={command_json}"
         )),
+        error_code: Some("input_error".to_string()),
+        error_details: Some(RunErrorDetails {
+            operation: "wasm::run_command".to_string(),
+            message: error.to_string(),
+            limit: None,
+            value: None,
+        }),
         halted: true,
         yielded: false,
         command_output: String::new(),
@@ -417,9 +567,7 @@ fn invalid_run_command_response(command_json: &str, error: &str) -> Vec<u8> {
             epoch_slice: None,
         }),
     };
-    serde_json::to_vec(&response).unwrap_or_else(|_| {
-        b"{\"ok\":false,\"diagnostics\":[],\"output\":[],\"stack\":[],\"halted\":true,\"yielded\":false,\"command_output\":\"\",\"fuel\":{\"enabled\":false,\"remaining\":null,\"check_interval\":1}}".to_vec()
-    })
+    serialize_run_response(&response)
 }
 
 #[cfg(feature = "runtime")]
@@ -460,6 +608,13 @@ fn invalid_run_options_response(options_json: &str, error: &str) -> Vec<u8> {
         error: Some(format!(
             "invalid run options: {error}; payload={options_json}"
         )),
+        error_code: Some("input_error".to_string()),
+        error_details: Some(RunErrorDetails {
+            operation: "wasm::run_options".to_string(),
+            message: error.to_string(),
+            limit: None,
+            value: None,
+        }),
         halted: true,
         yielded: false,
         command_output: String::new(),
@@ -473,9 +628,7 @@ fn invalid_run_options_response(options_json: &str, error: &str) -> Vec<u8> {
             epoch_slice: None,
         }),
     };
-    serde_json::to_vec(&response).unwrap_or_else(|_| {
-        b"{\"ok\":false,\"diagnostics\":[],\"output\":[],\"stack\":[],\"halted\":true,\"yielded\":false,\"command_output\":\"\",\"fuel\":{\"enabled\":false,\"remaining\":null,\"check_interval\":1}}".to_vec()
-    })
+    serialize_run_response(&response)
 }
 
 #[cfg(feature = "runtime")]
@@ -1043,7 +1196,8 @@ mod runtime_tests {
             embedded_stdlib_compile_options(),
         )
         .expect("playground example should compile for runtime verification");
-        let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+        let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+            .expect("fixture VM construction must not fail");
         let mut jit_config = *vm.jit_config();
         jit_config.enabled = false;
         vm.set_jit_config(jit_config);
@@ -2332,5 +2486,365 @@ mod runtime_tests {
             "expected debug output to contain 7, got {:?}",
             resumed.output
         );
+    }
+
+    #[test]
+    fn wasm_run_response_serializes_structured_error_fields_alongside_message() {
+        let report = run_source_with_flavor("let =", SourceFlavor::RustScript);
+        assert_eq!(report.error_code.as_deref(), Some("source_error"));
+        assert!(report.error.is_some());
+        let payload = super::run_response_to_json(report);
+        let json: serde_json::Value = serde_json::from_slice(&payload).expect("run JSON");
+        assert_eq!(json["error_code"], "source_error");
+        assert_eq!(json["error_details"]["operation"], "source");
+        assert!(json["error_details"]["message"].is_string());
+        assert!(json["error"].is_string());
+    }
+}
+
+#[cfg(all(test, feature = "runtime"))]
+mod fallback_tests {
+    use serde_json::Value;
+
+    use super::{
+        LintDiagnosticJson, LintSpanJson, RunResponse, invalid_run_command_response,
+        invalid_run_options_response, invalid_utf8_run_response, lint_diagnostic_to_json,
+        run_response_fallback, serialize_run_response,
+    };
+    use crate::runtime::{
+        FuelState, InterruptModeState, RunErrorDetails, RunReport, run_source_with_flavor,
+    };
+    use vm::SourceFlavor;
+
+    fn disabled_fuel_json() -> crate::runtime::FuelState {
+        FuelState {
+            enabled: false,
+            mode: InterruptModeState::None,
+            remaining: None,
+            check_interval: 1,
+            epoch_current: 0,
+            epoch_deadline: None,
+            epoch_slice: None,
+        }
+    }
+
+    fn report_with_details(message: &str, code: &str, operation: &str) -> RunReport {
+        RunReport {
+            diagnostics: Vec::new(),
+            output: Vec::new(),
+            stack: Vec::new(),
+            error: Some(message.to_string()),
+            error_code: Some(code.to_string()),
+            error_details: Some(RunErrorDetails {
+                operation: operation.to_string(),
+                message: message.to_string(),
+                limit: None,
+                value: None,
+            }),
+            halted: true,
+            yielded: false,
+            fuel: disabled_fuel_json(),
+            command_output: String::new(),
+        }
+    }
+
+    fn structured_report() -> RunReport {
+        // A realistic VM failure carrying a stable machine code and a
+        // structured detail payload (operation, limit, value).
+        RunReport::runtime_error(
+            "resource arena identity space is exhausted".to_string(),
+            Vec::new(),
+            Vec::new(),
+            disabled_fuel_json(),
+        )
+    }
+
+    fn response_for(report: RunReport) -> RunResponse {
+        let ok = report.error.is_none();
+        RunResponse {
+            ok,
+            diagnostics: report
+                .diagnostics
+                .into_iter()
+                .map(lint_diagnostic_to_json)
+                .collect(),
+            output: report.output,
+            stack: report.stack,
+            error: report.error,
+            error_code: report.error_code,
+            error_details: report.error_details,
+            halted: report.halted,
+            yielded: report.yielded,
+            command_output: report.command_output,
+            fuel: super::fuel_state_to_json(report.fuel),
+        }
+    }
+
+    /// A [`RunResponse`] whose diagnostics carry non-trivial content: quotes,
+    /// backslashes, control characters, Unicode, and a mix of span presence.
+    /// This is the payload that forces `lint_diagnostic_json_to_value` (and
+    /// its nested span reconstruction) to actually run in the fallback.
+    fn populated_response() -> RunResponse {
+        RunResponse {
+            ok: false,
+            diagnostics: vec![
+                LintDiagnosticJson {
+                    line: 7,
+                    severity: "error",
+                    message: "unterminated string literal \"oops\\n\"".to_string(),
+                    span: Some(LintSpanJson {
+                        start_line: 7,
+                        start_col: 3,
+                        end_line: 9,
+                        end_col: 41,
+                    }),
+                    rendered: "  --> line 7: unterminated \"quote\\\" \\\\ path\"".to_string(),
+                },
+                LintDiagnosticJson {
+                    line: 12,
+                    severity: "warning",
+                    message: "unused variable `café_中`\u{0} (nul)".to_string(),
+                    span: None,
+                    rendered: "  = note: `café_中` never used \\\\ backslash".to_string(),
+                },
+            ],
+            output: vec!["line \"quoted\"".to_string(), "tab\there".to_string()],
+            stack: vec!["at main (café_中)".to_string()],
+            error: Some("compile failed: \"syntax\" \\\\ path".to_string()),
+            error_code: Some("source_error".to_string()),
+            error_details: Some(RunErrorDetails {
+                operation: "source".to_string(),
+                message: "compile failed: \"syntax\" \\\\ path".to_string(),
+                limit: Some(12),
+                value: Some(0x1f600),
+            }),
+            halted: true,
+            yielded: false,
+            command_output: "cmd \"echo\" \\\\ done".to_string(),
+            fuel: super::fuel_state_to_json(disabled_fuel_json()),
+        }
+    }
+
+    #[test]
+    fn run_response_fallback_matches_serializer_with_populated_diagnostics() {
+        // The fallback's most drift-prone component is the manual
+        // field-by-field JSON reconstruction of each diagnostic, including the
+        // nested span. Exercise it with real, non-trivial content: one
+        // diagnostic with a full span and one without a span, carrying quotes,
+        // backslashes, control characters and Unicode in every string field.
+        let response = populated_response();
+        let expected: Value =
+            serde_json::from_slice(&serde_json::to_vec(&response).expect("full serialize"))
+                .expect("expected json");
+        let fallback: Value =
+            serde_json::from_slice(&run_response_fallback(&response)).expect("fallback json");
+
+        assert_eq!(
+            fallback, expected,
+            "fallback must be byte-parity with the serializer"
+        );
+        assert_eq!(fallback["diagnostics"].as_array().map(Vec::len), Some(2));
+
+        // The populated span survives reconstruction with exact coordinates.
+        let with_span = &fallback["diagnostics"][0];
+        assert_eq!(with_span["line"], 7);
+        assert_eq!(with_span["severity"], "error");
+        assert_eq!(with_span["span"]["start_line"], 7);
+        assert_eq!(with_span["span"]["start_col"], 3);
+        assert_eq!(with_span["span"]["end_line"], 9);
+        assert_eq!(with_span["span"]["end_col"], 41);
+
+        // The span-less diagnostic keeps `span: null`, never a dropped field.
+        let without_span = &fallback["diagnostics"][1];
+        assert_eq!(without_span["line"], 12);
+        assert_eq!(without_span["span"], Value::Null);
+        assert!(without_span["rendered"].as_str().unwrap().contains("\\"));
+        assert!(without_span["rendered"].as_str().unwrap().contains('中'));
+    }
+
+    #[test]
+    fn run_response_fallback_preserves_structured_error_fields_exactly() {
+        let report = structured_report();
+        let response = response_for(report);
+        let expected: Value =
+            serde_json::from_slice(&serde_json::to_vec(&response).expect("full serialize"))
+                .expect("expected json");
+        let fallback: Value =
+            serde_json::from_slice(&run_response_fallback(&response)).expect("fallback json");
+
+        assert_eq!(fallback, expected);
+        assert_eq!(
+            fallback["error"],
+            "resource arena identity space is exhausted"
+        );
+        assert_eq!(fallback["error_code"], "runtime_error");
+        assert_eq!(fallback["error_details"]["operation"], "runtime");
+        assert_eq!(
+            fallback["error_details"]["message"],
+            "resource arena identity space is exhausted"
+        );
+        assert_eq!(fallback["halted"], true);
+        assert_eq!(fallback["fuel"]["enabled"], false);
+    }
+
+    #[test]
+    fn run_response_fallback_keeps_arena_operation_and_legacy_codes_distinguishable() {
+        // Distinct structured detail payloads (arena, modern operation tag,
+        // legacy runtime code) must survive the fallback unchanged and remain
+        // distinguishable from each other.
+        let arena = report_with_details(
+            "resource arena identity space is exhausted",
+            "resource_arena_id_exhausted",
+            "resource::table",
+        );
+        let operation = report_with_details(
+            "operation registry tag identity space is exhausted",
+            "operation_registry_tag_exhausted",
+            "vm::operation_registry",
+        );
+        let legacy = report_with_details(
+            "legacy resource identity space is exhausted",
+            "legacy_runtime_resource_id_exhausted",
+            "legacy::resource_arena",
+        );
+
+        let arena_json: Value =
+            serde_json::from_slice(&run_response_fallback(&response_for(arena))).unwrap();
+        let operation_json: Value =
+            serde_json::from_slice(&run_response_fallback(&response_for(operation))).unwrap();
+        let legacy_json: Value =
+            serde_json::from_slice(&run_response_fallback(&response_for(legacy))).unwrap();
+
+        assert_eq!(arena_json["error_code"], "resource_arena_id_exhausted");
+        assert_eq!(
+            operation_json["error_code"],
+            "operation_registry_tag_exhausted"
+        );
+        assert_eq!(
+            legacy_json["error_code"],
+            "legacy_runtime_resource_id_exhausted"
+        );
+        assert_eq!(arena_json["error_details"]["operation"], "resource::table");
+        assert_eq!(
+            operation_json["error_details"]["operation"],
+            "vm::operation_registry"
+        );
+        assert_eq!(
+            legacy_json["error_details"]["operation"],
+            "legacy::resource_arena"
+        );
+        assert_ne!(
+            arena_json["error_details"]["operation"],
+            operation_json["error_details"]["operation"]
+        );
+        assert_ne!(
+            operation_json["error_details"]["operation"],
+            legacy_json["error_details"]["operation"]
+        );
+        assert_ne!(
+            arena_json["error_details"]["operation"],
+            legacy_json["error_details"]["operation"]
+        );
+    }
+
+    #[test]
+    fn run_response_fallback_never_drops_limit_and_value_details() {
+        let report = RunReport {
+            diagnostics: Vec::new(),
+            output: Vec::new(),
+            stack: Vec::new(),
+            error: Some("resource arena identity space is exhausted".to_string()),
+            error_code: Some("resource_arena_id_exhausted".to_string()),
+            error_details: Some(RunErrorDetails {
+                operation: "resource::table".to_string(),
+                message: "resource arena identity space is exhausted".to_string(),
+                limit: Some(0x00ff_ffff),
+                value: Some(0x0100_0000),
+            }),
+            halted: true,
+            yielded: false,
+            fuel: disabled_fuel_json(),
+            command_output: String::new(),
+        };
+        let json: Value =
+            serde_json::from_slice(&run_response_fallback(&response_for(report))).unwrap();
+        assert_eq!(json["error_details"]["limit"], 0x00ff_ffffu64);
+        assert_eq!(json["error_details"]["value"], 0x0100_0000u64);
+    }
+
+    #[test]
+    fn all_run_response_sites_preserve_error_fields_through_shared_fallback() {
+        // Normal path: run response with a structured VM error.
+        let run = run_source_with_flavor("let =", SourceFlavor::RustScript);
+        let run_json: Value =
+            serde_json::from_slice(&super::run_response_to_json(run)).expect("run json");
+        assert_eq!(run_json["error_code"], "source_error");
+        assert!(run_json["error_details"]["operation"].is_string());
+
+        // Invalid utf-8 run response.
+        let bad = String::from_utf8(vec![0xff])
+            .expect_err("invalid utf-8 produced at runtime")
+            .utf8_error();
+        let utf8_json: Value =
+            serde_json::from_slice(&invalid_utf8_run_response("source", &bad)).expect("utf8 json");
+        assert_eq!(utf8_json["error_code"], "input_error");
+        assert_eq!(utf8_json["error_details"]["operation"], "wasm::input");
+        assert!(
+            utf8_json["error"]
+                .as_str()
+                .unwrap()
+                .contains("invalid utf-8")
+        );
+
+        // Invalid run command response.
+        let command_json: Value =
+            serde_json::from_slice(&invalid_run_command_response("{}", "boom")).expect("cmd json");
+        assert_eq!(command_json["error_code"], "input_error");
+        assert_eq!(
+            command_json["error_details"]["operation"],
+            "wasm::run_command"
+        );
+        assert!(
+            command_json["error"]
+                .as_str()
+                .unwrap()
+                .contains("invalid run command")
+        );
+
+        // Invalid run options response.
+        let options_json: Value =
+            serde_json::from_slice(&invalid_run_options_response("{}", "boom")).expect("opts json");
+        assert_eq!(options_json["error_code"], "input_error");
+        assert_eq!(
+            options_json["error_details"]["operation"],
+            "wasm::run_options"
+        );
+        assert!(
+            options_json["error"]
+                .as_str()
+                .unwrap()
+                .contains("invalid run options")
+        );
+    }
+
+    #[test]
+    fn serialize_run_response_matches_shared_serializer_for_structured_errors() {
+        // `serialize_run_response` first tries the normal struct serializer.
+        // For plain serializable data that path succeeds, so this asserts the
+        // public helper's *normal* output equals the struct serializer — it
+        // does not (and cannot) force the fallback. Fallback parity itself is
+        // covered by the direct `run_response_fallback` tests above.
+        let report = structured_report();
+        let response = response_for(report);
+        let payload = serialize_run_response(&response);
+        let json: Value = serde_json::from_slice(&payload).expect("serialized json");
+        assert_eq!(
+            json,
+            serde_json::to_value(&response).expect("struct serialization"),
+            "normal path must equal the struct serializer"
+        );
+        assert_eq!(json["error_code"], "runtime_error");
+        assert_eq!(json["error_details"]["operation"], "runtime");
+        assert!(json["error"].is_string());
     }
 }

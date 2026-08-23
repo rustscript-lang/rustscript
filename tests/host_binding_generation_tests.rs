@@ -190,7 +190,7 @@ fn assert_runtime_sleep_loop_uses_native_host_call(bind_cached_registry: bool) {
         "#,
     )
     .expect("runtime::sleep loop should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: native_jit_supported(),
         hot_loop_threshold: 1,
@@ -259,7 +259,7 @@ fn restricted_capabilities_disable_trace_jit_for_host_imports_and_builtins() {
         "#,
     ] {
         let compiled = compile_source(source).expect("restricted loop should compile");
-        let mut vm = Vm::new(compiled.program);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
         vm.set_jit_config(JitConfig {
             enabled: native_jit_supported(),
             hot_loop_threshold: 1,
@@ -289,7 +289,7 @@ fn runtime_exit_still_halts_for_direct_and_cached_default_bindings() {
             "#,
         )
         .expect("runtime::exit program should compile");
-        let mut vm = Vm::new(compiled.program);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
         if bind_cached_registry {
             HostFunctionRegistry::new()
                 .bind_vm_cached(&mut vm)
@@ -354,7 +354,7 @@ fn generated_http_imports_are_unique_typed_and_independently_capability_gated() 
             http::client::sse({ url: "https://example.test/" }, callback);
         "#;
         let compiled = compile_source(source).expect("HTTP imports should compile");
-        let mut vm = Vm::new(compiled.program);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
         let mut registry = HostFunctionRegistry::new();
         // The standard compile entry emits exact V13 imports, so register the
         // standard HTTP extension against the combined snapshot — the
@@ -762,7 +762,7 @@ mod external_extension_sdk {
     fn install_extension_registers_functions_and_persistent_module_state() {
         let catalog = counter_catalog();
         let compiled = compile_with_catalog(&catalog, "use demo;\ndemo::ping();\n");
-        let mut vm = Vm::new(compiled.program);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
         vm.install_extension(&CounterExtension)
             .expect("extension should install");
 
@@ -794,7 +794,7 @@ mod external_extension_sdk {
             .register(&mut registry)
             .expect("extension registration must succeed on a restricted registry");
 
-        let mut vm = Vm::new(compiled.program);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
         let error = registry
             .bind_vm_cached(&mut vm)
             .expect_err("ungranted external import must be rejected");
@@ -813,7 +813,7 @@ mod external_extension_sdk {
             .allow_host_import("demo::ping")
             .build();
         granted.set_capability_profile(profile);
-        let mut vm = Vm::new(compiled.program);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
         granted
             .bind_vm_cached(&mut vm)
             .expect("granted external import must bind");
@@ -848,7 +848,7 @@ mod external_extension_sdk {
     fn install_extension_register_failure_is_transactional_and_retryable() {
         let catalog = counter_catalog();
         let compiled = compile_with_catalog(&catalog, "use demo;\ndemo::ping();\n");
-        let mut vm = Vm::new(compiled.program);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
         // A registration failure (duplicate exact schema) fails the whole
         // install before any install mutation happens...
@@ -913,7 +913,7 @@ mod external_extension_sdk {
     fn install_extension_binding_failure_leaves_first_extension_intact() {
         let catalog = counter_catalog();
         let compiled = compile_with_catalog(&catalog, "use demo;\ndemo::ping();\n");
-        let mut vm = Vm::new(compiled.program);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
         vm.install_extension(&CounterExtension)
             .expect("first install binds");

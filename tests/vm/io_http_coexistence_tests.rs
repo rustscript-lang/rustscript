@@ -116,7 +116,7 @@ fn io_and_http_both_register_via_shared_vm() {
     io::exists("/");
     "#;
     let compiled = compile_source(source).expect("source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     // Exact standard registration: the standard compile entry emits exact V13
     // imports carrying the combined catalog fingerprint, so the VM must bind
@@ -153,7 +153,7 @@ fn io_policy_persists_independently_of_http_config() {
     io::exists("/forbidden");
     "#;
     let compiled = compile_source(source).expect("source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     bind_standard_io_http(&mut vm);
 
@@ -219,7 +219,7 @@ fn http_config_persists_independently_of_io_config() {
             standard.fingerprint()
         );
     }
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     // Exact standard registration: the standard compile entry emits exact V13
     // imports, so bind the standard IO+HTTP extensions against the combined
@@ -296,7 +296,7 @@ fn reset_clears_io_resources_but_preserves_io_policy() {
     io::exists("/tmp");
     "#;
     let compiled = compile_source(source).expect("compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     bind_standard_io_http(&mut vm);
 
@@ -361,7 +361,7 @@ fn reset_clears_http_resources_but_preserves_http_config() {
         "#
     );
     let compiled = compile_source(&source).expect("compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     vm.configure_http(HttpConfig {
         allowed_schemes: vec!["http".to_string()],
@@ -421,7 +421,7 @@ fn io_and_http_coexist_through_vm_reset_cycle() {
     io::exists("/tmp");
     "#;
     let compiled = compile_source(source).expect("compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     bind_standard_io_http(&mut vm);
 
@@ -476,7 +476,7 @@ fn worker_cleanup_reaches_quiescence_after_io_and_http() {
         "#,
     );
     let compiled = compile_source(&io_source).expect("compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     vm.configure_io(IoPolicy {
         allowed_roots: vec!["/dev".into(), "/tmp".into()],
@@ -566,7 +566,7 @@ fn io_and_http_module_states_are_independent() {
     true;
     "#;
     let compiled = compile_source(source).expect("compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     // Configure IO
     vm.configure_io(IoPolicy {

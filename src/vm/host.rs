@@ -2559,17 +2559,7 @@ impl Vm {
             crate::builtins::runtime::BuiltinCallOutcome::Pending(op_id) => {
                 self.instance.stack.truncate(arg_start);
                 let resume_ip = self.call_resume_ip(call_ip)?;
-                if self.host.submitted_host_ops.contains(&op_id) {
-                    if let Err(error) = self.set_waiting_host_op(op_id) {
-                        self.host.submitted_host_ops.remove(&op_id);
-                        if let Some(bridge) = self.host.async_bridge.as_mut() {
-                            bridge.cancel_op(op_id);
-                        }
-                        return Err(error);
-                    }
-                } else {
-                    self.set_waiting_registered_op(op_id)?;
-                }
+                self.set_waiting_registered_op(op_id)?;
                 self.instance.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
             }
@@ -3273,34 +3263,24 @@ impl Vm {
     }
 
     fn set_waiting_registered_op(&mut self, op_id: HostOpId) -> VmResult<()> {
-        // Generic execution-scope operations (e.g. sqlite queries registered
-        // through the scoped host SDK) are tracked in the execution-scope
-        // registry, not the legacy owner registry: just record the waiting
-        // state; the awaiting path resolves the operation's own registry.
-        if let Ok(scope_id) = crate::vm::operation::OperationId::from_raw(op_id)
-            && self
-                .host
-                .execution_scope()
-                .operations()
-                .status(scope_id)
-                .is_ok()
-        {
-            return self.set_waiting_operation(op_id, ExactHostReturnPolicy::Legacy);
-        }
-        let operation_id = crate::builtins::runtime::cancellation::OperationId::from_raw(op_id)
+        // Generic execution-scope operations (bridge-submitted futures,
+        // sqlite queries, io/http ops registered through the scoped host SDK)
+        // are tracked in the single execution-scope registry: record the
+        // waiting state; the awaiting path resolves the operation's own
+        // registry.
+        let scope_id = crate::vm::operation::OperationId::from_raw(op_id)
             .map_err(|error| VmError::HostError(error.to_string()))?;
-        let operation = self
+        if self
             .host
-            .runtime_operations
-            .get(operation_id)
-            .map_err(|error| VmError::HostError(error.to_string()))?;
-        if operation.owner() == crate::builtins::runtime::cancellation::OperationOwner::HostBridge {
+            .execution_scope()
+            .operations()
+            .status(scope_id)
+            .is_err()
+        {
             return Err(VmError::HostError(format!(
-                "builtin pending operation {op_id} is owned by the host bridge",
+                "unknown runtime operation {op_id}"
             )));
         }
-        // Runtime-owned (builtin) pending ops are not host-import resource
-        // returns; they keep the legacy policy.
         self.set_waiting_operation(op_id, ExactHostReturnPolicy::Legacy)
     }
 
@@ -3323,69 +3303,48 @@ impl Vm {
 
     /// Registers a waiting host op under the legacy policy. Used by call sites
     /// that are not bound-host-import call sites (builtin pending ops, tests).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn set_waiting_host_op(&mut self, op_id: HostOpId) -> VmResult<()> {
         self.set_waiting_host_op_with_policy(op_id, ExactHostReturnPolicy::Legacy)
     }
 
     /// Registers a waiting host op carrying the exact-return policy captured at
     /// the actual call-site resolved import.
+    ///
+    /// A modern execution-scope operation (bridge-submitted future or a
+    /// generic `HostOperation` registered by a host-SDK consumer) is recorded
+    /// as a scope wait. Any other non-zero id is a bridge-external operation
+    /// (the bridge's own map, addressed by an arbitrary host-chosen raw id)
+    /// and is recorded directly; there is no second owner registry.
     fn set_waiting_host_op_with_policy(
         &mut self,
         op_id: HostOpId,
         exact_policy: ExactHostReturnPolicy,
     ) -> VmResult<()> {
-        let result = (|| {
-            let operation_id = crate::builtins::runtime::cancellation::OperationId::from_raw(op_id)
-                .map_err(|error| VmError::HostError(error.to_string()))?;
-            self.host
-                .runtime_operations
-                .retire_external_id(operation_id)
-                .map_err(|error| VmError::HostError(error.to_string()))?;
-            match self.host.runtime_operations.get(operation_id) {
-                Ok(operation)
-                    if operation.owner()
-                        == crate::builtins::runtime::cancellation::OperationOwner::HostBridge => {}
-                Ok(_) => {
-                    return Err(VmError::HostError(format!(
-                        "host bridge operation id {op_id} collides with a runtime-owned operation",
-                    )));
-                }
-                Err(_) => {
-                    self.host
-                        .runtime_operations
-                        .register_retired_external(
-                            operation_id,
-                            crate::builtins::runtime::cancellation::OperationOwner::HostBridge,
-                            Some(&self.run_ctx.cancellation),
-                            None,
-                            None,
-                        )
-                        .map_err(|error| VmError::HostError(error.to_string()))?;
-                }
-            }
-            self.set_waiting_operation(op_id, exact_policy)
-        })();
-
-        if result.is_err() {
+        if op_id == 0 {
+            // A zero id can never be a valid operation: reject it and cancel
+            // any bridge work that was started under it.
             let reason = crate::builtins::runtime::cancellation::CancellationReason::ResourceClosed;
-            if let Some(bridge) = self.host.async_bridge.as_mut() {
-                bridge.cancel_op_with_reason(op_id, reason);
+            if let Some(bridge) = self.host.async_bridge.clone() {
+                let _ = crate::vm::async_host::with_bridge(&bridge, |current| {
+                    current.cancel_op_with_reason(op_id, reason)
+                });
             }
-            if let Ok(operation_id) =
-                crate::builtins::runtime::cancellation::OperationId::from_raw(op_id)
-                && self
-                    .host
-                    .runtime_operations
-                    .get(operation_id)
-                    .is_ok_and(|operation| {
-                        operation.owner()
-                            == crate::builtins::runtime::cancellation::OperationOwner::HostBridge
-                    })
-            {
-                let _ = self.host.runtime_operations.cancel(operation_id, reason);
-            }
+            return Err(VmError::HostError(
+                "zero host operation id is invalid".to_string(),
+            ));
         }
-        result
+        if let Ok(scope_id) = crate::vm::operation::OperationId::from_raw(op_id)
+            && self
+                .host
+                .execution_scope()
+                .operations()
+                .status(scope_id)
+                .is_ok()
+        {
+            return self.set_waiting_operation(op_id, exact_policy);
+        }
+        self.set_waiting_operation(op_id, exact_policy)
     }
 
     fn set_waiting_operation(
@@ -3840,7 +3799,8 @@ mod exact_binding_registration_tests {
 
     #[test]
     fn manual_take_owned_registration_reclaims_unconsumed_guest_resource() {
-        let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+        let mut vm = Vm::try_new(Program::new(Vec::new(), Vec::new()))
+            .expect("test VM construction must not fail");
         let handle = vm
             .host_context()
             .push_resource(TestResource)
@@ -3921,7 +3881,8 @@ mod exact_binding_registration_tests {
         // (a) name-only: bind_static_function puts a function in the symbol
         // table under the import's name; the import still must not resolve to
         // it.
-        let mut named = Vm::new(legacy_schema_import_program(&import));
+        let mut named = Vm::try_new(legacy_schema_import_program(&import))
+            .expect("test VM construction must not fail");
         named.bind_static_function("test::guard", dummy_static);
         assert_missing_exact(
             named
@@ -3933,7 +3894,8 @@ mod exact_binding_registration_tests {
         // (b) positional: register_static_function binds by slot order with no
         // symbol at all; exact-schema imports are still never positionally
         // bound.
-        let mut positional = Vm::new(legacy_schema_import_program(&import));
+        let mut positional = Vm::try_new(legacy_schema_import_program(&import))
+            .expect("test VM construction must not fail");
         positional.register_static_function(dummy_static);
         assert_missing_exact(
             positional
@@ -3945,7 +3907,8 @@ mod exact_binding_registration_tests {
         // (c) the default host fallback is gated off exact-schema imports: a
         // fresh VM that would otherwise self-bind every import leaves the
         // schema import unbound and rejects it.
-        let mut fresh = Vm::new(legacy_schema_import_program(&import));
+        let mut fresh = Vm::try_new(legacy_schema_import_program(&import))
+            .expect("test VM construction must not fail");
         assert_missing_exact(
             fresh
                 .ensure_call_bindings()
@@ -3972,7 +3935,8 @@ mod exact_binding_registration_tests {
         }
         let import = guard_take_import();
 
-        let mut dynamic = Vm::new(legacy_schema_import_program(&import));
+        let mut dynamic = Vm::try_new(legacy_schema_import_program(&import))
+            .expect("test VM construction must not fail");
         dynamic.bind_function("test::guard", Box::new(DynFn));
         assert_missing_exact(
             dynamic
@@ -3981,7 +3945,8 @@ mod exact_binding_registration_tests {
             "bind_function",
         );
 
-        let mut stack = Vm::new(legacy_schema_import_program(&import));
+        let mut stack = Vm::try_new(legacy_schema_import_program(&import))
+            .expect("test VM construction must not fail");
         stack.bind_static_stack_function("test::guard", stack_fn);
         assert_missing_exact(
             stack
@@ -3990,7 +3955,8 @@ mod exact_binding_registration_tests {
             "bind_static_stack_function",
         );
 
-        let mut args = Vm::new(legacy_schema_import_program(&import));
+        let mut args = Vm::try_new(legacy_schema_import_program(&import))
+            .expect("test VM construction must not fail");
         args.bind_static_args_function("test::guard", args_fn);
         assert_missing_exact(
             args.ensure_call_bindings()
@@ -4582,7 +4548,7 @@ mod exact_contract_unit_tests {
             vec![scalar.clone(), open.clone()],
             None,
         );
-        let mut vm = Vm::new(program);
+        let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
         registry.bind_vm_cached(&mut vm).expect("bind");
         vm.sync_jit_non_yielding_host_imports();
         assert_eq!(

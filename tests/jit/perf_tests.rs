@@ -95,7 +95,8 @@ fn perf_vm_creation_cleanup_speed_and_ram_usage() {
     let rss_before = current_rss_bytes();
     let started = Instant::now();
     for _ in 0..iterations {
-        let vm = Vm::new(program.clone().with_local_count(64));
+        let vm = Vm::try_new(program.clone().with_local_count(64))
+            .expect("test VM construction must not fail");
         black_box(vm);
     }
     let elapsed = started.elapsed();
@@ -123,7 +124,10 @@ fn perf_vm_creation_cleanup_speed_and_ram_usage() {
     let retained_rss_before = current_rss_bytes();
     let mut retained_vms = Vec::with_capacity(retained_count);
     for _ in 0..retained_count {
-        retained_vms.push(Vm::new(program.clone().with_local_count(64)));
+        retained_vms.push(
+            Vm::try_new(program.clone().with_local_count(64))
+                .expect("test VM construction must not fail"),
+        );
     }
     black_box(&retained_vms);
     let retained_rss_after = current_rss_bytes();
@@ -166,7 +170,8 @@ fn perf_vm_creation_cleanup_speed_and_ram_usage() {
     let plain_rss_before = current_rss_bytes();
     let plain_started = Instant::now();
     for _ in 0..host_iterations {
-        let mut vm = Vm::new(plain_compiled.program.clone());
+        let mut vm = Vm::try_new(plain_compiled.program.clone())
+            .expect("test VM construction must not fail");
         let status = vm.run().expect("plain vm run should succeed");
         assert_eq!(status, VmStatus::Halted);
         black_box(vm.stack());
@@ -182,7 +187,8 @@ fn perf_vm_creation_cleanup_speed_and_ram_usage() {
     let host_rss_before = current_rss_bytes();
     let host_started = Instant::now();
     for _ in 0..host_iterations {
-        let mut vm = Vm::new(host_compiled.program.clone());
+        let mut vm =
+            Vm::try_new(host_compiled.program.clone()).expect("test VM construction must not fail");
         for name in &host_names {
             vm.bind_function(name, Box::new(PerfNoopHost { _marker: 0 }));
         }
@@ -217,7 +223,8 @@ fn perf_vm_creation_cleanup_speed_and_ram_usage() {
     let cached_rss_before = current_rss_bytes();
     let cached_started = Instant::now();
     for _ in 0..host_iterations {
-        let mut vm = Vm::new(host_compiled.program.clone());
+        let mut vm =
+            Vm::try_new(host_compiled.program.clone()).expect("test VM construction must not fail");
         registry
             .bind_vm_with_plan(&mut vm, &cached_plan)
             .expect("cached host binding should succeed");
@@ -251,7 +258,8 @@ fn perf_vm_creation_cleanup_speed_and_ram_usage() {
     let static_cached_rss_before = current_rss_bytes();
     let static_cached_started = Instant::now();
     for _ in 0..host_iterations {
-        let mut vm = Vm::new(host_compiled.program.clone());
+        let mut vm =
+            Vm::try_new(host_compiled.program.clone()).expect("test VM construction must not fail");
         static_registry
             .bind_vm_with_plan(&mut vm, &static_cached_plan)
             .expect("cached static host binding should succeed");
@@ -480,7 +488,7 @@ fn jit_emitted_machine_code_is_executed_on_native_targets() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: native_jit_supported(),
         hot_loop_threshold: 1,
@@ -537,7 +545,8 @@ fn perf_jit_diagnostics_capture_exit_and_call_boundary_counters() {
         sum;
     "#;
     let numeric_compiled = compile_source(numeric_source).expect("numeric diagnostics compile");
-    let mut numeric_vm = Vm::new(numeric_compiled.program);
+    let mut numeric_vm =
+        Vm::try_new(numeric_compiled.program).expect("test VM construction must not fail");
     numeric_vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -570,7 +579,8 @@ fn perf_jit_diagnostics_capture_exit_and_call_boundary_counters() {
         i;
     "#;
     let call_compiled = compile_source(call_source).expect("call diagnostics compile");
-    let mut call_vm = Vm::new(call_compiled.program);
+    let mut call_vm =
+        Vm::try_new(call_compiled.program).expect("test VM construction must not fail");
     call_vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -728,7 +738,8 @@ fn perf_jit_native_characterizes_array_builtin_loop_latency() {
     let expected = OUTER_LOOPS * elements.iter().sum::<i64>();
     let expected_stack = vec![Value::Int(expected)];
 
-    let mut interpreter_vm = Vm::new(program.clone());
+    let mut interpreter_vm =
+        Vm::try_new(program.clone()).expect("test VM construction must not fail");
     interpreter_vm.set_jit_config(JitConfig {
         enabled: false,
         hot_loop_threshold: 1,
@@ -738,7 +749,7 @@ fn perf_jit_native_characterizes_array_builtin_loop_latency() {
     let mut interpreter_times =
         sample_reused_vm_latencies(&mut interpreter_vm, &expected_stack, TRIALS);
 
-    let mut jit_vm = Vm::new(program);
+    let mut jit_vm = Vm::try_new(program).expect("test VM construction must not fail");
     jit_vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -821,7 +832,8 @@ fn perf_jit_native_characterizes_map_builtin_loop_latency() {
     let expected = OUTER_LOOPS * per_iter;
     let expected_stack = vec![Value::Int(expected)];
 
-    let mut interpreter_vm = Vm::new(program.clone());
+    let mut interpreter_vm =
+        Vm::try_new(program.clone()).expect("test VM construction must not fail");
     interpreter_vm.set_jit_config(JitConfig {
         enabled: false,
         hot_loop_threshold: 1,
@@ -831,7 +843,7 @@ fn perf_jit_native_characterizes_map_builtin_loop_latency() {
     let mut interpreter_times =
         sample_reused_vm_latencies(&mut interpreter_vm, &expected_stack, TRIALS);
 
-    let mut jit_vm = Vm::new(program);
+    let mut jit_vm = Vm::try_new(program).expect("test VM construction must not fail");
     jit_vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -930,7 +942,8 @@ fn perf_manual_aes_128_cbc_rustscript_matches_in_interpreter_and_jit() {
     let mut jit_native_exec_total = 0u64;
 
     for trial in 0..trials {
-        let mut vm_interpreter = Vm::new(compiled.program.clone());
+        let mut vm_interpreter =
+            Vm::try_new(compiled.program.clone()).expect("test VM construction must not fail");
         vm_interpreter.set_jit_config(JitConfig {
             enabled: false,
             hot_loop_threshold,
@@ -953,7 +966,8 @@ fn perf_manual_aes_128_cbc_rustscript_matches_in_interpreter_and_jit() {
         );
         interpreter_times.push(interpreter_elapsed);
 
-        let mut vm_jit = Vm::new(compiled.program.clone());
+        let mut vm_jit =
+            Vm::try_new(compiled.program.clone()).expect("test VM construction must not fail");
         vm_jit.set_jit_config(JitConfig {
             enabled: true,
             hot_loop_threshold,
@@ -1106,7 +1120,8 @@ fn perf_manual_ifft_math_matches_in_interpreter_and_jit_without_warmup() {
         source_compile_elapsed.as_micros()
     );
 
-    let mut vm_interpreter = Vm::new(compiled.program.clone());
+    let mut vm_interpreter =
+        Vm::try_new(compiled.program.clone()).expect("test VM construction must not fail");
     vm_interpreter.set_jit_config(JitConfig {
         enabled: false,
         hot_loop_threshold,
@@ -1116,7 +1131,8 @@ fn perf_manual_ifft_math_matches_in_interpreter_and_jit_without_warmup() {
     let mut interpreter_times =
         sample_reused_vm_latencies(&mut vm_interpreter, &expected_stack, trials);
 
-    let mut vm_jit = Vm::new(compiled.program.clone());
+    let mut vm_jit =
+        Vm::try_new(compiled.program.clone()).expect("test VM construction must not fail");
     vm_jit.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold,
@@ -1281,7 +1297,8 @@ fn run_sum_loop_with_mode(
     mode: PerfExecMode,
     expected: i64,
 ) -> PerfRun {
-    let mut vm = Vm::new(program.clone().with_local_count(local_count));
+    let mut vm = Vm::try_new(program.clone().with_local_count(local_count))
+        .expect("test VM construction must not fail");
     let enable_jit = mode == PerfExecMode::Jit;
     vm.set_jit_config(JitConfig {
         enabled: enable_jit,
@@ -1524,7 +1541,7 @@ fn benchmark_source_latency_case<F>(
     F: Fn(&mut Vm),
 {
     let compiled = compile_source(source).expect("benchmark source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: false,
         hot_loop_threshold: 1,
@@ -1619,7 +1636,8 @@ fn run_sum_loop_with_cooperative_fuel(
     fuel_per_yield: Option<u64>,
     fuel_check_interval: u32,
 ) -> FuelPerfRun {
-    let mut vm = Vm::new(program.clone().with_local_count(local_count));
+    let mut vm = Vm::try_new(program.clone().with_local_count(local_count))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: false,
         hot_loop_threshold: 1,

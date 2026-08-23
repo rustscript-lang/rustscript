@@ -173,7 +173,7 @@ fn same_stem_modules_in_different_directories_compile_and_run() {
     );
 
     let compiled = compile_source_file(&main_path).expect("same-stem modules should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(
@@ -189,7 +189,7 @@ fn same_stem_modules_in_different_directories_compile_and_run() {
 fn host_namespace_imports_keep_dedicated_resolution_path() {
     let source = "use io;\nio::exists(\".\");\n";
     let compiled = compile_source(source).expect("host namespace import should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let mut registry = HostFunctionRegistry::empty();
     vm::register_io_builtin_module(&mut registry).expect("standard IO registration should succeed");
     registry
@@ -273,7 +273,7 @@ fn named_import_with_alias_through_self_resolves_structurally() {
     );
 
     let compiled = compile_source_file(&main_path).expect("named alias import should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(42)]);

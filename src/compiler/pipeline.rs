@@ -2023,7 +2023,7 @@ mod tests {
             "direct-only call sites emit CallScript"
         );
 
-        let mut vm = Vm::new(compiled.program);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
         let status = vm.run().expect("vm should run");
         assert_eq!(status, crate::vm::VmStatus::Halted);
     }
@@ -2122,7 +2122,7 @@ mod tests {
         assert_eq!(compiled.program.root_callable_bindings.len(), 2);
         assert_eq!(compiled.program.exported_callables.len(), 2);
 
-        let mut vm = Vm::new(compiled.program);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
         let status = vm.run().expect("vm should run");
         assert_eq!(status, crate::vm::VmStatus::Halted);
     }

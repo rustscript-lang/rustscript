@@ -42,7 +42,7 @@ pub(crate) use self::async_host::{HostStreamAction, HostStreamDriver, HostStream
 pub use self::capability::{CapabilityProfile, CapabilityProfileBuilder};
 use self::engine::Engine;
 pub use self::epoch::{EpochCheckpoint, EpochHandle};
-use self::execution_scope::{ExecutionScopeError, ScopeCloseError, ScopeCloseOutcome};
+use self::execution_scope::{ExecutionScopeError, ScopeCloseFailure, ScopeCloseOutcome};
 pub use self::fuel::FuelCheckpoint;
 pub use self::host::{
     CallOutcome, CallReturn, HostArgsFunction, HostBindingPlan, HostFunction, HostFunctionRegistry,
@@ -57,6 +57,7 @@ pub use self::host_extension::{HostExtension, HostModuleState, catalog_import_sc
 use self::host_runtime::HostRuntime;
 use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable};
 pub use self::invocation::{Invocation, InvocationError, InvocationItem, InvocationPoll};
+use self::operation::{OperationError, OperationErrorCode};
 use self::resource::ResourceCloseReason;
 pub use self::resource::{
     CloseProgress, GuestReleaseOutcome, HostResource, OwnershipRelease, Resource,
@@ -67,6 +68,7 @@ pub use self::resource::{
 use self::run_context::{InterruptMode, RunContext};
 pub use crate::builtins::BuiltinFunction;
 pub use crate::builtins::runtime::cancellation::CancellationReason;
+pub use crate::builtins::runtime::error::{RuntimeError, RuntimeErrorCode};
 pub use crate::host_api::HostParamPassing;
 pub use crate::host_api::ResourceTypeKey;
 
@@ -154,6 +156,20 @@ pub enum VmError {
     /// A structured resource capability failure. This variant is preserved
     /// across host-context, macro adapter, and VM boundaries.
     Resource(ResourceError),
+    /// A structured failure from a legacy runtime identity space surfaced at
+    /// the VM boundary.
+    ///
+    /// Retained for public-SDK and wasm compatibility; the execution scope is
+    /// now the single authority for resources and operations, so the modern
+    /// construction path reports identity exhaustion through the typed
+    /// [`VmError::Resource`] / [`VmError::Operation`] variants instead.
+    LegacyRuntime(RuntimeError),
+    /// A structured failure from the modern operation registry, including
+    /// process-unique tag identity exhaustion.
+    Operation(OperationError),
+    /// A structured execution-scope state/close failure that is not a direct
+    /// resource or operation error.
+    ExecutionScope(ExecutionScopeError),
     /// A structured error from exact host-import binding / registration.
     HostImportBinding(HostImportBindingError),
     JitNative(String),
@@ -350,6 +366,9 @@ impl std::fmt::Display for VmError {
             VmError::BytecodeBounds => write!(f, "bytecode bounds"),
             VmError::HostError(message) => write!(f, "host error: {message}"),
             VmError::Resource(error) => write!(f, "resource error: {error}"),
+            VmError::LegacyRuntime(error) => write!(f, "legacy runtime error: {error}"),
+            VmError::Operation(error) => write!(f, "operation error: {error}"),
+            VmError::ExecutionScope(error) => write!(f, "execution scope error: {error}"),
             VmError::HostImportBinding(error) => write!(f, "host import binding error: {error}"),
             VmError::JitNative(message) => write!(f, "jit native error: {message}"),
             VmError::InvalidFuelCheckInterval(value) => {
@@ -376,7 +395,19 @@ impl std::fmt::Display for VmError {
     }
 }
 
-impl std::error::Error for VmError {}
+impl std::error::Error for VmError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Resource(error) => Some(error),
+            Self::LegacyRuntime(error) => Some(error),
+            Self::Operation(error) => Some(error),
+            Self::ExecutionScope(error) => Some(error),
+            Self::HostImportBinding(error) => Some(error),
+            Self::Reset(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<ResourceError> for VmError {
     fn from(error: ResourceError) -> Self {
@@ -388,7 +419,9 @@ impl From<ExecutionScopeError> for VmError {
     fn from(error: ExecutionScopeError) -> Self {
         match error {
             ExecutionScopeError::Resource(error) => Self::Resource(error),
-            other => Self::HostError(other.to_string()),
+            ExecutionScopeError::ArenaExhausted(error) => Self::Resource(error),
+            ExecutionScopeError::Operation(error) => Self::Operation(error),
+            other => Self::ExecutionScope(other),
         }
     }
 }
@@ -408,6 +441,40 @@ impl VmError {
     pub fn resource_error_code(&self) -> Option<ResourceErrorCode> {
         self.resource_error().map(ResourceError::code)
     }
+
+    /// Returns the structured modern operation-registry error without
+    /// requiring callers to parse the presentation string.
+    pub fn operation_error(&self) -> Option<&OperationError> {
+        match self {
+            Self::Operation(error) => Some(error),
+            _ => None,
+        }
+    }
+
+    /// Returns the stable modern operation error category, when present.
+    pub fn operation_error_code(&self) -> Option<OperationErrorCode> {
+        self.operation_error().map(OperationError::code)
+    }
+
+    /// Returns the structured legacy runtime error (retained for public-SDK
+    /// and wasm compatibility) without requiring callers to parse the
+    /// `HostError` display string.
+    ///
+    /// Callers can pattern-match on the stable [`RuntimeErrorCode`] via
+    /// [`RuntimeError::code`] and read the operation / message / limit / value
+    /// payloads through the structured accessors.
+    pub fn legacy_runtime_error(&self) -> Option<&RuntimeError> {
+        match self {
+            Self::LegacyRuntime(error) => Some(error),
+            _ => None,
+        }
+    }
+
+    /// Returns the stable legacy runtime error category, when this is a
+    /// legacy runtime identity-space failure.
+    pub fn legacy_runtime_error_code(&self) -> Option<RuntimeErrorCode> {
+        self.legacy_runtime_error().map(RuntimeError::code)
+    }
 }
 
 pub type VmResult<T> = Result<T, VmError>;
@@ -419,8 +486,8 @@ pub type VmResult<T> = Result<T, VmError>;
 /// [`Resetting`](Self::Resetting) while the execution-scope close is driven
 /// to quiescence; run/resume and pool reuse are rejected until the reset
 /// completes and the `Vm` returns to `Ready`. Any terminal reset failure
-/// (scope cleanup error, deadline, or legacy reset failure) moves the `Vm`
-/// to [`Poisoned`](Self::Poisoned), which is permanent: it never
+/// (scope cleanup error, scope recycle/arena exhaustion, or deadline) moves
+/// the `Vm` to [`Poisoned`](Self::Poisoned), which is permanent: it never
 /// auto-returns to `Ready`, the old scope and the recorded error are
 /// preserved for diagnostics, and the `Vm` is never lent out again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -465,20 +532,25 @@ pub enum VmResetError {
         resource_count: usize,
         operation_count: usize,
     },
-    /// The reset deadline passed before quiescence; the VM is poisoned and
-    /// resources were NOT forced-clean (the caller must not assume a clean
-    /// teardown).
-    Deadline { deadline: Instant, now: Instant },
+    /// The embedding/pool recycle deadline passed before the scope reached
+    /// quiescence. Typed [`ScopeCleanupDeadline`] per the pool contract: the
+    /// VM is permanently discarded/poisoned and no further reuse is
+    /// attempted.
+    ScopeCleanupDeadline { deadline: Instant, now: Instant },
     /// Scope shutdown finished but at least one cleanup failed; the VM is
-    /// poisoned and the old scope is preserved for diagnostics.
-    ScopeCleanup(ScopeCloseError),
+    /// poisoned and the old scope is preserved for diagnostics. Carries the
+    /// first (earliest) typed failure plus the total failure count observed
+    /// across the whole shutdown.
+    ScopeCleanup(ScopeCloseFailure),
     /// `take_quiescent_scope` was requested but the scope was not quiescent
     /// (defensive; cannot normally fire after a driven close).
     ScopeNotQuiescent(ExecutionScopeError),
-    /// The legacy `HostRuntime` reset failed after the generic scope reached
-    /// quiescence; the VM is poisoned and the installed scope is left in
-    /// place (a failed legacy reset never triggers a scope replacement).
-    LegacyReset(String),
+    /// The quiescent scope could not be recycled into a fresh Active scope
+    /// because a fresh execution scope could not be constructed (for example,
+    /// process-unique resource-arena or operation-registry identity space is
+    /// exhausted). The old scope stays installed and intact for diagnostics;
+    /// the VM is poisoned and never reused.
+    ScopeRecycle(ExecutionScopeError),
     /// A reset/reuse API was exercised on an already-poisoned VM.
     AlreadyPoisoned { reason: String },
 }
@@ -496,28 +568,37 @@ impl std::fmt::Display for VmResetError {
                 f,
                 "reset is pending: {resource_count} resource(s) and {operation_count} operation(s) still closing",
             ),
-            Self::Deadline { deadline, now } => write!(
+            Self::ScopeCleanupDeadline { deadline, now } => write!(
                 f,
-                "reset deadline {deadline:?} passed at {now:?}; the vm is poisoned",
+                "scope cleanup recycle deadline {deadline:?} passed at {now:?}; the vm is permanently discarded",
             ),
-            Self::ScopeCleanup(error) => {
+            Self::ScopeCleanup(failure) => {
                 write!(
                     f,
-                    "execution scope cleanup failed: {error:?}; the vm is poisoned"
+                    "execution scope cleanup failed ({} failure(s), first: {:?}); the vm is poisoned",
+                    failure.failed, failure.first
                 )
             }
             Self::ScopeNotQuiescent(error) => {
                 write!(f, "execution scope is not quiescent: {error}")
             }
-            Self::LegacyReset(message) => {
-                write!(f, "legacy host reset failed: {message}; the vm is poisoned",)
-            }
+            Self::ScopeRecycle(error) => write!(
+                f,
+                "execution scope recycle failed: {error}; the vm is poisoned"
+            ),
             Self::AlreadyPoisoned { reason } => write!(f, "vm is permanently poisoned: {reason}"),
         }
     }
 }
 
-impl std::error::Error for VmResetError {}
+impl std::error::Error for VmResetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ScopeNotQuiescent(error) | Self::ScopeRecycle(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 pub const DEFAULT_MAX_SCRIPT_CALL_DEPTH: usize = 1024;
 
@@ -848,33 +929,68 @@ fn inline_compatible_callable_prototype(value: &Value) -> Option<u32> {
 }
 
 impl Vm {
-    pub fn new(program: Program) -> Self {
-        Self::new_shared_with_jit_config(Arc::new(program), jit::JitConfig::default())
+    /// Creates a VM from a [`Program`] with the default JIT configuration.
+    ///
+    /// Fallible: initial construction allocates a process-unique execution
+    /// scope arena identity, which can be exhausted. See
+    /// [`Vm::try_new`]. Embeddings and pools must propagate this error.
+    pub fn try_new(program: Program) -> VmResult<Self> {
+        Self::try_new_shared_with_jit_config(Arc::new(program), jit::JitConfig::default())
     }
 
-    pub fn new_with_jit_config(program: Program, jit_config: jit::JitConfig) -> Self {
-        Self::new_shared_with_jit_config(Arc::new(program), jit_config)
+    /// Creates a VM from a [`Program`] with an explicit JIT configuration.
+    ///
+    /// Fallible: see [`Vm::try_new`].
+    pub fn try_new_with_jit_config(program: Program, jit_config: jit::JitConfig) -> VmResult<Self> {
+        Self::try_new_shared_with_jit_config(Arc::new(program), jit_config)
     }
 
-    pub fn new_shared(program: Arc<Program>) -> Self {
-        Self::new_shared_with_jit_config(program, jit::JitConfig::default())
+    /// Creates a VM sharing a [`Program`] with the default JIT configuration.
+    ///
+    /// Fallible: see [`Vm::try_new`].
+    pub fn try_new_shared(program: Arc<Program>) -> VmResult<Self> {
+        Self::try_new_shared_with_jit_config(program, jit::JitConfig::default())
     }
 
-    pub fn new_shared_with_jit_config(program: Arc<Program>, jit_config: jit::JitConfig) -> Self {
+    /// The core fallible construction path: builds a VM sharing `program` with
+    /// `jit_config` and a fresh host runtime / execution scope.
+    ///
+    /// # Arena exhaustion
+    ///
+    /// A VM always owns an execution scope backed by a process-unique arena
+    /// identity (20-bit, ~1,048,575 handouts per process). When that space is
+    /// exhausted, the typed construction path surfaces a
+    /// [`VmError::Resource`] with code
+    /// [`ResourceErrorCode::ResourceTableArenaExhausted`] — never a panic.
+    /// (The retained [`VmError::LegacyRuntime`] variant is an API-compat
+    /// legacy identity-space error and is not produced by this path.)
+    ///
+    /// There is **no** infallible construction path: every long-lived / embedding
+    /// / pool construction inside this crate (the CLI, the REPL, the replay/AOT
+    /// loaders, the WASM playground, and the scope-recycle/reset path) uses
+    /// these `try_*` constructors and interprets a
+    /// `ResourceTableArenaExhausted` as a terminal, non-reusable failure.
+    /// Tests call `try_*().expect("...")` locally. New embedding and pool
+    /// code must call `try_*`.
+    pub fn try_new_shared_with_jit_config(
+        program: Arc<Program>,
+        jit_config: jit::JitConfig,
+    ) -> VmResult<Self> {
         let engine = Engine::new(jit_config, &program);
         let mut instance = Instance::new(&program);
         instance.initialize_root_callable_bindings(&program);
-        Self {
+        let host = HostRuntime::new().map_err(VmError::from)?;
+        Ok(Self {
             program,
             engine,
             instance,
             run_ctx: RunContext::default(),
-            host: HostRuntime::default(),
+            host,
             reset_state: VmResetState::Ready,
             reset_deadline: None,
             reset_error: None,
             reset_first_reason: None,
-        }
+        })
     }
 
     /// Returns the generic host boundary for this VM.
@@ -1171,7 +1287,7 @@ impl Vm {
     ///   already Ready); the VM is `Ready` and reusable. Idempotent — a
     ///   repeated poll after success returns the same `Ready(Ok(()))`.
     /// - [`Poll::Ready`]`(Err(_))`: a terminal failure (deadline, scope
-    ///   cleanup error, or legacy reset failure) poisoned the VM; the old
+    ///   cleanup error, or scope recycle failure) poisoned the VM; the old
     ///   scope and the error are preserved and the VM is never reusable
     ///   again.
     pub fn poll_reset_for_reuse(
@@ -1192,9 +1308,12 @@ impl Vm {
                 if let Some(deadline) = self.reset_deadline {
                     let timeout = now >= deadline;
                     if timeout {
-                        // Timeout: poison without pretending cleanup ran. The
-                        // old scope and error stay in place for diagnostics.
-                        let error = VmResetError::Deadline { deadline, now };
+                        // Recycle deadline: poison without pretending cleanup
+                        // ran, and report the typed ScopeCleanupDeadline per
+                        // the pool contract (the VM is permanently discarded).
+                        // The old scope and error stay in place for
+                        // diagnostics.
+                        let error = VmResetError::ScopeCleanupDeadline { deadline, now };
                         self.poison(error.clone());
                         return Poll::Ready(Err(VmError::Reset(error)));
                     }
@@ -1250,30 +1369,33 @@ impl Vm {
         let _ = self.poll_reset_for_reuse(&mut cx, Instant::now());
     }
 
-    /// Executes the post-quiescence reset sequence: legacy HostRuntime reset
-    /// (pre-migration compatibility), then the R2A-safe scope recycle into a
-    /// fresh Active empty scope, then the existing interpreter rewinding.
-    /// The module store is deliberately preserved (never cleared by scope
-    /// cleanup or the legacy reset).
+    /// Executes the post-quiescence reset sequence: the HostRuntime reset
+    /// (clears cross-run bridge/stream/pending-result state), then the
+    /// R2A-safe scope recycle into a fresh Active empty scope, then the
+    /// existing interpreter rewinding. The module store is deliberately
+    /// preserved (never cleared by scope cleanup or reset).
     ///
     /// On any failure the caller must poison: this method never swaps the
-    /// scope on error (legacy failures are checked before the recycle).
+    /// scope on error.
     fn finish_reset_to_ready(&mut self) -> Result<(), VmResetError> {
         self.cancel_waiting_host_op_with_reason(
             crate::builtins::runtime::cancellation::CancellationReason::VmReset,
         );
         self.cancel_callable_stream();
         self.host.reset_for_reuse();
-        if let Some(error) = self.host.take_legacy_reset_failure() {
-            // Poison before any scope replacement: a failed legacy reset must
-            // never be followed by a fresh-scope swap.
-            return Err(VmResetError::LegacyReset(error));
-        }
         // R2A-safe: recycle only a Quiescent scope into a fresh Active scope.
+        // Arena exhaustion during the replacement is a terminal recycle
+        // failure: the old (quiescent) scope stays installed for diagnostics,
+        // no malformed scope is installed, and the caller poisons the VM.
         let old_scope = self
             .host
             .take_quiescent_scope()
-            .map_err(VmResetError::ScopeNotQuiescent)?;
+            .map_err(|error| match error {
+                ExecutionScopeError::ArenaExhausted(_) | ExecutionScopeError::Operation(_) => {
+                    VmResetError::ScopeRecycle(error)
+                }
+                other => VmResetError::ScopeNotQuiescent(other),
+            })?;
         drop(old_scope);
         self.run_ctx.reset_for_reuse();
         // Guest-owned release of every owned local still holding a live

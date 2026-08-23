@@ -68,7 +68,7 @@ fn assert_builtin_namespace_stays_builtin(
         "{import_prefix} namespace calls should lower as builtins, not host imports"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), expected_stack);
@@ -162,7 +162,7 @@ fn rustscript_io_namespace_builtin_calls_are_supported() {
         io::exists(".");
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let mut registry = HostFunctionRegistry::empty();
     vm::register_io_builtin_module(&mut registry).expect("standard IO registration should succeed");
     registry
@@ -538,7 +538,7 @@ fn compile_source_file_with_rustscript_complex_fixture() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example_complex.rss");
     let compiled = compile_source_file(path.as_path()).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     #[cfg(feature = "async")]
     super::async_test_bridge::install(&mut vm);
 
@@ -777,7 +777,8 @@ fn named_function_recursion_uses_runtime_frames_and_hits_depth_limit() {
     );
     assert_eq!(compiled.program.script_functions.len(), 1);
 
-    let mut runtime = vm::Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut runtime = vm::Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     assert!(matches!(
         runtime.run(),
         Err(vm::VmError::CallStackOverflow { limit: 1024 })
@@ -818,7 +819,8 @@ fn repeated_named_calls_share_one_emitted_body() {
     }
     assert_eq!(callscript_count, 3);
 
-    let mut runtime = vm::Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut runtime = vm::Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     assert_eq!(
         runtime.run().expect("runtime should halt"),
         VmStatus::Halted
@@ -865,7 +867,8 @@ fn recursive_closure_uses_self_binding_and_hits_depth_limit() {
         "#,
     )
     .expect("recursive closure should compile");
-    let mut runtime = vm::Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut runtime = vm::Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     assert!(matches!(
         runtime.run(),
         Err(vm::VmError::CallStackOverflow { .. })
@@ -1360,7 +1363,7 @@ fn closure_mut_capture_cell_is_fresh_after_vm_reset() {
         SourceFlavor::RustScript,
     )
     .expect("mutable capture source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("first run should halt"), VmStatus::Halted);
     assert_eq!(
         vm.stack(),
@@ -1684,7 +1687,7 @@ fn rustscript_local_move_consumes_source_slot_at_runtime() {
         b;
     "#;
     let compiled = vm::compile_source_for_repl(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::string("2")]);
@@ -1718,7 +1721,7 @@ fn rustscript_interprocedural_consumed_param_moves_caller_local_at_runtime() {
         .expect("debug info should exist");
     let a_index = debug.local_index("a").expect("a binding should exist");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::string("2")]);
@@ -1734,7 +1737,7 @@ fn rustscript_field_move_updates_runtime_container_state() {
         moved + rest;
     "#;
     let compiled = vm::compile_source_for_repl(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::string("xy")]);
@@ -1747,7 +1750,7 @@ fn rustscript_field_move_expr_statement_updates_runtime_container_state() {
         p.a;
     "#;
     let compiled = vm::compile_source_for_repl(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::string("x")]);
@@ -1787,7 +1790,7 @@ fn rustscript_index_move_updates_runtime_container_state() {
         moved + rest;
     "#;
     let compiled = vm::compile_source_for_repl(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::string("xy")]);
@@ -2324,7 +2327,7 @@ fn liveness_clears_local_after_closure_value_last_use() {
         .local_index("closure")
         .expect("closure binding should exist");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(
@@ -2368,7 +2371,7 @@ fn liveness_clears_local_after_function_value_last_use() {
         .local_index("func")
         .expect("func binding should exist");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(
@@ -2400,7 +2403,7 @@ fn script_function_frame_values_are_released_after_return() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack().last(), Some(&Value::Int(0)));
@@ -2423,7 +2426,7 @@ fn interprocedural_closure_capture_slots_are_cleared_after_last_use() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack().last(), Some(&Value::Int(0)));
@@ -2496,7 +2499,8 @@ fn builtin_host_functions_can_be_values() {
             .code
             .contains(&(vm::OpCode::CallValue as u8))
     );
-    let mut runtime = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut runtime = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     assert_eq!(
         runtime.run().expect("runtime should halt"),
         VmStatus::Halted
@@ -2988,7 +2992,7 @@ fn compile_source_file_rustscript_imports_merge_with_scoped_locals() {
         "imported function should only be declared once",
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.bind_function("add_one", Box::new(AddOne));
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -3033,7 +3037,7 @@ fn compile_source_file_rustscript_imported_function_capture_binds_once() {
     .expect("main source should write");
 
     let compiled = compile_source_file(main_path.as_path()).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(7)]);
@@ -3085,7 +3089,7 @@ fn compile_source_file_imported_capture_survives_later_root_slot_compaction() {
     .expect("main source should write");
 
     let compiled = compile_source_file(main_path.as_path()).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(7)]);
@@ -3136,7 +3140,7 @@ fn compile_source_file_rustscript_imported_borrow_capture_survives_nested_calls(
     .expect("main source should write");
 
     let compiled = compile_source_file(main_path.as_path()).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(4)]);
@@ -3292,7 +3296,7 @@ fn compile_source_file_rustscript_supports_namespace_and_named_imports() {
         "module functions should be fully inlined for RustScript root"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Bool(true), Value::Bool(true)]);
@@ -3337,7 +3341,7 @@ fn compile_source_file_rustscript_all_public_import_supports_namespace_calls() {
     .expect("main source should write");
 
     let compiled = compile_source_file(main_path.as_path()).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(3)]);
@@ -4289,7 +4293,7 @@ fn tail_expression_if_collects_module_call_local() {
 
     let compiled = compile_source_file_with_options(&main_path, options)
         .expect("tail expression-if module-call local should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::string("other!")]);
@@ -4485,7 +4489,7 @@ fn json_encode_accepts_string_key_runtime_map() {
     )
     .expect("string-key runtime maps must compile for json::encode");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("json::encode should run");
     assert_eq!(status, VmStatus::Halted);
     let [Value::String(text)] = vm.stack() else {
@@ -4522,7 +4526,7 @@ fn json_encode_accepts_nested_runtime_maps_and_arrays() {
     )
     .expect("nested runtime maps must compile for json::encode");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("json::encode should run");
     assert_eq!(status, VmStatus::Halted);
     let [Value::String(text)] = vm.stack() else {
@@ -4576,7 +4580,7 @@ fn json_encode_preserves_struct_support() {
     )
     .expect("struct-shaped values must keep compiling for json::encode");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("json::encode should run");
     assert_eq!(status, VmStatus::Halted);
     let [Value::String(text)] = vm.stack() else {
@@ -4608,7 +4612,7 @@ fn json_encode_runtime_map_rejects_non_string_key() {
     )
     .expect("non-string-key maps must compile; runtime must reject them");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let err = vm
         .run()
         .expect_err("json::encode must reject non-string map keys");
@@ -4634,7 +4638,7 @@ fn json_encode_runtime_map_rejects_nested_bytes() {
     )
     .expect("runtime maps with bytes values must compile; runtime must reject them");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let err = vm
         .run()
         .expect_err("json::encode must reject bytes values inside maps");
@@ -4661,7 +4665,7 @@ fn json_encode_runtime_map_rejects_nested_callable() {
     )
     .expect("runtime maps with callable values must compile; runtime must reject them");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let err = vm
         .run()
         .expect_err("json::encode must reject callable values inside maps");
@@ -4752,7 +4756,7 @@ fn json_encode_accepts_concrete_inner_map_of_encodable_values() {
     )
     .expect("map<int> must compile for json::encode");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("json::encode should run");
     assert_eq!(status, VmStatus::Halted);
     let [Value::String(text)] = vm.stack() else {
@@ -4909,7 +4913,7 @@ fn json_encode_accepts_mutually_recursive_structs_inside_concrete_map() {
                 return false;
             }
         };
-        let mut vm = Vm::new(compiled.program);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
         let status = match vm.run() {
             Ok(status) => status,
             Err(err) => {
@@ -5223,7 +5227,7 @@ fn json_encode_accepts_wrapped_recursion_in_concrete_map() {
                 return false;
             }
         };
-        let mut vm = Vm::new(compiled.program);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
         let status = match vm.run() {
             Ok(status) => status,
             Err(err) => {
@@ -5268,7 +5272,7 @@ fn json_encode_accepts_wrapped_recursion_in_concrete_map() {
                 return false;
             }
         };
-        let mut vm = Vm::new(compiled.program);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
         let status = match vm.run() {
             Ok(status) => status,
             Err(err) => {

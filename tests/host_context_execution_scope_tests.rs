@@ -119,8 +119,10 @@ fn drive_to_quiescence(cx: &mut vm::HostContext<'_>) -> ScopeCloseOutcome {
 
 #[test]
 fn every_host_context_owns_an_independent_active_scope() {
-    let mut vm_a = Vm::new(Program::new(vec![], vec![]));
-    let mut vm_b = Vm::new(Program::new(vec![], vec![]));
+    let mut vm_a =
+        Vm::try_new(Program::new(vec![], vec![])).expect("test VM construction must not fail");
+    let mut vm_b =
+        Vm::try_new(Program::new(vec![], vec![])).expect("test VM construction must not fail");
 
     let mut cx_a = vm_a.host_context();
     let cx_b = vm_b.host_context();
@@ -148,7 +150,8 @@ fn every_host_context_owns_an_independent_active_scope() {
 
 #[test]
 fn host_context_inserts_land_in_the_same_scope_and_are_queryable() {
-    let mut vm = Vm::new(Program::new(vec![], vec![]));
+    let mut vm =
+        Vm::try_new(Program::new(vec![], vec![])).expect("test VM construction must not fail");
     let mut cx = vm.host_context();
 
     let token = cx
@@ -193,7 +196,8 @@ fn host_context_inserts_land_in_the_same_scope_and_are_queryable() {
 
 #[test]
 fn parent_and_child_resources_close_child_first_through_the_sdk() {
-    let mut vm = Vm::new(Program::new(vec![], vec![]));
+    let mut vm =
+        Vm::try_new(Program::new(vec![], vec![])).expect("test VM construction must not fail");
     let mut cx = vm.host_context();
 
     let order = Arc::new(Mutex::new(Vec::new()));
@@ -247,7 +251,8 @@ fn parent_and_child_resources_close_child_first_through_the_sdk() {
 
 #[test]
 fn closing_scope_rejects_all_sdk_writes_with_structured_scope_closing() {
-    let mut vm = Vm::new(Program::new(vec![], vec![]));
+    let mut vm =
+        Vm::try_new(Program::new(vec![], vec![])).expect("test VM construction must not fail");
     let mut cx = vm.host_context();
 
     // A parent kept for the (rejected) child push.
@@ -294,7 +299,8 @@ fn closing_scope_rejects_all_sdk_writes_with_structured_scope_closing() {
 
 #[test]
 fn module_state_survives_execution_scope_close() {
-    let mut vm = Vm::new(Program::new(vec![], vec![]));
+    let mut vm =
+        Vm::try_new(Program::new(vec![], vec![])).expect("test VM construction must not fail");
     let mut cx = vm.host_context();
 
     assert!(!cx.set_module_state(CounterState { count: 9 }));
@@ -319,7 +325,8 @@ fn module_state_survives_execution_scope_close() {
 
 #[test]
 fn typed_recovery_is_type_checked_and_domain_free() {
-    let mut vm = Vm::new(Program::new(vec![], vec![]));
+    let mut vm =
+        Vm::try_new(Program::new(vec![], vec![])).expect("test VM construction must not fail");
     let mut cx = vm.host_context();
 
     let token = cx

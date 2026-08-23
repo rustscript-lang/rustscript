@@ -56,7 +56,7 @@ mod tests {
     #[test]
     fn init_accepts_compaction_independent_ids_and_rejects_oversized_ids() {
         let program = Program::new(Vec::new(), vec![OpCode::Ret as u8]).with_local_count(1);
-        let mut vm = Vm::new(program);
+        let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
 
         init(&mut vm, &[Value::map(Vec::new()), Value::Int(2)])
             .expect("logical iterator ids must not depend on compacted local count");

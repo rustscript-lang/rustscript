@@ -125,7 +125,8 @@ mod tests {
     fn default_print_binding_uses_vm_runtime_sink() {
         let lines = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink_lines = Arc::clone(&lines);
-        let mut vm = Vm::new(host_call_program(PRINT_NAME));
+        let mut vm =
+            Vm::try_new(host_call_program(PRINT_NAME)).expect("test VM construction must not fail");
         vm.set_runtime_print_sink(move |rendered| {
             sink_lines
                 .lock()
@@ -145,7 +146,8 @@ mod tests {
     fn host_function_registry_includes_default_print_binding() {
         let lines = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink_lines = Arc::clone(&lines);
-        let mut vm = Vm::new(host_call_program(PRINT_NAME));
+        let mut vm =
+            Vm::try_new(host_call_program(PRINT_NAME)).expect("test VM construction must not fail");
         vm.set_runtime_print_sink(move |rendered| {
             sink_lines
                 .lock()
@@ -169,7 +171,8 @@ mod tests {
     fn default_println_binding_appends_newline_before_sink() {
         let lines = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink_lines = Arc::clone(&lines);
-        let mut vm = Vm::new(host_call_program(PRINTLN_NAME));
+        let mut vm = Vm::try_new(host_call_program(PRINTLN_NAME))
+            .expect("test VM construction must not fail");
         vm.set_runtime_print_sink(move |rendered| {
             sink_lines
                 .lock()

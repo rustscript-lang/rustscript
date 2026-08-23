@@ -410,7 +410,8 @@ mod tests {
 
     #[test]
     fn stream_timeout_validation_precedes_permit_admission() {
-        let mut vm = crate::vm::Vm::new(crate::vm::Program::new(Vec::new(), Vec::new()));
+        let mut vm = crate::vm::Vm::try_new(crate::vm::Program::new(Vec::new(), Vec::new()))
+            .expect("test VM construction must not fail");
         vm.set_http_max_in_flight(0);
         vm.configure_http(HttpConfig::default())
             .expect("default config should be valid");
@@ -531,7 +532,8 @@ mod tests {
 
     #[test]
     fn http_config_persists_across_scope_reset() {
-        let mut vm = crate::vm::Vm::new(crate::vm::Program::new(Vec::new(), Vec::new()));
+        let mut vm = crate::vm::Vm::try_new(crate::vm::Program::new(Vec::new(), Vec::new()))
+            .expect("test VM construction must not fail");
         vm.configure_http(HttpConfig::default())
             .expect("default config should be valid");
         assert!(vm.http_is_configured());

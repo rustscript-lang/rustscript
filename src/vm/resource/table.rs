@@ -34,6 +34,59 @@ use super::reason::ResourceCloseReason;
 /// it) for the lifetime of the process.
 static NEXT_ARENA_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Test-only, per-thread arena-id source override.
+///
+/// Exhaustion is a *process-global* property: the real `NEXT_ARENA_ID` counter
+/// can only reach `MAX_HANDLE_ARENA_ID` after ~1,048,575 tables have been
+/// created in one process, which no test suite can (or should) reproduce
+/// deterministically. Exhaustion tests therefore install a private counter for
+/// their own thread; `with_limit` hands out arena ids from that counter while
+/// it is installed, and every other thread keeps allocating from the real
+/// process-global source. This keeps exhaustion deterministic, order-
+/// independent, and parallel-safe, and never mutates the real global
+/// allocator.
+///
+/// The override is per-thread (a `thread_local`), so concurrent tests on other
+/// threads are completely unaffected: they keep seeing the real `NEXT_ARENA_ID`
+/// and keep receiving process-unique monotonic ids.
+#[cfg(test)]
+pub(crate) mod test_seam {
+    use std::cell::Cell;
+    use std::sync::atomic::AtomicU64;
+
+    thread_local! {
+        static ARENA_SOURCE: Cell<Option<&'static AtomicU64>> = const { Cell::new(None) };
+    }
+
+    /// The arena-id source installed for the current thread, if any.
+    pub(crate) fn source() -> Option<&'static AtomicU64> {
+        ARENA_SOURCE.with(|cell| cell.get())
+    }
+
+    /// RAII guard installing `counter` as this thread's arena-id source for
+    /// the duration of the guard. Restores the previous source on drop.
+    pub(crate) struct ScopedArenaSource;
+
+    impl ScopedArenaSource {
+        pub(crate) fn install(counter: &'static AtomicU64) -> Self {
+            ARENA_SOURCE.with(|cell| {
+                assert!(
+                    cell.get().is_none(),
+                    "nested arena source override is unsupported"
+                );
+                cell.set(Some(counter));
+            });
+            Self
+        }
+    }
+
+    impl Drop for ScopedArenaSource {
+        fn drop(&mut self) {
+            ARENA_SOURCE.with(|cell| cell.set(None));
+        }
+    }
+}
+
 /// Lifecycle of one slot.
 enum SlotState {
     Vacant,
@@ -446,7 +499,26 @@ struct ResourceSlot {
 struct CloseAllState {
     reason: ResourceCloseReason,
     closed: usize,
+    /// Total number of cleanup failures observed across the sweep.
+    failed: usize,
     first_error: Option<ResourceError>,
+}
+
+/// Terminal report of one fully-driven close-all sweep.
+///
+/// Returned once the table is quiescent; carries the cumulative closed count,
+/// the total failure count, and the first (earliest) cleanup failure, so the
+/// caller can size the blast radius instead of only seeing one error.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CloseAllReport {
+    /// Cumulative number of resources closed across the whole sweep.
+    pub closed: usize,
+    /// Total number of cleanup failures observed (begin and poll closes),
+    /// including the one in `first_error`.
+    pub failed: usize,
+    /// Earliest cleanup failure observed during the sweep, if any
+    /// (first-error-wins).
+    pub first_error: Option<ResourceError>,
 }
 
 /// Bounded arena of erased resources owned by one execution scope.
@@ -463,6 +535,34 @@ pub struct ResourceTable {
     close_all: Option<CloseAllState>,
 }
 
+/// Hands out the next process-unique arena identity, or a typed
+/// [`ResourceErrorCode::ResourceTableArenaExhausted`] once the identity space
+/// is exhausted.
+///
+/// Allocation is atomic and monotonic: the counter is advanced exactly once
+/// per successful handout (via `fetch_update`), never on failure, and ids are
+/// never recycled or wrapped. Under `#[cfg(test)]`, the current thread's
+/// [`test_seam`] override (if installed) replaces the process-global
+/// `NEXT_ARENA_ID` so exhaustion tests are deterministic and never consume the
+/// real global allocator.
+fn allocate_arena_id() -> Result<u64, ResourceError> {
+    #[cfg(test)]
+    let source = test_seam::source().unwrap_or(&NEXT_ARENA_ID);
+    #[cfg(not(test))]
+    let source = &NEXT_ARENA_ID;
+    source
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |arena_id| {
+            (arena_id <= MAX_HANDLE_ARENA_ID).then_some(arena_id + 1)
+        })
+        .map_err(|_| {
+            ResourceError::new(
+                ResourceErrorCode::ResourceTableArenaExhausted,
+                "resource::table",
+                "resource table arena identity space is exhausted",
+            )
+        })
+}
+
 impl ResourceTable {
     /// Creates an empty table with a fresh arena identity and capacity limit.
     pub fn with_limit(max_entries: usize) -> ResourceResult<Self> {
@@ -474,17 +574,7 @@ impl ResourceTable {
             )
             .with_limit(MAX_RESOURCE_SLOTS));
         }
-        let arena_id = NEXT_ARENA_ID
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |arena_id| {
-                (arena_id <= MAX_HANDLE_ARENA_ID).then_some(arena_id + 1)
-            })
-            .map_err(|_| {
-                ResourceError::new(
-                    ResourceErrorCode::ResourceIdExhausted,
-                    "resource::table",
-                    "resource table arena identity space is exhausted",
-                )
-            })?;
+        let arena_id = allocate_arena_id()?;
         Ok(Self {
             arena_id,
             max_entries,
@@ -496,8 +586,13 @@ impl ResourceTable {
     }
 
     /// Creates a table with the default [`DEFAULT_MAX_RESOURCES`] capacity.
-    pub fn new() -> Self {
-        Self::with_limit(DEFAULT_MAX_RESOURCES).expect("default table configuration is valid")
+    ///
+    /// Fallible: arena identity allocation can fail with a typed
+    /// [`ResourceErrorCode::ResourceTableArenaExhausted`] once the
+    /// process-unique arena space is exhausted. Embeddings and pools must
+    /// propagate this error instead of panicking.
+    pub fn new() -> ResourceResult<Self> {
+        Self::with_limit(DEFAULT_MAX_RESOURCES)
     }
 
     pub fn len(&self) -> usize {
@@ -934,7 +1029,9 @@ impl ResourceTable {
     /// [`GuestReleaseOutcome::NotGuestOwned`]: never an error and never a
     /// second `begin_close`. A failure of the close launch itself (live
     /// children, or the resource's own `begin_close` error) is the only
-    /// structured error path, and it fires at most one `begin_close`.
+    /// structured error path; it fires at most one `begin_close` and leaves
+    /// the resource **Open** (not dropped), so a later scope shutdown sweep
+    /// retries the idempotent close request.
     pub fn release_guest_owner(
         &mut self,
         handle: ResourceHandle,
@@ -1158,6 +1255,33 @@ impl ResourceTable {
         reason: ResourceCloseReason,
         cx: &mut Context<'_>,
     ) -> Poll<ResourceResult<usize>> {
+        match self.poll_close_all_report(reason, cx) {
+            Poll::Pending => Poll::Pending,
+            // Preserve the legacy error surface: a sweep that finished with
+            // cleanup failures reports `Err(first_error)` here, while the
+            // report-based variant carries the full failure count.
+            Poll::Ready(Ok(report)) => match report.first_error {
+                Some(error) => Poll::Ready(Err(error)),
+                None => Poll::Ready(Ok(report.closed)),
+            },
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+        }
+    }
+
+    /// Drives a caller-context close of every live resource, child first, and
+    /// reports the full sweep result (closed count, failure count, first
+    /// failure) exactly once the table is quiescent.
+    ///
+    /// Same contract and sweep as [`poll_close_all`](Self::poll_close_all),
+    /// but the terminal [`CloseAllReport`] carries the cumulative closed
+    /// count, the total failure count, and the earliest failure instead of
+    /// only the first error. This is the report the execution scope consumes
+    /// so its own terminal outcome can carry the failure count.
+    pub fn poll_close_all_report(
+        &mut self,
+        reason: ResourceCloseReason,
+        cx: &mut Context<'_>,
+    ) -> Poll<ResourceResult<CloseAllReport>> {
         // Deterministically reject a conflicting reason. The in-flight sweep
         // keeps the reason it started with; we do not mutate any state here.
         if self
@@ -1172,11 +1296,13 @@ impl ResourceTable {
             self.close_all = Some(CloseAllState {
                 reason,
                 closed: 0,
+                failed: 0,
                 first_error: None,
             });
         }
         let reason = self.close_all.as_ref().unwrap().reason;
         let mut closed = self.close_all.as_ref().unwrap().closed;
+        let mut failed = self.close_all.as_ref().unwrap().failed;
         let mut first_error = self.close_all.as_ref().unwrap().first_error.clone();
 
         // Sweep until a full pass makes no progress: every current leaf is
@@ -1199,30 +1325,38 @@ impl ResourceTable {
                 if !is_open {
                     continue;
                 }
-                progressed |=
-                    self.try_begin_close(slot_index, reason, &mut closed, &mut first_error);
+                progressed |= self.try_begin_close(
+                    slot_index,
+                    reason,
+                    &mut closed,
+                    &mut failed,
+                    &mut first_error,
+                );
             }
             let closing_indices = match self.closing_indices() {
                 Ok(indices) => indices,
                 Err(error) => return Poll::Ready(Err(error)),
             };
             for slot_index in closing_indices {
-                progressed |= self.try_poll_close(slot_index, cx, &mut closed, &mut first_error);
+                progressed |=
+                    self.try_poll_close(slot_index, cx, &mut closed, &mut failed, &mut first_error);
             }
         }
 
         // Persist cumulative progress across Pending polls.
         let state = self.close_all.as_mut().unwrap();
         state.closed = closed;
+        state.failed = failed;
         state.first_error = first_error;
 
         if self.is_empty() {
             // Quiescent: this, and only this, warrants a Ready completion.
             let state = self.close_all.take().unwrap();
-            match state.first_error {
-                Some(error) => Poll::Ready(Err(error)),
-                None => Poll::Ready(Ok(state.closed)),
-            }
+            Poll::Ready(Ok(CloseAllReport {
+                closed: state.closed,
+                failed: state.failed,
+                first_error: state.first_error,
+            }))
         } else {
             Poll::Pending
         }
@@ -1300,7 +1434,12 @@ impl ResourceTable {
                         Ok(CloseProgress::Pending)
                     }
                     Err(error) => {
-                        self.reclaim(slot_index);
+                        // Explicit-close failure stays local: the resource is
+                        // left Open so a later shutdown sweep retries the
+                        // idempotent close request. The failure is returned to
+                        // the caller (which records it in the scope latch);
+                        // the resource is NOT dropped or reclaimed here.
+                        self.put_slot_state(slot_index, SlotState::Open(resource));
                         Err(error)
                     }
                 }
@@ -1320,6 +1459,7 @@ impl ResourceTable {
         slot_index: usize,
         reason: ResourceCloseReason,
         closed: &mut usize,
+        failed: &mut usize,
         first_error: &mut Option<ResourceError>,
     ) -> bool {
         let state = self.replace_slot_state(slot_index, SlotState::Vacant);
@@ -1345,6 +1485,7 @@ impl ResourceTable {
             Err(error) => {
                 self.reclaim(slot_index);
                 *closed += 1;
+                *failed += 1;
                 first_error.get_or_insert(error);
                 true
             }
@@ -1356,6 +1497,7 @@ impl ResourceTable {
         slot_index: usize,
         cx: &mut Context<'_>,
         closed: &mut usize,
+        failed: &mut usize,
         first_error: &mut Option<ResourceError>,
     ) -> bool {
         let state = self.replace_slot_state(slot_index, SlotState::Vacant);
@@ -1368,6 +1510,7 @@ impl ResourceTable {
                 self.reclaim(slot_index);
                 *closed += 1;
                 if let Err(error) = result {
+                    *failed += 1;
                     first_error.get_or_insert(error);
                 }
                 true
@@ -1568,12 +1711,6 @@ impl ResourceTable {
             SlotState::Open(_) => Ok(()),
             SlotState::Closing(_) | SlotState::Vacant => Err(already_closed_error(handle)),
         }
-    }
-}
-
-impl Default for ResourceTable {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -1841,7 +1978,7 @@ mod tests {
 
     #[test]
     fn typed_recovery_with_crate_private_resource_constructor_is_consistent() {
-        let mut table = ResourceTable::new();
+        let mut table = ResourceTable::new().expect("table");
         let (res, closes) = UnitRes::new();
         let token = table.push(res).unwrap();
 
@@ -1869,7 +2006,7 @@ mod tests {
 
     #[test]
     fn begin_close_rejects_mismatched_type_without_firing_close() {
-        let mut table = ResourceTable::new();
+        let mut table = ResourceTable::new().expect("table");
         let (res, closes) = UnitRes::new();
         let token = table.push(res).unwrap();
         let wrong: Resource<OtherRes> = Resource::from_handle(token.handle());
@@ -1891,7 +2028,7 @@ mod tests {
 
     #[test]
     fn poll_close_distinguishes_not_closing_vacant_and_mismatched_type() {
-        let mut table = ResourceTable::new();
+        let mut table = ResourceTable::new().expect("table");
         let (res, _) = UnitRes::new();
         let token = table.push(res).unwrap();
         let handle = token.handle();
@@ -1927,7 +2064,7 @@ mod tests {
 
     #[test]
     fn push_child_rejects_wrong_parent_type_and_closed_parent() {
-        let mut table = ResourceTable::new();
+        let mut table = ResourceTable::new().expect("table");
         let parent = table.push(UnitRes::new().0).unwrap();
         let wrong_parent: Resource<OtherRes> = Resource::from_handle(parent.handle());
 
@@ -1956,5 +2093,140 @@ mod tests {
             ResourceErrorCode::ResourceAlreadyClosed
         );
         assert_eq!(table.len(), 0);
+    }
+
+    // ---- arena identity exhaustion ----------------------------------------------
+    //
+    // These tests reproduce the arena-exhaustion decision deterministically via
+    // the per-thread `test_seam::ScopedArenaSource`: a private counter replaces
+    // the process-global `NEXT_ARENA_ID` for the current thread only, so the
+    // real global allocator is never consumed and concurrent tests on other
+    // threads are unaffected (they keep seeing real monotonic ids).
+
+    /// Extracts the typed error from a failed table construction (the table
+    /// itself is intentionally not `Debug`).
+    fn table_error(result: ResourceResult<ResourceTable>) -> ResourceError {
+        match result {
+            Ok(_) => panic!("expected exhaustion failure"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn with_limit_hands_out_the_last_arena_id_then_fails_typed() {
+        // Fresh counter per test so the full suite stays order-independent.
+        static COUNTER: AtomicU64 = AtomicU64::new(MAX_HANDLE_ARENA_ID);
+        let _source = test_seam::ScopedArenaSource::install(&COUNTER);
+
+        // The counter starts at the maximum handout: the first allocation
+        // succeeds and receives exactly `MAX_HANDLE_ARENA_ID`.
+        let table = ResourceTable::with_limit(1).expect("last arena id must hand out");
+        assert_eq!(table.arena_id(), MAX_HANDLE_ARENA_ID);
+
+        // The *next* allocation is the first call after the max handout: it
+        // must fail with a typed exhaustion error, never panic, never wrap.
+        let error = table_error(ResourceTable::with_limit(1));
+        assert_eq!(error.code(), ResourceErrorCode::ResourceTableArenaExhausted);
+        assert_eq!(error.operation(), "resource::table");
+        for _ in 0..3 {
+            let error = table_error(ResourceTable::with_limit(1));
+            assert_eq!(error.code(), ResourceErrorCode::ResourceTableArenaExhausted);
+            assert_eq!(
+                COUNTER.load(Ordering::SeqCst),
+                MAX_HANDLE_ARENA_ID + 1,
+                "repeated failures must not advance, wrap, or reuse the arena id"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_allocation_does_not_advance_the_arena_counter() {
+        // Fresh counter per test.
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        let counter = &COUNTER;
+        let _source = test_seam::ScopedArenaSource::install(counter);
+
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        let table = ResourceTable::with_limit(1).expect("first handout");
+        assert_eq!(table.arena_id(), 1);
+        // Counter advanced exactly once by the successful handout.
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        // Force the failure by jumping the private counter to the exhausted
+        // state, then assert a failed allocation leaves it untouched.
+        counter.store(MAX_HANDLE_ARENA_ID + 1, Ordering::SeqCst);
+        let error = table_error(ResourceTable::with_limit(1));
+        assert_eq!(error.code(), ResourceErrorCode::ResourceTableArenaExhausted);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            MAX_HANDLE_ARENA_ID + 1,
+            "a failed allocation must not advance the arena counter"
+        );
+    }
+
+    #[test]
+    fn arena_ids_are_unique_monotonic_and_never_wrap() {
+        static COUNTER: AtomicU64 = AtomicU64::new(MAX_HANDLE_ARENA_ID - 2);
+        let _source = test_seam::ScopedArenaSource::install(&COUNTER);
+
+        let first = ResourceTable::with_limit(1).expect("handout");
+        let second = ResourceTable::with_limit(1).expect("handout");
+        let third = ResourceTable::with_limit(1).expect("handout");
+        assert_eq!(first.arena_id(), MAX_HANDLE_ARENA_ID - 2);
+        assert_eq!(second.arena_id(), MAX_HANDLE_ARENA_ID - 1);
+        assert_eq!(third.arena_id(), MAX_HANDLE_ARENA_ID);
+        // Strictly monotonic, no reuse.
+        assert!(first.arena_id() < second.arena_id());
+        assert!(second.arena_id() < third.arena_id());
+
+        // The next call must fail; the identity space never wraps around to a
+        // recycled/lower id (no modulo, no free-list reuse).
+        let error = table_error(ResourceTable::with_limit(1));
+        assert_eq!(error.code(), ResourceErrorCode::ResourceTableArenaExhausted);
+    }
+
+    #[test]
+    fn default_construction_reports_typed_exhaustion() {
+        // Fresh counter per test.
+        static COUNTER: AtomicU64 = AtomicU64::new(MAX_HANDLE_ARENA_ID);
+        let _source = test_seam::ScopedArenaSource::install(&COUNTER);
+        // Consume the max handout first.
+        let _table = ResourceTable::new().expect("last arena id hands out");
+
+        let error = table_error(ResourceTable::new());
+        assert_eq!(error.code(), ResourceErrorCode::ResourceTableArenaExhausted);
+    }
+
+    #[test]
+    fn scoped_sources_never_advance_the_real_global_allocator() {
+        // The scoped source is a test double: handouts from it must never
+        // consume or advance the real process-global `NEXT_ARENA_ID`. The
+        // real global counter stays strictly monotonic across a scoped window
+        // (a later global allocation always receives a strictly larger id than
+        // an earlier one — no reuse, no wrap), and the scoped private counter
+        // is only ever advanced by scoped handouts.
+        let before = ResourceTable::with_limit(1).expect("global handout");
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        let counter = &COUNTER;
+        {
+            let _source = test_seam::ScopedArenaSource::install(counter);
+            let scoped = ResourceTable::with_limit(1).expect("scoped handout");
+            assert_eq!(
+                scoped.arena_id(),
+                1,
+                "scoped handout uses the private counter"
+            );
+        }
+        let after = ResourceTable::with_limit(1).expect("global handout");
+        assert!(
+            after.arena_id() > before.arena_id(),
+            "global arena ids must stay strictly monotonic across a scoped window (no reuse/wrap)"
+        );
+        // The scoped private counter is untouched by the global handouts.
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "global handouts must not advance the scoped counter"
+        );
     }
 }

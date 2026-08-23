@@ -152,7 +152,8 @@ async fn drive_vm_to_halt(vm: &mut Vm) -> Result<(), vm::VmError> {
 #[tokio::test(flavor = "current_thread")]
 async fn http_host_executes_a_bounded_request_and_returns_a_response_map() {
     let (port, server) = spawn_test_server();
-    let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
+    let mut vm = Vm::try_new(build_request_program(format!("http://127.0.0.1:{port}/")))
+        .expect("test VM construction must not fail");
     vm.configure_http(local_http_config(port))
         .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
@@ -174,7 +175,8 @@ async fn http_host_executes_a_bounded_request_and_returns_a_response_map() {
 
 #[test]
 fn http_host_rejects_targets_until_an_explicit_policy_allows_them() {
-    let mut vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
+    let mut vm = Vm::try_new(build_request_program("http://127.0.0.1:1/".to_string()))
+        .expect("test VM construction must not fail");
     standard_http_registry()
         .bind_vm_cached(&mut vm)
         .expect("default host registry should bind HTTP");
@@ -192,11 +194,12 @@ fn http_host_rejects_targets_until_an_explicit_policy_allows_them() {
 
 #[test]
 fn empty_registry_keeps_language_builtins_but_rejects_http_capability() {
-    let mut language_vm = Vm::new(
+    let mut language_vm = Vm::try_new(
         vm::compile_source("assert(true);")
             .expect("language builtin program should compile")
             .program,
-    );
+    )
+    .expect("test VM construction must not fail");
     HostFunctionRegistry::empty()
         .bind_vm_cached(&mut language_vm)
         .expect("empty registry should bind a program without host imports");
@@ -205,7 +208,8 @@ fn empty_registry_keeps_language_builtins_but_rejects_http_capability() {
         VmStatus::Halted
     );
 
-    let mut http_vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
+    let mut http_vm = Vm::try_new(build_request_program("http://127.0.0.1:1/".to_string()))
+        .expect("test VM construction must not fail");
     let error = standard_http_restricted_registry()
         .bind_vm_cached(&mut http_vm)
         .expect_err("unapproved HTTP capability must fail during preflight");
@@ -219,7 +223,7 @@ fn restricted_registry_requires_explicit_namespaced_builtin_capability() {
 io::open("/tmp/rustscript-capability-test", "r");"#,
     )
     .expect("namespaced host builtin should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     // The standard compile entry emits exact V13 io imports, so register the
     // standard IO extension against the combined snapshot; the restricted
     // profile then denies the unapproved capability instead of failing with
@@ -245,7 +249,7 @@ fn capability_binding_plan_cannot_cross_registry_profiles() {
     let plan = unrestricted
         .prepare_plan(&program.imports)
         .expect("unrestricted registry should prepare HTTP plan");
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let error = standard_http_restricted_registry()
         .bind_vm_with_plan(&mut vm, &plan)
         .expect_err("capability plan must not cross registry profiles");
@@ -262,7 +266,7 @@ fn capability_binding_plan_cannot_outlive_registry_mutation() {
     registry
         .allow_builtin("http::client::request")
         .expect("HTTP capability should be a known host callable");
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let error = registry
         .bind_vm_with_plan(&mut vm, &plan)
         .expect_err("stale capability plan must not bind");
@@ -280,7 +284,8 @@ fn capability_binding_plan_detects_divergent_registry_clone_mutations() {
         .prepare_plan(&unchanged_program.imports)
         .expect("restricted registry should prepare HTTP plan");
     let unchanged_clone = unchanged_registry.clone();
-    let mut unchanged_vm = Vm::new(unchanged_program);
+    let mut unchanged_vm =
+        Vm::try_new(unchanged_program).expect("test VM construction must not fail");
     unchanged_clone
         .bind_vm_with_plan(&mut unchanged_vm, &unchanged_plan)
         .expect("an unchanged registry clone should reuse the plan");
@@ -298,7 +303,7 @@ fn capability_binding_plan_detects_divergent_registry_clone_mutations() {
     let plan = first_mutation
         .prepare_plan(&branch_program.imports)
         .expect("first capability branch should prepare HTTP plan");
-    let mut mutated_vm = Vm::new(branch_program);
+    let mut mutated_vm = Vm::try_new(branch_program).expect("test VM construction must not fail");
     let error = second_mutation
         .bind_vm_with_plan(&mut mutated_vm, &plan)
         .expect_err("divergent capability branches must reject each other's plan");
@@ -317,7 +322,7 @@ fn registry_state_rejects_structural_sibling_mutations() {
     let plan = source
         .prepare_plan(&program.imports)
         .expect("mutated source registry should prepare HTTP plan");
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let error = destination
         .bind_vm_with_plan(&mut vm, &plan)
         .expect_err("structural sibling mutation must reject the plan");
@@ -331,7 +336,8 @@ fn cached_plan_refreshes_after_a_sibling_registry_mutation() {
     let mut mutating_sibling = registry.clone();
     let destination = registry;
 
-    let mut priming_vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
+    let mut priming_vm = Vm::try_new(build_request_program("http://127.0.0.1:1/".to_string()))
+        .expect("test VM construction must not fail");
     destination
         .bind_vm_cached(&mut priming_vm)
         .expect("destination should prime its plan cache");
@@ -339,7 +345,7 @@ fn cached_plan_refreshes_after_a_sibling_registry_mutation() {
         Ok(CallOutcome::Return(CallReturn::One(Value::Null)))
     });
 
-    let mut refreshed_vm = Vm::new(program);
+    let mut refreshed_vm = Vm::try_new(program).expect("test VM construction must not fail");
     destination
         .bind_vm_cached(&mut refreshed_vm)
         .expect("destination should rebuild a plan after sibling mutation");
@@ -358,7 +364,8 @@ async fn max_stream_duration_does_not_shorten_buffered_requests() {
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
             .unwrap();
     });
-    let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
+    let mut vm = Vm::try_new(build_request_program(format!("http://127.0.0.1:{port}/")))
+        .expect("test VM construction must not fail");
     let mut buffered_config = local_http_config(port);
     buffered_config.max_stream_duration = std::time::Duration::from_millis(1);
     buffered_config.request_timeout = std::time::Duration::from_millis(200);
@@ -372,7 +379,8 @@ async fn max_stream_duration_does_not_shorten_buffered_requests() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn explicitly_allowed_http_capability_reaches_http_policy() {
-    let mut vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
+    let mut vm = Vm::try_new(build_request_program("http://127.0.0.1:1/".to_string()))
+        .expect("test VM construction must not fail");
     vm.configure_http(HttpConfig {
         allowed_schemes: vec!["http".to_string()],
         allowed_hosts: vec!["127.0.0.1".to_string()],
@@ -397,7 +405,8 @@ async fn explicitly_allowed_http_capability_reaches_http_policy() {
 
 #[test]
 fn http_in_flight_limit_rejects_before_starting_a_request() {
-    let mut vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
+    let mut vm = Vm::try_new(build_request_program("http://127.0.0.1:1/".to_string()))
+        .expect("test VM construction must not fail");
     vm.set_http_max_in_flight(0);
     vm.configure_http(HttpConfig {
         allowed_schemes: vec!["http".to_string()],
@@ -465,7 +474,8 @@ fn http_config_accepts_bounded_stream_defaults_and_rejects_zero_bounds() {
         assert!(config.validate().is_err(), "zero stream bound must fail");
     }
 
-    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), Vec::new()))
+        .expect("test VM construction must not fail");
     let error = vm
         .configure_http(HttpConfig {
             max_stream_item_bytes: 0,
@@ -487,7 +497,8 @@ fn http_config_rejects_request_timeout_that_cannot_form_a_deadline() {
         .expect_err("overflowing request timeout must be rejected");
     assert!(validation_error.to_string().contains("request_timeout"));
 
-    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), Vec::new()))
+        .expect("test VM construction must not fail");
     let configure_error = vm
         .configure_http(invalid)
         .expect_err("configuration must reject an overflowing request timeout");
@@ -503,7 +514,8 @@ fn http_config_rejects_request_timeout_that_cannot_form_a_deadline() {
         .expect_err("overflowing stream duration must be rejected");
     assert!(validation_error.to_string().contains("max_stream_duration"));
 
-    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), Vec::new()))
+        .expect("test VM construction must not fail");
     let configure_error = vm
         .configure_http(invalid)
         .expect_err("configuration must reject an overflowing stream duration");
@@ -512,7 +524,8 @@ fn http_config_rejects_request_timeout_that_cannot_form_a_deadline() {
 }
 
 fn build_request_vm(url: &str) -> Vm {
-    let mut vm = Vm::new(build_request_program(url.to_string()));
+    let mut vm = Vm::try_new(build_request_program(url.to_string()))
+        .expect("test VM construction must not fail");
     vm.set_async_bridge(Box::<TokioHostDriver>::default());
     vm
 }
@@ -606,7 +619,7 @@ async fn sse_scope_resource_registered_and_scope_close_stops_worker() {
     // This test verifies that the SSE resource is registered in the scope
     // and that closing the scope stops the worker thread.
     let (port, server) = sse_event_server(5, 5);
-    let mut vm = Vm::new(build_sse_program(port));
+    let mut vm = Vm::try_new(build_sse_program(port)).expect("test VM construction must not fail");
     vm.configure_http(sse_config(port))
         .expect("SSE configuration should be valid");
     install_host_driver(&mut vm);
@@ -638,7 +651,7 @@ async fn sse_reset_releases_connection_permit() {
     // This test verifies that resetting the VM releases the connection permit
     // acquired by the SSE stream.
     let (port, server) = sse_event_server(10, 10);
-    let mut vm = Vm::new(build_sse_program(port));
+    let mut vm = Vm::try_new(build_sse_program(port)).expect("test VM construction must not fail");
     vm.set_http_max_in_flight(1);
     vm.configure_http(sse_config(port))
         .expect("SSE configuration should be valid");
@@ -658,7 +671,8 @@ async fn sse_reset_releases_connection_permit() {
     // The permit should now be available. Verify by running a new request
     // with max_in_flight=1 (the only permit was released).
     let (port2, server2) = spawn_test_server();
-    let mut vm2 = Vm::new(build_request_program(format!("http://127.0.0.1:{port2}/")));
+    let mut vm2 = Vm::try_new(build_request_program(format!("http://127.0.0.1:{port2}/")))
+        .expect("test VM construction must not fail");
     vm2.set_http_max_in_flight(1);
     vm2.configure_http(local_http_config(port2))
         .expect("HTTP configuration should be valid");
@@ -701,7 +715,7 @@ async fn sse_callback_stop_retires_without_end_and_returns_stopped_summary() {
         result;"#
     );
     let compiled = compile_source(&source).expect("SSE stop source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.configure_http(sse_config(port)).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default());
     standard_http_registry().bind_vm_cached(&mut vm).unwrap();
@@ -725,7 +739,7 @@ async fn sse_explicit_resource_close_via_scope_stops_worker() {
     // This test verifies that the SSE resource is registered in the scope
     // and that closing the scope (via shutdown) stops the worker.
     let (port, server) = sse_event_server(20, 10);
-    let mut vm = Vm::new(build_sse_program(port));
+    let mut vm = Vm::try_new(build_sse_program(port)).expect("test VM construction must not fail");
     vm.configure_http(sse_config(port))
         .expect("SSE configuration should be valid");
     install_host_driver(&mut vm);
@@ -750,7 +764,7 @@ async fn sse_child_first_cleanup_through_scope_close() {
     // This test verifies that child-first cleanup works: the SSE resource
     // is closed before the parent resource.
     let (port, server) = sse_event_server(5, 5);
-    let mut vm = Vm::new(build_sse_program(port));
+    let mut vm = Vm::try_new(build_sse_program(port)).expect("test VM construction must not fail");
     vm.configure_http(sse_config(port))
         .expect("SSE configuration should be valid");
     install_host_driver(&mut vm);
@@ -778,7 +792,7 @@ async fn sse_no_detached_worker_after_stream_driver_removal() {
     // This test verifies that the SSE worker is not left running after the
     // stream driver is removed (via cancel_callable_stream during shutdown).
     let (port, server) = sse_event_server(50, 20);
-    let mut vm = Vm::new(build_sse_program(port));
+    let mut vm = Vm::try_new(build_sse_program(port)).expect("test VM construction must not fail");
     vm.configure_http(sse_config(port))
         .expect("SSE configuration should be valid");
     install_host_driver(&mut vm);

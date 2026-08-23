@@ -28,6 +28,8 @@ pub enum OperationErrorCode {
     OperationPending,
     /// The operation id space was exhausted.
     OperationIdExhausted,
+    /// The process-unique operation-registry tag space was exhausted.
+    OperationRegistryTagExhausted,
     /// A cleanup hook failed after the operation's terminal transition.
     OperationCleanupFailed,
     /// The registry is sealed and rejects the start of new operations.
@@ -48,6 +50,7 @@ impl OperationErrorCode {
             Self::OperationNotFound => "operation_not_found",
             Self::OperationPending => "operation_pending",
             Self::OperationIdExhausted => "operation_id_exhausted",
+            Self::OperationRegistryTagExhausted => "operation_registry_tag_exhausted",
             Self::OperationCleanupFailed => "operation_cleanup_failed",
             Self::OperationRegistrySealed => "operation_registry_sealed",
             Self::OperationDriverFailed => "operation_driver_failed",
@@ -173,6 +176,10 @@ mod tests {
             (
                 OperationErrorCode::OperationIdExhausted,
                 "operation_id_exhausted",
+            ),
+            (
+                OperationErrorCode::OperationRegistryTagExhausted,
+                "operation_registry_tag_exhausted",
             ),
             (
                 OperationErrorCode::OperationCleanupFailed,

@@ -161,7 +161,7 @@ fn depth_zero_call_only_loop_program() -> ManualTraceProgram {
 #[test]
 fn jit_blocks_depth_zero_zero_benefit_call_boundary_trace() {
     let case = depth_zero_call_only_loop_program();
-    let mut vm = Vm::new(case.program);
+    let mut vm = Vm::try_new(case.program).expect("test VM construction must not fail");
     configure_jit(&mut vm);
     vm.register_function(Box::new(ReturnIntArgument));
 
@@ -241,7 +241,7 @@ fn depth_one_call_only_loop_program() -> ManualTraceProgram {
 #[test]
 fn jit_blocks_depth_one_zero_benefit_call_boundary_trace() {
     let case = depth_one_call_only_loop_program();
-    let mut vm = Vm::new(case.program);
+    let mut vm = Vm::try_new(case.program).expect("test VM construction must not fail");
     configure_jit(&mut vm);
     vm.register_function(Box::new(ReturnIntArgument));
 
@@ -283,7 +283,7 @@ fn jit_blocks_depth_one_zero_benefit_call_boundary_trace() {
 #[test]
 fn jit_supports_backward_brfalse_to_trace_root() {
     let case = loop_if_false_root_program();
-    let mut vm = Vm::new(case.program);
+    let mut vm = Vm::try_new(case.program).expect("test VM construction must not fail");
     configure_jit(&mut vm);
 
     let status = vm.run().expect("vm should run");
@@ -331,7 +331,7 @@ fn aot_supports_backward_brfalse_to_earlier_non_root_step() {
     }
 
     let (program, target_ip) = backward_brfalse_non_root_program();
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     install_aot(&mut vm);
 
     let status = vm.run().expect("aot vm should run");
@@ -357,7 +357,7 @@ fn aot_keeps_backward_brfalse_outside_trace_as_guard_false() {
     }
 
     let case = loop_if_false_root_program();
-    let mut vm = Vm::new(case.program);
+    let mut vm = Vm::try_new(case.program).expect("test VM construction must not fail");
     install_aot(&mut vm);
 
     let status = vm.run().expect("aot vm should run");
@@ -379,7 +379,7 @@ fn aot_keeps_backward_brfalse_outside_trace_as_guard_false() {
 #[test]
 fn jit_skips_tracing_when_builtin_override_disables_ssa_path() {
     let case = loop_if_false_root_program();
-    let mut vm = Vm::new(case.program);
+    let mut vm = Vm::try_new(case.program).expect("test VM construction must not fail");
     configure_jit(&mut vm);
     vm.bind_builtin_override("json::encode", Box::new(UnusedBuiltinOverride))
         .expect("json::encode should be a valid builtin override");
@@ -415,7 +415,8 @@ fn aot_bundle_roundtrips_loop_if_false_traces() {
     }
 
     let first_case = loop_if_false_root_program();
-    let mut compiled_vm = Vm::new(first_case.program);
+    let mut compiled_vm =
+        Vm::try_new(first_case.program).expect("test VM construction must not fail");
     install_aot(&mut compiled_vm);
     let expected_resume_ips = compiled_vm
         .aot_resume_ips()
@@ -428,7 +429,8 @@ fn aot_bundle_roundtrips_loop_if_false_traces() {
         .expect("artifact save should succeed");
 
     let second_case = loop_if_false_root_program();
-    let mut loaded_vm = Vm::new(second_case.program);
+    let mut loaded_vm =
+        Vm::try_new(second_case.program).expect("test VM construction must not fail");
     disable_trace_jit(&mut loaded_vm);
     loaded_vm
         .load_aot_artifact_from_file(&artifact_path)
@@ -458,14 +460,15 @@ fn aot_bundle_rejects_program_hash_mismatch() {
     }
 
     let source_case = loop_if_false_root_program();
-    let mut source_vm = Vm::new(source_case.program);
+    let mut source_vm =
+        Vm::try_new(source_case.program).expect("test VM construction must not fail");
     install_aot(&mut source_vm);
     let bytes = source_vm
         .encode_aot_artifact()
         .expect("artifact encode should succeed");
 
     let (other_program, _) = backward_brfalse_non_root_program();
-    let mut target_vm = Vm::new(other_program);
+    let mut target_vm = Vm::try_new(other_program).expect("test VM construction must not fail");
     disable_trace_jit(&mut target_vm);
     let err = target_vm
         .load_aot_artifact(&bytes)
@@ -489,7 +492,7 @@ fn jit_records_trace_too_long_nyi_and_preserves_results() {
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -528,7 +531,7 @@ fn jit_rejects_zero_hot_loop_threshold_with_explicit_nyi_reason() {
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 0,

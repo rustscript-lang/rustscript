@@ -33,7 +33,7 @@ fn empty_registry_allows_functions_registered_by_the_embedder() {
         compile_source("fn action() -> int; action();").expect("host call source should compile");
     let mut registry = HostFunctionRegistry::empty();
     registry.register_static_args("action", 0, returns_registered_value);
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry
         .bind_vm_cached(&mut vm)
         .expect("custom registry should bind its registered import");
@@ -54,7 +54,7 @@ fn explicit_capability_profile_authorizes_host_imports_during_preflight() {
     registry.register_static_args("action", 0, returns_registered_value);
     registry.set_capability_profile(CapabilityProfile::deny_all());
 
-    let mut denied = Vm::new(program.clone());
+    let mut denied = Vm::try_new(program.clone()).expect("test VM construction must not fail");
     let error = registry
         .bind_vm_cached(&mut denied)
         .expect_err("deny-all profile must reject the host import during binding");
@@ -67,7 +67,7 @@ fn explicit_capability_profile_authorizes_host_imports_during_preflight() {
             .build(),
     );
     allowed_registry.register_static_args("action", 0, returns_registered_value);
-    let mut allowed = Vm::new(program);
+    let mut allowed = Vm::try_new(program).expect("test VM construction must not fail");
     allowed_registry
         .bind_vm_cached(&mut allowed)
         .expect("allowed host import should bind");
@@ -82,7 +82,7 @@ fn explicit_capability_profile_authorizes_host_imports_during_preflight() {
 fn empty_registry_preserves_default_builtin_capabilities() {
     let compiled = compile_source("use bytes; bytes::from_array_u8([1, 2, 3]);")
         .expect("bytes source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     HostFunctionRegistry::empty()
         .bind_vm_cached(&mut vm)
         .expect("empty registry should bind builtin calls");
@@ -99,7 +99,7 @@ fn explicit_capability_profile_authorizes_builtin_calls_during_preflight() {
     let mut registry = HostFunctionRegistry::empty();
     registry.set_capability_profile(CapabilityProfile::deny_all());
 
-    let mut denied = Vm::new(program.clone());
+    let mut denied = Vm::try_new(program.clone()).expect("test VM construction must not fail");
     let error = registry
         .bind_vm_cached(&mut denied)
         .expect_err("deny-all profile must reject builtin calls during binding");
@@ -110,7 +110,7 @@ fn explicit_capability_profile_authorizes_builtin_calls_during_preflight() {
             .allow_builtin(vm::BuiltinFunction::BytesFromArrayU8)
             .build(),
     );
-    let mut allowed = Vm::new(program);
+    let mut allowed = Vm::try_new(program).expect("test VM construction must not fail");
     registry
         .bind_vm_cached(&mut allowed)
         .expect("allowed builtin should bind");
@@ -136,7 +136,7 @@ fn explicit_capability_profile_rejects_builtin_callable_metadata_during_prefligh
         self_slot: None,
         schema: None,
     });
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let mut registry = HostFunctionRegistry::empty();
     registry.set_capability_profile(CapabilityProfile::deny_all());
 
@@ -154,12 +154,12 @@ fn restricted_builtin_capabilities_are_rejected_before_interpreter_or_aot_execut
         .expect("bytes source should compile")
         .program;
 
-    let mut interpreter = Vm::new(program.clone());
+    let mut interpreter = Vm::try_new(program.clone()).expect("test VM construction must not fail");
     let interpreter_error = HostFunctionRegistry::restricted()
         .bind_vm_cached(&mut interpreter)
         .expect_err("restricted profile should reject before interpreter execution");
 
-    let mut aot = Vm::new(program);
+    let mut aot = Vm::try_new(program).expect("test VM construction must not fail");
     aot.compile_aot().expect("AOT compile should succeed");
     let aot_error = HostFunctionRegistry::restricted()
         .bind_vm_cached(&mut aot)
@@ -172,7 +172,7 @@ fn restricted_builtin_capabilities_are_rejected_before_interpreter_or_aot_execut
 fn non_yielding_args_return_type_contract_is_enforced_before_jit_compilation() {
     let compiled =
         compile_source("fn action() -> int; action();").expect("host call source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.bind_static_non_yielding_args_function("action", non_yielding_returns_bool);
 
     assert!(matches!(
@@ -193,7 +193,7 @@ fn non_yielding_args_contract_is_enforced_before_jit_compilation() {
     for (expected, function) in cases {
         let compiled = compile_source("fn action() -> int; action();")
             .expect("host call source should compile");
-        let mut vm = Vm::new(compiled.program);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
         vm.bind_static_non_yielding_args_function("action", function);
 
         let err = vm.run().expect_err("contract violation should fail");
@@ -227,7 +227,7 @@ fn builtin_call_index_with_arity(source: &str, argc: u8) -> u16 {
 #[test]
 fn regex_cache_capacity_is_configurable_through_public_vm_api() {
     let program = Program::new(Vec::new(), vec![OpCode::Ret as u8]);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
 
     assert_eq!(vm.regex_cache_capacity(), 512);
     vm.set_regex_cache_capacity(64);
@@ -247,7 +247,7 @@ fn arithmetic_works() {
     bc.ret();
 
     let program = Program::new(constants, bc.finish());
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -266,7 +266,7 @@ fn shift_ops_and_msil_literals_work() {
     "#;
 
     let program = assemble(source).expect("assemble should succeed");
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
 
     assert_eq!(status, VmStatus::Halted);
@@ -285,7 +285,7 @@ fn arithmetic_supports_float_and_mixed_numeric() {
     bc.ret();
 
     let program = Program::new(constants, bc.finish());
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -304,7 +304,7 @@ fn brfalse_skips_block() {
     bc.ret();
 
     let program = Program::new(constants, bc.finish());
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -318,7 +318,7 @@ fn call_can_yield_and_resume() {
     bc.ret();
 
     let program = Program::new(Vec::new(), bc.finish());
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.register_function(Box::new(YieldOnce { yielded: false }));
 
     let status = vm.run().expect("first run should yield");
@@ -353,7 +353,7 @@ fn args_only_call_can_yield_and_resume_without_rebuilding_args() {
     bc.ret();
 
     let program = Program::new(vec![Value::Int(4)], bc.finish());
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.register_args_function(Box::new(YieldOnceArgs { yielded: false }));
 
     let status = vm.run().expect("first run should yield");
@@ -388,7 +388,7 @@ fn call_can_wait_for_host_op_and_resume_without_replay() {
     bc.ret();
     let program = Program::new(Vec::new(), bc.finish());
 
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.register_function(Box::new(PendingOnce { called: false }));
 
     let status = vm.run().expect("first run should wait on host op");
@@ -426,7 +426,7 @@ fn args_only_call_can_wait_for_host_op_and_resume_without_replay() {
     bc.ret();
     let program = Program::new(vec![Value::Int(4)], bc.finish());
 
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.register_args_function(Box::new(PendingOnceArgs { called: false }));
 
     let status = vm.run().expect("first run should wait on host op");
@@ -445,15 +445,6 @@ fn args_only_call_can_wait_for_host_op_and_resume_without_replay() {
 
 #[test]
 fn namespaced_builtin_io_call_can_be_overridden_by_host_binding() {
-    struct ExistsOverride;
-
-    impl HostFunction for ExistsOverride {
-        fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
-            assert_eq!(args, &[Value::string("request_body")]);
-            Ok(CallOutcome::Return(vec![Value::Bool(false)].into()))
-        }
-    }
-
     let compiled = compile_source(
         r#"
         use io;
@@ -475,7 +466,7 @@ fn namespaced_builtin_io_call_can_be_overridden_by_host_binding() {
             Ok(CallOutcome::Return(vm::CallReturn::one(Value::Bool(false))))
         })
         .expect("exact io::exists override should register");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry
         .bind_vm_cached(&mut vm)
         .expect("exact override registry should bind");
@@ -487,14 +478,6 @@ fn namespaced_builtin_io_call_can_be_overridden_by_host_binding() {
 
 #[test]
 fn builtin_override_does_not_bypass_restricted_capability_profile() {
-    struct ExistsOverride;
-
-    impl HostFunction for ExistsOverride {
-        fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
-            Ok(CallOutcome::Return(vec![Value::Bool(false)].into()))
-        }
-    }
-
     let program = compile_source(
         r#"
         use io;
@@ -504,7 +487,7 @@ fn builtin_override_does_not_bypass_restricted_capability_profile() {
     .expect("source should compile")
     .program;
 
-    let mut denied = Vm::new(program.clone());
+    let mut denied = Vm::try_new(program.clone()).expect("test VM construction must not fail");
     let error = HostFunctionRegistry::restricted()
         .bind_vm_cached(&mut denied)
         .expect_err("restricted profile should reject before override installation");
@@ -527,7 +510,7 @@ fn builtin_override_does_not_bypass_restricted_capability_profile() {
         .allow_host_import("io::exists")
         .build();
     allowed_registry.set_capability_profile(profile);
-    let mut allowed = Vm::new(program);
+    let mut allowed = Vm::try_new(program).expect("test VM construction must not fail");
     allowed_registry
         .bind_vm_cached(&mut allowed)
         .expect("allowlisted registry should bind");
@@ -558,7 +541,7 @@ fn namespaced_builtin_json_encode_call_can_be_overridden_by_host_binding() {
     "#,
     )
     .expect("source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.bind_function("json::encode", Box::new(JsonEncodeOverride));
 
     let status = vm.run().expect("vm should run");
@@ -584,7 +567,7 @@ fn namespaced_builtin_math_call_can_be_overridden_by_host_binding() {
     "#,
     )
     .expect("source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.bind_function("math::sqrt", Box::new(MathSqrtOverride));
 
     let status = vm.run().expect("vm should run");
@@ -601,7 +584,7 @@ fn runtime_sleep_host_import_is_available_by_default() {
     "#,
     )
     .expect("source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -618,7 +601,7 @@ fn runtime_exit_host_import_halts_before_later_code_runs() {
     "#,
     )
     .expect("source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     let status = vm.run().expect("vm should halt");
     assert_eq!(status, VmStatus::Halted);
@@ -646,7 +629,7 @@ fn runtime_sleep_host_import_can_be_overridden_by_host_binding() {
     "#,
     )
     .expect("source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.bind_function("runtime::sleep", Box::new(RuntimeSleepOverride));
 
     let status = vm.run().expect("vm should run");
@@ -663,7 +646,7 @@ fn host_function_registry_includes_default_runtime_sleep() {
     "#,
     )
     .expect("source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let registry = HostFunctionRegistry::new();
     registry
         .bind_vm_cached(&mut vm)
@@ -684,7 +667,7 @@ fn host_function_registry_includes_default_runtime_exit() {
     "#,
     )
     .expect("source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let registry = HostFunctionRegistry::new();
     registry
         .bind_vm_cached(&mut vm)
@@ -708,7 +691,7 @@ fn json_encode_rejects_non_string_map_keys() {
     )
     .expect("non-string-key maps must compile; runtime must reject them");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let err = vm
         .run()
         .expect_err("json::encode must reject non-string map keys");
@@ -737,7 +720,7 @@ fn json_encode_rejects_nan_at_runtime() {
     )
     .expect("nan float must compile; runtime must reject it");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let err = vm.run().expect_err("json::encode must reject NaN");
     match err {
         vm::VmError::HostError(message) => {
@@ -770,7 +753,7 @@ fn json_encode_rejects_infinite_floats_at_runtime() {
     ] {
         let compiled =
             compile_source(source).expect("infinite float must compile; runtime must reject it");
-        let mut vm = Vm::new(compiled.program);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
         let err = vm.run().expect_err("json::encode must reject infinity");
         match err {
             vm::VmError::HostError(message) => {
@@ -799,7 +782,7 @@ fn json_encode_uses_last_duplicate_map_entry_from_constructor() {
     .expect("source should compile");
     compiled.program.constants = vec![duplicate_map];
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("json::encode should succeed");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::string("{\"k\":2}")]);
@@ -819,7 +802,7 @@ fn member_has_lowering_checks_container_membership() {
     )
     .expect("source should compile");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Bool(true)]);
@@ -835,7 +818,7 @@ fn json_decode_rejects_duplicate_object_keys() {
     )
     .expect("source should compile");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let err = vm
         .run()
         .expect_err("json::decode should reject duplicate object keys");
@@ -857,7 +840,8 @@ fn bind_builtin_override_rejects_unknown_namespaced_builtin() {
         }
     }
 
-    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), Vec::new()))
+        .expect("test VM construction must not fail");
     let err = vm
         .bind_builtin_override("io::not_real", Box::new(Dummy))
         .expect_err("unknown builtin override name should fail");
@@ -876,7 +860,7 @@ fn assembler_resolves_labels() {
     asm.ret();
 
     let program = asm.finish_program().expect("assembler should finish");
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -893,7 +877,7 @@ fn assemble_text_program() {
     "#;
 
     let program = assemble(source).expect("assemble should succeed");
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
 
     assert_eq!(status, VmStatus::Halted);
@@ -913,7 +897,7 @@ fn assemble_text_with_labels() {
     "#;
 
     let program = assemble(source).expect("assemble should succeed");
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
 
     assert_eq!(status, VmStatus::Halted);
@@ -931,7 +915,7 @@ fn assemble_text_with_data_and_string() {
     "#;
 
     let program = assemble(source).expect("assemble should succeed");
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
 
     assert_eq!(status, VmStatus::Halted);
@@ -957,7 +941,7 @@ fn fuel_budget_exhausts_and_recharge_allows_resume() {
     bc.ret();
 
     let program = Program::new(constants, bc.finish());
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_fuel(2);
 
     let status = vm
@@ -974,7 +958,8 @@ fn fuel_budget_exhausts_and_recharge_allows_resume() {
 
 #[test]
 fn fuel_checkpoint_and_restore_work() {
-    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), Vec::new()))
+        .expect("test VM construction must not fail");
     vm.set_fuel(10);
     let checkpoint = vm.fuel_checkpoint();
 
@@ -988,7 +973,8 @@ fn fuel_checkpoint_and_restore_work() {
 
 #[test]
 fn consume_fuel_tick_advances_checkpointed_metering() {
-    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), Vec::new()))
+        .expect("test VM construction must not fail");
     vm.set_fuel_check_interval(3)
         .expect("interval update should succeed");
     vm.set_fuel(6);
@@ -1018,7 +1004,10 @@ fn store_api_exposes_fuel_checkpoint_and_recharge() {
     bc.ret();
 
     let program = Program::new(constants, bc.finish());
-    let mut store = Store::new(Vm::new(program), String::from("ctx"));
+    let mut store = Store::new(
+        Vm::try_new(program).expect("test VM construction must not fail"),
+        String::from("ctx"),
+    );
     store.set_fuel(1);
     let checkpoint = store.checkpoint();
 
@@ -1046,7 +1035,7 @@ fn fuel_check_interval_can_be_configured() {
     bc.ret();
 
     let program = Program::new(constants, bc.finish());
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_fuel_check_interval(3)
         .expect("interval update should succeed");
     vm.set_fuel(3);
@@ -1065,7 +1054,7 @@ fn coarse_fuel_checking_trades_precision_for_overhead() {
     bc.ret();
 
     let program = Program::new(constants, bc.finish());
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_fuel_check_interval(3)
         .expect("interval update should succeed");
     vm.set_fuel(2);
@@ -1083,7 +1072,8 @@ fn coarse_fuel_checking_trades_precision_for_overhead() {
 
 #[test]
 fn fuel_check_interval_zero_is_rejected() {
-    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), Vec::new()))
+        .expect("test VM construction must not fail");
     let err = vm
         .set_fuel_check_interval(0)
         .expect_err("zero interval should fail");
@@ -1092,7 +1082,8 @@ fn fuel_check_interval_zero_is_rejected() {
 
 #[test]
 fn fuel_checkpoint_restores_interval() {
-    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), Vec::new()))
+        .expect("test VM construction must not fail");
     vm.set_fuel_check_interval(7)
         .expect("interval update should succeed");
     vm.set_fuel(22);
@@ -1118,7 +1109,7 @@ fn epoch_deadline_exhausts_and_auto_rearm_allows_resume() {
     bc.ret();
 
     let program = Program::new(constants, bc.finish());
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_epoch_deadline(1)
         .expect("setting epoch deadline should succeed");
     assert_eq!(vm.increment_epoch(), 1);
@@ -1135,7 +1126,8 @@ fn epoch_deadline_exhausts_and_auto_rearm_allows_resume() {
 
 #[test]
 fn epoch_checkpoint_and_restore_work() {
-    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), Vec::new()))
+        .expect("test VM construction must not fail");
     assert_eq!(vm.increment_epoch_by(10), 10);
     vm.set_epoch_deadline(5)
         .expect("setting epoch deadline should succeed");
@@ -1158,7 +1150,10 @@ fn store_api_exposes_epoch_checkpoint_and_deadline() {
     bc.ret();
 
     let program = Program::new(constants, bc.finish());
-    let mut store = Store::new(Vm::new(program), String::from("ctx"));
+    let mut store = Store::new(
+        Vm::try_new(program).expect("test VM construction must not fail"),
+        String::from("ctx"),
+    );
     store
         .set_epoch_deadline(1)
         .expect("setting epoch deadline should succeed");
@@ -1193,7 +1188,7 @@ fn epoch_check_interval_can_be_configured() {
     bc.ret();
 
     let program = Program::new(constants, bc.finish());
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_epoch_check_interval(3)
         .expect("interval update should succeed");
     vm.set_epoch_deadline(1)
@@ -1219,7 +1214,7 @@ fn epoch_deadline_zero_auto_rearms_without_manual_reconfiguration() {
     bc.ret();
 
     let program = Program::new(constants, bc.finish());
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_epoch_deadline(0)
         .expect("setting epoch deadline should succeed");
 
@@ -1244,7 +1239,8 @@ fn epoch_deadline_zero_auto_rearms_without_manual_reconfiguration() {
 
 #[test]
 fn epoch_check_interval_zero_is_rejected() {
-    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), Vec::new()))
+        .expect("test VM construction must not fail");
     let err = vm
         .set_epoch_check_interval(0)
         .expect_err("zero interval should fail");
@@ -1253,7 +1249,8 @@ fn epoch_check_interval_zero_is_rejected() {
 
 #[test]
 fn epoch_checkpoint_restores_interval() {
-    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), Vec::new()))
+        .expect("test VM construction must not fail");
     assert_eq!(vm.increment_epoch_by(3), 3);
     vm.set_epoch_check_interval(7)
         .expect("interval update should succeed");
@@ -1285,7 +1282,7 @@ fn float_division_by_zero_produces_signed_infinities() {
     bc.ret();
 
     let program = Program::new(constants, bc.finish());
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
 
     assert_eq!(status, VmStatus::Halted);
@@ -1306,7 +1303,7 @@ fn float_modulo_by_zero_produces_nan() {
     bc.ret();
 
     let program = Program::new(constants, bc.finish());
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
 
     assert_eq!(status, VmStatus::Halted);
@@ -1326,7 +1323,7 @@ fn not_flips_booleans_and_rejects_non_booleans() {
     "#,
     )
     .expect("assemble should succeed");
-    let mut bool_vm = Vm::new(bool_program);
+    let mut bool_vm = Vm::try_new(bool_program).expect("test VM construction must not fail");
     let bool_status = bool_vm.run().expect("boolean not should succeed");
     assert_eq!(bool_status, VmStatus::Halted);
     assert_eq!(bool_vm.stack(), &[Value::Bool(false)]);
@@ -1343,7 +1340,7 @@ fn not_flips_booleans_and_rejects_non_booleans() {
             OpCode::Ret as u8,
         ],
     );
-    let mut invalid_vm = Vm::new(invalid_program);
+    let mut invalid_vm = Vm::try_new(invalid_program).expect("test VM construction must not fail");
     let err = invalid_vm.run().expect_err("non-boolean not should fail");
     assert!(matches!(err, vm::VmError::TypeMismatch("bool")));
 }
@@ -1361,7 +1358,7 @@ fn shift_right_variants_distinguish_arithmetic_and_logical_behavior() {
     bc.ret();
 
     let program = Program::new(constants, bc.finish());
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
 
     assert_eq!(status, VmStatus::Halted);
@@ -1387,7 +1384,8 @@ fn shift_amount_must_be_between_zero_and_sixty_three() {
             OpCode::Ret as u8,
         ],
     );
-    let mut negative_vm = Vm::new(negative_program);
+    let mut negative_vm =
+        Vm::try_new(negative_program).expect("test VM construction must not fail");
     let negative_err = negative_vm.run().expect_err("negative shift should fail");
     assert!(matches!(negative_err, vm::VmError::InvalidShift(-1)));
 
@@ -1408,7 +1406,7 @@ fn shift_amount_must_be_between_zero_and_sixty_three() {
             OpCode::Ret as u8,
         ],
     );
-    let mut large_vm = Vm::new(large_program);
+    let mut large_vm = Vm::try_new(large_program).expect("test VM construction must not fail");
     let large_err = large_vm.run().expect_err("large shift should fail");
     assert!(matches!(large_err, vm::VmError::InvalidShift(64)));
 }
@@ -1432,7 +1430,7 @@ fn brfalse_rejects_non_boolean_condition() {
             OpCode::Ret as u8,
         ],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let err = vm.run().expect_err("brfalse should require a bool");
     assert!(matches!(err, vm::VmError::TypeMismatch("bool")));
 }
@@ -1447,7 +1445,7 @@ fn nan_is_not_equal_to_itself() {
     bc.ret();
 
     let program = Program::new(constants, bc.finish());
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
 
     assert_eq!(status, VmStatus::Halted);
@@ -1462,7 +1460,7 @@ fn resume_on_halted_vm_returns_bytecode_bounds() {
     "#,
     )
     .expect("assemble should succeed");
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let status = vm.run().expect("initial run should halt");
     assert_eq!(status, VmStatus::Halted);
 
@@ -1489,7 +1487,7 @@ fn map_equality_ignores_entry_order() {
     bc.ret();
 
     let program = Program::new(constants, bc.finish());
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
 
     assert_eq!(status, VmStatus::Halted);
@@ -1525,7 +1523,8 @@ fn get_and_set_use_hash_map_overwrite_semantics() {
     get_bc.ldc(1);
     get_bc.call(builtin_get, 2);
     get_bc.ret();
-    let mut get_vm = Vm::new(Program::new(constants.clone(), get_bc.finish()));
+    let mut get_vm = Vm::try_new(Program::new(constants.clone(), get_bc.finish()))
+        .expect("test VM construction must not fail");
     let get_status = get_vm.run().expect("get should succeed");
     assert_eq!(get_status, VmStatus::Halted);
     assert_eq!(get_vm.stack(), &[Value::Int(2)]);
@@ -1536,7 +1535,8 @@ fn get_and_set_use_hash_map_overwrite_semantics() {
     set_bc.ldc(2);
     set_bc.call(builtin_set, 3);
     set_bc.ret();
-    let mut set_vm = Vm::new(Program::new(constants, set_bc.finish()));
+    let mut set_vm = Vm::try_new(Program::new(constants, set_bc.finish()))
+        .expect("test VM construction must not fail");
     let set_status = set_vm.run().expect("set should succeed");
     assert_eq!(set_status, VmStatus::Halted);
     let [Value::Map(entries)] = set_vm.stack() else {
@@ -1569,7 +1569,8 @@ fn set_rejects_sparse_array_indexes() {
     bc.call(builtin_set, 3);
     bc.ret();
 
-    let mut vm = Vm::new(Program::new(constants, bc.finish()));
+    let mut vm = Vm::try_new(Program::new(constants, bc.finish()))
+        .expect("test VM construction must not fail");
     let err = vm.run().expect_err("sparse array set should fail");
     match err {
         vm::VmError::HostError(message) => {
@@ -1595,10 +1596,11 @@ fn int_div_and_mod_overflow_report_integer_overflow() {
         }
         bc.ret();
 
-        let mut vm = Vm::new(Program::new(
+        let mut vm = Vm::try_new(Program::new(
             vec![Value::Int(i64::MIN), Value::Int(-1)],
             bc.finish(),
-        ));
+        ))
+        .expect("test VM construction must not fail");
         let err = vm.run().expect_err("i64::MIN with -1 should overflow");
         assert!(
             matches!(err, vm::VmError::IntegerOverflow(found) if found == operation),

@@ -39,6 +39,17 @@ pub enum ResourceErrorCode {
     ResourceHasChildren,
     /// The resource identity space (slots, generations, arenas) is exhausted.
     ResourceIdExhausted,
+    /// The [`ResourceTable`](crate::vm::resource::table::ResourceTable)
+    /// process-unique arena identity space is exhausted: no new table can be
+    /// constructed because the bounded arena id space
+    /// ([`MAX_HANDLE_ARENA_ID`](crate::vm::resource::handle::MAX_HANDLE_ARENA_ID))
+    /// has been fully handed out.
+    ///
+    /// This is the typed, stable discriminator for ResourceTable arena-ID
+    /// identity exhaustion and is deliberately distinct from
+    /// [`ResourceIdExhausted`](Self::ResourceIdExhausted), which keeps covering
+    /// ordinary resource slot/id exhaustion inside an existing table.
+    ResourceTableArenaExhausted,
     /// Best-effort cleanup of a closing resource reported a failure.
     ResourceCleanupFailed,
     /// `poll_close` was called on a resource that is not in the closing state.
@@ -86,6 +97,7 @@ impl ResourceErrorCode {
             Self::ResourceAlreadyClosed => "resource_already_closed",
             Self::ResourceHasChildren => "resource_has_children",
             Self::ResourceIdExhausted => "resource_id_exhausted",
+            Self::ResourceTableArenaExhausted => "resource_arena_id_exhausted",
             Self::ResourceCleanupFailed => "resource_cleanup_failed",
             Self::ResourceNotClosing => "resource_not_closing",
             Self::ResourceCloseInProgress => "resource_close_in_progress",
@@ -207,6 +219,7 @@ mod tests {
             ResourceErrorCode::ResourceAlreadyClosed,
             ResourceErrorCode::ResourceHasChildren,
             ResourceErrorCode::ResourceIdExhausted,
+            ResourceErrorCode::ResourceTableArenaExhausted,
             ResourceErrorCode::ResourceCleanupFailed,
             ResourceErrorCode::ResourceNotClosing,
             ResourceErrorCode::ResourceCloseInProgress,
@@ -258,6 +271,10 @@ mod tests {
             (
                 ResourceErrorCode::ResourceIdExhausted,
                 "resource_id_exhausted",
+            ),
+            (
+                ResourceErrorCode::ResourceTableArenaExhausted,
+                "resource_arena_id_exhausted",
             ),
             (
                 ResourceErrorCode::ResourceCleanupFailed,

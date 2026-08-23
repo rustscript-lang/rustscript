@@ -274,7 +274,8 @@ fn aot_compiles_whole_non_loop_program() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     install_aot(&mut vm);
 
     let resume_ips = vm
@@ -315,7 +316,8 @@ fn aot_handles_string_equality_paths() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     install_aot(&mut vm);
 
     let status = vm.run().expect("aot vm should run");
@@ -341,7 +343,8 @@ fn aot_handles_structural_array_equality_paths() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     install_aot(&mut vm);
 
     let status = vm.run().expect("aot vm should run");
@@ -364,7 +367,8 @@ fn aot_inlines_typed_numeric_steps_without_bridge_fallback() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_bridge_stats_enabled(true);
     install_aot(&mut vm);
 
@@ -397,7 +401,8 @@ fn aot_inlines_same_local_array_set_without_builtin_boundary() {
     "#;
 
     let compiled = compile_source(source).expect("array-set aot compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_bridge_stats_enabled(true);
     install_aot(&mut vm);
 
@@ -431,7 +436,8 @@ fn aot_inlines_same_local_map_set_in_loop() {
     "#;
 
     let compiled = compile_source(source).expect("map-set aot compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_bridge_stats_enabled(true);
     install_aot(&mut vm);
     assert_eq!(vm.run().expect("aot vm should run"), VmStatus::Halted);
@@ -498,7 +504,7 @@ fn aot_inlines_same_local_array_push_in_loop() {
     )
     .with_local_count(2);
     let program = force_local_types(program, &[(0, ValueType::Array), (1, ValueType::Int)]);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_native_bridge_stats_enabled(true);
     install_aot(&mut vm);
 
@@ -537,7 +543,8 @@ fn aot_handles_scalar_local_clear_sequences() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     install_aot(&mut vm);
 
     let status = vm.run().expect("aot vm should run");
@@ -563,7 +570,8 @@ fn aot_handles_mixed_numeric_less_than_loops() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     install_aot(&mut vm);
 
     let status = vm.run().expect("aot vm should run");
@@ -589,7 +597,8 @@ fn aot_handles_dynamic_numeric_builtin_results_in_compares() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     install_aot(&mut vm);
 
     let status = vm.run().expect("aot vm should run");
@@ -611,7 +620,8 @@ fn aot_handles_mixed_numeric_arithmetic_promotions() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     install_aot(&mut vm);
 
     let status = vm.run().expect("aot vm should run");
@@ -634,7 +644,8 @@ fn aot_handles_tagged_array_elements_in_float_arithmetic() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     install_aot(&mut vm);
 
     let status = vm.run().expect("aot vm should run");
@@ -659,7 +670,8 @@ fn aot_handles_zero_result_assert_calls_in_loops() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     install_aot(&mut vm);
 
     let status = vm.run().expect("aot vm should run");
@@ -685,7 +697,8 @@ fn aot_executes_typed_string_concat_without_helper_bridge() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_bridge_stats_enabled(true);
     install_aot(&mut vm);
 
@@ -728,7 +741,8 @@ fn aot_executes_typed_bytes_concat_without_helper_bridge() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_bridge_stats_enabled(true);
     install_aot(&mut vm);
 
@@ -778,7 +792,8 @@ fn aot_executes_typed_bytes_sequence_builtins_without_builtin_bridge() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_bridge_stats_enabled(true);
     install_aot(&mut vm);
 
@@ -823,7 +838,8 @@ fn aot_executes_typed_string_sequence_builtins_without_builtin_bridge() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_bridge_stats_enabled(true);
     install_aot(&mut vm);
 
@@ -861,7 +877,8 @@ fn aot_executes_typed_bytes_array_codec_builtins_without_builtin_bridge() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_bridge_stats_enabled(true);
     install_aot(&mut vm);
 
@@ -897,7 +914,8 @@ fn aot_replays_host_yield_and_resumes_at_call_site() {
     bc.call(0, 0);
     bc.ret();
 
-    let mut vm = Vm::new(Program::new(Vec::new(), bc.finish()));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), bc.finish()))
+        .expect("test VM construction must not fail");
     vm.register_function(Box::new(YieldOnce { yielded: false }));
     install_aot(&mut vm);
 
@@ -922,7 +940,8 @@ fn aot_waits_for_pending_host_and_resumes_without_replay() {
     bc.ret();
 
     let op_id = 77;
-    let mut vm = Vm::new(Program::new(Vec::new(), bc.finish()));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), bc.finish()))
+        .expect("test VM construction must not fail");
     vm.register_function(Box::new(PendingOnce {
         called: false,
         op_id,
@@ -945,7 +964,8 @@ fn aot_honors_fuel_metering_at_host_call_boundaries_only() {
         return;
     }
 
-    let mut vm = Vm::new(counting_loop_program(4, true));
+    let mut vm =
+        Vm::try_new(counting_loop_program(4, true)).expect("test VM construction must not fail");
     vm.register_function(Box::new(PrintNoReturn));
     install_aot(&mut vm);
     vm.set_fuel_check_interval(100)
@@ -982,7 +1002,8 @@ fn aot_honors_epoch_interruption_at_host_call_boundaries_only() {
         return;
     }
 
-    let mut vm = Vm::new(counting_loop_program(2, true));
+    let mut vm =
+        Vm::try_new(counting_loop_program(2, true)).expect("test VM construction must not fail");
     vm.register_function(Box::new(PrintNoReturn));
     install_aot(&mut vm);
     vm.set_epoch_check_interval(100)
@@ -1010,7 +1031,8 @@ fn aot_ignores_fuel_interval_inside_no_call_loops() {
         return;
     }
 
-    let mut vm = Vm::new(counting_loop_program(20, false));
+    let mut vm =
+        Vm::try_new(counting_loop_program(20, false)).expect("test VM construction must not fail");
     install_aot(&mut vm);
     vm.set_fuel_check_interval(1)
         .expect("fuel interval update should succeed");
@@ -1041,7 +1063,8 @@ fn aot_survives_reset_for_reuse() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     install_aot(&mut vm);
 
     let first = vm.run().expect("first aot run should halt");
@@ -1078,11 +1101,12 @@ fn aot_preserves_drop_contract_parity_for_loop_locals() {
     "#;
 
     let compiled_interp = compile_source(source).expect("compile should succeed");
-    let mut interp_vm = Vm::new(
+    let mut interp_vm = Vm::try_new(
         compiled_interp
             .program
             .with_local_count(compiled_interp.locals),
-    );
+    )
+    .expect("test VM construction must not fail");
     disable_trace_jit(&mut interp_vm);
     interp_vm.set_drop_contract_events_enabled(true);
     let interp_status = interp_vm.run().expect("interpreter run should halt");
@@ -1090,7 +1114,8 @@ fn aot_preserves_drop_contract_parity_for_loop_locals() {
     let interp_drops = interp_vm.drop_contract_event_count();
 
     let compiled_aot = compile_source(source).expect("compile should succeed");
-    let mut aot_vm = Vm::new(compiled_aot.program.with_local_count(compiled_aot.locals));
+    let mut aot_vm = Vm::try_new(compiled_aot.program.with_local_count(compiled_aot.locals))
+        .expect("test VM construction must not fail");
     aot_vm.set_drop_contract_events_enabled(true);
     install_aot(&mut aot_vm);
     let aot_status = aot_vm.run().expect("aot run should halt");
@@ -1117,7 +1142,7 @@ fn trace_jit_compiles_hot_loop_and_is_dumpable() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: native_jit_supported(),
         hot_loop_threshold: 1,
@@ -1154,7 +1179,7 @@ fn trace_jit_diagnostics_preserve_public_snapshot_and_machine_code_toggle() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: native_jit_supported(),
         hot_loop_threshold: 1,
@@ -1204,7 +1229,8 @@ fn trace_jit_native_path_honors_fuel_metering() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: native_jit_supported(),
         hot_loop_threshold: 1,
@@ -1275,7 +1301,8 @@ fn trace_jit_preserves_local_move_semantics_across_fuel_yields() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: native_jit_supported(),
         hot_loop_threshold: 1,
@@ -1336,7 +1363,8 @@ fn changing_fuel_interval_recompiles_native_trace_variant() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -1383,7 +1411,8 @@ fn trace_jit_native_path_honors_epoch_interruption() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -1427,7 +1456,8 @@ fn native_trace_epoch_zero_deadline_auto_rearms_without_manual_reconfiguration()
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -1492,7 +1522,8 @@ fn trace_jit_preserves_local_move_semantics_across_epoch_yields() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -1553,7 +1584,8 @@ fn changing_epoch_interval_recompiles_native_trace_variant() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -1605,7 +1637,8 @@ fn fuel_and_epoch_compile_distinct_native_trace_variants() {
 
     let compiled = compile_source(source).expect("compile should succeed");
 
-    let mut fuel_vm = Vm::new(compiled.program.clone().with_local_count(compiled.locals));
+    let mut fuel_vm = Vm::try_new(compiled.program.clone().with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     fuel_vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -1621,7 +1654,8 @@ fn fuel_and_epoch_compile_distinct_native_trace_variants() {
     let fuel_code =
         first_native_code_hex(&fuel_dump).expect("fuel-mode run should emit native code bytes");
 
-    let mut epoch_vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut epoch_vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     epoch_vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -1663,7 +1697,7 @@ fn compiler_uses_shl_for_power_of_two_multiply_and_jit_accepts_it() {
         "expected compiler to emit shl for power-of-two multiply"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: native_jit_supported(),
         hot_loop_threshold: 1,
@@ -1723,7 +1757,7 @@ fn compiler_emits_mod_and_short_circuit_logic_and_jit_accepts_them() {
         "short-circuit lowering should not emit eager or"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: native_jit_supported(),
         hot_loop_threshold: 1,
@@ -1761,7 +1795,7 @@ fn trace_jit_supports_host_call_loops_with_branch_exit_traces() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: native_jit_supported(),
         hot_loop_threshold: 1,
@@ -1865,7 +1899,7 @@ fn trace_jit_enforces_scalar_host_return_contract_after_dirty_local_write() {
         "#,
     )
     .expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -1899,7 +1933,7 @@ fn trace_jit_passes_mixed_host_args_and_float_return_as_scalars() {
         "#,
     )
     .expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -1938,7 +1972,7 @@ fn trace_jit_passes_tagged_host_args_to_scalar_return() {
         "#,
     )
     .expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -1981,7 +2015,7 @@ fn trace_jit_passes_i64_host_args_and_bool_return_as_scalars() {
         "#,
     )
     .expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -2021,7 +2055,7 @@ fn trace_jit_keeps_non_yielding_static_args_calls_inside_loop_trace() {
         "#,
     )
     .expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -2111,7 +2145,7 @@ fn trace_jit_sparse_exit_preserves_clean_scalar_and_heap_locals() {
         code,
     )
     .with_local_count(2);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -2165,7 +2199,7 @@ fn trace_jit_sparse_exit_restores_one_dirty_scalar_local() {
     patch_branch_target(&mut code, guard_ip, exit_ip);
     let program =
         Program::new(vec![Value::Int(0), Value::Int(1), Value::Int(4)], code).with_local_count(1);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -2232,7 +2266,7 @@ fn trace_jit_sparse_heap_exit_transfers_ownership_across_reuse() {
         code,
     )
     .with_local_count(3);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -2303,7 +2337,7 @@ fn trace_jit_nested_call_loops_use_branch_exit_segments() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: native_jit_supported(),
         hot_loop_threshold: 1,
@@ -2348,7 +2382,7 @@ fn trace_jit_records_typed_int_add_steps() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -2387,7 +2421,7 @@ fn trace_jit_uses_ssa_lowering_for_supported_numeric_loop() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -2456,7 +2490,7 @@ fn trace_jit_links_between_nested_loop_native_traces() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -2512,7 +2546,8 @@ fn trace_jit_reports_exact_parent_exit_profiles() {
         total;
     "#;
     let compiled = compile_source(source).expect("branch profile fixture should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -2577,7 +2612,7 @@ fn trace_jit_direct_side_link_bypasses_rust_dispatch() {
         total;
     "#;
     let compiled = compile_source(source).expect("direct side-link fixture should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_native_direct_links_enabled(true);
     vm.set_jit_native_bridge_stats_enabled(true);
     vm.set_jit_config(JitConfig {
@@ -2662,7 +2697,7 @@ fn trace_jit_tail_link_cycle_has_bounded_host_stack() {
         total;
     "#;
     let compiled = compile_source(source).expect("tail-link cycle fixture should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_native_direct_links_enabled(true);
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -2699,7 +2734,7 @@ fn trace_jit_side_link_invalidation_clears_incoming_slots() {
         total;
     "#;
     let compiled = compile_source(source).expect("side-link invalidation fixture should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_native_direct_links_enabled(true);
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -2729,7 +2764,7 @@ fn trace_jit_side_link_generation_prevents_stale_entry_reuse() {
         total;
     "#;
     let compiled = compile_source(source).expect("side-link generation fixture should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_native_direct_links_enabled(true);
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -2771,7 +2806,8 @@ fn trace_jit_side_link_respects_callable_frame_and_interrupt_boundaries() {
         run(4096);
     "#;
     let compiled = compile_source(source).expect("direct boundary fixture should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_direct_links_enabled(true);
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -2823,7 +2859,8 @@ fn trace_jit_region_links_hot_same_frame_side_exit() {
         total;
     "#;
     let compiled = compile_source(source).expect("region fixture should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -2888,7 +2925,7 @@ fn trace_jit_region_cycle_propagates_disjoint_dirty_locals() {
         branch_counts(4096);
     "#;
     let compiled = compile_source(source).expect("disjoint dirty region compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -2946,7 +2983,7 @@ fn trace_jit_region_unlinked_exit_restores_callable_frame() {
         probe(257, 50) + 1;
     "#;
     let compiled = compile_source(source).expect("unlinked callable exit fixture should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -2981,7 +3018,8 @@ fn trace_jit_region_preserves_owned_value_drop_contract() {
         [payload, total];
     "#;
     let compiled = compile_source(source).expect("owned region fixture should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -3029,7 +3067,7 @@ fn trace_jit_region_progress_prevents_callable_frame_backoff() {
         run(256, [1]);
     "#;
     let compiled = compile_source(source).expect("region progress fixture should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -3087,7 +3125,7 @@ fn trace_jit_inherited_direct_progress_prevents_callable_frame_backoff() {
         sum;
     "#;
     let compiled = compile_source(source).expect("direct progress fixture should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_native_direct_links_enabled(true);
     vm.set_jit_native_bridge_stats_enabled(true);
     vm.set_jit_config(JitConfig {
@@ -3146,7 +3184,8 @@ fn trace_jit_region_respects_fuel_and_epoch_interrupts() {
         total;
     "#;
     let compiled = compile_source(source).expect("region interrupt fixture should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -3214,7 +3253,8 @@ fn trace_jit_region_reports_compile_and_code_telemetry() {
         total;
     "#;
     let compiled = compile_source(source).expect("region telemetry fixture should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -3260,7 +3300,8 @@ fn trace_jit_region_republishes_after_native_settings_change() {
         total;
     "#;
     let compiled = compile_source(source).expect("region fixture should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -3302,7 +3343,8 @@ fn trace_jit_region_invalidation_releases_owner_and_can_republish() {
         total;
     "#;
     let compiled = compile_source(source).expect("region fixture should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -3366,7 +3408,7 @@ fn trace_jit_restores_tagged_heap_locals_on_ssa_exit() {
     )
     .with_local_count(3);
 
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -3439,7 +3481,7 @@ fn trace_jit_snapshots_borrowed_tagged_locals_before_exit_writes() {
         code,
     )
     .with_local_count(3);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -3497,7 +3539,7 @@ fn trace_jit_restores_array_and_map_locals_on_ssa_exit() {
     )
     .with_local_count(3);
 
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -3553,7 +3595,7 @@ fn trace_jit_supports_array_len_get_has_in_ssa() {
             (2, ValueType::Int),
         ],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -3607,7 +3649,7 @@ fn trace_jit_specializes_same_local_array_set_through_loop_back() {
         compiled.program,
         &[(0, ValueType::Array), (1, ValueType::Int)],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -3711,7 +3753,7 @@ fn trace_jit_array_set_preserves_cow_alias() {
             (2, ValueType::Int),
         ],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -3785,7 +3827,7 @@ fn trace_jit_does_not_consume_non_moved_array_set_container() {
     )
     .with_local_count(2);
     let program = force_local_types(program, &[(0, ValueType::Array), (1, ValueType::Int)]);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -3863,7 +3905,7 @@ fn trace_jit_specializes_same_local_array_push_through_loop_back() {
     )
     .with_local_count(2);
     let program = force_local_types(program, &[(0, ValueType::Array), (1, ValueType::Int)]);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -3917,7 +3959,7 @@ fn trace_jit_specializes_same_local_map_set_through_loop_back() {
         compiled.program,
         &[(0, ValueType::Map), (1, ValueType::Int)],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -3998,7 +4040,7 @@ fn trace_jit_supports_map_len_get_has_in_ssa() {
             (2, ValueType::Int),
         ],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -4057,7 +4099,8 @@ fn trace_jit_supports_float_and_string_loops_through_ssa() {
     "#;
 
     let compiled_float = compile_source(float_source).expect("float compile should succeed");
-    let mut float_vm = Vm::new(compiled_float.program);
+    let mut float_vm =
+        Vm::try_new(compiled_float.program).expect("test VM construction must not fail");
     float_vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -4084,7 +4127,8 @@ fn trace_jit_supports_float_and_string_loops_through_ssa() {
     );
 
     let compiled_string = compile_source(string_source).expect("string compile should succeed");
-    let mut string_vm = Vm::new(compiled_string.program);
+    let mut string_vm =
+        Vm::try_new(compiled_string.program).expect("test VM construction must not fail");
     string_vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -4118,7 +4162,7 @@ fn trace_jit_boxes_scalar_before_native_to_string_helper() {
         out;
     "#;
     let compiled = compile_source(source).expect("scalar to_string fixture should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -4169,7 +4213,7 @@ fn trace_jit_supports_bytes_heavy_call_boundary_exits_without_fallback() {
     "#;
 
     let compiled = compile_source(source).expect("bytes trace compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -4213,7 +4257,7 @@ fn trace_jit_keeps_join_path_inline_for_straight_line_if_diamond() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -4262,7 +4306,7 @@ fn trace_jit_supports_float_math_in_ssa() {
     "#;
 
     let compiled = compile_source(source).expect("float math compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -4317,7 +4361,7 @@ fn trace_jit_supports_string_call_boundary_exits() {
     "#;
 
     let compiled = compile_source(source).expect("string concat compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -4364,7 +4408,7 @@ fn trace_jit_supports_bytes_call_boundary_exits() {
     "#;
 
     let compiled = compile_source(source).expect("bytes concat compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -4421,7 +4465,7 @@ fn trace_jit_supports_bytes_sequence_call_boundary_exits() {
     "#;
 
     let compiled = compile_source(source).expect("bytes builtin compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -4478,7 +4522,7 @@ fn trace_jit_supports_string_sequence_call_boundary_exits() {
     "#;
 
     let compiled = compile_source(source).expect("string builtin compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -4607,7 +4651,7 @@ fn trace_jit_supports_bytes_len_get_slice_in_ssa() {
         ],
     );
 
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -4720,7 +4764,7 @@ fn trace_jit_supports_bytes_has_in_ssa() {
         ],
     );
 
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -4818,7 +4862,7 @@ fn trace_jit_uses_call_operand_type_for_string_len_with_reused_local_slot() {
         ],
     );
 
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -4961,7 +5005,7 @@ fn trace_jit_supports_string_len_get_slice_in_ssa() {
         ],
     );
 
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -5059,7 +5103,7 @@ fn trace_jit_supports_manual_string_concat_in_ssa() {
         ],
     );
 
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -5154,7 +5198,7 @@ fn trace_jit_supports_manual_bytes_concat_in_ssa() {
         ],
     );
 
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -5273,7 +5317,7 @@ fn trace_jit_supports_bytes_array_codecs_in_ssa() {
         ],
     );
 
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -5380,7 +5424,7 @@ fn trace_jit_specializes_ascii_bytes_to_utf8_in_ssa() {
             (add_ip as usize, (ValueType::Int, ValueType::Int)),
         ],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -5414,7 +5458,8 @@ fn trace_jit_specializes_empty_array_construction_in_ssa() {
         "#,
     )
     .expect("array construction fixture should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -5504,7 +5549,7 @@ fn trace_jit_supports_shift_ops_in_ssa() {
         ],
     );
 
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -5613,7 +5658,7 @@ fn trace_jit_supports_eager_bool_ops_in_ssa() {
         ],
     );
 
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -5673,7 +5718,7 @@ fn trace_jit_supports_float_comparisons_in_ssa() {
     "#;
 
     let compiled = compile_source(source).expect("float compare compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -5729,7 +5774,7 @@ fn trace_jit_executes_nested_loop_with_one_live_caller_operand() {
         100 + sum_to(10);
     "#;
     let compiled = compile_source(source).expect("live entry stack source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -5766,7 +5811,7 @@ fn trace_jit_executes_nested_loop_with_two_live_caller_operands() {
         1 + (2 + sum_to(10));
     "#;
     let compiled = compile_source(source).expect("depth-two entry stack source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -5803,7 +5848,7 @@ fn trace_jit_executes_nested_loop_with_heap_caller_operand() {
         ["left", 7, sum_to(10)];
     "#;
     let compiled = compile_source(source).expect("heap entry stack source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -5847,7 +5892,7 @@ fn trace_jit_reuses_nested_frame_trace_after_reset() {
         100 + sum_to(10);
     "#;
     let compiled = compile_source(source).expect("reusable entry stack source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -5878,7 +5923,8 @@ fn literal_string_builtins_match_interpreter_semantics() {
         string_split_literal("甲｜乙｜丙", "｜");
     "#;
     let compiled = compile_source(source).expect("literal string builtin compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     disable_trace_jit(&mut vm);
     assert_eq!(
         vm.run().expect("literal string vm should run"),
@@ -5915,7 +5961,8 @@ fn aot_literal_string_builtins_match_interpreter_semantics() {
         string_split_literal("甲｜乙｜丙", "｜");
     "#;
     let compiled = compile_source(source).expect("literal string builtin compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     install_aot(&mut vm);
 
     assert_eq!(
@@ -5962,7 +6009,8 @@ fn trace_jit_specializes_literal_string_builtins_without_call_boundary() {
         pieces;
     "#;
     let compiled = compile_source(source).expect("literal string builtin compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -6031,7 +6079,8 @@ fn trace_jit_specializes_loop_carried_string_builtins() {
     "#;
     let compiled =
         compile_source(source).expect("loop-carried string builtin compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -6082,7 +6131,8 @@ fn trace_jit_links_dynamic_concat_callable_graph() {
         string_contains(&out, "a=one");
     "#;
     let compiled = compile_source(source).expect("dynamic concat fixture should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -6128,7 +6178,8 @@ fn trace_jit_folds_known_type_of_guards_after_map_get() {
         matched;
     "#;
     let compiled = compile_source(source).expect("known type guard fixture should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -6167,7 +6218,8 @@ fn trace_jit_specializes_regex_builtins_without_call_boundary() {
         replaced;
     "#;
     let compiled = compile_source(source).expect("regex match compile should succeed");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -6205,7 +6257,8 @@ fn trace_jit_scalar_to_string_uses_safe_call_boundary() {
         rendered;
     "#;
     let compiled = compile_source(source).expect("scalar to_string loop should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -6245,7 +6298,8 @@ fn trace_jit_executes_hot_loop_inside_script_callable_frame() {
         sum_to(100);
     "#;
     let compiled = compile_source(source).expect("nested-frame loop should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -6293,7 +6347,8 @@ fn trace_jit_region_cycles_without_external_handoffs() {
         alternating_sum(4096);
     "#;
     let compiled = compile_source(source).expect("exit-heavy callable loop should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_direct_links_enabled(false);
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -6353,7 +6408,8 @@ fn trace_jit_direct_links_cross_frame_call_and_return_edges() {
         total;
     "#;
     let compiled = compile_source(source).expect("direct callable loop should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_direct_links_enabled(true);
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -6395,7 +6451,8 @@ fn trace_jit_missing_dynamic_return_target_never_uses_stale_static_continuation(
         total;
     "#;
     let compiled = compile_source(source).expect("multiple continuation sites should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_direct_links_enabled(true);
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -6426,7 +6483,8 @@ fn trace_jit_direct_link_slots_clear_and_republish_after_mode_toggle() {
         total;
     "#;
     let compiled = compile_source(source).unwrap();
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_direct_links_enabled(true);
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -6471,7 +6529,8 @@ fn trace_jit_executes_call_value_natively_inside_loop() {
         total;
     "#;
     let compiled = compile_source(source).expect("callable loop should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -6523,7 +6582,8 @@ fn interpreter_superinstructions_use_script_frame_local_base() {
     "#;
     let compiled =
         compile_source(source).expect("script-frame superinstruction source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: false,
         ..JitConfig::default()
@@ -6555,7 +6615,8 @@ fn interpreter_superinstructions_read_nested_shared_capture_cells() {
     "#;
     let compiled =
         compile_source(source).expect("shared-capture superinstruction source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: false,
         ..JitConfig::default()
@@ -6586,7 +6647,8 @@ fn trace_jit_inlines_static_leaf_in_root_loop() {
         i;
     "#;
     let compiled = compile_source(source).expect("static leaf loop should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -6638,7 +6700,8 @@ fn trace_jit_guards_static_inline_callable_identity() {
     let replaced_slot = bindings.first().expect("add_one binding").local_slot;
     let replacement_id = bindings.get(1).expect("add_ten binding").prototype_id;
     let replacement_kind = compiled.program.callable_prototypes[replacement_id as usize].kind;
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_local(
         u8::try_from(replaced_slot).expect("root callable slot should fit u8"),
         Value::Callable(Arc::new(vm::CallableValue {
@@ -6686,7 +6749,8 @@ fn trace_jit_invalidates_native_inline_after_callable_local_replacement() {
     let replaced_slot = bindings.first().expect("add_one binding").local_slot;
     let replacement_id = bindings.get(1).expect("add_ten binding").prototype_id;
     let replacement_kind = compiled.program.callable_prototypes[replacement_id as usize].kind;
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -6738,7 +6802,8 @@ fn trace_jit_skips_frames_with_shared_capture_cells() {
     "#;
     let compiled =
         compile_source(source).expect("shared capture continuation source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -6785,7 +6850,8 @@ fn trace_jit_skips_callable_frame_with_nested_shared_capture() {
         outer(100);
     "#;
     let compiled = compile_source(source).expect("nested shared capture source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -6827,7 +6893,8 @@ fn trace_jit_native_return_does_not_link_into_shared_capture_caller() {
         before + shared + result;
     "#;
     let compiled = compile_source(source).expect("captured caller source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -6873,7 +6940,8 @@ fn trace_jit_preserves_inline_callable_argument_schema_checks() {
         .find(|local| local.name == "value")
         .expect("value local")
         .index;
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_fuel_check_interval(1).expect("fuel interval");
     vm.set_fuel(1);
     loop {
@@ -6929,7 +6997,8 @@ fn trace_jit_inline_instruction_failure_restores_callee_frame() {
         i + sink * 0;
     "#;
     let compiled = compile_source(source).expect("inline failure source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -6982,7 +7051,8 @@ fn trace_jit_inline_unbox_failure_matches_interpreter_error() {
         .index;
     let local_count = compiled.locals;
     let prepare = |program: Program| {
-        let mut vm = Vm::new(program.with_local_count(local_count));
+        let mut vm = Vm::try_new(program.with_local_count(local_count))
+            .expect("test VM construction must not fail");
         vm.set_fuel_check_interval(1).expect("fuel interval");
         vm.set_fuel(1);
         loop {
@@ -7052,7 +7122,8 @@ fn trace_jit_preserves_inline_callable_return_schema_checks() {
         .find(|local| local.name == "values")
         .expect("values local")
         .index;
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_fuel_check_interval(1).expect("fuel interval");
     vm.set_fuel(1);
     loop {
@@ -7120,7 +7191,8 @@ fn trace_jit_inlines_array_swap_leaf() {
         values[0] * 10 + values[1];
     "#;
     let compiled = compile_source(source).expect("array swap inline source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -7173,7 +7245,8 @@ fn trace_jit_inline_array_set_failure_restores_callee_frame() {
         i + sink * 0;
     "#;
     let compiled = compile_source(source).expect("inline array-set failure source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -7225,7 +7298,8 @@ fn trace_jit_inline_guard_exit_restores_callee() {
         result;
     "#;
     let compiled = compile_source(source).expect("guarded inline source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_bridge_stats_enabled(true);
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -7266,7 +7340,8 @@ fn trace_jit_call_site_profiles_clear_on_vm_reuse() {
         i;
     "#;
     let compiled = compile_source(source).expect("call-site profile source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: false,
         hot_loop_threshold: 64,
@@ -7322,7 +7397,8 @@ fn trace_jit_call_value_waits_and_resumes_host_callable_without_replay() {
         total;
     "#;
     let compiled = compile_source(source).expect("pending callable loop should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.register_function(Box::new(PendingCallableHost));
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -7372,7 +7448,8 @@ fn trace_jit_call_value_yields_and_resumes_host_callable_without_losing_frame_st
         total;
     "#;
     let compiled = compile_source(source).expect("yielding callable loop should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.register_function(Box::new(YieldOnce { yielded: false }));
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -7411,7 +7488,8 @@ fn trace_jit_missing_dynamic_return_target_does_not_use_stale_static_slot() {
         value;
     "#;
     let compiled = compile_source(source).expect("stale return target fixture should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_native_direct_links_enabled(true);
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -7451,7 +7529,8 @@ fn trace_jit_links_nested_dynamic_script_callables_without_interpreter_handoff()
         total;
     "#;
     let compiled = compile_source(source).expect("dynamic callable graph should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -7502,7 +7581,8 @@ fn trace_jit_links_finite_mutual_recursion_without_interpreter_handoff() {
         total;
     "#;
     let compiled = compile_source(source).expect("mutual recursion should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -7650,7 +7730,8 @@ fn call_script_direct_call_loop_runs_natively() {
         total;
     "#;
     let compiled = compile_source(source).expect("direct call loop should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -7695,7 +7776,8 @@ fn call_script_nested_direct_calls_resume_continuation() {
         total;
     "#;
     let compiled = compile_source(source).expect("nested direct calls should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -7743,7 +7825,8 @@ fn call_script_direct_recursion_inside_loop() {
         total;
     "#;
     let compiled = compile_source(source).expect("direct recursion should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -7786,7 +7869,8 @@ fn call_script_failure_exit_reports_typed_error() {
         total;
     "#;
     let compiled = compile_source(source).expect("failure program should compile");
-    let mut plain = Vm::new(compiled.program.clone().with_local_count(compiled.locals));
+    let mut plain = Vm::try_new(compiled.program.clone().with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     plain.set_jit_config(JitConfig {
         enabled: false,
         ..JitConfig::default()
@@ -7795,7 +7879,8 @@ fn call_script_failure_exit_reports_typed_error() {
         .run()
         .expect_err("interpreter recursion must hit the depth limit");
 
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -7846,7 +7931,7 @@ fn call_script_capture_prototype_fails_typed() {
             OpCode::Ret as u8,
         ],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -7886,7 +7971,7 @@ fn call_script_raw_fixture_loop_completes() {
         None,
         vec![OpCode::Ldc as u8, 1, 0, 0, 0, OpCode::Ret as u8],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
 
     assert_eq!(
         vm.run().expect("the raw fixture loop should complete"),
@@ -7946,7 +8031,8 @@ fn call_script_fuel_interruption_matches_interpreter() {
         assert_eq!(vm.stack(), &[Value::Int(1000)]);
     };
 
-    let mut plain = Vm::new(compiled.program.clone().with_local_count(compiled.locals));
+    let mut plain = Vm::try_new(compiled.program.clone().with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     plain.set_jit_config(JitConfig {
         enabled: false,
         ..JitConfig::default()
@@ -7959,7 +8045,8 @@ fn call_script_fuel_interruption_matches_interpreter() {
 
     // JIT: the direct call crosses the native boundary each iteration; fuel
     // must still interrupt execution with the same yield contract.
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -7987,7 +8074,8 @@ fn aot_call_script_direct_call_loop() {
         total;
     "#;
     let compiled = compile_source(source).expect("aot direct call loop should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     install_aot(&mut vm);
 
     let status = vm.run().expect("aot direct call loop should run");
@@ -8017,7 +8105,8 @@ fn aot_call_script_recursion() {
         fact(8);
     "#;
     let compiled = compile_source(source).expect("aot recursion should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     install_aot(&mut vm);
 
     let status = vm.run().expect("aot recursion should run");
@@ -8049,7 +8138,8 @@ fn aot_call_script_failure_exit() {
         total;
     "#;
     let compiled = compile_source(source).expect("aot failure program should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     install_aot(&mut vm);
 
     let err = vm
@@ -8077,7 +8167,8 @@ fn aot_call_script_epoch_interruption() {
         total;
     "#;
     let compiled = compile_source(source).expect("aot epoch program should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     install_aot(&mut vm);
     vm.set_epoch_check_interval(1)
         .expect("epoch interval update should succeed");
@@ -8261,7 +8352,7 @@ fn call_script_probe_loop_program_with_body(
 }
 
 fn run_call_script_probe_loop(program: Program, jit_enabled: bool) -> Result<Vec<Value>, String> {
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: jit_enabled,
         hot_loop_threshold: 1,
@@ -8298,7 +8389,7 @@ fn call_script_inline_inherits_callable_local_from_caller() {
         "probe must see the inherited callable"
     );
 
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -8346,7 +8437,7 @@ fn call_script_inline_refreshes_root_binding_slot() {
         "probe must see the freshly bound callable"
     );
 
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -8374,7 +8465,7 @@ fn run_call_script_guarded_probe_loop(
     program: Program,
     jit_enabled: bool,
 ) -> Result<Vec<Value>, String> {
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: jit_enabled,
         hot_loop_threshold: 1,
@@ -8466,7 +8557,7 @@ fn call_script_inline_guards_inherited_callable_local() {
         "probe must see the rewritten slot from the second iteration"
     );
 
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -8532,7 +8623,8 @@ fn call_script_division_failure_path_known_regression() {
 
     // Interpreter contract: the callee's division failure surfaces through
     // the `CallScript` boundary as a typed VmError.
-    let mut plain = Vm::new(compiled.program.clone().with_local_count(compiled.locals));
+    let mut plain = Vm::try_new(compiled.program.clone().with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     plain.set_jit_config(JitConfig {
         enabled: false,
         ..JitConfig::default()
@@ -8546,7 +8638,8 @@ fn call_script_division_failure_path_known_regression() {
     // KNOWN PRE-EXISTING REGRESSION: the traced non-inline `idiv` trap path
     // reports StackUnderflow because the VM stack is not materialized before
     // the error is relayed. Not a `CallScript` defect.
-    let mut vm = Vm::new(compiled.program.clone().with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.clone().with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -8560,7 +8653,8 @@ fn call_script_division_failure_path_known_regression() {
 
     // KNOWN PRE-EXISTING REGRESSION: the AOT entry relay reports a raw
     // JitNative failure without a typed VmError.
-    let mut aot = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut aot = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     aot.compile_aot().expect("aot compile should succeed");
     let aot_err = aot.run().expect_err("aot division must fail");
     assert!(

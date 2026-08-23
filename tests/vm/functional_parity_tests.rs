@@ -17,7 +17,7 @@ fn native_jit_supported() -> bool {
 
 fn run_halted_vm_with_flavor(source: &str, flavor: SourceFlavor, jit_config: JitConfig) -> Vm {
     let compiled = compile_source_with_flavor(source, flavor).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(jit_config);
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
@@ -161,7 +161,7 @@ fn jit_handles_yielding_host_calls_without_replaying_extra_returns() {
 
     let compiled = compile_source(source).expect("compile should succeed");
     let return_count = Arc::new(AtomicUsize::new(0));
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -239,7 +239,7 @@ fn jit_pending_host_call_waits_and_resumes_without_replay() {
 
     let compiled = compile_source(source).expect("compile should succeed");
     let call_count = Arc::new(AtomicUsize::new(0));
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -298,7 +298,7 @@ fn jit_uses_interpreter_trace_path_when_builtin_override_is_bound() {
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_jit_config(JitConfig {
         enabled: true,
         hot_loop_threshold: 1,

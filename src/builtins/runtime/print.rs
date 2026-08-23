@@ -131,10 +131,11 @@ mod tests {
     use super::{PrintHostFunction, PrintlnHostFunction, format_value};
 
     fn vm_for_host_call() -> Vm {
-        Vm::new(Program::new(
+        Vm::try_new(Program::new(
             Vec::new(),
             vec![crate::bytecode::OpCode::Ret as u8],
         ))
+        .expect("test VM construction must not fail")
     }
 
     #[test]

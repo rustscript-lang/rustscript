@@ -55,7 +55,7 @@ const SLOT_MASK: u64 = ((1u64 << SLOT_BITS) - 1) << SLOT_SHIFT;
 const GEN_MASK: u64 = ((1u64 << GEN_BITS) - 1) << GEN_SHIFT;
 
 /// Maximum registry tag (inclusive); tag `0` is reserved/invalid.
-pub(super) const MAX_REGISTRY_TAG: u64 = (1u64 << REG_TAG_BITS) - 1;
+pub(crate) const MAX_REGISTRY_TAG: u64 = (1u64 << REG_TAG_BITS) - 1;
 /// Maximum one-based slot identity (inclusive).
 pub(super) const MAX_SLOT_IDENTITY: u64 = (1u64 << SLOT_BITS) - 1;
 /// Maximum generation (inclusive); generation `0` is reserved/invalid.
@@ -65,8 +65,45 @@ pub(super) const MAX_GENERATION: u64 = (1u64 << GEN_BITS) - 1;
 ///
 /// Tags start at `1`, are handed out monotonically, are never reused, and
 /// eventually saturate at [`MAX_REGISTRY_TAG`]; the call immediately after
-/// the maximum is handed out fails with `OperationIdExhausted`.
+/// the maximum is handed out fails with `OperationRegistryTagExhausted`.
 static NEXT_REGISTRY_TAG: AtomicU64 = AtomicU64::new(1);
+
+/// Test-only, per-thread registry-tag source override.
+#[cfg(test)]
+pub(crate) mod test_seam {
+    use std::cell::Cell;
+    use std::sync::atomic::AtomicU64;
+
+    thread_local! {
+        static REGISTRY_TAG_SOURCE: Cell<Option<&'static AtomicU64>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn source() -> Option<&'static AtomicU64> {
+        REGISTRY_TAG_SOURCE.with(|cell| cell.get())
+    }
+
+    /// Installs a private tag counter for the current thread until drop.
+    pub(crate) struct ScopedRegistryTagSource;
+
+    impl ScopedRegistryTagSource {
+        pub(crate) fn install(counter: &'static AtomicU64) -> Self {
+            REGISTRY_TAG_SOURCE.with(|cell| {
+                assert!(
+                    cell.get().is_none(),
+                    "nested registry tag source override is unsupported"
+                );
+                cell.set(Some(counter));
+            });
+            Self
+        }
+    }
+
+    impl Drop for ScopedRegistryTagSource {
+        fn drop(&mut self) {
+            REGISTRY_TAG_SOURCE.with(|cell| cell.set(None));
+        }
+    }
+}
 
 /// Opaque, packed VM operation identifier.
 ///
@@ -142,10 +179,14 @@ impl OperationId {
 ///
 /// Returns monotonically increasing tags starting at `1`. Once
 /// [`MAX_REGISTRY_TAG`] has been handed out, every subsequent call returns
-/// `OperationIdExhausted`. Uses [`Ordering::Relaxed`] because tags are
+/// `OperationRegistryTagExhausted`. Uses [`Ordering::Relaxed`] because tags are
 /// never compared across threads, only required to be unique.
 pub(super) fn allocate_registry_tag() -> OperationResult<u64> {
-    match NEXT_REGISTRY_TAG.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    #[cfg(test)]
+    let source = test_seam::source().unwrap_or(&NEXT_REGISTRY_TAG);
+    #[cfg(not(test))]
+    let source = &NEXT_REGISTRY_TAG;
+    match source.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         // Hand out `current` (1..=MAX), advancing to `current + 1`; once
         // `current` exceeds `MAX_REGISTRY_TAG` the space is exhausted.
         if current <= MAX_REGISTRY_TAG {
@@ -155,11 +196,13 @@ pub(super) fn allocate_registry_tag() -> OperationResult<u64> {
         }
     }) {
         Ok(tag) => Ok(tag),
-        Err(_) => Err(OperationError::new(
-            OperationErrorCode::OperationIdExhausted,
+        Err(current) => Err(OperationError::new(
+            OperationErrorCode::OperationRegistryTagExhausted,
             "vm::operation",
-            "registry tag space exhausted",
-        )),
+            "operation registry tag identity space is exhausted",
+        )
+        .with_limit(MAX_REGISTRY_TAG)
+        .with_value(current)),
     }
 }
 
@@ -326,5 +369,52 @@ mod tests {
             tags.push(tag);
         }
         assert_eq!(tags.len(), 64);
+    }
+
+    #[test]
+    fn registry_tag_allocator_repeated_post_max_failures_are_typed_and_monotonic() {
+        use std::sync::atomic::AtomicU64;
+
+        static COUNTER: AtomicU64 = AtomicU64::new(MAX_REGISTRY_TAG);
+        let _source = test_seam::ScopedRegistryTagSource::install(&COUNTER);
+
+        assert_eq!(
+            allocate_registry_tag().expect("the maximum registry tag must hand out"),
+            MAX_REGISTRY_TAG
+        );
+        let exhausted_value = MAX_REGISTRY_TAG + 1;
+        for _ in 0..3 {
+            let error = allocate_registry_tag().expect_err("registry tag space must be exhausted");
+            assert_eq!(
+                error.code(),
+                OperationErrorCode::OperationRegistryTagExhausted
+            );
+            assert_eq!(error.limit(), Some(MAX_REGISTRY_TAG));
+            assert_eq!(error.value(), Some(exhausted_value));
+            assert_eq!(
+                COUNTER.load(std::sync::atomic::Ordering::SeqCst),
+                exhausted_value,
+                "failed tag handouts must not advance, wrap, or reuse"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_tag_seam_is_scoped_and_independent_construction_recovers_after_drop() {
+        use std::sync::atomic::AtomicU64;
+
+        static COUNTER: AtomicU64 = AtomicU64::new(MAX_REGISTRY_TAG + 1);
+        {
+            let _source = test_seam::ScopedRegistryTagSource::install(&COUNTER);
+            assert_eq!(
+                allocate_registry_tag()
+                    .expect_err("the installed exhausted source must fail")
+                    .code(),
+                OperationErrorCode::OperationRegistryTagExhausted
+            );
+        }
+
+        let tag = allocate_registry_tag().expect("dropping the seam restores the real source");
+        assert!(tag > 0);
     }
 }

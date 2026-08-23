@@ -257,7 +257,7 @@ fn closure_shared_capture_vmbc_round_trip() {
         "capture modes must survive the VMBC round trip"
     );
     validate_program(&decoded, 0).expect("decoded program should validate");
-    let mut runtime = vm::Vm::new(decoded);
+    let mut runtime = vm::Vm::try_new(decoded).expect("test VM construction must not fail");
     assert_eq!(
         runtime.run().expect("decoded program should run"),
         vm::VmStatus::Halted

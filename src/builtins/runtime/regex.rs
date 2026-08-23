@@ -175,7 +175,8 @@ mod tests {
 
     #[test]
     fn regex_cache_reuses_a_compiled_pattern_across_builtin_calls() {
-        let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+        let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+            .expect("test VM construction must not fail");
 
         assert!(builtin_re_match_impl(&mut vm, "(?i)^foo$", "FoO").expect("match should work"));
         assert_eq!(
@@ -201,7 +202,8 @@ mod tests {
 
     #[test]
     fn vm_regex_cache_capacity_can_be_changed_and_shrinks_immediately() {
-        let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+        let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+            .expect("test VM construction must not fail");
         assert_eq!(vm.regex_cache_capacity(), DEFAULT_REGEX_CACHE_CAPACITY);
 
         builtin_re_match_impl(&mut vm, "a", "a").expect("pattern should compile");
@@ -218,7 +220,8 @@ mod tests {
 
     #[test]
     fn zero_vm_regex_cache_capacity_disables_caching() {
-        let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+        let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+            .expect("test VM construction must not fail");
         vm.set_regex_cache_capacity(0);
 
         builtin_re_match_impl(&mut vm, "same", "same").expect("pattern should compile");

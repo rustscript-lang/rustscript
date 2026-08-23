@@ -45,7 +45,7 @@ pub fn run_runtime_case_with_bindings(case: &RuntimeCase<'_>, bindings: &[HostBi
             case.name
         );
     }
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     for binding in bindings {
         vm.bind_function(binding.name, (binding.factory)());
     }

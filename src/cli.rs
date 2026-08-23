@@ -167,7 +167,7 @@ fn run_main(runtime: &CliRuntime) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let recording_program = cli.record_path.as_ref().map(|_| compiled.program.clone());
-    let mut vm = new_cli_vm(compiled.program.with_local_count(compiled.locals), &cli);
+    let mut vm = new_cli_vm(compiled.program.with_local_count(compiled.locals), &cli)?;
     apply_runtime_flags(&mut vm, &cli)?;
     let imports = vm.program().imports.clone();
     register_imports(&mut vm, &imports)?;
@@ -856,10 +856,14 @@ fn register_imports(vm: &mut Vm, imports: &[HostImport]) -> Result<(), io::Error
     Ok(())
 }
 
-fn new_cli_vm(program: Program, cli: &CliConfig) -> Vm {
-    let mut vm = Vm::new_with_jit_config(program, cli_jit_config(cli));
+fn new_cli_vm(program: Program, cli: &CliConfig) -> Result<Vm, io::Error> {
+    // Fallible construction: arena-space exhaustion must surface as a typed
+    // error instead of panicking (long-lived CLI/REPL embeddings use the
+    // fallible `try_*` constructors).
+    let mut vm =
+        Vm::try_new_with_jit_config(program, cli_jit_config(cli)).map_err(io::Error::other)?;
     configure_cli_vm(&mut vm);
-    vm
+    Ok(vm)
 }
 
 fn cli_jit_config(cli: &CliConfig) -> JitConfig {
@@ -1020,13 +1024,22 @@ fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
                 let moved_by_rebinding =
                     repl_locals_moved_by_rebinding(&compiled.compiled.program, &session.locals);
                 let no_repl_moves = BTreeSet::new();
-                let mut vm = Vm::new_with_jit_config(
+                let mut vm = match Vm::try_new_with_jit_config(
                     compiled
                         .compiled
                         .program
                         .with_local_count(compiled.compiled.locals),
                     JitConfig::default(),
-                );
+                ) {
+                    Ok(vm) => vm,
+                    Err(err) => {
+                        // Arena-space exhaustion is terminal for a long-lived
+                        // REPL embedding: report the typed error and refuse
+                        // the snippet instead of panicking.
+                        println!("{err}");
+                        continue;
+                    }
+                };
                 configure_cli_vm(&mut vm);
                 let imports = vm.program().imports.clone();
                 if let Err(err) = register_imports(&mut vm, &imports) {
@@ -1677,12 +1690,13 @@ mod tests {
             super::compile_repl_snippet(snippet, &session.locals).expect("compile should succeed");
         let moved_by_rebinding =
             super::repl_locals_moved_by_rebinding(&compiled.compiled.program, &session.locals);
-        let mut vm = Vm::new(
+        let mut vm = Vm::try_new(
             compiled
                 .compiled
                 .program
                 .with_local_count(compiled.compiled.locals),
-        );
+        )
+        .expect("test VM construction must not fail");
         super::configure_cli_vm(&mut vm);
         let imports = vm.program().imports.clone();
         super::register_imports(&mut vm, &imports).expect("register should succeed");
@@ -1719,11 +1733,11 @@ mod tests {
         let program =
             Program::with_imports_and_debug(vec![], vec![OpCode::Ret as u8], imports.clone(), None);
 
-        let mut first = Vm::new(program.clone());
+        let mut first = Vm::try_new(program.clone()).expect("test VM construction must not fail");
         register_imports(&mut first, &imports).expect("first vm should bind imports");
         assert_eq!(first.bound_function_count(), 2);
 
-        let mut second = Vm::new(program);
+        let mut second = Vm::try_new(program).expect("test VM construction must not fail");
         register_imports(&mut second, &imports).expect("second vm should reuse cached plan");
         assert_eq!(second.bound_function_count(), 2);
     }
@@ -2089,7 +2103,7 @@ mod tests {
         );
         let artifact_path = unique_artifact_path();
 
-        let mut save_vm = Vm::new(program.clone());
+        let mut save_vm = Vm::try_new(program.clone()).expect("test VM construction must not fail");
         let save_cfg = CliConfig {
             aot_save_path: Some(artifact_path.display().to_string()),
             ..CliConfig::default()
@@ -2097,7 +2111,7 @@ mod tests {
         prepare_aot_for_cli(&mut save_vm, &save_cfg).expect("aot save should succeed");
         assert!(save_vm.has_aot_program(), "save path should install aot");
 
-        let mut load_vm = Vm::new(program);
+        let mut load_vm = Vm::try_new(program).expect("test VM construction must not fail");
         let load_cfg = CliConfig {
             aot_load_path: Some(artifact_path.display().to_string()),
             ..CliConfig::default()
@@ -2124,7 +2138,7 @@ mod tests {
         .with_local_count(5);
         let artifact_path = unique_artifact_path();
 
-        let mut save_vm = Vm::new(program.clone());
+        let mut save_vm = Vm::try_new(program.clone()).expect("test VM construction must not fail");
         let save_cfg = CliConfig {
             aot_save_path: Some(artifact_path.display().to_string()),
             ..CliConfig::default()

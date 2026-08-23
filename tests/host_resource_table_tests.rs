@@ -243,7 +243,7 @@ fn drive_close<T: HostResource>(
 #[test]
 fn typed_push_get_and_mut_round_trip() {
     require_send::<ResourceTable>();
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
 
     let (res, closes, drops) = CountingResource::new("conn");
     let token = table.push(res).expect("push should succeed");
@@ -279,7 +279,7 @@ fn typed_push_get_and_mut_round_trip() {
 
 #[test]
 fn handle_round_trips_through_value_and_recovers_through_typed() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (res, _, _) = CountingResource::new("f");
     let token = table.push(res).expect("push");
     let raw = token.handle();
@@ -309,7 +309,7 @@ fn handle_round_trips_through_value_and_recovers_through_typed() {
 
 #[test]
 fn typed_recovery_rejects_wrong_type_and_leaves_state_unchanged() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (res, closes, drops) = CountingResource::new("a");
     let token = table.push(res).expect("push");
     let handle = token.handle();
@@ -342,11 +342,11 @@ fn typed_recovery_rejects_wrong_type_and_leaves_state_unchanged() {
 
 #[test]
 fn typed_recovery_rejects_foreign_arena_and_leaves_state_unchanged() {
-    let mut table_a = ResourceTable::new();
+    let mut table_a = ResourceTable::new().expect("table");
     let token_a = table_a.push(CountingResource::new("a").0).expect("push");
     let handle_a = token_a.handle();
 
-    let table_b = ResourceTable::new();
+    let table_b = ResourceTable::new().expect("table");
     assert_eq!(
         table_b
             .typed::<CountingResource>(handle_a)
@@ -394,7 +394,7 @@ fn typed_recovery_rejects_stale_generation_after_slot_reuse() {
 
 #[test]
 fn close_moves_slot_to_closed_and_rejects_double_close() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (res, closes, drops) = CountingResource::new("x");
     let token = table.push(res).expect("push");
 
@@ -421,7 +421,7 @@ fn close_moves_slot_to_closed_and_rejects_double_close() {
 
 #[test]
 fn pending_close_holds_generation_until_poll_finishes() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (res, polls) = TwoPollResource::new();
     let token = table.push(res).expect("push");
 
@@ -461,7 +461,7 @@ fn pending_close_holds_generation_until_poll_finishes() {
 
 #[test]
 fn parent_cannot_close_while_live_children_exist() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let parent = table
         .push(CountingResource::new("parent").0)
         .expect("parent");
@@ -484,7 +484,7 @@ fn parent_cannot_close_while_live_children_exist() {
 
 #[test]
 fn child_insert_validates_parent_handle_and_liveness() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let parent = table.push(CountingResource::new("p").0).expect("parent");
     let _child = table
         .push_child(CountingResource::new("c").0, &parent)
@@ -500,7 +500,7 @@ fn child_insert_validates_parent_handle_and_liveness() {
     );
 
     // A closed (but not yet slot-reused) parent cannot accept new children.
-    let mut table2 = ResourceTable::new();
+    let mut table2 = ResourceTable::new().expect("table");
     let gone = table2.push(CountingResource::new("gone").0).expect("push");
     drive_close(&mut table2, gone, ResourceCloseReason::ResourceClosed);
     assert_eq!(
@@ -515,7 +515,7 @@ fn child_insert_validates_parent_handle_and_liveness() {
 #[test]
 fn close_all_is_child_first() {
     let order = Arc::new(Mutex::new(Vec::new()));
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
 
     let root = table
         .push(CloseRecorder {
@@ -570,7 +570,7 @@ fn close_all_is_child_first() {
 
 #[test]
 fn close_all_continues_past_failures_and_reports_first() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let _ok = table.push(CountingResource::new("ok").0).expect("ok");
     table.push(PollFailingResource).expect("failing");
 
@@ -587,7 +587,7 @@ fn close_all_continues_past_failures_and_reports_first() {
 
 #[test]
 fn sync_close_all_never_succeeds_while_resources_remain_pending() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     table.push(GateResource::new().0).expect("gated");
 
     // A genuinely pending resource cannot be synchronously driven with a
@@ -603,7 +603,7 @@ fn sync_close_all_never_succeeds_while_resources_remain_pending() {
 
 #[test]
 fn poll_close_open_resource_reports_not_closing() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let token = table.push(CountingResource::new("o").0).expect("push");
     let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
@@ -625,7 +625,7 @@ fn poll_close_open_resource_reports_not_closing() {
 
 #[test]
 fn poll_close_all_pending_across_calls_uses_caller_waker_and_progresses() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (gate, state) = GateResource::new();
     let token = table.push(gate).expect("push");
 
@@ -669,7 +669,7 @@ fn poll_close_all_pending_across_calls_uses_caller_waker_and_progresses() {
 fn poll_close_all_is_child_first_across_pending_polls() {
     let order = Arc::new(Mutex::new(Vec::new()));
     let state = Arc::new(GateState::default());
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
 
     let root = table
         .push(GateRecorder {
@@ -731,7 +731,7 @@ fn poll_close_all_is_child_first_across_pending_polls() {
 
 #[test]
 fn poll_close_all_retains_first_cleanup_error_until_all_resources_finish() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     // A resource that fails synchronously on its first poll.
     table.push(PollFailingResource).expect("failing");
     // A genuinely pending resource behind it.
@@ -765,7 +765,7 @@ fn poll_close_all_retains_first_cleanup_error_until_all_resources_finish() {
 
 #[test]
 fn poll_close_all_rejects_conflicting_reason_deterministically() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (gate, state) = GateResource::new();
     let _token = table.push(gate).expect("push");
     let (waker, _latch) = tracking_waker();
@@ -806,8 +806,8 @@ fn capacity_limit_is_enforced() {
 
 #[test]
 fn arena_identities_are_distinct_across_tables() {
-    let a = ResourceTable::new();
-    let b = ResourceTable::new();
+    let a = ResourceTable::new().expect("table");
+    let b = ResourceTable::new().expect("table");
     assert_ne!(a.arena_id(), b.arena_id());
 }
 
@@ -821,7 +821,7 @@ fn table_is_send() {
 
 #[test]
 fn begin_close_is_idempotent_for_closing_resource() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (res, _) = TwoPollResource::new();
     let token = table.push(res).expect("push");
 

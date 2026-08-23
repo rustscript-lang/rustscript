@@ -67,7 +67,7 @@ fn alias_exports_public_sqlite_configuration() {
     let program = rustscript::compile_source("0;")
         .expect("minimal alias SQLite program should compile")
         .program;
-    let mut vm = rustscript::Vm::new(program);
+    let mut vm = rustscript::Vm::try_new(program).expect("test VM construction must not fail");
     vm.configure_sqlite(rustscript::SqlitePolicy::default());
     let _limits = rustscript::SqliteLimits::default();
     vm.clear_sqlite_configuration();

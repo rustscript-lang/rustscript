@@ -1,7 +1,7 @@
-use super::async_host::WaitingHostOp;
 use super::*;
 use crate::builtins::BuiltinFunction;
 use crate::bytecode::TypeMap;
+use crate::vm::execution_scope::ScopeState;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -9,6 +9,97 @@ use std::sync::{Arc, Mutex, OnceLock};
 fn native_cache_test_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[test]
+fn vm_try_new_preserves_operation_registry_tag_exhaustion() {
+    static COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(crate::vm::operation::id::MAX_REGISTRY_TAG + 1);
+    let _source = crate::vm::operation::id::test_seam::ScopedRegistryTagSource::install(&COUNTER);
+
+    let error = match Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8])) {
+        Ok(_) => panic!("operation registry tag exhaustion must fail VM construction"),
+        Err(error) => error,
+    };
+    let VmError::Operation(error) = error else {
+        panic!("expected a structured modern operation error");
+    };
+    assert_eq!(
+        error.code(),
+        crate::vm::operation::OperationErrorCode::OperationRegistryTagExhausted
+    );
+    assert_eq!(
+        error.limit(),
+        Some(crate::vm::operation::id::MAX_REGISTRY_TAG)
+    );
+    assert_eq!(
+        error.value(),
+        Some(crate::vm::operation::id::MAX_REGISTRY_TAG + 1)
+    );
+}
+
+#[test]
+fn operation_tag_exhaustion_during_recycle_poisoned_vm_keeps_old_scope_and_drops_cleanly() {
+    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("test VM construction must succeed before the seam is installed");
+    let old_arena_id = vm.host.execution_scope().resources().arena_id();
+    vm.begin_reset_for_reuse(ResourceCloseReason::VmReset, None)
+        .expect("reset should begin");
+
+    let error = {
+        static COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(crate::vm::operation::id::MAX_REGISTRY_TAG + 1);
+        let _source =
+            crate::vm::operation::id::test_seam::ScopedRegistryTagSource::install(&COUNTER);
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        match vm.poll_reset_for_reuse(&mut cx, std::time::Instant::now()) {
+            Poll::Ready(Ok(())) => panic!("operation exhaustion must poison recycle"),
+            Poll::Pending => panic!("empty scope close should reach recycle immediately"),
+            Poll::Ready(Err(error)) => error,
+        }
+    };
+
+    let VmError::Reset(VmResetError::ScopeRecycle(ExecutionScopeError::Operation(operation))) =
+        error
+    else {
+        panic!("expected typed operation scope-recycle failure");
+    };
+    assert_eq!(
+        operation.code(),
+        crate::vm::operation::OperationErrorCode::OperationRegistryTagExhausted
+    );
+    assert_eq!(vm.reset_state(), VmResetState::Poisoned);
+    assert!(
+        !vm.is_reusable(),
+        "a failed recycle must never re-enter the pool"
+    );
+    assert_eq!(
+        vm.host.execution_scope().resources().arena_id(),
+        old_arena_id,
+        "failed replacement must not swap out the old scope"
+    );
+    assert_eq!(
+        vm.host.execution_scope_state(),
+        ScopeState::Quiescent,
+        "the preserved old scope remains the quiescent scope that failed replacement"
+    );
+    assert!(matches!(
+        vm.run(),
+        Err(VmError::Reset(VmResetError::NotReusable {
+            state: VmResetState::Poisoned,
+            ..
+        }))
+    ));
+    assert!(matches!(
+        vm.begin_reset_for_reuse(ResourceCloseReason::VmReset, None),
+        Err(VmError::Reset(VmResetError::AlreadyPoisoned { .. }))
+    ));
+    drop(vm);
+
+    let fresh = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("a fresh independent VM succeeds after the seam guard is removed");
+    assert!(fresh.is_reusable());
 }
 
 #[test]
@@ -23,7 +114,7 @@ fn failed_dynamic_builtin_override_preserves_runtime_owned_pending_binding() {
 
     let compiled = crate::compile_source("use runtime; runtime::sleep(0);")
         .expect("runtime sleep program should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.ensure_call_bindings()
         .expect("default fallback should bind runtime sleep");
     let slot = vm.host.host_function_symbols["runtime::sleep"];
@@ -44,7 +135,7 @@ fn failed_static_builtin_override_preserves_runtime_owned_pending_binding() {
 
     let compiled = crate::compile_source("use runtime; runtime::sleep(0);")
         .expect("runtime sleep program should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.ensure_call_bindings()
         .expect("default fallback should bind runtime sleep");
     let slot = vm.host.host_function_symbols["runtime::sleep"];
@@ -59,7 +150,8 @@ fn failed_static_builtin_override_preserves_runtime_owned_pending_binding() {
 
 #[test]
 fn root_ret_completes_explicit_halt_frame() {
-    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("test VM construction must not fail");
     assert_eq!(vm.instance.execution_frames.len(), 1);
     assert_eq!(
         vm.instance.execution_frames[0].continuation,
@@ -77,7 +169,8 @@ fn root_ret_completes_explicit_halt_frame() {
 
 #[test]
 fn reset_for_reuse_keeps_host_operation_ids_monotonic() {
-    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("test VM construction must not fail");
     assert_eq!(vm.allocate_host_op_id(), 1);
     vm.reset_for_reuse();
     assert_eq!(vm.allocate_host_op_id(), 2);
@@ -110,7 +203,8 @@ fn async_host_future_is_submitted_to_the_host_bridge() {
 
     let submitted = Arc::new(Mutex::new(Vec::new()));
     let future = Arc::new(Mutex::new(None));
-    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("test VM construction must not fail");
     vm.set_async_bridge(Box::new(RecordingBridge {
         submitted: Arc::clone(&submitted),
         future: Arc::clone(&future),
@@ -127,12 +221,14 @@ fn async_host_future_is_submitted_to_the_host_bridge() {
 
     assert_eq!(*submitted.lock().expect("submitted lock"), vec![op_id]);
     assert!(future.lock().expect("future lock").is_some());
-    assert_eq!(vm.host.runtime_operations.active_count(), 0);
+    // The submitted future is a single registered execution-scope operation.
+    assert_eq!(vm.host.execution_scope_operation_count(), 1);
 }
 
 #[test]
-fn async_host_submission_without_driver_fails_and_retires_the_id() {
-    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+fn async_host_submission_without_driver_fails_without_allocating() {
+    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("test VM construction must not fail");
     let error = vm
         .submit_host_future(Box::pin(async {
             Ok(HostFutureOutput::returning(CallReturn::none()))
@@ -144,8 +240,10 @@ fn async_host_submission_without_driver_fails_and_retires_the_id() {
             .to_string()
             .contains("async host function requires a host async bridge")
     );
-    assert_eq!(vm.allocate_host_op_id(), 2);
-    assert_eq!(vm.host.runtime_operations.active_count(), 0);
+    // The id space is untouched by a rejected submission: no bridge was
+    // present, so no operation (scope or bridge-external) was created.
+    assert_eq!(vm.allocate_host_op_id(), 1);
+    assert_eq!(vm.host.execution_scope_operation_count(), 0);
 }
 
 #[test]
@@ -173,7 +271,8 @@ fn completing_a_submitted_host_op_cancels_the_driver_future() {
     }
 
     let cancelled = Arc::new(Mutex::new(Vec::new()));
-    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("test VM construction must not fail");
     vm.set_async_bridge(Box::new(CancelRecordingBridge(Arc::clone(&cancelled))));
     let CallOutcome::Pending(op_id) = vm
         .submit_host_future(Box::pin(async {
@@ -191,7 +290,9 @@ fn completing_a_submitted_host_op_cancels_the_driver_future() {
 
     assert_eq!(*cancelled.lock().expect("cancel lock"), vec![op_id]);
     assert_eq!(vm.waiting_host_op_id(), None);
-    assert_eq!(vm.host.runtime_operations.active_count(), 0);
+    // External completion cancelled the registered driver; the terminal slot
+    // stays until the scope drains it.
+    assert_eq!(vm.host.execution_scope_operation_count(), 1);
 }
 
 #[test]
@@ -222,7 +323,8 @@ fn failed_submitted_host_completion_clears_waiting_state() {
         }
     }
 
-    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("test VM construction must not fail");
     vm.set_async_bridge(Box::new(FailingCompletionBridge));
     let CallOutcome::Pending(op_id) = vm
         .submit_host_future(Box::pin(async {
@@ -245,295 +347,783 @@ fn failed_submitted_host_completion_clears_waiting_state() {
             if message == "completion failed"
     ));
     assert_eq!(vm.waiting_host_op_id(), None);
-    assert_eq!(vm.host.runtime_operations.active_count(), 0);
+    // The failed poll consumed the registered operation's slot.
+    assert_eq!(vm.host.execution_scope_operation_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Bridge generation ownership: swap/clear with un-awaited pending operations
+// ---------------------------------------------------------------------------
+
+/// A bridge that records which generation instance it belongs to and drops
+/// into a shared counter when the last `Arc` reference to its generation is
+/// released. `poll`/`cancel` record the generation that actually served the
+/// call, proving an operation routes to the exact generation it was submitted
+/// against even after the VM swaps its current bridge.
+struct GenerationBridge {
+    generation: u64,
+    futures: std::collections::HashMap<HostOpId, HostFuture>,
+    served_by: Arc<Mutex<Vec<(HostOpId, &'static str, u64)>>>,
+    drops: Arc<AtomicUsize>,
+}
+
+impl GenerationBridge {
+    fn new(
+        generation: u64,
+        served_by: Arc<Mutex<Vec<(HostOpId, &'static str, u64)>>>,
+        drops: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            generation,
+            futures: std::collections::HashMap::new(),
+            served_by,
+            drops,
+        }
+    }
+}
+
+impl Drop for GenerationBridge {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl HostAsyncBridge for GenerationBridge {
+    fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
+        self.futures.insert(op_id, future);
+        self.served_by
+            .lock()
+            .expect("served-by lock")
+            .push((op_id, "submit", self.generation));
+        Ok(())
+    }
+
+    fn poll_op(
+        &mut self,
+        op_id: HostOpId,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<VmResult<CallReturn>> {
+        self.served_by
+            .lock()
+            .expect("served-by lock")
+            .push((op_id, "poll", self.generation));
+        std::task::Poll::Pending
+    }
+
+    fn poll_submitted_op(
+        &mut self,
+        op_id: HostOpId,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<VmResult<HostFutureOutput>> {
+        self.served_by.lock().expect("served-by lock").push((
+            op_id,
+            "poll_submitted",
+            self.generation,
+        ));
+        self.futures.get_mut(&op_id).map_or(
+            std::task::Poll::Ready(Err(VmError::HostError(format!(
+                "unknown submitted host operation {op_id}"
+            )))),
+            |future| future.as_mut().poll(cx),
+        )
+    }
+
+    fn cancel_op(&mut self, op_id: HostOpId) {
+        self.cancel_op_with_reason(op_id, CancellationReason::Requested);
+    }
+
+    fn cancel_op_with_reason(&mut self, op_id: HostOpId, _reason: CancellationReason) {
+        self.served_by
+            .lock()
+            .expect("served-by lock")
+            .push((op_id, "cancel", self.generation));
+        self.futures.remove(&op_id);
+    }
+}
+
+fn noop_test_waker() -> std::task::Waker {
+    std::task::Waker::from(std::sync::Arc::new(NoopWake))
+}
+
+struct NoopWake;
+
+impl std::task::Wake for NoopWake {
+    fn wake(self: std::sync::Arc<Self>) {}
+}
+
+/// An un-awaited pending bridge operation keeps polling and cancelling against
+/// its original bridge generation after `set_async_bridge` swaps in a new
+/// generation; new submissions use the new generation. The old generation
+/// drops only after its outstanding driver is released.
+#[test]
+fn pending_bridge_op_survives_swap_and_polls_old_generation() {
+    let served_by = Arc::new(Mutex::new(Vec::new()));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("test VM construction must not fail");
+    vm.set_async_bridge(Box::new(GenerationBridge::new(
+        1,
+        Arc::clone(&served_by),
+        Arc::clone(&drops),
+    )));
+
+    // Submit a pending op and *do not* await it: the driver holds the gen-1
+    // Arc clone, keeping generation 1 alive independently of the VM.
+    let CallOutcome::Pending(old_op) = vm
+        .submit_host_future(Box::pin(std::future::pending()))
+        .expect("gen-1 bridge should accept the future")
+    else {
+        panic!("submission should return pending");
+    };
+
+    // Swap the bridge: the VM's current generation becomes 2, but the old
+    // op's driver still pins generation 1 (the old bridge is not dropped).
+    vm.set_async_bridge(Box::new(GenerationBridge::new(
+        2,
+        Arc::clone(&served_by),
+        Arc::clone(&drops),
+    )));
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        0,
+        "gen-1 bridge must survive while its driver is registered"
+    );
+
+    // The old op can still be awaited: polling routes to generation 1.
+    vm.set_waiting_host_op(old_op)
+        .expect("old op should register as waiting");
+    let waker = noop_test_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+    assert!(matches!(
+        vm.poll_waiting_host_op(&mut cx),
+        std::task::Poll::Pending
+    ));
+    assert_eq!(
+        *served_by.lock().expect("served-by lock"),
+        vec![(old_op, "submit", 1), (old_op, "poll_submitted", 1)],
+        "old op must poll through generation 1"
+    );
+
+    // New submissions use the new generation (2).
+    let CallOutcome::Pending(new_op) = vm
+        .submit_host_future(Box::pin(std::future::pending()))
+        .expect("gen-2 bridge should accept the future")
+    else {
+        panic!("submission should return pending");
+    };
+    assert_eq!(
+        *served_by.lock().expect("served-by lock"),
+        vec![
+            (old_op, "submit", 1),
+            (old_op, "poll_submitted", 1),
+            (new_op, "submit", 2),
+        ],
+        "new op must submit through generation 2"
+    );
+
+    // Both generations coexist in the single modern registry.
+    assert_eq!(vm.host.execution_scope_operation_count(), 2);
+
+    // Cancelling the old op routes through generation 1 (its own bridge),
+    // not the current generation 2.
+    vm.cancel_waiting_host_op();
+    assert_eq!(
+        *served_by.lock().expect("served-by lock"),
+        vec![
+            (old_op, "submit", 1),
+            (old_op, "poll_submitted", 1),
+            (new_op, "submit", 2),
+            (old_op, "cancel", 1),
+        ],
+        "old op must cancel through generation 1"
+    );
+    // The old op's slot is now terminal (released only when the scope drains
+    // it); the new op still lives.
+    assert_eq!(vm.host.execution_scope_operation_count(), 2);
+
+    // Release the new op's driver too: now generation 2's bridge (held only
+    // by the VM and the new driver) drops once both are released, and
+    // generation 1 drops once its last driver reference is gone.
+    vm.set_waiting_host_op(new_op)
+        .expect("new op should register as waiting");
+    vm.cancel_waiting_host_op();
+    drop(vm);
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        2,
+        "both bridge generations must drop after their drivers finish"
+    );
+}
+
+/// Clearing the bridge while a pending (never-awaited) op is registered keeps
+/// the op safe: the op can still be polled/cancelled against its retained
+/// generation, and a scope reset cancels it exactly once with no double
+/// cancel and no crash.
+#[test]
+fn clear_bridge_keeps_unawaited_op_cancellable_once() {
+    let served_by = Arc::new(Mutex::new(Vec::new()));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("test VM construction must not fail");
+    vm.set_async_bridge(Box::new(GenerationBridge::new(
+        7,
+        Arc::clone(&served_by),
+        Arc::clone(&drops),
+    )));
+    let CallOutcome::Pending(op_id) = vm
+        .submit_host_future(Box::pin(std::future::pending()))
+        .expect("bridge should accept the future")
+    else {
+        panic!("submission should return pending");
+    };
+
+    // Clear: the VM drops its current generation reference, but the driver's
+    // clone keeps the bridge alive.
+    vm.clear_async_bridge();
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        0,
+        "clearing the VM's reference must not drop the generation while a driver is registered"
+    );
+
+    // New submissions are rejected after a clear.
+    let error = vm
+        .submit_host_future(Box::pin(std::future::pending()))
+        .expect_err("cleared bridge must reject new submissions");
+    assert!(error.to_string().contains("requires a host async bridge"));
+
+    // The retained generation still serves the pending op: it can be awaited
+    // and polled safely.
+    vm.set_waiting_host_op(op_id)
+        .expect("old op should register as waiting");
+    let waker = noop_test_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+    assert!(matches!(
+        vm.poll_waiting_host_op(&mut cx),
+        std::task::Poll::Pending
+    ));
+    assert_eq!(
+        *served_by.lock().expect("served-by lock"),
+        vec![(op_id, "submit", 7), (op_id, "poll_submitted", 7)],
+        "cleared-generation op must still poll through generation 7"
+    );
+
+    // A scope reset cancels the pending op exactly once through its retained
+    // generation, and the generation drops once the driver is released.
+    vm.reset_for_reuse();
+    assert_eq!(
+        *served_by.lock().expect("served-by lock"),
+        vec![
+            (op_id, "submit", 7),
+            (op_id, "poll_submitted", 7),
+            (op_id, "cancel", 7),
+        ],
+        "reset must cancel the retained-generation op exactly once"
+    );
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        1,
+        "generation 7 must drop after its driver is released"
+    );
+    // The registry is drained by the reset.
+    assert_eq!(vm.host.execution_scope_operation_count(), 0);
+}
+
+/// A *waiting* op is cancelled exactly once against its original generation
+/// when the bridge is swapped: `set_async_bridge` cancels the currently
+/// waited-on op (legacy swap semantics) through the generation it belongs to,
+/// clears the wait, and installs the new generation. No dangling reference and
+/// no double cancel.
+#[test]
+fn waiting_op_swap_cancels_exactly_once_against_original_generation() {
+    let served_by = Arc::new(Mutex::new(Vec::new()));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("test VM construction must not fail");
+    vm.set_async_bridge(Box::new(GenerationBridge::new(
+        3,
+        Arc::clone(&served_by),
+        Arc::clone(&drops),
+    )));
+    let CallOutcome::Pending(op_id) = vm
+        .submit_host_future(Box::pin(std::future::pending()))
+        .expect("bridge should accept the future")
+    else {
+        panic!("submission should return pending");
+    };
+    vm.set_waiting_host_op(op_id)
+        .expect("op should register as waiting");
+
+    // Swap while the op is actively waited on: the waiting op is cancelled
+    // exactly once through generation 3, then the new generation is installed.
+    vm.set_async_bridge(Box::new(GenerationBridge::new(
+        4,
+        Arc::clone(&served_by),
+        Arc::clone(&drops),
+    )));
+    assert_eq!(
+        *served_by.lock().expect("served-by lock"),
+        vec![(op_id, "submit", 3), (op_id, "cancel", 3)],
+        "waiting op must be cancelled exactly once through generation 3 on swap"
+    );
+    assert_eq!(vm.waiting_host_op_id(), None);
+
+    // The new generation is live and accepts a fresh submission.
+    let CallOutcome::Pending(new_op) = vm
+        .submit_host_future(Box::pin(std::future::pending()))
+        .expect("gen-4 bridge should accept the future")
+    else {
+        panic!("submission should return pending");
+    };
+    assert_eq!(
+        *served_by.lock().expect("served-by lock"),
+        vec![
+            (op_id, "submit", 3),
+            (op_id, "cancel", 3),
+            (new_op, "submit", 4),
+        ],
+        "new op must submit through generation 4"
+    );
+
+    // Cancelling the new op does not re-cancel the old (waiting) op: the old
+    // cancellation already happened exactly once.
+    vm.set_waiting_host_op(new_op)
+        .expect("new op should register as waiting");
+    vm.cancel_waiting_host_op();
+    assert_eq!(
+        *served_by.lock().expect("served-by lock"),
+        vec![
+            (op_id, "submit", 3),
+            (op_id, "cancel", 3),
+            (new_op, "submit", 4),
+            (new_op, "cancel", 4),
+        ],
+        "each op cancels exactly once against its own generation"
+    );
+    drop(vm);
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        2,
+        "both generations must drop at teardown"
+    );
+}
+
+/// Multiple operations across two bridge generations coexist in the single
+/// modern operation registry without interference: each op polls and cancels
+/// against its own generation.
+#[test]
+fn multiple_generations_coexist_in_one_registry() {
+    let served_by = Arc::new(Mutex::new(Vec::new()));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("test VM construction must not fail");
+    vm.set_async_bridge(Box::new(GenerationBridge::new(
+        10,
+        Arc::clone(&served_by),
+        Arc::clone(&drops),
+    )));
+    let CallOutcome::Pending(gen10_a) = vm
+        .submit_host_future(Box::pin(std::future::pending()))
+        .expect("gen-10 bridge should accept")
+    else {
+        panic!("submission should return pending");
+    };
+    let CallOutcome::Pending(gen10_b) = vm
+        .submit_host_future(Box::pin(std::future::pending()))
+        .expect("gen-10 bridge should accept")
+    else {
+        panic!("submission should return pending");
+    };
+
+    vm.set_async_bridge(Box::new(GenerationBridge::new(
+        11,
+        Arc::clone(&served_by),
+        Arc::clone(&drops),
+    )));
+    let CallOutcome::Pending(gen11_a) = vm
+        .submit_host_future(Box::pin(std::future::pending()))
+        .expect("gen-11 bridge should accept")
+    else {
+        panic!("submission should return pending");
+    };
+
+    assert_eq!(
+        vm.host.execution_scope_operation_count(),
+        3,
+        "all generations share one registry"
+    );
+
+    // Cancel the gen-10 ops and the gen-11 op; each routes to its own
+    // generation. Cancelled slots stay occupied until the scope drains them,
+    // so all three remain present.
+    for op_id in [gen10_a, gen10_b, gen11_a] {
+        vm.set_waiting_host_op(op_id)
+            .expect("op should register as waiting");
+        vm.cancel_waiting_host_op();
+    }
+    let served = served_by.lock().expect("served-by lock");
+    let submit_gen: Vec<u64> = served
+        .iter()
+        .filter(|(_, action, _)| *action == "submit")
+        .map(|(_, _, generation)| *generation)
+        .collect();
+    let cancel_gen: Vec<u64> = served
+        .iter()
+        .filter(|(_, action, _)| *action == "cancel")
+        .map(|(_, _, generation)| *generation)
+        .collect();
+    assert_eq!(submit_gen, vec![10, 10, 11]);
+    assert_eq!(cancel_gen, vec![10, 10, 11]);
+    drop(served);
+    assert_eq!(
+        vm.host.execution_scope_operation_count(),
+        3,
+        "both generations' operations share the one registry"
+    );
+    drop(vm);
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        2,
+        "both generations drop once all their drivers finish"
+    );
+}
+
+/// The output/result-cell semantics are preserved across a swap: an op whose
+/// future resolves after a swap still materializes its produced value through
+/// the pending-result adapter, and a poisoned bridge lock surfaces a typed
+/// error instead of a panic or a raw-pointer dereference.
+#[test]
+fn output_semantics_preserved_across_swap_and_poisoned_lock_is_typed() {
+    let served_by = Arc::new(Mutex::new(Vec::new()));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("test VM construction must not fail");
+    vm.set_async_bridge(Box::new(GenerationBridge::new(
+        5,
+        Arc::clone(&served_by),
+        Arc::clone(&drops),
+    )));
+    let CallOutcome::Pending(op_id) = vm
+        .submit_host_future(Box::pin(async {
+            Ok(HostFutureOutput::returning(CallReturn::one(Value::Int(7))))
+        }))
+        .expect("bridge should accept the future")
+    else {
+        panic!("submission should return pending");
+    };
+
+    // Swap the bridge before the op completes.
+    vm.set_async_bridge(Box::new(GenerationBridge::new(
+        6,
+        Arc::clone(&served_by),
+        Arc::clone(&drops),
+    )));
+    vm.set_waiting_host_op(op_id)
+        .expect("op should register as waiting");
+    let waker = noop_test_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+    // Polling the old op drives its future to Ready through generation 5.
+    assert!(matches!(
+        vm.poll_waiting_host_op(&mut cx),
+        std::task::Poll::Ready(Ok(()))
+    ));
+    assert_eq!(
+        *served_by.lock().expect("served-by lock"),
+        vec![(op_id, "submit", 5), (op_id, "poll_submitted", 5)],
+        "old op completes through generation 5"
+    );
+    assert_eq!(vm.waiting_host_op_id(), None);
+
+    // Poisoned-lock mapping: a poisoned generation mutex surfaces a typed
+    // VmError (never a panic and never a raw-pointer dereference).
+    let poisoned = Arc::new(Mutex::new(Box::new(GenerationBridge::new(
+        9,
+        Arc::clone(&served_by),
+        Arc::clone(&drops),
+    )) as Box<dyn HostAsyncBridge>));
+    let poisoned_clone = Arc::clone(&poisoned);
+    let poisoner = std::thread::spawn(move || {
+        let _guard = poisoned_clone.lock().expect("poison lock");
+        panic!("deliberate poison");
+    });
+    let _ = poisoner.join();
+    let poisoned_error = super::async_host::with_bridge(&poisoned, |_bridge| {
+        // Never reached: the lock is poisoned.
+    })
+    .expect_err("a poisoned bridge lock must surface a typed error");
+    assert!(
+        poisoned_error.to_string().contains("poisoned"),
+        "poison must map to a typed VmError, got: {poisoned_error}"
+    );
+
+    drop(vm);
+    // The two generation bridges used above drop exactly once each.
+    assert_eq!(drops.load(Ordering::SeqCst), 2);
 }
 
 #[test]
 fn unused_host_operation_ids_do_not_consume_registry_capacity() {
-    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("test VM construction must not fail");
     for _ in 0..128 {
         vm.allocate_host_op_id();
     }
-    assert_eq!(vm.host.runtime_operations.active_count(), 0);
+    // Bridge-external ids never consume execution-scope registry capacity.
+    assert_eq!(vm.host.execution_scope_operation_count(), 0);
+}
+
+#[test]
+fn poisoned_bridge_submit_failure_is_atomic_and_releases_capacity() {
+    use std::sync::{Arc, Mutex};
+
+    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("test VM construction must not fail");
+
+    // Poison the current bridge generation before submitting.
+    let poisoned: Arc<Mutex<Box<dyn HostAsyncBridge>>> =
+        Arc::new(Mutex::new(Box::new(PendingBridgeForRollback::default())));
+    let poisoned_clone = Arc::clone(&poisoned);
+    let poisoner = std::thread::spawn(move || {
+        let _guard = poisoned_clone.lock().expect("poison lock");
+        panic!("deliberate poison");
+    });
+    let _ = poisoner.join();
+    // Install the poisoned generation as the current bridge so the VM
+    // submits against the poisoned lock.
+    vm.host.async_bridge = Some(poisoned);
+
+    let baseline_active = vm.host.execution_scope().operations().active_count();
+    let baseline_len = vm.host.execution_scope().operations().len();
+    let capacity = vm.host.execution_scope().operations().max_pending();
+    assert_eq!(baseline_active, 0);
+    assert_eq!(baseline_len, 0);
+
+    let error = vm
+        .submit_host_future(Box::pin(async {
+            Ok(HostFutureOutput::returning(CallReturn::none()))
+        }))
+        .expect_err("a poisoned bridge generation must fail submission");
+
+    assert!(
+        error.to_string().contains("poisoned"),
+        "poison must map to a typed VmError, got: {error}"
+    );
+    // The registered operation was rolled back atomically: no occupant, no
+    // active operation, no pending-result adapter, no waiting state.
+    assert_eq!(vm.host.execution_scope_operation_count(), 0);
+    assert_eq!(vm.host.execution_scope().operations().active_count(), 0);
+    assert_eq!(vm.host.execution_scope().operations().len(), 0);
+    assert!(vm.host.execution_scope().operations().is_empty());
+    assert_eq!(vm.waiting_host_op_id(), None);
+    // No pending-result adapter was installed for the failed op.
+    assert!(
+        vm.host.pending_op_results.is_empty(),
+        "a failed submission must leave no pending-result adapter"
+    );
+
+    // Full capacity remains available: filling to the configured limit must
+    // succeed after the failed submission.
+    vm.set_async_bridge(Box::new(PendingBridgeForRollback::default()));
+    for _ in 0..capacity {
+        vm.submit_host_future(Box::pin(std::future::pending()))
+            .expect("full capacity must be available after a failed submission");
+    }
+    assert_eq!(
+        vm.host.execution_scope().operations().active_count(),
+        capacity
+    );
+    assert_eq!(vm.host.execution_scope_operation_count(), capacity);
+}
+
+#[test]
+fn bridge_rejected_submit_failure_is_atomic_and_releases_capacity() {
+    use std::sync::{Arc, Mutex};
+
+    struct RejectingBridge {
+        cancels: Arc<Mutex<Vec<HostOpId>>>,
+    }
+    impl HostAsyncBridge for RejectingBridge {
+        fn submit_op(&mut self, _op_id: HostOpId, _future: HostFuture) -> VmResult<()> {
+            Err(VmError::HostError(
+                "bridge rejected the submission".to_string(),
+            ))
+        }
+        fn poll_op(
+            &mut self,
+            _op_id: HostOpId,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<VmResult<CallReturn>> {
+            std::task::Poll::Pending
+        }
+        fn cancel_op(&mut self, op_id: HostOpId) {
+            self.cancels.lock().expect("cancel lock").push(op_id);
+        }
+    }
+
+    let cancels = Arc::new(Mutex::new(Vec::new()));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("test VM construction must not fail");
+    vm.set_async_bridge(Box::new(RejectingBridge {
+        cancels: Arc::clone(&cancels),
+    }));
+
+    let baseline_active = vm.host.execution_scope().operations().active_count();
+    let baseline_len = vm.host.execution_scope().operations().len();
+    let capacity = vm.host.execution_scope().operations().max_pending();
+    assert_eq!(baseline_active, 0);
+    assert_eq!(baseline_len, 0);
+
+    let error = vm
+        .submit_host_future(Box::pin(async {
+            Ok(HostFutureOutput::returning(CallReturn::none()))
+        }))
+        .expect_err("a rejecting bridge must fail submission");
+    assert!(
+        error.to_string().contains("bridge rejected the submission"),
+        "rejection must surface the bridge error, got: {error}"
+    );
+
+    // The registered operation was rolled back atomically.
+    assert_eq!(vm.host.execution_scope_operation_count(), 0);
+    assert_eq!(vm.host.execution_scope().operations().active_count(), 0);
+    assert_eq!(vm.host.execution_scope().operations().len(), 0);
+    assert!(vm.host.execution_scope().operations().is_empty());
+    assert_eq!(vm.waiting_host_op_id(), None);
+    // No pending-result adapter was installed for the failed op.
+    assert!(
+        vm.host.pending_op_results.is_empty(),
+        "a rejected submission must leave no pending-result adapter"
+    );
+
+    // The driver was cancelled exactly once with the failed op's id.
+    let cancels = cancels.lock().expect("cancel lock");
+    assert_eq!(
+        cancels.len(),
+        1,
+        "the registered driver must be cancelled exactly once"
+    );
+    drop(cancels);
+
+    // Full capacity remains available after the failed submission.
+    vm.set_async_bridge(Box::new(PendingBridgeForRollback::default()));
+    for _ in 0..capacity {
+        vm.submit_host_future(Box::pin(std::future::pending()))
+            .expect("full capacity must be available after a rejected submission");
+    }
+    assert_eq!(
+        vm.host.execution_scope().operations().active_count(),
+        capacity
+    );
+}
+
+/// A bridge that parks submitted futures and never completes them; used to
+/// prove that capacity freed by a failed submission can be refilled.
+#[derive(Default)]
+struct PendingBridgeForRollback {
+    futures: std::collections::HashMap<HostOpId, HostFuture>,
+}
+
+impl HostAsyncBridge for PendingBridgeForRollback {
+    fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
+        self.futures.insert(op_id, future);
+        Ok(())
+    }
+    fn poll_op(
+        &mut self,
+        _op_id: HostOpId,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<VmResult<CallReturn>> {
+        std::task::Poll::Pending
+    }
+    fn poll_submitted_op(
+        &mut self,
+        op_id: HostOpId,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<VmResult<HostFutureOutput>> {
+        self.futures.get_mut(&op_id).map_or(
+            std::task::Poll::Ready(Err(VmError::HostError(format!(
+                "unknown submitted host operation {op_id}"
+            )))),
+            |future| future.as_mut().poll(cx),
+        )
+    }
+    fn cancel_op(&mut self, op_id: HostOpId) {
+        self.futures.remove(&op_id);
+    }
 }
 
 #[test]
 fn external_host_operations_join_the_shared_registry_without_id_collisions() {
-    use crate::builtins::runtime::cancellation::{OperationId, OperationOwner};
+    use crate::vm::operation::{
+        HostOperation, OperationCancelReason, OperationResult, OperationSpec,
+    };
+    use std::task::Poll;
 
-    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
-    let runtime_operation = vm
+    struct PendingOp;
+    impl HostOperation for PendingOp {
+        fn poll(&mut self, _cx: &mut std::task::Context<'_>) -> Poll<OperationResult<()>> {
+            Poll::Pending
+        }
+        fn cancel(&mut self, _reason: OperationCancelReason) -> OperationResult<()> {
+            Ok(())
+        }
+    }
+
+    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("test VM construction must not fail");
+    // A modern execution-scope operation and a bridge-external raw id live in
+    // different identity spaces (packed modern ids vs. arbitrary raw ids), so
+    // waiting on both never collides and never requires an owner registry.
+    let scope_op = vm
         .host
-        .runtime_operations
-        .start_owned(
-            OperationOwner::Io,
-            Some(&vm.run_ctx.cancellation),
-            None,
-            None,
-        )
-        .expect("runtime operation should start");
+        .execution_scope_start_operation(OperationSpec::new(PendingOp))
+        .expect("scope operation should start");
+    let scope_raw = scope_op.raw();
 
-    let collision = vm
-        .set_waiting_host_op(runtime_operation.id().raw())
-        .expect_err("host operation must not reuse a runtime-owned id");
-    assert!(collision.to_string().contains("collides"));
-    assert!(
-        vm.host
-            .runtime_operations
-            .get(runtime_operation.id())
-            .is_ok()
-    );
-    vm.host
-        .runtime_operations
-        .complete(runtime_operation.id())
-        .expect("runtime operation should complete");
-    vm.set_waiting_host_op(runtime_operation.id().raw())
-        .expect_err("colliding external operation id must remain retired");
+    vm.set_waiting_host_op(scope_raw)
+        .expect("a scope operation id waits through the scope registry");
+    assert_eq!(vm.waiting_host_op_id(), Some(scope_raw));
+    vm.complete_host_op(scope_raw, CallReturn::none())
+        .expect("the scope operation completes externally");
+    assert_eq!(vm.waiting_host_op_id(), None);
 
     vm.set_waiting_host_op(99)
-        .expect("external host operation should register");
-    let external = vm
-        .host
-        .runtime_operations
-        .get(OperationId::from_raw(99).expect("operation id should be valid"))
-        .expect("external operation should be registered");
-    assert_eq!(external.owner(), OperationOwner::HostBridge);
+        .expect("a bridge-external host operation should register as a wait");
+    assert_eq!(vm.waiting_host_op_id(), Some(99));
+    assert_eq!(
+        vm.host.execution_scope_operation_count(),
+        1,
+        "the scope op completed; only its terminal slot remains until consumed"
+    );
+    vm.complete_host_op(99, CallReturn::none())
+        .expect("the bridge-external operation completes externally");
 }
 
 #[test]
-fn invalid_host_completion_preserves_the_registered_operation() {
-    use crate::builtins::runtime::cancellation::{OperationId, OperationOwner};
-
-    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+fn invalid_host_completion_preserves_the_waiting_operation() {
+    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("test VM construction must not fail");
     vm.set_waiting_host_op(101)
         .expect("external host operation should register");
 
     vm.complete_host_op(102, CallReturn::none())
         .expect_err("completion for a different operation should fail");
-    let operation_id = OperationId::from_raw(101).expect("operation id should be valid");
     assert_eq!(
-        vm.host
-            .runtime_operations
-            .get(operation_id)
-            .expect("waiting operation should remain registered")
-            .owner(),
-        OperationOwner::HostBridge
+        vm.waiting_host_op_id(),
+        Some(101),
+        "a rejected completion must preserve the waiting operation"
     );
+
+    // Zero is never a valid host-operation id.
+    vm.complete_host_op(0, CallReturn::none())
+        .expect_err("zero host operation id must be rejected");
     assert_eq!(vm.waiting_host_op_id(), Some(101));
 }
 
 #[test]
-fn reset_and_drop_cleanup_real_host_resources_exactly_once() {
-    use crate::builtins::runtime::cancellation::CancellationReason;
-    use crate::builtins::runtime::resource::ResourceTypeId;
-
-    let cleanup_count = Arc::new(AtomicUsize::new(0));
-    let reasons = Arc::new(Mutex::new(Vec::new()));
-    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
-    let cleanup_count_for_resource = Arc::clone(&cleanup_count);
-    let reasons_for_resource = Arc::clone(&reasons);
-    vm.host
-        .runtime_resources
-        .insert_with_cleanup(ResourceTypeId::IO_FILE, (), move |(), reason| {
-            cleanup_count_for_resource.fetch_add(1, Ordering::SeqCst);
-            reasons_for_resource
-                .lock()
-                .expect("reason lock")
-                .push(reason);
-            Ok(())
-        })
-        .expect("test resource should be inserted");
-
-    vm.reset_for_reuse();
-    assert_eq!(cleanup_count.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        reasons.lock().expect("reason lock").as_slice(),
-        &[CancellationReason::VmReset]
-    );
-
-    drop(vm);
-    assert_eq!(cleanup_count.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn drop_cleans_real_host_resources_without_prior_reset() {
-    use crate::builtins::runtime::cancellation::CancellationReason;
-    use crate::builtins::runtime::resource::ResourceTypeId;
-
-    let cleanup_count = Arc::new(AtomicUsize::new(0));
-    let cleanup_reason = Arc::new(Mutex::new(None));
-    {
-        let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
-        let cleanup_count_for_resource = Arc::clone(&cleanup_count);
-        let cleanup_reason_for_resource = Arc::clone(&cleanup_reason);
-        vm.host
-            .runtime_resources
-            .insert_with_cleanup(ResourceTypeId::IO_FILE, (), move |(), reason| {
-                cleanup_count_for_resource.fetch_add(1, Ordering::SeqCst);
-                *cleanup_reason_for_resource.lock().expect("reason lock") = Some(reason);
-                Ok(())
-            })
-            .expect("test resource should be inserted");
-    }
-
-    assert_eq!(cleanup_count.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        *cleanup_reason.lock().expect("reason lock"),
-        Some(CancellationReason::VmReset)
-    );
-}
-
-#[test]
-fn reset_propagates_to_real_host_operation_cleanup() {
-    use crate::builtins::runtime::cancellation::{
-        CancellationReason, OperationEnd, OperationOwner, OperationStatus,
-    };
-
-    let cleanup_end = Arc::new(Mutex::new(None));
-    let cleanup_end_for_operation = Arc::clone(&cleanup_end);
-    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
-    let operation = vm
-        .host
-        .runtime_operations
-        .start_owned(
-            OperationOwner::Io,
-            Some(&vm.run_ctx.cancellation),
-            None,
-            Some(Box::new(move |end| {
-                *cleanup_end_for_operation.lock().expect("cleanup lock") = Some(end);
-                Ok(())
-            })),
-        )
-        .expect("test operation should start");
-    vm.instance.waiting_host_op = Some(WaitingHostOp {
-        op_id: operation.id().raw(),
-        exact_policy: crate::vm::host::ExactHostReturnPolicy::Legacy,
-    });
-
-    vm.reset_for_reuse();
-    assert_eq!(
-        operation.status(),
-        OperationStatus::Cancelled(CancellationReason::VmReset)
-    );
-    assert_eq!(
-        *cleanup_end.lock().expect("cleanup lock"),
-        Some(OperationEnd::Cancelled(CancellationReason::VmReset))
-    );
-}
-
-#[test]
-fn deadline_cancellation_closes_operation_payload_before_registry_removal() {
-    use crate::builtins::runtime::cancellation::{CancellationReason, OperationOwner};
-    use crate::builtins::runtime::resource::ResourceTypeId;
-    use std::task::{Context, Poll};
-    use std::time::{Duration, Instant};
-
-    let cleanup_reason = Arc::new(Mutex::new(None));
-    let cleanup_reason_for_payload = Arc::clone(&cleanup_reason);
-    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
-    let operation = vm
-        .host
-        .runtime_operations
-        .start_owned(
-            OperationOwner::Io,
-            Some(&vm.run_ctx.cancellation),
-            Some(Instant::now() - Duration::from_millis(1)),
-            None,
-        )
-        .expect("deadline operation should start");
-    let payload = vm
-        .host
-        .runtime_resources
-        .insert_with_cleanup(ResourceTypeId::CALLBACK, (), move |(), reason| {
-            *cleanup_reason_for_payload.lock().expect("cleanup lock") = Some(reason);
-            Ok(())
-        })
-        .expect("payload should be inserted");
-    operation.set_payload(payload);
-
-    let waker = futures_util::task::noop_waker();
-    let mut context = Context::from_waker(&waker);
-    let result =
-        crate::builtins::runtime::poll_builtin_io_op(&mut vm, operation.id().raw(), &mut context);
-
-    assert!(matches!(result, Poll::Ready(Err(_))));
-    assert_eq!(
-        *cleanup_reason.lock().expect("cleanup lock"),
-        Some(CancellationReason::Deadline)
-    );
-    assert!(vm.host.runtime_operations.get(operation.id()).is_err());
-    assert!(
-        vm.host
-            .runtime_resources
-            .get::<()>(payload, ResourceTypeId::CALLBACK)
-            .is_err()
-    );
-}
-
-#[test]
-fn worker_observed_deadline_retains_payload_until_vm_consumes_operation() {
-    use crate::builtins::runtime::cancellation::{CancellationReason, OperationOwner};
-    use crate::builtins::runtime::error::{RuntimeError, RuntimeErrorCode};
-    use crate::builtins::runtime::resource::ResourceTypeId;
-    use std::task::{Context, Poll};
-    use std::time::{Duration, Instant};
-
-    let cleanup_reason = Arc::new(Mutex::new(None));
-    let cleanup_reason_for_payload = Arc::clone(&cleanup_reason);
-    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
-    let operation = vm
-        .host
-        .runtime_operations
-        .start_owned(
-            OperationOwner::Io,
-            Some(&vm.run_ctx.cancellation),
-            Some(Instant::now() - Duration::from_millis(1)),
-            None,
-        )
-        .expect("deadline operation should start");
-    let payload = vm
-        .host
-        .runtime_resources
-        .insert_with_cleanup(ResourceTypeId::CALLBACK, (), move |(), reason| {
-            *cleanup_reason_for_payload.lock().expect("cleanup lock") = Some(reason);
-            Ok(())
-        })
-        .expect("payload should be inserted");
-    operation.set_payload(payload);
-
-    assert!(
-        operation
-            .fail(RuntimeError::new(
-                RuntimeErrorCode::OperationFailed,
-                "test::worker",
-                "worker failure",
-            ))
-            .expect("worker terminal transition should succeed")
-    );
-    assert!(vm.host.runtime_operations.get(operation.id()).is_ok());
-
-    let waker = futures_util::task::noop_waker();
-    let mut context = Context::from_waker(&waker);
-    let result =
-        crate::builtins::runtime::poll_builtin_io_op(&mut vm, operation.id().raw(), &mut context);
-
-    assert!(matches!(result, Poll::Ready(Err(_))));
-    assert_eq!(
-        *cleanup_reason.lock().expect("cleanup lock"),
-        Some(CancellationReason::Deadline)
-    );
-    assert!(vm.host.runtime_operations.get(operation.id()).is_err());
-    assert!(
-        vm.host
-            .runtime_resources
-            .get::<()>(payload, ResourceTypeId::CALLBACK)
-            .is_err()
-    );
-}
-
-#[test]
 fn shared_capture_cell_rejects_callable_ownership_cycle() {
-    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]).with_local_count(1));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]).with_local_count(1))
+        .expect("test VM construction must not fail");
     let cell = Arc::new(Mutex::new(Value::Null));
     vm.instance.capture_cells.insert(0, Arc::clone(&cell));
     let environment = Arc::new(crate::CallableEnvironment {
@@ -555,7 +1145,8 @@ fn shared_capture_cell_rejects_callable_ownership_cycle() {
 
 #[test]
 fn inline_callable_identity_requires_capture_free_function_item_state() {
-    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]).with_local_count(1));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]).with_local_count(1))
+        .expect("test VM construction must not fail");
     let malformed_environment = Arc::new(crate::CallableEnvironment {
         cells: Mutex::new(vec![Arc::new(Mutex::new(Value::Int(7)))]),
     });
@@ -604,10 +1195,11 @@ fn callable_operand_type_hint_roundtrips() {
 
 #[test]
 fn callvalue_decodes_its_arity_before_callable_validation() {
-    let mut vm = Vm::new(Program::new(
+    let mut vm = Vm::try_new(Program::new(
         Vec::new(),
         vec![OpCode::CallValue as u8, 0, OpCode::Ret as u8],
-    ));
+    ))
+    .expect("test VM construction must not fail");
     vm.instance.stack.push(Value::Null);
     assert!(matches!(vm.run(), Err(VmError::InvalidCallable)));
     assert_eq!(vm.ip(), 2);
@@ -663,7 +1255,7 @@ fn callvalue_enters_script_frame_and_resumes_caller() {
                 prototype_id: 0,
             }],
         );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
 
     assert_eq!(vm.run().expect("script call should run"), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(42)]);
@@ -676,7 +1268,8 @@ fn script_call_depth_limit_is_configurable() {
         "fn recurse(value: int) -> int { recurse(value) } recurse(1);",
     )
     .expect("recursive callable should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
 
     assert_eq!(vm.max_script_call_depth(), 1024);
     assert!(matches!(
@@ -738,7 +1331,7 @@ fn host_can_invoke_exported_callable_and_reset_rebinds_program_owned_value() {
                 prototype_id: 0,
             }],
         );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let callable = vm.locals()[0].clone();
     assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
     assert_eq!(
@@ -785,7 +1378,8 @@ fn aot_executes_move_detach_without_stack_contract_mismatch() {
         "#,
     )
     .expect("move source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.compile_aot().expect("aot compilation should succeed");
     assert_eq!(
         vm.run().expect("aot execution should halt"),
@@ -806,7 +1400,8 @@ fn aot_executes_script_callable_frames_without_interpreter_boundary() {
         "#,
     )
     .expect("script frame source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.compile_aot().expect("aot compilation should succeed");
     assert_eq!(
         vm.run().expect("aot execution should halt"),
@@ -828,7 +1423,7 @@ fn aot_executes_typed_script_callable_parameter_equality_without_interpreter_bou
         "#,
     )
     .expect("typed equality source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.compile_aot().expect("aot compilation should succeed");
     assert_eq!(
         vm.run().expect("aot execution should halt"),
@@ -850,7 +1445,7 @@ fn aot_executes_script_callable_bool_return_in_branch_without_interpreter_bounda
         "#,
     )
     .expect("typed branch source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.compile_aot().expect("aot compilation should succeed");
     assert_eq!(
         vm.run().expect("aot execution should halt"),
@@ -871,7 +1466,8 @@ fn aot_executes_capturing_closure_without_interpreter_boundary() {
         "#,
     )
     .expect("closure source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.compile_aot().expect("aot compilation should succeed");
     assert_eq!(
         vm.run().expect("aot execution should halt"),
@@ -892,7 +1488,8 @@ fn aot_executes_builtin_callable_values_without_interpreter_boundary() {
         "#,
     )
     .expect("builtin callable source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.compile_aot().expect("aot compilation should succeed");
     assert_eq!(
         vm.run().expect("aot execution should halt"),
@@ -913,7 +1510,8 @@ fn aot_callable_call_resumes_after_fuel_yield_without_interpreter_boundary() {
         "#,
     )
     .expect("callable source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.compile_aot().expect("aot compilation should succeed");
     vm.set_fuel(0);
     assert_eq!(
@@ -943,7 +1541,8 @@ fn aot_executes_nested_script_callables_without_interpreter_boundary() {
         "#,
     )
     .expect("nested callable source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.compile_aot().expect("aot compilation should succeed");
     assert_eq!(
         vm.run().expect("nested aot call should halt"),
@@ -964,7 +1563,8 @@ fn aot_recursive_script_callable_reports_depth_limit_without_interpreter_boundar
         "#,
     )
     .expect("recursive callable source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.compile_aot().expect("aot compilation should succeed");
     assert!(matches!(
         vm.run(),
@@ -992,7 +1592,8 @@ fn aot_host_callable_value_waits_and_resumes_without_interpreter_boundary() {
         "#,
     )
     .expect("host callable source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.register_function(Box::new(PendingAotHost));
     vm.compile_aot().expect("aot compilation should succeed");
     assert_eq!(
@@ -1019,7 +1620,8 @@ fn typed_script_callbacks_invoke_queue_unsubscribe_and_invalidate() {
         "#,
     )
     .expect("callback source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
     let callable = vm.stack().last().cloned().expect("callable result");
     let mut store = crate::Store::from_vm(vm);
@@ -1083,7 +1685,8 @@ fn callback_unsubscribe_cancels_already_enqueued_work() {
         "#,
     )
     .expect("callback source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
     let callable = vm.stack().last().cloned().expect("callable result");
     let mut store = crate::Store::from_vm(vm);
@@ -1112,7 +1715,8 @@ fn store_reset_and_replacement_invalidate_callback_registries() {
         "#,
     )
     .expect("first callback source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("first root should halt"), VmStatus::Halted);
     let callable = vm.stack().last().cloned().expect("first callable result");
     let mut store = crate::Store::from_vm(vm);
@@ -1137,7 +1741,8 @@ fn store_reset_and_replacement_invalidate_callback_registries() {
         "#,
     )
     .expect("replacement callback source should compile");
-    let mut replacement_vm = Vm::new(replacement.program.with_local_count(replacement.locals));
+    let mut replacement_vm = Vm::try_new(replacement.program.with_local_count(replacement.locals))
+        .expect("test VM construction must not fail");
     assert_eq!(
         replacement_vm.run().expect("replacement root should halt"),
         VmStatus::Halted
@@ -1170,7 +1775,8 @@ fn synchronous_callback_error_unwinds_before_next_invocation() {
         "#,
     )
     .expect("callback error source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
     let fail_callable = vm.stack()[0].clone();
     let answer_callable = vm.stack()[1].clone();
@@ -1208,7 +1814,8 @@ fn final_script_callback_releases_capture_environment_once() {
         "#,
     )
     .expect("capturing callback source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
     let callable = vm.stack().last().cloned().expect("capturing callback");
     let Value::Callable(callable_value) = &callable else {
@@ -1241,7 +1848,8 @@ fn store_resolves_only_exported_script_functions_by_name() {
         "#,
     )
     .expect("exported callback source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
     let mut store = crate::Store::from_vm(vm);
     let callback: crate::ScriptCallback<(i64,), i64> = store
@@ -1258,8 +1866,10 @@ fn store_resolves_only_exported_script_functions_by_name() {
 fn store_rejects_callable_values_from_another_store() {
     let first =
         crate::compile_source_for_repl("pub fn value() -> int { 11 }").expect("first store source");
-    let mut first_store =
-        crate::Store::from_vm(Vm::new(first.program.with_local_count(first.locals)));
+    let mut first_store = crate::Store::from_vm(
+        Vm::try_new(first.program.with_local_count(first.locals))
+            .expect("test VM construction must not fail"),
+    );
     assert_eq!(first_store.run().expect("first root"), VmStatus::Halted);
     let foreign = first_store
         .resolve_exported_callable("value")
@@ -1267,8 +1877,10 @@ fn store_rejects_callable_values_from_another_store() {
 
     let second = crate::compile_source_for_repl("pub fn value() -> int { 22 }")
         .expect("second store source");
-    let mut second_store =
-        crate::Store::from_vm(Vm::new(second.program.with_local_count(second.locals)));
+    let mut second_store = crate::Store::from_vm(
+        Vm::try_new(second.program.with_local_count(second.locals))
+            .expect("test VM construction must not fail"),
+    );
     assert_eq!(second_store.run().expect("second root"), VmStatus::Halted);
     let injected_slot = u8::try_from(second_store.vm().program().exported_callables[0].local_slot)
         .expect("test slot fits u8");
@@ -1294,8 +1906,10 @@ fn callback_queue_preserves_completed_results_and_remaining_events_after_error()
         "#,
     )
     .expect("queue source");
-    let mut store =
-        crate::Store::from_vm(Vm::new(compiled.program.with_local_count(compiled.locals)));
+    let mut store = crate::Store::from_vm(
+        Vm::try_new(compiled.program.with_local_count(compiled.locals))
+            .expect("test VM construction must not fail"),
+    );
     assert_eq!(store.run().expect("queue root"), VmStatus::Halted);
     let first: crate::ScriptCallback<(), i64> = store.script_callback_by_name("first").unwrap();
     let fail: crate::ScriptCallback<(), i64> = store.script_callback_by_name("fail").unwrap();
@@ -1334,7 +1948,8 @@ fn typed_script_callback_can_wait_resume_and_return_to_host() {
         "#,
     )
     .expect("callback source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     vm.register_function(Box::new(PendingCallbackHost));
     assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
     let callable = vm.stack().last().cloned().expect("callable result");
@@ -1385,7 +2000,8 @@ fn typed_script_callback_can_yield_resume_and_return_to_host() {
         "#,
     )
     .expect("callback source should compile");
-    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
     let callable = vm.stack().last().cloned().expect("callable result");
     let mut store = crate::Store::from_vm(vm);
@@ -1440,12 +2056,14 @@ fn vm_instances_share_decoded_instruction_metadata_across_program_clones() {
     .expect("source should compile");
 
     let base_program = compiled.program.with_local_count(compiled.locals.max(8));
-    let vm_one = Vm::new(
+    let vm_one = Vm::try_new(
         base_program
             .clone()
             .with_local_count(base_program.local_count + 8),
-    );
-    let vm_two = Vm::new(base_program.with_local_count(compiled.locals.max(8) + 16));
+    )
+    .expect("test VM construction must not fail");
+    let vm_two = Vm::try_new(base_program.with_local_count(compiled.locals.max(8) + 16))
+        .expect("test VM construction must not fail");
 
     assert!(
         Arc::ptr_eq(
@@ -1471,7 +2089,7 @@ fn borrowed_map_iterator_state_is_released_after_break() {
         crate::SourceFlavor::RustScript,
     )
     .expect("source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     assert_eq!(vm.run().expect("vm should run"), VmStatus::Halted);
     assert!(
@@ -1497,7 +2115,7 @@ fn borrowed_map_iterator_state_is_released_after_runtime_error() {
         crate::SourceFlavor::RustScript,
     )
     .expect("source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     vm.run().expect_err("program should fail at runtime");
     assert!(
@@ -1513,7 +2131,7 @@ fn borrowed_map_iterator_state_is_released_after_runtime_error() {
 #[test]
 fn map_iterator_ids_are_isolated_by_call_depth() {
     let program = Program::new(Vec::new(), vec![OpCode::Ret as u8]);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let Value::Map(outer) = Value::map(vec![(Value::string("outer"), Value::Int(1))]) else {
         unreachable!();
     };
@@ -1575,7 +2193,7 @@ fn native_trace_cache_resets_when_program_changes() {
     let compiled_one = crate::compile_source(source_one).expect("source one should compile");
     let compiled_two = crate::compile_source(source_two).expect("source two should compile");
 
-    let mut vm_one = Vm::new(compiled_one.program);
+    let mut vm_one = Vm::try_new(compiled_one.program).expect("test VM construction must not fail");
     vm_one.set_jit_config(jit::JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -1601,7 +2219,7 @@ fn native_trace_cache_resets_when_program_changes() {
         "cache entry count should match first program traces"
     );
 
-    let mut vm_two = Vm::new(compiled_two.program);
+    let mut vm_two = Vm::try_new(compiled_two.program).expect("test VM construction must not fail");
     vm_two.set_jit_config(jit::JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -1657,7 +2275,8 @@ fn native_trace_cache_reuses_entries_for_same_program() {
     "#;
     let compiled = crate::compile_source(source).expect("source should compile");
 
-    let mut vm_one = Vm::new(compiled.program.clone());
+    let mut vm_one =
+        Vm::try_new(compiled.program.clone()).expect("test VM construction must not fail");
     vm_one.set_jit_config(jit::JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -1683,7 +2302,7 @@ fn native_trace_cache_reuses_entries_for_same_program() {
         "cache entry count should match first vm traces"
     );
 
-    let mut vm_two = Vm::new(compiled.program);
+    let mut vm_two = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm_two.set_jit_config(jit::JitConfig {
         enabled: true,
         hot_loop_threshold: 1,
@@ -1759,7 +2378,7 @@ fn interpreter_metrics_track_operand_hint_hits_for_typed_add() {
         optional_slots: vec![false, false],
         operand_types,
     });
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_local(0, Value::Int(7))
         .expect("setting first local should succeed");
     vm.set_local(1, Value::Int(5))
@@ -1812,7 +2431,7 @@ fn interpreter_uses_typed_builtin_fast_path_for_slice_calls() {
         optional_slots: Vec::new(),
         operand_types,
     });
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
 
     let status = vm.run().expect("typed slice builtin should run");
 
@@ -1851,7 +2470,7 @@ fn interpreter_superinstructions_use_local_type_hints() {
         optional_slots: vec![false],
         operand_types: HashMap::new(),
     });
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_local(0, Value::Int(9))
         .expect("setting local should succeed");
 
@@ -1873,7 +2492,7 @@ fn interpreter_ldc_shares_string_constant_backing() {
         vec![Value::string("shared")],
         vec![OpCode::Ldc as u8, 0, 0, 0, 0, OpCode::Ret as u8],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
 
     let outcome = step_once(&mut vm).expect("ldc should execute");
     assert!(matches!(outcome, ExecOutcome::Continue));
@@ -1888,7 +2507,7 @@ fn interpreter_ldc_shares_string_constant_backing() {
 #[test]
 fn interpreter_dup_shares_array_backing() {
     let program = Program::new(vec![], vec![OpCode::Dup as u8, OpCode::Ret as u8]);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.instance
         .stack
         .push(Value::array(vec![Value::Int(1), Value::Int(2)]));
@@ -1925,7 +2544,7 @@ fn shared_string_survives_local_overwrite_after_copy_like_read() {
         ],
     )
     .with_local_count(1);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_local(0, Value::string("alive"))
         .expect("setting local should succeed");
 
@@ -1961,7 +2580,7 @@ fn shared_array_survives_local_overwrite_after_copy_like_read() {
         ],
     )
     .with_local_count(1);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_local(0, Value::array(vec![Value::Int(1), Value::Int(2)]))
         .expect("setting local should succeed");
 
@@ -1997,7 +2616,7 @@ fn shared_map_survives_local_overwrite_after_copy_like_read() {
         ],
     )
     .with_local_count(1);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_local(0, Value::map(vec![(Value::string("k"), Value::Int(9))]))
         .expect("setting local should succeed");
 
@@ -2011,7 +2630,7 @@ fn shared_map_survives_local_overwrite_after_copy_like_read() {
 fn interpreter_ldloc_preserves_local_slot() {
     let program =
         Program::new(vec![], vec![OpCode::Ldloc as u8, 0, OpCode::Ret as u8]).with_local_count(1);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let map_value = Value::map(vec![(Value::string("k"), Value::Int(9))]);
     vm.set_local(0, map_value.clone())
         .expect("setting local should succeed");
@@ -2050,7 +2669,7 @@ fn interpreter_explicit_move_sequence_clears_local_slot() {
         ],
     )
     .with_local_count(1);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let map_value = Value::map(vec![(Value::string("k"), Value::Int(9))]);
     vm.set_local(0, map_value.clone())
         .expect("setting local should succeed");
@@ -2091,7 +2710,7 @@ fn interpreter_fuses_ldloc_ldc_add_stloc_without_touching_stack() {
         ],
     )
     .with_local_count(2);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_local(0, Value::Int(41))
         .expect("setting local should succeed");
 
@@ -2133,7 +2752,7 @@ fn interpreter_fuses_ldloc_ldc_compare_brfalse() {
         ],
     )
     .with_local_count(1);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_local(0, Value::Int(42))
         .expect("setting local should succeed");
 
@@ -2177,7 +2796,7 @@ fn interpreter_fuses_generic_scalar_update_chain() {
         ],
     )
     .with_local_count(2);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_local(0, Value::Int(10))
         .expect("setting local should succeed");
     vm.set_local(1, Value::Int(4))
@@ -2223,7 +2842,7 @@ fn interpreter_fuses_float_scalar_sequences() {
         ],
     )
     .with_local_count(1);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_local(0, Value::Float(1.0))
         .expect("setting local should succeed");
 
@@ -2258,7 +2877,7 @@ fn interpreter_does_not_fuse_ldloc_sequences_when_fuel_is_enabled() {
         ],
     )
     .with_local_count(1);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_local(0, Value::Int(41))
         .expect("setting local should succeed");
     vm.set_fuel(32);
@@ -2290,7 +2909,7 @@ fn interpreter_copy_like_ldloc_dup_stloc_shares_map_backing_with_fuel() {
         ],
     )
     .with_local_count(1);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_local(0, Value::map(vec![(Value::string("k"), Value::Int(9))]))
         .expect("setting local should succeed");
     vm.set_fuel(32);
@@ -2310,7 +2929,7 @@ fn interpreter_fuses_call_ret_without_fuel() {
         vec![],
         vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.instance.stack.push(Value::string("tail"));
 
     let outcome = step_once(&mut vm).expect("call should execute");
@@ -2329,7 +2948,7 @@ fn interpreter_fuses_call_ret_when_fuel_enabled_if_tail_tick_available() {
         vec![],
         vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_fuel(1);
     vm.instance.stack.push(Value::string("tail"));
 
@@ -2351,7 +2970,7 @@ fn interpreter_call_ret_fusion_preserves_ip_when_tail_tick_exhausted() {
         vec![],
         vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_fuel(0);
     vm.instance.stack.push(Value::string("tail"));
 
@@ -2374,7 +2993,7 @@ fn interpreter_call_ret_fusion_preserves_ip_when_epoch_deadline_is_reached() {
         vec![],
         vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_epoch_deadline(0)
         .expect("setting epoch deadline should succeed");
     vm.instance.stack.push(Value::string("tail"));
@@ -2398,7 +3017,7 @@ fn run_consumes_two_ticks_for_call_ret_when_fuel_enabled() {
         vec![],
         vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_fuel(2);
     vm.instance.stack.push(Value::string("tail"));
 
@@ -2420,7 +3039,7 @@ fn run_yields_before_ret_in_call_ret_sequence_when_out_of_fuel() {
         vec![],
         vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_fuel(1);
     vm.instance.stack.push(Value::string("tail"));
 
@@ -2447,7 +3066,7 @@ fn run_yields_before_ret_in_call_ret_sequence_when_epoch_deadline_is_reached() {
         vec![],
         vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_epoch_check_interval(2)
         .expect("epoch interval update should succeed");
     vm.set_epoch_deadline(1)
@@ -2485,7 +3104,7 @@ fn dropping_pre_cancelled_invocation_consumes_cancellation_at_the_boundary() {
         "#,
     )
     .expect("invocation source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("root frame should halt"), VmStatus::Halted);
 
     vm.run_ctx
@@ -2526,7 +3145,7 @@ fn pre_cancelled_invocation_delivers_one_typed_error_then_fused_end() {
         "#,
     )
     .expect("invocation source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("root frame should halt"), VmStatus::Halted);
 
     vm.run_ctx
@@ -2574,7 +3193,7 @@ fn call_ret_fusion_pattern_requires_immediate_ret() {
         vec![],
         vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Ret as u8],
     );
-    let mut vm_with_ret = Vm::new(with_ret);
+    let mut vm_with_ret = Vm::try_new(with_ret).expect("test VM construction must not fail");
     vm_with_ret.instance.ip = 4;
     assert!(vm_with_ret.can_fuse_call_ret_pattern());
 
@@ -2582,12 +3201,12 @@ fn call_ret_fusion_pattern_requires_immediate_ret() {
         vec![],
         vec![OpCode::Call as u8, call_lo, call_hi, 1, OpCode::Nop as u8],
     );
-    let mut vm_wrong_next = Vm::new(wrong_next);
+    let mut vm_wrong_next = Vm::try_new(wrong_next).expect("test VM construction must not fail");
     vm_wrong_next.instance.ip = 4;
     assert!(!vm_wrong_next.can_fuse_call_ret_pattern());
 
     let no_next = Program::new(vec![], vec![OpCode::Call as u8, call_lo, call_hi, 1]);
-    let mut vm_no_next = Vm::new(no_next);
+    let mut vm_no_next = Vm::try_new(no_next).expect("test VM construction must not fail");
     vm_no_next.instance.ip = 4;
     assert!(!vm_no_next.can_fuse_call_ret_pattern());
 }
@@ -2604,8 +3223,9 @@ fn program_cache_key_distinguishes_call_script_from_call_value() {
         crate::compile_source("fn add2(value: int) -> int { value + 2 } let f = add2; f(40);")
             .expect("materialized call source should compile");
 
-    let mut direct_vm = Vm::new(direct.program);
-    let mut materialized_vm = Vm::new(materialized.program);
+    let mut direct_vm = Vm::try_new(direct.program).expect("test VM construction must not fail");
+    let mut materialized_vm =
+        Vm::try_new(materialized.program).expect("test VM construction must not fail");
     let direct_key = direct_vm.ensure_program_cache_key();
     let materialized_key = materialized_vm.ensure_program_cache_key();
     assert_ne!(
@@ -2616,7 +3236,8 @@ fn program_cache_key_distinguishes_call_script_from_call_value() {
     // The same direct program reproduces the same key across VMs.
     let direct_repeat = crate::compile_source("fn add2(value: int) -> int { value + 2 } add2(40);")
         .expect("direct call source should compile");
-    let mut repeat_vm = Vm::new(direct_repeat.program);
+    let mut repeat_vm =
+        Vm::try_new(direct_repeat.program).expect("test VM construction must not fail");
     assert_eq!(
         repeat_vm.ensure_program_cache_key(),
         direct_key,
@@ -2637,187 +3258,216 @@ fn native_callable_abi_version_covers_direct_script_calls() {
     );
     let direct = crate::compile_source("fn add2(value: int) -> int { value + 2 } add2(40);")
         .expect("direct call source should compile");
-    let mut vm = Vm::new(direct.program);
+    let mut vm = Vm::try_new(direct.program).expect("test VM construction must not fail");
     let key = vm.ensure_program_cache_key();
     assert_ne!(key, 0, "cache key must be non-trivial");
 }
 
 #[test]
-fn legacy_reset_failure_poisons_without_replacing_the_scope() {
-    use crate::builtins::runtime::error::{RuntimeError, RuntimeErrorCode};
-    use crate::builtins::runtime::resource::ResourceTypeId;
-    use crate::vm::execution_scope::ScopeState;
-    use crate::vm::resource::ResourceCloseReason;
-    use std::task::{Context, Poll, Wake, Waker};
-    use std::time::Instant;
+fn try_new_returns_typed_exhaustion_error_and_never_panics() {
+    use crate::vm::resource::table::test_seam::ScopedArenaSource;
+    // Fresh counter per test: the first construction consumes the max handout,
+    // the second is the first call after the max.
+    static COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(crate::vm::resource::handle::MAX_HANDLE_ARENA_ID);
+    let _source = ScopedArenaSource::install(&COUNTER);
 
-    struct ResetWake;
-    impl Wake for ResetWake {
+    // The first construction consumes the max handout.
+    let _first = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("the last arena id must construct a vm");
+    // The second is the first call after the max handout.
+    let error = match Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8])) {
+        Ok(_) => panic!("arena space must be exhausted"),
+        Err(error) => error,
+    };
+    let resource = error.resource_error().expect("typed resource error");
+    assert_eq!(
+        resource.code(),
+        ResourceErrorCode::ResourceTableArenaExhausted,
+        "typed arena-exhaustion code must survive ResourceTable -> ExecutionScope -> HostRuntime -> Vm::try_new"
+    );
+}
+
+#[test]
+fn try_new_shared_with_jit_config_propagates_exhaustion_typed() {
+    use crate::vm::resource::table::test_seam::ScopedArenaSource;
+    static COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(crate::vm::resource::handle::MAX_HANDLE_ARENA_ID);
+    let _source = ScopedArenaSource::install(&COUNTER);
+
+    let _first = Vm::try_new_shared_with_jit_config(
+        Arc::new(Program::new(Vec::new(), vec![OpCode::Ret as u8])),
+        crate::vm::jit::JitConfig::default(),
+    )
+    .expect("last arena id must construct");
+    let error = match Vm::try_new_shared_with_jit_config(
+        Arc::new(Program::new(Vec::new(), vec![OpCode::Ret as u8])),
+        crate::vm::jit::JitConfig::default(),
+    ) {
+        Ok(_) => panic!("arena space must be exhausted"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.resource_error().expect("typed").code(),
+        ResourceErrorCode::ResourceTableArenaExhausted
+    );
+}
+
+/// Source-contract guard: the shipped VM construction path is fallible.
+///
+/// [`Vm::try_new`], [`Vm::try_new_shared`] and `CompiledProgram::into_vm`
+/// must return a `Result` so downstream production callers can propagate the
+/// typed arena-exhaustion error instead of panicking. The type-checking calls
+/// below fail to compile if any future change regresses those constructors or
+/// `into_vm` back to an infallible `-> Vm`.
+///
+/// The former infallible `Vm::new` / `Vm::new_with_jit_config` /
+/// `Vm::new_shared` public shims are intentionally absent: they are removed
+/// from the public API, so no downstream-callable production path can panic on
+/// arena exhaustion. Re-adding them must be treated as a breaking regression.
+#[test]
+fn shipped_construction_paths_are_fallible() {
+    fn needs_vm_result(_value: VmResult<Vm>) {}
+    fn needs_unit_result(_value: VmResult<()>) {}
+
+    let program = Program::new(Vec::new(), vec![OpCode::Ret as u8]);
+    needs_vm_result(Vm::try_new(program.clone()));
+    needs_vm_result(Vm::try_new_shared(Arc::new(program.clone())));
+    needs_vm_result(Vm::try_new_with_jit_config(
+        program.clone(),
+        crate::vm::jit::JitConfig::default(),
+    ));
+    needs_unit_result(
+        crate::compiler::CompiledProgram {
+            program: program.clone(),
+            locals: 0,
+            functions: Vec::new(),
+            callable_use_facts: Vec::new(),
+        }
+        .into_vm()
+        .map(|_| ()),
+    );
+
+    // Each fallible path, when it does succeed, yields a fully operational VM
+    // (a plain infallible shim that only wrapped the same body would silence
+    // the typed error but not change behavior here).
+    let mut vm = Vm::try_new(program).expect("construction should succeed");
+    vm.reset_for_reuse();
+    assert!(vm.is_reusable());
+}
+
+#[test]
+fn reset_at_arena_exhaustion_poisons_and_preserves_old_scope() {
+    use crate::vm::resource::table::test_seam::ScopedArenaSource;
+    use std::task::Wake;
+
+    struct NoopWake;
+    impl Wake for NoopWake {
         fn wake(self: Arc<Self>) {}
     }
-    fn noop_context() -> Context<'static> {
-        static WAKER: OnceLock<Waker> = OnceLock::new();
-        Context::from_waker(WAKER.get_or_init(|| Waker::from(Arc::new(ResetWake))))
-    }
 
-    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
-    // A legacy resource whose cleanup fails makes the legacy HostRuntime
-    // reset report a failure, even though the generic scope is empty and
-    // would otherwise quiesce cleanly.
-    vm.host
-        .runtime_resources
-        .insert_with_cleanup(ResourceTypeId::IO_FILE, (), |_, _| {
-            Err(RuntimeError::new(
-                RuntimeErrorCode::ResourceCleanupFailed,
-                "resource::cleanup",
-                "legacy cleanup failed",
-            ))
-        })
-        .expect("legacy resource should be inserted");
+    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("test VM construction must not fail");
+    assert_eq!(vm.run().expect("run"), VmStatus::Halted);
 
-    assert_eq!(
-        vm.begin_reset_for_reuse(ResourceCloseReason::VmReset, None)
-            .expect("begin reset"),
-        BeginResetOutcome::Started
-    );
+    // Exhaust the arena for the recycle step. The counter is set past the max
+    // handout so the recycle's first (and only) allocation already fails. The
+    // scope close itself never allocates an arena id, so driving the reset to
+    // completion quiesces cleanup and then fails atomically at the recycle.
+    static COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(crate::vm::resource::handle::MAX_HANDLE_ARENA_ID + 1);
+    let _source = ScopedArenaSource::install(&COUNTER);
 
-    let mut cx = noop_context();
+    vm.begin_reset_for_reuse(ResourceCloseReason::VmReset, None)
+        .expect("begin reset");
+    let waker = Arc::new(NoopWake).into();
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut drive_count = 0;
     let result = loop {
-        match vm.poll_reset_for_reuse(&mut cx, Instant::now()) {
-            Poll::Pending => continue,
-            Poll::Ready(result) => break result,
+        drive_count += 1;
+        assert!(
+            drive_count < 64,
+            "reset must reach a terminal state promptly"
+        );
+        match vm.poll_reset_for_reuse(&mut cx, std::time::Instant::now()) {
+            std::task::Poll::Pending => continue,
+            std::task::Poll::Ready(result) => break result,
         }
     };
-    let Err(VmError::Reset(VmResetError::LegacyReset(message))) = result else {
-        panic!("expected a legacy reset failure to poison the vm, got {result:?}");
-    };
-    assert!(
-        message.contains("legacy cleanup failed"),
-        "the recorded legacy reset failure must carry the cleanup diagnostics"
-    );
 
-    // Poisoned: never reusable, never auto-recovers, run rejected.
+    let Err(error) = result else {
+        panic!("recycle at arena exhaustion must poison the vm");
+    };
+    match error {
+        VmError::Reset(VmResetError::ScopeRecycle(
+            super::execution_scope::ExecutionScopeError::ArenaExhausted(resource),
+        )) => {
+            assert_eq!(
+                resource.code(),
+                ResourceErrorCode::ResourceTableArenaExhausted,
+                "typed arena-exhaustion code must survive the reset/recycle path"
+            );
+        }
+        other => panic!("expected ScopeRecycle(ArenaExhausted), got {other:?}"),
+    }
+
+    // The VM is permanently poisoned: not reusable, error preserved, old scope
+    // kept for diagnostics (no partial reset, no malformed scope install).
     assert_eq!(vm.reset_state(), VmResetState::Poisoned);
     assert!(!vm.is_reusable());
     assert!(matches!(
-        vm.run(),
-        Err(VmError::Reset(VmResetError::NotReusable {
-            state: VmResetState::Poisoned,
-            ..
-        }))
+        vm.reset_error(),
+        Some(VmResetError::ScopeRecycle(
+            super::execution_scope::ExecutionScopeError::ArenaExhausted(_)
+        ))
     ));
-
-    // The installed scope was NOT replaced: it remains Quiescent in place
-    // (the failed legacy reset never triggers a fresh-scope swap).
-    assert_eq!(vm.host.execution_scope_state(), ScopeState::Quiescent);
+    // The old scope remains installed and quiescent (cleanup finished).
     assert!(vm.host.execution_scope_is_quiescent());
-
-    // Repeated polls keep returning the same structured poison error.
-    match vm.poll_reset_for_reuse(&mut cx, Instant::now()) {
-        Poll::Ready(Err(VmError::Reset(VmResetError::LegacyReset(_)))) => {}
-        other => panic!("repeated poll after poisoning must stay stable, got {other:?}"),
-    }
+    assert_eq!(vm.host.execution_scope_resource_count(), 0);
+    assert_eq!(vm.host.execution_scope_operation_count(), 0);
+    // A further reset attempt is rejected typed.
+    let rejected = vm.begin_reset_for_reuse(ResourceCloseReason::VmReset, None);
+    assert!(matches!(
+        rejected,
+        Err(VmError::Reset(VmResetError::AlreadyPoisoned { .. }))
+    ));
+    // Drop safety: dropping the poisoned VM must not panic.
 }
 
 #[test]
-fn shutdown_legacy_failure_does_not_leak_into_later_clean_reset() {
-    use crate::builtins::runtime::error::{RuntimeError, RuntimeErrorCode};
-    use crate::builtins::runtime::resource::ResourceTypeId;
-    use crate::vm::execution_scope::ScopeState;
-    use crate::vm::resource::ResourceCloseReason;
-    use std::task::{Context, Poll, Wake, Waker};
-    use std::time::Instant;
+fn reset_recycle_succeeds_when_arena_is_available_again() {
+    use crate::vm::resource::table::test_seam::ScopedArenaSource;
+    use std::task::Wake;
 
-    struct ResetWake;
-    impl Wake for ResetWake {
+    struct NoopWake;
+    impl Wake for NoopWake {
         fn wake(self: Arc<Self>) {}
     }
-    fn noop_context() -> Context<'static> {
-        static WAKER: OnceLock<Waker> = OnceLock::new();
-        Context::from_waker(WAKER.get_or_init(|| Waker::from(Arc::new(ResetWake))))
+
+    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("test VM construction must not fail");
+    assert_eq!(vm.run().expect("run"), VmStatus::Halted);
+    vm.begin_reset_for_reuse(ResourceCloseReason::VmReset, None)
+        .expect("begin reset");
+
+    // A scoped exhaustion window that is released before the recycle step.
+    {
+        static COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(crate::vm::resource::handle::MAX_HANDLE_ARENA_ID);
+        let _source = ScopedArenaSource::install(&COUNTER);
     }
 
-    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
-    // A legacy resource whose cleanup fails: `Vm::shutdown` drives the legacy
-    // HostRuntime sweep through `close_all_handles` and records the failure,
-    // but the public shutdown API never consumes the latch afterwards.
-    vm.host
-        .runtime_resources
-        .insert_with_cleanup(ResourceTypeId::IO_FILE, (), |_, _| {
-            Err(RuntimeError::new(
-                RuntimeErrorCode::ResourceCleanupFailed,
-                "resource::cleanup",
-                "legacy cleanup failed",
-            ))
-        })
-        .expect("legacy resource should be inserted");
-
-    // Public shutdown leaves the failure latched inside HostRuntime.
-    vm.shutdown();
-
-    // The failing resource was consumed by that failed close, so the legacy
-    // failure condition is gone. A subsequent clean two-phase reset must NOT
-    // be falsely poisoned by the stale latch from the shutdown sweep.
-    assert_eq!(
-        vm.begin_reset_for_reuse(ResourceCloseReason::VmReset, None)
-            .expect("begin reset"),
-        BeginResetOutcome::Started
-    );
-    let mut cx = noop_context();
-    let result = loop {
-        match vm.poll_reset_for_reuse(&mut cx, Instant::now()) {
-            Poll::Pending => continue,
-            Poll::Ready(result) => break result,
+    let waker = Arc::new(NoopWake).into();
+    let mut cx = std::task::Context::from_waker(&waker);
+    for _ in 0..64 {
+        match vm.poll_reset_for_reuse(&mut cx, std::time::Instant::now()) {
+            std::task::Poll::Pending => continue,
+            std::task::Poll::Ready(result) => {
+                result.expect("reset must complete once the arena is available");
+                break;
+            }
         }
-    };
-    result.expect("a clean reset after shutdown-latched failure must not be poisoned");
-
-    // Ready, not Poisoned, error cleared, fresh scope installed.
+    }
     assert_eq!(vm.reset_state(), VmResetState::Ready);
     assert!(vm.is_reusable());
-    assert_eq!(vm.reset_error(), None);
-    assert_eq!(
-        vm.host.execution_scope_state(),
-        ScopeState::Active,
-        "the successful reset must install a fresh active scope"
-    );
-    // The reset sweep's own latch is empty: the shutdown failure was cleared
-    // at the start of the reset sweep, before the sweep ran.
-    assert_eq!(
-        vm.host.take_legacy_reset_failure(),
-        None,
-        "a stale shutdown failure must not survive into a clean reset sweep"
-    );
-}
-
-#[test]
-fn consecutive_host_resets_first_failure_second_success_leaves_no_latch() {
-    use crate::builtins::runtime::error::{RuntimeError, RuntimeErrorCode};
-    use crate::builtins::runtime::resource::ResourceTypeId;
-
-    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
-    // Sweep 1 fails: closing the failing resource records it as the first
-    // failure of *that* sweep. The close consumes the resource value even on
-    // error, so the legacy arena is empty again afterwards.
-    vm.host
-        .runtime_resources
-        .insert_with_cleanup(ResourceTypeId::IO_FILE, (), |_, _| {
-            Err(RuntimeError::new(
-                RuntimeErrorCode::ResourceCleanupFailed,
-                "resource::cleanup",
-                "legacy cleanup failed",
-            ))
-        })
-        .expect("failing legacy resource should be inserted");
-    vm.host.reset_for_reuse();
-
-    // Sweep 2 runs on the now-empty arena and succeeds. A failure recorded
-    // by sweep 1 must not survive into sweep 2: the latch is cleared when
-    // sweep 2 begins, so taking it observes `None`.
-    vm.host.reset_for_reuse();
-    assert_eq!(
-        vm.host.take_legacy_reset_failure(),
-        None,
-        "a failure from an earlier reset sweep must not leak into a later clean sweep"
-    );
 }

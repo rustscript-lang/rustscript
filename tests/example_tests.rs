@@ -54,7 +54,7 @@ fn run_vm_until_halted(vm: &mut Vm) {
 
 fn run_compiled_file(path: &Path) -> Vec<Value> {
     let compiled = compile_source_file(path).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let mut jit_config = *vm.jit_config();
     jit_config.enabled = false;
     vm.set_jit_config(jit_config);
@@ -65,7 +65,7 @@ fn run_compiled_file(path: &Path) -> Vec<Value> {
 
 fn run_compiled_source(flavor: SourceFlavor, source: &str) -> Vec<Value> {
     let compiled = compile_source_with_flavor(source, flavor).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let mut jit_config = *vm.jit_config();
     jit_config.enabled = false;
     vm.set_jit_config(jit_config);
@@ -375,7 +375,7 @@ for (key: string, value: int) in &values {}
 "#;
     let compiled = compile_source_with_flavor(source, SourceFlavor::RustScript)
         .expect("typed source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let err = vm
         .run()
         .expect_err("non-string map keys should fail at iterator init");

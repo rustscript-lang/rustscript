@@ -2206,7 +2206,8 @@ mod tests {
 
     #[test]
     fn virtual_frame_restore_is_atomic_for_invalid_metadata() {
-        let mut vm = Vm::new(virtual_frame_program());
+        let mut vm =
+            Vm::try_new(virtual_frame_program()).expect("test VM construction must not fail");
         let locals = [Value::Int(7)];
         let before = (
             vm.instance.ip,
@@ -2242,7 +2243,8 @@ mod tests {
 
     #[test]
     fn virtual_frame_restore_builds_script_frame_from_materialized_values() {
-        let mut vm = Vm::new(virtual_frame_program());
+        let mut vm =
+            Vm::try_new(virtual_frame_program()).expect("test VM construction must not fail");
         let mut locals = ManuallyDrop::new(vec![Value::Int(7)]);
         let status = pd_vm_native_restore_virtual_frame(
             &mut vm,
@@ -2271,7 +2273,8 @@ mod tests {
 
     #[test]
     fn materialize_root_callable_rejects_negative_prototype_id_typed() {
-        let mut vm = Vm::new(virtual_frame_program());
+        let mut vm =
+            Vm::try_new(virtual_frame_program()).expect("test VM construction must not fail");
         let mut slot = MaybeUninit::<Value>::uninit();
         let status = pd_vm_native_materialize_root_callable(&mut vm, slot.as_mut_ptr(), -1);
         assert_eq!(status, STATUS_ERROR);
@@ -2290,7 +2293,8 @@ mod tests {
 
     #[test]
     fn materialize_root_callable_rejects_out_of_range_prototype_id() {
-        let mut vm = Vm::new(virtual_frame_program());
+        let mut vm =
+            Vm::try_new(virtual_frame_program()).expect("test VM construction must not fail");
         let mut slot = MaybeUninit::<Value>::uninit();
         let status = pd_vm_native_materialize_root_callable(&mut vm, slot.as_mut_ptr(), 99);
         assert_eq!(status, STATUS_ERROR);
@@ -2328,7 +2332,7 @@ mod tests {
     fn native_frame_state_and_active_restore_are_frame_relative() {
         let program =
             crate::Program::new(Vec::new(), vec![crate::OpCode::Ret as u8]).with_local_count(2);
-        let mut vm = Vm::new(program);
+        let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
         vm.instance.stack = vec![Value::Int(10), Value::Int(20)];
         vm.instance.locals = vec![
             Value::Int(1),
@@ -2454,7 +2458,7 @@ mod tests {
             _ => panic!("expected script target"),
         };
         let ret_ip = function.end_ip as usize - 1;
-        let mut vm = Vm::new(compiled.program);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
         let callable = vm
             .bind_callable_value(0, vec![Value::Int(1)])
@@ -2506,7 +2510,7 @@ mod tests {
         let preserved = Arc::new("preserved".to_string());
         let program =
             crate::Program::new(Vec::new(), vec![crate::OpCode::Ret as u8]).with_local_count(2);
-        let mut vm = Vm::new(program);
+        let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
         vm.set_local(0, Value::Int(17)).expect("scalar local");
         vm.set_local(1, Value::String(preserved.clone()))
             .expect("heap local");
@@ -2536,7 +2540,7 @@ mod tests {
         clear_bridge_error();
         let program =
             crate::Program::new(Vec::new(), vec![crate::OpCode::Ret as u8]).with_local_count(1);
-        let mut vm = Vm::new(program);
+        let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
         vm.set_local(0, Value::Int(17)).expect("initial local");
         vm.instance.stack.push(Value::Int(23));
         let local_value = Value::Int(99);
@@ -2576,7 +2580,7 @@ mod tests {
         clear_bridge_error();
         let program =
             crate::Program::new(Vec::new(), vec![crate::OpCode::Ret as u8]).with_local_count(2);
-        let mut vm = Vm::new(program);
+        let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
         vm.set_local(0, Value::Int(17)).expect("initial local");
         let local_indices = [0_u32, 0_u32];
         let local_values = [Value::Int(98), Value::Int(99)];
@@ -2602,7 +2606,7 @@ mod tests {
         let replacement = Arc::new("replacement".to_string());
         let program =
             crate::Program::new(Vec::new(), vec![crate::OpCode::Ret as u8]).with_local_count(2);
-        let mut vm = Vm::new(program);
+        let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
         vm.set_drop_contract_events_enabled(true);
         vm.set_local(0, Value::Int(1)).expect("old scalar local");
         vm.set_local(1, Value::String(old.clone()))

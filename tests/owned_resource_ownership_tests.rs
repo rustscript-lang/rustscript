@@ -189,7 +189,7 @@ fn program_owned_local_slots_marks_direct_nested_and_plain_slots() {
 
 #[test]
 fn duplicate_mark_guest_owned_is_structured_error_and_atomic() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (res, begins, _reasons, _drops) = CountingResource::new();
     let token = table.push(res).expect("push");
     let handle = token.handle();
@@ -213,7 +213,7 @@ fn duplicate_mark_guest_owned_is_structured_error_and_atomic() {
 
 #[test]
 fn release_guest_owner_sync_close_fires_exactly_once() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (res, begins, reasons, _drops) = CountingResource::new();
     let token = table.push(res).expect("push");
     let handle = token.handle();
@@ -243,7 +243,7 @@ fn release_guest_owner_sync_close_fires_exactly_once() {
 
 #[test]
 fn release_guest_owner_pending_fires_begin_close_exactly_once() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (res, begins, _reasons, polls, gate) = GatedResource::new();
     let token = table.push(res).expect("push");
     let handle = token.handle();
@@ -284,7 +284,7 @@ fn release_guest_owner_pending_fires_begin_close_exactly_once() {
 
 #[test]
 fn close_all_closes_pending_guest_owned_once_and_never_refires_a_released_one() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     // Resource A: GuestOwned, never released; close_all is its fallback close.
     let (res_a, begins_a, reasons_a, _polls_a, gate_a) = GatedResource::new();
     // Resource B: GuestOwned and already released (Closing) before close_all.
@@ -341,7 +341,7 @@ fn close_all_closes_pending_guest_owned_once_and_never_refires_a_released_one() 
 
 #[test]
 fn take_owned_returns_the_value_and_the_handle_is_stale_afterwards() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (res, begins, _reasons, drops) = CountingResource::new();
     let token = table.push(res).expect("push");
     let handle = token.handle();
@@ -383,7 +383,7 @@ fn take_owned_returns_the_value_and_the_handle_is_stale_afterwards() {
 
 #[test]
 fn take_owned_wrong_type_is_an_error_and_consumes_nothing() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (res, begins, _reasons, _drops) = CountingResource::new();
     let token = table.push(res).expect("push");
     let handle = token.handle();
@@ -403,7 +403,7 @@ fn take_owned_wrong_type_is_an_error_and_consumes_nothing() {
 
 #[test]
 fn take_owned_wrong_key_is_an_error_and_consumes_nothing() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (res, begins, _reasons, _drops) = CountingResource::new();
     let token = table.push(res).expect("push");
     let handle = token.handle();
@@ -426,7 +426,7 @@ fn take_owned_wrong_key_is_an_error_and_consumes_nothing() {
 
 #[test]
 fn take_owned_with_live_children_is_an_error_and_consumes_nothing() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (parent_res, parent_begins, _parent_reasons, _parent_drops) = CountingResource::new();
     let parent = table.push(parent_res).expect("push parent");
     let (child_res, _child_begins, _child_reasons, _child_drops) = CountingResource::new();
@@ -471,8 +471,8 @@ fn take_owned_with_live_children_is_an_error_and_consumes_nothing() {
 
 #[test]
 fn take_owned_foreign_table_handle_is_an_error_and_consumes_nothing() {
-    let mut table = ResourceTable::new();
-    let mut foreign = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
+    let mut foreign = ResourceTable::new().expect("table");
     let (res, begins, _reasons, _drops) = CountingResource::new();
     let token = table.push(res).expect("push");
     let handle = token.handle();
@@ -502,8 +502,8 @@ fn take_owned_foreign_table_handle_is_an_error_and_consumes_nothing() {
 
 #[test]
 fn release_with_foreign_or_stale_handle_is_an_idempotent_noop() {
-    let mut table = ResourceTable::new();
-    let mut foreign = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
+    let mut foreign = ResourceTable::new().expect("table");
     let (res, begins, _reasons, _drops) = CountingResource::new();
     let token = table.push(res).expect("push");
     let handle = token.handle();
@@ -541,7 +541,7 @@ fn release_with_foreign_or_stale_handle_is_an_idempotent_noop() {
 #[test]
 fn mark_on_closing_or_taken_is_a_structured_error_and_atomic() {
     // Closing resource (release launched, close still pending).
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (res, begins, _reasons, _polls, _gate) = GatedResource::new();
     let token = table.push(res).expect("push");
     let handle = token.handle();
@@ -561,7 +561,7 @@ fn mark_on_closing_or_taken_is_a_structured_error_and_atomic() {
     assert_eq!(table.ownership(handle), Some(ResourceOwnership::GuestOwned));
 
     // Taken resource (concrete value moved out of the table).
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (res, _begins, _reasons, _drops) = CountingResource::new();
     let token = table.push(res).expect("push");
     let handle = token.handle();
@@ -579,7 +579,7 @@ fn mark_on_closing_or_taken_is_a_structured_error_and_atomic() {
 
 #[test]
 fn scope_begin_close_first_reason_wins_is_preserved() {
-    let mut scope = ExecutionScope::new();
+    let mut scope = ExecutionScope::new().expect("scope");
     assert!(
         scope
             .begin_close(ResourceCloseReason::OwnershipRelease)
@@ -621,7 +621,7 @@ fn scope_begin_close_first_reason_wins_is_preserved() {
 
 #[test]
 fn close_all_reclaims_host_and_guest_owned_once_and_never_touches_taken() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (host_res, host_begins, _host_reasons, _host_drops) = CountingResource::new();
     let (guest_res, guest_begins, _guest_reasons, _guest_drops) = CountingResource::new();
     let (taken_res, taken_begins, _taken_reasons, taken_drops) = CountingResource::new();
@@ -660,7 +660,7 @@ fn close_all_reclaims_host_and_guest_owned_once_and_never_touches_taken() {
 
 #[test]
 fn take_owned_guest_owned_child_unlinks_parent_and_parent_closes() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (parent_res, parent_begins, _parent_reasons, _parent_drops) = CountingResource::new();
     let parent = table.push(parent_res).expect("push parent");
     let (child_res, child_begins, _child_reasons, child_drops) = CountingResource::new();
@@ -697,7 +697,7 @@ fn take_owned_guest_owned_child_unlinks_parent_and_parent_closes() {
 
 #[test]
 fn take_owned_host_owned_is_not_guest_owned_and_consumes_nothing() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (res, begins, _reasons, drops) = CountingResource::new();
     let token = table.push(res).expect("push");
     let handle = token.handle();
@@ -731,7 +731,7 @@ fn take_owned_host_owned_is_not_guest_owned_and_consumes_nothing() {
 
 #[test]
 fn take_after_release_in_closing_is_already_closed_and_close_finishes() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (res, begins, _reasons, polls, gate) = GatedResource::new();
     let token = table.push(res).expect("push");
     let handle = token.handle();

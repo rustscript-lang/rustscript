@@ -72,7 +72,7 @@ fn same_named_helpers_across_modules_coexist() {
     );
 
     let compiled = compile_source_file(&main_path).expect("same-named helpers should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("vm should run"), VmStatus::Halted);
     assert_eq!(
         vm.stack(),
@@ -95,7 +95,7 @@ fn public_functions_are_importable_private_functions_are_not() {
         "main source",
     );
     let compiled = compile_source_file(&main_path).expect("public export should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("vm should run"), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(42)]);
 
@@ -153,7 +153,7 @@ fn transitive_imports_are_not_reexported() {
         "main source",
     );
     let compiled = compile_source_file(&main_path).expect("direct import should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("vm should run"), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(100), Value::Int(100)]);
 

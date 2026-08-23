@@ -13,7 +13,7 @@ fn prepared_vm(source: &str) -> Vm {
     let program = compile_source(source)
         .expect("runtime host source should compile")
         .program;
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
         .expect("default runtime host registry should bind");
@@ -118,7 +118,7 @@ fn public_sqlite_policy_configures_the_production_vm() {
     let program = compile_source("0;")
         .expect("minimal SQLite host program should compile")
         .program;
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.configure_sqlite(vm::SqlitePolicy::default());
     let _limits = vm::SqliteLimits::default();
     vm.clear_sqlite_configuration();

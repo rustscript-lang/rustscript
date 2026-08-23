@@ -1,4 +1,5 @@
-use std::fmt::Write as _;
+use std::error::Error;
+use std::fmt::{Display, Formatter, Write as _};
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -21,6 +22,49 @@ const DEFAULT_HOT_LOOP_OUTER: i64 = 8;
 const DEFAULT_CALLBACK_ITERS: usize = 50_000;
 const LOAD_HOST_COUNTS: [usize; 6] = [0, 1, 10, 50, 100, 500];
 
+#[derive(Debug)]
+enum BenchError {
+    Message(String),
+    Vm { context: String, source: VmError },
+}
+
+impl BenchError {
+    fn message(message: impl Into<String>) -> Self {
+        Self::Message(message.into())
+    }
+
+    fn vm(context: impl Into<String>, source: VmError) -> Self {
+        Self::Vm {
+            context: context.into(),
+            source,
+        }
+    }
+}
+
+impl Display for BenchError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Message(message) => formatter.write_str(message),
+            Self::Vm { context, source } => write!(formatter, "{context}: {source}"),
+        }
+    }
+}
+
+impl Error for BenchError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Vm { source, .. } => Some(source),
+            Self::Message(_) => None,
+        }
+    }
+}
+
+impl From<String> for BenchError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
 fn main() {
     if let Err(err) = real_main() {
         eprintln!("mini benchmark failed: {err}");
@@ -28,7 +72,7 @@ fn main() {
     }
 }
 
-fn real_main() -> Result<(), String> {
+fn real_main() -> Result<(), BenchError> {
     let config = BenchConfig::parse(std::env::args().skip(1))?;
     if let Some(mode) = config.rss_child_mode {
         let sample = measure_retained_rss_for_mode(mode, config.rss_vm_count)?;
@@ -282,7 +326,7 @@ fn benchmark_compile(config: &BenchConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn benchmark_load(config: &BenchConfig) -> Result<(), String> {
+fn benchmark_load(config: &BenchConfig) -> Result<(), BenchError> {
     println!("[load]");
     for host_count in LOAD_HOST_COUNTS {
         let load_program = build_load_program(host_count, config.load_local_count)?;
@@ -305,7 +349,7 @@ fn benchmark_load(config: &BenchConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn benchmark_runtime(config: &BenchConfig) -> Result<(), String> {
+fn benchmark_runtime(config: &BenchConfig) -> Result<(), BenchError> {
     println!("[run]");
 
     let aes_path = example_dir().join("aes_128_cbc_usage.rss");
@@ -340,7 +384,7 @@ fn benchmark_runtime(config: &BenchConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn benchmark_retained_callbacks(config: &BenchConfig) -> Result<(), String> {
+fn benchmark_retained_callbacks(config: &BenchConfig) -> Result<(), BenchError> {
     println!("[callback]");
     let compiled = compile_source_with_flavor(
         r#"
@@ -350,12 +394,15 @@ fn benchmark_retained_callbacks(config: &BenchConfig) -> Result<(), String> {
         SourceFlavor::RustScript,
     )
     .map_err(|err| format!("callback compile failed: {err}"))?;
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program)
+        .map_err(|source| BenchError::vm("callback VM construction failed", source))?;
     let status = vm
         .run()
-        .map_err(|err| format!("callback root run failed: {err}"))?;
+        .map_err(|source| BenchError::vm("callback root run failed", source))?;
     if status != VmStatus::Halted {
-        return Err(format!("callback root returned {status:?}"));
+        return Err(BenchError::message(format!(
+            "callback root returned {status:?}"
+        )));
     }
     let callable = vm
         .stack()
@@ -365,12 +412,16 @@ fn benchmark_retained_callbacks(config: &BenchConfig) -> Result<(), String> {
 
     let start = Instant::now();
     for value in 0..config.callback_iters {
-        let expected = i64::try_from(value).map_err(|_| "callback iteration overflow")? + 1;
+        let expected = i64::try_from(value)
+            .map_err(|_| BenchError::message("callback iteration overflow"))?
+            + 1;
         let result = vm
             .invoke_callable(callable.clone(), &[Value::Int(expected - 1)])
-            .map_err(|err| format!("callback invocation failed: {err}"))?;
+            .map_err(|source| BenchError::vm("callback invocation failed", source))?;
         if result != Value::Int(expected) {
-            return Err(format!("callback returned {result:?}, expected {expected}"));
+            return Err(BenchError::message(format!(
+                "callback returned {result:?}, expected {expected}"
+            )));
         }
     }
     let elapsed = start.elapsed();
@@ -389,7 +440,7 @@ fn benchmark_runtime_workload(
     program: &Program,
     expected_stack: &[Value],
     trials: usize,
-) -> Result<(), String> {
+) -> Result<(), BenchError> {
     let interpreter =
         measure_runtime_mode(program, expected_stack, PerfExecMode::Interpreter, trials)?;
     println!(
@@ -419,7 +470,7 @@ fn benchmark_runtime_workload(
     Ok(())
 }
 
-fn benchmark_rss(config: &BenchConfig) -> Result<(), String> {
+fn benchmark_rss(config: &BenchConfig) -> Result<(), BenchError> {
     println!("[rss]");
     let interpreter = measure_retained_rss_via_child(config, RssMode::Interpreter)?;
     print_rss_sample(&interpreter);
@@ -507,7 +558,7 @@ fn measure_load_time(
     iterations: usize,
     local_count: usize,
     host_count: usize,
-) -> Result<LoadSample, String> {
+) -> Result<LoadSample, BenchError> {
     let mut registry = HostFunctionRegistry::new();
     for index in 0..host_count {
         registry.register(format!("host_{index}"), 1, || {
@@ -520,17 +571,18 @@ fn measure_load_time(
         Some(
             registry
                 .prepare_plan(&program.imports)
-                .map_err(|err| format!("failed to prepare host binding plan: {err}"))?,
+                .map_err(|source| BenchError::vm("failed to prepare host binding plan", source))?,
         )
     };
 
     let started = Instant::now();
     for _ in 0..iterations {
-        let mut vm = Vm::new(program.clone().with_local_count(local_count));
+        let mut vm = Vm::try_new(program.clone().with_local_count(local_count))
+            .map_err(|source| BenchError::vm("load VM construction failed", source))?;
         if let Some(plan) = &plan {
             registry
                 .bind_vm_with_plan(&mut vm, plan)
-                .map_err(|err| format!("failed to bind host plan: {err}"))?;
+                .map_err(|source| BenchError::vm("failed to bind host plan", source))?;
         }
         black_box(vm.stack().len());
     }
@@ -563,17 +615,22 @@ fn measure_runtime_mode(
     expected_stack: &[Value],
     mode: PerfExecMode,
     trials: usize,
-) -> Result<RuntimeSample, String> {
+) -> Result<RuntimeSample, BenchError> {
     let mut samples = Vec::with_capacity(trials);
     for _ in 0..trials {
-        let mut vm = Vm::new(program.clone());
+        let mut vm = Vm::try_new(program.clone()).map_err(|source| {
+            BenchError::vm(
+                format!("timed {} VM construction failed", mode.label()),
+                source,
+            )
+        })?;
         configure_vm_for_mode(&mut vm, mode);
         warm_vm_for_mode(&mut vm, mode, expected_stack)?;
         vm.reset_for_reuse();
         let started = Instant::now();
-        let status = vm
-            .run()
-            .map_err(|err| format!("timed {} run failed: {err}", mode.label()))?;
+        let status = vm.run().map_err(|source| {
+            BenchError::vm(format!("timed {} run failed", mode.label()), source)
+        })?;
         let elapsed = started.elapsed();
         ensure_expected_completion(&vm, status, expected_stack, mode.label())?;
         if mode != PerfExecMode::Interpreter {
@@ -603,10 +660,10 @@ fn warm_vm_for_mode(
     vm: &mut Vm,
     mode: PerfExecMode,
     expected_stack: &[Value],
-) -> Result<(), String> {
+) -> Result<(), BenchError> {
     let status = vm
         .run()
-        .map_err(|err| format!("warmup {} run failed: {err}", mode.label()))?;
+        .map_err(|source| BenchError::vm(format!("warmup {} run failed", mode.label()), source))?;
     ensure_expected_completion(vm, status, expected_stack, mode.label())?;
     Ok(())
 }
@@ -796,13 +853,18 @@ fn decode_option_u64(value: &str) -> Result<Option<u64>, String> {
     }
 }
 
-fn measure_retained_rss_for_mode(mode: RssMode, vm_count: usize) -> Result<RssSample, String> {
+fn measure_retained_rss_for_mode(mode: RssMode, vm_count: usize) -> Result<RssSample, BenchError> {
     let hot_loop = build_hot_loop_workload(DEFAULT_HOT_LOOP_INNER / 4, DEFAULT_HOT_LOOP_OUTER)?;
     let expected_stack = vec![Value::Int(hot_loop.expected)];
     let before = current_rss_bytes();
     let mut retained = Vec::with_capacity(vm_count);
     for _ in 0..vm_count {
-        let mut vm = Vm::new(hot_loop.program.clone());
+        let mut vm = Vm::try_new(hot_loop.program.clone()).map_err(|source| {
+            BenchError::vm(
+                format!("RSS {} VM construction failed", mode.label()),
+                source,
+            )
+        })?;
         configure_vm_for_mode(
             &mut vm,
             match mode {
@@ -812,7 +874,7 @@ fn measure_retained_rss_for_mode(mode: RssMode, vm_count: usize) -> Result<RssSa
         );
         let status = vm
             .run()
-            .map_err(|err| format!("RSS {} run failed: {err}", mode.label()))?;
+            .map_err(|source| BenchError::vm(format!("RSS {} run failed", mode.label()), source))?;
         ensure_expected_completion(&vm, status, &expected_stack, mode.label())?;
         retained.push(vm);
     }

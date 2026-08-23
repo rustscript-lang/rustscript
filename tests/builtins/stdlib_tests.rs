@@ -19,7 +19,7 @@ fn run_rustscript_spec(path: &Path) -> Vec<Value> {
         "stdlib host imports must use the exact standard catalog fingerprint"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     #[cfg(feature = "async")]
     super::async_test_bridge::install(&mut vm);
     loop {

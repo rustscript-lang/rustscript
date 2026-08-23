@@ -222,7 +222,7 @@ fn run_type_inference_runtime_cases(cases: &[TypeInferenceRuntimeCase<'_>]) {
         }
         assert_type_metadata_expectations(&compiled, case.case.name, case.metadata_expectations);
 
-        let mut vm = Vm::new(compiled.program);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
         for binding in &case.bindings {
             vm.bind_function(binding.name, (binding.factory)());
         }

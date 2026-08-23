@@ -323,7 +323,7 @@ fn bind_and_run_two_import(
             target_static,
         )
         .expect("register target");
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     let result = vm.run();
     (vm, result)
@@ -699,7 +699,8 @@ fn wrong_key_rejected_zero_calls() {
             no_take_counted,
         )
         .expect("register take");
-    let mut vm = Vm::new(ping_then_call_program(&create_block, &take, 1));
+    let mut vm = Vm::try_new(ping_then_call_program(&create_block, &take, 1))
+        .expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
 
     let error = vm.run().expect_err("wrong-key TakeOwned must be rejected");
@@ -729,7 +730,7 @@ fn foreign_handle_rejected_zero_calls() {
     NO_TAKE_CALLS.store(0, Ordering::SeqCst);
 
     // Structurally-valid handle from a different table (different arena).
-    let mut foreign = ResourceTable::new();
+    let mut foreign = ResourceTable::new().expect("table");
     let handle = foreign
         .push(FileResource {
             value: 1,
@@ -743,7 +744,8 @@ fn foreign_handle_rejected_zero_calls() {
     registry
         .register_exact_static(&take.name, 1, schema, no_take_counted)
         .expect("register take");
-    let mut vm = Vm::new(call_program(&take, &[raw]));
+    let mut vm =
+        Vm::try_new(call_program(&take, &[raw])).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
 
     let error = vm.run().expect_err("foreign handle must be rejected");
@@ -1056,7 +1058,8 @@ fn host_panic_runs_post_contract_and_reclaims() {
             no_take_panic,
         )
         .expect("register take");
-    let mut vm = Vm::new(ping_then_call_program(&ping, &take, 1));
+    let mut vm = Vm::try_new(ping_then_call_program(&ping, &take, 1))
+        .expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
 
     let payload = catch_unwind(AssertUnwindSafe(|| vm.run()))
@@ -1110,7 +1113,8 @@ fn return_key_mismatch_keeps_host_owned_and_stack_atomic() {
     registry
         .register_exact(&ping.name, 1, schema, || Box::new(ReturnBlockHost))
         .expect("register ping");
-    let mut vm = Vm::new(call_program(&ping, &[7]));
+    let mut vm =
+        Vm::try_new(call_program(&ping, &[7])).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
 
     let error = vm.run().expect_err("wrong-key return must be rejected");
@@ -1139,7 +1143,8 @@ fn optional_resource_return_null_is_legal() {
             Ok(CallOutcome::Return(CallReturn::One(Value::Null)))
         })
         .expect("register maybe");
-    let mut vm = Vm::new(call_program(&maybe, &[7]));
+    let mut vm =
+        Vm::try_new(call_program(&maybe, &[7])).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
 
     let status = vm.run().expect("Null optional return must be legal");
@@ -1418,7 +1423,8 @@ fn jit_enabled_preserves_wrong_key_and_take_owned_contract() {
             jit_no_take_counted,
         )
         .expect("register take");
-    let mut vm = Vm::new(ping_then_call_program(&create_block, &take, 1));
+    let mut vm = Vm::try_new(ping_then_call_program(&create_block, &take, 1))
+        .expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     with_jit(&mut vm);
     let error = vm
@@ -1458,7 +1464,8 @@ fn jit_enabled_preserves_wrong_key_and_take_owned_contract() {
             jit_take_first_arg_counted,
         )
         .expect("register take");
-    let mut vm = Vm::new(ping_then_call_program(&ping, &take, 1));
+    let mut vm = Vm::try_new(ping_then_call_program(&ping, &take, 1))
+        .expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     with_jit(&mut vm);
     let status = vm.run().expect("consumed take under JIT");
@@ -1490,7 +1497,8 @@ fn jit_native_loop_preserves_exact_resource_return_ownership() {
     }
 
     // Prove the engine really runs natively with a host-call-free loop.
-    let mut vm = Vm::new(arithmetic_loop_program());
+    let mut vm =
+        Vm::try_new(arithmetic_loop_program()).expect("test VM construction must not fail");
     with_jit(&mut vm);
     let status = vm.run().expect("arithmetic loop under JIT");
     assert_eq!(status, VmStatus::Halted);
@@ -1545,7 +1553,7 @@ fn jit_native_loop_preserves_exact_resource_return_ownership() {
             Box::new(JitLoopPing)
         })
         .expect("register ping");
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     with_jit(&mut vm);
     let status = vm.run().expect("resource loop under JIT");
@@ -1630,7 +1638,8 @@ fn aot_preserves_exact_contract_at_call_boundary() {
             aot_no_take_counted,
         )
         .expect("register take");
-    let mut vm = Vm::new(ping_then_call_program(&create_block, &take, 1));
+    let mut vm = Vm::try_new(ping_then_call_program(&create_block, &take, 1))
+        .expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     vm.compile_aot().expect("aot compile");
     let error = vm
@@ -1662,7 +1671,8 @@ fn aot_preserves_exact_contract_at_call_boundary() {
             aot_take_first_arg_counted,
         )
         .expect("register take");
-    let mut vm = Vm::new(ping_then_call_program(&ping, &take, 1));
+    let mut vm = Vm::try_new(ping_then_call_program(&ping, &take, 1))
+        .expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     vm.compile_aot().expect("aot compile");
     let status = vm.run().expect("consumed take under AOT");

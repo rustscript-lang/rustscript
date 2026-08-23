@@ -21,7 +21,7 @@ fn compiled_vm(source: &str) -> Vm {
     let program = compile_source(source)
         .expect("invocation source should compile")
         .program;
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
         .expect("default runtime host registry should bind");
@@ -272,7 +272,7 @@ fn invocation_polling_pauses_execution_and_exposes_one_event_at_a_time() {
     )
     .expect("invocation source should compile")
     .program;
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let notes = Arc::new(Mutex::new(Vec::<Value>::new()));
     vm.bind_args_function("note_progress", Box::new(ProgressNote(Arc::clone(&notes))));
     // `stream::emit` binds lazily through the default host fallback; the custom
@@ -440,7 +440,7 @@ fn invocation_host_failure_produces_one_typed_error_item() {
     )
     .expect("invocation source should compile")
     .program;
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.bind_stack_function("fail_host", Box::new(FailingHost));
     assert_eq!(
         vm.run().expect("root frame should halt"),
@@ -543,7 +543,7 @@ fn invocation_waiting_host_operation_returns_pending_and_preserves_item_order() 
     )
     .expect("invocation source should compile")
     .program;
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.bind_stack_function("wait_host", Box::new(AsyncWaitHost));
     async_test_bridge::install(&mut vm);
     assert_eq!(
@@ -680,7 +680,7 @@ fn invocation_cancel_during_event_pending_discards_the_pending_event() {
     )
     .expect("invocation source should compile")
     .program;
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_drop_contract_events_enabled(true);
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
@@ -790,7 +790,7 @@ fn invocation_host_op_first_poll_failure_keeps_typed_capability_error() {
     )
     .expect("invocation source should compile")
     .program;
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.bind_stack_function("fail_host", Box::new(AsyncFailHost));
     async_test_bridge::install(&mut vm);
     assert_eq!(
@@ -840,7 +840,7 @@ fn invocation_cancellation_while_waiting_produces_one_typed_error_item() {
     )
     .expect("invocation source should compile")
     .program;
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.bind_stack_function("wait_host", Box::new(AsyncWaitHost));
     async_test_bridge::install(&mut vm);
     assert_eq!(

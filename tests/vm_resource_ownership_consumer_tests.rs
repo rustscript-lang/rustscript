@@ -377,7 +377,7 @@ fn exact_host_return_marks_guest_owned() {
         Arc::clone(&handles),
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     let status = vm.run().expect("run");
     assert_eq!(status, VmStatus::Halted);
@@ -426,7 +426,7 @@ fn exact_host_return_foreign_handle_rejected_stack_frame_unchanged() {
         .expect("open import");
     let schema = imported.schema.clone().expect("exact schema");
     let foreign_raw = {
-        let mut table = ResourceTable::new();
+        let mut table = ResourceTable::new().expect("table");
         let token = table.push(CountingResource {
             counters: CloseCounters::new(),
         });
@@ -470,7 +470,7 @@ fn exact_host_return_foreign_handle_rejected_stack_frame_unchanged() {
         None,
     )
     .with_local_count(1);
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_local(0, Value::Int(0x10_CA_11))
         .expect("set frame local");
     let stack_before = vec![sentinel, argument];
@@ -517,7 +517,7 @@ fn legacy_schema_none_return_keeps_old_behavior() {
     registry.register_static_non_yielding_args("legacy", 1, |_| {
         Ok(CallOutcome::Return(CallReturn::One(Value::Int(42))))
     });
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     let status = vm.run().expect("legacy Int return must run");
     assert_eq!(status, VmStatus::Halted);
@@ -553,7 +553,7 @@ fn exact_async_completion_marks_guest_owned() {
         })
         .expect("register exact");
 
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     let status = vm.run().expect("first run waits");
     assert_eq!(status, VmStatus::Waiting(op_id));
@@ -593,7 +593,7 @@ fn exact_async_completion_foreign_handle_rejected() {
     let schema = open_import_schema(&program);
     let op_id = 0xC0_DE_00_12;
     let foreign_raw = {
-        let mut table = ResourceTable::new();
+        let mut table = ResourceTable::new().expect("table");
         let token = table.push(CountingResource {
             counters: CloseCounters::new(),
         });
@@ -615,7 +615,7 @@ fn exact_async_completion_foreign_handle_rejected() {
             Box::new(ForeignPending { op_id })
         })
         .expect("register exact");
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     let status = vm.run().expect("run waits");
     assert_eq!(status, VmStatus::Waiting(op_id));
@@ -651,7 +651,7 @@ fn local_last_use_drop_releases_once() {
     );
     register_peek_noop(&mut registry, peek_schema);
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     let status = vm.run().expect("run");
     assert_eq!(status, VmStatus::Halted);
@@ -708,7 +708,7 @@ fn local_overwrite_releases_old_owner_once() {
     );
     register_peek_noop(&mut registry, peek_schema);
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     let status = vm.run().expect("run");
     assert_eq!(status, VmStatus::Halted);
@@ -778,7 +778,7 @@ acme::peek(&a);
     );
     register_peek_noop(&mut registry, peek_schema);
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     let status = vm.run().expect("run");
     assert_eq!(status, VmStatus::Halted);
@@ -829,7 +829,7 @@ fn pending_local_release_driven_by_scope_poll() {
         .expect("register open");
     register_peek_noop(&mut registry, peek_schema);
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     let status = vm.run().expect("run");
     assert_eq!(status, VmStatus::Halted);
@@ -873,7 +873,7 @@ fn local_release_close_failure_poisons_scope_terminal() {
         .expect("register open");
     register_peek_noop(&mut registry, peek_schema);
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     let status = vm.run().expect("run");
     assert_eq!(status, VmStatus::Halted);
@@ -919,7 +919,7 @@ fn borrow_arg_and_truncate_do_not_release() {
     );
     register_peek_noop(&mut registry, peek_schema);
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     let status = vm.run().expect("run");
     assert_eq!(status, VmStatus::Halted);
@@ -980,7 +980,7 @@ fn take_owned_move_var_never_releases_source() {
         }
     }
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     let status = vm.run().expect("run");
     assert_eq!(status, VmStatus::Halted);
@@ -1021,7 +1021,7 @@ fn nested_aggregate_array_release_releases_each_element_once() {
         .with_local_count(1);
 
     let counters = CloseCounters::new();
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let mut array_items = Vec::new();
     for _ in 0..2 {
         let resource = CountingResource {
@@ -1083,7 +1083,7 @@ fn malformed_shape_never_released_or_panicked() {
         .register_exact("acme::open", 1, open_schema, || Box::new(BadReturn))
         .expect("register open");
     register_peek_noop(&mut registry, peek_schema);
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     let error = vm.run().expect_err("malformed return must be rejected");
     assert!(
@@ -1125,7 +1125,7 @@ fn owned_local_program_never_jit_traces_and_releases_per_iteration() {
     );
     register_peek_noop(&mut registry, peek_schema);
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     vm.set_jit_config(JitConfig {
         enabled: true,
@@ -1168,7 +1168,7 @@ fn owned_local_program_aot_falls_back_to_interpreter_and_releases() {
     );
     register_peek_noop(&mut registry, peek_schema);
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     vm.compile_aot().expect("aot compile should succeed");
     let status = vm.run().expect("run");
@@ -1204,7 +1204,7 @@ fn drop_contract_flag_true_false_release_parity() {
         );
         register_peek_noop(&mut registry, peek_schema);
 
-        let mut vm = Vm::new(compiled.program);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
         registry.bind_vm_cached(&mut vm).expect("bind");
         vm.set_drop_contract_events_enabled(enabled);
         let status = vm.run().expect("run");
@@ -1289,7 +1289,7 @@ fn same_local_collection_rebind_never_releases_at_null_store() {
         }
     }
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     let status = vm.run().expect("run");
     assert_eq!(status, VmStatus::Halted);

@@ -81,8 +81,10 @@ fn one_immutable_program_creates_multiple_isolated_instances() {
         .program,
     );
 
-    let mut first = Vm::new_shared(Arc::clone(&program));
-    let mut second = Vm::new_shared(Arc::clone(&program));
+    let mut first =
+        Vm::try_new_shared(Arc::clone(&program)).expect("test VM construction must not fail");
+    let mut second =
+        Vm::try_new_shared(Arc::clone(&program)).expect("test VM construction must not fail");
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut first)
         .expect("runtime hosts should bind");
@@ -153,7 +155,8 @@ fn run_input_and_events_do_not_leak_between_runs() {
         .expect("source should compile")
         .program,
     );
-    let mut vm = Vm::new_shared(Arc::clone(&program));
+    let mut vm =
+        Vm::try_new_shared(Arc::clone(&program)).expect("test VM construction must not fail");
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
         .expect("runtime hosts should bind");
@@ -197,7 +200,7 @@ fn fuel_budgets_do_not_leak_between_runs() {
     )
     .expect("source should compile")
     .program;
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.bind_static_non_yielding_args_function("action", non_yielding_returns_zero);
 
     // A configured budget reads back as the configured amount.
@@ -252,8 +255,10 @@ fn shared_program_backend_does_not_share_stacks_or_resources() {
         .program,
     );
 
-    let mut first = Vm::new_shared(Arc::clone(&program));
-    let mut second = Vm::new_shared(Arc::clone(&program));
+    let mut first =
+        Vm::try_new_shared(Arc::clone(&program)).expect("test VM construction must not fail");
+    let mut second =
+        Vm::try_new_shared(Arc::clone(&program)).expect("test VM construction must not fail");
     first.bind_static_non_yielding_args_function("action", non_yielding_returns_seven);
     second.bind_static_non_yielding_args_function("action", non_yielding_returns_nine);
 
@@ -282,7 +287,7 @@ fn reset_closes_run_scoped_state_and_retains_reusable_state() {
     )
     .expect("source should compile")
     .program;
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_regex_cache_capacity(8);
     vm.bind_static_non_yielding_args_function("action", non_yielding_returns_forty_two);
 
@@ -328,7 +333,7 @@ fn reset_closes_waiting_state_before_the_next_run() {
     )
     .expect("source should compile")
     .program;
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.bind_args_function("action", Box::new(PendingOneHost));
 
     let status = vm.run().expect("run should yield");
@@ -383,7 +388,7 @@ fn reset_after_host_error_reruns_cleanly_on_the_same_instance() {
     )
     .expect("source should compile")
     .program;
-    let mut vm = vm::Vm::new(program);
+    let mut vm = vm::Vm::try_new(program).expect("test VM construction must not fail");
     vm.bind_static_non_yielding_args_function("action", flaky_action);
     assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
 
@@ -431,7 +436,8 @@ fn closure_capture_cells_do_not_leak_between_instances() {
         .expect("source should compile")
         .program,
     );
-    let mut first = Vm::new_shared(Arc::clone(&program));
+    let mut first =
+        Vm::try_new_shared(Arc::clone(&program)).expect("test VM construction must not fail");
     assert_eq!(
         first.run().expect("first instance should halt"),
         VmStatus::Halted
@@ -445,7 +451,8 @@ fn closure_capture_cells_do_not_leak_between_instances() {
     // A second instance over the same program starts with a fresh cell and
     // accumulates only its own deltas: the first instance's cell value must
     // not leak into it.
-    let mut second = Vm::new_shared(Arc::clone(&program));
+    let mut second =
+        Vm::try_new_shared(Arc::clone(&program)).expect("test VM construction must not fail");
     assert_eq!(
         second.run().expect("second instance should halt"),
         VmStatus::Halted
@@ -468,7 +475,7 @@ fn stale_callable_handles_are_rejected_after_reset() {
     )
     .expect("source should compile")
     .program;
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
 
     let stale = vm
@@ -579,8 +586,10 @@ fn callable_handles_do_not_cross_vm_instances() {
         .expect("source should compile")
         .program,
     );
-    let mut first = Vm::new_shared(Arc::clone(&program));
-    let mut second = Vm::new_shared(Arc::clone(&program));
+    let mut first =
+        Vm::try_new_shared(Arc::clone(&program)).expect("test VM construction must not fail");
+    let mut second =
+        Vm::try_new_shared(Arc::clone(&program)).expect("test VM construction must not fail");
     assert_eq!(
         first.run().expect("first root should halt"),
         VmStatus::Halted
@@ -678,7 +687,7 @@ fn stale_capture_callable_cannot_reach_the_previous_runs_cells() {
     )
     .expect("capture source should compile")
     .program;
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.bind_static_non_yielding_args_function("stash", stash_callback);
     assert_eq!(vm.run().expect("first run should halt"), VmStatus::Halted);
     assert_eq!(
@@ -789,7 +798,7 @@ fn jit_inlined_callee_root_callable_escapes_through_host_stash() {
     )
     .expect("source should compile")
     .program;
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.bind_static_non_yielding_args_function("stash", stash_callback);
     vm.set_jit_config(vm::JitConfig {
         enabled: true,
@@ -1115,7 +1124,7 @@ fn jit_materialize_root_callable_releases_prior_iteration_arcs() {
     )
     .expect("source should compile")
     .program;
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.bind_static_non_yielding_args_function("stash", stash_callback);
     vm.set_jit_config(vm::JitConfig {
         enabled: true,

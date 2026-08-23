@@ -1,4 +1,5 @@
 use std::env;
+use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -7,13 +8,38 @@ use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vm::{
-    JitConfig, SourceFlavor, Value, Vm, VmStatus, compile_source_file, compile_source_with_flavor,
+    JitConfig, SourceFlavor, Value, Vm, VmError, VmStatus, compile_source_file,
+    compile_source_with_flavor,
 };
 
 const DEFAULT_VALID_CASES: usize = 150;
 const DEFAULT_MUTATION_CASES: usize = 600;
 const DEFAULT_MUTATION_CORPUS: usize = 24;
 const MAX_MUTATED_SOURCE_LEN: usize = 8192;
+
+#[derive(Debug)]
+enum FuzzError {
+    Vm {
+        context: &'static str,
+        source: VmError,
+    },
+}
+
+impl fmt::Display for FuzzError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Vm { context, source } => write!(formatter, "{context}: {source}"),
+        }
+    }
+}
+
+impl Error for FuzzError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Vm { source, .. } => Some(source),
+        }
+    }
+}
 
 fn main() {
     if let Err(err) = run_main() {
@@ -316,11 +342,11 @@ impl Harness {
             detail,
             phase: FailurePhase::InterpreterPanic,
         })?;
-        let interpreted = interpreted.map_err(|detail| FailureRecord {
+        let interpreted = interpreted.map_err(|error| FailureRecord {
             lane: case.lane,
             name: case.name.clone(),
             source: source.clone(),
-            detail,
+            detail: error.to_string(),
             phase: FailurePhase::RuntimeError,
         })?;
         assert_expected_stack(case, "interpreter", &source, &interpreted)?;
@@ -336,11 +362,11 @@ impl Harness {
                 detail,
                 phase: FailurePhase::JitPanic,
             })?;
-            let jitted = jitted.map_err(|detail| FailureRecord {
+            let jitted = jitted.map_err(|error| FailureRecord {
                 lane: case.lane,
                 name: case.name.clone(),
                 source: source.clone(),
-                detail,
+                detail: error.to_string(),
                 phase: FailurePhase::RuntimeError,
             })?;
             assert_expected_stack(case, "jit", &source, &jitted)?;
@@ -547,10 +573,13 @@ enum ExecutionMode {
     Jit,
 }
 
-fn run_program(program: &vm::Program, mode: ExecutionMode) -> Result<Vec<Value>, String> {
+fn run_program(program: &vm::Program, mode: ExecutionMode) -> Result<Vec<Value>, FuzzError> {
     match mode {
         ExecutionMode::Interpreter => {
-            let mut vm = Vm::new(program.clone());
+            let mut vm = Vm::try_new(program.clone()).map_err(|source| FuzzError::Vm {
+                context: "interpreter VM construction failed",
+                source,
+            })?;
             configure_vm(&mut vm);
             vm.set_jit_config(JitConfig {
                 enabled: false,
@@ -560,7 +589,10 @@ fn run_program(program: &vm::Program, mode: ExecutionMode) -> Result<Vec<Value>,
             run_vm_to_completion(&mut vm)
         }
         ExecutionMode::Jit => {
-            let mut vm = Vm::new(program.clone());
+            let mut vm = Vm::try_new(program.clone()).map_err(|source| FuzzError::Vm {
+                context: "JIT VM construction failed",
+                source,
+            })?;
             configure_vm(&mut vm);
             vm.set_jit_config(JitConfig {
                 enabled: true,
@@ -576,7 +608,7 @@ fn configure_vm(vm: &mut Vm) {
     vm.set_runtime_print_sink(|_rendered| {});
 }
 
-fn run_vm_to_completion(vm: &mut Vm) -> Result<Vec<Value>, String> {
+fn run_vm_to_completion(vm: &mut Vm) -> Result<Vec<Value>, FuzzError> {
     let mut started = false;
     loop {
         let status = if started {
@@ -585,14 +617,21 @@ fn run_vm_to_completion(vm: &mut Vm) -> Result<Vec<Value>, String> {
             started = true;
             vm.run()
         }
-        .map_err(|err| format!("vm execution failed: {err}"))?;
+        .map_err(|source| FuzzError::Vm {
+            context: "VM execution failed",
+            source,
+        })?;
 
         match status {
             VmStatus::Halted => return Ok(vm.stack().to_vec()),
             VmStatus::Yielded => continue,
-            VmStatus::Waiting(_op_id) => vm
-                .wait_for_host_op_blocking()
-                .map_err(|err| format!("vm wait failed: {err}"))?,
+            VmStatus::Waiting(_op_id) => {
+                vm.wait_for_host_op_blocking()
+                    .map_err(|source| FuzzError::Vm {
+                        context: "VM host-operation wait failed",
+                        source,
+                    })?
+            }
         }
     }
 }

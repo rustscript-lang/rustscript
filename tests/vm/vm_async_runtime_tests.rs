@@ -185,7 +185,8 @@ async fn async_host_call_waits_and_resumes_via_tokio_runtime() {
     let ops = Arc::new(Mutex::new(TestAsyncOps::default()));
     let calls = Arc::new(AtomicUsize::new(0));
 
-    let mut vm = Vm::new(build_async_import_program(41));
+    let mut vm =
+        Vm::try_new(build_async_import_program(41)).expect("test VM construction must not fail");
     vm.bind_function(
         "edge::async_add_one",
         Box::new(AsyncAddOneFunction::new(
@@ -225,7 +226,8 @@ async fn async_host_call_waits_and_resumes_via_tokio_runtime() {
 async fn reset_cancels_pending_host_bridge_operation() {
     let ops = Arc::new(Mutex::new(TestAsyncOps::default()));
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut vm = Vm::new(build_async_import_program(41));
+    let mut vm =
+        Vm::try_new(build_async_import_program(41)).expect("test VM construction must not fail");
     vm.bind_function(
         "edge::async_add_one",
         Box::new(AsyncAddOneFunction::new(
@@ -253,7 +255,8 @@ async fn reset_cancels_pending_host_bridge_operation() {
 #[test]
 fn rejected_pending_result_cancels_bridge_owned_work() {
     let ops = Arc::new(Mutex::new(TestAsyncOps::default()));
-    let mut vm = Vm::new(build_async_import_program(41));
+    let mut vm =
+        Vm::try_new(build_async_import_program(41)).expect("test VM construction must not fail");
     vm.bind_function("edge::async_add_one", Box::new(InvalidPendingFunction));
     vm.set_async_bridge(Box::new(TestAsyncBridge::new(ops.clone())));
 
@@ -270,7 +273,8 @@ fn rejected_pending_result_cancels_bridge_owned_work() {
 async fn user_cancellation_reaches_host_bridge_and_clears_waiting_state() {
     let ops = Arc::new(Mutex::new(TestAsyncOps::default()));
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut vm = Vm::new(build_async_import_program(41));
+    let mut vm =
+        Vm::try_new(build_async_import_program(41)).expect("test VM construction must not fail");
     vm.bind_function(
         "edge::async_add_one",
         Box::new(AsyncAddOneFunction::new(
@@ -304,7 +308,8 @@ async fn vm_waiting_on_async_host_op_does_not_block_tokio_tasks() {
     let ops = Arc::new(Mutex::new(TestAsyncOps::default()));
     let calls = Arc::new(AtomicUsize::new(0));
 
-    let mut vm = Vm::new(build_async_import_program(5));
+    let mut vm =
+        Vm::try_new(build_async_import_program(5)).expect("test VM construction must not fail");
     vm.bind_function(
         "edge::async_add_one",
         Box::new(AsyncAddOneFunction::new(

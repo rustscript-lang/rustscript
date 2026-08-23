@@ -123,7 +123,7 @@ pub mod vm {
     impl TestHostRuntime {
         fn new() -> Self {
             Self {
-                execution_scope: ExecutionScope::new(),
+                execution_scope: ExecutionScope::new().expect("scope"),
                 module_states: HashMap::new(),
             }
         }
@@ -517,7 +517,7 @@ pub mod builtins {
                     .execution_scope
                     .begin_close(ResourceCloseReason::VmReset);
                 drive_quiescent(&mut vm.host.execution_scope);
-                vm.host.execution_scope = crate::vm::ExecutionScope::new();
+                vm.host.execution_scope = crate::vm::ExecutionScope::new().expect("scope");
             }
 
             /// Whether the operation is registered in the scope and
@@ -587,6 +587,9 @@ impl Wake for NoopWake {
 }
 
 fn new_vm() -> Vm {
+    // `Vm` here is the sqlite test mock (`pub mod vm` in this file), a
+    // test-only double that cannot allocate a production arena identity, so
+    // its own infallible `new` is the correct constructor.
     Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
 }
 
@@ -1739,7 +1742,7 @@ mod production_crate {
     }
 
     fn real_vm(program: rustscript_vm::Program) -> rustscript_vm::vm::Vm {
-        rustscript_vm::vm::Vm::new(program)
+        rustscript_vm::vm::Vm::try_new(program).expect("test VM construction must not fail")
     }
 
     fn noop_waker() -> Waker {
@@ -1764,7 +1767,8 @@ mod production_crate {
              let db = sqlite::open({ path: \":memory:\", mode: \"memory\", limits: {} });\n\
              sqlite::close(&db);\n",
         );
-        let mut vm = rustscript_vm::vm::Vm::new(compiled.program);
+        let mut vm = rustscript_vm::vm::Vm::try_new(compiled.program)
+            .expect("test VM construction must not fail");
         let error = vm
             .run()
             .expect_err("sqlite imports must not bind when the extension is absent");
@@ -1781,7 +1785,8 @@ mod production_crate {
              let db = sqlite::open({ path: \":memory:\", mode: \"memory\", limits: {} });\n\
              sqlite::close(&db);\n",
         );
-        let mut vm = rustscript_vm::vm::Vm::new(compiled.program);
+        let mut vm = rustscript_vm::vm::Vm::try_new(compiled.program)
+            .expect("test VM construction must not fail");
         vm.install_extension(&rustscript_vm::SqliteExtension)
             .expect("sqlite extension should install exact functions + module state");
         assert_eq!(
@@ -1802,7 +1807,8 @@ mod production_crate {
         let mut restricted = rustscript_vm::vm::HostFunctionRegistry::restricted();
         rustscript_vm::register_sqlite_builtin_module(&mut restricted)
             .expect("registration on a restricted registry must succeed");
-        let mut vm = rustscript_vm::vm::Vm::new(compiled.program);
+        let mut vm = rustscript_vm::vm::Vm::try_new(compiled.program)
+            .expect("test VM construction must not fail");
         let error = restricted
             .bind_vm_cached(&mut vm)
             .expect_err("ungranted sqlite import must be rejected");
@@ -1825,7 +1831,8 @@ mod production_crate {
             .allow_host_import("sqlite::close")
             .build();
         granted.set_capability_profile(profile);
-        let mut vm = rustscript_vm::vm::Vm::new(compiled_granted.program);
+        let mut vm = rustscript_vm::vm::Vm::try_new(compiled_granted.program)
+            .expect("test VM construction must not fail");
         granted
             .bind_vm_cached(&mut vm)
             .expect("granted sqlite import must bind");
@@ -1886,7 +1893,8 @@ mod production_crate {
             .register(&mut registry)
             .expect("ping registration should succeed");
 
-        let mut vm = rustscript_vm::vm::Vm::new(compiled_sqlite.program);
+        let mut vm = rustscript_vm::vm::Vm::try_new(compiled_sqlite.program)
+            .expect("test VM construction must not fail");
         registry
             .bind_vm_cached(&mut vm)
             .expect("sqlite + ping registry should bind");
@@ -1989,7 +1997,8 @@ mod production_crate {
              sqlite::close(&db);\n\
              sqlite::rows_affected(inserted);\n",
         );
-        let mut vm = rustscript_vm::vm::Vm::new(compiled.program);
+        let mut vm = rustscript_vm::vm::Vm::try_new(compiled.program)
+            .expect("test VM construction must not fail");
         vm.install_extension(&rustscript_vm::SqliteExtension)
             .expect("sqlite extension should install");
 

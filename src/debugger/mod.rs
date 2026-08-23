@@ -1060,7 +1060,7 @@ mod bridge_close_tests {
         let join = std::thread::spawn(move || {
             let mut debugger = Debugger::with_command_bridge(thread_bridge);
             debugger.stop_on_entry();
-            let mut vm = Vm::new(program);
+            let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
             vm.run_with_debugger(&mut debugger)
                 .expect("closed debugger bridge should detach without blocking")
         });

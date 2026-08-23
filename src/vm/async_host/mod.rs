@@ -112,31 +112,145 @@ fn noop_waker() -> Waker {
 }
 
 impl Vm {
+    /// Installs a new async host bridge as the *current generation*.
+    ///
+    /// The currently waited-on host operation (if any) is cancelled first,
+    /// matching legacy swap semantics. Every *other* bridge-submitted
+    /// operation — including ones that were submitted but never awaited —
+    /// keeps polling and cancelling against its original bridge generation:
+    /// each such operation's driver holds a clone of the generation's
+    /// `Arc<Mutex<Box<dyn HostAsyncBridge>>>`, so swapping the current
+    /// generation never invalidates outstanding operations, and the old
+    /// bridge box drops only after every driver that references it finishes.
+    /// New submissions from this point use the new bridge generation.
     pub fn set_async_bridge(&mut self, bridge: Box<dyn HostAsyncBridge>) {
         self.cancel_waiting_host_op();
-        self.host.async_bridge = Some(bridge);
+        self.host.async_bridge = Some(Arc::new(Mutex::new(bridge)));
     }
 
+    /// Removes the current async host bridge generation.
+    ///
+    /// The currently waited-on host operation (if any) is cancelled first.
+    /// Outstanding bridge-submitted operations from earlier generations are
+    /// *not* invalidated: they keep polling and cancelling against the
+    /// generation they were submitted to, and that generation drops once all
+    /// of its drivers finish. Only *new* `submit_host_future` calls are
+    /// rejected after a clear, with the usual "requires a host async bridge"
+    /// error.
     pub fn clear_async_bridge(&mut self) {
         self.cancel_waiting_host_op();
         self.host.async_bridge = None;
     }
 
+    /// Allocates the next host-operation id for a bridge-external operation.
+    ///
+    /// Bridge-external ids are small, monotonically increasing values that can
+    /// never collide with the packed ids of the single execution-scope
+    /// operation registry (a valid modern id requires a nonzero registry-tag
+    /// field, so small values always route to the bridge). The counter lives
+    /// in [`HostRuntime`](super::host_runtime::HostRuntime) and survives VM
+    /// resets.
     pub fn allocate_host_op_id(&mut self) -> HostOpId {
-        self.host
-            .runtime_operations
-            .allocate_id()
-            .expect("host operation id space should not be exhausted")
-            .raw()
+        self.host.allocate_host_op_id()
     }
 
     pub fn submit_host_future(&mut self, future: HostFuture) -> VmResult<CallOutcome> {
-        let op_id = self.allocate_host_op_id();
-        let bridge = self.host.async_bridge.as_mut().ok_or_else(|| {
-            VmError::HostError("async host function requires a host async bridge".to_string())
-        })?;
-        bridge.submit_op(op_id, future)?;
-        self.host.submitted_host_ops.insert(op_id);
+        // The future is handed to the bridge (which owns the runtime context
+        // needed to poll it) under the id the modern registry allocates. The
+        // driver clones the *current* bridge generation (`Arc<Mutex<Box<dyn
+        // HostAsyncBridge>>>`) before the registry is borrowed, so the two
+        // host fields never conflict and a later `set_async_bridge` /
+        // `clear_async_bridge` swap cannot invalidate this operation: the
+        // driver owns its generation and drops it exactly once it finishes.
+        let bridge = match self.host.async_bridge.clone() {
+            Some(bridge) => bridge,
+            None => {
+                return Err(VmError::HostError(
+                    "async host function requires a host async bridge".to_string(),
+                ));
+            }
+        };
+        let output_cell: std::sync::Arc<
+            std::sync::Mutex<Option<VmResult<HostFutureOutput<CallReturn>>>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let id_cell: std::sync::Arc<std::sync::Mutex<Option<HostOpId>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let driver = HostFutureOperation {
+            op_id: std::sync::Arc::clone(&id_cell),
+            bridge: Arc::clone(&bridge),
+            output: std::sync::Arc::clone(&output_cell),
+        };
+        let scope_id = self
+            .host
+            .execution_scope_start_operation(crate::vm::operation::OperationSpec::new(driver))
+            .map_err(|error| VmError::HostError(error.to_string()))?;
+        let op_id = scope_id.raw();
+        *id_cell
+            .lock()
+            .expect("bridge id cell lock should not be poisoned") = Some(op_id);
+        // Hand the future to the bridge, then install the pending-result
+        // adapter that materializes the produced HostFutureOutput. The
+        // current bridge generation is used for the initial submission;
+        // outstanding operations keep living against it even after a later
+        // swap.
+        //
+        // The handoff is failure-atomic: once `start_operation` succeeds,
+        // *every* later error — a poisoned generation lock (`Err` from
+        // `with_bridge` when `submit_op` was never reached) or a typed bridge
+        // rejection (`Ok(Err(_))`) — rolls back the operation through
+        // `abort_operation`, which cancels the driver exactly once and then
+        // consumes/releases the slot immediately. That restores full registry
+        // capacity, makes the id stale, and leaves no dangling pending-result
+        // adapter (the adapter that would materialize the return is installed
+        // only on the success path below).
+        //
+        // On a poisoned lock the rollback could only re-enter the bridge
+        // through `cancel`; that dispatch surfaces a typed error (never a
+        // panic or deadlock, because `with_bridge` maps the poisoned lock to
+        // a `VmError` and scopes the guard to one call), which the registry
+        // records as the first internal `Failed` reason exactly once while
+        // still releasing the slot.
+        let submit = match with_bridge(&bridge, |current| current.submit_op(op_id, future)) {
+            Ok(result) => result,
+            Err(error) => {
+                // Poisoned generation lock: the operation was registered but the
+                // bridge never saw the submission. Roll it back; the driver's
+                // cancel re-entry surfaces a typed poison failure that the
+                // registry records as the first internal reason, and the slot
+                // is still released.
+                let _ = self.host.execution_scope_abort_operation(
+                    scope_id,
+                    crate::vm::operation::OperationCancelReason::Requested,
+                );
+                return Err(error);
+            }
+        };
+        if let Err(error) = submit {
+            // The bridge explicitly rejected the submission (e.g. a full or
+            // policy-blocked bridge). Roll it back exactly like the poison
+            // path: cancel the driver once and release the slot immediately.
+            let _ = self.host.execution_scope_abort_operation(
+                scope_id,
+                crate::vm::operation::OperationCancelReason::Requested,
+            );
+            return Err(error);
+        }
+        let materialize = std::sync::Arc::clone(&output_cell);
+        self.host.register_pending_op_result(
+            op_id,
+            Box::new(move |vm: &mut Vm| {
+                let output = materialize
+                    .lock()
+                    .expect("bridge output cell lock should not be poisoned")
+                    .take()
+                    .ok_or_else(|| {
+                        VmError::HostError(format!(
+                            "host operation {op_id} completed without a result"
+                        ))
+                    })??;
+                output.finish(vm)
+            }),
+        );
         Ok(CallOutcome::Pending(op_id))
     }
 
@@ -145,9 +259,7 @@ impl Vm {
     }
 
     pub fn cancel_waiting_host_op(&mut self) {
-        self.cancel_waiting_host_op_with_reason(
-            crate::builtins::runtime::cancellation::CancellationReason::Requested,
-        );
+        self.cancel_waiting_host_op_with_reason(CancellationReason::Requested);
     }
 
     pub(crate) fn cancel_waiting_host_op_with_reason(
@@ -161,58 +273,30 @@ impl Vm {
             self.cancel_callable_stream();
             return;
         }
-        let Ok(operation_id) =
-            crate::builtins::runtime::cancellation::OperationId::from_raw(waiting.op_id)
-        else {
-            return;
-        };
-        let owner = self
-            .host
-            .runtime_operations
-            .get(operation_id)
-            .ok()
-            .map(|operation| operation.owner());
-        if owner == Some(crate::builtins::runtime::cancellation::OperationOwner::HostBridge) {
-            if let Some(bridge) = self.host.async_bridge.as_mut() {
-                bridge.cancel_op_with_reason(waiting.op_id, reason);
-            }
-            self.host.submitted_host_ops.remove(&waiting.op_id);
-            let _ = self.host.runtime_operations.cancel(operation_id, reason);
-        } else if let Some(scope_id) = crate::vm::operation::OperationId::from_raw(waiting.op_id)
-            .ok()
-            .filter(|scope_id| {
-                self.host
-                    .execution_scope()
-                    .operations()
-                    .status(*scope_id)
-                    .is_ok()
-            })
+        let scope_reason = scope_reason(reason);
+        // A modern execution-scope operation (bridge-submitted future or a
+        // generic HostOperation such as a sqlite query) is cancelled through
+        // its own driver with the parallel operation-cancellation vocabulary.
+        if let Ok(scope_id) = crate::vm::operation::OperationId::from_raw(waiting.op_id)
+            && self
+                .host
+                .execution_scope()
+                .operations()
+                .status(scope_id)
+                .is_ok()
         {
-            // An execution-scope (generic HostOperation) waiting op, e.g. a
-            // sqlite query: cancel through its driver with the parallel
-            // operation-cancellation vocabulary.
-            let scope_reason = match reason {
-                crate::builtins::runtime::cancellation::CancellationReason::Requested => {
-                    crate::vm::operation::OperationCancelReason::Requested
-                }
-                crate::builtins::runtime::cancellation::CancellationReason::Deadline => {
-                    crate::vm::operation::OperationCancelReason::Deadline
-                }
-                crate::builtins::runtime::cancellation::CancellationReason::VmReset => {
-                    crate::vm::operation::OperationCancelReason::VmReset
-                }
-                crate::builtins::runtime::cancellation::CancellationReason::Parent => {
-                    crate::vm::operation::OperationCancelReason::Parent
-                }
-                crate::builtins::runtime::cancellation::CancellationReason::ResourceClosed => {
-                    crate::vm::operation::OperationCancelReason::ResourceClosed
-                }
-            };
             let _ = self
                 .host
                 .execution_scope_cancel_operation(scope_id, scope_reason);
-        } else {
-            crate::builtins::runtime::cancel_builtin_io_op_with_reason(self, waiting.op_id, reason);
+            return;
+        }
+        // A bridge-external operation (the bridge's own map, addressed by an
+        // arbitrary host-chosen raw id) is cancelled through the current
+        // bridge generation.
+        if let Some(bridge) = self.host.async_bridge.clone() {
+            let _ = with_bridge(&bridge, |current| {
+                current.cancel_op_with_reason(waiting.op_id, reason)
+            });
         }
     }
 
@@ -232,26 +316,22 @@ impl Vm {
                 waiting.op_id
             )));
         }
-        let operation_id = crate::builtins::runtime::cancellation::OperationId::from_raw(op_id)
-            .map_err(|error| VmError::HostError(error.to_string()))?;
-        let operation = self
-            .host
-            .runtime_operations
-            .get(operation_id)
-            .map_err(|error| VmError::HostError(error.to_string()))?;
-        if operation.owner() != crate::builtins::runtime::cancellation::OperationOwner::HostBridge {
-            return Err(VmError::HostError(format!(
-                "host bridge cannot complete runtime-owned operation {op_id}",
-            )));
-        }
-        self.host
-            .runtime_operations
-            .complete(operation_id)
-            .map_err(|error| VmError::HostError(error.to_string()))?;
-        if self.host.submitted_host_ops.remove(&op_id)
-            && let Some(bridge) = self.host.async_bridge.as_mut()
+        // A modern execution-scope operation (e.g. a bridge-submitted future)
+        // is driven terminal through its own driver: external completion
+        // cancels the driver so its bridge work stops exactly once.
+        if let Ok(scope_id) = crate::vm::operation::OperationId::from_raw(op_id)
+            && self
+                .host
+                .execution_scope()
+                .operations()
+                .status(scope_id)
+                .is_ok()
         {
-            bridge.cancel_op(op_id);
+            let _ = self.host.execution_scope_cancel_operation(
+                scope_id,
+                crate::vm::operation::OperationCancelReason::Requested,
+            );
+            self.host.remove_pending_op_result(op_id);
         }
         self.complete_waiting_host_op(op_id, values.into())
     }
@@ -263,94 +343,47 @@ impl Vm {
         if self.host.stream_drivers.contains_key(&waiting.op_id) {
             return self.poll_callable_stream(waiting.op_id, cx);
         }
-        let operation_id =
-            match crate::builtins::runtime::cancellation::OperationId::from_raw(waiting.op_id) {
-                Ok(operation_id) => operation_id,
-                Err(error) => return Poll::Ready(Err(VmError::HostError(error.to_string()))),
-            };
-        let operation = match self.host.runtime_operations.get(operation_id) {
-            Ok(operation) => operation,
-            Err(not_found) => {
-                // A waiting op that the legacy owner registry does not know is
-                // an execution-scope operation (a generic [`HostOperation`]
-                // registered through `HostContext::start_operation`, e.g. a
-                // sqlite query). Drive it through the generic scope registry.
-                return self.poll_execution_scope_waiting_op(waiting.op_id, cx, not_found);
+        // A modern execution-scope operation (bridge-submitted future or a
+        // generic HostOperation registered by a host-SDK consumer) is driven
+        // through the single scope registry.
+        if let Ok(scope_id) = crate::vm::operation::OperationId::from_raw(waiting.op_id)
+            && self
+                .host
+                .execution_scope()
+                .operations()
+                .status(scope_id)
+                .is_ok()
+        {
+            return self.poll_execution_scope_waiting_op(waiting.op_id, cx);
+        }
+        // A bridge-external operation: the current bridge generation owns the
+        // poll. The generation is cloned so the poll does not hold a borrow
+        // of the host runtime across the bridge callback.
+        let bridge = match self.host.async_bridge.clone() {
+            Some(bridge) => bridge,
+            None => {
+                return Poll::Ready(Err(VmError::HostError(format!(
+                    "vm waiting on host op {} without an async bridge",
+                    waiting.op_id
+                ))));
             }
         };
-        let host_bridge_owned =
-            operation.owner() == crate::builtins::runtime::cancellation::OperationOwner::HostBridge;
-
-        let poll_result = if host_bridge_owned {
-            let bridge_ptr = match self.host.async_bridge.as_mut() {
-                Some(bridge) => bridge.as_mut() as *mut dyn HostAsyncBridge,
-                None => {
-                    return Poll::Ready(Err(VmError::HostError(format!(
-                        "vm waiting on host op {} without an async bridge",
-                        waiting.op_id
-                    ))));
-                }
-            };
-            if self.host.submitted_host_ops.contains(&waiting.op_id) {
-                unsafe { (&mut *bridge_ptr).poll_submitted_op(waiting.op_id, cx) }
-            } else {
-                unsafe { (&mut *bridge_ptr).poll_op(waiting.op_id, cx) }
-                    .map(|result| result.map(HostFutureOutput::Return))
+        let polled = match with_bridge(&bridge, |current| current.poll_op(waiting.op_id, cx)) {
+            Ok(polled) => polled,
+            Err(error) => {
+                self.instance.waiting_host_op = None;
+                return Poll::Ready(Err(error));
             }
-        } else {
-            crate::builtins::runtime::poll_builtin_io_op(self, waiting.op_id, cx)
-                .map(|result| result.map(HostFutureOutput::Return))
         };
-
-        match poll_result {
+        match polled {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(output)) => {
-                let values = match output.finish(self) {
-                    Ok(values) => values,
-                    Err(err) => {
-                        if host_bridge_owned {
-                            self.host.submitted_host_ops.remove(&waiting.op_id);
-                            let runtime_error = crate::builtins::runtime::error::RuntimeError::new(
-                                crate::builtins::runtime::error::RuntimeErrorCode::OperationFailed,
-                                "runtime::host_bridge",
-                                err.to_string(),
-                            )
-                            .with_value(waiting.op_id);
-                            let _ = self
-                                .host
-                                .runtime_operations
-                                .fail(operation_id, runtime_error);
-                        }
-                        self.instance.waiting_host_op = None;
-                        return Poll::Ready(Err(err));
-                    }
-                };
-                if host_bridge_owned {
-                    self.host
-                        .runtime_operations
-                        .complete(operation_id)
-                        .map_err(|error| VmError::HostError(error.to_string()))?;
-                    self.host.submitted_host_ops.remove(&waiting.op_id);
-                }
+            Poll::Ready(Ok(values)) => {
                 self.complete_waiting_host_op(waiting.op_id, values)?;
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Err(err)) => {
-                if host_bridge_owned {
-                    self.host.submitted_host_ops.remove(&waiting.op_id);
-                    let runtime_error = crate::builtins::runtime::error::RuntimeError::new(
-                        crate::builtins::runtime::error::RuntimeErrorCode::OperationFailed,
-                        "runtime::host_bridge",
-                        err.to_string(),
-                    )
-                    .with_value(waiting.op_id);
-                    let _ = self
-                        .host
-                        .runtime_operations
-                        .fail(operation_id, runtime_error);
-                }
+            Poll::Ready(Err(error)) => {
                 self.instance.waiting_host_op = None;
-                Poll::Ready(Err(err))
+                Poll::Ready(Err(error))
             }
         }
     }
@@ -360,35 +393,20 @@ impl Vm {
     }
 
     /// Drives a waiting host operation that lives in the execution scope — a
-    /// generic [`HostOperation`] registered by a host-SDK consumer through
-    /// `HostContext::start_operation` (e.g. a sqlite query). This is the
-    /// generic awaiting counterpart of the legacy owner-dispatched builtin
-    /// pollers: it polls the operation through its own driver, then
-    /// materializes the guest-visible value through the module-registered
-    /// pending-result adapter for the raw operation id.
-    ///
-    /// When the execution scope does not track the operation either, it
-    /// surfaces the original legacy not-found error, preserving the
-    /// established awaiting behaviour for unknown operations.
+    /// generic [`HostOperation`] registered by a host-SDK consumer or a
+    /// bridge-submitted future driver. This is the single awaiting path for
+    /// every modern registered operation: it polls the operation through its
+    /// own driver, then materializes the guest-visible value through the
+    /// module-registered pending-result adapter for the raw operation id.
     fn poll_execution_scope_waiting_op(
         &mut self,
         op_id: HostOpId,
         cx: &mut Context<'_>,
-        not_found: crate::builtins::runtime::error::RuntimeError,
     ) -> Poll<VmResult<()>> {
         let scope_operation_id = match crate::vm::operation::OperationId::from_raw(op_id) {
             Ok(id) => id,
             Err(error) => return Poll::Ready(Err(VmError::HostError(error.to_string()))),
         };
-        if self
-            .host
-            .execution_scope()
-            .operations()
-            .status(scope_operation_id)
-            .is_err()
-        {
-            return Poll::Ready(Err(VmError::HostError(not_found.to_string())));
-        }
         match self
             .host
             .execution_scope_poll_operation(scope_operation_id, cx)
@@ -418,6 +436,18 @@ impl Vm {
                     }
                 }
                 crate::vm::operation::OperationOutcome::Failed(error) => {
+                    // Record the typed failure on the active invocation (if
+                    // any) so `map_invocation_error` recovers a structured
+                    // capability error instead of flattening to a string.
+                    // The registry released the operation slot on this poll,
+                    // so the id can no longer be re-queried afterwards.
+                    if let Some(state) = self.instance.invocation.as_mut() {
+                        state.pending_error =
+                            Some(crate::vm::invocation::runtime_error_from_operation(
+                                op_id,
+                                error.clone(),
+                            ));
+                    }
                     self.instance.waiting_host_op = None;
                     Poll::Ready(Err(VmError::HostError(error.to_string())))
                 }
@@ -483,6 +513,143 @@ impl Vm {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Dispatches one bridge call under the generation's lock, mapping a poisoned
+/// mutex to a typed [`VmError::HostError`].
+///
+/// The guard is scoped strictly to the single bridge dispatch: it is dropped
+/// before the caller resumes any other host-runtime work, so no lock is held
+/// across a callback that could re-enter the VM (bridge implementations must
+/// not re-enter `set_async_bridge`/`clear_async_bridge`/`submit_host_future`
+/// from inside their own methods, which would deadlock on the same mutex).
+///
+/// Poison is surfaced as a typed error rather than panicking or silently
+/// reading inconsistent bridge state.
+pub(super) fn with_bridge<R>(
+    bridge: &Arc<Mutex<Box<dyn HostAsyncBridge>>>,
+    op: impl FnOnce(&mut dyn HostAsyncBridge) -> R,
+) -> VmResult<R> {
+    let mut guard = bridge
+        .lock()
+        .map_err(|_| VmError::HostError("async host bridge lock is poisoned".to_string()))?;
+    Ok(op(&mut **guard))
+}
+
+/// The modern `HostOperation` driver wrapping a bridge-submitted future.
+///
+/// The future itself lives in the bridge (which owns the runtime context);
+/// polling and cancellation forward to the bridge through the *generation*
+/// this operation was submitted against. The driver holds an
+/// [`Arc`] clone of the generation's `Arc<Mutex<Box<dyn HostAsyncBridge>>>`,
+/// so a later `set_async_bridge`/`clear_async_bridge` swap on the VM can
+/// never invalidate this operation: the old bridge box stays alive as long as
+/// this driver (and any sibling driver of the same generation) is registered,
+/// and drops exactly once the last clone is released. The produced
+/// [`HostFutureOutput`] is parked in a shared cell and materialized by the
+/// VM through the pending-result adapter registered at submission time. The
+/// operation id is written once the registry allocates it (the driver cannot
+/// know it before registration).
+struct HostFutureOperation {
+    op_id: std::sync::Arc<std::sync::Mutex<Option<HostOpId>>>,
+    bridge: Arc<Mutex<Box<dyn HostAsyncBridge>>>,
+    output: std::sync::Arc<std::sync::Mutex<Option<VmResult<HostFutureOutput<CallReturn>>>>>,
+}
+
+impl crate::vm::operation::HostOperation for HostFutureOperation {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<crate::vm::operation::OperationResult<()>> {
+        let op_id = self
+            .op_id
+            .lock()
+            .expect("bridge id cell lock should not be poisoned")
+            .expect("bridge driver id is set before any poll");
+        let polled = with_bridge(&self.bridge, |current| current.poll_submitted_op(op_id, cx));
+        match polled {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(Ok(output))) => {
+                *self
+                    .output
+                    .lock()
+                    .expect("bridge output cell lock should not be poisoned") = Some(Ok(output));
+                Poll::Ready(Ok(()))
+            }
+            Ok(Poll::Ready(Err(error))) => Poll::Ready(Err(driver_failure(error))),
+            Err(error) => Poll::Ready(Err(driver_failure(error))),
+        }
+    }
+
+    fn cancel(
+        &mut self,
+        reason: crate::vm::operation::OperationCancelReason,
+    ) -> crate::vm::operation::OperationResult<()> {
+        let op_id = self
+            .op_id
+            .lock()
+            .expect("bridge id cell lock should not be poisoned")
+            .expect("bridge driver id is set before any cancel");
+        with_bridge(&self.bridge, |current| {
+            current.cancel_op_with_reason(op_id, legacy_reason(reason));
+        })
+        .map_err(driver_failure)
+    }
+}
+
+/// Maps a [`VmError`] surfaced from the bridge (or from a poisoned generation
+/// lock) onto the typed modern operation failure vocabulary.
+fn driver_failure(error: VmError) -> crate::vm::operation::OperationError {
+    crate::vm::operation::OperationError::new(
+        crate::vm::operation::OperationErrorCode::OperationDriverFailed,
+        "vm::async_host",
+        error.to_string(),
+    )
+}
+
+/// Maps the modern operation cancellation reason onto the legacy public
+/// vocabulary exposed at the VM boundary.
+fn legacy_reason(
+    reason: crate::vm::operation::OperationCancelReason,
+) -> crate::builtins::runtime::cancellation::CancellationReason {
+    match reason {
+        crate::vm::operation::OperationCancelReason::Requested => {
+            crate::builtins::runtime::cancellation::CancellationReason::Requested
+        }
+        crate::vm::operation::OperationCancelReason::Deadline => {
+            crate::builtins::runtime::cancellation::CancellationReason::Deadline
+        }
+        crate::vm::operation::OperationCancelReason::VmReset => {
+            crate::builtins::runtime::cancellation::CancellationReason::VmReset
+        }
+        crate::vm::operation::OperationCancelReason::Parent => {
+            crate::builtins::runtime::cancellation::CancellationReason::Parent
+        }
+        crate::vm::operation::OperationCancelReason::ResourceClosed => {
+            crate::builtins::runtime::cancellation::CancellationReason::ResourceClosed
+        }
+    }
+}
+
+/// Maps the legacy public cancellation vocabulary onto the modern operation
+/// cancellation reason.
+fn scope_reason(
+    reason: crate::builtins::runtime::cancellation::CancellationReason,
+) -> crate::vm::operation::OperationCancelReason {
+    match reason {
+        crate::builtins::runtime::cancellation::CancellationReason::Requested => {
+            crate::vm::operation::OperationCancelReason::Requested
+        }
+        crate::builtins::runtime::cancellation::CancellationReason::Deadline => {
+            crate::vm::operation::OperationCancelReason::Deadline
+        }
+        crate::builtins::runtime::cancellation::CancellationReason::VmReset => {
+            crate::vm::operation::OperationCancelReason::VmReset
+        }
+        crate::builtins::runtime::cancellation::CancellationReason::Parent => {
+            crate::vm::operation::OperationCancelReason::Parent
+        }
+        crate::builtins::runtime::cancellation::CancellationReason::ResourceClosed => {
+            crate::vm::operation::OperationCancelReason::ResourceClosed
         }
     }
 }

@@ -28,8 +28,8 @@
 //!   [`ExecutionScope::poll_close`] returning [`Poll::Pending`]; a still-pending
 //!   (or otherwise not-drained) operation likewise prevents quiescence.
 //! - Cleanup is best-effort: a failing resource/operation close never stops the
-//!   remaining closes. The **first** cleanup failure is preserved and the
-//!   terminal state expresses it
+//!   remaining closes. The **first** cleanup failure is preserved, the total
+//!   failure count is accumulated, and the terminal state expresses both
 //!   ([`ScopeCloseOutcome::SuccessWithErrors`]) instead of a fake success.
 //! - Terminal state is reached at **Quiescent** and is idempotent: repeated
 //!   [`ExecutionScope::begin_close`] / [`ExecutionScope::poll_close`] calls
@@ -52,7 +52,7 @@ use super::operation::driver::{OperationOutcome, OperationSpec};
 use super::operation::error::{OperationError, OperationResult};
 use super::operation::id::OperationId;
 use super::operation::reason::OperationCancelReason;
-use super::operation::registry::OperationRegistry;
+use super::operation::registry::{DEFAULT_MAX_PENDING_OPERATIONS, OperationRegistry};
 use super::resource::close::{CloseProgress, HostResource};
 use super::resource::error::ResourceError;
 use super::resource::handle::{Resource, ResourceHandle};
@@ -97,6 +97,11 @@ pub enum ExecutionScopeError {
     /// scope actually reached quiescence. Cleanup must be driven to
     /// completion first; replacement is only legal from Quiescent.
     ScopeNotQuiescent,
+    /// Construction of a fresh scope failed because the process-unique
+    /// resource-arena identity space is exhausted. Carries the typed resource
+    /// error ([`ResourceErrorCode::ResourceTableArenaExhausted`]); the scope
+    /// was not created and no partial state exists.
+    ArenaExhausted(ResourceError),
     /// The underlying resource insert failed (limit, invalid parent, …).
     Resource(ResourceError),
     /// The underlying operation start failed (limit, sealed, …).
@@ -126,6 +131,9 @@ impl std::fmt::Display for ExecutionScopeError {
                 formatter,
                 "execution scope replacement requires the current scope to be quiescent",
             ),
+            Self::ArenaExhausted(error) => {
+                write!(formatter, "execution scope creation failed: {error}")
+            }
             Self::Resource(error) => write!(formatter, "execution scope resource error: {error}"),
             Self::Operation(error) => {
                 write!(formatter, "execution scope operation error: {error}")
@@ -134,12 +142,32 @@ impl std::fmt::Display for ExecutionScopeError {
     }
 }
 
-impl std::error::Error for ExecutionScopeError {}
+impl std::error::Error for ExecutionScopeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ArenaExhausted(error) | Self::Resource(error) => Some(error),
+            Self::Operation(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
-/// First cleanup failure preserved across the close sweep.
+/// First cleanup failure preserved across the close sweep, plus the total
+/// number of failed cleanups observed.
 ///
 /// Best-effort shutdown continues past a failing entry; this carries the
-/// earliest failure so the terminal state never claims a fake success.
+/// earliest failure so the terminal state never claims a fake success, and
+/// the failure count so the caller can size the blast radius.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopeCloseFailure {
+    /// The earliest cleanup failure (first-error-wins).
+    pub first: ScopeCloseError,
+    /// Total number of cleanup failures observed during the sweep
+    /// (operations then resources), including `first`.
+    pub failed: usize,
+}
+
+/// One typed cleanup failure in the scope close sweep.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScopeCloseError {
     /// An operation driver/cleanup failed during the operation drain.
@@ -154,8 +182,9 @@ pub enum ScopeCloseOutcome {
     /// Every operation drained and every resource closed cleanly.
     Success,
     /// The scope quiesced but at least one cleanup failed; the first error is
-    /// preserved, never overwritten by later successes or failures.
-    SuccessWithErrors(ScopeCloseError),
+    /// preserved, never overwritten by later successes or failures, and the
+    /// total failure count is carried alongside it.
+    SuccessWithErrors(ScopeCloseFailure),
 }
 
 /// One execution scope: an isolated resource arena plus an isolated operation
@@ -172,6 +201,9 @@ pub struct ExecutionScope {
     operations_drained: bool,
     /// First cleanup failure across the whole shutdown (operations then resources).
     first_error: Option<ScopeCloseError>,
+    /// Total cleanup failures observed across the whole shutdown (operations
+    /// then resources); includes the failure recorded in `first_error`.
+    failed_count: usize,
     terminal: Option<ScopeCloseOutcome>,
 }
 
@@ -181,16 +213,24 @@ impl ExecutionScope {
     /// The resource table gets a brand-new process-unique arena identity and
     /// the operation registry a brand-new process-unique tag, so nothing in a
     /// new scope can alias handles/ids from any other scope.
-    pub fn new() -> Self {
-        Self {
-            resources: ResourceTable::new(),
-            operations: OperationRegistry::default(),
+    ///
+    /// Fallible: arena identity or operation-registry tag allocation can fail
+    /// with [`ExecutionScopeError::ArenaExhausted`] or
+    /// [`ExecutionScopeError::Operation`] once the process-unique identity
+    /// space is exhausted. No partial scope is created on failure.
+    pub fn new() -> ExecutionScopeResult<Self> {
+        let resources = ResourceTable::new().map_err(ExecutionScopeError::ArenaExhausted)?;
+        Ok(Self {
+            resources,
+            operations: OperationRegistry::with_limit(DEFAULT_MAX_PENDING_OPERATIONS)
+                .map_err(ExecutionScopeError::Operation)?,
             state: ScopeState::Active,
             close_reason: None,
             operations_drained: false,
             first_error: None,
+            failed_count: 0,
             terminal: None,
-        }
+        })
     }
 
     /// The current lifecycle phase.
@@ -396,6 +436,28 @@ impl ExecutionScope {
             .map_err(ExecutionScopeError::Operation)
     }
 
+    /// Aborts a started operation in one step so it never produces a
+    /// guest-visible result: cancels the driver exactly once if pending
+    /// (recording the first reason), then consumes and immediately releases
+    /// the slot, restoring full registry capacity and making the id stale.
+    ///
+    /// This is the rollback counterpart to
+    /// [`start_operation`](Self::start_operation), intended for call sites
+    /// that register an operation and then hit a fallible handoff (such as a
+    /// bridge submission) before a pending-result adapter is installed. Even
+    /// when the driver's `cancel` reports a typed failure, the slot is still
+    /// released. A stale/foreign/out-of-range id is rejected with the typed
+    /// error and no registry mutation.
+    pub fn abort_operation(
+        &mut self,
+        id: OperationId,
+        reason: OperationCancelReason,
+    ) -> ExecutionScopeResult<bool> {
+        self.operations
+            .abort(id, reason)
+            .map_err(ExecutionScopeError::Operation)
+    }
+
     /// Cancels every pending operation associated with `handle`, then begins
     /// closing the underlying resource through the generic table contract.
     ///
@@ -502,13 +564,16 @@ impl ExecutionScope {
     }
 
     /// Records a best-effort guest-release failure in the scope's first-error
-    /// latch (first-error-wins, host-agnostic). Used by the VM when a local's
-    /// ownership release hits a synchronous close error: the failure is
-    /// preserved so the terminal scope outcome reports it, while the current
-    /// execution continues without panicking.
+    /// latch (first-error-wins, host-agnostic) and increments the failure
+    /// count. Used by the VM when a local's ownership release hits a
+    /// synchronous close error: the failure is preserved so the terminal
+    /// scope outcome reports it, while the current execution continues
+    /// without panicking.
     pub fn record_guest_release_error(&mut self, error: ResourceError) {
-        self.first_error
-            .get_or_insert(ScopeCloseError::Resource(error));
+        if self.first_error.is_none() {
+            self.first_error = Some(ScopeCloseError::Resource(error));
+        }
+        self.failed_count += 1;
     }
 
     /// The first cleanup failure recorded so far, if any. A close-failure
@@ -516,6 +581,13 @@ impl ExecutionScope {
     /// can be recorded mid-run and is surfaced at the terminal outcome.
     pub fn first_error(&self) -> Option<&ScopeCloseError> {
         self.first_error.as_ref()
+    }
+
+    /// Total cleanup failures recorded so far across the whole shutdown
+    /// (operations then resources), including the one in
+    /// [`first_error`](Self::first_error).
+    pub fn failed_count(&self) -> usize {
+        self.failed_count
     }
 
     /// Begins scope shutdown: **Active → Closing**, sealing new inserts.
@@ -582,9 +654,13 @@ impl ExecutionScope {
         if !self.operations_drained {
             let summary = self.operations.cancel_all(operation_reason(reason));
             if let Some(error) = summary.first_error() {
-                self.first_error
-                    .get_or_insert(ScopeCloseError::Operation(error.clone()));
+                self.record_failure(ScopeCloseError::Operation(error.clone()));
             }
+            // Every failed operation cancellation/cleanup counts toward the
+            // failure total; `failed` includes the first-error case above.
+            self.failed_count += summary
+                .failed()
+                .saturating_sub(usize::from(summary.first_error().is_some()));
             self.operations_drained = true;
         }
         if !self.operations.is_empty() {
@@ -593,9 +669,17 @@ impl ExecutionScope {
         }
 
         // Phase 2 — resources: child-first, best-effort, caller-context close.
-        match self.resources.poll_close_all(reason, cx) {
+        match self.resources.poll_close_all_report(reason, cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(_closed)) => {
+            Poll::Ready(Ok(report)) => {
+                if let Some(error) = report.first_error.clone() {
+                    self.record_failure(ScopeCloseError::Resource(error));
+                }
+                // The resource sweep's failure count already includes the
+                // first error (recorded above); only the remainder is new.
+                self.failed_count += report
+                    .failed
+                    .saturating_sub(usize::from(report.first_error.is_some()));
                 self.finish_close();
                 Poll::Ready(Ok(self
                     .terminal
@@ -603,8 +687,7 @@ impl ExecutionScope {
                     .expect("finish_close set terminal")))
             }
             Poll::Ready(Err(error)) => {
-                self.first_error
-                    .get_or_insert(ScopeCloseError::Resource(error));
+                self.record_failure(ScopeCloseError::Resource(error));
                 self.finish_close();
                 Poll::Ready(Ok(self
                     .terminal
@@ -623,21 +706,28 @@ impl ExecutionScope {
         }
     }
 
+    /// Records a cleanup failure: first-error-wins plus a failure-count
+    /// increment (host-agnostic; used by operations, resources and guest
+    /// releases).
+    fn record_failure(&mut self, error: ScopeCloseError) {
+        if self.first_error.is_none() {
+            self.first_error = Some(error);
+        }
+        self.failed_count += 1;
+    }
+
     /// Freezes the terminal outcome once both registries are empty.
     fn finish_close(&mut self) {
         debug_assert!(self.operations.is_empty(), "operations must be drained");
         debug_assert!(self.resources.is_empty(), "resources must be closed");
         self.state = ScopeState::Quiescent;
         self.terminal = Some(match self.first_error.take() {
-            Some(first) => ScopeCloseOutcome::SuccessWithErrors(first),
+            Some(first) => ScopeCloseOutcome::SuccessWithErrors(ScopeCloseFailure {
+                first,
+                failed: self.failed_count,
+            }),
             None => ScopeCloseOutcome::Success,
         });
-    }
-}
-
-impl Default for ExecutionScope {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -654,5 +744,34 @@ fn operation_reason(reason: ResourceCloseReason) -> OperationCancelReason {
         // A guest ownership release is an explicit caller-initiated close
         // request, so dependent operations see it as a requested cancel.
         ResourceCloseReason::OwnershipRelease => OperationCancelReason::Requested,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExecutionScope, ExecutionScopeError};
+    use crate::vm::operation::OperationErrorCode;
+    use crate::vm::operation::id::MAX_REGISTRY_TAG;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn construction_propagates_operation_registry_tag_exhaustion() {
+        static COUNTER: AtomicU64 = AtomicU64::new(MAX_REGISTRY_TAG + 1);
+        let _source =
+            crate::vm::operation::id::test_seam::ScopedRegistryTagSource::install(&COUNTER);
+
+        let error = match ExecutionScope::new() {
+            Ok(_) => panic!("operation registry tag exhaustion must be fallible"),
+            Err(error) => error,
+        };
+        let ExecutionScopeError::Operation(error) = error else {
+            panic!("expected the operation exhaustion variant");
+        };
+        assert_eq!(
+            error.code(),
+            OperationErrorCode::OperationRegistryTagExhausted
+        );
+        assert_eq!(error.limit(), Some(MAX_REGISTRY_TAG));
+        assert_eq!(error.value(), Some(MAX_REGISTRY_TAG + 1));
     }
 }

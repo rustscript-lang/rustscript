@@ -25,7 +25,7 @@ fn compiler_emits_expression() {
         .compile_program(&[Stmt::Expr { expr, line: 1 }])
         .expect("compiler should emit program");
 
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
 
     assert_eq!(status, VmStatus::Halted);
@@ -45,7 +45,7 @@ fn compile_source_program() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
 
     assert_eq!(status, VmStatus::Halted);
@@ -62,7 +62,7 @@ fn assignment_updates_existing_local_without_new_slot() {
 
     let compiled = compile_source(source).expect("compile should succeed");
     assert_eq!(compiled.locals, 1);
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
 
     assert_eq!(status, VmStatus::Halted);
@@ -84,7 +84,7 @@ fn compiler_reuses_slots_when_declared_locals_exceed_bytecode_limit() {
         "slot allocator should remap to bytecode locals"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(599)]);
@@ -124,7 +124,7 @@ fn compiler_preserves_source_slots_at_compat_threshold() {
         "debug locals at the threshold should retain distinct physical slots"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(
@@ -167,7 +167,7 @@ fn compiler_reuses_slots_immediately_above_compat_threshold() {
         "debug locals above the threshold should show physical slot reuse"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(
@@ -265,7 +265,7 @@ fn compiler_reuses_slots_with_large_programs_that_call_script_functions() {
         "slot allocator should keep inline-call programs within bytecode local limits"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(399)]);
@@ -317,7 +317,7 @@ fn frame_local_dispatch_single_file_pressure_is_bounded() {
         compiled.locals
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(1), Value::Int(32)]);
@@ -383,7 +383,7 @@ fn frame_local_root_accepts_256_simultaneously_live_locals_and_reads_highest_sho
     let compiled = compile_source(&source).expect("256-live program should compile");
     assert_eq!(compiled.locals, 256);
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     let expected: i64 = (0..256).sum();
@@ -435,7 +435,7 @@ fn frame_local_slot_reuse_across_recursive_call_frames() {
         "disjoint recursive frames should reuse the same relative slot"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(8)]);
@@ -480,7 +480,7 @@ fn frame_local_same_frame_values_keep_distinct_slots() {
         "simultaneously live values in one frame must keep distinct slots"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     // p = 4, q = 5, x = 7, y = 12, s = 13, t = 14, result = 33
@@ -502,7 +502,7 @@ fn frame_local_dispatch_data_pressure_is_small() {
         "per-frame data pressure should stay small, got {data_slots} data slots"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(1), Value::Int(32)]);
@@ -513,7 +513,7 @@ fn compile_source_with_functions() {
     let source = include_str!("../../examples/example.rss");
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     for func in &compiled.functions {
         match func.name.as_str() {
@@ -533,7 +533,7 @@ fn compile_source_with_functions() {
 fn compile_source_resolves_imports_by_name_not_registration_order() {
     let source = include_str!("../../examples/example.rss");
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     vm.bind_function("print", Box::new(PrintBuiltin));
     vm.bind_function("add_one", Box::new(AddOne));
@@ -668,7 +668,7 @@ fn run_fails_when_import_is_unbound() {
         add_one(41);
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.bind_function("print", Box::new(PrintBuiltin));
 
     let err = vm.run().expect_err("missing import should fail");
@@ -684,7 +684,8 @@ fn host_function_registry_caches_import_plan_across_vms() {
     registry.register("print", 1, || Box::new(PrintBuiltin));
     registry.register("add_one", 1, || Box::new(AddOne));
 
-    let mut vm1 = Vm::new(compiled.program.clone());
+    let mut vm1 =
+        Vm::try_new(compiled.program.clone()).expect("test VM construction must not fail");
     registry
         .bind_vm_cached(&mut vm1)
         .expect("cached host binding should succeed");
@@ -692,7 +693,7 @@ fn host_function_registry_caches_import_plan_across_vms() {
     assert_eq!(status1, VmStatus::Halted);
     assert_eq!(vm1.stack(), &[Value::Int(6)]);
 
-    let mut vm2 = Vm::new(compiled.program);
+    let mut vm2 = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry
         .bind_vm_cached(&mut vm2)
         .expect("cached host binding should succeed");
@@ -731,7 +732,7 @@ fn compile_source_supports_static_function_pointer_binding() {
         add_one(41);
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.bind_static_function("add_one", static_add_one);
 
     let status = vm.run().expect("vm should run");
@@ -746,7 +747,7 @@ fn compile_source_supports_static_args_function_pointer_binding() {
         add_one(41);
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.bind_static_args_function("add_one", static_add_one_args);
 
     let status = vm.run().expect("vm should run");
@@ -768,7 +769,8 @@ fn host_function_registry_caches_static_function_pointer_plan_across_vms() {
         .prepare_plan(&compiled.program.imports)
         .expect("plan should build");
 
-    let mut vm1 = Vm::new(compiled.program.clone());
+    let mut vm1 =
+        Vm::try_new(compiled.program.clone()).expect("test VM construction must not fail");
     registry
         .bind_vm_with_plan(&mut vm1, &plan)
         .expect("cached static host binding should succeed");
@@ -776,7 +778,7 @@ fn host_function_registry_caches_static_function_pointer_plan_across_vms() {
     assert_eq!(status1, VmStatus::Halted);
     assert_eq!(vm1.stack(), &[Value::Int(6)]);
 
-    let mut vm2 = Vm::new(compiled.program);
+    let mut vm2 = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry
         .bind_vm_with_plan(&mut vm2, &plan)
         .expect("cached static host binding should succeed");
@@ -799,7 +801,8 @@ fn host_function_registry_caches_static_args_function_pointer_plan_across_vms() 
         .prepare_plan(&compiled.program.imports)
         .expect("plan should build");
 
-    let mut vm1 = Vm::new(compiled.program.clone());
+    let mut vm1 =
+        Vm::try_new(compiled.program.clone()).expect("test VM construction must not fail");
     registry
         .bind_vm_with_plan(&mut vm1, &plan)
         .expect("cached static args host binding should succeed");
@@ -807,7 +810,7 @@ fn host_function_registry_caches_static_args_function_pointer_plan_across_vms() 
     assert_eq!(status1, VmStatus::Halted);
     assert_eq!(vm1.stack(), &[Value::Int(6)]);
 
-    let mut vm2 = Vm::new(compiled.program);
+    let mut vm2 = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry
         .bind_vm_with_plan(&mut vm2, &plan)
         .expect("cached static args host binding should succeed");
@@ -830,7 +833,8 @@ fn host_function_registry_caches_static_non_yielding_args_function_pointer_plan_
         .prepare_plan(&compiled.program.imports)
         .expect("plan should build");
 
-    let mut vm1 = Vm::new(compiled.program.clone());
+    let mut vm1 =
+        Vm::try_new(compiled.program.clone()).expect("test VM construction must not fail");
     registry
         .bind_vm_with_plan(&mut vm1, &plan)
         .expect("cached static non-yielding args host binding should succeed");
@@ -838,7 +842,7 @@ fn host_function_registry_caches_static_non_yielding_args_function_pointer_plan_
     assert_eq!(status1, VmStatus::Halted);
     assert_eq!(vm1.stack(), &[Value::Int(6)]);
 
-    let mut vm2 = Vm::new(compiled.program);
+    let mut vm2 = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry
         .bind_vm_with_plan(&mut vm2, &plan)
         .expect("cached static non-yielding args host binding should succeed");
@@ -861,7 +865,7 @@ fn host_function_registry_preserves_static_non_yielding_args_contract_in_prepare
         .prepare_plan(&compiled.program.imports)
         .expect("plan should build");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry
         .bind_vm_with_plan(&mut vm, &plan)
         .expect("cached static non-yielding args host binding should succeed");
@@ -987,7 +991,7 @@ fn path_dependent_local_redeclaration_before_assignment_is_allowed() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(9)]);
@@ -1013,7 +1017,7 @@ fn compiler_clears_uncertain_locals_after_control_flow_join() {
         .local_index("ephemeral")
         .expect("ephemeral local should be emitted");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(0)]);
@@ -1037,7 +1041,7 @@ fn liveness_pass_clears_dead_locals_after_last_use() {
     let d_index = debug.local_index("d").expect("d should exist");
     let e_index = debug.local_index("e").expect("e should exist");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::string("23232")]);
@@ -1232,7 +1236,7 @@ fn same_local_collection_set_clears_target_immediately_before_call() {
         "target should remain readable while key and rhs are evaluated"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("vm should run"), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(20)]);
 }
@@ -1329,7 +1333,8 @@ fn same_local_collection_set_preserves_key_then_rhs_evaluation_order() {
         ])
         .expect("compiler should preserve collection rebind evaluation order");
 
-    let mut vm = Vm::new(program.with_local_count(2));
+    let mut vm =
+        Vm::try_new(program.with_local_count(2)).expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("vm should run"), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::string("kv"), Value::Int(20)]);
 }
@@ -1394,7 +1399,8 @@ fn same_local_array_push_clears_target_immediately_before_call() {
     assert_eq!(result_store.op, OpCode::Stloc as u8);
     assert_eq!(result_store.u8_operand, Some(0));
 
-    let mut vm = Vm::new(program.with_local_count(1));
+    let mut vm =
+        Vm::try_new(program.with_local_count(1)).expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("vm should run"), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::array(vec![Value::Int(7)])]);
 }
@@ -1449,7 +1455,7 @@ fn liveness_avoids_in_loop_null_clears_but_clears_after_loop_exit() {
         );
     }
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(3)]);
@@ -1535,7 +1541,7 @@ fn compile_source_with_string_literals() {
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     for func in &compiled.functions {
         match func.name.as_str() {
@@ -1646,7 +1652,7 @@ fn local_declared_in_both_branches_is_available_after_merge() {
     "#;
     // This should compile and run - val in the outer scope is still 0.
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(0)]);
@@ -1676,7 +1682,7 @@ fn liveness_clears_dead_locals_in_nested_control_flow() {
     let outer_idx = debug.local_index("outer").expect("outer should exist");
     let inner_idx = debug.local_index("inner").expect("inner should exist");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(2)]);
@@ -1714,7 +1720,7 @@ fn for_loop_variable_is_null_after_last_use() {
         .expect("debug info should exist");
     let tmp_idx = debug.local_index("tmp").expect("tmp should exist");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     // sum = 0 + 2 + 4 + 6 = 12
@@ -1737,7 +1743,7 @@ fn stack_is_clean_after_halt_with_single_result() {
         c;
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(
@@ -1821,7 +1827,7 @@ fn named_callable_materialization_omits_direct_only_slots() {
         "direct-only call sites must emit CallScript"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(2), Value::Int(3), Value::Int(4)]);
@@ -1863,7 +1869,7 @@ fn named_callable_materialization_capturing_allocation_unchanged() {
         );
     }
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack().len(), 2, "callable value plus recursion result");
@@ -1936,7 +1942,7 @@ fn named_callable_without_facts_keeps_legacy_materialization() {
     );
     assert_eq!(program.root_callable_bindings.len(), 1);
 
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(1)]);
@@ -2002,7 +2008,7 @@ fn direct_script_call_lowering_omits_ldloc_and_bindings() {
     // local_count is exactly the data-slot pressure: no callable slots.
     assert_eq!(compiled.locals, 1, "one parameter slot for outer/helper");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(2)]);
@@ -2079,7 +2085,7 @@ fn direct_script_call_forward_and_mutual_recursion_run() {
             >= 4,
         "direct recursion and mutual recursion use CallScript"
     );
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(
@@ -2115,7 +2121,7 @@ fn direct_script_call_generic_functions_use_their_prototype() {
             .all(|prototype| prototype.self_slot.is_none()),
         "direct generic calls allocate no hidden callable slot"
     );
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(42)]);
@@ -2135,7 +2141,7 @@ fn direct_script_call_generic_functions_use_their_prototype() {
         2,
         "base plus specialized prototype both stay materialized"
     );
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(42)]);
@@ -2188,7 +2194,7 @@ fn direct_script_call_generic_resolves_instantiated_prototype_schema() {
         &vm::compiler::TypeSchema::Int,
         "specialized prototype schema must use the instantiated result type"
     );
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(42)]);
@@ -2225,7 +2231,7 @@ fn direct_script_call_exported_resolution_is_unchanged() {
         "#,
     )
     .expect("exported program should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(42)]);
@@ -2250,7 +2256,7 @@ fn direct_script_call_pressure_improves_with_slot_omission() {
         "direct-only functions must not consume hidden callable slots, got {}",
         compiled.locals
     );
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(1), Value::Int(32)]);

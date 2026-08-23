@@ -140,7 +140,7 @@ fn call_script_enters_script_frame_and_resumes_caller() {
         vec![0x02, 0x00, 0x00, 0x00, 0x00], // ldc 0 (41)
         callee_param_plus_one(),
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("script call should run"), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(42)]);
     assert_eq!(vm.call_depth(), 0);
@@ -160,7 +160,7 @@ fn call_script_preserves_caller_stack_below_operands() {
         vec![0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00],
         callee_param_plus_one(),
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("script call should run"), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(41), Value::Int(42)]);
     assert_eq!(vm.call_depth(), 0);
@@ -179,7 +179,7 @@ fn call_script_rejects_stack_underflow() {
         vec![0x02, 0x00, 0x00, 0x00, 0x00],
         vec![0x01],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     assert!(matches!(vm.run(), Err(VmError::StackUnderflow)));
 }
 
@@ -195,7 +195,7 @@ fn call_script_rejects_invalid_prototype_id() {
         vec![0x02, 0x00, 0x00, 0x00, 0x00],
         vec![0x01],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     assert!(matches!(
         vm.run(),
         Err(VmError::InvalidCallablePrototype(99))
@@ -219,7 +219,7 @@ fn call_script_rejects_invalid_script_function_id() {
         vec![0x02, 0x00, 0x00, 0x00, 0x00],
         vec![0x01],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     assert!(matches!(
         vm.run(),
         Err(VmError::InvalidCallablePrototype(0))
@@ -239,7 +239,7 @@ fn call_script_rejects_wrong_arity() {
         vec![0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00],
         vec![0x01],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     assert!(matches!(
         vm.run(),
         Err(VmError::CallableArityMismatch {
@@ -264,7 +264,7 @@ fn call_script_rejects_non_script_prototype() {
         vec![0x02, 0x00, 0x00, 0x00, 0x00],
         vec![0x01],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     assert!(matches!(
         vm.run(),
         Err(VmError::InvalidCallablePrototype(0))
@@ -274,7 +274,7 @@ fn call_script_rejects_non_script_prototype() {
 #[test]
 fn call_script_preserves_script_depth_limit() {
     let program = call_script_recursion_program();
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_max_script_call_depth(3)
         .expect("positive depth should be accepted");
     assert!(matches!(
@@ -289,7 +289,7 @@ fn call_script_frame_entry_charges_interruption_ticks() {
     // `CallValue`: with a tiny fuel budget the recursion exhausts fuel and
     // the vm yields with the fuel reason instead of looping forever.
     let program = call_script_recursion_program();
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_fuel_check_interval(1)
         .expect("interval update should succeed");
     vm.set_fuel(2);
@@ -312,7 +312,7 @@ fn call_script_rejects_capture_required_prototype() {
         vec![0x02, 0x00, 0x00, 0x00, 0x00],
         vec![0x01],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     assert!(matches!(
         vm.run(),
         Err(VmError::CallScriptRequiresEnvironment(0))
@@ -332,7 +332,7 @@ fn call_script_recursion_resumes_caller_locals_intact() {
         keep;
     "#;
     let compiled = compile_source(source).expect("recursion source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(0), Value::string("alive")]);
@@ -367,7 +367,7 @@ fn call_script_rejects_self_slot_required_prototype() {
         vec![0x02, 0x00, 0x00, 0x00, 0x00],
         vec![0x01],
     );
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     assert!(matches!(
         vm.run(),
         Err(VmError::CallScriptRequiresEnvironment(0))
@@ -395,7 +395,7 @@ fn call_script_callee_host_wait_resumes_caller_continuation() {
         vec![0x11, 0x00, 0x00, 0x00, 0x0F, 0x00, 0x01],
     );
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.register_function(Box::new(PendingOnceHostOp {
         call_count: Arc::clone(&calls),
         op_id: 802,

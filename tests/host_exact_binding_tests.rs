@@ -124,7 +124,7 @@ acme::compute(true);
         .register_exact("acme::compute", 1, computes[1].clone(), tag_factory(200))
         .expect("bind bool overload");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry
         .bind_vm_cached(&mut vm)
         .expect("exact bind should succeed");
@@ -397,7 +397,7 @@ fn exact_number_schema_registers_resolves_and_binds() {
     // Exact schema match: resolves to the freshly registered slot.
     assert_eq!(registry.resolve_import(import).unwrap(), slot);
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry
         .bind_vm_cached(&mut vm)
         .expect("exact bind must succeed");
@@ -447,7 +447,7 @@ fn exact_optional_number_schema_registers_resolves_and_binds() {
     // Exact schema match: resolves to the just-registered slot.
     assert_eq!(registry.resolve_import(import).unwrap(), slot);
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry
         .bind_vm_cached(&mut vm)
         .expect("exact bind must succeed");

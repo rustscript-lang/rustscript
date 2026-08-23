@@ -28,15 +28,17 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
-use vm::execution_scope::{ScopeCloseError, ScopeCloseOutcome, ScopeState};
+use vm::execution_scope::{
+    ExecutionScopeError, ScopeCloseError, ScopeCloseFailure, ScopeCloseOutcome, ScopeState,
+};
 use vm::operation::{HostOperation, OperationCancelReason, OperationResult, OperationSpec};
 use vm::resource::{
     CloseProgress, HostResource, Resource, ResourceCloseReason, ResourceError, ResourceErrorCode,
     ResourceResult,
 };
 use vm::{
-    BeginResetOutcome, Program, Value, Vm, VmError, VmResetError, VmResetState, VmStatus,
-    compile_source,
+    BeginResetOutcome, HostContextErrorKind, Program, Value, Vm, VmError, VmResetError,
+    VmResetState, VmStatus, compile_source,
 };
 
 // ---- fake generic resources / operations ------------------------------------
@@ -182,7 +184,7 @@ fn poll_reset_until_terminal(vm: &mut Vm, now: Instant) -> Result<(), VmResetErr
 
 #[test]
 fn fresh_vm_is_ready_reusable_and_runnable() {
-    let mut vm = Vm::new(seven_program().program);
+    let mut vm = Vm::try_new(seven_program().program).expect("test VM construction must not fail");
 
     // A brand-new VM is Ready and may be lent out of a pool.
     assert_eq!(vm.reset_state(), VmResetState::Ready);
@@ -200,7 +202,7 @@ fn fresh_vm_is_ready_reusable_and_runnable() {
 
 #[test]
 fn sync_reset_recycles_scope_and_rejects_old_handle() {
-    let mut vm = Vm::new(seven_program().program);
+    let mut vm = Vm::try_new(seven_program().program).expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("run should halt"), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(7)]);
 
@@ -263,7 +265,7 @@ fn sync_reset_recycles_scope_and_rejects_old_handle() {
 
 #[test]
 fn pending_scope_resource_blocks_reset_and_pool_then_completes() {
-    let mut vm = Vm::new(seven_program().program);
+    let mut vm = Vm::try_new(seven_program().program).expect("test VM construction must not fail");
     let released = push_gated(&mut vm);
 
     assert_eq!(
@@ -299,7 +301,8 @@ fn pending_scope_resource_blocks_reset_and_pool_then_completes() {
 
 #[test]
 fn pending_operation_is_cancelled_and_drained_by_the_reset() {
-    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), Vec::new()))
+        .expect("test VM construction must not fail");
     {
         let mut cx = vm.host_context();
         cx.start_operation(OperationSpec::new(TrackedOperation))
@@ -327,7 +330,8 @@ fn pending_operation_is_cancelled_and_drained_by_the_reset() {
 
 #[test]
 fn cleanup_error_poisons_without_replacing_the_scope() {
-    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), Vec::new()))
+        .expect("test VM construction must not fail");
     {
         let mut cx = vm.host_context();
         cx.push_resource(FailingResource)
@@ -341,7 +345,11 @@ fn cleanup_error_poisons_without_replacing_the_scope() {
     );
     let reset_error = poll_reset_until_terminal(&mut vm, Instant::now())
         .expect_err("a cleanup error must terminate the reset with a structured error");
-    let VmResetError::ScopeCleanup(ScopeCloseError::Resource(error)) = &reset_error else {
+    let VmResetError::ScopeCleanup(ScopeCloseFailure {
+        first: ScopeCloseError::Resource(error),
+        ..
+    }) = &reset_error
+    else {
         panic!("expected a preserved scope cleanup error, got {reset_error:?}");
     };
     assert_eq!(error.code(), ResourceErrorCode::ResourceCleanupFailed);
@@ -386,7 +394,8 @@ fn cleanup_error_poisons_without_replacing_the_scope() {
 
 #[test]
 fn deadline_poisons_without_claiming_cleanup() {
-    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), Vec::new()))
+        .expect("test VM construction must not fail");
     let _released = push_gated(&mut vm);
 
     let deadline = Instant::now() + Duration::from_secs(3600);
@@ -410,10 +419,12 @@ fn deadline_poisons_without_claiming_cleanup() {
 
     // Even though the resource is still unreleased (never cleaned), passing a
     // `now` past the deadline must poison — resources are NOT claimed clean.
+    // The typed pool-contract error is ScopeCleanupDeadline (recycle
+    // deadline; the VM is permanently discarded).
     let past = deadline + Duration::from_millis(1);
     match vm.poll_reset_for_reuse(&mut cx, past) {
-        Poll::Ready(Err(VmError::Reset(VmResetError::Deadline { .. }))) => {}
-        other => panic!("expected a deadline poison, got {other:?}"),
+        Poll::Ready(Err(VmError::Reset(VmResetError::ScopeCleanupDeadline { .. }))) => {}
+        other => panic!("expected a scope cleanup deadline poison, got {other:?}"),
     }
     assert_eq!(vm.reset_state(), VmResetState::Poisoned);
     assert!(!vm.is_reusable());
@@ -426,10 +437,10 @@ fn deadline_poisons_without_claiming_cleanup() {
         "the pending resource must still be registered (cleanup was not faked)"
     );
 
-    // `reset_error` keeps the deadline for diagnostics.
+    // `reset_error` keeps the recycle deadline for diagnostics.
     assert!(matches!(
         vm.reset_error(),
-        Some(VmResetError::Deadline { .. })
+        Some(VmResetError::ScopeCleanupDeadline { .. })
     ));
 }
 
@@ -442,7 +453,7 @@ fn module_state_survives_reset() {
         count: u32,
     }
 
-    let mut vm = Vm::new(seven_program().program);
+    let mut vm = Vm::try_new(seven_program().program).expect("test VM construction must not fail");
     {
         let mut cx = vm.host_context();
         assert!(!cx.set_module_state(ModuleState { count: 42 }));
@@ -469,7 +480,8 @@ fn module_state_survives_reset() {
 
 #[test]
 fn begin_is_first_reason_deadline_wins_and_repeat_begin_is_idempotent() {
-    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), Vec::new()))
+        .expect("test VM construction must not fail");
     let first_deadline = Instant::now() + Duration::from_secs(1);
 
     assert_eq!(
@@ -522,7 +534,7 @@ fn begin_is_first_reason_deadline_wins_and_repeat_begin_is_idempotent() {
 #[test]
 fn run_and_resume_are_rejected_while_resetting_and_poisoned() {
     // Resetting: a gated resource keeps the reset in progress.
-    let mut vm = Vm::new(seven_program().program);
+    let mut vm = Vm::try_new(seven_program().program).expect("test VM construction must not fail");
     let _released = push_gated(&mut vm);
     assert_eq!(
         vm.begin_reset_for_reuse(ResourceCloseReason::VmReset, None)
@@ -556,7 +568,7 @@ fn run_and_resume_are_rejected_while_resetting_and_poisoned() {
 
     // Poisoned: the deadline path poisons a separate VM.
     let deadline = Instant::now() + Duration::from_millis(10);
-    let mut vm2 = Vm::new(seven_program().program);
+    let mut vm2 = Vm::try_new(seven_program().program).expect("test VM construction must not fail");
     let _released2 = push_gated(&mut vm2);
     assert_eq!(
         vm2.begin_reset_for_reuse(ResourceCloseReason::VmReset, Some(deadline))
@@ -567,7 +579,9 @@ fn run_and_resume_are_rejected_while_resetting_and_poisoned() {
     let mut cx2 = Context::from_waker(&waker2);
     assert!(matches!(
         vm2.poll_reset_for_reuse(&mut cx2, deadline + Duration::from_millis(1)),
-        Poll::Ready(Err(VmError::Reset(VmResetError::Deadline { .. })))
+        Poll::Ready(Err(VmError::Reset(
+            VmResetError::ScopeCleanupDeadline { .. }
+        )))
     ));
     assert!(matches!(
         vm2.run(),
@@ -582,7 +596,7 @@ fn run_and_resume_are_rejected_while_resetting_and_poisoned() {
 
 #[test]
 fn stack_ip_and_frames_are_cleared_only_at_the_successful_endpoint() {
-    let mut vm = Vm::new(seven_program().program);
+    let mut vm = Vm::try_new(seven_program().program).expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("run"), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(7)]);
     let ip_before = vm.ip();
@@ -637,7 +651,7 @@ fn stack_ip_and_frames_are_cleared_only_at_the_successful_endpoint() {
 
 #[test]
 fn compat_reset_with_pending_resource_stays_resetting_and_completes_via_poll() {
-    let mut vm = Vm::new(seven_program().program);
+    let mut vm = Vm::try_new(seven_program().program).expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("run"), VmStatus::Halted);
     let released = push_gated(&mut vm);
 
@@ -680,7 +694,7 @@ fn compat_reset_with_pending_resource_stays_resetting_and_completes_via_poll() {
 
 #[test]
 fn shutdown_then_clean_reset_stays_ready_with_a_fresh_scope() {
-    let mut vm = Vm::new(seven_program().program);
+    let mut vm = Vm::try_new(seven_program().program).expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("run"), VmStatus::Halted);
 
     // Public shutdown runs the legacy HostRuntime reset through
@@ -705,4 +719,206 @@ fn shutdown_then_clean_reset_stays_ready_with_a_fresh_scope() {
         ScopeState::Active,
         "a clean reset after shutdown must install a fresh active scope"
     );
+}
+
+// ---- typed recycle deadline: never-completing close permanently discards ----
+
+/// A resource whose close never completes: `begin_close` returns Pending and
+/// every `poll_close` stays Pending forever. Only the recycle deadline can
+/// stop the drain.
+struct NeverCompletingResource {
+    polls: Arc<AtomicUsize>,
+}
+
+impl NeverCompletingResource {
+    fn new() -> (Self, Arc<AtomicUsize>) {
+        let polls = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                polls: polls.clone(),
+            },
+            polls,
+        )
+    }
+}
+
+impl HostResource for NeverCompletingResource {
+    fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
+        Ok(CloseProgress::Pending)
+    }
+
+    fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        Poll::Pending
+    }
+}
+
+#[test]
+fn never_completing_close_hits_typed_recycle_deadline_and_discards() {
+    let mut vm = Vm::try_new(Program::new(Vec::new(), Vec::new()))
+        .expect("test VM construction must not fail");
+    let (resource, polls) = NeverCompletingResource::new();
+    {
+        let mut cx = vm.host_context();
+        cx.push_resource(resource).expect("push never-completing");
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(3600);
+    assert_eq!(
+        vm.begin_reset_for_reuse(ResourceCloseReason::VmReset, Some(deadline))
+            .expect("begin reset"),
+        BeginResetOutcome::Started
+    );
+
+    // Before the deadline, the drain stays pending and the resource is polled
+    // (each poll attempts the close; it never completes).
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert!(matches!(
+        vm.poll_reset_for_reuse(&mut cx, deadline - Duration::from_millis(1)),
+        Poll::Pending
+    ));
+    let polls_before = polls.load(Ordering::SeqCst);
+    assert!(polls_before >= 1, "the close was polled at least once");
+
+    // Passing the recycle deadline returns the typed ScopeCleanupDeadline
+    // error and permanently poisons the VM (discarded, never reused).
+    let past = deadline + Duration::from_millis(1);
+    match vm.poll_reset_for_reuse(&mut cx, past) {
+        Poll::Ready(Err(VmError::Reset(VmResetError::ScopeCleanupDeadline {
+            deadline: d,
+            now: n,
+        }))) => {
+            assert_eq!(d, deadline);
+            assert_eq!(n, past);
+        }
+        other => panic!("expected typed ScopeCleanupDeadline, got {other:?}"),
+    }
+    assert_eq!(vm.reset_state(), VmResetState::Poisoned);
+    assert!(!vm.is_reusable(), "discarded VM is never reusable");
+    assert!(matches!(
+        vm.reset_error(),
+        Some(VmResetError::ScopeCleanupDeadline { .. })
+    ));
+
+    // The old scope stays in place (Closing), resources were NOT force-clean.
+    assert_eq!(vm.host_context().scope_state(), ScopeState::Closing);
+    assert!(
+        vm.host_context().execution_scope().resources().len() >= 1,
+        "the never-completing resource is still registered (no fake cleanup)"
+    );
+
+    // A poisoned VM remains safe to Drop (no panic, no further reuse).
+    drop(vm);
+}
+
+// ---- explicit single-resource close failure is local; shutdown retries --------
+
+/// A resource whose first explicit `begin_close` fails and whose retry
+/// succeeds (models a transient explicit-close failure the shutdown retry
+/// overcomes).
+struct FailOnceThenCloseResource {
+    began: Arc<AtomicUsize>,
+}
+
+impl FailOnceThenCloseResource {
+    fn new() -> (Self, Arc<AtomicUsize>) {
+        let began = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                began: began.clone(),
+            },
+            began,
+        )
+    }
+}
+
+impl HostResource for FailOnceThenCloseResource {
+    fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
+        if self.began.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err(ResourceError::new(
+                ResourceErrorCode::ResourceCleanupFailed,
+                "test::FailOnceThenCloseResource",
+                "first explicit close fails; shutdown retry succeeds",
+            ))
+        } else {
+            Ok(CloseProgress::Ready)
+        }
+    }
+}
+
+#[test]
+fn explicit_close_failure_stays_local_and_shutdown_retries_idempotent_close() {
+    let mut vm = Vm::try_new(Program::new(Vec::new(), Vec::new()))
+        .expect("test VM construction must not fail");
+    let (resource, began) = FailOnceThenCloseResource::new();
+    let handle = {
+        let mut cx = vm.host_context();
+        let token = cx.push_resource(resource).expect("push fail-once resource");
+        // Mark guest-owned so an explicit release fires a close.
+        cx.mark_resource_guest_owned(token.handle())
+            .expect("mark guest owned");
+        token.handle()
+    };
+
+    // Explicit single-resource close fails: the error is returned to the
+    // caller (local failure) and the resource stays open for a later retry.
+    let error = vm
+        .host_context()
+        .close_resource::<FailOnceThenCloseResource>(handle, ResourceCloseReason::Requested)
+        .expect_err("the first explicit close fails locally");
+    let HostContextErrorKind::Scope(ExecutionScopeError::Resource(resource_error)) = error.kind()
+    else {
+        panic!(
+            "expected a structured resource close failure, got {:?}",
+            error.kind()
+        );
+    };
+    assert_eq!(
+        resource_error.code(),
+        ResourceErrorCode::ResourceCleanupFailed
+    );
+    assert_eq!(began.load(Ordering::SeqCst), 1, "explicit close fired once");
+    assert_eq!(
+        vm.host_context().resource_count(),
+        1,
+        "the resource stays open (local failure does not drop it)"
+    );
+
+    // The explicit failure is local: nothing was latched in the scope, no
+    // terminal outcome was produced, and the VM keeps running (not poisoned).
+    assert_eq!(
+        vm.host_context().execution_scope().first_error(),
+        None,
+        "an explicit close failure returned to the caller is not latched"
+    );
+    assert_eq!(vm.reset_state(), VmResetState::Ready);
+    assert!(vm.is_reusable());
+
+    // Shutdown retries the idempotent close: the retry succeeds, the scope
+    // quiesces cleanly, and the VM returns Ready — the transient explicit
+    // failure never poisoned anything.
+    assert_eq!(
+        vm.begin_reset_for_reuse(ResourceCloseReason::VmReset, None)
+            .expect("begin reset"),
+        BeginResetOutcome::Started
+    );
+    drive_reset_to_success(&mut vm, Instant::now());
+
+    // The shutdown retried begin_close (idempotent) — the second attempt
+    // succeeded, so the scope closed cleanly and the VM is reusable again.
+    assert_eq!(
+        began.load(Ordering::SeqCst),
+        2,
+        "shutdown retried the close"
+    );
+    assert_eq!(vm.host_context().resource_count(), 0);
+    assert_eq!(
+        vm.host_context().scope_state(),
+        ScopeState::Active,
+        "a clean retry installs a fresh active scope"
+    );
+    assert_eq!(vm.reset_state(), VmResetState::Ready);
+    assert!(vm.is_reusable());
+    assert_eq!(vm.reset_error(), None);
 }

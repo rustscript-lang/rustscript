@@ -120,7 +120,7 @@ pub fn ok() {
 fn render_vm_error_includes_ip_and_source_line() {
     let source = "let value = 1 / 0;\n";
     let compiled = compile_source(source).expect("source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let err = vm
         .run()
         .expect_err("runtime should fail with division by zero");

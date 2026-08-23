@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 fn run_source(source: &str) -> Result<Vec<Value>, VmError> {
     let wrapped = format!("use io;\n{source}");
     let compiled = compile_source(&wrapped).expect("source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     let mut status = vm.run()?;
     loop {
@@ -90,7 +90,7 @@ fn io_policy_denies_process_launch_when_process_capability_is_disabled() {
             .allow_builtin(BuiltinFunction::IoPopen)
             .build(),
     );
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.configure_io(IoPolicy::default());
     registry
         .bind_vm_cached(&mut vm)
@@ -115,7 +115,7 @@ fn io_policy_denies_paths_outside_allowed_roots() {
             .allow_builtin(BuiltinFunction::IoExists)
             .build(),
     );
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.configure_io(IoPolicy::default());
     registry
         .bind_vm_cached(&mut vm)
@@ -140,7 +140,7 @@ fn restricted_registry_defaults_to_deny_when_io_host_state_is_absent() {
             .allow_builtin(BuiltinFunction::IoExists)
             .build(),
     );
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry
         .bind_vm_cached(&mut vm)
         .expect("profile should bind");
@@ -177,7 +177,7 @@ fn io_policy_limits_write_size() {
             .allow_builtin(BuiltinFunction::IoWrite)
             .build(),
     );
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.configure_io(policy);
     registry
         .bind_vm_cached(&mut vm)
@@ -217,7 +217,7 @@ fn io_policy_limits_read_all_size() {
             .allow_builtin(BuiltinFunction::IoReadAll)
             .build(),
     );
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.configure_io(policy);
     registry
         .bind_vm_cached(&mut vm)
@@ -257,7 +257,7 @@ fn io_policy_limits_read_line_size() {
             .allow_builtin(BuiltinFunction::IoReadLine)
             .build(),
     );
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.configure_io(policy);
     registry
         .bind_vm_cached(&mut vm)
@@ -316,7 +316,7 @@ fn reset_terminates_popen_descendants() {
         command = command
     ))
     .expect("descendant popen source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     let status = vm.run().expect("popen should start");
     assert!(matches!(status, VmStatus::Waiting(_)));
@@ -375,7 +375,7 @@ fn reset_interrupts_a_blocked_popen_read_within_a_bounded_time() {
         "#,
     )
     .expect("blocking popen source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     let first = vm.run().expect("popen should start");
     assert!(matches!(first, VmStatus::Waiting(_)));
@@ -408,7 +408,7 @@ fn reset_reaps_a_popen_child_before_completion_is_polled() {
         "#,
     )
     .expect("popen source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     let status = vm.run().expect("popen should start");
     // popen uses a worker thread now; drive the VM to completion.
@@ -569,7 +569,7 @@ fn io_exists_operation_is_truly_pending_before_worker_completes() {
         "#,
     )
     .expect("source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     // First call is run() which returns Wait for the first op
     let status = vm.run().expect("run should start");
@@ -649,7 +649,7 @@ fn close_begin_close_returns_pending_and_poll_close_completes() {
         path = path.display()
     ))
     .expect("source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     let mut status = vm.run().expect("run should start");
     loop {
@@ -708,7 +708,7 @@ fn worker_resource_is_present_after_blocking_io_open() {
         path = path.display()
     ))
     .expect("source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     let mut status = vm.run().expect("run should start");
     loop {
@@ -746,7 +746,7 @@ fn concurrent_blocking_operations_are_isolated() {
         path_b = path_b.display()
     ))
     .expect("source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     let mut status = vm.run().expect("run should start");
     loop {
@@ -788,7 +788,7 @@ fn reset_does_not_block_on_worker_teardown() {
         path = path.display()
     ))
     .expect("source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
 
     let status = vm.run().expect("run should start");
     assert!(matches!(status, VmStatus::Waiting(_)));

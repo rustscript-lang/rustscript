@@ -161,7 +161,7 @@ fn compile_source_file_module_override_path_redirects_import_spec() {
         "override module functions should be inlined into root program"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::string("override-body")]);
@@ -375,7 +375,7 @@ fn compile_source_file_rustscript_named_import_preserves_generic_function_type_p
         "generic imported RustScript functions should inline without host imports"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(6)]);
@@ -415,7 +415,7 @@ fn compile_source_file_rustscript_module_exports_only_pub_functions() {
         compiled.functions.is_empty(),
         "pure RustScript function module should not require host imports"
     );
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(42)]);
@@ -469,7 +469,7 @@ fn rss_function_definition_uses_script_target_without_host_imports() {
         "rss-defined functions should not be emitted as host imports"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Bool(true)]);
@@ -501,7 +501,7 @@ fn compile_source_file_imported_module_slice_hidden_bindings_work() {
     );
 
     let compiled = compile_source_file(main_path.as_path()).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(4)]);
@@ -539,7 +539,7 @@ fn compile_source_file_imported_module_dynamic_slice_end_bindings_work() {
     );
 
     let compiled = compile_source_file(main_path.as_path()).expect("compile should succeed");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(10)]);
@@ -576,7 +576,7 @@ fn nested_module_namespace_import_rewrites_sibling_calls() {
     );
 
     let compiled = compile_source_file(&main_path).expect("nested namespace import should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(7)]);
@@ -613,7 +613,7 @@ fn nested_module_named_import_rewrites_sibling_calls() {
     );
 
     let compiled = compile_source_file(&main_path).expect("nested named import should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(11)]);
@@ -651,7 +651,7 @@ fn nested_module_super_import_resolves_parent_directory_sibling() {
     );
 
     let compiled = compile_source_file(&main_path).expect("nested super import should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(13)]);
@@ -822,7 +822,7 @@ fn nested_module_rewrite_preserves_utf8_values_byte_for_byte() {
     );
 
     let compiled = compile_source_file(&main_path).expect("nested utf-8 imports should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(
@@ -866,7 +866,7 @@ fn nested_module_consecutive_super_import_resolves_two_levels_up() {
 
     let compiled =
         compile_source_file(&main_path).expect("consecutive super import should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(17)]);
@@ -899,7 +899,7 @@ fn path_aliases_resolve_to_single_module_identity() {
 
     let compiled =
         compile_source_file(&main_path).expect("lexically distinct path aliases should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(46)]);
@@ -971,7 +971,7 @@ fn duplicate_import_aliases_are_idempotent() {
 
     let compiled =
         compile_source_file(&main_path).expect("duplicate import aliases should be idempotent");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(29)]);
@@ -1002,7 +1002,7 @@ fn nested_module_host_namespace_import_stays_host() {
 
     let compiled =
         compile_source_file(&main_path).expect("nested host namespace import should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Float(9.0)]);
@@ -1030,7 +1030,7 @@ fn frame_local_dispatch_module_split_pressure_is_bounded() {
         compiled.locals
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(1), Value::Int(32)]);
@@ -1103,7 +1103,7 @@ fn named_callable_materialization_module_split_same_name_materialization() {
         "each module's run calls its own helper through CallScript"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(
@@ -1258,7 +1258,7 @@ fn module_callable_schema_preserves_cross_module_array_argument() {
         "only splice declares (string, array) and it must keep its string result"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm
         .run()
         .expect("cross-module array argument call should run");
@@ -1284,7 +1284,7 @@ fn module_callable_schema_literal_array_control() {
         result;
     "#;
     let compiled = compile_source(root_source).expect("literal array control should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("literal array control should run");
     assert_eq!(status, VmStatus::Halted);
     assert_result_map_kind(&vm, "ok");
@@ -1392,7 +1392,7 @@ fn module_callable_schema_preserves_first_map_parameter() {
         "complete must keep its (map, string, string, string) -> map schema"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm
         .run()
         .expect("first-map-parameter module graph should run");
@@ -1492,7 +1492,7 @@ fn module_callable_schema_second_parameter_control() {
         1,
         "complete must keep its (map, string, string, string) -> map schema"
     );
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("second-map-parameter control should run");
     assert_eq!(status, VmStatus::Halted);
     // The fixture's `complete(profile, ...)` reads `model` from the profile
@@ -1562,7 +1562,7 @@ fn callable_schema_survives_vmbc_round_trip_for_merged_modules() {
     }
     vm::validate_program(&decoded, 0).expect("decoded merged program should validate");
 
-    let mut vm = Vm::new(decoded);
+    let mut vm = Vm::try_new(decoded).expect("test VM construction must not fail");
     let status = vm.run().expect("decoded merged program should run");
     assert_eq!(status, VmStatus::Halted);
     assert_result_map_kind(&vm, "ok");
@@ -1617,7 +1617,7 @@ fn merged_module_graph_wrong_argument_reports_callable_argument_schema_mismatch(
         1,
         "splice must keep its (string, array) -> string schema in the merged graph"
     );
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     assert!(matches!(
         vm.run(),
         Err(vm::VmError::TypeMismatch("callable argument schema"))
@@ -1702,7 +1702,7 @@ fn wide_frame_exceeds_liveness_compaction_threshold() {
         compiled.program.local_count
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("wide-frame call should run");
     assert_eq!(status, VmStatus::Halted);
     match vm.stack().last() {
@@ -1767,7 +1767,7 @@ fn root_and_module_functions_share_schema_ab_contract() {
         2,
         "root and module ident must both keep their (map, string) -> string schema"
     );
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("root and module ident calls should run");
     assert_eq!(status, VmStatus::Halted);
     match vm.stack().last() {
@@ -1957,7 +1957,7 @@ fn body_defined_local_never_aliases_parameter_slot() {
         );
     }
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm
         .run()
         .expect("five-parameter caller with body-defined locals must run");
@@ -2066,7 +2066,7 @@ fn parameter_interference_preserves_local_slot_compaction_smoke() {
         compiled.program.local_count
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("boundary fixture should run");
     assert_eq!(status, VmStatus::Halted);
     match vm.stack().last() {
@@ -2152,7 +2152,7 @@ fn closure_parameter_stays_live_for_whole_closure_body() {
         "the closure body local must not share the parameter's physical slot: param {param_slots:?}, local at {local_slot}"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("closure fixture should run");
     assert_eq!(status, VmStatus::Halted);
     match vm.stack().last() {
@@ -2246,7 +2246,7 @@ fn nested_closure_parameters_stay_scoped_to_own_bodies() {
         "the inner closure body local must not share a parameter's physical slot: params {inner_param_slots:?}, inner_local at {inner_local_slot}"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("nested closure fixture should run");
     assert_eq!(status, VmStatus::Halted);
     match vm.stack().last() {
@@ -2330,7 +2330,7 @@ fn assign_to_parameter_keeps_full_body_interference_smoke() {
         "the body local must not share the parameter's physical slot even after an assign-to-param: param {param_slots:?}, c at {local_slot}"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("assign-to-param fixture should run");
     assert_eq!(status, VmStatus::Halted);
     match vm.stack().last() {
@@ -2472,7 +2472,7 @@ fn non_param_locals_still_compact_beside_wide_parameter_frames() {
         compiled.locals
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("wide-parameter program should run");
     assert_eq!(status, VmStatus::Halted);
     let expected: i64 = (0..local_count as i64).sum::<i64>() + (param_count as i64 - 1);
@@ -2528,7 +2528,7 @@ fn closure_local_call_keeps_unrelated_locals_compact() {
         compiled.locals
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("closure LocalCall program should run");
     assert_eq!(status, VmStatus::Halted);
     let mut expected = String::from("a");
@@ -2599,7 +2599,7 @@ fn nested_local_call_in_call_arg_optional_key_and_unwrap_fallback_stays_compact(
         compiled.locals
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("nested-LocalCall program should run");
     assert_eq!(status, VmStatus::Halted);
     let mut expected_tail = String::from("a");

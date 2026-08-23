@@ -70,7 +70,7 @@ fn same_exported_function_name_in_two_namespaces_calls_separately() {
     let main_path = write_same_export_fixture(&root);
 
     let compiled = compile_source_file(&main_path).expect("same-named exports should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(
@@ -110,7 +110,7 @@ fn same_named_private_helpers_are_resolved_within_their_own_module() {
     let main_path = write_same_export_fixture(&root);
 
     let compiled = compile_source_file(&main_path).expect("same-named helpers should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(
@@ -147,7 +147,7 @@ fn named_import_aliases_resolve_to_distinct_symbols() {
     );
 
     let compiled = compile_source_file(&main_path).expect("named alias imports should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(
@@ -187,7 +187,7 @@ fn local_functions_resolve_within_their_own_module() {
     );
 
     let compiled = compile_source_file(&main_path).expect("local functions should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(
@@ -248,7 +248,7 @@ fn ambiguous_direct_call_to_same_name_from_two_modules_is_a_diagnostic() {
         "main source",
     );
     let compiled = compile_source_file(&main_path).expect("qualified calls should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("vm should run"), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(1), Value::Int(2)]);
 
@@ -335,7 +335,7 @@ fn same_stem_modules_do_not_collide_local_binding_scope_names() {
         "same-stem modules must not share a scope identity: {x_names:?}"
     );
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     assert_eq!(vm.run().expect("vm should run"), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(7), Value::Int(8)]);
 

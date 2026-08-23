@@ -12,7 +12,7 @@ use vm::{
 };
 
 fn new_vm() -> Vm {
-    Vm::new(Program::new(Vec::new(), Vec::new()))
+    Vm::try_new(Program::new(Vec::new(), Vec::new())).expect("test VM construction must not fail")
 }
 
 fn fake_key() -> ResourceTypeKey {
@@ -72,7 +72,7 @@ fn fake(value: i64) -> (FakeResource, Arc<AtomicUsize>) {
 
 #[test]
 fn raw_handle_frame_supports_borrow_mut_and_take_owned_then_rejects_old_handle() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (resource, closes) = fake(7);
     let token = table.push(resource).expect("push");
     let handle = token.handle();
@@ -119,7 +119,7 @@ fn raw_handle_frame_supports_borrow_mut_and_take_owned_then_rejects_old_handle()
 
 #[test]
 fn wrong_type_or_key_and_late_bad_argument_leave_every_take_unconsumed() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (resource, _) = fake(1);
     let first = table.push(resource).expect("push");
     let first_handle = first.handle();
@@ -168,7 +168,7 @@ fn wrong_type_or_key_and_late_bad_argument_leave_every_take_unconsumed() {
 
 #[test]
 fn alias_rules_are_checked_before_any_take_and_shared_borrows_are_allowed() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let (resource, _) = fake(3);
     let token = table.push(resource).expect("push");
     let handle = token.handle();
@@ -209,7 +209,8 @@ fn alias_rules_are_checked_before_any_take_and_shared_borrows_are_allowed() {
 
 #[test]
 fn take_owned_rejects_children_and_associated_operations_without_consuming() {
-    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), Vec::new()))
+        .expect("test VM construction must not fail");
     let parent = vm.host_context().push_resource(fake(10).0).expect("parent");
     vm.host_context()
         .push_child_resource(fake(20).0, &parent)
@@ -234,7 +235,8 @@ fn take_owned_rejects_children_and_associated_operations_without_consuming() {
         Some(vm::ResourceOwnership::GuestOwned)
     );
 
-    let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    let mut vm = Vm::try_new(Program::new(Vec::new(), Vec::new()))
+        .expect("test VM construction must not fail");
     let token = vm
         .host_context()
         .push_resource(fake(30).0)
@@ -313,7 +315,7 @@ fn request_modes_keep_value_outside_the_resource_adapter() {
 
 #[test]
 fn resource_frame_rejects_repeated_mutable_borrow_for_one_request() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let token = table.push(fake(1).0).expect("push");
     let frame = table
         .begin_resource_access(vec![ResourceAccessRequest::borrow_mut::<FakeResource>(
@@ -333,7 +335,7 @@ fn resource_frame_rejects_repeated_mutable_borrow_for_one_request() {
 
 #[test]
 fn distinct_resource_requests_allow_multiple_mutable_guards() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let first = table.push(fake(1).0).expect("first");
     let second = table.push(fake(2).0).expect("second");
     let frame = table
@@ -357,7 +359,7 @@ fn distinct_resource_requests_allow_multiple_mutable_guards() {
 
 #[test]
 fn explicit_key_mismatch_is_rejected_before_push_mutation() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let error = table
         .push_with_key(fake(1).0, other_key())
         .expect_err("static resource key mismatch must reject the push");
@@ -367,7 +369,7 @@ fn explicit_key_mismatch_is_rejected_before_push_mutation() {
 
 #[test]
 fn from_value_key_mismatch_stays_structured_in_vm_error() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let token = table.push(fake(2).0).expect("push");
     let error = ResourceAccessRequest::from_value_with_key::<FakeResource>(
         &token.handle().as_value(),
@@ -388,7 +390,7 @@ fn from_value_key_mismatch_stays_structured_in_vm_error() {
 
 #[test]
 fn legacy_resource_requires_an_explicit_key_for_exact_frame_access() {
-    let mut table = ResourceTable::new();
+    let mut table = ResourceTable::new().expect("table");
     let key = ResourceTypeKey::new("test.legacy").expect("valid key");
     let token = table
         .push_with_key(LegacyResource(7), key.clone())

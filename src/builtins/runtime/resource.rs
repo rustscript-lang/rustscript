@@ -1,3 +1,8 @@
+// Legacy resource arena retained only as a test fixture: the execution
+// scope's modern resource table is the single production authority for
+// resource handles. Production code no longer references this module.
+#![cfg_attr(not(test), allow(dead_code))]
+
 use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -21,11 +26,79 @@ const HANDLE_ARENA_SHIFT: u64 = HANDLE_SLOT_SHIFT + HANDLE_SLOT_BITS;
 const HANDLE_TYPE_MASK: u64 = (1 << HANDLE_TYPE_BITS) - 1;
 const HANDLE_GENERATION_MASK: u64 = (1 << HANDLE_GENERATION_BITS) - 1;
 const HANDLE_SLOT_MASK: u64 = (1 << HANDLE_SLOT_BITS) - 1;
-const HANDLE_ARENA_MASK: u64 = (1 << HANDLE_ARENA_BITS) - 1;
+/// Maximum valid arena identity handed out by the legacy runtime arena.
+/// `pub(crate)` so exhaustion tests can wire the deterministic seam to the
+/// exact boundary.
+pub(crate) const HANDLE_ARENA_MASK: u64 = (1 << HANDLE_ARENA_BITS) - 1;
 
 /// Process-wide monotonic arena identity source. Arena identities are not
 /// recycled, so a handle from a dropped VM cannot resolve in a later VM.
 static NEXT_ARENA_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Test seam for deterministic arena-exhaustion coverage.
+///
+/// The legacy runtime arena hands out process-unique ids from
+/// [`NEXT_ARENA_ID`] and can only reach `HANDLE_ARENA_MASK` after
+/// ~1,048,575 arenas have been created in one process, which no test suite
+/// can (or should) reproduce deterministically. Exhaustion tests therefore
+/// install a private counter for their own thread; [`ResourceArena::with_limit`]
+/// hands out arena ids from that counter while it is installed, and every
+/// other thread keeps allocating from the real process-global source. This
+/// keeps exhaustion deterministic, order-independent, and parallel-safe, and
+/// never mutates the real global allocator.
+///
+/// The override is per-thread (a `thread_local`), so concurrent tests on
+/// other threads are completely unaffected: they keep seeing the real
+/// `NEXT_ARENA_ID` and keep receiving process-unique monotonic ids.
+#[cfg(test)]
+pub(crate) mod test_seam {
+    use std::cell::Cell;
+    use std::sync::atomic::AtomicU64;
+
+    thread_local! {
+        static ARENA_SOURCE: Cell<Option<&'static AtomicU64>> = const { Cell::new(None) };
+    }
+
+    /// The arena-id source installed for the current thread, if any.
+    pub(crate) fn source() -> Option<&'static AtomicU64> {
+        ARENA_SOURCE.with(|cell| cell.get())
+    }
+
+    /// RAII guard installing `counter` as this thread's arena-id source for
+    /// the duration of the guard. Restores the previous source on drop.
+    pub(crate) struct ScopedArenaSource;
+
+    impl ScopedArenaSource {
+        pub(crate) fn install(counter: &'static AtomicU64) -> Self {
+            ARENA_SOURCE.with(|cell| {
+                assert!(
+                    cell.get().is_none(),
+                    "nested arena source override is unsupported"
+                );
+                cell.set(Some(counter));
+            });
+            Self
+        }
+    }
+
+    impl Drop for ScopedArenaSource {
+        fn drop(&mut self) {
+            ARENA_SOURCE.with(|cell| cell.set(None));
+        }
+    }
+}
+
+/// Returns the arena-id source for the current thread: the installed test
+/// seam override (test builds only), or the real process-global source.
+fn arena_id_source() -> &'static AtomicU64 {
+    #[cfg(test)]
+    {
+        if let Some(counter) = test_seam::source() {
+            return counter;
+        }
+    }
+    &NEXT_ARENA_ID
+}
 
 /// Stable resource type identity carried by every opaque handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -162,7 +235,7 @@ impl ResourceArena {
             )
             .with_limit(HANDLE_SLOT_MASK as usize));
         }
-        let arena_id = NEXT_ARENA_ID
+        let arena_id = arena_id_source()
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |arena_id| {
                 (arena_id <= HANDLE_ARENA_MASK).then_some(arena_id + 1)
             })
@@ -425,13 +498,6 @@ impl ResourceArena {
     }
 }
 
-impl Default for ResourceArena {
-    fn default() -> Self {
-        Self::with_limit(DEFAULT_MAX_RESOURCES)
-            .expect("default resource arena configuration should be valid")
-    }
-}
-
 impl Drop for ResourceArena {
     fn drop(&mut self) {
         let _ = self.close_all(CancellationReason::VmReset);
@@ -523,6 +589,7 @@ fn type_mismatch(handle: ResourceHandle, expected: ResourceTypeId) -> RuntimeErr
 
 #[cfg(test)]
 mod tests {
+    use super::RuntimeErrorCode;
     use super::{CancellationReason, ResourceArena, ResourceTypeId};
 
     #[test]
@@ -544,5 +611,54 @@ mod tests {
 
         assert_eq!(replacement.slot_identity(), first.slot_identity());
         assert_eq!(replacement.generation(), first.generation() + 1);
+    }
+
+    #[test]
+    fn legacy_arena_with_limit_hands_out_last_id_then_fails_typed_at_exhaustion() {
+        // A fresh per-thread counter starting at the maximum handout: the first
+        // construction succeeds; the next one fails typed with
+        // `ResourceIdExhausted` rather than panicking.
+        static COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(super::HANDLE_ARENA_MASK);
+        let _source = super::test_seam::ScopedArenaSource::install(&COUNTER);
+
+        ResourceArena::with_limit(1).expect("last arena id must hand out");
+
+        let Err(error) = ResourceArena::with_limit(1) else {
+            panic!("arena space must be exhausted");
+        };
+        assert_eq!(
+            error.code(),
+            RuntimeErrorCode::ResourceIdExhausted,
+            "legacy arena exhaustion must remain typed"
+        );
+    }
+
+    #[test]
+    fn legacy_arena_failed_allocation_does_not_advance_the_counter() {
+        // Fresh counter per test so the suite stays order-independent. Start at
+        // the max: the first call hands out the last id (and advances to
+        // MAX+1); every later call must fail typed and must not advance the
+        // counter further (fetch_update only advances on success).
+        static COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(super::HANDLE_ARENA_MASK);
+        let _source = super::test_seam::ScopedArenaSource::install(&COUNTER);
+
+        ResourceArena::with_limit(1).expect("the last arena id must hand out");
+
+        for _ in 0..3 {
+            let Err(error) = ResourceArena::with_limit(1) else {
+                panic!("arena space must be exhausted");
+            };
+            assert_eq!(error.code(), RuntimeErrorCode::ResourceIdExhausted);
+
+            // A failed handout never advances the counter; the next attempt is
+            // therefore also typed (no wrap, no reuse, no silent advance).
+            assert_eq!(
+                COUNTER.load(std::sync::atomic::Ordering::SeqCst),
+                super::HANDLE_ARENA_MASK + 1,
+                "failed allocation must not advance the arena counter"
+            );
+        }
     }
 }

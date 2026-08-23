@@ -16,10 +16,8 @@
 use std::fmt;
 use std::task::{Context, Poll, Waker};
 
-use crate::builtins::runtime::cancellation::{
-    CancellationReason, CancellationToken, OperationId, OperationState, OperationStatus,
-};
-use crate::builtins::runtime::error::RuntimeError;
+use crate::builtins::runtime::cancellation::{CancellationReason, CancellationToken};
+use crate::builtins::runtime::error::{RuntimeError, RuntimeErrorCode};
 use crate::vm::{CallOutcome, CallReturn, Value, Vm, VmError, VmResult, VmStatus, VmYieldReason};
 
 /// One item yielded by an invocation stream.
@@ -409,39 +407,41 @@ impl Vm {
         }
     }
 
-    /// Captures the state of the host operation the VM is waiting on, if any.
+    /// Captures the operation id the VM is waiting on, if any.
     ///
     /// The waiting state must be captured after `run()` (the step may have
-    /// registered a new host op) and before a poll that may fail and remove
-    /// the operation from the registry: `map_invocation_error` needs the
-    /// retained state to recover the typed `OperationStatus::Failed` error
-    /// once the waiting state has been cleared.
-    fn capture_waiting_operation(&self) -> Option<OperationState> {
-        self.instance
-            .waiting_host_op
-            .as_ref()
-            .and_then(|op| OperationId::from_raw(op.op_id).ok())
-            .and_then(|operation_id| self.host.runtime_operations.get(operation_id).ok())
+    /// registered a new host op) and before a poll that may fail: the typed
+    /// error recovery in [`map_invocation_error`](Self::map_invocation_error)
+    /// needs the id once the waiting state has been cleared.
+    fn capture_waiting_operation(&self) -> Option<u64> {
+        self.instance.waiting_host_op.as_ref().map(|op| op.op_id)
     }
 
     /// Maps a low-level VM failure to the typed invocation error, preserving
     /// structured runtime errors from `stream::emit` validation and from failed
-    /// host operations. The waiting operation state is captured by the caller
-    /// before the poll that may fail and remove it from the registry.
+    /// host operations. The waiting operation id is captured by the caller
+    /// before the poll that may fail and clear the waiting state; the typed
+    /// failure is recovered from the single execution-scope registry.
     fn map_invocation_error(
         &mut self,
         error: VmError,
-        waiting_operation: Option<OperationState>,
+        waiting_operation: Option<u64>,
     ) -> InvocationError {
         if let Some(state) = self.instance.invocation.as_mut()
             && let Some(runtime_error) = state.pending_error.take()
         {
             return InvocationError::Capability(runtime_error);
         }
-        if let Some(operation) = waiting_operation
-            && let OperationStatus::Failed(runtime_error) = operation.status()
-        {
-            return InvocationError::Capability(runtime_error);
+        if let Some(op_id) = waiting_operation {
+            if let Ok(scope_id) = crate::vm::operation::OperationId::from_raw(op_id)
+                && let Ok(status) = self.host.execution_scope().operations().status(scope_id)
+                && let crate::vm::operation::OperationStatus::Failed(operation_error) = status
+            {
+                return InvocationError::Capability(runtime_error_from_operation(
+                    op_id,
+                    operation_error,
+                ));
+            }
         }
         match error {
             VmError::OutOfFuel { needed, remaining } => {
@@ -542,4 +542,20 @@ enum DriveOutcome {
     Continue,
     Pending,
     Error(InvocationError),
+}
+
+/// Converts a modern execution-scope operation failure into the typed
+/// runtime capability error the invocation boundary exposes. The
+/// namespace/code mirror the historical host-bridge vocabulary so the
+/// embedding-facing typed error is stable.
+pub(crate) fn runtime_error_from_operation(
+    op_id: u64,
+    operation_error: crate::vm::operation::OperationError,
+) -> RuntimeError {
+    RuntimeError::new(
+        RuntimeErrorCode::OperationFailed,
+        "runtime::host_bridge",
+        operation_error.to_string(),
+    )
+    .with_value(op_id)
 }

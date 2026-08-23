@@ -173,6 +173,11 @@ name = "vm_resource_ownership_consumer_tests"
 path = "tests/vm_resource_ownership_consumer_tests.rs"
 required-features = ["runtime"]
 
+[[test]]
+name = "vm_execution_scope_reset_tests"
+path = "tests/vm_execution_scope_reset_tests.rs"
+required-features = ["runtime"]
+
 [build-dependencies]
 syn = { version = "2", features = ["full"] }
 pd-host-schema = { path = "./crates/pd-host-schema" }

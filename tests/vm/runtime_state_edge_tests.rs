@@ -31,7 +31,7 @@ fn noop_waker() -> Waker {
 }
 
 fn new_runtime_state_vm(program: Program) -> Vm {
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_drop_contract_events_enabled(true);
     vm
 }

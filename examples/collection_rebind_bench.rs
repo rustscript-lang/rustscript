@@ -1,12 +1,57 @@
 use std::env;
+use std::error::Error;
+use std::fmt::{Display, Formatter};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use vm::{JitConfig, JitTraceTerminal, Program, Value, Vm, VmStatus, compile_source};
+use vm::{JitConfig, JitTraceTerminal, Program, Value, Vm, VmError, VmStatus, compile_source};
 
 const DEFAULT_WIDTH: usize = 256;
 const DEFAULT_ITERATIONS: usize = 50_000;
 const DEFAULT_SAMPLES: usize = 15;
+
+#[derive(Debug)]
+enum BenchError {
+    Message(String),
+    Vm { context: String, source: VmError },
+}
+
+impl BenchError {
+    fn message(message: impl Into<String>) -> Self {
+        Self::Message(message.into())
+    }
+
+    fn vm(context: impl Into<String>, source: VmError) -> Self {
+        Self::Vm {
+            context: context.into(),
+            source,
+        }
+    }
+}
+
+impl Display for BenchError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Message(message) => formatter.write_str(message),
+            Self::Vm { context, source } => write!(formatter, "{context}: {source}"),
+        }
+    }
+}
+
+impl Error for BenchError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Vm { source, .. } => Some(source),
+            Self::Message(_) => None,
+        }
+    }
+}
+
+impl From<String> for BenchError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 enum Workload {
@@ -105,7 +150,7 @@ fn main() {
     }
 }
 
-fn run() -> Result<(), String> {
+fn run() -> Result<(), BenchError> {
     let config = Config::parse()?;
     let modes: &[ExecMode] = if config.jit_only {
         &[ExecMode::Jit]
@@ -190,18 +235,21 @@ fn measure(
     workload: Workload,
     mode: ExecMode,
     config: Config,
-) -> Result<Measurement, String> {
-    let mut vm = configured_vm(program, mode);
-    let warmup = vm
-        .run()
-        .map_err(|err| format!("{} {} warmup failed: {err}", workload.label(), mode.label()))?;
+) -> Result<Measurement, BenchError> {
+    let mut vm = configured_vm(program, mode)?;
+    let warmup = vm.run().map_err(|source| {
+        BenchError::vm(
+            format!("{} {} warmup failed", workload.label(), mode.label()),
+            source,
+        )
+    })?;
     verify_result(&vm, warmup, config)?;
     if matches!(mode, ExecMode::Jit) && vm.jit_native_exec_count() == 0 {
-        return Err(format!(
+        return Err(BenchError::message(format!(
             "{} warmup did not execute native traces:\n{}",
             workload.label(),
             vm.dump_jit_info()
-        ));
+        )));
     }
 
     let snapshot_before = vm.jit_snapshot();
@@ -225,18 +273,21 @@ fn measure(
         vm.reset_for_reuse();
         let native_execs_before_sample = vm.jit_native_exec_count();
         let started = Instant::now();
-        let status = vm
-            .run()
-            .map_err(|err| format!("{} {} run failed: {err}", workload.label(), mode.label()))?;
+        let status = vm.run().map_err(|source| {
+            BenchError::vm(
+                format!("{} {} run failed", workload.label(), mode.label()),
+                source,
+            )
+        })?;
         let elapsed = started.elapsed();
         verify_result(&vm, status, config)?;
         if matches!(mode, ExecMode::Jit) && vm.jit_native_exec_count() <= native_execs_before_sample
         {
-            return Err(format!(
+            return Err(BenchError::message(format!(
                 "{} measured run did not execute a warmed native trace:\n{}",
                 workload.label(),
                 vm.dump_jit_info()
-            ));
+            )));
         }
         generic_builtin_calls = generic_builtin_calls
             .saturating_add(vm.interpreter_metrics_snapshot().generic_builtin_call_count);
@@ -251,11 +302,11 @@ fn measure(
         || measured_recorded_traces != recorded_traces
         || measured_native_traces != native_traces
     {
-        return Err(format!(
+        return Err(BenchError::message(format!(
             "{} {} changed JIT trace state during measured runs: warmup=attempts:{trace_attempts}/recorded:{recorded_traces}/native:{native_traces} measured=attempts:{measured_trace_attempts}/recorded:{measured_recorded_traces}/native:{measured_native_traces}",
             workload.label(),
             mode.label(),
-        ));
+        )));
     }
     let metrics_after = snapshot_after.metrics;
     Ok(Measurement {
@@ -281,14 +332,15 @@ fn measure(
     })
 }
 
-fn configured_vm(program: &Program, mode: ExecMode) -> Vm {
-    let mut vm = Vm::new(program.clone());
+fn configured_vm(program: &Program, mode: ExecMode) -> Result<Vm, BenchError> {
+    let mut vm = Vm::try_new(program.clone())
+        .map_err(|source| BenchError::vm("vm construction failed", source))?;
     vm.set_jit_config(JitConfig {
         enabled: matches!(mode, ExecMode::Jit),
         hot_loop_threshold: 1,
         max_trace_len: 16_384,
     });
-    vm
+    Ok(vm)
 }
 
 fn verify_result(vm: &Vm, status: VmStatus, config: Config) -> Result<(), String> {

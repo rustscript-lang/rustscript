@@ -67,7 +67,8 @@ mod tests {
         let mut bc = BytecodeBuilder::new();
         bc.ldc(0);
         bc.ret();
-        let mut vm = Vm::new(Program::new(vec![Value::Int(7)], bc.finish()));
+        let mut vm = Vm::try_new(Program::new(vec![Value::Int(7)], bc.finish()))
+            .expect("test VM construction must not fail");
         let args: &[Value] = &[];
 
         assert!(
@@ -94,7 +95,8 @@ mod tests {
 
     #[test]
     fn builtin_aot_dump_reports_disabled_and_exec_count_defaults() {
-        let mut vm = Vm::new(Program::new(Vec::new(), vec![crate::OpCode::Ret as u8]));
+        let mut vm = Vm::try_new(Program::new(Vec::new(), vec![crate::OpCode::Ret as u8]))
+            .expect("test VM construction must not fail");
         let args: &[Value] = &[];
 
         assert_eq!(

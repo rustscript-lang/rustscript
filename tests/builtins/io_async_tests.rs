@@ -8,7 +8,7 @@ use vm::{
 fn run_source(source: &str) -> Result<Vec<Value>, VmError> {
     let compiled =
         compile_source(&format!("use io;\n{source}")).expect("async io source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     super::async_test_bridge::install(&mut vm);
 
     let mut status = vm.run()?;
@@ -140,7 +140,7 @@ fn async_io_silent_pipe_read_cancellation() {
     )
     .expect("source should compile");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     super::async_test_bridge::install(&mut vm);
 
     // Run until we're waiting on the pipe read, with a bounded timeout.
@@ -451,7 +451,7 @@ fn async_io_blocked_write_cancellation() {
     )
     .expect("source should compile");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     super::async_test_bridge::install(&mut vm);
 
     let mut status = vm.run().expect("vm should start");
@@ -507,7 +507,7 @@ fn async_io_flush_cancellation() {
     )
     .expect("source should compile");
 
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     super::async_test_bridge::install(&mut vm);
 
     let mut status = vm.run().expect("vm should start");

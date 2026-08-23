@@ -6,19 +6,6 @@ use std::task::{Context, Poll};
 use crate::builtins::BuiltinFunction;
 use crate::host_api::{HostApiCatalog, HostApiFingerprint};
 use crate::vm::{CallOutcome, CallReturn, HostOpId, Value, Vm, VmResult};
-#[cfg(feature = "async")]
-use crate::vm::{CaptureAsyncHostContext, HostFutureOutput, VmError};
-
-use self::cancellation::{CancellationReason, OperationId, OperationOwner, OperationState};
-use self::error::{RuntimeError, RuntimeErrorCode};
-use self::resource::ResourceHandle;
-
-type RuntimeOperationPoller = fn(&mut Vm, HostOpId, &mut Context<'_>) -> Poll<VmResult<CallReturn>>;
-
-const RUNTIME_OPERATION_POLLERS: &[(OperationOwner, RuntimeOperationPoller)] = &[
-    // IO has migrated to the HostOperation/HostResource generic scope SDK.
-    // The legacy RUNTIME_OPERATION_POLLERS entry for IO has been removed.
-];
 
 mod aot;
 mod bytes;
@@ -288,129 +275,6 @@ pub(crate) fn execute_builtin_call(
     }
 }
 
-pub(crate) fn cancel_builtin_io_op_with_reason(
-    vm: &mut Vm,
-    op_id: HostOpId,
-    reason: CancellationReason,
-) {
-    let Ok(op_id) = OperationId::from_raw(op_id) else {
-        return;
-    };
-    cancel_runtime_operation(vm, op_id, reason);
-}
-
-pub(crate) fn cancel_runtime_operation(
-    vm: &mut Vm,
-    op_id: OperationId,
-    reason: CancellationReason,
-) {
-    let payload = vm
-        .host
-        .runtime_operations
-        .get(op_id)
-        .ok()
-        .and_then(|operation| operation.payload());
-    let _ = vm.host.runtime_operations.cancel(op_id, reason);
-    if let Some(payload) = payload {
-        let _ = close_runtime_resource(vm, payload, reason);
-    }
-}
-
-fn cancel_runtime_operations(
-    vm: &mut Vm,
-    operations: Vec<OperationState>,
-    reason: CancellationReason,
-) {
-    let operations = operations
-        .into_iter()
-        .map(|operation| {
-            let payload = operation.payload();
-            (operation, payload)
-        })
-        .collect::<Vec<_>>();
-    for (operation, _) in &operations {
-        operation.token().mark_cancelled(reason);
-    }
-    for (operation, _) in &operations {
-        let _ = vm.host.runtime_operations.cancel(operation.id(), reason);
-    }
-    for (_, payload) in operations {
-        if let Some(payload) = payload {
-            let _ = close_runtime_resource(vm, payload, reason);
-        }
-    }
-}
-
-pub(crate) fn close_runtime_resource(
-    vm: &mut Vm,
-    handle: ResourceHandle,
-    reason: CancellationReason,
-) -> error::RuntimeResult<resource::CloseStatus> {
-    let operations = vm.host.runtime_operations.operations_for_resource(handle);
-    cancel_runtime_operations(vm, operations, reason);
-    vm.host.runtime_resources.close(handle, reason)
-}
-
-pub(crate) fn poll_builtin_io_op(
-    vm: &mut Vm,
-    op_id: HostOpId,
-    cx: &mut Context<'_>,
-) -> Poll<VmResult<CallReturn>> {
-    let operation_id = match OperationId::from_raw(op_id) {
-        Ok(operation_id) => operation_id,
-        Err(error) => {
-            return Poll::Ready(Err(crate::vm::VmError::HostError(error.to_string())));
-        }
-    };
-    let operation = match vm.host.runtime_operations.get(operation_id) {
-        Ok(operation) => operation,
-        Err(error) => {
-            return Poll::Ready(Err(crate::vm::VmError::HostError(error.to_string())));
-        }
-    };
-    if let Err(error) = operation.token().check() {
-        let reason = operation
-            .token()
-            .reason()
-            .unwrap_or(CancellationReason::Requested);
-        cancel_builtin_io_op_with_reason(vm, op_id, reason);
-        return Poll::Ready(Err(crate::vm::VmError::HostError(error.to_string())));
-    }
-
-    let Some((_, poller)) = RUNTIME_OPERATION_POLLERS
-        .iter()
-        .find(|(owner, _)| *owner == operation.owner())
-    else {
-        return Poll::Ready(Err(crate::vm::VmError::HostError(format!(
-            "runtime operation owner {:?} is unavailable in this build",
-            operation.owner()
-        ))));
-    };
-    let result = poller(vm, op_id, cx);
-
-    match result {
-        Poll::Pending => Poll::Pending,
-        Poll::Ready(Ok(values)) => {
-            let _ = vm.host.runtime_operations.complete(operation_id);
-            Poll::Ready(Ok(values))
-        }
-        Poll::Ready(Err(error)) => {
-            if let Some(reason) = operation.token().reason() {
-                cancel_builtin_io_op_with_reason(vm, op_id, reason);
-                return Poll::Ready(Err(error));
-            }
-            let runtime_error = RuntimeError::new(
-                RuntimeErrorCode::OperationFailed,
-                "runtime::operation",
-                error.to_string(),
-            )
-            .with_value(op_id);
-            let _ = vm.host.runtime_operations.fail(operation_id, runtime_error);
-            Poll::Ready(Err(error))
-        }
-    }
-}
-
 pub(crate) fn close_all_handles(vm: &mut Vm) {
     vm.host.reset_for_reuse();
 }
@@ -453,7 +317,8 @@ mod tests {
 
     #[test]
     fn builtin_assert_success_returns_no_stack_value() {
-        let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+        let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+            .expect("test VM construction must not fail");
         let mut args = [Value::Bool(true)];
 
         let outcome = execute_builtin_call(&mut vm, BuiltinFunction::Assert, &mut args)

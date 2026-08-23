@@ -1,19 +1,7 @@
-use std::task::{Context, Poll};
-
 use pd_host_function::pd_host_function;
 
 use super::HostCallResult;
-use crate::vm::{CallReturn, HostOpId, Value, Vm, VmError, VmResult};
-
-pub(super) fn poll_builtin_io_op(
-    _vm: &mut Vm,
-    op_id: HostOpId,
-    _cx: &mut Context<'_>,
-) -> Poll<VmResult<CallReturn>> {
-    Poll::Ready(Err(VmError::HostError(format!(
-        "builtin io op {op_id} is unsupported on wasm32 runtime",
-    ))))
-}
+use crate::vm::{Vm, VmError, VmResult};
 
 /// Opens a file handle for runtime I/O.
 #[pd_host_function(name = "io::open")]

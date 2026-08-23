@@ -369,7 +369,7 @@ fn setup(source: &str) -> (Vm, Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<AtomicUsi
     let polls = Arc::new(AtomicUsize::new(0));
     let applied = Arc::new(AtomicUsize::new(0));
     let stopped = Arc::new(AtomicUsize::new(0));
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_async_bridge(Box::new(PendingBridge::default()));
     for function in compiled.functions {
         match function.name.as_str() {
@@ -408,7 +408,7 @@ fn poll_once(vm: &mut Vm) -> Poll<Result<(), VmError>> {
 
 fn direct_callback_vm(source: &str, export: &str) -> (Vm, Value) {
     let compiled = compile_source(source).expect("direct callback source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     assert_eq!(vm.run().unwrap(), VmStatus::Halted);
     let callback = vm.resolve_exported_callable(export).unwrap();
     (vm, callback)
@@ -774,7 +774,7 @@ fn dropping_invocation_during_callback_yield_does_not_resume_the_callback() {
     let applied = Arc::new(AtomicUsize::new(0));
     let stopped = Arc::new(AtomicUsize::new(0));
     let callback_calls = Arc::new(AtomicUsize::new(0));
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_async_bridge(Box::new(PendingBridge::default()));
     for function in compiled.functions {
         match function.name.as_str() {
@@ -863,7 +863,7 @@ fn dropping_invocation_during_producer_wait_retires_the_stream_and_reuses_the_vm
     let applied = Arc::new(AtomicUsize::new(0));
     let stopped = Arc::new(AtomicUsize::new(0));
     let op_id = Arc::new(AtomicUsize::new(0));
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     for function in compiled.functions {
         match function.name.as_str() {
             "synthetic_pending" => {

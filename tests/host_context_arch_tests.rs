@@ -161,7 +161,8 @@ struct FlagState {
 
 #[test]
 fn external_host_extension_registers_typed_state_through_generic_surface() {
-    let mut vm = Vm::new(Program::new(vec![], vec![]));
+    let mut vm =
+        Vm::try_new(Program::new(vec![], vec![])).expect("test VM construction must not fail");
 
     // Freshly registered value is new (no replacement).
     {
@@ -206,7 +207,8 @@ fn external_host_extension_registers_typed_state_through_generic_surface() {
 
 #[test]
 fn host_module_state_survives_invocation_reset() {
-    let mut vm = Vm::new(Program::new(vec![], vec![]));
+    let mut vm =
+        Vm::try_new(Program::new(vec![], vec![])).expect("test VM construction must not fail");
 
     {
         let mut cx = vm.host_context();

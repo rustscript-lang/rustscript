@@ -56,7 +56,7 @@ fn wildcard_import_exposes_all_public_exports_directly_and_by_namespace() {
         compiled.functions.is_empty(),
         "wildcard imports must not produce host imports"
     );
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(10)]);
@@ -112,7 +112,7 @@ fn imported_function_values_resolve_to_module_symbols() {
         compiled.functions.is_empty(),
         "imported function values must not produce host imports"
     );
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(42)]);
@@ -160,7 +160,7 @@ fn generic_calls_work_through_named_namespace_and_alias_import_forms() {
         compiled.functions.is_empty(),
         "generic imported calls must not produce host imports"
     );
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(3)]);
@@ -192,7 +192,7 @@ fn single_segment_module_import_namespace_calls_stay_module_calls() {
         compiled.functions.is_empty(),
         "file-module namespace calls must not become host imports"
     );
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(42)]);
@@ -255,7 +255,7 @@ fn same_exported_name_from_two_modules_resolves_per_namespace() {
     );
 
     let compiled = compile_source_file(&main_path).expect("same-name exports should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(1), Value::Int(2)]);
@@ -330,7 +330,7 @@ fn import_order_swap_produces_identical_behavior() {
 
     let run = |path: &Path| -> Vec<Value> {
         let compiled = compile_source_file(path).expect("compile should succeed");
-        let mut vm = Vm::new(compiled.program);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
         assert_eq!(vm.run().expect("vm should run"), VmStatus::Halted);
         vm.stack().to_vec()
     };

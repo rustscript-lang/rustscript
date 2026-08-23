@@ -43,7 +43,7 @@ fn compile_run_vm(source: &str) -> Vm {
 }
 
 fn new_drop_contract_vm(program: Program) -> Vm {
-    let mut vm = Vm::new(program);
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_drop_contract_events_enabled(true);
     vm
 }
