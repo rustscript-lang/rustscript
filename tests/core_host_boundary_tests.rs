@@ -358,6 +358,131 @@ fn vm_reset_uses_no_domain_owner_or_type_dispatch() {
     }
 }
 
+/// The host-agnostic VM core must not *compose* the standard host surfaces.
+///
+/// Beyond the concrete `register_*_builtin_module` entrypoints (pinned by
+/// `vm_core_never_stages_concrete_standard_surfaces`), the core must also not
+/// reach into the standard builtin composition layer through wrapper
+/// functions or classify imports by concrete `io::` / `http::` / `sqlite::`
+/// namespaces. Composition, missing-surface staging, default-registry
+/// construction and default host-function fallback all belong to the standard
+/// builtin layer; `src/vm` consumes only generic caller-provided registry /
+/// catalog / binding abstractions and exact `HostImport` schemas.
+///
+/// Each needle below is an identifier that names a concrete standard-surface
+/// composition entrypoint (or the concrete surface-flag struct). The scan is
+/// token-based after comments/strings/fixtures are sanitized, so doc comments
+/// discussing the boundary never trip it.
+#[test]
+fn vm_core_never_composes_standard_surfaces() {
+    let sources = scanned_core();
+    assert!(
+        !sources.is_empty(),
+        "the core boundary scan must find production sources"
+    );
+    let composition_entrypoints = [
+        // Catalog composition / fingerprint access.
+        "standard_host_catalog",
+        "standard_host_catalog_fingerprint",
+        // Concrete namespace classification of exact imports.
+        "standard_exact_surface_requirements",
+        // The concrete surface-flag struct (io/http/database).
+        "StandardSurfaces",
+        // Missing-surface staging on a registry.
+        "stage_missing_standard_surfaces",
+        // Fresh full-standard default registry construction.
+        "standard_host_registry",
+        // Legacy by-name default host-function fallback.
+        "bind_default_host_function",
+    ];
+    for (path, code) in &sources {
+        for name in composition_entrypoints {
+            assert!(
+                !contains_token(code, name),
+                "{} must not invoke the standard composition entrypoint `{name}`; \
+                 standard catalog composition / missing-surface staging / default \
+                 registry / default fallback belong in the builtin composition layer",
+                path.display(),
+            );
+        }
+    }
+}
+
+/// The host-agnostic VM core must never classify exact imports by a concrete
+/// standard namespace prefix (`io::`, `http::`, `sqlite::`). Surface
+/// classification is a composition-layer concern: the core only sees opaque
+/// surface flags supplied by the caller-provided composition abstraction.
+///
+/// The structural vehicle of namespace classification is a core helper that
+/// receives a concrete namespace prefix and reports whether that surface is
+/// already registered (`has_standard_surface`). After the dependency
+/// inversion the core no longer defines it — surface presence is computed by
+/// the composition implementation from the generic `exact_entries`
+/// enumeration.
+#[test]
+fn vm_core_never_classifies_imports_by_concrete_namespace() {
+    let sources = scanned_core();
+    assert!(
+        !sources.is_empty(),
+        "the core boundary scan must find production sources"
+    );
+    for (path, code) in &sources {
+        assert!(
+            !contains_token(code, "has_standard_surface"),
+            "{} must not classify imports by concrete namespace via `has_standard_surface`; \
+             concrete surface classification belongs in the builtin composition layer",
+            path.display(),
+        );
+    }
+}
+
+/// The legacy parallel resource system (`ResourceArena`,
+/// `ResourceTypeId::{IO_FILE,CALLBACK,...}`) is retired. Production code must
+/// not define or use it; the generic `vm::resource::ResourceTable` /
+/// `ExecutionScope` contract is the single resource authority. Test fixtures
+/// (the `tests/` tree and `#[cfg(test)]` modules) are deliberately not
+/// scanned: they exist to discuss the forbidden tokens.
+///
+/// The scan covers the two former homes of the retired system — the VM core
+/// and the standard builtin runtime layer. (A whole-`src/` scan would drag in
+/// unrelated compiler files whose `#[cfg(test)]` block structure the
+/// sanitizer's brace-balancer does not handle; those files can never define
+/// the retired arena anyway.)
+#[test]
+fn production_never_defines_or_uses_legacy_resource_arena() {
+    let mut files = Vec::new();
+    for dir in ["src/vm", "src/builtins/runtime"] {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(dir);
+        collect(&root, &mut files);
+    }
+    files.retain(|path| {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        name != "tests.rs" && name != "host_stream_tests.rs"
+    });
+    files.sort();
+    files.dedup();
+    assert!(!files.is_empty(), "production sources must be scanned");
+    for path in files {
+        let source = fs::read_to_string(&path).expect("read production source");
+        let code = sanitize(&source);
+        for (needle, label) in [
+            ("ResourceArena", "ResourceArena"),
+            ("ResourceTypeId", "ResourceTypeId"),
+            ("IO_FILE", "domain resource constant IO_FILE"),
+            ("CALLBACK", "domain resource constant CALLBACK"),
+        ] {
+            assert!(
+                !contains_token(&code, needle),
+                "{} must not define or use the retired {label}",
+                path.display(),
+            );
+        }
+    }
+}
+
 #[test]
 fn resource_core_and_operation_core_are_domain_free() {
     for dir in ["src/vm/resource", "src/vm/operation"] {

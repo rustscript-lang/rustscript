@@ -150,6 +150,13 @@ impl HostRuntime {
     /// propagate the typed [`HostRuntimeInitError`]; there is no infallible
     /// construction path that can panic on exhaustion.
     pub(crate) fn new() -> Result<Self, HostRuntimeInitError> {
+        // Arm the host-agnostic default composition (idempotent): the standard
+        // builtin layer installs its concrete implementation into the VM
+        // core's generic slot so the VM's name-only / exact-import default
+        // fallback paths can bind standard functions. Without this, a fresh
+        // VM's `ensure_call_bindings` legacy/default path would have no
+        // standard surface to fall back onto.
+        crate::builtins::runtime::ensure_standard_composition_installed();
         Ok(Self {
             host_functions: Vec::new(),
             host_function_symbols: HashMap::new(),

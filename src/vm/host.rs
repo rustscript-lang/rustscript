@@ -1431,18 +1431,17 @@ impl HostFunctionRegistry {
         &self,
         imports: &[HostImport],
     ) -> VmResult<Option<StandardStageResult>> {
-        use crate::builtins::runtime::standard_host_catalog_fingerprint;
-
-        let standard = crate::builtins::runtime::standard_host_catalog();
-        let fingerprint = standard_host_catalog_fingerprint();
+        let Some(composition) = super::standard_composition::default_composition() else {
+            // No standard composition installed (e.g. a build without the
+            // standard builtins): the registry has nothing standard to stage,
+            // so fall through to the ordinary (non-staging) resolution path.
+            return Ok(None);
+        };
+        let fingerprint = composition.standard_catalog_fingerprint();
         if imports.is_empty()
-            || imports.iter().any(|import| {
-                let Some(schema) = import.schema.as_ref() else {
-                    return true;
-                };
-                schema.fingerprint != fingerprint
-                    || standard.functions_named(&import.name).is_empty()
-            })
+            || imports
+                .iter()
+                .any(|import| !composition.import_in_standard(import))
         {
             return Ok(None);
         }
@@ -1465,7 +1464,6 @@ impl HostFunctionRegistry {
         }
         drop(snapshot_guard);
 
-        let required = crate::builtins::runtime::standard_exact_surface_requirements(imports);
         // Reject custom / mixed fingerprints in the registry: an existing
         // exact entry that is not standard-fingerprint compatible must never
         // be combined with the standard snapshot. Restricted registries keep
@@ -1478,11 +1476,9 @@ impl HostFunctionRegistry {
                 return Ok(None);
             }
         }
-        let missing = crate::builtins::runtime::StandardSurfaces {
-            io: required.0 && !self.has_standard_surface("io::", fingerprint),
-            http: required.1 && !self.has_standard_surface("http::", fingerprint),
-            database: required.2 && !self.has_standard_surface("sqlite::", fingerprint),
-        };
+        let required = composition.required_surface_mask(imports);
+        let present = composition.present_surface_mask(self);
+        let missing = required.missing(present);
         if missing.none() {
             // All required surfaces are already present on the current
             // registry; nothing to stage.
@@ -1492,7 +1488,7 @@ impl HostFunctionRegistry {
         }
 
         let mut staged = self.transaction_clone();
-        self.stage_missing_standard_surfaces(&mut staged, missing)?;
+        composition.stage_missing(&mut staged, missing)?;
         self.standard_staging_registrations
             .fetch_add(1, Ordering::Relaxed);
         let staged = Arc::new(staged);
@@ -1509,39 +1505,6 @@ impl HostFunctionRegistry {
         Ok(Some(StandardStageResult { registry: staged }))
     }
 
-    /// Whether the registry already carries at least one exact entry under the
-    /// given namespace prefix registered against the authoritative standard
-    /// fingerprint. Presence means that surface is considered "completed" and
-    /// is not re-registered (duplicates are rejected by the registry).
-    #[cfg(feature = "runtime")]
-    fn has_standard_surface(&self, prefix: &str, fingerprint: HostApiFingerprint) -> bool {
-        self.by_exact.keys().any(|name| {
-            name.starts_with(prefix)
-                && self.by_exact.get(name).is_some_and(|schemas| {
-                    schemas
-                        .keys()
-                        .any(|schema| schema.fingerprint == fingerprint)
-                })
-        })
-    }
-
-    /// Registers only the missing standard adapter surfaces on `staged`,
-    /// leaving every already-present surface untouched.
-    ///
-    /// The concrete registration (which same-crate builtin modules to stage,
-    /// feature-gated per member) lives in the standard builtin composition
-    /// layer ([`crate::builtins::runtime::stage_missing_standard_surfaces`]);
-    /// the VM core only supplies the generic surface flags and stays
-    /// host-agnostic.
-    #[cfg(feature = "runtime")]
-    fn stage_missing_standard_surfaces(
-        &self,
-        staged: &mut HostFunctionRegistry,
-        missing: crate::builtins::runtime::StandardSurfaces,
-    ) -> VmResult<()> {
-        crate::builtins::runtime::stage_missing_standard_surfaces(staged, missing)
-    }
-
     /// Deterministic count of standard auto-stage registration rounds performed
     /// by this registry lineage through [`bind_vm_cached`]. A second bind that
     /// reuses the memoized snapshot does not increment it.
@@ -1556,6 +1519,23 @@ impl HostFunctionRegistry {
             .expect("poisoned lock")
             .as_ref()
             .map(|snapshot| Arc::clone(&snapshot.registry))
+    }
+
+    /// Host-agnostic enumeration of every exact-registered import name and the
+    /// fingerprints its overloads carry.
+    ///
+    /// Provided so the standard composition layer can detect which of its own
+    /// surfaces a registry already carries (by prefix + standard fingerprint).
+    /// The VM core exposes the raw names with no namespace knowledge;
+    /// classifying them is the caller's job.
+    pub(crate) fn exact_entries(&self) -> Vec<(String, Vec<HostApiFingerprint>)> {
+        self.by_exact
+            .iter()
+            .map(|(name, schemas)| {
+                let fingerprints = schemas.keys().map(|schema| schema.fingerprint).collect();
+                (name.clone(), fingerprints)
+            })
+            .collect()
     }
 
     pub fn prepare_plan(&self, imports: &[HostImport]) -> VmResult<HostBindingPlan> {
@@ -3476,11 +3456,16 @@ impl Vm {
                 .any(|import| import.schema.is_none());
             if has_exact_import && !has_legacy_import {
                 // The default fallback for a bare exact-import program stages
-                // every *enabled* standard surface from the composition layer
-                // (IO under `runtime`, HTTP under `http-client`, SQLite under
-                // `sqlite`). The VM core never names a concrete builtin
-                // module or feature.
-                let registry = crate::builtins::runtime::standard_host_registry()?;
+                // every *enabled* standard surface from the caller-provided
+                // composition layer (IO under `runtime`, HTTP under
+                // `http-client`, SQLite under `sqlite`). The VM core never
+                // names a concrete builtin module or feature.
+                let Some(composition) = super::standard_composition::default_composition() else {
+                    return Err(VmError::UnboundImport(
+                        "exact import requires a standard composition".to_string(),
+                    ));
+                };
+                let registry = composition.build_default_registry()?;
                 registry.bind_vm_cached(self)?;
                 return Ok(());
             }
@@ -3495,8 +3480,11 @@ impl Vm {
                 .filter(|import| import.schema.is_none())
                 .map(|import| import.name.clone())
                 .collect::<Vec<_>>();
+            let composition = super::standard_composition::default_composition();
             for name in import_names {
-                let _ = crate::builtins::runtime::bind_default_host_function(self, &name);
+                if let Some(composition) = composition.as_ref() {
+                    let _ = composition.bind_default_name(self, &name);
+                }
             }
         }
 
@@ -3526,20 +3514,22 @@ impl Vm {
                 continue;
             }
 
-            let bound =
-                if let Some(bound) = self.host.host_function_symbols.get(&import.name).copied() {
-                    bound
-                } else if self.host.allow_default_host_fallback
-                    && crate::builtins::runtime::bind_default_host_function(self, &import.name)
-                {
-                    self.host
-                        .host_function_symbols
-                        .get(&import.name)
-                        .copied()
-                        .ok_or_else(|| VmError::UnboundImport(import.name.clone()))?
-                } else {
-                    return Err(VmError::UnboundImport(import.name.clone()));
-                };
+            let bound = if let Some(bound) =
+                self.host.host_function_symbols.get(&import.name).copied()
+            {
+                bound
+            } else if self.host.allow_default_host_fallback
+                && super::standard_composition::default_composition()
+                    .is_some_and(|composition| composition.bind_default_name(self, &import.name))
+            {
+                self.host
+                    .host_function_symbols
+                    .get(&import.name)
+                    .copied()
+                    .ok_or_else(|| VmError::UnboundImport(import.name.clone()))?
+            } else {
+                return Err(VmError::UnboundImport(import.name.clone()));
+            };
             resolved.push(bound);
         }
 

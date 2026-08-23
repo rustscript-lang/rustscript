@@ -28,6 +28,7 @@ pub mod operation;
 pub mod program;
 pub mod resource;
 mod run_context;
+pub(crate) mod standard_composition;
 mod store;
 mod superinstructions;
 #[cfg(test)]

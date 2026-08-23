@@ -14,18 +14,11 @@ mod error;
 #[allow(dead_code)]
 #[path = "../src/builtins/runtime/event.rs"]
 mod event;
-#[allow(dead_code)]
-#[path = "../src/builtins/runtime/resource.rs"]
-mod resource;
-
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cancellation::CancellationReason;
 use context::{RuntimeContext, RuntimeContextConfig};
 use error::RuntimeErrorCode;
 use event::{EventLimits, EventPayload};
-use resource::{CloseStatus, ResourceArena, ResourceHandle, ResourceTypeId};
 use vm::Value;
 
 #[test]
@@ -60,95 +53,6 @@ fn event_payload_validates_the_per_item_bound_before_placement() {
     )
     .expect_err("too-deep event should be rejected");
     assert_eq!(too_deep.code(), RuntimeErrorCode::EventDepthExceeded);
-}
-
-#[test]
-fn resource_handles_are_opaque_bounded_typed_and_cleanup_is_idempotent() {
-    let cleanup_count = Arc::new(AtomicUsize::new(0));
-    let count_for_cleanup = Arc::clone(&cleanup_count);
-    let mut arena = ResourceArena::with_limit(1).expect("resource limit should be valid");
-    let handle = arena
-        .insert_with_cleanup(ResourceTypeId::IO_FILE, 7_u32, move |resource, reason| {
-            assert_eq!(resource, 7);
-            assert_eq!(reason, CancellationReason::ResourceClosed);
-            count_for_cleanup.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        })
-        .expect("first resource should be allocated");
-
-    assert_eq!(
-        arena
-            .get::<u32>(handle, ResourceTypeId::IO_FILE)
-            .expect("handle should resolve"),
-        &7
-    );
-    assert_eq!(
-        ResourceHandle::from_value(&handle.as_value()).expect("VM value should decode"),
-        handle
-    );
-    let Value::Int(encoded) = handle.as_value() else {
-        unreachable!("resource handle should encode as an integer");
-    };
-    let forged_generation = ResourceHandle::from_value(&Value::Int(encoded + (1 << 8)))
-        .expect("the altered token remains structurally valid");
-    let forged = arena
-        .get::<u32>(forged_generation, ResourceTypeId::IO_FILE)
-        .expect_err("an altered generation must not resolve");
-    assert_eq!(forged.code(), RuntimeErrorCode::ResourceStale);
-    let wrong_type = arena
-        .get::<u32>(handle, ResourceTypeId::CALLBACK)
-        .expect_err("wrong resource type should be rejected");
-    assert_eq!(wrong_type.code(), RuntimeErrorCode::ResourceTypeMismatch);
-    let limit_error = arena
-        .insert(ResourceTypeId::IO_FILE, 8_u32)
-        .expect_err("the bounded arena should reject a second resource");
-    assert_eq!(limit_error.code(), RuntimeErrorCode::ResourceLimitExceeded);
-
-    assert_eq!(
-        arena
-            .close(handle, CancellationReason::ResourceClosed)
-            .expect("close should succeed"),
-        CloseStatus::Closed
-    );
-    assert_eq!(
-        arena
-            .close(handle, CancellationReason::ResourceClosed)
-            .expect("repeated close should be harmless"),
-        CloseStatus::AlreadyClosed
-    );
-    assert_eq!(cleanup_count.load(Ordering::SeqCst), 1);
-
-    let replacement = arena
-        .insert(ResourceTypeId::IO_FILE, 9_u32)
-        .expect("capacity should be reusable after close");
-    assert_ne!(
-        replacement, handle,
-        "reusing a slot must change its generation"
-    );
-    let closed = arena
-        .get::<u32>(handle, ResourceTypeId::IO_FILE)
-        .expect_err("the prior generation must not resolve after slot reuse");
-    assert_eq!(closed.code(), RuntimeErrorCode::ResourceStale);
-    assert_eq!(
-        arena
-            .get::<u32>(replacement, ResourceTypeId::IO_FILE)
-            .expect("the replacement generation should resolve"),
-        &9
-    );
-}
-
-#[test]
-fn resource_handles_cannot_cross_resource_arenas() {
-    let mut first = ResourceArena::with_limit(1).expect("resource limit should be valid");
-    let second = ResourceArena::with_limit(1).expect("resource limit should be valid");
-    let handle = first
-        .insert(ResourceTypeId::IO_FILE, 1_u32)
-        .expect("resource should be allocated");
-
-    let error = second
-        .get::<u32>(handle, ResourceTypeId::IO_FILE)
-        .expect_err("a handle from another arena must be rejected");
-    assert_eq!(error.code(), RuntimeErrorCode::ResourceHandleWrongTable);
 }
 
 #[test]

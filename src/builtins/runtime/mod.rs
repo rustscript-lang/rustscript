@@ -26,8 +26,8 @@ mod map_iter;
 mod math;
 pub(crate) mod print;
 pub(crate) mod regex;
-#[cfg_attr(test, allow(dead_code))]
-pub(crate) mod resource;
+mod standard_composition;
+pub(crate) use standard_composition::ensure_standard_composition_installed;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 mod typed;
@@ -87,6 +87,11 @@ fn standard_host_catalog_snapshot() -> &'static StandardHostCatalogSnapshot {
     STANDARD_HOST_CATALOG.get_or_init(|| {
         use crate::host_api::HostApiBuilder;
 
+        // Install the concrete standard-surface composition into the VM core's
+        // generic default slot (idempotent). Any first access to the standard
+        // catalog therefore arms the host-agnostic registry/VM fallback paths.
+        standard_composition::ensure_standard_composition_installed();
+
         let mut builder = HostApiBuilder::new();
         let push = |builder: &mut HostApiBuilder, catalog: &Arc<HostApiCatalog>| {
             for resource in catalog.resources() {
@@ -139,14 +144,6 @@ pub(crate) struct StandardSurfaces {
     pub io: bool,
     pub http: bool,
     pub database: bool,
-}
-
-#[cfg(feature = "runtime")]
-impl StandardSurfaces {
-    /// Whether none of the standard surfaces is required.
-    pub(crate) fn none(&self) -> bool {
-        !self.io && !self.http && !self.database
-    }
 }
 
 /// Registers only the missing standard adapter surfaces on `registry`,
