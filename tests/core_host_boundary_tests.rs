@@ -285,6 +285,43 @@ fn vm_core_never_imports_sqlite_or_rusqlite() {
     }
 }
 
+/// The concrete standard-surface registration entrypoints must never be
+/// invoked from `src/vm`. Staging which same-crate builtin surfaces a program
+/// needs (IO, HTTP, SQLite) is a *composition* decision that belongs in the
+/// standard builtin layer (`builtins::runtime`), not the host-agnostic core.
+///
+/// The earlier token scan only matched a standalone `sqlite` identifier;
+/// identifiers such as `register_sqlite_builtin_module` embedded `sqlite`
+/// between identifier characters and slipped through. This pin catches the
+/// full registration entrypoint names so any direct concrete staging from the
+/// core fails the gate.
+#[test]
+fn vm_core_never_stages_concrete_standard_surfaces() {
+    let sources = scanned_core();
+    assert!(
+        !sources.is_empty(),
+        "the core boundary scan must find production sources"
+    );
+    // These identifiers are the concrete same-crate builtin registration
+    // entrypoints. Presence of any of them in `src/vm` means the host-agnostic
+    // core is directly coupling to a concrete standard domain module.
+    let staging_entrypoints = [
+        "register_io_builtin_module",
+        "register_http_builtin_module",
+        "register_sqlite_builtin_module",
+    ];
+    for (path, code) in &sources {
+        for name in staging_entrypoints {
+            assert!(
+                !contains_token(code, name),
+                "{} must not register the concrete standard surface `{name}`; \
+                 standard-surface staging belongs in the builtin composition layer",
+                path.display(),
+            );
+        }
+    }
+}
+
 #[test]
 fn execution_scope_has_no_sqlite_dispatch() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/vm/execution_scope.rs");

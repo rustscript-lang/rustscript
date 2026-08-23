@@ -633,22 +633,6 @@ impl HostBindingPlan {
     }
 }
 
-/// The standard adapter surfaces a program's exact imports require.
-#[cfg(feature = "runtime")]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct StandardSurfaces {
-    io: bool,
-    http: bool,
-    database: bool,
-}
-
-#[cfg(feature = "runtime")]
-impl StandardSurfaces {
-    fn none(&self) -> bool {
-        !self.io && !self.http && !self.database
-    }
-}
-
 /// The registry a [`HostFunctionRegistry::bind_vm_cached`] should bind from:
 /// either the current registry (all surfaces present) or a freshly staged /
 /// memoized snapshot that already carries every required standard surface.
@@ -1494,7 +1478,7 @@ impl HostFunctionRegistry {
                 return Ok(None);
             }
         }
-        let missing = StandardSurfaces {
+        let missing = crate::builtins::runtime::StandardSurfaces {
             io: required.0 && !self.has_standard_surface("io::", fingerprint),
             http: required.1 && !self.has_standard_surface("http::", fingerprint),
             database: required.2 && !self.has_standard_surface("sqlite::", fingerprint),
@@ -1543,24 +1527,19 @@ impl HostFunctionRegistry {
 
     /// Registers only the missing standard adapter surfaces on `staged`,
     /// leaving every already-present surface untouched.
+    ///
+    /// The concrete registration (which same-crate builtin modules to stage,
+    /// feature-gated per member) lives in the standard builtin composition
+    /// layer ([`crate::builtins::runtime::stage_missing_standard_surfaces`]);
+    /// the VM core only supplies the generic surface flags and stays
+    /// host-agnostic.
     #[cfg(feature = "runtime")]
     fn stage_missing_standard_surfaces(
         &self,
         staged: &mut HostFunctionRegistry,
-        missing: StandardSurfaces,
+        missing: crate::builtins::runtime::StandardSurfaces,
     ) -> VmResult<()> {
-        if missing.io {
-            crate::builtins::runtime::register_io_builtin_module(staged)?;
-        }
-        #[cfg(feature = "http-client")]
-        if missing.http {
-            crate::builtins::runtime::register_http_builtin_module(staged)?;
-        }
-        #[cfg(feature = "sqlite")]
-        if missing.database {
-            crate::builtins::runtime::register_sqlite_builtin_module(staged)?;
-        }
-        Ok(())
+        crate::builtins::runtime::stage_missing_standard_surfaces(staged, missing)
     }
 
     /// Deterministic count of standard auto-stage registration rounds performed
@@ -3496,13 +3475,12 @@ impl Vm {
                 .iter()
                 .any(|import| import.schema.is_none());
             if has_exact_import && !has_legacy_import {
-                let mut registry = HostFunctionRegistry::empty();
-                #[cfg(feature = "runtime")]
-                crate::builtins::runtime::register_io_builtin_module(&mut registry)?;
-                #[cfg(feature = "http-client")]
-                crate::builtins::runtime::register_http_builtin_module(&mut registry)?;
-                #[cfg(feature = "sqlite")]
-                crate::builtins::runtime::register_sqlite_builtin_module(&mut registry)?;
+                // The default fallback for a bare exact-import program stages
+                // every *enabled* standard surface from the composition layer
+                // (IO under `runtime`, HTTP under `http-client`, SQLite under
+                // `sqlite`). The VM core never names a concrete builtin
+                // module or feature.
+                let registry = crate::builtins::runtime::standard_host_registry()?;
                 registry.bind_vm_cached(self)?;
                 return Ok(());
             }

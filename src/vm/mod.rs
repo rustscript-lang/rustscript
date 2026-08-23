@@ -1764,6 +1764,22 @@ impl Drop for Vm {
             .map(|frame| frame.local_count)
             .unwrap_or(self.program.local_count);
         self.release_owned_locals_range(base, count);
+        // Execution-scope shutdown (plan section 5.3): dropping the Vm must
+        // synchronously begin the execution-scope close with the VmDrop
+        // reason and drive one round of the close pipeline with a no-op
+        // waker. That synchronously cancels every pending operation (with the
+        // parallel OperationCancelReason::VmDrop) and issues child-first
+        // `begin_close` to every live resource (with ResourceCloseReason::
+        // VmDrop), so a Pending child can never prevent its parent's
+        // begin_close from running before the owned tables fall through to
+        // their Drop guards. Genuinely event-driven Pending resources stay
+        // Closing here and are released by their own Drop guards — Drop never
+        // blocks, never claims quiescence, and the pool never recycles a
+        // dropped Vm.
+        let _ = self
+            .host
+            .execution_scope_begin_close(ResourceCloseReason::VmDrop);
+        self.host.drive_execution_scope_close_once_with_noop_waker();
         self.host.reset_for_reuse();
         self.instance.drop_cleanup();
     }

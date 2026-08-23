@@ -744,6 +744,9 @@ fn operation_reason(reason: ResourceCloseReason) -> OperationCancelReason {
         // A guest ownership release is an explicit caller-initiated close
         // request, so dependent operations see it as a requested cancel.
         ResourceCloseReason::OwnershipRelease => OperationCancelReason::Requested,
+        // A Vm drop is a full VM teardown: pending operations are cancelled
+        // with the parallel VmDrop reason.
+        ResourceCloseReason::VmDrop => OperationCancelReason::VmDrop,
     }
 }
 

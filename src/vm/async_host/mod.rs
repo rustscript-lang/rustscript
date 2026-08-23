@@ -627,6 +627,9 @@ fn legacy_reason(
         crate::vm::operation::OperationCancelReason::ResourceClosed => {
             crate::builtins::runtime::cancellation::CancellationReason::ResourceClosed
         }
+        crate::vm::operation::OperationCancelReason::VmDrop => {
+            crate::builtins::runtime::cancellation::CancellationReason::VmDrop
+        }
     }
 }
 
@@ -650,6 +653,9 @@ fn scope_reason(
         }
         crate::builtins::runtime::cancellation::CancellationReason::ResourceClosed => {
             crate::vm::operation::OperationCancelReason::ResourceClosed
+        }
+        crate::builtins::runtime::cancellation::CancellationReason::VmDrop => {
+            crate::vm::operation::OperationCancelReason::VmDrop
         }
     }
 }

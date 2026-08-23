@@ -148,6 +148,7 @@ fn operation_reason(reason: ResourceCloseReason) -> OperationCancelReason {
         ResourceCloseReason::Parent => OperationCancelReason::Parent,
         ResourceCloseReason::ResourceClosed => OperationCancelReason::ResourceClosed,
         ResourceCloseReason::OwnershipRelease => OperationCancelReason::Requested,
+        ResourceCloseReason::VmDrop => OperationCancelReason::VmDrop,
     }
 }
 

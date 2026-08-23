@@ -19,6 +19,10 @@ pub enum ResourceCloseReason {
     /// The guest released its ownership of the resource; the release launches
     /// the close exactly once.
     OwnershipRelease = 6,
+    /// The `Vm` itself is being dropped. Scope shutdown begun here must
+    /// synchronously cancel/begin-close every live resource with this reason
+    /// (child first), as far as the nonblocking Drop contract permits.
+    VmDrop = 7,
 }
 
 impl ResourceCloseReason {
@@ -31,6 +35,7 @@ impl ResourceCloseReason {
             Self::Parent => "parent",
             Self::ResourceClosed => "resource_closed",
             Self::OwnershipRelease => "ownership_release",
+            Self::VmDrop => "vm_drop",
         }
     }
 
@@ -44,6 +49,7 @@ impl ResourceCloseReason {
             4 => Some(Self::Parent),
             5 => Some(Self::ResourceClosed),
             6 => Some(Self::OwnershipRelease),
+            7 => Some(Self::VmDrop),
             _ => None,
         }
     }
@@ -77,6 +83,7 @@ mod tests {
                 6,
                 "ownership_release",
             ),
+            (ResourceCloseReason::VmDrop, 7, "vm_drop"),
         ] {
             assert_eq!(reason.raw(), raw, "raw encoding of {reason:?}");
             assert_eq!(
@@ -94,7 +101,7 @@ mod tests {
         }
         // Unknown encodings decode to None.
         assert!(ResourceCloseReason::from_raw(0).is_none());
-        assert!(ResourceCloseReason::from_raw(7).is_none());
+        assert!(ResourceCloseReason::from_raw(8).is_none());
         assert!(ResourceCloseReason::from_raw(u8::MAX).is_none());
     }
 }

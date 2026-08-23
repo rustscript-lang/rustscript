@@ -30,6 +30,8 @@ pub enum CancellationReason {
     VmReset = 3,
     Parent = 4,
     ResourceClosed = 5,
+    /// The `Vm` itself was dropped while the work was pending.
+    VmDrop = 6,
 }
 
 impl CancellationReason {
@@ -40,6 +42,7 @@ impl CancellationReason {
             Self::VmReset => "vm_reset",
             Self::Parent => "parent",
             Self::ResourceClosed => "resource_closed",
+            Self::VmDrop => "vm_drop",
         }
     }
 
@@ -50,6 +53,7 @@ impl CancellationReason {
             3 => Some(Self::VmReset),
             4 => Some(Self::Parent),
             5 => Some(Self::ResourceClosed),
+            6 => Some(Self::VmDrop),
             _ => None,
         }
     }

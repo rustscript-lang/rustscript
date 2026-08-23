@@ -473,6 +473,22 @@ impl HostRuntime {
         self.execution_scope.poll_close(cx)
     }
 
+    /// Drives exactly one round of the closing scope's close pipeline with a
+    /// no-op waker (nonblocking). Used only by `Vm::drop`: it synchronously
+    /// cancels every pending operation and issues child-first `begin_close` to
+    /// every live resource, then polls that single round. It never loops and
+    /// never waits for quiescence — genuinely event-driven Pending resources
+    /// stay in `Closing` and are released by their own `Drop` guards.
+    pub(crate) fn drive_execution_scope_close_once_with_noop_waker(&mut self) {
+        struct DropNoopWake;
+        impl std::task::Wake for DropNoopWake {
+            fn wake(self: Arc<Self>) {}
+        }
+        let waker = Arc::new(DropNoopWake).into();
+        let mut cx = Context::from_waker(&waker);
+        let _ = self.execution_scope.poll_close(&mut cx);
+    }
+
     /// Recycles the owned execution scope to a fresh, empty, Active scope.
     ///
     /// Takes the current scope out **only** once it is Quiescent (all cleanup

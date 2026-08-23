@@ -24,6 +24,7 @@
 //! sql/io/http/SSE/rusqlite, no concrete builtin).
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
@@ -812,7 +813,111 @@ fn never_completing_close_hits_typed_recycle_deadline_and_discards() {
     drop(vm);
 }
 
-// ---- explicit single-resource close failure is local; shutdown retries --------
+// ---- Vm Drop synchronously issues scope shutdown with the VmDrop reason ----
+
+/// Records every begin_close reason it observes (child resources record into
+/// the same shared list as their parent so ordering is observable).
+struct ReasonRecordingResource {
+    reasons: Arc<Mutex<Vec<ResourceCloseReason>>>,
+}
+
+impl HostResource for ReasonRecordingResource {
+    fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
+        self.reasons.lock().unwrap().push(reason);
+        Ok(CloseProgress::Ready)
+    }
+}
+
+/// An operation driver that records the first cancellation reason it receives.
+struct ReasonRecordingOperation {
+    cancelled: Arc<Mutex<Vec<OperationCancelReason>>>,
+}
+
+impl HostOperation for ReasonRecordingOperation {
+    fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
+        Poll::Pending
+    }
+
+    fn cancel(&mut self, reason: OperationCancelReason) -> OperationResult<()> {
+        self.cancelled.lock().unwrap().push(reason);
+        Ok(())
+    }
+}
+
+/// The Vm Drop contract (plan section 5.3): dropping a `Vm` that still owns
+/// live resources and pending operations must synchronously begin execution
+/// scope shutdown with [`ResourceCloseReason::VmDrop`] — cancelling every
+/// pending operation with the parallel [`OperationCancelReason::VmDrop`] and
+/// issuing child-first `begin_close` to every live resource with the VmDrop
+/// reason — as far as the nonblocking Drop contract permits. It must never
+/// fall through to the `ResourceTable::drop` no-op-waker sweep alone (which
+/// would use `VmReset`, would not cancel operations through the scope, and
+/// could let a Pending child block its parent's `begin_close`).
+#[test]
+fn vm_drop_begins_scope_close_with_vm_drop_reason_child_first_and_cancels_operations() {
+    let mut vm = Vm::try_new(Program::new(Vec::new(), Vec::new()))
+        .expect("test VM construction must not fail");
+    let reasons = Arc::new(Mutex::new(Vec::new()));
+    let operation_cancels = Arc::new(Mutex::new(Vec::new()));
+
+    let (parent, child) = {
+        let mut cx = vm.host_context();
+        let parent = cx
+            .push_resource(ReasonRecordingResource {
+                reasons: reasons.clone(),
+            })
+            .expect("push parent resource");
+        let child = cx
+            .push_child_resource(
+                ReasonRecordingResource {
+                    reasons: reasons.clone(),
+                },
+                &parent,
+            )
+            .expect("push child resource under parent");
+        cx.start_operation(OperationSpec::new(ReasonRecordingOperation {
+            cancelled: operation_cancels.clone(),
+        }))
+        .expect("start pending operation");
+        (parent, child)
+    };
+    let _ = (parent, child); // held live until the Vm is dropped
+
+    assert_eq!(vm.host_context().resource_count(), 2);
+    assert_eq!(vm.host_context().operation_count(), 1);
+
+    // Dropping the Vm must synchronously issue the scope shutdown. The Vm is
+    // never recycled, so quiescence is not required — but every live resource
+    // must have received a VmDrop begin_close (child first) and every pending
+    // operation a VmDrop cancellation before the owned tables fall through to
+    // their Drop guards.
+    drop(vm);
+
+    let reasons = reasons.lock().unwrap();
+    assert_eq!(
+        reasons.len(),
+        2,
+        "both resources must receive a begin_close during Vm drop"
+    );
+    assert_eq!(
+        reasons[0],
+        ResourceCloseReason::VmDrop,
+        "child resource must be closed first with the VmDrop reason"
+    );
+    assert_eq!(
+        reasons[1],
+        ResourceCloseReason::VmDrop,
+        "parent resource must be closed with the VmDrop reason"
+    );
+    drop(reasons);
+
+    let operation_cancels = operation_cancels.lock().unwrap();
+    assert_eq!(
+        operation_cancels.as_slice(),
+        &[OperationCancelReason::VmDrop],
+        "the pending operation must be cancelled with the VmDrop reason during Vm drop"
+    );
+}
 
 /// A resource whose first explicit `begin_close` fails and whose retry
 /// succeeds (models a transient explicit-close failure the shutdown retry

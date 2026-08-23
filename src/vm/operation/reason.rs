@@ -25,6 +25,8 @@ pub enum OperationCancelReason {
     Parent = 4,
     /// A resource the operation depended on was closed.
     ResourceClosed = 5,
+    /// The `Vm` itself was dropped while the operation was pending.
+    VmDrop = 6,
 }
 
 impl OperationCancelReason {
@@ -45,6 +47,7 @@ impl OperationCancelReason {
             3 => Some(Self::VmReset),
             4 => Some(Self::Parent),
             5 => Some(Self::ResourceClosed),
+            6 => Some(Self::VmDrop),
             _ => None,
         }
     }
@@ -60,6 +63,7 @@ impl OperationCancelReason {
             Self::VmReset => "vm_reset",
             Self::Parent => "parent",
             Self::ResourceClosed => "resource_closed",
+            Self::VmDrop => "vm_drop",
         }
     }
 }
@@ -81,6 +85,7 @@ mod tests {
         assert_eq!(OperationCancelReason::VmReset.raw(), 3);
         assert_eq!(OperationCancelReason::Parent.raw(), 4);
         assert_eq!(OperationCancelReason::ResourceClosed.raw(), 5);
+        assert_eq!(OperationCancelReason::VmDrop.raw(), 6);
     }
 
     #[test]
@@ -105,6 +110,10 @@ mod tests {
             OperationCancelReason::from_raw(5),
             Some(OperationCancelReason::ResourceClosed)
         );
+        assert_eq!(
+            OperationCancelReason::from_raw(6),
+            Some(OperationCancelReason::VmDrop)
+        );
     }
 
     #[test]
@@ -113,7 +122,7 @@ mod tests {
         // is rejected too.
         assert_eq!(OperationCancelReason::from_raw(0), None);
         assert_eq!(OperationCancelReason::from_raw(255), None);
-        assert_eq!(OperationCancelReason::from_raw(6), None);
+        assert_eq!(OperationCancelReason::from_raw(7), None);
     }
 
     #[test]
@@ -126,6 +135,7 @@ mod tests {
             OperationCancelReason::ResourceClosed.as_str(),
             "resource_closed"
         );
+        assert_eq!(OperationCancelReason::VmDrop.as_str(), "vm_drop");
     }
 
     #[test]
@@ -136,6 +146,7 @@ mod tests {
             (OperationCancelReason::VmReset, "vm_reset"),
             (OperationCancelReason::Parent, "parent"),
             (OperationCancelReason::ResourceClosed, "resource_closed"),
+            (OperationCancelReason::VmDrop, "vm_drop"),
         ];
         for (reason, expected) in cases {
             assert_eq!(reason.to_string(), expected);
