@@ -16,6 +16,7 @@ The complete language, runtime, and implementation guides live on the [RustScrip
 - [Runtime controls and artifacts](https://rustscript.org/docs/reference/runtime-controls/)
 - [Callable-driven HTTP client contract](docs/http-client.md)
 - [Script call frames and callable values](docs/callable-runtime.md)
+- [Scoped host resources and the host extension SDK](docs/scoped-host-resources.md)
 - [Compiler frontend syntax and feature support](src/compiler/frontends/README.md)
 
 ## Crate usage

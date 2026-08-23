@@ -6,11 +6,19 @@ compiler, parser, CLI, debugger, JIT/AOT backends, filesystem support, and opera
 
 ## Runtime surface
 
-- VMBC v12 decoding with environment-free `CallScript` direct script calls alongside dynamic callable calls
+- VMBC v13 decoding with environment-free `CallScript` direct script calls alongside dynamic callable calls
 - stack, local, and recursive script-frame execution for direct bytecode opcodes
 - instruction fuel with pause/resume support
 - synchronous named host bindings and dynamic host dispatch
 - `Rc`-backed strings, bytes, arrays, and maps for single-threaded targets
+
+VMBC v13 is the implemented, fixed wire format: the decoder accepts exactly version 13 and rejects
+every other version (including v12 and below) with a deterministic `UnsupportedVersion` error.
+There is no compatibility decoder and no old-version alias. VMBC v13 carries the resolved
+`HostImport` schema — parameter labels, resource keys, passing modes, return schema and the catalog
+fingerprint — so the no-std decoder validates the same exact host-import contract as the host `pd-vm`
+decoder, including arity, coarse return type, schema depth, passing tags and duplicate-field
+rejection.
 
 Compile RustScript source to VMBC with the standard `pd-vm` host tools, then decode and execute it on
 the target:
