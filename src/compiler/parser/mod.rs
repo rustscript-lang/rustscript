@@ -188,8 +188,6 @@ pub(super) struct Parser {
     parsed_semantic_index: ParsedSemanticIndex,
     /// Parser scope stack for tracking current scope during parse.
     parser_scope_stack: Vec<ScopeId>,
-    /// Parser-built catalog visibility from alias/import maps.
-    catalog_visibility: CatalogVisibility,
 }
 
 struct ClosureCaptureContext {
@@ -255,7 +253,6 @@ impl Parser {
             catalog_function_decls: HashMap::new(),
             parsed_semantic_index: ParsedSemanticIndex::default(),
             parser_scope_stack: vec![0],
-            catalog_visibility: CatalogVisibility::default(),
         })
     }
 
@@ -303,7 +300,7 @@ impl Parser {
         dialect: &'static dyn ParserDialect,
         predeclared_locals: &[ReplLocalBinding],
     ) -> Result<Self, ParseError> {
-        let mut parser = Self::new_with_predeclared_locals_and_host_catalog(
+        let parser = Self::new_with_predeclared_locals_and_host_catalog(
             source,
             source_id,
             allow_implicit_externs,

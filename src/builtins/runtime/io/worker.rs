@@ -45,8 +45,7 @@ pub(crate) fn io_worker_key() -> ResourceTypeKey {
 /// A worker thread resource.
 ///
 /// The worker owns a shared state (cancellation flag, result, terminal error)
-/// and a [`JoinHandle`]. The thread should periodically check
-/// [`Self::is_cancelled`] and exit.
+/// The worker thread checks the shared cancellation flag periodically and exits.
 ///
 /// Both [`IoWorkerResource`] and the corresponding
 /// [`ThreadedOperation`](super::ops::ThreadedOperation) share the same
@@ -73,25 +72,6 @@ impl IoWorkerResource {
             handle: Some(handle),
             name: name.into(),
         }
-    }
-
-    /// Whether the worker has been asked to stop.
-    pub(crate) fn is_cancelled(&self) -> bool {
-        self.state.cancelled.load(Ordering::SeqCst)
-    }
-
-    /// Returns a reference to the shared state.
-    pub(crate) fn shared_state(&self) -> &Arc<SharedWorkerState> {
-        &self.state
-    }
-
-    /// Take the result from the shared state, if available.
-    pub(crate) fn take_result(&self) -> Option<Result<(), String>> {
-        self.state
-            .result
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
     }
 }
 

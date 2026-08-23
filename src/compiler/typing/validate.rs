@@ -24,21 +24,6 @@ pub(super) struct DiagnosticSite<'a> {
     pub(super) span: Option<crate::compiler::source_map::Span>,
 }
 
-impl<'a> DiagnosticSite<'a> {
-    pub(super) fn new(line: Option<u32>, source_name: Option<&'a str>) -> Self {
-        Self {
-            line,
-            source_name,
-            span: None,
-        }
-    }
-
-    pub(super) fn with_span(mut self, span: Option<crate::compiler::source_map::Span>) -> Self {
-        self.span = span;
-        self
-    }
-}
-
 struct CallableBody<'a> {
     param_slots: &'a [LocalSlot],
     param_schemas: Option<&'a [Option<TypeSchema>]>,

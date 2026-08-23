@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::pin::Pin;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
@@ -14,17 +14,13 @@ use super::request::{
 };
 use super::{HttpRequestContext, policy};
 use crate::builtins::runtime::{HostCallResult, VmCallable, VmMap, VmMapHandle};
-use crate::vm::operation::{
-    HostOperation, OperationCancelReason, OperationError, OperationErrorCode, OperationResult,
-    OperationSpec,
-};
+use crate::vm::operation::{HostOperation, OperationCancelReason, OperationResult, OperationSpec};
 use crate::vm::resource::{
     CloseProgress, HostResource, ResourceCloseReason, ResourceError, ResourceErrorCode,
     ResourceResult, ResourceTypeKey,
 };
 use crate::vm::{
-    CallOutcome, CallReturn, HostStreamAction, HostStreamDriver, HostStreamPoll, Value, Vm,
-    VmError, VmResult,
+    CallOutcome, HostStreamAction, HostStreamDriver, HostStreamPoll, Value, Vm, VmError, VmResult,
 };
 
 /// Maximum number of SSE items buffered between the worker and the stream
@@ -702,7 +698,8 @@ struct SseStreamDriver {
     url: String,
     items: usize,
     bytes_received: Arc<AtomicUsize>,
-    permit: super::ConnectionPermit,
+    /// Held for RAII admission accounting until the stream driver terminates.
+    _permit: super::ConnectionPermit,
 }
 
 impl SseStreamDriver {
@@ -1077,7 +1074,7 @@ pub(super) fn builtin_http_client_sse(
         url: String::new(),
         items: 0,
         bytes_received,
-        permit,
+        _permit: permit,
     };
 
     match vm.submit_callable_stream(callback, driver)? {
@@ -1135,7 +1132,7 @@ mod tests {
             url: String::new(),
             items: 0,
             bytes_received: Arc::new(AtomicUsize::new(0)),
-            permit: super::super::policy::ConnectionAdmission::new(1)
+            _permit: super::super::policy::ConnectionAdmission::new(1)
                 .acquire()
                 .expect("test connection permit"),
         }

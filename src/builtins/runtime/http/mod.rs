@@ -1,4 +1,3 @@
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -10,14 +9,8 @@ use crate::host_api::{
     HostApiBuilder, HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema,
     HostTypeSchema, ResourceTypeSchema,
 };
-use crate::vm::operation::{OperationCancelReason, OperationError};
-use crate::vm::resource::{
-    CloseProgress, HostResource, ResourceCloseReason, ResourceError, ResourceHandle,
-    ResourceResult, ResourceTypeKey,
-};
-use crate::vm::{
-    CallOutcome, CallReturn, HostContextError, HostFunctionRegistry, Value, Vm, VmError, VmResult,
-};
+use crate::vm::resource::HostResource;
+use crate::vm::{CallOutcome, CallReturn, HostFunctionRegistry, Value, Vm, VmError, VmResult};
 
 mod config;
 pub(super) mod policy;
@@ -163,39 +156,9 @@ impl HttpRequestContext {
 
     /// Consumes the captured permit, transferring it to the caller (e.g. the
     /// SSE driver that releases it when the stream finishes).
-    pub(super) fn into_permit(self) -> ConnectionPermit {
+    fn into_permit(self) -> ConnectionPermit {
         self.permit
     }
-}
-
-/// Maps a generic resource-close reason onto the parallel operation-cancellation
-/// vocabulary (the same stable 1:1 mapping the execution scope uses).
-pub(super) fn operation_reason(reason: ResourceCloseReason) -> OperationCancelReason {
-    match reason {
-        ResourceCloseReason::Requested => OperationCancelReason::Requested,
-        ResourceCloseReason::Deadline => OperationCancelReason::Deadline,
-        ResourceCloseReason::VmReset => OperationCancelReason::VmReset,
-        ResourceCloseReason::Parent => OperationCancelReason::Parent,
-        ResourceCloseReason::ResourceClosed => OperationCancelReason::ResourceClosed,
-        ResourceCloseReason::OwnershipRelease => OperationCancelReason::Requested,
-    }
-}
-
-fn host_boundary_error(error: HostContextError) -> VmError {
-    VmError::HostError(error.to_string())
-}
-
-fn operation_error(error: OperationError) -> VmError {
-    VmError::HostError(error.to_string())
-}
-
-fn http_handle(raw: i64) -> VmResult<ResourceHandle> {
-    ResourceHandle::from_value(&Value::Int(raw))
-        .map_err(|error| VmError::HostError(format!("unknown HTTP handle: {error}")))
-}
-
-fn resource_error(error: ResourceError) -> VmError {
-    VmError::HostError(error.to_string())
 }
 
 /// The shared [`HostApiCatalog`] describing every HTTP host function.
@@ -340,20 +303,6 @@ pub fn register_http_builtin_module_from_catalog(
         }
         Ok(())
     })
-}
-
-/// Standard [`HostExtension`] registering HTTP through the exact catalog
-/// path and installing the persistent policy module state.
-pub struct HttpExtension;
-
-impl crate::vm::HostExtension for HttpExtension {
-    fn register(&self, registry: &mut HostFunctionRegistry) -> VmResult<()> {
-        register_http_builtin_module(registry)
-    }
-
-    fn install(&self, vm: &mut Vm) {
-        vm.host_context().set_module_state(HttpHostState::default());
-    }
 }
 
 fn request_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {

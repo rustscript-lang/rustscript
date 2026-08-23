@@ -12,7 +12,6 @@
 //! The VM provides lifecycle storage without depending on host-specific state
 //! types or configuration APIs.
 
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -189,35 +188,6 @@ impl HostRuntime {
         // the concrete value cells they reference are released by the
         // modules' own scope-close lifecycle.
         self.pending_op_results.clear();
-    }
-
-    pub(crate) fn set_host_function_state<T>(&mut self, state: T)
-    where
-        T: Any + Send + 'static,
-    {
-        self.module_state.set(state);
-    }
-
-    pub(crate) fn host_function_state<T>(&self) -> Option<&T>
-    where
-        T: Any + Send + 'static,
-    {
-        self.module_state.get()
-    }
-
-    #[cfg(feature = "http-client")]
-    pub(crate) fn host_function_state_mut<T>(&mut self) -> Option<&mut T>
-    where
-        T: Any + Send + 'static,
-    {
-        self.module_state.get_mut()
-    }
-
-    pub(crate) fn remove_host_function_state<T>(&mut self) -> Option<T>
-    where
-        T: Any + Send + 'static,
-    {
-        self.module_state.take::<T>()
     }
 
     /// Registers typed per-VM module state through the host boundary, returning

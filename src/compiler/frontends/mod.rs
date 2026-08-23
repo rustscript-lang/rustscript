@@ -135,6 +135,7 @@ pub fn parse_source_with_dialect(
     )
 }
 
+#[cfg(test)]
 pub(super) fn parse_rustscript_repl_source(
     source: &str,
     predefined_locals: &[ReplLocalBinding],

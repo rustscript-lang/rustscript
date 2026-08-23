@@ -179,6 +179,7 @@ impl<T: Send + 'static> PipeTransferGuard<T> {
     }
 
     /// Whether the pipe handle is still available (not yet taken by the worker).
+    #[cfg(test)]
     pub(crate) fn is_available(&self) -> bool {
         self.inner
             .lock()
@@ -186,6 +187,7 @@ impl<T: Send + 'static> PipeTransferGuard<T> {
             .is_some()
     }
 
+    #[cfg(test)]
     pub(crate) fn key(&self) -> &str {
         &self.key
     }
@@ -300,8 +302,7 @@ pub(crate) struct SharedWorkerState {
     pub(crate) cancelled: AtomicBool,
     /// One-shot result signalled by the worker thread.
     pub(crate) result: Mutex<Option<ThreadedWorkerSignal>>,
-    /// Terminal error from the worker (beyond the signal — e.g. panic).
-    pub(crate) terminal_error: Mutex<Option<String>>,
+
     /// Waker registered by `ThreadedOperation::poll` when returning `Pending`.
     /// Stored under a separate lock so the worker can take-and-call after
     /// publishing the result without holding the result lock.
@@ -313,7 +314,7 @@ impl SharedWorkerState {
         Self {
             cancelled: AtomicBool::new(false),
             result: Mutex::new(None),
-            terminal_error: Mutex::new(None),
+
             waker: Mutex::new(None),
         }
     }
@@ -358,19 +359,6 @@ pub(crate) struct ThreadedOperation {
 }
 
 impl ThreadedOperation {
-    /// Create a new threaded operation from a pre-constructed shared state.
-    pub(crate) fn new(
-        name: impl Into<String>,
-        state: Arc<SharedWorkerState>,
-        receiver: Receiver<ThreadedWorkerSignal>,
-    ) -> Self {
-        Self {
-            state,
-            receiver: Some(receiver),
-            name: name.into(),
-        }
-    }
-
     /// Create the channel, shared state, and operation BEFORE spawning the
     /// worker thread. Returns `(Self, Sender, Arc<SharedWorkerState>)` so the
     /// caller can register the operation and resource first, then spawn the
@@ -413,6 +401,7 @@ impl ThreadedOperation {
     /// Create a shared worker state and channel pair, then spawn the worker
     /// thread. Returns `(Self, IoWorkerResource)` — the operation driver and
     /// the resource that manages the thread lifecycle.
+    #[cfg(test)]
     pub(crate) fn spawn(
         name: impl Into<String>,
         work: impl FnOnce(Arc<SharedWorkerState>, Sender<ThreadedWorkerSignal>) + Send + 'static,
@@ -420,16 +409,6 @@ impl ThreadedOperation {
         let (operation, tx, state) = Self::prepare(name);
         let worker = Self::spawn_worker(&operation.name, state, tx, work);
         (operation, worker)
-    }
-
-    /// Returns the cancelled flag from the shared state.
-    pub(crate) fn is_cancelled(&self) -> bool {
-        self.state.cancelled.load(Ordering::SeqCst)
-    }
-
-    /// Returns a reference to the shared state.
-    pub(crate) fn shared_state(&self) -> &Arc<SharedWorkerState> {
-        &self.state
     }
 }
 
@@ -918,7 +897,8 @@ mod tests {
         });
 
         // Cancel the operation.
-        op.cancel(OperationCancelReason::Requested);
+        op.cancel(OperationCancelReason::Requested)
+            .expect("test operation cancellation should succeed");
 
         let (waker, _wake_count) = CountingWaker::new();
         let waker = waker.into_waker();

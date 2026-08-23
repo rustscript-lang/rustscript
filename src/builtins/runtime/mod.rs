@@ -1,7 +1,6 @@
 // VM-side builtin execution entrypoints.
 // Builtin metadata and call-index mapping live in crate::builtins.
 use std::sync::{Arc, OnceLock};
-use std::task::{Context, Poll};
 
 use crate::builtins::BuiltinFunction;
 use crate::host_api::{HostApiCatalog, HostApiFingerprint};
@@ -38,7 +37,7 @@ pub use http::{
     register_http_builtin_module_from_catalog,
 };
 pub use io::{
-    IoExtension, IoHostExt, IoHostState, IoPolicy, io_host_catalog, register_io_builtin_module,
+    IoExtension, IoHostExt, IoPolicy, io_host_catalog, register_io_builtin_module,
     register_io_builtin_module_from_catalog,
 };
 #[cfg(feature = "sqlite")]
@@ -88,7 +87,7 @@ fn standard_host_catalog_snapshot() -> &'static StandardHostCatalogSnapshot {
         use crate::host_api::HostApiBuilder;
 
         let mut builder = HostApiBuilder::new();
-        let mut push = |builder: &mut HostApiBuilder, catalog: &Arc<HostApiCatalog>| {
+        let push = |builder: &mut HostApiBuilder, catalog: &Arc<HostApiCatalog>| {
             for resource in catalog.resources() {
                 builder.resource(resource.clone());
             }

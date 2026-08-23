@@ -591,10 +591,6 @@ pub(super) fn host_boundary_error(error: crate::vm::HostContextError) -> VmError
     VmError::HostError(error.to_string())
 }
 
-pub(super) fn operation_error(error: OperationError) -> VmError {
-    VmError::HostError(error.to_string())
-}
-
 // ---------------------------------------------------------------------------
 // Buffered request
 // ---------------------------------------------------------------------------

@@ -304,68 +304,6 @@ impl IoPipeResource {
         let guard = self.pipe.lock().unwrap_or_else(|e| e.into_inner());
         matches!(&*guard, IoPipeInner::Read(_))
     }
-
-    pub(crate) fn with_reader<T>(
-        &self,
-        apply: impl FnOnce(&mut std::process::ChildStdout) -> VmResult<T>,
-    ) -> VmResult<T> {
-        let mut guard = self
-            .pipe
-            .lock()
-            .map_err(|_| VmError::HostError("io pipe lock was poisoned".to_string()))?;
-        match &mut *guard {
-            IoPipeInner::Read(pipe) => apply(pipe),
-            IoPipeInner::Write(_) => Err(VmError::HostError(
-                "io_read_all requires a readable handle".to_string(),
-            )),
-            IoPipeInner::Closed => Err(VmError::HostError("io pipe is already closed".to_string())),
-        }
-    }
-
-    pub(crate) fn with_writer<T>(
-        &self,
-        apply: impl FnOnce(&mut std::process::ChildStdin) -> VmResult<T>,
-    ) -> VmResult<T> {
-        let mut guard = self
-            .pipe
-            .lock()
-            .map_err(|_| VmError::HostError("io pipe lock was poisoned".to_string()))?;
-        match &mut *guard {
-            IoPipeInner::Write(pipe) => apply(pipe),
-            IoPipeInner::Read(_) => Err(VmError::HostError(
-                "io_write requires a writable handle".to_string(),
-            )),
-            IoPipeInner::Closed => Err(VmError::HostError("io pipe is already closed".to_string())),
-        }
-    }
-}
-
-// ============================================================================
-// Helpers: dispatch to file or pipe resource
-// ============================================================================
-
-pub(crate) fn with_file_or_pipe_mut<T>(
-    vm: &mut Vm,
-    handle: ResourceHandle,
-    file_op: impl FnOnce(&mut IoFileResource) -> VmResult<T>,
-    pipe_op: impl FnOnce(&mut IoPipeResource) -> VmResult<T>,
-) -> VmResult<T> {
-    let mut ctx = vm.host_context();
-    let token = ctx.typed_resource::<IoFileResource>(handle);
-    if let Ok(token) = token {
-        let mut resource = ctx
-            .resource_mut(&token)
-            .map_err(|error| VmError::HostError(format!("io handle lookup failed: {error}")))?;
-        file_op(resource.get())
-    } else {
-        let token = ctx
-            .typed_resource::<IoPipeResource>(handle)
-            .map_err(|error| VmError::HostError(format!("io handle lookup failed: {error}")))?;
-        let mut resource = ctx
-            .resource_mut(&token)
-            .map_err(|error| VmError::HostError(format!("io handle lookup failed: {error}")))?;
-        pipe_op(resource.get())
-    }
 }
 
 /// Register a worker resource in the execution scope, returning its handle.
