@@ -1083,7 +1083,10 @@ async fn sse_stalled_tls_connect_reports_connect_deadline_not_total() {
         !error.to_string().contains("SSE total deadline exceeded"),
         "a connect timeout must not be mislabelled as the SSE total deadline: {error}"
     );
-    join_with_timeout(server, "sse_stalled_tls_connect_reports_connect_deadline server");
+    join_with_timeout(
+        server,
+        "sse_stalled_tls_connect_reports_connect_deadline server",
+    );
 }
 
 /// A server that accepts the connection and reads the request but withholds the

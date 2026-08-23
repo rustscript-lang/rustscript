@@ -705,9 +705,7 @@ impl SseStreamDriver {
             .take();
         let outcome = if stopping { "stopped" } else { "eof" };
         Some(match result {
-            None | Some(Ok(())) => {
-                Poll::Ready(Ok(HostStreamPoll::Complete(self.summary(outcome))))
-            }
+            None | Some(Ok(())) => Poll::Ready(Ok(HostStreamPoll::Complete(self.summary(outcome)))),
             Some(Err(error)) => Poll::Ready(Err(error)),
         })
     }
@@ -788,11 +786,10 @@ impl HostStreamDriver for SseStreamDriver {
         // driver only delivers a callback after the worker has published
         // `open`, which follows deadline initialization), so it is surfaced as
         // a typed internal error rather than an unwrap panic.
-        let deadline = self
-            .shared
-            .deadline
-            .get()
-            .ok_or_else(|| VmError::HostError("SSE stream deadline not initialized".to_string()))?;
+        let deadline =
+            self.shared.deadline.get().ok_or_else(|| {
+                VmError::HostError("SSE stream deadline not initialized".to_string())
+            })?;
         if Instant::now() >= *deadline {
             return Err(VmError::HostError(SSE_TOTAL_DEADLINE_ERROR.to_string()));
         }
@@ -1049,9 +1046,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker};
 
-    use super::{
-        SSE_CHANNEL_CAPACITY, SseEvent, SseParser, SseShared, SseStreamDriver, VmMap,
-    };
+    use super::{SSE_CHANNEL_CAPACITY, SseEvent, SseParser, SseShared, SseStreamDriver, VmMap};
     use crate::vm::{HostStreamAction, HostStreamDriver, HostStreamPoll, Value, VmError};
     use tokio::sync::{Notify, mpsc};
 
@@ -1269,14 +1264,8 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
 
         // Two items are already queued before the terminal is published.
-        shared
-            .items
-            .try_send(Value::Int(1))
-            .expect("test send");
-        shared
-            .items
-            .try_send(Value::Int(2))
-            .expect("test send");
+        shared.items.try_send(Value::Int(1)).expect("test send");
+        shared.items.try_send(Value::Int(2)).expect("test send");
         *shared.result.lock().expect("sse result lock") = Some(Ok(()));
         shared.done.store(true, Ordering::SeqCst);
 

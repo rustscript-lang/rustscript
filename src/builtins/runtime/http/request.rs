@@ -1177,18 +1177,12 @@ async fn send_request(
         tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
         let server_name = rustls::pki_types::ServerName::try_from(resolved.host.clone())
             .map_err(|_| VmError::HostError("HTTP TLS server name is invalid".to_string()))?;
-        let stream = with_deadline(
-            connect_deadline,
-            HTTP_CONNECT_DEADLINE_EXCEEDED,
-            async {
-                tokio_rustls::TlsConnector::from(Arc::new(tls_config))
-                    .connect(server_name, raw)
-                    .await
-                    .map_err(|error| {
-                        VmError::HostError(format!("HTTP request failed: {error}"))
-                    })
-            },
-        )
+        let stream = with_deadline(connect_deadline, HTTP_CONNECT_DEADLINE_EXCEEDED, async {
+            tokio_rustls::TlsConnector::from(Arc::new(tls_config))
+                .connect(server_name, raw)
+                .await
+                .map_err(|error| VmError::HostError(format!("HTTP request failed: {error}")))
+        })
         .await?;
         send_over_io(
             method,
@@ -1329,11 +1323,9 @@ where
     let (response, connection) = match response_budget {
         Some(budget) => {
             with_deadline(
-                Instant::now()
-                    .checked_add(budget.duration)
-                    .ok_or_else(|| {
-                        VmError::HostError("HTTP response deadline cannot form a deadline".to_string())
-                    })?,
+                Instant::now().checked_add(budget.duration).ok_or_else(|| {
+                    VmError::HostError("HTTP response deadline cannot form a deadline".to_string())
+                })?,
                 budget.deadline_error,
                 send_response,
             )
