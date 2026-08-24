@@ -5,10 +5,9 @@
 //! dispatch wrapper; the actual function bodies live in `shared.rs`.
 //!
 //! Uses the same concrete [`HostResource`] types as the async path:
-//! [`IoFileResource`], [`IoProcessResource`], [`IoPipeResource`] stored in
-//! the execution scope via `push_resource_with_key` /
-//! `push_child_resource_with_key`. Operations use [`HostOperation`] drivers
-//! and the scope's [`OperationRegistry`].
+//! [`IoFileResource`] and aggregate [`IoPipeResource`] values stored in the
+//! execution scope via `push_resource_with_key`. Operations use
+//! [`HostOperation`] drivers and the scope's [`OperationRegistry`].
 
 use pd_host_function::pd_host_function;
 

@@ -124,7 +124,7 @@ impl Vm {
     /// bridge box drops only after every driver that references it finishes.
     /// New submissions from this point use the new bridge generation.
     pub fn try_set_async_bridge(&mut self, bridge: Box<dyn HostAsyncBridge>) -> VmResult<()> {
-        self.cancel_waiting_host_op()?;
+        self.try_cancel_waiting_host_op()?;
         self.host.async_bridge = Some(Arc::new(Mutex::new(bridge)));
         Ok(())
     }
@@ -146,7 +146,7 @@ impl Vm {
     /// rejected after a clear, with the usual "requires a host async bridge"
     /// error.
     pub fn try_clear_async_bridge(&mut self) -> VmResult<()> {
-        self.cancel_waiting_host_op()?;
+        self.try_cancel_waiting_host_op()?;
         self.host.async_bridge = None;
         Ok(())
     }
@@ -270,7 +270,11 @@ impl Vm {
         self.instance.waiting_host_op.as_ref().map(|op| op.op_id)
     }
 
-    pub fn cancel_waiting_host_op(&mut self) -> VmResult<()> {
+    pub fn cancel_waiting_host_op(&mut self) {
+        let _ = self.try_cancel_waiting_host_op();
+    }
+
+    pub fn try_cancel_waiting_host_op(&mut self) -> VmResult<()> {
         self.cancel_waiting_host_op_with_reason(CancellationReason::Requested)
     }
 
@@ -348,8 +352,8 @@ impl Vm {
         let Some(waiting) = self.instance.waiting_host_op.clone() else {
             return Poll::Ready(Ok(()));
         };
-        // A callable stream is driven through its VM-side continuation, which
-        // polls the producer through the shared driver slot.
+        // A callable stream is driven through its registered `HostOperation`;
+        // continuation state only exchanges events and callback actions.
         if self
             .instance
             .host_stream
@@ -496,7 +500,7 @@ impl Vm {
                 let cancellation_result = self
                     .run_ctx
                     .cancel(crate::builtins::runtime::cancellation::CancellationReason::Requested);
-                self.cancel_waiting_host_op()?;
+                self.try_cancel_waiting_host_op()?;
                 cancellation_result?;
                 return Err(VmError::HostError("host operation cancelled".to_string()));
             }

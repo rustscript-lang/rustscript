@@ -11,6 +11,7 @@ use super::{
 
 const MAGIC: [u8; 4] = *b"VMBC";
 const VERSION_V13: u16 = 13;
+const VERSION_V14: u16 = 14;
 const FLAGS: u16 = 0;
 const MAX_SCHEMA_DEPTH: usize = 64;
 const MAX_CONSTANT_DEPTH: usize = 64;
@@ -59,7 +60,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     }
 
     let version = cursor.read_u16()?;
-    if version != VERSION_V13 {
+    if version != VERSION_V13 && version != VERSION_V14 {
         return Err(WireError::UnsupportedVersion(version));
     }
     let flags = cursor.read_u16()?;
@@ -133,6 +134,9 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     }
 
     let encoded_local_count = skip_type_map(&mut cursor)?;
+    if version >= VERSION_V14 {
+        skip_named_struct_schemas(&mut cursor)?;
+    }
     skip_debug_info(&mut cursor)?;
     let (
         script_functions,
@@ -178,6 +182,19 @@ fn read_host_param_passing(raw: u8) -> Result<HostParamPassing, WireError> {
         3 => Ok(HostParamPassing::TakeOwned),
         value => Err(WireError::InvalidHostParamPassing(value)),
     }
+}
+
+fn skip_named_struct_schemas(cursor: &mut Cursor<'_>) -> Result<(), WireError> {
+    let count = cursor.read_u32()? as usize;
+    for _ in 0..count {
+        let _name = cursor.read_string()?;
+        let type_param_count = cursor.read_u32()? as usize;
+        for _ in 0..type_param_count {
+            let _type_param = cursor.read_string()?;
+        }
+        let _body = read_schema(cursor, 0)?;
+    }
+    Ok(())
 }
 
 fn skip_type_map(cursor: &mut Cursor<'_>) -> Result<Option<usize>, WireError> {

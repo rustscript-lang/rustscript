@@ -8,9 +8,9 @@ use crate::host_api::{HostApiFingerprint, HostParamPassing};
 
 /// Bytecode ABI version used for VM-internal cache identity (JIT trace cache,
 /// program cache keys). The VMBC wire format version lives in `src/vmbc.rs`
-/// (`VERSION_V13`); both are bumped for bytecode-shape changes, most recently
-/// for exact host-import schemas and per-call catalog identity.
-pub const BYTECODE_ABI_VERSION: u16 = 13;
+/// (`VERSION_V14`); both are bumped for bytecode-shape changes, most recently
+/// for persisted recursive named-struct schema definitions.
+pub const BYTECODE_ABI_VERSION: u16 = 14;
 
 pub type SharedString = Arc<String>;
 pub type SharedBytes = Arc<Vec<u8>>;
@@ -78,6 +78,91 @@ pub struct RootCallableBinding {
 pub struct ExportedCallable {
     pub name: String,
     pub local_slot: u16,
+}
+
+/// Runtime-visible definition of a named struct schema.
+///
+/// Named identities remain in recursive type graphs. Persisting their finite
+/// declaration bodies lets ownership traversal instantiate one edge at a time
+/// against the finite runtime value instead of erasing recursive edges.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamedStructSchema {
+    pub type_params: Vec<String>,
+    pub body_schema: TypeSchema,
+}
+
+impl NamedStructSchema {
+    pub fn instantiate(&self, args: &[TypeSchema]) -> Option<TypeSchema> {
+        if self.type_params.len() != args.len() {
+            return None;
+        }
+        let bindings = self
+            .type_params
+            .iter()
+            .cloned()
+            .zip(args.iter().cloned())
+            .collect::<HashMap<_, _>>();
+        Some(substitute_named_schema_params(&self.body_schema, &bindings))
+    }
+}
+
+fn substitute_named_schema_params(
+    schema: &TypeSchema,
+    bindings: &HashMap<String, TypeSchema>,
+) -> TypeSchema {
+    match schema {
+        TypeSchema::GenericParam(name) => bindings
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| schema.clone()),
+        TypeSchema::Array(inner) => {
+            TypeSchema::Array(Box::new(substitute_named_schema_params(inner, bindings)))
+        }
+        TypeSchema::ArrayTuple(items) => TypeSchema::ArrayTuple(
+            items
+                .iter()
+                .map(|item| substitute_named_schema_params(item, bindings))
+                .collect(),
+        ),
+        TypeSchema::ArrayTupleRest { prefix, rest } => TypeSchema::ArrayTupleRest {
+            prefix: prefix
+                .iter()
+                .map(|item| substitute_named_schema_params(item, bindings))
+                .collect(),
+            rest: Box::new(substitute_named_schema_params(rest, bindings)),
+        },
+        TypeSchema::Map(inner) => {
+            TypeSchema::Map(Box::new(substitute_named_schema_params(inner, bindings)))
+        }
+        TypeSchema::Optional(inner) => {
+            TypeSchema::Optional(Box::new(substitute_named_schema_params(inner, bindings)))
+        }
+        TypeSchema::Object(fields) => TypeSchema::Object(
+            fields
+                .iter()
+                .map(|(name, field)| {
+                    (
+                        name.clone(),
+                        substitute_named_schema_params(field, bindings),
+                    )
+                })
+                .collect(),
+        ),
+        TypeSchema::Named(name, args) => TypeSchema::Named(
+            name.clone(),
+            args.iter()
+                .map(|arg| substitute_named_schema_params(arg, bindings))
+                .collect(),
+        ),
+        TypeSchema::Callable { params, result } => TypeSchema::Callable {
+            params: params
+                .iter()
+                .map(|param| substitute_named_schema_params(param, bindings))
+                .collect(),
+            result: Box::new(substitute_named_schema_params(result, bindings)),
+        },
+        _ => schema.clone(),
+    }
 }
 
 #[derive(Debug)]
@@ -639,6 +724,7 @@ pub struct Program {
     pub imports: Vec<HostImport>,
     pub debug: Option<crate::debug_info::DebugInfo>,
     pub type_map: Option<TypeMap>,
+    pub named_struct_schemas: HashMap<String, NamedStructSchema>,
     pub script_functions: Vec<ScriptFunction>,
     pub callable_prototypes: Vec<CallablePrototype>,
     pub function_regions: Vec<FunctionRegion>,
@@ -660,6 +746,7 @@ impl Program {
             imports: Vec::new(),
             debug: None,
             type_map: None,
+            named_struct_schemas: HashMap::new(),
             script_functions: Vec::new(),
             callable_prototypes: Vec::new(),
             function_regions: Vec::new(),
@@ -684,6 +771,7 @@ impl Program {
             imports: Vec::new(),
             debug,
             type_map: None,
+            named_struct_schemas: HashMap::new(),
             script_functions: Vec::new(),
             callable_prototypes: Vec::new(),
             function_regions: Vec::new(),
@@ -709,6 +797,7 @@ impl Program {
             imports,
             debug,
             type_map: None,
+            named_struct_schemas: HashMap::new(),
             script_functions: Vec::new(),
             callable_prototypes: Vec::new(),
             function_regions: Vec::new(),
@@ -728,6 +817,15 @@ impl Program {
     pub fn with_type_map(mut self, type_map: TypeMap) -> Self {
         self.type_map = Some(type_map);
         self.operand_type_hints_cache = Arc::new(OnceLock::new());
+        self.owned_local_slots_cache = Arc::new(OnceLock::new());
+        self
+    }
+
+    pub fn with_named_struct_schemas(
+        mut self,
+        named_struct_schemas: HashMap<String, NamedStructSchema>,
+    ) -> Self {
+        self.named_struct_schemas = named_struct_schemas;
         self.owned_local_slots_cache = Arc::new(OnceLock::new());
         self
     }
@@ -777,23 +875,90 @@ impl Program {
     /// hashing, or wire serialization, and cloning a `Program` shares it for
     /// free. A program without a type map owns no local slots.
     pub fn owned_local_slots(&self) -> &[bool] {
-        self.owned_local_slots_cache
-            .get_or_init(|| build_owned_local_slots(self.type_map.as_ref()))
+        self.owned_local_slots_cache.get_or_init(|| {
+            build_owned_local_slots(self.type_map.as_ref(), &self.named_struct_schemas)
+        })
     }
 }
 
 /// Computes the [`Program::owned_local_slots`] projection from the type map:
 /// one entry per `local_schemas` slot, `true` when the slot's schema contains
 /// a host resource anywhere in its shape.
-fn build_owned_local_slots(type_map: Option<&TypeMap>) -> Arc<[bool]> {
+fn build_owned_local_slots(
+    type_map: Option<&TypeMap>,
+    named_struct_schemas: &HashMap<String, NamedStructSchema>,
+) -> Arc<[bool]> {
     let Some(type_map) = type_map else {
         return Arc::from(Vec::new().into_boxed_slice());
     };
     type_map
         .local_schemas
         .iter()
-        .map(|schema| schema.as_ref().is_some_and(TypeSchema::contains_resource))
+        .map(|schema| {
+            schema.as_ref().is_some_and(|schema| {
+                schema_contains_resource(schema, named_struct_schemas, &mut Vec::new())
+            })
+        })
         .collect()
+}
+
+fn schema_contains_resource(
+    schema: &TypeSchema,
+    named_struct_schemas: &HashMap<String, NamedStructSchema>,
+    active: &mut Vec<String>,
+) -> bool {
+    match schema {
+        TypeSchema::Resource(_) => true,
+        TypeSchema::Array(inner) | TypeSchema::Map(inner) | TypeSchema::Optional(inner) => {
+            schema_contains_resource(inner, named_struct_schemas, active)
+        }
+        TypeSchema::ArrayTuple(items) => items
+            .iter()
+            .any(|item| schema_contains_resource(item, named_struct_schemas, active)),
+        TypeSchema::ArrayTupleRest { prefix, rest } => {
+            prefix
+                .iter()
+                .any(|item| schema_contains_resource(item, named_struct_schemas, active))
+                || schema_contains_resource(rest, named_struct_schemas, active)
+        }
+        TypeSchema::Object(fields) => fields
+            .values()
+            .any(|field| schema_contains_resource(field, named_struct_schemas, active)),
+        TypeSchema::Named(name, args) => {
+            if active.contains(name) {
+                return args
+                    .iter()
+                    .any(|arg| schema_contains_resource(arg, named_struct_schemas, active));
+            }
+            let Some(body) = named_struct_schemas
+                .get(name)
+                .and_then(|definition| definition.instantiate(args))
+            else {
+                return args
+                    .iter()
+                    .any(|arg| schema_contains_resource(arg, named_struct_schemas, active));
+            };
+            active.push(name.clone());
+            let contains = schema_contains_resource(&body, named_struct_schemas, active);
+            active.pop();
+            contains
+        }
+        TypeSchema::Callable { params, result } => {
+            params
+                .iter()
+                .any(|param| schema_contains_resource(param, named_struct_schemas, active))
+                || schema_contains_resource(result, named_struct_schemas, active)
+        }
+        TypeSchema::Unknown
+        | TypeSchema::Null
+        | TypeSchema::Int
+        | TypeSchema::Float
+        | TypeSchema::Number
+        | TypeSchema::Bool
+        | TypeSchema::String
+        | TypeSchema::Bytes
+        | TypeSchema::GenericParam(_) => false,
+    }
 }
 
 #[allow(dead_code)]

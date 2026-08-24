@@ -214,7 +214,7 @@ against a different catalog is rejected at bind time.
 | `pd-vm --no-default-features --features runtime` | generic core only | `io::*` surface | `HostApiCatalog` snapshot |
 | `+ sqlite` | generic core only (no `cfg(feature = "sqlite")` in `src/vm`) | SQLite builtin (rusqlite, optional dep) | sqlite surface in the catalog |
 | `+ http-client` | generic core only (no `cfg(feature = "http-client")` in `src/vm`) | HTTP/SSE builtin (hyper/rustls) | http surface in the catalog |
-| `pd-vm-nostd` | n/a (no compiler/VM; VMBC v13 decoder only) | none | decodes exact `HostImport` schemas |
+| `pd-vm-nostd` | n/a (no compiler/VM; VMBC v14 plus v13 compatibility decoder) | none | decodes exact `HostImport` schemas |
 | `pd-vm-wasm` (`runtime` feature) | generic core compiled to wasm32 | io surface when enabled | — |
 
 The `sqlite` / `http-client` features only decide whether the same-crate standard builtin is

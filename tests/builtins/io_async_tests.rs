@@ -162,6 +162,33 @@ fn reset_to_ready(vm: &mut Vm) {
 }
 
 #[test]
+fn async_io_explicit_close_reclaims_resource_slots_repeatedly() {
+    let path = temp_path("close-slot-reuse");
+    let mut source = String::from("use io;\n");
+    for index in 0..16 {
+        source.push_str(&format!(
+            "let handle_{index} = io::open(\"{}\", \"w\");\nio::close(handle_{index});\n",
+            path.display()
+        ));
+    }
+    source.push_str("true;\n");
+
+    let compiled = compile_source(&source).expect("repeated close source should compile");
+    let mut vm = run_compiled(compiled.program).expect("repeated explicit closes should complete");
+    assert_eq!(
+        vm.host_context().resource_count(),
+        0,
+        "every explicit close must reclaim its resource-table slot"
+    );
+    assert_eq!(
+        vm.host_context().execution_scope().operations().len(),
+        0,
+        "every explicit close completion operation must retire"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn async_io_schema_less_open_preserves_legacy_guest_ownership_at_materialization() {
     let path = temp_path("legacy-open-ownership");
     let mut vm = run_legacy_builtin_source(
@@ -319,13 +346,8 @@ fn async_io_silent_pipe_read_cancellation() {
         "expected to be waiting on pipe read within 5s timeout"
     );
 
-    // Kill the sleep process so the pipe closes and the worker can unblock.
-    let _ = std::process::Command::new("pkill")
-        .arg("-f")
-        .arg("sleep 60")
-        .output();
-
-    // Reset the VM — this should cancel the operation and close resources.
+    // Reset must interrupt the pipe read and terminate/reap the aggregate
+    // process without external process matching or cleanup.
     vm.reset_for_reuse();
     // Wait for the reset to complete (workers to join).
     let started = std::time::Instant::now();
@@ -336,6 +358,17 @@ fn async_io_silent_pipe_read_cancellation() {
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    assert_eq!(vm.reset_state(), vm::VmResetState::Ready);
+    assert_eq!(
+        vm.host_context().execution_scope().operations().len(),
+        0,
+        "reset must leave no live pipe operation"
+    );
+    assert_eq!(
+        vm.host_context().execution_scope().resources().len(),
+        0,
+        "reset must leave no live pipe/process resource"
+    );
 }
 
 /// Test that concurrent operations on different handles are isolated.

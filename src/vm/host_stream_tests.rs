@@ -949,13 +949,11 @@ fn reset_and_shutdown_release_a_waiting_stream_driver() {
     assert!(shutdown_vm.waiting_host_op_id().is_none());
 }
 
-/// Every terminal stream path must leave *zero* entries in the VM's
-/// `stream_drivers` map and *zero* occupied slots in the execution-scope
-/// operation registry: the producer is released exactly once through the
-/// registered operation driver and neither the map nor the scope retains a
-/// stale entry.
+/// Every terminal stream path must leave zero occupied slots in the
+/// execution-scope operation registry: the producer and its event adapter are
+/// released exactly once through the registered operation driver.
 #[test]
-fn terminal_paths_leave_zero_map_and_scope_entries() {
+fn terminal_paths_leave_zero_stream_operation_entries() {
     // (a) Normal producer completion (the producer itself signals EOF).
     let (mut complete_vm, ..) = setup(
         r#"
@@ -1016,7 +1014,7 @@ fn terminal_paths_leave_zero_map_and_scope_entries() {
     );
     assert!(matches!(cancel_vm.run().unwrap(), VmStatus::Waiting(_)));
     cancel_vm
-        .cancel_waiting_host_op()
+        .try_cancel_waiting_host_op()
         .expect("waiting host operation cancellation should succeed");
 
     assert_eq!(
@@ -1054,7 +1052,7 @@ fn producer_is_dropped_exactly_once_across_every_terminal_path() {
 
     fn run_to_waiting_then_cancel(vm: &mut Vm) {
         assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
-        vm.cancel_waiting_host_op()
+        vm.try_cancel_waiting_host_op()
             .expect("waiting host operation cancellation should succeed");
     }
 
@@ -1139,7 +1137,7 @@ fn callable_stream_cancellation_preserves_explicit_reset_and_drop_reasons() {
     let (mut explicit, _, _, explicit_drops, explicit_reasons) = setup_with_cancellations(SOURCE);
     assert!(matches!(explicit.run().unwrap(), VmStatus::Waiting(_)));
     explicit
-        .cancel_waiting_host_op()
+        .try_cancel_waiting_host_op()
         .expect("waiting host operation cancellation should succeed");
     assert_eq!(
         explicit_reasons.lock().unwrap().as_slice(),

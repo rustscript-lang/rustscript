@@ -1220,6 +1220,38 @@ impl ResourceTable {
         }
     }
 
+    /// Polls every resource already in `Closing` without beginning close on
+    /// unrelated open resources. This is the canonical active-scope driver for
+    /// explicit close operations.
+    pub(crate) fn poll_in_progress_closes(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<ResourceResult<usize>> {
+        let mut closed = 0usize;
+        let mut failed = 0usize;
+        let mut first_error = None;
+        loop {
+            let indices = match self.closing_indices() {
+                Ok(indices) => indices,
+                Err(error) => return Poll::Ready(Err(error)),
+            };
+            if indices.is_empty() {
+                return match first_error {
+                    Some(error) => Poll::Ready(Err(error)),
+                    None => Poll::Ready(Ok(closed)),
+                };
+            }
+            let mut progressed = false;
+            for index in indices {
+                progressed |=
+                    self.try_poll_close(index, cx, &mut closed, &mut failed, &mut first_error);
+            }
+            if !progressed {
+                return Poll::Pending;
+            }
+        }
+    }
+
     /// Drives a caller-context close of every live resource, child first.
     ///
     /// This is the event-driven close-all: unlike a synchronous sweep it can

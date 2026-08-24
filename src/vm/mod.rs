@@ -55,7 +55,6 @@ pub use self::host_context::{
     HostContext, HostContextError, HostContextErrorKind, HostContextResult, HostModule,
 };
 pub use self::host_extension::{HostExtension, HostModuleState, catalog_import_schemas};
-use self::host_runtime::HostRuntime;
 use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable};
 pub use self::invocation::{Invocation, InvocationError, InvocationItem, InvocationPoll};
 use self::operation::{OperationError, OperationErrorCode};
@@ -73,6 +72,7 @@ pub use crate::builtins::runtime::cancellation::CancellationReason;
 pub use crate::builtins::runtime::error::{RuntimeError, RuntimeErrorCode};
 pub use crate::host_api::HostParamPassing;
 pub use crate::host_api::ResourceTypeKey;
+use host_runtime::HostRuntime;
 
 pub use crate::bytecode::{
     CallableTarget, CallableValue, HostImport, HostImportParam, HostImportSchema, OpCode, Program,
@@ -2287,13 +2287,6 @@ impl Vm {
         }
     }
 
-    pub(super) fn clear_locals_with_drop_contract(&mut self) {
-        for slot in 0..self.instance.locals.len() {
-            let previous = std::mem::replace(&mut self.instance.locals[slot], Value::Null);
-            self.drop_value_with_contract(previous);
-        }
-    }
-
     pub(super) fn drop_value_with_contract(&mut self, value: Value) {
         if self.instance.drop_contract_events_enabled {
             self.count_value_drop_contract(&value);
@@ -2357,8 +2350,9 @@ impl Vm {
             return;
         }
         let mut seen = HashSet::new();
+        let mut named_visits = HashSet::new();
         let mut depth = 0usize;
-        self.release_owned_value(&schema, &value, &mut seen, &mut depth);
+        self.release_owned_value(&schema, &value, &mut seen, &mut named_visits, &mut depth);
     }
 
     /// Schema-driven recursive release walk over one runtime `Value`.
@@ -2367,6 +2361,7 @@ impl Vm {
         schema: &crate::compiler::TypeSchema,
         value: &Value,
         seen: &mut HashSet<u64>,
+        named_visits: &mut HashSet<(String, usize)>,
         depth: &mut usize,
     ) {
         const MAX_RELEASE_DEPTH: usize = 256;
@@ -2374,7 +2369,7 @@ impl Vm {
             return;
         }
         *depth += 1;
-        self.release_owned_value_inner(schema, value, seen, depth);
+        self.release_owned_value_inner(schema, value, seen, named_visits, depth);
         *depth -= 1;
     }
 
@@ -2383,6 +2378,7 @@ impl Vm {
         schema: &crate::compiler::TypeSchema,
         value: &Value,
         seen: &mut HashSet<u64>,
+        named_visits: &mut HashSet<(String, usize)>,
         depth: &mut usize,
     ) {
         use crate::compiler::TypeSchema;
@@ -2419,27 +2415,33 @@ impl Vm {
             }
             TypeSchema::Optional(inner) => {
                 if !matches!(value, Value::Null) {
-                    self.release_owned_value(inner, value, seen, depth);
+                    self.release_owned_value(inner, value, seen, named_visits, depth);
                 }
             }
             TypeSchema::Array(item) | TypeSchema::ArrayTupleRest { rest: item, .. } => {
                 if let Value::Array(items) = value {
                     for item_value in items.iter() {
-                        self.release_owned_value(item, item_value, seen, depth);
+                        self.release_owned_value(item, item_value, seen, named_visits, depth);
                     }
                 }
             }
             TypeSchema::ArrayTuple(items) => {
                 if let Value::Array(values) = value {
                     for (item_schema, item_value) in items.iter().zip(values.iter()) {
-                        self.release_owned_value(item_schema, item_value, seen, depth);
+                        self.release_owned_value(
+                            item_schema,
+                            item_value,
+                            seen,
+                            named_visits,
+                            depth,
+                        );
                     }
                 }
             }
             TypeSchema::Map(item) => {
                 if let Value::Map(entries) = value {
                     for (_, map_value) in entries.iter() {
-                        self.release_owned_value(item, map_value, seen, depth);
+                        self.release_owned_value(item, map_value, seen, named_visits, depth);
                     }
                 }
             }
@@ -2450,18 +2452,41 @@ impl Vm {
                             continue;
                         };
                         if let Some(field_schema) = fields.get(key.as_str()) {
-                            self.release_owned_value(field_schema, map_value, seen, depth);
+                            self.release_owned_value(
+                                field_schema,
+                                map_value,
+                                seen,
+                                named_visits,
+                                depth,
+                            );
                         }
                     }
                 }
             }
-            // Plain scalars, unresolved named identities, callables, and
-            // unknown/generic schemas never release anything. Compiled runtime
-            // type maps persist named structs as exact `Object` layouts before
-            // reaching this walker.
+            TypeSchema::Named(name, args) => {
+                let value_identity = match value {
+                    Value::Map(entries) => Arc::as_ptr(entries) as usize,
+                    Value::Array(items) => Arc::as_ptr(items) as usize,
+                    _ => value as *const Value as usize,
+                };
+                if !named_visits.insert((name.clone(), value_identity)) {
+                    return;
+                }
+                let Some(instantiated) = self
+                    .program
+                    .named_struct_schemas
+                    .get(name)
+                    .and_then(|definition| definition.instantiate(args))
+                else {
+                    return;
+                };
+                self.release_owned_value(&instantiated, value, seen, named_visits, depth);
+            }
+            // Plain scalars, unresolved generic identities, and callables do
+            // not release anything. Named identities are resolved above from
+            // the program's finite declaration table.
             TypeSchema::Unknown
             | TypeSchema::GenericParam(_)
-            | TypeSchema::Named(_, _)
             | TypeSchema::Null
             | TypeSchema::Int
             | TypeSchema::Float
@@ -3955,40 +3980,66 @@ impl Vm {
         Ok(results)
     }
 
+    /// Shuts the VM down through the execution scope's typed two-phase close.
+    ///
+    /// The compatibility wrapper preserves the historical unit return. Cleanup
+    /// failures remain observable through [`Vm::reset_error`]; callers that
+    /// need immediate propagation should use [`Vm::try_shutdown`].
     pub fn shutdown(&mut self) {
+        let _ = self.try_shutdown();
+    }
+
+    /// Closes all scoped operations and resources, reports the first cleanup
+    /// failure, and marks the VM shut down only after the scope is quiescent.
+    pub fn try_shutdown(&mut self) -> VmResult<()> {
+        if self.instance.shutdown {
+            return Ok(());
+        }
         self.invalidate_callback_registries();
-        let _ = self.cancel_waiting_host_op();
-        let _ = self.cancel_callable_stream(
-            crate::builtins::runtime::cancellation::CancellationReason::Requested,
-        );
-        self.instance.queued_callables.clear();
-        self.instance.completed_callable_results.clear();
-        self.instance.owned_callables.clear();
-        self.instance.draining_queued_callables = false;
-        self.clear_stack_with_drop_contract();
-        self.instance.capture_cells.clear();
-        self.instance.shared_capture_slots.clear();
-        // Guest-owned release of every owned local before the interpreter
-        // values are dropped (scope shutdown falls back to closing anything
-        // still guest-owned; releasing here launches each close exactly once
-        // with the ownership-release reason).
-        let base = self.active_local_base();
-        let count = self
-            .instance
-            .execution_frames
-            .last()
-            .map(|frame| frame.local_count)
-            .unwrap_or(self.program.local_count);
-        self.release_owned_locals_range(base, count);
-        self.clear_locals_with_drop_contract();
-        self.instance.execution_frames.clear();
-        self.instance.active_local_base_cache = 0;
-        self.instance.active_operand_stack_base_cache = 0;
-        self.instance.call_depth = 0;
-        self.instance.host_return = None;
-        self.instance.waiting_host_op = None;
-        crate::builtins::runtime::close_all_handles(self);
-        self.instance.shutdown = true;
+        let deadline = Instant::now()
+            .checked_add(std::time::Duration::from_secs(5))
+            .expect("shutdown deadline should fit in Instant");
+        self.begin_reset_for_reuse(ResourceCloseReason::Requested, Some(deadline))?;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let waker = {
+            struct ShutdownWake(std::thread::Thread);
+            impl std::task::Wake for ShutdownWake {
+                fn wake(self: Arc<Self>) {
+                    self.0.unpark();
+                }
+                fn wake_by_ref(self: &Arc<Self>) {
+                    self.0.unpark();
+                }
+            }
+            std::task::Waker::from(Arc::new(ShutdownWake(std::thread::current())))
+        };
+        #[cfg(target_arch = "wasm32")]
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        loop {
+            match self.poll_reset_for_reuse(&mut cx, Instant::now()) {
+                Poll::Ready(Ok(())) => {
+                    self.instance.shutdown = true;
+                    return Ok(());
+                }
+                Poll::Ready(Err(error)) => return Err(error),
+                Poll::Pending => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    std::thread::park_timeout(std::time::Duration::from_millis(1));
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        return Err(VmError::Reset(self.reset_error.clone().unwrap_or(
+                            VmResetError::ResetPending {
+                                resource_count: self.host.execution_scope_resource_count(),
+                                operation_count: self.host.execution_scope_operation_count(),
+                            },
+                        )));
+                    }
+                }
+            }
+        }
     }
 
     pub(super) fn register_callback_registry(&mut self, active: &Arc<AtomicBool>) {
@@ -4132,7 +4183,7 @@ impl Vm {
         }
         self.instance.call_depth = self.script_frame_depth();
         self.instance.host_return = None;
-        let _ = self.cancel_waiting_host_op();
+        self.cancel_waiting_host_op();
         self.instance.last_yield_reason = None;
         self.instance
             .map_iterators

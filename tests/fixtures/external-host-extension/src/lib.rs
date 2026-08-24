@@ -54,6 +54,13 @@ pub static CANCELLED_OPS: AtomicUsize = AtomicUsize::new(0);
 /// `ASYNC_READY` (then the future completes and the script resumes).
 static ASYNC_READY: AtomicBool = AtomicBool::new(false);
 
+/// Compile-time compatibility check for the legacy infallible cancellation
+/// wrapper and the explicit fallible variant.
+pub fn assert_waiting_host_op_cancel_api(vm: &mut Vm) {
+    let _: () = vm.cancel_waiting_host_op();
+    let _: VmResult<()> = vm.try_cancel_waiting_host_op();
+}
+
 /// Serializes tests that observe or mutate the close/cancel trackers. The
 /// test harness runs tests concurrently; without this, a close driven by one
 /// test's `Drop` can race another test's counter assertions.

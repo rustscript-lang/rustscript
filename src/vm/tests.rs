@@ -732,7 +732,7 @@ fn pending_bridge_op_survives_swap_and_polls_old_generation() {
 
     // Cancelling the old op routes through generation 1 (its own bridge),
     // not the current generation 2.
-    vm.cancel_waiting_host_op()
+    vm.try_cancel_waiting_host_op()
         .expect("waiting host operation cancellation should succeed");
     assert_eq!(
         *served_by.lock().expect("served-by lock"),
@@ -755,7 +755,7 @@ fn pending_bridge_op_survives_swap_and_polls_old_generation() {
     // generation 1 drops once its last driver reference is gone.
     vm.set_waiting_host_op(new_op)
         .expect("new op should register as waiting");
-    vm.cancel_waiting_host_op()
+    vm.try_cancel_waiting_host_op()
         .expect("waiting host operation cancellation should succeed");
     drop(vm);
     assert_eq!(
@@ -899,7 +899,7 @@ fn waiting_op_swap_cancels_exactly_once_against_original_generation() {
     // cancellation already happened exactly once.
     vm.set_waiting_host_op(new_op)
         .expect("new op should register as waiting");
-    vm.cancel_waiting_host_op()
+    vm.try_cancel_waiting_host_op()
         .expect("waiting host operation cancellation should succeed");
     assert_eq!(
         *served_by.lock().expect("served-by lock"),
@@ -969,7 +969,7 @@ fn multiple_generations_coexist_in_one_registry() {
     for op_id in [gen10_a, gen10_b, gen11_a] {
         vm.set_waiting_host_op(op_id)
             .expect("op should register as waiting");
-        vm.cancel_waiting_host_op()
+        vm.try_cancel_waiting_host_op()
             .expect("waiting host operation cancellation should succeed");
     }
     assert_eq!(vm.host.execution_scope_operation_count(), 0);

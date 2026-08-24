@@ -190,6 +190,7 @@ impl Default for HostFunctionRegistry {
 }
 
 pub use typed::HostCallResult;
+#[cfg(feature = "http-client")]
 pub(crate) use typed::VmMapHandle;
 
 #[cfg(all(test, feature = "sqlite"))]
@@ -335,10 +336,6 @@ pub(crate) fn execute_builtin_call(
         }),
         _ => execute_namespaced_builtin_call(vm, builtin, args),
     }
-}
-
-pub(crate) fn close_all_handles(vm: &mut Vm) {
-    vm.host.reset_for_reuse();
 }
 
 #[cfg(test)]

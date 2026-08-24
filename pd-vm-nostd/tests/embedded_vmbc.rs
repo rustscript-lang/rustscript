@@ -80,9 +80,9 @@ fn assert_invalid_host_import_schema(bytes: &[u8]) {
 }
 
 #[test]
-fn embedded_decoder_reads_host_generated_v13() {
+fn embedded_decoder_reads_host_generated_v14() {
     let (bytes, fingerprint) = encoded_scalar_program();
-    let program = decode_program(&bytes).expect("embedded decoder should accept VMBC v13");
+    let program = decode_program(&bytes).expect("embedded decoder should accept VMBC v14");
 
     assert_eq!(
         program.code(),
@@ -111,6 +111,20 @@ fn embedded_decoder_reads_host_generated_v13() {
         &schema.params[0].schema,
         EmbeddedTypeSchema::Resource(key) if key.as_str() == "io.file"
     ));
+}
+
+#[test]
+fn embedded_decoder_reads_host_generated_v13() {
+    let mut bytes = encode_program(&Program::new(Vec::new(), Vec::new()))
+        .expect("std VMBC encoder should succeed");
+    assert_eq!(&bytes[19..23], &[0, 0, 0, 0]);
+    bytes.drain(19..23);
+    bytes[4..6].copy_from_slice(&13u16.to_le_bytes());
+
+    let program = decode_program(&bytes).expect("embedded decoder should accept VMBC v13");
+    assert!(program.constants().is_empty());
+    assert!(program.code().is_empty());
+    assert_eq!(program.local_count(), 0);
 }
 
 #[test]

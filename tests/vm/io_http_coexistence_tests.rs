@@ -537,7 +537,7 @@ fn worker_cleanup_reaches_quiescence_after_io_and_http() {
 
 #[test]
 fn io_and_http_resource_type_keys_are_disjoint() {
-    let io_keys = ["io.file", "io.socket", "io.process", "io.worker", "io.pipe"];
+    let io_keys = ["io.file", "io.pipe"];
     let http_keys = ["http.request", "http.response", "http.sse"];
 
     for k in &io_keys {

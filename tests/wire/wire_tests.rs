@@ -66,7 +66,7 @@ fn wire_roundtrip_preserves_constants_and_code() {
     });
 
     let encoded = encode_program(&program).expect("encode should succeed");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 14);
     let decoded = decode_program(&encoded).expect("decode should succeed");
 
     assert_eq!(decoded.constants, program.constants);
@@ -191,7 +191,7 @@ fn validate_accepts_known_good_program() {
 }
 
 #[test]
-fn callable_metadata_roundtrips_vmbc_v13() {
+fn callable_metadata_roundtrips_vmbc_v14() {
     let compiled = vm::compile_source_for_repl(
         r#"
             fn add_one(value: int) -> int { value + 1 }
@@ -925,10 +925,10 @@ fn validate_rejects_call_script_targeting_host_import_prototype() {
 }
 
 #[test]
-fn call_script_wire_version_is_v13_and_rejects_v12() {
+fn call_script_wire_version_is_v14_and_rejects_v12() {
     let program = Program::new(vec![], vec![vm::OpCode::Ret as u8]);
     let encoded = encode_program(&program).expect("encode should succeed");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 14);
 
     let mut old = encoded.clone();
     old[4..6].copy_from_slice(&12u16.to_le_bytes());
@@ -939,8 +939,26 @@ fn call_script_wire_version_is_v13_and_rejects_v12() {
 }
 
 #[test]
+fn decoder_accepts_v13_payload_without_named_struct_section() {
+    // For this empty program the v14-only named-struct count begins at byte 19:
+    // magic/version, zero constants, zero code, zero imports, then the absent
+    // type-map flag. Removing that zero count recreates the canonical v13
+    // layout without relying on a second encoder.
+    let program = Program::new(Vec::new(), Vec::new());
+    let mut encoded = encode_program(&program).expect("encode should succeed");
+    assert_eq!(&encoded[19..23], &[0, 0, 0, 0]);
+    encoded.drain(19..23);
+    encoded[4..6].copy_from_slice(&13u16.to_le_bytes());
+
+    let decoded = decode_program(&encoded).expect("v13 payload should remain decodable");
+    assert!(decoded.named_struct_schemas.is_empty());
+    assert!(decoded.constants.is_empty());
+    assert!(decoded.code.is_empty());
+}
+
+#[test]
 fn call_script_no_script_program_code_bytes_unchanged_by_version_bump() {
-    // The V13 bump must not alter instruction bytes for programs without
+    // The V14 bump must not alter instruction bytes for programs without
     // script calls: encode a plain arithmetic program and verify the
     // embedded code section is exactly the assembler output.
     let mut bc = BytecodeBuilder::new();
@@ -950,7 +968,7 @@ fn call_script_no_script_program_code_bytes_unchanged_by_version_bump() {
     bc.ret();
     let program = Program::new(vec![Value::Int(1), Value::Int(2)], bc.finish());
     let encoded = encode_program(&program).expect("encode should succeed");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 14);
     let decoded = decode_program(&encoded).expect("decode should succeed");
     assert_eq!(decoded.code, program.code);
     assert_eq!(decoded.constants, program.constants);

@@ -33,7 +33,9 @@ use std::task::{Context, Poll};
 
 use super::execution_scope::{ExecutionScope, ExecutionScopeError, ScopeCloseOutcome, ScopeState};
 use super::host_runtime::HostRuntime;
-use super::operation::{OperationError, OperationId, OperationSpec, OperationStatus};
+use super::operation::{
+    OperationCancelReason, OperationError, OperationId, OperationSpec, OperationStatus,
+};
 use super::resource::{
     CloseProgress, HostResource, Resource, ResourceAccessFrame, ResourceAccessRequest,
     ResourceCloseReason, ResourceError, ResourceHandle, ResourceMut, ResourceOwnership,
@@ -304,6 +306,20 @@ impl<'a> HostContext<'a> {
     pub fn start_operation(&mut self, spec: OperationSpec) -> HostContextResult<OperationId> {
         self.host
             .execution_scope_start_operation(spec)
+            .map_err(HostContextError::from_scope)
+    }
+
+    /// Aborts a started operation after a later handoff step fails. The driver
+    /// is cancelled at most once, the occupied registry slot is released, and
+    /// any pending guest-result adapter is removed as one atomic host-runtime
+    /// lifecycle action.
+    pub fn abort_operation(
+        &mut self,
+        id: OperationId,
+        reason: OperationCancelReason,
+    ) -> HostContextResult<bool> {
+        self.host
+            .abort_operation(id, reason)
             .map_err(HostContextError::from_scope)
     }
 

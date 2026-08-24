@@ -4,8 +4,8 @@ use std::fmt::Write;
 use crate::builtins::BuiltinFunction;
 use crate::bytecode::{
     CallableKind, CallablePrototype, CallableTarget, CaptureBindingMode, ExportedCallable,
-    FunctionRegion, HostImportParam, HostImportSchema, RootCallableBinding, ScriptFunction,
-    TypeMap, ValueType,
+    FunctionRegion, HostImportParam, HostImportSchema, NamedStructSchema, RootCallableBinding,
+    ScriptFunction, TypeMap, ValueType,
 };
 use crate::compiler::ir::TypeSchema;
 use crate::debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
@@ -14,6 +14,7 @@ use crate::vm::{HostImport, OpCode, Program, Value};
 
 const MAGIC: [u8; 4] = *b"VMBC";
 const VERSION_V13: u16 = 13;
+const VERSION_V14: u16 = 14;
 const FLAGS: u16 = 0;
 const MAX_SCHEMA_DEPTH: usize = 64;
 
@@ -31,6 +32,7 @@ pub enum WireError {
     InvalidCaptureBindingMode(u8),
     InvalidHostParamPassing(u8),
     InvalidHostImportSchema(&'static str),
+    InvalidNamedStructSchema(&'static str),
     SchemaTooDeep,
     InvalidUtf8,
     InvalidResourceKey(String),
@@ -63,6 +65,9 @@ impl std::fmt::Display for WireError {
             }
             WireError::InvalidHostImportSchema(message) => {
                 write!(f, "invalid host import schema: {message}")
+            }
+            WireError::InvalidNamedStructSchema(message) => {
+                write!(f, "invalid named struct schema: {message}")
             }
             WireError::SchemaTooDeep => f.write_str("schema nesting depth exceeds the limit"),
             WireError::InvalidUtf8 => write!(f, "invalid utf-8 string"),
@@ -284,7 +289,7 @@ fn read_constant(cursor: &mut Cursor<'_>, depth: usize) -> Result<Value, WireErr
 pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&VERSION_V13.to_le_bytes());
+    out.extend_from_slice(&VERSION_V14.to_le_bytes());
     out.extend_from_slice(&FLAGS.to_le_bytes());
     write_u32_count("constants", program.constants.len(), &mut out)?;
 
@@ -335,6 +340,7 @@ pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
     }
 
     write_type_map(&mut out, program.type_map.as_ref())?;
+    write_named_struct_schemas(&mut out, &program.named_struct_schemas)?;
     write_debug_info(&mut out, program.debug.as_ref())?;
     write_callable_metadata(&mut out, program)?;
 
@@ -350,7 +356,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     }
 
     let version = cursor.read_u16()?;
-    if version != VERSION_V13 {
+    if version != VERSION_V13 && version != VERSION_V14 {
         return Err(WireError::UnsupportedVersion(version));
     }
 
@@ -422,6 +428,11 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
         });
     }
     let type_map = read_type_map(&mut cursor)?;
+    let named_struct_schemas = if version >= VERSION_V14 {
+        read_named_struct_schemas(&mut cursor)?
+    } else {
+        HashMap::new()
+    };
     let debug = read_debug_info(&mut cursor)?;
     let (
         script_functions,
@@ -437,6 +448,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
 
     let mut program = Program::with_imports_and_debug(constants, code, imports, debug);
     program.type_map = type_map;
+    program.named_struct_schemas = named_struct_schemas;
     program.script_functions = script_functions;
     program.callable_prototypes = callable_prototypes;
     program.function_regions = function_regions;
@@ -1303,6 +1315,66 @@ fn read_debug_info(cursor: &mut Cursor<'_>) -> Result<Option<DebugInfo>, WireErr
         }
         other => Err(WireError::InvalidDebugFlag(other)),
     }
+}
+
+fn write_named_struct_schemas(
+    out: &mut Vec<u8>,
+    schemas: &HashMap<String, NamedStructSchema>,
+) -> Result<(), WireError> {
+    write_u32_count("named struct schemas", schemas.len(), out)?;
+    let ordered = schemas.iter().collect::<BTreeMap<_, _>>();
+    for (name, definition) in ordered {
+        write_string("named struct name", name, out)?;
+        write_u32_count(
+            "named struct type parameters",
+            definition.type_params.len(),
+            out,
+        )?;
+        let mut seen_params = HashSet::new();
+        for parameter in &definition.type_params {
+            if !seen_params.insert(parameter) {
+                return Err(WireError::InvalidNamedStructSchema(
+                    "duplicate type parameter",
+                ));
+            }
+            write_string("named struct type parameter", parameter, out)?;
+        }
+        write_schema(&definition.body_schema, out)?;
+    }
+    Ok(())
+}
+
+fn read_named_struct_schemas(
+    cursor: &mut Cursor<'_>,
+) -> Result<HashMap<String, NamedStructSchema>, WireError> {
+    let count = cursor.read_u32()? as usize;
+    let mut schemas = HashMap::with_capacity(count);
+    for _ in 0..count {
+        let name = cursor.read_string()?;
+        if schemas.contains_key(&name) {
+            return Err(WireError::InvalidNamedStructSchema("duplicate struct name"));
+        }
+        let parameter_count = cursor.read_u32()? as usize;
+        let mut type_params = Vec::with_capacity(parameter_count);
+        for _ in 0..parameter_count {
+            let parameter = cursor.read_string()?;
+            if type_params.contains(&parameter) {
+                return Err(WireError::InvalidNamedStructSchema(
+                    "duplicate type parameter",
+                ));
+            }
+            type_params.push(parameter);
+        }
+        let body_schema = read_schema(cursor)?;
+        schemas.insert(
+            name,
+            NamedStructSchema {
+                type_params,
+                body_schema,
+            },
+        );
+    }
+    Ok(schemas)
 }
 
 fn write_type_map(out: &mut Vec<u8>, type_map: Option<&TypeMap>) -> Result<(), WireError> {

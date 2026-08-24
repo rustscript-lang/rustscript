@@ -1,12 +1,11 @@
 //! Generic scoped I/O host module.
 //!
-//! The same-crate `io::*` builtins (file, socket/listener, child process,
-//! worker thread, stdio pipe) are concrete consumers of the generic scoped
-//! host SDK:
+//! The same-crate `io::*` builtins (file, socket/listener, child process, and
+//! stdio pipe) are concrete consumers of the generic scoped host SDK:
 //!
-//! - file, socket/listener, child process and worker thread are concrete
+//! - file, socket/listener, child process, and stdio pipe are concrete
 //!   [`HostResource`] implementations stored in the VM's execution scope;
-//! - stdio pipes are child resources of their owning process resource;
+//! - blocking work is owned by its single [`HostOperation`] driver;
 //! - read/write/accept/connect/wait and other pending I/O work are dynamic
 //!   [`HostOperation`] drivers associated with the relevant resource handle;
 //! - [`IoPolicy`] is persistent per-VM module state that survives
@@ -121,23 +120,8 @@ pub(crate) fn io_file_key() -> ResourceTypeKey {
     ResourceTypeKey::new("io.file").expect("io.file resource type key must be valid")
 }
 
-/// Stable catalog identity for an IO socket resource.
-pub(crate) fn io_socket_key() -> ResourceTypeKey {
-    ResourceTypeKey::new("io.socket").expect("io.socket resource type key must be valid")
-}
-
-/// Stable catalog identity for an IO child-process resource.
-pub(crate) fn io_process_key() -> ResourceTypeKey {
-    ResourceTypeKey::new("io.process").expect("io.process resource type key must be valid")
-}
-
-/// Stable catalog identity for an IO worker-thread resource.
-pub(crate) fn io_worker_key() -> ResourceTypeKey {
-    ResourceTypeKey::new("io.worker").expect("io.worker resource type key must be valid")
-}
-
-/// Stable catalog identity for an IO stdio pipe resource (a child of a
-/// process resource).
+/// Stable catalog identity for an IO stdio pipe and its aggregate child
+/// process lifecycle.
 pub(crate) fn io_pipe_key() -> ResourceTypeKey {
     ResourceTypeKey::new("io.pipe").expect("io.pipe resource type key must be valid")
 }
@@ -160,20 +144,8 @@ fn build_io_host_catalog() -> Arc<HostApiCatalog> {
         "An open file handle",
     ));
     builder.resource(ResourceTypeSchema::new(
-        io_socket_key(),
-        "An open socket or listener",
-    ));
-    builder.resource(ResourceTypeSchema::new(
-        io_process_key(),
-        "A spawned child process",
-    ));
-    builder.resource(ResourceTypeSchema::new(
-        io_worker_key(),
-        "A cooperative worker thread",
-    ));
-    builder.resource(ResourceTypeSchema::new(
         io_pipe_key(),
-        "A stdio pipe of a child process",
+        "A stdio pipe with its aggregate child process",
     ));
 
     builder.function(HostFunctionSchema::with_return(
@@ -481,7 +453,6 @@ mod ops;
 mod shared;
 #[cfg(windows)]
 mod windows_process_tree;
-mod worker;
 
 #[cfg(target_arch = "wasm32")]
 pub(super) use super::io_wasm::*;

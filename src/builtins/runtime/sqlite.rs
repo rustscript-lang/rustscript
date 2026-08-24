@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::thread;
@@ -208,8 +208,10 @@ struct ConnectionSlot {
     /// First cancellation reason (operation vocabulary) recorded against this
     /// connection, for diagnostics when a worker aborts mid-statement.
     closing_reason: Arc<AtomicU8>,
-    /// Number of worker threads still alive for this connection.
+    /// Number of worker slots reserved or running for this connection.
     live_workers: Arc<AtomicUsize>,
+    /// Number of operation slots reserved or live for this connection.
+    pending_operations: Arc<AtomicUsize>,
     /// Completion waker for the connection resource's poll-based close.
     close_waker: Mutex<Option<Waker>>,
     /// Per-operation completion cells, keyed by raw operation id. Owned by the
@@ -952,6 +954,42 @@ fn execute_with_connection(
     ]))
 }
 
+/// One atomic capacity reservation. The counter is decremented exactly once
+/// when the reservation owner is dropped.
+struct CounterReservation {
+    counter: Arc<AtomicUsize>,
+}
+
+impl CounterReservation {
+    fn acquire(counter: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        let mut current = counter.load(Ordering::SeqCst);
+        loop {
+            if current >= limit {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Some(Self {
+                        counter: Arc::clone(counter),
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for CounterReservation {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Driver for one async SQLite activity (query / execute / transaction).
 ///
 /// The worker thread runs the statement on the shared connection slot and
@@ -965,6 +1003,8 @@ struct SqliteOperationDriver {
     cell: Arc<OperationCell>,
     running: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
+    operation_id: Arc<AtomicU64>,
+    _pending_reservation: CounterReservation,
 }
 
 impl HostOperation for SqliteOperationDriver {
@@ -1013,6 +1053,30 @@ impl HostOperation for SqliteOperationDriver {
     }
 }
 
+impl Drop for SqliteOperationDriver {
+    fn drop(&mut self) {
+        let operation_id = self.operation_id.load(Ordering::SeqCst);
+        if operation_id == 0 {
+            return;
+        }
+        let preserve_for_success_adapter = self
+            .cell
+            .state
+            .lock()
+            .expect("sqlite operation cell lock")
+            .value
+            .as_ref()
+            .is_some_and(Result::is_ok);
+        if !preserve_for_success_adapter {
+            self.slot
+                .pending_results
+                .lock()
+                .expect("sqlite pending results lock")
+                .remove(&operation_id);
+        }
+    }
+}
+
 /// Maximum live sqlite worker threads per connection (safety valve).
 const SQLITE_MAX_WORKERS_PER_SLOT: usize = 8;
 
@@ -1025,75 +1089,31 @@ fn schedule_operation(
     + Send
     + 'static,
 ) -> VmResult<HostOpId> {
-    let pending = vm
-        .host_context()
-        .execution_scope()
-        .operations()
-        .operations_for_resource(handle)
-        .len();
-    if pending >= slot.limits.max_pending_operations {
-        return Err(VmError::HostError(format!(
-            "SQLite pending operation limit {} reached",
-            slot.limits.max_pending_operations
-        )));
-    }
-    if slot.live_workers.load(Ordering::SeqCst) >= SQLITE_MAX_WORKERS_PER_SLOT {
-        return Err(VmError::HostError(
-            "SQLite worker limit reached".to_string(),
-        ));
-    }
+    let pending_reservation =
+        CounterReservation::acquire(&slot.pending_operations, slot.limits.max_pending_operations)
+            .ok_or_else(|| {
+            VmError::HostError(format!(
+                "SQLite pending operation limit {} reached",
+                slot.limits.max_pending_operations
+            ))
+        })?;
+    let worker_reservation =
+        CounterReservation::acquire(&slot.live_workers, SQLITE_MAX_WORKERS_PER_SLOT)
+            .ok_or_else(|| VmError::HostError("SQLite worker limit reached".to_string()))?;
 
     let cell: Arc<OperationCell> = Arc::new(OperationCell::new());
     let running: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let operation_id = Arc::new(AtomicU64::new(0));
     let deadline =
         Instant::now().checked_add(Duration::from_millis(slot.limits.max_transaction_ms));
-
-    let worker_slot = Arc::clone(&slot);
-    let worker_result = Arc::clone(&cell);
-    let worker_running = Arc::clone(&running);
-    let worker_cancelled = Arc::clone(&cancelled);
-    thread::Builder::new()
-        .name(format!(
-            "rustscript-sqlite-worker-{}",
-            slot.live_workers.load(Ordering::SeqCst)
-        ))
-        .spawn(move || {
-            worker_slot.live_workers.fetch_add(1, Ordering::SeqCst);
-            let _execution = worker_slot
-                .execution
-                .lock()
-                .expect("SQLite execution lock should not be poisoned");
-            worker_running.store(true, Ordering::SeqCst);
-            let result = operation(Arc::clone(&worker_slot), worker_cancelled);
-            worker_running.store(false, Ordering::SeqCst);
-            worker_slot.live_workers.fetch_sub(1, Ordering::SeqCst);
-            // Publish the completed value *first*, then wake the operation's
-            // registered waker (and the connection-close waker) so a waiter
-            // that wakes observes the published result on its next poll.
-            let wake = {
-                let mut state = worker_result
-                    .state
-                    .lock()
-                    .expect("SQLite result cell lock should not be poisoned");
-                state.value = Some(result);
-                state.waker.take()
-            };
-            if let Some(waker) = wake {
-                waker.wake();
-            }
-            if let Ok(mut waker) = worker_slot.close_waker.lock()
-                && let Some(waker) = waker.take()
-            {
-                waker.wake();
-            }
-        })
-        .map_err(|error| VmError::HostError(format!("failed to start SQLite worker: {error}")))?;
 
     let driver = SqliteOperationDriver {
         slot: Arc::clone(&slot),
         cell: Arc::clone(&cell),
-        running,
-        cancelled,
+        running: Arc::clone(&running),
+        cancelled: Arc::clone(&cancelled),
+        operation_id: Arc::clone(&operation_id),
+        _pending_reservation: pending_reservation,
     };
     let mut spec = OperationSpec::new(driver).with_resource(handle);
     if let Some(deadline) = deadline {
@@ -1104,14 +1124,12 @@ fn schedule_operation(
         .start_operation(spec)
         .map_err(host_boundary_error)?;
     let raw = op_id.raw();
+    operation_id.store(raw, Ordering::SeqCst);
     slot.pending_results
         .lock()
         .expect("sqlite pending results lock")
-        .insert(raw, cell);
-    // Register the module adapter that materializes this operation's
-    // guest-visible return once the VM's pending host-call awaiting observes
-    // the operation terminal. The adapter pulls the completed value from the
-    // connection slot's pending-result cell; the core never inspects it.
+        .insert(raw, Arc::clone(&cell));
+
     let conn_raw = handle.raw() as i64;
     vm.host.register_pending_op_result(
         raw,
@@ -1123,6 +1141,53 @@ fn schedule_operation(
             })
         }),
     );
+
+    let worker_slot = Arc::clone(&slot);
+    let worker_result = Arc::clone(&cell);
+    let worker_running = Arc::clone(&running);
+    let worker_cancelled = Arc::clone(&cancelled);
+    let spawn_result = thread::Builder::new()
+        .name(format!("rustscript-sqlite-worker-{raw}"))
+        .spawn(move || {
+            let _execution = worker_slot
+                .execution
+                .lock()
+                .expect("SQLite execution lock should not be poisoned");
+            worker_running.store(true, Ordering::SeqCst);
+            let result = operation(Arc::clone(&worker_slot), worker_cancelled);
+            worker_running.store(false, Ordering::SeqCst);
+            let wake = {
+                let mut state = worker_result
+                    .state
+                    .lock()
+                    .expect("SQLite result cell lock should not be poisoned");
+                state.value = Some(result);
+                state.waker.take()
+            };
+            drop(worker_reservation);
+            if let Some(waker) = wake {
+                waker.wake();
+            }
+            if let Ok(mut waker) = worker_slot.close_waker.lock()
+                && let Some(waker) = waker.take()
+            {
+                waker.wake();
+            }
+        });
+
+    if let Err(error) = spawn_result {
+        let cause = VmError::HostError(format!("failed to start SQLite worker: {error}"));
+        return match vm
+            .host_context()
+            .abort_operation(op_id, OperationCancelReason::Requested)
+        {
+            Ok(_) => Err(cause),
+            Err(cleanup) => Err(VmError::HostError(format!(
+                "{cause}; operation rollback failed: {cleanup}"
+            ))),
+        };
+    }
+
     Ok(raw)
 }
 
@@ -1147,6 +1212,19 @@ pub(super) fn take_pending_result(
         .expect("sqlite result cell lock")
         .value
         .take()
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(super) fn pending_result_count(vm: &mut Vm, resource_id: i64) -> usize {
+    lookup_connection(vm, resource_id)
+        .map(|(_, slot)| {
+            slot.pending_results
+                .lock()
+                .expect("sqlite pending results lock")
+                .len()
+        })
+        .unwrap_or(0)
 }
 
 /// Number of worker threads still alive for the connection identified by
@@ -1197,6 +1275,7 @@ pub(super) fn builtin_sqlite_open_impl(vm: &mut Vm, options: VmMapRef<'_>) -> Vm
         closing: Arc::new(AtomicBool::new(false)),
         closing_reason: Arc::new(AtomicU8::new(0)),
         live_workers: Arc::new(AtomicUsize::new(0)),
+        pending_operations: Arc::new(AtomicUsize::new(0)),
         close_waker: Mutex::new(None),
         pending_results: Mutex::new(std::collections::HashMap::new()),
         limits: options.limits,

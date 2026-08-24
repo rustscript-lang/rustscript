@@ -94,7 +94,6 @@ pub(crate) type PendingOpResult =
 
 /// Terminal transition used by the single VM-side operation retirement path.
 pub(crate) enum OperationRetirement {
-    Completed,
     Cancelled(OperationCancelReason),
     Failed(OperationError),
     /// The registry poll already consumed and released the terminal slot.
@@ -185,15 +184,10 @@ impl HostRuntime {
         })
     }
 
-    /// Closes run-scoped host state between runs: the async bridge, callable
-    /// streams and pending-result adapters are cleared. Host bindings,
-    /// capability allow-lists, module state and the execution scope are the
-    /// authoritative lifecycle owners; interpreter resets drive the scope
-    /// close/recycle themselves.
-    ///
-    /// The return type stays `()` for the migration-period builtin caller
-    /// (`close_all_handles`); the execution scope's own close/recycle reports
-    /// failures through the typed two-phase reset path.
+    /// Closes run-scoped host adapters after the execution scope has reached
+    /// quiescence. Host bindings, capability allow-lists and module state are
+    /// preserved; the VM's typed two-phase reset/shutdown path owns scope close
+    /// and recycle.
     pub(crate) fn reset_for_reuse(&mut self) {
         // Drop any module-registered pending-call adapters: they belong to
         // execution-scope operations that a reset is cancelling/closing, and
@@ -329,6 +323,7 @@ impl HostRuntime {
         id: OperationId,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<OperationResult<OperationOutcome>> {
+        self.execution_scope.poll_in_progress_resource_closes(cx);
         self.execution_scope.poll_operation(id, cx)
     }
 
@@ -376,40 +371,33 @@ impl HostRuntime {
         self.pending_op_results.remove(&raw)
     }
 
+    /// Atomically aborts one operation and removes any result adapter installed
+    /// for it. This is the canonical rollback path after a fallible handoff
+    /// that occurs after [`execution_scope_start_operation`](Self::execution_scope_start_operation).
+    pub(crate) fn abort_operation(
+        &mut self,
+        id: OperationId,
+        reason: OperationCancelReason,
+    ) -> ExecutionScopeResult<bool> {
+        let aborted = self.execution_scope.abort_operation(id, reason);
+        self.pending_op_results.remove(&id.raw());
+        aborted
+    }
+
     /// Retires one operation through its requested terminal transition and
     /// always removes the corresponding result adapter. Completion/failure are
     /// followed by `take_outcome`; cancellation uses the registry's atomic
     /// abort (cancel plus consume/release). `Polled` is used when registry poll
     /// already released the slot. Transition/cleanup errors remain typed.
-    pub(crate) fn with_operation_driver_mut<T, R>(
-        &mut self,
-        id: OperationId,
-        apply: impl FnOnce(&mut T) -> R,
-    ) -> ExecutionScopeResult<R>
-    where
-        T: crate::vm::operation::HostOperation,
-    {
-        self.execution_scope.with_operation_driver_mut(id, apply)
-    }
-
     pub(crate) fn retire_operation(
         &mut self,
         id: OperationId,
         retirement: OperationRetirement,
     ) -> ExecutionScopeResult<Option<OperationOutcome>> {
         let retired = match retirement {
-            OperationRetirement::Completed => {
-                let transition = self.execution_scope.complete_operation(id);
-                let outcome = self.execution_scope.take_operation_outcome(id);
-                match (transition, outcome) {
-                    (Err(error), _) | (Ok(_), Err(error)) => Err(error),
-                    (Ok(_), Ok(outcome)) => Ok(Some(outcome)),
-                }
+            OperationRetirement::Cancelled(reason) => {
+                self.abort_operation(id, reason).map(|_| None)
             }
-            OperationRetirement::Cancelled(reason) => self
-                .execution_scope
-                .abort_operation(id, reason)
-                .map(|_| None),
             OperationRetirement::Failed(error) => {
                 let transition = self.execution_scope.fail_operation(id, error);
                 let outcome = self.execution_scope.take_operation_outcome(id);

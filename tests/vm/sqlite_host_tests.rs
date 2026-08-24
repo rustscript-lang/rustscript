@@ -153,6 +153,16 @@ pub mod vm {
             // (mirroring the production module side channel); it does not need
             // to store the adapter — this only keeps the union surface in sync.
         }
+
+        fn abort_operation(
+            &mut self,
+            id: OperationId,
+            reason: OperationCancelReason,
+        ) -> rustscript_vm::VmResult<bool> {
+            self.execution_scope
+                .abort_operation(id, reason)
+                .map_err(|error| rustscript_vm::VmError::HostError(error.to_string()))
+        }
     }
 
     /// The mock `Vm` mirrors the production `Vm::host_context()` surface with
@@ -232,6 +242,14 @@ pub mod vm {
                     .start_operation(spec)
                     .map_err(|error| rustscript_vm::VmError::HostError(error.to_string())),
             )
+        }
+
+        pub fn abort_operation(
+            &mut self,
+            id: OperationId,
+            reason: OperationCancelReason,
+        ) -> HostContextResult<bool> {
+            Self::from_scope(self.host.abort_operation(id, reason))
         }
 
         pub fn close_resource<T: HostResource>(
@@ -412,6 +430,10 @@ pub mod builtins {
                 sqlite::builtin_sqlite_query(vm, args)
             }
 
+            pub fn pending_result_count(vm: &mut Vm, resource_id: i64) -> usize {
+                sqlite::pending_result_count(vm, resource_id)
+            }
+
             pub fn transaction(
                 vm: &mut Vm,
                 args: &[Value],
@@ -456,7 +478,10 @@ pub mod builtins {
                         OperationOutcome::Cancelled(reason) => Poll::Ready(Err(
                             VmError::HostError(format!("SQLite operation cancelled ({reason})")),
                         )),
-                        _ => {
+                        OperationOutcome::Failed(error) => {
+                            Poll::Ready(Err(VmError::HostError(error.to_string())))
+                        }
+                        OperationOutcome::Completed => {
                             let value = connection
                                 .and_then(|raw| sqlite::take_pending_result(vm, op_id, raw))
                                 .unwrap_or_else(|| {
@@ -1535,6 +1560,103 @@ fn sqlite_query_gets_identical_typed_cancellation_on_close_and_reset() {
 
         fs::remove_dir_all(&root).expect("temporary SQLite root should be removed");
     }
+}
+
+#[test]
+fn sqlite_failure_and_cancellation_release_pending_cells_and_capacity() {
+    let root = temporary_root("pending_cell_cleanup");
+    let mut vm = new_vm();
+    let db_id = open_db(
+        &mut vm,
+        open_options(
+            &root,
+            "state.db",
+            "read_write_create",
+            limits([
+                ("max_pending_operations", 1),
+                ("max_transaction_ms", 10_000),
+                ("max_result_bytes", 64 * 1024),
+            ]),
+        ),
+    );
+    let query_limits = limits([("max_rows", 1), ("max_result_bytes", 64 * 1024)]);
+
+    let failed = sqlite::query(
+        &mut vm,
+        &[
+            Value::Int(db_id),
+            Value::string("SELECT value FROM missing_table"),
+            empty_params(),
+            query_limits.clone(),
+        ],
+    )
+    .expect("invalid query should still schedule");
+    let HostCallResult::Pending(failed_id) = failed else {
+        panic!("invalid query should return a pending operation");
+    };
+    assert_eq!(sqlite::pending_result_count(&mut vm, db_id), 1);
+    wait_pending(&mut vm, failed_id).expect_err("invalid query should fail in its worker");
+    assert_eq!(
+        sqlite::pending_result_count(&mut vm, db_id),
+        0,
+        "failed operation must remove its connection result cell"
+    );
+
+    let pending = sqlite::query(
+        &mut vm,
+        &[
+            Value::Int(db_id),
+            Value::string(
+                "WITH RECURSIVE numbers(value) AS (\
+                    SELECT 1 UNION ALL SELECT value + 1 FROM numbers LIMIT 2000000\
+                ) SELECT sum(value) FROM numbers",
+            ),
+            empty_params(),
+            query_limits.clone(),
+        ],
+    )
+    .expect("slow query should schedule after failed capacity is released");
+    let HostCallResult::Pending(cancelled_id) = pending else {
+        panic!("slow query should return a pending operation");
+    };
+    assert_eq!(sqlite::pending_result_count(&mut vm, db_id), 1);
+    wait_for_worker(
+        &mut vm,
+        db_id,
+        std::time::Instant::now() + std::time::Duration::from_secs(1),
+    );
+    let limit_error = sqlite::query(
+        &mut vm,
+        &[
+            Value::Int(db_id),
+            Value::string("SELECT 1"),
+            empty_params(),
+            query_limits.clone(),
+        ],
+    )
+    .expect_err("reserved pending capacity must reject a concurrent query");
+    assert!(
+        limit_error
+            .to_string()
+            .contains("pending operation limit 1")
+    );
+    let cancelled_id = vm::OperationId::from_raw(cancelled_id)
+        .expect("sqlite pending id should be a packed scope operation id");
+    assert!(
+        vm.host_context()
+            .abort_operation(cancelled_id, vm::OperationCancelReason::Requested)
+            .expect("sqlite operation cancellation should succeed")
+    );
+    assert_eq!(
+        sqlite::pending_result_count(&mut vm, db_id),
+        0,
+        "cancelled operation must remove its connection result cell"
+    );
+
+    query(&mut vm, db_id, "SELECT 1", empty_params(), query_limits)
+        .expect("cancelled operation must release pending capacity");
+    sqlite::close_all(&mut vm);
+    fs::remove_dir_all(root).expect("temporary SQLite root should be removed");
 }
 
 #[test]

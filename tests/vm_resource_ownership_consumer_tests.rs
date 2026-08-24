@@ -23,6 +23,7 @@
 //!
 //! Only fake generic [`HostResource`] types with close counters are used.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1137,6 +1138,65 @@ fn nested_aggregate_array_release_releases_each_element_once() {
         0,
         "nested aggregate walk must release every element exactly once"
     );
+}
+
+#[test]
+fn recursive_named_resource_values_release_every_level_exactly_once() {
+    let key = io_file_key();
+    let node_schema = TypeSchema::Named("Node".to_string(), Vec::new());
+    let definition = vm::NamedStructSchema {
+        type_params: Vec::new(),
+        body_schema: TypeSchema::Object(HashMap::from([
+            ("owned".to_string(), TypeSchema::Resource(key)),
+            (
+                "next".to_string(),
+                TypeSchema::Optional(Box::new(node_schema.clone())),
+            ),
+        ])),
+    };
+    let mut bc = BytecodeBuilder::new();
+    bc.ret();
+    let program = Program::new(Vec::new(), bc.finish())
+        .with_named_struct_schemas(HashMap::from([("Node".to_string(), definition)]))
+        .with_local_count(1);
+    let encoded = vm::encode_program(&program).expect("encode recursive named schema");
+    let program = vm::decode_program(&encoded)
+        .expect("decode recursive named schema")
+        .with_type_map(TypeMap {
+            local_types: vec![vm::ValueType::Map],
+            local_schemas: vec![Some(node_schema)],
+            ..TypeMap::default()
+        })
+        .with_local_count(1);
+
+    let counters = CloseCounters::new();
+    let mut vm = Vm::try_new(program).expect("construct VM");
+    let mut raws = Vec::new();
+    for _ in 0..3 {
+        let token = vm
+            .host_context()
+            .push_resource(CountingResource {
+                counters: counters.clone(),
+            })
+            .expect("push recursive resource");
+        let handle = token.handle();
+        vm.host_context()
+            .mark_resource_guest_owned(handle)
+            .expect("mark recursive resource guest-owned");
+        raws.push(handle.raw() as i64);
+    }
+    let mut next = Value::Null;
+    for raw in raws.into_iter().rev() {
+        next = Value::map(vec![
+            (Value::string("owned"), Value::Int(raw)),
+            (Value::string("next"), next),
+        ]);
+    }
+    vm.set_local(0, next).expect("install recursive value");
+
+    assert_eq!(vm.run().expect("run"), VmStatus::Halted);
+    assert_eq!(counters.began(), 3);
+    assert_eq!(vm.host_context().execution_scope().resources().len(), 0);
 }
 
 /// A malformed runtime shape is never released and never panics: returning a

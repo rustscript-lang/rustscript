@@ -290,10 +290,9 @@ pub struct StructDecl {
 
 /// Resolves a named struct instantiation to the exact structural schema used
 /// by runtime ownership traversal. Generic parameters are substituted before
-/// nested named declarations are expanded. A recursive edge is represented as
-/// `Unknown`: the current declaration's concrete fields have already been
-/// persisted, while stopping at the back-edge keeps malformed or recursive
-/// schemas finite and prevents recursive compiler/runtime walks.
+/// nested named declarations are expanded. A recursive edge remains a named
+/// identity so the runtime can resolve it one value level at a time against
+/// the persisted declaration table.
 pub(crate) fn instantiate_named_struct_schema(
     schema: &TypeSchema,
     struct_schemas: &HashMap<String, StructDecl>,
@@ -358,7 +357,7 @@ pub(crate) fn instantiate_named_struct_schema(
                     return TypeSchema::Named(name.clone(), args);
                 };
                 if active.contains(name) {
-                    return TypeSchema::Unknown;
+                    return TypeSchema::Named(name.clone(), args);
                 }
                 if decl.type_params.len() != args.len() {
                     return TypeSchema::Named(name.clone(), args);
@@ -2200,7 +2199,7 @@ mod type_schema_contains_resource_tests {
         assert_eq!(fields["owned"], resource());
         assert_eq!(
             fields["next"],
-            TypeSchema::Optional(Box::new(TypeSchema::Unknown))
+            TypeSchema::Optional(Box::new(TypeSchema::Named("Node".into(), Vec::new())))
         );
     }
 }

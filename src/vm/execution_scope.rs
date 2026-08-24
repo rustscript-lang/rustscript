@@ -405,20 +405,6 @@ impl ExecutionScope {
             .map_err(ExecutionScopeError::Operation)
     }
 
-    pub(crate) fn with_operation_driver_mut<T, R>(
-        &mut self,
-        id: OperationId,
-        apply: impl FnOnce(&mut T) -> R,
-    ) -> ExecutionScopeResult<R>
-    where
-        T: crate::vm::operation::HostOperation,
-    {
-        self.ensure_accepting()?;
-        self.operations
-            .with_driver_mut(id, apply)
-            .map_err(ExecutionScopeError::Operation)
-    }
-
     /// Polls one registered operation to its terminal state using the
     /// caller's context.
     ///
@@ -613,10 +599,22 @@ impl ExecutionScope {
     /// scope outcome reports it, while the current execution continues
     /// without panicking.
     pub fn record_guest_release_error(&mut self, error: ResourceError) {
+        self.record_resource_cleanup_error(error);
+    }
+
+    fn record_resource_cleanup_error(&mut self, error: ResourceError) {
         if self.first_error.is_none() {
             self.first_error = Some(ScopeCloseError::Resource(error));
         }
         self.failed_count += 1;
+    }
+
+    /// Drives only resources whose explicit close already began while the
+    /// scope remains active. Failures are retained in the typed cleanup latch.
+    pub(crate) fn poll_in_progress_resource_closes(&mut self, cx: &mut Context<'_>) {
+        if let Poll::Ready(Err(error)) = self.resources.poll_in_progress_closes(cx) {
+            self.record_resource_cleanup_error(error);
+        }
     }
 
     /// The first cleanup failure recorded so far, if any. A close-failure

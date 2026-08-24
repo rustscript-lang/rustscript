@@ -349,6 +349,15 @@ fn is_compiler_primitive_import(name: &str) -> bool {
     name.starts_with("__prim_")
 }
 
+fn normalize_named_struct_schemas(
+    type_info: &mut typing::TypeInferenceResult,
+    struct_schemas: &HashMap<String, crate::compiler::ir::StructDecl>,
+) {
+    for schema in type_info.local_schemas.iter_mut().flatten() {
+        *schema = instantiate_named_struct_schema(schema, struct_schemas);
+    }
+}
+
 fn compile_parsed_output(
     source: String,
     parsed: FrontendIr,
@@ -390,7 +399,8 @@ fn compile_parsed_output_with_entry_locals(
     // strict RustScript resolution gate and the resource-ownership metadata
     // for the lifetime passes. Slot indices are the pre-compaction logical
     // locals here, exactly the space availability/liveness analyze in.
-    let pre_lifetime_type_info = typing::infer_types(&parsed, typing_mode, entry_local_types);
+    let mut pre_lifetime_type_info = typing::infer_types(&parsed, typing_mode, entry_local_types);
+    normalize_named_struct_schemas(&mut pre_lifetime_type_info, &parsed.struct_schemas);
     if typing_mode.is_strict() {
         enforce_strict_rustscript_type_resolution(&parsed, &pre_lifetime_type_info)
             .map_err(SourceError::Compile)?;
@@ -430,9 +440,7 @@ fn compile_parsed_output_with_entry_locals(
     // concrete instantiated field layout, including generic substitution, so
     // normalize every persisted local schema before lifetime analysis and
     // code generation consume it.
-    for schema in type_info.local_schemas.iter_mut().flatten() {
-        *schema = instantiate_named_struct_schema(schema, &parsed.struct_schemas);
-    }
+    normalize_named_struct_schemas(&mut type_info, &parsed.struct_schemas);
     let FrontendIr {
         stmts,
         locals,

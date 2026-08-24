@@ -157,7 +157,9 @@ fn decode_rejects_invalid_flag_tag_bool_utf8_and_trailing_bytes() {
     ));
 
     let mut bad_debug_flag = encoded_simple.clone();
-    bad_debug_flag[22] = 9;
+    // VMBC v14 inserts the four-byte named-struct declaration count between
+    // the type-map flag and the debug flag.
+    bad_debug_flag[26] = 9;
     assert!(matches!(
         decode_program(&bad_debug_flag),
         Err(WireError::InvalidDebugFlag(9))

@@ -706,3 +706,22 @@ fn vm_core_has_no_legacy_arbitrary_pending_id_lifecycle() {
         }
     }
 }
+
+#[test]
+fn named_schema_normalization_precedes_ownership_and_lifetime_analysis() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/compiler/pipeline.rs");
+    let source = fs::read_to_string(path).expect("read compiler pipeline source");
+    let normalization = source
+        .find("normalize_named_struct_schemas(&mut pre_lifetime_type_info")
+        .expect("the pre-lifetime type map must normalize named struct schemas");
+    let ownership = source
+        .find("let owned_local_slots = pre_lifetime_type_info")
+        .expect("the pipeline must classify resource-owned locals");
+    let lifetime = source
+        .find("lifetime::enforce_local_availability_with_entry_locals")
+        .expect("the pipeline must enforce local availability");
+    assert!(
+        normalization < ownership && ownership < lifetime,
+        "named struct instantiation must run before owned-local classification and lifetime rewriting"
+    );
+}

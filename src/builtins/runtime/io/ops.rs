@@ -3,26 +3,24 @@
 //! These operation drivers are used by both the blocking and async IO paths.
 //! Each driver implements [`HostOperation`] with a one-shot pending-result
 //! provider: a synchronous operation completes immediately (returns `Ready` on
-//! first poll), while an operation that runs on a worker thread stores a
-//! `mpsc::Receiver` and returns `Pending` until the worker completes.
+//! first poll), while an operation that runs on a worker thread publishes one
+//! shared terminal result and returns `Pending` until that result is visible.
 //!
 //! Cancellation uses typed [`OperationCancelReason`] and is idempotent.
-//! Workers are registered as [`IoWorkerResource`] resources in the execution
-//! scope so the generic close lifecycle handles them.
+//! Worker joins are owned directly by their operation, so the operation
+//! registry is the only terminal lifecycle authority.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::task::{Context, Poll, Waker};
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 use crate::vm::Vm;
 use crate::vm::operation::driver::HostOperation;
 use crate::vm::operation::error::{OperationError, OperationErrorCode, OperationResult};
 use crate::vm::operation::reason::OperationCancelReason;
-
-use super::worker::IoWorkerResource;
 
 /// Shared race-free close-completion state that carries a terminal result
 /// and an optional [`Waker`]. Both the resource's close worker and the
@@ -38,46 +36,55 @@ use super::worker::IoWorkerResource;
 ///
 /// This replaces the old `Arc<AtomicBool>` approach, which lost the waker
 /// and could not propagate errors.
+struct CloseCompletionInner {
+    result: Option<Result<(), String>>,
+    waker: Option<Waker>,
+}
+
 pub(crate) struct CloseCompletionState {
-    /// Terminal close result: `None` = still pending, `Some(Ok(()))` = success,
-    /// `Some(Err(msg))` = flush/kill/wait/panic cleanup error.
-    result: Mutex<Option<Result<(), String>>>,
-    /// Waker registered by `CloseCompletionOperation::poll` when returning
-    /// `Pending`. Stored under the same lock as `result` so the
-    /// check-and-register is atomic — no lost wake.
-    waker: Mutex<Option<Waker>>,
+    inner: Mutex<CloseCompletionInner>,
 }
 
 impl CloseCompletionState {
     pub(crate) fn new() -> Self {
         Self {
-            result: Mutex::new(None),
-            waker: Mutex::new(None),
+            inner: Mutex::new(CloseCompletionInner {
+                result: None,
+                waker: None,
+            }),
         }
     }
 
-    /// Store the terminal result, take and wake any registered waker, then
-    /// wake the resource close progression (via `wake_by_ref` to the scope
-    /// poller). Thread-safe; the result and waker are under separate locks
-    /// but the waker is only taken-and-called after the result is stored.
     pub(crate) fn complete(&self, result: Result<(), String>) {
-        // Store the result first.
-        *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
-        // Take and call the waker (if any) so the executor re-polls.
-        if let Some(waker) = self.waker.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let waker = {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if inner.result.is_some() {
+                return;
+            }
+            inner.result = Some(result);
+            inner.waker.take()
+        };
+        if let Some(waker) = waker {
             waker.wake();
         }
     }
 
-    /// Check whether a terminal result is available. Returns `None` if still
-    /// pending; `Some(Ok(()))` or `Some(Err(msg))` if the close has finished.
-    pub(crate) fn take_result(&self) -> Option<Result<(), String>> {
-        self.result.lock().unwrap_or_else(|e| e.into_inner()).take()
+    pub(crate) fn result(&self) -> Option<Result<(), String>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .result
+            .clone()
     }
 
-    /// Register or replace the waker. Called by `CloseCompletionOperation::poll`.
-    fn register_waker(&self, waker: &Waker) {
-        *self.waker.lock().unwrap_or_else(|e| e.into_inner()) = Some(waker.clone());
+    pub(crate) fn poll_result(&self, cx: &Context<'_>) -> Option<Result<(), String>> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.waker = Some(cx.waker().clone());
+        let result = inner.result.clone();
+        if result.is_some() {
+            inner.waker = None;
+        }
+        result
     }
 }
 
@@ -106,28 +113,16 @@ impl CloseCompletionOperation {
 
 impl HostOperation for CloseCompletionOperation {
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
-        // Check terminal state under the lock. If the result is available,
-        // return Ready immediately even if we never polled before
-        // (completion-before-first-poll race).
-        if let Some(result) = self.close_completion.take_result() {
-            return Poll::Ready(result.map_err(|msg| {
-                OperationError::new(OperationErrorCode::OperationDriverFailed, "io::close", msg)
-            }));
+        match self.close_completion.poll_result(cx) {
+            Some(result) => Poll::Ready(result.map_err(|message| {
+                OperationError::new(
+                    OperationErrorCode::OperationDriverFailed,
+                    "io::close",
+                    message,
+                )
+            })),
+            None => Poll::Pending,
         }
-        // No result yet — register the waker (atomically, under the same
-        // lock discipline) so the close worker can wake us.
-        self.close_completion.register_waker(cx.waker());
-        // Double-check: the worker might have completed between our
-        // take_result check and the waker registration. If so, we must
-        // return Ready to avoid a lost wake.
-        // The waker registration is fine — calling it with an already-
-        // completed state is a harmless no-op or extra wake.
-        if let Some(result) = self.close_completion.take_result() {
-            return Poll::Ready(result.map_err(|msg| {
-                OperationError::new(OperationErrorCode::OperationDriverFailed, "io::close", msg)
-            }));
-        }
-        Poll::Pending
     }
 
     fn cancel(&mut self, _reason: OperationCancelReason) -> OperationResult<()> {
@@ -278,248 +273,224 @@ impl HostOperation for ReadyOperation {
     }
 }
 
-/// Signal sent from a worker thread back to the operation driver.
-/// The actual result data is communicated through a separate shared
-/// [`Arc`]`<`[`Mutex`]`<Option<...>>>` that the [`PendingOpResult`] closure
-/// reads from.
+/// Terminal signal published by an IO worker.
 pub(crate) type ThreadedWorkerSignal = Result<(), String>;
 
-/// Shared state between a [`ThreadedOperation`] and its corresponding
-/// [`IoWorkerResource`]. Both reference the same `Arc<SharedWorkerState>`.
-///
-/// The waker protocol uses a two-lock check-register-double-check pattern:
-/// 1. `poll` checks the result under the result lock — if available, returns
-///    `Ready` (completion-before-poll race).
-/// 2. If no result yet, `poll` stores `cx.waker()` under the waker lock.
-/// 3. `poll` re-checks the result (completion-between-check-and-register race).
-/// 4. Worker calls `publish_result` which stores the result, then takes and
-///    wakes the waker under the waker lock.
-pub(crate) struct SharedWorkerState {
-    /// Cancellation flag — set by either operation cancel or resource close.
-    pub(crate) cancelled: AtomicBool,
-    /// One-shot result signalled by the worker thread.
-    pub(crate) result: Mutex<Option<ThreadedWorkerSignal>>,
+#[derive(Clone)]
+pub(crate) struct ThreadedWorkerPublisher {
+    state: Arc<SharedWorkerState>,
+}
 
-    /// Waker registered by `ThreadedOperation::poll` when returning `Pending`.
-    /// Stored under a separate lock so the worker can take-and-call after
-    /// publishing the result without holding the result lock.
-    waker: Mutex<Option<Waker>>,
+impl ThreadedWorkerPublisher {
+    pub(crate) fn send(&self, signal: ThreadedWorkerSignal) -> Result<(), ThreadedWorkerSignal> {
+        self.state.publish_result(signal);
+        Ok(())
+    }
+}
+
+struct WorkerLifecycle {
+    terminal: Option<ThreadedWorkerSignal>,
+    waker: Option<Waker>,
+    handle: Option<JoinHandle<()>>,
+}
+
+/// One terminal authority shared by the operation and its worker thread.
+/// Waker registration and terminal inspection use the same lock, so polling
+/// registers first and then checks without a lost-wake window.
+pub(crate) struct SharedWorkerState {
+    pub(crate) cancelled: AtomicBool,
+    lifecycle: Mutex<WorkerLifecycle>,
 }
 
 impl SharedWorkerState {
     pub(crate) fn new() -> Self {
         Self {
             cancelled: AtomicBool::new(false),
-            result: Mutex::new(None),
-
-            waker: Mutex::new(None),
+            lifecycle: Mutex::new(WorkerLifecycle {
+                terminal: None,
+                waker: None,
+                handle: None,
+            }),
         }
     }
 
-    /// Publish the terminal result and wake any registered waker.
-    /// Called by the worker thread when it finishes.
-    /// This is the sole terminal signal: once called, the result is set and
-    /// the mpsc channel signal is also sent. The mpsc+state cannot diverge
-    /// because both are set in the same critical section (the worker's
-    /// completion handler sets both before returning).
     pub(crate) fn publish_result(&self, signal: ThreadedWorkerSignal) {
-        *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(signal);
-        // Take and call the waker (if any) so the executor re-polls.
-        if let Some(waker) = self.waker.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let waker = {
+            let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            if lifecycle.terminal.is_some() {
+                return;
+            }
+            lifecycle.terminal = Some(signal);
+            lifecycle.waker.take()
+        };
+        if let Some(waker) = waker {
             waker.wake();
         }
     }
 
-    /// Register or replace the waker. Called by `ThreadedOperation::poll`.
-    pub(crate) fn register_waker(&self, waker: &Waker) {
-        *self.waker.lock().unwrap_or_else(|e| e.into_inner()) = Some(waker.clone());
+    fn poll_terminal(&self, cx: &Context<'_>) -> Option<ThreadedWorkerSignal> {
+        let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        lifecycle.waker = Some(cx.waker().clone());
+        let terminal = lifecycle.terminal.clone();
+        if terminal.is_some() {
+            lifecycle.waker = None;
+        }
+        terminal
+    }
+
+    fn install_worker(&self, handle: JoinHandle<()>) -> Result<(), String> {
+        let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if lifecycle.handle.is_some() {
+            return Err("io worker handle was installed more than once".to_string());
+        }
+        lifecycle.handle = Some(handle);
+        Ok(())
+    }
+
+    fn finish_worker(&self, cancel: bool, wait: bool, name: &str) -> Result<(), String> {
+        if cancel {
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
+        let handle = {
+            let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            match lifecycle.handle.as_ref() {
+                Some(handle) if wait || handle.is_finished() => lifecycle.handle.take(),
+                _ => None,
+            }
+        };
+        if let Some(handle) = handle {
+            handle
+                .join()
+                .map_err(|_| format!("worker thread '{name}' panicked"))?;
+        }
+        Ok(())
     }
 }
 
-/// A cancellation-aware operation that runs work on a dedicated thread and
-/// reports completion via a channel.
-///
-/// The worker thread checks the cancellation flag before starting work.
-/// Once cancelled, the receiver returns `Cancelled` on the next poll.
-/// The actual IO result value is communicated through a separate shared
-/// state (e.g. `Arc<Mutex<Option<...>>>`) that the `PendingOpResult` closure
-/// reads from when the operation completes.
-///
-/// Both [`ThreadedOperation`] and [`IoWorkerResource`] share the same
-/// [`SharedWorkerState`] reference. The former drives the VM operation
-/// lifecycle; the latter manages the thread lifecycle (close/drop).
+/// A cancellation-aware operation whose worker, terminal state, panic path,
+/// cancellation path, and wakeup are owned by one operation driver.
 pub(crate) struct ThreadedOperation {
     state: Arc<SharedWorkerState>,
-    /// The worker sends a completion signal through this channel.
-    receiver: Option<Receiver<ThreadedWorkerSignal>>,
     name: String,
-    worker: Option<IoWorkerResource>,
 }
 
 impl ThreadedOperation {
-    /// Create the channel, shared state, and operation BEFORE spawning the
-    /// worker thread. Returns `(Self, Sender, Arc<SharedWorkerState>)` so the
-    /// caller can register the operation and resource first, then spawn the
-    /// worker with `spawn_worker`.
     pub(crate) fn prepare(
         name: impl Into<String>,
-    ) -> (Self, Sender<ThreadedWorkerSignal>, Arc<SharedWorkerState>) {
-        let (tx, rx) = mpsc::channel();
-        let name: String = name.into();
+    ) -> (Self, ThreadedWorkerPublisher, Arc<SharedWorkerState>) {
+        let name = name.into();
         let state = Arc::new(SharedWorkerState::new());
-        let operation = Self {
-            state: state.clone(),
-            receiver: Some(rx),
-            name,
-            worker: None,
+        let publisher = ThreadedWorkerPublisher {
+            state: Arc::clone(&state),
         };
-        (operation, tx, state)
+        (
+            Self {
+                state: Arc::clone(&state),
+                name,
+            },
+            publisher,
+            state,
+        )
     }
 
-    pub(crate) fn attach_worker(&mut self, worker: IoWorkerResource) {
-        debug_assert!(self.worker.is_none());
-        self.worker = Some(worker);
-    }
-
-    fn finish_worker(&mut self, cancel: bool) -> OperationResult<()> {
-        let Some(mut worker) = self.worker.take() else {
-            return Ok(());
-        };
-        worker.stop_and_join(cancel).map_err(|message| {
-            OperationError::new(
-                OperationErrorCode::OperationDriverFailed,
-                "io::operation",
-                message,
-            )
-        })
-    }
-
-    /// Spawn a worker thread using the sender and shared state from
-    /// [`Self::prepare`]. Returns an [`IoWorkerResource`] that manages the
-    /// thread lifecycle.
     pub(crate) fn spawn_worker(
         name: impl Into<String>,
         state: Arc<SharedWorkerState>,
-        tx: Sender<ThreadedWorkerSignal>,
-        work: impl FnOnce(Arc<SharedWorkerState>, Sender<ThreadedWorkerSignal>) + Send + 'static,
-    ) -> IoWorkerResource {
-        let name: String = name.into();
-        let name_clone = name.clone();
-        let state_clone = state.clone();
+        publisher: ThreadedWorkerPublisher,
+        work: impl FnOnce(Arc<SharedWorkerState>, ThreadedWorkerPublisher) + Send + 'static,
+    ) -> Result<(), String> {
+        let name = name.into();
+        let thread_name = name.clone();
+        let worker_name = name.clone();
+        let worker_state = Arc::clone(&state);
+        let fallback_publisher = publisher.clone();
         let handle = thread::Builder::new()
-            .name(name_clone)
+            .name(thread_name)
             .spawn(move || {
-                work(state_clone, tx);
+                if worker_state.cancelled.load(Ordering::SeqCst) {
+                    let _ = fallback_publisher.send(Err(format!(
+                        "operation '{worker_name}' was cancelled before starting"
+                    )));
+                    return;
+                }
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    work(Arc::clone(&worker_state), publisher)
+                }));
+                if result.is_err() {
+                    fallback_publisher
+                        .send(Err(format!("worker thread '{worker_name}' panicked")))
+                        .ok();
+                } else {
+                    let mut lifecycle = worker_state
+                        .lifecycle
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if lifecycle.terminal.is_none() {
+                        lifecycle.terminal = Some(Ok(()));
+                        let waker = lifecycle.waker.take();
+                        drop(lifecycle);
+                        if let Some(waker) = waker {
+                            waker.wake();
+                        }
+                    }
+                }
             })
-            .expect("io worker thread must spawn");
-        IoWorkerResource::new(name, state, handle)
+            .map_err(|error| format!("failed to spawn io worker '{name}': {error}"))?;
+        state.install_worker(handle)
     }
 
-    /// Create a shared worker state and channel pair, then spawn the worker
-    /// thread. Returns `(Self, IoWorkerResource)` — the operation driver and
-    /// the resource that manages the thread lifecycle.
     #[cfg(test)]
     pub(crate) fn spawn(
         name: impl Into<String>,
-        work: impl FnOnce(Arc<SharedWorkerState>, Sender<ThreadedWorkerSignal>) + Send + 'static,
-    ) -> (Self, IoWorkerResource) {
-        let (operation, tx, state) = Self::prepare(name);
-        let worker = Self::spawn_worker(&operation.name, state, tx, work);
-        (operation, worker)
+        work: impl FnOnce(Arc<SharedWorkerState>, ThreadedWorkerPublisher) + Send + 'static,
+    ) -> (Self, ()) {
+        let name = name.into();
+        let (operation, publisher, state) = Self::prepare(name.clone());
+        Self::spawn_worker(name, state, publisher, work).expect("test worker must spawn");
+        (operation, ())
+    }
+
+    fn finish_worker(&self, cancel: bool, wait: bool) -> OperationResult<()> {
+        self.state
+            .finish_worker(cancel, wait, &self.name)
+            .map_err(|message| {
+                OperationError::new(
+                    OperationErrorCode::OperationDriverFailed,
+                    "io::operation",
+                    message,
+                )
+            })
     }
 }
 
 impl HostOperation for ThreadedOperation {
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
-        // Check if cancelled.
-        if self.state.cancelled.load(Ordering::SeqCst) {
-            return Poll::Ready(Err(OperationError::new(
+        let Some(signal) = self.state.poll_terminal(cx) else {
+            return Poll::Pending;
+        };
+        self.finish_worker(false, true)?;
+        Poll::Ready(signal.map_err(|message| {
+            OperationError::new(
                 OperationErrorCode::OperationDriverFailed,
                 "io::operation",
-                format!("operation '{}' was cancelled", self.name),
-            )));
-        }
-        // Check-1: terminal result available? (completion-before-poll race)
-        {
-            let result = self.state.result.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(signal) = result.as_ref() {
-                return match signal {
-                    Ok(()) => {
-                        self.receiver.take();
-                        Poll::Ready(Ok(()))
-                    }
-                    Err(msg) => {
-                        self.receiver.take();
-                        Poll::Ready(Err(OperationError::new(
-                            OperationErrorCode::OperationDriverFailed,
-                            "io::operation",
-                            msg.clone(),
-                        )))
-                    }
-                };
-            }
-        }
-        // No result yet — check channel for disconnected/panic.
-        let receiver = match self.receiver.as_ref() {
-            Some(r) => r,
-            None => return Poll::Ready(Ok(())),
-        };
-        match receiver.try_recv() {
-            Ok(Ok(())) => {
-                self.receiver.take();
-                Poll::Ready(Ok(()))
-            }
-            Ok(Err(msg)) => {
-                self.receiver.take();
-                Poll::Ready(Err(OperationError::new(
-                    OperationErrorCode::OperationDriverFailed,
-                    "io::operation",
-                    msg,
-                )))
-            }
-            Err(mpsc::TryRecvError::Empty) => {
-                // Register the waker so the worker can wake us.
-                self.state.register_waker(cx.waker());
-                // Double-check: the worker might have completed between our
-                // check-1 / try_recv and the waker registration.
-                let result = self.state.result.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(signal) = result.as_ref() {
-                    return match signal {
-                        Ok(()) => {
-                            self.receiver.take();
-                            Poll::Ready(Ok(()))
-                        }
-                        Err(msg) => {
-                            self.receiver.take();
-                            Poll::Ready(Err(OperationError::new(
-                                OperationErrorCode::OperationDriverFailed,
-                                "io::operation",
-                                msg.clone(),
-                            )))
-                        }
-                    };
-                }
-                Poll::Pending
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                // Worker thread panicked or exited without sending a result.
-                self.receiver.take();
-                Poll::Ready(Err(OperationError::new(
-                    OperationErrorCode::OperationDriverFailed,
-                    "io::operation",
-                    format!(
-                        "worker thread '{}' disconnected without a result",
-                        self.name
-                    ),
-                )))
-            }
-        }
+                message,
+            )
+        }))
     }
 
     fn cancel(&mut self, reason: OperationCancelReason) -> OperationResult<()> {
         self.state.cancelled.store(true, Ordering::SeqCst);
-        let _ = reason;
-        self.finish_worker(true)
+        self.state.publish_result(Err(format!(
+            "operation '{}' was cancelled: {reason:?}",
+            self.name
+        )));
+        self.finish_worker(true, false)
+    }
+}
+
+impl Drop for ThreadedOperation {
+    fn drop(&mut self) {
+        let _ = self.state.finish_worker(true, false, &self.name);
     }
 }
 
@@ -878,26 +849,24 @@ mod tests {
         ));
     }
 
-    /// Test: worker disconnects without sending a result.
+    /// Test: a worker panic is published through the same terminal state.
     #[test]
-    fn threaded_op_disconnect_returns_error() {
-        // Create a ThreadedOperation where the worker drops the sender without
-        // sending a result.
-        let (operation, tx, _state) = ThreadedOperation::prepare("test");
-        let mut op = operation;
-        // Drop the sender immediately — simulates worker panic/disconnect.
-        drop(tx);
+    fn threaded_op_worker_panic_returns_error() {
+        let (mut op, ()) = ThreadedOperation::spawn("test", |_state, _tx| {
+            panic!("synthetic worker panic");
+        });
 
         let (waker, _wake_count) = CountingWaker::new();
         let waker = waker.into_waker();
         let mut cx = Context::from_waker(&waker);
 
+        std::thread::sleep(std::time::Duration::from_millis(10));
         let poll_result = HostOperation::poll(&mut op, &mut cx);
         match poll_result {
             Poll::Ready(Err(err)) => {
                 assert!(
-                    err.message().contains("disconnected"),
-                    "error should mention disconnected: {}",
+                    err.message().contains("panicked"),
+                    "error should mention worker panic: {}",
                     err.message()
                 );
             }
@@ -908,14 +877,26 @@ mod tests {
     /// Test: cancellation before poll returns cancelled error.
     #[test]
     fn threaded_op_cancelled_returns_error() {
-        let (mut op, worker) = ThreadedOperation::spawn("test", |_state, _tx| {
-            // Worker does nothing — should never be reached if cancelled.
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (mut op, ()) = ThreadedOperation::spawn("test", move |_state, _tx| {
+            started_tx
+                .send(())
+                .expect("worker start signal should be observed");
+            std::thread::sleep(std::time::Duration::from_millis(200));
         });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("worker should start");
 
-        // Cancel the operation.
+        // Cancellation only publishes the typed terminal and requests worker
+        // stop. It must never synchronously join an uncooperative worker.
+        let started = std::time::Instant::now();
         op.cancel(OperationCancelReason::Requested)
             .expect("test operation cancellation should succeed");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "operation cancellation synchronously joined a live worker"
+        );
 
         let (waker, _wake_count) = CountingWaker::new();
         let waker = waker.into_waker();
@@ -932,12 +913,6 @@ mod tests {
             }
             other => panic!("expected Ready(Err), got {other:?}"),
         }
-
-        // Wait for the worker thread to finish before dropping the worker.
-        // The IoWorkerResource::Drop asserts the thread is finished.
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        // Ensure the worker is cancelled so it won't block on anything.
-        drop(worker);
     }
 
     /// Test: error result from worker propagates.
@@ -967,9 +942,7 @@ mod tests {
         }
     }
 
-    /// Test: publish_result is the sole terminal signal — mpsc+state cannot diverge.
-    /// Both are set atomically in the completion handler, so polling via either
-    /// path returns the same result.
+    /// Test: the shared publisher is the sole terminal signal.
     #[test]
     fn threaded_op_publish_result_is_terminal_signal() {
         let (operation, tx, state) = ThreadedOperation::prepare("test");

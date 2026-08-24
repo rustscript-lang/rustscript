@@ -4,8 +4,8 @@ use crate::assembler::Assembler;
 use crate::builtins::BuiltinFunction;
 use crate::{
     CallableKind, CallablePrototype, CallableTarget, ExportedCallable, FunctionRegion, HostImport,
-    HostImportParam, HostImportSchema, Program, RootCallableBinding, ScriptFunction, TypeMap,
-    Value, ValueType,
+    HostImportParam, HostImportSchema, NamedStructSchema, Program, RootCallableBinding,
+    ScriptFunction, TypeMap, Value, ValueType,
 };
 
 use super::ir::{
@@ -247,6 +247,19 @@ impl Compiler {
             .map_err(CompileError::Assembler)?;
         self.type_map.strict_types = self.typing_mode.is_strict();
         program.type_map = Some(self.type_map);
+        program.named_struct_schemas = self
+            .struct_schemas
+            .into_iter()
+            .map(|(name, declaration)| {
+                (
+                    name,
+                    NamedStructSchema {
+                        type_params: declaration.type_params,
+                        body_schema: declaration.body_schema,
+                    },
+                )
+            })
+            .collect();
         program.local_count = self.frame_local_count;
         program.script_functions = self.script_functions;
         program.callable_prototypes = self.callable_prototypes;

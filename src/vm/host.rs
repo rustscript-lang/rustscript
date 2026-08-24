@@ -653,8 +653,8 @@ pub struct HostFunctionRegistry {
     registry_state: Arc<()>,
     registry_generation_token: Arc<()>,
     registry_generation: Arc<AtomicU64>,
-    /// Shared by ordinary `Clone` siblings; transaction staging keeps the
-    /// origin and publishes only through its typed transaction handle.
+    /// Isolated for ordinary `Clone` siblings. Transaction staging explicitly
+    /// preserves this origin and publishes only through its typed handle.
     transaction_origin: Arc<()>,
     /// Memoized fully-staged standard snapshot (per registry lineage). After a
     /// successful auto-stage of missing standard adapter surfaces, the staged
