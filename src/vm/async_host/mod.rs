@@ -123,9 +123,17 @@ impl Vm {
     /// generation never invalidates outstanding operations, and the old
     /// bridge box drops only after every driver that references it finishes.
     /// New submissions from this point use the new bridge generation.
-    pub fn set_async_bridge(&mut self, bridge: Box<dyn HostAsyncBridge>) {
-        self.cancel_waiting_host_op();
+    pub fn try_set_async_bridge(&mut self, bridge: Box<dyn HostAsyncBridge>) -> VmResult<()> {
+        self.cancel_waiting_host_op()?;
         self.host.async_bridge = Some(Arc::new(Mutex::new(bridge)));
+        Ok(())
+    }
+
+    /// Backward-compatible bridge setter. Embeddings that need to handle a
+    /// typed retirement failure should call [`Vm::try_set_async_bridge`].
+    pub fn set_async_bridge(&mut self, bridge: Box<dyn HostAsyncBridge>) {
+        self.try_set_async_bridge(bridge)
+            .expect("async bridge replacement failed while retiring the waiting operation");
     }
 
     /// Removes the current async host bridge generation.
@@ -137,9 +145,17 @@ impl Vm {
     /// of its drivers finish. Only *new* `submit_host_future` calls are
     /// rejected after a clear, with the usual "requires a host async bridge"
     /// error.
-    pub fn clear_async_bridge(&mut self) {
-        self.cancel_waiting_host_op();
+    pub fn try_clear_async_bridge(&mut self) -> VmResult<()> {
+        self.cancel_waiting_host_op()?;
         self.host.async_bridge = None;
+        Ok(())
+    }
+
+    /// Backward-compatible bridge clearer. Embeddings that need to handle a
+    /// typed retirement failure should call [`Vm::try_clear_async_bridge`].
+    pub fn clear_async_bridge(&mut self) {
+        self.try_clear_async_bridge()
+            .expect("async bridge removal failed while retiring the waiting operation");
     }
 
     pub fn submit_host_future(&mut self, future: HostFuture) -> VmResult<CallOutcome> {
@@ -206,10 +222,14 @@ impl Vm {
                 // cancel re-entry surfaces a typed poison failure that the
                 // registry records as the first internal reason, and the slot
                 // is still released.
-                let _ = self.host.execution_scope_abort_operation(
-                    scope_id,
-                    crate::vm::operation::OperationCancelReason::Requested,
-                );
+                self.host
+                    .retire_operation(
+                        scope_id,
+                        crate::vm::host_runtime::OperationRetirement::Cancelled(
+                            crate::vm::operation::OperationCancelReason::Requested,
+                        ),
+                    )
+                    .map_err(VmError::from)?;
                 return Err(error);
             }
         };
@@ -217,10 +237,14 @@ impl Vm {
             // The bridge explicitly rejected the submission (e.g. a full or
             // policy-blocked bridge). Roll it back exactly like the poison
             // path: cancel the driver once and release the slot immediately.
-            let _ = self.host.execution_scope_abort_operation(
-                scope_id,
-                crate::vm::operation::OperationCancelReason::Requested,
-            );
+            self.host
+                .retire_operation(
+                    scope_id,
+                    crate::vm::host_runtime::OperationRetirement::Cancelled(
+                        crate::vm::operation::OperationCancelReason::Requested,
+                    ),
+                )
+                .map_err(VmError::from)?;
             return Err(error);
         }
         let materialize = std::sync::Arc::clone(&output_cell);
@@ -246,43 +270,38 @@ impl Vm {
         self.instance.waiting_host_op.as_ref().map(|op| op.op_id)
     }
 
-    pub fn cancel_waiting_host_op(&mut self) {
-        self.cancel_waiting_host_op_with_reason(CancellationReason::Requested);
+    pub fn cancel_waiting_host_op(&mut self) -> VmResult<()> {
+        self.cancel_waiting_host_op_with_reason(CancellationReason::Requested)
     }
 
     pub(crate) fn cancel_waiting_host_op_with_reason(
         &mut self,
         reason: crate::builtins::runtime::cancellation::CancellationReason,
-    ) {
+    ) -> VmResult<()> {
         let Some(waiting) = self.instance.waiting_host_op.take() else {
-            return;
+            return Ok(());
         };
-        // A callable stream is cancelled through its VM-side continuation
-        // (callback cleanup + operation release through its driver).
+        // A callable stream is retired through its VM-side continuation so the
+        // producer receives the exact cancellation reason and every VM-side
+        // map/value is released once.
         if self
             .instance
             .host_stream
             .as_ref()
             .is_some_and(|stream| stream.op_id == waiting.op_id)
         {
-            self.cancel_callable_stream();
-            return;
+            return self.cancel_callable_stream(reason);
         }
         let scope_reason = scope_reason(reason);
-        // Every production pending host operation is a real execution-scope
-        // operation with a packed id; the waiting state can only have been
-        // entered through scope-membership validation. Cancel the exact
-        // waiting operation through its own driver with the parallel
-        // operation-cancellation vocabulary. A fabricated/stale waiting id
-        // cannot silently cancel an unrelated operation: cancellation is
-        // routed only through the exact registered waiting operation's id,
-        // and an id that no longer names a live current-scope operation
-        // (stale/foreign) is simply left terminal — nothing to cancel.
-        if let Ok(scope_id) = crate::vm::operation::OperationId::from_raw(waiting.op_id) {
-            let _ = self
-                .host
-                .execution_scope_cancel_operation(scope_id, scope_reason);
-        }
+        let scope_id = crate::vm::operation::OperationId::from_raw(waiting.op_id)
+            .map_err(VmError::Operation)?;
+        self.host
+            .retire_operation(
+                scope_id,
+                crate::vm::host_runtime::OperationRetirement::Cancelled(scope_reason),
+            )
+            .map_err(VmError::from)?;
+        Ok(())
     }
 
     pub fn complete_host_op(
@@ -308,11 +327,14 @@ impl Vm {
         // External completion cancels the waiting operation's own driver so
         // its bridge/background work stops exactly once, then delivers the
         // provided values through the normal waiting-state completion.
-        let _ = self.host.execution_scope_cancel_operation(
-            scope_id,
-            crate::vm::operation::OperationCancelReason::Requested,
-        );
-        self.host.remove_pending_op_result(op_id);
+        self.host
+            .retire_operation(
+                scope_id,
+                crate::vm::host_runtime::OperationRetirement::Cancelled(
+                    crate::vm::operation::OperationCancelReason::Requested,
+                ),
+            )
+            .map_err(VmError::from)?;
         self.complete_waiting_host_op(op_id, values.into())
     }
 
@@ -363,6 +385,12 @@ impl Vm {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(error)) => {
                 self.instance.waiting_host_op = None;
+                if let Err(retirement_error) = self.host.retire_operation(
+                    scope_operation_id,
+                    crate::vm::host_runtime::OperationRetirement::Polled,
+                ) {
+                    return Poll::Ready(Err(VmError::from(retirement_error)));
+                }
                 Poll::Ready(Err(VmError::HostError(error.to_string())))
             }
             Poll::Ready(Ok(outcome)) => match outcome {
@@ -373,6 +401,13 @@ impl Vm {
                             "host operation {op_id} completed without a result"
                         ))),
                     };
+                    if let Err(retirement_error) = self.host.retire_operation(
+                        scope_operation_id,
+                        crate::vm::host_runtime::OperationRetirement::Polled,
+                    ) {
+                        self.instance.waiting_host_op = None;
+                        return Poll::Ready(Err(VmError::from(retirement_error)));
+                    }
                     match value {
                         Ok(values) => match self.complete_waiting_host_op(op_id, values) {
                             Ok(()) => Poll::Ready(Ok(())),
@@ -398,10 +433,22 @@ impl Vm {
                             ));
                     }
                     self.instance.waiting_host_op = None;
+                    if let Err(retirement_error) = self.host.retire_operation(
+                        scope_operation_id,
+                        crate::vm::host_runtime::OperationRetirement::Polled,
+                    ) {
+                        return Poll::Ready(Err(VmError::from(retirement_error)));
+                    }
                     Poll::Ready(Err(VmError::HostError(error.to_string())))
                 }
                 crate::vm::operation::OperationOutcome::Cancelled(reason) => {
                     self.instance.waiting_host_op = None;
+                    if let Err(retirement_error) = self.host.retire_operation(
+                        scope_operation_id,
+                        crate::vm::host_runtime::OperationRetirement::Polled,
+                    ) {
+                        return Poll::Ready(Err(VmError::from(retirement_error)));
+                    }
                     Poll::Ready(Err(VmError::HostError(format!(
                         "host operation {op_id} cancelled ({reason})"
                     ))))
@@ -443,7 +490,7 @@ impl Vm {
                 let cancellation_result = self
                     .run_ctx
                     .cancel(crate::builtins::runtime::cancellation::CancellationReason::Requested);
-                self.cancel_waiting_host_op();
+                self.cancel_waiting_host_op()?;
                 cancellation_result?;
                 return Err(VmError::HostError("host operation cancelled".to_string()));
             }

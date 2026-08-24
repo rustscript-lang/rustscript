@@ -451,6 +451,10 @@ pub(crate) fn builtin_io_open_body(
                 Some(Ok(file)) => {
                     let resource = IoFileResource::new(file);
                     let handle = insert_io_file_resource(vm, resource)?;
+                    vm.transfer_legacy_materialized_resource(
+                        resource_handle(handle)?,
+                        super::io_file_key(),
+                    )?;
                     Ok(CallReturn::one(Value::Int(handle)))
                 }
                 Some(Err(msg)) => Err(VmError::HostError(msg)),
@@ -575,6 +579,10 @@ pub(crate) fn builtin_io_popen_body(
                     }
                     _ => unreachable!("mode validated above"),
                 };
+                vm.transfer_legacy_materialized_resource(
+                    resource_handle(handle)?,
+                    super::io_pipe_key(),
+                )?;
                 Ok(CallReturn::one(Value::Int(handle)))
             })();
             retire_worker_resource(vm, worker_handle);

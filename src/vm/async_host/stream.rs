@@ -58,6 +58,16 @@ pub(crate) trait HostStreamDriver: Send + 'static {
 
     /// Validates and applies one callback-returned action value.
     fn apply_action(&mut self, action: Value) -> VmResult<HostStreamAction>;
+
+    /// Receives the exact lifecycle cancellation reason before producer release.
+    /// Successful completion and operation failure drop the driver without
+    /// invoking this hook.
+    fn cancel(
+        &mut self,
+        _reason: crate::builtins::runtime::cancellation::CancellationReason,
+    ) -> VmResult<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +84,13 @@ pub(crate) struct HostStreamContinuation {
     pub(crate) parent_stack_base: usize,
     pub(crate) parent_frame_count: usize,
     pub(crate) parent_ip: usize,
+}
+
+enum CallableStreamRetirement {
+    Completed,
+    Cancelled(crate::builtins::runtime::cancellation::CancellationReason),
+    Failed(String),
+    Polled,
 }
 
 impl Vm {
@@ -171,10 +188,23 @@ impl Vm {
         }
     }
 
-    pub(crate) fn cancel_callable_stream(&mut self) {
-        if let Some(stream) = self.instance.host_stream.take() {
-            self.retire_callable_stream(stream);
-        }
+    pub(crate) fn cancel_callable_stream(
+        &mut self,
+        reason: crate::builtins::runtime::cancellation::CancellationReason,
+    ) -> VmResult<()> {
+        let Some(stream) = self.instance.host_stream.take() else {
+            return Ok(());
+        };
+        self.retire_callable_stream(stream, CallableStreamRetirement::Cancelled(reason))
+    }
+
+    pub(crate) fn clear_callable_stream_after_scope_close(&mut self) {
+        let Some(stream) = self.instance.host_stream.take() else {
+            self.instance.waiting_host_op = None;
+            return;
+        };
+        self.retire_callable_stream(stream, CallableStreamRetirement::Polled)
+            .expect("polled callable-stream retirement is infallible");
     }
 
     pub(crate) fn poll_callable_stream(
@@ -217,13 +247,12 @@ impl Vm {
         };
         match polled {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(error)) => {
-                self.abort_callable_stream();
-                Poll::Ready(Err(error))
-            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(self
+                .abort_callable_stream(&error)
+                .err()
+                .unwrap_or(error))),
             Poll::Ready(Ok(HostStreamPoll::Complete(summary))) => {
-                self.finish_callable_stream(summary);
-                Poll::Ready(Ok(()))
+                Poll::Ready(self.finish_callable_stream(summary))
             }
             Poll::Ready(Ok(HostStreamPoll::Item(item))) => {
                 self.instance.waiting_host_op = None;
@@ -242,10 +271,10 @@ impl Vm {
                         Err(error) => Poll::Ready(Err(error)),
                     },
                     Ok(VmStatus::Yielded | VmStatus::Waiting(_)) => Poll::Ready(Ok(())),
-                    Err(error) => {
-                        self.abort_callable_stream();
-                        Poll::Ready(Err(error))
-                    }
+                    Err(error) => Poll::Ready(Err(self
+                        .abort_callable_stream(&error)
+                        .err()
+                        .unwrap_or(error))),
                 }
             }
         }
@@ -304,23 +333,22 @@ impl Vm {
         self.finish_callable_stream_callback()
     }
 
-    pub(crate) fn abort_callable_stream_on_run_error(&mut self) {
+    pub(crate) fn abort_callable_stream_on_run_error(&mut self, error: &VmError) -> VmResult<()> {
         if self
             .instance
             .host_stream
             .as_ref()
             .is_some_and(|stream| stream.phase == HostStreamPhase::RunCallback)
         {
-            self.abort_callable_stream();
+            self.abort_callable_stream(error)?;
         }
+        Ok(())
     }
 
     fn finish_callable_stream_callback(&mut self) -> VmResult<VmStatus> {
         let Some(action) = self.instance.host_return.take() else {
-            self.abort_callable_stream();
-            return Err(VmError::InvalidFrameState(
-                "callable stream callback returned no action",
-            ));
+            let error = VmError::InvalidFrameState("callable stream callback returned no action");
+            return Err(self.abort_callable_stream(&error).err().unwrap_or(error));
         };
         let op_id = self
             .instance
@@ -362,55 +390,81 @@ impl Vm {
                 Ok(VmStatus::Waiting(op_id))
             }
             Ok(HostStreamAction::Complete(summary)) => {
-                self.finish_callable_stream(summary);
+                self.finish_callable_stream(summary)?;
                 Ok(VmStatus::Halted)
             }
-            Err(error) => {
-                self.abort_callable_stream();
-                Err(error)
-            }
+            Err(error) => Err(self.abort_callable_stream(&error).err().unwrap_or(error)),
         }
     }
 
-    fn finish_callable_stream(&mut self, summary: Value) {
+    fn finish_callable_stream(&mut self, summary: Value) -> VmResult<()> {
         let Some(stream) = self.instance.host_stream.take() else {
-            return;
+            return Ok(());
         };
-        self.retire_callable_stream(stream);
+        self.retire_callable_stream(stream, CallableStreamRetirement::Completed)?;
         self.instance.stack.push(summary);
+        Ok(())
     }
 
-    fn abort_callable_stream(&mut self) {
+    fn abort_callable_stream(&mut self, failure: &VmError) -> VmResult<()> {
         let Some(stream) = self.instance.host_stream.take() else {
-            return;
+            return Ok(());
         };
         let parent_stack_base = stream.parent_stack_base;
         let parent_frame_count = stream.parent_frame_count;
-        self.retire_callable_stream(stream);
+        let retired = self.retire_callable_stream(
+            stream,
+            CallableStreamRetirement::Failed(failure.to_string()),
+        );
         self.abort_host_invocation(parent_stack_base, parent_frame_count);
+        retired
     }
 
     /// Central terminal teardown for a callable stream.
     ///
-    /// The registered `StreamScopeOperation` is the *sole* producer-release
-    /// owner: aborting the scope operation first cancels the operation driver,
-    /// which takes (drops) the producer out of the shared slot exactly once.
-    /// The VM then removes only its own `stream_drivers` map reference and
-    /// clears the waiting/continuation state. Every terminal path (finish,
-    /// abort, explicit cancel) funnels through this helper so producer release
-    /// is never duplicated in a parallel VM-side path.
-    fn retire_callable_stream(&mut self, stream: HostStreamContinuation) {
-        let _ = self.host.execution_scope_abort_operation(
-            crate::vm::operation::OperationId::from_raw(stream.op_id)
-                .expect("callable stream op id is a packed scope id"),
-            crate::vm::operation::OperationCancelReason::Requested,
-        );
+    /// The operation registry owns the producer lifecycle transition. Normal
+    /// completion marks/consumes `Completed`; operation failures mark/consume
+    /// `Failed`; lifecycle cancellation aborts with its exact reason. Every
+    /// path then removes the VM map entry and continuation values exactly once.
+    fn retire_callable_stream(
+        &mut self,
+        stream: HostStreamContinuation,
+        retirement: CallableStreamRetirement,
+    ) -> VmResult<()> {
+        let scope_id = crate::vm::operation::OperationId::from_raw(stream.op_id)
+            .expect("callable stream op id is a packed scope id");
+        let retirement = match retirement {
+            CallableStreamRetirement::Completed => {
+                crate::vm::host_runtime::OperationRetirement::Completed
+            }
+            CallableStreamRetirement::Cancelled(reason) => {
+                crate::vm::host_runtime::OperationRetirement::Cancelled(super::scope_reason(reason))
+            }
+            CallableStreamRetirement::Failed(message) => {
+                crate::vm::host_runtime::OperationRetirement::Failed(
+                    crate::vm::operation::OperationError::new(
+                        crate::vm::operation::OperationErrorCode::OperationDriverFailed,
+                        "vm::callable-stream",
+                        message,
+                    )
+                    .with_value(stream.op_id),
+                )
+            }
+            CallableStreamRetirement::Polled => {
+                crate::vm::host_runtime::OperationRetirement::Polled
+            }
+        };
+        let retired = self
+            .host
+            .retire_operation(scope_id, retirement)
+            .map_err(VmError::from);
         self.host.stream_drivers.remove(&stream.op_id);
         self.instance.waiting_host_op = None;
         self.drop_value_with_contract(stream.callback);
         if let Some(item) = stream.item {
             self.drop_value_with_contract(item);
         }
+        retired.map(|_| ())
     }
 }
 
@@ -443,14 +497,40 @@ impl crate::vm::operation::HostOperation for StreamScopeOperation {
 
     fn cancel(
         &mut self,
-        _reason: crate::vm::operation::OperationCancelReason,
+        reason: crate::vm::operation::OperationCancelReason,
     ) -> crate::vm::operation::OperationResult<()> {
-        // Release the producer driver now — the sole producer-release owner:
-        // dropping it releases producer resources without requiring another
-        // poll. The VM removes only its map reference afterward.
-        if let Ok(mut guard) = self.slot.lock() {
-            guard.take();
+        let mut guard = self.slot.lock().map_err(|_| {
+            crate::vm::operation::OperationError::new(
+                crate::vm::operation::OperationErrorCode::OperationDriverFailed,
+                "vm::callable-stream",
+                "callable stream driver slot is poisoned during cancellation",
+            )
+        })?;
+        let Some(mut driver) = guard.take() else {
+            return Ok(());
+        };
+        driver.cancel(cancellation_reason(reason)).map_err(|error| {
+            crate::vm::operation::OperationError::new(
+                crate::vm::operation::OperationErrorCode::OperationDriverFailed,
+                "vm::callable-stream",
+                error.to_string(),
+            )
+        })
+    }
+}
+
+fn cancellation_reason(
+    reason: crate::vm::operation::OperationCancelReason,
+) -> crate::builtins::runtime::cancellation::CancellationReason {
+    use crate::builtins::runtime::cancellation::CancellationReason;
+    match reason {
+        crate::vm::operation::OperationCancelReason::Requested => CancellationReason::Requested,
+        crate::vm::operation::OperationCancelReason::Deadline => CancellationReason::Deadline,
+        crate::vm::operation::OperationCancelReason::VmReset => CancellationReason::VmReset,
+        crate::vm::operation::OperationCancelReason::Parent => CancellationReason::Parent,
+        crate::vm::operation::OperationCancelReason::ResourceClosed => {
+            CancellationReason::ResourceClosed
         }
-        Ok(())
+        crate::vm::operation::OperationCancelReason::VmDrop => CancellationReason::VmDrop,
     }
 }

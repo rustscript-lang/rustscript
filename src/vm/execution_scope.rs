@@ -436,6 +436,35 @@ impl ExecutionScope {
             .map_err(ExecutionScopeError::Operation)
     }
 
+    /// Marks an operation completed without polling. The terminal slot remains
+    /// occupied until [`take_operation_outcome`](Self::take_operation_outcome).
+    pub fn complete_operation(&mut self, id: OperationId) -> ExecutionScopeResult<bool> {
+        self.operations
+            .complete(id)
+            .map_err(ExecutionScopeError::Operation)
+    }
+
+    /// Marks an operation failed without polling. First-terminal-state wins.
+    pub fn fail_operation(
+        &mut self,
+        id: OperationId,
+        error: OperationError,
+    ) -> ExecutionScopeResult<bool> {
+        self.operations
+            .fail(id, error)
+            .map_err(ExecutionScopeError::Operation)
+    }
+
+    /// Consumes one terminal outcome and releases its slot for generation reuse.
+    pub fn take_operation_outcome(
+        &mut self,
+        id: OperationId,
+    ) -> ExecutionScopeResult<OperationOutcome> {
+        self.operations
+            .take_outcome(id)
+            .map_err(ExecutionScopeError::Operation)
+    }
+
     /// Aborts a started operation in one step so it never produces a
     /// guest-visible result: cancels the driver exactly once if pending
     /// (recording the first reason), then consumes and immediately releases
@@ -618,6 +647,17 @@ impl ExecutionScope {
                 }
             }
         }
+    }
+
+    /// Runs the VM-Drop-only nonblocking resource close launch after the normal
+    /// scope close poll has cancelled operations and begun all current leaves.
+    /// This never changes the scope state or claims quiescence.
+    pub(crate) fn begin_drop_resource_close_nonblocking(&mut self) -> ExecutionScopeResult<()> {
+        debug_assert_eq!(self.state, ScopeState::Closing);
+        let reason = self.close_reason.unwrap_or(ResourceCloseReason::VmDrop);
+        self.resources
+            .begin_close_remaining_for_drop(reason)
+            .map_err(ExecutionScopeError::Resource)
     }
 
     /// Drives the closing scope to quiescence.

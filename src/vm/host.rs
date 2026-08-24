@@ -1375,23 +1375,38 @@ impl HostFunctionRegistry {
             return Ok(None);
         }
 
-        // Memoized snapshot reuse: when self hasn't changed since the snapshot
-        // was published, it already covers every standard surface, so bind from
-        // it directly (zero registration / generation change). A later source
-        // mutation (custom registration, capability change) bumps self's
-        // generation and invalidates the snapshot.
-        let snapshot_guard = self
+        // Memoized snapshot reuse: when self hasn't changed since publication,
+        // ask the opaque composition to ensure this import set against a clone
+        // of the cached registry. The first bind may have staged only one
+        // standard surface, so direct reuse would make later imports depend on
+        // bind order. A fully covering snapshot returns unchanged with zero
+        // registration; newly required surfaces extend and replace the cached
+        // snapshot. A later source mutation still invalidates it by generation.
+        let source_generation = self.registry_generation.load(Ordering::Relaxed);
+        let cached = self
             .standard_staging_snapshot
             .read()
-            .expect("poisoned lock");
-        if let Some(snapshot) = snapshot_guard.as_ref()
-            && snapshot.source_generation == self.registry_generation.load(Ordering::Relaxed)
-        {
-            let snapshot = Arc::clone(&snapshot.registry);
-            drop(snapshot_guard);
-            return Ok(Some(StandardStageResult { registry: snapshot }));
+            .expect("poisoned lock")
+            .as_ref()
+            .filter(|snapshot| snapshot.source_generation == source_generation)
+            .map(|snapshot| Arc::clone(&snapshot.registry));
+        if let Some(cached) = cached {
+            let mut expanded = cached.transaction_clone();
+            if !composition.ensure_surfaces(imports, &mut expanded)? {
+                return Ok(Some(StandardStageResult { registry: cached }));
+            }
+            self.standard_staging_registrations
+                .fetch_add(1, Ordering::Relaxed);
+            let expanded = Arc::new(expanded);
+            *self
+                .standard_staging_snapshot
+                .write()
+                .expect("poisoned lock") = Some(StandardStagingSnapshot {
+                registry: Arc::clone(&expanded),
+                source_generation,
+            });
+            return Ok(Some(StandardStageResult { registry: expanded }));
         }
-        drop(snapshot_guard);
 
         // Reject custom / mixed fingerprints in the registry: an existing
         // exact entry that is not standard-fingerprint compatible must never
@@ -3137,11 +3152,24 @@ impl Vm {
                 .with_value(op_id),
             )
         })?;
-        self.host
+        let status = self
+            .host
             .execution_scope()
             .operations()
             .status(scope_id)
             .map_err(VmError::Operation)?;
+        if status != crate::vm::operation::OperationStatus::Pending {
+            return Err(VmError::Operation(
+                crate::vm::operation::OperationError::new(
+                    crate::vm::operation::OperationErrorCode::OperationNotPending,
+                    "vm::host-operation-admission",
+                    format!(
+                        "operation {op_id} is terminal ({status:?}); only Pending operations may enter Waiting"
+                    ),
+                )
+                .with_value(op_id),
+            ));
+        }
         Ok(scope_id)
     }
 
@@ -3232,6 +3260,33 @@ impl Vm {
         }
         self.instance.waiting_host_op = None;
         values.push_onto_stack(&mut self.instance.stack);
+        Ok(())
+    }
+
+    /// Transfers a resource produced at an asynchronous materialization boundary
+    /// only when the active return contract is legacy/schema-less. Exact
+    /// contracts deliberately remain HostOwned here so their single strict
+    /// transfer still occurs in the generic exact-return path.
+    pub(crate) fn transfer_legacy_materialized_resource(
+        &mut self,
+        handle: ResourceHandle,
+        expected_key: ResourceTypeKey,
+    ) -> VmResult<()> {
+        let policy = self
+            .instance
+            .waiting_host_op
+            .as_ref()
+            .map(|waiting| waiting.exact_policy.clone())
+            .ok_or_else(|| {
+                VmError::HostError(
+                    "legacy resource materialization requires a waiting host operation".to_string(),
+                )
+            })?;
+        if matches!(policy, ExactHostReturnPolicy::Legacy) {
+            self.host
+                .execution_scope_mark_guest_owned_with_key(handle, &expected_key)
+                .map_err(VmError::from)?;
+        }
         Ok(())
     }
 

@@ -61,6 +61,7 @@ struct SyntheticDriver {
     applied: Arc<AtomicUsize>,
     stopped: Arc<AtomicUsize>,
     producer_error: bool,
+    cancellations: Arc<Mutex<Vec<CancellationReason>>>,
 }
 
 impl Drop for SyntheticDriver {
@@ -109,6 +110,11 @@ impl HostStreamDriver for SyntheticDriver {
                 "invalid synthetic stream action '{other}'"
             ))),
         }
+    }
+
+    fn cancel(&mut self, reason: CancellationReason) -> VmResult<()> {
+        self.cancellations.lock().unwrap().push(reason);
+        Ok(())
     }
 }
 
@@ -189,6 +195,7 @@ struct SyntheticStreamHost {
     stopped: Arc<AtomicUsize>,
     invalid_first: bool,
     producer_error: bool,
+    cancellations: Arc<Mutex<Vec<CancellationReason>>>,
 }
 
 struct YieldOnceHost(bool);
@@ -358,6 +365,7 @@ impl HostFunction for SyntheticStreamHost {
             applied: Arc::clone(&self.applied),
             stopped: Arc::clone(&self.stopped),
             producer_error: self.producer_error,
+            cancellations: Arc::clone(&self.cancellations),
         };
         let outcome = vm.submit_callable_stream(callback.clone(), driver)?;
         Ok(outcome)
@@ -365,10 +373,24 @@ impl HostFunction for SyntheticStreamHost {
 }
 
 fn setup(source: &str) -> (Vm, Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let (vm, polls, applied, stopped, _) = setup_with_cancellations(source);
+    (vm, polls, applied, stopped)
+}
+
+fn setup_with_cancellations(
+    source: &str,
+) -> (
+    Vm,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Vec<CancellationReason>>>,
+) {
     let compiled = compile_source(source).expect("stream source should compile");
     let polls = Arc::new(AtomicUsize::new(0));
     let applied = Arc::new(AtomicUsize::new(0));
     let stopped = Arc::new(AtomicUsize::new(0));
+    let cancellations = Arc::new(Mutex::new(Vec::new()));
     let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     vm.set_async_bridge(Box::new(PendingBridge::default()));
     for function in compiled.functions {
@@ -382,6 +404,7 @@ fn setup(source: &str) -> (Vm, Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<AtomicUsi
                     stopped: Arc::clone(&stopped),
                     invalid_first,
                     producer_error,
+                    cancellations: Arc::clone(&cancellations),
                 }));
             }
             "yield_once" => {
@@ -399,7 +422,7 @@ fn setup(source: &str) -> (Vm, Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<AtomicUsi
             other => panic!("unexpected host import {other}"),
         }
     }
-    (vm, polls, applied, stopped)
+    (vm, polls, applied, stopped, cancellations)
 }
 
 fn poll_once(vm: &mut Vm) -> Poll<Result<(), VmError>> {
@@ -785,6 +808,7 @@ fn dropping_invocation_during_callback_yield_does_not_resume_the_callback() {
                     stopped: Arc::clone(&stopped),
                     invalid_first: false,
                     producer_error: false,
+                    cancellations: Arc::new(Mutex::new(Vec::new())),
                 }));
             }
             "yield_forever" => {
@@ -1001,7 +1025,9 @@ fn terminal_paths_leave_zero_map_and_scope_entries() {
     "#,
     );
     assert!(matches!(cancel_vm.run().unwrap(), VmStatus::Waiting(_)));
-    cancel_vm.cancel_waiting_host_op();
+    cancel_vm
+        .cancel_waiting_host_op()
+        .expect("waiting host operation cancellation should succeed");
     assert!(
         cancel_vm.host.stream_drivers.is_empty(),
         "explicit cancellation must clear the stream driver map"
@@ -1041,7 +1067,8 @@ fn producer_is_dropped_exactly_once_across_every_terminal_path() {
 
     fn run_to_waiting_then_cancel(vm: &mut Vm) {
         assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
-        vm.cancel_waiting_host_op();
+        vm.cancel_waiting_host_op()
+            .expect("waiting host operation cancellation should succeed");
     }
 
     fn run_to_waiting_then_reset(vm: &mut Vm) {
@@ -1116,6 +1143,109 @@ fn producer_is_dropped_exactly_once_across_every_terminal_path() {
             vm.host.stream_drivers.is_empty(),
             "{label}: stream driver map must be empty"
         );
+    }
+}
+
+#[test]
+fn callable_stream_cancellation_preserves_explicit_reset_and_drop_reasons() {
+    const SOURCE: &str = r#"
+        fn synthetic_stream(callback: fn(map) -> map) -> map;
+        synthetic_stream(|item| item);
+    "#;
+
+    let (mut explicit, _, _, explicit_drops, explicit_reasons) = setup_with_cancellations(SOURCE);
+    assert!(matches!(explicit.run().unwrap(), VmStatus::Waiting(_)));
+    explicit
+        .cancel_waiting_host_op()
+        .expect("waiting host operation cancellation should succeed");
+    assert_eq!(
+        explicit_reasons.lock().unwrap().as_slice(),
+        &[CancellationReason::Requested]
+    );
+    assert_eq!(explicit_drops.load(Ordering::SeqCst), 1);
+    assert!(explicit.host.stream_drivers.is_empty());
+    assert_eq!(explicit.host.execution_scope_operation_count(), 0);
+
+    let (mut reset, _, _, reset_drops, reset_reasons) = setup_with_cancellations(SOURCE);
+    assert!(matches!(reset.run().unwrap(), VmStatus::Waiting(_)));
+    reset.reset_for_reuse();
+    assert_eq!(
+        reset_reasons.lock().unwrap().as_slice(),
+        &[CancellationReason::VmReset]
+    );
+    assert_eq!(reset_drops.load(Ordering::SeqCst), 1);
+    assert!(reset.host.stream_drivers.is_empty());
+    assert_eq!(reset.host.execution_scope_operation_count(), 0);
+
+    let (mut dropped, _, _, drop_count, drop_reasons) = setup_with_cancellations(SOURCE);
+    assert!(matches!(dropped.run().unwrap(), VmStatus::Waiting(_)));
+    drop(dropped);
+    assert_eq!(
+        drop_reasons.lock().unwrap().as_slice(),
+        &[CancellationReason::VmDrop]
+    );
+    assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn callable_stream_success_and_errors_drop_without_requested_cancellation() {
+    fn drive_success(vm: &mut Vm) {
+        assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+        while matches!(poll_once(vm), Poll::Pending) {
+            assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+        }
+        assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    }
+
+    for (label, source, succeeds) in [
+        (
+            "producer completion",
+            r#"
+                fn synthetic_stream(callback: fn(map) -> map) -> map;
+                synthetic_stream(|_item| { action: "continue" });
+            "#,
+            true,
+        ),
+        (
+            "callback completion",
+            r#"
+                fn synthetic_stream(callback: fn(map) -> map) -> map;
+                synthetic_stream(|item| item);
+            "#,
+            true,
+        ),
+        (
+            "producer error",
+            r#"
+                fn synthetic_error(callback: fn(map) -> map) -> map;
+                synthetic_error(|item| item);
+            "#,
+            false,
+        ),
+        (
+            "callback error",
+            r#"
+                fn synthetic_invalid(callback: fn(map) -> map) -> map;
+                synthetic_invalid(|item| item);
+            "#,
+            false,
+        ),
+    ] {
+        let (mut vm, _, _, drops, reasons) = setup_with_cancellations(source);
+        if succeeds {
+            drive_success(&mut vm);
+        } else {
+            assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+            assert!(matches!(poll_once(&mut vm), Poll::Ready(Err(_))));
+        }
+        assert!(
+            reasons.lock().unwrap().is_empty(),
+            "{label} is terminal completion/failure, not requested cancellation"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "{label}");
+        assert!(vm.host.stream_drivers.is_empty(), "{label}");
+        assert_eq!(vm.host.execution_scope_operation_count(), 0, "{label}");
+        assert_eq!(vm.host.pending_op_results.len(), 0, "{label}");
     }
 }
 
@@ -1213,6 +1343,7 @@ fn terminal_stream_rejects_late_completion_through_the_direct_vm_api() {
                 applied,
                 stopped,
                 producer_error: false,
+                cancellations: Arc::new(Mutex::new(Vec::new())),
             },
         )
         .unwrap()

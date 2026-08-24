@@ -31,6 +31,79 @@ impl HostAsyncBridge for NoopPendingBridge {
     }
 }
 
+struct NeverReadyOperation;
+
+impl crate::vm::operation::HostOperation for NeverReadyOperation {
+    fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<crate::vm::operation::OperationResult<()>> {
+        Poll::Pending
+    }
+
+    fn cancel(
+        &mut self,
+        _reason: crate::vm::operation::OperationCancelReason,
+    ) -> crate::vm::operation::OperationResult<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn waiting_admission_rejects_every_occupied_terminal_operation() {
+    let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8])).unwrap();
+    let completed = vm
+        .host_context()
+        .start_operation(crate::vm::operation::OperationSpec::new(
+            NeverReadyOperation,
+        ))
+        .unwrap();
+    vm.host
+        .execution_scope_complete_operation(completed)
+        .unwrap();
+
+    let cancelled = vm
+        .host_context()
+        .start_operation(crate::vm::operation::OperationSpec::new(
+            NeverReadyOperation,
+        ))
+        .unwrap();
+    vm.host
+        .execution_scope_cancel_operation(
+            cancelled,
+            crate::vm::operation::OperationCancelReason::Requested,
+        )
+        .unwrap();
+
+    let failed = vm
+        .host_context()
+        .start_operation(crate::vm::operation::OperationSpec::new(
+            NeverReadyOperation,
+        ))
+        .unwrap();
+    vm.host
+        .execution_scope_fail_operation(
+            failed,
+            crate::vm::operation::OperationError::new(
+                crate::vm::operation::OperationErrorCode::OperationDriverFailed,
+                "test",
+                "external failure",
+            ),
+        )
+        .unwrap();
+
+    for id in [completed, cancelled, failed] {
+        let error = vm
+            .set_waiting_host_op(id.raw())
+            .expect_err("terminal operation must not be admitted as Waiting");
+        assert!(matches!(
+            error,
+            VmError::Operation(ref operation)
+                if operation.code()
+                    == crate::vm::operation::OperationErrorCode::OperationNotPending
+        ));
+        assert!(vm.waiting_host_op_id().is_none());
+    }
+    assert_eq!(vm.host.execution_scope_operation_count(), 3);
+}
+
 #[test]
 fn vm_try_new_preserves_operation_registry_tag_exhaustion() {
     static COUNTER: std::sync::atomic::AtomicU64 =
@@ -254,9 +327,16 @@ fn completing_a_submitted_host_op_cancels_the_driver_future() {
 
     assert_eq!(*cancelled.lock().expect("cancel lock"), vec![op_id]);
     assert_eq!(vm.waiting_host_op_id(), None);
-    // External completion cancelled the registered driver; the terminal slot
-    // stays until the scope drains it.
-    assert_eq!(vm.host.execution_scope_operation_count(), 1);
+    assert_eq!(
+        vm.host.execution_scope_operation_count(),
+        0,
+        "external completion must consume and release the terminal slot"
+    );
+    assert_eq!(
+        vm.host.pending_op_results.len(),
+        0,
+        "external completion must remove the result adapter"
+    );
 }
 
 #[test]
@@ -311,8 +391,45 @@ fn failed_submitted_host_completion_clears_waiting_state() {
             if message == "completion failed"
     ));
     assert_eq!(vm.waiting_host_op_id(), None);
-    // The failed poll consumed the registered operation's slot.
+    // The failed poll consumed the registered operation's slot and adapter.
     assert_eq!(vm.host.execution_scope_operation_count(), 0);
+    assert!(vm.host.pending_op_results.is_empty());
+}
+
+#[test]
+fn cancelled_submitted_host_poll_retires_slot_and_result_adapter() {
+    let mut vm =
+        Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8])).expect("construct VM");
+    vm.set_async_bridge(Box::new(NoopPendingBridge));
+    let CallOutcome::Pending(raw) = vm
+        .submit_host_future(Box::pin(async {
+            Ok(HostFutureOutput::returning(CallReturn::none()))
+        }))
+        .expect("submit pending future")
+    else {
+        panic!("future should be pending");
+    };
+    vm.set_waiting_host_op(raw)
+        .expect("admit pending operation");
+    let id = crate::vm::operation::OperationId::from_raw(raw).unwrap();
+    vm.host
+        .execution_scope_cancel_operation(
+            id,
+            crate::vm::operation::OperationCancelReason::Requested,
+        )
+        .expect("mark operation cancelled");
+
+    let waker = futures_util::task::noop_waker();
+    let mut context = std::task::Context::from_waker(&waker);
+    let result = vm.poll_waiting_host_op(&mut context);
+    assert!(matches!(
+        result,
+        Poll::Ready(Err(VmError::HostError(message)))
+            if message.contains(&format!("host operation {raw} cancelled"))
+    ));
+    assert_eq!(vm.host.execution_scope_operation_count(), 0);
+    assert!(vm.host.pending_op_results.is_empty());
+    assert_eq!(vm.waiting_host_op_id(), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -490,7 +607,8 @@ fn pending_bridge_op_survives_swap_and_polls_old_generation() {
 
     // Cancelling the old op routes through generation 1 (its own bridge),
     // not the current generation 2.
-    vm.cancel_waiting_host_op();
+    vm.cancel_waiting_host_op()
+        .expect("waiting host operation cancellation should succeed");
     assert_eq!(
         *served_by.lock().expect("served-by lock"),
         vec![
@@ -501,16 +619,19 @@ fn pending_bridge_op_survives_swap_and_polls_old_generation() {
         ],
         "old op must cancel through generation 1"
     );
-    // The old op's slot is now terminal (released only when the scope drains
-    // it); the new op still lives.
-    assert_eq!(vm.host.execution_scope_operation_count(), 2);
+    assert_eq!(
+        vm.host.execution_scope_operation_count(),
+        1,
+        "explicit cancellation retires the old slot while the new op remains"
+    );
 
     // Release the new op's driver too: now generation 2's bridge (held only
     // by the VM and the new driver) drops once both are released, and
     // generation 1 drops once its last driver reference is gone.
     vm.set_waiting_host_op(new_op)
         .expect("new op should register as waiting");
-    vm.cancel_waiting_host_op();
+    vm.cancel_waiting_host_op()
+        .expect("waiting host operation cancellation should succeed");
     drop(vm);
     assert_eq!(
         drops.load(Ordering::SeqCst),
@@ -653,7 +774,8 @@ fn waiting_op_swap_cancels_exactly_once_against_original_generation() {
     // cancellation already happened exactly once.
     vm.set_waiting_host_op(new_op)
         .expect("new op should register as waiting");
-    vm.cancel_waiting_host_op();
+    vm.cancel_waiting_host_op()
+        .expect("waiting host operation cancellation should succeed");
     assert_eq!(
         *served_by.lock().expect("served-by lock"),
         vec![
@@ -718,13 +840,15 @@ fn multiple_generations_coexist_in_one_registry() {
     );
 
     // Cancel the gen-10 ops and the gen-11 op; each routes to its own
-    // generation. Cancelled slots stay occupied until the scope drains them,
-    // so all three remain present.
+    // generation and retires immediately.
     for op_id in [gen10_a, gen10_b, gen11_a] {
         vm.set_waiting_host_op(op_id)
             .expect("op should register as waiting");
-        vm.cancel_waiting_host_op();
+        vm.cancel_waiting_host_op()
+            .expect("waiting host operation cancellation should succeed");
     }
+    assert_eq!(vm.host.execution_scope_operation_count(), 0);
+    assert_eq!(vm.host.pending_op_results.len(), 0);
     let served = served_by.lock().expect("served-by lock");
     let submit_gen: Vec<u64> = served
         .iter()
@@ -741,8 +865,8 @@ fn multiple_generations_coexist_in_one_registry() {
     drop(served);
     assert_eq!(
         vm.host.execution_scope_operation_count(),
-        3,
-        "both generations' operations share the one registry"
+        0,
+        "all cancelled generations retire from the one registry"
     );
     drop(vm);
     assert_eq!(

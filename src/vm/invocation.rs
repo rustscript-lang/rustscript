@@ -123,8 +123,10 @@ impl Invocation<'_> {
     /// which the stream is fused.
     pub fn cancel(&mut self, reason: CancellationReason) -> VmResult<()> {
         let cancellation_result = self.vm.run_ctx.cancel(reason);
-        self.vm.cancel_waiting_host_op_with_reason(reason);
-        self.vm.cancel_callable_stream();
+        let host_cancel_result = self.vm.cancel_waiting_host_op_with_reason(reason);
+        let stream_cancel_result = self.vm.cancel_callable_stream(reason);
+        host_cancel_result?;
+        stream_cancel_result?;
         cancellation_result
     }
 }
@@ -491,8 +493,8 @@ impl Vm {
         // `Requested` is the embedding-owned cancellation reason used when a
         // consumer abandons a handle. For callable-stream producer waits this
         // also removes the driver; for callback waits it cancels the nested op.
-        self.cancel_waiting_host_op_with_reason(CancellationReason::Requested);
-        self.cancel_callable_stream();
+        let _ = self.cancel_waiting_host_op_with_reason(CancellationReason::Requested);
+        let _ = self.cancel_callable_stream(CancellationReason::Requested);
         self.abort_host_invocation(stack_base, frame_count);
         // Pending Event/Complete values must follow the VM drop contract even
         // when their terminal item can no longer be observed.

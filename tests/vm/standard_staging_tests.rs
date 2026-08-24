@@ -52,6 +52,17 @@ const IO_ONLY_SOURCE: &str = r#"
     io::exists("/");
 "#;
 
+const HTTP_ONLY_SOURCE: &str = r#"
+    use http;
+    http::client::request({ "method": "GET", "url": "http://127.0.0.1:1/x" });
+"#;
+
+const SQLITE_ONLY_SOURCE: &str = r#"
+    use sqlite;
+    let db = sqlite::open({ path: ":memory:", mode: "memory", limits: {} });
+    sqlite::close(&db);
+"#;
+
 // ---------------------------------------------------------------------------
 // Finding 4: partial standard registry completion
 // ---------------------------------------------------------------------------
@@ -187,6 +198,73 @@ fn second_bind_reuses_memoized_snapshot_with_zero_registration_change() {
         snapshot_generation_after_second, snapshot_generation_after_first,
         "reusing the memoized snapshot must not bump its generation"
     );
+}
+
+#[test]
+fn io_first_snapshot_expands_for_later_http_and_sqlite_imports() {
+    let registry = HostFunctionRegistry::new();
+
+    for (source, expected_rounds) in [
+        (IO_ONLY_SOURCE, 1),
+        (HTTP_ONLY_SOURCE, 2),
+        (SQLITE_ONLY_SOURCE, 3),
+    ] {
+        let compiled = compile_standard(source);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+        registry
+            .bind_vm_cached(&mut vm)
+            .expect("a cached partial snapshot must expand for later standard imports");
+        assert_eq!(
+            registry.standard_staging_registrations(),
+            expected_rounds,
+            "each newly required surface is staged exactly once"
+        );
+    }
+
+    let compiled = compile_standard(IO_HTTP_SQLITE_SOURCE);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("the expanded snapshot must cover all three surfaces");
+    assert_eq!(
+        registry.standard_staging_registrations(),
+        3,
+        "a fully covering cached snapshot must not restage any surface"
+    );
+}
+
+#[test]
+fn standard_snapshot_expansion_is_order_independent() {
+    let surfaces = [IO_ONLY_SOURCE, HTTP_ONLY_SOURCE, SQLITE_ONLY_SOURCE];
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let registry = HostFunctionRegistry::new();
+        for (round, index) in order.into_iter().enumerate() {
+            let compiled = compile_standard(surfaces[index]);
+            let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+            registry
+                .bind_vm_cached(&mut vm)
+                .expect("every standard surface order must bind");
+            assert_eq!(
+                registry.standard_staging_registrations(),
+                (round + 1) as u64,
+                "each order stages only its newly required surface"
+            );
+        }
+
+        let compiled = compile_standard(IO_HTTP_SQLITE_SOURCE);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+        registry
+            .bind_vm_cached(&mut vm)
+            .expect("the final cached snapshot must cover every surface");
+        assert_eq!(registry.standard_staging_registrations(), 3);
+    }
 }
 
 /// A registry that already fully covers a required surface (IO) never needs a

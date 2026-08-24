@@ -430,9 +430,14 @@ impl OperationRegistry {
         // Whether the driver cancelled cleanly, the driver's cancel failed
         // (the entry is now terminal `Failed`), or the entry was already
         // terminal before this call, consuming the outcome releases the slot
-        // and makes the id stale exactly once.
-        let _ = self.take_outcome(id);
-        cancel_result
+        // and makes the id stale exactly once. Preserve the first transition
+        // error, while still surfacing an outcome-consumption error when the
+        // cancellation itself succeeded.
+        let take_result = self.take_outcome(id);
+        match (cancel_result, take_result) {
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+            (Ok(cancelled), Ok(_)) => Ok(cancelled),
+        }
     }
 
     /// Cancels every pending operation associated with `resource` and drains

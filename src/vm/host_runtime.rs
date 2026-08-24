@@ -23,7 +23,8 @@ use crate::vm::execution_scope::{
 use crate::vm::host::VmHostFunction;
 use crate::vm::host_context::{HostModule, HostModuleStore};
 use crate::vm::operation::{
-    OperationCancelReason, OperationId, OperationOutcome, OperationResult, OperationSpec,
+    OperationCancelReason, OperationError, OperationId, OperationOutcome, OperationResult,
+    OperationSpec,
 };
 use crate::vm::resource::{
     HostResource, Resource, ResourceAccessFrame, ResourceAccessRequest, ResourceCloseReason,
@@ -90,6 +91,15 @@ impl From<HostRuntimeInitError> for crate::vm::VmError {
 /// module-provided closure does.
 pub(crate) type PendingOpResult =
     Box<dyn FnOnce(&mut crate::vm::Vm) -> crate::vm::VmResult<crate::vm::CallReturn> + Send>;
+
+/// Terminal transition used by the single VM-side operation retirement path.
+pub(crate) enum OperationRetirement {
+    Completed,
+    Cancelled(OperationCancelReason),
+    Failed(OperationError),
+    /// The registry poll already consumed and released the terminal slot.
+    Polled,
+}
 
 /// Host-owned capabilities, resources, operations, and subsystem state.
 ///
@@ -332,8 +342,18 @@ impl HostRuntime {
         self.execution_scope.poll_operation(id, cx)
     }
 
+    /// Marks one current-scope operation completed without consuming its slot.
+    #[cfg(test)]
+    pub(crate) fn execution_scope_complete_operation(
+        &mut self,
+        id: OperationId,
+    ) -> ExecutionScopeResult<bool> {
+        self.execution_scope.complete_operation(id)
+    }
+
     /// Cancels one registered execution-scope operation by id, forwarding the
     /// reason to its driver.
+    #[cfg(test)]
     pub(crate) fn execution_scope_cancel_operation(
         &mut self,
         id: OperationId,
@@ -342,17 +362,14 @@ impl HostRuntime {
         self.execution_scope.cancel_operation(id, reason)
     }
 
-    /// Aborts one registered execution-scope operation so it never produces a
-    /// guest-visible result: cancels the driver exactly once if pending, then
-    /// consumes and immediately releases the slot (restoring full capacity
-    /// and making the id stale). Used to roll back a registered operation
-    /// whose fallible handoff (e.g. a bridge submission) failed.
-    pub(crate) fn execution_scope_abort_operation(
+    /// Marks one current-scope operation failed without consuming its slot.
+    #[cfg(test)]
+    pub(crate) fn execution_scope_fail_operation(
         &mut self,
         id: OperationId,
-        reason: OperationCancelReason,
+        error: OperationError,
     ) -> ExecutionScopeResult<bool> {
-        self.execution_scope.abort_operation(id, reason)
+        self.execution_scope.fail_operation(id, error)
     }
 
     /// Registers the module-provided adapter that materializes the
@@ -369,9 +386,41 @@ impl HostRuntime {
         self.pending_op_results.remove(&raw)
     }
 
-    /// Removes (discards) the module adapter for `raw` without running it.
-    pub(crate) fn remove_pending_op_result(&mut self, raw: u64) {
-        self.pending_op_results.remove(&raw);
+    /// Retires one operation through its requested terminal transition and
+    /// always removes the corresponding result adapter. Completion/failure are
+    /// followed by `take_outcome`; cancellation uses the registry's atomic
+    /// abort (cancel plus consume/release). `Polled` is used when registry poll
+    /// already released the slot. Transition/cleanup errors remain typed.
+    pub(crate) fn retire_operation(
+        &mut self,
+        id: OperationId,
+        retirement: OperationRetirement,
+    ) -> ExecutionScopeResult<Option<OperationOutcome>> {
+        let retired = match retirement {
+            OperationRetirement::Completed => {
+                let transition = self.execution_scope.complete_operation(id);
+                let outcome = self.execution_scope.take_operation_outcome(id);
+                match (transition, outcome) {
+                    (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+                    (Ok(_), Ok(outcome)) => Ok(Some(outcome)),
+                }
+            }
+            OperationRetirement::Cancelled(reason) => self
+                .execution_scope
+                .abort_operation(id, reason)
+                .map(|_| None),
+            OperationRetirement::Failed(error) => {
+                let transition = self.execution_scope.fail_operation(id, error);
+                let outcome = self.execution_scope.take_operation_outcome(id);
+                match (transition, outcome) {
+                    (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+                    (Ok(_), Ok(outcome)) => Ok(Some(outcome)),
+                }
+            }
+            OperationRetirement::Polled => Ok(None),
+        };
+        self.pending_op_results.remove(&id.raw());
+        retired
     }
 
     /// Closes one resource in the owned execution scope, cancelling its
@@ -472,20 +521,27 @@ impl HostRuntime {
         self.execution_scope.poll_close(cx)
     }
 
-    /// Drives exactly one round of the closing scope's close pipeline with a
-    /// no-op waker (nonblocking). Used only by `Vm::drop`: it synchronously
-    /// cancels every pending operation and issues child-first `begin_close` to
-    /// every live resource, then polls that single round. It never loops and
-    /// never waits for quiescence — genuinely event-driven Pending resources
-    /// stay in `Closing` and are released by their own `Drop` guards.
-    pub(crate) fn drive_execution_scope_close_once_with_noop_waker(&mut self) {
+    /// Drives exactly one round of the closing scope's normal close pipeline
+    /// with a no-op waker, then runs the Drop-only nonblocking ancestor launch.
+    /// Pending descendants still block polling/reclaim during reusable reset;
+    /// Drop nevertheless notifies every remaining open ancestor child-first.
+    pub(crate) fn drive_execution_scope_close_once_with_noop_waker(
+        &mut self,
+    ) -> ExecutionScopeResult<()> {
         struct DropNoopWake;
         impl std::task::Wake for DropNoopWake {
             fn wake(self: Arc<Self>) {}
         }
         let waker = Arc::new(DropNoopWake).into();
         let mut cx = Context::from_waker(&waker);
-        let _ = self.execution_scope.poll_close(&mut cx);
+        if let Poll::Ready(Err(error)) = self.execution_scope.poll_close(&mut cx) {
+            return Err(error);
+        }
+        if self.execution_scope.is_closing() {
+            self.execution_scope
+                .begin_drop_resource_close_nonblocking()?;
+        }
+        Ok(())
     }
 
     /// Recycles the owned execution scope to a fresh, empty, Active scope.

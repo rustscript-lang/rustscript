@@ -1403,10 +1403,12 @@ impl Vm {
     /// On any failure the caller must poison: this method never swaps the
     /// scope on error.
     fn finish_reset_to_ready(&mut self) -> Result<(), VmResetError> {
-        self.cancel_waiting_host_op_with_reason(
-            crate::builtins::runtime::cancellation::CancellationReason::VmReset,
-        );
-        self.cancel_callable_stream();
+        // Scope close already delivered VmReset to every pending operation and
+        // consumed all operation slots. Clear only VM-side continuations/maps;
+        // attempting a second cancellation here would overwrite stream
+        // semantics with Requested and target a stale id.
+        self.instance.waiting_host_op = None;
+        self.clear_callable_stream_after_scope_close();
         self.host.reset_for_reuse();
         // R2A-safe: recycle only a Quiescent scope into a fresh Active scope.
         // Arena exhaustion during the replacement is a terminal recycle
@@ -1749,7 +1751,7 @@ impl Vm {
         let status = match self.run_internal(None, true) {
             Ok(status) => status,
             Err(error) => {
-                self.abort_callable_stream_on_run_error();
+                self.abort_callable_stream_on_run_error(&error)?;
                 return Err(error);
             }
         };
@@ -1764,7 +1766,7 @@ impl Vm {
         let status = match self.run_internal(Some(debugger), false) {
             Ok(status) => status,
             Err(error) => {
-                self.abort_callable_stream_on_run_error();
+                self.abort_callable_stream_on_run_error(&error)?;
                 return Err(error);
             }
         };
@@ -1774,10 +1776,12 @@ impl Vm {
 
 impl Drop for Vm {
     fn drop(&mut self) {
-        self.cancel_waiting_host_op_with_reason(
+        let _ = self.cancel_waiting_host_op_with_reason(
             crate::builtins::runtime::cancellation::CancellationReason::VmDrop,
         );
-        self.cancel_callable_stream();
+        let _ = self.cancel_callable_stream(
+            crate::builtins::runtime::cancellation::CancellationReason::VmDrop,
+        );
         // Guest-owned release before the interpreter values are dropped: a
         // `Vm` being dropped without a prior halt/reset/shutdown still owes
         // exactly-once closes for any guest-owned local handles.
@@ -1804,7 +1808,7 @@ impl Drop for Vm {
         let _ = self
             .host
             .execution_scope_begin_close(ResourceCloseReason::VmDrop);
-        self.host.drive_execution_scope_close_once_with_noop_waker();
+        let _ = self.host.drive_execution_scope_close_once_with_noop_waker();
         self.host.reset_for_reuse();
         self.instance.drop_cleanup();
     }
@@ -3818,7 +3822,7 @@ impl Vm {
         let status = match self.run_internal(None, allow_jit) {
             Ok(status) => status,
             Err(error) => {
-                self.abort_callable_stream_on_run_error();
+                self.abort_callable_stream_on_run_error(&error)?;
                 return Err(error);
             }
         };
@@ -3993,8 +3997,10 @@ impl Vm {
 
     pub fn shutdown(&mut self) {
         self.invalidate_callback_registries();
-        self.cancel_waiting_host_op();
-        self.cancel_callable_stream();
+        let _ = self.cancel_waiting_host_op();
+        let _ = self.cancel_callable_stream(
+            crate::builtins::runtime::cancellation::CancellationReason::Requested,
+        );
         self.instance.queued_callables.clear();
         self.instance.completed_callable_results.clear();
         self.instance.owned_callables.clear();
@@ -4166,7 +4172,7 @@ impl Vm {
         }
         self.instance.call_depth = self.script_frame_depth();
         self.instance.host_return = None;
-        self.cancel_waiting_host_op();
+        let _ = self.cancel_waiting_host_op();
         self.instance.last_yield_reason = None;
         self.instance
             .map_iterators

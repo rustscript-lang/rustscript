@@ -522,6 +522,62 @@ fn exact_host_return_foreign_handle_rejected_stack_frame_unchanged() {
     );
 }
 
+#[test]
+fn exact_host_return_rejects_already_guest_owned_handle_as_structured_error() {
+    let compiled = compile_catalog_program("acme::open(\"/tmp/x\");\n");
+    let schema = open_import_schema(&compiled.program);
+    let counters = CloseCounters::new();
+    let host_counters = counters.clone();
+
+    struct AlreadyGuestReturn {
+        counters: CloseCounters,
+    }
+
+    impl HostFunction for AlreadyGuestReturn {
+        fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+            let token = vm
+                .host_context()
+                .push_resource(CountingResource {
+                    counters: self.counters.clone(),
+                })
+                .expect("push");
+            let handle = token.handle();
+            vm.host_context()
+                .mark_resource_guest_owned(handle)
+                .expect("pre-mark guest ownership");
+            Ok(CallOutcome::Return(CallReturn::One(Value::Int(
+                handle.raw() as i64,
+            ))))
+        }
+    }
+
+    let mut registry = HostFunctionRegistry::new();
+    registry
+        .register_exact("acme::open", 1, schema, move || {
+            Box::new(AlreadyGuestReturn {
+                counters: host_counters.clone(),
+            })
+        })
+        .expect("register exact");
+    let mut vm = Vm::try_new(compiled.program).expect("construct VM");
+    registry.bind_vm_cached(&mut vm).expect("bind exact host");
+
+    let error = vm
+        .run()
+        .expect_err("duplicate exact ownership transfer must fail");
+    assert_eq!(
+        error.resource_error_code(),
+        Some(ResourceErrorCode::ResourceNotHostOwned),
+        "already-guest exact return must remain a typed duplicate-transfer error: {error}"
+    );
+    drop(vm);
+    assert_eq!(
+        counters.began(),
+        1,
+        "VM teardown must close the pre-marked guest resource exactly once"
+    );
+}
+
 /// A legacy `schema:None` host return keeps the old behavior: no ownership
 /// transfer, no rejection, plain Int flows through.
 #[test]

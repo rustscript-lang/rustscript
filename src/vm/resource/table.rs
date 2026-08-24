@@ -1362,6 +1362,46 @@ impl ResourceTable {
         }
     }
 
+    /// Drop-only, nonblocking close launch for every remaining open resource.
+    ///
+    /// Unlike the reusable close/reset sweep, this phase does not wait for a
+    /// pending descendant to become quiescent before notifying its ancestors.
+    /// It invokes `begin_close` once for each still-open slot in dependency
+    /// order (deepest child first), retains parents in `Closing` while children
+    /// remain live, and never reports table quiescence. Already-closing slots
+    /// are left untouched, preserving exactly-once begin semantics.
+    pub(crate) fn begin_close_remaining_for_drop(
+        &mut self,
+        reason: ResourceCloseReason,
+    ) -> ResourceResult<()> {
+        let indices = self.live_indices_child_first()?;
+        let mut first_error = None;
+
+        for slot_index in indices {
+            let state = self.replace_slot_state(slot_index, SlotState::Vacant);
+            let SlotState::Open(mut resource) = state else {
+                self.put_slot_state(slot_index, state);
+                continue;
+            };
+            let has_children = !self.slots[slot_index].children.get_mut().is_empty();
+            match resource.begin_close(reason) {
+                Ok(CloseProgress::Ready) if !has_children => self.reclaim(slot_index),
+                Ok(CloseProgress::Ready | CloseProgress::Pending) => {
+                    self.put_slot_state(slot_index, SlotState::Closing(resource));
+                }
+                Err(error) => {
+                    self.put_slot_state(slot_index, SlotState::Open(resource));
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     /// Best-effort synchronous child-first close of every live resource.
     ///
     /// Drives a single [`poll_close_all`](ResourceTable::poll_close_all) sweep
@@ -1500,6 +1540,13 @@ impl ResourceTable {
         failed: &mut usize,
         first_error: &mut Option<ResourceError>,
     ) -> bool {
+        // A Drop-only launch may have moved an ancestor to Closing before a
+        // pending descendant finished. Keep reusable close semantics strictly
+        // child-first: the ancestor is not polled or reclaimed until all child
+        // links have been removed.
+        if !self.slots[slot_index].children.get_mut().is_empty() {
+            return false;
+        }
         let state = self.replace_slot_state(slot_index, SlotState::Vacant);
         let SlotState::Closing(mut resource) = state else {
             self.put_slot_state(slot_index, state);
@@ -1581,6 +1628,27 @@ impl ResourceTable {
             }
         }
         Ok(indices)
+    }
+
+    fn live_indices_child_first(&mut self) -> ResourceResult<Vec<usize>> {
+        let mut indexed_depths = Vec::new();
+        for slot_index in 0..self.slots.len() {
+            if matches!(self.slots[slot_index].state.get_mut(), SlotState::Vacant) {
+                continue;
+            }
+            let mut depth = 0usize;
+            let mut current = slot_index;
+            while let Some(parent) = *self.slots[current].parent.get_mut() {
+                current = self.resolve_index(parent)?;
+                depth = depth.saturating_add(1);
+            }
+            indexed_depths.push((depth, slot_index));
+        }
+        indexed_depths.sort_unstable_by(|left, right| right.cmp(left));
+        Ok(indexed_depths
+            .into_iter()
+            .map(|(_, slot_index)| slot_index)
+            .collect())
     }
 
     // ---- allocation ---------------------------------------------------------------

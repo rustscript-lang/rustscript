@@ -26,6 +26,8 @@ pub enum OperationErrorCode {
     OperationNotFound,
     /// The operation is currently pending.
     OperationPending,
+    /// The operation exists, but has already reached a terminal status.
+    OperationNotPending,
     /// The operation id space was exhausted.
     OperationIdExhausted,
     /// The process-unique operation-registry tag space was exhausted.
@@ -49,6 +51,7 @@ impl OperationErrorCode {
             Self::OperationStale => "operation_stale",
             Self::OperationNotFound => "operation_not_found",
             Self::OperationPending => "operation_pending",
+            Self::OperationNotPending => "operation_not_pending",
             Self::OperationIdExhausted => "operation_id_exhausted",
             Self::OperationRegistryTagExhausted => "operation_registry_tag_exhausted",
             Self::OperationCleanupFailed => "operation_cleanup_failed",
@@ -173,6 +176,10 @@ mod tests {
             (OperationErrorCode::OperationStale, "operation_stale"),
             (OperationErrorCode::OperationNotFound, "operation_not_found"),
             (OperationErrorCode::OperationPending, "operation_pending"),
+            (
+                OperationErrorCode::OperationNotPending,
+                "operation_not_pending",
+            ),
             (
                 OperationErrorCode::OperationIdExhausted,
                 "operation_id_exhausted",

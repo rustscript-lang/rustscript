@@ -828,6 +828,29 @@ impl HostResource for ReasonRecordingResource {
     }
 }
 
+struct NamedDropResource {
+    name: &'static str,
+    pending: bool,
+    events: Arc<Mutex<Vec<(&'static str, ResourceCloseReason)>>>,
+    begins: Arc<AtomicUsize>,
+}
+
+impl HostResource for NamedDropResource {
+    fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
+        self.begins.fetch_add(1, Ordering::SeqCst);
+        self.events.lock().unwrap().push((self.name, reason));
+        Ok(if self.pending {
+            CloseProgress::Pending
+        } else {
+            CloseProgress::Ready
+        })
+    }
+
+    fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
+        Poll::Pending
+    }
+}
+
 /// An operation driver that records the first cancellation reason it receives.
 struct ReasonRecordingOperation {
     cancelled: Arc<Mutex<Vec<OperationCancelReason>>>,
@@ -917,6 +940,64 @@ fn vm_drop_begins_scope_close_with_vm_drop_reason_child_first_and_cancels_operat
         &[OperationCancelReason::VmDrop],
         "the pending operation must be cancelled with the VmDrop reason during Vm drop"
     );
+}
+
+#[test]
+fn vm_drop_begins_open_ancestors_when_a_child_close_remains_pending() {
+    let mut vm = Vm::try_new(Program::new(Vec::new(), Vec::new()))
+        .expect("test VM construction must not fail");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let leaf_begins = Arc::new(AtomicUsize::new(0));
+    let parent_begins = Arc::new(AtomicUsize::new(0));
+    let grandparent_begins = Arc::new(AtomicUsize::new(0));
+
+    {
+        let mut cx = vm.host_context();
+        let grandparent = cx
+            .push_resource(NamedDropResource {
+                name: "grandparent",
+                pending: false,
+                events: Arc::clone(&events),
+                begins: Arc::clone(&grandparent_begins),
+            })
+            .expect("push grandparent");
+        let parent = cx
+            .push_child_resource(
+                NamedDropResource {
+                    name: "parent",
+                    pending: false,
+                    events: Arc::clone(&events),
+                    begins: Arc::clone(&parent_begins),
+                },
+                &grandparent,
+            )
+            .expect("push parent");
+        cx.push_child_resource(
+            NamedDropResource {
+                name: "leaf",
+                pending: true,
+                events: Arc::clone(&events),
+                begins: Arc::clone(&leaf_begins),
+            },
+            &parent,
+        )
+        .expect("push pending leaf");
+    }
+
+    drop(vm);
+
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        &[
+            ("leaf", ResourceCloseReason::VmDrop),
+            ("parent", ResourceCloseReason::VmDrop),
+            ("grandparent", ResourceCloseReason::VmDrop),
+        ],
+        "Drop must synchronously begin every remaining resource child-first"
+    );
+    assert_eq!(leaf_begins.load(Ordering::SeqCst), 1);
+    assert_eq!(parent_begins.load(Ordering::SeqCst), 1);
+    assert_eq!(grandparent_begins.load(Ordering::SeqCst), 1);
 }
 
 /// A resource whose first explicit `begin_close` fails and whose retry

@@ -1,21 +1,29 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vm::{
-    HostFunctionRegistry, IoHostExt, IoPolicy, Value, Vm, VmError, VmStatus, compile_source,
-    standard_composition,
+    BuiltinFunction, HostFunctionRegistry, IoHostExt, IoPolicy, ResourceHandle, ResourceOwnership,
+    Value, Vm, VmError, VmStatus, compile_source, standard_composition,
 };
 
 fn run_source(source: &str) -> Result<Vec<Value>, VmError> {
     let compiled =
         compile_source(&format!("use io;\n{source}")).expect("async io source should compile");
-    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+    let vm = run_compiled(compiled.program)?;
+    Ok(vm.stack().to_vec())
+}
+
+fn run_compiled(program: vm::Program) -> Result<Vm, VmError> {
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.set_standard_composition(standard_composition());
     super::async_test_bridge::install(&mut vm);
+    drive_vm(vm)
+}
 
+fn drive_vm(mut vm: Vm) -> Result<Vm, VmError> {
     let mut status = vm.run()?;
     loop {
         match status {
-            VmStatus::Halted => return Ok(vm.stack().to_vec()),
+            VmStatus::Halted => return Ok(vm),
             VmStatus::Yielded => status = vm.resume()?,
             VmStatus::Waiting(_) => {
                 vm.wait_for_host_op_blocking()?;
@@ -23,6 +31,41 @@ fn run_source(source: &str) -> Result<Vec<Value>, VmError> {
             }
         }
     }
+}
+
+fn run_legacy_builtin_source(
+    source: &str,
+    import_name: &str,
+    builtin: BuiltinFunction,
+) -> Result<Vm, VmError> {
+    let mut compiled =
+        compile_source(&format!("use io;\n{source}")).expect("async io source should compile");
+    let import_index = compiled
+        .program
+        .imports
+        .iter()
+        .position(|import| import.name == import_name)
+        .expect("legacy target import should exist") as u16;
+    let mut rewrites = 0usize;
+    let mut ip = 0usize;
+    while ip < compiled.program.code.len() {
+        let opcode = vm::OpCode::try_from(compiled.program.code[ip])
+            .expect("compiled bytecode opcode should be valid");
+        if opcode == vm::OpCode::Call {
+            let index =
+                u16::from_le_bytes([compiled.program.code[ip + 1], compiled.program.code[ip + 2]]);
+            if index == import_index {
+                let replacement = builtin.call_index().to_le_bytes();
+                compiled.program.code[ip + 1] = replacement[0];
+                compiled.program.code[ip + 2] = replacement[1];
+                rewrites += 1;
+            }
+        }
+        ip += 1 + opcode.operand_len();
+    }
+    assert!(rewrites > 0, "legacy builtin call should be rewritten");
+    compiled.program.imports.clear();
+    run_compiled(compiled.program)
 }
 
 /// Helper: create a unique temp file path.
@@ -99,6 +142,110 @@ fn async_io_popen_reads_through_tokio_process_pipe() {
 
     assert_eq!(stack.last(), Some(&Value::string("async-process")));
 }
+
+fn returned_handle(vm: &Vm) -> ResourceHandle {
+    ResourceHandle::from_value(vm.stack().last().expect("returned IO handle")).unwrap()
+}
+
+fn reset_to_ready(vm: &mut Vm) {
+    for _ in 0..100 {
+        vm.reset_for_reuse();
+        if vm.is_reusable() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!(
+        "async IO reset did not become ready: {:?}",
+        vm.reset_error()
+    );
+}
+
+#[test]
+fn async_io_schema_less_open_preserves_legacy_guest_ownership_at_materialization() {
+    let path = temp_path("legacy-open-ownership");
+    let mut vm = run_legacy_builtin_source(
+        &format!(r#"io::open("{}", "w");"#, path.display()),
+        "io::open",
+        BuiltinFunction::IoOpen,
+    )
+    .expect("schema-less async open should complete");
+    let handle = returned_handle(&vm);
+
+    assert_eq!(
+        vm.host_context().resource_ownership(handle),
+        Some(ResourceOwnership::GuestOwned)
+    );
+    reset_to_ready(&mut vm);
+    assert_eq!(vm.host_context().resource_count(), 0);
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(unix)]
+#[test]
+fn async_io_schema_less_popen_preserves_legacy_guest_ownership_at_materialization() {
+    let mut vm = run_legacy_builtin_source(
+        r#"io::popen("printf legacy-process", "r");"#,
+        "io::popen",
+        BuiltinFunction::IoPopen,
+    )
+    .expect("schema-less async popen should complete");
+    let handle = returned_handle(&vm);
+
+    assert_eq!(
+        vm.host_context().resource_ownership(handle),
+        Some(ResourceOwnership::GuestOwned)
+    );
+    reset_to_ready(&mut vm);
+    assert_eq!(vm.host_context().resource_count(), 0);
+}
+
+#[test]
+fn async_io_exact_open_transfers_once_before_reset_close() {
+    let path = temp_path("exact-open-ownership");
+    let compiled = compile_source(&format!(
+        r#"
+        use io;
+        io::open("{}", "w");
+        "#,
+        path.display()
+    ))
+    .expect("exact async open source should compile");
+    let mut vm = run_compiled(compiled.program).expect("exact async open should complete");
+    let handle = returned_handle(&vm);
+
+    assert_eq!(
+        vm.host_context().resource_ownership(handle),
+        Some(ResourceOwnership::GuestOwned),
+        "an exact async return must remain a single successful strict transfer"
+    );
+    reset_to_ready(&mut vm);
+    assert_eq!(vm.host_context().resource_count(), 0);
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(unix)]
+#[test]
+fn async_io_exact_popen_transfers_once_before_reset_close() {
+    let compiled = compile_source(
+        r#"
+        use io;
+        io::popen("printf exact-process", "r");
+        "#,
+    )
+    .expect("exact async popen source should compile");
+    let mut vm = run_compiled(compiled.program).expect("exact async popen should complete");
+    let handle = returned_handle(&vm);
+
+    assert_eq!(
+        vm.host_context().resource_ownership(handle),
+        Some(ResourceOwnership::GuestOwned),
+        "an exact async pipe return must remain a single successful strict transfer"
+    );
+    reset_to_ready(&mut vm);
+    assert_eq!(vm.host_context().resource_count(), 0);
+}
+
 /// Test that operations return Pending first and complete on a subsequent
 /// resume (i.e., the VM thread is not blocked).
 #[test]
