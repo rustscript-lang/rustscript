@@ -76,13 +76,16 @@ fn local_visible_at_current_line(vm: &Vm, name: &str) -> bool {
 /// Host function that returns Pending on first call, then returns empty result on resume.
 struct PendingOnce {
     call_count: Arc<AtomicUsize>,
-    op_id: u64,
 }
 
 impl HostFunction for PendingOnce {
-    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+    fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
-        Ok(CallOutcome::Pending(self.op_id))
+        let op_id = vm
+            .host_context()
+            .start_operation(vm::operation::OperationSpec::new(PendingOperationDriver))
+            .expect("start pending scope operation");
+        Ok(CallOutcome::Pending(op_id.raw()))
     }
 }
 
@@ -206,16 +209,17 @@ fn drop_events_fire_across_host_op_boundary() {
     let mut vm = new_drop_contract_vm(compiled.program);
     vm.register_function(Box::new(PendingOnce {
         call_count: Arc::clone(&calls),
-        op_id: 800,
     }));
 
     // First run → Waiting
     let status = vm.run().expect("first run should wait");
-    assert_eq!(status, VmStatus::Waiting(800));
+    let VmStatus::Waiting(op_id) = status else {
+        panic!("expected waiting status, got {status:?}");
+    };
     let drops_before = vm.drop_contract_event_count();
 
     // Complete host op and resume
-    vm.complete_host_op(800, Vec::new())
+    vm.complete_host_op(op_id, Vec::new())
         .expect("complete should succeed");
     let status = vm.resume().expect("resume should halt");
     assert_eq!(status, VmStatus::Halted);
@@ -723,12 +727,13 @@ fn drop_events_across_host_op_hide_dead_local_before_wait() {
     let mut vm = new_drop_contract_vm(compiled.program);
     vm.register_function(Box::new(PendingOnce {
         call_count: Arc::clone(&calls),
-        op_id: 900,
     }));
 
     // First run → Waiting; 'a' should already be dropped (dead before wait).
     let status = vm.run().expect("first run should wait");
-    assert_eq!(status, VmStatus::Waiting(900));
+    let VmStatus::Waiting(op_id) = status else {
+        panic!("expected waiting status, got {status:?}");
+    };
     assert_eq!(
         vm.drop_contract_event_count(),
         3,
@@ -740,7 +745,7 @@ fn drop_events_across_host_op_hide_dead_local_before_wait() {
     );
 
     // Complete and resume.
-    vm.complete_host_op(900, Vec::new())
+    vm.complete_host_op(op_id, Vec::new())
         .expect("complete should succeed");
     let status = vm.resume().expect("resume should halt");
     assert_eq!(status, VmStatus::Halted);
@@ -968,12 +973,13 @@ fn named_call_yield_resumes_with_caller_locals_intact() {
     let mut vm = new_drop_contract_vm(compiled.program);
     vm.register_function(Box::new(PendingOnce {
         call_count: Arc::clone(&calls),
-        op_id: 802,
     }));
 
     let status = vm.run().expect("first run should wait");
-    assert_eq!(status, VmStatus::Waiting(802));
-    vm.complete_host_op(802, Vec::new())
+    let VmStatus::Waiting(op_id) = status else {
+        panic!("expected waiting status, got {status:?}");
+    };
+    vm.complete_host_op(op_id, Vec::new())
         .expect("complete should succeed");
     let status = vm.resume().expect("resume should halt");
     assert_eq!(status, VmStatus::Halted);

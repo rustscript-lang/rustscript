@@ -57,11 +57,13 @@ fn collect_invocation_items(
     items
 }
 
-struct PendingOneHost;
+struct PendingOneHost {
+    op_id: u64,
+}
 
 impl vm::HostArgsFunction for PendingOneHost {
     fn call(&mut self, _args: &[Value]) -> vm::VmResult<vm::CallOutcome> {
-        Ok(vm::CallOutcome::Pending(1))
+        Ok(vm::CallOutcome::Pending(self.op_id))
     }
 }
 
@@ -334,11 +336,12 @@ fn reset_closes_waiting_state_before_the_next_run() {
     .expect("source should compile")
     .program;
     let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
-    vm.bind_args_function("action", Box::new(PendingOneHost));
+    let op_id = start_scope_pending_op(&mut vm);
+    vm.bind_args_function("action", Box::new(PendingOneHost { op_id }));
 
     let status = vm.run().expect("run should yield");
-    assert_eq!(status, VmStatus::Waiting(1));
-    assert_eq!(vm.waiting_host_op_id(), Some(1));
+    assert_eq!(status, VmStatus::Waiting(op_id));
+    assert_eq!(vm.waiting_host_op_id(), Some(op_id));
 
     vm.reset_for_reuse();
     assert_eq!(

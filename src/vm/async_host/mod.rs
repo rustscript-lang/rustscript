@@ -270,8 +270,14 @@ impl Vm {
         }
         let scope_reason = scope_reason(reason);
         // Every production pending host operation is a real execution-scope
-        // operation with a packed id; cancel it through its own driver with
-        // the parallel operation-cancellation vocabulary.
+        // operation with a packed id; the waiting state can only have been
+        // entered through scope-membership validation. Cancel the exact
+        // waiting operation through its own driver with the parallel
+        // operation-cancellation vocabulary. A fabricated/stale waiting id
+        // cannot silently cancel an unrelated operation: cancellation is
+        // routed only through the exact registered waiting operation's id,
+        // and an id that no longer names a live current-scope operation
+        // (stale/foreign) is simply left terminal — nothing to cancel.
         if let Ok(scope_id) = crate::vm::operation::OperationId::from_raw(waiting.op_id) {
             let _ = self
                 .host
@@ -295,36 +301,18 @@ impl Vm {
                 waiting.op_id
             )));
         }
-        // Every production pending host operation is a real execution-scope
-        // operation with a packed id: external completion cancels its driver so
-        // its bridge work stops exactly once. A legacy host-callable `Pending`
-        // id (a plain host function returning `CallOutcome::Pending`) is a
-        // distinct by-name contract that carries no scope driver to cancel; an
-        // invalid packed id is rejected with a typed error, and a stale/unset
-        // driver is simply skipped (nothing to cancel). No fabricated lifecycle
-        // is created here.
-        let scope_id = match crate::vm::operation::OperationId::from_raw(op_id) {
-            Ok(scope_id) => Some(scope_id),
-            Err(_) => {
-                // A non-packed (legacy host-callable) id carries no scope
-                // driver; complete the waiting state directly below.
-                return self.complete_waiting_host_op(op_id, values.into());
-            }
-        };
-        if let Some(scope_id) = scope_id
-            && self
-                .host
-                .execution_scope()
-                .operations()
-                .status(scope_id)
-                .is_ok()
-        {
-            let _ = self.host.execution_scope_cancel_operation(
-                scope_id,
-                crate::vm::operation::OperationCancelReason::Requested,
-            );
-            self.host.remove_pending_op_result(op_id);
-        }
+        // The exact waiting id must still name a live operation in this VM's
+        // current scope. Shared validation runs before any driver cancellation
+        // or waiting-state mutation.
+        let scope_id = self.validate_current_scope_operation_id(op_id)?;
+        // External completion cancels the waiting operation's own driver so
+        // its bridge/background work stops exactly once, then delivers the
+        // provided values through the normal waiting-state completion.
+        let _ = self.host.execution_scope_cancel_operation(
+            scope_id,
+            crate::vm::operation::OperationCancelReason::Requested,
+        );
+        self.host.remove_pending_op_result(op_id);
         self.complete_waiting_host_op(op_id, values.into())
     }
 

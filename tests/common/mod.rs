@@ -1,6 +1,7 @@
 #![allow(unused_imports)]
 
 use std::path::{Path, PathBuf};
+use std::task::{Context, Poll};
 
 pub use vm::{
     Assembler, BytecodeBuilder, CallOutcome, CapabilityProfile, CompileSourceFileOptions, Compiler,
@@ -8,6 +9,43 @@ pub use vm::{
     StaticHostArgsFunction, Stmt, Store, Value, Vm, VmStatus, assemble, compile_source,
     compile_source_file, compile_source_file_with_options, compile_source_with_flavor,
 };
+
+/// A generic driver for a test pending host operation: stays `Pending` until
+/// the operation is cancelled (by `complete_host_op`, reset/drop or an
+/// explicit scope close). Tests deliver values through `complete_host_op`.
+///
+/// Positive tests that exercise successful waiting register a real
+/// current-scope operation through the public
+/// [`vm::HostContext::start_operation`] SDK and return its packed raw id. The
+/// separate negative tests intentionally use fabricated ids to verify that the
+/// VM rejects them before entering Waiting.
+#[derive(Default)]
+pub struct PendingOperationDriver;
+
+impl vm::operation::HostOperation for PendingOperationDriver {
+    fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<vm::operation::OperationResult<()>> {
+        Poll::Pending
+    }
+
+    fn cancel(
+        &mut self,
+        _reason: vm::operation::OperationCancelReason,
+    ) -> vm::operation::OperationResult<()> {
+        Ok(())
+    }
+}
+
+/// Registers a fresh [`PendingOperationDriver`] in `vm`'s current execution
+/// scope and returns its packed [`vm::HostOpId`], ready to be returned from a
+/// bound host function as `CallOutcome::Pending(...)`.
+#[allow(dead_code)]
+pub fn start_scope_pending_op(vm: &mut Vm) -> vm::HostOpId {
+    let id = vm
+        .host_context()
+        .start_operation(vm::operation::OperationSpec::new(PendingOperationDriver))
+        .expect("starting a test pending operation must succeed");
+    id.raw()
+}
 
 pub struct RuntimeCase<'a> {
     pub name: &'a str,

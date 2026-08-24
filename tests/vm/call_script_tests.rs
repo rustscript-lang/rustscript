@@ -338,17 +338,20 @@ fn call_script_recursion_resumes_caller_locals_intact() {
     assert_eq!(vm.stack(), &[Value::Int(0), Value::string("alive")]);
 }
 
-/// Host function that reports `Pending` once; the test delivers the
-/// completion through `complete_host_op`.
+/// Host function that reports `Pending` once (for a scope-registered
+/// operation); the test delivers the completion through `complete_host_op`.
 struct PendingOnceHostOp {
     call_count: Arc<AtomicUsize>,
-    op_id: u64,
 }
 
 impl HostFunction for PendingOnceHostOp {
-    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+    fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
-        Ok(CallOutcome::Pending(self.op_id))
+        let op_id = vm
+            .host_context()
+            .start_operation(vm::operation::OperationSpec::new(PendingOperationDriver))
+            .expect("start pending scope operation");
+        Ok(CallOutcome::Pending(op_id.raw()))
     }
 }
 
@@ -398,14 +401,15 @@ fn call_script_callee_host_wait_resumes_caller_continuation() {
     let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     vm.register_function(Box::new(PendingOnceHostOp {
         call_count: Arc::clone(&calls),
-        op_id: 802,
     }));
 
     let status = vm.run().expect("first run should wait");
-    assert_eq!(status, VmStatus::Waiting(802));
+    let VmStatus::Waiting(op_id) = status else {
+        panic!("expected waiting status, got {status:?}");
+    };
     assert_eq!(calls.load(Ordering::SeqCst), 1, "host op should run once");
 
-    vm.complete_host_op(802, Vec::new())
+    vm.complete_host_op(op_id, Vec::new())
         .expect("host op completion should succeed");
     let status = vm.resume().expect("resume should halt");
     assert_eq!(status, VmStatus::Halted);

@@ -1473,7 +1473,6 @@ pub(super) struct SqliteAdapterContract {
     pub(super) name: &'static str,
     pub(super) arity: u8,
     pub(super) adapter: fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>,
-    pub(super) runtime_owned_pending: bool,
 }
 
 pub(super) const SQLITE_ADAPTER_CONTRACTS: &[SqliteAdapterContract] = &[
@@ -1481,49 +1480,41 @@ pub(super) const SQLITE_ADAPTER_CONTRACTS: &[SqliteAdapterContract] = &[
         name: "sqlite::open",
         arity: 1,
         adapter: open_adapter,
-        runtime_owned_pending: false,
     },
     SqliteAdapterContract {
         name: "sqlite::execute",
         arity: 3,
         adapter: execute_adapter,
-        runtime_owned_pending: true,
     },
     SqliteAdapterContract {
         name: "sqlite::query",
         arity: 4,
         adapter: query_adapter,
-        runtime_owned_pending: true,
     },
     SqliteAdapterContract {
         name: "sqlite::transaction",
         arity: 2,
         adapter: transaction_adapter,
-        runtime_owned_pending: true,
     },
     SqliteAdapterContract {
         name: "sqlite::close",
         arity: 1,
         adapter: close_adapter,
-        runtime_owned_pending: false,
     },
     SqliteAdapterContract {
         name: "sqlite::rows_affected",
         arity: 1,
         adapter: rows_affected_adapter,
-        runtime_owned_pending: false,
     },
     SqliteAdapterContract {
         name: "sqlite::truncated",
         arity: 1,
         adapter: truncated_adapter,
-        runtime_owned_pending: false,
     },
     SqliteAdapterContract {
         name: "sqlite::next_cursor",
         arity: 1,
         adapter: next_cursor_adapter,
-        runtime_owned_pending: false,
     },
 ];
 
@@ -1581,9 +1572,6 @@ pub fn register_sqlite_builtin_module_from_catalog(
                 staged.register_exact_static(entry.name, entry.arity, schema, entry.adapter)?;
             }
             staged.authorize_registered_builtin_import(entry.name);
-            if entry.runtime_owned_pending {
-                staged.mark_exact_runtime_owned_pending(entry.name)?;
-            }
         }
         Ok(())
     })

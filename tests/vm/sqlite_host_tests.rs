@@ -55,10 +55,6 @@ pub mod vm {
             Ok(0)
         }
 
-        pub fn mark_exact_runtime_owned_pending(&mut self, _name: &str) -> VmResult<()> {
-            Ok(())
-        }
-
         pub fn authorize_registered_builtin_import(&mut self, _name: &str) {}
 
         /// Mock transaction surface: the included registration path compiles

@@ -110,7 +110,6 @@ enum RegistryEntryKind {
 struct RegistryEntry {
     arity: u8,
     kind: RegistryEntryKind,
-    runtime_owned_pending: bool,
 }
 
 /// Bounding depth for recursive schema walks in the exact host-call contract.
@@ -614,7 +613,6 @@ pub struct HostBindingPlan {
     import_signature: Vec<HostImport>,
     registry_slots: Vec<u16>,
     resolved_calls: Vec<u16>,
-    runtime_owned_pending_slots: Vec<u16>,
     allowed_builtin_calls: Vec<u16>,
     allow_default_builtin_capabilities: bool,
     allowed_host_function_slots: Vec<u16>,
@@ -868,43 +866,6 @@ impl HostFunctionRegistry {
         self.commit_transaction(&mut transaction)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn mark_runtime_owned_pending(&mut self, name: &str) {
-        let slot = self
-            .by_name
-            .get(name)
-            .copied()
-            .expect("generated runtime host function should be registered");
-        let entry = Arc::make_mut(&mut self.entries)
-            .get_mut(slot as usize)
-            .expect("generated runtime host function slot should exist");
-        entry.runtime_owned_pending = true;
-    }
-
-    /// Marks every exact-registration slot bound to `name` as runtime-owned:
-    /// its pending operations are generic execution-scope `HostOperation`s
-    /// (awaited through the scope registry), not async-bridge futures.
-    /// Mirrors [`mark_runtime_owned_pending`](Self::mark_runtime_owned_pending)
-    /// for exact (schema-keyed) registrations.
-    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
-    pub(crate) fn mark_exact_runtime_owned_pending(&mut self, name: &str) -> VmResult<()> {
-        let Some(schemas) = self.by_exact.get(name) else {
-            return Err(VmError::HostImportBinding(
-                HostImportBindingError::MissingExact {
-                    import: name.to_string(),
-                },
-            ));
-        };
-        let entries = Arc::make_mut(&mut self.entries);
-        for &slot in schemas.values() {
-            entries
-                .get_mut(slot as usize)
-                .expect("exact host function slot should exist")
-                .runtime_owned_pending = true;
-        }
-        Ok(())
-    }
-
     pub fn register<F>(&mut self, name: impl Into<String>, arity: u8, factory: F)
     where
         F: Fn() -> Box<dyn HostFunction> + Send + Sync + 'static,
@@ -914,7 +875,6 @@ impl HostFunctionRegistry {
             && let Some(entry) = Arc::make_mut(&mut self.entries).get_mut(slot as usize)
         {
             entry.arity = arity;
-            entry.runtime_owned_pending = false;
             entry.kind = RegistryEntryKind::Factory(Arc::new(factory));
             self.invalidate_plan_cache();
             return;
@@ -924,7 +884,6 @@ impl HostFunctionRegistry {
         let slot = entries.len() as u16;
         entries.push(RegistryEntry {
             arity,
-            runtime_owned_pending: false,
             kind: RegistryEntryKind::Factory(Arc::new(factory)),
         });
         Arc::make_mut(&mut self.by_name).insert(name, slot);
@@ -942,7 +901,6 @@ impl HostFunctionRegistry {
             && let Some(entry) = Arc::make_mut(&mut self.entries).get_mut(slot as usize)
         {
             entry.arity = arity;
-            entry.runtime_owned_pending = false;
             entry.kind = RegistryEntryKind::Static(function);
             self.invalidate_plan_cache();
             return;
@@ -952,7 +910,6 @@ impl HostFunctionRegistry {
         let slot = entries.len() as u16;
         entries.push(RegistryEntry {
             arity,
-            runtime_owned_pending: false,
             kind: RegistryEntryKind::Static(function),
         });
         Arc::make_mut(&mut self.by_name).insert(name, slot);
@@ -968,7 +925,6 @@ impl HostFunctionRegistry {
             && let Some(entry) = Arc::make_mut(&mut self.entries).get_mut(slot as usize)
         {
             entry.arity = arity;
-            entry.runtime_owned_pending = false;
             entry.kind = RegistryEntryKind::StackFactory(Arc::new(factory));
             self.invalidate_plan_cache();
             return;
@@ -978,7 +934,6 @@ impl HostFunctionRegistry {
         let slot = entries.len() as u16;
         entries.push(RegistryEntry {
             arity,
-            runtime_owned_pending: false,
             kind: RegistryEntryKind::StackFactory(Arc::new(factory)),
         });
         Arc::make_mut(&mut self.by_name).insert(name, slot);
@@ -996,7 +951,6 @@ impl HostFunctionRegistry {
             && let Some(entry) = Arc::make_mut(&mut self.entries).get_mut(slot as usize)
         {
             entry.arity = arity;
-            entry.runtime_owned_pending = false;
             entry.kind = RegistryEntryKind::StackStatic(function);
             self.invalidate_plan_cache();
             return;
@@ -1006,7 +960,6 @@ impl HostFunctionRegistry {
         let slot = entries.len() as u16;
         entries.push(RegistryEntry {
             arity,
-            runtime_owned_pending: false,
             kind: RegistryEntryKind::StackStatic(function),
         });
         Arc::make_mut(&mut self.by_name).insert(name, slot);
@@ -1022,7 +975,6 @@ impl HostFunctionRegistry {
             && let Some(entry) = Arc::make_mut(&mut self.entries).get_mut(slot as usize)
         {
             entry.arity = arity;
-            entry.runtime_owned_pending = false;
             entry.kind = RegistryEntryKind::ArgsFactory(Arc::new(factory));
             self.invalidate_plan_cache();
             return;
@@ -1032,7 +984,6 @@ impl HostFunctionRegistry {
         let slot = entries.len() as u16;
         entries.push(RegistryEntry {
             arity,
-            runtime_owned_pending: false,
             kind: RegistryEntryKind::ArgsFactory(Arc::new(factory)),
         });
         Arc::make_mut(&mut self.by_name).insert(name, slot);
@@ -1050,7 +1001,6 @@ impl HostFunctionRegistry {
             && let Some(entry) = Arc::make_mut(&mut self.entries).get_mut(slot as usize)
         {
             entry.arity = arity;
-            entry.runtime_owned_pending = false;
             entry.kind = RegistryEntryKind::ArgsStatic(function);
             self.invalidate_plan_cache();
             return;
@@ -1060,7 +1010,6 @@ impl HostFunctionRegistry {
         let slot = entries.len() as u16;
         entries.push(RegistryEntry {
             arity,
-            runtime_owned_pending: false,
             kind: RegistryEntryKind::ArgsStatic(function),
         });
         Arc::make_mut(&mut self.by_name).insert(name, slot);
@@ -1084,7 +1033,6 @@ impl HostFunctionRegistry {
             && let Some(entry) = Arc::make_mut(&mut self.entries).get_mut(slot as usize)
         {
             entry.arity = arity;
-            entry.runtime_owned_pending = false;
             entry.kind = RegistryEntryKind::ArgsStaticNonYielding(function);
             self.invalidate_plan_cache();
             return;
@@ -1094,7 +1042,6 @@ impl HostFunctionRegistry {
         let slot = entries.len() as u16;
         entries.push(RegistryEntry {
             arity,
-            runtime_owned_pending: false,
             kind: RegistryEntryKind::ArgsStaticNonYielding(function),
         });
         Arc::make_mut(&mut self.by_name).insert(name, slot);
@@ -1330,11 +1277,7 @@ impl HostFunctionRegistry {
             })
         })?;
         let entries = Arc::make_mut(&mut self.entries);
-        entries.push(RegistryEntry {
-            arity,
-            runtime_owned_pending: false,
-            kind,
-        });
+        entries.push(RegistryEntry { arity, kind });
         let map = Arc::make_mut(&mut self.by_exact);
         map.entry(name).or_default().insert(schema, slot);
         self.invalidate_plan_cache();
@@ -1697,22 +1640,11 @@ impl HostFunctionRegistry {
             .collect::<Vec<_>>();
         allowed_host_function_slots.sort_unstable();
         allowed_host_function_slots.dedup();
-        let runtime_owned_pending_slots = registry_slots
-            .iter()
-            .enumerate()
-            .filter_map(|(vm_slot, registry_slot)| {
-                self.entries
-                    .get(*registry_slot as usize)
-                    .filter(|entry| entry.runtime_owned_pending)
-                    .map(|_| vm_slot as u16)
-            })
-            .collect();
         let import_key = imports.to_vec();
         let computed = Arc::new(HostBindingPlan {
             import_signature: import_key.clone(),
             registry_slots,
             resolved_calls,
-            runtime_owned_pending_slots,
             allowed_builtin_calls: self.allowed_builtin_calls.as_ref().clone(),
             allow_default_builtin_capabilities: self.allow_default_builtin_capabilities,
             allowed_host_function_slots,
@@ -1800,8 +1732,6 @@ impl HostFunctionRegistry {
         vm.host.allow_default_builtin_capabilities = plan.allow_default_builtin_capabilities;
         vm.host.allowed_host_function_slots = plan.allowed_host_function_slots.clone();
         vm.host.allow_default_host_capabilities = plan.allow_default_host_capabilities;
-        vm.host.runtime_owned_pending_host_slots =
-            plan.runtime_owned_pending_slots.iter().copied().collect();
         vm.install_resolved_calls(plan.resolved_calls.clone())?;
         // Propagate the registry's caller-provided standard-surface composition
         // to the VM (explicit per-instance state): a VM bound by a standard
@@ -2089,37 +2019,8 @@ impl Vm {
         index
     }
 
-    fn clear_runtime_owned_pending_binding(&mut self, name: &str) {
-        let slot = builtin_for_binding_name(name)
-            .and_then(|builtin| {
-                self.host
-                    .builtin_overrides
-                    .get(&builtin.call_index())
-                    .copied()
-            })
-            .or_else(|| self.host.host_function_symbols.get(name).copied());
-        if let Some(slot) = slot {
-            self.host.runtime_owned_pending_host_slots.remove(&slot);
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn mark_runtime_owned_pending_binding(&mut self, name: &str) {
-        let slot = builtin_for_binding_name(name)
-            .and_then(|builtin| {
-                self.host
-                    .builtin_overrides
-                    .get(&builtin.call_index())
-                    .copied()
-            })
-            .or_else(|| self.host.host_function_symbols.get(name).copied())
-            .expect("generated runtime host binding should exist");
-        self.host.runtime_owned_pending_host_slots.insert(slot);
-    }
-
     pub fn bind_function(&mut self, name: impl Into<String>, function: Box<dyn HostFunction>) {
         let name = name.into();
-        self.clear_runtime_owned_pending_binding(&name);
         if let Some(builtin) = builtin_for_binding_name(&name) {
             self.bind_builtin_overrideslot(builtin.call_index(), VmHostFunction::Dynamic(function));
             return;
@@ -2139,7 +2040,6 @@ impl Vm {
 
     pub fn bind_static_function(&mut self, name: impl Into<String>, function: StaticHostFunction) {
         let name = name.into();
-        self.clear_runtime_owned_pending_binding(&name);
         if let Some(builtin) = builtin_for_binding_name(&name) {
             self.bind_builtin_overrideslot(builtin.call_index(), VmHostFunction::Static(function));
             return;
@@ -2163,7 +2063,6 @@ impl Vm {
         function: Box<dyn HostStackFunction>,
     ) {
         let name = name.into();
-        self.clear_runtime_owned_pending_binding(&name);
         if let Some(&index) = self.host.host_function_symbols.get(&name)
             && let Some(slot) = self.host.host_functions.get_mut(index as usize)
         {
@@ -2183,7 +2082,6 @@ impl Vm {
         function: StaticHostStackFunction,
     ) {
         let name = name.into();
-        self.clear_runtime_owned_pending_binding(&name);
         if let Some(builtin) = builtin_for_binding_name(&name) {
             self.bind_builtin_overrideslot(
                 builtin.call_index(),
@@ -2210,7 +2108,6 @@ impl Vm {
         function: Box<dyn HostArgsFunction>,
     ) {
         let name = name.into();
-        self.clear_runtime_owned_pending_binding(&name);
         if let Some(builtin) = builtin_for_binding_name(&name) {
             self.bind_builtin_overrideslot(
                 builtin.call_index(),
@@ -2237,7 +2134,6 @@ impl Vm {
         function: StaticHostArgsFunction,
     ) {
         let name = name.into();
-        self.clear_runtime_owned_pending_binding(&name);
         if let Some(builtin) = builtin_for_binding_name(&name) {
             self.bind_builtin_overrideslot(
                 builtin.call_index(),
@@ -2270,7 +2166,6 @@ impl Vm {
         function: StaticHostArgsFunction,
     ) {
         let name = name.into();
-        self.clear_runtime_owned_pending_binding(&name);
         if let Some(builtin) = builtin_for_binding_name(&name) {
             self.bind_builtin_overrideslot(
                 builtin.call_index(),
@@ -2300,7 +2195,6 @@ impl Vm {
         let builtin = BuiltinFunction::from_namespaced_name(&name).ok_or_else(|| {
             VmError::HostError(format!("unknown namespaced builtin override '{name}'"))
         })?;
-        self.clear_runtime_owned_pending_binding(&name);
         self.bind_builtin_overrideslot(builtin.call_index(), VmHostFunction::Dynamic(function));
         Ok(())
     }
@@ -2314,7 +2208,6 @@ impl Vm {
         let builtin = BuiltinFunction::from_namespaced_name(&name).ok_or_else(|| {
             VmError::HostError(format!("unknown namespaced builtin override '{name}'"))
         })?;
-        self.clear_runtime_owned_pending_binding(&name);
         self.bind_builtin_overrideslot(builtin.call_index(), VmHostFunction::Static(function));
         Ok(())
     }
@@ -2533,7 +2426,7 @@ impl Vm {
             crate::builtins::runtime::BuiltinCallOutcome::Pending(op_id) => {
                 self.instance.stack.truncate(arg_start);
                 let resume_ip = self.call_resume_ip(call_ip)?;
-                self.set_waiting_registered_op(op_id)?;
+                self.set_waiting_bound_host_op(op_id, ExactHostReturnPolicy::Legacy)?;
                 self.instance.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
             }
@@ -3001,11 +2894,7 @@ impl Vm {
                 self.instance.stack = saved_stack;
                 let resume_ip = self.call_resume_ip(call_ip)?;
                 self.record_callable_stream_resume_ip(op_id, resume_ip);
-                if self.host.stream_drivers.contains_key(&op_id) {
-                    self.set_waiting_operation(op_id, exact_policy.clone())?;
-                } else {
-                    self.set_waiting_bound_host_op(resolved_index, op_id, exact_policy.clone())?;
-                }
+                self.set_waiting_bound_host_op(op_id, exact_policy.clone())?;
                 self.instance.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
             }
@@ -3134,11 +3023,7 @@ impl Vm {
                 self.instance.stack.truncate(arg_start);
                 let resume_ip = self.call_resume_ip(call_ip)?;
                 self.record_callable_stream_resume_ip(op_id, resume_ip);
-                if self.host.stream_drivers.contains_key(&op_id) {
-                    self.set_waiting_operation(op_id, exact_policy.clone())?;
-                } else {
-                    self.set_waiting_bound_host_op(resolved_index, op_id, exact_policy.clone())?;
-                }
+                self.set_waiting_bound_host_op(op_id, exact_policy.clone())?;
                 self.instance.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
             }
@@ -3205,11 +3090,7 @@ impl Vm {
                 self.instance.stack.truncate(arg_start);
                 let resume_ip = self.call_resume_ip(call_ip)?;
                 self.record_callable_stream_resume_ip(op_id, resume_ip);
-                if self.host.stream_drivers.contains_key(&op_id) {
-                    self.set_waiting_operation(op_id, exact_policy.clone())?;
-                } else {
-                    self.set_waiting_bound_host_op(resolved_index, op_id, exact_policy.clone())?;
-                }
+                self.set_waiting_bound_host_op(op_id, exact_policy.clone())?;
                 self.instance.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
             }
@@ -3236,74 +3117,66 @@ impl Vm {
         Ok(resume_ip)
     }
 
-    fn set_waiting_registered_op(&mut self, op_id: HostOpId) -> VmResult<()> {
-        // Generic execution-scope operations (bridge-submitted futures,
-        // sqlite queries, io/http ops registered through the scoped host SDK)
-        // are tracked in the single execution-scope registry: record the
-        // waiting state; the awaiting path resolves the operation's own
-        // registry.
-        let scope_id = crate::vm::operation::OperationId::from_raw(op_id)
-            .map_err(|error| VmError::HostError(error.to_string()))?;
-        if self
-            .host
+    /// Decodes `op_id` and verifies that it names a live operation in this
+    /// VM's current execution scope.
+    ///
+    /// Bound-host admission and external completion share this validation so
+    /// malformed, stale, and foreign ids are rejected consistently before
+    /// either waiting state or an operation driver can be mutated.
+    pub(super) fn validate_current_scope_operation_id(
+        &self,
+        op_id: HostOpId,
+    ) -> VmResult<crate::vm::operation::OperationId> {
+        let scope_id = crate::vm::operation::OperationId::from_raw(op_id).map_err(|error| {
+            VmError::Operation(
+                crate::vm::operation::OperationError::new(
+                    error.code(),
+                    "vm::host-operation-id",
+                    format!("host operation id {op_id} is not a valid packed operation id"),
+                )
+                .with_value(op_id),
+            )
+        })?;
+        self.host
             .execution_scope()
             .operations()
             .status(scope_id)
-            .is_err()
-        {
-            return Err(VmError::HostError(format!(
-                "unknown runtime operation {op_id}"
-            )));
-        }
-        self.set_waiting_operation(op_id, ExactHostReturnPolicy::Legacy)
+            .map_err(VmError::Operation)?;
+        Ok(scope_id)
     }
 
+    /// Validates that a bound HostFunction's `CallOutcome::Pending` id is a
+    /// live operation in this VM's current `ExecutionScope`, then records the
+    /// VM's waiting state with the call-site exact-return policy.
+    ///
+    /// This is the single path by which *any* bound host slot's pending result
+    /// enters Waiting. Every production pending host operation is a real
+    /// execution-scope operation: the packed id must decode to a
+    /// [`crate::vm::operation::OperationId`] that is currently registered in
+    /// this VM's scope. A fabricated arbitrary / stale / foreign / zero id is
+    /// rejected with a structured [`VmError::Operation`] **before** the VM
+    /// enters Waiting — there is no legacy lifecycle distinction between
+    /// runtime-owned builtins and embedder custom operations.
     fn set_waiting_bound_host_op(
         &mut self,
-        resolved_index: u16,
         op_id: HostOpId,
         exact_policy: ExactHostReturnPolicy,
     ) -> VmResult<()> {
-        if self
-            .host
-            .runtime_owned_pending_host_slots
-            .contains(&resolved_index)
-        {
-            self.set_waiting_registered_op(op_id)
-        } else {
-            self.set_waiting_host_op_with_policy(op_id, exact_policy)
-        }
+        self.validate_current_scope_operation_id(op_id)?;
+        self.set_waiting_operation(op_id, exact_policy)
     }
 
-    /// Registers a waiting host op under the legacy policy.
+    /// Test-only waiting-state helper.
     ///
-    /// Test-only: production call sites that are not bound-host-import sites
-    /// (builtin pending ops) use [`Self::set_waiting_host_op_with_policy`]
-    /// directly, so this isolated waiting-state helper ships only under
-    /// `#[cfg(test)]` and never forms a second production lifecycle.
+    /// Constructs the VM's waiting state for an operation that was already
+    /// registered as a live current-scope operation (e.g. via
+    /// `submit_host_future`). Routes through the same scope-membership
+    /// validation as every production bound-pending path, so it can never
+    /// accept a fabricated arbitrary id — it only exists to drive
+    /// poll/cancel/completion unit tests without executing a program.
     #[cfg(test)]
     pub(super) fn set_waiting_host_op(&mut self, op_id: HostOpId) -> VmResult<()> {
-        self.set_waiting_host_op_with_policy(op_id, ExactHostReturnPolicy::Legacy)
-    }
-
-    /// Registers a waiting host op carrying the exact-return policy captured at
-    /// the actual call-site resolved import.
-    ///
-    /// Every production pending host operation is a real execution-scope
-    /// operation with a packed scope id; there is no bridge-external owner
-    /// registry.
-    fn set_waiting_host_op_with_policy(
-        &mut self,
-        op_id: HostOpId,
-        exact_policy: ExactHostReturnPolicy,
-    ) -> VmResult<()> {
-        if op_id == 0 {
-            // A zero id can never be a valid packed operation id: reject it.
-            return Err(VmError::HostError(
-                "zero host operation id is invalid".to_string(),
-            ));
-        }
-        self.set_waiting_operation(op_id, exact_policy)
+        self.set_waiting_bound_host_op(op_id, ExactHostReturnPolicy::Legacy)
     }
 
     fn set_waiting_operation(
@@ -3636,7 +3509,6 @@ mod exact_binding_registration_tests {
     fn registry_entry() -> RegistryEntry {
         RegistryEntry {
             arity: 0,
-            runtime_owned_pending: false,
             kind: RegistryEntryKind::Static(dummy_static),
         }
     }

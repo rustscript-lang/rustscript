@@ -2,7 +2,7 @@
 mod common;
 use common::*;
 use vm::OpCode;
-use vm::standard_composition;
+use vm::{HostOpId, standard_composition};
 
 fn non_yielding_returns_none(_: &[Value]) -> Result<CallOutcome, vm::VmError> {
     Ok(CallOutcome::Return(vm::CallReturn::none()))
@@ -370,6 +370,7 @@ fn args_only_call_can_yield_and_resume_without_rebuilding_args() {
 fn call_can_wait_for_host_op_and_resume_without_replay() {
     struct PendingOnce {
         called: bool,
+        op_id: HostOpId,
     }
 
     impl HostFunction for PendingOnce {
@@ -380,7 +381,7 @@ fn call_can_wait_for_host_op_and_resume_without_replay() {
                 ));
             }
             self.called = true;
-            Ok(CallOutcome::Pending(99))
+            Ok(CallOutcome::Pending(self.op_id))
         }
     }
 
@@ -390,12 +391,16 @@ fn call_can_wait_for_host_op_and_resume_without_replay() {
     let program = Program::new(Vec::new(), bc.finish());
 
     let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
-    vm.register_function(Box::new(PendingOnce { called: false }));
+    let op_id = start_scope_pending_op(&mut vm);
+    vm.register_function(Box::new(PendingOnce {
+        called: false,
+        op_id,
+    }));
 
     let status = vm.run().expect("first run should wait on host op");
-    assert_eq!(status, VmStatus::Waiting(99));
+    assert_eq!(status, VmStatus::Waiting(op_id));
 
-    vm.complete_host_op(99, vec![Value::Int(7)])
+    vm.complete_host_op(op_id, vec![Value::Int(7)])
         .expect("host op completion should succeed");
     let resumed = vm.resume().expect("resume should halt after completion");
     assert_eq!(resumed, VmStatus::Halted);
@@ -406,6 +411,7 @@ fn call_can_wait_for_host_op_and_resume_without_replay() {
 fn args_only_call_can_wait_for_host_op_and_resume_without_replay() {
     struct PendingOnceArgs {
         called: bool,
+        op_id: HostOpId,
     }
 
     impl HostArgsFunction for PendingOnceArgs {
@@ -417,7 +423,7 @@ fn args_only_call_can_wait_for_host_op_and_resume_without_replay() {
                 ));
             }
             self.called = true;
-            Ok(CallOutcome::Pending(99))
+            Ok(CallOutcome::Pending(self.op_id))
         }
     }
 
@@ -428,16 +434,20 @@ fn args_only_call_can_wait_for_host_op_and_resume_without_replay() {
     let program = Program::new(vec![Value::Int(4)], bc.finish());
 
     let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
-    vm.register_args_function(Box::new(PendingOnceArgs { called: false }));
+    let op_id = start_scope_pending_op(&mut vm);
+    vm.register_args_function(Box::new(PendingOnceArgs {
+        called: false,
+        op_id,
+    }));
 
     let status = vm.run().expect("first run should wait on host op");
-    assert_eq!(status, VmStatus::Waiting(99));
+    assert_eq!(status, VmStatus::Waiting(op_id));
     assert!(
         vm.stack().is_empty(),
         "pending args-only call should consume args"
     );
 
-    vm.complete_host_op(99, vec![Value::Int(7)])
+    vm.complete_host_op(op_id, vec![Value::Int(7)])
         .expect("host op completion should succeed");
     let resumed = vm.resume().expect("resume should halt after completion");
     assert_eq!(resumed, VmStatus::Halted);

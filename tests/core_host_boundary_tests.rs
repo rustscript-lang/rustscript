@@ -658,3 +658,51 @@ fn core_source_manifest_has_no_production_sqlite_identifier() {
         "production core files must not even use a lowercase `sqlite` identifier: {offenders:?}"
     );
 }
+
+/// Every bound HostFunction's `CallOutcome::Pending` id must be a live
+/// current-scope `OperationId`. The legacy runtime-owned/non-runtime-owned
+/// lifecycle split and the arbitrary-id acceptance path are retired: there is
+/// exactly one validation path (`set_waiting_bound_host_op` → scope
+/// membership), and `complete_host_op` / cancellation never accept a
+/// fabricated arbitrary id. The scan covers the two former homes of the
+/// flag — the VM core and the standard builtin runtime staging layer — so
+/// neither can reintroduce the split.
+#[test]
+fn vm_core_has_no_legacy_arbitrary_pending_id_lifecycle() {
+    let mut files = Vec::new();
+    for dir in ["src/vm", "src/builtins/runtime"] {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(dir);
+        collect(&root, &mut files);
+    }
+    files.retain(|path| {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        name != "tests.rs" && name != "host_stream_tests.rs"
+    });
+    files.sort();
+    files.dedup();
+    assert!(!files.is_empty(), "production sources must be scanned");
+    for path in files {
+        let source = fs::read_to_string(&path).expect("read production source");
+        let code = sanitize(&source);
+        for needle in [
+            "runtime_owned_pending_host_slots",
+            "runtime_owned_pending_slots",
+            "set_waiting_host_op_with_policy",
+            "mark_runtime_owned_pending",
+            "mark_exact_runtime_owned_pending",
+            "mark_runtime_owned_pending_binding",
+            "clear_runtime_owned_pending_binding",
+            "runtime_owned_pending",
+        ] {
+            assert!(
+                !contains_token(&code, needle),
+                "{} must not define/use the retired arbitrary-Pending lifecycle `{needle}`; \
+                 every bound pending host operation must be a live current-scope operation",
+                path.display(),
+            );
+        }
+    }
+}

@@ -123,54 +123,6 @@ fn operation_tag_exhaustion_during_recycle_poisoned_vm_keeps_old_scope_and_drops
 }
 
 #[test]
-fn failed_dynamic_builtin_override_preserves_runtime_owned_pending_binding() {
-    struct Dummy;
-
-    impl HostFunction for Dummy {
-        fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
-            unreachable!("rejected override must never be installed")
-        }
-    }
-
-    let compiled = crate::compile_source("use runtime; runtime::sleep(0);")
-        .expect("runtime sleep program should compile");
-    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
-    vm.set_standard_composition(crate::builtins::runtime::standard_composition());
-    vm.ensure_call_bindings()
-        .expect("default fallback should bind runtime sleep");
-    let slot = vm.host.host_function_symbols["runtime::sleep"];
-    vm.host.runtime_owned_pending_host_slots.insert(slot);
-    assert!(vm.host.runtime_owned_pending_host_slots.contains(&slot));
-
-    vm.bind_builtin_override("runtime::sleep", Box::new(Dummy))
-        .expect_err("runtime sleep is a host import, not a builtin override");
-
-    assert!(vm.host.runtime_owned_pending_host_slots.contains(&slot));
-}
-
-#[test]
-fn failed_static_builtin_override_preserves_runtime_owned_pending_binding() {
-    fn dummy(_vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
-        unreachable!("rejected override must never be installed")
-    }
-
-    let compiled = crate::compile_source("use runtime; runtime::sleep(0);")
-        .expect("runtime sleep program should compile");
-    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
-    vm.set_standard_composition(crate::builtins::runtime::standard_composition());
-    vm.ensure_call_bindings()
-        .expect("default fallback should bind runtime sleep");
-    let slot = vm.host.host_function_symbols["runtime::sleep"];
-    vm.host.runtime_owned_pending_host_slots.insert(slot);
-    assert!(vm.host.runtime_owned_pending_host_slots.contains(&slot));
-
-    vm.bind_builtin_static_override("runtime::sleep", dummy)
-        .expect_err("runtime sleep is a host import, not a builtin override");
-
-    assert!(vm.host.runtime_owned_pending_host_slots.contains(&slot));
-}
-
-#[test]
 fn root_ret_completes_explicit_halt_frame() {
     let mut vm = Vm::try_new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
         .expect("test VM construction must not fail");

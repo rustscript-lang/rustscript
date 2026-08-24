@@ -226,7 +226,6 @@ struct HttpAdapterContract {
     name: &'static str,
     arity: u8,
     adapter: fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>,
-    runtime_owned_pending: bool,
 }
 
 const HTTP_ADAPTER_CONTRACTS: &[HttpAdapterContract] = &[
@@ -234,13 +233,11 @@ const HTTP_ADAPTER_CONTRACTS: &[HttpAdapterContract] = &[
         name: "http::client::request",
         arity: 1,
         adapter: request_adapter,
-        runtime_owned_pending: true,
     },
     HttpAdapterContract {
         name: "http::client::sse",
         arity: 2,
         adapter: sse_adapter,
-        runtime_owned_pending: true,
     },
 ];
 /// Registers every HTTP host function into `registry` using the exact
@@ -297,9 +294,6 @@ pub fn register_http_builtin_module_from_catalog(
                 staged.register_exact_static(entry.name, entry.arity, schema, entry.adapter)?;
             }
             staged.authorize_registered_builtin_import(entry.name);
-            if entry.runtime_owned_pending {
-                staged.mark_exact_runtime_owned_pending(entry.name)?;
-            }
         }
         Ok(())
     })

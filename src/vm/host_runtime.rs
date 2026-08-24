@@ -12,7 +12,7 @@
 //! The VM provides lifecycle storage without depending on host-specific state
 //! types or configuration APIs.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -106,7 +106,6 @@ pub(crate) struct HostRuntime {
     pub(crate) allowed_host_function_slots: Vec<u16>,
     pub(crate) allow_default_host_capabilities: bool,
     pub(crate) builtin_overrides: HashMap<u16, u16>,
-    pub(crate) runtime_owned_pending_host_slots: HashSet<u16>,
     pub(crate) resolved_calls: Vec<u16>,
     pub(crate) resolved_calls_dirty: bool,
     /// The host-agnostic execution scope of this runtime, created Active.
@@ -173,7 +172,6 @@ impl HostRuntime {
             allowed_host_function_slots: Vec::new(),
             allow_default_host_capabilities: true,
             builtin_overrides: HashMap::new(),
-            runtime_owned_pending_host_slots: HashSet::new(),
             resolved_calls: Vec::new(),
             resolved_calls_dirty: true,
             execution_scope: ExecutionScope::new().map_err(HostRuntimeInitError::Scope)?,

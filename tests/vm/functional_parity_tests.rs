@@ -210,7 +210,7 @@ struct PendingOnceThenAddOne {
 }
 
 impl HostFunction for PendingOnceThenAddOne {
-    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
         let value = match args {
             [Value::Int(value)] => *value,
@@ -218,7 +218,11 @@ impl HostFunction for PendingOnceThenAddOne {
         };
         if !self.pending_emitted {
             self.pending_emitted = true;
-            return Ok(CallOutcome::Pending(4242));
+            let op_id = vm
+                .host_context()
+                .start_operation(vm::operation::OperationSpec::new(PendingOperationDriver))
+                .expect("start pending scope operation");
+            return Ok(CallOutcome::Pending(op_id.raw()));
         }
         Ok(CallOutcome::Return(vec![Value::Int(value + 1)].into()))
     }
@@ -265,7 +269,6 @@ fn jit_pending_host_call_waits_and_resumes_without_replay() {
                 status = vm.resume().expect("resume after yield should succeed");
             }
             VmStatus::Waiting(op_id) => {
-                assert_eq!(op_id, 4242);
                 vm.complete_host_op(op_id, vec![Value::Int(1)])
                     .expect("pending host op completion should succeed");
                 status = vm.resume().expect("resume after pending should succeed");

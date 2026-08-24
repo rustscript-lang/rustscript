@@ -1289,8 +1289,6 @@ pub(crate) fn insert_io_file_resource(vm: &mut Vm, resource: IoFileResource) -> 
         Value::Int(value) => value,
         _ => unreachable!(),
     };
-    ctx.mark_resource_guest_owned(handle)
-        .map_err(|error| VmError::HostError(format!("io resource ownership failed: {error}")))?;
     Ok(raw)
 }
 
@@ -1320,10 +1318,6 @@ pub(crate) fn insert_io_pipe_child_resource(
     let token = ctx
         .push_child_resource_with_key(resource, parent, super::io_pipe_key())
         .map_err(|error| VmError::HostError(format!("io pipe resource insert failed: {error}")))?;
-    let handle = token.handle();
-    ctx.mark_resource_guest_owned(handle).map_err(|error| {
-        VmError::HostError(format!("io pipe resource ownership failed: {error}"))
-    })?;
     Ok(token)
 }
 

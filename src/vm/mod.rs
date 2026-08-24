@@ -1775,7 +1775,7 @@ impl Vm {
 impl Drop for Vm {
     fn drop(&mut self) {
         self.cancel_waiting_host_op_with_reason(
-            crate::builtins::runtime::cancellation::CancellationReason::VmReset,
+            crate::builtins::runtime::cancellation::CancellationReason::VmDrop,
         );
         self.cancel_callable_stream();
         // Guest-owned release before the interpreter values are dropped: a

@@ -19,7 +19,9 @@
 //! and fingerprints come from a real catalog + compiler.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 
 use vm::compiler::{CompileSourceFileOptions, SourceFlavor, TypeSchema};
 use vm::resource::{
@@ -33,6 +35,32 @@ use vm::{
     ResourceTypeKey, ResourceTypeSchema, Value, Vm, VmError, VmStatus,
     compile_source_with_flavor_and_options,
 };
+
+/// A test pending host-operation driver: stays `Pending` until cancelled.
+struct PendingOperationDriver;
+
+impl vm::operation::HostOperation for PendingOperationDriver {
+    fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<vm::operation::OperationResult<()>> {
+        Poll::Pending
+    }
+
+    fn cancel(
+        &mut self,
+        _reason: vm::operation::OperationCancelReason,
+    ) -> vm::operation::OperationResult<()> {
+        Ok(())
+    }
+}
+
+/// Registers a fresh pending scope operation in `vm` and returns its packed
+/// id. Pre-registering lets args-only hosts (which cannot reach the VM) return
+/// a real scope op id.
+fn start_pending_op(vm: &mut Vm) -> HostOpId {
+    vm.host_context()
+        .start_operation(vm::operation::OperationSpec::new(PendingOperationDriver))
+        .expect("start pending scope operation")
+        .raw()
+}
 
 // ---- tiny test resource ---------------------------------------------------
 
@@ -715,42 +743,60 @@ fn resource_param_plain_int_import_is_not_native_eligible_and_trace_exits() {
 // structured rejection that also terminates the waiting op (no re-poll can
 // deliver the bad values again).
 
-/// An args-only host op that reports `Pending` once.
+/// An args-only host op that reports `Pending` once, using a scope
+/// pre-registered operation id captured in `cell`.
 struct PendingArgsHost {
-    op_id: HostOpId,
+    cell: Arc<Mutex<Option<HostOpId>>>,
     call_count: Arc<AtomicUsize>,
 }
 
 impl HostArgsFunction for PendingArgsHost {
     fn call(&mut self, _args: &[Value]) -> vm::VmResult<CallOutcome> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
-        Ok(CallOutcome::Pending(self.op_id))
+        let op_id = self
+            .cell
+            .lock()
+            .expect("pending op cell should not be poisoned")
+            .expect("scope pending op must be pre-registered");
+        Ok(CallOutcome::Pending(op_id))
     }
 }
 
-/// A stack-borrowed host op that reports `Pending` once.
+/// A stack-borrowed host op that reports `Pending` once, using a scope
+/// pre-registered operation id captured in `cell`.
 struct PendingStackHost {
-    op_id: HostOpId,
+    cell: Arc<Mutex<Option<HostOpId>>>,
     call_count: Arc<AtomicUsize>,
 }
 
 impl HostStackFunction for PendingStackHost {
     fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> vm::VmResult<CallOutcome> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
-        Ok(CallOutcome::Pending(self.op_id))
+        let op_id = self
+            .cell
+            .lock()
+            .expect("pending op cell should not be poisoned")
+            .expect("scope pending op must be pre-registered");
+        Ok(CallOutcome::Pending(op_id))
     }
 }
 
-/// A VM-aware host op that reports `Pending` once.
+/// A VM-aware host op that reports `Pending` once, using a scope
+/// pre-registered operation id captured in `cell`.
 struct PendingDynamicHost {
-    op_id: HostOpId,
+    cell: Arc<Mutex<Option<HostOpId>>>,
     call_count: Arc<AtomicUsize>,
 }
 
 impl HostFunction for PendingDynamicHost {
     fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> vm::VmResult<CallOutcome> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
-        Ok(CallOutcome::Pending(self.op_id))
+        let op_id = self
+            .cell
+            .lock()
+            .expect("pending op cell should not be poisoned")
+            .expect("scope pending op must be pre-registered");
+        Ok(CallOutcome::Pending(op_id))
     }
 }
 
@@ -799,14 +845,17 @@ fn bind_ping_exact_args(
 fn exact_resource_args_dynamic_pending_completion_accepts_valid_handle() {
     let calls = Arc::new(AtomicUsize::new(0));
     let bound_calls = Arc::clone(&calls);
-    let op_id = 0xC0_DE_00_01;
+    let cell = Arc::new(Mutex::new(None::<HostOpId>));
+    let bound_cell = Arc::clone(&cell);
     let mut vm = bind_ping_exact_args(pending_resource_call_program(), move || {
         Box::new(PendingArgsHost {
-            op_id,
+            cell: Arc::clone(&bound_cell),
             call_count: Arc::clone(&bound_calls),
         })
     })
     .expect("bind");
+    let op_id = start_pending_op(&mut vm);
+    *cell.lock().unwrap() = Some(op_id);
 
     let status = vm.run().expect("first run should wait on host op");
     assert_eq!(status, VmStatus::Waiting(op_id));
@@ -850,14 +899,17 @@ fn exact_resource_args_dynamic_pending_completion_rejects_plain_int() {
     for bad in [0i64, -1, 7, 12345] {
         let calls = Arc::new(AtomicUsize::new(0));
         let bound_calls = Arc::clone(&calls);
-        let op_id = 0xC0_DE_00_02;
+        let cell = Arc::new(Mutex::new(None::<HostOpId>));
+        let bound_cell = Arc::clone(&cell);
         let mut vm = bind_ping_exact_args(pending_resource_call_program(), move || {
             Box::new(PendingArgsHost {
-                op_id,
+                cell: Arc::clone(&bound_cell),
                 call_count: Arc::clone(&bound_calls),
             })
         })
         .expect("bind");
+        let op_id = start_pending_op(&mut vm);
+        *cell.lock().unwrap() = Some(op_id);
 
         let status = vm.run().expect("first run should wait on host op");
         assert_eq!(status, VmStatus::Waiting(op_id));
@@ -894,14 +946,17 @@ fn exact_resource_args_dynamic_pending_completion_rejects_plain_int() {
     // is pushed.
     let calls = Arc::new(AtomicUsize::new(0));
     let bound_calls = Arc::clone(&calls);
-    let op_id = 0xC0_DE_00_02;
+    let cell = Arc::new(Mutex::new(None::<HostOpId>));
+    let bound_cell = Arc::clone(&cell);
     let mut vm = bind_ping_exact_args(pending_resource_call_program(), move || {
         Box::new(PendingArgsHost {
-            op_id,
+            cell: Arc::clone(&bound_cell),
             call_count: Arc::clone(&bound_calls),
         })
     })
     .expect("bind");
+    let op_id = start_pending_op(&mut vm);
+    *cell.lock().unwrap() = Some(op_id);
     let status = vm.run().expect("first run should wait on host op");
     assert_eq!(status, VmStatus::Waiting(op_id));
     let error = vm
@@ -956,18 +1011,21 @@ fn optional_resource_args_dynamic_pending_completion_null_is_legal() {
 
     let calls = Arc::new(AtomicUsize::new(0));
     let bound_calls = Arc::clone(&calls);
-    let op_id = 0xC0_DE_00_03;
+    let cell = Arc::new(Mutex::new(None::<HostOpId>));
+    let bound_cell = Arc::clone(&cell);
     let mut registry = HostFunctionRegistry::new();
     registry
         .register_exact_args(&import.name, 1, schema, move || {
             Box::new(PendingArgsHost {
-                op_id,
+                cell: Arc::clone(&bound_cell),
                 call_count: Arc::clone(&bound_calls),
             })
         })
         .expect("register optional-resource exact args");
     let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
+    let op_id = start_pending_op(&mut vm);
+    *cell.lock().unwrap() = Some(op_id);
 
     let status = vm.run().expect("first run should wait on host op");
     assert_eq!(status, VmStatus::Waiting(op_id));
@@ -1003,12 +1061,11 @@ fn nested_resource_args_dynamic_pending_completion_explicitly_rejected() {
         schema.return_type
     );
 
-    let op_id = 0xC0_DE_00_05;
     let mut registry = HostFunctionRegistry::new();
     let error = registry
         .register_exact_args(&import.name, 1, schema, move || {
             Box::new(PendingArgsHost {
-                op_id,
+                cell: Arc::new(Mutex::new(None)),
                 call_count: Arc::new(AtomicUsize::new(0)),
             })
         })
@@ -1028,14 +1085,17 @@ fn nested_resource_args_dynamic_pending_completion_explicitly_rejected() {
 fn schema_none_args_dynamic_pending_completion_keeps_legacy_behavior() {
     let calls = Arc::new(AtomicUsize::new(0));
     let call_count = Arc::clone(&calls);
-    let op_id = 0xC0_DE_00_04;
     let mut bc = BytecodeBuilder::new();
     bc.ldc(0);
     bc.call(0, 1);
     bc.ret();
     let mut vm = Vm::try_new(Program::new(vec![Value::Int(4)], bc.finish()))
         .expect("test VM construction must not fail");
-    vm.register_args_function(Box::new(PendingArgsHost { op_id, call_count }));
+    let op_id = start_pending_op(&mut vm);
+    vm.register_args_function(Box::new(PendingArgsHost {
+        cell: Arc::new(Mutex::new(Some(op_id))),
+        call_count,
+    }));
 
     let status = vm.run().expect("first run should wait on host op");
     assert_eq!(status, VmStatus::Waiting(op_id));
@@ -1095,18 +1155,21 @@ fn nonresource_exact_args_dynamic_pending_completion_unaffected() {
 
     let calls = Arc::new(AtomicUsize::new(0));
     let bound_calls = Arc::clone(&calls);
-    let op_id = 0xC0_DE_00_05;
+    let cell = Arc::new(Mutex::new(None::<HostOpId>));
+    let bound_cell = Arc::clone(&cell);
     let mut registry = HostFunctionRegistry::new();
     registry
         .register_exact_args(&import.name, 1, schema, move || {
             Box::new(PendingArgsHost {
-                op_id,
+                cell: Arc::clone(&bound_cell),
                 call_count: Arc::clone(&bound_calls),
             })
         })
         .expect("register exact non-resource args");
     let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
+    let op_id = start_pending_op(&mut vm);
+    *cell.lock().unwrap() = Some(op_id);
 
     let status = vm.run().expect("first run should wait on host op");
     assert_eq!(status, VmStatus::Waiting(op_id));
@@ -1132,12 +1195,13 @@ fn exact_resource_dynamic_pending_completion_accepts_valid_handle() {
     let schema = import.schema.clone().expect("exact schema");
     let calls = Arc::new(AtomicUsize::new(0));
     let bound_calls = Arc::clone(&calls);
-    let op_id = 0xC0_DE_00_06;
+    let cell = Arc::new(Mutex::new(None::<HostOpId>));
+    let bound_cell = Arc::clone(&cell);
     let mut registry = HostFunctionRegistry::new();
     registry
         .register_exact(&import.name, 1, schema, move || {
             Box::new(PendingDynamicHost {
-                op_id,
+                cell: Arc::clone(&bound_cell),
                 call_count: Arc::clone(&bound_calls),
             })
         })
@@ -1145,6 +1209,8 @@ fn exact_resource_dynamic_pending_completion_accepts_valid_handle() {
     let mut vm =
         Vm::try_new(pending_resource_call_program()).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
+    let op_id = start_pending_op(&mut vm);
+    *cell.lock().unwrap() = Some(op_id);
 
     let status = vm.run().expect("first run should wait on host op");
     assert_eq!(status, VmStatus::Waiting(op_id));
@@ -1165,12 +1231,13 @@ fn exact_resource_dynamic_pending_completion_accepts_valid_handle() {
 fn exact_resource_dynamic_pending_completion_rejects_plain_int() {
     let import = compiled_ping_import();
     let schema = import.schema.clone().expect("exact schema");
-    let op_id = 0xC0_DE_00_07;
+    let cell = Arc::new(Mutex::new(None::<HostOpId>));
+    let bound_cell = Arc::clone(&cell);
     let mut registry = HostFunctionRegistry::new();
     registry
         .register_exact(&import.name, 1, schema, move || {
             Box::new(PendingDynamicHost {
-                op_id,
+                cell: Arc::clone(&bound_cell),
                 call_count: Arc::new(AtomicUsize::new(0)),
             })
         })
@@ -1178,6 +1245,8 @@ fn exact_resource_dynamic_pending_completion_rejects_plain_int() {
     let mut vm =
         Vm::try_new(pending_resource_call_program()).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
+    let op_id = start_pending_op(&mut vm);
+    *cell.lock().unwrap() = Some(op_id);
 
     let status = vm.run().expect("first run should wait on host op");
     assert_eq!(status, VmStatus::Waiting(op_id));
@@ -1208,12 +1277,13 @@ fn exact_resource_stack_dynamic_pending_completion_validates_handle() {
     let schema = import.schema.clone().expect("exact schema");
     let calls = Arc::new(AtomicUsize::new(0));
     let bound_calls = Arc::clone(&calls);
-    let op_id = 0xC0_DE_00_08;
+    let cell = Arc::new(Mutex::new(None::<HostOpId>));
+    let bound_cell = Arc::clone(&cell);
     let mut registry = HostFunctionRegistry::new();
     registry
         .register_exact_stack(&import.name, 1, schema, move || {
             Box::new(PendingStackHost {
-                op_id,
+                cell: Arc::clone(&bound_cell),
                 call_count: Arc::clone(&bound_calls),
             })
         })
@@ -1221,6 +1291,8 @@ fn exact_resource_stack_dynamic_pending_completion_validates_handle() {
     let mut vm =
         Vm::try_new(pending_resource_call_program()).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
+    let op_id = start_pending_op(&mut vm);
+    *cell.lock().unwrap() = Some(op_id);
 
     let status = vm.run().expect("first run should wait on host op");
     assert_eq!(status, VmStatus::Waiting(op_id));
@@ -1243,16 +1315,17 @@ fn exact_resource_stack_dynamic_pending_completion_validates_handle() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
     // A fresh call with a real table handle is validated and pushed.
-    let op_id2 = 0xC0_DE_00_09;
     let calls2 = Arc::new(AtomicUsize::new(0));
     let bound_calls2 = Arc::clone(&calls2);
+    let cell2 = Arc::new(Mutex::new(None::<HostOpId>));
+    let bound_cell2 = Arc::clone(&cell2);
     let import = compiled_ping_import();
     let schema = import.schema.clone().expect("exact schema");
     let mut registry = HostFunctionRegistry::new();
     registry
         .register_exact_stack(&import.name, 1, schema, move || {
             Box::new(PendingStackHost {
-                op_id: op_id2,
+                cell: Arc::clone(&bound_cell2),
                 call_count: Arc::clone(&bound_calls2),
             })
         })
@@ -1260,6 +1333,8 @@ fn exact_resource_stack_dynamic_pending_completion_validates_handle() {
     let mut vm =
         Vm::try_new(pending_resource_call_program()).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
+    let op_id2 = start_pending_op(&mut vm);
+    *cell2.lock().unwrap() = Some(op_id2);
 
     let status = vm.run().expect("first run should wait on host op");
     assert_eq!(status, VmStatus::Waiting(op_id2));

@@ -1,3 +1,4 @@
+use std::task::{Context, Poll};
 use std::{cell::Cell, sync::Arc};
 
 use vm::{
@@ -5,6 +6,22 @@ use vm::{
     Program, Value, ValueType, Vm, VmStatus, VmYieldReason, builtin_call_index, compile_source,
     disassemble_program,
 };
+
+/// A test pending host-operation driver: stays `Pending` until cancelled.
+struct PendingOperationDriver;
+
+impl vm::operation::HostOperation for PendingOperationDriver {
+    fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<vm::operation::OperationResult<()>> {
+        Poll::Pending
+    }
+
+    fn cancel(
+        &mut self,
+        _reason: vm::operation::OperationCancelReason,
+    ) -> vm::operation::OperationResult<()> {
+        Ok(())
+    }
+}
 
 fn native_jit_supported() -> bool {
     (cfg!(target_arch = "x86_64")
@@ -197,18 +214,21 @@ impl HostFunction for YieldOnce {
 
 struct PendingOnce {
     called: bool,
-    op_id: u64,
 }
 
 impl HostFunction for PendingOnce {
-    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+    fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
         if self.called {
             return Err(vm::VmError::HostError(
                 "pending host should not be replayed".to_string(),
             ));
         }
         self.called = true;
-        Ok(CallOutcome::Pending(self.op_id))
+        let op_id = vm
+            .host_context()
+            .start_operation(vm::operation::OperationSpec::new(PendingOperationDriver))
+            .expect("start pending scope operation");
+        Ok(CallOutcome::Pending(op_id.raw()))
     }
 }
 
@@ -939,17 +959,15 @@ fn aot_waits_for_pending_host_and_resumes_without_replay() {
     bc.call(0, 0);
     bc.ret();
 
-    let op_id = 77;
     let mut vm = Vm::try_new(Program::new(Vec::new(), bc.finish()))
         .expect("test VM construction must not fail");
-    vm.register_function(Box::new(PendingOnce {
-        called: false,
-        op_id,
-    }));
+    vm.register_function(Box::new(PendingOnce { called: false }));
     install_aot(&mut vm);
 
     let waiting = vm.run().expect("first aot run should wait");
-    assert_eq!(waiting, VmStatus::Waiting(op_id));
+    let VmStatus::Waiting(op_id) = waiting else {
+        panic!("expected waiting status, got {waiting:?}");
+    };
 
     vm.complete_host_op(op_id, vec![Value::Int(7)])
         .expect("host op completion should succeed");
@@ -7372,8 +7390,8 @@ fn trace_jit_call_value_waits_and_resumes_host_callable_without_replay() {
     struct PendingCallableHost;
 
     impl HostFunction for PendingCallableHost {
-        fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
-            let value = match args {
+        fn call(&mut self, vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
+            let _value = match args {
                 [Value::Int(value)] => *value,
                 _ => {
                     return Err(vm::VmError::HostError(
@@ -7381,7 +7399,11 @@ fn trace_jit_call_value_waits_and_resumes_host_callable_without_replay() {
                     ));
                 }
             };
-            Ok(CallOutcome::Pending(900 + value as u64))
+            let op_id = vm
+                .host_context()
+                .start_operation(vm::operation::OperationSpec::new(PendingOperationDriver))
+                .expect("start pending scope operation");
+            Ok(CallOutcome::Pending(op_id.raw()))
         }
     }
 
@@ -7406,17 +7428,17 @@ fn trace_jit_call_value_waits_and_resumes_host_callable_without_replay() {
         max_trace_len: 512,
     });
 
-    assert_eq!(
-        vm.run().expect("first callable host call should wait"),
-        VmStatus::Waiting(900)
-    );
-    vm.complete_host_op(900, CallReturn::one(Value::Int(10)))
+    let status = vm.run().expect("first callable host call should wait");
+    let VmStatus::Waiting(op1) = status else {
+        panic!("expected first waiting status, got {status:?}");
+    };
+    vm.complete_host_op(op1, CallReturn::one(Value::Int(10)))
         .expect("first pending call should complete");
-    assert_eq!(
-        vm.resume().expect("second callable host call should wait"),
-        VmStatus::Waiting(901)
-    );
-    vm.complete_host_op(901, CallReturn::one(Value::Int(20)))
+    let status = vm.resume().expect("second callable host call should wait");
+    let VmStatus::Waiting(op2) = status else {
+        panic!("expected second waiting status, got {status:?}");
+    };
+    vm.complete_host_op(op2, CallReturn::one(Value::Int(20)))
         .expect("second pending call should complete");
     assert_eq!(
         vm.resume().expect("callable host loop should finish"),

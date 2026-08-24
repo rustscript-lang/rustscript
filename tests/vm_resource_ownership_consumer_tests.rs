@@ -40,6 +40,22 @@ use vm::{
     compile_source_with_flavor_and_options,
 };
 
+/// A test pending host-operation driver: stays `Pending` until cancelled.
+struct PendingOperationDriver;
+
+impl vm::operation::HostOperation for PendingOperationDriver {
+    fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<vm::operation::OperationResult<()>> {
+        Poll::Pending
+    }
+
+    fn cancel(
+        &mut self,
+        _reason: vm::operation::OperationCancelReason,
+    ) -> vm::operation::OperationResult<()> {
+        Ok(())
+    }
+}
+
 // ---- test resources ---------------------------------------------------------
 
 /// Shared close counters for a family of resources.
@@ -192,9 +208,8 @@ impl HostFunction for OpenFailingHost {
 }
 
 /// Dynamic host that pushes a fresh `CountingResource` and returns
-/// `Pending(op_id)`.
+/// `Pending(op_id)` for a real scope-registered operation.
 struct PendingOpenHost {
-    op_id: u64,
     counters: CloseCounters,
     handle: Arc<Mutex<Option<i64>>>,
 }
@@ -207,7 +222,11 @@ impl HostFunction for PendingOpenHost {
         let token = vm.host_context().push_resource(resource).expect("push");
         let raw = token.handle().raw() as i64;
         *self.handle.lock().unwrap() = Some(raw);
-        Ok(CallOutcome::Pending(self.op_id))
+        let op_id = vm
+            .host_context()
+            .start_operation(vm::operation::OperationSpec::new(PendingOperationDriver))
+            .expect("start pending scope operation");
+        Ok(CallOutcome::Pending(op_id.raw()))
     }
 }
 
@@ -536,7 +555,6 @@ fn pending_open_program() -> vm::Program {
 fn exact_async_completion_marks_guest_owned() {
     let program = pending_open_program();
     let schema = open_import_schema(&program);
-    let op_id = 0xC0_DE_00_11;
     let counters = CloseCounters::new();
     let handle = Arc::new(Mutex::new(None::<i64>));
     let handle_for_host = Arc::clone(&handle);
@@ -546,7 +564,6 @@ fn exact_async_completion_marks_guest_owned() {
     registry
         .register_exact("acme::open", 1, schema, move || {
             Box::new(PendingOpenHost {
-                op_id,
                 counters: counters_for_host.clone(),
                 handle: Arc::clone(&handle_for_host),
             })
@@ -556,7 +573,9 @@ fn exact_async_completion_marks_guest_owned() {
     let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     let status = vm.run().expect("first run waits");
-    assert_eq!(status, VmStatus::Waiting(op_id));
+    let VmStatus::Waiting(op_id) = status else {
+        panic!("expected waiting status, got {status:?}");
+    };
     let raw = handle.lock().unwrap().expect("handle captured");
     vm.complete_host_op(op_id, vec![Value::Int(raw)])
         .expect("good completion");
@@ -591,7 +610,6 @@ fn exact_async_completion_marks_guest_owned() {
 fn exact_async_completion_foreign_handle_rejected() {
     let program = pending_open_program();
     let schema = open_import_schema(&program);
-    let op_id = 0xC0_DE_00_12;
     let foreign_raw = {
         let mut table = ResourceTable::new().expect("table");
         let token = table.push(CountingResource {
@@ -600,25 +618,27 @@ fn exact_async_completion_foreign_handle_rejected() {
         token.expect("push").handle().raw()
     };
 
-    struct ForeignPending {
-        op_id: u64,
-    }
+    struct ForeignPending;
     impl HostFunction for ForeignPending {
-        fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
-            Ok(CallOutcome::Pending(self.op_id))
+        fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+            let op_id = vm
+                .host_context()
+                .start_operation(vm::operation::OperationSpec::new(PendingOperationDriver))
+                .expect("start pending scope operation");
+            Ok(CallOutcome::Pending(op_id.raw()))
         }
     }
 
     let mut registry = HostFunctionRegistry::new();
     registry
-        .register_exact("acme::open", 1, schema, move || {
-            Box::new(ForeignPending { op_id })
-        })
+        .register_exact("acme::open", 1, schema, move || Box::new(ForeignPending))
         .expect("register exact");
     let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
     registry.bind_vm_cached(&mut vm).expect("bind");
     let status = vm.run().expect("run waits");
-    assert_eq!(status, VmStatus::Waiting(op_id));
+    let VmStatus::Waiting(op_id) = status else {
+        panic!("expected waiting status, got {status:?}");
+    };
     let error = vm
         .complete_host_op(op_id, vec![Value::Int(foreign_raw as i64)])
         .expect_err("foreign completion must be rejected");

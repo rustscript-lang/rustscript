@@ -243,7 +243,6 @@ struct IoAdapterContract {
     name: &'static str,
     arity: u8,
     adapter: fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>,
-    runtime_owned_pending: bool,
 }
 
 const IO_ADAPTER_CONTRACTS: &[IoAdapterContract] = &[
@@ -251,49 +250,41 @@ const IO_ADAPTER_CONTRACTS: &[IoAdapterContract] = &[
         name: "io::open",
         arity: 2,
         adapter: open_adapter,
-        runtime_owned_pending: true,
     },
     IoAdapterContract {
         name: "io::popen",
         arity: 2,
         adapter: popen_adapter,
-        runtime_owned_pending: true,
     },
     IoAdapterContract {
         name: "io::read_all",
         arity: 1,
         adapter: read_all_adapter,
-        runtime_owned_pending: true,
     },
     IoAdapterContract {
         name: "io::read_line",
         arity: 1,
         adapter: read_line_adapter,
-        runtime_owned_pending: true,
     },
     IoAdapterContract {
         name: "io::write",
         arity: 2,
         adapter: write_adapter,
-        runtime_owned_pending: true,
     },
     IoAdapterContract {
         name: "io::flush",
         arity: 1,
         adapter: flush_adapter,
-        runtime_owned_pending: true,
     },
     IoAdapterContract {
         name: "io::close",
         arity: 1,
         adapter: close_adapter,
-        runtime_owned_pending: true,
     },
     IoAdapterContract {
         name: "io::exists",
         arity: 1,
         adapter: exists_adapter,
-        runtime_owned_pending: true,
     },
 ];
 
@@ -303,10 +294,10 @@ const IO_ADAPTER_CONTRACTS: &[IoAdapterContract] = &[
 /// The exact path is the catalog-driven host-import surface (like sqlite):
 /// it binds the same `#[pd_host_function]`-generated adapter functions the
 /// namespaced-builtin dispatch uses, so behavior is identical across both
-/// compile paths. `mark_exact_runtime_owned_pending` keeps pending IO on the
-/// generic execution-scope await path. Available in every build matrix:
-/// blocking, async (tokio), and wasm32 (structured unsupported errors) —
-/// the adapters always dispatch to the actually-enabled implementation.
+/// compile paths. Pending IO stays on the generic execution-scope await
+/// path. Available in every build matrix: blocking, async (tokio), and
+/// wasm32 (structured unsupported errors) — the adapters always dispatch to
+/// the actually-enabled implementation.
 ///
 /// Callers that compose their own custom catalog or an IO *subcatalog*
 /// snapshot must use [`register_io_builtin_module_from_catalog`] instead.
@@ -355,9 +346,6 @@ pub fn register_io_builtin_module_from_catalog(
                 staged.register_exact_static(entry.name, entry.arity, schema, entry.adapter)?;
             }
             staged.authorize_registered_builtin_import(entry.name);
-            if entry.runtime_owned_pending {
-                staged.mark_exact_runtime_owned_pending(entry.name)?;
-            }
         }
         Ok(())
     })
@@ -371,7 +359,7 @@ pub fn register_io_builtin_module_from_catalog(
 // implementation (blocking / async / wasm), all of which expose the same
 // generated wrapper names and signatures, so a single adapter set is used for
 // every build matrix. Pending ops are kept on the generic execution-scope
-// await path via [`mark_exact_runtime_owned_pending`].
+// await path.
 
 fn open_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     use super::HostCallResult;

@@ -121,7 +121,6 @@ struct CallableDecl {
     wrapper: Option<WrapperDecl>,
     host_binding_kind: HostBindingKind,
     host_execution: HostExecutionKind,
-    runtime_owned_pending: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -479,8 +478,6 @@ fn parse_source_file(path: &Path, spec: &SourceSpec, _order_offset: usize) -> Ve
             wrapper,
             host_binding_kind: classify_host_binding(function),
             host_execution: infer_host_execution(function),
-            runtime_owned_pending: function.sig.asyncness.is_none()
-                && contains_host_call_result(&normalized_return_type(&function.sig.output)),
         });
     }
     out
@@ -1162,14 +1159,6 @@ fn render_builtin_runtime_dispatch(
             )
             .unwrap();
         }
-        if callable.runtime_owned_pending {
-            writeln!(
-                &mut out,
-                "    registry.mark_runtime_owned_pending({:?});",
-                callable.name
-            )
-            .unwrap();
-        }
     }
     // The standard default-registry constructor also installs the concrete
     // standard-surface composition as explicit per-instance state (never a
@@ -1197,14 +1186,6 @@ fn render_builtin_runtime_dispatch(
             .render_bind_static_call(&callable.name, &host_wrapper_adapter_name(callable));
         writeln!(&mut out, "        {:?} => {{", callable.name).unwrap();
         writeln!(&mut out, "            {bind_call}").unwrap();
-        if callable.runtime_owned_pending {
-            writeln!(
-                &mut out,
-                "            vm.mark_runtime_owned_pending_binding({:?});",
-                callable.name
-            )
-            .unwrap();
-        }
         writeln!(&mut out, "            true").unwrap();
         writeln!(&mut out, "        }}").unwrap();
     }
