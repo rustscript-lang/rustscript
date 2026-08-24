@@ -104,6 +104,7 @@ pub(super) struct TypeContext<'a> {
     pub(super) function_names: &'a HashMap<u16, String>,
     pub(super) host_import_return_types: &'a HashMap<u16, BoundType>,
     pub(super) host_import_signatures: &'a HashMap<u16, HostCallableSignature>,
+    declared_param_schemas: HashMap<LocalSlot, TypeSchema>,
     pub(super) typing_mode: TypingMode,
     pub(super) active_functions: Vec<(u16, Vec<TypeSchema>)>,
     pub(super) generic_bindings: Vec<HashMap<String, TypeSchema>>,
@@ -143,6 +144,21 @@ impl<'a> TypeContext<'a> {
         typing_mode: TypingMode,
         parsed: Option<&'a crate::compiler::ir::ParsedSemanticIndex>,
     ) -> Self {
+        let declared_param_schemas = function_impls
+            .iter()
+            .filter_map(|(index, function_impl)| {
+                function_decls
+                    .get(index)
+                    .map(|decl| (&function_impl.param_slots, &decl.arg_schemas))
+            })
+            .flat_map(|(slots, schemas)| {
+                slots
+                    .iter()
+                    .copied()
+                    .zip(schemas.iter())
+                    .filter_map(|(slot, schema)| schema.clone().map(|schema| (slot, schema)))
+            })
+            .collect();
         Self {
             function_impls,
             function_decls,
@@ -150,6 +166,7 @@ impl<'a> TypeContext<'a> {
             function_names,
             host_import_return_types,
             host_import_signatures,
+            declared_param_schemas,
             typing_mode,
             active_functions: Vec::new(),
             generic_bindings: Vec::new(),
@@ -831,7 +848,10 @@ impl<'a> TypeContext<'a> {
         state: &LocalTypeState,
     ) -> Option<TypeSchema> {
         match expr {
-            Expr::Var(slot) | Expr::MoveVar(slot) => state.schema(*slot).cloned(),
+            Expr::Var(slot) | Expr::MoveVar(slot) => state
+                .schema(*slot)
+                .cloned()
+                .or_else(|| self.declared_param_schemas.get(slot).cloned()),
             Expr::OptionalGet { container, key, .. } => self
                 .infer_expr_schema(container, state)
                 .and_then(|schema| infer_access_schema(&schema, key, self, state).ok()),
@@ -1071,7 +1091,10 @@ impl<'a> TypeContext<'a> {
             Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
                 self.infer_expr_schema(inner, state)
             }
-            Expr::Var(slot) | Expr::MoveVar(slot) => state.schema(*slot).cloned(),
+            Expr::Var(slot) | Expr::MoveVar(slot) => state
+                .schema(*slot)
+                .cloned()
+                .or_else(|| self.declared_param_schemas.get(slot).cloned()),
             Expr::FunctionRef(index, type_args) => {
                 let decl = self.function_decls.get(index).cloned()?;
                 if decl.type_params.len() != type_args.len() && !type_args.is_empty() {
