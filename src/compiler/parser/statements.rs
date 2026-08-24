@@ -966,6 +966,24 @@ impl Parser {
                 "bool" => TypeSchema::Bool,
                 "string" => TypeSchema::String,
                 "bytes" => TypeSchema::Bytes,
+                "resource" => {
+                    self.expect(&TokenKind::Less, "expected '<' before resource type key")?;
+                    let mut key = self.expect_ident("expected resource type key")?;
+                    while self.match_kind(&TokenKind::Dot) {
+                        key.push('.');
+                        key.push_str(
+                            &self.expect_ident("expected resource type key segment after '.'")?,
+                        );
+                    }
+                    self.expect(&TokenKind::Greater, "expected '>' after resource type key")?;
+                    let key = ResourceTypeKey::new(key.clone()).map_err(|error| ParseError {
+                        span: Some(span),
+                        code: None,
+                        line: self.current_line(),
+                        message: format!("invalid resource type key '{key}': {error}"),
+                    })?;
+                    TypeSchema::Resource(key)
+                }
                 "array" => {
                     if self.match_kind(&TokenKind::Less) {
                         let element = self.parse_declared_type_schema()?;

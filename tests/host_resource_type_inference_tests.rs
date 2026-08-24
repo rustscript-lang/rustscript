@@ -686,6 +686,27 @@ fn default_analysis_resolves_standard_catalog_calls_and_annotations() {
     );
 }
 
+#[test]
+fn declared_resource_type_parses_qualified_key_and_resolves_borrow_call() {
+    let model = analyze_source_from_string_with_options(
+        "resource_param.rss",
+        r#"
+use sqlite;
+fn query(db: resource<sqlite.connection>) -> int {
+    sqlite::query(&db, "SELECT 1")
+}
+"#,
+        CompileSourceFileOptions::default().with_host_api_catalog(test_catalog()),
+    )
+    .expect("qualified resource type declaration should parse and analyze");
+
+    assert!(
+        model.diagnostics().is_empty(),
+        "declared resource parameter should resolve exactly: {:?}",
+        model.diagnostics()
+    );
+}
+
 #[cfg(feature = "runtime")]
 #[test]
 fn explicit_analysis_catalog_is_not_augmented_by_standard_catalog() {

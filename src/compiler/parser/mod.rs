@@ -17,7 +17,7 @@ use crate::builtins::{
 };
 use crate::compiler::modules::{UseDecl, UsePathSegment};
 use crate::compiler::source_map::{SourceId, Span};
-use crate::host_api::{HostApiCatalog, HostFunctionSchema};
+use crate::host_api::{HostApiCatalog, HostFunctionSchema, ResourceTypeKey};
 
 pub(crate) use self::expressions::host_generic_type_arg_arity;
 use self::lexer::{Lexer, ParserFormatArg, Token, TokenKind, is_ident_continue, is_ident_start};
