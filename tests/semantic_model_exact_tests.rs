@@ -116,6 +116,56 @@ fn analyze_modules(root: &str, overrides: &[(&str, &str)]) -> SemanticModel {
     model
 }
 
+#[test]
+fn declared_resource_schema_survives_cross_module_parameter_forwarding() {
+    let root = r#"
+use io;
+use outer;
+let db = io::open("db");
+outer::run(db, true);
+"#;
+    let outer = r#"
+use inner;
+pub fn run(db: resource<db.session>, use_first: bool) -> string {
+    let mut failed: bool = false;
+    if use_first {
+        if !inner::session_exists(&db) {
+            failed = true;
+        }
+    }
+    if failed == false {
+        if use_first && !inner::run_exists(&db) {
+            failed = true;
+        }
+    }
+    if failed == false {
+        inner::read(&db)
+    } else {
+        "missing"
+    }
+}
+"#;
+    let inner = r#"
+use io;
+pub fn session_exists(db: resource<db.session>) -> bool {
+    io::read(&db) != ""
+}
+pub fn run_exists(db: resource<db.session>) -> bool {
+    io::read(&db) != ""
+}
+pub fn read(db: resource<db.session>) -> string {
+    io::read(&db)
+}
+"#;
+
+    let model = analyze_modules(root, &[("outer", outer), ("inner", inner)]);
+    assert!(
+        model.diagnostics().is_empty(),
+        "resource schema must survive module linking and forwarding: {:?}",
+        model.diagnostics()
+    );
+}
+
 /// The completion labels at a position in the given source, in order.
 fn labels(model: &SemanticModel, offset: usize) -> Vec<String> {
     model

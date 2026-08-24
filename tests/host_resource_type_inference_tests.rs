@@ -695,6 +695,10 @@ use sqlite;
 fn query(db: resource<sqlite.connection>) -> int {
     sqlite::query(&db, "SELECT 1")
 }
+fn forwarded(db: resource<sqlite.connection>) -> int {
+    query(&db);
+    query(&db)
+}
 "#,
         CompileSourceFileOptions::default().with_host_api_catalog(test_catalog()),
     )
