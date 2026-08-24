@@ -363,28 +363,28 @@ impl LocalTypeState {
             }
             let lhs_schema = lhs.schema(slot);
             let rhs_schema = rhs.schema(slot);
-            let one_sided_declared_resource =
-                match (lhs.has_declared_schema(slot), rhs.has_declared_schema(slot)) {
-                    (true, false) => lhs_schema
-                        .filter(|schema| schema.contains_resource())
-                        .cloned(),
-                    (false, true) => rhs_schema
-                        .filter(|schema| schema.contains_resource())
-                        .cloned(),
-                    _ => None,
-                };
+            let one_sided_resource_schema = match (lhs_schema, rhs_schema) {
+                (Some(schema), None) | (None, Some(schema)) if schema.contains_resource() => {
+                    Some(schema.clone())
+                }
+                _ => None,
+            };
             let declared_schema = if lhs.has_declared_schema(slot)
                 && rhs.has_declared_schema(slot)
                 && lhs_schema == rhs_schema
             {
                 lhs_schema.cloned()
+            } else if one_sided_resource_schema.is_some()
+                && (lhs.has_declared_schema(slot) || rhs.has_declared_schema(slot))
+            {
+                one_sided_resource_schema.clone()
             } else {
-                one_sided_declared_resource
+                None
             };
             let merged_schema = if lhs_schema == rhs_schema {
                 lhs_schema.cloned()
             } else {
-                declared_schema.clone()
+                one_sided_resource_schema
             };
             if let Some(schema) = merged_schema {
                 self.schemas.insert(slot, schema);
@@ -472,6 +472,20 @@ mod tests {
     use crate::host_api::ResourceTypeKey;
 
     use super::*;
+
+    #[test]
+    fn branch_merge_preserves_one_sided_inferred_resource_schema() {
+        let slot = 8;
+        let schema = TypeSchema::Resource(ResourceTypeKey::new("sqlite.connection").unwrap());
+        let mut typed_branch = LocalTypeState::default();
+        typed_branch.set_with_schema_origin(slot, BoundType::Int, Some(schema.clone()), false);
+
+        let mut merged = LocalTypeState::default();
+        merged.merge_from_branches(&typed_branch, &LocalTypeState::default());
+
+        assert_eq!(merged.schema(slot), Some(&schema));
+        assert!(!merged.has_declared_schema(slot));
+    }
 
     #[test]
     fn branch_merge_preserves_one_sided_declared_resource_schema() {
