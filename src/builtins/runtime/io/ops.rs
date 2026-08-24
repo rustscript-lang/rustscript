@@ -133,18 +133,15 @@ impl HostOperation for CloseCompletionOperation {
     }
 }
 
-/// A shared transfer guard that holds a pipe handle that can be taken by
-/// the worker thread or restored to the resource if the worker is cancelled
-/// before starting. This prevents the OS descriptor leak described in
-/// FINDING 1: the pipe handle is NOT taken from the resource until the
-/// worker is actually about to start work. If cancellation fires before
-/// the worker takes the handle, the guard's `restore_or_drop` restores it.
+/// A shared transfer guard that holds a pipe handle until the worker takes
+/// ownership. The worker returns a transferred handle through the operation's
+/// pipe-result slot on normal completion; cancellation closes the associated
+/// resource, and the guard drops any handle that was never transferred.
 ///
 /// Unlike the raw `Arc<Mutex<Option<...>>>` pattern, this guard:
 /// - Provides a typed, single-purpose API
 /// - Clones the `Arc` for shared ownership (the guard itself is clonable)
-/// - Has a `restore_or_drop` method that attempts to restore the pipe
-///   handle into the resource, or drops it if the resource is closing
+/// - Enforces one live owner at a time across pre-start and worker transfer
 pub(crate) struct PipeTransferGuard<T> {
     inner: Arc<Mutex<Option<T>>>,
     key: String,
@@ -187,39 +184,15 @@ impl<T: Send + 'static> PipeTransferGuard<T> {
         &self.key
     }
 
-    /// Restore the pipe handle into the resource, or drop it if the resource
-    /// is closing. This is the canonical restore path for the case where the
-    /// worker was cancelled before starting and the guard still holds the
-    /// pipe handle.
-    ///
-    /// If the handle was already taken by the worker, this is a no-op.
-    /// If the resource is closing or gone, the pipe handle is dropped to
-    /// avoid leaking the OS descriptor.
-    pub(crate) fn restore_or_drop(
-        &self,
-        vm: &mut Vm,
-        handle: crate::vm::resource::ResourceHandle,
-        restore: impl FnOnce(&mut IoPipeResource, T),
-    ) {
-        let pipe = match self.take() {
-            Some(p) => p,
-            None => return,
-        };
-        let mut ctx = vm.host_context();
-        if let Ok(token) = ctx.typed_resource::<IoPipeResource>(handle)
-            && let Ok(mut resource) = ctx.resource_mut::<IoPipeResource>(&token)
-            && !resource.get().is_closed()
-        {
-            restore(resource.get(), pipe);
-            return;
-        }
-        // Resource is closing or gone — drop the pipe handle (OS descriptor
-        // is closed by Drop). This is safe: the worker never took it.
-        drop(pipe);
+    /// Drops a handle that was never transferred to the worker. A live handle
+    /// returned by a worker is restored through the operation result adapter;
+    /// cancellation instead closes the associated resource before this final
+    /// owner release.
+    pub(crate) fn restore_or_drop(&self) {
+        drop(self.take());
     }
 }
 
-// Re-import IoPipeResource for the restore_or_drop and free functions.
 use super::shared::IoPipeResource;
 
 /// Restore a reader pipe handle into the resource, or drop it if the
@@ -299,6 +272,7 @@ struct WorkerLifecycle {
 /// registers first and then checks without a lost-wake window.
 pub(crate) struct SharedWorkerState {
     pub(crate) cancelled: AtomicBool,
+    finished: AtomicBool,
     lifecycle: Mutex<WorkerLifecycle>,
 }
 
@@ -306,6 +280,7 @@ impl SharedWorkerState {
     pub(crate) fn new() -> Self {
         Self {
             cancelled: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
             lifecycle: Mutex::new(WorkerLifecycle {
                 terminal: None,
                 waker: None,
@@ -323,6 +298,33 @@ impl SharedWorkerState {
             lifecycle.terminal = Some(signal);
             lifecycle.waker.take()
         };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    pub(crate) fn worker_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+
+    fn register_finished_waker(&self, cx: &Context<'_>) {
+        if self.worker_finished() {
+            return;
+        }
+        let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.worker_finished() {
+            lifecycle.waker = Some(cx.waker().clone());
+        }
+    }
+
+    fn mark_worker_finished(&self) {
+        self.finished.store(true, Ordering::Release);
+        let waker = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .waker
+            .take();
         if let Some(waker) = waker {
             waker.wake();
         }
@@ -367,6 +369,16 @@ impl SharedWorkerState {
     }
 }
 
+struct WorkerFinishGuard {
+    state: Arc<SharedWorkerState>,
+}
+
+impl Drop for WorkerFinishGuard {
+    fn drop(&mut self) {
+        self.state.mark_worker_finished();
+    }
+}
+
 /// A cancellation-aware operation whose worker, terminal state, panic path,
 /// cancellation path, and wakeup are owned by one operation driver.
 pub(crate) struct ThreadedOperation {
@@ -404,38 +416,44 @@ impl ThreadedOperation {
         let worker_name = name.clone();
         let worker_state = Arc::clone(&state);
         let fallback_publisher = publisher.clone();
-        let handle = thread::Builder::new()
-            .name(thread_name)
-            .spawn(move || {
-                if worker_state.cancelled.load(Ordering::SeqCst) {
-                    let _ = fallback_publisher.send(Err(format!(
-                        "operation '{worker_name}' was cancelled before starting"
-                    )));
-                    return;
-                }
-                let result = catch_unwind(AssertUnwindSafe(|| {
-                    work(Arc::clone(&worker_state), publisher)
-                }));
-                if result.is_err() {
-                    fallback_publisher
-                        .send(Err(format!("worker thread '{worker_name}' panicked")))
-                        .ok();
-                } else {
-                    let mut lifecycle = worker_state
-                        .lifecycle
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    if lifecycle.terminal.is_none() {
-                        lifecycle.terminal = Some(Ok(()));
-                        let waker = lifecycle.waker.take();
-                        drop(lifecycle);
-                        if let Some(waker) = waker {
-                            waker.wake();
-                        }
+        let handle = match thread::Builder::new().name(thread_name).spawn(move || {
+            let _finished = WorkerFinishGuard {
+                state: Arc::clone(&worker_state),
+            };
+            if worker_state.cancelled.load(Ordering::SeqCst) {
+                let _ = fallback_publisher.send(Err(format!(
+                    "operation '{worker_name}' was cancelled before starting"
+                )));
+                return;
+            }
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                work(Arc::clone(&worker_state), publisher)
+            }));
+            if result.is_err() {
+                fallback_publisher
+                    .send(Err(format!("worker thread '{worker_name}' panicked")))
+                    .ok();
+            } else {
+                let mut lifecycle = worker_state
+                    .lifecycle
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if lifecycle.terminal.is_none() {
+                    lifecycle.terminal = Some(Ok(()));
+                    let waker = lifecycle.waker.take();
+                    drop(lifecycle);
+                    if let Some(waker) = waker {
+                        waker.wake();
                     }
                 }
-            })
-            .map_err(|error| format!("failed to spawn io worker '{name}': {error}"))?;
+            }
+        }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                state.mark_worker_finished();
+                return Err(format!("failed to spawn io worker '{name}': {error}"));
+            }
+        };
         state.install_worker(handle)
     }
 
@@ -485,6 +503,19 @@ impl HostOperation for ThreadedOperation {
             self.name
         )));
         self.finish_worker(true, false)
+    }
+
+    fn is_quiescent(&self) -> bool {
+        self.state.worker_finished()
+    }
+
+    fn register_quiescence_waker(&mut self, cx: &Context<'_>) {
+        self.state.register_finished_waker(cx);
+    }
+
+    fn cancel_and_wait(&mut self, reason: OperationCancelReason) -> OperationResult<()> {
+        self.cancel(reason)?;
+        self.finish_worker(true, true)
     }
 }
 

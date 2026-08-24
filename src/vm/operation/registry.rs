@@ -67,6 +67,8 @@ struct Operation {
     driver: Box<dyn HostOperation>,
     deadline: Option<Instant>,
     resource: Option<ResourceHandle>,
+    close_resource_on_cancel: bool,
+    close_resource_on_terminal: bool,
     cleanup: Option<OperationCleanup>,
     status: OperationStatus,
 }
@@ -185,6 +187,8 @@ impl OperationRegistry {
             driver: spec.driver,
             deadline: spec.deadline,
             resource: spec.resource,
+            close_resource_on_cancel: spec.close_resource_on_cancel,
+            close_resource_on_terminal: spec.close_resource_on_terminal,
             cleanup: spec.cleanup,
             status: OperationStatus::Pending,
         };
@@ -207,11 +211,14 @@ impl OperationRegistry {
     /// registry; drive it to terminal with `poll` first.
     pub fn take_outcome(&mut self, id: OperationId) -> OperationResult<OperationOutcome> {
         let slot = self.location(id)?;
-        let status = self.slots[slot]
+        let operation = self.slots[slot]
             .operation
             .as_ref()
-            .map(|operation| operation.status.clone())
             .ok_or_else(|| operation_stale(id))?;
+        if !operation.driver.is_quiescent() {
+            return Err(pending_outcome(id));
+        }
+        let status = operation.status.clone();
         let outcome = status
             .terminal_outcome()
             .ok_or_else(|| pending_outcome(id))?;
@@ -222,6 +229,29 @@ impl OperationRegistry {
     /// The resource handle an operation is associated with, if any.
     pub fn resource_of(&self, id: OperationId) -> OperationResult<Option<ResourceHandle>> {
         Ok(self.operation(id)?.resource)
+    }
+
+    /// Returns the associated resource only when this operation owns that
+    /// resource's terminal cleanup lifecycle.
+    pub fn terminal_resource_of(&self, id: OperationId) -> OperationResult<Option<ResourceHandle>> {
+        let operation = self.operation(id)?;
+        Ok(operation
+            .close_resource_on_terminal
+            .then_some(operation.resource)
+            .flatten())
+    }
+
+    /// Returns the associated resource only when cancellation must close it
+    /// instead of leaving a transferred handle detached from its resource.
+    pub fn cancellation_resource_of(
+        &self,
+        id: OperationId,
+    ) -> OperationResult<Option<ResourceHandle>> {
+        let operation = self.operation(id)?;
+        Ok(operation
+            .close_resource_on_cancel
+            .then_some(operation.resource)
+            .flatten())
     }
 
     /// Ids of operations associated with the given resource handle.
@@ -248,10 +278,9 @@ impl OperationRegistry {
     /// cancels the operation with `OperationCancelReason::Deadline`.
     ///
     /// The terminal outcome is delivered exactly once: when this returns
-    /// `Poll::Ready`, the operation's slot is released immediately and the id
-    /// becomes stale. A later `poll`, `status` or `take_outcome` on that id
-    /// returns `OperationStale`. An out-of-band terminal (`complete`, `fail`
-    /// or `cancel`) left on the entry is consumed here on the next `poll`.
+    /// `Poll::Ready`, the operation's slot is released and the id becomes
+    /// stale. A cancelled terminal whose driver still owns a worker remains
+    /// pending until that worker reports quiescence.
     pub fn poll(
         &mut self,
         id: OperationId,
@@ -269,6 +298,14 @@ impl OperationRegistry {
             .as_ref()
             .is_some_and(|operation| operation.status.is_terminal())
         {
+            let operation = self.slots[slot]
+                .operation
+                .as_mut()
+                .expect("terminal slot remains occupied");
+            if !operation.driver.is_quiescent() {
+                operation.driver.register_quiescence_waker(cx);
+                return Poll::Pending;
+            }
             return Poll::Ready(Ok(self.consume_terminal(slot)));
         }
 
@@ -296,6 +333,14 @@ impl OperationRegistry {
                     Ok(slot) => slot,
                     Err(error) => return Poll::Ready(Err(error)),
                 };
+                let operation = self.slots[slot]
+                    .operation
+                    .as_mut()
+                    .expect("cancelled deadline operation remains occupied");
+                if !operation.driver.is_quiescent() {
+                    operation.driver.register_quiescence_waker(cx);
+                    return Poll::Pending;
+                }
                 Poll::Ready(Ok(self.consume_terminal(slot)))
             }
             Poll::Ready(Ok(())) => {
@@ -346,6 +391,15 @@ impl OperationRegistry {
         id: OperationId,
         reason: OperationCancelReason,
     ) -> OperationResult<bool> {
+        self.cancel_with_wait(id, reason, false)
+    }
+
+    fn cancel_with_wait(
+        &mut self,
+        id: OperationId,
+        reason: OperationCancelReason,
+        wait_for_worker: bool,
+    ) -> OperationResult<bool> {
         let slot = self.location(id)?;
         let pending = self.slots[slot]
             .operation
@@ -358,7 +412,11 @@ impl OperationRegistry {
         // Call the driver while still pending, before recording any status.
         let driver_result = {
             let operation = self.slots[slot].operation.as_mut().expect("pending above");
-            operation.driver.cancel(reason)
+            if wait_for_worker {
+                operation.driver.cancel_and_wait(reason)
+            } else {
+                operation.driver.cancel(reason)
+            }
         };
         match driver_result {
             Ok(()) => {
@@ -425,8 +483,13 @@ impl OperationRegistry {
     ) -> OperationResult<bool> {
         // Validate fully before any mutation; an unresolvable id is rejected
         // without touching cancel/consume state.
-        let _ = self.location(id)?;
-        let cancel_result = self.cancel(id, reason);
+        let slot = self.location(id)?;
+        let has_resource = self.slots[slot]
+            .operation
+            .as_ref()
+            .and_then(|operation| operation.resource)
+            .is_some();
+        let cancel_result = self.cancel_with_wait(id, reason, !has_resource);
         // Whether the driver cancelled cleanly, the driver's cancel failed
         // (the entry is now terminal `Failed`), or the entry was already
         // terminal before this call, consuming the outcome releases the slot
@@ -463,54 +526,63 @@ impl OperationRegistry {
     ) -> OperationCancelSummary {
         let mut summary = OperationCancelSummary::default();
         for id in self.ids_for_resource(resource) {
-            if let Some(result) = self.drain_batch(id, reason) {
+            if let Some(result) = self.drain_batch(id, reason, true) {
                 summary.record(result);
             }
         }
         summary
     }
 
-    /// Cancels all pending operations and drains every terminal slot, so the
-    /// registry reaches quiescence (`is_empty()` and `len() == 0`).
-    ///
-    /// Snapshots every occupied slot (pending and pre-existing terminal) in
-    /// ascending slot order. For each snapshot id: if it is still pending, it
-    /// is cancelled exactly once, the resulting terminal outcome is consumed
-    /// and its slot released, and exactly one result is recorded in the
-    /// returned [`OperationCancelSummary`] (every attempted pending operation
-    /// increments `matched`, only a successful `Cancelled` increments
-    /// `cancelled`, and a driver/cleanup failure increments `failed` with the
-    /// first error stored). If it was already terminal before this call, its
-    /// outcome is consumed and discarded and its slot released without
-    /// counting toward the summary. On return every previous id is stale,
-    /// including pre-existing terminal operations, and the registry is empty.
+    /// Cancels all pending operations and drains terminal slots whose drivers
+    /// have quiesced. A cancellation-aware worker may keep its terminal slot
+    /// until a later [`poll_quiescence`](Self::poll_quiescence) call; the scope
+    /// close driver uses that method to avoid joining from the cancellation
+    /// phase.
     pub fn cancel_all(&mut self, reason: OperationCancelReason) -> OperationCancelSummary {
         let mut summary = OperationCancelSummary::default();
         for id in self.occupied_ids() {
-            if let Some(result) = self.drain_batch(id, reason) {
+            if let Some(result) = self.drain_batch(id, reason, false) {
                 summary.record(result);
             }
         }
         summary
+    }
+
+    /// Polls cancellation-owned workers without blocking the VM thread. A
+    /// terminal operation is released only after its driver reports that every
+    /// underlying worker has terminated.
+    pub fn poll_quiescence(&mut self, cx: &mut Context<'_>) -> bool {
+        for id in self.occupied_ids() {
+            let Ok(slot) = self.location(id) else {
+                continue;
+            };
+            let Some(operation) = self.slots[slot].operation.as_mut() else {
+                continue;
+            };
+            if !operation.status.is_terminal() {
+                continue;
+            }
+            if operation.driver.is_quiescent() {
+                let _ = self.consume_terminal(slot);
+            } else {
+                operation.driver.register_quiescence_waker(cx);
+            }
+        }
+        self.is_empty()
     }
 
     /// Bulk-drain helper shared by [`cancel_all`](Self::cancel_all) and
     /// [`cancel_for_resource`](Self::cancel_for_resource).
     ///
-    /// If the snapshot id is still pending, it is cancelled exactly once, the
-    /// resulting terminal outcome is consumed and its slot released through
-    /// [`take_outcome`](Self::take_outcome) (so generation/free-list updates
-    /// happen exactly once), and `Some(result)` is returned for the caller to
-    /// record in an [`OperationCancelSummary`]. If `id` was already terminal
-    /// before the snapshot, its outcome is consumed and discarded, its slot
-    /// released, and `None` is returned so the caller does not count a
-    /// matched/cancelled/failed increment. A pending slot is never released
-    /// without cancelling: `take_outcome` refuses to release an id that is
-    /// (impossibly) still pending after a successful cancellation.
+    /// If the snapshot id is still pending, it is cancelled exactly once. A
+    /// resource-close drain waits for a worker before consuming the outcome;
+    /// a scope-wide drain records the cancellation and leaves a non-quiescent
+    /// terminal slot for [`poll_quiescence`](Self::poll_quiescence).
     fn drain_batch(
         &mut self,
         id: OperationId,
         reason: OperationCancelReason,
+        wait_for_worker: bool,
     ) -> Option<OperationResult<bool>> {
         let is_pending = self
             .location(id)
@@ -518,7 +590,7 @@ impl OperationRegistry {
             .and_then(|slot| self.slots[slot].operation.as_ref())
             .is_some_and(|operation| matches!(operation.status, OperationStatus::Pending));
         if is_pending {
-            let result = self.cancel(id, reason);
+            let result = self.cancel_with_wait(id, reason, wait_for_worker);
             let _ = self.take_outcome(id);
             Some(result)
         } else {
@@ -566,7 +638,9 @@ impl OperationRegistry {
         let terminal = self.slots[index]
             .operation
             .as_ref()
-            .is_some_and(|operation| operation.status.is_terminal());
+            .is_some_and(|operation| {
+                operation.status.is_terminal() && operation.driver.is_quiescent()
+            });
         if !terminal {
             return Err(pending_outcome(id));
         }

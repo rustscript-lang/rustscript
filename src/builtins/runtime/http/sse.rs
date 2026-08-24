@@ -14,7 +14,6 @@ use super::request::{
 };
 use super::{HttpRequestContext, policy};
 use crate::builtins::runtime::{HostCallResult, VmCallable, VmMap, VmMapHandle};
-use crate::vm::operation::{HostOperation, OperationCancelReason, OperationResult, OperationSpec};
 use crate::vm::resource::{
     CloseProgress, HostResource, ResourceCloseReason, ResourceError, ResourceErrorCode,
     ResourceResult, ResourceTypeKey,
@@ -855,6 +854,32 @@ impl HostStreamDriver for SseStreamDriver {
             ))),
         }
     }
+
+    fn cancel(
+        &mut self,
+        _reason: crate::builtins::runtime::cancellation::CancellationReason,
+    ) -> VmResult<()> {
+        self.shared.stopping.store(true, Ordering::SeqCst);
+        self.shared.cancel.notify_one();
+        if let Ok(mut waker) = self.shared.waker.lock()
+            && let Some(waker) = waker.take()
+        {
+            waker.wake();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SseStreamDriver {
+    fn drop(&mut self) {
+        self.shared.stopping.store(true, Ordering::SeqCst);
+        self.shared.cancel.notify_one();
+        if let Ok(mut waker) = self.shared.waker.lock()
+            && let Some(waker) = waker.take()
+        {
+            waker.wake();
+        }
+    }
 }
 
 /// The SSE stream reader registered as a child resource in the execution
@@ -880,6 +905,45 @@ impl HostResource for SseStreamResource {
         {
             waker.wake();
         }
+        if self.shared.done.load(Ordering::Acquire) {
+            let handle = self
+                .shared
+                .join_handle
+                .lock()
+                .map_err(|_| {
+                    ResourceError::new(
+                        ResourceErrorCode::ResourceCleanupFailed,
+                        "http::sse::resource",
+                        "SSE join handle lock was poisoned",
+                    )
+                })?
+                .take();
+            if let Some(handle) = handle {
+                handle.join().map_err(|_| {
+                    ResourceError::new(
+                        ResourceErrorCode::ResourceCleanupFailed,
+                        "http::sse::resource",
+                        "SSE worker thread panicked",
+                    )
+                })?;
+            }
+            return Ok(CloseProgress::Ready);
+        }
+        if self
+            .shared
+            .join_handle
+            .lock()
+            .map_err(|_| {
+                ResourceError::new(
+                    ResourceErrorCode::ResourceCleanupFailed,
+                    "http::sse::resource",
+                    "SSE join handle lock was poisoned",
+                )
+            })?
+            .is_none()
+        {
+            return Ok(CloseProgress::Ready);
+        }
         // Return Pending: the worker thread may still be running. The
         // scope's poll_close machinery will call poll_close below.
         Ok(CloseProgress::Pending)
@@ -899,19 +963,22 @@ impl HostResource for SseStreamResource {
             return Poll::Ready(Ok(()));
         };
         if !handle.is_finished() {
-            // Worker is still running. Store the close waker and put the
-            // handle back so we can try again next poll.
-            *self
+            let mut close_waker = self
                 .shared
                 .close_waker
                 .lock()
-                .expect("sse close waker lock should not be poisoned") = Some(cx.waker().clone());
-            *self
-                .shared
-                .join_handle
-                .lock()
-                .expect("sse join handle lock should not be poisoned") = Some(handle);
-            return Poll::Pending;
+                .expect("sse close waker lock should not be poisoned");
+            *close_waker = Some(cx.waker().clone());
+            if !self.shared.done.load(Ordering::Acquire) && !handle.is_finished() {
+                drop(close_waker);
+                *self
+                    .shared
+                    .join_handle
+                    .lock()
+                    .expect("sse join handle lock should not be poisoned") = Some(handle);
+                return Poll::Pending;
+            }
+            close_waker.take();
         }
         // The worker thread has exited. Join to propagate any panic.
         match handle.join() {
@@ -934,34 +1001,35 @@ impl HostResource for SseStreamResource {
     }
 }
 
-/// Scope operation that tracks the pending SSE network poll. Cancel sets
-/// `stopping` on the shared state so the worker stops promptly. The actual
-/// item delivery is driven by the `SseStreamDriver` through the callable
-/// stream path; this operation exists only for scope lifecycle management.
-pub(super) struct SseScopeOperation {
-    shared: Arc<SseShared>,
-}
-
-impl HostOperation for SseScopeOperation {
-    fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
-        if self.shared.done.load(Ordering::SeqCst) {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Pending
-        }
+fn rollback_sse_resources(
+    vm: &mut Vm,
+    shared: &Arc<SseShared>,
+    sse_handle: crate::vm::resource::ResourceHandle,
+    response_handle: crate::vm::resource::ResourceHandle,
+) -> VmResult<()> {
+    shared.stopping.store(true, Ordering::SeqCst);
+    shared.cancel.notify_one();
+    let join = shared
+        .join_handle
+        .lock()
+        .map_err(|_| VmError::HostError("SSE join handle lock was poisoned".to_string()))?
+        .take();
+    if let Some(handle) = join {
+        handle
+            .join()
+            .map_err(|_| VmError::HostError("SSE worker thread panicked".to_string()))?;
     }
-
-    fn cancel(&mut self, reason: OperationCancelReason) -> OperationResult<()> {
-        let _ = reason;
-        self.shared.stopping.store(true, Ordering::SeqCst);
-        self.shared.cancel.notify_one();
-        if let Ok(mut waker) = self.shared.waker.lock()
-            && let Some(waker) = waker.take()
+    let mut first_error = None;
+    for handle in [sse_handle, response_handle] {
+        if let Err(error) = vm
+            .host_context()
+            .close_resource_handle(handle, ResourceCloseReason::Requested)
+            && first_error.is_none()
         {
-            waker.wake();
+            first_error = Some(error);
         }
-        Ok(())
     }
+    first_error.map_or(Ok(()), |error| Err(VmError::HostError(error.to_string())))
 }
 
 /// Streams one bounded SSE item into one script callback at a time.
@@ -1006,35 +1074,42 @@ pub(super) fn builtin_http_client_sse(
         deadline: std::sync::OnceLock::new(),
     });
 
-    // Register the HTTP response stream as a root resource, then register
-    // the SSE stream as a child of it. The generic child-first scope shutdown
-    // closes the SSE reader before its underlying response stream parent.
+    // Resource insertion is the first part of one startup transaction. Any
+    // later failure closes the child and parent in canonical child-first order.
     let response_resource = HttpResponseResource;
-    let response_token = vm
-        .host_context()
-        .push_resource(response_resource)
-        .map_err(|error| {
-            VmError::HostError(format!("failed to push HTTP response resource: {error}"))
-        })?;
+    let response_token = match vm.host_context().push_resource(response_resource) {
+        Ok(token) => token,
+        Err(error) => {
+            return Err(VmError::HostError(format!(
+                "failed to push HTTP response resource: {error}"
+            )));
+        }
+    };
+    let response_handle = response_token.handle();
 
     let sse_resource = SseStreamResource {
         shared: Arc::clone(&shared),
     };
-    let sse_token = vm
+    let sse_token = match vm
         .host_context()
         .push_child_resource(sse_resource, &response_token)
-        .map_err(|error| {
-            VmError::HostError(format!("failed to push SSE child resource: {error}"))
-        })?;
-    let sse_handle = sse_token.handle();
-    let op = SseScopeOperation {
-        shared: Arc::clone(&shared),
+    {
+        Ok(token) => token,
+        Err(error) => {
+            let cleanup = vm
+                .host_context()
+                .close_resource_handle(response_handle, ResourceCloseReason::Requested);
+            if let Err(cleanup) = cleanup {
+                return Err(VmError::HostError(format!(
+                    "failed to push SSE child resource: {error}; rollback failed: {cleanup}"
+                )));
+            }
+            return Err(VmError::HostError(format!(
+                "failed to push SSE child resource: {error}"
+            )));
+        }
     };
-    let op_id = vm
-        .host_context()
-        .start_operation(OperationSpec::new(op).with_resource(sse_handle))
-        .map_err(|error| VmError::HostError(format!("failed to start SSE operation: {error}")))?;
-    let _ = op_id;
+    let sse_handle = sse_token.handle();
 
     // The absolute stream duration mirrors `HttpRequestContext::capture`:
     // the script `timeout_ms` caps the host maximum stream duration. The
@@ -1056,17 +1131,28 @@ pub(super) fn builtin_http_client_sse(
     });
     let bytes_received = worker.bytes_received.clone();
 
-    let join_handle = std::thread::Builder::new()
+    let join_handle = match std::thread::Builder::new()
         .name("rustscript-sse-worker".to_string())
         .spawn(move || {
             worker.run();
-        })
-        .map_err(|error| VmError::HostError(format!("failed to start SSE worker: {error}")))?;
+        }) {
+        Ok(handle) => handle,
+        Err(error) => {
+            if let Err(cleanup) = rollback_sse_resources(vm, &shared, sse_handle, response_handle) {
+                return Err(VmError::HostError(format!(
+                    "failed to start SSE worker: {error}; rollback failed: {cleanup}"
+                )));
+            }
+            return Err(VmError::HostError(format!(
+                "failed to start SSE worker: {error}"
+            )));
+        }
+    };
     *shared.join_handle.lock().expect("sse join handle lock") = Some(join_handle);
 
     let permit = context.into_permit();
     let driver = SseStreamDriver {
-        shared,
+        shared: Arc::clone(&shared),
         receiver,
         status: 0,
         headers: Arc::new(VmMap::default()),
@@ -1076,11 +1162,28 @@ pub(super) fn builtin_http_client_sse(
         _permit: permit,
     };
 
-    match vm.submit_callable_stream(callback, driver)? {
-        CallOutcome::Pending(op_id) => Ok(HostCallResult::Pending(op_id)),
-        _ => Err(VmError::InvalidFrameState(
-            "callable stream admission returned a non-pending outcome",
-        )),
+    match vm.submit_callable_stream_with_resources(
+        callback,
+        driver,
+        vec![sse_handle, response_handle],
+    ) {
+        Ok(CallOutcome::Pending(op_id)) => Ok(HostCallResult::Pending(op_id)),
+        Ok(outcome) => {
+            let error =
+                VmError::HostError(format!("callable stream admission returned {outcome:?}"));
+            match rollback_sse_resources(vm, &shared, sse_handle, response_handle) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(VmError::HostError(format!(
+                    "{error}; rollback failed: {cleanup}"
+                ))),
+            }
+        }
+        Err(error) => match rollback_sse_resources(vm, &shared, sse_handle, response_handle) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(VmError::HostError(format!(
+                "{error}; rollback failed: {cleanup}"
+            ))),
+        },
     }
 }
 

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use pd_vm_nostd::{
     HostParamPassing as EmbeddedHostParamPassing, OpCode as EmbeddedOpCode,
     TypeSchema as EmbeddedTypeSchema, Value as EmbeddedValue, Vm as EmbeddedVm,
@@ -6,8 +8,9 @@ use pd_vm_nostd::{
 use vm::compiler::TypeSchema;
 use vm::{
     HostApiBuilder, HostFunctionSchema, HostImport, HostImportParam, HostImportSchema,
-    HostParamPassing, OpCode, Program, ReplLocalBinding, ResourceTypeKey, Value, ValueType,
-    compile_source, compile_source_for_repl, compile_source_for_repl_with_locals, encode_program,
+    HostParamPassing, NamedStructSchema, OpCode, Program, ReplLocalBinding, ResourceTypeKey, Value,
+    ValueType, compile_source, compile_source_for_repl, compile_source_for_repl_with_locals,
+    encode_program,
 };
 
 fn encoded_scalar_program() -> (Vec<u8>, u64) {
@@ -125,6 +128,59 @@ fn embedded_decoder_reads_host_generated_v13() {
     assert!(program.constants().is_empty());
     assert!(program.code().is_empty());
     assert_eq!(program.local_count(), 0);
+}
+
+fn named_schema_bytes() -> Vec<u8> {
+    let mut schemas = HashMap::new();
+    schemas.insert(
+        "AA".to_string(),
+        NamedStructSchema {
+            type_params: vec!["T0".to_string(), "T1".to_string()],
+            body_schema: TypeSchema::GenericParam("T0".to_string()),
+        },
+    );
+    schemas.insert(
+        "BB".to_string(),
+        NamedStructSchema {
+            type_params: Vec::new(),
+            body_schema: TypeSchema::Int,
+        },
+    );
+    encode_program(&Program::new(Vec::new(), Vec::new()).with_named_struct_schemas(schemas))
+        .expect("named schemas should encode")
+}
+
+fn replace_wire_string(bytes: &mut [u8], old: &[u8], new: &[u8]) {
+    assert_eq!(old.len(), new.len());
+    let mut marker = (old.len() as u32).to_le_bytes().to_vec();
+    marker.extend_from_slice(old);
+    let offset = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("wire string should exist");
+    bytes[offset + 4..offset + 4 + new.len()].copy_from_slice(new);
+}
+
+#[test]
+fn embedded_decoder_rejects_duplicate_v14_named_struct_names() {
+    let mut bytes = named_schema_bytes();
+    replace_wire_string(&mut bytes, b"BB", b"AA");
+    let error = decode_program(&bytes).expect_err("duplicate named struct names must be rejected");
+    assert!(matches!(
+        error,
+        WireError::InvalidNamedStructSchema("duplicate struct name")
+    ));
+}
+
+#[test]
+fn embedded_decoder_rejects_duplicate_v14_type_parameters() {
+    let mut bytes = named_schema_bytes();
+    replace_wire_string(&mut bytes, b"T1", b"T0");
+    let error = decode_program(&bytes).expect_err("duplicate type parameters must be rejected");
+    assert!(matches!(
+        error,
+        WireError::InvalidNamedStructSchema("duplicate type parameter")
+    ));
 }
 
 #[test]

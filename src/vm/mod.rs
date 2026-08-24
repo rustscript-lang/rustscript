@@ -4015,7 +4015,11 @@ impl Vm {
             std::task::Waker::from(Arc::new(ShutdownWake(std::thread::current())))
         };
         #[cfg(target_arch = "wasm32")]
-        let waker = futures_util::task::noop_waker();
+        let waker = {
+            struct ShutdownWake;
+            impl std::task::Wake for ShutdownWake {}
+            std::task::Waker::from(Arc::new(ShutdownWake))
+        };
         let mut cx = Context::from_waker(&waker);
 
         loop {

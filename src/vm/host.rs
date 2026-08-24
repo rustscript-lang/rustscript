@@ -109,6 +109,7 @@ enum RegistryEntryKind {
 struct RegistryEntry {
     arity: u8,
     kind: RegistryEntryKind,
+    legacy_resource_return_key: Option<ResourceTypeKey>,
 }
 
 /// Bounding depth for recursive schema walks in the exact host-call contract.
@@ -611,6 +612,7 @@ impl HostStackFunction for GuardedStaticHostStackFunction {
 pub struct HostBindingPlan {
     import_signature: Vec<HostImport>,
     registry_slots: Vec<u16>,
+    legacy_resource_return_keys: Vec<Option<ResourceTypeKey>>,
     resolved_calls: Vec<u16>,
     allowed_builtin_calls: Vec<u16>,
     allow_default_builtin_capabilities: bool,
@@ -908,6 +910,7 @@ impl HostFunctionRegistry {
         {
             entry.arity = arity;
             entry.kind = RegistryEntryKind::Factory(Arc::new(factory));
+            entry.legacy_resource_return_key = None;
             self.invalidate_plan_cache();
             return;
         }
@@ -917,6 +920,7 @@ impl HostFunctionRegistry {
         entries.push(RegistryEntry {
             arity,
             kind: RegistryEntryKind::Factory(Arc::new(factory)),
+            legacy_resource_return_key: None,
         });
         Arc::make_mut(&mut self.by_name).insert(name, slot);
         self.invalidate_plan_cache();
@@ -934,6 +938,7 @@ impl HostFunctionRegistry {
         {
             entry.arity = arity;
             entry.kind = RegistryEntryKind::Static(function);
+            entry.legacy_resource_return_key = None;
             self.invalidate_plan_cache();
             return;
         }
@@ -943,6 +948,7 @@ impl HostFunctionRegistry {
         entries.push(RegistryEntry {
             arity,
             kind: RegistryEntryKind::Static(function),
+            legacy_resource_return_key: None,
         });
         Arc::make_mut(&mut self.by_name).insert(name, slot);
         self.invalidate_plan_cache();
@@ -958,6 +964,7 @@ impl HostFunctionRegistry {
         {
             entry.arity = arity;
             entry.kind = RegistryEntryKind::StackFactory(Arc::new(factory));
+            entry.legacy_resource_return_key = None;
             self.invalidate_plan_cache();
             return;
         }
@@ -967,6 +974,7 @@ impl HostFunctionRegistry {
         entries.push(RegistryEntry {
             arity,
             kind: RegistryEntryKind::StackFactory(Arc::new(factory)),
+            legacy_resource_return_key: None,
         });
         Arc::make_mut(&mut self.by_name).insert(name, slot);
         self.invalidate_plan_cache();
@@ -984,6 +992,7 @@ impl HostFunctionRegistry {
         {
             entry.arity = arity;
             entry.kind = RegistryEntryKind::StackStatic(function);
+            entry.legacy_resource_return_key = None;
             self.invalidate_plan_cache();
             return;
         }
@@ -993,6 +1002,7 @@ impl HostFunctionRegistry {
         entries.push(RegistryEntry {
             arity,
             kind: RegistryEntryKind::StackStatic(function),
+            legacy_resource_return_key: None,
         });
         Arc::make_mut(&mut self.by_name).insert(name, slot);
         self.invalidate_plan_cache();
@@ -1008,6 +1018,7 @@ impl HostFunctionRegistry {
         {
             entry.arity = arity;
             entry.kind = RegistryEntryKind::ArgsFactory(Arc::new(factory));
+            entry.legacy_resource_return_key = None;
             self.invalidate_plan_cache();
             return;
         }
@@ -1017,6 +1028,7 @@ impl HostFunctionRegistry {
         entries.push(RegistryEntry {
             arity,
             kind: RegistryEntryKind::ArgsFactory(Arc::new(factory)),
+            legacy_resource_return_key: None,
         });
         Arc::make_mut(&mut self.by_name).insert(name, slot);
         self.invalidate_plan_cache();
@@ -1034,6 +1046,7 @@ impl HostFunctionRegistry {
         {
             entry.arity = arity;
             entry.kind = RegistryEntryKind::ArgsStatic(function);
+            entry.legacy_resource_return_key = None;
             self.invalidate_plan_cache();
             return;
         }
@@ -1043,6 +1056,7 @@ impl HostFunctionRegistry {
         entries.push(RegistryEntry {
             arity,
             kind: RegistryEntryKind::ArgsStatic(function),
+            legacy_resource_return_key: None,
         });
         Arc::make_mut(&mut self.by_name).insert(name, slot);
         self.invalidate_plan_cache();
@@ -1066,6 +1080,7 @@ impl HostFunctionRegistry {
         {
             entry.arity = arity;
             entry.kind = RegistryEntryKind::ArgsStaticNonYielding(function);
+            entry.legacy_resource_return_key = None;
             self.invalidate_plan_cache();
             return;
         }
@@ -1075,6 +1090,7 @@ impl HostFunctionRegistry {
         entries.push(RegistryEntry {
             arity,
             kind: RegistryEntryKind::ArgsStaticNonYielding(function),
+            legacy_resource_return_key: None,
         });
         Arc::make_mut(&mut self.by_name).insert(name, slot);
         self.invalidate_plan_cache();
@@ -1363,7 +1379,14 @@ impl HostFunctionRegistry {
             })
         })?;
         let entries = Arc::make_mut(&mut self.entries);
-        entries.push(RegistryEntry { arity, kind });
+        entries.push(RegistryEntry {
+            arity,
+            kind,
+            legacy_resource_return_key: match &schema.return_type {
+                crate::compiler::ir::TypeSchema::Resource(key) => Some(key.clone()),
+                _ => None,
+            },
+        });
         let map = Arc::make_mut(&mut self.by_exact);
         map.entry(name).or_default().insert(schema, slot);
         self.invalidate_plan_cache();
@@ -1721,10 +1744,19 @@ impl HostFunctionRegistry {
             .collect::<Vec<_>>();
         allowed_host_function_slots.sort_unstable();
         allowed_host_function_slots.dedup();
+        let legacy_resource_return_keys = registry_slots
+            .iter()
+            .map(|slot| {
+                self.entries
+                    .get(*slot as usize)
+                    .and_then(|entry| entry.legacy_resource_return_key.clone())
+            })
+            .collect();
         let import_key = imports.to_vec();
         let computed = Arc::new(HostBindingPlan {
             import_signature: import_key.clone(),
             registry_slots,
+            legacy_resource_return_keys,
             resolved_calls,
             allowed_builtin_calls: self.allowed_builtin_calls.as_ref().clone(),
             allow_default_builtin_capabilities: self.allow_default_builtin_capabilities,
@@ -1809,6 +1841,7 @@ impl HostFunctionRegistry {
             }
         }
         vm.set_default_host_fallback_enabled(false);
+        vm.host.legacy_resource_return_keys = plan.legacy_resource_return_keys.clone();
         vm.host.allowed_builtin_calls = plan.allowed_builtin_calls.clone();
         vm.host.allow_default_builtin_capabilities = plan.allow_default_builtin_capabilities;
         vm.host.allowed_host_function_slots = plan.allowed_host_function_slots.clone();
@@ -2342,6 +2375,22 @@ impl Vm {
         Ok(())
     }
 
+    fn effective_exact_host_return_policy(&self, import_index: u16) -> ExactHostReturnPolicy {
+        let policy = exact_host_return_policy(self.program.imports.get(usize::from(import_index)));
+        if !matches!(policy, ExactHostReturnPolicy::Legacy) {
+            return policy;
+        }
+        let Some(vm_slot) = self.host.resolved_calls.get(usize::from(import_index)) else {
+            return policy;
+        };
+        self.host
+            .legacy_resource_return_keys
+            .get(usize::from(*vm_slot))
+            .and_then(|key| key.clone())
+            .map(ExactHostReturnPolicy::Resource)
+            .unwrap_or(policy)
+    }
+
     pub(super) fn execute_host_call(
         &mut self,
         index: u16,
@@ -2383,7 +2432,7 @@ impl Vm {
             .imports
             .get(usize::from(index))
             .map(|import| import.return_type);
-        let exact_policy = exact_host_return_policy(self.program.imports.get(usize::from(index)));
+        let exact_policy = self.effective_exact_host_return_policy(index);
         let resolved_index = self.resolve_call_target(index, argc_u8)?;
         if !self.host.allow_default_host_capabilities
             && !self
@@ -3632,6 +3681,7 @@ mod exact_binding_registration_tests {
         RegistryEntry {
             arity: 0,
             kind: RegistryEntryKind::Static(dummy_static),
+            legacy_resource_return_key: None,
         }
     }
 
@@ -3791,6 +3841,7 @@ mod exact_binding_registration_tests {
         assert_eq!(
             vm.host_context().resource_ownership(handle),
             Some(ResourceOwnership::HostOwned),
+            "unconsumed take reclaims the guest slot; the closed slot remains resolvable as host-owned",
         );
     }
 

@@ -116,6 +116,10 @@ pub(crate) struct HostRuntime {
     pub(crate) allow_default_host_capabilities: bool,
     pub(crate) builtin_overrides: HashMap<u16, u16>,
     pub(crate) resolved_calls: Vec<u16>,
+    /// Resource return keys supplied by an exact registry entry for a
+    /// schema-less import. This keeps legacy calls on the same ownership path
+    /// without teaching the VM about concrete host modules.
+    pub(crate) legacy_resource_return_keys: Vec<Option<crate::vm::resource::ResourceTypeKey>>,
     pub(crate) resolved_calls_dirty: bool,
     /// The host-agnostic execution scope of this runtime, created Active.
     ///
@@ -174,6 +178,7 @@ impl HostRuntime {
             allow_default_host_capabilities: true,
             builtin_overrides: HashMap::new(),
             resolved_calls: Vec::new(),
+            legacy_resource_return_keys: Vec::new(),
             resolved_calls_dirty: true,
             execution_scope: ExecutionScope::new().map_err(HostRuntimeInitError::Scope)?,
             module_state: HostModuleStore::new(),
@@ -327,6 +332,14 @@ impl HostRuntime {
         self.execution_scope.poll_operation(id, cx)
     }
 
+    #[cfg_attr(not(feature = "http-client"), allow(dead_code))]
+    pub(crate) fn execution_scope_poll_in_progress_resource_closes(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) {
+        self.execution_scope.poll_in_progress_resource_closes(cx);
+    }
+
     /// Marks one current-scope operation completed without consuming its slot.
     #[cfg(test)]
     pub(crate) fn execution_scope_complete_operation(
@@ -420,6 +433,18 @@ impl HostRuntime {
         reason: crate::vm::resource::ResourceCloseReason,
     ) -> ExecutionScopeResult<crate::vm::resource::CloseProgress> {
         self.execution_scope.close_resource::<T>(handle, reason)
+    }
+
+    /// Closes a resource by its validated current-scope handle. This is used
+    /// by host-only aggregate lifecycles (such as a stream owning a response
+    /// and its child reader) without naming a concrete resource type.
+    #[cfg_attr(not(feature = "http-client"), allow(dead_code))]
+    pub(crate) fn execution_scope_close_resource_handle(
+        &mut self,
+        handle: crate::vm::resource::ResourceHandle,
+        reason: crate::vm::resource::ResourceCloseReason,
+    ) -> ExecutionScopeResult<crate::vm::resource::CloseProgress> {
+        self.execution_scope.close_resource_handle(handle, reason)
     }
 
     /// Marks a resource in the owned execution scope as guest-owned (exact
@@ -851,7 +876,7 @@ mod tests {
             .execution_scope()
             .resources()
             .get(&old_handle)
-            .expect_err("old handle must still be resolvable to a closed resource");
+            .expect_err("old handle must still resolve to the closed slot");
         assert_eq!(old_error.code(), ResourceErrorCode::ResourceAlreadyClosed);
         assert_eq!(
             host.execution_scope().terminal(),

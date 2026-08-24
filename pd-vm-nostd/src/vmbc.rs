@@ -186,11 +186,29 @@ fn read_host_param_passing(raw: u8) -> Result<HostParamPassing, WireError> {
 
 fn skip_named_struct_schemas(cursor: &mut Cursor<'_>) -> Result<(), WireError> {
     let count = cursor.read_u32()? as usize;
+    let mut names = Vec::new();
+    reserve(&mut names, "named struct schemas", count)?;
     for _ in 0..count {
-        let _name = cursor.read_string()?;
+        let name = cursor.read_string()?;
+        if names.iter().any(|seen| seen == &name) {
+            return Err(WireError::InvalidNamedStructSchema("duplicate struct name"));
+        }
+        names.push(name);
         let type_param_count = cursor.read_u32()? as usize;
+        let mut type_params = Vec::new();
+        reserve(
+            &mut type_params,
+            "named struct type parameters",
+            type_param_count,
+        )?;
         for _ in 0..type_param_count {
-            let _type_param = cursor.read_string()?;
+            let type_param = cursor.read_string()?;
+            if type_params.iter().any(|seen| seen == &type_param) {
+                return Err(WireError::InvalidNamedStructSchema(
+                    "duplicate type parameter",
+                ));
+            }
+            type_params.push(type_param);
         }
         let _body = read_schema(cursor, 0)?;
     }

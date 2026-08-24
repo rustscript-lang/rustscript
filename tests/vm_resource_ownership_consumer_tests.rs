@@ -1075,7 +1075,7 @@ fn take_owned_move_var_never_releases_source() {
             .resources()
             .ownership(handle),
         Some(ResourceOwnership::Taken),
-        "taken handle reports Taken"
+        "taken handle reports Taken",
     );
 }
 

@@ -44,7 +44,8 @@
 //! The scope is `Send` (each layer is), but intentionally `!Sync`: it must be
 //! owned and mutated by a single thread.
 
-use std::task::{Context, Poll};
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
 
 use crate::host_api::ResourceTypeKey;
 
@@ -52,7 +53,9 @@ use super::operation::driver::{OperationOutcome, OperationSpec};
 use super::operation::error::{OperationError, OperationResult};
 use super::operation::id::OperationId;
 use super::operation::reason::OperationCancelReason;
-use super::operation::registry::{DEFAULT_MAX_PENDING_OPERATIONS, OperationRegistry};
+use super::operation::registry::{
+    DEFAULT_MAX_PENDING_OPERATIONS, OperationRegistry, OperationStatus,
+};
 use super::resource::close::{CloseProgress, HostResource};
 use super::resource::error::ResourceError;
 use super::resource::handle::{Resource, ResourceHandle};
@@ -193,8 +196,8 @@ pub enum ScopeCloseOutcome {
 /// `Send + !Sync`: the scope owns its registries and must be driven by a
 /// single thread.
 pub struct ExecutionScope {
-    resources: ResourceTable,
     operations: OperationRegistry,
+    resources: ResourceTable,
     state: ScopeState,
     close_reason: Option<ResourceCloseReason>,
     /// Whether the operation phase of this close already ran (idempotent).
@@ -400,6 +403,11 @@ impl ExecutionScope {
     /// Registers a host operation while the scope is Active.
     pub fn start_operation(&mut self, spec: OperationSpec) -> ExecutionScopeResult<OperationId> {
         self.ensure_accepting()?;
+        if let Some(handle) = spec.resource {
+            self.resources
+                .validate_operation_association(handle)
+                .map_err(ExecutionScopeError::Resource)?;
+        }
         self.operations
             .start(spec)
             .map_err(ExecutionScopeError::Operation)
@@ -420,7 +428,20 @@ impl ExecutionScope {
         id: OperationId,
         cx: &mut Context<'_>,
     ) -> Poll<OperationResult<OperationOutcome>> {
-        self.operations.poll(id, cx)
+        let terminal_resource = self.operations.terminal_resource_of(id).ok().flatten();
+        let cancellation_resource = self.operations.cancellation_resource_of(id).ok().flatten();
+        let result = self.operations.poll(id, cx);
+        if let Poll::Ready(Ok(OperationOutcome::Cancelled(reason))) = &result
+            && let Some(handle) = cancellation_resource
+        {
+            let _ = self.close_resource_handle(handle, resource_reason(*reason));
+        }
+        if result.is_ready()
+            && let Some(handle) = terminal_resource
+        {
+            self.cleanup_terminal_resource(handle);
+        }
+        result
     }
 
     /// Cancels one registered operation by id, forwarding the reason to its
@@ -431,9 +452,39 @@ impl ExecutionScope {
         id: OperationId,
         reason: OperationCancelReason,
     ) -> ExecutionScopeResult<bool> {
-        self.operations
-            .cancel(id, reason)
-            .map_err(ExecutionScopeError::Operation)
+        let terminal_resource = self.operations.terminal_resource_of(id).ok().flatten();
+        let cancellation_resource = self.operations.cancellation_resource_of(id).ok().flatten();
+        if let Some(handle) = cancellation_resource {
+            let was_pending = self
+                .operations
+                .status(id)
+                .ok()
+                .is_some_and(|status| matches!(status, OperationStatus::Pending));
+            let result = self
+                .close_resource_handle(handle, resource_reason(reason))
+                .map(|_| was_pending);
+            if let Some(handle) = terminal_resource {
+                self.cleanup_terminal_resource(handle);
+            }
+            return result;
+        }
+
+        let result = self.operations.cancel(id, reason);
+        if let Some(handle) = terminal_resource {
+            self.cleanup_terminal_resource(handle);
+        }
+        result.map_err(ExecutionScopeError::Operation)
+    }
+
+    fn cleanup_terminal_resource(&mut self, handle: ResourceHandle) {
+        match self.close_resource_handle(handle, ResourceCloseReason::Requested) {
+            Ok(_) => {}
+            Err(ExecutionScopeError::Resource(error)) => self.record_resource_cleanup_error(error),
+            Err(ExecutionScopeError::Operation(error)) => {
+                self.record_failure(ScopeCloseError::Operation(error));
+            }
+            Err(_) => {}
+        }
     }
 
     /// Marks an operation completed without polling. The terminal slot remains
@@ -482,39 +533,80 @@ impl ExecutionScope {
         id: OperationId,
         reason: OperationCancelReason,
     ) -> ExecutionScopeResult<bool> {
+        let cancellation_resource = self
+            .operations
+            .cancellation_resource_of(id)
+            .map_err(ExecutionScopeError::Operation)?;
+        if let Some(handle) = cancellation_resource {
+            match self.close_resource_handle(handle, resource_reason(reason)) {
+                Ok(_) => return Ok(true),
+                Err(close_error) => {
+                    let _ = self.operations.abort(id, reason);
+                    return Err(close_error);
+                }
+            }
+        }
+
         self.operations
             .abort(id, reason)
             .map_err(ExecutionScopeError::Operation)
     }
 
-    /// Cancels every pending operation associated with `handle`, then begins
-    /// closing the underlying resource through the generic table contract.
+    /// Begins closing the resource through the generic table contract, then
+    /// cancels every operation associated with `handle`.
     ///
     /// This is the generic "close one resource plus its dependent operations"
-    /// adapter (host-agnostic): closing a resource first cancels the
-    /// operations associated with it — mapping `reason` onto the parallel
-    /// operation cancellation vocabulary — then launches the resource's close
-    /// via [`HostResource::begin_close`]. A `Pending` close is driven by the
-    /// usual scope [`poll_close`](Self::poll_close) machinery, so the caller
-    /// never has to dispatch on a concrete resource class.
-    ///
-    /// Cancellation is best-effort: a failing operation cancel never prevents
-    /// the resource close request from being launched.
+    /// adapter (host-agnostic): the resource arena/type/generation/live/child
+    /// checks and `begin_close` happen before operation cancellation, so every
+    /// rejected close leaves its associated operations untouched. A `Pending`
+    /// close is driven by the usual scope [`poll_close`](Self::poll_close)
+    /// machinery, so the caller never has to dispatch on a concrete resource
+    /// class. A cancellation/cleanup failure is returned with its typed first
+    /// error and retained in the scope's first-error latch.
     pub fn close_resource<T: HostResource>(
         &mut self,
         handle: ResourceHandle,
         reason: ResourceCloseReason,
     ) -> ExecutionScopeResult<CloseProgress> {
-        let _ = self
-            .operations
-            .cancel_for_resource(handle, operation_reason(reason));
         let token = self
             .resources
             .typed::<T>(handle)
             .map_err(ExecutionScopeError::Resource)?;
-        self.resources
+        let progress = self
+            .resources
             .begin_close(token, reason)
-            .map_err(ExecutionScopeError::Resource)
+            .map_err(ExecutionScopeError::Resource)?;
+        let summary = self
+            .operations
+            .cancel_for_resource(handle, operation_reason(reason));
+        if let Some(error) = summary.first_error().cloned() {
+            self.record_operation_cancel_failure(&summary, &error);
+            return Err(ExecutionScopeError::Operation(error));
+        }
+        Ok(progress)
+    }
+
+    /// Begins closing a resource associated with an internal operation without
+    /// requiring the concrete host resource type. The same preflight and
+    /// cancellation ordering as [`close_resource`](Self::close_resource)
+    /// applies.
+    pub(crate) fn close_resource_handle(
+        &mut self,
+        handle: ResourceHandle,
+        reason: ResourceCloseReason,
+    ) -> ExecutionScopeResult<CloseProgress> {
+        let progress = self
+            .resources
+            .begin_close_handle(handle, reason)
+            .map_err(ExecutionScopeError::Resource)?;
+        let summary = self
+            .operations
+            .cancel_for_resource(handle, operation_reason(reason));
+        if let Some(error) = summary.first_error().cloned() {
+            self.record_operation_cancel_failure(&summary, &error);
+            return Err(ExecutionScopeError::Operation(error));
+        }
+        Ok(progress)
     }
 
     /// Marks an open, host-owned resource as guest-owned (ownership transfer
@@ -715,6 +807,12 @@ impl ExecutionScope {
                 .saturating_sub(usize::from(summary.first_error().is_some()));
             self.operations_drained = true;
         }
+        if !self.operations.poll_quiescence(cx) {
+            // A cancellation may have released the guest-visible operation
+            // result before its worker terminated. Keep the scope Closing and
+            // let the worker's completion waker drive the next poll.
+            return Poll::Pending;
+        }
         if !self.operations.is_empty() {
             // A still-registered operation (not yet drained) blocks quiescence.
             return Poll::Pending;
@@ -768,6 +866,17 @@ impl ExecutionScope {
         self.failed_count += 1;
     }
 
+    fn record_operation_cancel_failure(
+        &mut self,
+        summary: &super::operation::registry::OperationCancelSummary,
+        error: &OperationError,
+    ) {
+        self.record_failure(ScopeCloseError::Operation(error.clone()));
+        self.failed_count += summary
+            .failed()
+            .saturating_sub(usize::from(summary.first_error().is_some()));
+    }
+
     /// Freezes the terminal outcome once both registries are empty.
     fn finish_close(&mut self) {
         debug_assert!(self.operations.is_empty(), "operations must be drained");
@@ -780,6 +889,47 @@ impl ExecutionScope {
             }),
             None => ScopeCloseOutcome::Success,
         });
+    }
+}
+
+struct ScopeDropWake;
+
+impl Wake for ScopeDropWake {
+    fn wake(self: Arc<Self>) {}
+}
+
+impl Drop for ExecutionScope {
+    fn drop(&mut self) {
+        if self.state == ScopeState::Active {
+            self.state = ScopeState::Closing;
+            self.close_reason = Some(ResourceCloseReason::VmDrop);
+            self.operations.seal();
+        }
+        if self.state != ScopeState::Closing {
+            return;
+        }
+        let waker = Waker::from(Arc::new(ScopeDropWake));
+        let mut cx = Context::from_waker(&waker);
+        let _ = self.poll_close(&mut cx);
+        if self.state == ScopeState::Closing {
+            // A standalone scope drop cannot keep polling a Pending resource,
+            // but it must still launch every remaining ancestor close with the
+            // VmDrop reason before ResourceTable itself is dropped.
+            let _ = self.begin_drop_resource_close_nonblocking();
+        }
+    }
+}
+
+/// Maps an operation cancellation back to the resource close reason used
+/// when cancellation owns the resource lifecycle.
+fn resource_reason(reason: OperationCancelReason) -> ResourceCloseReason {
+    match reason {
+        OperationCancelReason::Requested => ResourceCloseReason::Requested,
+        OperationCancelReason::Deadline => ResourceCloseReason::Deadline,
+        OperationCancelReason::VmReset => ResourceCloseReason::VmReset,
+        OperationCancelReason::Parent => ResourceCloseReason::Parent,
+        OperationCancelReason::ResourceClosed => ResourceCloseReason::ResourceClosed,
+        OperationCancelReason::VmDrop => ResourceCloseReason::VmDrop,
     }
 }
 

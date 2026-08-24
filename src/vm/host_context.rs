@@ -341,6 +341,20 @@ impl<'a> HostContext<'a> {
             .map_err(HostContextError::from_scope)
     }
 
+    /// Closes an internal resource by its validated raw handle. This is used
+    /// by generic operation/stream cleanup when the concrete resource type is
+    /// intentionally outside the VM core API.
+    #[cfg_attr(not(feature = "http-client"), allow(dead_code))]
+    pub(crate) fn close_resource_handle(
+        &mut self,
+        handle: ResourceHandle,
+        reason: ResourceCloseReason,
+    ) -> HostContextResult<CloseProgress> {
+        self.host
+            .execution_scope_close_resource_handle(handle, reason)
+            .map_err(HostContextError::from_scope)
+    }
+
     /// Immutably borrows a live resource for the duration of a host call.
     ///
     /// The token is re-validated against the current scope (arena, slot

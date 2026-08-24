@@ -271,10 +271,13 @@ impl HostResource for SqliteConnectionResource {
     }
 
     fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
+        let _ = self.slot.closing_reason.compare_exchange(
+            0,
+            operation_reason(reason).raw(),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
         self.slot.closing.store(true, Ordering::SeqCst);
-        self.slot
-            .closing_reason
-            .store(operation_reason(reason).raw(), Ordering::SeqCst);
         self.slot.interrupt.interrupt();
         if self.slot.live_workers.load(Ordering::SeqCst) == 0 {
             Ok(CloseProgress::Ready)
@@ -284,7 +287,15 @@ impl HostResource for SqliteConnectionResource {
     }
 
     fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
+        let mut close_waker = self
+            .slot
+            .close_waker
+            .lock()
+            .expect("sqlite close waker lock");
+        *close_waker = Some(cx.waker().clone());
         if self.slot.live_workers.load(Ordering::SeqCst) == 0 {
+            close_waker.take();
+            drop(close_waker);
             self.slot
                 .pending_results
                 .lock()
@@ -293,11 +304,6 @@ impl HostResource for SqliteConnectionResource {
             self.release_counter();
             return Poll::Ready(Ok(()));
         }
-        *self
-            .slot
-            .close_waker
-            .lock()
-            .expect("sqlite close waker lock") = Some(cx.waker().clone());
         Poll::Pending
     }
 }
@@ -802,22 +808,31 @@ fn sqlite_params(values: VmArrayRef<'_>, limits: SqliteLimits) -> VmResult<Vec<S
     Ok(params)
 }
 
-fn cancellation_error(slot: &ConnectionSlot) -> VmError {
-    let reason = OperationCancelReason::from_raw(slot.closing_reason.load(Ordering::SeqCst))
-        .unwrap_or(OperationCancelReason::Requested);
+fn cancellation_error(
+    slot: &ConnectionSlot,
+    cancelled: &AtomicBool,
+    cancel_reason: &AtomicU8,
+) -> VmError {
+    let raw = if cancelled.load(Ordering::SeqCst) {
+        cancel_reason.load(Ordering::SeqCst)
+    } else {
+        slot.closing_reason.load(Ordering::SeqCst)
+    };
+    let reason = OperationCancelReason::from_raw(raw).unwrap_or(OperationCancelReason::Requested);
     VmError::HostError(format!("SQLite operation cancelled ({reason})"))
 }
 
 fn with_connection<T>(
     slot: &ConnectionSlot,
     cancelled: &Arc<AtomicBool>,
+    cancel_reason: &Arc<AtomicU8>,
     operation: impl FnOnce(&mut Connection) -> Result<T, rusqlite::Error>,
 ) -> VmResult<T> {
     if slot.closing.load(Ordering::SeqCst) || cancelled.load(Ordering::SeqCst) {
         // A worker that was cancelled (its own operation, or the whole
         // connection closing) before it could run must not execute (and
         // auto-commit) its statement.
-        return Err(cancellation_error(slot));
+        return Err(cancellation_error(slot, cancelled, cancel_reason));
     }
     let mut connection = slot
         .connection
@@ -832,7 +847,7 @@ fn with_connection<T>(
     let result = operation(&mut connection);
     connection.progress_handler(0, None::<fn() -> bool>);
     if slot.closing.load(Ordering::SeqCst) || cancelled.load(Ordering::SeqCst) {
-        return Err(cancellation_error(slot));
+        return Err(cancellation_error(slot, cancelled, cancel_reason));
     }
     result.map_err(sqlite_error)
 }
@@ -1003,6 +1018,7 @@ struct SqliteOperationDriver {
     cell: Arc<OperationCell>,
     running: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
+    cancel_reason: Arc<AtomicU8>,
     operation_id: Arc<AtomicU64>,
     _pending_reservation: CounterReservation,
 }
@@ -1033,6 +1049,12 @@ impl HostOperation for SqliteOperationDriver {
         // runs (the `cancelled` flag is checked by `with_connection`) or while
         // it runs (interrupt).
         self.cancelled.store(true, Ordering::SeqCst);
+        let _ = self.cancel_reason.compare_exchange(
+            0,
+            reason.raw(),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
         if self.running.load(Ordering::SeqCst) {
             self.slot.interrupt.interrupt();
         }
@@ -1044,10 +1066,13 @@ impl HostOperation for SqliteOperationDriver {
             reason,
             OperationCancelReason::Requested | OperationCancelReason::Deadline
         ) {
+            let _ = self.slot.closing_reason.compare_exchange(
+                0,
+                reason.raw(),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
             self.slot.closing.store(true, Ordering::SeqCst);
-            self.slot
-                .closing_reason
-                .store(reason.raw(), Ordering::SeqCst);
         }
         Ok(())
     }
@@ -1059,15 +1084,11 @@ impl Drop for SqliteOperationDriver {
         if operation_id == 0 {
             return;
         }
-        let preserve_for_success_adapter = self
-            .cell
-            .state
-            .lock()
-            .expect("sqlite operation cell lock")
-            .value
-            .as_ref()
-            .is_some_and(Result::is_ok);
+        let mut state = self.cell.state.lock().expect("sqlite operation cell lock");
+        let preserve_for_success_adapter = !self.cancelled.load(Ordering::SeqCst)
+            && state.value.as_ref().is_some_and(Result::is_ok);
         if !preserve_for_success_adapter {
+            state.value.take();
             self.slot
                 .pending_results
                 .lock()
@@ -1085,7 +1106,7 @@ fn schedule_operation(
     handle: ResourceHandle,
     slot: Arc<ConnectionSlot>,
     cancelled: Arc<AtomicBool>,
-    operation: impl FnOnce(Arc<ConnectionSlot>, Arc<AtomicBool>) -> VmResult<CallReturn>
+    operation: impl FnOnce(Arc<ConnectionSlot>, Arc<AtomicBool>, Arc<AtomicU8>) -> VmResult<CallReturn>
     + Send
     + 'static,
 ) -> VmResult<HostOpId> {
@@ -1101,6 +1122,8 @@ fn schedule_operation(
         CounterReservation::acquire(&slot.live_workers, SQLITE_MAX_WORKERS_PER_SLOT)
             .ok_or_else(|| VmError::HostError("SQLite worker limit reached".to_string()))?;
 
+    let cancelled: Arc<AtomicBool> = cancelled;
+    let cancel_reason: Arc<AtomicU8> = Arc::new(AtomicU8::new(0));
     let cell: Arc<OperationCell> = Arc::new(OperationCell::new());
     let running: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let operation_id = Arc::new(AtomicU64::new(0));
@@ -1112,6 +1135,7 @@ fn schedule_operation(
         cell: Arc::clone(&cell),
         running: Arc::clone(&running),
         cancelled: Arc::clone(&cancelled),
+        cancel_reason: Arc::clone(&cancel_reason),
         operation_id: Arc::clone(&operation_id),
         _pending_reservation: pending_reservation,
     };
@@ -1146,6 +1170,7 @@ fn schedule_operation(
     let worker_result = Arc::clone(&cell);
     let worker_running = Arc::clone(&running);
     let worker_cancelled = Arc::clone(&cancelled);
+    let worker_cancel_reason = Arc::clone(&cancel_reason);
     let spawn_result = thread::Builder::new()
         .name(format!("rustscript-sqlite-worker-{raw}"))
         .spawn(move || {
@@ -1154,7 +1179,11 @@ fn schedule_operation(
                 .lock()
                 .expect("SQLite execution lock should not be poisoned");
             worker_running.store(true, Ordering::SeqCst);
-            let result = operation(Arc::clone(&worker_slot), worker_cancelled);
+            let result = operation(
+                Arc::clone(&worker_slot),
+                worker_cancelled,
+                worker_cancel_reason,
+            );
             worker_running.store(false, Ordering::SeqCst);
             let wake = {
                 let mut state = worker_result
@@ -1310,8 +1339,8 @@ pub(super) fn builtin_sqlite_execute_impl(
         handle,
         slot,
         Arc::clone(&cancelled),
-        move |slot, cancelled| {
-            with_connection(&slot, &cancelled, |connection| {
+        move |slot, cancelled, cancel_reason| {
+            with_connection(&slot, &cancelled, &cancel_reason, |connection| {
                 execute_with_connection(connection, &sql, &params)
             })
             .map(|value| CallReturn::one(Value::Map(Arc::new(value))))
@@ -1340,8 +1369,8 @@ pub(super) fn builtin_sqlite_query_impl(
         handle,
         slot,
         Arc::clone(&cancelled),
-        move |slot, cancelled| {
-            with_connection(&slot, &cancelled, |connection| {
+        move |slot, cancelled, cancel_reason| {
+            with_connection(&slot, &cancelled, &cancel_reason, |connection| {
                 query_with_connection(connection, &sql, &params, query_limits)
             })
             .map(|value| CallReturn::one(Value::Map(Arc::new(value))))
@@ -1421,8 +1450,8 @@ pub(super) fn builtin_sqlite_transaction_impl(
         handle,
         slot,
         Arc::clone(&cancelled),
-        move |slot, cancelled| {
-            with_connection(&slot, &cancelled, |connection| {
+        move |slot, cancelled, cancel_reason| {
+            with_connection(&slot, &cancelled, &cancel_reason, |connection| {
                 let transaction =
                     connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let mut results = Vec::with_capacity(statements.len());

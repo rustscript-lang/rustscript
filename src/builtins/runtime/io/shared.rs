@@ -430,7 +430,7 @@ pub(crate) fn register_threaded_operation(
 ) -> VmResult<OperationId> {
     let mut spec = OperationSpec::new(operation);
     if let Some(handle) = resource_handle {
-        spec = spec.with_resource(handle);
+        spec = spec.with_resource(handle).close_resource_on_cancel();
     }
     vm.host_context()
         .start_operation(spec)
@@ -694,6 +694,10 @@ pub(crate) fn builtin_io_read_all_body(
 
     let shared: Arc<Mutex<Option<Result<String, String>>>> = Arc::new(Mutex::new(None));
     let shared_worker = shared.clone();
+    // For pipes, the worker returns the transferred descriptor through this
+    // slot so successful completion can restore the live guest resource.
+    let pipe_shared: Arc<Mutex<Option<std::process::ChildStdout>>> = Arc::new(Mutex::new(None));
+    let pipe_shared_worker = pipe_shared.clone();
 
     let (operation, tx, state) = ThreadedOperation::prepare("io::read_all");
     let op_id = register_threaded_operation(vm, operation, Some(handle))?;
@@ -715,6 +719,11 @@ pub(crate) fn builtin_io_read_all_body(
         tx,
         move |state, tx: ThreadedWorkerPublisher| {
             if state.cancelled.load(Ordering::SeqCst) {
+                if let Some(ref guard) = pipe_guard_worker
+                    && let Some(pipe) = guard.take()
+                {
+                    *pipe_shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
+                }
                 let _ = tx.send(Err("io::read_all was cancelled before starting".to_string()));
                 return;
             }
@@ -738,7 +747,7 @@ pub(crate) fn builtin_io_read_all_body(
                     &mut out,
                     &state.cancelled,
                 );
-                drop(pipe);
+                *pipe_shared_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(pipe);
                 r.map(|_| out)
             } else {
                 Err(VmError::HostError(
@@ -762,7 +771,7 @@ pub(crate) fn builtin_io_read_all_body(
         },
     ) {
         if let Some(ref guard) = pipe_guard {
-            guard.restore_or_drop(vm, handle, |resource, pipe| resource.restore_reader(pipe));
+            guard.restore_or_drop();
         }
         return Err(rollback_threaded_start(
             vm,
@@ -772,13 +781,23 @@ pub(crate) fn builtin_io_read_all_body(
     }
 
     let shared_provider = shared.clone();
+    let pipe_provider = pipe_shared.clone();
     vm.host.register_pending_op_result(
         raw,
         Box::new(move |vm: &mut Vm| {
-            // Restore pipe handle if the worker didn't take it (cancellation
-            // before start). The pipe handle is still in the guard.
+            if let Some(pipe) = pipe_provider
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                restore_reader_or_drop(vm, handle, pipe);
+            }
+
+            // The guard still owns the pipe only when cancellation won before
+            // the worker transferred it; in that case the resource close path
+            // is authoritative and this drop is the final owner release.
             if let Some(ref guard) = pipe_guard {
-                guard.restore_or_drop(vm, handle, |res, pipe| res.restore_reader(pipe));
+                guard.restore_or_drop();
             }
 
             match shared_provider
@@ -879,7 +898,7 @@ pub(crate) fn builtin_io_read_line_body(
         },
     ) {
         if let Some(ref guard) = pipe_guard {
-            guard.restore_or_drop(vm, handle, |resource, pipe| resource.restore_reader(pipe));
+            guard.restore_or_drop();
         }
         return Err(rollback_threaded_start(
             vm,
@@ -1000,7 +1019,7 @@ pub(crate) fn builtin_io_write_body(
         },
     ) {
         if let Some(ref guard) = pipe_guard {
-            guard.restore_or_drop(vm, handle, |resource, pipe| resource.restore_writer(pipe));
+            guard.restore_or_drop();
         }
         return Err(rollback_threaded_start(
             vm,
@@ -1137,7 +1156,7 @@ pub(crate) fn builtin_io_flush_body(vm: &mut Vm, handle_id: i64) -> VmResult<Hos
         },
     ) {
         if let Some(ref guard) = pipe_guard {
-            guard.restore_or_drop(vm, handle, |resource, pipe| resource.restore_writer(pipe));
+            guard.restore_or_drop();
         }
         return Err(rollback_threaded_start(
             vm,

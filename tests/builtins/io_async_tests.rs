@@ -570,6 +570,29 @@ fn async_io_popen_read_line() {
     assert_eq!(stack[second_idx], Value::string("line2\n"));
 }
 
+#[cfg(unix)]
+#[test]
+fn async_io_popen_read_all_restores_pipe_for_followup_operation() {
+    let stack = run_source(
+        r#"
+        let handle = io::popen("printf all-data", "r");
+        let first = io::read_all(handle);
+        let second = io::read_line(handle);
+        io::close(handle);
+        first;
+        second;
+        "#,
+    )
+    .expect("read_all followed by read_line should complete");
+
+    assert!(
+        stack.len() >= 2,
+        "expected both read results, got {stack:?}"
+    );
+    assert_eq!(stack[stack.len() - 2], Value::string("all-data"));
+    assert_eq!(stack[stack.len() - 1], Value::string(""));
+}
+
 /// Test that write to a pipe works.
 #[cfg(unix)]
 #[test]

@@ -1,6 +1,7 @@
 use std::task::{Context, Poll};
 
 use crate::compiler::TypeSchema;
+use crate::vm::resource::ResourceHandle;
 use crate::vm::{CallOutcome, HostOpId, Value, Vm, VmError, VmResult, VmStatus};
 
 /// The result of one host-side producer poll for a callable stream.
@@ -84,6 +85,7 @@ pub(crate) struct HostStreamContinuation {
     pub(crate) parent_stack_base: usize,
     pub(crate) parent_frame_count: usize,
     pub(crate) parent_ip: usize,
+    pub(crate) resource_handles: Vec<ResourceHandle>,
 }
 
 struct StreamOperationState {
@@ -177,31 +179,29 @@ enum CallableStreamRetirement {
 }
 
 impl Vm {
-    /// Installs a host-only callable stream and suspends the current VM call.
-    ///
-    /// This Rust embedding API does not create a script-visible handle. The VM
-    /// always validates that `callback` is a callable owned by this VM and has
-    /// arity one. When its metadata is [`TypeSchema::Callable`], the VM also
-    /// validates its argument and result schemas against `fn(map) -> map`. It
-    /// then owns the callback and driver until completion, cancellation, reset,
-    /// or error; removing the driver drops it to release producer resources.
-    ///
-    /// The driver is registered as a [`HostOperation`] in the current
-    /// `ExecutionScope` (a [`StreamScopeOperation`]), so the returned pending id
-    /// is a *packed* scope id and scope reset/drop cancellation reaches the
-    /// producer through the operation driver. Producer polling and callback
-    /// action application both pass through that registered operation; scope
-    /// cancellation releases the producer through the operation driver's
-    /// `cancel`.
-    ///
-    /// The driver contract is documented on [`HostStreamDriver`]. In
-    /// particular, producer polling and callback action application stay
-    /// serialized and neither driver method may re-enter the VM.
-    #[cfg_attr(not(feature = "http-client"), allow(dead_code))]
+    /// Installs a host-only callable stream without extra resource ownership.
+    /// The compatibility entry point delegates to the single operation-owner
+    /// implementation used by resource-backed streams.
+    #[cfg(test)]
     pub(crate) fn submit_callable_stream(
         &mut self,
         callback: Value,
         driver: impl HostStreamDriver,
+    ) -> VmResult<CallOutcome> {
+        self.submit_callable_stream_with_resources(callback, driver, Vec::new())
+    }
+
+    /// Installs a callable stream with one canonical operation and the
+    /// resources retired by that operation's terminal lifecycle. The first
+    /// handle is also the operation association used to route resource-close
+    /// cancellation to the driver; additional handles are closed during the
+    /// same retirement transaction.
+    #[cfg_attr(not(feature = "http-client"), allow(dead_code))]
+    pub(crate) fn submit_callable_stream_with_resources(
+        &mut self,
+        callback: Value,
+        driver: impl HostStreamDriver,
+        resource_handles: Vec<ResourceHandle>,
     ) -> VmResult<CallOutcome> {
         self.validate_stream_callback_value(&callback)?;
         if self.instance.host_stream.is_some() {
@@ -214,9 +214,13 @@ impl Vm {
             driver: Box::new(driver),
             state: std::sync::Arc::clone(&operation_state),
         };
+        let mut spec = crate::vm::operation::OperationSpec::new(scope_op);
+        if let Some(handle) = resource_handles.first().copied() {
+            spec = spec.with_resource(handle);
+        }
         let scope_id = self
             .host
-            .execution_scope_start_operation(crate::vm::operation::OperationSpec::new(scope_op))
+            .execution_scope_start_operation(spec)
             .map_err(|error| VmError::HostError(error.to_string()))?;
         let op_id = scope_id.raw();
         self.instance.host_stream = Some(HostStreamContinuation {
@@ -228,6 +232,7 @@ impl Vm {
             parent_stack_base: self.instance.stack.len(),
             parent_frame_count: self.instance.execution_frames.len(),
             parent_ip: self.instance.ip,
+            resource_handles,
         });
         Ok(CallOutcome::Pending(op_id))
     }
@@ -660,7 +665,93 @@ impl Vm {
         for value in stream.operation_state.drain_values()? {
             self.drop_value_with_contract(value);
         }
-        retired.map(|_| ())
+        let mut cleanup_error = None;
+        let mut deferred = Vec::new();
+        for handle in stream.resource_handles {
+            match self.host.execution_scope_close_resource_handle(
+                handle,
+                crate::vm::resource::ResourceCloseReason::Requested,
+            ) {
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        &error,
+                        crate::vm::execution_scope::ExecutionScopeError::Resource(resource_error)
+                            if resource_error.code()
+                                == crate::vm::resource::ResourceErrorCode::ResourceHasChildren
+                    ) =>
+                {
+                    deferred.push(handle)
+                }
+                Err(error)
+                    if matches!(
+                        &error,
+                        crate::vm::execution_scope::ExecutionScopeError::Resource(resource_error)
+                            if matches!(
+                                resource_error.code(),
+                                crate::vm::resource::ResourceErrorCode::ResourceStale
+                                    | crate::vm::resource::ResourceErrorCode::ResourceAlreadyClosed
+                            )
+                    ) => {}
+                Err(error) => {
+                    if cleanup_error.is_none() {
+                        cleanup_error = Some(VmError::from(error));
+                    }
+                }
+            }
+        }
+        let waker = super::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        for _ in 0..64 {
+            if deferred.is_empty() {
+                break;
+            }
+            self.host
+                .execution_scope_poll_in_progress_resource_closes(&mut cx);
+            let mut next_deferred = Vec::new();
+            for handle in deferred.drain(..) {
+                match self.host.execution_scope_close_resource_handle(
+                    handle,
+                    crate::vm::resource::ResourceCloseReason::Requested,
+                ) {
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            &error,
+                            crate::vm::execution_scope::ExecutionScopeError::Resource(resource_error)
+                                if resource_error.code()
+                                    == crate::vm::resource::ResourceErrorCode::ResourceHasChildren
+                        ) =>
+                    {
+                        next_deferred.push(handle)
+                    }
+                    Err(error)
+                        if matches!(
+                            &error,
+                            crate::vm::execution_scope::ExecutionScopeError::Resource(resource_error)
+                                if matches!(
+                                    resource_error.code(),
+                                    crate::vm::resource::ResourceErrorCode::ResourceStale
+                                        | crate::vm::resource::ResourceErrorCode::ResourceAlreadyClosed
+                                )
+                        ) => {}
+                    Err(error) => {
+                        if cleanup_error.is_none() {
+                            cleanup_error = Some(VmError::from(error));
+                        }
+                    }
+                }
+            }
+            deferred = next_deferred;
+            if !deferred.is_empty() {
+                std::thread::yield_now();
+            }
+        }
+        match (retired, cleanup_error) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Some(error)) => Err(error),
+            (Ok(_), None) => Ok(()),
+        }
     }
 }
 

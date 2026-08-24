@@ -1,6 +1,6 @@
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -400,6 +400,9 @@ struct BufferedRequestShared {
     waker: std::sync::Mutex<Option<std::task::Waker>>,
     /// The worker thread handle, taken during close to join.
     join_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Published after the result cell and before completion wakers are read.
+    /// Pollers register before checking this bit/cell to avoid lost wakes.
+    finished: AtomicBool,
     /// Waker registered by the close poll when the worker is still running.
     close_waker: std::sync::Mutex<Option<std::task::Waker>>,
     /// The connection permit, held until the shared state is dropped (after
@@ -449,6 +452,22 @@ impl HostResource for HttpRequestResource {
         {
             waker.wake();
         }
+        if shared.finished.load(Ordering::Acquire)
+            && shared
+                .join_handle
+                .lock()
+                .map_err(|_| {
+                    ResourceError::new(
+                        ResourceErrorCode::ResourceCleanupFailed,
+                        "http::request::resource",
+                        "HTTP request join handle lock was poisoned",
+                    )
+                })?
+                .is_none()
+        {
+            self.shared = None;
+            return Ok(CloseProgress::Ready);
+        }
         // Return Pending: the worker thread may still be running. The
         // scope's poll_close machinery will call poll_close below.
         Ok(CloseProgress::Pending)
@@ -470,18 +489,23 @@ impl HostResource for HttpRequestResource {
             return Poll::Ready(Ok(()));
         };
         if !handle.is_finished() {
-            // Worker is still running. Store the close waker and put the
-            // handle back so we can try again next poll.
-            *shared
+            // Register before rechecking the completion state. The worker
+            // publishes `finished` and then consumes this waker, so a finish
+            // racing with this poll cannot leave close asleep forever.
+            let mut close_waker = shared
                 .close_waker
                 .lock()
-                .expect("http request close waker lock should not be poisoned") =
-                Some(cx.waker().clone());
-            *shared
-                .join_handle
-                .lock()
-                .expect("http request join handle lock should not be poisoned") = Some(handle);
-            return Poll::Pending;
+                .expect("http request close waker lock should not be poisoned");
+            *close_waker = Some(cx.waker().clone());
+            if !shared.finished.load(Ordering::Acquire) && !handle.is_finished() {
+                drop(close_waker);
+                *shared
+                    .join_handle
+                    .lock()
+                    .expect("http request join handle lock should not be poisoned") = Some(handle);
+                return Poll::Pending;
+            }
+            close_waker.take();
         }
         // The worker thread has exited. Join to propagate any panic.
         match handle.join() {
@@ -538,19 +562,48 @@ impl HttpRequestOperation {
 
 impl HostOperation for HttpRequestOperation {
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
-        let state = self.shared.result.lock().expect("http request result lock");
-        match state.as_ref() {
-            Some(Ok(_)) => Poll::Ready(Ok(())),
-            Some(Err(error)) => Poll::Ready(Err(OperationError::new(
+        // Register first, then check the result cell. The worker publishes the
+        // result and consumes the waker under the same ordering.
+        *self.shared.waker.lock().expect("http request waker lock") = Some(cx.waker().clone());
+        let result = self
+            .shared
+            .result
+            .lock()
+            .expect("http request result lock")
+            .as_ref()
+            .map(|result| result.is_ok());
+        let Some(success) = result else {
+            return Poll::Pending;
+        };
+        self.shared
+            .waker
+            .lock()
+            .expect("http request waker lock")
+            .take();
+        if let Err(message) = join_worker(&self.shared) {
+            return Poll::Ready(Err(OperationError::new(
                 OperationErrorCode::OperationDriverFailed,
                 "http::client::request",
-                error.to_string(),
-            ))),
-            None => {
-                *self.shared.waker.lock().expect("http request waker lock") =
-                    Some(cx.waker().clone());
-                Poll::Pending
-            }
+                message,
+            )));
+        }
+        if success {
+            Poll::Ready(Ok(()))
+        } else {
+            let error = self
+                .shared
+                .result
+                .lock()
+                .expect("http request result lock")
+                .as_ref()
+                .and_then(|result| result.as_ref().err())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "HTTP request produced no result".to_string());
+            Poll::Ready(Err(OperationError::new(
+                OperationErrorCode::OperationDriverFailed,
+                "http::client::request",
+                error,
+            )))
         }
     }
 
@@ -594,19 +647,10 @@ pub(super) fn perform_buffered_request(
         result: std::sync::Mutex::new(None),
         waker: std::sync::Mutex::new(None),
         join_handle: std::sync::Mutex::new(None),
+        finished: AtomicBool::new(false),
         close_waker: std::sync::Mutex::new(None),
         _permit: permit,
     });
-
-    // Register an HTTP request resource in the scope and associate the
-    // operation with it. The scope lifecycle closes the resource (and
-    // cancels the operation) on reset/shutdown.
-    let request_resource = HttpRequestResource::new(Arc::clone(&shared));
-    let resource_token = vm
-        .host_context()
-        .push_resource(request_resource)
-        .map_err(host_boundary_error)?;
-    let request_handle = resource_token.handle();
 
     // Run the request on a worker thread; the operation driver polls the
     // shared completion cell. The worker uses tokio::select! to respond
@@ -638,19 +682,22 @@ pub(super) fn perform_buffered_request(
                     }
                 }
             });
-            // Publish the result and wake the operation poller.
-            let wake = {
+            // Publish the result before marking the worker finished. Pollers
+            // register before checking their cell, so this ordering closes the
+            // result/wake race.
+            {
                 let mut state = worker_shared
                     .result
                     .lock()
-                    .expect("http request result lock should not be poisoned");
+                    .expect("HTTP request result lock should not be poisoned");
                 *state = Some(value);
-                worker_shared
-                    .waker
-                    .lock()
-                    .expect("http request waker lock")
-                    .take()
-            };
+            }
+            worker_shared.finished.store(true, Ordering::Release);
+            let wake = worker_shared
+                .waker
+                .lock()
+                .expect("HTTP request waker lock should not be poisoned")
+                .take();
             // Wake the close waker before the operation waker so the
             // close poll sees the thread is finished before the operation
             // poll processes the result.
@@ -674,14 +721,39 @@ pub(super) fn perform_buffered_request(
         .lock()
         .expect("http request join handle lock") = Some(join_handle);
 
+    // Resource insertion is part of the startup transaction. A capacity or
+    // arena failure must stop and join the worker before the permit is dropped.
+    let request_resource = HttpRequestResource::new(Arc::clone(&shared));
+    let resource_token = match vm.host_context().push_resource(request_resource) {
+        Ok(token) => token,
+        Err(error) => {
+            shared.cancel.notify_one();
+            let _ = join_worker(&shared);
+            return Err(host_boundary_error(error));
+        }
+    };
+    let request_handle = resource_token.handle();
+
     // Clone the result handle before moving it into the operation so the
     // pending-result closure can also access it.
     let pending_result = Arc::clone(&shared);
-    let op = HttpRequestOperation::new(shared);
-    let op_id = vm
-        .host_context()
-        .start_operation(OperationSpec::new(op).with_resource(request_handle))
-        .map_err(host_boundary_error)?;
+    let op = HttpRequestOperation::new(Arc::clone(&shared));
+    let op_id = match vm.host_context().start_operation(
+        OperationSpec::new(op)
+            .with_resource(request_handle)
+            .close_resource_on_terminal(),
+    ) {
+        Ok(op_id) => op_id,
+        Err(error) => {
+            shared.cancel.notify_one();
+            let _ = join_worker(&shared);
+            let _ = vm.host_context().close_resource::<HttpRequestResource>(
+                request_handle,
+                ResourceCloseReason::Requested,
+            );
+            return Err(host_boundary_error(error));
+        }
+    };
     let raw = op_id.raw();
     vm.host.register_pending_op_result(
         raw,
@@ -699,6 +771,26 @@ pub(super) fn perform_buffered_request(
         }),
     );
     Ok(HostCallResult::Pending(raw))
+}
+
+fn join_worker(shared: &Arc<BufferedRequestShared>) -> Result<(), String> {
+    let handle = shared
+        .join_handle
+        .lock()
+        .map_err(|_| "HTTP request join handle lock was poisoned".to_string())?
+        .take();
+    let Some(handle) = handle else {
+        return Ok(());
+    };
+    handle.join().map_err(|panic| {
+        if let Some(message) = panic.downcast_ref::<&str>() {
+            (*message).to_string()
+        } else if let Some(message) = panic.downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "HTTP request worker thread panicked".to_string()
+        }
+    })
 }
 
 /// Builds a current-thread tokio runtime to run the blocking HTTP transport.

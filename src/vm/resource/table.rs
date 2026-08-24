@@ -966,6 +966,35 @@ impl ResourceTable {
         self.slots[slot_index].type_key.clone()
     }
 
+    /// Validates the untyped association used by an operation before the
+    /// operation registry consumes a slot. The handle must name this table's
+    /// current generation and an open resource; type-key validation remains a
+    /// separate exact-access concern.
+    pub fn validate_operation_association(&self, handle: ResourceHandle) -> ResourceResult<()> {
+        let slot_index = self.resolve_index(handle)?;
+        let state = self.slots[slot_index]
+            .state
+            .try_borrow()
+            .map_err(|_| resource_borrow_conflict_error(handle))?;
+        if matches!(&*state, SlotState::Open(_)) {
+            Ok(())
+        } else {
+            Err(already_closed_error(handle))
+        }
+    }
+
+    /// Begins closing a live resource by raw handle. This is reserved for
+    /// canonical operation cleanup where the operation already carries the
+    /// validated association and no concrete `HostResource` type is available.
+    pub(crate) fn begin_close_handle(
+        &mut self,
+        handle: ResourceHandle,
+        reason: ResourceCloseReason,
+    ) -> ResourceResult<CloseProgress> {
+        let slot_index = self.resolve_index(handle)?;
+        self.close_open_slot(slot_index, handle, reason)
+    }
+
     /// Marks an open, host-owned resource as guest-owned.
     ///
     /// Succeeds only when `handle` names a resource in *this* table, with a
@@ -1069,9 +1098,9 @@ impl ResourceTable {
     /// On success the concrete `T` is moved out (ownership transfers to the
     /// caller; no `unsafe` is involved — the erased box is reconnected to `T`
     /// through `Any` after the exact `TypeId` check) and the slot is retired
-    /// as [`ResourceOwnership::Taken`]: the raw handle is stale from then on,
-    /// the slot is never reused, and the table never closes the moved-out
-    /// value.
+    /// as [`ResourceOwnership::Taken`]: the raw handle remains resolvable as
+    /// Taken (a double take reports `ResourceAlreadyTaken`), the slot is never
+    /// reused, and the table never closes the moved-out value.
     pub fn take_owned<T: HostResource>(&mut self, handle: ResourceHandle) -> ResourceResult<T> {
         let expected = T::resource_type_key();
         self.take_owned_with_key(handle, expected.as_ref())
@@ -2150,8 +2179,6 @@ mod tests {
             ResourceErrorCode::ResourceTypeMismatch
         );
 
-        // After a synchronous-close the slot is vacant at the same generation,
-        // so poll_close reports ResourceAlreadyClosed (precise, not generic).
         assert_eq!(
             table.begin_close(token, REASON).unwrap(),
             CloseProgress::Ready
@@ -2178,12 +2205,13 @@ mod tests {
         // No orphan child was left behind.
         assert_eq!(table.len(), 1);
 
-        // A closed parent (vacant slot, same generation) rejects new children.
         let parent_handle = parent.handle();
         assert_eq!(
             table.begin_close(parent, REASON).unwrap(),
             CloseProgress::Ready
         );
+        // Closing reclaims the parent but keeps its generation; the old handle
+        // still resolves to the vacant, closed slot.
         let stale_parent: Resource<UnitRes> = Resource::from_handle(parent_handle);
         assert_eq!(
             table

@@ -60,6 +60,23 @@ pub trait HostOperation: Any + Send + 'static {
     /// single cancellation authority; drivers must not build their own
     /// parent/child token trees.
     fn cancel(&mut self, reason: OperationCancelReason) -> OperationResult<()>;
+
+    /// Whether all underlying work has terminated after cancellation. The
+    /// registry uses this to keep scope quiescence from claiming completion
+    /// while a detached worker still owns resources.
+    fn is_quiescent(&self) -> bool {
+        true
+    }
+
+    /// Registers a waker for the transition to quiescent after cancellation.
+    fn register_quiescence_waker(&mut self, _cx: &Context<'_>) {}
+
+    /// Cancels and, when a resource is already in its close phase, waits for
+    /// the driver's worker to terminate. The default is appropriate for
+    /// drivers without separate background work.
+    fn cancel_and_wait(&mut self, reason: OperationCancelReason) -> OperationResult<()> {
+        self.cancel(reason)
+    }
 }
 
 /// Optional per-operation cleanup, called exactly once on the first terminal
@@ -85,6 +102,16 @@ pub struct OperationSpec {
     pub driver: Box<dyn HostOperation>,
     /// Optional cleanup run once on the first terminal transition.
     pub cleanup: Option<OperationCleanup>,
+    /// Whether the associated resource is an internal operation-owned
+    /// resource that must be closed when this operation is cancelled. This is
+    /// separate from terminal cleanup: a successful operation may restore and
+    /// leave a resource live, while cancellation canonically closes it.
+    pub close_resource_on_cancel: bool,
+    /// Whether the associated resource is an internal operation-owned
+    /// resource that must be closed when this operation reaches any terminal
+    /// state. Ordinary resource operations leave this false because a file or
+    /// connection normally outlives an individual read/query.
+    pub close_resource_on_terminal: bool,
 }
 
 impl OperationSpec {
@@ -95,6 +122,8 @@ impl OperationSpec {
             resource: None,
             driver: Box::new(driver),
             cleanup: None,
+            close_resource_on_cancel: false,
+            close_resource_on_terminal: false,
         }
     }
 
@@ -111,9 +140,24 @@ impl OperationSpec {
         self
     }
 
+    /// Closes the associated resource when cancellation wins before a normal
+    /// terminal result can restore or otherwise retain it.
+    pub fn close_resource_on_cancel(mut self) -> Self {
+        self.close_resource_on_cancel = true;
+        self
+    }
+
     /// Attaches a cleanup hook.
     pub fn with_cleanup(mut self, cleanup: OperationCleanup) -> Self {
         self.cleanup = Some(cleanup);
+        self
+    }
+
+    /// Marks the associated resource as owned by this operation's lifecycle.
+    /// The execution scope closes it exactly once after the terminal outcome
+    /// has been consumed.
+    pub fn close_resource_on_terminal(mut self) -> Self {
+        self.close_resource_on_terminal = true;
         self
     }
 }

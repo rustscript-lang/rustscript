@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
+use vm::ResourceTypeKey;
 use vm::execution_scope::{
     ExecutionScope, ExecutionScopeError, ScopeCloseError, ScopeCloseFailure, ScopeCloseOutcome,
     ScopeState,
@@ -22,7 +23,7 @@ use vm::operation::{
 };
 use vm::resource::{
     CloseProgress, HostResource, ResourceCloseReason, ResourceError, ResourceErrorCode,
-    ResourceResult,
+    ResourceOwnership, ResourceResult,
 };
 
 // ---- fake resources -------------------------------------------------------
@@ -48,6 +49,13 @@ impl CountingResource {
 }
 
 impl HostResource for CountingResource {
+    fn resource_type_key() -> Option<ResourceTypeKey>
+    where
+        Self: Sized,
+    {
+        Some(ResourceTypeKey::new("test.counting").expect("valid key"))
+    }
+
     fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         self.closes.fetch_add(1, Ordering::SeqCst);
         Ok(CloseProgress::Ready)
@@ -123,6 +131,56 @@ impl HostResource for CloseRecorder {
     fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         self.order.lock().unwrap().push(self.name);
         Ok(CloseProgress::Ready)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DropEvent {
+    Operation(OperationCancelReason),
+    Resource(ResourceCloseReason),
+}
+
+struct DropOrderedResource {
+    events: Arc<Mutex<Vec<DropEvent>>>,
+}
+
+impl HostResource for DropOrderedResource {
+    fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(DropEvent::Resource(reason));
+        Ok(CloseProgress::Ready)
+    }
+}
+
+struct DropOrderedOperation {
+    events: Arc<Mutex<Vec<DropEvent>>>,
+}
+
+impl HostOperation for DropOrderedOperation {
+    fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<vm::operation::OperationResult<()>> {
+        Poll::Pending
+    }
+
+    fn cancel(&mut self, reason: OperationCancelReason) -> vm::operation::OperationResult<()> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(DropEvent::Operation(reason));
+        Ok(())
+    }
+}
+
+struct BeginCloseFailureResource;
+
+impl HostResource for BeginCloseFailureResource {
+    fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
+        Err(ResourceError::new(
+            ResourceErrorCode::ResourceCleanupFailed,
+            "test::begin_close",
+            "begin_close rejected the request",
+        ))
     }
 }
 
@@ -931,4 +989,152 @@ fn cancelling_scope_rejects_new_allocations_without_firing_any_hooks() {
         scope.poll_close(&mut cx),
         Poll::Ready(Ok(ScopeCloseOutcome::Success))
     );
+}
+
+#[test]
+fn standalone_scope_drop_cancels_operations_before_resources_with_vm_drop_reason() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    {
+        let mut scope = ExecutionScope::new().expect("scope");
+        let resource = scope
+            .push_resource(DropOrderedResource {
+                events: events.clone(),
+            })
+            .expect("resource");
+        scope
+            .start_operation(
+                OperationSpec::new(DropOrderedOperation {
+                    events: events.clone(),
+                })
+                .with_resource(resource.handle()),
+            )
+            .expect("operation");
+    }
+
+    assert_eq!(
+        events.lock().unwrap().clone(),
+        vec![
+            DropEvent::Operation(OperationCancelReason::VmDrop),
+            DropEvent::Resource(ResourceCloseReason::VmDrop),
+        ]
+    );
+}
+
+#[test]
+fn explicit_close_preflights_type_and_begin_failure_before_cancelling_operations() {
+    let mut scope = ExecutionScope::new().expect("scope");
+    let resource = scope
+        .push_resource(CountingResource::new().0)
+        .expect("resource");
+    let (operation, cancels) = PendingOperation::new();
+    scope
+        .start_operation(OperationSpec::new(operation).with_resource(resource.handle()))
+        .expect("operation");
+
+    let error = scope
+        .close_resource::<GatedResource>(resource.handle(), ResourceCloseReason::Requested)
+        .expect_err("wrong resource type must reject atomically");
+    assert!(matches!(
+        error,
+        ExecutionScopeError::Resource(ref error)
+            if error.code() == ResourceErrorCode::ResourceTypeMismatch
+    ));
+    assert_eq!(cancels.load(Ordering::SeqCst), 0);
+    assert_eq!(scope.operations().len(), 1);
+
+    let failure_resource = scope
+        .push_resource(BeginCloseFailureResource)
+        .expect("failure resource");
+    let (failure_operation, failure_cancels) = PendingOperation::new();
+    scope
+        .start_operation(
+            OperationSpec::new(failure_operation).with_resource(failure_resource.handle()),
+        )
+        .expect("failure operation");
+    let error = scope
+        .close_resource::<BeginCloseFailureResource>(
+            failure_resource.handle(),
+            ResourceCloseReason::Requested,
+        )
+        .expect_err("begin_close failure must reject before cancellation");
+    assert!(matches!(
+        error,
+        ExecutionScopeError::Resource(ref error)
+            if error.code() == ResourceErrorCode::ResourceCleanupFailed
+    ));
+    assert_eq!(failure_cancels.load(Ordering::SeqCst), 0);
+    assert_eq!(scope.operations().len(), 2);
+}
+
+#[test]
+fn operation_association_rejects_foreign_and_closed_resources_before_capacity_use() {
+    let mut first = ExecutionScope::new().expect("first scope");
+    let first_resource = first
+        .push_resource(CountingResource::new().0)
+        .expect("first resource");
+    let mut second = ExecutionScope::new().expect("second scope");
+
+    let (foreign_operation, _) = PendingOperation::new();
+    let error = second
+        .start_operation(
+            OperationSpec::new(foreign_operation).with_resource(first_resource.handle()),
+        )
+        .expect_err("foreign association must be rejected");
+    assert!(matches!(
+        error,
+        ExecutionScopeError::Resource(ref error)
+            if error.code() == ResourceErrorCode::ResourceHandleWrongTable
+    ));
+    assert_eq!(second.operations().len(), 0);
+
+    let first_handle = first_resource.handle();
+    first
+        .close_resource::<CountingResource>(first_handle, ResourceCloseReason::Requested)
+        .expect("close");
+    let (closed_operation, _) = PendingOperation::new();
+    let error = first
+        .start_operation(OperationSpec::new(closed_operation).with_resource(first_handle))
+        .expect_err("closed association must be rejected");
+    assert!(matches!(
+        error,
+        ExecutionScopeError::Resource(ref error)
+            if error.code() == ResourceErrorCode::ResourceStale
+                || error.code() == ResourceErrorCode::ResourceAlreadyClosed
+    ));
+    assert_eq!(first.operations().len(), 0);
+}
+
+#[test]
+fn take_owned_leaves_taken_tombstone_and_rejects_double_take() {
+    let mut scope = ExecutionScope::new().expect("scope");
+    let first = scope
+        .push_resource(CountingResource::new().0)
+        .expect("first resource");
+    let old_handle = first.handle();
+    scope
+        .mark_resource_guest_owned(old_handle)
+        .expect("guest ownership");
+    let owned = scope
+        .take_resource::<CountingResource>(old_handle)
+        .expect("take owned");
+    drop(owned);
+
+    // The taken slot is retired as a Taken tombstone: it no longer counts as
+    // a live resource, but the handle stays resolvable so a double take is a
+    // structured ResourceAlreadyTaken rejection rather than a stale handle.
+    assert_eq!(scope.resources().len(), 0);
+    assert_eq!(
+        scope.resources().ownership(old_handle),
+        Some(ResourceOwnership::Taken),
+        "consumed handle remains resolvable as Taken"
+    );
+    let double = match scope.take_resource::<CountingResource>(old_handle) {
+        Ok(_) => panic!("double take must be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        double,
+        ExecutionScopeError::Resource(ref error)
+            if error.code() == ResourceErrorCode::ResourceAlreadyTaken
+    ));
 }
