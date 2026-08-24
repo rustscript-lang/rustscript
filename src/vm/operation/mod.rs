@@ -711,15 +711,16 @@ mod architecture_gate {
     /// The recursive enumerator finds a depth-2 tree of `.rs` files (census)
     /// and the sanitizer detects forbidden content inside it, then the RAII
     /// cleanup guard removes the whole root even on the normal completion. The
-    /// root is a unique direct child `/mnt/TEMP/rustscript/archgate-{pid}-{i}`
+    /// root is a unique direct child of `std::env::temp_dir()` named
+    /// `rustscript-archgate-{pid}-{i}`
     /// with no shared parent, so the guard removing the root cannot touch work
     /// done by any other test or process.
     #[test]
     fn recursive_collector_detects_depth2_tree_and_cleans_up() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let root = PathBuf::from(format!(
-            "/mnt/TEMP/rustscript/archgate-{}-{}",
+        let root = std::env::temp_dir().join(format!(
+            "rustscript-archgate-{}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::SeqCst)
         ));
@@ -778,13 +779,13 @@ mod architecture_gate {
 
     /// A missing directory fails closed (returns Err) with no partial census.
     /// It uses a unique nonexistent direct child under
-    /// `/mnt/TEMP/rustscript/archgate-missing-{pid}-{i}` but never creates it.
+    /// `std::env::temp_dir()/rustscript-archgate-missing-{pid}-{i}` but never creates it.
     #[test]
     fn collect_rs_files_fails_closed_on_missing_dir() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let missing = PathBuf::from(format!(
-            "/mnt/TEMP/rustscript/archgate-missing-{}-{}",
+        let missing = std::env::temp_dir().join(format!(
+            "rustscript-archgate-missing-{}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::SeqCst)
         ));
@@ -801,14 +802,14 @@ mod architecture_gate {
     /// A symlink anywhere in the tree fails closed with `InvalidData` naming
     /// the exact path, never following the link (which could cause a cycle or
     /// escape the operation core). The test uses its own unique direct root
-    /// under `/mnt/TEMP/rustscript` and removes target, link, and root on drop.
+    /// under `std::env::temp_dir()` and removes target, link, and root on drop.
     #[cfg(unix)]
     #[test]
     fn collect_rs_files_fails_closed_on_symlink() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let root = PathBuf::from(format!(
-            "/mnt/TEMP/rustscript/archgate-symlink-{}-{}",
+        let root = std::env::temp_dir().join(format!(
+            "rustscript-archgate-symlink-{}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::SeqCst)
         ));

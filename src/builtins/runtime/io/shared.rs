@@ -27,7 +27,6 @@ use std::thread::JoinHandle;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-#[cfg(unix)]
 use super::super::HostCallResult;
 use super::ops::{
     CloseCompletionOperation, CloseCompletionState, PipeTransferGuard, ReadyOperation,
