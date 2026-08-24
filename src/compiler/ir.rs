@@ -288,6 +288,135 @@ pub struct StructDecl {
     pub body_schema: TypeSchema,
 }
 
+/// Resolves a named struct instantiation to the exact structural schema used
+/// by runtime ownership traversal. Generic parameters are substituted before
+/// nested named declarations are expanded. A recursive edge is represented as
+/// `Unknown`: the current declaration's concrete fields have already been
+/// persisted, while stopping at the back-edge keeps malformed or recursive
+/// schemas finite and prevents recursive compiler/runtime walks.
+pub(crate) fn instantiate_named_struct_schema(
+    schema: &TypeSchema,
+    struct_schemas: &HashMap<String, StructDecl>,
+) -> TypeSchema {
+    fn substitute(schema: &TypeSchema, bindings: &HashMap<String, TypeSchema>) -> TypeSchema {
+        match schema {
+            TypeSchema::GenericParam(name) => bindings
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| schema.clone()),
+            TypeSchema::Array(inner) => TypeSchema::Array(Box::new(substitute(inner, bindings))),
+            TypeSchema::ArrayTuple(items) => TypeSchema::ArrayTuple(
+                items
+                    .iter()
+                    .map(|item| substitute(item, bindings))
+                    .collect(),
+            ),
+            TypeSchema::ArrayTupleRest { prefix, rest } => TypeSchema::ArrayTupleRest {
+                prefix: prefix
+                    .iter()
+                    .map(|item| substitute(item, bindings))
+                    .collect(),
+                rest: Box::new(substitute(rest, bindings)),
+            },
+            TypeSchema::Map(inner) => TypeSchema::Map(Box::new(substitute(inner, bindings))),
+            TypeSchema::Optional(inner) => {
+                TypeSchema::Optional(Box::new(substitute(inner, bindings)))
+            }
+            TypeSchema::Object(fields) => TypeSchema::Object(
+                fields
+                    .iter()
+                    .map(|(name, field)| (name.clone(), substitute(field, bindings)))
+                    .collect(),
+            ),
+            TypeSchema::Named(name, args) => TypeSchema::Named(
+                name.clone(),
+                args.iter().map(|arg| substitute(arg, bindings)).collect(),
+            ),
+            TypeSchema::Callable { params, result } => TypeSchema::Callable {
+                params: params
+                    .iter()
+                    .map(|param| substitute(param, bindings))
+                    .collect(),
+                result: Box::new(substitute(result, bindings)),
+            },
+            _ => schema.clone(),
+        }
+    }
+
+    fn resolve(
+        schema: &TypeSchema,
+        struct_schemas: &HashMap<String, StructDecl>,
+        active: &mut Vec<String>,
+    ) -> TypeSchema {
+        match schema {
+            TypeSchema::Named(name, args) => {
+                let args = args
+                    .iter()
+                    .map(|arg| resolve(arg, struct_schemas, active))
+                    .collect::<Vec<_>>();
+                let Some(decl) = struct_schemas.get(name) else {
+                    return TypeSchema::Named(name.clone(), args);
+                };
+                if active.contains(name) {
+                    return TypeSchema::Unknown;
+                }
+                if decl.type_params.len() != args.len() {
+                    return TypeSchema::Named(name.clone(), args);
+                }
+                let bindings = decl
+                    .type_params
+                    .iter()
+                    .cloned()
+                    .zip(args)
+                    .collect::<HashMap<_, _>>();
+                active.push(name.clone());
+                let instantiated = substitute(&decl.body_schema, &bindings);
+                let resolved = resolve(&instantiated, struct_schemas, active);
+                active.pop();
+                resolved
+            }
+            TypeSchema::Array(inner) => {
+                TypeSchema::Array(Box::new(resolve(inner, struct_schemas, active)))
+            }
+            TypeSchema::ArrayTuple(items) => TypeSchema::ArrayTuple(
+                items
+                    .iter()
+                    .map(|item| resolve(item, struct_schemas, active))
+                    .collect(),
+            ),
+            TypeSchema::ArrayTupleRest { prefix, rest } => TypeSchema::ArrayTupleRest {
+                prefix: prefix
+                    .iter()
+                    .map(|item| resolve(item, struct_schemas, active))
+                    .collect(),
+                rest: Box::new(resolve(rest, struct_schemas, active)),
+            },
+            TypeSchema::Map(inner) => {
+                TypeSchema::Map(Box::new(resolve(inner, struct_schemas, active)))
+            }
+            TypeSchema::Optional(inner) => {
+                TypeSchema::Optional(Box::new(resolve(inner, struct_schemas, active)))
+            }
+            TypeSchema::Object(fields) => TypeSchema::Object(
+                fields
+                    .iter()
+                    .map(|(name, field)| (name.clone(), resolve(field, struct_schemas, active)))
+                    .collect(),
+            ),
+            TypeSchema::Callable { params, result } => TypeSchema::Callable {
+                params: params
+                    .iter()
+                    .map(|param| resolve(param, struct_schemas, active))
+                    .collect(),
+                result: Box::new(resolve(result, struct_schemas, active)),
+            },
+            _ => schema.clone(),
+        }
+    }
+
+    resolve(schema, struct_schemas, &mut Vec::new())
+}
+
 fn known_host_accepts_arity(name: &str, arity: u8) -> bool {
     #[cfg(feature = "edge-abi")]
     if let Some(function) = edge_abi::function_by_name(name) {
@@ -1850,7 +1979,7 @@ mod call_resolution_carrier_tests {
 
 #[cfg(test)]
 mod type_schema_contains_resource_tests {
-    use super::TypeSchema;
+    use super::{StructDecl, TypeSchema, instantiate_named_struct_schema};
     use crate::host_api::ResourceTypeKey;
     use std::collections::HashMap;
 
@@ -2012,5 +2141,66 @@ mod type_schema_contains_resource_tests {
             )))],
         );
         assert!(!nested.contains_resource());
+    }
+
+    #[test]
+    fn named_struct_instantiation_persists_exact_nested_generic_layout_and_stops_cycles() {
+        let holder_fields = HashMap::from([
+            field("label", TypeSchema::String),
+            field(
+                "payload",
+                TypeSchema::Optional(Box::new(TypeSchema::Map(Box::new(TypeSchema::Array(
+                    Box::new(TypeSchema::GenericParam("T".into())),
+                ))))),
+            ),
+        ]);
+        let recursive_fields = HashMap::from([
+            field("owned", resource()),
+            field(
+                "next",
+                TypeSchema::Optional(Box::new(TypeSchema::Named("Node".into(), Vec::new()))),
+            ),
+        ]);
+        let declarations = HashMap::from([
+            (
+                "Holder".to_string(),
+                StructDecl {
+                    name: "Holder".into(),
+                    type_params: vec!["T".into()],
+                    body_schema: TypeSchema::Object(holder_fields),
+                },
+            ),
+            (
+                "Node".to_string(),
+                StructDecl {
+                    name: "Node".into(),
+                    type_params: Vec::new(),
+                    body_schema: TypeSchema::Object(recursive_fields),
+                },
+            ),
+        ]);
+
+        let resolved = instantiate_named_struct_schema(
+            &TypeSchema::Named("Holder".into(), vec![resource()]),
+            &declarations,
+        );
+        let TypeSchema::Object(fields) = resolved else {
+            panic!("named schema must become an exact object layout");
+        };
+        assert_eq!(fields.len(), 2);
+        assert!(fields["payload"].contains_resource());
+
+        let recursive = instantiate_named_struct_schema(
+            &TypeSchema::Named("Node".into(), Vec::new()),
+            &declarations,
+        );
+        let TypeSchema::Object(fields) = recursive else {
+            panic!("recursive root must retain its exact fields");
+        };
+        assert_eq!(fields["owned"], resource());
+        assert_eq!(
+            fields["next"],
+            TypeSchema::Optional(Box::new(TypeSchema::Unknown))
+        );
     }
 }

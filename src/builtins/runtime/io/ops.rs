@@ -353,6 +353,7 @@ pub(crate) struct ThreadedOperation {
     /// The worker sends a completion signal through this channel.
     receiver: Option<Receiver<ThreadedWorkerSignal>>,
     name: String,
+    worker: Option<IoWorkerResource>,
 }
 
 impl ThreadedOperation {
@@ -370,8 +371,27 @@ impl ThreadedOperation {
             state: state.clone(),
             receiver: Some(rx),
             name,
+            worker: None,
         };
         (operation, tx, state)
+    }
+
+    pub(crate) fn attach_worker(&mut self, worker: IoWorkerResource) {
+        debug_assert!(self.worker.is_none());
+        self.worker = Some(worker);
+    }
+
+    fn finish_worker(&mut self, cancel: bool) -> OperationResult<()> {
+        let Some(mut worker) = self.worker.take() else {
+            return Ok(());
+        };
+        worker.stop_and_join(cancel).map_err(|message| {
+            OperationError::new(
+                OperationErrorCode::OperationDriverFailed,
+                "io::operation",
+                message,
+            )
+        })
     }
 
     /// Spawn a worker thread using the sender and shared state from
@@ -499,7 +519,7 @@ impl HostOperation for ThreadedOperation {
     fn cancel(&mut self, reason: OperationCancelReason) -> OperationResult<()> {
         self.state.cancelled.store(true, Ordering::SeqCst);
         let _ = reason;
-        Ok(())
+        self.finish_worker(true)
     }
 }
 

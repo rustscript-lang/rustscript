@@ -1776,35 +1776,13 @@ impl Vm {
 
 impl Drop for Vm {
     fn drop(&mut self) {
-        let _ = self.cancel_waiting_host_op_with_reason(
-            crate::builtins::runtime::cancellation::CancellationReason::VmDrop,
-        );
-        let _ = self.cancel_callable_stream(
-            crate::builtins::runtime::cancellation::CancellationReason::VmDrop,
-        );
-        // Guest-owned release before the interpreter values are dropped: a
-        // `Vm` being dropped without a prior halt/reset/shutdown still owes
-        // exactly-once closes for any guest-owned local handles.
-        let base = self.active_local_base();
-        let count = self
-            .instance
-            .execution_frames
-            .last()
-            .map(|frame| frame.local_count)
-            .unwrap_or(self.program.local_count);
-        self.release_owned_locals_range(base, count);
-        // Execution-scope shutdown (plan section 5.3): dropping the Vm must
-        // synchronously begin the execution-scope close with the VmDrop
-        // reason and drive one round of the close pipeline with a no-op
-        // waker. That synchronously cancels every pending operation (with the
-        // parallel OperationCancelReason::VmDrop) and issues child-first
-        // `begin_close` to every live resource (with ResourceCloseReason::
-        // VmDrop), so a Pending child can never prevent its parent's
-        // begin_close from running before the owned tables fall through to
-        // their Drop guards. Genuinely event-driven Pending resources stay
-        // Closing here and are released by their own Drop guards — Drop never
-        // blocks, never claims quiescence, and the pool never recycles a
-        // dropped Vm.
+        // Drop-time cancellation and resource closure are owned by the
+        // execution scope. Starting with any local OwnershipRelease would
+        // retire a guest-owned resource and its associated operation before
+        // the scope can apply the single VmDrop reason and global ordering.
+        // Scope begin-close cancels all operations first, then the Drop-only
+        // close drive begins every remaining resource child-first, including
+        // ancestors blocked behind a Pending child.
         let _ = self
             .host
             .execution_scope_begin_close(ResourceCloseReason::VmDrop);
@@ -2477,30 +2455,13 @@ impl Vm {
                     }
                 }
             }
-            TypeSchema::Named(_, type_args) => {
-                // Named (struct-like) schemas carry positional type args; the
-                // runtime representation is a Map. Match by position against
-                // the sorted field order when the map keys are strings.
-                if let Value::Map(entries) = value {
-                    let mut entries = entries
-                        .iter()
-                        .filter_map(|(key, map_value)| {
-                            let Value::String(key) = key else {
-                                return None;
-                            };
-                            Some((key.clone(), map_value))
-                        })
-                        .collect::<Vec<_>>();
-                    entries.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
-                    for (arg_schema, (_, map_value)) in type_args.iter().zip(entries.iter()) {
-                        self.release_owned_value(arg_schema, map_value, seen, depth);
-                    }
-                }
-            }
-            // Plain scalars, callables, and unknown/generic schemas never
-            // release anything (a resource can only appear where the schema
-            // names one).
+            // Plain scalars, unresolved named identities, callables, and
+            // unknown/generic schemas never release anything. Compiled runtime
+            // type maps persist named structs as exact `Object` layouts before
+            // reaching this walker.
             TypeSchema::Unknown
+            | TypeSchema::GenericParam(_)
+            | TypeSchema::Named(_, _)
             | TypeSchema::Null
             | TypeSchema::Int
             | TypeSchema::Float
@@ -2508,7 +2469,6 @@ impl Vm {
             | TypeSchema::Bool
             | TypeSchema::String
             | TypeSchema::Bytes
-            | TypeSchema::GenericParam(_)
             | TypeSchema::Callable { .. } => {}
         }
     }

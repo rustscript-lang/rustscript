@@ -115,62 +115,6 @@ fn standard_host_catalog_snapshot() -> &'static StandardHostCatalogSnapshot {
     })
 }
 
-pub(crate) fn standard_exact_surface_requirements(
-    imports: &[crate::bytecode::HostImport],
-) -> (bool, bool, bool) {
-    let mut io = false;
-    let mut http = false;
-    let mut sqlite = false;
-    for import in imports {
-        io |= import.name.starts_with("io::");
-        http |= import.name.starts_with("http::");
-        sqlite |= import.name.starts_with("sqlite::");
-    }
-    (io, http, sqlite)
-}
-
-/// The standard adapter surfaces a program's exact imports may require.
-///
-/// Pure capability flags — which of the same-crate standard builtin surfaces
-/// (IO, HTTP, SQLite) need to be staged onto a registry. The struct lives in
-/// the composition layer so `src/vm` never names a concrete domain module or
-/// feature; only the generic flags cross the boundary.
-#[cfg(feature = "runtime")]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct StandardSurfaces {
-    pub io: bool,
-    pub http: bool,
-    pub database: bool,
-}
-
-/// Registers only the missing standard adapter surfaces on `registry`,
-/// leaving every already-present surface untouched.
-///
-/// This is the *composition* step: it decides which same-crate builtin
-/// modules to register based on the feature-gated build. It lives in the
-/// standard builtin layer, not the host-agnostic VM core, so `src/vm` never
-/// imports `register_io_builtin_module` / `register_http_builtin_module` /
-/// `register_sqlite_builtin_module` and never carries
-/// `cfg(feature = "sqlite")` / `cfg(feature = "http-client")` gates.
-#[cfg(feature = "runtime")]
-pub(crate) fn stage_missing_standard_surfaces(
-    registry: &mut HostFunctionRegistry,
-    missing: StandardSurfaces,
-) -> VmResult<()> {
-    if missing.io {
-        register_io_builtin_module(registry)?;
-    }
-    #[cfg(feature = "http-client")]
-    if missing.http {
-        register_http_builtin_module(registry)?;
-    }
-    #[cfg(feature = "sqlite")]
-    if missing.database {
-        register_sqlite_builtin_module(registry)?;
-    }
-    Ok(())
-}
-
 /// Builds a fresh registry carrying every *enabled* standard adapter surface
 /// for the current build (IO under `runtime`, HTTP under `http-client`,
 /// SQLite under `sqlite`), used by the VM's default-fallback path for exact
@@ -395,37 +339,6 @@ pub(crate) fn execute_builtin_call(
 
 pub(crate) fn close_all_handles(vm: &mut Vm) {
     vm.host.reset_for_reuse();
-}
-
-#[cfg(test)]
-mod standard_surface_tests {
-    use super::standard_exact_surface_requirements;
-    use crate::bytecode::HostImport;
-
-    fn import(name: &str) -> HostImport {
-        HostImport {
-            name: name.to_owned(),
-            arity: 0,
-            return_type: crate::vm::ValueType::Null,
-            schema: None,
-        }
-    }
-
-    #[test]
-    fn exact_binding_registers_only_imported_standard_surfaces() {
-        assert_eq!(
-            standard_exact_surface_requirements(&[import("io::exists"), import("io::read_all")]),
-            (true, false, false)
-        );
-        assert_eq!(
-            standard_exact_surface_requirements(&[import("http::client::request")]),
-            (false, true, false)
-        );
-        assert_eq!(
-            standard_exact_surface_requirements(&[import("sqlite::open")]),
-            (false, false, true)
-        );
-    }
 }
 
 #[cfg(test)]

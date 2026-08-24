@@ -10,6 +10,7 @@ use super::codegen::Compiler;
 use super::frontends;
 use super::ir::{
     Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, SemanticIndex, Stmt, TypeSchema,
+    instantiate_named_struct_schema,
 };
 use super::linker::{ParsedUnit, merge_units};
 use super::modules::ModuleGraph;
@@ -424,7 +425,14 @@ fn compile_parsed_output_with_entry_locals(
     // the unallocated IR.
     let callable_use_facts = materialization::classify_named_callables(&parsed);
     let parsed = lifetime::allocate_local_slots(parsed).map_err(SourceError::Parse)?;
-    let type_info = typing::infer_types(&parsed, typing_mode, entry_local_types);
+    let mut type_info = typing::infer_types(&parsed, typing_mode, entry_local_types);
+    // Named schemas are a compiler identity form. Runtime ownership needs the
+    // concrete instantiated field layout, including generic substitution, so
+    // normalize every persisted local schema before lifetime analysis and
+    // code generation consume it.
+    for schema in type_info.local_schemas.iter_mut().flatten() {
+        *schema = instantiate_named_struct_schema(schema, &parsed.struct_schemas);
+    }
     let FrontendIr {
         stmts,
         locals,

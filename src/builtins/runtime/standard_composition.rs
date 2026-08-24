@@ -18,10 +18,7 @@ use crate::bytecode::HostImport;
 use crate::vm::standard_composition::StandardSurfaceComposition;
 use crate::vm::{HostFunctionRegistry, Vm, VmResult};
 
-use super::{
-    StandardSurfaces, stage_missing_standard_surfaces, standard_exact_surface_requirements,
-    standard_host_catalog, standard_host_catalog_fingerprint,
-};
+use super::{standard_host_catalog, standard_host_catalog_fingerprint, standard_host_registry};
 
 /// The concrete standard-surface composition for this build.
 ///
@@ -52,33 +49,8 @@ impl StandardSurfaceComposition for StandardSurfaceCompositionImpl {
         imports: &[HostImport],
         registry: &mut HostFunctionRegistry,
     ) -> VmResult<bool> {
-        let (io, http, database) = standard_exact_surface_requirements(imports);
-        let fingerprint = standard_host_catalog_fingerprint();
-        // Present-surface computation: which standard surfaces does `registry`
-        // already carry? Only standard-fingerprint exact entries count.
-        let mut present = StandardSurfaces::default();
-        for (name, fingerprints) in registry.exact_entries() {
-            if !fingerprints.contains(&fingerprint) {
-                continue;
-            }
-            if name.starts_with("io::") {
-                present.io = true;
-            } else if name.starts_with("http::") {
-                present.http = true;
-            } else if name.starts_with("sqlite::") {
-                present.database = true;
-            }
-        }
-        let missing = StandardSurfaces {
-            io: io && !present.io,
-            http: http && !present.http,
-            database: database && !present.database,
-        };
-        if missing == StandardSurfaces::default() {
-            return Ok(false);
-        }
-        stage_missing_standard_surfaces(registry, missing)?;
-        Ok(true)
+        let standard = standard_host_registry()?;
+        registry.stage_missing_exact_imports_from(&standard, imports)
     }
 
     fn build_default_registry(&self) -> VmResult<HostFunctionRegistry> {

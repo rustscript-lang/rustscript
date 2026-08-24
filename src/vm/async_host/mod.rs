@@ -324,9 +324,15 @@ impl Vm {
         // current scope. Shared validation runs before any driver cancellation
         // or waiting-state mutation.
         let scope_id = self.validate_current_scope_operation_id(op_id)?;
-        // External completion cancels the waiting operation's own driver so
-        // its bridge/background work stops exactly once, then delivers the
-        // provided values through the normal waiting-state completion.
+        // Once validation proves this is the current live operation, take the
+        // wait state before retirement. Retirement always consumes the slot
+        // and adapter, even when driver cancellation reports a typed cleanup
+        // failure, so no terminal exit may leave a replayable wait behind.
+        let waiting = self
+            .instance
+            .waiting_host_op
+            .take()
+            .expect("validated waiting operation must still be present");
         self.host
             .retire_operation(
                 scope_id,
@@ -335,7 +341,7 @@ impl Vm {
                 ),
             )
             .map_err(VmError::from)?;
-        self.complete_waiting_host_op(op_id, values.into())
+        self.finish_taken_waiting_host_op(waiting, values.into())
     }
 
     pub fn poll_waiting_host_op(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<()>> {

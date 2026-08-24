@@ -1,6 +1,8 @@
 use super::*;
 use crate::builtins::BuiltinFunction;
 use crate::bytecode::TypeMap;
+use crate::compiler::TypeSchema;
+use crate::resource::ResourceResult;
 use crate::vm::execution_scope::ScopeState;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32,6 +34,129 @@ impl HostAsyncBridge for NoopPendingBridge {
 }
 
 struct NeverReadyOperation;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VmDropOrderEvent {
+    Operation(crate::vm::operation::OperationCancelReason),
+    Resource(&'static str, ResourceCloseReason),
+}
+
+struct VmDropOrderResource {
+    name: &'static str,
+    pending: bool,
+    events: Arc<Mutex<Vec<VmDropOrderEvent>>>,
+}
+
+impl HostResource for VmDropOrderResource {
+    fn resource_type_key() -> Option<ResourceTypeKey> {
+        Some(ResourceTypeKey::new("test.vm-drop-order").unwrap())
+    }
+
+    fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(VmDropOrderEvent::Resource(self.name, reason));
+        Ok(if self.pending {
+            CloseProgress::Pending
+        } else {
+            CloseProgress::Ready
+        })
+    }
+
+    fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
+        Poll::Pending
+    }
+}
+
+struct VmDropOrderOperation {
+    events: Arc<Mutex<Vec<VmDropOrderEvent>>>,
+}
+
+impl crate::vm::operation::HostOperation for VmDropOrderOperation {
+    fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<crate::vm::operation::OperationResult<()>> {
+        Poll::Pending
+    }
+
+    fn cancel(
+        &mut self,
+        reason: crate::vm::operation::OperationCancelReason,
+    ) -> crate::vm::operation::OperationResult<()> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(VmDropOrderEvent::Operation(reason));
+        Ok(())
+    }
+}
+
+#[test]
+fn vm_drop_owns_guest_cleanup_and_orders_operation_before_child_first_resources() {
+    let resource_key = ResourceTypeKey::new("test.vm-drop-order").unwrap();
+    let program = Program::new(Vec::new(), Vec::new())
+        .with_local_count(1)
+        .with_type_map(TypeMap {
+            local_schemas: vec![Some(TypeSchema::Resource(resource_key))],
+            ..TypeMap::default()
+        });
+    let mut vm = Vm::try_new(program).unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (grandparent, parent, child) = {
+        let mut host = vm.host_context();
+        let grandparent = host
+            .push_resource(VmDropOrderResource {
+                name: "grandparent",
+                pending: false,
+                events: Arc::clone(&events),
+            })
+            .unwrap();
+        let parent = host
+            .push_child_resource(
+                VmDropOrderResource {
+                    name: "parent",
+                    pending: false,
+                    events: Arc::clone(&events),
+                },
+                &grandparent,
+            )
+            .unwrap();
+        let child = host
+            .push_child_resource(
+                VmDropOrderResource {
+                    name: "child",
+                    pending: true,
+                    events: Arc::clone(&events),
+                },
+                &parent,
+            )
+            .unwrap();
+        for handle in [grandparent.handle(), parent.handle(), child.handle()] {
+            host.mark_resource_guest_owned(handle).unwrap();
+        }
+        host.start_operation(
+            crate::vm::operation::OperationSpec::new(VmDropOrderOperation {
+                events: Arc::clone(&events),
+            })
+            .with_resource(child.handle()),
+        )
+        .unwrap();
+        (grandparent, parent, child)
+    };
+    vm.instance.locals[0] = Value::Int(i64::try_from(child.handle().raw()).unwrap());
+    let _owners = (grandparent, parent, child);
+
+    drop(vm);
+
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        &[
+            VmDropOrderEvent::Operation(crate::vm::operation::OperationCancelReason::VmDrop,),
+            VmDropOrderEvent::Resource("child", ResourceCloseReason::VmDrop),
+            VmDropOrderEvent::Resource("parent", ResourceCloseReason::VmDrop),
+            VmDropOrderEvent::Resource("grandparent", ResourceCloseReason::VmDrop),
+        ]
+    );
+}
 
 impl crate::vm::operation::HostOperation for NeverReadyOperation {
     fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<crate::vm::operation::OperationResult<()>> {

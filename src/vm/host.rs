@@ -2,7 +2,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::builtins::BuiltinFunction;
-use crate::host_api::HostApiFingerprint;
 
 use super::async_host::WaitingHostOp;
 use super::*;
@@ -639,7 +638,6 @@ struct StandardStageResult {
     registry: Arc<HostFunctionRegistry>,
 }
 
-#[derive(Clone)]
 pub struct HostFunctionRegistry {
     entries: Arc<Vec<RegistryEntry>>,
     by_name: Arc<HashMap<String, u16>>,
@@ -701,6 +699,35 @@ impl RegistryTransaction {
         self.staged
             .as_mut()
             .expect("registry transaction must be live while staging")
+    }
+}
+
+impl Clone for HostFunctionRegistry {
+    fn clone(&self) -> Self {
+        let snapshot = self
+            .standard_staging_snapshot
+            .read()
+            .expect("poisoned lock")
+            .clone();
+        Self {
+            entries: Arc::clone(&self.entries),
+            by_name: Arc::clone(&self.by_name),
+            by_exact: Arc::clone(&self.by_exact),
+            plan_cache: Arc::clone(&self.plan_cache),
+            allowed_builtin_calls: Arc::clone(&self.allowed_builtin_calls),
+            allow_default_builtin_capabilities: self.allow_default_builtin_capabilities,
+            allow_default_host_capabilities: self.allow_default_host_capabilities,
+            capability_profile: Arc::clone(&self.capability_profile),
+            registry_state: Arc::clone(&self.registry_state),
+            registry_generation_token: Arc::clone(&self.registry_generation_token),
+            registry_generation: Arc::clone(&self.registry_generation),
+            transaction_origin: Arc::new(()),
+            standard_staging_snapshot: Arc::new(RwLock::new(snapshot)),
+            standard_staging_registrations: Arc::new(AtomicU64::new(
+                self.standard_staging_registrations.load(Ordering::Acquire),
+            )),
+            composition: self.composition.clone(),
+        }
     }
 }
 
@@ -785,8 +812,13 @@ impl HostFunctionRegistry {
     }
 
     fn invalidate_plan_cache(&mut self) {
+        let next_generation = self
+            .registry_generation
+            .load(Ordering::Acquire)
+            .saturating_add(1);
         self.registry_state = Arc::new(());
-        self.registry_generation.fetch_add(1, Ordering::Relaxed);
+        self.registry_generation_token = Arc::new(());
+        self.registry_generation = Arc::new(AtomicU64::new(next_generation));
         self.plan_cache = Arc::new(RwLock::new(HashMap::new()));
     }
 
@@ -1046,6 +1078,60 @@ impl HostFunctionRegistry {
         });
         Arc::make_mut(&mut self.by_name).insert(name, slot);
         self.invalidate_plan_cache();
+    }
+
+    pub(crate) fn stage_missing_exact_imports_from(
+        &mut self,
+        source: &HostFunctionRegistry,
+        imports: &[HostImport],
+    ) -> VmResult<bool> {
+        let mut staged = false;
+        for import in imports {
+            let Some(schema) = import.schema.as_ref() else {
+                continue;
+            };
+            if self
+                .by_exact
+                .get(&import.name)
+                .is_some_and(|schemas| schemas.contains_key(schema))
+            {
+                continue;
+            }
+            let source_slot = source
+                .by_exact
+                .get(&import.name)
+                .and_then(|schemas| schemas.get(schema))
+                .copied()
+                .ok_or_else(|| {
+                    VmError::HostImportBinding(HostImportBindingError::MissingExact {
+                        import: import.name.clone(),
+                    })
+                })?;
+            let entry = source
+                .entries
+                .get(usize::from(source_slot))
+                .cloned()
+                .ok_or_else(|| {
+                    VmError::HostError(format!(
+                        "exact source slot {source_slot} for '{}' is missing",
+                        import.name
+                    ))
+                })?;
+            let slot = u16::try_from(self.entries.len()).map_err(|_| {
+                VmError::HostError("host function registry exceeds u16 slot capacity".to_string())
+            })?;
+            Arc::make_mut(&mut self.entries).push(entry);
+            Arc::make_mut(&mut self.by_exact)
+                .entry(import.name.clone())
+                .or_default()
+                .insert(schema.clone(), slot);
+            self.authorize_registered_builtin_import(&import.name);
+            staged = true;
+        }
+        if staged {
+            self.invalidate_plan_cache();
+        }
+        Ok(staged)
     }
 
     /// Registers a dynamic host fn under an exact `HostImportSchema` (name + ordered param
@@ -1382,11 +1468,12 @@ impl HostFunctionRegistry {
         // bind order. A fully covering snapshot returns unchanged with zero
         // registration; newly required surfaces extend and replace the cached
         // snapshot. A later source mutation still invalidates it by generation.
-        let source_generation = self.registry_generation.load(Ordering::Relaxed);
-        let cached = self
+        let source_generation = self.registry_generation.load(Ordering::Acquire);
+        let mut snapshot_guard = self
             .standard_staging_snapshot
-            .read()
-            .expect("poisoned lock")
+            .write()
+            .expect("poisoned lock");
+        let cached = snapshot_guard
             .as_ref()
             .filter(|snapshot| snapshot.source_generation == source_generation)
             .map(|snapshot| Arc::clone(&snapshot.registry));
@@ -1398,10 +1485,7 @@ impl HostFunctionRegistry {
             self.standard_staging_registrations
                 .fetch_add(1, Ordering::Relaxed);
             let expanded = Arc::new(expanded);
-            *self
-                .standard_staging_snapshot
-                .write()
-                .expect("poisoned lock") = Some(StandardStagingSnapshot {
+            *snapshot_guard = Some(StandardStagingSnapshot {
                 registry: Arc::clone(&expanded),
                 source_generation,
             });
@@ -1426,8 +1510,10 @@ impl HostFunctionRegistry {
         // `staged` already carries, and registers exactly the missing ones.
         // The core never sees a surface mask or count.
         if !composition.ensure_surfaces(imports, &mut staged)? {
-            // Every required surface is already present; bind from the current
-            // registry directly (no staging, no snapshot, no counter bump).
+            // Every required exact entry is already present. Release the
+            // publication lock before cloning because `Clone` snapshots this
+            // registry's cache into a detached lock.
+            drop(snapshot_guard);
             return Ok(Some(StandardStageResult {
                 registry: Arc::new(self.clone()),
             }));
@@ -1438,12 +1524,9 @@ impl HostFunctionRegistry {
         // Publish the staged snapshot so subsequent binds reuse it without
         // re-registering: the fully-staged registry is the immutable template,
         // guarded by the source registry's current generation.
-        *self
-            .standard_staging_snapshot
-            .write()
-            .expect("poisoned lock") = Some(StandardStagingSnapshot {
+        *snapshot_guard = Some(StandardStagingSnapshot {
             registry: Arc::clone(&staged),
-            source_generation: self.registry_generation.load(Ordering::Relaxed),
+            source_generation,
         });
         Ok(Some(StandardStageResult { registry: staged }))
     }
@@ -1484,23 +1567,6 @@ impl HostFunctionRegistry {
             .expect("poisoned lock")
             .as_ref()
             .map(|snapshot| Arc::clone(&snapshot.registry))
-    }
-
-    /// Host-agnostic enumeration of every exact-registered import name and the
-    /// fingerprints its overloads carry.
-    ///
-    /// Provided so the standard composition layer can detect which of its own
-    /// surfaces a registry already carries (by prefix + standard fingerprint).
-    /// The VM core exposes the raw names with no namespace knowledge;
-    /// classifying them is the caller's job.
-    pub(crate) fn exact_entries(&self) -> Vec<(String, Vec<HostApiFingerprint>)> {
-        self.by_exact
-            .iter()
-            .map(|(name, schemas)| {
-                let fingerprints = schemas.keys().map(|schema| schema.fingerprint).collect();
-                (name.clone(), fingerprints)
-            })
-            .collect()
     }
 
     pub fn prepare_plan(&self, imports: &[HostImport]) -> VmResult<HostBindingPlan> {
@@ -3238,27 +3304,28 @@ impl Vm {
             ))
         })?;
         if waiting.op_id != op_id {
+            let active_id = waiting.op_id;
+            self.instance.waiting_host_op = Some(waiting);
             return Err(VmError::HostError(format!(
-                "host op {op_id} completed while vm waits on {}",
-                waiting.op_id
+                "host op {op_id} completed while vm waits on {active_id}"
             )));
         }
-        let values = validate_exact_host_return_values(values, waiting.exact_policy.clone())
-            .inspect_err(|_| {
-                self.instance.waiting_host_op = None;
-            })?;
+        self.finish_taken_waiting_host_op(waiting, values)
+    }
+
+    pub(super) fn finish_taken_waiting_host_op(
+        &mut self,
+        waiting: WaitingHostOp,
+        values: CallReturn,
+    ) -> VmResult<()> {
+        let values = validate_exact_host_return_values(values, waiting.exact_policy.clone())?;
         // Exact `Resource` async completions transfer ownership the same way
         // a synchronous return does: the handle's table entry moves
         // HostOwned -> GuestOwned before any stack mutation. A structurally
         // valid handle that is foreign/stale/already-guest/taken/closing is a
         // structured error that terminates the waiting op and leaves the
         // stack untouched.
-        if let Err(error) = self.transfer_exact_host_return_ownership(&values, waiting.exact_policy)
-        {
-            self.instance.waiting_host_op = None;
-            return Err(error);
-        }
-        self.instance.waiting_host_op = None;
+        self.transfer_exact_host_return_ownership(&values, waiting.exact_policy)?;
         values.push_onto_stack(&mut self.instance.stack);
         Ok(())
     }
@@ -4541,7 +4608,7 @@ mod registry_transaction_tests {
     }
 
     #[test]
-    fn ordinary_clones_share_coherence_identity_but_staging_does_not() {
+    fn ordinary_clones_share_until_mutation_while_staging_is_always_detached() {
         let registry = HostFunctionRegistry::empty();
         let sibling = registry.clone();
         assert!(Arc::ptr_eq(

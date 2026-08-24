@@ -10,6 +10,7 @@
 //! [`OperationCancelReason`] and the terminal status but does not build a
 //! parent/child signal graph.
 
+use std::any::Any;
 use std::task::{Context, Poll};
 
 use super::error::{OperationError, OperationResult};
@@ -40,7 +41,7 @@ pub enum OperationOutcome {
 /// runs work on another thread) and not borrow from the VM across a poll.
 /// Polling advances the operation; cancellation is delivered in-band through
 /// [`HostOperation::cancel`].
-pub trait HostOperation: Send + 'static {
+pub trait HostOperation: Any + Send + 'static {
     /// Drive the operation one step.
     ///
     /// Return `Poll::Pending` while the operation is still running, or

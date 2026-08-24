@@ -405,6 +405,20 @@ impl ExecutionScope {
             .map_err(ExecutionScopeError::Operation)
     }
 
+    pub(crate) fn with_operation_driver_mut<T, R>(
+        &mut self,
+        id: OperationId,
+        apply: impl FnOnce(&mut T) -> R,
+    ) -> ExecutionScopeResult<R>
+    where
+        T: crate::vm::operation::HostOperation,
+    {
+        self.ensure_accepting()?;
+        self.operations
+            .with_driver_mut(id, apply)
+            .map_err(ExecutionScopeError::Operation)
+    }
+
     /// Polls one registered operation to its terminal state using the
     /// caller's context.
     ///

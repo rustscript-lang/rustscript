@@ -968,10 +968,6 @@ fn terminal_paths_leave_zero_map_and_scope_entries() {
         assert!(matches!(complete_vm.run().unwrap(), VmStatus::Waiting(_)));
     }
     assert_eq!(complete_vm.run().unwrap(), VmStatus::Halted);
-    assert!(
-        complete_vm.host.stream_drivers.is_empty(),
-        "normal completion must clear the stream driver map"
-    );
     assert_eq!(
         complete_vm.host.execution_scope().operations().len(),
         0,
@@ -988,10 +984,7 @@ fn terminal_paths_leave_zero_map_and_scope_entries() {
     assert!(matches!(callback_vm.run().unwrap(), VmStatus::Waiting(_)));
     assert!(matches!(poll_once(&mut callback_vm), Poll::Ready(Ok(()))));
     assert_eq!(callback_vm.run().unwrap(), VmStatus::Halted);
-    assert!(
-        callback_vm.host.stream_drivers.is_empty(),
-        "callback completion must clear the stream driver map"
-    );
+
     assert_eq!(
         callback_vm.host.execution_scope().operations().len(),
         0,
@@ -1007,10 +1000,7 @@ fn terminal_paths_leave_zero_map_and_scope_entries() {
     );
     assert!(matches!(error_vm.run().unwrap(), VmStatus::Waiting(_)));
     assert!(matches!(poll_once(&mut error_vm), Poll::Ready(Err(_))));
-    assert!(
-        error_vm.host.stream_drivers.is_empty(),
-        "producer error must clear the stream driver map"
-    );
+
     assert_eq!(
         error_vm.host.execution_scope().operations().len(),
         0,
@@ -1028,10 +1018,7 @@ fn terminal_paths_leave_zero_map_and_scope_entries() {
     cancel_vm
         .cancel_waiting_host_op()
         .expect("waiting host operation cancellation should succeed");
-    assert!(
-        cancel_vm.host.stream_drivers.is_empty(),
-        "explicit cancellation must clear the stream driver map"
-    );
+
     assert_eq!(
         cancel_vm.host.execution_scope().operations().len(),
         0,
@@ -1139,10 +1126,6 @@ fn producer_is_dropped_exactly_once_across_every_terminal_path() {
             1,
             "{label}: producer must be dropped exactly once"
         );
-        assert!(
-            vm.host.stream_drivers.is_empty(),
-            "{label}: stream driver map must be empty"
-        );
     }
 }
 
@@ -1163,7 +1146,7 @@ fn callable_stream_cancellation_preserves_explicit_reset_and_drop_reasons() {
         &[CancellationReason::Requested]
     );
     assert_eq!(explicit_drops.load(Ordering::SeqCst), 1);
-    assert!(explicit.host.stream_drivers.is_empty());
+
     assert_eq!(explicit.host.execution_scope_operation_count(), 0);
 
     let (mut reset, _, _, reset_drops, reset_reasons) = setup_with_cancellations(SOURCE);
@@ -1174,7 +1157,7 @@ fn callable_stream_cancellation_preserves_explicit_reset_and_drop_reasons() {
         &[CancellationReason::VmReset]
     );
     assert_eq!(reset_drops.load(Ordering::SeqCst), 1);
-    assert!(reset.host.stream_drivers.is_empty());
+
     assert_eq!(reset.host.execution_scope_operation_count(), 0);
 
     let (mut dropped, _, _, drop_count, drop_reasons) = setup_with_cancellations(SOURCE);
@@ -1243,7 +1226,7 @@ fn callable_stream_success_and_errors_drop_without_requested_cancellation() {
             "{label} is terminal completion/failure, not requested cancellation"
         );
         assert_eq!(drops.load(Ordering::SeqCst), 1, "{label}");
-        assert!(vm.host.stream_drivers.is_empty(), "{label}");
+
         assert_eq!(vm.host.execution_scope_operation_count(), 0, "{label}");
         assert_eq!(vm.host.pending_op_results.len(), 0, "{label}");
     }

@@ -102,6 +102,37 @@ impl HostFunction for RecordingPendingHost {
     }
 }
 
+struct FailingCancelOperation;
+
+impl vm::operation::HostOperation for FailingCancelOperation {
+    fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<vm::operation::OperationResult<()>> {
+        Poll::Pending
+    }
+
+    fn cancel(
+        &mut self,
+        _reason: vm::operation::OperationCancelReason,
+    ) -> vm::operation::OperationResult<()> {
+        Err(vm::operation::OperationError::new(
+            vm::operation::OperationErrorCode::OperationDriverFailed,
+            "test::cancel",
+            "cancel cleanup failed",
+        ))
+    }
+}
+
+struct FailingCancelPendingHost;
+
+impl HostFunction for FailingCancelPendingHost {
+    fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+        let id = vm
+            .host_context()
+            .start_operation(vm::operation::OperationSpec::new(FailingCancelOperation))
+            .expect("start failing-cancel operation");
+        Ok(CallOutcome::Pending(id.raw()))
+    }
+}
+
 struct ReadyOperation;
 
 impl vm::operation::HostOperation for ReadyOperation {
@@ -258,6 +289,34 @@ fn complete_host_op_rejects_wrong_and_missing_ids() {
         missing_err.to_string().contains("not waiting"),
         "unexpected error: {missing_err}"
     );
+}
+
+#[test]
+fn failed_external_completion_cleanup_clears_waiting_and_retires_slot() {
+    let mut bc = BytecodeBuilder::new();
+    bc.call(0, 0);
+    bc.ret();
+    let mut vm = new_runtime_state_vm(Program::new(Vec::new(), bc.finish()));
+    vm.register_function(Box::new(FailingCancelPendingHost));
+
+    let VmStatus::Waiting(op_id) = vm.run().expect("host should wait") else {
+        panic!("expected waiting status");
+    };
+    let error = vm
+        .complete_host_op(op_id, Vec::new())
+        .expect_err("driver cancellation failure must remain typed");
+    assert_eq!(
+        error.operation_error_code(),
+        Some(vm::operation::OperationErrorCode::OperationDriverFailed)
+    );
+    assert_eq!(vm.waiting_host_op_id(), None);
+    assert_eq!(vm.host_context().operation_count(), 0);
+
+    let retry = vm
+        .complete_host_op(op_id, Vec::new())
+        .expect_err("retired completion must not replay");
+    assert!(retry.to_string().contains("not waiting"));
+    assert_eq!(vm.host_context().operation_count(), 0);
 }
 
 /// A dynamic bound host returning a fabricated Pending id is rejected before

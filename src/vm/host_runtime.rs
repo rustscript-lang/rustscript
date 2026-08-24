@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use crate::vm::async_host::{HostAsyncBridge, HostStreamDriver};
+use crate::vm::async_host::HostAsyncBridge;
 use crate::vm::execution_scope::{
     ExecutionScope, ExecutionScopeError, ExecutionScopeResult, ScopeCloseOutcome, ScopeState,
 };
@@ -139,14 +139,6 @@ pub(crate) struct HostRuntime {
     /// `BridgePtr` lifetime coupling (no raw pointer can outlive its bridge
     /// allocation under the public APIs).
     pub(crate) async_bridge: Option<Arc<Mutex<Box<dyn HostAsyncBridge>>>>,
-    /// Current callable-stream producer drivers, keyed by the *packed* scope
-    /// `OperationId` raw. Each value is a shared slot jointly owned with the
-    /// stream's registered `HostOperation` driver (`StreamScopeOperation`): the
-    /// VM polls the producer through the slot, and scope cancellation/release
-    /// takes (drops) the driver out of the same slot, so the producer resource
-    /// is always released exactly once through the operation driver. Keys are
-    /// scope operation ids — never small external ids from a separate counter.
-    pub(crate) stream_drivers: HashMap<u64, Arc<Mutex<Option<Box<dyn HostStreamDriver>>>>>,
     pub(crate) runtime_print_sink: Option<Box<RuntimePrintSink>>,
     /// Module-registered adapters that materialize the guest-visible return of
     /// a completed execution-scope host operation, keyed by raw operation id.
@@ -187,7 +179,6 @@ impl HostRuntime {
             execution_scope: ExecutionScope::new().map_err(HostRuntimeInitError::Scope)?,
             module_state: HostModuleStore::new(),
             async_bridge: None,
-            stream_drivers: HashMap::new(),
             runtime_print_sink: None,
             pending_op_results: HashMap::new(),
             standard_composition: None,
@@ -204,7 +195,6 @@ impl HostRuntime {
     /// (`close_all_handles`); the execution scope's own close/recycle reports
     /// failures through the typed two-phase reset path.
     pub(crate) fn reset_for_reuse(&mut self) {
-        self.stream_drivers.clear();
         // Drop any module-registered pending-call adapters: they belong to
         // execution-scope operations that a reset is cancelling/closing, and
         // the concrete value cells they reference are released by the
@@ -391,6 +381,17 @@ impl HostRuntime {
     /// followed by `take_outcome`; cancellation uses the registry's atomic
     /// abort (cancel plus consume/release). `Polled` is used when registry poll
     /// already released the slot. Transition/cleanup errors remain typed.
+    pub(crate) fn with_operation_driver_mut<T, R>(
+        &mut self,
+        id: OperationId,
+        apply: impl FnOnce(&mut T) -> R,
+    ) -> ExecutionScopeResult<R>
+    where
+        T: crate::vm::operation::HostOperation,
+    {
+        self.execution_scope.with_operation_driver_mut(id, apply)
+    }
+
     pub(crate) fn retire_operation(
         &mut self,
         id: OperationId,

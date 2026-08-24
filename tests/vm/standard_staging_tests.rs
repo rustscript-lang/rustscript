@@ -15,11 +15,14 @@
 //!   change (the registration counter and the snapshot's generation are
 //!   stable).
 
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 
+use vm::compiler::TypeSchema;
 use vm::{
-    CompileSourceFileOptions, HostFunctionRegistry, SourceFlavor, Vm,
-    compile_source_with_flavor_and_options, register_io_builtin_module, standard_host_catalog,
+    CallOutcome, CallReturn, CapabilityProfile, CompileSourceFileOptions, HostFunctionRegistry,
+    HostImport, OpCode, Program, SourceFlavor, Value, ValueType, Vm,
+    compile_source_with_flavor_and_options, register_io_builtin_module, standard_composition,
+    standard_host_catalog,
 };
 
 /// Compiles `source` against the authoritative combined standard snapshot so
@@ -32,6 +35,61 @@ fn compile_standard(source: &str) -> vm::CompiledProgram {
         CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog)),
     )
     .expect("source should compile against the standard catalog")
+}
+
+fn coarse_host_type(schema: &TypeSchema) -> ValueType {
+    match schema {
+        TypeSchema::Unknown
+        | TypeSchema::Number
+        | TypeSchema::GenericParam(_)
+        | TypeSchema::Resource(_) => ValueType::Unknown,
+        TypeSchema::Null => ValueType::Null,
+        TypeSchema::Int => ValueType::Int,
+        TypeSchema::Float => ValueType::Float,
+        TypeSchema::Bool => ValueType::Bool,
+        TypeSchema::String => ValueType::String,
+        TypeSchema::Bytes => ValueType::Bytes,
+        TypeSchema::Array(_) | TypeSchema::ArrayTuple(_) | TypeSchema::ArrayTupleRest { .. } => {
+            ValueType::Array
+        }
+        TypeSchema::Named(_, _) | TypeSchema::Map(_) | TypeSchema::Object(_) => ValueType::Map,
+        TypeSchema::Optional(inner) => coarse_host_type(inner),
+        TypeSchema::Callable { .. } => ValueType::Callable,
+    }
+}
+
+fn standard_import(name: &str) -> HostImport {
+    let catalog = standard_host_catalog();
+    let schema = vm::catalog_import_schemas(&catalog, name)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("missing standard schema for {name}"));
+    HostImport {
+        name: name.to_string(),
+        arity: schema.params.len() as u8,
+        return_type: coarse_host_type(&schema.return_type),
+        schema: Some(schema),
+    }
+}
+
+fn bind_exact_imports(registry: &HostFunctionRegistry, imports: Vec<HostImport>) {
+    let mut program = Program::new(Vec::new(), vec![OpCode::Ret as u8]);
+    program.imports = imports;
+    let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("standard exact imports should bind");
+}
+
+fn register_override(registry: &mut HostFunctionRegistry, import: &HostImport) -> u16 {
+    registry
+        .register_exact_static(
+            import.name.clone(),
+            import.arity,
+            import.schema.clone().expect("exact standard import"),
+            |_vm, _args| Ok(CallOutcome::Return(CallReturn::one(Value::Null))),
+        )
+        .expect("single exact override should register")
 }
 
 /// A program exercising IO + HTTP + SQLite surfaces so all three standard
@@ -289,4 +347,184 @@ fn pre_registered_surface_needs_no_auto_stage() {
         registry.standard_staging_snapshot().is_none(),
         "no staging happens when every required surface is already present"
     );
+}
+
+#[test]
+fn a_single_exact_override_does_not_claim_complete_standard_surface() {
+    for (override_name, missing_name) in [
+        ("io::exists", "io::open"),
+        ("http::client::request", "http::client::sse"),
+        ("sqlite::open", "sqlite::query"),
+    ] {
+        let override_import = standard_import(override_name);
+        let missing_import = standard_import(missing_name);
+        let mut registry = HostFunctionRegistry::new();
+        let override_slot = register_override(&mut registry, &override_import);
+
+        bind_exact_imports(&registry, vec![missing_import.clone()]);
+
+        let snapshot = registry
+            .standard_staging_snapshot()
+            .unwrap_or_else(|| panic!("{missing_name} should stage a missing exact entry"));
+        assert_eq!(
+            snapshot
+                .resolve_import(&override_import)
+                .expect("valid exact override must remain present"),
+            override_slot,
+            "staging {missing_name} replaced the valid {override_name} override"
+        );
+        snapshot
+            .resolve_import(&missing_import)
+            .unwrap_or_else(|error| panic!("{missing_name} was not staged: {error}"));
+    }
+}
+
+#[test]
+fn mixed_overrides_and_standard_entries_expand_in_every_bind_order() {
+    let pairs = [
+        ("io::exists", "io::open"),
+        ("http::client::request", "http::client::sse"),
+        ("sqlite::open", "sqlite::query"),
+    ];
+    for order in [[0, 1, 2], [2, 0, 1], [1, 2, 0]] {
+        let mut registry = HostFunctionRegistry::new();
+        let overrides = pairs
+            .iter()
+            .map(|(name, _)| {
+                let import = standard_import(name);
+                let slot = register_override(&mut registry, &import);
+                (import, slot)
+            })
+            .collect::<Vec<_>>();
+
+        for index in order {
+            bind_exact_imports(&registry, vec![standard_import(pairs[index].1)]);
+        }
+
+        let snapshot = registry
+            .standard_staging_snapshot()
+            .expect("mixed registry should publish an expanded snapshot");
+        for ((override_import, override_slot), (_, standard_name)) in overrides.iter().zip(pairs) {
+            assert_eq!(
+                snapshot.resolve_import(override_import).unwrap(),
+                *override_slot,
+                "exact override was replaced during order-dependent staging"
+            );
+            snapshot
+                .resolve_import(&standard_import(standard_name))
+                .unwrap_or_else(|error| panic!("{standard_name} missing after expansion: {error}"));
+        }
+    }
+}
+
+#[test]
+fn ordinary_clone_mutations_detach_generation_snapshot_and_capability_state() {
+    let original = HostFunctionRegistry::new();
+    bind_exact_imports(&original, vec![standard_import("io::exists")]);
+    assert_eq!(original.standard_staging_registrations(), 1);
+    let original_generation = original.registry_generation();
+    let original_snapshot = original
+        .standard_staging_snapshot()
+        .expect("original should own its staged snapshot");
+
+    let mut divergent = original.clone();
+    divergent.set_capability_profile(
+        CapabilityProfile::builder()
+            .allow_host_import("io::exists")
+            .build(),
+    );
+    divergent.set_standard_composition(standard_composition());
+
+    assert_eq!(
+        original.registry_generation(),
+        original_generation,
+        "mutating a clone must not advance the source registry generation"
+    );
+    assert!(
+        original.standard_staging_snapshot().is_some(),
+        "mutating a clone must not clear the source registry snapshot"
+    );
+    assert_eq!(
+        original.standard_staging_registrations(),
+        1,
+        "clone staging counters must not alias"
+    );
+    let divergent_generation = divergent.registry_generation();
+    divergent.register_static("clone::custom", 0, |_vm, _args| {
+        Ok(CallOutcome::Return(CallReturn::none()))
+    });
+    assert!(divergent.registry_generation() > divergent_generation);
+    assert_eq!(
+        original.registry_generation(),
+        original_generation,
+        "custom registration on a clone must not invalidate the source"
+    );
+
+    bind_exact_imports(&divergent, vec![standard_import("io::exists")]);
+    assert_eq!(
+        original.standard_staging_registrations(),
+        1,
+        "binding the divergent clone must not change source publication state"
+    );
+    assert_eq!(
+        original_snapshot
+            .resolve_import(&standard_import("io::exists"))
+            .unwrap(),
+        original
+            .standard_staging_snapshot()
+            .unwrap()
+            .resolve_import(&standard_import("io::exists"))
+            .unwrap(),
+        "the original snapshot must remain the same registry lineage"
+    );
+
+    bind_exact_imports(&original, vec![standard_import("http::client::request")]);
+    assert_eq!(
+        original.standard_staging_registrations(),
+        2,
+        "the original must expand from its own capability and composition state"
+    );
+}
+
+#[test]
+fn concurrent_snapshot_publication_serializes_complete_exact_coverage() {
+    let registry = Arc::new(HostFunctionRegistry::new());
+    let barrier = Arc::new(Barrier::new(3));
+    let mut joins = Vec::new();
+    for name in ["io::open", "http::client::request"] {
+        let registry = Arc::clone(&registry);
+        let barrier = Arc::clone(&barrier);
+        joins.push(std::thread::spawn(move || {
+            barrier.wait();
+            bind_exact_imports(&registry, vec![standard_import(name)]);
+        }));
+    }
+    barrier.wait();
+    for join in joins {
+        join.join().expect("concurrent binder must not panic");
+    }
+
+    assert_eq!(
+        registry.standard_staging_registrations(),
+        2,
+        "each concurrently requested exact entry should publish once"
+    );
+    let imports = vec![
+        standard_import("io::open"),
+        standard_import("http::client::request"),
+    ];
+    bind_exact_imports(&registry, imports.clone());
+    assert_eq!(
+        registry.standard_staging_registrations(),
+        2,
+        "the atomically published snapshot must retain both concurrent expansions"
+    );
+    let snapshot = registry
+        .standard_staging_snapshot()
+        .expect("concurrent publication should leave one snapshot");
+    for import in imports {
+        snapshot
+            .resolve_import(&import)
+            .unwrap_or_else(|error| panic!("concurrent import was lost: {error}"));
+    }
 }

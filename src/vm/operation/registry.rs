@@ -327,6 +327,39 @@ impl OperationRegistry {
         }
     }
 
+    pub(crate) fn with_driver_mut<T, R>(
+        &mut self,
+        id: OperationId,
+        apply: impl FnOnce(&mut T) -> R,
+    ) -> OperationResult<R>
+    where
+        T: HostOperation,
+    {
+        let slot = self.location(id)?;
+        let operation = self.slots[slot]
+            .operation
+            .as_mut()
+            .expect("validated operation slot is occupied");
+        if operation.status.is_terminal() {
+            return Err(OperationError::new(
+                OperationErrorCode::OperationNotPending,
+                "operation::with-driver-mut",
+                "operation driver is already terminal",
+            )
+            .with_value(id.raw()));
+        }
+        let any: &mut dyn std::any::Any = operation.driver.as_mut();
+        let driver = any.downcast_mut::<T>().ok_or_else(|| {
+            OperationError::new(
+                OperationErrorCode::OperationDriverFailed,
+                "operation::with-driver-mut",
+                "operation driver type mismatch",
+            )
+            .with_value(id.raw())
+        })?;
+        Ok(apply(driver))
+    }
+
     /// Cancels one operation, forwarding the reason to its driver.
     ///
     /// The id is validated before any mutation, and the driver's

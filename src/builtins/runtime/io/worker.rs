@@ -73,6 +73,18 @@ impl IoWorkerResource {
             name: name.into(),
         }
     }
+
+    pub(crate) fn stop_and_join(&mut self, cancel: bool) -> Result<(), String> {
+        if cancel {
+            self.state.cancelled.store(true, Ordering::SeqCst);
+        }
+        if let Some(handle) = self.handle.take() {
+            handle
+                .join()
+                .map_err(|_| format!("worker thread '{}' panicked", self.name))?;
+        }
+        Ok(())
+    }
 }
 
 impl HostResource for IoWorkerResource {
@@ -108,27 +120,10 @@ impl HostResource for IoWorkerResource {
 
 impl Drop for IoWorkerResource {
     fn drop(&mut self) {
-        self.state.cancelled.store(true, Ordering::SeqCst);
-        // Invariant: the thread must already be finished by the time Drop
-        // runs. The close lifecycle (begin_close/poll_close) or the
-        // ThreadedOperation completion path drives the worker to completion
-        // before Drop.
-        if let Some(handle) = self.handle.take() {
-            debug_assert!(
-                handle.is_finished(),
-                "IoWorkerResource dropped while thread '{}' is still running — \
-                 the close lifecycle must retire the worker before Drop",
-                self.name
-            );
-            if handle.is_finished() {
-                let _ = handle.join();
-            }
-            // If the thread is not finished at this point, something went
-            // wrong in the lifecycle — the handle is dropped and the thread
-            // is detached. This is a last-resort fallback only; the
-            // cancellation flag was set above so the thread exits promptly
-            // and retains no OS handles. In debug builds, the assertion
-            // above will catch this.
-        }
+        // The operation is the sole owner. Any terminal path that did not
+        // explicitly join (including start/materialization rollback) cancels
+        // and joins here, so no detached worker or hidden scope resource can
+        // survive the operation slot.
+        let _ = self.stop_and_join(true);
     }
 }
