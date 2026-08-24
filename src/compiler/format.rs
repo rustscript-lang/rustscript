@@ -294,4 +294,105 @@ mod tests {
             "let mut next_node: LruNode<K, V> = (&next_nodes)[next_head];\n"
         );
     }
+
+    fn assert_format_error_with_span(
+        input: &str,
+        expected_message_contains: &str,
+        expected_line: usize,
+    ) {
+        let error = match format_source_with_flavor(input, SourceFlavor::RustScript) {
+            Ok(formatted) => panic!(
+                "formatting should fail for malformed delimiter input; got output: {formatted:?}"
+            ),
+            Err(error) => error,
+        };
+        let parse_error = match error {
+            crate::compiler::FormatError::Parse(error) => error,
+            crate::compiler::FormatError::UnsupportedFlavor(flavor) => {
+                panic!("unexpected unsupported flavor error for RustScript: {flavor:?}")
+            }
+        };
+        assert!(
+            parse_error.message.contains(expected_message_contains),
+            "error message {:?} should contain {:?}",
+            parse_error.message,
+            expected_message_contains
+        );
+        assert_eq!(
+            parse_error.line, expected_line,
+            "error line should point at the malformed delimiter"
+        );
+        let span = parse_error
+            .span
+            .expect("formatter delimiter errors should carry a source span");
+        assert!(span.lo < span.hi, "span should be non-empty, got {span:?}");
+        assert!(
+            span.hi <= input.len(),
+            "span should be within the source, got {span:?} for input of length {}",
+            input.len()
+        );
+        assert_eq!(
+            &input[span.lo..span.hi],
+            expected_message_contains,
+            "span should cover the offending delimiter token"
+        );
+    }
+
+    #[test]
+    fn rejects_unmatched_close_paren_with_error_span() {
+        assert_format_error_with_span("let value = 1);\nlet other = 3;\n", ")", 1);
+    }
+
+    #[test]
+    fn rejects_unmatched_close_bracket_with_error_span() {
+        assert_format_error_with_span("let values = 1];\nlet other = 3;\n", "]", 1);
+    }
+
+    #[test]
+    fn rejects_unmatched_close_brace_with_error_span() {
+        assert_format_error_with_span("let value = 1;\n}\n", "}", 2);
+    }
+
+    #[test]
+    fn rejects_mismatched_close_delimiter_with_error_span() {
+        assert_format_error_with_span("let value = (1 + 2];\n", "]", 1);
+    }
+
+    #[test]
+    fn rejects_mismatched_close_brace_after_paren_with_error_span() {
+        assert_format_error_with_span("let value = (1 + 2};\n", "}", 1);
+    }
+
+    #[test]
+    fn rejects_mismatched_close_paren_after_bracket_with_error_span() {
+        assert_format_error_with_span("let values = [1, 2);\n", ")", 1);
+    }
+
+    #[test]
+    fn rejects_extra_close_brace_after_block_with_error_span() {
+        assert_format_error_with_span("fn main() {\n    let value = 1;\n}\n}\n", "}", 4);
+    }
+
+    #[test]
+    fn reports_first_malformed_delimiter_not_panicking_on_later_ones() {
+        let error =
+            match format_source_with_flavor("let a = (1;\nlet b = ]);\n", SourceFlavor::RustScript)
+            {
+                Ok(formatted) => panic!("formatting should fail; got output: {formatted:?}"),
+                Err(error) => error,
+            };
+        let parse_error = match error {
+            crate::compiler::FormatError::Parse(error) => error,
+            crate::compiler::FormatError::UnsupportedFlavor(flavor) => {
+                panic!("unexpected unsupported flavor error: {flavor:?}")
+            }
+        };
+        assert_eq!(parse_error.line, 2);
+        let span = parse_error.span.expect("span should be present");
+        assert_eq!(span_source(span, "let a = (1;\nlet b = ]);\n"), "]");
+    }
+
+    fn span_source(span: crate::compiler::source_map::Span, input: &str) -> &str {
+        &input[span.lo..span.hi]
+    }
 }

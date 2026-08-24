@@ -285,19 +285,19 @@ impl<'a> SourceFormatter<'a> {
                 self.emit_open_paren();
             }
             TokenKind::RParen => {
-                self.emit_close_delimiter(ContextKind::Paren { for_head: false }, ")");
+                self.emit_close_delimiter(ContextKind::Paren { for_head: false }, ")")?;
             }
             TokenKind::LBracket => {
                 self.emit_open_bracket();
             }
             TokenKind::RBracket => {
-                self.emit_close_delimiter(ContextKind::Bracket, "]");
+                self.emit_close_delimiter(ContextKind::Bracket, "]")?;
             }
             TokenKind::LBrace => {
                 self.emit_open_brace();
             }
             TokenKind::RBrace => {
-                self.emit_close_brace();
+                self.emit_close_brace()?;
             }
             TokenKind::Comma => {
                 self.clear_pending_space();
@@ -718,10 +718,25 @@ impl<'a> SourceFormatter<'a> {
         }
     }
 
-    fn emit_close_brace(&mut self) {
+    fn emit_close_brace(&mut self) -> Result<(), ParseError> {
         let next_kind = self.peek_kind_at(self.index + 1).cloned();
-        let context = self.pop_context_of_kind(ContextKind::Brace(BraceKind::Collection));
-        let context = context.expect("brace close should have a matching context");
+        let context = match self.pop_context_of_kind(ContextKind::Brace(BraceKind::Collection)) {
+            Ok(Some(context)) => context,
+            Ok(None) => {
+                let token = &self.tokens[self.index];
+                return Err(self.delimiter_error(token, "unmatched closing delimiter '}'"));
+            }
+            Err(actual) => {
+                let token = &self.tokens[self.index];
+                return Err(self.delimiter_error(
+                    token,
+                    format!(
+                        "mismatched closing delimiter '}}' closes a {}",
+                        self.describe_kind(actual)
+                    ),
+                ));
+            }
+        };
         self.prepare_close(&context);
         self.write_raw("}");
         self.prev_kind = Some(PrevKind::RBrace);
@@ -737,11 +752,33 @@ impl<'a> SourceFormatter<'a> {
         } else {
             self.at_stmt_start = false;
         }
+        Ok(())
     }
 
-    fn emit_close_delimiter(&mut self, fallback_kind: ContextKind, text: &str) {
-        let context = self.pop_context_of_kind(fallback_kind);
-        let context = context.expect("close delimiter should have a matching context");
+    fn emit_close_delimiter(
+        &mut self,
+        fallback_kind: ContextKind,
+        text: &str,
+    ) -> Result<(), ParseError> {
+        let context = match self.pop_context_of_kind(fallback_kind) {
+            Ok(Some(context)) => context,
+            Ok(None) => {
+                let token = &self.tokens[self.index];
+                return Err(
+                    self.delimiter_error(token, format!("unmatched closing delimiter '{text}'"))
+                );
+            }
+            Err(actual) => {
+                let token = &self.tokens[self.index];
+                return Err(self.delimiter_error(
+                    token,
+                    format!(
+                        "mismatched closing delimiter '{text}' closes a {}",
+                        self.describe_kind(actual)
+                    ),
+                ));
+            }
+        };
         self.prepare_close(&context);
         self.write_raw(text);
         self.prev_kind = Some(match text {
@@ -751,6 +788,24 @@ impl<'a> SourceFormatter<'a> {
         });
         self.pending_code_break = false;
         self.at_stmt_start = false;
+        Ok(())
+    }
+
+    fn delimiter_error(&self, token: &Token, message: impl Into<String>) -> ParseError {
+        ParseError {
+            line: token.line,
+            message: message.into(),
+            span: Some(token.span),
+            code: None,
+        }
+    }
+
+    fn describe_kind(&self, kind: ContextKind) -> &'static str {
+        match kind {
+            ContextKind::Brace(_) => "brace '{'",
+            ContextKind::Bracket => "bracket '['",
+            ContextKind::Paren { .. } => "paren '('",
+        }
     }
 
     fn prepare_close(&mut self, context: &Context) {
@@ -858,13 +913,26 @@ impl<'a> SourceFormatter<'a> {
         )
     }
 
-    fn pop_context_of_kind(&mut self, fallback_kind: ContextKind) -> Option<Context> {
-        let context = self.contexts.pop()?;
-        match (context.kind, fallback_kind) {
+    /// Result of attempting to pop the context that a closing delimiter can close.
+    /// `Ok(None)` means the context stack is empty (unmatched close). `Err(actual)`
+    /// means the innermost context is a different delimiter kind (mismatched close).
+    fn pop_context_of_kind(
+        &mut self,
+        fallback_kind: ContextKind,
+    ) -> Result<Option<Context>, ContextKind> {
+        let Some(context) = self.contexts.pop() else {
+            return Ok(None);
+        };
+        let matched = matches!(
+            (context.kind, fallback_kind),
             (ContextKind::Brace(_), ContextKind::Brace(_))
-            | (ContextKind::Bracket, ContextKind::Bracket)
-            | (ContextKind::Paren { .. }, ContextKind::Paren { .. }) => Some(context),
-            _ => Some(context),
+                | (ContextKind::Bracket, ContextKind::Bracket)
+                | (ContextKind::Paren { .. }, ContextKind::Paren { .. })
+        );
+        if matched {
+            Ok(Some(context))
+        } else {
+            Err(context.kind)
         }
     }
 
