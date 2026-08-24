@@ -116,10 +116,24 @@ pub enum ResourceOwnership {
     /// scope close.
     GuestOwned,
     /// The concrete resource was atomically moved out by
-    /// [`ResourceTable::take_owned`]. The raw copy is stale: the slot is
-    /// retired (never reused, never closed again) and the raw handle fails
-    /// every validated use from then on.
+    /// [`ResourceTable::take_owned`] and control of the value handed to the
+    /// caller. The current generation's `ownership` cell is reset to
+    /// [`HostOwned`](ResourceOwnership::HostOwned) because the physical slot is
+    /// returned to the vacant pool for reuse; the *consumed* generation remains
+    /// resolvable as `Taken` only through the slot's bounded
+    /// [`last_taken_generation`](crate::vm::resource::table::ResourceSlot)
+    /// tombstone until a later take supersedes it.
     Taken,
+}
+
+/// Classification of a handle that names a slot in a resource table.
+#[derive(Clone, Copy, Debug)]
+enum Resolved {
+    /// The handle names the slot's current live resource.
+    Live(usize),
+    /// The handle names the most recent consumed (Taken) generation, kept
+    /// alive only by the slot's bounded `last_taken_generation` tombstone.
+    Taken(usize),
 }
 
 /// Resource-parameter state used by an exact host call.
@@ -487,8 +501,20 @@ struct ResourceSlot {
     /// Live child handles. A child is removed only once its close is fully
     /// finished and the slot is vacant again.
     children: RefCell<BTreeSet<ResourceHandle>>,
-    /// Ownership of the raw resource copy.
+    /// Ownership of the raw resource copy of the **current** generation.
     ownership: Cell<ResourceOwnership>,
+    /// Bounded compatibility marker: the most recent generation consumed by
+    /// [`ResourceTable::take_owned`]. A handle naming exactly this generation
+    /// reports the resource as [`ResourceOwnership::Taken`] (`ResourceAlreadyTaken`
+    /// on re-take) even after the physical slot has been returned to the vacant
+    /// pool and reallocated to a newer generation. Only one generation is
+    /// retained per slot, so the tombstone is O(1) and bounded regardless of
+    /// how many takes the slot undergoes; a later successful take overwrites it
+    /// (superseding), which demotes the older consumed handle to a normal stale
+    /// handle. `None` means no generation has been consumed here yet. Normal
+    /// close/reclaim never sets this marker, so a normally-closed handle is
+    /// never falsely reported as `Taken`.
+    last_taken_generation: Cell<Option<u32>>,
     /// The resource state is independently guarded so distinct frame requests
     /// may hold disjoint borrows without an aliased `&mut ResourceTable`.
     state: RefCell<SlotState>,
@@ -529,7 +555,9 @@ pub struct ResourceTable {
     arena_id: u64,
     max_entries: usize,
     slots: Vec<ResourceSlot>,
-    vacant_slots: Vec<usize>,
+    /// Indices of reusable physical slots. Interior mutability lets the
+    /// `&self`-based take path return a consumed slot to the pool immediately.
+    vacant_slots: RefCell<Vec<usize>>,
     active_entries: Cell<usize>,
     /// In-flight `poll_close_all` sweep, if one is active.
     close_all: Option<CloseAllState>,
@@ -579,7 +607,7 @@ impl ResourceTable {
             arena_id,
             max_entries,
             slots: Vec::new(),
-            vacant_slots: Vec::new(),
+            vacant_slots: RefCell::new(Vec::new()),
             active_entries: Cell::new(0),
             close_all: None,
         })
@@ -602,6 +630,15 @@ impl ResourceTable {
     /// Whether the table currently holds no live resources.
     pub fn is_empty(&self) -> bool {
         self.active_entries.get() == 0
+    }
+
+    /// Number of physical slot entries ever carved out of the arena.
+    ///
+    /// Test-only: proves that take/reuse cycles return slots to the vacant
+    /// pool instead of growing physical identity usage without bound.
+    #[cfg(test)]
+    fn slots_len(&self) -> usize {
+        self.slots.len()
     }
 
     /// Inserts a root resource and returns its typed token.
@@ -823,7 +860,10 @@ impl ResourceTable {
             ));
         }
         validate_request_type_key(request)?;
-        let slot_index = self.resolve_index(request.handle)?;
+        let slot_index = match self.resolve_handle(request.handle)? {
+            Resolved::Live(slot_index) => slot_index,
+            Resolved::Taken(_) => return Err(already_taken_error(request.handle)),
+        };
         if self.slots[slot_index].type_id != request.type_id {
             return Err(type_mismatch(request.handle, request.type_id));
         }
@@ -902,7 +942,10 @@ impl ResourceTable {
                 format!("resource mode {mode:?} is not a resource operation",),
             ));
         }
-        let slot_index = self.resolve_index(handle)?;
+        let slot_index = match self.resolve_handle(handle)? {
+            Resolved::Live(slot_index) => slot_index,
+            Resolved::Taken(_) => return Err(already_taken_error(handle)),
+        };
         self.check_access_key(slot_index, handle, Some(expected_key))?;
         if self.slots[slot_index].ownership.get() == ResourceOwnership::Taken {
             return Err(already_taken_error(handle));
@@ -945,7 +988,12 @@ impl ResourceTable {
         reason: ResourceCloseReason,
     ) -> ResourceResult<CloseProgress> {
         let handle = resource.handle();
-        let slot_index = self.resolve_index(handle)?;
+        let slot_index = match self.resolve_handle(handle)? {
+            Resolved::Live(slot_index) => slot_index,
+            // A consumed handle is already closed from the table's point of
+            // view: it never gets a close fired and reports AlreadyClosed.
+            Resolved::Taken(_) => return Err(already_closed_error(handle)),
+        };
         self.check_generation(slot_index, handle)?;
         self.check_type::<T>(slot_index, handle)?;
         self.close_open_slot(slot_index, handle, reason)
@@ -955,14 +1003,22 @@ impl ResourceTable {
 
     /// The current [`ResourceOwnership`] of the slot `handle` names, or
     /// `None` when the handle is foreign or stale (names no live slot here).
+    /// A handle that names the most recent consumed (Taken) generation
+    /// reports [`ResourceOwnership::Taken`].
     pub fn ownership(&self, handle: ResourceHandle) -> Option<ResourceOwnership> {
-        let slot_index = self.resolve_index(handle).ok()?;
+        let resolved = self.resolve_handle(handle).ok()?;
+        let slot_index = match resolved {
+            Resolved::Live(slot_index) => slot_index,
+            Resolved::Taken(_) => return Some(ResourceOwnership::Taken),
+        };
         Some(self.slots[slot_index].ownership.get())
     }
 
     /// The declaration key stored with a live or taken slot.
     pub fn resource_type_key(&self, handle: ResourceHandle) -> Option<ResourceTypeKey> {
-        let slot_index = self.resolve_index(handle).ok()?;
+        let slot_index = match self.resolve_handle(handle).ok()? {
+            Resolved::Live(slot_index) | Resolved::Taken(slot_index) => slot_index,
+        };
         self.slots[slot_index].type_key.clone()
     }
 
@@ -971,7 +1027,10 @@ impl ResourceTable {
     /// current generation and an open resource; type-key validation remains a
     /// separate exact-access concern.
     pub fn validate_operation_association(&self, handle: ResourceHandle) -> ResourceResult<()> {
-        let slot_index = self.resolve_index(handle)?;
+        let slot_index = match self.resolve_handle(handle)? {
+            Resolved::Live(slot_index) => slot_index,
+            Resolved::Taken(_) => return Err(already_closed_error(handle)),
+        };
         let state = self.slots[slot_index]
             .state
             .try_borrow()
@@ -991,7 +1050,10 @@ impl ResourceTable {
         handle: ResourceHandle,
         reason: ResourceCloseReason,
     ) -> ResourceResult<CloseProgress> {
-        let slot_index = self.resolve_index(handle)?;
+        let slot_index = match self.resolve_handle(handle)? {
+            Resolved::Live(slot_index) => slot_index,
+            Resolved::Taken(_) => return Err(already_closed_error(handle)),
+        };
         self.close_open_slot(slot_index, handle, reason)
     }
 
@@ -1010,7 +1072,10 @@ impl ResourceTable {
     /// - already guest-owned (duplicate mark) →
     ///   [`ResourceErrorCode::ResourceNotHostOwned`]
     pub fn mark_guest_owned(&mut self, handle: ResourceHandle) -> ResourceResult<()> {
-        let slot_index = self.resolve_index(handle)?;
+        let slot_index = match self.resolve_handle(handle)? {
+            Resolved::Live(slot_index) => slot_index,
+            Resolved::Taken(_) => return Err(already_taken_error(handle)),
+        };
         let slot = &self.slots[slot_index];
         if slot.ownership.get() == ResourceOwnership::Taken {
             return Err(already_taken_error(handle));
@@ -1043,7 +1108,10 @@ impl ResourceTable {
         handle: ResourceHandle,
         expected_key: &ResourceTypeKey,
     ) -> ResourceResult<()> {
-        let slot_index = self.resolve_index(handle)?;
+        let slot_index = match self.resolve_handle(handle)? {
+            Resolved::Live(slot_index) => slot_index,
+            Resolved::Taken(_) => return Err(already_taken_error(handle)),
+        };
         self.check_access_key(slot_index, handle, Some(expected_key))?;
         self.mark_guest_owned(handle)
     }
@@ -1097,10 +1165,15 @@ impl ResourceTable {
     ///
     /// On success the concrete `T` is moved out (ownership transfers to the
     /// caller; no `unsafe` is involved — the erased box is reconnected to `T`
-    /// through `Any` after the exact `TypeId` check) and the slot is retired
-    /// as [`ResourceOwnership::Taken`]: the raw handle remains resolvable as
-    /// Taken (a double take reports `ResourceAlreadyTaken`), the slot is never
-    /// reused, and the table never closes the moved-out value.
+    /// through `Any` after the exact `TypeId` check) and the consumed
+    /// generation is recorded as the slot's bounded
+    /// [`last_taken_generation`](ResourceSlot) tombstone: the raw handle
+    /// remains resolvable as [`ResourceOwnership::Taken`] (a double take
+    /// reports `ResourceAlreadyTaken`) while the physical slot is immediately
+    /// returned to the vacant pool with its generation advanced for reuse. A
+    /// later successful take in the same slot supersedes the tombstone, after
+    /// which the older consumed handle degrades to a normal stale handle. The
+    /// table never closes the moved-out value.
     pub fn take_owned<T: HostResource>(&mut self, handle: ResourceHandle) -> ResourceResult<T> {
         let expected = T::resource_type_key();
         self.take_owned_with_key(handle, expected.as_ref())
@@ -1132,7 +1205,11 @@ impl ResourceTable {
         expected_key: Option<&ResourceTypeKey>,
     ) -> ResourceResult<T> {
         validate_declared_type_key::<T>(expected_key, Some(handle))?;
-        let slot_index = self.resolve_index(handle)?;
+        // Taken-aware resolution: a handle that names the most recent consumed
+        // generation reports `ResourceAlreadyTaken` instead of a stale error.
+        let Resolved::Live(slot_index) = self.resolve_handle(handle)? else {
+            return Err(already_taken_error(handle));
+        };
         self.check_type::<T>(slot_index, handle)?;
         self.check_access_key(slot_index, handle, expected_key)?;
         match self.slots[slot_index].ownership.get() {
@@ -1175,13 +1252,20 @@ impl ResourceTable {
                 .map_err(|_| resource_borrow_conflict_error(handle))?;
         }
 
+        // The slot state was validated as `Open` above and cannot transition
+        // between the validation and this extraction (the table is not shared
+        // mutably and no borrow is held across), so both the state and the
+        // downcast are structurally infallible. Keeping them fallible here
+        // would leave a recoverable error path *after* the slot was already
+        // mutated to `Vacant`, i.e. a ghost path that drops the resource
+        // without closing or reclaiming it.
         let state = self.replace_open_state_with_vacant(slot_index, handle)?;
         let SlotState::Open(resource) = state else {
-            return Err(already_closed_error(handle));
+            unreachable!("validated open resource cannot leave the Open state before a take");
         };
         let boxed = (resource as Box<dyn Any>)
             .downcast::<T>()
-            .map_err(|_| type_mismatch(handle, TypeId::of::<T>()))?;
+            .expect("validated resource TypeId must match downcast type");
         if let Some(parent_index) = parent_index {
             self.slots[parent_index]
                 .children
@@ -1193,9 +1277,34 @@ impl ResourceTable {
             .parent
             .try_borrow_mut()
             .map_err(|_| resource_borrow_conflict_error(handle))? = None;
-        self.slots[slot_index]
-            .ownership
-            .set(ResourceOwnership::Taken);
+        // Record the consumed generation as the bounded compatibility
+        // tombstone, then advance the slot generation so the consumed handle
+        // is in the past and the physical slot can be reused with a fresh
+        // identity. The marker is only ever overwritten by a later successful
+        // take — never by allocation or normal close.
+        let consumed = self.slots[slot_index].generation.get();
+        let next = u64::from(consumed) + 1;
+        if next <= MAX_HANDLE_GENERATION {
+            self.slots[slot_index]
+                .last_taken_generation
+                .set(Some(consumed));
+            self.slots[slot_index].generation.set(next as u32);
+            self.vacant_slots.borrow_mut().push(slot_index);
+            self.slots[slot_index]
+                .ownership
+                .set(ResourceOwnership::HostOwned);
+        } else {
+            // Generation exhaustion: keep the existing rule that a slot whose
+            // generation can no longer advance is permanently retired (never
+            // returned to the vacant pool). The ownership cell stays `Taken` so
+            // the single consumed handle continues to report `Taken`, exactly
+            // matching the pre-bounded behavior; the tombstone alias is never
+            // reachable because the generation cannot advance.
+            self.slots[slot_index].last_taken_generation.set(None);
+            self.slots[slot_index]
+                .ownership
+                .set(ResourceOwnership::Taken);
+        }
         self.active_entries.set(self.active_entries.get() - 1);
         Ok(*boxed)
     }
@@ -1652,7 +1761,7 @@ impl ResourceTable {
             .ownership
             .set(ResourceOwnership::HostOwned);
         if u64::from(self.slots[slot_index].generation.get()) < MAX_HANDLE_GENERATION {
-            self.vacant_slots.push(slot_index);
+            self.vacant_slots.get_mut().push(slot_index);
         }
         self.active_entries.set(self.active_entries.get() - 1);
     }
@@ -1733,7 +1842,7 @@ impl ResourceTable {
         let type_id = TypeId::of::<T>();
         let value: Box<dyn HostResource> = Box::new(value);
 
-        let (slot_index, generation) = if let Some(slot_index) = self.vacant_slots.pop() {
+        let (slot_index, generation) = if let Some(slot_index) = self.vacant_slots.get_mut().pop() {
             let generation = self.slots[slot_index]
                 .generation
                 .get()
@@ -1767,6 +1876,7 @@ impl ResourceTable {
                 parent: RefCell::new(parent),
                 children: RefCell::new(BTreeSet::new()),
                 ownership: Cell::new(ResourceOwnership::HostOwned),
+                last_taken_generation: Cell::new(None),
                 state: RefCell::new(SlotState::Open(value)),
             });
             (slot_index, generation)
@@ -1793,6 +1903,36 @@ impl ResourceTable {
         Ok(slot_index)
     }
 
+    /// Resolves a handle to its slot, distinguishing the current live resource
+    /// from the most-recently-consumed (Taken) generation.
+    ///
+    /// This is the taken-aware resolution: a handle that names the slot's
+    /// current generation is [`Resolved::Live`]; a handle that names exactly
+    /// the slot's bounded `last_taken_generation` tombstone is
+    /// [`Resolved::Taken`] (so an immediately consumed handle keeps reporting
+    /// `Taken` even after the physical slot is reallocated); any other
+    /// generation is a normal stale handle. Callers choose whether `Taken`
+    /// maps to `ResourceAlreadyTaken` or `ResourceAlreadyClosed`.
+    fn resolve_handle(&self, handle: ResourceHandle) -> ResourceResult<Resolved> {
+        if handle.arena_id() != self.arena_id {
+            return Err(wrong_arena_error(handle));
+        }
+        let slot_index = handle.slot_index()?;
+        if slot_index >= self.slots.len() {
+            return Err(stale_handle_error(handle));
+        }
+        let slot = &self.slots[slot_index];
+        let current = u64::from(slot.generation.get());
+        let generation = handle.generation();
+        if generation == current {
+            Ok(Resolved::Live(slot_index))
+        } else if slot.last_taken_generation.get().map(u64::from) == Some(generation) {
+            Ok(Resolved::Taken(slot_index))
+        } else {
+            Err(stale_handle_error(handle))
+        }
+    }
+
     fn check_generation(&self, slot_index: usize, handle: ResourceHandle) -> ResourceResult<()> {
         if u64::from(self.slots[slot_index].generation.get()) != handle.generation() {
             return Err(stale_handle_error(handle));
@@ -1814,7 +1954,12 @@ impl ResourceTable {
     /// Validates that the handle points at a live, open resource of the given
     /// concrete type.
     fn validate_active<T: 'static>(&self, handle: ResourceHandle) -> ResourceResult<usize> {
-        let slot_index = self.resolve_index(handle)?;
+        // A consumed generation is not Open and reports AlreadyClosed (never a
+        // stale error) so a `typed`/`get` on a taken handle is precise.
+        let slot_index = match self.resolve_handle(handle)? {
+            Resolved::Live(slot_index) => slot_index,
+            Resolved::Taken(_) => return Err(already_closed_error(handle)),
+        };
         self.check_type::<T>(slot_index, handle)?;
         let state = self.slots[slot_index]
             .state
@@ -1827,7 +1972,10 @@ impl ResourceTable {
     }
 
     fn validate_open<T: 'static>(&self, handle: ResourceHandle) -> ResourceResult<()> {
-        let slot_index = self.resolve_index(handle)?;
+        let slot_index = match self.resolve_handle(handle)? {
+            Resolved::Live(slot_index) => slot_index,
+            Resolved::Taken(_) => return Err(already_taken_error(handle)),
+        };
         self.check_type::<T>(slot_index, handle)?;
         if self.slots[slot_index].ownership.get() == ResourceOwnership::Taken {
             return Err(already_taken_error(handle));
@@ -2077,6 +2225,7 @@ mod tests {
     const REASON: ResourceCloseReason = ResourceCloseReason::ResourceClosed;
 
     /// A resource that counts synchronous closes.
+    #[derive(Debug)]
     struct UnitRes(Arc<AtomicUsize>);
 
     impl UnitRes {
@@ -2131,6 +2280,178 @@ mod tests {
         assert_eq!(table.len(), 1);
         assert_eq!(closes.load(Ordering::SeqCst), 0);
         table.get(&token).expect("real token unaffected");
+    }
+
+    // ---- bounded TakeOwned tombstones (F50) ---------------------------------
+    //
+    // `take_owned` must not permanently retire physical slots: the consumed
+    // generation is remembered by a bounded per-slot tombstone while the slot
+    // itself returns to the vacant pool for immediate reuse. These tests prove
+    // the reuse (bounded `slots_len()` over many cycles), the preserved
+    // immediate-consumed contract (`Taken` / `ResourceAlreadyTaken`), the
+    // supersede semantics (a later take demotes the older consumed handle to
+    // stale), and that a normal close is never falsely reported as Taken.
+
+    #[test]
+    fn take_owned_cycles_reuse_slots_and_stay_bounded() {
+        let mut table = ResourceTable::with_limit(4).expect("table");
+        let cycles = 2_000;
+
+        for _ in 0..cycles {
+            let token = table.push(UnitRes::new().0).expect("push must succeed");
+            let handle = token.handle();
+            table.mark_guest_owned(handle).expect("mark guest owned");
+            let owned = table
+                .take_owned::<UnitRes>(handle)
+                .expect("every take must succeed");
+            // The immediate consumed handle reports Taken...
+            assert_eq!(
+                table.ownership(handle),
+                Some(ResourceOwnership::Taken),
+                "consumed handle must report Taken in cycle"
+            );
+            // ...and a double take is a structured already-taken rejection,
+            // never a stale error.
+            assert_eq!(
+                table.take_owned::<UnitRes>(handle).unwrap_err().code(),
+                ResourceErrorCode::ResourceAlreadyTaken,
+                "double take must be ResourceAlreadyTaken"
+            );
+            assert_eq!(
+                table.mark_guest_owned(handle).unwrap_err().code(),
+                ResourceErrorCode::ResourceAlreadyTaken,
+                "mark on a consumed handle must be ResourceAlreadyTaken"
+            );
+            drop(owned);
+        }
+
+        // Far more push -> mark -> take cycles than the table capacity ran,
+        // yet the physical slot identity never grew past the capacity.
+        assert!(
+            table.slots_len() <= 4,
+            "physical slot usage must stay bounded by max_entries, got {}",
+            table.slots_len()
+        );
+        // The next push after all the cycles still succeeds.
+        table.push(UnitRes::new().0).expect("next push succeeds");
+        assert_eq!(table.len(), 1, "one live resource remains after final push");
+    }
+
+    #[test]
+    fn take_owned_generation_tombstone_supersedes_and_never_aliases() {
+        let mut table = ResourceTable::with_limit(2).expect("table");
+
+        // First occupant: consumed.
+        let first = table.push(UnitRes::new().0).expect("push first");
+        let first_handle = first.handle();
+        table
+            .mark_guest_owned(first_handle)
+            .expect("mark first guest owned");
+        let first_owned = table
+            .take_owned::<UnitRes>(first_handle)
+            .expect("take first");
+        drop(first_owned);
+        assert_eq!(
+            table.ownership(first_handle),
+            Some(ResourceOwnership::Taken),
+            "first consumed handle reports Taken"
+        );
+
+        // The physical slot is reused for a second occupant, whose handle must
+        // be a fresh identity (generation advanced): no aliasing with the
+        // consumed handle.
+        let second = table.push(UnitRes::new().0).expect("push second succeeds");
+        let second_handle = second.handle();
+        assert_ne!(
+            first_handle.raw(),
+            second_handle.raw(),
+            "reused slot must mint a fresh handle identity"
+        );
+        // The current resource is fully accessible.
+        table.get(&second).expect("current resource is accessible");
+        assert_eq!(
+            table
+                .typed::<UnitRes>(second_handle)
+                .expect("current handle types")
+                .handle(),
+            second_handle
+        );
+        // The preceding consumed handle still maps to Taken across the reuse.
+        assert_eq!(
+            table.ownership(first_handle),
+            Some(ResourceOwnership::Taken),
+            "preceding consumed handle stays Taken after slot reuse"
+        );
+        assert_eq!(
+            table
+                .take_owned::<UnitRes>(first_handle)
+                .unwrap_err()
+                .code(),
+            ResourceErrorCode::ResourceAlreadyTaken
+        );
+
+        // Consume the second occupant: the bounded tombstone is superseded.
+        table
+            .mark_guest_owned(second_handle)
+            .expect("mark second guest owned");
+        let second_owned = table
+            .take_owned::<UnitRes>(second_handle)
+            .expect("take second");
+        drop(second_owned);
+        assert_eq!(
+            table.ownership(second_handle),
+            Some(ResourceOwnership::Taken),
+            "newest consumed handle is Taken"
+        );
+        // The older consumed handle is now outside the bounded window: a
+        // normal stale handle, never aliasing the newest Taken identity.
+        assert_eq!(
+            table.ownership(first_handle),
+            None,
+            "superseded consumed handle must be stale (no ownership)"
+        );
+        assert_eq!(
+            table
+                .take_owned::<UnitRes>(first_handle)
+                .unwrap_err()
+                .code(),
+            ResourceErrorCode::ResourceStale,
+            "superseded consumed handle must be stale on take"
+        );
+    }
+
+    #[test]
+    fn normal_close_is_never_reported_as_taken() {
+        let mut table = ResourceTable::with_limit(2).expect("table");
+        let token = table.push(UnitRes::new().0).expect("push");
+        let handle = token.handle();
+
+        // A normal close reclaims the slot without any tombstone.
+        assert_eq!(
+            table.begin_close(token, REASON).expect("close"),
+            CloseProgress::Ready
+        );
+        assert_eq!(table.ownership(handle), Some(ResourceOwnership::HostOwned));
+        assert_eq!(
+            table.typed::<UnitRes>(handle).unwrap_err().code(),
+            ResourceErrorCode::ResourceAlreadyClosed,
+            "normally closed handle is closed, not taken"
+        );
+        // Reusing the slot advances its generation, so the old closed handle
+        // becomes a normal stale handle — and allocation never invents a Taken
+        // marker, so nothing reports the closed handle as Taken.
+        let reused = table.push(UnitRes::new().0).expect("reuse");
+        table.get(&reused).expect("reused resource accessible");
+        assert_eq!(
+            table.ownership(handle),
+            None,
+            "closed handle must be stale (never Taken) after slot reuse"
+        );
+        assert_eq!(
+            table.take_owned::<UnitRes>(handle).unwrap_err().code(),
+            ResourceErrorCode::ResourceStale,
+            "closed handle must be stale on take after reuse, never Taken"
+        );
     }
 
     #[test]

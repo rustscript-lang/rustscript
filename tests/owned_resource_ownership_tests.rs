@@ -775,9 +775,9 @@ fn take_after_release_in_closing_is_already_closed_and_close_finishes() {
 fn with_limit_capacity_counts_live_entries_not_take_tombstones() {
     let mut table = ResourceTable::with_limit(2).expect("capacity 2");
 
-    // Two push+mark+take rounds retire both slots as take tombstones. Taken
-    // slots are never reused, so their stale handles must keep reporting
-    // ResourceAlreadyTaken no matter what happens later.
+    // Two push+mark+take rounds consume the two slot generations. Because the
+    // physical slot is returned to the vacant pool for reuse, those slots are
+    // re-allocated rather than permanently retired (bounded tombstones).
     let (res1, _begins1, _reasons1, _drops1) = CountingResource::new();
     let token1 = table.push(res1).expect("push 1");
     table.mark_guest_owned(token1.handle()).expect("mark 1");
@@ -793,8 +793,8 @@ fn with_limit_capacity_counts_live_entries_not_take_tombstones() {
         .expect("take 2");
     assert_eq!(table.len(), 0);
 
-    // Capacity counts *live* (open/closing) entries: both taken slots are
-    // retired, so fresh pushes still succeed.
+    // Capacity counts *live* (open/closing) entries: the consumed slots are
+    // returned to the vacant pool, so fresh pushes still succeed.
     let (_res3, _b3, _r3, _d3) = CountingResource::new();
     let _token3 = table.push(_res3).expect("push 3 succeeds after takes");
     let (_res4, _b4, _r4, _d4) = CountingResource::new();
@@ -808,16 +808,8 @@ fn with_limit_capacity_counts_live_entries_not_take_tombstones() {
     assert_eq!(error.code(), ResourceErrorCode::ResourceLimitExceeded);
     assert_eq!(table.len(), 2);
 
-    // The old taken handles never come back to life: even with the capacity
-    // pressure above, they keep reporting ResourceAlreadyTaken (the retired
-    // vs. reused distinction must not change).
-    assert_eq!(
-        table
-            .take_owned::<CountingResource>(token1.handle())
-            .unwrap_err()
-            .code(),
-        ResourceErrorCode::ResourceAlreadyTaken
-    );
+    // The bounded tombstone keeps the *latest* consumed generation reporting
+    // Taken (it was superseded by no later take in its slot):
     assert_eq!(
         table
             .take_owned::<CountingResource>(token2.handle())
@@ -825,14 +817,21 @@ fn with_limit_capacity_counts_live_entries_not_take_tombstones() {
             .code(),
         ResourceErrorCode::ResourceAlreadyTaken
     );
+    // ...while the earlier consumed generation, superseded by token2's take in
+    // the same physical slot, degrades to a normal stale handle. It never
+    // aliases the live occupant and never reports Taken.
     assert_eq!(
-        table.ownership(token1.handle()),
-        Some(ResourceOwnership::Taken)
+        table
+            .take_owned::<CountingResource>(token1.handle())
+            .unwrap_err()
+            .code(),
+        ResourceErrorCode::ResourceStale
     );
     assert_eq!(
         table.ownership(token2.handle()),
         Some(ResourceOwnership::Taken)
     );
+    assert_eq!(table.ownership(token1.handle()), None);
 
     // The two live entries still close and drain normally.
     let closed = table
