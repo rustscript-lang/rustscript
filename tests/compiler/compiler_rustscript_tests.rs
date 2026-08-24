@@ -3513,6 +3513,104 @@ fn rustscript_language_runtime_cases_work() {
 }
 
 #[test]
+fn rustscript_string_ordered_comparison_runtime_cases_work() {
+    let cases = vec![
+        RuntimeCase {
+            name: "string less-than is lexicographic",
+            source: r#"
+                ("abc" < "abd") && ("abd" > "abc");
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Bool(true)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "equal strings are neither less-than nor greater-than",
+            source: r#"
+                let equal = ("abc" < "abc") == false && ("abc" > "abc") == false;
+                equal;
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Bool(true)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "less-than-or-equal / greater-than-or-equal include equality",
+            source: r#"
+                ("abc" <= "abc") && ("abc" >= "abc") && ("abc" <= "abd") && ("abd" >= "abc");
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Bool(true)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "empty string compares before and after non-empty strings",
+            source: r#"
+                ("" < "a") && (!("a" < "")) && ("" <= "") && ("" == "");
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Bool(true)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "ascii prefix ordering matches byte lexicographic order",
+            source: r#"
+                ("ab" < "abc") && (!("abc" < "ab")) && ("abc" > "ab");
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Bool(true)],
+            expected_locals: None,
+        },
+        RuntimeCase {
+            name: "non-ascii utf-8 compares by code-point lexicographic order",
+            source: r#"
+                ("é" > "e") && ("日本" < "英語") && ("中" < "乙") && ("🌍" > "A");
+            "#,
+            flavor: SourceFlavor::RustScript,
+            expected_stack: vec![Value::Bool(true)],
+            expected_locals: None,
+        },
+    ];
+    run_runtime_cases(&cases);
+}
+
+#[test]
+fn rustscript_string_ordered_comparison_rejects_mixed_types() {
+    // A compiler-allowed comparison between a string and a number must not
+    // silently coerce: both the std VM and the no-std VM keep it a typed
+    // runtime error (TypeMismatch), never a lexicographic or numeric answer.
+    let source = r#"
+        let mixed = "abc" < 1;
+        mixed;
+    "#;
+    let compiled = compile_source_with_flavor(source, SourceFlavor::RustScript)
+        .expect("compile should succeed");
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+    let err = vm
+        .run()
+        .expect_err("mixed string/number ordering must remain a typed error");
+    assert!(
+        matches!(err, vm::VmError::TypeMismatch(_)),
+        "expected TypeMismatch, got {err:?}"
+    );
+
+    let source_gt = r#"
+        let mixed = 1 >= "abc";
+        mixed;
+    "#;
+    let compiled_gt = compile_source_with_flavor(source_gt, SourceFlavor::RustScript)
+        .expect("compile should succeed");
+    let mut vm_gt = Vm::try_new(compiled_gt.program).expect("test VM construction must not fail");
+    let err_gt = vm_gt
+        .run()
+        .expect_err("mixed number/string ordering must remain a typed error");
+    assert!(
+        matches!(err_gt, vm::VmError::TypeMismatch(_)),
+        "expected TypeMismatch, got {err_gt:?}"
+    );
+}
+
+#[test]
 fn rustscript_language_parse_rejection_cases_work() {
     let cases = vec![
         ParseErrorCase {

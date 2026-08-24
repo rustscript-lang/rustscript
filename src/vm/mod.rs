@@ -2780,6 +2780,24 @@ impl Vm {
         Ok(())
     }
 
+    pub(super) fn string_compare_op(
+        &mut self,
+        op: impl FnOnce(&str, &str) -> bool,
+    ) -> VmResult<()> {
+        let rhs = match self.pop_value()? {
+            Value::String(value) => value,
+            _ => return Err(VmError::TypeMismatch("string")),
+        };
+        let lhs = match self.pop_value()? {
+            Value::String(value) => value,
+            _ => return Err(VmError::TypeMismatch("string")),
+        };
+        self.instance
+            .stack
+            .push(Value::Bool(op(lhs.as_str(), rhs.as_str())));
+        Ok(())
+    }
+
     pub(super) fn null_eq_op(&mut self) -> VmResult<()> {
         let rhs = self.pop_value()?;
         let lhs = self.pop_value()?;
@@ -3669,6 +3687,10 @@ impl Vm {
                         self.record_operand_hint_hit();
                         self.float_compare_op(|lhs, rhs| lhs < rhs)?
                     }
+                    STRING_STRING_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
+                        self.string_compare_op(|lhs, rhs| lhs < rhs)?
+                    }
                     _ => {
                         self.record_operand_hint_miss();
                         self.compare_numeric_op(|lhs, rhs| lhs < rhs, |lhs, rhs| lhs < rhs)?
@@ -3685,6 +3707,10 @@ impl Vm {
                     FLOAT_FLOAT_OPERAND_TYPE_HINT => {
                         self.record_operand_hint_hit();
                         self.float_compare_op(|lhs, rhs| lhs > rhs)?
+                    }
+                    STRING_STRING_OPERAND_TYPE_HINT => {
+                        self.record_operand_hint_hit();
+                        self.string_compare_op(|lhs, rhs| lhs > rhs)?
                     }
                     _ => {
                         self.record_operand_hint_miss();

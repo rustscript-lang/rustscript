@@ -475,8 +475,16 @@ impl<C> Vm<C> {
                     let lhs = self.pop()?;
                     self.stack.push(Value::Bool(lhs == rhs));
                 }
-                OpCode::Clt => self.numeric_compare(|lhs, rhs| lhs < rhs, |lhs, rhs| lhs < rhs)?,
-                OpCode::Cgt => self.numeric_compare(|lhs, rhs| lhs > rhs, |lhs, rhs| lhs > rhs)?,
+                OpCode::Clt => self.compare(
+                    |lhs, rhs| lhs < rhs,
+                    |lhs, rhs| lhs < rhs,
+                    |lhs, rhs| lhs < rhs,
+                )?,
+                OpCode::Cgt => self.compare(
+                    |lhs, rhs| lhs > rhs,
+                    |lhs, rhs| lhs > rhs,
+                    |lhs, rhs| lhs > rhs,
+                )?,
                 OpCode::Br => {
                     let target = self.read_u32()?;
                     self.jump(target)?;
@@ -968,19 +976,31 @@ impl<C> Vm<C> {
         Ok(())
     }
 
-    fn numeric_compare(
+    fn compare(
         &mut self,
         int_op: impl FnOnce(i64, i64) -> bool,
         float_op: impl FnOnce(f64, f64) -> bool,
+        string_op: impl FnOnce(&str, &str) -> bool,
     ) -> VmResult<()> {
-        let rhs = self.pop_numeric()?;
-        let lhs = self.pop_numeric()?;
-        let result = match (lhs, rhs) {
-            (NumericValue::Int(lhs), NumericValue::Int(rhs)) => int_op(lhs, rhs),
-            (lhs, rhs) => float_op(as_float(lhs), as_float(rhs)),
-        };
-        self.stack.push(Value::Bool(result));
-        Ok(())
+        let rhs = self.pop()?;
+        let lhs = self.pop()?;
+        match (lhs, rhs) {
+            (Value::String(lhs), Value::String(rhs)) => {
+                self.stack
+                    .push(Value::Bool(string_op(lhs.as_str(), rhs.as_str())));
+                Ok(())
+            }
+            (lhs, rhs) => {
+                let rhs = numeric_value(rhs)?;
+                let lhs = numeric_value(lhs)?;
+                let result = match (lhs, rhs) {
+                    (NumericValue::Int(lhs), NumericValue::Int(rhs)) => int_op(lhs, rhs),
+                    (lhs, rhs) => float_op(as_float(lhs), as_float(rhs)),
+                };
+                self.stack.push(Value::Bool(result));
+                Ok(())
+            }
+        }
     }
 
     fn pop(&mut self) -> VmResult<Value> {
@@ -1077,6 +1097,14 @@ impl<C> Vm<C> {
             .ok_or(VmError::BytecodeBounds)?;
         self.ip = end;
         bytes.try_into().map_err(|_| VmError::BytecodeBounds)
+    }
+}
+
+fn numeric_value(value: Value) -> VmResult<NumericValue> {
+    match value {
+        Value::Int(value) => Ok(NumericValue::Int(value)),
+        Value::Float(value) => Ok(NumericValue::Float(value)),
+        _ => Err(VmError::TypeMismatch("number")),
     }
 }
 

@@ -1187,6 +1187,112 @@ fn trace_jit_compiles_hot_loop_and_is_dumpable() {
 }
 
 #[test]
+fn trace_jit_string_ordered_compare_falls_back_to_interpreter_without_divergence() {
+    // String `<`/`>` are compiler-allowed but not SSA-specializable in the
+    // trace JIT: the recorder rejects them, so the VM must fall back to the
+    // interpreter for exactly those operations and still produce the same
+    // Rust `str` lexicographic result as a pure interpreter run. This pins
+    // that JIT tracing introduces no semantic divergence for ordered string
+    // comparisons.
+    let source = r#"
+        let mut count = 0;
+        let mut i = 0;
+        while i < 12 {
+            if "abc" < "abd" { count = count + 1; }
+            if "abd" > "abc" { count = count + 1; }
+            if "abc" <= "abc" { count = count + 1; }
+            if "ab" < "abc" { count = count + 1; }
+            if "é" > "e" { count = count + 1; }
+            if "日本" < "英語" { count = count + 1; }
+            i = i + 1;
+        }
+        count;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::try_new(compiled.program.with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
+    // hot_loop_threshold 1 forces eager tracing; 6 string comparisons per
+    // iteration present the recorder with non-specializable operands, so the
+    // trace must be abandoned and the interpreter must finish the loop.
+    vm.set_jit_config(JitConfig {
+        enabled: native_jit_supported(),
+        hot_loop_threshold: 1,
+        max_trace_len: 8192,
+    });
+
+    assert_eq!(vm.run().expect("vm should run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(72)], "each iteration adds 6");
+
+    // Even if the JIT compiled some numeric prefix of the trace, running the
+    // final program must match the interpreter exactly (no per-iteration drift).
+    let compiled_interp = compile_source(source).expect("compile should succeed");
+    let mut interp = Vm::try_new(
+        compiled_interp
+            .program
+            .with_local_count(compiled_interp.locals),
+    )
+    .expect("interpreter VM construction must not fail");
+    interp.set_jit_config(JitConfig {
+        enabled: false,
+        hot_loop_threshold: 1,
+        max_trace_len: 8192,
+    });
+    assert_eq!(
+        interp.run().expect("interpreter should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), interp.stack());
+}
+
+#[test]
+fn aot_string_ordered_compare_compilation_defers_to_interpreter() {
+    if !native_jit_supported() {
+        return;
+    }
+    // AOT lowering for `Clt`/`Cgt` on string-string operands is
+    // non-specializable. The AOT SSA builder reports the instruction as
+    // unsupported and defers the whole program to the interpreter, so the
+    // result is still correct Rust `str` lexicographic ordering and there is
+    // no divergence between the AOT-attempted run and a pure interpreter run.
+    let source = r#"
+        let mut count = 0;
+        for i in 0..8 {
+            if "abc" < "abd" { count = count + 1; }
+            if "abd" > "abc" { count = count + 1; }
+            if "日本" < "英語" { count = count + 1; }
+        }
+        count;
+    "#;
+
+    let compiled = compile_source(source).expect("compile should succeed");
+    let mut vm = Vm::try_new(compiled.program.clone().with_local_count(compiled.locals))
+        .expect("test VM construction must not fail");
+    disable_trace_jit(&mut vm);
+    // String `<`/`>` cannot be AOT-specialized; the builder must report the
+    // unsupported instruction so the VM stays on the (correct) interpreter.
+    vm.compile_aot()
+        .expect_err("string ordered compare must be unsupported for AOT SSA");
+    assert!(!vm.has_aot_program(), "no AOT program should be installed");
+    assert_eq!(
+        vm.run().expect("vm without AOT should still run"),
+        VmStatus::Halted
+    );
+
+    let mut interp = Vm::try_new(compiled.program.clone().with_local_count(compiled.locals))
+        .expect("interpreter VM construction must not fail");
+    assert_eq!(
+        interp.run().expect("interpreter should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(
+        vm.stack(),
+        interp.stack(),
+        "AOT attempt must not change results"
+    );
+}
+
+#[test]
 fn trace_jit_diagnostics_preserve_public_snapshot_and_machine_code_toggle() {
     let source = r#"
         let mut i = 0;

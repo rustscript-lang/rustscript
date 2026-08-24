@@ -363,3 +363,63 @@ fn call_script_binding_outside_frame_fails_typed() {
         "expected InvalidFrameState for the out-of-frame binding, got {err:?}"
     );
 }
+
+#[test]
+fn string_ordered_comparison_matches_rust_lexicographic_semantics() {
+    // Compiler-allowed string `<`/`>`/`<=`/`>=` must lower in the no-std VM
+    // with the same Rust `str` lexicographic ordering as the std VM, and
+    // mixed string/number ordering must remain a typed error.
+    let compiled = compile_source(
+        r#"
+            let lt = "abc" < "abd";
+            let gt = "abd" > "abc";
+            let eq_le = "abc" <= "abc";
+            let eq_ge = "abc" >= "abc";
+            let empty_lt = "" < "a";
+            let prefix = "ab" < "abc";
+            let utf8 = ("é" > "e") && ("日本" < "英語");
+            if lt && gt && eq_le && eq_ge && empty_lt && prefix && utf8 {
+                1;
+            } else {
+                0;
+            }
+        "#,
+    )
+    .expect("string ordering source should compile");
+    let bytes = encode_program(&compiled.program.with_local_count(compiled.locals))
+        .expect("string ordering program should encode as VMBC v14");
+    let program = decode_program(&bytes).expect("no-std should decode VMBC v14");
+
+    let mut vm = EmbeddedVm::new(program);
+    assert_eq!(
+        vm.run().expect("string ordering should halt"),
+        EmbeddedVmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[EmbeddedValue::Int(1)]);
+}
+
+#[test]
+fn string_numeric_mixed_ordered_comparison_remains_typed_error() {
+    // `"abc" < 1` must stay a typed error in the no-std VM: the operand type
+    // hint is (String, Int), which is not the string-string fast path and
+    // must not be coerced into a numeric or string comparison.
+    let compiled = compile_source(
+        r#"
+            let mixed = "abc" < 1;
+            mixed;
+        "#,
+    )
+    .expect("mixed ordering source should compile");
+    let bytes = encode_program(&compiled.program.with_local_count(compiled.locals))
+        .expect("mixed ordering program should encode");
+    let program = decode_program(&bytes).expect("no-std should decode mixed ordering program");
+
+    let mut vm = EmbeddedVm::new(program);
+    let err = vm
+        .run()
+        .expect_err("mixed string/number ordering must remain a typed error");
+    assert!(
+        matches!(err, VmError::TypeMismatch(_)),
+        "expected TypeMismatch, got {err:?}"
+    );
+}
