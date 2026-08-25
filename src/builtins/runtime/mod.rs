@@ -136,10 +136,6 @@ pub(crate) fn poll_builtin_io_op(
     io::poll_builtin_io_op(vm, op_id, cx)
 }
 
-pub(crate) fn close_all_handles(vm: &mut Vm) {
-    io::close_all_handles(vm);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

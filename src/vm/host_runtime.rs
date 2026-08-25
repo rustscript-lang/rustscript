@@ -66,6 +66,18 @@ impl HostRuntime {
                 .expect("host runtime execution-scope identity space must be available"),
         }
     }
+
+    /// Replaces the active execution scope with a fresh one.
+    ///
+    /// Dropping the old scope runs its generic close sweep, retiring every
+    /// in-flight IO operation and closing every IO handle/process resource
+    /// before the new scope starts. Used by `Vm::reset_for_reuse` so IO
+    /// retirement goes through the generic scope lifecycle.
+    pub(crate) fn reset_execution_scope(&mut self) {
+        self.io_state = IoState::default();
+        self.execution_scope = ExecutionScope::new()
+            .expect("host runtime execution-scope identity space must be available");
+    }
 }
 
 impl Default for HostRuntime {

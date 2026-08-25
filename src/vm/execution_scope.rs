@@ -309,6 +309,22 @@ impl ExecutionScope {
             .map_err(ExecutionScopeError::Operation)
     }
 
+    /// Drives one operation to terminal, polling its concrete driver.
+    ///
+    /// Forwarding the operation registry's [`poll`](OperationRegistry::poll)
+    /// through the scope keeps the concrete driver's `poll`/cancel running in
+    /// the operation layer while the scope remains the single ownership unit.
+    pub fn poll_operation(
+        &mut self,
+        id: OperationId,
+        cx: &mut Context<'_>,
+    ) -> Poll<ExecutionScopeResult<OperationOutcome>> {
+        match self.operations.poll(id, cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => Poll::Ready(result.map_err(ExecutionScopeError::Operation)),
+        }
+    }
+
     /// Aborts a started operation in one step so it never produces a
     /// guest-visible result: cancels the driver exactly once if pending
     /// (recording the first reason), then consumes and immediately releases
