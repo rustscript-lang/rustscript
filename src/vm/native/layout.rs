@@ -66,39 +66,43 @@ pub(crate) fn detect_native_stack_layout() -> VmResult<NativeStackLayout> {
 }
 
 fn detect_native_stack_layout_uncached() -> VmResult<NativeStackLayout> {
-    let vm_stack_offset = usize_to_i32(std::mem::offset_of!(Vm, stack), "Vm::stack offset")?;
-    let vm_locals_offset = usize_to_i32(std::mem::offset_of!(Vm, locals), "Vm::locals offset")?;
+    let vm_stack_offset =
+        usize_to_i32(std::mem::offset_of!(Vm, instance.stack), "Vm::stack offset")?;
+    let vm_locals_offset = usize_to_i32(
+        std::mem::offset_of!(Vm, instance.locals),
+        "Vm::locals offset",
+    )?;
     let vm_program_constants_ptr_offset = usize_to_i32(
-        std::mem::offset_of!(Vm, program_constants_ptr),
+        std::mem::offset_of!(Vm, engine.program_constants_ptr),
         "Vm::program_constants_ptr offset",
     )?;
-    let vm_ip_offset = usize_to_i32(std::mem::offset_of!(Vm, ip), "Vm::ip offset")?;
+    let vm_ip_offset = usize_to_i32(std::mem::offset_of!(Vm, instance.ip), "Vm::ip offset")?;
     let vm_fuel_remaining_offset = usize_to_i32(
-        std::mem::offset_of!(Vm, fuel_remaining),
+        std::mem::offset_of!(Vm, run_ctx.fuel_remaining),
         "Vm::fuel_remaining offset",
     )?;
     let vm_fuel_ops_until_check_offset = usize_to_i32(
-        std::mem::offset_of!(Vm, fuel_ops_until_check),
+        std::mem::offset_of!(Vm, run_ctx.fuel_ops_until_check),
         "Vm::fuel_ops_until_check offset",
     )?;
     let vm_epoch_deadline_offset = usize_to_i32(
-        std::mem::offset_of!(Vm, epoch_deadline),
+        std::mem::offset_of!(Vm, run_ctx.epoch_deadline),
         "Vm::epoch_deadline offset",
     )?;
     let vm_epoch_counter_ptr_offset = usize_to_i32(
-        std::mem::offset_of!(Vm, epoch_counter_ptr),
+        std::mem::offset_of!(Vm, run_ctx.epoch_counter_ptr),
         "Vm::epoch_counter_ptr offset",
     )?;
     let vm_jit_native_region_edge_count_offset = usize_to_i32(
-        std::mem::offset_of!(Vm, jit_native_region_edge_count),
+        std::mem::offset_of!(Vm, engine.jit_native_region_edge_count),
         "Vm::jit_native_region_edge_count offset",
     )?;
     let vm_jit_native_direct_link_count_offset = usize_to_i32(
-        std::mem::offset_of!(Vm, jit_native_direct_link_count),
+        std::mem::offset_of!(Vm, engine.jit_native_direct_link_count),
         "Vm::jit_native_direct_link_count offset",
     )?;
     let vm_jit_native_active_direct_trace_id_offset = usize_to_i32(
-        std::mem::offset_of!(Vm, jit_native_active_direct_trace_id),
+        std::mem::offset_of!(Vm, engine.jit_native_active_direct_trace_id),
         "Vm::jit_native_active_direct_trace_id offset",
     )?;
     let stack_vec = detect_vec_layout()?;

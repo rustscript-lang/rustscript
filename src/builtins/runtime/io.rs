@@ -40,7 +40,7 @@ struct IoAsyncCompletion {
 }
 
 pub(super) fn cancel_pending_op(vm: &mut Vm, op_id: HostOpId) {
-    vm.io_state.pending_ops.remove(&op_id);
+    vm.host.io_state.pending_ops.remove(&op_id);
 }
 
 pub(super) fn poll_builtin_io_op(
@@ -49,7 +49,7 @@ pub(super) fn poll_builtin_io_op(
     cx: &mut Context<'_>,
 ) -> Poll<VmResult<CallReturn>> {
     let poll_result = {
-        let receiver = match vm.io_state.pending_ops.get_mut(&op_id) {
+        let receiver = match vm.host.io_state.pending_ops.get_mut(&op_id) {
             Some(receiver) => receiver,
             None => {
                 return Poll::Ready(Err(VmError::HostError(format!(
@@ -63,14 +63,14 @@ pub(super) fn poll_builtin_io_op(
     match poll_result {
         Poll::Pending => Poll::Pending,
         Poll::Ready(Ok(completion)) => {
-            vm.io_state.pending_ops.remove(&op_id);
+            vm.host.io_state.pending_ops.remove(&op_id);
             if let Some((handle_id, handle)) = completion.restored_handle {
-                vm.io_state.handles.insert(handle_id, handle);
+                vm.host.io_state.handles.insert(handle_id, handle);
             }
             Poll::Ready(completion.result)
         }
         Poll::Ready(Err(_)) => {
-            vm.io_state.pending_ops.remove(&op_id);
+            vm.host.io_state.pending_ops.remove(&op_id);
             Poll::Ready(Err(VmError::HostError(format!(
                 "builtin io op {op_id} was cancelled",
             ))))
@@ -79,7 +79,7 @@ pub(super) fn poll_builtin_io_op(
 }
 
 pub(super) fn close_all_handles(vm: &mut Vm) {
-    let handles = std::mem::take(&mut vm.io_state.handles);
+    let handles = std::mem::take(&mut vm.host.io_state.handles);
     for (_, handle) in handles {
         let _ = close_io_handle(handle);
     }
@@ -412,8 +412,8 @@ fn spawn_shell_command(command: &str, mode: &str) -> VmResult<Child> {
 }
 
 fn io_reserve_handle_id(vm: &mut Vm) -> i64 {
-    let id = vm.io_state.next_handle;
-    vm.io_state.next_handle = vm.io_state.next_handle.saturating_add(1);
+    let id = vm.host.io_state.next_handle;
+    vm.host.io_state.next_handle = vm.host.io_state.next_handle.saturating_add(1);
     id
 }
 
@@ -423,7 +423,8 @@ fn io_take_handle(vm: &mut Vm, handle_id: i64) -> VmResult<IoHandle> {
             "invalid io handle id {handle_id}; expected positive handle id"
         )));
     }
-    vm.io_state
+    vm.host
+        .io_state
         .handles
         .remove(&handle_id)
         .ok_or_else(|| VmError::HostError(format!("io handle {handle_id} not found")))
@@ -442,7 +443,7 @@ fn schedule_io_task(
             let _ = sender.send(completion);
         })
         .map_err(|err| VmError::HostError(format!("failed to spawn io task: {err}")))?;
-    vm.io_state.pending_ops.insert(op_id, receiver);
+    vm.host.io_state.pending_ops.insert(op_id, receiver);
     Ok(op_id)
 }
 

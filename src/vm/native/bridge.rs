@@ -393,12 +393,12 @@ pub(crate) fn non_yielding_i64_host_call_entry_address() -> usize {
 }
 
 pub(crate) fn helper_entry_offset() -> i32 {
-    i32::try_from(std::mem::offset_of!(Vm, native_helper_fn))
+    i32::try_from(std::mem::offset_of!(Vm, engine.native_helper_fn))
         .expect("Vm::native_helper_fn offset must fit i32")
 }
 
 pub(crate) fn interrupt_helper_entry_offset() -> i32 {
-    i32::try_from(std::mem::offset_of!(Vm, native_interrupt_helper_fn))
+    i32::try_from(std::mem::offset_of!(Vm, engine.native_interrupt_helper_fn))
         .expect("Vm::native_interrupt_helper_fn offset must fit i32")
 }
 
@@ -780,10 +780,10 @@ pub(crate) extern "C" fn pd_vm_native_restore_exit_state(
     ip: usize,
 ) -> i32 {
     run_step(vm, "restore_exit_state", |vm| {
-        if locals_len != vm.locals.len() {
+        if locals_len != vm.instance.locals.len() {
             return Err(VmError::JitNative(format!(
                 "native exit restore locals length mismatch: expected {}, got {}",
-                vm.locals.len(),
+                vm.instance.locals.len(),
                 locals_len
             )));
         }
@@ -799,10 +799,10 @@ pub(crate) extern "C" fn pd_vm_native_restore_exit_state(
         }
 
         vm.clear_stack_with_drop_contract();
-        vm.stack.reserve(stack_len);
+        vm.instance.stack.reserve(stack_len);
         for index in 0..stack_len {
             let value = unsafe { std::ptr::read(stack_src.add(index)) };
-            vm.stack.push(value);
+            vm.instance.stack.push(value);
         }
 
         for index in 0..locals_len {
@@ -819,13 +819,14 @@ pub(crate) extern "C" fn pd_vm_native_restore_exit_state(
 }
 
 fn native_frame_state(vm: &Vm) -> VmResult<NativeFrameState> {
-    let frame = vm.execution_frames.last();
+    let frame = vm.instance.execution_frames.last();
     let operand_stack_base = frame.map(|frame| frame.operand_stack_base).unwrap_or(0);
     let local_base = frame.map(|frame| frame.local_base).unwrap_or(0);
     let local_count = frame
         .map(|frame| frame.local_count)
-        .unwrap_or(vm.locals.len());
+        .unwrap_or(vm.instance.locals.len());
     let active_stack_len = vm
+        .instance
         .stack
         .len()
         .checked_sub(operand_stack_base)
@@ -847,7 +848,7 @@ fn native_frame_state(vm: &Vm) -> VmResult<NativeFrameState> {
         active_stack_len,
         local_base,
         local_count,
-        frame_depth: vm.call_depth,
+        frame_depth: vm.instance.call_depth,
         continuation_kind,
     })
 }
@@ -900,7 +901,7 @@ fn write_inherited_state_packet(vm: &Vm, packet: *mut u8) -> VmResult<()> {
         packet
             .add(INHERITED_STATE_TARGET_IP_OFFSET as usize)
             .cast::<usize>()
-            .write(vm.ip);
+            .write(vm.instance.ip);
         packet
             .add(INHERITED_STATE_VALUE_COUNT_OFFSET as usize)
             .cast::<usize>()
@@ -908,11 +909,11 @@ fn write_inherited_state_packet(vm: &Vm, packet: *mut u8) -> VmResult<()> {
         let values = packet
             .add(INHERITED_STATE_VALUES_OFFSET as usize)
             .cast::<*const Value>();
-        let stack = vm.stack.as_ptr().add(state.operand_stack_base);
+        let stack = vm.instance.stack.as_ptr().add(state.operand_stack_base);
         for index in 0..state.active_stack_len {
             values.add(index).write(stack.add(index));
         }
-        let locals = vm.locals.as_ptr().add(state.local_base);
+        let locals = vm.instance.locals.as_ptr().add(state.local_base);
         for index in 0..state.local_count {
             values
                 .add(state.active_stack_len + index)
@@ -957,13 +958,13 @@ fn native_enter_call_value(
         .map_err(|_| VmError::InvalidFrameState("native call ip out of range"))?;
     let resume_ip = usize::try_from(resume_ip)
         .map_err(|_| VmError::InvalidFrameState("native resume ip out of range"))?;
-    if vm.ip != call_ip {
+    if vm.instance.ip != call_ip {
         vm.jump_to(call_ip)?;
     }
     if resume_ip > vm.program.code.len() {
         return Err(VmError::BytecodeBounds);
     }
-    vm.ip = resume_ip;
+    vm.instance.ip = resume_ip;
     let status = match vm.execute_call_value(argc, Some(call_ip))? {
         ExecOutcome::Continue => STATUS_LINKED_CONTINUE,
         ExecOutcome::Halted => STATUS_HALTED,
@@ -1067,17 +1068,17 @@ pub(crate) extern "C" fn pd_vm_native_restore_active_exit_state(
         let expected_locals_len = local_base
             .checked_add(locals_len)
             .ok_or_else(|| VmError::JitNative("native active local length overflow".to_string()))?;
-        if expected_locals_len != vm.locals.len() {
+        if expected_locals_len != vm.instance.locals.len() {
             return Err(VmError::JitNative(format!(
                 "native active exit restore locals length mismatch: expected {}, got {}",
-                vm.locals.len(),
+                vm.instance.locals.len(),
                 expected_locals_len
             )));
         }
-        if stack_base > vm.stack.len() {
+        if stack_base > vm.instance.stack.len() {
             return Err(VmError::JitNative(format!(
                 "native active stack base {stack_base} exceeds stack length {}",
-                vm.stack.len()
+                vm.instance.stack.len()
             )));
         }
         if stack_len != 0 && stack_src.is_null() {
@@ -1091,11 +1092,11 @@ pub(crate) extern "C" fn pd_vm_native_restore_active_exit_state(
             ));
         }
 
-        vm.stack.truncate(stack_base);
-        vm.stack.reserve(stack_len);
+        vm.instance.stack.truncate(stack_base);
+        vm.instance.stack.reserve(stack_len);
         for index in 0..stack_len {
             let value = unsafe { std::ptr::read(stack_src.add(index)) };
-            vm.stack.push(value);
+            vm.instance.stack.push(value);
         }
 
         for index in 0..locals_len {
@@ -1145,10 +1146,10 @@ pub(crate) extern "C" fn pd_vm_native_restore_sparse_exit_state(
                     "native sparse exit restore local index out of range".to_string(),
                 )
             })?;
-            if local_index_usize >= vm.locals.len() {
+            if local_index_usize >= vm.instance.locals.len() {
                 return Err(VmError::JitNative(format!(
                     "native sparse exit restore local index {local_index} out of range for {} locals",
-                    vm.locals.len()
+                    vm.instance.locals.len()
                 )));
             }
             let local_index = u8::try_from(local_index).map_err(|_| {
@@ -1165,10 +1166,10 @@ pub(crate) extern "C" fn pd_vm_native_restore_sparse_exit_state(
         }
 
         vm.clear_stack_with_drop_contract();
-        vm.stack.reserve(stack_len);
+        vm.instance.stack.reserve(stack_len);
         for index in 0..stack_len {
             let value = unsafe { std::ptr::read(stack_src.add(index)) };
-            vm.stack.push(value);
+            vm.instance.stack.push(value);
         }
 
         for (compact_index, local_index) in validated_indices.into_iter().enumerate() {
@@ -1212,29 +1213,29 @@ pub(crate) extern "C" fn pd_vm_native_restore_active_sparse_exit_state(
         // while the sparse exit metadata is built.
 
         let stack_base = vm.active_operand_stack_base();
-        if stack_base > vm.stack.len() {
+        if stack_base > vm.instance.stack.len() {
             return Err(VmError::JitNative(format!(
                 "native active sparse stack base {stack_base} exceeds stack length {}",
-                vm.stack.len()
+                vm.instance.stack.len()
             )));
         }
-        vm.stack.truncate(stack_base);
-        vm.stack.reserve(stack_len);
+        vm.instance.stack.truncate(stack_base);
+        vm.instance.stack.reserve(stack_len);
         for index in 0..stack_len {
             let value = unsafe { std::ptr::read(stack_src.add(index)) };
-            vm.stack.push(value);
+            vm.instance.stack.push(value);
         }
 
-        if vm.capture_cells.is_empty() {
+        if vm.instance.capture_cells.is_empty() {
             let local_base = vm.active_local_base();
-            let count_drop_events = vm.drop_contract_events_enabled;
+            let count_drop_events = vm.instance.drop_contract_events_enabled;
             for compact_index in 0..dirty_local_count {
                 let local_index = unsafe { *dirty_local_indices.add(compact_index) } as usize;
                 debug_assert!(local_index < 256);
                 let absolute = local_base + local_index;
-                debug_assert!(absolute < vm.locals.len());
+                debug_assert!(absolute < vm.instance.locals.len());
                 let value = unsafe { std::ptr::read(dirty_local_values.add(compact_index)) };
-                let slot = unsafe { vm.locals.get_unchecked_mut(absolute) };
+                let slot = unsafe { vm.instance.locals.get_unchecked_mut(absolute) };
                 let previous = std::mem::replace(slot, value);
                 if count_drop_events {
                     vm.count_value_drop_contract(&previous);
@@ -1253,7 +1254,7 @@ pub(crate) extern "C" fn pd_vm_native_restore_active_sparse_exit_state(
         if ip >= vm.program.code.len() {
             return Err(VmError::InvalidBranchTarget { target: ip });
         }
-        vm.ip = ip;
+        vm.instance.ip = ip;
         Ok(STATUS_CONTINUE)
     })
 }
@@ -1281,9 +1282,9 @@ pub(crate) extern "C" fn pd_vm_native_restore_virtual_frame(
                 "virtual frame restore received null locals buffer".to_string(),
             ));
         }
-        if vm.call_depth >= vm.max_script_call_depth {
+        if vm.instance.call_depth >= vm.instance.max_script_call_depth {
             return Err(VmError::CallStackOverflow {
-                limit: vm.max_script_call_depth,
+                limit: vm.instance.max_script_call_depth,
             });
         }
         let prototype = vm
@@ -1326,29 +1327,31 @@ pub(crate) extern "C" fn pd_vm_native_restore_virtual_frame(
             ));
         }
 
-        let operand_stack_base = vm.stack.len();
-        let local_base = vm.locals.len();
-        vm.stack.reserve(stack_len);
-        vm.locals.reserve(locals_len);
+        let operand_stack_base = vm.instance.stack.len();
+        let local_base = vm.instance.locals.len();
+        vm.instance.stack.reserve(stack_len);
+        vm.instance.locals.reserve(locals_len);
         for index in 0..stack_len {
-            vm.stack
+            vm.instance
+                .stack
                 .push(unsafe { std::ptr::read(stack_src.add(index)) });
         }
         for index in 0..locals_len {
-            vm.locals
+            vm.instance
+                .locals
                 .push(unsafe { std::ptr::read(locals_src.add(index)) });
         }
-        vm.execution_frames.push(ExecutionFrame {
+        vm.instance.execution_frames.push(ExecutionFrame {
             continuation: FrameContinuation::ResumeBytecode { return_ip },
             operand_stack_base,
             local_base,
             local_count: locals_len,
             prototype_id: Some(prototype_id),
         });
-        vm.active_local_base_cache = local_base;
-        vm.active_operand_stack_base_cache = operand_stack_base;
-        vm.call_depth = vm.script_frame_depth();
-        vm.ip = resume_ip;
+        vm.instance.active_local_base_cache = local_base;
+        vm.instance.active_operand_stack_base_cache = operand_stack_base;
+        vm.instance.call_depth = vm.script_frame_depth();
+        vm.instance.ip = resume_ip;
         Ok(STATUS_CONTINUE)
     })
 }
@@ -1662,10 +1665,11 @@ fn call_non_yielding_host_value(
     expected_return_type: Option<ValueType>,
 ) -> VmResult<Value> {
     let resolved = *vm
+        .host
         .resolved_calls
         .get(import)
         .ok_or(VmError::InvalidCall(import as u16))?;
-    let function = match vm.host_functions.get(usize::from(resolved)) {
+    let function = match vm.host.host_functions.get(usize::from(resolved)) {
         Some(VmHostFunction::ArgsStaticNonYielding(function)) => *function,
         _ => {
             return Err(VmError::JitNative(
@@ -1673,9 +1677,9 @@ fn call_non_yielding_host_value(
             ));
         }
     };
-    vm.call_depth = vm.call_depth.saturating_add(1);
+    vm.instance.call_depth = vm.instance.call_depth.saturating_add(1);
     let outcome = function(args);
-    vm.call_depth = vm.call_depth.saturating_sub(1);
+    vm.instance.call_depth = vm.instance.call_depth.saturating_sub(1);
     outcome
         .and_then(crate::vm::host::require_non_yielding_host_value)
         .and_then(|value| {
@@ -1809,7 +1813,7 @@ pub(crate) extern "C" fn pd_vm_native_step(vm: *mut Vm, op: i64, a: i64, b: i64,
                     .get(index as usize)
                     .cloned()
                     .ok_or(VmError::InvalidConstant(index))?;
-                vm.stack.push(value);
+                vm.instance.stack.push(value);
                 Ok(STATUS_CONTINUE)
             }
             OP_ADD => {
@@ -1841,34 +1845,41 @@ pub(crate) extern "C" fn pd_vm_native_step(vm: *mut Vm, op: i64, a: i64, b: i64,
             OP_SHL => {
                 let rhs = vm.pop_shift_amount()?;
                 let lhs = vm.pop_int()?;
-                vm.stack
+                vm.instance
+                    .stack
                     .push(crate::bytecode::Value::Int(lhs.wrapping_shl(rhs)));
                 Ok(STATUS_CONTINUE)
             }
             OP_SHR => {
                 let rhs = vm.pop_shift_amount()?;
                 let lhs = vm.pop_int()?;
-                vm.stack
+                vm.instance
+                    .stack
                     .push(crate::bytecode::Value::Int(lhs.wrapping_shr(rhs)));
                 Ok(STATUS_CONTINUE)
             }
             OP_LSHR => {
                 let rhs = vm.pop_shift_amount()?;
                 let lhs = vm.pop_int()?;
-                vm.stack
+                vm.instance
+                    .stack
                     .push(crate::bytecode::Value::Int(logical_shr_i64(lhs, rhs)));
                 Ok(STATUS_CONTINUE)
             }
             OP_AND => {
                 let rhs = vm.pop_bool()?;
                 let lhs = vm.pop_bool()?;
-                vm.stack.push(crate::bytecode::Value::Bool(lhs && rhs));
+                vm.instance
+                    .stack
+                    .push(crate::bytecode::Value::Bool(lhs && rhs));
                 Ok(STATUS_CONTINUE)
             }
             OP_OR => {
                 let rhs = vm.pop_bool()?;
                 let lhs = vm.pop_bool()?;
-                vm.stack.push(crate::bytecode::Value::Bool(lhs || rhs));
+                vm.instance
+                    .stack
+                    .push(crate::bytecode::Value::Bool(lhs || rhs));
                 Ok(STATUS_CONTINUE)
             }
             OP_NOT => {
@@ -1879,18 +1890,22 @@ pub(crate) extern "C" fn pd_vm_native_step(vm: *mut Vm, op: i64, a: i64, b: i64,
                 let value = vm.pop_numeric()?;
                 match value {
                     NumericValue::Int(value) => vm
+                        .instance
                         .stack
                         .push(crate::bytecode::Value::Int(value.wrapping_neg())),
-                    NumericValue::Float(value) => {
-                        vm.stack.push(crate::bytecode::Value::Float(-value))
-                    }
+                    NumericValue::Float(value) => vm
+                        .instance
+                        .stack
+                        .push(crate::bytecode::Value::Float(-value)),
                 }
                 Ok(STATUS_CONTINUE)
             }
             OP_CEQ => {
                 let rhs = vm.pop_value()?;
                 let lhs = vm.pop_value()?;
-                vm.stack.push(crate::bytecode::Value::Bool(lhs == rhs));
+                vm.instance
+                    .stack
+                    .push(crate::bytecode::Value::Bool(lhs == rhs));
                 Ok(STATUS_CONTINUE)
             }
             OP_CLT => {
@@ -1907,18 +1922,19 @@ pub(crate) extern "C" fn pd_vm_native_step(vm: *mut Vm, op: i64, a: i64, b: i64,
             }
             OP_DUP => {
                 let value = vm.peek_value()?.clone();
-                vm.stack.push(value);
+                vm.instance.stack.push(value);
                 Ok(STATUS_CONTINUE)
             }
             OP_LDLOC => {
                 let index = u8::try_from(a)
                     .map_err(|_| VmError::JitNative("ldloc index out of range".to_string()))?;
                 let value = vm
+                    .instance
                     .locals
                     .get(index as usize)
                     .cloned()
                     .ok_or(VmError::InvalidLocal(index))?;
-                vm.stack.push(value);
+                vm.instance.stack.push(value);
                 Ok(STATUS_CONTINUE)
             }
             OP_STLOC => {
@@ -2046,11 +2062,11 @@ mod tests {
         let mut vm = Vm::new(virtual_frame_program());
         let locals = [Value::Int(7)];
         let before = (
-            vm.ip,
-            vm.stack.len(),
-            vm.locals.len(),
-            vm.execution_frames.len(),
-            vm.call_depth,
+            vm.instance.ip,
+            vm.instance.stack.len(),
+            vm.instance.locals.len(),
+            vm.instance.execution_frames.len(),
+            vm.instance.call_depth,
         );
         let status = pd_vm_native_restore_virtual_frame(
             &mut vm,
@@ -2067,11 +2083,11 @@ mod tests {
         assert_eq!(
             before,
             (
-                vm.ip,
-                vm.stack.len(),
-                vm.locals.len(),
-                vm.execution_frames.len(),
-                vm.call_depth,
+                vm.instance.ip,
+                vm.instance.stack.len(),
+                vm.instance.locals.len(),
+                vm.instance.execution_frames.len(),
+                vm.instance.call_depth,
             )
         );
         let _ = take_bridge_error();
@@ -2093,11 +2109,11 @@ mod tests {
             locals.len(),
         );
         assert_eq!(status, STATUS_CONTINUE);
-        assert_eq!(vm.ip, 2);
-        assert_eq!(vm.call_depth, 1);
-        assert_eq!(vm.execution_frames.len(), 2);
-        assert_eq!(vm.locals.last(), Some(&Value::Int(7)));
-        let frame = vm.execution_frames.last().unwrap();
+        assert_eq!(vm.instance.ip, 2);
+        assert_eq!(vm.instance.call_depth, 1);
+        assert_eq!(vm.instance.execution_frames.len(), 2);
+        assert_eq!(vm.instance.locals.last(), Some(&Value::Int(7)));
+        let frame = vm.instance.execution_frames.last().unwrap();
         assert_eq!(frame.prototype_id, Some(0));
         assert_eq!(frame.local_count, 1);
         assert_eq!(
@@ -2135,24 +2151,26 @@ mod tests {
         let program =
             crate::Program::new(Vec::new(), vec![crate::OpCode::Ret as u8]).with_local_count(2);
         let mut vm = Vm::new(program);
-        vm.stack = vec![Value::Int(10), Value::Int(20)];
-        vm.locals = vec![
+        vm.instance.stack = vec![Value::Int(10), Value::Int(20)];
+        vm.instance.locals = vec![
             Value::Int(1),
             Value::Int(2),
             Value::Int(3),
             Value::Int(4),
             Value::Int(5),
         ];
-        vm.execution_frames.push(crate::vm::ExecutionFrame {
-            continuation: FrameContinuation::ResumeBytecode { return_ip: 0 },
-            operand_stack_base: 1,
-            local_base: 2,
-            local_count: 3,
-            prototype_id: Some(7),
-        });
-        vm.active_local_base_cache = 2;
-        vm.active_operand_stack_base_cache = 1;
-        vm.call_depth = 1;
+        vm.instance
+            .execution_frames
+            .push(crate::vm::ExecutionFrame {
+                continuation: FrameContinuation::ResumeBytecode { return_ip: 0 },
+                operand_stack_base: 1,
+                local_base: 2,
+                local_count: 3,
+                prototype_id: Some(7),
+            });
+        vm.instance.active_local_base_cache = 2;
+        vm.instance.active_operand_stack_base_cache = 1;
+        vm.instance.call_depth = 1;
 
         let mut state = MaybeUninit::<NativeFrameState>::uninit();
         assert_eq!(
@@ -2188,9 +2206,9 @@ mod tests {
         );
         std::mem::forget(stack);
         std::mem::forget(locals);
-        assert_eq!(vm.stack, vec![Value::Int(10), Value::Int(99)]);
+        assert_eq!(vm.instance.stack, vec![Value::Int(10), Value::Int(99)]);
         assert_eq!(
-            vm.locals,
+            vm.instance.locals,
             vec![
                 Value::Int(1),
                 Value::Int(2),
@@ -2218,11 +2236,11 @@ mod tests {
         std::mem::forget(sparse_stack);
         std::mem::forget(dirty_values);
         assert_eq!(
-            vm.stack,
+            vm.instance.stack,
             vec![Value::Int(10), Value::Int(77), Value::Int(88)]
         );
         assert_eq!(
-            vm.locals,
+            vm.instance.locals,
             vec![
                 Value::Int(1),
                 Value::Int(2),
@@ -2265,22 +2283,22 @@ mod tests {
             .expect("bind callable");
         assert!(matches!(callable, Value::Callable(_)));
 
-        vm.stack.extend([callable, Value::Int(41)]);
+        vm.instance.stack.extend([callable, Value::Int(41)]);
         assert_eq!(
             pd_vm_native_enter_call_value(&mut vm, 1, call_ip as i64, resume_ip as i64,),
             STATUS_LINKED_CONTINUE
         );
-        assert_eq!(vm.call_depth, 1);
-        assert_eq!(vm.ip, function.entry_ip as usize);
+        assert_eq!(vm.instance.call_depth, 1);
+        assert_eq!(vm.instance.ip, function.entry_ip as usize);
 
-        vm.stack.push(Value::Int(42));
+        vm.instance.stack.push(Value::Int(42));
         assert_eq!(
             pd_vm_native_leave_frame(&mut vm, ret_ip as i64),
             STATUS_LINKED_CONTINUE
         );
-        assert_eq!(vm.call_depth, 0);
-        assert_eq!(vm.ip, resume_ip);
-        assert_eq!(vm.stack, vec![Value::Int(42)]);
+        assert_eq!(vm.instance.call_depth, 0);
+        assert_eq!(vm.instance.ip, resume_ip);
+        assert_eq!(vm.instance.stack, vec![Value::Int(42)]);
     }
 
     #[test]
@@ -2314,7 +2332,7 @@ mod tests {
         vm.set_local(0, Value::Int(17)).expect("scalar local");
         vm.set_local(1, Value::String(preserved.clone()))
             .expect("heap local");
-        vm.stack.push(Value::Int(99));
+        vm.instance.stack.push(Value::Int(99));
 
         let status = pd_vm_native_restore_sparse_exit_state(
             &mut vm,
@@ -2342,7 +2360,7 @@ mod tests {
             crate::Program::new(Vec::new(), vec![crate::OpCode::Ret as u8]).with_local_count(1);
         let mut vm = Vm::new(program);
         vm.set_local(0, Value::Int(17)).expect("initial local");
-        vm.stack.push(Value::Int(23));
+        vm.instance.stack.push(Value::Int(23));
         let local_value = Value::Int(99);
 
         let null_indices = pd_vm_native_restore_sparse_exit_state(
