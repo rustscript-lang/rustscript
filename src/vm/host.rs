@@ -540,6 +540,8 @@ pub(super) struct WaitingHostOp {
 pub(super) enum WaitingHostOpSource {
     HostBridge,
     BuiltinIo,
+    #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+    BuiltinSqlite,
 }
 
 struct NoopWake;
@@ -558,6 +560,28 @@ fn builtin_for_binding_name(name: &str) -> Option<BuiltinFunction> {
         return None;
     }
     BuiltinFunction::from_namespaced_name(name)
+}
+
+/// Maps a pending builtin to the waiting-op source that polls its concrete
+/// driver. IO builtins are driven through the builtin IO mailbox; SQLite
+/// builtins through their own completion mailbox. Both poll the shared
+/// execution-scope operation registry; only the result-mailbox lookup
+/// differs.
+#[cfg_attr(
+    not(all(feature = "sqlite", not(target_arch = "wasm32"))),
+    allow(unused_variables)
+)]
+fn builtin_waiting_source(builtin: BuiltinFunction) -> WaitingHostOpSource {
+    #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+    {
+        // The generated `BuiltinFunction::name()` renders the source name with
+        // `::` collapsed to `_` (e.g. `sqlite_execute`), matching the internal
+        // catalog name rather than the guest-facing `sqlite::execute`.
+        if builtin.name().starts_with("sqlite_") {
+            return WaitingHostOpSource::BuiltinSqlite;
+        }
+    }
+    WaitingHostOpSource::BuiltinIo
 }
 
 impl Vm {
@@ -895,6 +919,10 @@ impl Vm {
             WaitingHostOpSource::BuiltinIo => {
                 crate::builtins::runtime::cancel_builtin_io_op(self, waiting.op_id);
             }
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+            WaitingHostOpSource::BuiltinSqlite => {
+                crate::builtins::runtime::cancel_builtin_sqlite_op(self, waiting.op_id);
+            }
         }
     }
 
@@ -927,6 +955,10 @@ impl Vm {
             }
             WaitingHostOpSource::BuiltinIo => {
                 crate::builtins::runtime::poll_builtin_io_op(self, waiting.op_id, cx)
+            }
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+            WaitingHostOpSource::BuiltinSqlite => {
+                crate::builtins::runtime::poll_builtin_sqlite_op(self, waiting.op_id, cx)
             }
         };
 
@@ -1095,7 +1127,8 @@ impl Vm {
             crate::builtins::runtime::BuiltinCallOutcome::Pending(op_id) => {
                 self.instance.stack.truncate(arg_start);
                 let resume_ip = self.call_resume_ip(call_ip)?;
-                self.set_waiting_host_op(op_id, WaitingHostOpSource::BuiltinIo)?;
+                let source = builtin_waiting_source(builtin);
+                self.set_waiting_host_op(op_id, source)?;
                 self.instance.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
             }

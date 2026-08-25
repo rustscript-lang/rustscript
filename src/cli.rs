@@ -1637,6 +1637,9 @@ mod tests {
     fn cli_build_features_report_compiled_capabilities() {
         let features = super::cli_build_features();
 
+        let mut modules = vec!["bytes", "io", "re", "json", "jit", "math"];
+        #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+        modules.push("sqlite");
         assert_eq!(
             features,
             vec![
@@ -1646,7 +1649,7 @@ mod tests {
                     .module_override_source("stdlib/rss/strings.rss")
                     .is_some()
                     .then_some("stdlibs".to_string()),
-                Some("modules=bytes, io, re, json, jit, math".to_string()),
+                Some(format!("modules={}", modules.join(", "))),
             ]
             .into_iter()
             .flatten()

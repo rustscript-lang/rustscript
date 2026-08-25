@@ -38,6 +38,8 @@ use self::host_runtime::HostRuntime;
 use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable};
 pub use self::resource::ResourceCloseReason;
 use self::run_context::{InterruptMode, RunContext};
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+pub use crate::builtins::runtime::sqlite::{SqliteLimits, SqlitePolicy};
 pub use crate::bytecode::{
     CallableTarget, CallableValue, HostImport, OpCode, Program, Value, ValueType,
 };
@@ -2668,6 +2670,32 @@ impl Vm {
     /// starting/cancelling operations without reaching into VM private state.
     pub fn execution_scope(&mut self) -> &mut crate::vm::execution_scope::ExecutionScope {
         &mut self.host.execution_scope
+    }
+
+    /// Replaces the adapter-owned SQLite embedding policy.
+    ///
+    /// Open connections keep the limits they were opened with; new opens use
+    /// this policy. Part of the adapter-owned `configure`/`clear` cleanup
+    /// surface (no generic lifecycle helper involved).
+    #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+    pub fn configure_sqlite(&mut self, policy: SqlitePolicy) {
+        crate::builtins::runtime::sqlite::configure_policy(self, policy);
+    }
+
+    /// Restores the default SQLite embedding policy.
+    ///
+    /// Pending operations and open connections are unaffected (they carry
+    /// their own state); a VM reset or explicit `sqlite::close` retires them
+    /// through the generic scope close.
+    #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+    pub fn clear_sqlite(&mut self) {
+        crate::builtins::runtime::sqlite::clear_policy(self);
+    }
+
+    /// Returns the current SQLite embedding policy.
+    #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+    pub fn sqlite_policy(&self) -> &SqlitePolicy {
+        &self.host.sqlite_state.policy
     }
 
     pub fn has_bound_function(&self, name: &str) -> bool {

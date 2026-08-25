@@ -16,6 +16,11 @@
 // | special-call | 0xFF90 ..= 0xFFA1 | special-call builtins (incl. internal lowering builtins) |
 // | ordinary | 0xFFA2 ..= 0xFFFF | ordinary builtins (language + namespaced) |
 //
+// The top-u16 range 0xFFFC ..= 0xFFFF is reserved for the frozen SQLite
+// assignments below. Do not allocate an ordinary ID by incrementing a u16
+// cursor through this range: incrementing 0xFFFF would overflow, and these
+// four IDs must remain stable even when SQLite is feature-disabled.
+//
 // # Rules
 //
 // - IDs are immutable once assigned. Appending or reordering entries must not
@@ -63,6 +68,11 @@ builtin_id!(0xFFB9, "io::write", IoWrite, Ordinary, none);
 builtin_id!(0xFFBA, "io::flush", IoFlush, Ordinary, none);
 builtin_id!(0xFFBB, "io::close", IoClose, Ordinary, none);
 builtin_id!(0xFFBC, "io::exists", IoExists, Ordinary, none);
+builtin_id!(0xFFC3, "sqlite::open", SqliteOpen, Ordinary, none);
+builtin_id!(0xFFFC, "sqlite::execute", SqliteExecute, Ordinary, none);
+builtin_id!(0xFFFD, "sqlite::query", SqliteQuery, Ordinary, none);
+builtin_id!(0xFFFE, "sqlite::transaction", SqliteTransaction, Ordinary, none);
+builtin_id!(0xFFFF, "sqlite::close", SqliteClose, Ordinary, none);
 builtin_id!(0xFFBD, "re::match", ReMatch, Ordinary, none);
 builtin_id!(0xFFBE, "re::find", ReFind, Ordinary, none);
 builtin_id!(0xFFBF, "re::replace", ReReplace, Ordinary, none);

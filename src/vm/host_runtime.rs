@@ -16,6 +16,8 @@
 use std::collections::HashMap;
 
 use crate::builtins::runtime::IoState;
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+use crate::builtins::runtime::SqliteState;
 use crate::vm::execution_scope::ExecutionScope;
 use crate::vm::host::{HostAsyncBridge, HostOpId, VmHostFunction};
 
@@ -37,6 +39,8 @@ pub(crate) struct HostRuntime {
     pub(crate) async_bridge: Option<Box<dyn HostAsyncBridge>>,
     pub(crate) runtime_print_sink: Option<Box<RuntimePrintSink>>,
     pub(crate) io_state: IoState,
+    #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+    pub(crate) sqlite_state: SqliteState,
     pub(crate) next_host_op_id: HostOpId,
     /// The isolated execution scope owned by this host runtime.
     pub(super) execution_scope: ExecutionScope,
@@ -61,6 +65,8 @@ impl HostRuntime {
             async_bridge: None,
             runtime_print_sink: None,
             io_state: IoState::default(),
+            #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+            sqlite_state: SqliteState::default(),
             next_host_op_id: 1,
             execution_scope: ExecutionScope::new()
                 .expect("host runtime execution-scope identity space must be available"),
@@ -75,6 +81,10 @@ impl HostRuntime {
     /// retirement goes through the generic scope lifecycle.
     pub(crate) fn reset_execution_scope(&mut self) {
         self.io_state = IoState::default();
+        #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+        {
+            self.sqlite_state = SqliteState::default();
+        }
         self.execution_scope = ExecutionScope::new()
             .expect("host runtime execution-scope identity space must be available");
     }

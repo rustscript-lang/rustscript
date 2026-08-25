@@ -69,6 +69,10 @@ impl HostBindingKind {
 /// Documented call-index blocks shared by builtins and host imports.
 ///
 /// Must match the block table in `src/builtins/catalog.rs`.
+/// The ordinary block's top four IDs are frozen for SQLite. Keep allocation
+/// explicit here: incrementing a `u16` cursor from `0xFFFF` would overflow.
+pub(crate) const SQLITE_RESERVED_TOP_START: u16 = 0xFFFC;
+pub(crate) const SQLITE_RESERVED_TOP_END: u16 = u16::MAX;
 pub(crate) const ORDINARY_BLOCK_START: u16 = 0xFFA2;
 pub(crate) const SPECIAL_CALL_BLOCK_START: u16 = 0xFF90;
 pub(crate) const SPECIAL_CALL_BLOCK_END: u16 = 0xFFA1;
@@ -143,11 +147,24 @@ fn main() {
         .join("runtime")
         .join("namespaces.rs");
     println!("cargo:rerun-if-changed={}", namespace_manifest.display());
-    let namespaces = parse_namespace_manifest(&namespace_manifest);
+    let mut namespaces = parse_namespace_manifest(&namespace_manifest);
 
     let catalog_path = manifest_dir.join("src").join("builtins").join("catalog.rs");
     println!("cargo:rerun-if-changed={}", catalog_path.display());
-    let catalog = parse_catalog(&catalog_path);
+    let mut catalog = parse_catalog(&catalog_path);
+
+    // The SQLite namespace is optional: its builtin module links rusqlite,
+    // which is not available on every target or without the `sqlite` feature.
+    // When the feature is off (or the target is wasm32, where rusqlite's
+    // bundled build is unsupported), drop the namespace and its static
+    // catalog IDs so the generated catalog, dispatch, and compiler namespace
+    // surface stay consistent and feature-clean.
+    let sqlite_enabled = env::var_os("CARGO_FEATURE_SQLITE").is_some()
+        && env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("wasm32");
+    if !sqlite_enabled {
+        namespaces.retain(|namespace| namespace.namespace != "sqlite");
+        catalog.retain(|entry| !entry.source_name.starts_with("sqlite::"));
+    }
 
     let host_sources = [SourceSpec {
         path: "src/builtins/runtime/host.rs".to_string(),
@@ -522,6 +539,7 @@ fn strip_quoted(value: &str) -> Option<String> {
 /// - a catalog variant does not match the derived variant for its source name;
 /// - a class disagrees with the dispatch classification (ordinary vs
 ///   special-call) or with the `__` internal-name prefix;
+/// - a non-SQLite entry uses one of the frozen top-u16 SQLite IDs;
 /// - an ID falls outside its documented block.
 pub(crate) fn validate_catalog_contract(
     entries: &[CatalogEntry],
@@ -547,6 +565,16 @@ pub(crate) fn validate_catalog_contract(
         );
     }
     for entry in entries {
+        if (SQLITE_RESERVED_TOP_START..=SQLITE_RESERVED_TOP_END).contains(&entry.id)
+            && !entry.source_name.starts_with("sqlite::")
+        {
+            panic!(
+                "builtin '{}' id 0x{:04X} falls in the SQLite-reserved top-u16 range \
+                 0x{SQLITE_RESERVED_TOP_START:04X}..=0x{SQLITE_RESERVED_TOP_END:04X}; \
+                 do not allocate IDs by arithmetic",
+                entry.source_name, entry.id
+            );
+        }
         let expected_variant = builtin_variant_name(&entry.source_name);
         if expected_variant != entry.variant {
             panic!(
@@ -766,6 +794,11 @@ fn render_builtin_catalog(
             .collect::<Vec<_>>(),
     ));
 
+    writeln!(
+        &mut out,
+        "// The top-u16 range 0xFFFC..=0xFFFF is reserved for SQLite's frozen IDs; do not allocate it arithmetically."
+    )
+    .unwrap();
     writeln!(
         &mut out,
         "#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]"

@@ -25,6 +25,8 @@ pub use assembler::{AsmParseError, Assembler, AssemblerError, BytecodeBuilder, a
 pub use builtins::runtime::HostCallResult;
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::print::{PrintHostFunction, PrintlnHostFunction, format_value};
+#[cfg(all(feature = "runtime", feature = "sqlite", not(target_arch = "wasm32")))]
+pub use builtins::runtime::sqlite::{SqliteLimits, SqlitePolicy};
 pub use builtins::{
     BUILTIN_CATALOG, BuiltinFunction, BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec,
     CallableDef, CallableParam, CallableParamType, CallableSignature, HostExecution,

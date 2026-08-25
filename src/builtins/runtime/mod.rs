@@ -19,12 +19,16 @@ mod map_iter;
 mod math;
 pub(crate) mod print;
 pub(crate) mod regex;
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+pub(crate) mod sqlite;
 mod typed;
 
 #[cfg(target_arch = "wasm32")]
 use io_wasm as io;
 
 pub(crate) use io::IoState;
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+pub(crate) use sqlite::SqliteState;
 pub use typed::HostCallResult;
 use typed::{
     AnyValue, IntoBuiltinCallOutcome, IntoHostCallOutcome, NumberValue, UnknownValue, VmArray,
@@ -134,6 +138,20 @@ pub(crate) fn poll_builtin_io_op(
     cx: &mut Context<'_>,
 ) -> Poll<VmResult<CallReturn>> {
     io::poll_builtin_io_op(vm, op_id, cx)
+}
+
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+pub(crate) fn cancel_builtin_sqlite_op(vm: &mut Vm, op_id: HostOpId) {
+    sqlite::cancel_pending_op(vm, op_id);
+}
+
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+pub(crate) fn poll_builtin_sqlite_op(
+    vm: &mut Vm,
+    op_id: HostOpId,
+    cx: &mut Context<'_>,
+) -> Poll<VmResult<CallReturn>> {
+    sqlite::poll_pending_op(vm, op_id, cx)
 }
 
 #[cfg(test)]
