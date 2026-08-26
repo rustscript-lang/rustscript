@@ -7,12 +7,14 @@
 //!
 //! The embedder-facing fuel/epoch APIs live on the VM facade (see
 //! `crate::vm::fuel` and `crate::vm::epoch`) and delegate here. Cancellation of
-//! pending host operations lives in the facade because it crosses into
-//! [`HostRuntime`](super::host_runtime::HostRuntime) state. There is no per-run
-//! input/event state here by design: this mechanical decomposition only moves
-//! budgets and interruption state, and new runtime semantics (input/event
-//! scopes, cancellation tokens) are intentionally left out of this commit.
+//! pending host operations is per-invocation and lives in the invocation layer
+//! (see `crate::vm::invocation`), because it crosses into
+//! [`HostRuntime`](super::host_runtime::HostRuntime) waiting-host-op state. The
+//! run-scoped invocation stream configuration (per-item event limits) also
+//! lives here. There is no per-run input/event buffer state here: the event
+//! value is owned by the active invocation's single pending-event slot.
 
+use crate::builtins::runtime::RuntimeContext;
 use crate::vm::VmError;
 use crate::vm::VmResult;
 use crate::vm::epoch::EpochHandle;
@@ -42,6 +44,7 @@ impl InterruptMode {
 /// shared; one facade owns one context. Clone semantics: not `Clone` — a clone
 /// would duplicate budget state across runs.
 pub(crate) struct RunContext {
+    pub(crate) runtime_context: RuntimeContext,
     pub(crate) interrupt_mode: InterruptMode,
     pub(crate) fuel_remaining: u64,
     pub(crate) fuel_check_interval: u32,
@@ -62,6 +65,7 @@ impl RunContext {
         let epoch_handle = EpochHandle::default();
         let epoch_counter_ptr = epoch_handle.as_ptr() as usize;
         Self {
+            runtime_context: RuntimeContext::default(),
             interrupt_mode: InterruptMode::None,
             fuel_remaining: 0,
             fuel_check_interval: 1,

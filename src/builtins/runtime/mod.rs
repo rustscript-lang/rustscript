@@ -10,7 +10,11 @@ use crate::vm::CaptureAsyncHostContext;
 
 mod aot;
 mod bytes;
+pub(crate) mod context;
+pub(crate) mod context_host;
 pub(crate) mod core;
+pub(crate) mod error;
+pub(crate) mod event;
 mod host;
 #[cfg(not(target_arch = "wasm32"))]
 mod io;
@@ -30,6 +34,9 @@ mod typed;
 #[cfg(target_arch = "wasm32")]
 use io_wasm as io;
 
+pub(crate) use context::{RuntimeContext, RuntimeContextConfig, STREAM_EMIT_NAME};
+pub use error::{RuntimeError, RuntimeErrorCode, RuntimeResult};
+pub(crate) use event::{EventLimits, EventPayload};
 pub(crate) use io::IoState;
 #[cfg(not(target_arch = "wasm32"))]
 pub use io::{IoHostExt, IoPolicy};

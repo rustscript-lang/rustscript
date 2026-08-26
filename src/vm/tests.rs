@@ -2054,3 +2054,107 @@ fn capability_profile_allow_all_and_deny_all_differ() {
     assert!(!deny_all.allows_host_import("anything::at::all"));
     assert_ne!(allow_all.fingerprint(), deny_all.fingerprint());
 }
+
+#[test]
+fn dropping_cancelled_invocation_consumes_cancellation_at_the_boundary() {
+    // Dropping an invocation with a pending typed cancellation retires that
+    // invocation without manufacturing an unobservable terminal item. The
+    // per-invocation cancellation reason is cleared on fusion, so the VM can
+    // be reused immediately without inheriting the old reason.
+    let compiled = crate::compile_source(
+        r#"
+        pub fn run() -> int {
+            42;
+        }
+        "#,
+    )
+    .expect("invocation source should compile");
+    let mut vm = Vm::new(compiled.program);
+    assert_eq!(vm.run().expect("root frame should halt"), VmStatus::Halted);
+
+    let callable = vm
+        .resolve_exported_callable("run")
+        .expect("exported run callable should resolve");
+    {
+        let mut invocation = vm
+            .start_invocation(callable.clone(), vec![])
+            .expect("invocation should start");
+        invocation
+            .cancel(crate::vm::operation::OperationCancelReason::Requested)
+            .expect("cancellation should be accepted");
+        // Dropping the handle retires the invocation and clears the reason.
+    }
+    assert!(
+        vm.instance.invocation.as_ref().is_none_or(|state| matches!(
+            state.phase,
+            crate::vm::invocation::InvocationPhase::Fused
+        )) && vm
+            .instance
+            .invocation
+            .as_ref()
+            .is_none_or(|state| state.cancel_reason.is_none()),
+        "dropping the invocation must fuse it and clear its cancellation reason"
+    );
+
+    let mut replacement = vm
+        .start_invocation(callable, vec![])
+        .expect("the vm should be reusable after the dropped invocation");
+    assert!(matches!(
+        replacement.poll_next().expect("poll should succeed"),
+        InvocationPoll::Ready(Some(Ok(InvocationItem::Complete(Value::Int(42)))))
+    ));
+}
+
+#[test]
+fn cancelled_invocation_delivers_one_typed_error_then_fused_end() {
+    // Functional contract of the cancellation path: exactly one typed
+    // Cancelled item, a fused end, and the cancellation consumed at the
+    // invocation boundary (a later invocation runs normally).
+    let compiled = crate::compile_source(
+        r#"
+        pub fn run() -> int {
+            42;
+        }
+        "#,
+    )
+    .expect("invocation source should compile");
+    let mut vm = Vm::new(compiled.program);
+    assert_eq!(vm.run().expect("root frame should halt"), VmStatus::Halted);
+
+    let callable = vm
+        .resolve_exported_callable("run")
+        .expect("exported run callable should resolve");
+    {
+        let mut invocation = vm
+            .start_invocation(callable.clone(), vec![])
+            .expect("invocation should start");
+        invocation
+            .cancel(crate::vm::operation::OperationCancelReason::Deadline)
+            .expect("cancellation should be accepted");
+
+        match invocation.poll_next().expect("poll should succeed") {
+            InvocationPoll::Ready(Some(Err(InvocationError::Cancelled(
+                crate::vm::operation::OperationCancelReason::Deadline,
+            )))) => {}
+            other => panic!("expected a typed cancellation item, got {other:?}"),
+        }
+        assert!(matches!(
+            invocation.poll_next().expect("poll should succeed"),
+            InvocationPoll::Ready(None)
+        ));
+    }
+
+    // A new invocation on the same VM must run to completion instead of
+    // being cancelled on arrival.
+    let mut second = vm
+        .start_invocation(callable, vec![])
+        .expect("a new invocation may start after fusion");
+    match second.poll_next().expect("poll should succeed") {
+        InvocationPoll::Ready(Some(Ok(InvocationItem::Complete(Value::Int(42))))) => {}
+        other => panic!("the second invocation must complete normally, got {other:?}"),
+    }
+    assert!(matches!(
+        second.poll_next().expect("poll should succeed"),
+        InvocationPoll::Ready(None)
+    ));
+}

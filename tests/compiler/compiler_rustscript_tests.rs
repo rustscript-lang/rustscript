@@ -3809,3 +3809,25 @@ fn rustscript_generic_schema_errors_are_reported() {
 
     run_source_error_cases(&cases);
 }
+
+#[test]
+fn rustscript_strict_stream_emit_accepts_any_payload() {
+    // In strict RustScript, `stream::emit` is the one host function whose
+    // `any` payload is accepted at compile time; the per-item event bound is
+    // validated at runtime by the invocation stream. The exemption is tied to
+    // the authoritative runtime builtin identity (see the compiler unit test
+    // `stream_emit_any_payload_exemption_requires_authoritative_builtin_identity`),
+    // so a same-name function registered through another catalog cannot
+    // inherit it.
+    compile_source(
+        r#"
+        use stream;
+        pub fn run() -> int {
+            stream::emit({"a": 1, "b": 2});
+            stream::emit("text");
+            42;
+        }
+        "#,
+    )
+    .expect("strict stream::emit with any payloads must compile");
+}

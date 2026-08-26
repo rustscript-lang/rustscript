@@ -166,11 +166,18 @@ fn main() {
         catalog.retain(|entry| !entry.source_name.starts_with("sqlite::"));
     }
 
-    let host_sources = [SourceSpec {
-        path: "src/builtins/runtime/host.rs".to_string(),
-        module: "host".to_string(),
-        category: SourceCategory::DefaultHost,
-    }];
+    let host_sources = vec![
+        SourceSpec {
+            path: "src/builtins/runtime/host.rs".to_string(),
+            module: "host".to_string(),
+            category: SourceCategory::DefaultHost,
+        },
+        SourceSpec {
+            path: "src/builtins/runtime/context_host.rs".to_string(),
+            module: "context_host".to_string(),
+            category: SourceCategory::DefaultHost,
+        },
+    ];
     let builtin_sources = builtin_source_specs(&namespaces);
     let core_sources = [SourceSpec {
         path: "src/builtins/runtime/core.rs".to_string(),

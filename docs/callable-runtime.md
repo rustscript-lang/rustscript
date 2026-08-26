@@ -43,6 +43,18 @@ Reset clears Program runtime values and rebinds root function items from Program
 
 PDRC recordings preserve full execution-frame metadata. Callable environments use identity-table encoding, so aliases still share one environment after decode.
 
+## Invocation item stream
+
+`Vm::start_invocation` starts one exported callable with ordinary `Value` arguments and returns an `Invocation` handle that behaves like a fused `Stream<Item = Result<InvocationItem, InvocationError>>`:
+
+- `InvocationItem::Event(value)` items arrive in order for each `stream::emit(value)` call; `stream::emit` still evaluates to `()` inside RSS.
+- exactly one `InvocationItem::Complete(value)` carries the callable return value; events never replace it;
+- cancellation, fuel exhaustion, epoch deadline expiry, runtime capability failures (including event payload bound violations), and host failures each produce exactly one typed `InvocationError` item;
+- every poll after `Complete` or the error item returns `Ready(None)` (fused end of stream);
+- `InvocationPoll::Pending` means the VM is paused on an outstanding host operation; drive it through the embedding-owned async bridge and poll again.
+
+Polling drives execution and provides backpressure: at most one event item is buffered between polls, and the VM does not produce items while the consumer is not polling. `stream::emit` validates only the configured per-item value bound (payload bytes and nesting depth); sequence assignment, receipts, persistence, and delivery policy belong to the embedding. At most one invocation is active per VM, `Invocation::cancel(reason)` cancels with a typed `OperationCancelReason`, dropping the handle retires the invocation synchronously for immediate VM reuse, and the low-level `Vm::run` pump is unchanged for custom drivers.
+
 ## Optimized backends
 
 Whole-program AOT and Trace JIT use the same builtin call path (static catalog IDs) for environment binding and native frame dispatch for `callvalue`. Script-frame entry and return preserve frame-relative locals and typed continuations.

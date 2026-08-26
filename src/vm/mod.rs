@@ -16,6 +16,7 @@ pub mod host_context;
 pub mod host_extension;
 mod host_runtime;
 mod instance;
+pub mod invocation;
 pub(crate) mod jit;
 mod map_iter;
 pub(crate) mod native;
@@ -52,6 +53,7 @@ pub use self::host_extension::{
 };
 use self::host_runtime::HostRuntime;
 use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable};
+pub use self::invocation::{Invocation, InvocationError, InvocationItem, InvocationPoll};
 pub use self::resource::ResourceCloseReason;
 use self::run_context::{InterruptMode, RunContext};
 pub use self::standard_composition::StandardSurfaceComposition;
@@ -2883,6 +2885,7 @@ impl Vm {
     pub fn shutdown(&mut self) {
         self.invalidate_callback_registries();
         self.cancel_waiting_host_op();
+        self.instance.drop_invocation_state();
         // Begin execution-scope shutdown (first-reason-wins; sealing the
         // operation registry) before tearing down interpreter state.
         let _ = self

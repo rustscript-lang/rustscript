@@ -1124,6 +1124,23 @@ impl Vm {
         self.host.runtime_print_sink = None;
     }
 
+    /// Configures the per-item event bound applied by `stream::emit` on the
+    /// invocation stream.
+    ///
+    /// `max_payload_bytes` bounds the estimated payload size of one emitted
+    /// event value; `max_depth` bounds its nesting depth. Both must be
+    /// positive. The bound is run-scoped configuration and survives a VM
+    /// reset, matching the other run-scoped configuration on the facade.
+    pub fn set_event_limits(&mut self, max_payload_bytes: usize, max_depth: usize) -> VmResult<()> {
+        let limits = crate::builtins::runtime::EventLimits::new(max_payload_bytes, max_depth)
+            .map_err(|error| VmError::HostError(error.to_string()))?;
+        self.run_ctx.runtime_context = crate::builtins::runtime::RuntimeContext::with_config(
+            crate::builtins::runtime::RuntimeContextConfig::new(limits),
+        )
+        .map_err(|error| VmError::HostError(error.to_string()))?;
+        Ok(())
+    }
+
     pub(crate) fn write_runtime_print(&mut self, rendered: String) -> VmResult<()> {
         let Some(sink) = self.host.runtime_print_sink.as_mut() else {
             return Err(VmError::HostError(
