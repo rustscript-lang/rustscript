@@ -46,7 +46,8 @@ impl Vm {
 
     #[inline(always)]
     pub(super) fn decoded_ldc_value_at(&self, opcode_ip: usize) -> Option<&Value> {
-        self.decoded_instruction_data
+        self.engine
+            .decoded_instruction_data
             .ldc_values
             .get(opcode_ip)
             .and_then(|value| value.as_ref())
@@ -54,7 +55,8 @@ impl Vm {
 
     #[inline(always)]
     pub(super) fn decoded_jump_target_at(&self, opcode_ip: usize) -> Option<usize> {
-        self.decoded_instruction_data
+        self.engine
+            .decoded_instruction_data
             .jump_targets
             .get(opcode_ip)
             .and_then(|target| *target)
@@ -62,7 +64,8 @@ impl Vm {
 
     #[inline(always)]
     pub(super) fn decoded_jump_target_is_valid_at(&self, opcode_ip: usize) -> bool {
-        self.decoded_instruction_data
+        self.engine
+            .decoded_instruction_data
             .valid_jump_targets
             .get(opcode_ip)
             .copied()
@@ -71,7 +74,8 @@ impl Vm {
 
     #[inline(always)]
     pub(super) fn decoded_local_index_at(&self, opcode_ip: usize) -> Option<u8> {
-        self.decoded_instruction_data
+        self.engine
+            .decoded_instruction_data
             .local_indices
             .get(opcode_ip)
             .and_then(|index| *index)
@@ -90,7 +94,7 @@ impl Vm {
         let Some(initial) = self.local_scalar_value_with_hint(src) else {
             return Ok(false);
         };
-        let mut cursor = self.ip;
+        let mut cursor = self.instance.ip;
         let mut stack = [None; 8];
         let mut stack_len = 1usize;
         stack[0] = Some(initial);
@@ -221,7 +225,7 @@ impl Vm {
                             ))?;
                     self.store_local_absolute_with_drop_contract(absolute, dst, value)?;
                     self.record_scalar_superinstruction();
-                    self.ip = cursor + 2;
+                    self.instance.ip = cursor + 2;
                     return Ok(true);
                 }
                 OpCode::Clt | OpCode::Cgt => {
@@ -261,10 +265,10 @@ impl Vm {
                         },
                         _ => unreachable!(),
                     };
-                    self.ip = cursor + 6;
+                    self.instance.ip = cursor + 6;
                     if !condition {
                         if self.decoded_jump_target_is_valid_at(jump_opcode_ip) {
-                            self.ip = target;
+                            self.instance.ip = target;
                         } else {
                             self.jump_to(target)?;
                         }

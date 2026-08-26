@@ -108,11 +108,12 @@ impl From<crate::WireError> for AotArtifactError {
 
 impl Vm {
     pub fn encode_aot_artifact(&mut self) -> Result<Vec<u8>, AotArtifactError> {
-        if self.aot_program.is_none() {
+        if self.engine.aot_program.is_none() {
             self.compile_aot()?;
         }
         let program_hash = self.ensure_program_cache_key();
         let aot_program = self
+            .engine
             .aot_program
             .as_ref()
             .ok_or(AotArtifactError::MissingAotProgram)?;
@@ -135,8 +136,8 @@ impl Vm {
         } else {
             CompiledProgram::from_code(decoded.code, decoded.resume_ips)?
         };
-        self.aot_program = Some(compiled);
-        self.aot_exec_count = 0;
+        self.engine.aot_program = Some(compiled);
+        self.engine.aot_exec_count = 0;
         Ok(())
     }
 
@@ -159,8 +160,8 @@ impl Vm {
         } else {
             CompiledProgram::from_code(decoded.code, decoded.resume_ips)?
         };
-        vm.aot_program = Some(compiled);
-        vm.aot_exec_count = 0;
+        vm.engine.aot_program = Some(compiled);
+        vm.engine.aot_exec_count = 0;
         Ok(vm)
     }
 
@@ -201,7 +202,11 @@ fn encode_artifact(
     write_string("os", std::env::consts::OS, &mut out)?;
     write_string("backend", selected_codegen_backend(), &mut out)?;
 
-    write_u32("vm ip offset", std::mem::offset_of!(Vm, ip), &mut out)?;
+    write_u32(
+        "vm ip offset",
+        std::mem::offset_of!(Vm, instance.ip),
+        &mut out,
+    )?;
     write_u32(
         "native helper offset",
         helper_entry_offset() as usize,
@@ -283,7 +288,7 @@ fn decode_artifact(
     )?;
     validate_runtime_field(
         "vm ip offset",
-        std::mem::offset_of!(Vm, ip).to_string(),
+        std::mem::offset_of!(Vm, instance.ip).to_string(),
         cursor.read_u32()?.to_string(),
     )?;
     validate_runtime_field(
@@ -446,7 +451,8 @@ mod tests {
         bc.ret();
         let mut vm = Vm::new(Program::new(Vec::new(), bc.finish()));
         vm.compile_aot().expect("aot compile should succeed");
-        vm.aot_program
+        vm.engine
+            .aot_program
             .as_mut()
             .expect("compiled program")
             .interpreter_boundary_only = true;
@@ -468,6 +474,7 @@ mod tests {
         .expect("boundary artifact should load");
         assert!(
             standalone
+                .engine
                 .aot_program
                 .as_ref()
                 .expect("loaded aot program")

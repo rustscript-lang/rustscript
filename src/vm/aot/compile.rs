@@ -566,7 +566,7 @@ fn compile_ssa(
     let ctx_setup_elapsed = ctx_setup_started.elapsed();
 
     let vm_ip_offset =
-        i32::try_from(std::mem::offset_of!(Vm, ip)).expect("Vm::ip offset must fit i32");
+        i32::try_from(std::mem::offset_of!(Vm, instance.ip)).expect("Vm::ip offset must fit i32");
     let code_len_i64 = i64::try_from(program.code.len())
         .map_err(|_| AotCompileError::Codegen("program length does not fit i64".to_string()))?;
 

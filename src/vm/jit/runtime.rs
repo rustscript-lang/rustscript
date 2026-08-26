@@ -257,20 +257,27 @@ pub(crate) extern "C" fn pd_vm_native_resume_linked_trace(vm: *mut Vm) -> i32 {
         return native::STATUS_ERROR;
     };
 
-    if vm_ref.jit_native_link_dispatch_depth > 0 {
+    if vm_ref.engine.jit_native_link_dispatch_depth > 0 {
         return native::STATUS_TRACE_EXIT;
     }
 
-    vm_ref.jit_native_link_dispatch_depth = vm_ref.jit_native_link_dispatch_depth.saturating_add(1);
+    vm_ref.engine.jit_native_link_dispatch_depth = vm_ref
+        .engine
+        .jit_native_link_dispatch_depth
+        .saturating_add(1);
     match vm_ref.continue_linked_native_trace_from_exit() {
         Ok(status) => {
-            vm_ref.jit_native_link_dispatch_depth =
-                vm_ref.jit_native_link_dispatch_depth.saturating_sub(1);
+            vm_ref.engine.jit_native_link_dispatch_depth = vm_ref
+                .engine
+                .jit_native_link_dispatch_depth
+                .saturating_sub(1);
             status
         }
         Err(err) => {
-            vm_ref.jit_native_link_dispatch_depth =
-                vm_ref.jit_native_link_dispatch_depth.saturating_sub(1);
+            vm_ref.engine.jit_native_link_dispatch_depth = vm_ref
+                .engine
+                .jit_native_link_dispatch_depth
+                .saturating_sub(1);
             native::store_bridge_error(err);
             native::STATUS_ERROR
         }
@@ -283,9 +290,9 @@ impl Vm {
             return None;
         }
         let entry_callable_prototypes = self.active_local_callable_prototypes();
-        self.jit.compiled_trace_for_entry_with_callables(
+        self.engine.jit.compiled_trace_for_entry_with_callables(
             self.active_frame_key(),
-            self.ip,
+            self.instance.ip,
             self.active_operand_stack_len(),
             entry_callable_prototypes.as_deref(),
         )
@@ -299,21 +306,21 @@ impl Vm {
         all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
     ))]
     fn continue_linked_native_trace_from_exit(&mut self) -> VmResult<i32> {
-        self.jit_trace_exit_count = self.jit_trace_exit_count.saturating_add(1);
+        self.engine.jit_trace_exit_count = self.engine.jit_trace_exit_count.saturating_add(1);
         let mut current_trace_id = {
-            let ip = self.ip;
+            let ip = self.instance.ip;
             let frame_key = self.active_frame_key();
             let stack_depth = self.active_operand_stack_len();
             let mut next_trace_id = self.compiled_trace_for_active_entry();
             if next_trace_id.is_none()
                 && !self.active_frame_has_shared_capture_cells()
-                && !self.jit.callable_frame_is_blocked(frame_key)
+                && !self.engine.jit.callable_frame_is_blocked(frame_key)
             {
                 let entry_local_types =
                     (frame_key != ROOT_FRAME_KEY).then(|| self.active_local_types());
                 let entry_callable_prototypes = self.active_local_callable_prototypes();
                 let program = &self.program;
-                next_trace_id = self.jit.observe_exit_entry_with_local_types(
+                next_trace_id = self.engine.jit.observe_exit_entry_with_local_types(
                     frame_key,
                     ip,
                     stack_depth,
@@ -352,15 +359,16 @@ impl Vm {
 
         loop {
             native::clear_bridge_error();
-            let region_edges_before = self.jit_native_region_edge_count;
-            let direct_links_before = self.jit_native_direct_link_count;
+            let region_edges_before = self.engine.jit_native_region_edge_count;
+            let direct_links_before = self.engine.jit_native_direct_link_count;
             let status = unsafe { entry(self as *mut Vm) };
-            self.native_trace_exec_count = self.native_trace_exec_count.saturating_add(1);
+            self.engine.native_trace_exec_count =
+                self.engine.native_trace_exec_count.saturating_add(1);
             if !is_region
-                && self.jit_native_active_direct_trace_id != usize::MAX
-                && self.jit_native_active_direct_trace_id != current_trace_id
+                && self.engine.jit_native_active_direct_trace_id != usize::MAX
+                && self.engine.jit_native_active_direct_trace_id != current_trace_id
             {
-                current_trace_id = self.jit_native_active_direct_trace_id;
+                current_trace_id = self.engine.jit_native_active_direct_trace_id;
                 let state = self.native_trace_state(current_trace_id)?;
                 entry = state.0;
                 root_ip = state.1;
@@ -371,13 +379,15 @@ impl Vm {
             }
             self.record_native_direct_escape(status, direct_links_before);
             if is_region {
-                self.jit_native_region_entry_count =
-                    self.jit_native_region_entry_count.saturating_add(1);
-                if self.jit_native_region_edge_count > region_edges_before {
-                    self.jit.record_native_region_progress(current_trace_id);
+                self.engine.jit_native_region_entry_count =
+                    self.engine.jit_native_region_entry_count.saturating_add(1);
+                if self.engine.jit_native_region_edge_count > region_edges_before {
+                    self.engine
+                        .jit
+                        .record_native_region_progress(current_trace_id);
                 }
             }
-            self.jit.mark_trace_executed(current_trace_id);
+            self.engine.jit.mark_trace_executed(current_trace_id);
             let mut trace_exit_key = None;
             let mut instruction_failure_exit = false;
             let status = if let Some(exit_id) = native::decode_jit_trace_exit_status(status) {
@@ -393,8 +403,9 @@ impl Vm {
                         exit_id: SsaExitId::new(exit_id),
                     }
                 };
-                instruction_failure_exit = self.jit.trace_exit_is_instruction_failure(key);
-                self.jit
+                instruction_failure_exit = self.engine.jit.trace_exit_is_instruction_failure(key);
+                self.engine
+                    .jit
                     .record_trace_exit(key)
                     .map_err(|err| VmError::JitNative(err.message()))?;
                 trace_exit_key = Some(key);
@@ -445,37 +456,39 @@ impl Vm {
                     return Ok(native::STATUS_LINKED_CONTINUE);
                 }
                 native::STATUS_TRACE_EXIT => {
-                    self.jit_trace_exit_count = self.jit_trace_exit_count.saturating_add(1);
+                    self.engine.jit_trace_exit_count =
+                        self.engine.jit_trace_exit_count.saturating_add(1);
                     if instruction_failure_exit {
                         return Ok(native::STATUS_LINKED_CONTINUE);
                     }
                     if !has_yielding_call
                         && terminal == JitTraceTerminal::LoopBack
-                        && self.ip == root_ip
+                        && self.instance.ip == root_ip
                     {
-                        self.jit.record_native_loop_back(current_trace_id);
-                        self.jit_native_loop_back_count =
-                            self.jit_native_loop_back_count.saturating_add(1);
+                        self.engine.jit.record_native_loop_back(current_trace_id);
+                        self.engine.jit_native_loop_back_count =
+                            self.engine.jit_native_loop_back_count.saturating_add(1);
                         continue;
                     }
-                    if self.jit.record_native_side_exit(current_trace_id)
-                        && !self.jit_native_direct_links_enabled
+                    if self.engine.jit.record_native_side_exit(current_trace_id)
+                        && !self.engine.jit_native_direct_links_enabled
                     {
                         self.block_jit_callable_frame(current_trace_id);
                         return Ok(native::STATUS_LINKED_CONTINUE);
                     }
                     if !has_yielding_call && !self.active_frame_has_shared_capture_cells() {
-                        let ip = self.ip;
+                        let ip = self.instance.ip;
                         let frame_key = self.active_frame_key();
                         let stack_depth = self.active_operand_stack_len();
                         let mut next_trace_id = self.compiled_trace_for_active_entry();
-                        if next_trace_id.is_none() && !self.jit.callable_frame_is_blocked(frame_key)
+                        if next_trace_id.is_none()
+                            && !self.engine.jit.callable_frame_is_blocked(frame_key)
                         {
                             let entry_local_types =
                                 (frame_key != ROOT_FRAME_KEY).then(|| self.active_local_types());
                             let entry_callable_prototypes = self.active_local_callable_prototypes();
                             let program = &self.program;
-                            next_trace_id = self.jit.observe_exit_entry_with_local_types(
+                            next_trace_id = self.engine.jit.observe_exit_entry_with_local_types(
                                 frame_key,
                                 ip,
                                 stack_depth,
@@ -534,19 +547,19 @@ impl Vm {
     }
 
     fn active_native_interrupt_settings(&self) -> Option<native::NativeInterruptSettings> {
-        match self.interrupt_mode {
+        match self.run_ctx.interrupt_mode {
             super::super::InterruptMode::None => None,
             super::super::InterruptMode::Fuel => Some(native::NativeInterruptSettings::fuel(
-                self.fuel_check_interval,
+                self.run_ctx.fuel_check_interval,
             )),
             super::super::InterruptMode::Epoch => Some(native::NativeInterruptSettings::epoch(
-                self.fuel_check_interval,
+                self.run_ctx.fuel_check_interval,
             )),
         }
     }
 
     fn clear_native_direct_links(&self) {
-        for native in self.native_traces.iter().flatten() {
+        for native in self.engine.native_traces.iter().flatten() {
             for slot in native.direct_slots.values() {
                 slot.clear();
             }
@@ -554,15 +567,16 @@ impl Vm {
     }
 
     fn record_native_direct_escape(&mut self, _status: i32, direct_links_before: u64) {
-        if !self.jit_native_direct_links_enabled
-            || self.jit_native_direct_link_count == direct_links_before
+        if !self.engine.jit_native_direct_links_enabled
+            || self.engine.jit_native_direct_link_count == direct_links_before
         {
             return;
         }
-        self.jit_native_direct_escape_streak = 0;
-        if self.jit_native_active_direct_trace_id != usize::MAX {
-            self.jit
-                .record_native_loop_back(self.jit_native_active_direct_trace_id);
+        self.engine.jit_native_direct_escape_streak = 0;
+        if self.engine.jit_native_active_direct_trace_id != usize::MAX {
+            self.engine
+                .jit
+                .record_native_loop_back(self.engine.jit_native_active_direct_trace_id);
         }
     }
 
@@ -571,7 +585,9 @@ impl Vm {
         key: TraceExitKey,
         child_trace_id: usize,
     ) -> VmResult<()> {
-        if !self.jit_native_direct_links_enabled || self.jit_native_direct_region_fallback {
+        if !self.engine.jit_native_direct_links_enabled
+            || self.engine.jit_native_direct_region_fallback
+        {
             return Ok(());
         }
         self.publish_native_direct_slot(key.parent_trace_id, key.exit_id.raw(), child_trace_id)
@@ -590,15 +606,21 @@ impl Vm {
         slot_id: u32,
         child_trace_id: usize,
     ) -> VmResult<()> {
-        if self.jit.trace_has_entry_callable_guards(child_trace_id) {
+        if self
+            .engine
+            .jit
+            .trace_has_entry_callable_guards(child_trace_id)
+        {
             return Ok(());
         }
-        if !self.jit_native_direct_cross_frame_enabled {
+        if !self.engine.jit_native_direct_cross_frame_enabled {
             let parent_frame_key = self
+                .engine
                 .jit
                 .trace_clone(parent_trace_id)
                 .map(|trace| trace.frame_key);
             let child_frame_key = self
+                .engine
                 .jit
                 .trace_clone(child_trace_id)
                 .map(|trace| trace.frame_key);
@@ -608,6 +630,7 @@ impl Vm {
         }
         self.ensure_native_trace(child_trace_id, native::NativeCompileProfile::Jit)?;
         let child_entry = self
+            .engine
             .native_traces
             .get(child_trace_id)
             .and_then(Option::as_ref)
@@ -616,6 +639,7 @@ impl Vm {
             })?
             .tail_entry as *const u8;
         let Some(slot) = self
+            .engine
             .native_traces
             .get(parent_trace_id)
             .and_then(Option::as_ref)
@@ -652,28 +676,34 @@ impl Vm {
         all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
     ))]
     fn maybe_publish_native_region(&mut self, key: TraceExitKey, child_trace_id: usize) {
-        if self.jit_native_direct_links_enabled && !self.jit_native_direct_region_fallback {
-            return;
-        }
-        if self
-            .jit
-            .trace_has_entry_callable_guards(key.parent_trace_id)
-            || self.jit.trace_has_entry_callable_guards(child_trace_id)
+        if self.engine.jit_native_direct_links_enabled
+            && !self.engine.jit_native_direct_region_fallback
         {
             return;
         }
-        let Some(candidate) = self.jit.region_candidate(key, child_trace_id) else {
-            return;
-        };
-        if candidate.generation != self.jit.region_generation() {
+        if self
+            .engine
+            .jit
+            .trace_has_entry_callable_guards(key.parent_trace_id)
+            || self
+                .engine
+                .jit
+                .trace_has_entry_callable_guards(child_trace_id)
+        {
             return;
         }
-        let Some(parent) = self.jit.trace_clone(key.parent_trace_id) else {
-            self.jit.record_region_compile_failure(&candidate);
+        let Some(candidate) = self.engine.jit.region_candidate(key, child_trace_id) else {
             return;
         };
-        let Some(child) = self.jit.trace_clone(child_trace_id) else {
-            self.jit.record_region_compile_failure(&candidate);
+        if candidate.generation != self.engine.jit.region_generation() {
+            return;
+        }
+        let Some(parent) = self.engine.jit.trace_clone(key.parent_trace_id) else {
+            self.engine.jit.record_region_compile_failure(&candidate);
+            return;
+        };
+        let Some(child) = self.engine.jit.trace_clone(child_trace_id) else {
+            self.engine.jit.record_region_compile_failure(&candidate);
             return;
         };
         let back_import = scalar_cycle_import(&candidate.import)
@@ -684,7 +714,8 @@ impl Vm {
                     .iter()
                     .filter(|exit| exit.exit_ip == parent.root_ip)
                     .find_map(|exit| {
-                        self.jit
+                        self.engine
+                            .jit
                             .side_trace_import(child.id, exit.id, parent.id)
                             .ok()
                     })
@@ -699,7 +730,7 @@ impl Vm {
         ) {
             Ok(fused) => fused,
             Err(_) => {
-                self.jit.record_region_compile_failure(&candidate);
+                self.engine.jit.record_region_compile_failure(&candidate);
                 return;
             }
         };
@@ -713,13 +744,14 @@ impl Vm {
             compile_profile,
             drop_contract_events_enabled,
         );
-        self.jit_native_region_compile_time_ns = self
+        self.engine.jit_native_region_compile_time_ns = self
+            .engine
             .jit_native_region_compile_time_ns
             .saturating_add(elapsed_ns(compile_started));
         let compiled = match compile_result {
             Ok(compiled) => compiled,
             Err(_) => {
-                self.jit.record_region_compile_failure(&candidate);
+                self.engine.jit.record_region_compile_failure(&candidate);
                 return;
             }
         };
@@ -741,37 +773,38 @@ impl Vm {
             exit_keys: Arc::new(fused.exit_keys),
         };
         let Some(parent_native) = self
+            .engine
             .native_traces
             .get_mut(key.parent_trace_id)
             .and_then(Option::as_mut)
         else {
-            self.jit.record_region_compile_failure(&candidate);
+            self.engine.jit.record_region_compile_failure(&candidate);
             return;
         };
-        if !self.jit.publish_region(&candidate) {
+        if !self.engine.jit.publish_region(&candidate) {
             return;
         }
         parent_native.region = Some(region);
     }
 
     fn clear_native_region_owners(&mut self) {
-        for native in self.native_traces.iter_mut().flatten() {
+        for native in self.engine.native_traces.iter_mut().flatten() {
             native.region = None;
         }
     }
 
     pub(crate) fn disconnect_native_regions(&mut self) {
-        self.jit.invalidate_regions();
+        self.engine.jit.invalidate_regions();
         self.clear_native_region_owners();
     }
 
     fn block_jit_trace(&mut self, trace_id: usize) {
-        self.jit.block_trace(trace_id);
+        self.engine.jit.block_trace(trace_id);
         self.clear_native_region_owners();
     }
 
     fn block_jit_callable_frame(&mut self, trace_id: usize) {
-        self.jit.block_callable_frame(trace_id);
+        self.engine.jit.block_callable_frame(trace_id);
         self.clear_native_region_owners();
     }
 
@@ -780,26 +813,26 @@ impl Vm {
             self.ensure_program_cache_key();
         }
         self.clear_native_direct_links();
-        self.native_traces.clear();
-        self.native_trace_exec_count = 0;
-        self.jit_native_region_entry_count = 0;
-        self.jit_native_region_edge_count = 0;
-        self.jit_native_direct_link_count = 0;
-        self.jit_native_active_direct_trace_id = usize::MAX;
-        self.jit_native_direct_escape_streak = 0;
-        self.jit_native_direct_region_fallback = false;
-        self.jit_native_compile_time_ns = 0;
-        self.jit_native_region_compile_time_ns = 0;
-        self.jit_trace_exit_count = 0;
-        self.jit_native_loop_back_count = 0;
-        self.jit_native_link_handoff_count = 0;
-        self.jit_native_link_dispatch_depth = 0;
-        self.jit_helper_fallback_count = 0;
-        self.jit.set_config(config);
+        self.engine.native_traces.clear();
+        self.engine.native_trace_exec_count = 0;
+        self.engine.jit_native_region_entry_count = 0;
+        self.engine.jit_native_region_edge_count = 0;
+        self.engine.jit_native_direct_link_count = 0;
+        self.engine.jit_native_active_direct_trace_id = usize::MAX;
+        self.engine.jit_native_direct_escape_streak = 0;
+        self.engine.jit_native_direct_region_fallback = false;
+        self.engine.jit_native_compile_time_ns = 0;
+        self.engine.jit_native_region_compile_time_ns = 0;
+        self.engine.jit_trace_exit_count = 0;
+        self.engine.jit_native_loop_back_count = 0;
+        self.engine.jit_native_link_handoff_count = 0;
+        self.engine.jit_native_link_dispatch_depth = 0;
+        self.engine.jit_helper_fallback_count = 0;
+        self.engine.jit.set_config(config);
     }
 
     pub fn jit_config(&self) -> &super::JitConfig {
-        self.jit.config()
+        self.engine.jit.config()
     }
 
     pub fn jit_snapshot(&self) -> super::JitSnapshot {
@@ -807,15 +840,16 @@ impl Vm {
     }
 
     pub fn jit_exit_profiles(&self) -> Vec<super::JitExitProfile> {
-        self.jit.exit_profiles()
+        self.engine.jit.exit_profiles()
     }
 
     pub fn jit_call_site_profiles(&self) -> Vec<super::JitCallSiteProfile> {
-        self.jit.call_site_profiles()
+        self.engine.jit.call_site_profiles()
     }
 
     pub fn jit_native_code_bytes(&self) -> usize {
-        self.native_traces
+        self.engine
+            .native_traces
             .iter()
             .flatten()
             .map(|native| native.code.len())
@@ -823,7 +857,8 @@ impl Vm {
     }
 
     pub fn jit_native_region_code_bytes(&self) -> usize {
-        self.native_traces
+        self.engine
+            .native_traces
             .iter()
             .flatten()
             .filter_map(|native| native.region.as_ref())
@@ -832,11 +867,11 @@ impl Vm {
     }
 
     pub fn jit_native_compile_time_ns(&self) -> u64 {
-        self.jit_native_compile_time_ns
+        self.engine.jit_native_compile_time_ns
     }
 
     pub fn jit_native_region_compile_time_ns(&self) -> u64 {
-        self.jit_native_region_compile_time_ns
+        self.engine.jit_native_region_compile_time_ns
     }
 
     pub fn dump_jit_info(&self) -> String {
@@ -909,15 +944,16 @@ impl Vm {
         ) = self.native_trace_state(current_trace_id)?;
         native::clear_bridge_error();
         loop {
-            let region_edges_before = self.jit_native_region_edge_count;
-            let direct_links_before = self.jit_native_direct_link_count;
+            let region_edges_before = self.engine.jit_native_region_edge_count;
+            let direct_links_before = self.engine.jit_native_direct_link_count;
             let status = unsafe { entry(self as *mut Vm) };
-            self.native_trace_exec_count = self.native_trace_exec_count.saturating_add(1);
+            self.engine.native_trace_exec_count =
+                self.engine.native_trace_exec_count.saturating_add(1);
             if !is_region
-                && self.jit_native_active_direct_trace_id != usize::MAX
-                && self.jit_native_active_direct_trace_id != current_trace_id
+                && self.engine.jit_native_active_direct_trace_id != usize::MAX
+                && self.engine.jit_native_active_direct_trace_id != current_trace_id
             {
-                current_trace_id = self.jit_native_active_direct_trace_id;
+                current_trace_id = self.engine.jit_native_active_direct_trace_id;
                 let state = self.native_trace_state(current_trace_id)?;
                 entry = state.0;
                 root_ip = state.1;
@@ -928,13 +964,15 @@ impl Vm {
             }
             self.record_native_direct_escape(status, direct_links_before);
             if is_region {
-                self.jit_native_region_entry_count =
-                    self.jit_native_region_entry_count.saturating_add(1);
-                if self.jit_native_region_edge_count > region_edges_before {
-                    self.jit.record_native_region_progress(current_trace_id);
+                self.engine.jit_native_region_entry_count =
+                    self.engine.jit_native_region_entry_count.saturating_add(1);
+                if self.engine.jit_native_region_edge_count > region_edges_before {
+                    self.engine
+                        .jit
+                        .record_native_region_progress(current_trace_id);
                 }
             }
-            self.jit.mark_trace_executed(current_trace_id);
+            self.engine.jit.mark_trace_executed(current_trace_id);
             let mut trace_exit_key = None;
             let mut instruction_failure_exit = false;
             let status = if let Some(exit_id) = native::decode_jit_trace_exit_status(status) {
@@ -950,8 +988,9 @@ impl Vm {
                         exit_id: SsaExitId::new(exit_id),
                     }
                 };
-                instruction_failure_exit = self.jit.trace_exit_is_instruction_failure(key);
-                self.jit
+                instruction_failure_exit = self.engine.jit.trace_exit_is_instruction_failure(key);
+                self.engine
+                    .jit
                     .record_trace_exit(key)
                     .map_err(|err| VmError::JitNative(err.message()))?;
                 trace_exit_key = Some(key);
@@ -1017,13 +1056,19 @@ impl Vm {
                     return Ok(ExecOutcome::Continue);
                 }
                 native::STATUS_TRACE_EXIT => {
-                    self.jit_trace_exit_count = self.jit_trace_exit_count.saturating_add(1);
+                    self.engine.jit_trace_exit_count =
+                        self.engine.jit_trace_exit_count.saturating_add(1);
                     if instruction_failure_exit {
                         return Ok(ExecOutcome::Continue);
                     }
-                    if self.jit.trace_clone(current_trace_id).is_some_and(|trace| {
-                        trace.op_names.last().map(String::as_str) == Some("callable_boundary")
-                    }) {
+                    if self
+                        .engine
+                        .jit
+                        .trace_clone(current_trace_id)
+                        .is_some_and(|trace| {
+                            trace.op_names.last().map(String::as_str) == Some("callable_boundary")
+                        })
+                    {
                         self.block_jit_trace(current_trace_id);
                         return Ok(ExecOutcome::Continue);
                     }
@@ -1031,25 +1076,26 @@ impl Vm {
                     // calls, keep executing in native mode without bouncing through the interpreter.
                     if !has_yielding_call
                         && terminal == JitTraceTerminal::LoopBack
-                        && self.ip == root_ip
+                        && self.instance.ip == root_ip
                     {
-                        self.jit.record_native_loop_back(current_trace_id);
-                        self.jit_native_loop_back_count =
-                            self.jit_native_loop_back_count.saturating_add(1);
+                        self.engine.jit.record_native_loop_back(current_trace_id);
+                        self.engine.jit_native_loop_back_count =
+                            self.engine.jit_native_loop_back_count.saturating_add(1);
                         continue;
                     }
-                    if self.jit.record_native_side_exit(current_trace_id)
-                        && !self.jit_native_direct_links_enabled
+                    if self.engine.jit.record_native_side_exit(current_trace_id)
+                        && !self.engine.jit_native_direct_links_enabled
                     {
                         self.block_jit_callable_frame(current_trace_id);
                         return Ok(ExecOutcome::Continue);
                     }
                     if !has_yielding_call && !self.active_frame_has_shared_capture_cells() {
-                        let ip = self.ip;
+                        let ip = self.instance.ip;
                         let frame_key = self.active_frame_key();
                         let stack_depth = self.active_operand_stack_len();
                         let mut next_trace_id = self.compiled_trace_for_active_entry();
-                        if next_trace_id.is_none() && !self.jit.callable_frame_is_blocked(frame_key)
+                        if next_trace_id.is_none()
+                            && !self.engine.jit.callable_frame_is_blocked(frame_key)
                         {
                             next_trace_id = {
                                 let entry_local_types = (frame_key != ROOT_FRAME_KEY)
@@ -1057,7 +1103,7 @@ impl Vm {
                                 let entry_callable_prototypes =
                                     self.active_local_callable_prototypes();
                                 let program = &self.program;
-                                self.jit.observe_exit_entry_with_local_types(
+                                self.engine.jit.observe_exit_entry_with_local_types(
                                     frame_key,
                                     ip,
                                     stack_depth,
@@ -1121,17 +1167,19 @@ impl Vm {
                     if self.active_frame_has_shared_capture_cells() {
                         return Ok(ExecOutcome::Continue);
                     }
-                    let ip = self.ip;
+                    let ip = self.instance.ip;
                     let frame_key = self.active_frame_key();
                     let stack_depth = self.active_operand_stack_len();
                     let mut next_trace_id = self.compiled_trace_for_active_entry();
-                    if next_trace_id.is_none() && !self.jit.callable_frame_is_blocked(frame_key) {
+                    if next_trace_id.is_none()
+                        && !self.engine.jit.callable_frame_is_blocked(frame_key)
+                    {
                         next_trace_id = {
                             let entry_local_types =
                                 (frame_key != ROOT_FRAME_KEY).then(|| self.active_local_types());
                             let entry_callable_prototypes = self.active_local_callable_prototypes();
                             let program = &self.program;
-                            self.jit.observe_exit_entry_with_local_types(
+                            self.engine.jit.observe_exit_entry_with_local_types(
                                 frame_key,
                                 ip,
                                 stack_depth,
@@ -1186,26 +1234,31 @@ impl Vm {
                     return Ok(ExecOutcome::Continue);
                 }
                 native::STATUS_YIELDED => {
-                    self.last_yield_reason = Some(super::super::VmYieldReason::Host);
+                    self.instance.last_yield_reason = Some(super::super::VmYieldReason::Host);
                     return Ok(ExecOutcome::Yielded);
                 }
                 native::STATUS_WAITING => {
-                    let op_id = self.waiting_host_op.map(|op| op.op_id).ok_or_else(|| {
-                        VmError::JitNative(
-                            "native call bridge reported waiting without a pending op".to_string(),
-                        )
-                    })?;
+                    let op_id = self
+                        .instance
+                        .waiting_host_op
+                        .map(|op| op.op_id)
+                        .ok_or_else(|| {
+                            VmError::JitNative(
+                                "native call bridge reported waiting without a pending op"
+                                    .to_string(),
+                            )
+                        })?;
                     return Ok(ExecOutcome::Waiting(op_id));
                 }
                 native::STATUS_OUT_OF_FUEL => {
-                    return match self.interrupt_mode {
+                    return match self.run_ctx.interrupt_mode {
                         super::super::InterruptMode::Fuel => Err(VmError::OutOfFuel {
-                            needed: u64::from(self.fuel_check_interval),
-                            remaining: self.fuel_remaining,
+                            needed: u64::from(self.run_ctx.fuel_check_interval),
+                            remaining: self.run_ctx.fuel_remaining,
                         }),
                         super::super::InterruptMode::Epoch => Err(VmError::EpochDeadlineReached {
                             current: self.current_epoch(),
-                            deadline: self.epoch_deadline,
+                            deadline: self.run_ctx.epoch_deadline,
                         }),
                         super::super::InterruptMode::None => Err(VmError::JitNative(
                             "native interruption checkpoint fired while interruption was disabled"
@@ -1215,19 +1268,20 @@ impl Vm {
                 }
                 native::STATUS_ERROR => {
                     let err = native::take_bridge_error().unwrap_or_else(|| {
-                        let trace_meta = self.jit.trace_clone(current_trace_id).map(|trace| {
-                            format!(
-                                "trace_id={} root_ip={} terminal={:?} ops={}",
-                                trace.id,
-                                trace.root_ip,
-                                trace.terminal,
-                                trace.op_names.len()
-                            )
-                        });
+                        let trace_meta =
+                            self.engine.jit.trace_clone(current_trace_id).map(|trace| {
+                                format!(
+                                    "trace_id={} root_ip={} terminal={:?} ops={}",
+                                    trace.id,
+                                    trace.root_ip,
+                                    trace.terminal,
+                                    trace.op_names.len()
+                                )
+                            });
                         VmError::JitNative(format!(
                             "jit bridge reported failure without VmError (ip={} stack_len={} {})",
-                            self.ip,
-                            self.stack.len(),
+                            self.instance.ip,
+                            self.instance.stack.len(),
                             trace_meta.unwrap_or_else(|| "trace=<missing>".to_string())
                         ))
                     });
@@ -1252,6 +1306,7 @@ impl Vm {
     ))]
     fn native_trace_state(&self, trace_id: usize) -> VmResult<NativeTraceState> {
         let native = self
+            .engine
             .native_traces
             .get(trace_id)
             .and_then(Option::as_ref)
@@ -1259,7 +1314,7 @@ impl Vm {
                 VmError::JitNative(format!("native trace entry for id {} missing", trace_id))
             })?;
         if let Some(region) = native.region.as_ref().filter(|region| {
-            self.jit.published_region().is_some_and(|published| {
+            self.engine.jit.published_region().is_some_and(|published| {
                 published.generation == region.generation
                     && published.key == region.key
                     && published.child_trace_id == region.child_trace_id
@@ -1300,10 +1355,10 @@ impl Vm {
         trace_id: usize,
         compile_profile: native::NativeCompileProfile,
     ) -> Option<NativeTraceState> {
-        let native = self.native_traces.get(trace_id)?.as_ref()?;
+        let native = self.engine.native_traces.get(trace_id)?.as_ref()?;
         (native.interrupt_settings == self.active_native_interrupt_settings()
             && compile_profile_satisfies(native.compile_profile, compile_profile)
-            && native.drop_contract_events_enabled == self.drop_contract_events_enabled)
+            && native.drop_contract_events_enabled == self.instance.drop_contract_events_enabled)
             .then(|| self.native_trace_state(trace_id).ok())
             .flatten()
     }
@@ -1337,7 +1392,11 @@ impl Vm {
         compile_profile: native::NativeCompileProfile,
         interrupt_settings: Option<native::NativeInterruptSettings>,
     ) -> VmResult<()> {
-        if let Some(native) = self.native_traces.get(trace_id).and_then(Option::as_ref)
+        if let Some(native) = self
+            .engine
+            .native_traces
+            .get(trace_id)
+            .and_then(Option::as_ref)
             && native.interrupt_settings == interrupt_settings
             && compile_profile_satisfies(native.compile_profile, compile_profile)
             && native.drop_contract_events_enabled == self.drop_contract_events_enabled()
@@ -1345,6 +1404,7 @@ impl Vm {
             return Ok(());
         }
         if self
+            .engine
             .native_traces
             .get(trace_id)
             .and_then(Option::as_ref)
@@ -1353,12 +1413,12 @@ impl Vm {
             self.disconnect_native_regions();
         }
         self.clear_native_direct_links();
-        if let Some(slot) = self.native_traces.get_mut(trace_id) {
+        if let Some(slot) = self.engine.native_traces.get_mut(trace_id) {
             *slot = None;
         }
 
         let program_cache_key = self.ensure_program_cache_key();
-        let trace = self.jit.trace_clone(trace_id).ok_or_else(|| {
+        let trace = self.engine.jit.trace_clone(trace_id).ok_or_else(|| {
             VmError::JitNative(format!("trace {} missing for native compile", trace_id))
         })?;
         let drop_contract_events_enabled = self.drop_contract_events_enabled();
@@ -1393,10 +1453,10 @@ impl Vm {
                 .collect();
             let mut code = cached.code.to_vec();
             code.extend_from_slice(&dispatcher.code);
-            if self.native_traces.len() <= trace_id {
-                self.native_traces.resize_with(trace_id + 1, || None);
+            if self.engine.native_traces.len() <= trace_id {
+                self.engine.native_traces.resize_with(trace_id + 1, || None);
             }
-            self.native_traces[trace_id] = Some(NativeTrace {
+            self.engine.native_traces[trace_id] = Some(NativeTrace {
                 _keepalive: cached.keepalive,
                 _direct_keepalives: direct_keepalives,
                 entry,
@@ -1423,7 +1483,8 @@ impl Vm {
             compile_profile,
             drop_contract_events_enabled,
         );
-        self.jit_native_compile_time_ns = self
+        self.engine.jit_native_compile_time_ns = self
+            .engine
             .jit_native_compile_time_ns
             .saturating_add(elapsed_ns(compile_started));
         let compiled = compile_result?;
@@ -1463,10 +1524,10 @@ impl Vm {
         let mut code = compiled.code;
         code.extend_from_slice(&dispatcher.code);
         let code = Arc::<[u8]>::from(code.into_boxed_slice());
-        if self.native_traces.len() <= trace_id {
-            self.native_traces.resize_with(trace_id + 1, || None);
+        if self.engine.native_traces.len() <= trace_id {
+            self.engine.native_traces.resize_with(trace_id + 1, || None);
         }
-        self.native_traces[trace_id] = Some(NativeTrace {
+        self.engine.native_traces[trace_id] = Some(NativeTrace {
             _keepalive: keepalive,
             _direct_keepalives: direct_keepalives,
             entry,
@@ -1487,21 +1548,24 @@ impl Vm {
     }
 
     pub fn jit_native_trace_count(&self) -> usize {
-        self.native_traces.iter().flatten().count()
+        self.engine.native_traces.iter().flatten().count()
     }
 
     pub fn jit_native_exec_count(&self) -> u64 {
-        self.native_trace_exec_count
+        self.engine.native_trace_exec_count
     }
 
     pub(crate) fn jit_native_inherited_target(&self) -> usize {
-        if !self.jit_native_direct_links_enabled || self.active_frame_has_shared_capture_cells() {
+        if !self.engine.jit_native_direct_links_enabled
+            || self.active_frame_has_shared_capture_cells()
+        {
             return 0;
         }
         let Some(trace_id) = self.compiled_trace_for_active_entry() else {
             return 0;
         };
-        self.native_traces
+        self.engine
+            .native_traces
             .get(trace_id)
             .and_then(Option::as_ref)
             .map(|native| native.tail_entry as usize)
@@ -1510,24 +1574,25 @@ impl Vm {
 
     pub fn set_jit_native_direct_links_enabled(&mut self, enabled: bool) {
         let cross_frame_enabled = enabled;
-        if self.jit_native_direct_links_enabled == enabled
-            && self.jit_native_direct_cross_frame_enabled == cross_frame_enabled
+        if self.engine.jit_native_direct_links_enabled == enabled
+            && self.engine.jit_native_direct_cross_frame_enabled == cross_frame_enabled
         {
             return;
         }
         self.clear_native_direct_links();
         self.disconnect_native_regions();
-        self.native_traces.clear();
-        self.jit_native_direct_links_enabled = enabled;
-        self.jit_native_direct_cross_frame_enabled = cross_frame_enabled;
-        self.jit_native_direct_link_count = 0;
-        self.jit_native_active_direct_trace_id = usize::MAX;
-        self.jit_native_direct_escape_streak = 0;
-        self.jit_native_direct_region_fallback = false;
+        self.engine.native_traces.clear();
+        self.engine.jit_native_direct_links_enabled = enabled;
+        self.engine.jit_native_direct_cross_frame_enabled = cross_frame_enabled;
+        self.engine.jit_native_direct_link_count = 0;
+        self.engine.jit_native_active_direct_trace_id = usize::MAX;
+        self.engine.jit_native_direct_escape_streak = 0;
+        self.engine.jit_native_direct_region_fallback = false;
     }
 
     pub fn jit_native_region_count(&self) -> usize {
-        self.native_traces
+        self.engine
+            .native_traces
             .iter()
             .flatten()
             .filter(|native| native.region.is_some())
@@ -1535,19 +1600,20 @@ impl Vm {
     }
 
     pub fn jit_native_region_entry_count(&self) -> u64 {
-        self.jit_native_region_entry_count
+        self.engine.jit_native_region_entry_count
     }
 
     pub fn jit_native_internal_region_edge_count(&self) -> u64 {
-        self.jit_native_region_edge_count
+        self.engine.jit_native_region_edge_count
     }
 
     pub fn jit_native_direct_link_count(&self) -> u64 {
-        self.jit_native_direct_link_count
+        self.engine.jit_native_direct_link_count
     }
 
     pub fn jit_native_active_direct_link_slot_count(&self) -> usize {
-        self.native_traces
+        self.engine
+            .native_traces
             .iter()
             .flatten()
             .flat_map(|native| native.direct_slots.values())
@@ -1556,19 +1622,21 @@ impl Vm {
     }
 
     pub fn jit_helper_fallback_count(&self) -> u64 {
-        self.jit_helper_fallback_count
+        self.engine.jit_helper_fallback_count
     }
 
     pub fn jit_native_link_handoff_count(&self) -> u64 {
-        self.jit_native_link_handoff_count
+        self.engine.jit_native_link_handoff_count
     }
 
     fn record_jit_helper_fallback(&mut self) {
-        self.jit_helper_fallback_count = self.jit_helper_fallback_count.saturating_add(1);
+        self.engine.jit_helper_fallback_count =
+            self.engine.jit_helper_fallback_count.saturating_add(1);
     }
 
     fn record_jit_link_handoff(&mut self) {
-        self.jit_native_link_handoff_count = self.jit_native_link_handoff_count.saturating_add(1);
+        self.engine.jit_native_link_handoff_count =
+            self.engine.jit_native_link_handoff_count.saturating_add(1);
     }
 }
 
