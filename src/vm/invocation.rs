@@ -145,7 +145,8 @@ impl Invocation<'_> {
             ));
         }
         state.cancel_reason = Some(reason);
-        self.vm.cancel_waiting_host_op();
+        self.vm.cancel_waiting_host_op_with_reason(reason);
+        self.vm.cancel_callable_stream();
         Ok(())
     }
 }
@@ -461,7 +462,8 @@ impl Vm {
             .as_ref()
             .map(|state| (state.stack_base, state.frame_count))
             .unwrap_or((0, 0));
-        self.cancel_waiting_host_op();
+        self.cancel_waiting_host_op_with_reason(OperationCancelReason::Requested);
+        self.cancel_callable_stream();
         self.abort_host_invocation(stack_base, frame_count);
         self.instance.drop_invocation_state();
     }

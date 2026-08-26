@@ -14,6 +14,7 @@ name = "rustscript"
 default = ["runtime", "cli", "cranelift-jit"]
 runtime = ["pd_vm_crate/runtime"]
 sqlite = ["pd_vm_crate/sqlite"]
+http-client = ["runtime", "pd_vm_crate/http-client"]
 edge-abi = ["pd_vm_crate/edge-abi"]
 cli = ["pd_vm_crate/cli"]
 cranelift-jit = ["pd_vm_crate/cranelift-jit"]

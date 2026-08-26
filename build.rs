@@ -166,7 +166,7 @@ fn main() {
         catalog.retain(|entry| !entry.source_name.starts_with("sqlite::"));
     }
 
-    let host_sources = vec![
+    let mut host_sources = vec![
         SourceSpec {
             path: "src/builtins/runtime/host.rs".to_string(),
             module: "host".to_string(),
@@ -178,6 +178,19 @@ fn main() {
             category: SourceCategory::DefaultHost,
         },
     ];
+    if env::var_os("CARGO_FEATURE_HTTP_CLIENT").is_some() {
+        host_sources.push(SourceSpec {
+            path: "src/builtins/runtime/http/mod.rs".to_string(),
+            module: "http".to_string(),
+            category: SourceCategory::DefaultHost,
+        });
+
+        host_sources.push(SourceSpec {
+            path: "src/builtins/runtime/http/sse.rs".to_string(),
+            module: "http::sse".to_string(),
+            category: SourceCategory::DefaultHost,
+        });
+    }
     let builtin_sources = builtin_source_specs(&namespaces);
     let core_sources = [SourceSpec {
         path: "src/builtins/runtime/core.rs".to_string(),

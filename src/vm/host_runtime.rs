@@ -20,6 +20,7 @@ use std::sync::Arc;
 use crate::builtins::runtime::IoState;
 #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 use crate::builtins::runtime::SqliteState;
+use crate::vm::async_host::HostStreamDriver;
 use crate::vm::execution_scope::ExecutionScope;
 use crate::vm::host::{HostAsyncBridge, HostOpId, VmHostFunction};
 
@@ -82,6 +83,11 @@ pub(crate) struct HostRuntime {
     /// that are still pending. These route to the bridge's
     /// `poll_submitted_op` instead of a runtime-owned operation driver.
     pub(crate) submitted_host_ops: HashSet<HostOpId>,
+    /// Callable-stream drivers keyed by their host-operation id. A driver is
+    /// installed by `Vm::submit_callable_stream` and removed when its stream
+    /// completes, is cancelled, or errors; dropping a driver releases its
+    /// producer resources.
+    pub(crate) stream_drivers: HashMap<HostOpId, Box<dyn HostStreamDriver>>,
 }
 
 impl HostRuntime {
@@ -116,6 +122,7 @@ impl HostRuntime {
             allowed_host_function_slots: Vec::new(),
             allow_default_host_fallback: true,
             submitted_host_ops: HashSet::new(),
+            stream_drivers: HashMap::new(),
         }
     }
 
@@ -138,6 +145,18 @@ impl HostRuntime {
             .and_then(|state| state.downcast_ref::<T>())
     }
 
+    /// Mutable access to host-owned typed policy/configuration state, if any.
+    #[cfg(feature = "http-client")]
+    pub(crate) fn host_function_state_mut<T>(&mut self) -> Option<&mut T>
+    where
+        T: Send + Sync + 'static,
+    {
+        self.host_function_state
+            .get_mut(&TypeId::of::<T>())
+            .map(|state| Arc::get_mut(state).expect("http host state is uniquely owned"))
+            .and_then(|state| state.downcast_mut::<T>())
+    }
+
     /// Removes host-owned typed policy/configuration state.
     pub(crate) fn remove_host_function_state<T>(&mut self) -> Option<Arc<dyn Any + Send + Sync>>
     where
@@ -157,13 +176,35 @@ impl HostRuntime {
     /// in-flight IO operation and closing every IO handle/process resource
     /// before the new scope starts. Used by `Vm::reset_for_reuse` so IO
     /// retirement goes through the generic scope lifecycle.
+    ///
+    /// The typed policy/configuration store is cleared, except the persistent
+    /// HTTP host configuration, which is a *module-level* policy that survives
+    /// scope reset so an embedder's accepted hosts/schemes/limits remain in
+    /// force across `reset_for_reuse` (only the in-flight connection permits
+    /// and live streams are retired, never the configured policy).
     pub(crate) fn reset_execution_scope(&mut self) {
         self.io_state = IoState::default();
         #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
         {
             self.sqlite_state = SqliteState::default();
         }
-        self.host_function_state.clear();
+        #[cfg(feature = "http-client")]
+        {
+            let http_config = self
+                .host_function_state::<crate::builtins::runtime::http::HttpHostState>()
+                .cloned();
+            self.host_function_state.clear();
+            if let Some(config) = http_config {
+                self.host_function_state.insert(
+                    std::any::TypeId::of::<crate::builtins::runtime::http::HttpHostState>(),
+                    std::sync::Arc::new(config),
+                );
+            }
+        }
+        #[cfg(not(feature = "http-client"))]
+        {
+            self.host_function_state.clear();
+        }
         self.execution_scope = ExecutionScope::new()
             .expect("host runtime execution-scope identity space must be available");
     }

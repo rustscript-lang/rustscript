@@ -23,6 +23,9 @@ use std::pin::Pin;
 
 use super::*;
 
+pub(crate) mod stream;
+pub(crate) use stream::{HostStreamAction, HostStreamDriver, HostStreamPoll};
+
 /// A completion closure that runs against the VM after the async call's
 /// future has resolved.
 pub type HostVmCompletion<T> = Box<dyn FnOnce(&mut Vm) -> VmResult<T> + Send + 'static>;

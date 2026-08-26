@@ -780,6 +780,11 @@ pub(super) enum WaitingHostOpSource {
     BuiltinIo,
     #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
     BuiltinSqlite,
+    /// A callable-stream continuation (a host-only producer whose items are
+    /// serialized through a script callback). Polling and cancellation are
+    /// handled by the stream driver machinery rather than a bridge or a
+    /// runtime-owned operation.
+    CallableStream,
 }
 
 struct NoopWake;
@@ -1177,6 +1182,13 @@ impl Vm {
     }
 
     pub(super) fn cancel_waiting_host_op(&mut self) {
+        self.cancel_waiting_host_op_with_reason(OperationCancelReason::Requested);
+    }
+
+    /// Cancels the currently waiting host op (if any), forwarding a typed
+    /// reason so the bridge/stream driver can distinguish an explicit request
+    /// from a reset, deadline, or drop.
+    pub(super) fn cancel_waiting_host_op_with_reason(&mut self, reason: OperationCancelReason) {
         let Some(waiting) = self.instance.waiting_host_op.take() else {
             return;
         };
@@ -1184,7 +1196,7 @@ impl Vm {
             WaitingHostOpSource::HostBridge => {
                 self.host.submitted_host_ops.remove(&waiting.op_id);
                 if let Some(bridge) = self.host.async_bridge.as_mut() {
-                    bridge.cancel_op(waiting.op_id);
+                    bridge.cancel_op_with_reason(waiting.op_id, reason);
                 }
             }
             WaitingHostOpSource::BuiltinIo => {
@@ -1193,6 +1205,9 @@ impl Vm {
             #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             WaitingHostOpSource::BuiltinSqlite => {
                 crate::builtins::runtime::cancel_builtin_sqlite_op(self, waiting.op_id);
+            }
+            WaitingHostOpSource::CallableStream => {
+                self.cancel_callable_stream();
             }
         }
     }
@@ -1209,6 +1224,10 @@ impl Vm {
         let Some(waiting) = self.instance.waiting_host_op else {
             return Poll::Ready(Ok(()));
         };
+
+        if waiting.source == WaitingHostOpSource::CallableStream {
+            return self.poll_callable_stream(waiting.op_id, cx);
+        }
 
         // The HostBridge arm produces a `HostFutureOutput` (so a submitted
         // future's completion closure can run against the VM); the runtime
@@ -1248,6 +1267,8 @@ impl Vm {
                 crate::builtins::runtime::poll_builtin_sqlite_op(self, waiting.op_id, cx)
                     .map(|result| result.map(HostFutureOutput::Return))
             }
+            // Handled above through `poll_callable_stream`; unreachable here.
+            WaitingHostOpSource::CallableStream => unreachable!(),
         };
 
         match poll_result {
@@ -1457,7 +1478,10 @@ impl Vm {
             crate::builtins::runtime::BuiltinCallOutcome::Pending(op_id) => {
                 self.instance.stack.truncate(arg_start);
                 let resume_ip = self.call_resume_ip(call_ip)?;
-                if self.host.submitted_host_ops.contains(&op_id) {
+                self.record_callable_stream_resume_ip(op_id, resume_ip);
+                if self.host.stream_drivers.contains_key(&op_id) {
+                    self.set_waiting_host_op(op_id, WaitingHostOpSource::CallableStream)?;
+                } else if self.host.submitted_host_ops.contains(&op_id) {
                     if let Err(error) =
                         self.set_waiting_host_op(op_id, WaitingHostOpSource::HostBridge)
                     {
@@ -1916,7 +1940,12 @@ impl Vm {
                 saved_stack.append(&mut host_stack);
                 self.instance.stack = saved_stack;
                 let resume_ip = self.call_resume_ip(call_ip)?;
-                self.set_waiting_host_op(op_id, WaitingHostOpSource::HostBridge)?;
+                self.record_callable_stream_resume_ip(op_id, resume_ip);
+                if self.host.stream_drivers.contains_key(&op_id) {
+                    self.set_waiting_host_op(op_id, WaitingHostOpSource::CallableStream)?;
+                } else {
+                    self.set_waiting_host_op(op_id, WaitingHostOpSource::HostBridge)?;
+                }
                 self.instance.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
             }
@@ -2031,7 +2060,12 @@ impl Vm {
             CallOutcome::Pending(op_id) => {
                 self.instance.stack.truncate(arg_start);
                 let resume_ip = self.call_resume_ip(call_ip)?;
-                self.set_waiting_host_op(op_id, WaitingHostOpSource::HostBridge)?;
+                self.record_callable_stream_resume_ip(op_id, resume_ip);
+                if self.host.stream_drivers.contains_key(&op_id) {
+                    self.set_waiting_host_op(op_id, WaitingHostOpSource::CallableStream)?;
+                } else {
+                    self.set_waiting_host_op(op_id, WaitingHostOpSource::HostBridge)?;
+                }
                 self.instance.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
             }
@@ -2092,7 +2126,12 @@ impl Vm {
             CallOutcome::Pending(op_id) => {
                 self.instance.stack.truncate(arg_start);
                 let resume_ip = self.call_resume_ip(call_ip)?;
-                self.set_waiting_host_op(op_id, WaitingHostOpSource::HostBridge)?;
+                self.record_callable_stream_resume_ip(op_id, resume_ip);
+                if self.host.stream_drivers.contains_key(&op_id) {
+                    self.set_waiting_host_op(op_id, WaitingHostOpSource::CallableStream)?;
+                } else {
+                    self.set_waiting_host_op(op_id, WaitingHostOpSource::HostBridge)?;
+                }
                 self.instance.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
             }

@@ -49,3 +49,11 @@ fn alias_exports_public_invocation_stream_contract() {
         message: "boom".to_string(),
     });
 }
+
+#[cfg(feature = "http-client")]
+#[test]
+fn alias_http_client_includes_runtime_contract() {
+    fn accept_runtime_result(_result: rustscript::RuntimeResult<()>) {}
+
+    accept_runtime_result(Ok(()));
+}

@@ -6,7 +6,7 @@ use crate::builtins::BuiltinFunction;
 #[allow(unused_imports)]
 use crate::vm::{CallOutcome, CallReturn, HostOpId, Value, Vm, VmError, VmResult};
 #[cfg(feature = "async")]
-use crate::vm::CaptureAsyncHostContext;
+use crate::vm::{CaptureAsyncHostContext, HostFutureOutput};
 
 mod aot;
 mod bytes;
@@ -16,6 +16,8 @@ pub(crate) mod core;
 pub(crate) mod error;
 pub(crate) mod event;
 mod host;
+#[cfg(feature = "http-client")]
+pub(crate) mod http;
 #[cfg(not(target_arch = "wasm32"))]
 mod io;
 #[cfg(target_arch = "wasm32")]
@@ -37,6 +39,8 @@ use io_wasm as io;
 pub(crate) use context::{RuntimeContext, RuntimeContextConfig, STREAM_EMIT_NAME};
 pub use error::{RuntimeError, RuntimeErrorCode, RuntimeResult};
 pub(crate) use event::{EventLimits, EventPayload};
+#[cfg(feature = "http-client")]
+pub use http::{HttpConfig, HttpHostExt};
 pub(crate) use io::IoState;
 #[cfg(not(target_arch = "wasm32"))]
 pub use io::{IoHostExt, IoPolicy};

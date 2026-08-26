@@ -15,6 +15,8 @@ mod host;
 pub mod host_context;
 pub mod host_extension;
 mod host_runtime;
+#[cfg(test)]
+mod host_stream_tests;
 mod instance;
 pub mod invocation;
 pub(crate) mod jit;
@@ -31,6 +33,8 @@ mod superinstructions;
 mod tests;
 pub use self::aot::AotArtifactError;
 pub use self::async_host::{CaptureAsyncHostContext, HostFuture, HostFutureOutput};
+#[cfg_attr(not(feature = "http-client"), allow(unused_imports))]
+pub(crate) use self::async_host::{HostStreamAction, HostStreamDriver, HostStreamPoll};
 pub use self::capability::{CapabilityProfile, CapabilityProfileBuilder};
 use self::engine::Engine;
 pub use self::epoch::{EpochCheckpoint, EpochHandle};
@@ -730,6 +734,7 @@ impl Vm {
     /// dropped and replaced with a fresh one).
     pub fn reset_for_reuse(&mut self) {
         self.cancel_waiting_host_op();
+        self.cancel_callable_stream();
         self.host.reset_execution_scope();
         self.run_ctx.reset_for_reuse();
         self.instance.reset(&self.program);
@@ -1011,20 +1016,35 @@ impl Vm {
     }
 
     pub fn run(&mut self) -> VmResult<VmStatus> {
-        self.run_internal(None, true)
+        let status = match self.run_internal(None, true) {
+            Ok(status) => status,
+            Err(error) => {
+                self.abort_callable_stream_on_run_error();
+                return Err(error);
+            }
+        };
+        self.resume_callable_stream_after_run(status)
     }
 
     pub fn run_with_debugger(
         &mut self,
         debugger: &mut crate::debugger::Debugger,
     ) -> VmResult<VmStatus> {
-        self.run_internal(Some(debugger), false)
+        let status = match self.run_internal(Some(debugger), false) {
+            Ok(status) => status,
+            Err(error) => {
+                self.abort_callable_stream_on_run_error();
+                return Err(error);
+            }
+        };
+        self.resume_callable_stream_after_run(status)
     }
 }
 
 impl Drop for Vm {
     fn drop(&mut self) {
         self.cancel_waiting_host_op();
+        self.cancel_callable_stream();
         self.instance.drop_cleanup();
         // Live IO handles and in-flight IO operations are retired by the
         // `ExecutionScope`'s own `Drop`, which runs as part of `HostRuntime`.
@@ -2758,7 +2778,14 @@ impl Vm {
                 .map(|frame| &frame.continuation),
             Some(FrameContinuation::ReturnToHost)
         );
-        self.run_internal(None, allow_jit)
+        let status = match self.run_internal(None, allow_jit) {
+            Ok(status) => status,
+            Err(error) => {
+                self.abort_callable_stream_on_run_error();
+                return Err(error);
+            }
+        };
+        self.resume_callable_stream_after_run(status)
     }
 
     pub fn stack(&self) -> &[Value] {
@@ -2993,6 +3020,7 @@ impl Vm {
     pub fn shutdown(&mut self) {
         self.invalidate_callback_registries();
         self.cancel_waiting_host_op();
+        self.cancel_callable_stream();
         self.instance.drop_invocation_state();
         // Begin execution-scope shutdown (first-reason-wins; sealing the
         // operation registry) before tearing down interpreter state.
