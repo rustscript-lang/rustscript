@@ -4,6 +4,9 @@
 #[path = "vm/drop_contract_tests.rs"]
 mod drop_contract_tests;
 
+#[path = "vm/execution_scope_tests.rs"]
+mod execution_scope_tests;
+
 #[path = "vm/functional_parity_tests.rs"]
 mod functional_parity_tests;
 

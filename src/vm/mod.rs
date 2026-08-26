@@ -7,14 +7,18 @@ pub(crate) mod aot;
 pub mod diagnostics;
 mod engine;
 mod epoch;
+pub mod execution_scope;
 mod fuel;
 mod host;
 mod host_runtime;
+pub(crate) mod host_state;
 mod instance;
 pub(crate) mod jit;
 mod map_iter;
 pub(crate) mod native;
+pub mod operation;
 pub mod program;
+pub mod resource;
 mod run_context;
 mod store;
 mod superinstructions;
@@ -23,6 +27,7 @@ mod tests;
 pub use self::aot::AotArtifactError;
 use self::engine::Engine;
 pub use self::epoch::{EpochCheckpoint, EpochHandle};
+use self::execution_scope::ExecutionScopeError;
 pub use self::fuel::FuelCheckpoint;
 pub use self::host::{
     CallOutcome, CallReturn, HostArgsFunction, HostAsyncBridge, HostBindingPlan, HostFunction,
@@ -32,6 +37,7 @@ pub use self::host::{
 use self::host::{HostCallExecOutcome, VmHostFunction};
 use self::host_runtime::HostRuntime;
 use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable};
+pub use self::resource::ResourceCloseReason;
 use self::run_context::{InterruptMode, RunContext};
 pub use crate::bytecode::{
     CallableTarget, CallableValue, HostImport, OpCode, Program, Value, ValueType,
@@ -107,6 +113,10 @@ pub enum VmError {
     BytecodeBounds,
     HostError(String),
     JitNative(String),
+    /// A structured failure from the execution scope (resource or operation
+    /// registry state/close error), preserved for the modern resource and
+    /// operation lifecycle.
+    ExecutionScope(ExecutionScopeError),
     InvalidFuelCheckInterval(u32),
     InvalidEpochCheckInterval(u32),
     InterruptionModeConflict {
@@ -183,6 +193,7 @@ impl std::fmt::Display for VmError {
             VmError::BytecodeBounds => write!(f, "bytecode bounds"),
             VmError::HostError(message) => write!(f, "host error: {message}"),
             VmError::JitNative(message) => write!(f, "jit native error: {message}"),
+            VmError::ExecutionScope(error) => write!(f, "execution scope error: {error}"),
             VmError::InvalidFuelCheckInterval(value) => {
                 write!(f, "invalid fuel check interval {value}, expected >= 1")
             }
@@ -281,9 +292,8 @@ pub struct Vm {
     pub(crate) host: HostRuntime,
     /// Legacy pre-scope IO runtime state.
     ///
-    /// This commit keeps IO ownership on the `Vm` facade (it was not moved
-    /// into [`HostRuntime`]); the generic scope-lifecycle migration relocates
-    /// it in a later commit.
+    /// This commit keeps IO ownership on the `Vm` facade; the generic
+    /// scope-lifecycle migration relocates it in a later commit.
     pub(crate) io_state: crate::builtins::runtime::IoState,
 }
 
@@ -2650,8 +2660,18 @@ impl Vm {
         self.program.as_ref()
     }
 
+    /// Returns the bound host function count.
     pub fn bound_function_count(&self) -> usize {
         self.host.host_functions.len()
+    }
+
+    /// Mutable access to the VM's isolated execution scope.
+    ///
+    /// The scope owns one resource registry and one operation registry; this
+    /// is the host-facing surface for allocating/borrowing resources and
+    /// starting/cancelling operations without reaching into VM private state.
+    pub fn execution_scope(&mut self) -> &mut crate::vm::execution_scope::ExecutionScope {
+        &mut self.host.execution_scope
     }
 
     pub fn has_bound_function(&self, name: &str) -> bool {
@@ -2795,6 +2815,12 @@ impl Vm {
     pub fn shutdown(&mut self) {
         self.invalidate_callback_registries();
         self.cancel_waiting_host_op();
+        // Begin execution-scope shutdown (first-reason-wins; sealing the
+        // operation registry) before tearing down interpreter state.
+        let _ = self
+            .host
+            .execution_scope
+            .begin_close(crate::vm::resource::ResourceCloseReason::VmDrop);
         self.instance.queued_callables.clear();
         self.instance.completed_callable_results.clear();
         self.instance.owned_callables.clear();
