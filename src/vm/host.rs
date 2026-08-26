@@ -1,8 +1,12 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::task::{Context, Poll, Wake, Waker};
 
 use crate::builtins::BuiltinFunction;
+use crate::vm::operation::OperationCancelReason;
 
+use super::async_host::{HostFuture, HostFutureOutput};
+use super::capability::CapabilityProfile;
 use super::*;
 
 pub type HostOpId = u64;
@@ -86,9 +90,28 @@ pub trait HostArgsFunction: Send {
 }
 
 pub trait HostAsyncBridge: Send {
+    fn submit_op(&mut self, _op_id: HostOpId, _future: HostFuture) -> VmResult<()> {
+        Err(VmError::HostError(
+            "async host bridge does not accept submitted futures".to_string(),
+        ))
+    }
+
     fn poll_op(&mut self, op_id: HostOpId, cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>>;
 
+    fn poll_submitted_op(
+        &mut self,
+        op_id: HostOpId,
+        cx: &mut Context<'_>,
+    ) -> Poll<VmResult<HostFutureOutput>> {
+        self.poll_op(op_id, cx)
+            .map(|result| result.map(HostFutureOutput::Return))
+    }
+
     fn cancel_op(&mut self, _op_id: HostOpId) {}
+
+    fn cancel_op_with_reason(&mut self, op_id: HostOpId, _reason: OperationCancelReason) {
+        self.cancel_op(op_id);
+    }
 }
 
 pub type StaticHostFunction = fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>;
@@ -121,6 +144,15 @@ pub struct HostBindingPlan {
     import_signature: Vec<HostImport>,
     registry_slots: Vec<u16>,
     resolved_calls: Vec<u16>,
+    allowed_builtin_calls: Vec<u16>,
+    allow_default_builtin_capabilities: bool,
+    allowed_host_function_slots: Vec<u16>,
+    allow_default_host_capabilities: bool,
+    capability_profile: Arc<CapabilityProfile>,
+    capability_fingerprint: u64,
+    registry_state: Arc<()>,
+    registry_generation_token: Arc<()>,
+    registry_generation: u64,
 }
 
 #[derive(Clone)]
@@ -128,6 +160,18 @@ pub struct HostFunctionRegistry {
     entries: Arc<Vec<RegistryEntry>>,
     by_name: Arc<HashMap<String, u16>>,
     plan_cache: Arc<RwLock<HashMap<Vec<HostImport>, Arc<HostBindingPlan>>>>,
+    allowed_builtin_calls: Arc<Vec<u16>>,
+    allow_default_builtin_capabilities: bool,
+    allow_default_host_capabilities: bool,
+    capability_profile: Arc<CapabilityProfile>,
+    registry_state: Arc<()>,
+    registry_generation_token: Arc<()>,
+    registry_generation: Arc<AtomicU64>,
+    /// Caller-provided standard-surface composition strategy, if installed.
+    ///
+    /// This is explicit per-instance state: the outer standard-runtime
+    /// constructor installs it; `src/vm` never names a concrete domain.
+    standard_composition: Option<Arc<dyn super::standard_composition::StandardSurfaceComposition>>,
 }
 
 impl Default for HostFunctionRegistry {
@@ -137,27 +181,111 @@ impl Default for HostFunctionRegistry {
 }
 
 impl HostFunctionRegistry {
-    fn empty() -> Self {
+    pub fn empty() -> Self {
         Self {
             entries: Arc::new(Vec::new()),
             by_name: Arc::new(HashMap::new()),
             plan_cache: Arc::new(RwLock::new(HashMap::new())),
+            allowed_builtin_calls: Arc::new(Vec::new()),
+            allow_default_builtin_capabilities: true,
+            allow_default_host_capabilities: true,
+            capability_profile: Arc::new(CapabilityProfile::allow_all()),
+            registry_state: Arc::new(()),
+            registry_generation_token: Arc::new(()),
+            registry_generation: Arc::new(AtomicU64::new(0)),
+            standard_composition: None,
         }
     }
 
     pub fn new() -> Self {
         static DEFAULT_REGISTRY: OnceLock<HostFunctionRegistry> = OnceLock::new();
 
-        DEFAULT_REGISTRY
+        let mut registry = DEFAULT_REGISTRY
             .get_or_init(|| {
                 let mut registry = Self::empty();
                 crate::builtins::runtime::register_default_host_functions(&mut registry);
+                registry.allow_default_builtin_capabilities = true;
+                registry.allow_default_host_capabilities = true;
                 registry
             })
-            .clone()
+            .clone();
+        registry.plan_cache = Arc::new(RwLock::new(HashMap::new()));
+        registry.capability_profile = Arc::new(CapabilityProfile::allow_all());
+        registry.registry_state = Arc::new(());
+        registry.registry_generation_token = Arc::new(());
+        registry.registry_generation = Arc::new(AtomicU64::new(0));
+        registry
+    }
+
+    /// Returns the standard host registry with every registered host function present but
+    /// requiring an explicit capability grant before execution.
+    pub fn restricted() -> Self {
+        let mut registry = Self::new();
+        registry.allow_default_builtin_capabilities = false;
+        registry.allow_default_host_capabilities = false;
+        registry.capability_profile = Arc::new(CapabilityProfile::deny_all());
+        registry.registry_state = Arc::new(());
+        registry.registry_generation_token = Arc::new(());
+        registry.registry_generation = Arc::new(AtomicU64::new(0));
+        registry.invalidate_plan_cache();
+        registry
+    }
+
+    /// Replaces the registry's immutable capability profile.
+    pub fn set_capability_profile(&mut self, profile: CapabilityProfile) {
+        self.allowed_builtin_calls = Arc::new(profile.allowed_builtin_calls().to_vec());
+        self.allow_default_builtin_capabilities = profile.allows_all_builtins();
+        self.allow_default_host_capabilities = profile.allows_all_host_imports();
+        self.capability_profile = Arc::new(profile);
+        self.invalidate_plan_cache();
+    }
+
+    /// Installs the caller-provided standard-surface composition strategy.
+    ///
+    /// Explicit per-instance state: the outer standard-runtime constructor
+    /// installs it; `src/vm` never names a concrete domain module or feature.
+    pub fn set_standard_composition(
+        &mut self,
+        composition: Arc<dyn super::standard_composition::StandardSurfaceComposition>,
+    ) {
+        self.standard_composition = Some(composition);
+    }
+
+    /// The installed standard-surface composition strategy, if any.
+    pub fn standard_composition(
+        &self,
+    ) -> Option<&Arc<dyn super::standard_composition::StandardSurfaceComposition>> {
+        self.standard_composition.as_ref()
+    }
+
+    /// Whether a host function with the given name is currently registered.
+    pub fn contains_name(&self, name: &str) -> bool {
+        self.by_name.contains_key(name)
+    }
+
+    /// Explicitly permits a namespaced builtin when this registry is used as a capability plan.
+    pub fn allow_builtin(&mut self, name: impl AsRef<str>) -> VmResult<()> {
+        let name = name.as_ref();
+        if self.by_name.contains_key(name) {
+            self.capability_profile = Arc::new(self.capability_profile.with_host_import(name));
+            self.invalidate_plan_cache();
+            return Ok(());
+        }
+        let builtin = BuiltinFunction::from_namespaced_name(name)
+            .ok_or_else(|| VmError::HostError(format!("unknown namespaced builtin '{name}'")))?;
+        let calls = Arc::make_mut(&mut self.allowed_builtin_calls);
+        if !calls.contains(&builtin.call_index()) {
+            calls.push(builtin.call_index());
+            calls.sort_unstable();
+        }
+        self.capability_profile = Arc::new(self.capability_profile.with_builtin(builtin));
+        self.invalidate_plan_cache();
+        Ok(())
     }
 
     fn invalidate_plan_cache(&mut self) {
+        self.registry_state = Arc::new(());
+        self.registry_generation.fetch_add(1, Ordering::Relaxed);
         self.plan_cache = Arc::new(RwLock::new(HashMap::new()));
     }
 
@@ -343,7 +471,51 @@ impl HostFunctionRegistry {
         self.invalidate_plan_cache();
     }
 
+    fn validate_builtin_capability(&self, call_index: u16) -> VmResult<()> {
+        if let Some(builtin) = BuiltinFunction::from_call_index(call_index)
+            && builtin.requires_explicit_host_capability()
+            && !self.allowed_builtin_calls.contains(&call_index)
+        {
+            return Err(VmError::HostError(format!(
+                "capability profile does not allow builtin '{}'",
+                builtin.name()
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_program_capabilities(&self, program: &Program) -> VmResult<()> {
+        if self.allow_default_builtin_capabilities {
+            return Ok(());
+        }
+        let mut ip = 0usize;
+        while let Some(&raw_opcode) = program.code.get(ip) {
+            let opcode =
+                OpCode::try_from(raw_opcode).map_err(|_| VmError::InvalidOpcode(raw_opcode))?;
+            let operand_end = ip
+                .checked_add(1 + opcode.operand_len())
+                .ok_or(VmError::BytecodeBounds)?;
+            if operand_end > program.code.len() {
+                return Err(VmError::BytecodeBounds);
+            }
+            if opcode == OpCode::Call {
+                let bytes: [u8; 2] = program.code[ip + 1..ip + 3]
+                    .try_into()
+                    .map_err(|_| VmError::BytecodeBounds)?;
+                self.validate_builtin_capability(u16::from_le_bytes(bytes))?;
+            }
+            ip = operand_end;
+        }
+        for prototype in &program.callable_prototypes {
+            if let CallableTarget::HostImport(call_index) = prototype.target {
+                self.validate_builtin_capability(call_index)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn bind_vm_cached(&self, vm: &mut Vm) -> VmResult<()> {
+        self.validate_program_capabilities(&vm.program)?;
         let plan = self.prepare_shared_plan(&vm.program.imports)?;
         self.bind_vm_with_plan(vm, &plan)
     }
@@ -356,6 +528,17 @@ impl HostFunctionRegistry {
         self.plan_for_imports(imports)
     }
 
+    fn plan_matches_current(&self, plan: &HostBindingPlan) -> bool {
+        self.capability_profile.fingerprint() == plan.capability_fingerprint
+            && self.capability_profile.as_ref() == plan.capability_profile.as_ref()
+            && Arc::ptr_eq(&self.registry_state, &plan.registry_state)
+            && Arc::ptr_eq(
+                &self.registry_generation_token,
+                &plan.registry_generation_token,
+            )
+            && self.registry_generation.load(Ordering::Relaxed) == plan.registry_generation
+    }
+
     fn plan_for_imports(&self, imports: &[HostImport]) -> VmResult<Arc<HostBindingPlan>> {
         if let Some(plan) = self
             .plan_cache
@@ -363,6 +546,7 @@ impl HostFunctionRegistry {
             .expect("host binding plan cache read lock should not be poisoned")
             .get(imports)
             .cloned()
+            && self.plan_matches_current(&plan)
         {
             return Ok(plan);
         }
@@ -381,6 +565,14 @@ impl HostFunctionRegistry {
                 .entries
                 .get(registry_slot as usize)
                 .ok_or(VmError::InvalidCall(registry_slot))?;
+            if !self.allow_default_host_capabilities
+                && !self.capability_profile.allows_host_import(&import.name)
+            {
+                return Err(VmError::HostError(format!(
+                    "capability profile does not allow host import '{}'",
+                    import.name
+                )));
+            }
             if entry.arity != import.arity {
                 return Err(VmError::InvalidCallArity {
                     import: import.name.clone(),
@@ -400,23 +592,64 @@ impl HostFunctionRegistry {
             resolved_calls.push(vm_slot);
         }
 
+        let allowed_host_function_slots = imports
+            .iter()
+            .zip(resolved_calls.iter().copied())
+            .filter_map(|(import, vm_slot)| {
+                self.capability_profile
+                    .allows_host_import(&import.name)
+                    .then_some(vm_slot)
+            })
+            .collect::<Vec<_>>();
         let import_key = imports.to_vec();
         let computed = Arc::new(HostBindingPlan {
             import_signature: import_key.clone(),
             registry_slots,
             resolved_calls,
+            allowed_builtin_calls: self.allowed_builtin_calls.as_ref().clone(),
+            allow_default_builtin_capabilities: self.allow_default_builtin_capabilities,
+            allowed_host_function_slots,
+            allow_default_host_capabilities: self.allow_default_host_capabilities,
+            capability_profile: Arc::clone(&self.capability_profile),
+            capability_fingerprint: self.capability_profile.fingerprint(),
+            registry_state: Arc::clone(&self.registry_state),
+            registry_generation_token: Arc::clone(&self.registry_generation_token),
+            registry_generation: self.registry_generation.load(Ordering::Relaxed),
         });
         let mut cache = self
             .plan_cache
             .write()
             .expect("host binding plan cache write lock should not be poisoned");
-        Ok(cache.entry(import_key).or_insert_with(|| computed).clone())
+        cache.insert(import_key, Arc::clone(&computed));
+        Ok(computed)
     }
 
     pub fn bind_vm_with_plan(&self, vm: &mut Vm, plan: &HostBindingPlan) -> VmResult<()> {
+        self.validate_program_capabilities(&vm.program)?;
         if vm.program.imports != plan.import_signature {
             return Err(VmError::HostError(
                 "host binding plan does not match vm import signature".to_string(),
+            ));
+        }
+        if self.capability_profile.fingerprint() != plan.capability_fingerprint
+            || self.capability_profile.as_ref() != plan.capability_profile.as_ref()
+        {
+            return Err(VmError::HostError(
+                "host binding plan belongs to a different capability profile".to_string(),
+            ));
+        }
+        if !Arc::ptr_eq(&self.registry_state, &plan.registry_state) {
+            return Err(VmError::HostError(
+                "host binding plan belongs to a different registry state".to_string(),
+            ));
+        }
+        if !Arc::ptr_eq(
+            &self.registry_generation_token,
+            &plan.registry_generation_token,
+        ) || self.registry_generation.load(Ordering::Relaxed) != plan.registry_generation
+        {
+            return Err(VmError::HostError(
+                "host binding plan is stale for this registry".to_string(),
             ));
         }
         if !vm.host.host_functions.is_empty() || !vm.host.host_function_symbols.is_empty() {
@@ -455,6 +688,11 @@ impl HostFunctionRegistry {
                 }
             }
         }
+        vm.set_default_host_fallback_enabled(false);
+        vm.host.allowed_builtin_calls = plan.allowed_builtin_calls.clone();
+        vm.host.allow_default_builtin_capabilities = plan.allow_default_builtin_capabilities;
+        vm.host.allowed_host_function_slots = plan.allowed_host_function_slots.clone();
+        vm.host.allow_default_host_capabilities = plan.allow_default_host_capabilities;
         vm.install_resolved_calls(plan.resolved_calls.clone())?;
         Ok(())
     }
@@ -896,6 +1134,21 @@ impl Vm {
         Ok(())
     }
 
+    /// Enables or disables implicit binding of built-in host functions.
+    ///
+    /// Disabling this makes the VM use only explicitly registered host
+    /// functions. The default remains enabled for backwards compatibility
+    /// until a registry is bound.
+    pub fn set_default_host_fallback_enabled(&mut self, enabled: bool) {
+        self.host.allow_default_host_fallback = enabled;
+        self.host.resolved_calls_dirty = true;
+    }
+
+    /// Whether unbound host imports fall back to the default host functions.
+    pub fn default_host_fallback_enabled(&self) -> bool {
+        self.host.allow_default_host_fallback
+    }
+
     pub fn allocate_host_op_id(&mut self) -> HostOpId {
         let op_id = self.host.next_host_op_id;
         self.host.next_host_op_id = self.host.next_host_op_id.wrapping_add(1).max(1);
@@ -912,6 +1165,7 @@ impl Vm {
         };
         match waiting.source {
             WaitingHostOpSource::HostBridge => {
+                self.host.submitted_host_ops.remove(&waiting.op_id);
                 if let Some(bridge) = self.host.async_bridge.as_mut() {
                     bridge.cancel_op(waiting.op_id);
                 }
@@ -939,7 +1193,10 @@ impl Vm {
             return Poll::Ready(Ok(()));
         };
 
-        let poll_result = match waiting.source {
+        // The HostBridge arm produces a `HostFutureOutput` (so a submitted
+        // future's completion closure can run against the VM); the runtime
+        // builtin arms produce an already-finished `CallReturn`.
+        let poll_result: Poll<VmResult<HostFutureOutput>> = match waiting.source {
             WaitingHostOpSource::HostBridge => {
                 let bridge_ptr = match self.host.async_bridge.as_mut() {
                     Some(bridge) => bridge.as_mut() as *mut dyn HostAsyncBridge,
@@ -950,25 +1207,61 @@ impl Vm {
                         ))));
                     }
                 };
-
-                unsafe { (&mut *bridge_ptr).poll_op(waiting.op_id, cx) }
+                let submitted = self.host.submitted_host_ops.contains(&waiting.op_id);
+                // SAFETY: `bridge_ptr` was derived from the unique mutable borrow of
+                // `self.host.async_bridge` above. The bridge methods receive only the
+                // pointer's `&mut` reborrow, not `self`, so they cannot move or replace
+                // the owning `Box`; the pointer is used only for this synchronous call.
+                unsafe {
+                    if submitted {
+                        (&mut *bridge_ptr).poll_submitted_op(waiting.op_id, cx)
+                    } else {
+                        (&mut *bridge_ptr)
+                            .poll_op(waiting.op_id, cx)
+                            .map(|result| result.map(HostFutureOutput::Return))
+                    }
+                }
             }
             WaitingHostOpSource::BuiltinIo => {
                 crate::builtins::runtime::poll_builtin_io_op(self, waiting.op_id, cx)
+                    .map(|result| result.map(HostFutureOutput::Return))
             }
             #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
             WaitingHostOpSource::BuiltinSqlite => {
                 crate::builtins::runtime::poll_builtin_sqlite_op(self, waiting.op_id, cx)
+                    .map(|result| result.map(HostFutureOutput::Return))
             }
         };
 
         match poll_result {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(values)) => {
+            Poll::Ready(Ok(output)) => {
+                let host_bridge_owned = self.host.submitted_host_ops.contains(&waiting.op_id);
+                let values = match output.finish(self) {
+                    Ok(values) => values,
+                    Err(err) => {
+                        if host_bridge_owned {
+                            self.host.submitted_host_ops.remove(&waiting.op_id);
+                        }
+                        self.instance.waiting_host_op = None;
+                        return Poll::Ready(Err(err));
+                    }
+                };
+                if host_bridge_owned {
+                    self.host.submitted_host_ops.remove(&waiting.op_id);
+                    if let Some(bridge) = self.host.async_bridge.as_mut() {
+                        bridge.cancel_op(waiting.op_id);
+                    }
+                }
                 self.complete_waiting_host_op(waiting.op_id, values)?;
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(err)) => {
+                if self.host.submitted_host_ops.remove(&waiting.op_id)
+                    && let Some(bridge) = self.host.async_bridge.as_mut()
+                {
+                    bridge.cancel_op(waiting.op_id);
+                }
                 self.instance.waiting_host_op = None;
                 Poll::Ready(Err(err))
             }
@@ -1009,6 +1302,12 @@ impl Vm {
     ) -> VmResult<HostCallExecOutcome> {
         let argc = argc_u8 as usize;
         if let Some(builtin) = BuiltinFunction::from_call_index(index) {
+            if builtin.requires_explicit_host_capability()
+                && !self.host.allow_default_builtin_capabilities
+                && !self.host.allowed_builtin_calls.contains(&index)
+            {
+                return Err(VmError::UnboundImport(builtin.name().to_string()));
+            }
             if !builtin.accepts_arity(argc_u8) {
                 return Err(VmError::InvalidCallArity {
                     import: builtin.name().to_string(),
@@ -1037,6 +1336,20 @@ impl Vm {
             .get(usize::from(index))
             .map(|import| import.return_type);
         let resolved_index = self.resolve_call_target(index, argc_u8)?;
+        if !self.host.allow_default_host_capabilities
+            && !self
+                .host
+                .allowed_host_function_slots
+                .contains(&resolved_index)
+        {
+            let import_name = self
+                .program
+                .imports
+                .get(usize::from(index))
+                .map(|import| import.name.clone())
+                .unwrap_or_else(|| format!("host slot {resolved_index}"));
+            return Err(VmError::UnboundImport(import_name));
+        }
         if let Some(function) = self
             .host
             .host_functions
@@ -1127,8 +1440,20 @@ impl Vm {
             crate::builtins::runtime::BuiltinCallOutcome::Pending(op_id) => {
                 self.instance.stack.truncate(arg_start);
                 let resume_ip = self.call_resume_ip(call_ip)?;
-                let source = builtin_waiting_source(builtin);
-                self.set_waiting_host_op(op_id, source)?;
+                if self.host.submitted_host_ops.contains(&op_id) {
+                    if let Err(error) =
+                        self.set_waiting_host_op(op_id, WaitingHostOpSource::HostBridge)
+                    {
+                        self.host.submitted_host_ops.remove(&op_id);
+                        if let Some(bridge) = self.host.async_bridge.as_mut() {
+                            bridge.cancel_op(op_id);
+                        }
+                        return Err(error);
+                    }
+                } else {
+                    let source = builtin_waiting_source(builtin);
+                    self.set_waiting_host_op(op_id, source)?;
+                }
                 self.instance.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
             }
@@ -1839,7 +2164,10 @@ impl Vm {
             return Ok(());
         }
 
-        if self.host.host_function_symbols.is_empty() && self.host.host_functions.is_empty() {
+        if self.host.allow_default_host_fallback
+            && self.host.host_function_symbols.is_empty()
+            && self.host.host_functions.is_empty()
+        {
             let import_names = self
                 .program
                 .imports
@@ -1866,7 +2194,9 @@ impl Vm {
             let bound =
                 if let Some(bound) = self.host.host_function_symbols.get(&import.name).copied() {
                     bound
-                } else if crate::builtins::runtime::bind_default_host_function(self, &import.name) {
+                } else if self.host.allow_default_host_fallback
+                    && crate::builtins::runtime::bind_default_host_function(self, &import.name)
+                {
                     self.host
                         .host_function_symbols
                         .get(&import.name)

@@ -1993,3 +1993,64 @@ fn call_ret_fusion_pattern_requires_immediate_ret() {
     vm_no_next.instance.ip = 4;
     assert!(!vm_no_next.can_fuse_call_ret_pattern());
 }
+
+#[test]
+fn async_host_future_is_submitted_to_the_host_bridge() {
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingBridge {
+        submitted: Arc<Mutex<Vec<HostOpId>>>,
+        future: Arc<Mutex<Option<HostFuture>>>,
+    }
+
+    impl HostAsyncBridge for RecordingBridge {
+        fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
+            self.submitted.lock().expect("submitted lock").push(op_id);
+            *self.future.lock().expect("future lock") = Some(future);
+            Ok(())
+        }
+
+        fn poll_op(
+            &mut self,
+            _op_id: HostOpId,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<VmResult<CallReturn>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    let submitted = Arc::new(Mutex::new(Vec::new()));
+    let future = Arc::new(Mutex::new(None));
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.set_async_bridge(Box::new(RecordingBridge {
+        submitted: Arc::clone(&submitted),
+        future: Arc::clone(&future),
+    }));
+
+    let outcome = vm
+        .submit_host_future(Box::pin(async {
+            Ok(HostFutureOutput::returning(CallReturn::one(Value::Int(42))))
+        }))
+        .expect("host bridge should accept future");
+    let CallOutcome::Pending(op_id) = outcome else {
+        panic!("async host submission should suspend");
+    };
+
+    assert_eq!(*submitted.lock().expect("submitted lock"), vec![op_id]);
+    assert!(future.lock().expect("future lock").is_some());
+    assert!(
+        vm.host.submitted_host_ops.contains(&op_id),
+        "submitted bridge op should be tracked in the host runtime"
+    );
+}
+
+#[test]
+fn capability_profile_allow_all_and_deny_all_differ() {
+    let allow_all = crate::vm::CapabilityProfile::allow_all();
+    let deny_all = crate::vm::CapabilityProfile::deny_all();
+    assert!(allow_all.allows_builtin(crate::builtins::BuiltinFunction::Len));
+    assert!(allow_all.allows_host_import("anything::at::all"));
+    assert!(!deny_all.allows_builtin(crate::builtins::BuiltinFunction::Len));
+    assert!(!deny_all.allows_host_import("anything::at::all"));
+    assert_ne!(allow_all.fingerprint(), deny_all.fingerprint());
+}

@@ -4,12 +4,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub(crate) mod aot;
+pub mod async_host;
+mod capability;
 pub mod diagnostics;
 mod engine;
 mod epoch;
 pub mod execution_scope;
 mod fuel;
 mod host;
+pub mod host_context;
+pub mod host_extension;
 mod host_runtime;
 mod instance;
 pub(crate) mod jit;
@@ -19,11 +23,14 @@ pub mod operation;
 pub mod program;
 pub mod resource;
 mod run_context;
+pub mod standard_composition;
 mod store;
 mod superinstructions;
 #[cfg(test)]
 mod tests;
 pub use self::aot::AotArtifactError;
+pub use self::async_host::{CaptureAsyncHostContext, HostFuture, HostFutureOutput};
+pub use self::capability::{CapabilityProfile, CapabilityProfileBuilder};
 use self::engine::Engine;
 pub use self::epoch::{EpochCheckpoint, EpochHandle};
 use self::execution_scope::ExecutionScopeError;
@@ -34,10 +41,20 @@ pub use self::host::{
     StaticHostStackFunction,
 };
 use self::host::{HostCallExecOutcome, VmHostFunction};
+pub use self::host_context::{
+    HostContext, HostContextError, HostContextErrorKind, HostContextResult, HostModule,
+    HostModule as HostModuleState,
+};
+pub use self::host_extension::{
+    HostExtension, HostImportParam, HostImportSchema, catalog_import_schemas,
+    register_catalog_function, validate_catalog_import_schemas,
+    validate_catalog_import_schemas_with_fingerprints,
+};
 use self::host_runtime::HostRuntime;
 use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable};
 pub use self::resource::ResourceCloseReason;
 use self::run_context::{InterruptMode, RunContext};
+pub use self::standard_composition::StandardSurfaceComposition;
 #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 pub use crate::builtins::runtime::sqlite::{SqliteLimits, SqlitePolicy};
 pub use crate::bytecode::{
@@ -2670,6 +2687,33 @@ impl Vm {
     /// starting/cancelling operations without reaching into VM private state.
     pub fn execution_scope(&mut self) -> &mut crate::vm::execution_scope::ExecutionScope {
         &mut self.host.execution_scope
+    }
+
+    /// Returns the generic host boundary for this VM.
+    ///
+    /// [`HostContext`](crate::vm::host_context::HostContext) exposes typed
+    /// per-VM module state (policy / configuration) and the generic
+    /// host-agnostic execution-scope SDK (insert resources, start / cancel /
+    /// poll host operations, borrow and take resources) to external host
+    /// extensions without leaking the underlying host runtime or naming a
+    /// builtin domain module.
+    pub fn host_context(&mut self) -> crate::vm::host_context::HostContext<'_> {
+        crate::vm::host_context::HostContext::new(self)
+    }
+
+    /// Installs a [`HostExtension`](crate::vm::host_extension::HostExtension)
+    /// onto this VM.
+    ///
+    /// Registration (into the VM's bound host-function registry) is
+    /// transactional and runs *before* the infallible install phase, so a
+    /// fallible registration/registry-binding failure surfaces before any
+    /// per-VM module state is installed. See
+    /// [`HostExtension`](crate::vm::host_extension::HostExtension).
+    pub fn install_extension(
+        &mut self,
+        extension: &dyn crate::vm::host_extension::HostExtension,
+    ) -> VmResult<()> {
+        extension.install_into(self)
     }
 
     /// Replaces the adapter-owned SQLite embedding policy.

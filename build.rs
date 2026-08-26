@@ -246,10 +246,21 @@ fn write_generated_file(path: &Path, contents: &str) {
 fn builtin_source_specs(namespaces: &[NamespaceDecl]) -> Vec<SourceSpec> {
     namespaces
         .iter()
-        .map(|namespace| SourceSpec {
-            path: format!("src/builtins/runtime/{}.rs", namespace.module),
-            module: namespace.module.clone(),
-            category: SourceCategory::NamespacedBuiltin,
+        .map(|namespace| {
+            let path = if namespace.module == "io" {
+                if cfg!(feature = "async") {
+                    "src/builtins/runtime/io/async_io.rs".to_string()
+                } else {
+                    "src/builtins/runtime/io/blocking.rs".to_string()
+                }
+            } else {
+                format!("src/builtins/runtime/{}.rs", namespace.module)
+            };
+            SourceSpec {
+                path,
+                module: namespace.module.clone(),
+                category: SourceCategory::NamespacedBuiltin,
+            }
         })
         .collect()
 }
@@ -271,6 +282,9 @@ fn parse_sources(
 }
 
 pub(crate) fn classify_host_binding(function: &ItemFn) -> HostBindingKind {
+    if function.sig.asyncness.is_some() {
+        return HostBindingKind::StaticStack;
+    }
     if function.sig.inputs.iter().any(|input| match input {
         FnArg::Typed(pat_type) => is_vm_context_type(&pat_type.ty),
         _ => false,
@@ -296,6 +310,9 @@ pub(crate) fn classify_host_binding(function: &ItemFn) -> HostBindingKind {
 }
 
 pub(crate) fn infer_host_execution(function: &ItemFn) -> HostExecutionKind {
+    if function.sig.asyncness.is_some() {
+        return HostExecutionKind::MaySuspend;
+    }
     let return_type = normalized_return_type(&function.sig.output);
     if contains_host_call_result(&return_type) {
         HostExecutionKind::MaySuspend
@@ -979,6 +996,7 @@ fn render_builtin_catalog(
         &actual_builtin_by_variant,
     );
     render_builtin_signature_method(&mut out, &builtin_variant_order);
+    render_builtin_capability_method(&mut out, builtin_callables);
     writeln!(
         &mut out,
         "    pub fn from_namespaced_name(name: &str) -> Option<Self> {{"
@@ -1553,6 +1571,35 @@ fn required_param_count(params: &[CallableParamDecl]) -> usize {
     params.iter().take_while(|param| !param.optional).count()
 }
 
+fn render_builtin_capability_method(out: &mut String, builtin_callables: &[CallableDecl]) {
+    let mut capability_variants = Vec::new();
+    for callable in builtin_callables {
+        let variant = builtin_variant_name(&callable.name);
+        if !capability_variants.contains(&variant) {
+            capability_variants.push(variant);
+        }
+    }
+    capability_variants.sort();
+    writeln!(out, "    #[cfg(feature = \"runtime\")]").unwrap();
+    writeln!(
+        out,
+        "    pub(crate) const fn requires_explicit_host_capability(self) -> bool {{"
+    )
+    .unwrap();
+    if capability_variants.is_empty() {
+        writeln!(out, "        false").unwrap();
+    } else {
+        let patterns = capability_variants
+            .iter()
+            .map(|variant| format!("BuiltinFunction::{variant}"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        writeln!(out, "        matches!(self, {patterns})").unwrap();
+    }
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+}
+
 fn stable_groups<F>(callables: &[CallableDecl], mut key_fn: F) -> Vec<Group<'_>>
 where
     F: FnMut(&CallableDecl) -> String,
@@ -1863,6 +1910,9 @@ fn host_wrapper_adapter_name(callable: &CallableDecl) -> String {
 
 fn generated_wrapper_decl(function: &ItemFn) -> WrapperDecl {
     let mut params = Vec::new();
+    if function.sig.asyncness.is_some() {
+        params.push(WrapperParamKind::Vm);
+    }
     for input in &function.sig.inputs {
         let FnArg::Typed(pat_type) = input else {
             panic!("methods are not supported in #[pd_host_function] declarations");
@@ -1889,6 +1939,13 @@ fn parse_callable_params(function: &ItemFn) -> Vec<CallableParamDecl> {
             let FnArg::Typed(pat_type) = input else {
                 panic!("methods are not supported in #[pd_host_function] declarations");
             };
+            if pat_type
+                .attrs
+                .iter()
+                .any(|attr| attr.path().is_ident("pd_host_context"))
+            {
+                return None;
+            }
             if is_vm_context_type(&pat_type.ty) {
                 return None;
             }
@@ -2055,7 +2112,7 @@ fn type_label(ty: &Type) -> String {
                     };
                     format!("{} | null", type_label(inner))
                 }
-                "VmResult" | "HostCallResult" => {
+                "VmResult" | "HostCallResult" | "HostFutureOutput" => {
                     let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
                         panic!("{ident}<T> requires one generic argument");
                     };

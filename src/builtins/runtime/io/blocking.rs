@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,17 +29,10 @@ use crate::vm::{CallReturn, HostOpId, Value, Vm, VmError, VmResult};
 /// worker thread back to [`poll_builtin_io_op`]. Polling and cancellation
 /// of the operations themselves go directly through the scope's operation
 /// registry — this map is a value mailbox, not a poller table.
+#[derive(Default)]
 pub(crate) struct IoState {
     /// Packed [`OperationId::raw`] -> completion mailbox for pending IO ops.
     pending_results: HashMap<HostOpId, Arc<IoOpShared>>,
-}
-
-impl Default for IoState {
-    fn default() -> Self {
-        Self {
-            pending_results: HashMap::new(),
-        }
-    }
 }
 
 /// A file / child-process backed IO handle.
@@ -359,7 +353,7 @@ impl Drop for IoOpDriver {
 }
 
 /// Cancels one pending builtin IO operation through the execution scope.
-pub(super) fn cancel_pending_op(vm: &mut Vm, op_id: HostOpId) {
+pub(crate) fn cancel_pending_op(vm: &mut Vm, op_id: HostOpId) {
     let Ok(id) = OperationId::from_raw(op_id) else {
         return;
     };
@@ -373,7 +367,7 @@ pub(super) fn cancel_pending_op(vm: &mut Vm, op_id: HostOpId) {
 
 /// Polls one pending builtin IO operation through the execution scope's
 /// operation registry, delivering the worker's guest-visible value.
-pub(super) fn poll_builtin_io_op(
+pub(crate) fn poll_builtin_io_op(
     vm: &mut Vm,
     op_id: HostOpId,
     cx: &mut Context<'_>,
@@ -557,7 +551,10 @@ pub(super) fn builtin_io_open(
     path: &str,
     mode: &str,
 ) -> VmResult<HostCallResult<i64>> {
-    let path = path.to_string();
+    let writes = matches!(mode, "w" | "a" | "r+" | "w+" | "a+");
+    let path = authorize_blocking_io_path(vm, path, writes)?
+        .display()
+        .to_string();
     let mode = mode.to_string();
     let op_id = schedule_io_task(vm, "io::open", move |shared| {
         let mut options = OpenOptions::new();
@@ -615,6 +612,14 @@ pub(super) fn builtin_io_popen(
         return Err(VmError::HostError(format!(
             "unsupported io_popen mode '{mode}', expected r or w"
         )));
+    }
+    if super::io_policy(vm)
+        .as_ref()
+        .is_some_and(|policy| !policy.allow_process)
+    {
+        return Err(VmError::HostError(
+            "io_popen requires the process capability".to_string(),
+        ));
     }
     let command = command.to_string();
     let mode = mode.to_string();
@@ -771,6 +776,14 @@ pub(super) fn builtin_io_write(
     handle_id: i64,
     text: &str,
 ) -> VmResult<HostCallResult<i64>> {
+    if super::io_policy(vm)
+        .as_ref()
+        .is_some_and(|policy| text.len() > policy.max_write_bytes)
+    {
+        return Err(VmError::HostError(
+            "io_write exceeded write limit".to_string(),
+        ));
+    }
     let bytes = text.as_bytes().to_vec();
     let (_handle, resource) = io_resource_for_handle(vm, handle_id)?;
     let op_id = schedule_io_task(vm, "io::write", move |shared| {
@@ -905,7 +918,9 @@ pub(super) fn builtin_io_close(vm: &mut Vm, handle_id: i64) -> VmResult<HostCall
 /// Returns whether a file system path exists.
 #[pd_host_function(name = "io::exists")]
 pub(super) fn builtin_io_exists(vm: &mut Vm, path: &str) -> VmResult<HostCallResult<bool>> {
-    let path = path.to_string();
+    let path = authorize_blocking_io_path(vm, path, false)?
+        .display()
+        .to_string();
     let op_id = schedule_io_task(vm, "io::exists", move |shared| {
         shared.succeed(CallReturn::one(Value::Bool(
             std::path::Path::new(path.as_str()).exists(),
@@ -1022,6 +1037,56 @@ fn io_parse_handle(handle_id: i64) -> VmResult<ResourceHandle> {
     }
     ResourceHandle::from_raw(handle_id as u64)
         .map_err(|error| VmError::HostError(format!("invalid io handle id {handle_id}: {error}")))
+}
+
+/// Authorizes one IO path against the configured policy, mirroring the
+/// async path: a policy with no matching allowed root denies the path.
+fn authorize_blocking_io_path(vm: &Vm, path: &str, writes: bool) -> VmResult<PathBuf> {
+    let requested = PathBuf::from(path);
+    let Some(policy) = super::io_policy(vm) else {
+        return Ok(requested);
+    };
+    if writes && !policy.allow_write {
+        return Err(VmError::HostError(
+            "io path write requires the write capability".to_string(),
+        ));
+    }
+    let absolute = if requested.is_absolute() {
+        requested
+    } else {
+        std::env::current_dir()
+            .map_err(|error| VmError::HostError(format!("io path resolution failed: {error}")))?
+            .join(requested)
+    };
+    let canonical = canonicalize_blocking_target(&absolute)?;
+    for root in &policy.allowed_roots {
+        let root = std::fs::canonicalize(Path::new(root)).map_err(|error| {
+            VmError::HostError(format!(
+                "io allowed root '{root}' cannot be resolved: {error}"
+            ))
+        })?;
+        if canonical.starts_with(root) {
+            return Ok(canonical);
+        }
+    }
+    Err(VmError::HostError(format!(
+        "io path '{}' is outside the allowed roots",
+        canonical.display()
+    )))
+}
+
+fn canonicalize_blocking_target(path: &Path) -> VmResult<PathBuf> {
+    if path.exists() {
+        return std::fs::canonicalize(path)
+            .map_err(|error| VmError::HostError(format!("io path resolution failed: {error}")));
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let canonical_parent = std::fs::canonicalize(parent)
+        .map_err(|error| VmError::HostError(format!("io path resolution failed: {error}")))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| VmError::HostError("io path has no file name".to_string()))?;
+    Ok(canonical_parent.join(name))
 }
 
 fn close_io_handle(mut handle: IoHandle) -> VmResult<()> {

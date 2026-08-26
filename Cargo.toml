@@ -5,6 +5,7 @@ members = [
     "pd-vm-nostd",
     "pd-vm-wasm",
     "crates/rustscript",
+    "crates/pd-host-schema",
 ]
 resolver = "2"
 
@@ -27,6 +28,7 @@ name = "vm"
 [features]
 default = ["runtime", "cli", "cranelift-jit"]
 runtime = []
+async = ["runtime", "dep:tokio"]
 sqlite = ["runtime", "dep:rusqlite"]
 edge-abi = [
     "dep:edge_abi",
@@ -62,11 +64,12 @@ cranelift-module = { version = "0.129.1", optional = true }
 cranelift-native = { version = "0.129.1", optional = true }
 pd-host-function = { path = "./pd-host-function", version = "0.1.0" }
 rusqlite = { version = "0.32", default-features = false, features = ["bundled", "hooks", "limits"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "fs", "io-util", "process"], optional = true }
 edge_abi = { package = "pd-edge-abi", version = "0.1.1", default-features = false, optional = true }
 futures-channel = "0.3"
 paste = "1"
 regex = "1"
-serde = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rt-format = "0.3.1"
 self_cell = "1"
@@ -86,6 +89,16 @@ tokio = { version = "1", features = ["macros", "rt", "time", "sync"] }
 name = "host_binding_generation_tests"
 path = "tests/host_binding_generation_tests.rs"
 required-features = ["cranelift-jit"]
+
+[[test]]
+name = "host_sdk_tests"
+path = "tests/host_sdk_tests.rs"
+required-features = ["runtime"]
+
+[[test]]
+name = "host_context_arch_tests"
+path = "tests/host_context_arch_tests.rs"
+required-features = ["runtime"]
 
 [build-dependencies]
 syn = { version = "2", features = ["full"] }

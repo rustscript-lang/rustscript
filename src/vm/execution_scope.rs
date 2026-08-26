@@ -245,6 +245,13 @@ impl ExecutionScope {
         &self.resources
     }
 
+    /// Mutable access to the owned resource table (typed borrows for the
+    /// duration of a host call). New inserts must still go through the guarded
+    /// scope API.
+    pub fn resources_mut(&mut self) -> &mut ResourceTable {
+        &mut self.resources
+    }
+
     /// Read access to the owned operation registry (observe counts/status).
     /// New starts must go through the guarded scope API.
     pub fn operations(&self) -> &OperationRegistry {

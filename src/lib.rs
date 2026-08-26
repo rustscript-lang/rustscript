@@ -6,6 +6,7 @@ pub mod compiler;
 pub mod debug_info;
 #[cfg(feature = "runtime")]
 pub mod debugger;
+pub mod host_api;
 #[cfg(feature = "runtime")]
 pub mod jit {
     pub use crate::vm::jit::{
@@ -22,11 +23,20 @@ pub mod vmbc;
 
 pub use assembler::{AsmParseError, Assembler, AssemblerError, BytecodeBuilder, assemble};
 #[cfg(feature = "runtime")]
-pub use builtins::runtime::HostCallResult;
-#[cfg(feature = "runtime")]
 pub use builtins::runtime::print::{PrintHostFunction, PrintlnHostFunction, format_value};
 #[cfg(all(feature = "runtime", feature = "sqlite", not(target_arch = "wasm32")))]
 pub use builtins::runtime::sqlite::{SqliteLimits, SqlitePolicy};
+#[cfg(feature = "runtime")]
+pub use builtins::runtime::{
+    BorrowVmValue, FromVmValue, HostCallResult, IntoHostCallOutcome, TakeVmValue, arg, borrow_arg,
+    return_one, take_arg,
+};
+#[cfg(all(feature = "runtime", feature = "http-client"))]
+pub use builtins::runtime::{HttpConfig, HttpHostExt};
+#[cfg(all(feature = "runtime", not(target_arch = "wasm32")))]
+pub use builtins::runtime::{IoHostExt, IoPolicy};
+#[cfg(feature = "runtime")]
+pub use builtins::runtime::{RuntimeError, RuntimeErrorCode, RuntimeResult, standard_composition};
 pub use builtins::{
     BUILTIN_CATALOG, BuiltinFunction, BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec,
     CallableDef, CallableParam, CallableParamType, CallableSignature, HostExecution,
@@ -38,6 +48,11 @@ pub use bytecode::{
     CallableEnvironment, CallableKind, CallablePrototype, CallableTarget, CallableValue,
     CaptureBindingMode, ExportedCallable, FunctionRegion, HostImport, OpCode, Program,
     RootCallableBinding, ScriptFunction, TypeMap, Value, ValueType,
+};
+pub use host_api::{
+    FunctionNameError, HostApiBuilder, HostApiCatalog, HostApiCatalogError, HostApiFingerprint,
+    HostFunctionSchema, HostParamPassing, HostParamSchema, HostTypeSchema, ResourceTypeKey,
+    ResourceTypeKeyError, ResourceTypeSchema,
 };
 pub fn builtin_call_index(name: &str) -> Option<u16> {
     use builtins::BuiltinFunction;
@@ -84,12 +99,18 @@ pub use jit::{
 pub use vm::diagnostics::render_vm_error;
 #[cfg(feature = "runtime")]
 pub use vm::{
-    AotArtifactError, CallOutcome, CallReturn, DEFAULT_MAX_SCRIPT_CALL_DEPTH, EpochCheckpoint,
-    EpochHandle, FuelCheckpoint, HostArgsFunction, HostAsyncBridge, HostBindingPlan, HostFunction,
-    HostFunctionRegistry, HostOpId, HostStackFunction, IntoScriptValue, QueuedScriptInvocation,
-    ResourceCloseReason, ScriptArgs, ScriptCallback, ScriptResult, StaticHostArgsFunction,
+    AotArtifactError, CallOutcome, CallReturn, CapabilityProfile, CapabilityProfileBuilder,
+    CaptureAsyncHostContext, DEFAULT_MAX_SCRIPT_CALL_DEPTH, EpochCheckpoint, EpochHandle,
+    FuelCheckpoint, HostArgsFunction, HostAsyncBridge, HostBindingPlan, HostContext,
+    HostContextError, HostContextErrorKind, HostContextResult, HostExtension, HostFunction,
+    HostFunctionRegistry, HostFuture, HostFutureOutput, HostImportParam, HostImportSchema,
+    HostModule, HostModuleState, HostOpId, HostStackFunction, IntoScriptValue, Invocation,
+    InvocationError, InvocationItem, InvocationPoll, QueuedScriptInvocation, ResourceCloseReason,
+    ScriptArgs, ScriptCallback, ScriptResult, StandardSurfaceComposition, StaticHostArgsFunction,
     StaticHostFunction, StaticHostStackFunction, Store, Vm, VmError, VmResult, VmStatus,
-    VmYieldReason, execution_scope, operation, resource,
+    VmYieldReason, async_host, catalog_import_schemas, execution_scope, host_context,
+    host_extension, operation, register_catalog_function, resource,
+    validate_catalog_import_schemas, validate_catalog_import_schemas_with_fingerprints,
 };
 #[cfg(feature = "runtime")]
 pub use vmbc::{

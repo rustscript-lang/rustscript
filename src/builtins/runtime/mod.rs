@@ -3,7 +3,10 @@
 use std::task::{Context, Poll};
 
 use crate::builtins::BuiltinFunction;
-use crate::vm::{CallOutcome, CallReturn, HostOpId, Value, Vm, VmResult};
+#[allow(unused_imports)]
+use crate::vm::{CallOutcome, CallReturn, HostOpId, Value, Vm, VmError, VmResult};
+#[cfg(feature = "async")]
+use crate::vm::CaptureAsyncHostContext;
 
 mod aot;
 mod bytes;
@@ -21,18 +24,27 @@ pub(crate) mod print;
 pub(crate) mod regex;
 #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 pub(crate) mod sqlite;
+pub(crate) mod standard_composition;
 mod typed;
 
 #[cfg(target_arch = "wasm32")]
 use io_wasm as io;
 
 pub(crate) use io::IoState;
+#[cfg(not(target_arch = "wasm32"))]
+pub use io::{IoHostExt, IoPolicy};
 #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 pub(crate) use sqlite::SqliteState;
+pub use standard_composition::standard_composition;
 pub use typed::HostCallResult;
 use typed::{
-    AnyValue, IntoBuiltinCallOutcome, IntoHostCallOutcome, NumberValue, UnknownValue, VmArray,
-    VmBytes, VmMap, arg, borrow_arg, return_none, return_one, take_arg,
+    AnyValue, IntoBuiltinCallOutcome, IntoVmValue, NumberValue, UnknownValue, VmArray, VmBytes,
+    VmCallable, VmMap,
+};
+#[allow(unused_imports)]
+pub use typed::{
+    BorrowVmValue, FromVmValue, IntoHostCallOutcome, TakeVmValue, arg, borrow_arg, return_none,
+    return_one, take_arg,
 };
 
 pub(crate) enum BuiltinCallOutcome {
