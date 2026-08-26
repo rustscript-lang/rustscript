@@ -213,7 +213,9 @@ fn remap_inst_inputs(
         }};
     }
     match kind {
-        SsaInstKind::Constant(_) | SsaInstKind::ArrayNew => {}
+        SsaInstKind::Constant(_)
+        | SsaInstKind::MaterializeRootCallable { .. }
+        | SsaInstKind::ArrayNew => {}
         SsaInstKind::HostCall { args, .. } => {
             for arg in args {
                 one!(arg);
@@ -447,7 +449,8 @@ fn offset_terminator(
         }
         SsaTerminator::Exit { exit }
         | SsaTerminator::Return { exit }
-        | SsaTerminator::CallValue { exit, .. } => {
+        | SsaTerminator::CallValue { exit, .. }
+        | SsaTerminator::CallScript { exit, .. } => {
             *exit = offset_exit_id(*exit, exit_offset)?;
         }
     }

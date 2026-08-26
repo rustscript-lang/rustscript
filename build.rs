@@ -1208,9 +1208,9 @@ fn render_callable_consts(callables: &[&CallableDecl]) -> String {
         for param in &callable.params {
             writeln!(
                 &mut out,
-                "    CallableParam {{ name: {:?}, ty: CallableParamType::{}, optional: {} }},",
+                "    CallableParam {{ name: {:?}, ty: {}, optional: {} }},",
                 param.name,
-                callable_param_variant(&param.ty_label),
+                callable_param_expr(&param.ty_label),
                 param.optional
             )
             .unwrap();
@@ -1633,18 +1633,38 @@ fn callable_const_base(callable: &CallableDecl) -> String {
     to_shouty_snake(&format!("{prefix}_{}", callable.rust_ident))
 }
 
-fn callable_param_variant(label: &str) -> &'static str {
+pub(crate) fn callable_param_expr(label: &str) -> String {
     match label {
-        "any" => "Any",
-        "null" => "Null",
-        "int" => "Int",
-        "float" => "Float",
-        "bool" => "Bool",
-        "string" => "String",
-        "bytes" => "Bytes",
-        "array" => "Array",
-        "map" => "Map",
-        "number" => "Number",
+        "any" => "CallableParamType::Any".to_string(),
+        "null" => "CallableParamType::Null".to_string(),
+        "int" => "CallableParamType::Int".to_string(),
+        "float" => "CallableParamType::Float".to_string(),
+        "bool" => "CallableParamType::Bool".to_string(),
+        "string" => "CallableParamType::String".to_string(),
+        "bytes" => "CallableParamType::Bytes".to_string(),
+        "array" => "CallableParamType::Array".to_string(),
+        "map" => "CallableParamType::Map".to_string(),
+        "number" => "CallableParamType::Number".to_string(),
+        other if other.starts_with("fn(") => {
+            let (params, result) = other
+                .strip_prefix("fn(")
+                .and_then(|value| value.split_once(") -> "))
+                .unwrap_or_else(|| panic!("invalid callable schema '{other}'"));
+            let params = if params.is_empty() {
+                Vec::new()
+            } else {
+                params
+                    .split(", ")
+                    .map(callable_param_expr)
+                    .collect::<Vec<_>>()
+            };
+            let result = callable_param_expr(result);
+            format!(
+                "CallableParamType::Callable(CallableType {{ params: &[{}], return_type: &{} }})",
+                params.join(", "),
+                result
+            )
+        }
         other => panic!("unsupported callable param type '{other}'"),
     }
 }
@@ -2070,7 +2090,7 @@ fn static_return_type_label(output: &ReturnType) -> String {
     value_type_from_label(&return_type_label(output)).to_string()
 }
 
-fn type_label(ty: &Type) -> String {
+pub(crate) fn type_label(ty: &Type) -> String {
     match ty {
         Type::Group(group) => type_label(&group.elem),
         Type::Paren(paren) => type_label(&paren.elem),
@@ -2108,6 +2128,7 @@ fn type_label(ty: &Type) -> String {
                 "Array" | "VmArray" | "VmArrayRef" | "VmArrayHandle" => "array".to_string(),
                 "Map" | "VmMap" | "VmMapRef" | "VmMapHandle" => "map".to_string(),
                 "Number" | "NumberValue" => "number".to_string(),
+                "VmCallable" => callable_type_label(segment),
                 "Unknown" | "UnknownValue" => "unknown".to_string(),
                 "CallOutcome" => "unknown".to_string(),
                 "Option" => {
@@ -2134,6 +2155,25 @@ fn type_label(ty: &Type) -> String {
         }
         _ => panic!("unsupported callable type"),
     }
+}
+
+fn callable_type_label(segment: &syn::PathSegment) -> String {
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        panic!("VmCallable requires a function signature");
+    };
+    let Some(syn::GenericArgument::Type(Type::BareFn(function))) = args.args.first() else {
+        panic!("VmCallable requires fn(...) -> ...");
+    };
+    let params = function
+        .inputs
+        .iter()
+        .map(|input| type_label(&input.ty))
+        .collect::<Vec<_>>();
+    let result = match &function.output {
+        ReturnType::Default => "null".to_string(),
+        ReturnType::Type(_, ty) => type_label(ty),
+    };
+    format!("fn({}) -> {result}", params.join(", "))
 }
 
 fn type_label_for_vec(segment: &syn::PathSegment) -> String {
@@ -2309,4 +2349,27 @@ fn find_matching_paren(source: &str) -> usize {
         }
     }
     panic!("unterminated macro invocation");
+}
+
+#[cfg(test)]
+mod callable_schema_tests {
+    use super::*;
+    use syn::parse_quote;
+
+    #[test]
+    fn build_metadata_renders_typed_callable_parameters() {
+        let ty: Type = parse_quote!(VmCallable<fn(VmMap) -> VmMap>);
+        assert_eq!(type_label(&ty), "fn(map) -> map");
+        assert_eq!(
+            callable_param_expr("fn(map) -> map"),
+            "CallableParamType::Callable(CallableType { params: &[CallableParamType::Map], return_type: &CallableParamType::Map })"
+        );
+
+        let float_ty: Type = parse_quote!(VmCallable<fn(f64) -> f64>);
+        assert_eq!(type_label(&float_ty), "fn(float) -> float");
+        assert_eq!(
+            callable_param_expr("fn(float) -> float"),
+            "CallableParamType::Callable(CallableType { params: &[CallableParamType::Float], return_type: &CallableParamType::Float })"
+        );
+    }
 }

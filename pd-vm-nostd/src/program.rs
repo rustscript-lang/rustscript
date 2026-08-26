@@ -230,6 +230,12 @@ pub enum OpCode {
     Not = 0x17,
     Lshr = 0x18,
     CallValue = 0x19,
+    /// Static direct script-function call: `prototype_id:u32 LE, argc:u8`.
+    ///
+    /// Mirrors the std ISA contract (opcode 0x1A, five operand bytes); the
+    /// decoder validates the target prototype and arity against the callable
+    /// metadata so an environment-free script call is a supported operation.
+    CallScript = 0x1A,
 }
 
 impl OpCode {
@@ -238,6 +244,7 @@ impl OpCode {
             Self::Ldc | Self::Br | Self::Brfalse => 4,
             Self::Ldloc | Self::Stloc | Self::CallValue => 1,
             Self::Call => 3,
+            Self::CallScript => 5,
             _ => 0,
         }
     }
@@ -274,6 +281,7 @@ impl TryFrom<u8> for OpCode {
             0x17 => Ok(Self::Not),
             0x18 => Ok(Self::Lshr),
             0x19 => Ok(Self::CallValue),
+            0x1a => Ok(Self::CallScript),
             _ => Err(()),
         }
     }

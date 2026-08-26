@@ -12,7 +12,9 @@ use pd_host_schema::{
 #[proc_macro_attribute]
 pub fn pd_host_function(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr with Punctuated::<Meta, Token![,]>::parse_terminated);
-    match expand_pd_host_function(args, parse_macro_input!(item as ItemFn)) {
+    let item = parse_macro_input!(item as ItemFn);
+    let result = expand_pd_host_function(args, item);
+    match result {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }
@@ -470,7 +472,7 @@ fn generate_async_vm_wrapper(
             continue;
         }
         let label = LitStr::new(
-            &format!("{} {ident}", wrapper_name),
+            &format!("{} {}", wrapper_name, ident),
             proc_macro2::Span::call_site(),
         );
         let index = syn::Index::from(arg_index);
@@ -594,12 +596,6 @@ fn unwrap_vm_result_type(ty: &Type) -> Result<Option<Type>, Error> {
     }
 }
 
-fn return_is_vm_result(output: &ReturnType) -> bool {
-    vm_result_inner_type(output)
-        .expect("pd_host_function return type should already be validated")
-        .is_some()
-}
-
 fn return_is_host_future_output(output: &ReturnType) -> bool {
     vm_result_inner_type(output)
         .expect("pd_host_function return type should already be validated")
@@ -612,6 +608,12 @@ fn return_is_host_future_output(output: &ReturnType) -> bool {
             _ => None,
         })
         .is_some_and(|ident| ident == "HostFutureOutput")
+}
+
+fn return_is_vm_result(output: &ReturnType) -> bool {
+    vm_result_inner_type(output)
+        .expect("pd_host_function return type should already be validated")
+        .is_some()
 }
 
 fn type_label(ty: &Type) -> Result<String, Error> {
@@ -695,6 +697,31 @@ fn type_label(ty: &Type) -> Result<String, Error> {
         }
         _ => Err(Error::new_spanned(ty, "unsupported callable type")),
     }
+}
+
+fn callable_type_label(segment: &syn::PathSegment) -> Result<String, Error> {
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return Err(Error::new_spanned(
+            &segment.arguments,
+            "VmCallable requires a function signature",
+        ));
+    };
+    let Some(syn::GenericArgument::Type(Type::BareFn(function))) = args.args.first() else {
+        return Err(Error::new_spanned(
+            args,
+            "VmCallable requires fn(...) -> ...",
+        ));
+    };
+    let params = function
+        .inputs
+        .iter()
+        .map(|input| type_label(&input.ty))
+        .collect::<Result<Vec<_>, _>>()?;
+    let result = match &function.output {
+        ReturnType::Default => "null".to_string(),
+        ReturnType::Type(_, ty) => type_label(ty)?,
+    };
+    Ok(format!("fn({}) -> {result}", params.join(", ")))
 }
 
 fn type_label_for_vec(segment: &syn::PathSegment) -> Result<String, Error> {
@@ -794,8 +821,8 @@ fn uses_taken_extractor(ty: &Type) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::expand_pd_host_function;
-    use syn::{ItemFn, Meta, Token, parse_quote, punctuated::Punctuated};
+    use super::{expand_pd_host_function, type_label};
+    use syn::{ItemFn, Meta, Token, Type, parse_quote, punctuated::Punctuated};
 
     #[test]
     fn accepts_host_call_result_from_the_function_signature() {

@@ -894,3 +894,141 @@ fn all_locals_null_after_halt_for_simple_program() {
         "c should be Null"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 14. Named-call cross-frame drops
+// ---------------------------------------------------------------------------
+
+#[test]
+fn named_call_cross_frame_heap_values_drop_exactly_once() {
+    // Caller and callee frames each own heap values around a named call.
+    // Each additional dead callee-produced map must add exactly its own drop
+    // events: no double-drop of the caller's value, no omission of the
+    // callee's.
+    let drops_one = compile_run_drop_count(
+        r#"
+        fn pass(x) { x }
+        let a = { tag: "a" };
+        let b = pass({ tag: "b" });
+        0;
+    "#,
+    );
+    let drops_two = compile_run_drop_count(
+        r#"
+        fn pass(x) { x }
+        let a = { tag: "a" };
+        let b = pass({ tag: "b" });
+        let c = pass({ tag: "c" });
+        0;
+    "#,
+    );
+    assert!(
+        drops_two > drops_one,
+        "more dead values across named calls should produce more drop events ({drops_two} vs {drops_one})"
+    );
+    // The delta is exactly one extra map (map + key + value events) plus one
+    // extra call's machinery; a double-drop or an omitted drop would change it.
+    // Direct-only named calls (`CallScript`) no longer materialize a callable
+    // value, so the per-call machinery drops one event fewer than the
+    // `CallValue`-era baseline.
+    assert_eq!(
+        drops_two - drops_one,
+        6,
+        "named calls should add exactly one map and one call of drop events"
+    );
+}
+
+#[test]
+fn named_call_yield_resumes_with_caller_locals_intact() {
+    // A named callee suspends on a host op; the caller's heap local must
+    // survive the suspension, and the drop count must match the unsuspended
+    // control exactly.
+    let plain_source = r#"
+        fn paused(x) {
+            x;
+        }
+        let caller = { tag: "caller" };
+        let back = paused({ tag: "callee" });
+        0;
+    "#;
+    let wait_source = r#"
+        fn wait();
+        fn paused(x) {
+            wait();
+            x;
+        }
+        let caller = { tag: "caller" };
+        let back = paused({ tag: "callee" });
+        0;
+    "#;
+    let plain = compile_run_drop_count(plain_source);
+
+    let compiled = compile_source(wait_source).expect("compile should succeed");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut vm = new_drop_contract_vm(compiled.program);
+    vm.register_function(Box::new(PendingOnce {
+        call_count: Arc::clone(&calls),
+        op_id: 802,
+    }));
+
+    let status = vm.run().expect("first run should wait");
+    assert_eq!(status, VmStatus::Waiting(802));
+    vm.complete_host_op(802, Vec::new())
+        .expect("complete should succeed");
+    let status = vm.resume().expect("resume should halt");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(0)]);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "host op should run once");
+
+    assert_eq!(
+        vm.drop_contract_event_count(),
+        plain,
+        "suspension must not add or remove drop events"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 11. Direct script-call (CallScript) drop behavior
+// ---------------------------------------------------------------------------
+
+#[test]
+fn direct_script_call_preserves_drop_contract() {
+    // A named helper invoked through the direct script-call path drops its
+    // dead heap locals exactly once per value and restores the caller
+    // stack. The callee's parameter (an int) and its dead string local are
+    // both dropped when the callee frame completes.
+    let source = r#"
+        fn consume(value: int) -> int {
+            let tmp = "temp";
+            value + 1
+        }
+        consume(41);
+    "#;
+    let drops = compile_run_drop_count(source);
+    assert_eq!(
+        drops, 2,
+        "callee parameter and tmp string each drop exactly once, got {drops}"
+    );
+    let vm = compile_run_vm(source);
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+}
+
+#[test]
+fn direct_script_call_preserves_caller_heap_values() {
+    // A caller heap local must survive a direct script call and drop only
+    // at the root frame's end; the callee's scalar parameter drops in the
+    // callee frame.
+    let source = r#"
+        fn bump(value: int) -> int { value + 1 }
+        let keep = "alive";
+        bump(1);
+        keep;
+    "#;
+    let drops = compile_run_drop_count(source);
+    assert_eq!(
+        drops, 2,
+        "callee parameter and caller keep string each drop once, got {drops}"
+    );
+    let vm = compile_run_vm(source);
+    assert_eq!(vm.stack(), &[Value::Int(2), Value::string("alive")]);
+}

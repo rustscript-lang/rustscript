@@ -3,12 +3,12 @@ use alloc::vec::Vec;
 
 use super::{
     CallableKind, CallablePrototype, CallableTarget, CaptureBindingMode, ExportedCallable,
-    FunctionRegion, HostImport, Program, RootCallableBinding, ScriptFunction, Value, ValueType,
-    WireError,
+    FunctionRegion, HostImport, OpCode, Program, RootCallableBinding, ScriptFunction, Value,
+    ValueType, WireError,
 };
 
 const MAGIC: [u8; 4] = *b"VMBC";
-const VERSION_V11: u16 = 11;
+const VERSION_V12: u16 = 12;
 const FLAGS: u16 = 0;
 const MAX_SCHEMA_DEPTH: usize = 64;
 const MAX_CONSTANT_DEPTH: usize = 64;
@@ -57,7 +57,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     }
 
     let version = cursor.read_u16()?;
-    if version != VERSION_V11 {
+    if version != VERSION_V12 {
         return Err(WireError::UnsupportedVersion(version));
     }
     let flags = cursor.read_u16()?;
@@ -96,6 +96,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     if !cursor.is_empty() {
         return Err(WireError::TrailingBytes);
     }
+    validate_call_script_operands(&code, &callable_prototypes)?;
 
     let program = Program::new(constants, code, imports);
     let program = match encoded_local_count {
@@ -347,6 +348,64 @@ fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, W
         bindings,
         exported_callables,
     ))
+}
+
+/// Deterministically reject malformed or inconsistent `CallScript` operands,
+/// mirroring the std VMBC V12 decoder: truncated operands, out-of-range
+/// prototype ids, prototypes that do not target a script function, and argc
+/// values that disagree with the prototype arity.
+fn validate_call_script_operands(
+    code: &[u8],
+    prototypes: &[CallablePrototype],
+) -> Result<(), WireError> {
+    let mut ip = 0usize;
+    while ip < code.len() {
+        let opcode_byte = code[ip];
+        let Ok(opcode) = OpCode::try_from(opcode_byte) else {
+            // Unknown opcodes surface as `InvalidOpcode` at run time; skip a
+            // single byte so the walk stays aligned for the opcodes that
+            // follow.
+            ip = ip.saturating_add(1);
+            continue;
+        };
+        let operand_len = opcode.operand_len();
+        let operands_start = ip.saturating_add(1);
+        let operands_end = operands_start
+            .checked_add(operand_len)
+            .ok_or(WireError::LengthTooLarge("code", code.len()))?;
+        if operands_end > code.len() {
+            return Err(WireError::TruncatedOperand {
+                opcode: opcode_byte,
+                expected_bytes: operand_len,
+            });
+        }
+        if matches!(opcode, OpCode::CallScript) {
+            let prototype_id = u32::from_le_bytes(
+                code[operands_start..operands_start + 4]
+                    .try_into()
+                    .expect("operand width validated above"),
+            );
+            let argc = code[operands_start + 4];
+            let Some(prototype) = prototypes.get(prototype_id as usize) else {
+                return Err(WireError::InvalidCallScriptTarget { prototype_id });
+            };
+            // `CallScript` is a static script-function call: a host-import
+            // prototype must never be routed to the host path, so reject it
+            // deterministically here as well.
+            if !matches!(prototype.target, CallableTarget::ScriptFunction(_)) {
+                return Err(WireError::InvalidCallScriptTarget { prototype_id });
+            }
+            if argc != prototype.arity {
+                return Err(WireError::InvalidCallScriptArity {
+                    prototype_id,
+                    expected: prototype.arity,
+                    got: argc,
+                });
+            }
+        }
+        ip = operands_end;
+    }
+    Ok(())
 }
 
 fn skip_debug_info(cursor: &mut Cursor<'_>) -> Result<(), WireError> {

@@ -44,6 +44,7 @@ pub use io::{IoHostExt, IoPolicy};
 pub(crate) use sqlite::SqliteState;
 pub use standard_composition::standard_composition;
 pub use typed::HostCallResult;
+#[allow(unused_imports)]
 use typed::{
     AnyValue, IntoBuiltinCallOutcome, IntoVmValue, NumberValue, UnknownValue, VmArray, VmBytes,
     VmCallable, VmMap,

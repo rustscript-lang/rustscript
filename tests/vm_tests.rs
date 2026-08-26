@@ -18,3 +18,9 @@ mod vm_async_runtime_tests;
 
 #[path = "vm/vm_runtime_tests.rs"]
 mod vm_runtime_tests;
+
+#[path = "vm/call_script_tests.rs"]
+mod call_script_tests;
+
+#[path = "vm/ownership_tests.rs"]
+mod ownership_tests;

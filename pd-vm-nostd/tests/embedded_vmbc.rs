@@ -29,9 +29,9 @@ fn encoded_scalar_program() -> Vec<u8> {
 }
 
 #[test]
-fn embedded_decoder_reads_host_generated_v11() {
+fn embedded_decoder_reads_host_generated_v12() {
     let bytes = encoded_scalar_program();
-    let program = decode_program(&bytes).expect("embedded decoder should accept VMBC v11");
+    let program = decode_program(&bytes).expect("embedded decoder should accept VMBC v12");
 
     assert_eq!(
         program.code(),
@@ -182,7 +182,13 @@ fn embedded_runtime_executes_compiler_generated_capturing_callable() {
 }
 
 #[test]
-fn removed_callable_creation_opcode_is_rejected() {
-    assert!(OpCode::try_from(0x1a).is_err());
-    assert!(EmbeddedOpCode::try_from(0x1a).is_err());
+fn call_script_opcode_is_0x1a_in_both_crates() {
+    // The historical callable-creation opcode slot (0x1A) is now the static
+    // script-call opcode in both the std and embedded opcode tables.
+    assert_eq!(OpCode::try_from(0x1a), Ok(OpCode::CallScript));
+    assert_eq!(
+        EmbeddedOpCode::try_from(0x1a),
+        Ok(EmbeddedOpCode::CallScript)
+    );
+    assert!(EmbeddedOpCode::try_from(0x7f).is_err());
 }

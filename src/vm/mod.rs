@@ -116,6 +116,10 @@ pub enum VmError {
     InvalidCallable,
 
     InvalidCallablePrototype(u32),
+    /// A JIT bridge received a callable prototype id outside the valid `u32`
+    /// index range (e.g. a negative value). Carries the raw value so the
+    /// error stays accurate instead of masquerading as a truncated id.
+    InvalidCallablePrototypeId(i64),
     InvalidBranchTarget {
         target: usize,
     },
@@ -124,6 +128,9 @@ pub enum VmError {
         expected: u8,
         got: u8,
     },
+    /// `CallScript` targeted a prototype whose capture layout requires a
+    /// callable environment, which a static script call cannot supply.
+    CallScriptRequiresEnvironment(u32),
     CallStackOverflow {
         limit: usize,
     },
@@ -185,6 +192,9 @@ impl std::fmt::Display for VmError {
             VmError::InvalidCallablePrototype(id) => {
                 write!(f, "invalid callable prototype {id}")
             }
+            VmError::InvalidCallablePrototypeId(id) => {
+                write!(f, "invalid callable prototype id {id}")
+            }
             VmError::InvalidBranchTarget { target } => {
                 write!(
                     f,
@@ -198,6 +208,10 @@ impl std::fmt::Display for VmError {
             } => write!(
                 f,
                 "invalid call arity for callable {prototype_id}: expected {expected}, got {got}"
+            ),
+            VmError::CallScriptRequiresEnvironment(prototype_id) => write!(
+                f,
+                "callscript prototype {prototype_id} requires a callable environment"
             ),
             VmError::CallStackOverflow { limit } => {
                 write!(f, "script call stack limit {limit} exceeded")
@@ -1114,17 +1128,88 @@ impl Vm {
         let Value::Callable(callable) = callee else {
             return Err(VmError::InvalidCallable);
         };
+        let prototype_id = callable.prototype_id;
+        let continuation = FrameContinuation::ResumeBytecode {
+            return_ip: self.instance.ip,
+        };
+        self.enter_script_frame(
+            prototype_id,
+            Some(callable),
+            operands,
+            operand_stack_base,
+            call_site_ip,
+            continuation,
+        )
+    }
+
+    /// Execute a static `CallScript(prototype_id, argc)` instruction.
+    ///
+    /// The operands are split off the stack and the frame is entered through
+    /// the shared [`Self::enter_script_frame`] helper with no callable value:
+    /// `CallScript` can never supply a callable environment, so capture- or
+    /// self-requiring prototypes are rejected there with a typed error.
+    fn execute_call_script(
+        &mut self,
+        prototype_id: u32,
+        argc: u8,
+        call_ip: usize,
+    ) -> VmResult<ExecOutcome> {
+        let operand_count = argc as usize;
+        if self.instance.stack.len() < operand_count {
+            return Err(VmError::StackUnderflow);
+        }
+        let operand_stack_base = self.instance.stack.len() - operand_count;
+        let operands = self.instance.stack.split_off(operand_stack_base);
+        let continuation = FrameContinuation::ResumeBytecode {
+            return_ip: self.instance.ip,
+        };
+        self.enter_script_frame(
+            prototype_id,
+            None,
+            operands,
+            operand_stack_base,
+            Some(call_ip),
+            continuation,
+        )
+    }
+
+    /// Shared script-frame entry for `CallValue` and `CallScript`.
+    ///
+    /// Enters a callable frame from `(prototype_id, optional callable value,
+    /// operands, continuation)`. `CallValue` passes the runtime callable
+    /// value, which carries the environment and provides the self binding;
+    /// `CallScript` passes `None` and must only reach environment-free
+    /// function prototypes. The helper preserves arity validation, schema
+    /// checks, depth limits, interruption ticks, the return continuation,
+    /// operand stack cleanup, root callable binding initialization, capture
+    /// cell wiring, and self-slot binding.
+    fn enter_script_frame(
+        &mut self,
+        prototype_id: u32,
+        callable: Option<Arc<CallableValue>>,
+        operands: Vec<Value>,
+        operand_stack_base: usize,
+        call_site_ip: Option<usize>,
+        continuation: FrameContinuation,
+    ) -> VmResult<ExecOutcome> {
         let prototype = self
             .program
             .callable_prototypes
-            .get(callable.prototype_id as usize)
+            .get(prototype_id as usize)
             .cloned()
-            .ok_or(VmError::InvalidCallablePrototype(callable.prototype_id))?;
-        if prototype.arity != argc {
+            .ok_or(VmError::InvalidCallablePrototype(prototype_id))?;
+        // A call without a runtime callable value (`CallScript`) cannot
+        // populate capture cells or bind the function's self identity.
+        if callable.is_none()
+            && (!prototype.capture_slots.is_empty() || prototype.self_slot.is_some())
+        {
+            return Err(VmError::CallScriptRequiresEnvironment(prototype_id));
+        }
+        if prototype.arity != operands.len() as u8 {
             return Err(VmError::CallableArityMismatch {
-                prototype_id: callable.prototype_id,
+                prototype_id,
                 expected: prototype.arity,
-                got: argc,
+                got: operands.len() as u8,
             });
         }
         if let Some(crate::compiler::TypeSchema::Callable { params, .. }) = &prototype.schema
@@ -1143,7 +1228,7 @@ impl Vm {
                     self.engine.jit.observe_script_call_target(
                         self.active_frame_key(),
                         call_ip,
-                        callable.prototype_id,
+                        prototype_id,
                     );
                 }
                 if self.instance.call_depth >= self.instance.max_script_call_depth {
@@ -1156,12 +1241,12 @@ impl Vm {
                     .script_functions
                     .get(function_id as usize)
                     .cloned()
-                    .ok_or(VmError::InvalidCallablePrototype(callable.prototype_id))?;
+                    .ok_or(VmError::InvalidCallablePrototype(prototype_id))?;
                 if prototype.parameter_slots.len() != operands.len() {
                     return Err(VmError::CallableArityMismatch {
-                        prototype_id: callable.prototype_id,
+                        prototype_id,
                         expected: prototype.parameter_slots.len() as u8,
-                        got: argc,
+                        got: operands.len() as u8,
                     });
                 }
                 let inherited_callables = self
@@ -1219,7 +1304,9 @@ impl Vm {
                     }
                     self.instance.locals[local_base + relative] = argument;
                 }
-                if let Some(environment) = &callable.env {
+                if let Some(environment) =
+                    callable.as_ref().and_then(|callable| callable.env.as_ref())
+                {
                     let cells = environment
                         .cells
                         .lock()
@@ -1267,15 +1354,19 @@ impl Vm {
                             "self slot is outside the script frame",
                         ));
                     }
+                    let Some(callable) = callable else {
+                        return Err(VmError::InvalidFrameState(
+                            "self slot requires a callable value",
+                        ));
+                    };
                     self.instance.locals[local_base + relative] = Value::Callable(callable.clone());
                 }
-                let return_ip = self.instance.ip;
                 self.instance.execution_frames.push(ExecutionFrame {
-                    continuation: FrameContinuation::ResumeBytecode { return_ip },
+                    continuation,
                     operand_stack_base,
                     local_base,
                     local_count,
-                    prototype_id: Some(callable.prototype_id),
+                    prototype_id: Some(prototype_id),
                 });
                 self.instance.active_local_base_cache = local_base;
                 self.instance.active_operand_stack_base_cache = operand_stack_base;
@@ -1285,6 +1376,12 @@ impl Vm {
                 Ok(ExecOutcome::Continue)
             }
             CallableTarget::HostImport(import_index) => {
+                let Some(callable) = callable else {
+                    // `CallScript` is a static script-function call and must
+                    // never route a host-import prototype to the host path.
+                    return Err(VmError::InvalidCallablePrototype(prototype_id));
+                };
+                let argc = operands.len() as u8;
                 self.instance.stack.extend(operands);
                 let call_ip = self.instance.ip.saturating_sub(2);
                 match self.execute_host_call(import_index, argc, call_ip)? {
@@ -1293,7 +1390,7 @@ impl Vm {
                     HostCallExecOutcome::Yielded => {
                         self.instance
                             .stack
-                            .insert(operand_stack_base, Value::Callable(callable));
+                            .insert(operand_stack_base, Value::Callable(callable.clone()));
                         Ok(ExecOutcome::Yielded)
                     }
                     HostCallExecOutcome::Pending(op_id) => Ok(ExecOutcome::Waiting(op_id)),
@@ -2642,6 +2739,12 @@ impl Vm {
                 let argc = self.read_u8()?;
                 return self.execute_call_value(argc, Some(call_ip));
             }
+            x if x == OpCode::CallScript as u8 => {
+                let call_ip = self.instance.ip.saturating_sub(1);
+                let prototype_id = self.read_u32()?;
+                let argc = self.read_u8()?;
+                return self.execute_call_script(prototype_id, argc, call_ip);
+            }
             other => return Err(VmError::InvalidOpcode(other)),
         }
         Ok(ExecOutcome::Continue)
@@ -2813,6 +2916,11 @@ impl Vm {
         if !matches!(&callable, Value::Callable(_)) {
             return Err(VmError::InvalidCallable);
         }
+        if !self.owns_callable(&callable) {
+            return Err(VmError::InvalidFrameState(
+                "callable does not belong to this vm",
+            ));
+        }
         self.instance.queued_callables.push_back(QueuedCallable {
             callable,
             args,
@@ -2923,6 +3031,11 @@ impl Vm {
         }
         if !matches!(&callable, Value::Callable(_)) {
             return Err(VmError::InvalidCallable);
+        }
+        if !self.owns_callable(&callable) {
+            return Err(VmError::InvalidFrameState(
+                "callable does not belong to this vm",
+            ));
         }
         if !self.instance.execution_frames.is_empty() {
             return Err(VmError::InvalidFrameState(

@@ -238,21 +238,26 @@ impl<C> Vm<C> {
                     Value::Null,
                 );
                 for binding in self.program.root_callable_bindings() {
-                    if let Some(binding_prototype) = self
+                    // Mirror the interpreter's `enter_script_frame`: every
+                    // root binding must fit the callee frame and reference a
+                    // known prototype; a malformed program errors instead of
+                    // silently skipping the slot.
+                    let binding_prototype = self
                         .program
                         .callable_prototypes()
                         .get(binding.prototype_id as usize)
-                    {
-                        let slot = binding.local_slot as usize;
-                        if slot < prototype.frame_local_count {
-                            self.locals[local_base + slot] =
-                                Value::Callable(Rc::new(CallableValue {
-                                    prototype_id: binding.prototype_id,
-                                    kind: binding_prototype.kind,
-                                    env: None,
-                                }));
-                        }
+                        .ok_or(VmError::InvalidCallablePrototype(binding.prototype_id))?;
+                    let slot = binding.local_slot as usize;
+                    if slot >= prototype.frame_local_count {
+                        return Err(VmError::InvalidFrameState(
+                            "root callable binding is outside the script frame",
+                        ));
                     }
+                    self.locals[local_base + slot] = Value::Callable(Rc::new(CallableValue {
+                        prototype_id: binding.prototype_id,
+                        kind: binding_prototype.kind,
+                        env: None,
+                    }));
                 }
                 for (slot, value) in inherited {
                     if slot < prototype.frame_local_count {
@@ -297,6 +302,119 @@ impl<C> Vm<C> {
                 Ok(())
             }
         }
+    }
+
+    /// Execute a static `CallScript(prototype_id, argc)` instruction.
+    ///
+    /// Mirrors [`Self::call_value`] but resolves the callee from the static
+    /// prototype metadata: no runtime callable value exists, so
+    /// capture- or self-requiring prototypes fail with
+    /// [`VmError::CallScriptRequiresEnvironment`] and host-import prototypes
+    /// are never routed to the host path.
+    fn call_script(&mut self, prototype_id: u32, argc: u8) -> VmResult<()> {
+        // Mirror the interpreter contract: the operand underflow check comes
+        // before any prototype-driven rejection so a malformed call with a
+        // short stack reports `StackUnderflow`, not an environment error.
+        let operand_count = argc as usize;
+        if self.stack.len() < operand_count {
+            return Err(VmError::StackUnderflow);
+        }
+        let prototype = self
+            .program
+            .callable_prototypes()
+            .get(prototype_id as usize)
+            .cloned()
+            .ok_or(VmError::InvalidCallablePrototype(prototype_id))?;
+        // A static script call can never supply a callable environment.
+        if !prototype.capture_slots.is_empty() || prototype.self_slot.is_some() {
+            return Err(VmError::CallScriptRequiresEnvironment(prototype_id));
+        }
+        let stack_base = self.stack.len() - operand_count;
+        let operands = self.stack.split_off(stack_base);
+        if prototype.arity != argc || prototype.parameter_slots.len() != operands.len() {
+            return Err(VmError::InvalidCallArity {
+                import: String::from("script call"),
+                expected: prototype.arity,
+                got: argc,
+            });
+        }
+        let CallableTarget::ScriptFunction(function_id) = prototype.target else {
+            // `CallScript` is a static script-function call and must never
+            // route a host-import prototype to the host path.
+            return Err(VmError::InvalidCallablePrototype(prototype_id));
+        };
+        if self.frames.len() >= self.max_script_call_depth {
+            return Err(VmError::CallStackOverflow);
+        }
+        let function = self
+            .program
+            .script_functions()
+            .get(function_id as usize)
+            .cloned()
+            .ok_or(VmError::InvalidCallablePrototype(prototype_id))?;
+        let inherited = {
+            let base = self.active_local_base();
+            let count = self
+                .frames
+                .last()
+                .map_or(self.locals.len(), |frame| frame.local_count);
+            self.locals[base..base.saturating_add(count)]
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, value)| match value {
+                    Value::Callable(_) => Some((slot, value.clone())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let local_base = self.locals.len();
+        self.locals.resize(
+            local_base.saturating_add(prototype.frame_local_count),
+            Value::Null,
+        );
+        for binding in self.program.root_callable_bindings() {
+            // Mirror the interpreter's `enter_script_frame`: every root
+            // binding must fit the callee frame and reference a known
+            // prototype; a malformed program errors instead of silently
+            // skipping the slot.
+            let binding_prototype = self
+                .program
+                .callable_prototypes()
+                .get(binding.prototype_id as usize)
+                .ok_or(VmError::InvalidCallablePrototype(binding.prototype_id))?;
+            let slot = binding.local_slot as usize;
+            if slot >= prototype.frame_local_count {
+                return Err(VmError::InvalidFrameState(
+                    "root callable binding is outside the script frame",
+                ));
+            }
+            self.locals[local_base + slot] = Value::Callable(Rc::new(CallableValue {
+                prototype_id: binding.prototype_id,
+                kind: binding_prototype.kind,
+                env: None,
+            }));
+        }
+        for (slot, value) in inherited {
+            if slot < prototype.frame_local_count {
+                self.locals[local_base + slot] = value;
+            }
+        }
+        for (slot, argument) in prototype.parameter_slots.iter().zip(operands) {
+            let slot = *slot as usize;
+            if slot >= prototype.frame_local_count {
+                return Err(VmError::InvalidCallablePrototype(prototype_id));
+            }
+            self.locals[local_base + slot] = argument;
+        }
+        self.frames.push(ExecutionFrame {
+            return_ip: self.ip,
+            operand_stack_base: stack_base,
+            local_base,
+            local_count: prototype.frame_local_count,
+            prototype_id,
+        });
+        self.ip = function.entry_ip as usize;
+        Ok(())
     }
 
     fn return_from_frame(&mut self) -> VmResult<bool> {
@@ -408,6 +526,11 @@ impl<C> Vm<C> {
                 OpCode::CallValue => {
                     let arity = self.read_u8()?;
                     self.call_value(arity)?;
+                }
+                OpCode::CallScript => {
+                    let prototype_id = self.read_u32()?;
+                    let arity = self.read_u8()?;
+                    self.call_script(prototype_id, arity)?;
                 }
 
                 OpCode::Shl => {
