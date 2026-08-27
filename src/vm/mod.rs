@@ -4,12 +4,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub(crate) mod aot;
+pub mod async_host;
+mod capability;
 pub mod diagnostics;
 mod engine;
 mod epoch;
 pub mod execution_scope;
 mod fuel;
 mod host;
+pub mod host_context;
+pub mod host_extension;
 mod host_runtime;
 pub(crate) mod host_state;
 mod instance;
@@ -20,25 +24,39 @@ pub mod operation;
 pub mod program;
 pub mod resource;
 mod run_context;
+pub mod standard_composition;
 mod store;
 mod superinstructions;
 #[cfg(test)]
 mod tests;
 pub use self::aot::AotArtifactError;
+pub use self::async_host::{CaptureAsyncHostContext, HostFuture, HostFutureOutput};
+pub use self::capability::{CapabilityProfile, CapabilityProfileBuilder};
 use self::engine::Engine;
 pub use self::epoch::{EpochCheckpoint, EpochHandle};
 use self::execution_scope::ExecutionScopeError;
 pub use self::fuel::FuelCheckpoint;
 pub use self::host::{
     CallOutcome, CallReturn, HostArgsFunction, HostAsyncBridge, HostBindingPlan, HostFunction,
-    HostFunctionRegistry, HostOpId, HostStackFunction, StaticHostArgsFunction, StaticHostFunction,
-    StaticHostStackFunction,
+    HostFunctionRegistry, HostOpId, HostStackFunction, RegistrySchemaError, StaticHostArgsFunction,
+    StaticHostFunction, StaticHostStackFunction,
 };
 use self::host::{HostCallExecOutcome, VmHostFunction};
+pub use self::host_context::{
+    HostContext, HostContextError, HostContextErrorKind, HostContextResult, HostModule,
+    HostModule as HostModuleState,
+};
+pub use self::host_extension::{
+    CatalogRegistrationError, CatalogSchemaSelection, HostExtension, HostImportParam,
+    HostImportSchema, catalog_import_schemas, register_catalog_function,
+    register_catalog_static_function, validate_catalog_import_schemas,
+    validate_catalog_import_schemas_with_fingerprints,
+};
 use self::host_runtime::HostRuntime;
 use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable};
 pub use self::resource::ResourceCloseReason;
 use self::run_context::{InterruptMode, RunContext};
+pub use self::standard_composition::StandardSurfaceComposition;
 pub use crate::bytecode::{
     CallableTarget, CallableValue, HostImport, OpCode, Program, Value, ValueType,
 };
@@ -362,6 +380,11 @@ fn compute_program_cache_key(program: &Program) -> u64 {
         hash_value(constant, &mut hasher);
     }
     program.imports.hash(&mut hasher);
+    let has_host_import_schemas = program.host_import_schemas.iter().any(Option::is_some);
+    has_host_import_schemas.hash(&mut hasher);
+    if has_host_import_schemas {
+        program.host_import_schemas.hash(&mut hasher);
+    }
     program.script_functions.hash(&mut hasher);
     program.function_regions.hash(&mut hasher);
     program.root_callable_bindings.hash(&mut hasher);
@@ -552,7 +575,9 @@ impl Vm {
             engine,
             instance,
             run_ctx: RunContext::default(),
-            host: HostRuntime::default(),
+            host: HostRuntime::with_standard_composition(
+                crate::builtins::runtime::standard_composition(),
+            ),
         }
     }
 
@@ -695,7 +720,9 @@ impl Vm {
     /// retired through the generic execution-scope lifecycle (the old scope is
     /// dropped and replaced with a fresh one).
     pub fn reset_for_reuse(&mut self) {
-        self.cancel_waiting_host_op();
+        self.cancel_waiting_host_op_with_reason(
+            crate::vm::operation::OperationCancelReason::VmReset,
+        );
         self.host.reset_execution_scope();
         self.run_ctx.reset_for_reuse();
         self.instance.reset(&self.program);
@@ -990,7 +1017,11 @@ impl Vm {
 
 impl Drop for Vm {
     fn drop(&mut self) {
-        self.cancel_waiting_host_op();
+        self.cancel_waiting_host_op_with_reason(
+            crate::vm::operation::OperationCancelReason::VmDrop,
+        );
+        self.host
+            .cancel_submitted_host_ops(crate::vm::operation::OperationCancelReason::VmDrop);
         self.instance.drop_cleanup();
         // Live IO handles and in-flight IO operations are retired by the
         // `ExecutionScope`'s own `Drop`, which runs as part of `HostRuntime`.
@@ -2125,7 +2156,7 @@ impl Vm {
     ) -> VmResult<VmStatus> {
         self.ensure_call_bindings()?;
         self.sync_jit_non_yielding_host_imports();
-        if let Some(waiting) = self.instance.waiting_host_op {
+        if let Some(waiting) = self.instance.waiting_host_op.as_ref() {
             self.instance.last_yield_reason = None;
             let status = VmStatus::Waiting(waiting.op_id);
             self.notify_debugger_status(&mut debugger, status);
@@ -2671,6 +2702,30 @@ impl Vm {
         &mut self.host.execution_scope
     }
 
+    /// Returns the generic host boundary for this VM.
+    ///
+    /// [`HostContext`](crate::vm::host_context::HostContext) exposes typed
+    /// per-VM module state and the generic host-agnostic execution-scope SDK
+    /// to external host extensions without leaking the underlying host runtime
+    /// or naming a builtin domain module.
+    pub fn host_context(&mut self) -> crate::vm::host_context::HostContext<'_> {
+        crate::vm::host_context::HostContext::new(self)
+    }
+
+    /// Installs a [`HostExtension`](crate::vm::host_extension::HostExtension)
+    /// onto this VM.
+    ///
+    /// Registration (into the VM's bound host-function registry) is
+    /// transactional and runs before the install phase, so a fallible
+    /// registration/registry-binding failure surfaces before any per-VM
+    /// module state is installed.
+    pub fn install_extension(
+        &mut self,
+        extension: &dyn crate::vm::host_extension::HostExtension,
+    ) -> VmResult<()> {
+        extension.install_into(self)
+    }
+
     pub fn has_bound_function(&self, name: &str) -> bool {
         self.host.host_function_symbols.contains_key(name)
     }
@@ -2811,7 +2866,12 @@ impl Vm {
 
     pub fn shutdown(&mut self) {
         self.invalidate_callback_registries();
-        self.cancel_waiting_host_op();
+        self.cancel_waiting_host_op_with_reason(
+            crate::vm::operation::OperationCancelReason::VmDrop,
+        );
+        self.host
+            .cancel_submitted_host_ops(crate::vm::operation::OperationCancelReason::VmDrop);
+        self.host.scoped_operation_completions.clear();
         // Begin execution-scope shutdown (first-reason-wins; sealing the
         // operation registry) before tearing down interpreter state.
         let _ = self

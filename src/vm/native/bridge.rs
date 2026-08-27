@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 use crate::builtins::BuiltinFunction;
 use crate::bytecode::{CallableKind, CallableTarget, Value, ValueType, VmMap};
+use crate::host_api::HostImportSchema;
 use crate::vm::{
     CallOutcome, CallReturn, ExecOutcome, ExecutionFrame, FrameContinuation, HostCallExecOutcome,
     NumericValue, Vm, VmError, VmHostFunction, VmResult, logical_shr_i64,
@@ -1646,7 +1647,18 @@ pub(crate) extern "C" fn pd_vm_native_non_yielding_host_call(
         .imports
         .get(import)
         .map(|host_import| host_import.return_type);
-    match call_non_yielding_host_value(vm, import, args, expected_return_type) {
+    let expected_return_schema = vm
+        .program
+        .host_import_schemas
+        .get(import)
+        .and_then(Clone::clone);
+    match call_non_yielding_host_value(
+        vm,
+        import,
+        args,
+        expected_return_type,
+        expected_return_schema.as_ref(),
+    ) {
         Ok(value) => {
             unsafe { std::ptr::write(out, value) };
             STATUS_CONTINUE
@@ -1663,6 +1675,7 @@ fn call_non_yielding_host_value(
     import: usize,
     args: &[Value],
     expected_return_type: Option<ValueType>,
+    expected_return_schema: Option<&HostImportSchema>,
 ) -> VmResult<Value> {
     let resolved = *vm
         .host
@@ -1680,11 +1693,16 @@ fn call_non_yielding_host_value(
     vm.instance.call_depth = vm.instance.call_depth.saturating_add(1);
     let outcome = function(args);
     vm.instance.call_depth = vm.instance.call_depth.saturating_sub(1);
-    outcome
-        .and_then(crate::vm::host::require_non_yielding_host_value)
-        .and_then(|value| {
-            crate::vm::host::validate_non_yielding_host_value(value, expected_return_type)
-        })
+    let value = outcome.and_then(crate::vm::host::require_non_yielding_host_value)?;
+    let returned = CallReturn::one(value.clone());
+    crate::vm::host::validate_host_call_return(
+        &returned,
+        expected_return_type,
+        expected_return_schema,
+        &vm.program,
+        vm.host.execution_scope.resources(),
+    )?;
+    Ok(value)
 }
 
 fn scalar_host_return_type(return_type: i64) -> VmResult<ValueType> {
@@ -1742,8 +1760,21 @@ pub(crate) extern "C" fn pd_vm_native_non_yielding_scalar_host_call(
         return STATUS_ERROR;
     }
     let args = unsafe { std::slice::from_raw_parts(args, argc) };
+    let expected_return_schema = vm
+        .program
+        .host_import_schemas
+        .get(import)
+        .and_then(Clone::clone);
     match scalar_host_return_type(return_type)
-        .and_then(|expected| call_non_yielding_host_value(vm, import, args, Some(expected)))
+        .and_then(|expected| {
+            call_non_yielding_host_value(
+                vm,
+                import,
+                args,
+                Some(expected),
+                expected_return_schema.as_ref(),
+            )
+        })
         .and_then(|value| store_scalar_host_result(value, return_type, out))
     {
         Ok(()) => STATUS_CONTINUE,
@@ -1776,9 +1807,20 @@ pub(crate) extern "C" fn pd_vm_native_non_yielding_i64_host_call(
         return STATUS_ERROR;
     }
     let storage = [Value::Int(arg0), Value::Int(arg1)];
+    let expected_return_schema = vm
+        .program
+        .host_import_schemas
+        .get(import)
+        .and_then(Clone::clone);
     match scalar_host_return_type(return_type)
         .and_then(|expected| {
-            call_non_yielding_host_value(vm, import, &storage[..argc], Some(expected))
+            call_non_yielding_host_value(
+                vm,
+                import,
+                &storage[..argc],
+                Some(expected),
+                expected_return_schema.as_ref(),
+            )
         })
         .and_then(|value| store_scalar_host_result(value, return_type, out))
     {

@@ -1,0 +1,19 @@
+[package]
+name = "external-host-extension"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone fixture crate that consumes only the PUBLIC host-extension SDK of
+# pd-vm. It is deliberately NOT a member of the pd-vm workspace: this proves
+# the extension surface (HostContext module state / resource insert / operation
+# start, HostExtension register/install, external resource/operation SDK, and
+# the host-API catalog) works from a genuinely separate crate with no
+# crate-private access. The empty [workspace] table detaches it from the
+# enclosing pd-vm workspace so `cargo check --manifest-path` treats it as its
+# own root.
+[workspace]
+
+[dependencies]
+vm = { package = "pd-vm", path = "../../..", default-features = false, features = ["runtime"] }
+pd-host-function = { path = "../../../pd-host-function" }

@@ -245,6 +245,18 @@ impl ExecutionScope {
         &self.resources
     }
 
+    /// Mutable access to the owned resource table (typed borrows for the
+    /// duration of a host call). New inserts must still go through the guarded
+    /// scope API.
+    /// Returns mutable access for VM-internal typed resource operations.
+    ///
+    /// Public callers must use the guarded `push_resource`/`resource_*` methods
+    /// on [`ExecutionScope`]; exposing this raw table would allow admission to
+    /// bypass the scope's `Open` lifecycle state.
+    pub(crate) fn resources_mut(&mut self) -> &mut ResourceTable {
+        &mut self.resources
+    }
+
     // ---- typed scope-state arena -------------------------------------------------
 
     /// Returns a mutable handle to the `T`-typed scope state, creating it with
@@ -308,6 +320,27 @@ impl ExecutionScope {
             .map_err(ExecutionScopeError::Resource)
     }
 
+    /// Takes an open typed resource out of the current scope and transfers its
+    /// concrete value to the caller. Validation precedes slot mutation; a
+    /// rejected take leaves the resource available.
+    pub fn take_resource<T: HostResource>(
+        &mut self,
+        handle: ResourceHandle,
+    ) -> ExecutionScopeResult<T> {
+        self.resources
+            .take::<T>(handle)
+            .map_err(ExecutionScopeError::Resource)
+    }
+
+    /// Alias for [`Self::take_resource`] using the ownership terminology used
+    /// by host-function declarations.
+    pub fn take_owned<T: HostResource>(
+        &mut self,
+        handle: ResourceHandle,
+    ) -> ExecutionScopeResult<T> {
+        self.take_resource::<T>(handle)
+    }
+
     /// Registers a host operation while the scope is Active.
     pub fn start_operation(&mut self, spec: OperationSpec) -> ExecutionScopeResult<OperationId> {
         self.ensure_accepting()?;
@@ -365,15 +398,16 @@ impl ExecutionScope {
 
     /// Aborts a started operation in one step so it never produces a
     /// guest-visible result: cancels the driver exactly once if pending
-    /// (recording the first reason), then consumes and immediately releases
-    /// the slot, restoring full registry capacity and making the id stale.
+    /// (recording the first reason), waits through the driver's
+    /// `cancel_and_wait` boundary, then consumes/releases the slot, restoring
+    /// full registry capacity and making the id stale.
     ///
     /// This is the rollback counterpart to
     /// [`start_operation`](Self::start_operation), intended for call sites
     /// that register an operation and then hit a fallible handoff. Even when
-    /// the driver's `cancel` reports a typed failure, the slot is still
-    /// released. A stale/foreign/out-of-range id is rejected with the typed
-    /// error and no registry mutation.
+    /// the driver's cancellation boundary reports a typed failure, the slot
+    /// is still released. A stale/foreign/out-of-range id is rejected with
+    /// the typed error and no registry mutation.
     pub fn abort_operation(
         &mut self,
         id: OperationId,

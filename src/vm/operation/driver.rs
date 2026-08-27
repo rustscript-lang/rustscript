@@ -73,9 +73,15 @@ pub trait HostOperation: Any + Send + 'static {
     /// Registers a waker for the transition to quiescent after cancellation.
     fn register_quiescence_waker(&mut self, _cx: &Context<'_>) {}
 
-    /// Cancels and, when a resource is already in its close phase, waits for
-    /// the driver's worker to terminate. The default is appropriate for
-    /// drivers without separate background work.
+    /// Cancels and waits for the driver's worker to terminate.
+    ///
+    /// This method is the cancellation/quiescence boundary. Implementations
+    /// must not return until the underlying work no longer needs the operation
+    /// slot, including when returning an error. An error reports cancellation
+    /// failure to the caller; it does not permit the operation registry to keep
+    /// an occupied failed slot.
+    ///
+    /// The default is appropriate for drivers without separate background work.
     fn cancel_and_wait(&mut self, reason: OperationCancelReason) -> OperationResult<()> {
         self.cancel(reason)
     }

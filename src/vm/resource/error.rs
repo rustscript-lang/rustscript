@@ -31,6 +31,8 @@ pub enum ResourceErrorCode {
     /// A resource token named a concrete type that did not match the live
     /// resource's actual type.
     ResourceTypeMismatch,
+    /// A declared catalog resource key did not match the live/concrete key.
+    ResourceTypeKeyMismatch,
     /// A handle referred to a slot generation that had moved on (stale).
     ResourceStale,
     /// The resource was already closed or is in the middle of closing.
@@ -71,6 +73,7 @@ impl ResourceErrorCode {
             Self::InvalidResourceHandle => "invalid_resource_handle",
             Self::ResourceHandleWrongTable => "resource_handle_wrong_table",
             Self::ResourceTypeMismatch => "resource_type_mismatch",
+            Self::ResourceTypeKeyMismatch => "resource_type_key_mismatch",
             Self::ResourceStale => "resource_stale",
             Self::ResourceAlreadyClosed => "resource_already_closed",
             Self::ResourceIdExhausted => "resource_id_exhausted",

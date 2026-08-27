@@ -17,6 +17,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
+use crate::host_api::ResourceTypeKey;
+
 use super::close::{CloseProgress, HostResource};
 use super::error::{ResourceError, ResourceErrorCode, ResourceResult};
 use super::handle::{
@@ -101,6 +103,9 @@ struct ResourceSlot {
     generation: Cell<u32>,
     /// Concrete type of the current occupant; borrow-time validation only.
     type_id: TypeId,
+    /// Stable host-facing identity of the current occupant, when declared by
+    /// the concrete resource type.
+    resource_type_key: Option<ResourceTypeKey>,
     /// The resource state is independently guarded so distinct frame requests
     /// may hold disjoint borrows without an aliased `&mut ResourceTable`.
     state: RefCell<SlotState>,
@@ -571,6 +576,42 @@ impl ResourceTable {
         self.arena_id
     }
 
+    /// Removes an open typed resource from the table and transfers its concrete
+    /// value to the caller.
+    ///
+    /// Validation happens before the slot is changed. A wrong type, stale
+    /// generation, foreign arena, or active borrow therefore leaves the table
+    /// untouched. A successful take vacates the slot without invoking
+    /// [`HostResource::begin_close`], so the same token is rejected on the next
+    /// call and a later replacement receives a new generation.
+    pub fn take<T: HostResource>(&mut self, handle: ResourceHandle) -> ResourceResult<T> {
+        let slot_index = self.resolve_index(handle)?;
+        self.check_type::<T>(slot_index, handle)?;
+
+        let mut slot_state = self.slots[slot_index]
+            .state
+            .try_borrow_mut()
+            .map_err(|_| resource_borrow_conflict_error(handle))?;
+        let state = std::mem::replace(&mut *slot_state, SlotState::Vacant);
+        drop(slot_state);
+
+        match state {
+            SlotState::Open(resource) => {
+                self.reclaim(slot_index);
+                let resource: Box<dyn Any> = resource;
+                resource
+                    .downcast::<T>()
+                    .map(|value| *value)
+                    .map_err(|_| type_mismatch(handle, TypeId::of::<T>()))
+            }
+            SlotState::Closing(resource) => {
+                self.put_slot_state(slot_index, SlotState::Closing(resource));
+                Err(already_closed_error(handle))
+            }
+            SlotState::Vacant => Err(already_closed_error(handle)),
+        }
+    }
+
     // ---- typed scope-state arena -------------------------------------------------
 
     /// Returns a mutable handle to the `T`-typed scope state, creating it with
@@ -794,6 +835,7 @@ impl ResourceTable {
         }
 
         let type_id = TypeId::of::<T>();
+        let resource_type_key = T::resource_type_key();
         let value: Box<dyn HostResource> = Box::new(value);
 
         let (slot_index, generation) = if let Some(slot_index) = self.vacant_slots.get_mut().pop() {
@@ -805,6 +847,7 @@ impl ResourceTable {
                 .expect("only reusable generations enter the vacant list");
             self.slots[slot_index].generation.set(generation);
             self.slots[slot_index].type_id = type_id;
+            self.slots[slot_index].resource_type_key = resource_type_key;
             *self.slots[slot_index].state.get_mut() = SlotState::Open(value);
             (slot_index, generation)
         } else {
@@ -820,6 +863,7 @@ impl ResourceTable {
             self.slots.push(ResourceSlot {
                 generation: Cell::new(generation),
                 type_id,
+                resource_type_key,
                 state: RefCell::new(SlotState::Open(value)),
             });
             (slot_index, generation)
@@ -877,6 +921,47 @@ impl ResourceTable {
             return Err(already_closed_error(handle));
         }
         Ok(slot_index)
+    }
+
+    /// Validates a live resource handle against a declared catalog key without
+    /// borrowing, taking, closing, or otherwise mutating the resource.
+    pub fn validate_resource_type_key(
+        &self,
+        handle: ResourceHandle,
+        expected: &ResourceTypeKey,
+    ) -> ResourceResult<()> {
+        let slot_index = self.resolve_index(handle)?;
+        let state = self.slots[slot_index]
+            .state
+            .try_borrow()
+            .map_err(|_| resource_borrow_conflict_error(handle))?;
+        if !matches!(&*state, SlotState::Open(_)) {
+            return Err(already_closed_error(handle));
+        }
+        if self.slots[slot_index].resource_type_key.as_ref() != Some(expected) {
+            return Err(resource_type_key_mismatch(
+                Some(handle),
+                self.slots[slot_index].resource_type_key.as_ref(),
+                expected,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates the declaration key of a concrete resource type before any
+    /// handle access or host handler logic occurs.
+    pub fn validate_concrete_resource_type_key<T: HostResource>(
+        expected: &ResourceTypeKey,
+    ) -> ResourceResult<()> {
+        if T::resource_type_key().as_ref() == Some(expected) {
+            Ok(())
+        } else {
+            Err(resource_type_key_mismatch(
+                None,
+                T::resource_type_key().as_ref(),
+                expected,
+            ))
+        }
     }
 }
 
@@ -948,6 +1033,25 @@ fn type_mismatch(handle: ResourceHandle, expected: TypeId) -> ResourceError {
     .with_value(handle.raw())
 }
 
+fn resource_type_key_mismatch(
+    handle: Option<ResourceHandle>,
+    actual: Option<&ResourceTypeKey>,
+    expected: &ResourceTypeKey,
+) -> ResourceError {
+    let actual = actual.map_or("<none>".to_string(), ToString::to_string);
+    let mut error = ResourceError::new(
+        ResourceErrorCode::ResourceTypeKeyMismatch,
+        "resource::table",
+        format!(
+            "resource type key does not match expected key '{expected}'; actual key is '{actual}'"
+        ),
+    );
+    if let Some(handle) = handle {
+        error = error.with_value(handle.raw());
+    }
+    error
+}
+
 fn not_closing_error(handle: ResourceHandle) -> ResourceError {
     ResourceError::new(
         ResourceErrorCode::ResourceNotClosing,
@@ -1007,6 +1111,7 @@ mod tests {
     }
 
     /// A distinct inert type used to mint a mismatched `Resource<Other>`.
+    #[derive(Debug)]
     struct OtherRes;
 
     impl HostResource for OtherRes {}
@@ -1036,6 +1141,44 @@ mod tests {
         assert_eq!(table.len(), 1);
         assert_eq!(closes.load(Ordering::SeqCst), 0);
         table.get(&token).expect("real token unaffected");
+    }
+
+    #[test]
+    fn take_removes_the_value_once_and_preserves_typed_errors() {
+        let mut table = ResourceTable::new().expect("table");
+        let (res, closes) = UnitRes::new();
+        let token = table.push(res).unwrap();
+        let handle = token.handle();
+
+        let wrong: Resource<OtherRes> = Resource::from_handle(handle);
+        assert_eq!(
+            table.take::<OtherRes>(wrong.handle()).unwrap_err().code(),
+            ResourceErrorCode::ResourceTypeMismatch
+        );
+        assert_eq!(
+            table.len(),
+            1,
+            "a wrong-type take must not consume the slot"
+        );
+
+        let taken: UnitRes = table.take(token.handle()).expect("take succeeds");
+        assert_eq!(taken.0.load(Ordering::SeqCst), 0);
+        assert_eq!(table.len(), 0, "take removes the resource from the table");
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            0,
+            "take transfers without closing"
+        );
+        assert_eq!(
+            table.take::<UnitRes>(token.handle()).unwrap_err().code(),
+            ResourceErrorCode::ResourceAlreadyClosed
+        );
+
+        let _replacement = table.push(UnitRes::new().0).expect("slot is reusable");
+        assert_eq!(
+            table.take::<UnitRes>(token.handle()).unwrap_err().code(),
+            ResourceErrorCode::ResourceStale
+        );
     }
 
     #[test]

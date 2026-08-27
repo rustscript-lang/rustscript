@@ -1,0 +1,5 @@
+error: ResourceRef cannot be a host function return; resource borrows cannot cross the host boundary
+  --> tests/ui/fail/direct_resource_ref_return.rs:17:44
+   |
+17 |         fn direct_resource_ref_return() -> ResourceRef<'static, Counter> {
+   |                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

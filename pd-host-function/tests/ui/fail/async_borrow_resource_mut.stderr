@@ -1,0 +1,5 @@
+error: resource borrows cannot cross async/yield; only TakeOwned may move into an owned operation
+  --> tests/ui/fail/async_borrow_resource_mut.rs:18:22
+   |
+18 |             counter: ResourceMut<'_, Counter>,
+   |                      ^^^^^^^^^^^^^^^^^^^^^^^^

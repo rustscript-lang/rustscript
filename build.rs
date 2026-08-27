@@ -22,10 +22,10 @@ struct SourceSpec {
 }
 
 #[derive(Clone, Debug)]
-struct CallableParamDecl {
-    name: String,
-    ty_label: String,
-    optional: bool,
+pub(crate) struct CallableParamDecl {
+    pub(crate) name: String,
+    pub(crate) ty_label: String,
+    pub(crate) optional: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -171,7 +171,9 @@ fn main() {
         module: "host".to_string(),
         category: SourceCategory::DefaultHost,
     }];
-    let builtin_sources = builtin_source_specs(&namespaces);
+    let async_enabled = env::var_os("CARGO_FEATURE_ASYNC").is_some();
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("missing target architecture");
+    let builtin_sources = builtin_source_specs(&namespaces, async_enabled, &target_arch);
     let core_sources = [SourceSpec {
         path: "src/builtins/runtime/core.rs".to_string(),
         module: "core".to_string(),
@@ -243,15 +245,26 @@ fn write_generated_file(path: &Path, contents: &str) {
         .unwrap_or_else(|err| panic!("failed to write {}: {err}", path.display()));
 }
 
-fn builtin_source_specs(namespaces: &[NamespaceDecl]) -> Vec<SourceSpec> {
+pub(crate) fn select_io_source_path(async_enabled: bool, target_arch: &str) -> &'static str {
+    if target_arch == "wasm32" {
+        "src/builtins/runtime/io_wasm.rs"
+    } else if async_enabled {
+        "src/builtins/runtime/io/async_io.rs"
+    } else {
+        "src/builtins/runtime/io/blocking.rs"
+    }
+}
+
+fn builtin_source_specs(
+    namespaces: &[NamespaceDecl],
+    async_enabled: bool,
+    target_arch: &str,
+) -> Vec<SourceSpec> {
     namespaces
         .iter()
         .map(|namespace| {
-            // At this layer the `io` namespace maps directly to the blocking
-            // backend; the async/blocking split is introduced later with the
-            // host async execution layer.
             let path = if namespace.module == "io" {
-                "src/builtins/runtime/io/blocking.rs".to_string()
+                select_io_source_path(async_enabled, target_arch).to_string()
             } else {
                 format!("src/builtins/runtime/{}.rs", namespace.module)
             };
@@ -281,6 +294,9 @@ fn parse_sources(
 }
 
 pub(crate) fn classify_host_binding(function: &ItemFn) -> HostBindingKind {
+    if function.sig.asyncness.is_some() {
+        return HostBindingKind::StaticStack;
+    }
     if function.sig.inputs.iter().any(|input| match input {
         FnArg::Typed(pat_type) => is_vm_context_type(&pat_type.ty),
         _ => false,
@@ -306,6 +322,9 @@ pub(crate) fn classify_host_binding(function: &ItemFn) -> HostBindingKind {
 }
 
 pub(crate) fn infer_host_execution(function: &ItemFn) -> HostExecutionKind {
+    if function.sig.asyncness.is_some() {
+        return HostExecutionKind::MaySuspend;
+    }
     let return_type = normalized_return_type(&function.sig.output);
     if contains_host_call_result(&return_type) {
         HostExecutionKind::MaySuspend
@@ -575,13 +594,6 @@ pub(crate) fn validate_catalog_contract(
         );
     }
     for entry in entries {
-        let expected_variant = builtin_variant_name(&entry.source_name);
-        if expected_variant != entry.variant {
-            panic!(
-                "catalog variant mismatch for '{}': derived {expected_variant}, catalog {}",
-                entry.source_name, entry.variant
-            );
-        }
         if (SQLITE_RESERVED_TOP_START..=SQLITE_RESERVED_TOP_END).contains(&entry.id)
             && !entry.source_name.starts_with("sqlite::")
         {
@@ -590,6 +602,13 @@ pub(crate) fn validate_catalog_contract(
                  0x{SQLITE_RESERVED_TOP_START:04X}..=0x{SQLITE_RESERVED_TOP_END:04X}; \
                  do not allocate IDs by arithmetic",
                 entry.source_name, entry.id
+            );
+        }
+        let expected_variant = builtin_variant_name(&entry.source_name);
+        if expected_variant != entry.variant {
+            panic!(
+                "catalog variant mismatch for '{}': derived {expected_variant}, catalog {}",
+                entry.source_name, entry.variant
             );
         }
         let is_special_call = special_variants.contains(&entry.variant);
@@ -989,6 +1008,7 @@ fn render_builtin_catalog(
         &actual_builtin_by_variant,
     );
     render_builtin_signature_method(&mut out, &builtin_variant_order);
+    render_builtin_capability_method(&mut out, builtin_callables);
     writeln!(
         &mut out,
         "    pub fn from_namespaced_name(name: &str) -> Option<Self> {{"
@@ -1563,6 +1583,35 @@ fn required_param_count(params: &[CallableParamDecl]) -> usize {
     params.iter().take_while(|param| !param.optional).count()
 }
 
+fn render_builtin_capability_method(out: &mut String, builtin_callables: &[CallableDecl]) {
+    let mut capability_variants = Vec::new();
+    for callable in builtin_callables {
+        let variant = builtin_variant_name(&callable.name);
+        if !capability_variants.contains(&variant) {
+            capability_variants.push(variant);
+        }
+    }
+    capability_variants.sort();
+    writeln!(out, "    #[cfg(feature = \"runtime\")]").unwrap();
+    writeln!(
+        out,
+        "    pub(crate) const fn requires_explicit_host_capability(self) -> bool {{"
+    )
+    .unwrap();
+    if capability_variants.is_empty() {
+        writeln!(out, "        false").unwrap();
+    } else {
+        let patterns = capability_variants
+            .iter()
+            .map(|variant| format!("BuiltinFunction::{variant}"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        writeln!(out, "        matches!(self, {patterns})").unwrap();
+    }
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+}
+
 fn stable_groups<F>(callables: &[CallableDecl], mut key_fn: F) -> Vec<Group<'_>>
 where
     F: FnMut(&CallableDecl) -> String,
@@ -1590,6 +1639,7 @@ fn callable_const_base(callable: &CallableDecl) -> String {
 }
 
 fn callable_param_variant(label: &str) -> &'static str {
+    let label = label.strip_suffix(" | null").unwrap_or(label);
     match label {
         "any" => "Any",
         "null" => "Null",
@@ -1601,6 +1651,7 @@ fn callable_param_variant(label: &str) -> &'static str {
         "array" => "Array",
         "map" => "Map",
         "number" => "Number",
+        "resource" => "Resource",
         other => panic!("unsupported callable param type '{other}'"),
     }
 }
@@ -1872,14 +1923,24 @@ fn host_wrapper_adapter_name(callable: &CallableDecl) -> String {
 }
 
 fn generated_wrapper_decl(function: &ItemFn) -> WrapperDecl {
-    let mut params = Vec::new();
+    let mut needs_vm = function.sig.asyncness.is_some();
     for input in &function.sig.inputs {
         let FnArg::Typed(pat_type) = input else {
             panic!("methods are not supported in #[pd_host_function] declarations");
         };
         if is_vm_context_type(&pat_type.ty) {
-            params.push(WrapperParamKind::Vm);
+            needs_vm = true;
         }
+        if pd_host_schema::resource_spec(&pat_type.ty, &pat_type.attrs)
+            .unwrap_or_else(|message| panic!("unsupported callable resource parameter: {message}"))
+            .is_some()
+        {
+            needs_vm = true;
+        }
+    }
+    let mut params = Vec::new();
+    if needs_vm {
+        params.push(WrapperParamKind::Vm);
     }
     params.push(WrapperParamKind::SliceArgs);
     let fn_name = wrapper_name_for_callable(&function.sig.ident.to_string());
@@ -1890,7 +1951,7 @@ fn generated_wrapper_decl(function: &ItemFn) -> WrapperDecl {
     }
 }
 
-fn parse_callable_params(function: &ItemFn) -> Vec<CallableParamDecl> {
+pub(crate) fn parse_callable_params(function: &ItemFn) -> Vec<CallableParamDecl> {
     function
         .sig
         .inputs
@@ -1899,13 +1960,22 @@ fn parse_callable_params(function: &ItemFn) -> Vec<CallableParamDecl> {
             let FnArg::Typed(pat_type) = input else {
                 panic!("methods are not supported in #[pd_host_function] declarations");
             };
+            if pat_type
+                .attrs
+                .iter()
+                .any(|attr| attr.path().is_ident("pd_host_context"))
+            {
+                return None;
+            }
             if is_vm_context_type(&pat_type.ty) {
                 return None;
             }
             let Pat::Ident(ident) = pat_type.pat.as_ref() else {
                 panic!("callable parameters must use identifier patterns");
             };
-            let (ty_label, optional) = param_type_label(&pat_type.ty);
+            let (ty_label, optional) =
+                pd_host_schema::parameter_type_label_with_attrs(&pat_type.ty, &pat_type.attrs)
+                    .unwrap_or_else(|message| panic!("unsupported callable parameter: {message}"));
             Some(CallableParamDecl {
                 name: ident.ident.to_string(),
                 ty_label,
@@ -1913,37 +1983,6 @@ fn parse_callable_params(function: &ItemFn) -> Vec<CallableParamDecl> {
             })
         })
         .collect()
-}
-
-fn param_type_label(ty: &Type) -> (String, bool) {
-    match ty {
-        Type::Group(group) => param_type_label(&group.elem),
-        Type::Paren(paren) => param_type_label(&paren.elem),
-        Type::Reference(reference) => param_type_label(&reference.elem),
-        Type::Path(path) => {
-            let segment = path
-                .path
-                .segments
-                .last()
-                .unwrap_or_else(|| panic!("unsupported callable type"));
-            if segment.ident == "Option" {
-                let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
-                    panic!("Option<T> requires one generic argument");
-                };
-                let Some(syn::GenericArgument::Type(inner)) = args.args.first() else {
-                    panic!("Option<T> requires one generic argument");
-                };
-                let (inner_label, inner_optional) = param_type_label(inner);
-                if inner_optional {
-                    panic!("nested Option<T> is not supported in callable parameters");
-                }
-                (inner_label, true)
-            } else {
-                (type_label(ty), false)
-            }
-        }
-        _ => (type_label(ty), false),
-    }
 }
 
 fn pd_host_function_name(attrs: &[Attribute]) -> Option<String> {
@@ -2008,108 +2047,13 @@ fn callable_docs(name: &str, attrs: &[Attribute]) -> String {
 fn return_type_label(output: &ReturnType) -> String {
     match output {
         ReturnType::Default => "null".to_string(),
-        ReturnType::Type(_, ty) => type_label(ty),
+        ReturnType::Type(_, ty) => pd_host_schema::type_label(ty)
+            .unwrap_or_else(|message| panic!("unsupported callable return type: {message}")),
     }
 }
 
 fn static_return_type_label(output: &ReturnType) -> String {
     value_type_from_label(&return_type_label(output)).to_string()
-}
-
-fn type_label(ty: &Type) -> String {
-    match ty {
-        Type::Group(group) => type_label(&group.elem),
-        Type::Paren(paren) => type_label(&paren.elem),
-        Type::Reference(reference) => type_label(&reference.elem),
-        Type::Slice(slice) => match slice.elem.as_ref() {
-            Type::Path(path) => {
-                let segment = path
-                    .path
-                    .segments
-                    .last()
-                    .unwrap_or_else(|| panic!("unsupported callable type"));
-                match segment.ident.to_string().as_str() {
-                    "u8" => "bytes".to_string(),
-                    _ => panic!("unsupported callable type"),
-                }
-            }
-            _ => panic!("unsupported callable type"),
-        },
-        Type::Tuple(tuple) if tuple.elems.is_empty() => "null".to_string(),
-        Type::Path(path) => {
-            let segment = path
-                .path
-                .segments
-                .last()
-                .unwrap_or_else(|| panic!("unsupported callable type"));
-            let ident = segment.ident.to_string();
-            match ident.as_str() {
-                "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64"
-                | "u128" | "usize" => "int".to_string(),
-                "f32" | "f64" => "float".to_string(),
-                "bool" => "bool".to_string(),
-                "String" | "str" | "VmStringRef" => "string".to_string(),
-                "Bytes" | "VmBytes" | "VmBytesRef" | "VmBytesHandle" => "bytes".to_string(),
-                "Any" | "AnyValue" | "Value" | "VmValueRef" | "VmValueOwned" => "any".to_string(),
-                "Array" | "VmArray" | "VmArrayRef" | "VmArrayHandle" => "array".to_string(),
-                "Map" | "VmMap" | "VmMapRef" | "VmMapHandle" => "map".to_string(),
-                "Number" | "NumberValue" => "number".to_string(),
-                "Unknown" | "UnknownValue" => "unknown".to_string(),
-                "CallOutcome" => "unknown".to_string(),
-                "Option" => {
-                    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
-                        panic!("Option<T> requires one generic argument");
-                    };
-                    let Some(syn::GenericArgument::Type(inner)) = args.args.first() else {
-                        panic!("Option<T> requires one generic argument");
-                    };
-                    format!("{} | null", type_label(inner))
-                }
-                "VmResult" | "HostCallResult" => {
-                    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
-                        panic!("{ident}<T> requires one generic argument");
-                    };
-                    let Some(syn::GenericArgument::Type(inner)) = args.args.first() else {
-                        panic!("{ident}<T> requires one generic argument");
-                    };
-                    type_label(inner)
-                }
-                "Vec" => type_label_for_vec(segment),
-                _ => panic!("unsupported callable type '{ident}'"),
-            }
-        }
-        _ => panic!("unsupported callable type"),
-    }
-}
-
-fn type_label_for_vec(segment: &syn::PathSegment) -> String {
-    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
-        panic!("Vec<T> requires one generic argument");
-    };
-    let Some(syn::GenericArgument::Type(inner)) = args.args.first() else {
-        panic!("Vec<T> requires one generic argument");
-    };
-    if is_value_type(inner) {
-        return "array".to_string();
-    }
-    match inner {
-        Type::Tuple(tuple) if tuple.elems.len() == 2 => {
-            let lhs = tuple
-                .elems
-                .first()
-                .expect("tuple should contain first element");
-            let rhs = tuple
-                .elems
-                .last()
-                .expect("tuple should contain second element");
-            if is_value_type(lhs) && is_value_type(rhs) {
-                "map".to_string()
-            } else {
-                panic!("unsupported Vec tuple type in callable metadata")
-            }
-        }
-        _ => panic!("unsupported Vec return type in callable metadata"),
-    }
 }
 
 fn value_type_from_label(label: &str) -> &'static str {
@@ -2136,20 +2080,6 @@ fn is_vm_context_type(ty: &Type) -> bool {
             .segments
             .last()
             .is_some_and(|segment| segment.ident == "Vm"),
-        _ => false,
-    }
-}
-
-fn is_value_type(ty: &Type) -> bool {
-    match ty {
-        Type::Group(group) => is_value_type(&group.elem),
-        Type::Paren(paren) => is_value_type(&paren.elem),
-        Type::Reference(reference) => is_value_type(&reference.elem),
-        Type::Path(path) => path
-            .path
-            .segments
-            .last()
-            .is_some_and(|segment| segment.ident == "Value"),
         _ => false,
     }
 }
@@ -2255,4 +2185,91 @@ fn find_matching_paren(source: &str) -> usize {
         }
     }
     panic!("unterminated macro invocation");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        HostExecutionKind, NamespaceDecl, SourceCategory, builtin_source_specs, parse_source_file,
+        select_io_source_path,
+    };
+    use std::path::Path;
+
+    fn io_namespace() -> NamespaceDecl {
+        NamespaceDecl {
+            namespace: "io".to_string(),
+            module: "io".to_string(),
+            docs: "I/O".to_string(),
+            runtime_supported_on_wasm: false,
+        }
+    }
+
+    #[test]
+    fn io_source_selection_matches_runtime_module_cfg() {
+        assert_eq!(
+            select_io_source_path(false, "x86_64"),
+            "src/builtins/runtime/io/blocking.rs"
+        );
+        assert_eq!(
+            select_io_source_path(true, "x86_64"),
+            "src/builtins/runtime/io/async_io.rs"
+        );
+        assert_eq!(
+            select_io_source_path(false, "aarch64"),
+            "src/builtins/runtime/io/blocking.rs"
+        );
+        assert_eq!(
+            select_io_source_path(true, "aarch64"),
+            "src/builtins/runtime/io/async_io.rs"
+        );
+        assert_eq!(
+            select_io_source_path(false, "wasm32"),
+            "src/builtins/runtime/io_wasm.rs"
+        );
+        assert_eq!(
+            select_io_source_path(true, "wasm32"),
+            "src/builtins/runtime/io_wasm.rs"
+        );
+    }
+
+    #[test]
+    fn selected_io_source_drives_generated_metadata_input() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let namespace = io_namespace();
+        for (async_enabled, target_arch) in [
+            (false, "x86_64"),
+            (true, "x86_64"),
+            (false, "wasm32"),
+            (true, "wasm32"),
+        ] {
+            let specs =
+                builtin_source_specs(std::slice::from_ref(&namespace), async_enabled, target_arch);
+            let spec = specs
+                .iter()
+                .find(|spec| spec.category == SourceCategory::NamespacedBuiltin)
+                .expect("the IO namespace must produce a source spec");
+            assert_eq!(
+                spec.path,
+                select_io_source_path(async_enabled, target_arch),
+                "metadata must use the same source selected by the runtime module"
+            );
+            let source = std::fs::read_to_string(manifest_dir.join(&spec.path))
+                .expect("selected IO source must be readable");
+            let open_marker = if async_enabled && target_arch != "wasm32" {
+                "async fn builtin_io_open"
+            } else {
+                "fn builtin_io_open"
+            };
+            assert!(
+                source.contains(open_marker),
+                "selected source must provide the expected IO implementation"
+            );
+            let callables = parse_source_file(&manifest_dir.join(&spec.path), spec, 0);
+            let open = callables
+                .iter()
+                .find(|callable| callable.name == "io::open")
+                .expect("selected IO source must contain io::open");
+            assert_eq!(open.host_execution, HostExecutionKind::MaySuspend);
+        }
+    }
 }

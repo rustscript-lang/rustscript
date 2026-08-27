@@ -6,13 +6,39 @@ use build_script::{
     HostBindingKind, HostExecutionKind, classify_host_binding, infer_host_execution,
 };
 use syn::parse_quote;
-use vm::{HostFunctionRegistry, JitConfig, JitTraceTerminal, Value, Vm, VmStatus, compile_source};
+use vm::{
+    BuiltinFunction, CapabilityProfile, HostFunctionRegistry, JitConfig, JitTraceTerminal, Value,
+    Vm, VmStatus, compile_source,
+};
 
 fn native_jit_supported() -> bool {
     (cfg!(target_arch = "x86_64")
         && (cfg!(target_os = "windows") || (cfg!(unix) && !cfg!(target_os = "macos"))))
         || (cfg!(target_arch = "aarch64")
             && (cfg!(target_os = "linux") || cfg!(target_os = "macos")))
+}
+
+#[test]
+fn build_scanner_uses_the_shared_host_type_parser() {
+    let function: syn::ItemFn = parse_quote! {
+        fn inspect(
+            #[pd_host_resource(passing = "take_owned")]
+            resource: DemoResource,
+            optional: Option<i64>,
+        ) -> VmResult<Option<String>> {
+            unimplemented!()
+        }
+    };
+    let params = build_script::parse_callable_params(&function);
+    assert_eq!(params.len(), 2);
+    assert_eq!(params[0].ty_label, "resource");
+    assert!(!params[0].optional);
+    assert_eq!(params[1].ty_label, "int | null");
+    assert!(params[1].optional);
+    assert_eq!(
+        pd_host_schema::type_label(&parse_quote!(VmResult<Option<String>>)).unwrap(),
+        "string | null"
+    );
 }
 
 #[test]
@@ -140,6 +166,18 @@ fn infers_host_suspension_from_the_return_signature() {
         fn host() -> VmResult<Value> {}
     );
     assert_eq!(infer_host_execution(&synchronous), HostExecutionKind::Sync);
+
+    let asynchronous = parse_quote!(
+        async fn host(value: String) -> VmResult<String> {}
+    );
+    assert_eq!(
+        infer_host_execution(&asynchronous),
+        HostExecutionKind::MaySuspend
+    );
+    assert_eq!(
+        classify_host_binding(&asynchronous),
+        HostBindingKind::StaticStack
+    );
 }
 
 fn assert_runtime_sleep_loop_uses_native_host_call(bind_cached_registry: bool) {
@@ -224,5 +262,102 @@ fn runtime_exit_still_halts_for_direct_and_cached_default_bindings() {
             VmStatus::Halted
         );
         assert!(vm.stack().is_empty());
+    }
+}
+
+#[test]
+fn restricted_capabilities_disable_trace_jit_for_host_imports_and_builtins() {
+    for source in [
+        r#"
+            use runtime;
+            let mut i = 0;
+            while i < 4 {
+                let _ = runtime::sleep(0);
+                i = i + 1;
+            }
+            i;
+        "#,
+        r#"
+            use re;
+            let mut i = 0;
+            while i < 4 {
+                let _ = re::match("a", "a");
+                i = i + 1;
+            }
+            i;
+        "#,
+    ] {
+        let compiled = compile_source(source).expect("restricted loop should compile");
+        let mut vm = Vm::new(compiled.program);
+        vm.set_jit_config(JitConfig {
+            enabled: native_jit_supported(),
+            hot_loop_threshold: 1,
+            max_trace_len: 512,
+        });
+        let error = HostFunctionRegistry::restricted()
+            .bind_vm_cached(&mut vm)
+            .expect_err("restricted registry should reject ungranted capability during preflight");
+
+        assert!(
+            error
+                .to_string()
+                .contains("capability profile does not allow")
+        );
+        assert_eq!(vm.jit_native_exec_count(), 0);
+    }
+}
+
+#[test]
+fn capability_profile_fingerprint_uses_stable_callable_identities() {
+    let first = CapabilityProfile::builder()
+        .allow_builtin(BuiltinFunction::JsonEncode)
+        .allow_host_import("custom::echo")
+        .build();
+    let reordered = CapabilityProfile::builder()
+        .allow_host_import("custom::echo")
+        .allow_builtin(BuiltinFunction::JsonEncode)
+        .build();
+
+    assert_eq!(first, reordered);
+    assert_eq!(first.fingerprint(), reordered.fingerprint());
+    assert!(first.allows_builtin(BuiltinFunction::JsonEncode));
+    assert!(first.allows_host_import("custom::echo"));
+    assert!(!first.allows_host_import("custom::other"));
+    assert_ne!(
+        first.fingerprint(),
+        CapabilityProfile::deny_all().fingerprint()
+    );
+    assert_ne!(
+        CapabilityProfile::allow_all().fingerprint(),
+        CapabilityProfile::deny_all().fingerprint()
+    );
+}
+
+#[test]
+fn vm_host_core_does_not_name_builtin_subsystem_policies() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let host_runtime = std::fs::read_to_string(manifest.join("src/vm/host_runtime.rs"))
+        .expect("host runtime source");
+    let capability =
+        std::fs::read_to_string(manifest.join("src/vm/capability.rs")).expect("capability source");
+    let host = std::fs::read_to_string(manifest.join("src/vm/host.rs")).expect("host source");
+
+    for forbidden in [
+        "HttpState",
+        "IoPolicy",
+        "SqlitePolicy",
+        "http_state",
+        "io_policy",
+        "sqlite_policy",
+    ] {
+        assert!(
+            !host_runtime.contains(forbidden),
+            "HostRuntime leaked {forbidden}"
+        );
+        assert!(
+            !capability.contains(forbidden),
+            "capability.rs leaked {forbidden}"
+        );
+        assert!(!host.contains(forbidden), "host.rs leaked {forbidden}");
     }
 }
