@@ -24,7 +24,8 @@ mod typed;
 #[cfg(target_arch = "wasm32")]
 use io_wasm as io;
 
-pub(crate) use io::IoState;
+#[cfg(not(target_arch = "wasm32"))]
+pub use io::{IoHostExt, IoPolicy};
 pub use typed::HostCallResult;
 use typed::{
     AnyValue, IntoBuiltinCallOutcome, IntoHostCallOutcome, NumberValue, UnknownValue, VmArray,
@@ -134,10 +135,6 @@ pub(crate) fn poll_builtin_io_op(
     cx: &mut Context<'_>,
 ) -> Poll<VmResult<CallReturn>> {
     io::poll_builtin_io_op(vm, op_id, cx)
-}
-
-pub(crate) fn close_all_handles(vm: &mut Vm) {
-    io::close_all_handles(vm);
 }
 
 #[cfg(test)]
