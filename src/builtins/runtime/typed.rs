@@ -45,7 +45,7 @@ pub(super) fn missing_arg(label: &str) -> VmError {
     VmError::HostError(format!("missing argument: {label}"))
 }
 
-pub(super) trait BorrowVmValue<'a>: Sized {
+pub trait BorrowVmValue<'a>: Sized {
     fn borrow_vm_value(value: &'a Value, label: &str) -> VmResult<Self>;
 
     fn from_missing_arg(label: &str) -> VmResult<Self> {
@@ -53,7 +53,7 @@ pub(super) trait BorrowVmValue<'a>: Sized {
     }
 }
 
-pub(super) trait FromVmValue<'a>: Sized {
+pub trait FromVmValue<'a>: Sized {
     fn from_vm_value(value: &'a Value, label: &str) -> VmResult<Self>;
 
     fn from_missing_arg(label: &str) -> VmResult<Self> {
@@ -74,7 +74,7 @@ where
     }
 }
 
-pub(super) trait TakeVmValue: Sized {
+pub trait TakeVmValue: Sized {
     fn take_vm_value(slot: &mut Value, label: &str) -> VmResult<Self>;
 
     fn from_missing_arg(label: &str) -> VmResult<Self> {
@@ -82,7 +82,7 @@ pub(super) trait TakeVmValue: Sized {
     }
 }
 
-pub(super) fn borrow_arg<'a, T>(args: &'a [Value], index: usize, label: &str) -> VmResult<T>
+pub fn borrow_arg<'a, T>(args: &'a [Value], index: usize, label: &str) -> VmResult<T>
 where
     T: BorrowVmValue<'a>,
 {
@@ -92,14 +92,14 @@ where
     }
 }
 
-pub(super) fn arg<'a, T>(args: &'a [Value], index: usize, label: &str) -> VmResult<T>
+pub fn arg<'a, T>(args: &'a [Value], index: usize, label: &str) -> VmResult<T>
 where
     T: BorrowVmValue<'a>,
 {
     borrow_arg(args, index, label)
 }
 
-pub(super) fn take_arg<T>(args: &mut [Value], index: usize, label: &str) -> VmResult<T>
+pub fn take_arg<T>(args: &mut [Value], index: usize, label: &str) -> VmResult<T>
 where
     T: TakeVmValue,
 {
@@ -130,6 +130,15 @@ impl<'a> FromVmValue<'a> for &'a str {
     }
 }
 
+impl FromVmValue<'_> for String {
+    fn from_vm_value(value: &Value, _label: &str) -> VmResult<Self> {
+        match value {
+            Value::String(text) => Ok(text.to_string()),
+            _ => Err(VmError::TypeMismatch("string")),
+        }
+    }
+}
+
 impl<'a> FromVmValue<'a> for &'a [u8] {
     fn from_vm_value(value: &'a Value, _label: &str) -> VmResult<Self> {
         match value {
@@ -152,6 +161,15 @@ impl<'a> FromVmValue<'a> for &'a VmMap {
     fn from_vm_value(value: &'a Value, _label: &str) -> VmResult<Self> {
         match value {
             Value::Map(entries) => Ok(entries.as_ref()),
+            _ => Err(VmError::TypeMismatch("map")),
+        }
+    }
+}
+
+impl FromVmValue<'_> for VmMap {
+    fn from_vm_value(value: &Value, _label: &str) -> VmResult<Self> {
+        match value {
+            Value::Map(entries) => Ok(entries.as_ref().clone()),
             _ => Err(VmError::TypeMismatch("map")),
         }
     }
@@ -308,15 +326,15 @@ where
     }
 }
 
-pub(super) trait IntoVmValue {
+pub trait IntoVmValue {
     fn into_vm_value(self) -> Value;
 }
 
-pub(super) fn return_none() -> CallReturn {
+pub fn return_none() -> CallReturn {
     CallReturn::none()
 }
 
-pub(super) fn return_one<T>(value: T) -> CallReturn
+pub fn return_one<T>(value: T) -> CallReturn
 where
     T: IntoVmValue,
 {
@@ -465,7 +483,18 @@ where
     }
 }
 
-pub(super) trait IntoHostCallOutcome {
+impl IntoBuiltinCallOutcome for CallOutcome {
+    fn into_builtin_call_outcome(self) -> BuiltinCallOutcome {
+        match self {
+            CallOutcome::Return(values) => BuiltinCallOutcome::Return(values),
+            CallOutcome::Halt => BuiltinCallOutcome::Halt,
+            CallOutcome::Pending(op_id) => BuiltinCallOutcome::Pending(op_id),
+            CallOutcome::Yield => unreachable!("async builtin wrappers cannot return Yield"),
+        }
+    }
+}
+
+pub trait IntoHostCallOutcome {
     fn into_host_call_outcome(self) -> CallOutcome;
 }
 

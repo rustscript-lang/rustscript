@@ -1,0 +1,5 @@
+error: synchronous host functions cannot combine `&mut Vm` with borrowed resource parameters (`ResourceRef`/`ResourceMut`); generated HostContext holds the same mutable VM borrow
+  --> tests/ui/fail/sync_vm_resource_borrow_mut.rs:19:22
+   |
+19 |             counter: ResourceMut<'_, Counter>,
+   |                      ^^^^^^^^^^^^^^^^^^^^^^^^

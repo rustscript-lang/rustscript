@@ -1,0 +1,12 @@
+[package]
+name = "pd-host-schema"
+version.workspace = true
+edition.workspace = true
+description = "Shared host-schema parsing for the pd-host-function proc macro and the pd-vm build script"
+license = "MIT"
+homepage = "https://rustscript.org/"
+repository = "https://github.com/rustscript-lang/rustscript"
+
+[dependencies]
+proc-macro2 = "1"
+syn = { version = "2", features = ["full", "extra-traits"] }

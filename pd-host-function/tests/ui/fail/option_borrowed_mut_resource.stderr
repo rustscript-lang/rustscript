@@ -1,0 +1,5 @@
+error: ResourceMut cannot appear in a host function return nested inside `Option`; resource borrows cannot cross the host boundary
+  --> tests/ui/fail/option_borrowed_mut_resource.rs:17:46
+   |
+17 |         fn option_borrowed_mut_resource() -> Option<ResourceMut<'static, Counter>> {
+   |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

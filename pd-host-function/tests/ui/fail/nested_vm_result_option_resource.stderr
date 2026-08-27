@@ -1,0 +1,5 @@
+error: ResourceRef cannot appear in a host function return nested inside `VmResult` -> `Option`; resource borrows cannot cross the host boundary
+  --> tests/ui/fail/nested_vm_result_option_resource.rs:17:50
+   |
+17 |         fn nested_vm_result_option_resource() -> VmResult<Option<ResourceRef<'static, Counter>>> {
+   |                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

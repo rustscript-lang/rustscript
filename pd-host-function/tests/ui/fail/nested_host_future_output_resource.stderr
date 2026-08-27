@@ -1,0 +1,5 @@
+error: ResourceMut cannot appear in a host function return nested inside `VmResult` -> `HostFutureOutput`; resource borrows cannot cross the host boundary
+  --> tests/ui/fail/nested_host_future_output_resource.rs:18:52
+   |
+18 |         fn nested_host_future_output_resource() -> VmResult<HostFutureOutput<ResourceMut<'static, Counter>>> {
+   |                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

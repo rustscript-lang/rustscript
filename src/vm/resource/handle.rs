@@ -119,6 +119,55 @@ impl ResourceHandle {
     }
 }
 
+/// A concrete value transferred out of a resource table by a TakeOwned host
+/// parameter.
+///
+/// `Resource<T>` is the copyable capability token used while a value remains
+/// in a scope. `ResourceOwned<T>` is deliberately a different, non-token type:
+/// once constructed, it owns the concrete `T` and the corresponding table slot
+/// is vacant. The distinction prevents a taken value from being mistaken for a
+/// live handle and documents the type name used by the host-function schema.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ResourceOwned<T>(T);
+
+impl<T> ResourceOwned<T> {
+    /// Wraps a value whose resource-table ownership has been transferred.
+    pub fn new(value: T) -> Self {
+        Self(value)
+    }
+
+    /// Returns the transferred value to its caller.
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<T> AsRef<T> for ResourceOwned<T> {
+    fn as_ref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> AsMut<T> for ResourceOwned<T> {
+    fn as_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
+impl<T> std::ops::Deref for ResourceOwned<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for ResourceOwned<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 /// A type-marked capability token over one resource.
 ///
 /// `Resource<T>` is `Copy` and cheap; it is a key into a table, not an owner.

@@ -424,6 +424,9 @@ fn param_accepts_bound_type(expected: CallableParamType, actual: BoundType, stri
         }
         CallableParamType::Map => matches!(actual, BoundType::Map | BoundType::MapOf(_)),
         CallableParamType::Number => is_numeric_bound_type(actual),
+        // Resource handles are represented by guest integers at the bytecode
+        // boundary; the host wrapper performs the typed table lookup.
+        CallableParamType::Resource => actual == BoundType::Int,
     }
 }
 
