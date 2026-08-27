@@ -17,7 +17,7 @@
 //! fields (the legacy IO completion mailbox remains on the `Vm` facade until
 //! the adapter migrates it onto the scope lifecycle).
 
-use std::any::{Any, TypeId};
+use std::any::Any;
 use std::collections::HashMap;
 
 use crate::vm::execution_scope::ExecutionScope;
@@ -89,6 +89,7 @@ impl HostRuntime {
     }
 
     /// Borrows the registered typed module state mutably, if any.
+    #[allow(dead_code)] // used by later host layers (SQLite/capability) in c4/c5
     pub(crate) fn get_module_state_mut<T: Any + Send + 'static>(&mut self) -> Option<&mut T> {
         self.module_state_store.get_mut()
     }
@@ -99,6 +100,7 @@ impl HostRuntime {
     }
 
     /// Returns `true` when no module state is currently registered.
+    #[allow(dead_code)] // used by later host layers (SQLite/capability) in c4/c5
     pub(crate) fn is_module_state_empty(&self) -> bool {
         self.module_state_store.is_empty()
     }

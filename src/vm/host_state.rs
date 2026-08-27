@@ -53,6 +53,7 @@ impl ModuleStateStore {
     }
 
     /// Borrows the registered typed module state mutably, if any.
+    #[allow(dead_code)] // used by later host layers (SQLite/capability) in c4/c5
     pub(crate) fn get_mut<T: Any + Send + 'static>(&mut self) -> Option<&mut T> {
         self.entries
             .get_mut(&TypeId::of::<T>())
@@ -72,6 +73,7 @@ impl ModuleStateStore {
     }
 
     /// Returns `true` when no module state is currently registered.
+    #[allow(dead_code)] // used by later host layers (SQLite/capability) in c4/c5
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
