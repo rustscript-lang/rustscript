@@ -27,6 +27,10 @@ const EXTENSION_BLOCK_END: u16 = 0xFF8F;
 const SPECIAL_CALL_BLOCK_START: u16 = 0xFF90;
 const SPECIAL_CALL_BLOCK_END: u16 = 0xFFA1;
 const ORDINARY_BLOCK_START: u16 = 0xFFA2;
+#[cfg(feature = "sqlite")]
+const SQLITE_RESERVED_TOP_START: u16 = 0xFFFC;
+#[cfg(feature = "sqlite")]
+const SQLITE_RESERVED_TOP_END: u16 = u16::MAX;
 
 /// Reserved sentinel gap inside the special-call block (see the catalog docs
 /// and `core.rs::internal_builtins_have_unique_reserved_call_indices`).
@@ -80,7 +84,38 @@ fn parse_catalog(source: &str) -> Vec<CatalogEntry> {
             feature_gate: parts[4].to_string(),
         });
     }
+    // The SQLite namespace is optional (mirrors the build.rs feature filter):
+    // when the feature is off, the generated catalog excludes it, so the
+    // parsed raw catalog must agree.
+    #[cfg(not(feature = "sqlite"))]
+    entries.retain(|entry| !entry.source_name.starts_with("sqlite::"));
     entries
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_top_u16_ids_are_explicitly_reserved_for_frozen_entries() {
+    let entries = parse_catalog(&catalog_source());
+    let top_entries: Vec<_> = entries
+        .iter()
+        .filter(|entry| (SQLITE_RESERVED_TOP_START..=SQLITE_RESERVED_TOP_END).contains(&entry.id))
+        .map(|entry| (entry.id, entry.source_name.as_str()))
+        .collect();
+    assert_eq!(
+        top_entries,
+        vec![
+            (0xFFFC, "sqlite::execute"),
+            (0xFFFD, "sqlite::query"),
+            (0xFFFE, "sqlite::transaction"),
+            (0xFFFF, "sqlite::close"),
+        ]
+    );
+    assert!(
+        top_entries
+            .iter()
+            .all(|(_, source_name)| source_name.starts_with("sqlite::")),
+        "new ordinary IDs must not be allocated in the SQLite-reserved top-u16 range"
+    );
 }
 
 fn assert_unique(values: &[String], what: &str) {
@@ -244,6 +279,13 @@ fn checked_in_nostd_mirror_matches_std_catalog() {
         };
         let id = u16::from_str_radix(hex.trim().trim_start_matches("0x"), 16)
             .unwrap_or_else(|err| panic!("mirror const {const_name} has invalid id: {err}"));
+        // The SQLite namespace is optional (mirrors the build.rs feature
+        // filter): when the feature is off, the mirror's sqlite consts are
+        // excluded from the sync contract.
+        #[cfg(not(feature = "sqlite"))]
+        if const_name.starts_with("SQLITE_") {
+            continue;
+        }
         mirror_ids.push(id);
         mirror_by_const.insert(const_name.to_string(), id);
     }
@@ -344,12 +386,17 @@ fn appending_or_reordering_catalog_entries_does_not_renumber_existing_ids() {
     }
 
     // Appending a new entry at the next free ordinary ID (append-only
-    // allocation) must not renumber any existing entry.
+    // allocation) must not renumber any existing entry. When the optional
+    // SQLite namespace is enabled the ordinary block (0xFFA2..=0xFFFF) is
+    // exactly full, so there is nothing to append and the property is
+    // trivially preserved.
     let mut used: Vec<u16> = entries.iter().map(|entry| entry.id).collect();
     used.sort_unstable();
-    let next_free = (ORDINARY_BLOCK_START..=u16::MAX)
-        .find(|candidate| used.binary_search(candidate).is_err())
-        .expect("ordinary block is exhausted");
+    let Some(next_free) =
+        (ORDINARY_BLOCK_START..=u16::MAX).find(|candidate| used.binary_search(candidate).is_err())
+    else {
+        return;
+    };
     let appended = format!(
         "{source}\nbuiltin_id!(0x{next_free:04X}, \"synthetic_contract_probe\", \
          SyntheticContractProbe, Ordinary, none);\n"
