@@ -229,10 +229,20 @@ fn write_generated_file(path: &Path, contents: &str) {
 fn builtin_source_specs(namespaces: &[NamespaceDecl]) -> Vec<SourceSpec> {
     namespaces
         .iter()
-        .map(|namespace| SourceSpec {
-            path: format!("src/builtins/runtime/{}.rs", namespace.module),
-            module: namespace.module.clone(),
-            category: SourceCategory::NamespacedBuiltin,
+        .map(|namespace| {
+            // At this layer the `io` namespace maps directly to the blocking
+            // backend; the async/blocking split is introduced later with the
+            // host async execution layer.
+            let path = if namespace.module == "io" {
+                "src/builtins/runtime/io/blocking.rs".to_string()
+            } else {
+                format!("src/builtins/runtime/{}.rs", namespace.module)
+            };
+            SourceSpec {
+                path,
+                module: namespace.module.clone(),
+                category: SourceCategory::NamespacedBuiltin,
+            }
         })
         .collect()
 }

@@ -290,11 +290,6 @@ pub struct Vm {
     pub(crate) instance: Instance,
     pub(crate) run_ctx: RunContext,
     pub(crate) host: HostRuntime,
-    /// Legacy pre-scope IO runtime state.
-    ///
-    /// This commit keeps IO ownership on the `Vm` facade; the generic
-    /// scope-lifecycle migration relocates it in a later commit.
-    pub(crate) io_state: crate::builtins::runtime::IoState,
 }
 
 pub(crate) enum ExecOutcome {
@@ -558,7 +553,6 @@ impl Vm {
             instance,
             run_ctx: RunContext::default(),
             host: HostRuntime::default(),
-            io_state: crate::builtins::runtime::IoState::default(),
         }
     }
 
@@ -697,11 +691,12 @@ impl Vm {
     /// preserving JIT artifacts and registered host bindings.
     ///
     /// Locals are reset to `Null`, stack is cleared, and instruction pointer is
-    /// rewound to the program entry.
+    /// rewound to the program entry. In-flight IO work and live IO handles are
+    /// retired through the generic execution-scope lifecycle (the old scope is
+    /// dropped and replaced with a fresh one).
     pub fn reset_for_reuse(&mut self) {
         self.cancel_waiting_host_op();
-        crate::builtins::runtime::close_all_handles(self);
-        self.io_state = crate::builtins::runtime::IoState::default();
+        self.host.reset_execution_scope();
         self.run_ctx.reset_for_reuse();
         self.instance.reset(&self.program);
         self.engine.reset_runtime_state(&self.program);
@@ -997,7 +992,9 @@ impl Drop for Vm {
     fn drop(&mut self) {
         self.cancel_waiting_host_op();
         self.instance.drop_cleanup();
-        crate::builtins::runtime::close_all_handles(self);
+        // Live IO handles and in-flight IO operations are retired by the
+        // `ExecutionScope`'s own `Drop`, which runs as part of `HostRuntime`.
+        // (No custom close-all side channel is needed.)
     }
 }
 
@@ -2835,7 +2832,6 @@ impl Vm {
         self.instance.call_depth = 0;
         self.instance.host_return = None;
         self.instance.waiting_host_op = None;
-        crate::builtins::runtime::close_all_handles(self);
         self.instance.shutdown = true;
     }
 
