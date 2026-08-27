@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::Program;
 use crate::assembler::AssemblerError;
+use crate::host_api::{HostApiCatalog, HostImportSchema, HostTypeSchema};
 #[cfg(feature = "runtime")]
 use crate::vm::Vm;
 
@@ -460,6 +461,30 @@ impl SourceFlavor {
     }
 }
 
+fn compiler_type_matches_host(actual: &TypeSchema, expected: &HostTypeSchema) -> bool {
+    match (actual, expected) {
+        (TypeSchema::Unknown, _) => true,
+        (TypeSchema::Null, HostTypeSchema::Null) => true,
+        (TypeSchema::Int, HostTypeSchema::Int | HostTypeSchema::Number) => true,
+        (TypeSchema::Float, HostTypeSchema::Float | HostTypeSchema::Number) => true,
+        (TypeSchema::Number, HostTypeSchema::Number) => true,
+        (TypeSchema::Bool, HostTypeSchema::Bool) => true,
+        (TypeSchema::String, HostTypeSchema::String) => true,
+        (TypeSchema::Bytes, HostTypeSchema::Bytes) => true,
+        (TypeSchema::Optional(actual), HostTypeSchema::Optional(expected)) => {
+            compiler_type_matches_host(actual, expected)
+        }
+        (TypeSchema::Array(actual), HostTypeSchema::Array(expected)) => {
+            compiler_type_matches_host(actual, expected)
+        }
+        (TypeSchema::Map(actual), HostTypeSchema::Map(expected)) => {
+            compiler_type_matches_host(actual, expected)
+        }
+        (TypeSchema::Callable { .. }, HostTypeSchema::Callable { .. }) => true,
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplLocalBinding {
     pub name: String,
@@ -481,6 +506,70 @@ pub struct CompiledProgram {
 }
 
 impl CompiledProgram {
+    /// Attaches the exact catalog schema selected for each compiled host
+    /// import. Binding later uses the full identity, including resource keys,
+    /// return schema and catalog fingerprint.
+    pub fn with_host_import_schemas(
+        mut self,
+        schemas: Vec<HostImportSchema>,
+    ) -> Result<Self, String> {
+        self.program = self.program.with_host_import_schemas(schemas)?;
+        Ok(self)
+    }
+
+    /// Selects and attaches catalog schemas for imports that have one
+    /// unambiguous overload. An import with multiple candidates is rejected
+    /// until the caller supplies [`Self::with_host_import_schemas`] explicitly,
+    /// unless the compiler recorded concrete argument schemas that select one.
+    pub fn with_host_catalog(mut self, catalog: &HostApiCatalog) -> Result<Self, String> {
+        let mut schemas = Vec::with_capacity(self.program.imports.len());
+        for (index, import) in self.program.imports.iter().enumerate() {
+            let candidates: Vec<_> = catalog
+                .functions_named(&import.name)
+                .into_iter()
+                .filter(|function| function.params.len() == import.arity as usize)
+                .collect();
+            if candidates.is_empty() {
+                return Err(format!(
+                    "catalog has no overload for host import `{}` with arity {}",
+                    import.name, import.arity
+                ));
+            }
+            let selected = if candidates.len() == 1 {
+                candidates[0]
+            } else {
+                let declaration = self.functions.get(index);
+                let matching: Vec<_> = candidates
+                    .into_iter()
+                    .filter(|candidate| {
+                        declaration.is_some_and(|declaration| {
+                            declaration.arg_schemas.len() == candidate.params.len()
+                                && declaration
+                                    .arg_schemas
+                                    .iter()
+                                    .zip(candidate.params.iter())
+                                    .all(|(actual, expected)| {
+                                        actual.as_ref().is_none_or(|actual| {
+                                            compiler_type_matches_host(actual, &expected.ty)
+                                        })
+                                    })
+                        })
+                    })
+                    .collect();
+                if matching.len() != 1 {
+                    return Err(format!(
+                        "catalog import `{}` with arity {} is ambiguous; attach its full schema",
+                        import.name, import.arity
+                    ));
+                }
+                matching[0]
+            };
+            schemas.push(HostImportSchema::from_function(catalog, selected));
+        }
+        self.program = self.program.with_host_import_schemas(schemas)?;
+        Ok(self)
+    }
+
     #[cfg(feature = "runtime")]
     pub fn into_vm(self) -> Vm {
         Vm::new(self.program)

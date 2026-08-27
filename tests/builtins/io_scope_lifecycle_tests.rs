@@ -288,16 +288,70 @@ fn pending_io_operation_can_be_cancelled_through_scope() {
         vm.execution_scope().operations().is_empty(),
         "polling the cancelled operation must release it exactly once"
     );
-
-    // Cancelling the read must also retire the underlying child process so no
-    // orphaned `sleep 30` survives the test.
-    wait_for_child_exit();
 }
 
-/// Best-effort wait so a cancelled child process has time to be reaped before
-/// the test process exits (the driver kills it on cancel).
-fn wait_for_child_exit() {
-    std::thread::sleep(std::time::Duration::from_millis(100));
+#[cfg(unix)]
+struct ProcessTreeCleanup {
+    leader: i32,
+    descendant: i32,
+    marker: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for ProcessTreeCleanup {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(-self.leader, libc::SIGKILL);
+            libc::kill(self.descendant, libc::SIGKILL);
+        }
+        let _ = std::fs::remove_file(&self.marker);
+    }
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: i32) -> bool {
+    let path = format!("/proc/{pid}/stat");
+    let Ok(stat) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Some((_, state)) = stat.split_once(") ") else {
+        return true;
+    };
+    !state.starts_with('Z')
+}
+
+#[cfg(unix)]
+fn wait_for_process_exit(pid: i32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while process_is_running(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "popen descendant remained alive after reset"
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(unix)]
+fn read_process_marker(path: &std::path::Path) -> (i32, i32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            let values = contents
+                .split_whitespace()
+                .map(str::parse::<i32>)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("popen marker should contain process ids");
+            if values.len() == 2 {
+                return (values[0], values[1]);
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "popen test child did not publish its process marker"
+        );
+        std::thread::yield_now();
+    }
 }
 
 // ------------------------------------------------ reset / drop retirement
@@ -343,4 +397,45 @@ fn drop_retires_io_resources_through_scope() {
     let mut vm = vm_for("io::open(\"Cargo.toml\", \"r\");");
     assert!(!vm.execution_scope().resources().is_empty());
     drop(vm);
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_for_reuse_terminates_live_popen_process_tree() {
+    static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let suffix = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let marker = std::env::temp_dir().join(format!(
+        "pd-vm-blocking-io-reset-{0}-{suffix}.marker",
+        std::process::id()
+    ));
+    let command = format!(
+        "parent=$$; sleep 30 & child=$!; printf '%s %s' $parent $child > {}; wait $child",
+        marker.display()
+    );
+    let source = format!("use io;\nlet h = io::popen(\"{command}\", \"r\");\nh;");
+    let compiled = compile_source(&source).expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    let mut status = vm.run().expect("run should start");
+    loop {
+        match status {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => status = vm.resume().expect("resume should continue"),
+            VmStatus::Waiting(_) => {
+                vm.wait_for_host_op_blocking()
+                    .expect("waiting op should finish");
+                status = vm.resume().expect("resume should continue");
+            }
+        }
+    }
+    let (leader, descendant) = read_process_marker(&marker);
+    let _cleanup = ProcessTreeCleanup {
+        leader,
+        descendant,
+        marker: marker.clone(),
+    };
+
+    vm.reset_for_reuse();
+    assert!(vm.execution_scope().resources().is_empty());
+    wait_for_process_exit(descendant);
+    let _ = std::fs::remove_file(marker);
 }

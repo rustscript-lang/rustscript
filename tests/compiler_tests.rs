@@ -1,5 +1,9 @@
 #![allow(clippy::duplicate_mod)]
 
+#[cfg(feature = "async")]
+#[path = "support/async_test_bridge.rs"]
+mod async_test_bridge;
+
 #[cfg(feature = "runtime")]
 #[path = "compiler/compiler_common_tests.rs"]
 mod compiler_common_tests;

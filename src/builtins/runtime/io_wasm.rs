@@ -1,25 +1,7 @@
-use std::task::{Context, Poll};
-
 use pd_host_function::pd_host_function;
 
 use super::HostCallResult;
-use crate::vm::{CallReturn, HostOpId, Vm, VmError, VmResult};
-
-/// There are no pending native I/O workers on wasm32. The generic VM
-/// cancellation hook still calls into the selected I/O backend, so keep the
-/// wasm implementation a deliberate no-op with the same feature-neutral
-/// signature as the native backends.
-pub(super) fn cancel_pending_op(_vm: &mut Vm, _op_id: HostOpId) {}
-
-pub(super) fn poll_builtin_io_op(
-    _vm: &mut Vm,
-    op_id: HostOpId,
-    _cx: &mut Context<'_>,
-) -> Poll<VmResult<CallReturn>> {
-    Poll::Ready(Err(VmError::HostError(format!(
-        "builtin io op {op_id} is unsupported on wasm32 runtime",
-    ))))
-}
+use crate::vm::{Vm, VmError, VmResult};
 
 /// Opens a file handle for runtime I/O.
 #[pd_host_function(name = "io::open")]

@@ -1,19 +1,22 @@
-//! IO builtin host implementation.
+//! IO builtin host implementation, selected by feature:
 //!
-//! At this layer IO is blocking-only: it drives IO through worker threads
-//! registered as concrete [`HostOperation`] drivers in the execution scope.
-//! Live handles are [`IoResource`]s owned by the VM's execution scope and
-//! in-flight IO work is driven by concrete operation drivers registered in
-//! the same scope.
+//! - `async` (non-wasm32): [`async_io`] drives IO through tokio and submits
+//!   async host functions via the generic async host bridge.
+//! - default (non-wasm32): [`blocking`] drives IO through worker threads
+//!   registered as concrete [`HostOperation`] drivers in the execution scope.
+//! - wasm32: the wasm stub implementation.
 //!
-//! The capability system (restricted registries and explicit grants) is
-//! introduced by the public host SDK layer; before that layer exists,
-//! [`io_policy`] returns only the configured persistent [`IoPolicy`] held in
-//! the generic module-state store.
+//! Both non-wasm32 implementations share the same execution-scope resource
+//! model: live handles are [`IoResource`]s owned by the VM's execution scope
+//! and in-flight IO work is driven by concrete operation drivers registered
+//! in the same scope. Only the concurrency mechanism differs.
 
 use super::borrow_arg;
+#[cfg(all(feature = "async", not(target_arch = "wasm32")))]
+use super::{CallOutcome, CaptureAsyncHostContext, return_one};
 use crate::vm::Vm;
 
+#[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
 pub(super) use super::HostCallResult;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,8 +52,8 @@ impl IoHostExt for Vm {
         policy.allowed_roots.dedup();
         // Adapter-declared policy stored in the generic module-state store:
         // module-level policy survives execution-scope reset (an embedder's
-        // roots remain in force across `reset_for_reuse`), while the adapter's
-        // per-invocation runtime state lives in the scope arena.
+        // roots/capabilities remain in force across `reset_for_reuse`), while
+        // the adapter's per-invocation runtime state lives in the scope arena.
         self.host.set_module_state(policy);
     }
 
@@ -60,12 +63,20 @@ impl IoHostExt for Vm {
 }
 
 pub(super) fn io_policy(vm: &Vm) -> Option<IoPolicy> {
-    vm.host.get_module_state::<IoPolicy>().cloned()
+    vm.host
+        .get_module_state::<IoPolicy>()
+        .cloned()
+        .or_else(|| (!vm.host.default_builtin_capabilities_enabled()).then(IoPolicy::default))
 }
+
+#[cfg(all(feature = "async", not(target_arch = "wasm32")))]
+mod async_io;
+#[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
+mod blocking;
 
 #[cfg(target_arch = "wasm32")]
 pub(super) use super::io_wasm::*;
-#[cfg(not(target_arch = "wasm32"))]
-mod blocking;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "async", not(target_arch = "wasm32")))]
+pub(crate) use async_io::*;
+#[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
 pub(crate) use blocking::*;

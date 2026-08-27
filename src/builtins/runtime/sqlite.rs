@@ -21,7 +21,6 @@
 //! transaction statement count, and transaction deadline, plus SQL-safety
 //! rejection and read-only enforcement.
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -42,7 +41,7 @@ use super::{HostCallResult, VmMap};
 use crate::vm::operation::driver::HostOperation;
 use crate::vm::operation::error::{OperationError, OperationErrorCode, OperationResult};
 use crate::vm::operation::reason::OperationCancelReason;
-use crate::vm::operation::{OperationId, OperationSpec};
+use crate::vm::operation::{OperationId, OperationOutcome, OperationSpec};
 use crate::vm::resource::close::{CloseProgress, HostResource};
 use crate::vm::resource::error::ResourceResult;
 use crate::vm::resource::{ResourceCloseReason, ResourceHandle};
@@ -259,7 +258,7 @@ impl Drop for SqliteResource {
 }
 
 /// Shared state between one SQLite worker, its [`SqliteOpDriver`] operation,
-/// and [`poll_pending_op`] on the VM thread.
+/// and the adapter-owned completion hook on the VM thread.
 ///
 /// The worker writes the terminal signal and guest-visible value; the driver
 /// reflects the signal into the operation registry and the VM wrapper reads
@@ -486,7 +485,6 @@ impl Drop for SqliteOpDriver {
 /// module state stored in the generic `ModuleStateStore`, so it survives
 /// `reset_for_reuse` while this runtime state does not.
 pub(crate) struct SqliteState {
-    pending_results: HashMap<HostOpId, Arc<SqliteOpShared>>,
     /// Adapter-owned live connection count, shared with each
     /// [`SqliteResource`] so `begin_close` can decrement it. Avoids a generic
     /// by-type close helper.
@@ -496,7 +494,6 @@ pub(crate) struct SqliteState {
 impl Default for SqliteState {
     fn default() -> Self {
         Self {
-            pending_results: HashMap::new(),
             open_connections: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -564,88 +561,27 @@ fn cancellation_message(shared: &SqliteOpShared) -> String {
     }
 }
 
-/// Cancels one pending SQLite operation through the execution scope.
-pub(super) fn cancel_pending_op(vm: &mut Vm, op_id: HostOpId) {
-    let Ok(id) = OperationId::from_raw(op_id) else {
-        return;
-    };
-    // Drop the completion mailbox from the adapter-declared scope state; the
-    // operation's driver is cancelled through the registry (which forwards to
-    // the driver's `cancel`).
-    if let Ok(state) = sqlite_state(vm) {
-        state.pending_results.remove(&op_id);
+/// Completes one operation after the generic scope registry reports a
+/// terminal outcome. The adapter owns the mailbox; the VM only invokes this
+/// opaque completion hook.
+fn finish_sqlite_operation(
+    _vm: &mut Vm,
+    op_id: OperationId,
+    outcome: OperationOutcome,
+    shared: Arc<SqliteOpShared>,
+) -> VmResult<CallReturn> {
+    // A cancelled/closed operation reports a guest-visible error even if the
+    // worker happened to complete concurrently.
+    if matches!(outcome, OperationOutcome::Cancelled(_)) || shared.is_cancelled() {
+        return Err(VmError::HostError(cancellation_message(&shared)));
     }
-    let _ = vm
-        .execution_scope()
-        .cancel_operation(id, OperationCancelReason::Requested);
-}
-
-/// Polls one pending SQLite operation through the execution scope's operation
-/// registry, delivering the worker's guest-visible value.
-pub(super) fn poll_pending_op(
-    vm: &mut Vm,
-    op_id: HostOpId,
-    cx: &mut Context<'_>,
-) -> Poll<VmResult<CallReturn>> {
-    let id = match OperationId::from_raw(op_id) {
-        Ok(id) => id,
-        Err(error) => {
-            return Poll::Ready(Err(VmError::HostError(format!(
-                "invalid builtin sqlite op {op_id}: {error}"
-            ))));
-        }
-    };
-
-    let poll_result = vm.execution_scope().poll_operation(id, cx);
-    match poll_result {
-        Poll::Pending => Poll::Pending,
-        Poll::Ready(Err(error)) => {
-            // Drop the completion mailbox from the adapter-declared scope
-            // state; the operation itself already failed terminal.
-            if let Ok(state) = sqlite_state(vm) {
-                state.pending_results.remove(&op_id);
-            }
-            Poll::Ready(Err(VmError::HostError(format!(
-                "builtin sqlite op {op_id} failed: {error}"
-            ))))
-        }
-        Poll::Ready(Ok(outcome)) => {
-            // The worker wrote the authoritative guest-visible result into
-            // the completion mailbox before signalling terminal. Extract the
-            // mailbox entry (an `Arc`) so the scope borrow ends before any
-            // later scope mutation.
-            let shared = match sqlite_state(vm) {
-                Ok(state) => {
-                    let Some(shared) = state.pending_results.remove(&op_id) else {
-                        return Poll::Ready(Err(VmError::HostError(format!(
-                            "builtin sqlite op {op_id} has no completion mailbox"
-                        ))));
-                    };
-                    shared
-                }
-                Err(error) => {
-                    return Poll::Ready(Err(VmError::HostError(format!(
-                        "builtin sqlite op {op_id} mailbox unavailable: {error}"
-                    ))));
-                }
-            };
-            // A cancelled/closed operation reports a guest-visible error even if
-            // the worker happened to complete concurrently.
-            if matches!(
-                outcome,
-                crate::vm::operation::driver::OperationOutcome::Cancelled(_)
-            ) || shared.is_cancelled()
-            {
-                return Poll::Ready(Err(VmError::HostError(cancellation_message(&shared))));
-            }
-            let value = shared.value.lock().expect("sqlite value lock").take();
-            match value {
-                Some(value) => Poll::Ready(value),
-                None => Poll::Ready(Err(VmError::HostError(format!(
-                    "builtin sqlite op {op_id} completed without a result"
-                )))),
-            }
-        }
+    let value = shared.value.lock().expect("sqlite value lock").take();
+    match value {
+        Some(value) => value,
+        None => Err(VmError::HostError(format!(
+            "scoped operation {} completed without a result",
+            op_id.raw()
+        ))),
     }
 }
 
@@ -1303,6 +1239,16 @@ fn schedule_operation(
         .lock()
         .expect("sqlite driver id lock should not be poisoned") = Some(op_id);
     slot.register(op_id);
+    if let Err(error) = vm.register_scoped_operation_completion(op_id, {
+        let completion_shared = Arc::clone(&shared);
+        move |vm, outcome| finish_sqlite_operation(vm, op_id, outcome, completion_shared)
+    }) {
+        let _ = vm
+            .execution_scope()
+            .abort_operation(op_id, OperationCancelReason::Requested);
+        slot.unregister(op_id);
+        return Err(error);
+    }
     let raw = op_id.raw();
 
     let worker = thread::Builder::new()
@@ -1337,6 +1283,7 @@ fn schedule_operation(
         })
         .map_err(|error| {
             shared.mark_worker_done();
+            vm.discard_scoped_operation_completion(op_id);
             let _ = vm
                 .execution_scope()
                 .abort_operation(op_id, OperationCancelReason::Requested);
@@ -1345,7 +1292,6 @@ fn schedule_operation(
         })?;
     shared.set_worker(worker);
 
-    sqlite_state(vm)?.pending_results.insert(raw, shared);
     Ok(raw)
 }
 

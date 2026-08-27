@@ -1,8 +1,9 @@
 // VM-side builtin execution entrypoints.
 // Builtin metadata and call-index mapping live in crate::builtins.
-use std::task::{Context, Poll};
 
 use crate::builtins::BuiltinFunction;
+#[cfg(feature = "async")]
+use crate::vm::CaptureAsyncHostContext;
 #[allow(unused_imports)]
 use crate::vm::{CallOutcome, CallReturn, HostOpId, Value, Vm, VmError, VmResult};
 
@@ -22,6 +23,7 @@ pub(crate) mod print;
 pub(crate) mod regex;
 #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 pub(crate) mod sqlite;
+pub(crate) mod standard_composition;
 mod typed;
 
 #[cfg(target_arch = "wasm32")]
@@ -29,10 +31,13 @@ use io_wasm as io;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use io::{IoHostExt, IoPolicy};
+pub use standard_composition::standard_composition;
 pub use typed::HostCallResult;
-use typed::{
-    AnyValue, IntoBuiltinCallOutcome, IntoHostCallOutcome, NumberValue, UnknownValue, VmArray,
-    VmBytes, VmMap, arg, borrow_arg, return_none, return_one, take_arg,
+use typed::{AnyValue, IntoBuiltinCallOutcome, NumberValue, UnknownValue, VmArray, VmBytes, VmMap};
+#[allow(unused_imports)]
+pub use typed::{
+    BorrowVmValue, FromVmValue, IntoHostCallOutcome, TakeVmValue, arg, borrow_arg, return_none,
+    return_one, take_arg,
 };
 
 pub(crate) enum BuiltinCallOutcome {
@@ -125,49 +130,6 @@ pub(crate) fn execute_builtin_call(
             BuiltinCallOutcome::Return(return_none())
         }),
         _ => execute_namespaced_builtin_call(vm, builtin, args),
-    }
-}
-
-pub(crate) fn cancel_builtin_io_op(vm: &mut Vm, op_id: HostOpId) {
-    io::cancel_pending_op(vm, op_id);
-}
-
-pub(crate) fn poll_builtin_io_op(
-    vm: &mut Vm,
-    op_id: HostOpId,
-    cx: &mut Context<'_>,
-) -> Poll<VmResult<CallReturn>> {
-    io::poll_builtin_io_op(vm, op_id, cx)
-}
-
-/// Cancels one pending SQLite operation. The generic VM (feature-neutral)
-/// calls this hook unconditionally; on builds without the SQLite adapter the
-/// delegation below is compiled out and the call is a no-op.
-pub(crate) fn cancel_builtin_sqlite_op(vm: &mut Vm, op_id: HostOpId) {
-    #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
-    sqlite::cancel_pending_op(vm, op_id);
-    #[cfg(not(all(feature = "sqlite", not(target_arch = "wasm32"))))]
-    let _ = (vm, op_id);
-}
-
-/// Polls one pending SQLite operation. The generic VM (feature-neutral) calls
-/// this hook unconditionally; on builds without the SQLite adapter it reports
-/// an unsupported-operations error.
-pub(crate) fn poll_builtin_sqlite_op(
-    vm: &mut Vm,
-    op_id: HostOpId,
-    cx: &mut Context<'_>,
-) -> Poll<VmResult<CallReturn>> {
-    #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
-    {
-        sqlite::poll_pending_op(vm, op_id, cx)
-    }
-    #[cfg(not(all(feature = "sqlite", not(target_arch = "wasm32"))))]
-    {
-        let _ = (vm, cx);
-        Poll::Ready(Err(VmError::HostError(format!(
-            "builtin sqlite op {op_id} is unsupported in this build"
-        ))))
     }
 }
 

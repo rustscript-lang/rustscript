@@ -443,7 +443,23 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BytecodeBuilder, Program, Value, ValueType, VmStatus};
+    use crate::host_api::{
+        HostApiBuilder, HostFunctionSchema, HostImportSchema, HostParamSchema, HostTypeSchema,
+    };
+    use crate::{
+        BytecodeBuilder, CallOutcome, CallReturn, HostFunctionRegistry, Program, Value, ValueType,
+        VmResult, VmStatus,
+    };
+
+    fn aot_overloaded_int(_vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+        Ok(CallOutcome::Return(CallReturn::one(Value::Int(11))))
+    }
+
+    fn aot_overloaded_string(_vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+        Ok(CallOutcome::Return(CallReturn::one(Value::string(
+            "string",
+        ))))
+    }
 
     #[test]
     fn aot_artifact_preserves_interpreter_boundary_mode() {
@@ -558,6 +574,22 @@ mod tests {
             None,
         )
         .with_local_count(8);
+        let mut schema_builder = HostApiBuilder::new();
+        let schema_function = HostFunctionSchema::with_return(
+            "print",
+            vec![HostParamSchema::value(
+                "value",
+                HostTypeSchema::Array(Box::new(HostTypeSchema::Int)),
+            )],
+            HostTypeSchema::Unknown,
+        );
+        schema_builder.function(schema_function.clone());
+        let schema_catalog = schema_builder.build().expect("schema catalog should build");
+        let schema =
+            crate::host_api::HostImportSchema::from_function(&schema_catalog, &schema_function);
+        let program = program
+            .with_host_import_schemas(vec![schema.clone()])
+            .expect("schema metadata should align");
         let mut vm = Vm::new(program.clone());
         vm.compile_aot().expect("aot compile should succeed");
 
@@ -570,11 +602,97 @@ mod tests {
         assert_eq!(standalone.program().local_count, 8);
         assert_eq!(standalone.program().constants, program.constants);
         assert_eq!(standalone.program().imports, program.imports);
+        assert_eq!(
+            standalone.program().host_import_schemas(),
+            program.host_import_schemas()
+        );
         assert_eq!(standalone.program().type_map, program.type_map);
         assert!(
             standalone.has_aot_program(),
             "standalone vm should install aot"
         );
+    }
+
+    #[test]
+    fn aot_loaded_program_binds_full_schema_overloads() {
+        let mut catalog_builder = HostApiBuilder::new();
+        let int_function = HostFunctionSchema::with_return(
+            "aot::overloaded",
+            vec![HostParamSchema::value("value", HostTypeSchema::Int)],
+            HostTypeSchema::Int,
+        );
+        let string_function = HostFunctionSchema::with_return(
+            "aot::overloaded",
+            vec![HostParamSchema::value("value", HostTypeSchema::String)],
+            HostTypeSchema::String,
+        );
+        catalog_builder.function(int_function.clone());
+        catalog_builder.function(string_function.clone());
+        let catalog = catalog_builder.build().expect("overload catalog");
+        let int_schema = HostImportSchema::from_function(&catalog, &int_function);
+        let string_schema = HostImportSchema::from_function(&catalog, &string_function);
+
+        let mut bytecode = BytecodeBuilder::new();
+        bytecode.ldc(0);
+        bytecode.call(0, 1);
+        bytecode.ldc(1);
+        bytecode.call(1, 1);
+        bytecode.ret();
+        let program = Program::with_imports_and_debug(
+            vec![Value::Int(1), Value::string("x")],
+            bytecode.finish(),
+            vec![
+                crate::bytecode::HostImport {
+                    name: "aot::overloaded".to_string(),
+                    arity: 1,
+                    return_type: ValueType::Int,
+                },
+                crate::bytecode::HostImport {
+                    name: "aot::overloaded".to_string(),
+                    arity: 1,
+                    return_type: ValueType::String,
+                },
+            ],
+            None,
+        )
+        .with_host_import_schemas(vec![int_schema.clone(), string_schema.clone()])
+        .expect("schema alignment");
+        let mut compiler_vm = Vm::new(program);
+        compiler_vm
+            .compile_aot()
+            .expect("aot compile should succeed");
+        let artifact = compiler_vm
+            .encode_aot_artifact()
+            .expect("aot artifact should encode");
+
+        let mut loaded = Vm::new_from_aot_artifact_with_jit_config(&artifact, JitConfig::default())
+            .expect("aot artifact should load");
+        let mut registry = HostFunctionRegistry::empty();
+        registry
+            .register_catalog_static(int_schema, aot_overloaded_int)
+            .expect("integer overload registration");
+        registry
+            .register_catalog_static(string_schema, aot_overloaded_string)
+            .expect("string overload registration");
+        registry
+            .bind_vm_cached(&mut loaded)
+            .expect("loaded aot program should bind both overloads");
+        assert_eq!(
+            loaded.run().expect("aot overloads should execute"),
+            VmStatus::Halted
+        );
+        assert_eq!(loaded.stack(), &[Value::Int(11), Value::string("string")]);
+
+        let mut wrong_schema = HostImportSchema::from_function(&catalog, &int_function);
+        wrong_schema.params[0].schema = HostTypeSchema::String;
+        let mut wrong_registry = HostFunctionRegistry::empty();
+        wrong_registry
+            .register_catalog_static(wrong_schema, aot_overloaded_int)
+            .expect("mismatched registration");
+        let mut rejected =
+            Vm::new_from_aot_artifact_with_jit_config(&artifact, JitConfig::default())
+                .expect("aot artifact should load for mismatch check");
+        assert!(wrong_registry.bind_vm_cached(&mut rejected).is_err());
     }
 
     #[test]

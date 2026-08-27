@@ -4,11 +4,12 @@ use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
 use crate::compiler::TypeSchema;
+use crate::host_api::HostImportSchema;
 
 /// Bytecode ABI version used for VM-internal cache identity (JIT trace cache,
 /// program cache keys). The VMBC wire format version lives in `src/vmbc.rs`
-/// (`VERSION_V11`); both were bumped together for the static builtin ID break.
-pub const BYTECODE_ABI_VERSION: u16 = 11;
+/// (`VERSION_V12`); both were bumped together for the static builtin ID break.
+pub const BYTECODE_ABI_VERSION: u16 = 12;
 
 pub type SharedString = Arc<String>;
 pub type SharedBytes = Arc<Vec<u8>>;
@@ -619,6 +620,16 @@ pub struct Program {
     pub code: Vec<u8>,
     pub local_count: usize,
     pub imports: Vec<HostImport>,
+    /// Full catalog identity for each import, aligned with [`Self::imports`].
+    /// `Program::new` and legacy bytecode decoders leave this empty, which
+    /// keeps their name/arity bindings available for non-overloaded hosts.
+    ///
+    /// This is crate-visible storage rather than a new public struct field: the
+    /// existing private instruction caches already mean that downstream crates
+    /// cannot construct `Program` with a struct literal. Keeping this field
+    /// non-public avoids expanding the public layout while exposing the
+    /// semantic metadata through [`Self::host_import_schemas`].
+    pub(crate) host_import_schemas: Vec<Option<HostImportSchema>>,
     pub debug: Option<crate::debug_info::DebugInfo>,
     pub type_map: Option<TypeMap>,
     pub script_functions: Vec<ScriptFunction>,
@@ -639,6 +650,7 @@ impl Program {
             code,
             local_count,
             imports: Vec::new(),
+            host_import_schemas: Vec::new(),
             debug: None,
             type_map: None,
             script_functions: Vec::new(),
@@ -662,6 +674,7 @@ impl Program {
             code,
             local_count,
             imports: Vec::new(),
+            host_import_schemas: Vec::new(),
             debug,
             type_map: None,
             script_functions: Vec::new(),
@@ -686,6 +699,7 @@ impl Program {
             code,
             local_count,
             imports,
+            host_import_schemas: Vec::new(),
             debug,
             type_map: None,
             script_functions: Vec::new(),
@@ -696,6 +710,51 @@ impl Program {
             decoded_instruction_data_cache: Arc::new(OnceLock::new()),
             operand_type_hints_cache: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Attaches the full selected catalog schema to every host import.
+    ///
+    /// The metadata is checked before it is stored so a caller cannot leave a
+    /// partially aligned program behind. Runtime binding uses this identity
+    /// rather than reducing an overload to name and arity.
+    pub fn with_host_import_schemas(
+        mut self,
+        schemas: Vec<HostImportSchema>,
+    ) -> Result<Self, String> {
+        if schemas.len() != self.imports.len() {
+            return Err(format!(
+                "host import schema count {} does not match import count {}",
+                schemas.len(),
+                self.imports.len()
+            ));
+        }
+        for (index, (import, schema)) in self.imports.iter().zip(schemas.iter()).enumerate() {
+            if schema.name != import.name {
+                return Err(format!(
+                    "host import schema {index} names `{}` but import names `{}`",
+                    schema.name, import.name
+                ));
+            }
+            if schema.arity() != import.arity as usize {
+                return Err(format!(
+                    "host import schema {index} has arity {} but import has arity {}",
+                    schema.arity(),
+                    import.arity
+                ));
+            }
+        }
+        self.host_import_schemas = schemas.into_iter().map(Some).collect();
+        Ok(self)
+    }
+
+    /// Returns the complete catalog identity retained for each host import.
+    ///
+    /// An empty slice means that the program uses legacy name/arity imports or
+    /// was built without catalog metadata. When non-empty it is aligned with
+    /// [`Self::imports`] and retains every parameter, passing mode, nested
+    /// schema, return schema, and catalog fingerprint.
+    pub fn host_import_schemas(&self) -> &[Option<HostImportSchema>] {
+        &self.host_import_schemas
     }
 
     pub fn with_local_count(mut self, local_count: usize) -> Self {

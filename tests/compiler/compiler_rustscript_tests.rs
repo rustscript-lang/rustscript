@@ -87,11 +87,11 @@ fn rustscript_host_import_runtime_cases_work() {
                     use runtime;
                     runtime::sleep(41);
                 "#,
-                vec![Value::Int(42)],
+                vec![Value::Bool(true)],
             ),
             bindings: vec![HostBindingCase {
                 name: "runtime::sleep",
-                factory: make_add_one,
+                factory: make_always_allow,
             }],
         },
         BoundRuntimeCase {
@@ -115,11 +115,11 @@ fn rustscript_host_import_runtime_cases_work() {
                     use runtime;
                     runtime::sleep(41);
                 "#,
-                vec![Value::Int(42)],
+                vec![Value::Bool(true)],
             ),
             bindings: vec![HostBindingCase {
                 name: "runtime::sleep",
-                factory: make_add_one,
+                factory: make_always_allow,
             }],
         },
         BoundRuntimeCase {
@@ -143,11 +143,11 @@ fn rustscript_host_import_runtime_cases_work() {
                     use runtime as rt;
                     rt::sleep(41);
                 "#,
-                vec![Value::Int(42)],
+                vec![Value::Bool(true)],
             ),
             bindings: vec![HostBindingCase {
                 name: "runtime::sleep",
-                factory: make_add_one,
+                factory: make_always_allow,
             }],
         },
     ];
@@ -163,6 +163,8 @@ fn rustscript_io_namespace_builtin_calls_are_supported() {
     "#;
     let compiled = compile_source(source).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
+    #[cfg(feature = "async")]
+    super::async_test_bridge::install(&mut vm);
 
     loop {
         let status = vm.run().expect("vm should run");
@@ -532,6 +534,8 @@ fn compile_source_file_with_rustscript_complex_fixture() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/example_complex.rss");
     let compiled = compile_source_file(path.as_path()).expect("compile should succeed");
     let mut vm = Vm::new(compiled.program);
+    #[cfg(feature = "async")]
+    super::async_test_bridge::install(&mut vm);
 
     for func in &compiled.functions {
         match func.name.as_str() {
