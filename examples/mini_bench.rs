@@ -569,7 +569,7 @@ fn measure_runtime_mode(
         let mut vm = Vm::new(program.clone());
         configure_vm_for_mode(&mut vm, mode);
         warm_vm_for_mode(&mut vm, mode, expected_stack)?;
-        vm.reset_for_reuse();
+        let _ = vm.reset_for_reuse();
         let started = Instant::now();
         let status = vm
             .run()

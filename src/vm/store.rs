@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::Value;
 use crate::compiler::TypeSchema;
 
+use super::execution_scope::ExecutionScopeError;
 use super::{EpochCheckpoint, EpochHandle, FuelCheckpoint, Vm, VmError, VmResult, VmStatus};
 
 /// Lightweight Wasmtime-style store wrapper for VM state and host context data.
@@ -338,6 +339,12 @@ impl<T> Store<T> {
         Args: ScriptArgs,
         Ret: ScriptResult,
     {
+        if let Some(error) = self.vm.scope_reset_error().cloned() {
+            return Err(VmError::ExecutionScope(error));
+        }
+        if self.vm.scope_reset_pending() {
+            return Err(VmError::ExecutionScope(ExecutionScopeError::ScopeClosing));
+        }
         if !self.callback_registry.0.load(Ordering::Acquire) {
             self.install_callback_registry();
         }
@@ -428,9 +435,36 @@ impl<T> Store<T> {
         Ok(())
     }
 
-    pub fn reset_for_reuse(&mut self) {
-        self.vm.reset_for_reuse();
-        self.install_callback_registry();
+    pub fn reset_for_reuse(&mut self) -> VmResult<()> {
+        self.vm.reset_for_reuse()?;
+        if !self.vm.scope_reset_pending() {
+            self.install_callback_registry();
+        }
+        Ok(())
+    }
+
+    /// Polls a pending reset and publishes a callback registry only after the
+    /// VM's old execution scope has reached clean quiescence.
+    pub fn poll_reset_for_reuse(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<VmResult<()>> {
+        let was_pending = self.vm.scope_reset_pending();
+        match self.vm.poll_reset_for_reuse(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(Ok(())) => {
+                if was_pending && !self.vm.scope_reset_pending() {
+                    self.install_callback_registry();
+                }
+                std::task::Poll::Ready(Ok(()))
+            }
+            std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(error)),
+        }
+    }
+
+    /// Whether this store is safe to return to a VM reuse pool.
+    pub fn is_reusable(&self) -> bool {
+        self.vm.is_reusable()
     }
 
     pub fn replace_vm(&mut self, mut vm: Vm) {

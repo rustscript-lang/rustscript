@@ -236,7 +236,7 @@ fn async_io_reset_kills_and_reaps_the_entire_popen_process_group() {
         descendant: Some(descendant_pid),
     };
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert!(vm.execution_scope().resources().is_empty());
     assert!(vm.execution_scope().operations().is_empty());
     std::thread::sleep(std::time::Duration::from_millis(1_200));

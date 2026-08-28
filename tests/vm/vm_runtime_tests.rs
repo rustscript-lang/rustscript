@@ -250,6 +250,10 @@ fn call_can_wait_for_host_op_and_resume_without_replay() {
 
     let status = vm.run().expect("first run should wait on host op");
     assert_eq!(status, VmStatus::Waiting(99));
+    assert!(
+        !vm.is_reusable(),
+        "waiting host operation makes VM unavailable for pool reuse"
+    );
 
     vm.complete_host_op(99, vec![Value::Int(7)])
         .expect("host op completion should succeed");

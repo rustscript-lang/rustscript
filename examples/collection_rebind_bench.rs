@@ -222,7 +222,7 @@ fn measure(
     let mut samples = Vec::with_capacity(config.samples);
     let mut generic_builtin_calls = 0u64;
     for _ in 0..config.samples {
-        vm.reset_for_reuse();
+        let _ = vm.reset_for_reuse();
         let native_execs_before_sample = vm.jit_native_exec_count();
         let started = Instant::now();
         let status = vm

@@ -551,7 +551,7 @@ fn reset_driven_scope_cleanup_closes_resources_and_cancels_operations() {
     assert_eq!(vm.host_context().operation_count(), 1);
 
     // Reset drives the scope to quiescence: resources close, op cancels.
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert_eq!(vm.host_context().resource_count(), 0);
     assert_eq!(vm.host_context().operation_count(), 0);
     assert_eq!(CLOSED_COUNTERS.load(Ordering::SeqCst), 1);
@@ -567,7 +567,7 @@ fn module_state_survives_reset_and_never_participates_in_close() {
     let _tracker_guard = TRACKER_LOCK.lock().unwrap();
     reset_trackers();
     let mut vm = installed_vm();
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert!(
         vm.host_context().module_state::<DemoPolicy>().is_some(),
         "module state must survive reset"

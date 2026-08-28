@@ -97,7 +97,7 @@ mod tests {
 }
 
 /// Architecture guard: the resource support modules must stay free of
-/// `crate::builtins` (and comment-only noise) so they can be reused without
+/// `builtin registration paths` (and comment-only noise) so they can be reused without
 /// pulling in the core crate's builtin registry. The scan is dynamic: every
 /// production `.rs` file directly under `src/vm/resource/` is enumerated at
 /// test time, so any future module is covered automatically without editing

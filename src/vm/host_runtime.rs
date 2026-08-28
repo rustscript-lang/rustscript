@@ -19,15 +19,38 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use crate::host_api::HostImportSchema;
-use crate::vm::execution_scope::ExecutionScope;
-use crate::vm::host::{HostAsyncBridge, HostOpId, ScopedOperationCompletion, VmHostFunction};
+use crate::vm::execution_scope::{ExecutionScope, ExecutionScopeError, ScopeCloseOutcome};
+use crate::vm::host::{
+    HostAsyncBridge, HostAsyncOpTerminal, HostOpId, ScopedOperationCompletion, VmHostFunction,
+};
 use crate::vm::operation::{OperationCancelReason, OperationId};
 use crate::vm::standard_composition::StandardSurfaceComposition;
+use crate::vm::{VmError, VmResult};
 
 /// Embedder-supplied print sink for `print`/`debug` output.
 pub(crate) type RuntimePrintSink = dyn FnMut(String) + Send;
+
+#[derive(Debug)]
+struct BridgeOperationState {
+    cancellation_reason: Option<OperationCancelReason>,
+    cancellation_error: Option<String>,
+    terminal: Option<HostAsyncOpTerminal>,
+    cleanup_error: Option<String>,
+}
+
+impl BridgeOperationState {
+    fn new() -> Self {
+        Self {
+            cancellation_reason: None,
+            cancellation_error: None,
+            terminal: None,
+            cleanup_error: None,
+        }
+    }
+}
 
 /// Host-owned capabilities, resources, operations, and subsystem state.
 ///
@@ -48,6 +71,18 @@ pub(crate) struct HostRuntime {
     pub(crate) next_host_op_id: HostOpId,
     /// The isolated execution scope owned by this host runtime.
     pub(super) execution_scope: ExecutionScope,
+    /// True after reset has begun closing the old scope but before the generic
+    /// close driver has reached quiescence. No usable replacement scope may be
+    /// admitted while this flag is set.
+    pub(crate) scope_reset_pending: bool,
+    /// The terminal failure of the current reset attempt, if any. A failed
+    /// reset must stay non-reusable and must not silently start another reset
+    /// or publish a callback registry on a later poll.
+    scope_reset_error: Option<ExecutionScopeError>,
+    /// The one replacement scope allocated for the current reset. It remains
+    /// unpublished until the old scope in `execution_scope` reaches
+    /// quiescence.
+    replacement_execution_scope: Option<ExecutionScope>,
     /// The generic per-VM module-state store surfaced to external host
     /// extensions through [`HostContext`](super::host_context::HostContext).
     ///
@@ -80,6 +115,10 @@ pub(crate) struct HostRuntime {
     /// that are still pending. These route to the bridge's
     /// `poll_submitted_op` instead of a runtime-owned operation driver.
     pub(crate) submitted_host_ops: HashSet<HostOpId>,
+    /// Every active bridge-owned operation, including pending host calls that
+    /// did not originate from `submit_host_future`. Entries remain until the
+    /// bridge acknowledges a terminal/quiescent state and cleanup succeeds.
+    bridge_operations: HashMap<HostOpId, BridgeOperationState>,
     /// Adapter-owned completions for operations driven by the execution scope.
     pub(crate) scoped_operation_completions: HashMap<OperationId, ScopedOperationCompletion>,
 }
@@ -107,6 +146,9 @@ impl HostRuntime {
             next_host_op_id: 1,
             execution_scope: ExecutionScope::new()
                 .expect("host runtime execution-scope identity space must be available"),
+            scope_reset_pending: false,
+            scope_reset_error: None,
+            replacement_execution_scope: None,
             module_state_store: super::host_state::ModuleStateStore::new(),
             allow_default_builtin_capabilities: true,
             allowed_builtin_calls: Vec::new(),
@@ -115,6 +157,7 @@ impl HostRuntime {
             allow_default_host_fallback: true,
             standard_composition: None,
             submitted_host_ops: HashSet::new(),
+            bridge_operations: HashMap::new(),
             scoped_operation_completions: HashMap::new(),
         }
     }
@@ -132,31 +175,280 @@ impl HostRuntime {
         self.allow_default_builtin_capabilities
     }
 
-    /// Cancels every bridge-submitted operation still owned by this runtime.
-    ///
-    /// The set is drained before invoking the bridge so each submitted id is
-    /// handed to the bridge at most once, even when a later lifecycle path
-    /// runs again. This also makes bridge replacement safe: no old submitted
-    /// id remains after the old bridge is discarded.
-    pub(crate) fn cancel_submitted_host_ops(&mut self, reason: OperationCancelReason) {
-        let mut op_ids = self.submitted_host_ops.drain().collect::<Vec<_>>();
+    pub(crate) fn reserve_submitted_host_op(&mut self) -> VmResult<HostOpId> {
+        let op_id = self.next_host_op_id;
+        if op_id == 0 || op_id == HostOpId::MAX {
+            return Err(VmError::HostError(
+                "async host operation id space exhausted".to_string(),
+            ));
+        }
+        if self.submitted_host_ops.contains(&op_id) {
+            return Err(VmError::HostError(format!(
+                "submitted host op {op_id} is already tracked"
+            )));
+        }
+        if self.bridge_operations.contains_key(&op_id) {
+            return Err(VmError::HostError(format!(
+                "bridge host op {op_id} is already tracked"
+            )));
+        }
+        self.submitted_host_ops.insert(op_id);
+        self.bridge_operations
+            .insert(op_id, BridgeOperationState::new());
+        self.next_host_op_id = op_id + 1;
+        Ok(op_id)
+    }
+
+    pub(crate) fn rollback_submitted_host_op(&mut self, op_id: HostOpId) {
+        let removed_submitted = self.submitted_host_ops.remove(&op_id);
+        let removed_bridge = self.bridge_operations.remove(&op_id).is_some();
+        if removed_submitted || removed_bridge {
+            self.next_host_op_id = op_id;
+        }
+    }
+
+    pub(crate) fn track_bridge_host_op(&mut self, op_id: HostOpId) -> VmResult<()> {
+        if self.bridge_operations.contains_key(&op_id) {
+            return Ok(());
+        }
+        self.bridge_operations
+            .insert(op_id, BridgeOperationState::new());
+        Ok(())
+    }
+
+    pub(crate) fn has_active_bridge_operations(&self) -> bool {
+        !self.bridge_operations.is_empty()
+    }
+
+    pub(crate) fn has_pending_bridge_cancellations(&self) -> bool {
+        self.bridge_operations
+            .values()
+            .any(|state| state.cancellation_reason.is_some())
+    }
+
+    pub(crate) fn is_bridge_operation_tracked(&self, op_id: HostOpId) -> bool {
+        self.bridge_operations.contains_key(&op_id)
+    }
+
+    pub(crate) fn request_cancel_host_op(
+        &mut self,
+        op_id: HostOpId,
+        reason: OperationCancelReason,
+    ) -> VmResult<()> {
+        let should_request = {
+            let state = self.bridge_operations.get_mut(&op_id).ok_or_else(|| {
+                VmError::HostError(format!("bridge host op {op_id} is not tracked"))
+            })?;
+            if let Some(error) = state.cancellation_error.as_ref() {
+                return Err(VmError::HostError(error.clone()));
+            }
+            if let Some(error) = state.cleanup_error.as_ref() {
+                return Err(VmError::HostError(error.clone()));
+            }
+            if state.terminal.is_some() || state.cancellation_reason.is_some() {
+                false
+            } else {
+                state.cancellation_reason = Some(reason);
+                true
+            }
+        };
+        if !should_request {
+            return Ok(());
+        }
+
+        let result = match self.async_bridge.as_mut() {
+            Some(bridge) => bridge.request_cancel_op(op_id, reason),
+            None => Err(VmError::HostError(format!(
+                "cannot cancel bridge host op {op_id} without an async bridge"
+            ))),
+        };
+        if let Err(error) = result {
+            if let Some(state) = self.bridge_operations.get_mut(&op_id) {
+                state.cancellation_error = Some(error.to_string());
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn request_cancel_submitted_host_ops(
+        &mut self,
+        reason: OperationCancelReason,
+    ) -> VmResult<()> {
+        let mut op_ids = self.bridge_operations.keys().copied().collect::<Vec<_>>();
         op_ids.sort_unstable();
-        if let Some(bridge) = self.async_bridge.as_mut() {
-            for op_id in op_ids {
-                bridge.cancel_op_with_reason(op_id, reason);
+        let mut first_error = None;
+        for op_id in op_ids {
+            let result = self.request_cancel_host_op(op_id, reason);
+            if first_error.is_none() {
+                first_error = result.err();
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Requests cancellation for every bridge operation as a best-effort
+    /// terminal/drop action. IDs are deliberately retained until a later
+    /// acknowledgement poll or until this runtime is dropped.
+    pub(crate) fn cancel_submitted_host_ops(&mut self, reason: OperationCancelReason) {
+        let _ = self.request_cancel_submitted_host_ops(reason);
+    }
+
+    fn bridge_operation_error(message: String) -> VmError {
+        VmError::HostError(message)
+    }
+
+    pub(crate) fn complete_bridge_operation(
+        &mut self,
+        op_id: HostOpId,
+        terminal: HostAsyncOpTerminal,
+    ) -> VmResult<()> {
+        let state_snapshot = self.bridge_operations.get(&op_id).map(|state| {
+            (
+                state.cancellation_reason,
+                state.cancellation_error.clone(),
+                state.terminal,
+                state.cleanup_error.clone(),
+            )
+        });
+        let Some((cancellation_reason, cancellation_error, previous_terminal, cleanup_error)) =
+            state_snapshot
+        else {
+            return Err(Self::bridge_operation_error(format!(
+                "bridge host op {op_id} is not tracked"
+            )));
+        };
+        if let Some(error) = cancellation_error.or(cleanup_error) {
+            return Err(Self::bridge_operation_error(error));
+        }
+        if cancellation_reason.is_some() && terminal != HostAsyncOpTerminal::Cancelled {
+            return Err(Self::bridge_operation_error(format!(
+                "bridge host op {op_id} has an outstanding cancellation request"
+            )));
+        }
+        if let Some(previous_terminal) = previous_terminal {
+            if previous_terminal != terminal {
+                return Err(Self::bridge_operation_error(format!(
+                    "bridge host op {op_id} reached conflicting terminal states"
+                )));
+            }
+        } else if let Some(state) = self.bridge_operations.get_mut(&op_id) {
+            state.terminal = Some(terminal);
+        }
+
+        let cleanup_result = match self.async_bridge.as_mut() {
+            Some(bridge) => bridge.cleanup_op(op_id, terminal),
+            None => Err(Self::bridge_operation_error(format!(
+                "cannot clean up bridge host op {op_id} without an async bridge"
+            ))),
+        };
+        match cleanup_result {
+            Ok(()) => {
+                self.bridge_operations.remove(&op_id);
+                self.submitted_host_ops.remove(&op_id);
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(state) = self.bridge_operations.get_mut(&op_id) {
+                    state.cleanup_error = Some(error.to_string());
+                }
+                Err(error)
             }
         }
     }
 
-    /// Replaces the active execution scope with a fresh one.
-    ///
-    /// Dropping the old scope runs its generic close sweep, retiring every
-    /// in-flight operation, closing every resource, and dropping every
-    /// adapter-declared scope-arena typed-state entry before the new scope
-    /// starts. Any bridge-submitted futures are cancelled with `VmReset` and
-    /// the submitted-id set is drained before the old scope is dropped. Used
-    /// by `Vm::reset_for_reuse` so adapter runtime-state teardown goes through
-    /// the generic scope lifecycle.
+    pub(crate) fn bridge_cancellation_requested(&self, op_id: HostOpId) -> bool {
+        self.bridge_operations
+            .get(&op_id)
+            .is_some_and(|state| state.cancellation_reason.is_some())
+    }
+
+    /// Polls one cancellation acknowledgement. An operation is removed only
+    /// after `poll_cancel_op` reports quiescence and `cleanup_op` succeeds.
+    pub(crate) fn poll_bridge_operation_cancellation(
+        &mut self,
+        op_id: HostOpId,
+        cx: &mut Context<'_>,
+    ) -> Poll<VmResult<()>> {
+        let state_snapshot = self.bridge_operations.get(&op_id).map(|state| {
+            (
+                state.cancellation_reason,
+                state.cancellation_error.clone(),
+                state.terminal,
+                state.cleanup_error.clone(),
+            )
+        });
+        let Some((cancellation_reason, cancellation_error, terminal, cleanup_error)) =
+            state_snapshot
+        else {
+            return Poll::Ready(Ok(()));
+        };
+        if let Some(error) = cancellation_error.or(cleanup_error) {
+            return Poll::Ready(Err(Self::bridge_operation_error(error)));
+        }
+        if terminal.is_some() {
+            return Poll::Ready(Ok(()));
+        }
+        if cancellation_reason.is_none() {
+            return Poll::Ready(Err(Self::bridge_operation_error(format!(
+                "bridge host op {op_id} has no cancellation request"
+            ))));
+        }
+
+        let poll_result = match self.async_bridge.as_mut() {
+            Some(bridge) => bridge.poll_cancel_op(op_id, cx),
+            None => Poll::Ready(Err(Self::bridge_operation_error(format!(
+                "cannot poll cancellation for bridge host op {op_id} without an async bridge"
+            )))),
+        };
+        match poll_result {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => {
+                Poll::Ready(self.complete_bridge_operation(op_id, HostAsyncOpTerminal::Cancelled))
+            }
+            Poll::Ready(Err(error)) => {
+                if let Some(state) = self.bridge_operations.get_mut(&op_id) {
+                    state.cancellation_error = Some(error.to_string());
+                }
+                Poll::Ready(Err(error))
+            }
+        }
+    }
+
+    /// Polls all cancellation acknowledgements. Entries without a cancellation
+    /// request remain pending; reset callers request all of them first.
+    pub(crate) fn poll_bridge_operations(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<()>> {
+        let mut op_ids = self.bridge_operations.keys().copied().collect::<Vec<_>>();
+        op_ids.sort_unstable();
+        let mut first_error = None;
+        for op_id in op_ids {
+            if !self.bridge_cancellation_requested(op_id) {
+                continue;
+            }
+            match self.poll_bridge_operation_cancellation(op_id, cx) {
+                Poll::Pending | Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            Poll::Ready(Err(error))
+        } else if self.bridge_operations.is_empty() {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    /// Starts generic execution-scope reset and replaces the old scope only
+    /// after its operation/resource registries report quiescence. Exactly one
+    /// replacement is allocated at reset start and retained privately while
+    /// the old scope closes; callers must poll
+    /// [`poll_reset_execution_scope`](Self::poll_reset_execution_scope) before
+    /// the VM can be reused.
     ///
     /// Persistent policy/configuration — including the HTTP host
     /// configuration and max-in-flight policy, IO policy, SQLite policy, and
@@ -165,14 +457,123 @@ impl HostRuntime {
     /// therefore survives reset (only per-invocation resources, operations,
     /// and scope-arena runtime state are retired). This function contains no
     /// adapter name, feature, or concrete `TypeId`: it is wholly feature-neutral.
-    pub(crate) fn reset_execution_scope(&mut self) {
-        self.cancel_submitted_host_ops(OperationCancelReason::VmReset);
+    pub(crate) fn reset_execution_scope(&mut self) -> VmResult<()> {
+        if let Some(error) = self.scope_reset_error.clone() {
+            return Err(VmError::ExecutionScope(error));
+        }
+
+        if !self.scope_reset_pending {
+            self.request_cancel_submitted_host_ops(OperationCancelReason::VmReset)?;
+            // Allocate the replacement before publishing or closing anything.
+            // There is no second allocation after the old scope quiesces.
+            let replacement = match ExecutionScope::new() {
+                Ok(scope) => scope,
+                Err(error) => {
+                    self.fail_reset(error.clone());
+                    return Err(VmError::ExecutionScope(error));
+                }
+            };
+            let close_result = self.execution_scope.is_active().then(|| {
+                self.execution_scope
+                    .begin_close(crate::vm::resource::ResourceCloseReason::VmReset)
+            });
+            if let Some(Err(error)) = close_result {
+                self.fail_reset(error.clone());
+                return Err(VmError::ExecutionScope(error));
+            }
+            self.scoped_operation_completions.clear();
+            self.execution_scope
+                .cancel_operations_and_wait(crate::vm::operation::OperationCancelReason::VmReset);
+            self.replacement_execution_scope = Some(replacement);
+            self.scope_reset_pending = true;
+        } else {
+            self.request_cancel_submitted_host_ops(OperationCancelReason::VmReset)?;
+            self.scoped_operation_completions.clear();
+        }
+
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        match self.poll_reset_execution_scope(&mut cx) {
+            Poll::Pending | Poll::Ready(Ok(())) => Ok(()),
+            Poll::Ready(Err(error)) => Err(error),
+        }
+    }
+
+    /// Records a terminal reset failure and closes the old scope without
+    /// publishing any replacement. The error itself remains authoritative for
+    /// all later reset/poll attempts.
+    fn fail_reset(&mut self, error: ExecutionScopeError) {
+        if self.execution_scope.is_active() {
+            let _ = self
+                .execution_scope
+                .begin_close(crate::vm::resource::ResourceCloseReason::VmReset);
+        }
         self.scoped_operation_completions.clear();
-        let _ = self
-            .execution_scope
-            .begin_close(crate::vm::resource::ResourceCloseReason::VmReset);
-        self.execution_scope = ExecutionScope::new()
-            .expect("host runtime execution-scope identity space must be available");
+        self.execution_scope
+            .cancel_operations_and_wait(crate::vm::operation::OperationCancelReason::VmReset);
+        self.replacement_execution_scope = None;
+        self.scope_reset_pending = false;
+        self.scope_reset_error = Some(error);
+    }
+
+    /// The old scope remains the guarded `execution_scope` while it is closing;
+    /// the one fresh Active scope is installed only after the old scope reaches
+    /// `Quiescent`. This is the pool/reuse boundary that prevents stale
+    /// operation/resource workers from overlapping a replacement VM run.
+    pub(crate) fn poll_reset_execution_scope(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<VmResult<()>> {
+        if let Some(error) = self.scope_reset_error.clone() {
+            return Poll::Ready(Err(VmError::ExecutionScope(error)));
+        }
+        match self.poll_bridge_operations(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Ready(Ok(())) => {}
+        }
+        if !self.scope_reset_pending {
+            return Poll::Ready(Ok(()));
+        }
+
+        let result = self.execution_scope.poll_close(cx);
+        match result {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => {
+                self.scope_reset_error = Some(error.clone());
+                Poll::Ready(Err(VmError::ExecutionScope(error)))
+            }
+            Poll::Ready(Ok(ScopeCloseOutcome::Success)) => {
+                let replacement = self
+                    .replacement_execution_scope
+                    .take()
+                    .expect("pending scope reset must retain one replacement scope");
+                self.execution_scope = replacement;
+                self.scope_reset_pending = false;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(outcome @ ScopeCloseOutcome::SuccessWithErrors(_))) => {
+                // The old scope is quiescent but not clean. Keep it and the
+                // unpublished replacement in place so a failed reset cannot
+                // make the VM/pool appear reusable; retain the exact outcome
+                // for the caller instead of collapsing it into success.
+                let error = ExecutionScopeError::Close(outcome);
+                self.scope_reset_error = Some(error.clone());
+                Poll::Ready(Err(VmError::ExecutionScope(error)))
+            }
+        }
+    }
+
+    pub(crate) fn scope_reset_error(&self) -> Option<&ExecutionScopeError> {
+        self.scope_reset_error.as_ref()
+    }
+
+    pub(crate) fn is_reusable(&self) -> bool {
+        !self.scope_reset_pending
+            && self.scope_reset_error.is_none()
+            && self.execution_scope.is_reusable()
+            && self.bridge_operations.is_empty()
+            && self.scoped_operation_completions.is_empty()
     }
 }
 

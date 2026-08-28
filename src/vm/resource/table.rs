@@ -236,6 +236,10 @@ impl ResourceTable {
         self.active_entries.get() == 0
     }
 
+    pub(crate) fn is_clean(&self) -> bool {
+        self.is_empty() && self.scope_states.is_empty()
+    }
+
     /// Number of physical slot entries ever carved out of the arena.
     ///
     /// Test-only: proves that close/reuse cycles return slots to the vacant

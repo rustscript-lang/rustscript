@@ -1,0 +1,675 @@
+//! Invocation item stream.
+//!
+//! One exported callable started with ordinary arguments behaves like
+//! `Stream<Item = Result<InvocationItem, InvocationError>>`: zero or more
+//! `Event` items produced by `stream::emit`, then exactly one `Complete` item
+//! or one typed error, then a fused end of stream. Polling drives execution;
+//! the VM does not produce items while the consumer is not polling, and at most
+//! one event item is buffered between polls (natural backpressure).
+//!
+//! The invocation reuses the existing callable execution state
+//! ([`Vm::start_callable`], [`Vm::run`], [`Vm::take_invocation_result`]) and the
+//! existing async host bridge; it does not duplicate interpreter or host loops,
+//! and it does not add an executor, generator syntax, an event queue, or event
+//! persistence policy. Cancellation is a per-invocation typed reason carried
+//! on the invocation state and forwarded to outstanding waiting host
+//! operations; there is no standalone cancellation-token graph or parallel
+//! event subsystem.
+
+use std::collections::HashSet;
+use std::fmt;
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
+
+use crate::bytecode::{CallableEnvironment, CallableValue, VmMap};
+use crate::vm::operation::reason::OperationCancelReason;
+use crate::vm::runtime::{EventPayload, RuntimeError, RuntimeErrorCode};
+use crate::vm::{CallOutcome, CallReturn, Value, Vm, VmError, VmResult, VmStatus, VmYieldReason};
+
+/// One item yielded by an invocation stream.
+#[derive(Clone, Debug, PartialEq)]
+pub enum InvocationItem {
+    /// One bounded event produced by `stream::emit(value)`.
+    Event(Value),
+    /// The callable's return value; exactly one per invocation.
+    Complete(Value),
+}
+
+/// Typed terminal failure of an invocation stream.
+///
+/// The failure is machine-readable: cancellation keeps its reason, fuel and
+/// deadline failures keep their numeric state, and stream::emit validation
+/// keeps its structured [`RuntimeError`] instead of being flattened to a
+/// string.
+#[derive(Debug)]
+pub enum InvocationError {
+    /// The invocation was cancelled with this reason.
+    Cancelled(OperationCancelReason),
+    /// The configured fuel budget was exhausted.
+    OutOfFuel { needed: u64, remaining: u64 },
+    /// The configured epoch deadline expired.
+    DeadlineReached { current: u64, deadline: u64 },
+    /// A structured runtime error (for example event payload validation).
+    Capability(RuntimeError),
+    /// An embedding host failure without a structured runtime code.
+    Host { message: String },
+    /// A low-level VM failure (script error or invalid frame state).
+    Vm(VmError),
+}
+
+/// Poll outcome of an invocation stream.
+#[derive(Debug)]
+pub enum InvocationPoll {
+    /// The VM is paused (waiting on a host operation or a host-driven yield);
+    /// drive the outstanding work and poll again.
+    Pending,
+    /// One stream item, or `None` after the fused end of stream.
+    Ready(Option<Result<InvocationItem, InvocationError>>),
+}
+
+/// Run-scoped state of the single active invocation on a VM.
+#[derive(Debug)]
+pub(crate) struct InvocationState {
+    pub(crate) phase: InvocationPhase,
+    /// True while the VM is yielded at a `stream::emit` call site whose event
+    /// has already been delivered. The resumed call site re-enters
+    /// `stream::emit` and consumes this marker instead of emitting a second
+    /// event for the same call.
+    pub(crate) emit_yield_pending: bool,
+    /// A structured runtime error produced by `stream::emit` validation,
+    /// preserved for the terminal error item without string flattening.
+    pub(crate) pending_error: Option<RuntimeError>,
+    /// A typed cancellation request made through [`Invocation::cancel`],
+    /// consumed by the poller to produce exactly one `Cancelled` item.
+    /// Per-invocation: cleared on fusion so it cannot leak into a later
+    /// invocation started on the same VM.
+    pub(crate) cancel_reason: Option<OperationCancelReason>,
+    /// Stack and frame position recorded when the invocation started, used to
+    /// release interpreter state on terminal failure.
+    pub(crate) stack_base: usize,
+    pub(crate) frame_count: usize,
+}
+
+#[derive(Debug)]
+pub(crate) enum InvocationPhase {
+    Running,
+    EventPending(Value),
+    CompletePending(Value),
+    ErrorPending(InvocationError),
+    Fused,
+}
+
+/// One active invocation handle borrowing the VM.
+///
+/// Polling drives execution. Dropping a handle that has not fused retires its
+/// invocation synchronously and leaves bridge-owned work tracked until its
+/// cancellation acknowledgement is observed. The VM must not be reused while
+/// that acknowledgement is pending.
+pub struct Invocation<'vm> {
+    vm: &'vm mut Vm,
+}
+
+impl fmt::Debug for Invocation<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("Invocation").finish_non_exhaustive()
+    }
+}
+
+impl Invocation<'_> {
+    /// Polls the invocation stream.
+    ///
+    /// Returns `Ready(Some(Ok(Event(value))))` for each emitted event,
+    /// `Ready(Some(Ok(Complete(value))))` exactly once for the callable return
+    /// value, `Ready(Some(Err(error)))` exactly once for a typed terminal
+    /// failure, and `Ready(None)` on every poll after the stream has fused.
+    /// `Pending` means the VM is paused on an outstanding host operation or
+    /// host-driven yield; drive it and poll again.
+    ///
+    /// This convenience method uses a no-op waker for synchronous/manual
+    /// polling. Async callers should use [`Self::poll_next_with_context`] so
+    /// pending host operations can wake their executor.
+    pub fn poll_next(&mut self) -> VmResult<InvocationPoll> {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        self.poll_next_with_context(&mut context)
+    }
+
+    /// Polls the invocation with the caller's task context.
+    ///
+    /// The supplied waker is forwarded to a pending host operation. This is
+    /// the executor-compatible entry point; it does not spin while an async
+    /// host bridge is waiting.
+    pub fn poll_next_with_context(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> VmResult<InvocationPoll> {
+        self.vm.poll_invocation_with_context(context)
+    }
+
+    /// Cancels the active invocation with a typed reason.
+    ///
+    /// Outstanding waiting host operations are cancelled. The next poll
+    /// produces exactly one `Cancelled(reason)` error item, after which the
+    /// stream is fused.
+    pub fn cancel(&mut self, reason: OperationCancelReason) -> VmResult<()> {
+        let state = self
+            .vm
+            .instance
+            .invocation
+            .as_mut()
+            .ok_or(VmError::InvalidFrameState(
+                "no invocation is active on this vm",
+            ))?;
+        if matches!(state.phase, InvocationPhase::Fused) {
+            return Err(VmError::InvalidFrameState(
+                "the active invocation has already fused",
+            ));
+        }
+        let cancellation_reason = match state.cancel_reason {
+            Some(first) => first,
+            None => {
+                state.cancel_reason = Some(reason);
+                reason
+            }
+        };
+        self.vm
+            .cancel_waiting_host_op_with_reason(cancellation_reason)?;
+        Ok(())
+    }
+}
+
+impl Drop for Invocation<'_> {
+    fn drop(&mut self) {
+        let active = self
+            .vm
+            .instance
+            .invocation
+            .as_ref()
+            .is_some_and(|state| !matches!(state.phase, InvocationPhase::Fused));
+        if active {
+            self.vm.release_invocation();
+        }
+    }
+}
+
+/// One poll step selected from the current invocation phase.
+enum InvocationAction {
+    Cancelled,
+    Event,
+    Complete,
+    Error,
+    Fused,
+    Drive,
+}
+
+const MAX_CALLABLE_OWNERSHIP_NODES: usize = 65_536;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum CallableOwnershipIdentity {
+    Array(*const Vec<Value>),
+    Map(*const VmMap),
+    Callable(*const CallableValue),
+    Environment(*const CallableEnvironment),
+}
+
+impl Vm {
+    fn validate_invocation_callable_ownership(
+        &self,
+        callable: &Value,
+        args: &[Value],
+    ) -> VmResult<()> {
+        if args.len().saturating_add(1) > MAX_CALLABLE_OWNERSHIP_NODES {
+            return Err(VmError::InvalidCallable);
+        }
+        let mut pending = Vec::with_capacity(args.len().saturating_add(1));
+        pending.push(callable.clone());
+        pending.extend(args.iter().cloned());
+        let mut visited = HashSet::new();
+        let mut visited_nodes = 0usize;
+
+        let push_pending = |pending: &mut Vec<Value>, value: Value| -> VmResult<()> {
+            if pending.len() >= MAX_CALLABLE_OWNERSHIP_NODES {
+                return Err(VmError::InvalidCallable);
+            }
+            pending.push(value);
+            Ok(())
+        };
+
+        while let Some(value) = pending.pop() {
+            visited_nodes = visited_nodes.saturating_add(1);
+            if visited_nodes > MAX_CALLABLE_OWNERSHIP_NODES {
+                return Err(VmError::InvalidCallable);
+            }
+
+            match value {
+                Value::Array(values) => {
+                    if visited.insert(CallableOwnershipIdentity::Array(Arc::as_ptr(&values))) {
+                        for value in values.iter().cloned() {
+                            push_pending(&mut pending, value)?;
+                        }
+                    }
+                }
+                Value::Map(values) => {
+                    if visited.insert(CallableOwnershipIdentity::Map(Arc::as_ptr(&values))) {
+                        for (key, value) in values.iter() {
+                            push_pending(&mut pending, key.clone())?;
+                            push_pending(&mut pending, value.clone())?;
+                        }
+                    }
+                }
+                Value::Callable(callable) => {
+                    if !visited.insert(CallableOwnershipIdentity::Callable(Arc::as_ptr(&callable)))
+                    {
+                        continue;
+                    }
+                    if !self.owns_callable(&Value::Callable(Arc::clone(&callable))) {
+                        return Err(VmError::InvalidCallable);
+                    }
+                    let Some(environment) = callable.env.as_ref() else {
+                        continue;
+                    };
+                    if !visited.insert(CallableOwnershipIdentity::Environment(Arc::as_ptr(
+                        environment,
+                    ))) {
+                        continue;
+                    }
+                    let cells = environment
+                        .cells
+                        .lock()
+                        .map_err(|_| VmError::InvalidCallable)?;
+                    for cell in cells.iter() {
+                        let value = cell.lock().map_err(|_| VmError::InvalidCallable)?.clone();
+                        push_pending(&mut pending, value)?;
+                    }
+                }
+                Value::Null
+                | Value::Int(_)
+                | Value::Float(_)
+                | Value::Bool(_)
+                | Value::String(_)
+                | Value::Bytes(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Starts one invocation of an exported callable with ordinary arguments.
+    ///
+    /// The VM must be halted (complete the root frame with [`Vm::run`] first),
+    /// and must not already have an active invocation. A second invocation on
+    /// the same VM is rejected while one is active.
+    pub fn start_invocation(
+        &mut self,
+        callable: Value,
+        args: Vec<Value>,
+    ) -> VmResult<Invocation<'_>> {
+        self.validate_invocation_callable_ownership(&callable, &args)?;
+        if self.host.has_active_bridge_operations() {
+            return Err(VmError::HostError(
+                "bridge host operation is not quiescent".to_string(),
+            ));
+        }
+        self.ensure_scope_ready()?;
+        if self
+            .instance
+            .invocation
+            .as_ref()
+            .is_some_and(|state| !matches!(state.phase, InvocationPhase::Fused))
+        {
+            return Err(VmError::InvalidFrameState(
+                "an invocation is already active on this vm",
+            ));
+        }
+        let stack_base = self.instance.stack.len();
+        let frame_count = self.instance.execution_frames.len();
+        self.instance.invocation = Some(InvocationState {
+            phase: InvocationPhase::Running,
+            emit_yield_pending: false,
+            pending_error: None,
+            cancel_reason: None,
+            stack_base,
+            frame_count,
+        });
+
+        match self.start_callable(callable, &args) {
+            Ok(VmStatus::Halted) => {
+                let result = match self.take_invocation_result() {
+                    Some(result) => result,
+                    None => {
+                        let error = self.map_invocation_error(VmError::InvalidFrameState(
+                            "invocation halted without a callable result",
+                        ));
+                        self.release_invocation();
+                        self.instance
+                            .invocation
+                            .as_mut()
+                            .expect("invocation state")
+                            .phase = InvocationPhase::ErrorPending(error);
+                        return Ok(Invocation { vm: self });
+                    }
+                };
+                self.instance
+                    .invocation
+                    .as_mut()
+                    .expect("invocation state")
+                    .phase = InvocationPhase::CompletePending(result);
+            }
+            Ok(VmStatus::Yielded) => {
+                // Either `stream::emit` placed one pending event, or the
+                // embedding must drive a host-owned yield; both are serviced by
+                // the next poll.
+            }
+            Ok(VmStatus::Waiting(_)) => {}
+            Err(error) => {
+                let error = self.map_invocation_error(error);
+                self.release_invocation();
+                self.instance
+                    .invocation
+                    .as_mut()
+                    .expect("invocation state")
+                    .phase = InvocationPhase::ErrorPending(error);
+            }
+        }
+        Ok(Invocation { vm: self })
+    }
+
+    fn poll_invocation_with_context(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> VmResult<InvocationPoll> {
+        loop {
+            let action = match self.instance.invocation.as_ref() {
+                Some(state) => {
+                    // Authoritative cancellation supersedes a pending Event or
+                    // Complete: the pending value is discarded (through the
+                    // drop-contract path) and the stream transitions to one
+                    // Cancelled item, then a fused end.
+                    let bridge_cancellation_pending = state.cancel_reason.is_some()
+                        && self
+                            .instance
+                            .waiting_host_op
+                            .as_ref()
+                            .is_some_and(|waiting| {
+                                matches!(
+                                    waiting.source,
+                                    crate::vm::host::WaitingHostOpSource::HostBridge
+                                )
+                            });
+                    if state.cancel_reason.is_some()
+                        && !bridge_cancellation_pending
+                        && matches!(
+                            state.phase,
+                            InvocationPhase::EventPending(_) | InvocationPhase::CompletePending(_)
+                        )
+                    {
+                        InvocationAction::Cancelled
+                    } else {
+                        match state.phase {
+                            InvocationPhase::EventPending(_) => InvocationAction::Event,
+                            InvocationPhase::CompletePending(_) => InvocationAction::Complete,
+                            InvocationPhase::ErrorPending(_) => InvocationAction::Error,
+                            InvocationPhase::Fused => InvocationAction::Fused,
+                            InvocationPhase::Running => InvocationAction::Drive,
+                        }
+                    }
+                }
+                None => return Ok(InvocationPoll::Ready(None)),
+            };
+            match action {
+                InvocationAction::Cancelled => {
+                    let reason = self
+                        .instance
+                        .invocation
+                        .as_ref()
+                        .and_then(|state| state.cancel_reason)
+                        .expect("a cancelled action requires a cancellation reason");
+                    let discarded = self.replace_invocation_phase(InvocationPhase::ErrorPending(
+                        InvocationError::Cancelled(reason),
+                    ));
+                    match discarded {
+                        InvocationPhase::EventPending(value)
+                        | InvocationPhase::CompletePending(value) => {
+                            self.drop_value_with_contract(value);
+                        }
+                        _ => unreachable!("the cancelled action matched a pending phase above"),
+                    }
+                }
+                InvocationAction::Event => {
+                    let value = match self.replace_invocation_phase(InvocationPhase::Running) {
+                        InvocationPhase::EventPending(value) => value,
+                        _ => unreachable!("phase matched above"),
+                    };
+                    // `emit_yield_pending` stays set until the resumed call
+                    // site re-enters `stream::emit`.
+                    return Ok(InvocationPoll::Ready(Some(Ok(InvocationItem::Event(
+                        value,
+                    )))));
+                }
+                InvocationAction::Complete => {
+                    let value = match self.replace_invocation_phase(InvocationPhase::Fused) {
+                        InvocationPhase::CompletePending(value) => value,
+                        _ => unreachable!("phase matched above"),
+                    };
+                    self.release_invocation();
+                    return Ok(InvocationPoll::Ready(Some(Ok(InvocationItem::Complete(
+                        value,
+                    )))));
+                }
+                InvocationAction::Error => {
+                    let error = match self.replace_invocation_phase(InvocationPhase::Fused) {
+                        InvocationPhase::ErrorPending(error) => error,
+                        _ => unreachable!("phase matched above"),
+                    };
+                    self.release_invocation();
+                    return Ok(InvocationPoll::Ready(Some(Err(error))));
+                }
+                InvocationAction::Fused => return Ok(InvocationPoll::Ready(None)),
+                InvocationAction::Drive => {
+                    let result = self.drive_invocation(context);
+                    match result {
+                        DriveOutcome::Continue => {}
+                        DriveOutcome::Pending => return Ok(InvocationPoll::Pending),
+                        DriveOutcome::Error(error) => {
+                            self.release_invocation();
+                            self.instance
+                                .invocation
+                                .as_mut()
+                                .expect("invocation state")
+                                .phase = InvocationPhase::ErrorPending(error);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Runs the low-level pump once and folds the outcome into the invocation
+    /// phase. `Vm::run` itself is unchanged.
+    fn drive_invocation(&mut self, context: &mut Context<'_>) -> DriveOutcome {
+        if let Some(reason) = self
+            .instance
+            .invocation
+            .as_ref()
+            .and_then(|state| state.cancel_reason)
+        {
+            if self
+                .instance
+                .waiting_host_op
+                .as_ref()
+                .is_some_and(|waiting| {
+                    matches!(
+                        waiting.source,
+                        crate::vm::host::WaitingHostOpSource::HostBridge
+                    )
+                })
+            {
+                return match self.poll_waiting_host_op(context) {
+                    Poll::Pending => DriveOutcome::Pending,
+                    Poll::Ready(Ok(())) => DriveOutcome::Error(InvocationError::Cancelled(reason)),
+                    Poll::Ready(Err(error)) => {
+                        DriveOutcome::Error(self.map_invocation_error(error))
+                    }
+                };
+            }
+            return DriveOutcome::Error(InvocationError::Cancelled(reason));
+        }
+        match self.run() {
+            Ok(VmStatus::Halted) => {
+                let result = match self.take_invocation_result() {
+                    Some(result) => result,
+                    None => {
+                        return DriveOutcome::Error(InvocationError::Vm(
+                            VmError::InvalidFrameState(
+                                "invocation halted without a callable result",
+                            ),
+                        ));
+                    }
+                };
+                self.instance
+                    .invocation
+                    .as_mut()
+                    .expect("invocation state")
+                    .phase = InvocationPhase::CompletePending(result);
+                DriveOutcome::Continue
+            }
+            Ok(VmStatus::Yielded) => match self.last_yield_reason() {
+                Some(VmYieldReason::Fuel) => DriveOutcome::Error(InvocationError::OutOfFuel {
+                    needed: u64::from(self.run_ctx.fuel_check_interval),
+                    remaining: self.run_ctx.fuel_remaining,
+                }),
+                Some(VmYieldReason::Epoch) => {
+                    DriveOutcome::Error(InvocationError::DeadlineReached {
+                        current: self.run_ctx.epoch_handle.current(),
+                        deadline: self.run_ctx.epoch_deadline,
+                    })
+                }
+                _ => {
+                    // A `stream::emit` yield leaves one pending event; any other
+                    // host-driven yield is paused for the embedding.
+                    let event_pending = matches!(
+                        self.instance.invocation.as_ref().map(|state| &state.phase),
+                        Some(InvocationPhase::EventPending(_))
+                    );
+                    if event_pending {
+                        DriveOutcome::Continue
+                    } else {
+                        DriveOutcome::Pending
+                    }
+                }
+            },
+            Ok(VmStatus::Waiting(_)) => {
+                // Forward the caller's context so the embedding-owned driver
+                // can wake the task when the operation progresses.
+                match self.poll_waiting_host_op(context) {
+                    Poll::Ready(Ok(())) => DriveOutcome::Continue,
+                    Poll::Ready(Err(error)) => {
+                        DriveOutcome::Error(self.map_invocation_error(error))
+                    }
+                    Poll::Pending => DriveOutcome::Pending,
+                }
+            }
+            Err(error) => DriveOutcome::Error(self.map_invocation_error(error)),
+        }
+    }
+
+    /// Maps a low-level VM failure to the typed invocation error, preserving
+    /// structured runtime errors from `stream::emit` validation.
+    fn map_invocation_error(&mut self, error: VmError) -> InvocationError {
+        if let Some(state) = self.instance.invocation.as_mut()
+            && let Some(runtime_error) = state.pending_error.take()
+        {
+            return InvocationError::Capability(runtime_error);
+        }
+        match error {
+            VmError::OutOfFuel { needed, remaining } => {
+                InvocationError::OutOfFuel { needed, remaining }
+            }
+            VmError::EpochDeadlineReached { current, deadline } => {
+                InvocationError::DeadlineReached { current, deadline }
+            }
+            VmError::ExecutionScope(scope_error) => InvocationError::Capability(RuntimeError::new(
+                RuntimeErrorCode::OperationFailed,
+                "execution_scope",
+                scope_error.to_string(),
+            )),
+            VmError::HostError(message) => InvocationError::Host { message },
+            other => InvocationError::Vm(other),
+        }
+    }
+
+    /// Replaces the active invocation phase, returning the previous one so the
+    /// caller can consume it or drop it (the pending-event drop contract stays
+    /// with the caller).
+    fn replace_invocation_phase(&mut self, phase: InvocationPhase) -> InvocationPhase {
+        std::mem::replace(
+            &mut self
+                .instance
+                .invocation
+                .as_mut()
+                .expect("invocation state")
+                .phase,
+            phase,
+        )
+    }
+
+    /// Releases the active invocation: cancels outstanding waiting host
+    /// operations, drops interpreter frames and stack entries introduced by
+    /// the invocation, and fuses the stream. The per-invocation cancellation
+    /// reason is cleared by the drop, so it cannot leak into a later
+    /// invocation started on the same VM.
+    fn release_invocation(&mut self) {
+        let (stack_base, frame_count, cancel_reason) = self
+            .instance
+            .invocation
+            .as_ref()
+            .map(|state| (state.stack_base, state.frame_count, state.cancel_reason))
+            .unwrap_or((0, 0, None));
+        let _ = self.cancel_waiting_host_op_with_reason(
+            cancel_reason.unwrap_or(OperationCancelReason::Requested),
+        );
+        self.abort_host_invocation(stack_base, frame_count);
+        self.instance.drop_invocation_state();
+    }
+
+    /// Implements the script-visible `stream::emit(value)` builtin: validates
+    /// the per-item bound, places one pending event, and yields control to the
+    /// invocation poller. `stream::emit` still evaluates to `()` inside RSS.
+    ///
+    /// When the poller has delivered the event and the VM resumes, the call
+    /// site re-executes; the second entry consumes the `emit_yield_pending`
+    /// marker and returns normally instead of emitting a second event.
+    pub(crate) fn emit_stream_item(&mut self, value: Value) -> VmResult<CallOutcome> {
+        let state = self.instance.invocation.as_mut().ok_or_else(|| {
+            VmError::HostError("stream::emit requires an active invocation".to_string())
+        })?;
+        if !matches!(state.phase, InvocationPhase::Running) {
+            return Err(VmError::HostError(
+                "stream::emit is only valid while the invocation is running".to_string(),
+            ));
+        }
+        if state.emit_yield_pending {
+            state.emit_yield_pending = false;
+            return Ok(CallOutcome::Return(CallReturn::none()));
+        }
+        let limits = self.run_ctx.runtime_context.event_limits();
+        match EventPayload::try_new(value, limits) {
+            Ok(payload) => {
+                state.phase = InvocationPhase::EventPending(payload.into_value());
+                state.emit_yield_pending = true;
+                Ok(CallOutcome::Yield)
+            }
+            Err(runtime_error) => {
+                let message = runtime_error.to_string();
+                state.pending_error = Some(runtime_error);
+                Err(VmError::HostError(message))
+            }
+        }
+    }
+}
+
+/// Outcome of one low-level drive step.
+enum DriveOutcome {
+    Continue,
+    Pending,
+    Error(InvocationError),
+}

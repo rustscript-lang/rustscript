@@ -465,6 +465,27 @@ impl OperationRegistry {
         }
     }
 
+    /// Cancels every pending operation through the driver's synchronous
+    /// `cancel_and_wait` boundary and consumes each terminal slot. This is used
+    /// by VM reset, where the pool cannot retain a pending operation across the
+    /// reset boundary. Drivers with background work must implement
+    /// `cancel_and_wait` so it returns only after that work is quiescent.
+    pub fn cancel_all_and_wait(&mut self, reason: OperationCancelReason) -> OperationCancelSummary {
+        let mut summary = OperationCancelSummary::default();
+        for id in self.occupied_ids() {
+            let pending = self
+                .location(id)
+                .ok()
+                .and_then(|slot| self.slots[slot].operation.as_ref())
+                .is_some_and(|operation| matches!(operation.status, OperationStatus::Pending));
+            if !pending {
+                continue;
+            }
+            summary.record(self.abort(id, reason));
+        }
+        summary
+    }
+
     /// Cancels every pending operation and records the outcome in a
     /// [`OperationCancelSummary`]. This is intentionally *cancel-only*: it
     /// records the first cancellation reason on each still-pending driver

@@ -306,6 +306,17 @@ impl HostResource for IoResource {
         if self.wait_for_operations(cx) {
             return Poll::Pending;
         }
+        if tokio::runtime::Handle::try_current().is_err() {
+            // A close future must not be discarded while an operation is still
+            // active. Once operations are quiescent, there is no reactor in
+            // which to flush/finish the future, so report a concrete cleanup
+            // error and let the resource table decide how to retire the slot.
+            return Poll::Ready(Err(ResourceError::new(
+                ResourceErrorCode::ResourceCleanupFailed,
+                "io::resource",
+                "async IO close requires a Tokio runtime",
+            )));
+        }
         let Some(close_future) = self.close_future.as_mut() else {
             return Poll::Ready(Ok(()));
         };
@@ -901,6 +912,34 @@ mod tests {
     #[tokio::test]
     async fn async_io_close_while_write_lock_is_busy_stays_pending() {
         assert_close_waits_for_busy_handle_lock().await;
+    }
+
+    #[test]
+    fn async_io_close_without_runtime_waits_for_active_operations_then_reports_error() {
+        let mut resource = file_resource();
+        let lease = resource
+            .begin_operation("test")
+            .expect("test operation should start");
+        assert_eq!(
+            resource
+                .begin_close(ResourceCloseReason::Requested)
+                .expect("close should start"),
+            CloseProgress::Pending
+        );
+
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            matches!(resource.poll_close(&mut cx), Poll::Pending),
+            "a no-runtime close must not release an active IO handle"
+        );
+
+        drop(lease);
+        match resource.poll_close(&mut cx) {
+            Poll::Ready(Err(error)) => {
+                assert_eq!(error.code(), ResourceErrorCode::ResourceCleanupFailed);
+            }
+            other => panic!("no-runtime close should surface a concrete error, got {other:?}"),
+        }
     }
 
     #[cfg(unix)]

@@ -64,8 +64,22 @@ impl HostAsyncBridge for TokioTestBridge {
     fn cancel_op(&mut self, op_id: HostOpId) {
         self.futures.remove(&op_id);
     }
+
+    fn request_cancel_op(
+        &mut self,
+        op_id: HostOpId,
+        _reason: vm::operation::OperationCancelReason,
+    ) -> VmResult<()> {
+        self.futures.remove(&op_id);
+        Ok(())
+    }
+
+    fn poll_cancel_op(&mut self, _op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<()>> {
+        Poll::Ready(Ok(()))
+    }
 }
 
 pub(crate) fn install(vm: &mut Vm) {
-    vm.set_async_bridge(Box::new(TokioTestBridge::new()));
+    vm.set_async_bridge(Box::new(TokioTestBridge::new()))
+        .expect("test async bridge should install");
 }

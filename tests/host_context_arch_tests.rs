@@ -30,6 +30,11 @@ const FORBIDDEN_DOMAIN_IMPORTS: &[&str] = &[
 /// `rusqlite` must never appear in `src/vm`.
 const FORBIDDEN_RUSQLITE: &str = "rusqlite";
 
+/// The generic VM must not depend on the builtin registration/adapter crate
+/// path. Standard registration remains outside the recursive VM production
+/// tree.
+const FORBIDDEN_BUILTIN_CRATE_PATH: &str = "crate::builtins";
+
 /// Concrete adapter state, policy, and dispatch symbols do not belong in the
 /// generic VM. Keep these tokens explicit so a future adapter integration
 /// cannot quietly reintroduce a domain branch under a different module.
@@ -167,6 +172,11 @@ fn vm_core_does_not_import_builtin_domain_modules() {
         assert!(
             !code.contains(FORBIDDEN_RUSQLITE),
             "`src/vm` file `{}` must not reference rusqlite",
+            file.display()
+        );
+        assert!(
+            !code.contains(FORBIDDEN_BUILTIN_CRATE_PATH),
+            "`src/vm` file `{}` must not reference the builtin registration crate",
             file.display()
         );
         for forbidden in FORBIDDEN_ADAPTER_TOKENS {
