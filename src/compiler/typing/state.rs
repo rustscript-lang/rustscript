@@ -435,4 +435,9 @@ pub(crate) struct TypeInferenceResult {
 pub(crate) struct HostCallableSignature {
     pub(crate) name: String,
     pub(crate) params: Vec<CallableParam>,
+    /// True when this signature comes from the authoritative runtime builtin
+    /// catalog. Same-name functions from another host catalog do not inherit
+    /// runtime-builtin typing exemptions.
+    #[cfg_attr(not(feature = "runtime"), allow(dead_code))]
+    pub(crate) runtime_builtin: bool,
 }

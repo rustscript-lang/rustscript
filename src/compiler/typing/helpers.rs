@@ -1234,6 +1234,7 @@ pub(super) fn known_host_signature(name: &str) -> Option<HostCallableSignature> 
         return Some(HostCallableSignature {
             name: callable.name.to_string(),
             params: callable.signature.params.to_vec(),
+            runtime_builtin: true,
         });
     }
 
@@ -1253,6 +1254,7 @@ pub(super) fn known_host_signature(name: &str) -> Option<HostCallableSignature> 
                     optional: false,
                 })
                 .collect(),
+            runtime_builtin: false,
         })
     }
 

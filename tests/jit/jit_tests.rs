@@ -1050,7 +1050,7 @@ fn aot_survives_reset_for_reuse() {
     let first_execs = vm.aot_exec_count();
     assert!(first_execs > 0, "first run should execute aot");
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert!(vm.has_aot_program(), "reset should preserve aot program");
 
     let second = vm.run().expect("second aot run should halt");
@@ -1219,7 +1219,7 @@ fn trace_jit_native_path_honors_fuel_metering() {
             "expected warmup to compile and execute native traces, dump:\n{}",
             vm.dump_jit_info()
         );
-        vm.reset_for_reuse();
+        let _ = vm.reset_for_reuse();
     }
     vm.set_fuel_check_interval(1)
         .expect("fuel interval update should succeed");
@@ -1352,7 +1352,7 @@ fn changing_fuel_interval_recompiles_native_trace_variant() {
     let bytes_first =
         first_native_code_bytes(&dump_first).expect("first run should produce native code bytes");
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     vm.set_fuel_check_interval(8)
         .expect("fuel interval update should succeed");
     vm.set_fuel(1_000_000);
@@ -1443,7 +1443,7 @@ fn native_trace_epoch_zero_deadline_auto_rearms_without_manual_reconfiguration()
         vm.dump_jit_info()
     );
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     vm.set_epoch_check_interval(1)
         .expect("epoch interval update should succeed");
     vm.set_epoch_deadline(0)
@@ -1570,7 +1570,7 @@ fn changing_epoch_interval_recompiles_native_trace_variant() {
     let bytes_first =
         first_native_code_bytes(&dump_first).expect("first run should produce native code bytes");
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     vm.set_epoch_check_interval(8)
         .expect("epoch interval update should succeed");
     vm.set_epoch_deadline(1)
@@ -2277,7 +2277,7 @@ fn trace_jit_sparse_heap_exit_transfers_ownership_across_reuse() {
         assert_native_ssa_call_boundary_trace(&vm, &snapshot, "sparse heap exit");
 
         if run == 0 {
-            vm.reset_for_reuse();
+            let _ = vm.reset_for_reuse();
             assert_eq!(std::sync::Arc::strong_count(&old), counts.0);
             assert_eq!(std::sync::Arc::strong_count(&replacement), counts.1 - 3);
         }
@@ -2605,7 +2605,7 @@ fn trace_jit_direct_side_link_bypasses_rust_dispatch() {
     );
 
     vm.clear_jit_native_bridge_stats();
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert_eq!(vm.run().unwrap(), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(16_384)]);
     assert!(
@@ -2744,7 +2744,7 @@ fn trace_jit_side_link_generation_prevents_stale_entry_reuse() {
     });
     assert_eq!(vm.jit_native_active_direct_link_slot_count(), 0);
     assert_eq!(vm.jit_native_direct_link_count(), 0);
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert_eq!(vm.run().unwrap(), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(16_384)]);
     assert!(vm.jit_native_direct_link_count() > 4_000);
@@ -2782,7 +2782,7 @@ fn trace_jit_side_link_respects_callable_frame_and_interrupt_boundaries() {
     assert_eq!(vm.stack(), &[Value::Int(16_384)]);
     assert!(vm.jit_native_direct_link_count() > 4_000);
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     vm.set_fuel(8);
     let mut fuel_yields = 0_u64;
     loop {
@@ -2845,7 +2845,7 @@ fn trace_jit_region_links_hot_same_frame_side_exit() {
     assert!(first_region_entries > 0, "{}", vm.dump_jit_info());
     assert!(first_internal_edges > 0, "{}", vm.dump_jit_info());
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert_eq!(vm.run().expect("second region run"), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(1_024)]);
 
@@ -2906,7 +2906,7 @@ fn trace_jit_region_cycle_propagates_disjoint_dirty_locals() {
     );
     assert_eq!(vm.jit_native_region_count(), 1, "{}", vm.dump_jit_info());
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert_eq!(
         vm.run().expect("second disjoint dirty region run"),
         VmStatus::Halted
@@ -2999,7 +2999,7 @@ fn trace_jit_region_preserves_owned_value_drop_contract() {
 
     vm.set_drop_contract_events_enabled(true);
     assert_eq!(vm.jit_native_region_count(), 0);
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert_eq!(Arc::strong_count(&output), 1);
     drop(vm);
     assert_eq!(Arc::strong_count(&output), 1);
@@ -3041,7 +3041,7 @@ fn trace_jit_region_progress_prevents_callable_frame_backoff() {
     let first_execs = vm.jit_native_exec_count();
     let first_edges = vm.jit_native_internal_region_edge_count();
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert_eq!(vm.run().unwrap(), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(1_025)]);
     assert!(
@@ -3104,7 +3104,7 @@ fn trace_jit_inherited_direct_progress_prevents_callable_frame_backoff() {
     let first_direct_links = vm.jit_native_direct_link_count();
 
     vm.clear_jit_native_bridge_stats();
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert_eq!(vm.run().unwrap(), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(8_224)]);
     assert!(
@@ -3157,7 +3157,7 @@ fn trace_jit_region_respects_fuel_and_epoch_interrupts() {
     assert_eq!(vm.run().unwrap(), VmStatus::Halted);
     assert_eq!(vm.jit_native_region_count(), 1, "{}", vm.dump_jit_info());
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     vm.set_fuel(8);
     let mut fuel_yields = 0_u64;
     loop {
@@ -3177,13 +3177,13 @@ fn trace_jit_region_respects_fuel_and_epoch_interrupts() {
     assert_eq!(vm.jit_native_region_count(), 1, "{}", vm.dump_jit_info());
 
     vm.clear_fuel();
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     vm.set_epoch_check_interval(1).unwrap();
     vm.set_epoch_deadline(1_000_000).unwrap();
     assert_eq!(vm.run().unwrap(), VmStatus::Halted);
     assert_eq!(vm.jit_native_region_count(), 1, "{}", vm.dump_jit_info());
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     vm.set_epoch_deadline(0).unwrap();
     assert_eq!(vm.run().unwrap(), VmStatus::Yielded);
     assert_eq!(vm.last_yield_reason(), Some(VmYieldReason::Epoch));
@@ -3272,7 +3272,7 @@ fn trace_jit_region_republishes_after_native_settings_change() {
     assert_eq!(vm.jit_native_region_count(), 1, "{}", vm.dump_jit_info());
     let first_edges = vm.jit_native_internal_region_edge_count();
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     vm.set_fuel_check_interval(1).unwrap();
     vm.set_fuel(1_000_000);
     assert_eq!(vm.run().unwrap(), VmStatus::Halted);
@@ -3314,7 +3314,7 @@ fn trace_jit_region_invalidation_releases_owner_and_can_republish() {
     vm.set_drop_contract_events_enabled(true);
     assert_eq!(vm.jit_native_region_count(), 0);
     vm.set_drop_contract_events_enabled(false);
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert_eq!(vm.run().unwrap(), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(1_024)]);
     assert_eq!(vm.jit_native_region_count(), 1, "{}", vm.dump_jit_info());
@@ -5857,7 +5857,7 @@ fn trace_jit_reuses_nested_frame_trace_after_reset() {
     let first_native_exec_count = vm.jit_native_exec_count();
     assert!(first_native_exec_count > 0, "{}", vm.dump_jit_info());
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert_eq!(vm.run().expect("second run"), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(145)]);
     assert!(vm.jit_native_exec_count() > first_native_exec_count);
@@ -6312,7 +6312,7 @@ fn trace_jit_region_cycles_without_external_handoffs() {
     assert!(first_region_entries > 0, "{}", vm.dump_jit_info());
     assert!(first_internal_edges > 0, "{}", vm.dump_jit_info());
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert_eq!(
         vm.run().expect("linked callable loop should run again"),
         VmStatus::Halted
@@ -6362,7 +6362,7 @@ fn trace_jit_direct_links_cross_frame_call_and_return_edges() {
     let first_direct = vm.jit_native_direct_link_count();
     let first_handoffs = vm.jit_native_link_handoff_count();
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert_eq!(vm.run().unwrap(), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(12_288)]);
     let direct_delta = vm.jit_native_direct_link_count() - first_direct;
@@ -6402,7 +6402,7 @@ fn trace_jit_missing_dynamic_return_target_never_uses_stale_static_continuation(
     assert_eq!(vm.run().unwrap(), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(2_917)]);
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert_eq!(vm.run().unwrap(), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(2_917)]);
 }
@@ -6434,13 +6434,13 @@ fn trace_jit_direct_link_slots_clear_and_republish_after_mode_toggle() {
     assert!(vm.jit_native_direct_link_count() > 500);
 
     vm.set_jit_native_direct_links_enabled(false);
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert_eq!(vm.run().unwrap(), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(2_048)]);
     assert_eq!(vm.jit_native_direct_link_count(), 0);
 
     vm.set_jit_native_direct_links_enabled(true);
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert_eq!(vm.run().unwrap(), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(2_048)]);
     assert!(
@@ -6685,7 +6685,7 @@ fn trace_jit_invalidates_native_inline_after_callable_local_replacement() {
     assert_eq!(vm.stack(), &[Value::Int(100)]);
     assert!(vm.jit_native_trace_count() > 0, "{}", vm.dump_jit_info());
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     vm.set_local(
         u8::try_from(replaced_slot).expect("root callable slot should fit u8"),
         Value::Callable(Arc::new(vm::CallableValue {
@@ -7242,7 +7242,7 @@ fn trace_jit_call_site_profiles_clear_on_vm_reuse() {
     assert_eq!(vm.run().expect("first profile run"), VmStatus::Halted);
     assert_eq!(vm.jit_snapshot().metrics.script_call_observations, 3);
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
 
     assert_eq!(vm.jit_snapshot().metrics.script_call_observations, 0);
     assert!(vm.jit_call_site_profiles().is_empty());

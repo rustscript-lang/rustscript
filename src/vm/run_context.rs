@@ -1,18 +1,16 @@
 //! Run-scoped execution context.
 //!
-//! [`RunContext`] owns everything that belongs to one execution of a program:
-//! fuel and epoch budgets, the interrupt mode, and the epoch counter handle. A
-//! fresh logical run starts from a reset context; nothing here survives a reset
-//! except the epoch handle identity (which is intentionally process-lifetime).
-//!
+//! [`RunContext`] owns everything that belongs to one execution of a
+//! program: fuel and epoch budgets, the interrupt mode, the epoch counter
+//! handle, and generic per-item invocation configuration. A fresh logical run
+//! starts from a reset context; persistent policy such as event limits remains
+//! attached to the VM until explicitly changed.
 //! The embedder-facing fuel/epoch APIs live on the VM facade (see
 //! `crate::vm::fuel` and `crate::vm::epoch`) and delegate here. Cancellation of
 //! pending host operations lives in the facade because it crosses into
-//! [`HostRuntime`](super::host_runtime::HostRuntime) state. There is no per-run
-//! input/event state here by design: this mechanical decomposition only moves
-//! budgets and interruption state, and new runtime semantics (input/event
-//! scopes, cancellation tokens) are intentionally left out of this commit.
+//! [`HostRuntime`](super::host_runtime::HostRuntime) state.
 
+use super::runtime::RuntimeContext;
 use crate::vm::VmError;
 use crate::vm::VmResult;
 use crate::vm::epoch::EpochHandle;
@@ -42,6 +40,7 @@ impl InterruptMode {
 /// shared; one facade owns one context. Clone semantics: not `Clone` — a clone
 /// would duplicate budget state across runs.
 pub(crate) struct RunContext {
+    pub(crate) runtime_context: RuntimeContext,
     pub(crate) interrupt_mode: InterruptMode,
     pub(crate) fuel_remaining: u64,
     pub(crate) fuel_check_interval: u32,
@@ -62,6 +61,7 @@ impl RunContext {
         let epoch_handle = EpochHandle::default();
         let epoch_counter_ptr = epoch_handle.as_ptr() as usize;
         Self {
+            runtime_context: RuntimeContext::default(),
             interrupt_mode: InterruptMode::None,
             fuel_remaining: 0,
             fuel_check_interval: 1,
@@ -80,6 +80,15 @@ impl RunContext {
         self.epoch_rearm_pending = false;
         self.clear_fuel_internal();
         self.clear_epoch_deadline_internal();
+    }
+
+    pub(crate) fn is_reusable(&self) -> bool {
+        self.interrupt_mode == InterruptMode::None
+            && self.fuel_remaining == 0
+            && self.epoch_deadline == 0
+            && self.epoch_deadline_delta == 0
+            && !self.epoch_rearm_pending
+            && self.fuel_ops_until_check == self.fuel_check_interval.max(1)
     }
 
     pub(crate) fn reset_interrupt_countdown(&mut self) {

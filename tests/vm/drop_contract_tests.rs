@@ -679,7 +679,7 @@ fn reset_for_reuse_clears_all_locals_to_null() {
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert_eq!(
         vm.drop_contract_event_count(),
         0,

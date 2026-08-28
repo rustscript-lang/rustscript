@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use crate::builtins::BuiltinFunction;
+use crate::BuiltinFunction;
 use crate::bytecode::{CallableKind, CallableTarget, Value, ValueType, VmMap};
 use crate::host_api::HostImportSchema;
 use crate::vm::{
@@ -506,12 +506,10 @@ pub(crate) extern "C" fn pd_vm_native_string_contains(
 ) -> i32 {
     let text = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(text_ptr)) };
     let needle = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(needle_ptr)) };
-    i32::from(
-        crate::builtins::runtime::core::builtin_string_contains_impl(
-            text.as_str(),
-            needle.as_str(),
-        ),
-    )
+    i32::from(crate::vm::standard_ops::string_contains(
+        text.as_str(),
+        needle.as_str(),
+    ))
 }
 
 pub(crate) extern "C" fn pd_vm_native_regex_match(
@@ -527,8 +525,7 @@ pub(crate) extern "C" fn pd_vm_native_regex_match(
     };
     let pattern = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(pattern_ptr)) };
     let text = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(text_ptr)) };
-    match crate::builtins::runtime::regex::native_re_match(vm_ref, pattern.as_str(), text.as_str())
-    {
+    match vm_ref.standard_regex_match(pattern.as_str(), text.as_str()) {
         Ok(matched) => i32::from(matched),
         Err(err) => {
             store_bridge_error(err);
@@ -553,12 +550,7 @@ pub(crate) extern "C" fn pd_vm_native_regex_replace(
     let text = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(text_ptr)) };
     let replacement =
         unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(replacement_ptr)) };
-    match crate::builtins::runtime::regex::native_re_replace(
-        vm_ref,
-        pattern.as_str(),
-        text.as_str(),
-        replacement.as_str(),
-    ) {
+    match vm_ref.standard_regex_replace(pattern.as_str(), text.as_str(), replacement.as_str()) {
         Ok(replaced) => arc_into_repr_ptr(Arc::new(replaced)),
         Err(err) => {
             store_bridge_error(err);
@@ -579,20 +571,18 @@ pub(crate) extern "C" fn pd_vm_native_string_replace_literal(
     if !needle.is_empty() && !text.contains(needle.as_str()) {
         return arc_into_repr_ptr(Arc::clone(&*text));
     }
-    arc_into_repr_ptr(Arc::new(
-        crate::builtins::runtime::core::builtin_string_replace_literal_impl(
-            text.as_str(),
-            needle.as_str(),
-            replacement.as_str(),
-        ),
-    ))
+    arc_into_repr_ptr(Arc::new(crate::vm::standard_ops::string_replace_literal(
+        text.as_str(),
+        needle.as_str(),
+        replacement.as_str(),
+    )))
 }
 
 pub(crate) extern "C" fn pd_vm_native_string_lower_ascii(text_ptr: *mut u8) -> *mut u8 {
     let text = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(text_ptr)) };
-    arc_into_repr_ptr(Arc::new(
-        crate::builtins::runtime::core::builtin_string_lower_ascii_impl(text.as_str()),
-    ))
+    arc_into_repr_ptr(Arc::new(crate::vm::standard_ops::string_lower_ascii(
+        text.as_str(),
+    )))
 }
 
 pub(crate) extern "C" fn pd_vm_native_type_of(value_ptr: *const Value) -> *mut u8 {
@@ -612,9 +602,7 @@ pub(crate) extern "C" fn pd_vm_native_type_of(value_ptr: *const Value) -> *mut u
 
 pub(crate) extern "C" fn pd_vm_native_to_string(value_ptr: *const Value) -> *mut u8 {
     let value = unsafe { &*value_ptr };
-    arc_into_repr_ptr(Arc::new(
-        crate::builtins::runtime::core::builtin_to_string_impl(value),
-    ))
+    arc_into_repr_ptr(Arc::new(crate::vm::standard_ops::value_to_string(value)))
 }
 
 pub(crate) extern "C" fn pd_vm_native_string_split_literal(
@@ -624,12 +612,10 @@ pub(crate) extern "C" fn pd_vm_native_string_split_literal(
     let text = unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(text_ptr)) };
     let delimiter =
         unsafe { std::mem::ManuallyDrop::new(arc_from_repr_ptr::<String>(delimiter_ptr)) };
-    arc_into_repr_ptr(Arc::new(
-        crate::builtins::runtime::core::builtin_string_split_literal_impl(
-            text.as_str(),
-            delimiter.as_str(),
-        ),
-    ))
+    arc_into_repr_ptr(Arc::new(crate::vm::standard_ops::string_split_literal(
+        text.as_str(),
+        delimiter.as_str(),
+    )))
 }
 
 pub(crate) extern "C" fn pd_vm_native_clone_value_to_slot(
@@ -1366,7 +1352,7 @@ pub(crate) extern "C" fn pd_vm_native_map_has(repr_ptr: *mut u8, key: *const Val
     }
 
     let key = unsafe { &*key };
-    if let Err(err) = crate::builtins::runtime::core::ensure_supported_map_key(key) {
+    if let Err(err) = crate::vm::standard_ops::ensure_supported_map_key(key) {
         store_bridge_error(err);
         return STATUS_ERROR;
     }
@@ -1389,7 +1375,7 @@ pub(crate) extern "C" fn pd_vm_native_map_get(
     }
 
     let key = unsafe { &*key };
-    if let Err(err) = crate::builtins::runtime::core::ensure_supported_map_key(key) {
+    if let Err(err) = crate::vm::standard_ops::ensure_supported_map_key(key) {
         store_bridge_error(err);
         return STATUS_ERROR;
     }
@@ -1478,7 +1464,7 @@ pub(crate) extern "C" fn pd_vm_native_collection_set(
     let container = unsafe { std::ptr::replace(container, Value::Null) };
     let key = unsafe { (&*key).clone() };
     let value = unsafe { (&*value).clone() };
-    match crate::builtins::runtime::core::builtin_set_owned(container, key, value) {
+    match crate::vm::standard_ops::set_owned(container, key, value) {
         Ok(result) => {
             let previous = unsafe { std::ptr::replace(dst, result) };
             drop(previous);
@@ -1569,7 +1555,7 @@ pub(crate) extern "C" fn pd_vm_native_map_set(
     }
     let key = unsafe { (&*key).clone() };
     let value = unsafe { (&*value).clone() };
-    if let Err(err) = crate::builtins::runtime::core::ensure_supported_map_key(&key) {
+    if let Err(err) = crate::vm::standard_ops::ensure_supported_map_key(&key) {
         store_bridge_error(err);
         return STATUS_ERROR;
     }
@@ -1581,9 +1567,7 @@ pub(crate) extern "C" fn pd_vm_native_map_set(
             return STATUS_ERROR;
         }
     };
-    let result = Value::Map(crate::builtins::runtime::core::builtin_set_map_shared_impl(
-        entries, key, value,
-    ));
+    let result = Value::Map(crate::vm::standard_ops::set_map_shared(entries, key, value));
     let previous = unsafe { std::ptr::replace(dst, result) };
     drop(previous);
     STATUS_CONTINUE
@@ -1614,8 +1598,7 @@ pub(crate) extern "C" fn pd_vm_native_array_push(
             return STATUS_ERROR;
         }
     };
-    let result =
-        Value::Array(crate::builtins::runtime::core::builtin_array_push_shared_impl(values, value));
+    let result = Value::Array(crate::vm::standard_ops::array_push_shared(values, value));
     let previous = unsafe { std::ptr::replace(dst, result) };
     drop(previous);
     STATUS_CONTINUE

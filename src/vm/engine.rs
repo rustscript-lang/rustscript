@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::builtins::runtime::regex::RegexCache;
+use super::regex_cache::RegexCache;
 use crate::bytecode::{DecodedInstructionData, Program};
 use crate::vm::aot;
 use crate::vm::jit;

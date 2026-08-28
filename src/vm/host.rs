@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll, Wake, Waker};
 
-use crate::builtins::BuiltinFunction;
+use crate::BuiltinFunction;
 use crate::host_api::{HostImportSchema, HostTypeSchema};
 use crate::vm::operation::{OperationCancelReason, OperationId, OperationOutcome};
 use crate::vm::resource::handle::ResourceHandle;
@@ -109,6 +109,32 @@ pub trait HostArgsFunction: Send {
     fn call(&mut self, args: &[Value]) -> VmResult<CallOutcome>;
 }
 
+/// Terminal state supplied to [`HostAsyncBridge::cleanup_op`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostAsyncOpTerminal {
+    /// The submitted future produced a normal result.
+    Completed,
+    /// The bridge acknowledged cancellation and quiescence.
+    Cancelled,
+    /// The submitted future failed and no longer owns host work.
+    Failed,
+}
+
+impl HostAsyncOpTerminal {
+    /// Returns the reason used when default cleanup finalizes this terminal
+    /// operation. Cleanup is a terminal resource-release action rather than a
+    /// new cancellation request, so every terminal state uses the stable
+    /// `Requested` compatibility reason; an actual cancellation reason is
+    /// delivered earlier through `request_cancel_op`.
+    pub const fn cleanup_reason(self) -> OperationCancelReason {
+        match self {
+            Self::Completed => OperationCancelReason::Requested,
+            Self::Cancelled => OperationCancelReason::Requested,
+            Self::Failed => OperationCancelReason::Requested,
+        }
+    }
+}
+
 pub trait HostAsyncBridge: Send {
     fn submit_op(&mut self, _op_id: HostOpId, _future: HostFuture) -> VmResult<()> {
         Err(VmError::HostError(
@@ -128,15 +154,55 @@ pub trait HostAsyncBridge: Send {
     }
 
     /// Legacy cancellation hook kept for bridge implementations that do not
-    /// need a lifecycle reason. VM cleanup calls `cancel_op_with_reason`.
+    /// need a lifecycle reason. It is used as a best-effort fallback by the
+    /// default [`request_cancel_op`](Self::request_cancel_op) implementation.
     fn cancel_op(&mut self, _op_id: HostOpId) {}
 
-    /// Removes/cancels a bridge-owned operation. The VM supplies the lifecycle
-    /// reason for manual completion, bridge replacement, reset, and drop; the
-    /// default preserves compatibility with bridges implementing only
-    /// `cancel_op`.
+    /// Legacy cancellation hook kept for bridge implementations that do not
+    /// need a lifecycle reason. New bridges should implement
+    /// [`request_cancel_op`](Self::request_cancel_op) and
+    /// [`poll_cancel_op`](Self::poll_cancel_op) instead.
     fn cancel_op_with_reason(&mut self, op_id: HostOpId, _reason: OperationCancelReason) {
         self.cancel_op(op_id);
+    }
+
+    /// Requests cancellation of one bridge-owned operation.
+    ///
+    /// Returning `Ok(())` only records that the request was accepted. It does
+    /// not mean that the operation has stopped; callers must poll
+    /// [`poll_cancel_op`](Self::poll_cancel_op) until it returns `Ready(Ok(()))`.
+    /// The default invokes the legacy best-effort hook, then fails explicitly so
+    /// an adapter that has not opted into acknowledgement can never claim
+    /// quiescence.
+    fn request_cancel_op(
+        &mut self,
+        op_id: HostOpId,
+        reason: OperationCancelReason,
+    ) -> VmResult<()> {
+        self.cancel_op_with_reason(op_id, reason);
+        Err(VmError::HostError(format!(
+            "async host bridge does not provide cancellation acknowledgement for op {op_id}"
+        )))
+    }
+
+    /// Polls completion of a previously accepted cancellation request.
+    /// `Ready(Ok(()))` is the bridge's acknowledgement that the operation is
+    /// terminal and quiescent. The default fails closed rather than treating a
+    /// no-op implementation as an acknowledgement.
+    fn poll_cancel_op(&mut self, op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<()>> {
+        Poll::Ready(Err(VmError::HostError(format!(
+            "async host bridge does not provide cancellation acknowledgement for op {op_id}"
+        ))))
+    }
+
+    /// Runs bridge-side cleanup after a terminal/quiescent outcome has been
+    /// reported. The VM invokes this at most once for each tracked operation.
+    /// The default preserves compatibility with bridges whose legacy
+    /// `cancel_op` method also removes completed operation state while routing
+    /// through the reason-aware hook for newer bridges.
+    fn cleanup_op(&mut self, op_id: HostOpId, terminal: HostAsyncOpTerminal) -> VmResult<()> {
+        self.cancel_op_with_reason(op_id, terminal.cleanup_reason());
+        Ok(())
     }
 }
 
@@ -302,7 +368,7 @@ impl HostFunctionRegistry {
 
     pub fn new() -> Self {
         let mut registry = Self::empty();
-        crate::builtins::runtime::register_default_host_functions(&mut registry);
+        crate::install_default_host_functions(&mut registry);
         registry
     }
 
@@ -1387,6 +1453,7 @@ pub(super) struct WaitingHostOp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WaitingHostOpSource {
     HostBridge,
+    Manual,
     ScopedOperation,
 }
 
@@ -1697,18 +1764,48 @@ impl Vm {
             .insert(builtin_call_index, host_slot);
     }
 
-    pub fn set_async_bridge(&mut self, bridge: Box<dyn HostAsyncBridge>) {
-        self.cancel_waiting_host_op_with_reason(OperationCancelReason::Requested);
-        self.host
-            .cancel_submitted_host_ops(OperationCancelReason::Requested);
+    pub fn set_async_bridge(&mut self, bridge: Box<dyn HostAsyncBridge>) -> VmResult<()> {
+        if self.host.has_active_bridge_operations()
+            || self
+                .instance
+                .waiting_host_op
+                .as_ref()
+                .is_some_and(|waiting| {
+                    matches!(
+                        waiting.source,
+                        crate::vm::host::WaitingHostOpSource::HostBridge
+                    )
+                })
+        {
+            return Err(VmError::HostError(
+                "cannot replace async bridge while an active host operation is present".to_string(),
+            ));
+        }
+        self.cancel_waiting_host_op_with_reason(OperationCancelReason::Requested)?;
         self.host.async_bridge = Some(bridge);
+        Ok(())
     }
 
-    pub fn clear_async_bridge(&mut self) {
-        self.cancel_waiting_host_op_with_reason(OperationCancelReason::Requested);
-        self.host
-            .cancel_submitted_host_ops(OperationCancelReason::Requested);
+    pub fn clear_async_bridge(&mut self) -> VmResult<()> {
+        if self.host.has_active_bridge_operations()
+            || self
+                .instance
+                .waiting_host_op
+                .as_ref()
+                .is_some_and(|waiting| {
+                    matches!(
+                        waiting.source,
+                        crate::vm::host::WaitingHostOpSource::HostBridge
+                    )
+                })
+        {
+            return Err(VmError::HostError(
+                "cannot clear async bridge while an active host operation is present".to_string(),
+            ));
+        }
+        self.cancel_waiting_host_op_with_reason(OperationCancelReason::Requested)?;
         self.host.async_bridge = None;
+        Ok(())
     }
 
     pub fn set_runtime_print_sink<F>(&mut self, sink: F)
@@ -1720,6 +1817,18 @@ impl Vm {
 
     pub fn clear_runtime_print_sink(&mut self) {
         self.host.runtime_print_sink = None;
+    }
+
+    /// Configures the per-item event bound applied by `stream::emit` on the
+    /// invocation stream.
+    pub fn set_event_limits(&mut self, max_payload_bytes: usize, max_depth: usize) -> VmResult<()> {
+        let limits = super::runtime::EventLimits::new(max_payload_bytes, max_depth)
+            .map_err(|error| VmError::HostError(error.to_string()))?;
+        self.run_ctx.runtime_context = super::runtime::RuntimeContext::with_config(
+            super::runtime::RuntimeContextConfig::new(limits),
+        )
+        .map_err(|error| VmError::HostError(error.to_string()))?;
+        Ok(())
     }
 
     pub(crate) fn write_runtime_print(&mut self, rendered: String) -> VmResult<()> {
@@ -1760,6 +1869,25 @@ impl Vm {
         &self,
     ) -> Option<&Arc<dyn super::standard_composition::StandardSurfaceComposition>> {
         self.host.standard_composition.as_ref()
+    }
+
+    pub(crate) fn standard_regex_match(&mut self, pattern: &str, text: &str) -> VmResult<bool> {
+        let composition = self.host.standard_composition.clone().ok_or_else(|| {
+            VmError::HostError("standard surface composition is not installed".to_string())
+        })?;
+        composition.regex_match(self, pattern, text)
+    }
+
+    pub(crate) fn standard_regex_replace(
+        &mut self,
+        pattern: &str,
+        text: &str,
+        replacement: &str,
+    ) -> VmResult<String> {
+        let composition = self.host.standard_composition.clone().ok_or_else(|| {
+            VmError::HostError("standard surface composition is not installed".to_string())
+        })?;
+        composition.regex_replace(self, pattern, text, replacement)
     }
 
     /// Whether unbound host imports fall back to the default host functions.
@@ -1803,29 +1931,6 @@ impl Vm {
         self.instance.waiting_host_op.as_ref().map(|op| op.op_id)
     }
 
-    fn cleanup_submitted_host_op_with_reason(
-        &mut self,
-        op_id: HostOpId,
-        reason: OperationCancelReason,
-    ) {
-        if self.host.submitted_host_ops.remove(&op_id)
-            && let Some(bridge) = self.host.async_bridge.as_mut()
-        {
-            bridge.cancel_op_with_reason(op_id, reason);
-        }
-    }
-
-    fn cleanup_waiting_host_bridge_op_with_reason(
-        &mut self,
-        op_id: HostOpId,
-        reason: OperationCancelReason,
-    ) {
-        self.host.submitted_host_ops.remove(&op_id);
-        if let Some(bridge) = self.host.async_bridge.as_mut() {
-            bridge.cancel_op_with_reason(op_id, reason);
-        }
-    }
-
     fn cleanup_waiting_host_op(
         &mut self,
         waiting: WaitingHostOp,
@@ -1833,9 +1938,9 @@ impl Vm {
     ) -> VmResult<()> {
         match waiting.source {
             WaitingHostOpSource::HostBridge => {
-                self.cleanup_waiting_host_bridge_op_with_reason(waiting.op_id, reason);
-                Ok(())
+                self.host.request_cancel_host_op(waiting.op_id, reason)
             }
+            WaitingHostOpSource::Manual => Ok(()),
             WaitingHostOpSource::ScopedOperation => {
                 let op_id = OperationId::from_raw(waiting.op_id).map_err(|error| {
                     VmError::ExecutionScope(ExecutionScopeError::Operation(error))
@@ -1849,15 +1954,30 @@ impl Vm {
         }
     }
 
-    pub(super) fn cancel_waiting_host_op_with_reason(&mut self, reason: OperationCancelReason) {
-        let Some(waiting) = self.instance.waiting_host_op.take() else {
-            return;
+    pub(super) fn cancel_waiting_host_op_with_reason(
+        &mut self,
+        reason: OperationCancelReason,
+    ) -> VmResult<()> {
+        let Some(waiting) = self.instance.waiting_host_op.clone() else {
+            return Ok(());
         };
-        let _ = self.cleanup_waiting_host_op(waiting, reason);
+        match waiting.source {
+            WaitingHostOpSource::HostBridge => {
+                self.host.request_cancel_host_op(waiting.op_id, reason)
+            }
+            WaitingHostOpSource::Manual => {
+                self.instance.waiting_host_op = None;
+                Ok(())
+            }
+            WaitingHostOpSource::ScopedOperation => {
+                self.instance.waiting_host_op = None;
+                self.cleanup_waiting_host_op(waiting, reason)
+            }
+        }
     }
 
-    pub(super) fn cancel_waiting_host_op(&mut self) {
-        self.cancel_waiting_host_op_with_reason(OperationCancelReason::Requested);
+    pub(super) fn cancel_waiting_host_op(&mut self) -> VmResult<()> {
+        self.cancel_waiting_host_op_with_reason(OperationCancelReason::Requested)
     }
 
     pub fn complete_host_op(
@@ -1878,23 +1998,34 @@ impl Vm {
         }
 
         let values = values.into();
-        if let Err(error) = validate_host_call_return(
+        let validation_error = validate_host_call_return(
             &values,
             waiting.expected_return_type,
             waiting.expected_return_schema.as_ref(),
             &self.program,
             self.host.execution_scope.resources(),
-        ) {
-            let cleanup_result =
-                self.cleanup_waiting_host_op(waiting, OperationCancelReason::Requested);
-            self.instance.waiting_host_op = None;
-            cleanup_result?;
+        )
+        .err();
+        let terminal = if validation_error.is_some() {
+            HostAsyncOpTerminal::Failed
+        } else {
+            HostAsyncOpTerminal::Completed
+        };
+        let cleanup_result = match waiting.source {
+            WaitingHostOpSource::HostBridge if self.host.is_bridge_operation_tracked(op_id) => {
+                self.host.complete_bridge_operation(op_id, terminal)
+            }
+            WaitingHostOpSource::HostBridge => Ok(()),
+            WaitingHostOpSource::Manual => Ok(()),
+            WaitingHostOpSource::ScopedOperation => {
+                self.cleanup_waiting_host_op(waiting, OperationCancelReason::Requested)
+            }
+        };
+        cleanup_result?;
+        self.instance.waiting_host_op = None;
+        if let Some(error) = validation_error {
             return Err(error);
         }
-        let cleanup_result =
-            self.cleanup_waiting_host_op(waiting, OperationCancelReason::Requested);
-        self.instance.waiting_host_op = None;
-        cleanup_result?;
         values.push_onto_stack(&mut self.instance.stack);
         Ok(())
     }
@@ -1904,6 +2035,25 @@ impl Vm {
             return Poll::Ready(Ok(()));
         };
 
+        if matches!(waiting.source, WaitingHostOpSource::HostBridge)
+            && self.host.bridge_cancellation_requested(waiting.op_id)
+        {
+            return match self
+                .host
+                .poll_bridge_operation_cancellation(waiting.op_id, cx)
+            {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(())) => {
+                    self.instance.waiting_host_op = None;
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            };
+        }
+
+        let bridge_owned = matches!(waiting.source, WaitingHostOpSource::HostBridge)
+            && self.host.is_bridge_operation_tracked(waiting.op_id);
+        let submitted = self.host.submitted_host_ops.contains(&waiting.op_id);
         let poll_result: Poll<VmResult<HostFutureOutput>> = match waiting.source {
             WaitingHostOpSource::HostBridge => {
                 let bridge_ptr = match self.host.async_bridge.as_mut() {
@@ -1915,7 +2065,6 @@ impl Vm {
                         ))));
                     }
                 };
-                let submitted = self.host.submitted_host_ops.contains(&waiting.op_id);
                 // SAFETY: `bridge_ptr` was derived from the unique mutable borrow of
                 // `self.host.async_bridge` above. The bridge methods receive only the
                 // pointer's `&mut` reborrow, not `self`, so they cannot move or replace
@@ -1930,31 +2079,60 @@ impl Vm {
                     }
                 }
             }
+            WaitingHostOpSource::Manual => {
+                return Poll::Ready(Err(VmError::HostError(format!(
+                    "vm waiting on host op {} without an async bridge",
+                    waiting.op_id
+                ))));
+            }
             WaitingHostOpSource::ScopedOperation => self.poll_scoped_operation(waiting.op_id, cx),
         };
 
         match poll_result {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(output)) => {
-                let bridge_owned = matches!(waiting.source, WaitingHostOpSource::HostBridge);
                 let values = match output.finish(self) {
                     Ok(values) => values,
                     Err(err) => {
                         if bridge_owned {
-                            self.cleanup_submitted_host_op_with_reason(
+                            let cleanup = self.host.complete_bridge_operation(
                                 waiting.op_id,
-                                OperationCancelReason::Requested,
+                                HostAsyncOpTerminal::Failed,
                             );
+                            if let Err(cleanup_error) = cleanup {
+                                self.instance.waiting_host_op = None;
+                                return Poll::Ready(Err(cleanup_error));
+                            }
                         }
                         self.instance.waiting_host_op = None;
                         return Poll::Ready(Err(err));
                     }
                 };
                 if bridge_owned {
-                    self.cleanup_submitted_host_op_with_reason(
-                        waiting.op_id,
-                        OperationCancelReason::Requested,
+                    let validation = validate_host_call_return(
+                        &values,
+                        waiting.expected_return_type,
+                        waiting.expected_return_schema.as_ref(),
+                        &self.program,
+                        self.host.execution_scope.resources(),
                     );
+                    if let Err(error) = validation {
+                        let cleanup = self
+                            .host
+                            .complete_bridge_operation(waiting.op_id, HostAsyncOpTerminal::Failed);
+                        self.instance.waiting_host_op = None;
+                        return Poll::Ready(Err(cleanup.err().unwrap_or(error)));
+                    }
+                    if let Err(error) = self
+                        .host
+                        .complete_bridge_operation(waiting.op_id, HostAsyncOpTerminal::Completed)
+                    {
+                        self.instance.waiting_host_op = None;
+                        return Poll::Ready(Err(error));
+                    }
+                    self.instance.waiting_host_op = None;
+                    values.push_onto_stack(&mut self.instance.stack);
+                    return Poll::Ready(Ok(()));
                 }
                 if let Err(error) = self.complete_waiting_host_op(waiting.op_id, values) {
                     return Poll::Ready(Err(error));
@@ -1963,10 +2141,13 @@ impl Vm {
             }
             Poll::Ready(Err(err)) => {
                 if matches!(waiting.source, WaitingHostOpSource::HostBridge) {
-                    self.cleanup_submitted_host_op_with_reason(
-                        waiting.op_id,
-                        OperationCancelReason::Requested,
-                    );
+                    let cleanup = self
+                        .host
+                        .complete_bridge_operation(waiting.op_id, HostAsyncOpTerminal::Failed);
+                    if let Err(cleanup_error) = cleanup {
+                        self.instance.waiting_host_op = None;
+                        return Poll::Ready(Err(cleanup_error));
+                    }
                 }
                 self.instance.waiting_host_op = None;
                 Poll::Ready(Err(err))
@@ -2194,27 +2375,34 @@ impl Vm {
             .len()
             .checked_sub(argc)
             .ok_or(VmError::StackUnderflow)?;
-        // Builtin dispatch reads arguments from the current stack tail while mutating the VM.
-        // The builtin runtime must not mutate `self.instance.stack` until this borrowed slice is consumed.
+        let composition = self.host.standard_composition.clone().ok_or_else(|| {
+            VmError::HostError("standard surface composition is not installed".to_string())
+        })?;
+        // Standard dispatch reads arguments from the current stack tail while mutating the VM.
+        // The composition must not mutate `self.instance.stack` until this borrowed slice is consumed.
         let outcome = unsafe {
             let args = std::slice::from_raw_parts_mut(
                 self.instance.stack.as_mut_ptr().add(arg_start),
                 argc,
             );
-            crate::builtins::runtime::execute_builtin_call(self, builtin, args)
+            composition.execute_builtin_call(self, builtin, args)
         }?;
 
         match outcome {
-            crate::builtins::runtime::BuiltinCallOutcome::Return(values) => {
+            CallOutcome::Return(values) => {
                 self.instance.stack.truncate(arg_start);
                 values.push_onto_stack(&mut self.instance.stack);
                 Ok(HostCallExecOutcome::Returned)
             }
-            crate::builtins::runtime::BuiltinCallOutcome::Halt => {
+            CallOutcome::Halt => {
                 self.instance.stack.truncate(arg_start);
                 Ok(HostCallExecOutcome::Halted)
             }
-            crate::builtins::runtime::BuiltinCallOutcome::Pending(op_id) => {
+            CallOutcome::Yield => {
+                self.instance.stack.truncate(arg_start);
+                Ok(HostCallExecOutcome::Yielded)
+            }
+            CallOutcome::Pending(op_id) => {
                 self.instance.stack.truncate(arg_start);
                 let resume_ip = self.call_resume_ip(call_ip)?;
                 let expected_return_type = Some(builtin.static_return_type());
@@ -2225,10 +2413,9 @@ impl Vm {
                         expected_return_type,
                         None,
                     ) {
-                        self.cleanup_submitted_host_op_with_reason(
-                            op_id,
-                            OperationCancelReason::Requested,
-                        );
+                        let _ = self
+                            .host
+                            .request_cancel_host_op(op_id, OperationCancelReason::Requested);
                         return Err(error);
                     }
                 } else {
@@ -2295,18 +2482,18 @@ impl Vm {
                 },
                 BuiltinFunction::StringContains => match (lhs, rhs, args) {
                     (ValueType::String, ValueType::String, [text, needle]) => {
-                        Self::fast_path_string_contains_result(text, needle)
+                        self.fast_path_string_contains_result(text, needle)
                     }
                     _ => None,
                 },
                 BuiltinFunction::StringReplaceLiteral => match (lhs, rhs, args) {
                     (ValueType::String, ValueType::String, [text, needle, replacement]) => {
-                        Self::fast_path_string_replace_literal_result(text, needle, replacement)
+                        self.fast_path_string_replace_literal_result(text, needle, replacement)
                     }
                     _ => None,
                 },
                 BuiltinFunction::StringLowerAscii => match (lhs, args) {
-                    (ValueType::String, [text]) => Self::fast_path_string_lower_ascii_result(text),
+                    (ValueType::String, [text]) => self.fast_path_string_lower_ascii_result(text),
                     _ => None,
                 },
                 BuiltinFunction::BytesFromArrayU8 => match (lhs, args) {
@@ -2376,19 +2563,19 @@ impl Vm {
         }
     }
 
-    fn fast_path_string_contains_result(text: &Value, needle: &Value) -> Option<Value> {
+    fn fast_path_string_contains_result(&self, text: &Value, needle: &Value) -> Option<Value> {
         let (Value::String(text), Value::String(needle)) = (text, needle) else {
             return None;
         };
-        Some(Value::Bool(
-            crate::builtins::runtime::core::builtin_string_contains_impl(
-                text.as_str(),
-                needle.as_str(),
-            ),
-        ))
+        self.host
+            .standard_composition
+            .as_ref()?
+            .string_contains(text.as_str(), needle.as_str())
+            .map(Value::Bool)
     }
 
     fn fast_path_string_replace_literal_result(
+        &self,
         text: &Value,
         needle: &Value,
         replacement: &Value,
@@ -2398,22 +2585,22 @@ impl Vm {
         else {
             return None;
         };
-        Some(Value::string(
-            crate::builtins::runtime::core::builtin_string_replace_literal_impl(
-                text.as_str(),
-                needle.as_str(),
-                replacement.as_str(),
-            ),
-        ))
+        self.host
+            .standard_composition
+            .as_ref()?
+            .string_replace_literal(text.as_str(), needle.as_str(), replacement.as_str())
+            .map(Value::string)
     }
 
-    fn fast_path_string_lower_ascii_result(text: &Value) -> Option<Value> {
+    fn fast_path_string_lower_ascii_result(&self, text: &Value) -> Option<Value> {
         let Value::String(text) = text else {
             return None;
         };
-        Some(Value::string(
-            crate::builtins::runtime::core::builtin_string_lower_ascii_impl(text.as_str()),
-        ))
+        self.host
+            .standard_composition
+            .as_ref()?
+            .string_lower_ascii(text.as_str())
+            .map(Value::string)
     }
 
     fn fast_path_get_result(container: &Value, key: &Value) -> VmResult<Option<Value>> {
@@ -2700,7 +2887,7 @@ impl Vm {
                 let resume_ip = self.call_resume_ip(call_ip)?;
                 self.set_waiting_host_op_with_return(
                     op_id,
-                    WaitingHostOpSource::HostBridge,
+                    self.host_call_pending_source(),
                     expected_return_type,
                     expected_return_schema,
                 )?;
@@ -2845,7 +3032,7 @@ impl Vm {
                 let resume_ip = self.call_resume_ip(call_ip)?;
                 self.set_waiting_host_op_with_return(
                     op_id,
-                    WaitingHostOpSource::HostBridge,
+                    self.host_call_pending_source(),
                     expected_return_type,
                     expected_return_schema,
                 )?;
@@ -2920,7 +3107,7 @@ impl Vm {
                 let resume_ip = self.call_resume_ip(call_ip)?;
                 self.set_waiting_host_op_with_return(
                     op_id,
-                    WaitingHostOpSource::HostBridge,
+                    self.host_call_pending_source(),
                     expected_return_type,
                     expected_return_schema,
                 )?;
@@ -2950,6 +3137,14 @@ impl Vm {
         Ok(resume_ip)
     }
 
+    fn host_call_pending_source(&self) -> WaitingHostOpSource {
+        if self.host.async_bridge.is_some() {
+            WaitingHostOpSource::HostBridge
+        } else {
+            WaitingHostOpSource::Manual
+        }
+    }
+
     pub(super) fn set_waiting_host_op_with_return(
         &mut self,
         op_id: HostOpId,
@@ -2964,6 +3159,9 @@ impl Vm {
                 "vm already waiting on host op {}, cannot wait on {}",
                 active.op_id, op_id
             )));
+        }
+        if matches!(source, WaitingHostOpSource::HostBridge) && self.host.async_bridge.is_some() {
+            self.host.track_bridge_host_op(op_id)?;
         }
         let expected_return_schema = expected_return_schema.cloned();
         self.instance.waiting_host_op = Some(WaitingHostOp {

@@ -111,12 +111,22 @@ impl Vm {
     /// Requires a configured [`HostAsyncBridge`] that accepts submitted
     /// futures; otherwise a host error is returned.
     pub fn submit_host_future(&mut self, future: HostFuture) -> VmResult<CallOutcome> {
-        let op_id = self.allocate_host_op_id();
-        let bridge = self.host.async_bridge.as_mut().ok_or_else(|| {
-            VmError::HostError("async host function requires a host async bridge".to_string())
-        })?;
-        bridge.submit_op(op_id, future)?;
-        self.host.submitted_host_ops.insert(op_id);
+        if self.host.async_bridge.is_none() {
+            return Err(VmError::HostError(
+                "async host function requires a host async bridge".to_string(),
+            ));
+        }
+        let op_id = self.host.reserve_submitted_host_op()?;
+        let submit_result = self
+            .host
+            .async_bridge
+            .as_mut()
+            .expect("bridge presence checked before reservation")
+            .submit_op(op_id, future);
+        if let Err(error) = submit_result {
+            self.host.rollback_submitted_host_op(op_id);
+            return Err(error);
+        }
         Ok(CallOutcome::Pending(op_id))
     }
 }

@@ -298,7 +298,7 @@ fn sqlite_close_cancels_siblings_and_reset_retires_all() {
         matches!(status, VmStatus::Waiting(_)),
         "long query should leave the VM waiting, got: {status:?}"
     );
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert!(
         vm.execution_scope().operations().is_empty(),
         "reset must retire all pending sqlite operations"

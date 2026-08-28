@@ -21,3 +21,31 @@ fn alias_exports_op_code() {
     let _ = rustscript::OpCode::Nop;
     let _ = rustscript::OpCode::Add;
 }
+
+#[cfg(feature = "runtime")]
+#[test]
+fn alias_exports_public_invocation_stream_contract() {
+    fn accept_item(_item: rustscript::InvocationItem) {}
+
+    accept_item(rustscript::InvocationItem::Complete(
+        rustscript::Value::Null,
+    ));
+    accept_item(rustscript::InvocationItem::Event(rustscript::Value::Bool(
+        true,
+    )));
+
+    fn accept_poll(_poll: rustscript::InvocationPoll) {}
+    accept_poll(rustscript::InvocationPoll::Pending);
+    accept_poll(rustscript::InvocationPoll::Ready(None));
+    accept_poll(rustscript::InvocationPoll::Ready(Some(Ok(
+        rustscript::InvocationItem::Complete(rustscript::Value::Null),
+    ))));
+
+    fn accept_error(_error: rustscript::InvocationError) {}
+    accept_error(rustscript::InvocationError::Cancelled(
+        rustscript::operation::OperationCancelReason::Requested,
+    ));
+    accept_error(rustscript::InvocationError::Host {
+        message: "boom".to_string(),
+    });
+}

@@ -1509,7 +1509,7 @@ fn build_map_builtin_perf_source(entries: &[(&str, i64)], outer_loops: i64) -> S
 
 fn warm_reusable_vm_once(vm: &mut Vm, expected_stack: &[Value]) -> std::time::Duration {
     let elapsed = run_vm_once(vm, expected_stack);
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     elapsed
 }
 
@@ -1552,7 +1552,7 @@ fn sample_reused_vm_latencies(
     for _ in 0..trials {
         let elapsed = run_vm_once(vm, expected_stack);
         samples.push(elapsed);
-        vm.reset_for_reuse();
+        let _ = vm.reset_for_reuse();
     }
     samples
 }

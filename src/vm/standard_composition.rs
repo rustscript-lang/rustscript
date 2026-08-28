@@ -1,77 +1,127 @@
-//! Generic contract for composing standard host surfaces.
+//! Generic boundary for the optional standard runtime surface.
 //!
-//! The host-agnostic VM core must not know which concrete standard domains
-//! exist (`io::`, `http::`, `sqlite::`, …) or which same-crate builtin modules
-//! implement them. All of that knowledge belongs to the standard builtin
-//! composition layer. This module defines the *generic* abstraction the core
-//! consumes instead:
-//!
-//! - [`StandardSurfaceComposition`] — the caller-provided strategy the core
-//!   delegates to for: deciding whether an import belongs to the standard
-//!   catalog, ensuring the required standard surfaces are present on a
-//!   registry, building a fresh default registry, and binding a legacy
-//!   by-name default host function.
-//!
-//! The composition is **explicit caller-provided per-instance state**: a
-//! `HostFunctionRegistry` and a `Vm` carry an `Arc<dyn
-//! StandardSurfaceComposition>` installed through the outer standard-runtime
-//! constructor/registry path. There is deliberately no process-global slot and
-//! no first-wins installation: `src/vm` never names a concrete domain module,
-//! feature, surface count, or bit assignment.
-//!
-//! This module is compiled only under `feature = "runtime"` (like the rest of
-//! `src/vm`).
+//! The VM owns the trait and its opaque call outcomes. The standard runtime
+//! implements it from the builtin registration area; alternate embeddings can
+//! provide another composition without importing that area into `src/vm`.
 
 use std::sync::Arc;
 
-use crate::bytecode::HostImport;
+use crate::bytecode::{HostImport, SharedArray, SharedMap};
+use crate::{BuiltinFunction, Value};
 
-use super::host::HostFunctionRegistry;
-use super::{Vm, VmResult};
+use super::{CallOutcome, HostFunctionRegistry, Vm, VmError, VmResult};
 
-/// Caller-provided strategy for composing the standard host surfaces.
-///
-/// Implemented by the standard builtin composition layer
-/// (`crate::builtins::runtime`). The VM core invokes it generically and never
-/// names a concrete domain module, namespace prefix, feature, or surface
-/// count.
+/// Runtime surface operations that the VM may request without knowing their
+/// concrete implementation module.
 pub trait StandardSurfaceComposition: Send + Sync {
-    /// Whether `import` belongs to the standard catalog (its name resolves to
-    /// a registered standard host callable).
+    /// Reports whether this composition owns a standard host import.
     fn import_in_standard(&self, import: &HostImport) -> bool;
 
-    /// Ensures every standard surface required by `imports` is present on
-    /// `registry`, staging exactly the missing surfaces, and returns whether
-    /// any surface was staged.
-    ///
-    /// This is the single opaque required/present/stage operation: the
-    /// composition implementation computes which surfaces the import set
-    /// requires and which the registry already carries, and registers only
-    /// the missing ones. The VM core never sees a surface mask, a concrete
-    /// surface count, or a bit assignment.
+    /// Stages standard host functions needed by the supplied imports.
     fn ensure_surfaces(
         &self,
         imports: &[HostImport],
         registry: &mut HostFunctionRegistry,
     ) -> VmResult<bool>;
 
-    /// Builds a fresh registry carrying every enabled standard surface.
+    /// Builds a fresh registry containing this composition's standard host
+    /// functions.
     fn build_default_registry(&self) -> VmResult<HostFunctionRegistry>;
 
-    /// Binds the legacy by-name default host function `name` on `vm`, if one
-    /// exists; returns whether it bound.
+    /// Binds one standard host function by source name.
     fn bind_default_name(&self, vm: &mut Vm, name: &str) -> bool;
+
+    /// Dispatches a catalog builtin. The default keeps custom compositions
+    /// source-compatible while reporting that no builtin dispatcher is present.
+    fn execute_builtin_call(
+        &self,
+        _vm: &mut Vm,
+        _builtin: BuiltinFunction,
+        _args: &mut [Value],
+    ) -> VmResult<CallOutcome> {
+        Err(VmError::HostError(
+            "standard surface has no builtin dispatcher".to_string(),
+        ))
+    }
+
+    /// Optional fast paths used by the portable interpreter and native bridge.
+    fn string_contains(&self, _text: &str, _needle: &str) -> Option<bool> {
+        None
+    }
+
+    fn string_replace_literal(
+        &self,
+        _text: &str,
+        _needle: &str,
+        _replacement: &str,
+    ) -> Option<String> {
+        None
+    }
+
+    fn string_lower_ascii(&self, _text: &str) -> Option<String> {
+        None
+    }
+
+    fn string_split_literal(&self, _text: &str, _delimiter: &str) -> Option<Vec<Value>> {
+        None
+    }
+
+    fn value_to_string(&self, _value: &Value) -> Option<String> {
+        None
+    }
+
+    fn regex_match(&self, _vm: &mut Vm, _pattern: &str, _text: &str) -> VmResult<bool> {
+        Err(VmError::HostError(
+            "standard surface has no regex matcher".to_string(),
+        ))
+    }
+
+    fn regex_replace(
+        &self,
+        _vm: &mut Vm,
+        _pattern: &str,
+        _text: &str,
+        _replacement: &str,
+    ) -> VmResult<String> {
+        Err(VmError::HostError(
+            "standard surface has no regex replacer".to_string(),
+        ))
+    }
+
+    fn ensure_supported_map_key(&self, _key: &Value) -> VmResult<()> {
+        Err(VmError::HostError(
+            "standard surface has no map-key validator".to_string(),
+        ))
+    }
+
+    fn set_owned(&self, _container: Value, _key: Value, _value: Value) -> VmResult<Value> {
+        Err(VmError::HostError(
+            "standard surface has no container setter".to_string(),
+        ))
+    }
+
+    fn set_map_shared(&self, _entries: SharedMap, _key: Value, _value: Value) -> Option<SharedMap> {
+        None
+    }
+
+    fn array_push_shared(&self, _items: SharedArray, _value: Value) -> Option<SharedArray> {
+        None
+    }
 }
 
-/// Shared per-runtime handle wrapping a caller-provided composition and kept
-/// out of `src/vm` core dispatch. External host crates can store one on their
-/// own extension state, or a VM can carry it through the standard runtime.
+/// Shared per-runtime handle wrapping a caller-provided composition.
 #[derive(Clone)]
 pub struct StandardCompositionHandle(pub Arc<dyn StandardSurfaceComposition>);
 
 impl StandardCompositionHandle {
-    /// Install this composition on a registry's standard composition slot.
+    /// Installs this composition on a registry's standard composition slot.
     pub fn install(&self, registry: &mut HostFunctionRegistry) {
         registry.set_standard_composition(Arc::clone(&self.0));
     }
+}
+
+/// Returns a fresh standard-surface handle for callers that want the default
+/// runtime composition.
+pub fn standard_composition() -> Arc<dyn StandardSurfaceComposition> {
+    crate::standard_composition()
 }

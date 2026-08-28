@@ -9,7 +9,11 @@ use crate::vm::{CallOutcome, CallReturn, HostOpId, Value, Vm, VmError, VmResult}
 
 mod aot;
 mod bytes;
+pub(crate) mod context;
+mod context_host;
 pub(crate) mod core;
+pub(crate) mod error;
+pub(crate) mod event;
 mod host;
 #[cfg(not(target_arch = "wasm32"))]
 mod io;
@@ -29,6 +33,12 @@ mod typed;
 #[cfg(target_arch = "wasm32")]
 use io_wasm as io;
 
+#[allow(unused_imports)]
+pub(crate) use context::{RuntimeContext, RuntimeContextConfig, STREAM_EMIT_NAME};
+#[allow(unused_imports)]
+pub use error::{RuntimeError, RuntimeErrorCode, RuntimeResult};
+#[allow(unused_imports)]
+pub(crate) use event::{EventLimits, EventPayload};
 #[cfg(not(target_arch = "wasm32"))]
 pub use io::{IoHostExt, IoPolicy};
 pub use standard_composition::standard_composition;
