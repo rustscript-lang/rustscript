@@ -1987,6 +1987,19 @@ impl<'a> TypeContext<'a> {
             }
             return Ok(());
         }
+        #[cfg(feature = "runtime")]
+        if signature.runtime_builtin && signature.name == crate::builtins::runtime::STREAM_EMIT_NAME
+        {
+            return validate_host_signature(
+                &signature.name,
+                &signature.params,
+                args,
+                state,
+                self,
+                line_context,
+                source_name,
+            );
+        }
         if self.is_strict()
             && signature
                 .params

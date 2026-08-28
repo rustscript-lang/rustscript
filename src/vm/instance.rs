@@ -19,6 +19,7 @@ use std::sync::{Arc, Weak};
 
 use crate::bytecode::{CallableValue, Program, SharedCaptureCell, Value};
 use crate::vm::host::WaitingHostOp;
+use crate::vm::invocation::{InvocationPhase, InvocationState};
 use crate::vm::map_iter::MapIteratorState;
 use crate::vm::{DEFAULT_MAX_SCRIPT_CALL_DEPTH, VmYieldReason};
 
@@ -74,6 +75,7 @@ pub(crate) struct Instance {
     pub(crate) active_local_base_cache: usize,
     pub(crate) active_operand_stack_base_cache: usize,
     pub(crate) call_depth: usize,
+    pub(crate) run_depth: usize,
     pub(crate) max_script_call_depth: usize,
     pub(crate) host_return: Option<Value>,
     pub(crate) queued_callables: VecDeque<QueuedCallable>,
@@ -84,6 +86,7 @@ pub(crate) struct Instance {
     pub(crate) shutdown: bool,
     pub(super) waiting_host_op: Option<WaitingHostOp>,
     pub(crate) last_yield_reason: Option<VmYieldReason>,
+    pub(crate) invocation: Option<InvocationState>,
     pub(crate) map_iterators: Vec<Vec<Option<MapIteratorState>>>,
     pub(crate) drop_contract_events_enabled: bool,
     pub(crate) drop_contract_events: u64,
@@ -110,6 +113,7 @@ impl Instance {
             active_local_base_cache: 0,
             active_operand_stack_base_cache: 0,
             call_depth: 0,
+            run_depth: 0,
             max_script_call_depth: DEFAULT_MAX_SCRIPT_CALL_DEPTH,
             host_return: None,
             queued_callables: VecDeque::new(),
@@ -120,6 +124,7 @@ impl Instance {
             shutdown: false,
             waiting_host_op: None,
             last_yield_reason: None,
+            invocation: None,
             map_iterators: Vec::new(),
             drop_contract_events_enabled: false,
             drop_contract_events: 0,
@@ -149,6 +154,7 @@ impl Instance {
         self.locals.resize(program.local_count, Value::Null);
         self.initialize_root_callable_bindings(program);
         self.call_depth = 0;
+        self.run_depth = 0;
         self.execution_frames.clear();
         self.execution_frames
             .push(ExecutionFrame::root(program.local_count));
@@ -157,21 +163,119 @@ impl Instance {
         self.host_return = None;
         self.queued_callables.clear();
         self.completed_callable_results.clear();
-        self.owned_callables.clear();
         self.draining_queued_callables = false;
         self.shutdown = false;
         self.waiting_host_op = None;
+        self.drop_invocation_state();
+        self.invocation = None;
         self.map_iterators.clear();
         self.clear_interpreter_metrics();
+    }
+
+    pub(crate) fn is_reusable(&self, program: &Program) -> bool {
+        if self.run_depth != 0
+            || !self.stack.is_empty()
+            || !self.capture_cells.is_empty()
+            || !self.shared_capture_slots.is_empty()
+            || self.active_local_base_cache != 0
+            || self.active_operand_stack_base_cache != 0
+            || self.call_depth != 0
+            || self.host_return.is_some()
+            || !self.queued_callables.is_empty()
+            || !self.completed_callable_results.is_empty()
+            || self.draining_queued_callables
+            || self.shutdown
+            || self.waiting_host_op.is_some()
+            || self.last_yield_reason.is_some()
+            || self.map_iterators.iter().flatten().any(Option::is_some)
+        {
+            return false;
+        }
+
+        let reset_frame = self
+            .execution_frames
+            .as_slice()
+            .first()
+            .is_some_and(|root| {
+                self.execution_frames.len() == 1
+                    && root.continuation == FrameContinuation::Halt
+                    && root.operand_stack_base == 0
+                    && root.local_base == 0
+                    && root.local_count == program.local_count
+                    && root.prototype_id.is_none()
+            });
+        let halted = self.execution_frames.is_empty();
+        if (!reset_frame && !halted) || (reset_frame && self.ip != 0) {
+            return false;
+        }
+        if self.locals.len() != program.local_count {
+            return false;
+        }
+
+        let mut root_bindings = HashMap::new();
+        for binding in &program.root_callable_bindings {
+            if binding.local_slot as usize >= program.local_count
+                || program
+                    .callable_prototypes
+                    .get(binding.prototype_id as usize)
+                    .is_none()
+            {
+                continue;
+            }
+            root_bindings.insert(binding.local_slot as usize, binding.prototype_id);
+        }
+        for (slot, value) in self.locals.iter().enumerate() {
+            match root_bindings.get(&slot) {
+                Some(prototype_id) => {
+                    if !matches!(value, Value::Callable(callable) if callable.prototype_id == *prototype_id)
+                    {
+                        return false;
+                    }
+                }
+                None if !matches!(value, Value::Null) => return false,
+                None => {}
+            }
+        }
+
+        match self.invocation.as_ref() {
+            None => true,
+            Some(state) => {
+                matches!(state.phase, InvocationPhase::Fused)
+                    && !state.emit_yield_pending
+                    && state.pending_error.is_none()
+                    && state.cancel_reason.is_none()
+            }
+        }
     }
 
     /// Releases interpreter-owned values with drop-contract accounting. Used by
     /// the facade's `Drop` (and by `shutdown`).
     pub(crate) fn drop_cleanup(&mut self) {
+        self.drop_invocation_state();
         self.clear_stack_with_drop_contract();
         self.capture_cells.clear();
         self.shared_capture_slots.clear();
         self.clear_locals_with_drop_contract();
+    }
+
+    /// Drops pending invocation stream values with drop-contract accounting and
+    /// rewinds the invocation state to a fresh, fused position.
+    pub(crate) fn drop_invocation_state(&mut self) {
+        let Some(state) = self.invocation.as_mut() else {
+            return;
+        };
+        let value = match std::mem::replace(&mut state.phase, InvocationPhase::Fused) {
+            InvocationPhase::EventPending(value) | InvocationPhase::CompletePending(value) => {
+                Some(value)
+            }
+            _ => None,
+        };
+        state.emit_yield_pending = false;
+        state.pending_error = None;
+        state.cancel_reason = None;
+        if let Some(value) = value {
+            self.drop_value_with_contract(value);
+        }
     }
 
     pub(crate) fn invalidate_callback_registries(&mut self) {

@@ -18,7 +18,7 @@
 //! implementation modules or on `rusqlite`.
 //!
 //! **Boundary contract (enforced by `tests/host_context_arch_tests.rs`):**
-//! this module references neither `crate::builtins::*` nor `rusqlite`.
+//! this module references neither concrete builtin paths nor `rusqlite`.
 //!
 //! Host module state is owned directly by [`HostRuntime`]: typed, per-VM, and
 //! deliberately **not** cleared on

@@ -11,9 +11,9 @@ use std::time::Instant;
 
 use serde::Deserialize;
 use vm::{
-    CallOutcome, CallReturn, FunctionDecl, HostAsyncBridge, HostFunction, HostOpId, LocalInfo,
-    SourceFlavor, SourcePathError, Value, Vm, VmError, VmResult, VmStatus, VmYieldReason,
-    compile_source_with_flavor_and_options, format_value, render_vm_error,
+    CallOutcome, CallReturn, FunctionDecl, HostAsyncBridge, HostAsyncOpTerminal, HostFunction,
+    HostOpId, LocalInfo, SourceFlavor, SourcePathError, Value, Vm, VmError, VmResult, VmStatus,
+    VmYieldReason, compile_source_with_flavor_and_options, format_value, render_vm_error,
 };
 
 use crate::analyzer::{LintDiagnostic, lint_source_with_flavor, lint_success_diagnostics};
@@ -293,6 +293,34 @@ impl HostAsyncBridge for BrowserAsyncBridge {
         } else {
             Poll::Pending
         }
+    }
+
+    fn request_cancel_op(
+        &mut self,
+        op_id: HostOpId,
+        _reason: vm::operation::OperationCancelReason,
+    ) -> VmResult<()> {
+        let Ok(mut state) = self.state.lock() else {
+            return Err(VmError::HostError(
+                "browser async bridge state is unavailable".to_string(),
+            ));
+        };
+        state.deadlines_ms.remove(&op_id);
+        Ok(())
+    }
+
+    fn poll_cancel_op(&mut self, _op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn cleanup_op(&mut self, op_id: HostOpId, _terminal: HostAsyncOpTerminal) -> VmResult<()> {
+        let Ok(mut state) = self.state.lock() else {
+            return Err(VmError::HostError(
+                "browser async bridge state is unavailable".to_string(),
+            ));
+        };
+        state.deadlines_ms.remove(&op_id);
+        Ok(())
     }
 }
 
@@ -1323,7 +1351,8 @@ fn register_functions(
         .any(|decl| decl.name == "runtime::sleep")
         .then(|| {
             let state = Arc::new(Mutex::new(BrowserAsyncState::default()));
-            vm.set_async_bridge(Box::new(BrowserAsyncBridge::new(Arc::clone(&state))));
+            vm.set_async_bridge(Box::new(BrowserAsyncBridge::new(Arc::clone(&state))))
+                .expect("browser async bridge should install");
             state
         });
     for decl in functions {

@@ -96,6 +96,23 @@ impl HostAsyncBridge for TestAsyncBridge {
             .pending
             .remove(&op_id);
     }
+
+    fn request_cancel_op(
+        &mut self,
+        op_id: HostOpId,
+        _reason: vm::operation::OperationCancelReason,
+    ) -> Result<(), VmError> {
+        self.cancel_op(op_id);
+        Ok(())
+    }
+
+    fn poll_cancel_op(
+        &mut self,
+        _op_id: HostOpId,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), VmError>> {
+        Poll::Ready(Ok(()))
+    }
 }
 
 struct AsyncAddOneFunction {
@@ -178,7 +195,8 @@ async fn async_host_call_waits_and_resumes_via_tokio_runtime() {
             Duration::from_millis(25),
         )),
     );
-    vm.set_async_bridge(Box::new(TestAsyncBridge::new(ops)));
+    vm.set_async_bridge(Box::new(TestAsyncBridge::new(ops)))
+        .expect("test async bridge should install");
 
     let status = vm.run().expect("vm should wait for async host operation");
     let op_id = match status {
@@ -218,14 +236,15 @@ async fn reset_cancels_pending_host_bridge_operation() {
             Duration::from_secs(60),
         )),
     );
-    vm.set_async_bridge(Box::new(TestAsyncBridge::new(ops.clone())));
+    vm.set_async_bridge(Box::new(TestAsyncBridge::new(ops.clone())))
+        .expect("test async bridge should install");
 
     assert!(matches!(
         vm.run().expect("pending call"),
         VmStatus::Waiting(_)
     ));
     assert_eq!(ops.lock().unwrap().pending.len(), 1);
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert_eq!(ops.lock().unwrap().pending.len(), 0);
     assert_eq!(vm.waiting_host_op_id(), None);
 }
@@ -244,7 +263,8 @@ async fn vm_waiting_on_async_host_op_does_not_block_tokio_tasks() {
             Duration::from_millis(40),
         )),
     );
-    vm.set_async_bridge(Box::new(TestAsyncBridge::new(ops)));
+    vm.set_async_bridge(Box::new(TestAsyncBridge::new(ops)))
+        .expect("test async bridge should install");
 
     let ticks = Arc::new(AtomicUsize::new(0));
     let stop_ticker = Arc::new(AtomicBool::new(false));

@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::builtins::BuiltinFunction;
+use crate::BuiltinFunction;
 use crate::vm::{OpCode, Program, ValueType};
 
 use super::cfg::{AotBasicBlock, AotBlockTerminal, AotCfg, AotCfgError, AotCfgRegion, build_cfg};
