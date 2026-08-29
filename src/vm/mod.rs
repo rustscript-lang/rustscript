@@ -61,10 +61,12 @@ use self::host_runtime::HostRuntime;
 use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable};
 pub use self::invocation::{Invocation, InvocationError, InvocationItem, InvocationPoll};
 pub use self::resource::ResourceCloseReason;
+use self::resource::{ResourceHandle, ResourceTable};
 use self::run_context::{InterruptMode, RunContext};
 pub use self::standard_composition::StandardSurfaceComposition;
 pub use crate::bytecode::{
-    CallableTarget, CallableValue, HostImport, OpCode, Program, Value, ValueType,
+    CallableTarget, CallableValue, HostImport, MAX_FRAME_LOCAL_COUNT, OpCode, Program, Value,
+    ValueType,
 };
 use crate::bytecode::{StableHasher, hash_value};
 pub use store::{
@@ -117,9 +119,18 @@ pub enum VmError {
         got: u8,
     },
     InvalidFrameState(&'static str),
+    /// A program requested more local slots than one runtime frame may own.
+    FrameAllocationLimit {
+        requested: usize,
+        limit: usize,
+    },
     InvalidCallable,
 
     InvalidCallablePrototype(u32),
+    /// A JIT bridge received a callable prototype id outside the valid `u32`
+    /// index range (e.g. a negative value). Carries the raw value so the
+    /// error stays accurate instead of masquerading as a truncated id.
+    InvalidCallablePrototypeId(i64),
     InvalidBranchTarget {
         target: usize,
     },
@@ -128,6 +139,9 @@ pub enum VmError {
         expected: u8,
         got: u8,
     },
+    /// `CallScript` targeted a prototype whose capture layout requires a
+    /// callable environment, which a static script call cannot supply.
+    CallScriptRequiresEnvironment(u32),
     CallStackOverflow {
         limit: usize,
     },
@@ -184,10 +198,17 @@ impl std::fmt::Display for VmError {
             VmError::InvalidFrameState(message) => {
                 write!(f, "invalid execution frame state: {message}")
             }
+            VmError::FrameAllocationLimit { requested, limit } => write!(
+                f,
+                "frame local allocation of {requested} slots exceeds limit {limit}"
+            ),
             VmError::InvalidCallable => write!(f, "callvalue operand is not callable"),
 
             VmError::InvalidCallablePrototype(id) => {
                 write!(f, "invalid callable prototype {id}")
+            }
+            VmError::InvalidCallablePrototypeId(id) => {
+                write!(f, "invalid callable prototype id {id}")
             }
             VmError::InvalidBranchTarget { target } => {
                 write!(
@@ -202,6 +223,10 @@ impl std::fmt::Display for VmError {
             } => write!(
                 f,
                 "invalid call arity for callable {prototype_id}: expected {expected}, got {got}"
+            ),
+            VmError::CallScriptRequiresEnvironment(prototype_id) => write!(
+                f,
+                "callscript prototype {prototype_id} requires a callable environment"
             ),
             VmError::CallStackOverflow { limit } => {
                 write!(f, "script call stack limit {limit} exceeded")
@@ -452,28 +477,207 @@ fn hash_local_schemas(schemas: &[Option<crate::compiler::TypeSchema>], state: &m
     }
 }
 
-fn value_matches_type_schema(value: &Value, schema: &crate::compiler::TypeSchema) -> bool {
+fn validate_value_against_type_schema(
+    value: &Value,
+    schema: &crate::compiler::TypeSchema,
+    resources: &ResourceTable,
+    validate_scalars: bool,
+) -> VmResult<()> {
     use crate::compiler::TypeSchema;
 
     match schema {
-        TypeSchema::Unknown | TypeSchema::GenericParam(_) => true,
-        TypeSchema::Null => matches!(value, Value::Null),
-        TypeSchema::Int => matches!(value, Value::Int(_)),
-        TypeSchema::Float => matches!(value, Value::Float(_)),
-        TypeSchema::Number => matches!(value, Value::Int(_) | Value::Float(_)),
-        TypeSchema::Bool => matches!(value, Value::Bool(_)),
-        TypeSchema::String => matches!(value, Value::String(_)),
-        TypeSchema::Bytes => matches!(value, Value::Bytes(_)),
+        TypeSchema::Unknown | TypeSchema::GenericParam(_) => Ok(()),
+        TypeSchema::Null => {
+            if !validate_scalars || matches!(value, Value::Null) {
+                Ok(())
+            } else {
+                Err(VmError::TypeMismatch("null"))
+            }
+        }
+        TypeSchema::Int => {
+            if !validate_scalars || matches!(value, Value::Int(_)) {
+                Ok(())
+            } else {
+                Err(VmError::TypeMismatch("int"))
+            }
+        }
+        TypeSchema::Float => {
+            if !validate_scalars || matches!(value, Value::Float(_)) {
+                Ok(())
+            } else {
+                Err(VmError::TypeMismatch("float"))
+            }
+        }
+        TypeSchema::Number => {
+            if !validate_scalars || matches!(value, Value::Int(_) | Value::Float(_)) {
+                Ok(())
+            } else {
+                Err(VmError::TypeMismatch("number"))
+            }
+        }
+        TypeSchema::Bool => {
+            if !validate_scalars || matches!(value, Value::Bool(_)) {
+                Ok(())
+            } else {
+                Err(VmError::TypeMismatch("bool"))
+            }
+        }
+        TypeSchema::String => {
+            if !validate_scalars || matches!(value, Value::String(_)) {
+                Ok(())
+            } else {
+                Err(VmError::TypeMismatch("string"))
+            }
+        }
+        TypeSchema::Bytes => {
+            if !validate_scalars || matches!(value, Value::Bytes(_)) {
+                Ok(())
+            } else {
+                Err(VmError::TypeMismatch("bytes"))
+            }
+        }
         TypeSchema::Optional(inner) => {
-            matches!(value, Value::Null) || value_matches_type_schema(value, inner)
+            if matches!(value, Value::Null) {
+                Ok(())
+            } else {
+                validate_value_against_type_schema(value, inner, resources, validate_scalars)
+            }
         }
-        TypeSchema::Named(_, _) | TypeSchema::Map(_) | TypeSchema::Object(_) => {
-            matches!(value, Value::Map(_))
+        TypeSchema::Named(_, _) => {
+            if matches!(value, Value::Map(_)) {
+                Ok(())
+            } else {
+                Err(VmError::TypeMismatch("map"))
+            }
         }
-        TypeSchema::Array(_) | TypeSchema::ArrayTuple(_) | TypeSchema::ArrayTupleRest { .. } => {
-            matches!(value, Value::Array(_))
+        TypeSchema::Map(inner) => {
+            let Value::Map(values) = value else {
+                return Err(VmError::TypeMismatch("map"));
+            };
+            if !schema_contains_resource(inner) {
+                return Ok(());
+            }
+            for (_, value) in values.iter() {
+                validate_value_against_type_schema(value, inner, resources, false)?;
+            }
+            Ok(())
         }
-        TypeSchema::Callable { .. } => matches!(value, Value::Callable(_)),
+        TypeSchema::Object(fields) => {
+            let Value::Map(values) = value else {
+                return Err(VmError::TypeMismatch("object"));
+            };
+            for (name, field_schema) in fields {
+                if !schema_contains_resource(field_schema) {
+                    continue;
+                }
+                if let Some(field) = values.get(&Value::string(name)) {
+                    validate_value_against_type_schema(field, field_schema, resources, false)?;
+                }
+            }
+            Ok(())
+        }
+        TypeSchema::Array(inner) => {
+            let Value::Array(values) = value else {
+                return Err(VmError::TypeMismatch("array"));
+            };
+            if !schema_contains_resource(inner) {
+                return Ok(());
+            }
+            for value in values.iter() {
+                validate_value_against_type_schema(value, inner, resources, false)?;
+            }
+            Ok(())
+        }
+        TypeSchema::ArrayTuple(items) => {
+            let Value::Array(values) = value else {
+                return Err(VmError::TypeMismatch("tuple"));
+            };
+            if !schema_contains_resource(schema) {
+                return Ok(());
+            }
+            if values.len() != items.len() {
+                return Err(VmError::TypeMismatch("tuple"));
+            }
+            for (value, item) in values.iter().zip(items) {
+                if schema_contains_resource(item) {
+                    validate_value_against_type_schema(value, item, resources, false)?;
+                }
+            }
+            Ok(())
+        }
+        TypeSchema::ArrayTupleRest { prefix, rest } => {
+            let Value::Array(values) = value else {
+                return Err(VmError::TypeMismatch("tuple"));
+            };
+            if !schema_contains_resource(schema) {
+                return Ok(());
+            }
+            if values.len() < prefix.len() {
+                return Err(VmError::TypeMismatch("tuple"));
+            }
+            for (value, item) in values.iter().zip(prefix) {
+                if schema_contains_resource(item) {
+                    validate_value_against_type_schema(value, item, resources, false)?;
+                }
+            }
+            if schema_contains_resource(rest) {
+                for value in values.iter().skip(prefix.len()) {
+                    validate_value_against_type_schema(value, rest, resources, false)?;
+                }
+            }
+            Ok(())
+        }
+        TypeSchema::Callable { .. } => {
+            if matches!(value, Value::Callable(_)) {
+                Ok(())
+            } else {
+                Err(VmError::TypeMismatch("callable"))
+            }
+        }
+        TypeSchema::Resource(key) => {
+            let Value::Int(raw) = value else {
+                return Err(VmError::TypeMismatch("resource"));
+            };
+            let handle = ResourceHandle::from_raw(*raw as u64)
+                .map_err(|error| VmError::HostError(error.to_string()))?;
+            resources
+                .validate_resource_type_key(handle, key)
+                .map_err(|error| VmError::HostError(error.to_string()))
+        }
+    }
+}
+
+fn schema_contains_resource(schema: &crate::compiler::TypeSchema) -> bool {
+    use crate::compiler::TypeSchema;
+
+    match schema {
+        TypeSchema::Resource(_) => true,
+        TypeSchema::Optional(inner) | TypeSchema::Array(inner) | TypeSchema::Map(inner) => {
+            schema_contains_resource(inner)
+        }
+        TypeSchema::Object(fields) => fields.values().any(schema_contains_resource),
+        TypeSchema::ArrayTuple(items) => items.iter().any(schema_contains_resource),
+        TypeSchema::ArrayTupleRest { prefix, rest } => {
+            prefix.iter().any(schema_contains_resource) || schema_contains_resource(rest)
+        }
+        TypeSchema::Callable { .. }
+        | TypeSchema::Unknown
+        | TypeSchema::GenericParam(_)
+        | TypeSchema::Null
+        | TypeSchema::Int
+        | TypeSchema::Float
+        | TypeSchema::Number
+        | TypeSchema::Bool
+        | TypeSchema::String
+        | TypeSchema::Bytes
+        | TypeSchema::Named(_, _) => false,
+    }
+}
+
+fn map_callable_schema_error(error: VmError, context: &'static str) -> VmError {
+    match error {
+        VmError::HostError(_) => error,
+        _ => VmError::TypeMismatch(context),
     }
 }
 
@@ -545,6 +749,10 @@ fn hash_type_schema(schema: &crate::compiler::TypeSchema, state: &mut impl Hashe
             }
             hash_type_schema(result, state);
         }
+        TypeSchema::Resource(key) => {
+            17u8.hash(state);
+            key.hash(state);
+        }
     }
 }
 
@@ -559,9 +767,53 @@ fn inline_compatible_callable_prototype(value: &Value) -> Option<u32> {
     }
 }
 
+fn checked_frame_end(local_base: usize, local_count: usize) -> VmResult<usize> {
+    if local_count > MAX_FRAME_LOCAL_COUNT {
+        return Err(VmError::FrameAllocationLimit {
+            requested: local_count,
+            limit: MAX_FRAME_LOCAL_COUNT,
+        });
+    }
+    local_base
+        .checked_add(local_count)
+        .ok_or(VmError::FrameAllocationLimit {
+            requested: local_count,
+            limit: MAX_FRAME_LOCAL_COUNT,
+        })
+}
+
+fn validate_frame_allocation_limits(program: &Program) -> VmResult<()> {
+    if program.local_count > MAX_FRAME_LOCAL_COUNT {
+        return Err(VmError::FrameAllocationLimit {
+            requested: program.local_count,
+            limit: MAX_FRAME_LOCAL_COUNT,
+        });
+    }
+    if let Some(prototype) = program
+        .callable_prototypes
+        .iter()
+        .find(|prototype| prototype.frame_local_count > MAX_FRAME_LOCAL_COUNT)
+    {
+        return Err(VmError::FrameAllocationLimit {
+            requested: prototype.frame_local_count,
+            limit: MAX_FRAME_LOCAL_COUNT,
+        });
+    }
+    Ok(())
+}
+
 impl Vm {
     pub fn new(program: Program) -> Self {
         Self::new_shared_with_jit_config(Arc::new(program), jit::JitConfig::default())
+    }
+
+    /// Fallible construction hook used by compiler integrations that may
+    /// allocate execution-scope state. This VM revision has no fallible
+    /// allocation during construction, so the established constructor is
+    /// wrapped without changing its lifecycle semantics.
+    pub fn try_new(program: Program) -> VmResult<Self> {
+        validate_frame_allocation_limits(&program)?;
+        Ok(Self::new(program))
     }
 
     pub fn new_with_jit_config(program: Program, jit_config: jit::JitConfig) -> Self {
@@ -725,6 +977,7 @@ impl Vm {
     /// is still pending, the old scope remains retained and VM execution is
     /// blocked until `poll_reset_for_reuse` reaches quiescence.
     pub fn reset_for_reuse(&mut self) -> VmResult<()> {
+        validate_frame_allocation_limits(&self.program)?;
         self.cancel_waiting_host_op_with_reason(
             crate::vm::operation::OperationCancelReason::VmReset,
         )?;
@@ -772,6 +1025,7 @@ impl Vm {
     }
 
     fn ensure_scope_ready(&mut self) -> VmResult<()> {
+        validate_frame_allocation_limits(&self.program)?;
         if self.instance.shutdown {
             return Err(VmError::InvalidFrameState("vm is shut down"));
         }
@@ -958,7 +1212,9 @@ impl Vm {
             return false;
         };
         let base = frame.local_base;
-        let end = base.saturating_add(frame.local_count);
+        let Some(end) = base.checked_add(frame.local_count) else {
+            return false;
+        };
         self.instance
             .shared_capture_slots
             .iter()
@@ -1196,27 +1452,110 @@ impl Vm {
         let Value::Callable(callable) = callee else {
             return Err(VmError::InvalidCallable);
         };
+        let prototype_id = callable.prototype_id;
+        let continuation = FrameContinuation::ResumeBytecode {
+            return_ip: self.instance.ip,
+        };
+        self.enter_script_frame(
+            prototype_id,
+            Some(callable),
+            operands,
+            operand_stack_base,
+            call_site_ip,
+            continuation,
+        )
+    }
+
+    /// Execute a static `CallScript(prototype_id, argc)` instruction.
+    ///
+    /// The operands are split off the stack and the frame is entered through
+    /// the shared [`Self::enter_script_frame`] helper with no callable value:
+    /// `CallScript` can never supply a callable environment, so capture- or
+    /// self-requiring prototypes are rejected there with a typed error.
+    fn execute_call_script(
+        &mut self,
+        prototype_id: u32,
+        argc: u8,
+        call_ip: usize,
+    ) -> VmResult<ExecOutcome> {
+        let operand_count = argc as usize;
+        if self.instance.stack.len() < operand_count {
+            return Err(VmError::StackUnderflow);
+        }
+        let operand_stack_base = self.instance.stack.len() - operand_count;
+        let operands = self.instance.stack.split_off(operand_stack_base);
+        let continuation = FrameContinuation::ResumeBytecode {
+            return_ip: self.instance.ip,
+        };
+        self.enter_script_frame(
+            prototype_id,
+            None,
+            operands,
+            operand_stack_base,
+            Some(call_ip),
+            continuation,
+        )
+    }
+
+    /// Shared script-frame entry for `CallValue` and `CallScript`.
+    ///
+    /// Enters a callable frame from `(prototype_id, optional callable value,
+    /// operands, continuation)`. `CallValue` passes the runtime callable
+    /// value, which carries the environment and provides the self binding;
+    /// `CallScript` passes `None` and must only reach environment-free
+    /// function prototypes. The helper preserves arity validation, schema
+    /// checks, depth limits, interruption ticks, the return continuation,
+    /// operand stack cleanup, root callable binding initialization, capture
+    /// cell wiring, and self-slot binding.
+    fn enter_script_frame(
+        &mut self,
+        prototype_id: u32,
+        callable: Option<Arc<CallableValue>>,
+        operands: Vec<Value>,
+        operand_stack_base: usize,
+        call_site_ip: Option<usize>,
+        continuation: FrameContinuation,
+    ) -> VmResult<ExecOutcome> {
         let prototype = self
             .program
             .callable_prototypes
-            .get(callable.prototype_id as usize)
+            .get(prototype_id as usize)
             .cloned()
-            .ok_or(VmError::InvalidCallablePrototype(callable.prototype_id))?;
-        if prototype.arity != argc {
-            return Err(VmError::CallableArityMismatch {
-                prototype_id: callable.prototype_id,
-                expected: prototype.arity,
-                got: argc,
+            .ok_or(VmError::InvalidCallablePrototype(prototype_id))?;
+        if prototype.frame_local_count > MAX_FRAME_LOCAL_COUNT {
+            return Err(VmError::FrameAllocationLimit {
+                requested: prototype.frame_local_count,
+                limit: MAX_FRAME_LOCAL_COUNT,
             });
         }
-        if let Some(crate::compiler::TypeSchema::Callable { params, .. }) = &prototype.schema
-            && (params.len() != operands.len()
-                || !params
-                    .iter()
-                    .zip(&operands)
-                    .all(|(schema, value)| value_matches_type_schema(value, schema)))
+        // A call without a runtime callable value (`CallScript`) cannot
+        // populate capture cells or bind the function's self identity.
+        if callable.is_none()
+            && (!prototype.capture_slots.is_empty() || prototype.self_slot.is_some())
         {
-            return Err(VmError::TypeMismatch("callable argument schema"));
+            return Err(VmError::CallScriptRequiresEnvironment(prototype_id));
+        }
+        if prototype.arity != operands.len() as u8 {
+            return Err(VmError::CallableArityMismatch {
+                prototype_id,
+                expected: prototype.arity,
+                got: operands.len() as u8,
+            });
+        }
+        if let Some(crate::compiler::TypeSchema::Callable { params, .. }) = &prototype.schema {
+            if params.len() != operands.len() {
+                return Err(VmError::TypeMismatch("callable argument schema"));
+            }
+            for (schema, value) in params.iter().zip(&operands) {
+                if let Err(error) = validate_value_against_type_schema(
+                    value,
+                    schema,
+                    self.host.execution_scope.resources(),
+                    true,
+                ) {
+                    return Err(map_callable_schema_error(error, "callable argument schema"));
+                }
+            }
         }
 
         match prototype.target {
@@ -1225,7 +1564,7 @@ impl Vm {
                     self.engine.jit.observe_script_call_target(
                         self.active_frame_key(),
                         call_ip,
-                        callable.prototype_id,
+                        prototype_id,
                     );
                 }
                 if self.instance.call_depth >= self.instance.max_script_call_depth {
@@ -1238,32 +1577,40 @@ impl Vm {
                     .script_functions
                     .get(function_id as usize)
                     .cloned()
-                    .ok_or(VmError::InvalidCallablePrototype(callable.prototype_id))?;
+                    .ok_or(VmError::InvalidCallablePrototype(prototype_id))?;
                 if prototype.parameter_slots.len() != operands.len() {
                     return Err(VmError::CallableArityMismatch {
-                        prototype_id: callable.prototype_id,
+                        prototype_id,
                         expected: prototype.parameter_slots.len() as u8,
-                        got: argc,
+                        got: operands.len() as u8,
                     });
                 }
-                let inherited_callables = self
-                    .instance
-                    .execution_frames
-                    .last()
-                    .map(|frame| {
-                        self.instance.locals[frame.local_base..frame.local_base + frame.local_count]
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, value)| matches!(value, Value::Callable(_)))
-                            .map(|(slot, value)| (slot, value.clone()))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let local_base = self.instance.locals.len();
                 let local_count = prototype.frame_local_count;
-                self.instance
-                    .locals
-                    .resize(local_base.saturating_add(local_count), Value::Null);
+                let local_base = self.instance.locals.len();
+                let local_end = checked_frame_end(local_base, local_count)?;
+                let inherited_callables = if let Some(frame) = self.instance.execution_frames.last()
+                {
+                    let frame_end = frame
+                        .local_base
+                        .checked_add(frame.local_count)
+                        .ok_or(VmError::InvalidFrameState("local frame range overflow"))?;
+                    let locals = self
+                        .instance
+                        .locals
+                        .get(frame.local_base..frame_end)
+                        .ok_or(VmError::InvalidFrameState(
+                            "active local frame range is invalid",
+                        ))?;
+                    locals
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, value)| matches!(value, Value::Callable(_)))
+                        .map(|(slot, value)| (slot, value.clone()))
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                self.instance.locals.resize(local_end, Value::Null);
                 for binding in &self.program.root_callable_bindings {
                     let relative = binding.local_slot as usize;
                     if relative >= local_count {
@@ -1301,7 +1648,9 @@ impl Vm {
                     }
                     self.instance.locals[local_base + relative] = argument;
                 }
-                if let Some(environment) = &callable.env {
+                if let Some(environment) =
+                    callable.as_ref().and_then(|callable| callable.env.as_ref())
+                {
                     let cells = environment
                         .cells
                         .lock()
@@ -1349,15 +1698,19 @@ impl Vm {
                             "self slot is outside the script frame",
                         ));
                     }
+                    let Some(callable) = callable else {
+                        return Err(VmError::InvalidFrameState(
+                            "self slot requires a callable value",
+                        ));
+                    };
                     self.instance.locals[local_base + relative] = Value::Callable(callable.clone());
                 }
-                let return_ip = self.instance.ip;
                 self.instance.execution_frames.push(ExecutionFrame {
-                    continuation: FrameContinuation::ResumeBytecode { return_ip },
+                    continuation,
                     operand_stack_base,
                     local_base,
                     local_count,
-                    prototype_id: Some(callable.prototype_id),
+                    prototype_id: Some(prototype_id),
                 });
                 self.instance.active_local_base_cache = local_base;
                 self.instance.active_operand_stack_base_cache = operand_stack_base;
@@ -1367,6 +1720,12 @@ impl Vm {
                 Ok(ExecOutcome::Continue)
             }
             CallableTarget::HostImport(import_index) => {
+                let Some(callable) = callable else {
+                    // `CallScript` is a static script-function call and must
+                    // never route a host-import prototype to the host path.
+                    return Err(VmError::InvalidCallablePrototype(prototype_id));
+                };
+                let argc = operands.len() as u8;
                 self.instance.stack.extend(operands);
                 let call_ip = self.instance.ip.saturating_sub(2);
                 match self.execute_host_call(import_index, argc, call_ip)? {
@@ -1375,7 +1734,7 @@ impl Vm {
                     HostCallExecOutcome::Yielded => {
                         self.instance
                             .stack
-                            .insert(operand_stack_base, Value::Callable(callable));
+                            .insert(operand_stack_base, Value::Callable(callable.clone()));
                         Ok(ExecOutcome::Yielded)
                     }
                     HostCallExecOutcome::Pending(op_id) => Ok(ExecOutcome::Waiting(op_id)),
@@ -1431,7 +1790,7 @@ impl Vm {
         self.instance.call_depth = self.script_frame_depth();
 
         if frame.prototype_id.is_some() {
-            let frame_end = frame.local_base.saturating_add(frame.local_count);
+            let frame_end = checked_frame_end(frame.local_base, frame.local_count)?;
             self.instance
                 .capture_cells
                 .retain(|absolute, _| *absolute < frame.local_base || *absolute >= frame_end);
@@ -1466,10 +1825,15 @@ impl Vm {
                 .callable_prototypes
                 .get(prototype_id as usize)
                 .and_then(|prototype| prototype.schema.as_ref())
-            && !value_matches_type_schema(&result, schema)
+            && let Err(error) = validate_value_against_type_schema(
+                &result,
+                schema,
+                self.host.execution_scope.resources(),
+                true,
+            )
         {
             self.drop_value_with_contract(result);
-            return Err(VmError::TypeMismatch("callable return schema"));
+            return Err(map_callable_schema_error(error, "callable return schema"));
         }
 
         match frame.continuation {
@@ -2726,6 +3090,12 @@ impl Vm {
                 let argc = self.read_u8()?;
                 return self.execute_call_value(argc, Some(call_ip));
             }
+            x if x == OpCode::CallScript as u8 => {
+                let call_ip = self.instance.ip.saturating_sub(1);
+                let prototype_id = self.read_u32()?;
+                let argc = self.read_u8()?;
+                return self.execute_call_script(prototype_id, argc, call_ip);
+            }
             other => return Err(VmError::InvalidOpcode(other)),
         }
         Ok(ExecOutcome::Continue)
@@ -2869,6 +3239,11 @@ impl Vm {
         if !matches!(&callable, Value::Callable(_)) {
             return Err(VmError::InvalidCallable);
         }
+        if !self.owns_callable(&callable) {
+            return Err(VmError::InvalidFrameState(
+                "callable does not belong to this vm",
+            ));
+        }
         self.instance.queued_callables.push_back(QueuedCallable {
             callable,
             args,
@@ -2986,6 +3361,11 @@ impl Vm {
         if !matches!(&callable, Value::Callable(_)) {
             return Err(VmError::InvalidCallable);
         }
+        if !self.owns_callable(&callable) {
+            return Err(VmError::InvalidFrameState(
+                "callable does not belong to this vm",
+            ));
+        }
         if !self.instance.execution_frames.is_empty() {
             return Err(VmError::InvalidFrameState(
                 "host invocation requires a halted VM",
@@ -3066,7 +3446,10 @@ impl Vm {
             let Some(frame) = self.instance.execution_frames.pop() else {
                 break;
             };
-            let frame_end = frame.local_base.saturating_add(frame.local_count);
+            let frame_end = match frame.local_base.checked_add(frame.local_count) {
+                Some(end) => end,
+                None => self.instance.locals.len(),
+            };
             self.instance
                 .capture_cells
                 .retain(|absolute, _| *absolute < frame.local_base || *absolute >= frame_end);

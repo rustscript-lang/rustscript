@@ -17,6 +17,7 @@ use crate::builtins::{
 };
 use crate::compiler::modules::{UseDecl, UsePathSegment};
 use crate::compiler::source_map::{SourceId, Span};
+use crate::host_api::{HostApiCatalog, HostFunctionSchema, ResourceTypeKey};
 
 pub(crate) use self::expressions::host_generic_type_arg_arity;
 use self::lexer::{Lexer, ParserFormatArg, Token, TokenKind, is_ident_continue, is_ident_start};
@@ -24,8 +25,12 @@ use self::symbols::is_virtual_host_namespace_spec;
 use super::{
     ParseError, ReplLocalBinding, STDLIB_PRINT_ARITY, STDLIB_PRINT_NAME,
     ir::{
-        AssignmentKind, ClosureExpr, Expr, FunctionDecl, FunctionImpl, FunctionParam, LocalSlot,
-        MatchPattern, MatchTypePattern, Stmt, StructDecl, TypeSchema,
+        AssignmentKind, CatalogVisibility, ClosureExpr, Expr, FunctionDecl, FunctionDeclSite,
+        FunctionImpl, FunctionParam, FunctionRefSite, FunctionRefTarget, HostApiIrMetadata,
+        LexerToken, LocalDeclSite, LocalRefSite, LocalSlot, MatchPattern, MatchTypePattern,
+        ModuleNamespaceAlias, ParsedCallSite, ParsedCallTarget, ParsedLexicalScope,
+        ParsedSemanticIndex, ResolvedHostCall, ScopeId, SemanticNodeId, Stmt, StmtSpanSite,
+        StructDecl, StructDeclSite, TypeSchema,
     },
 };
 
@@ -156,6 +161,33 @@ pub(super) struct Parser {
     mutable_locals: Vec<bool>,
     borrowed_map_iter_locals: Vec<LocalSlot>,
     local_schemas: HashMap<LocalSlot, TypeSchema>,
+    /// Immutable host-API catalog snapshot threaded from the compile options.
+    ///
+    /// `Some` when a [`HostApiCatalog`] was supplied on the
+    /// [`CompileSourceFileOptions`](crate::compiler::CompileSourceFileOptions)
+    /// for this parse; `None` for REPL and public dialect parses, which carry
+    /// no catalog. When present it is authoritative for any host name it
+    /// declares.
+    host_catalog: Option<std::sync::Arc<HostApiCatalog>>,
+    /// Fingerprint-bound host candidate metadata produced from
+    /// [`Parser::host_catalog`].
+    ///
+    /// `Some` exactly when a catalog is present, holding the catalog
+    /// fingerprint even when the source makes zero host calls. `None` when no
+    /// catalog was supplied.
+    host_api_metadata: Option<HostApiIrMetadata>,
+    /// Catalog-declared host function declarations, keyed by `(name, arity)`.
+    ///
+    /// Distinct arities of the same host name are distinct flat functions, so
+    /// they are kept out of the name-only [`Parser::functions`] map (which
+    /// still owns user-declared, builtin and extern identities) and tracked
+    /// here by `(name, arity)` so the same overload call reuses its index
+    /// without colliding across arities.
+    catalog_function_decls: HashMap<(String, u8), FunctionDecl>,
+    /// Parser-produced semantic provenance index tracked during parse.
+    parsed_semantic_index: ParsedSemanticIndex,
+    /// Parser scope stack for tracking current scope during parse.
+    parser_scope_stack: Vec<ScopeId>,
 }
 
 struct ClosureCaptureContext {
@@ -216,7 +248,48 @@ impl Parser {
             mutable_locals: Vec::new(),
             borrowed_map_iter_locals: Vec::new(),
             local_schemas: HashMap::new(),
+            host_catalog: None,
+            host_api_metadata: None,
+            catalog_function_decls: HashMap::new(),
+            parsed_semantic_index: ParsedSemanticIndex::default(),
+            parser_scope_stack: vec![0],
         })
+    }
+
+    /// Catalog-aware constructor that additionally threads the immutable
+    /// [`HostApiCatalog`] snapshot from the compile options.
+    ///
+    /// This is the internal entry point used by RustScript file/module parses.
+    /// The frontend increments the options-held `Arc` when entering the parser
+    /// boundary; this constructor consumes that `Arc` into the parser, so the
+    /// catalog allocation and its data are never copied. The metadata carrier
+    /// is initialized once for the parse. [`Parser::define_host_function`] may
+    /// temporarily increment the `Arc` again per catalog host call to release
+    /// the `self` borrow. REPL and the public [`ParserDialect`] path keep using
+    /// [`Parser::new`] and thus stay catalog-free (`host_api_metadata` `None`).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_with_host_catalog(
+        source: &str,
+        source_id: SourceId,
+        allow_implicit_externs: bool,
+        allow_implicit_semicolons: bool,
+        enforce_mutable_bindings: bool,
+        import_scan_mode: bool,
+        dialect: &'static dyn ParserDialect,
+        catalog: std::sync::Arc<HostApiCatalog>,
+    ) -> Result<Self, ParseError> {
+        let mut parser = Self::new(
+            source,
+            source_id,
+            allow_implicit_externs,
+            allow_implicit_semicolons,
+            enforce_mutable_bindings,
+            import_scan_mode,
+            dialect,
+        )?;
+        parser.host_api_metadata = Some(HostApiIrMetadata::new(catalog.fingerprint()));
+        parser.host_catalog = Some(catalog);
+        Ok(parser)
     }
 
     pub(super) fn new_with_predeclared_locals(
@@ -228,6 +301,34 @@ impl Parser {
         dialect: &'static dyn ParserDialect,
         predeclared_locals: &[ReplLocalBinding],
     ) -> Result<Self, ParseError> {
+        let parser = Self::new_with_predeclared_locals_and_host_catalog(
+            source,
+            source_id,
+            allow_implicit_externs,
+            allow_implicit_semicolons,
+            enforce_mutable_bindings,
+            dialect,
+            predeclared_locals,
+            None,
+        )?;
+        Ok(parser)
+    }
+
+    /// Catalog-aware REPL constructor: combines the predeclared-locals path
+    /// with an optional [`HostApiCatalog`] snapshot so REPL compiles emit
+    /// exact V13 `HostImport` schemas against the standard snapshot (when a
+    /// catalog is supplied) instead of name-only imports.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_with_predeclared_locals_and_host_catalog(
+        source: &str,
+        source_id: SourceId,
+        allow_implicit_externs: bool,
+        allow_implicit_semicolons: bool,
+        enforce_mutable_bindings: bool,
+        dialect: &'static dyn ParserDialect,
+        predeclared_locals: &[ReplLocalBinding],
+        host_catalog: Option<std::sync::Arc<HostApiCatalog>>,
+    ) -> Result<Self, ParseError> {
         let mut parser = Self::new(
             source,
             source_id,
@@ -237,6 +338,10 @@ impl Parser {
             false,
             dialect,
         )?;
+        if let Some(catalog) = host_catalog {
+            parser.host_api_metadata = Some(HostApiIrMetadata::new(catalog.fingerprint()));
+            parser.host_catalog = Some(catalog);
+        }
         for binding in predeclared_locals {
             parser.predeclare_local(binding)?;
         }
@@ -249,11 +354,26 @@ impl Parser {
 
     pub(super) fn parse_program(&mut self) -> Result<Vec<Stmt>, ParseError> {
         self.predeclare_functions()?;
+        // Record root scope (first token to EOF). The root scope has no
+        // parent; clear the sentinel so the first real scope gets `None`.
+        let root_span = self
+            .tokens
+            .last()
+            .map(|t| Span::new(t.span.source_id, 0, t.span.hi))
+            .unwrap_or(Span::new(0, 0, 0));
+        self.parser_scope_stack.clear();
+        self.enter_scope(root_span);
         let mut stmts = Vec::new();
         while !self.check(&TokenKind::Eof) {
             stmts.push(self.parse_stmt()?);
         }
-        self.validate_schema_reference_sites()?;
+        // Import-scan parses exist only to discover `use` directives; body
+        // semantic validation (unknown struct schemas, callable contracts,
+        // mutability) is deferred to the real compile parse so an unrelated
+        // body error can never hide a valid import.
+        if !self.import_scan_mode {
+            self.validate_schema_reference_sites()?;
+        }
         Ok(stmts)
     }
 
@@ -385,6 +505,16 @@ impl Parser {
         self.function_impls.clone()
     }
 
+    /// Cloned host candidate metadata produced by this parse.
+    ///
+    /// `Some` (bound to the catalog fingerprint, even with zero declared host
+    /// calls) exactly when a [`HostApiCatalog`] was threaded into the parser;
+    /// `None` when parse had no catalog. The carrier holds the complete
+    /// candidate schema lists recorded per catalog-declared flat function.
+    pub(super) fn host_api_metadata(&self) -> Option<HostApiIrMetadata> {
+        self.host_api_metadata.clone()
+    }
+
     pub(super) fn local_bindings(&self) -> Vec<(String, LocalSlot)> {
         let mut locals = self.named_local_bindings.clone();
         locals.sort_by_key(|(_, index)| *index);
@@ -426,6 +556,368 @@ impl Parser {
 
     pub(super) fn is_implicit_extern(&self, name: &str) -> bool {
         self.implicit_extern_names.contains(name)
+    }
+
+    /// Take the parser's semantic provenance index.
+    pub(super) fn take_parsed_semantic_index(&mut self) -> ParsedSemanticIndex {
+        std::mem::take(&mut self.parsed_semantic_index)
+    }
+
+    /// Take the parser's full lexer token stream as structured metadata.
+    ///
+    /// The raw lexer token spans are narrowed to their exact range and
+    /// translated into language-service oriented [`LexerToken`] records; the
+    /// trailing EOF token is dropped. Identifiers carry their text.
+    pub(super) fn take_lexer_tokens(&mut self) -> Vec<LexerToken> {
+        self.tokens
+            .iter()
+            .filter(|token| !matches!(token.kind, TokenKind::Eof))
+            .map(|token| LexerToken {
+                kind: lexer_token_kind_tag(&token.kind),
+                ident: match &token.kind {
+                    TokenKind::Ident(name) => name.clone(),
+                    _ => String::new(),
+                },
+                span: token.span,
+            })
+            .collect()
+    }
+
+    /// Take the parser's catalog visibility.
+    pub(super) fn take_catalog_visibility(&mut self) -> CatalogVisibility {
+        CatalogVisibility {
+            host_namespace_aliases: self
+                .host_namespace_aliases
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            direct_host_call_aliases: self
+                .direct_host_call_aliases
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            direct_host_wildcard_imports: self
+                .direct_host_wildcard_imports
+                .iter()
+                .cloned()
+                .collect(),
+            module_namespace_aliases: self
+                .module_namespace_aliases
+                .iter()
+                .map(|(alias, module_path)| ModuleNamespaceAlias {
+                    alias: alias.clone(),
+                    module_path: module_path.clone(),
+                    source: String::new(),
+                })
+                .collect(),
+            use_declarations: std::mem::take(&mut self.use_declarations),
+        }
+    }
+
+    /// Current scope id.
+    pub(super) fn current_scope_id(&self) -> ScopeId {
+        *self.parser_scope_stack.last().copied().get_or_insert(0)
+    }
+
+    /// Allocate a [`SemanticNodeId`] and record a call site in the provenance
+    /// index. Returns `Some(id)` for every recorded call; the [`Option`]
+    /// return type keeps the signature symmetric with node builders that may
+    /// fall back to a synthetic call without a site. Every parser caller
+    /// passes a real source expression and receives `Some`.
+    pub(super) fn alloc_call_id(
+        &mut self,
+        callee_span: Span,
+        expr_span: Span,
+        target: ParsedCallTarget,
+        name: String,
+        is_namespace_call: bool,
+    ) -> Option<SemanticNodeId> {
+        let id = self.parsed_semantic_index.alloc_node_id();
+        let scope_id = self.current_scope_id();
+        self.parsed_semantic_index.call_sites.push(ParsedCallSite {
+            id,
+            callee_span,
+            expr_span,
+            target,
+            name,
+            scope_id,
+            is_namespace_call,
+        });
+        Some(id)
+    }
+
+    /// Allocate provenance for a direct local-callable call
+    /// (`name(...)` where `name` binds a local). Records the exact callee
+    /// token span and the full call span through the closing `)`.
+    pub(super) fn alloc_local_call_id(
+        &mut self,
+        callee_span: Span,
+        rparen_span: Span,
+        slot: LocalSlot,
+        name: String,
+    ) -> Option<SemanticNodeId> {
+        let expr_span = Span::new(callee_span.source_id, callee_span.lo, rparen_span.hi);
+        self.alloc_call_id(
+            callee_span,
+            expr_span,
+            ParsedCallTarget::Local(slot),
+            name,
+            false,
+        )
+    }
+
+    /// Build an [`Expr::Call`] with provenance tracking. Returns the call
+    /// expression with the fifth field set to `Some(id)`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn build_call_expr_with_provenance(
+        &mut self,
+        index: u16,
+        type_args: Vec<TypeSchema>,
+        args: Vec<Expr>,
+        host_resolution: Option<Box<ResolvedHostCall>>,
+        callee_span: Span,
+        name: String,
+        is_namespace_call: bool,
+    ) -> Expr {
+        // Compute expr_span from callee start through the last consumed token.
+        let expr_span = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|t| Span::new(callee_span.source_id, callee_span.lo, t.span.hi))
+            .unwrap_or(callee_span);
+        let semantic_id = self.alloc_call_id(
+            callee_span,
+            expr_span,
+            ParsedCallTarget::Function(index),
+            name,
+            is_namespace_call,
+        );
+        Expr::Call(index, type_args, args, host_resolution, semantic_id)
+    }
+
+    /// Attach exact provenance to an ordinary source-level [`Expr::Call`]
+    /// that was built by a direct identifier/path + `(args)` branch without
+    /// its own provenance tracking.
+    ///
+    /// Only plain `Expr::Call(..., None)` expressions are annotated — local
+    /// calls, function-value references, and compiler-synthetic calls built
+    /// by helpers lacking direct source syntax pass through untouched. The
+    /// `callee_span` is the exact callee token range captured before args;
+    /// the recorded expr span runs from the callee start through the closing
+    /// `)` (`rparen_span`).
+    pub(super) fn attach_ordinary_call_provenance(
+        &mut self,
+        expr: Expr,
+        callee_span: Span,
+        rparen_span: Span,
+        name: String,
+    ) -> Expr {
+        let Expr::Call(index, type_args, args, host_resolution, None) = expr else {
+            return expr;
+        };
+        let expr_span = Span::new(callee_span.source_id, callee_span.lo, rparen_span.hi);
+        // Record the direct function callee as a function reference site with
+        // the exact identifier token span.
+        self.record_func_ref(callee_span, index, name.clone());
+        let semantic_id = self.alloc_call_id(
+            callee_span,
+            expr_span,
+            ParsedCallTarget::Function(index),
+            name,
+            false,
+        );
+        Expr::Call(index, type_args, args, host_resolution, semantic_id)
+    }
+
+    /// Attach exact provenance to a builtin/host namespace call
+    /// (`json::encode(...)`, `math::abs(...)`) or a dotted JS call
+    /// (`console.log(...)`) that was built by a path-based branch without its
+    /// own provenance tracking.
+    ///
+    /// Only plain `Expr::Call(..., None)` expressions are annotated. The
+    /// `callee_span` is the exact full namespace path token range
+    /// (`json::encode`); the recorded expr span runs from the path start
+    /// through the closing `)` of the consumed argument list. The call is
+    /// marked as a namespace call so downstream consumers can distinguish
+    /// path-based calls from plain direct calls.
+    pub(super) fn attach_namespace_call_provenance(
+        &mut self,
+        expr: Expr,
+        callee_span: Span,
+        name: String,
+    ) -> Expr {
+        let Expr::Call(index, type_args, args, host_resolution, None) = expr else {
+            return expr;
+        };
+        let expr_span = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|t| Span::new(callee_span.source_id, callee_span.lo, t.span.hi))
+            .unwrap_or(callee_span);
+        let semantic_id = self.alloc_call_id(
+            callee_span,
+            expr_span,
+            ParsedCallTarget::Function(index),
+            name,
+            true,
+        );
+        Expr::Call(index, type_args, args, host_resolution, semantic_id)
+    }
+
+    /// Record a local declaration site.
+    pub(super) fn record_local_decl(
+        &mut self,
+        ident_span: Span,
+        stmt_span: Span,
+        slot: LocalSlot,
+        name: String,
+    ) {
+        let id = self.parsed_semantic_index.alloc_node_id();
+        let scope_id = self.current_scope_id();
+        let decl_order =
+            if let Some(scope) = self.parsed_semantic_index.scopes.get_mut(scope_id as usize) {
+                let order = scope.declarations.len() as u32;
+                scope.declarations.push(slot);
+                order
+            } else {
+                0
+            };
+        self.parsed_semantic_index.local_decls.push(LocalDeclSite {
+            id,
+            ident_span,
+            stmt_span,
+            slot,
+            name,
+            scope_id,
+            decl_order,
+        });
+    }
+
+    /// Record a local variable reference site.
+    pub(super) fn record_local_ref(&mut self, ident_span: Span, slot: LocalSlot, name: String) {
+        let id = self.parsed_semantic_index.alloc_node_id();
+        let scope_id = self.current_scope_id();
+        self.parsed_semantic_index.local_refs.push(LocalRefSite {
+            id,
+            ident_span,
+            slot,
+            name,
+            scope_id,
+        });
+    }
+
+    /// Record a function declaration site.
+    pub(super) fn record_func_decl(&mut self, ident_span: Span, function_index: u16, name: String) {
+        let id = self.parsed_semantic_index.alloc_node_id();
+        let scope_id = self.current_scope_id();
+        let decl_order =
+            if let Some(scope) = self.parsed_semantic_index.scopes.get_mut(scope_id as usize) {
+                let order = scope.functions.len() as u32;
+                scope.functions.push(function_index);
+                order
+            } else {
+                0
+            };
+        self.parsed_semantic_index
+            .func_decls
+            .push(FunctionDeclSite {
+                id,
+                ident_span,
+                function_index,
+                name,
+                scope_id,
+                decl_order,
+            });
+    }
+
+    /// Record a function value reference site.
+    pub(super) fn record_func_ref(&mut self, ident_span: Span, function_index: u16, name: String) {
+        self.record_func_ref_target(
+            ident_span,
+            FunctionRefTarget::Function(function_index),
+            name,
+        );
+    }
+
+    /// Record a struct declaration site.
+    ///
+    /// Structs have no flat function index, so the provenance site carries
+    /// the exact identifier span, the full `struct`..`}` declaration span,
+    /// and the declaring scope. Strict-mode resolution uses the declaration
+    /// span to point at the exact struct declaration in diagnostics.
+    pub(super) fn record_struct_decl(&mut self, ident_span: Span, decl_span: Span, name: String) {
+        let id = self.parsed_semantic_index.alloc_node_id();
+        let scope_id = self.current_scope_id();
+        self.parsed_semantic_index
+            .struct_decls
+            .push(StructDeclSite {
+                id,
+                ident_span,
+                decl_span,
+                name,
+                scope_id,
+            });
+    }
+
+    pub(super) fn record_func_ref_target(
+        &mut self,
+        ident_span: Span,
+        target: FunctionRefTarget,
+        name: String,
+    ) {
+        let id = self.parsed_semantic_index.alloc_node_id();
+        let scope_id = self.current_scope_id();
+        self.parsed_semantic_index.func_refs.push(FunctionRefSite {
+            id,
+            ident_span,
+            target,
+            name,
+            scope_id,
+        });
+    }
+
+    /// Enter a new scope and return its id.
+    pub(super) fn enter_scope(&mut self, range: Span) -> ScopeId {
+        let id = self.parsed_semantic_index.alloc_scope_id();
+        let parent = self.parser_scope_stack.last().copied();
+        self.parsed_semantic_index.scopes.push(ParsedLexicalScope {
+            id,
+            parent,
+            range,
+            declarations: Vec::new(),
+            functions: Vec::new(),
+        });
+        self.parser_scope_stack.push(id);
+        id
+    }
+
+    /// Exit the current scope.
+    pub(super) fn exit_scope(&mut self) {
+        self.parser_scope_stack.pop();
+    }
+
+    /// Run `f` inside a fresh child scope and exit on every path (success or
+    /// error), keeping the parser scope stack balanced. The scope's recorded
+    /// range spans `open_span.lo` through the last token consumed by `f` (the
+    /// closing `}` of a brace block, or the final token of an expression
+    /// production). Returns the scope id so callers can assert on it.
+    pub(super) fn with_scope<T>(
+        &mut self,
+        open_span: Span,
+        f: impl FnOnce(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        let scope_id = self.enter_scope(open_span);
+        let result = f(self);
+        let close_hi = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|token| token.span.hi)
+            .unwrap_or(open_span.hi);
+        if let Some(scope) = self.parsed_semantic_index.scopes.get_mut(scope_id as usize) {
+            scope.range.hi = close_hi.max(open_span.hi);
+        }
+        self.exit_scope();
+        result
     }
 
     /// Look up a file-module namespace alias recorded from a structured
@@ -536,5 +1028,72 @@ impl Parser {
 
     fn function_param_names(params: &[FunctionParam]) -> Vec<String> {
         params.iter().map(|param| param.name.clone()).collect()
+    }
+}
+
+/// A stable string tag for a lexer token kind, used by the language-service
+/// token metadata. The tag is the [`TokenKind`] variant name; identifier
+/// tokens keep the `Ident` tag with their text carried separately.
+fn lexer_token_kind_tag(kind: &TokenKind) -> String {
+    match kind {
+        TokenKind::Ident(_) => "Ident".to_string(),
+        TokenKind::Int(_) => "Int".to_string(),
+        TokenKind::IntMinMagnitude(_) => "IntMinMagnitude".to_string(),
+        TokenKind::Float(_) => "Float".to_string(),
+        TokenKind::String(_) => "String".to_string(),
+        TokenKind::Bytes(_) => "Bytes".to_string(),
+        TokenKind::True => "True".to_string(),
+        TokenKind::False => "False".to_string(),
+        TokenKind::Null => "Null".to_string(),
+        TokenKind::Pub => "Pub".to_string(),
+        TokenKind::Use => "Use".to_string(),
+        TokenKind::Import => "Import".to_string(),
+        TokenKind::From => "From".to_string(),
+        TokenKind::As => "As".to_string(),
+        TokenKind::Fn => "Fn".to_string(),
+        TokenKind::Struct => "Struct".to_string(),
+        TokenKind::Let => "Let".to_string(),
+        TokenKind::For => "For".to_string(),
+        TokenKind::If => "If".to_string(),
+        TokenKind::Else => "Else".to_string(),
+        TokenKind::Match => "Match".to_string(),
+        TokenKind::While => "While".to_string(),
+        TokenKind::Break => "Break".to_string(),
+        TokenKind::Continue => "Continue".to_string(),
+        TokenKind::Bang => "Bang".to_string(),
+        TokenKind::BangEqual => "BangEqual".to_string(),
+        TokenKind::Plus => "Plus".to_string(),
+        TokenKind::PlusPlus => "PlusPlus".to_string(),
+        TokenKind::PlusEqual => "PlusEqual".to_string(),
+        TokenKind::Minus => "Minus".to_string(),
+        TokenKind::Star => "Star".to_string(),
+        TokenKind::Slash => "Slash".to_string(),
+        TokenKind::Percent => "Percent".to_string(),
+        TokenKind::Ampersand => "Ampersand".to_string(),
+        TokenKind::AmpersandAmpersand => "AmpersandAmpersand".to_string(),
+        TokenKind::PipePipe => "PipePipe".to_string(),
+        TokenKind::Pipe => "Pipe".to_string(),
+        TokenKind::LParen => "LParen".to_string(),
+        TokenKind::RParen => "RParen".to_string(),
+        TokenKind::LBracket => "LBracket".to_string(),
+        TokenKind::RBracket => "RBracket".to_string(),
+        TokenKind::LBrace => "LBrace".to_string(),
+        TokenKind::RBrace => "RBrace".to_string(),
+        TokenKind::Comma => "Comma".to_string(),
+        TokenKind::Colon => "Colon".to_string(),
+        TokenKind::Question => "Question".to_string(),
+        TokenKind::Dot => "Dot".to_string(),
+        TokenKind::DotDot => "DotDot".to_string(),
+        TokenKind::DotDotEqual => "DotDotEqual".to_string(),
+        TokenKind::Ellipsis => "Ellipsis".to_string(),
+        TokenKind::Semicolon => "Semicolon".to_string(),
+        TokenKind::Equal => "Equal".to_string(),
+        TokenKind::EqualEqual => "EqualEqual".to_string(),
+        TokenKind::FatArrow => "FatArrow".to_string(),
+        TokenKind::Less => "Less".to_string(),
+        TokenKind::LessEqual => "LessEqual".to_string(),
+        TokenKind::Greater => "Greater".to_string(),
+        TokenKind::GreaterEqual => "GreaterEqual".to_string(),
+        TokenKind::Eof => "Eof".to_string(),
     }
 }

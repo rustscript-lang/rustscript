@@ -19,7 +19,8 @@ pub use error::{VmError, WireError};
 pub use host::{HostBinding, HostDispatcher, HostError, HostFunction};
 pub use program::{
     CallablePrototype, CallableTarget, CaptureBindingMode, ExportedCallable, FunctionRegion,
-    HostImport, OpCode, Program, RootCallableBinding, ScriptFunction, ValueType,
+    HostImport, MAX_FRAME_LOCAL_COUNT, OpCode, Program, RootCallableBinding, ScriptFunction,
+    ValueType,
 };
 pub use value::{CallableEnvironment, CallableKind, CallableValue, Value};
 pub use vm::{DEFAULT_MAX_SCRIPT_CALL_DEPTH, Vm, VmResult, VmStatus};

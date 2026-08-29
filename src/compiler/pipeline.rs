@@ -1,20 +1,25 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::HostImport;
+use crate::host_api::HostApiCatalog;
 
 use super::ReplLocalState;
 use super::codegen::Compiler;
 use super::frontends;
-use super::ir::{Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, Stmt, TypeSchema};
+use super::ir::{
+    Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, SemanticIndex, Stmt, TypeSchema,
+};
 use super::linker::{ParsedUnit, merge_units};
 use super::modules::ModuleGraph;
+use super::semantic_model::SemanticModel;
 use super::source_loader::load_units_for_source_file;
 use super::source_map::SourceMap;
 use super::{
     CompileError, CompileSourceFileOptions, CompiledProgram, CompiledReplProgram, ParseError,
-    ReplLocalBinding, SourceError, SourceFlavor, SourcePathError, TypingMode, lifetime, parser,
-    typing,
+    ReplLocalBinding, SourceError, SourceFlavor, SourcePathError, TypingMode, lifetime,
+    materialization, parser, typing,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -188,6 +193,7 @@ fn record_expr_local_debug_ranges(
             key,
             container_slot,
             key_slot,
+            semantic_id: _,
         } => {
             note_local_use(ranges, *container_slot, line);
             note_local_use(ranges, *key_slot, line);
@@ -198,17 +204,18 @@ fn record_expr_local_debug_ranges(
             value,
             value_slot,
             fallback,
+            semantic_id: _,
         } => {
             note_local_use(ranges, *value_slot, line);
             record_expr_local_debug_ranges(value, line, ranges);
             record_expr_local_debug_ranges(fallback, line, ranges);
         }
-        Expr::Call(_, _, args) | Expr::ModuleCall(_, _, args) => {
+        Expr::Call(_, _, args, _, _) | Expr::ModuleCall(_, _, args, _) => {
             for arg in args {
                 record_expr_local_debug_ranges(arg, line, ranges);
             }
         }
-        Expr::LocalCall(index, _, args) => {
+        Expr::LocalCall(index, _, args, _) => {
             note_local_use(ranges, *index, line);
             for arg in args {
                 record_expr_local_debug_ranges(arg, line, ranges);
@@ -374,21 +381,53 @@ fn compile_parsed_output_with_entry_locals(
         reject_strict_unknown_annotations(&parsed).map_err(SourceError::Parse)?;
     }
     let local_debug_ranges = collect_named_local_debug_ranges(&parsed);
-    let parsed = typing::legalize_builtins_and_bind_types(parsed, typing_mode, entry_local_types);
+    let parsed = typing::legalize_builtins_and_bind_types(parsed, typing_mode, entry_local_types)
+        .map_err(SourceError::Compile)?;
     typing::validate_if_else_type_consistency(&parsed, typing_mode, entry_local_types)
         .map_err(SourceError::Compile)?;
+    // One strict inference run over the post-legalize IR: it feeds both the
+    // strict RustScript resolution gate and the resource-ownership metadata
+    // for the lifetime passes. Slot indices are the pre-compaction logical
+    // locals here, exactly the space availability/liveness analyze in.
+    let pre_lifetime_type_info = typing::infer_types(&parsed, typing_mode, entry_local_types);
     if typing_mode.is_strict() {
-        let strict_type_info = typing::infer_types(&parsed, typing_mode, entry_local_types);
-        enforce_strict_rustscript_type_resolution(&parsed, &strict_type_info)
+        enforce_strict_rustscript_type_resolution(&parsed, &pre_lifetime_type_info)
             .map_err(SourceError::Compile)?;
     }
+    // A local slot is resource-owned when its post-legalize logical schema
+    // contains a resource anywhere (direct or nested). These slots are the
+    // move-only contract for availability/liveness; plain programs carry no
+    // resource schemas, so their behavior is untouched.
+    let owned_local_slots = pre_lifetime_type_info
+        .local_schemas
+        .iter()
+        .map(|schema| {
+            schema.as_ref().is_some_and(|schema| {
+                schema.contains_resource_with_named_types(&parsed.struct_schemas)
+            })
+        })
+        .collect::<Vec<_>>();
     let parsed = lifetime::enforce_local_availability_with_entry_locals(
         parsed,
         entry_locals,
         behavior.clear_dead_locals,
         enable_local_move_semantics,
+        &owned_local_slots,
     )
     .map_err(SourceError::Parse)?;
+    // Classify named callable materialization on the final merged IR
+    // (post-lifetime, so capture metadata and rewritten uses are
+    // authoritative). Codegen consumes `requires_callable_slot` to omit
+    // hidden callable slots for direct-only functions.
+    //
+    // The classification runs BEFORE local-slot compaction: it tracks
+    // named-function values through slot flows, and merged physical slots
+    // would collapse distinct flows into one slot, producing spurious
+    // dynamic-target facts. Pre-compaction slots are the true frame-relative
+    // value identities, so the classification is strictly more precise on
+    // the unallocated IR.
+    let callable_use_facts = materialization::classify_named_callables(&parsed);
+    let parsed = lifetime::allocate_local_slots(parsed).map_err(SourceError::Parse)?;
     let type_info = typing::infer_types(&parsed, typing_mode, entry_local_types);
     let FrontendIr {
         stmts,
@@ -404,6 +443,27 @@ fn compile_parsed_output_with_entry_locals(
         .cloned()
         .map(|decl| (decl.index, decl))
         .collect::<HashMap<_, _>>();
+
+    // Milestone-5 observation for the crate's unit tests: capture the
+    // classification keyed by the merged flat function identity before the
+    // facts move into the Compiler, so tests observe exactly what the
+    // compiler received. Compiled into unit-test builds only; never part of
+    // the public API.
+    #[cfg(test)]
+    let mut callable_use_observations = functions
+        .iter()
+        .filter_map(|decl| {
+            callable_use_facts.get(&decl.index).map(|facts| {
+                materialization::CallableUseObservation {
+                    function_index: decl.index,
+                    name: decl.name.clone(),
+                    facts: *facts,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    #[cfg(test)]
+    callable_use_observations.sort_unstable_by_key(|observation| observation.function_index);
 
     let mut runtime_import_functions: Vec<FunctionDecl> = functions
         .iter()
@@ -442,10 +502,21 @@ fn compile_parsed_output_with_entry_locals(
     compiler.set_root_local_count(locals);
     compiler.set_function_decls(function_decls);
     compiler.set_function_impls(function_impls);
+    compiler.set_callable_use_facts(callable_use_facts);
     compiler.set_struct_schemas(struct_schemas);
     compiler.set_host_import_return_types(host_import_return_types);
     compiler.set_host_import_signatures(host_import_signatures);
     compiler.set_call_index_remap(call_index_remap);
+    compiler.set_host_imports(
+        runtime_import_functions
+            .iter()
+            .map(|func| HostImport {
+                name: func.name.clone(),
+                arity: func.arity,
+                return_type: func.return_type,
+            })
+            .collect(),
+    );
     compiler.set_enable_local_move_semantics(enable_local_move_semantics);
     for func in &functions {
         compiler.add_function_debug(func);
@@ -460,19 +531,13 @@ fn compile_parsed_output_with_entry_locals(
         .compile_program(&stmts)
         .map_err(SourceError::Compile)?;
     program.local_count = program.local_count.max(locals);
-    program.imports = runtime_import_functions
-        .iter()
-        .map(|func| HostImport {
-            name: func.name.clone(),
-            arity: func.arity,
-            return_type: func.return_type,
-        })
-        .collect();
     let runtime_locals = program.local_count;
     Ok(CompiledProgram {
         program,
         locals: runtime_locals,
         functions: visible_runtime_import_functions,
+        #[cfg(test)]
+        callable_use_facts: callable_use_observations,
     })
 }
 
@@ -502,10 +567,18 @@ fn enforce_strict_rustscript_type_resolution(
     parsed: &FrontendIr,
     type_info: &typing::TypeInferenceResult,
 ) -> Result<(), CompileError> {
+    let parsed_index = parsed.parsed_semantic_index.as_ref();
     for schema in parsed.struct_schemas.values() {
         if schema_is_fully_known(&schema.body_schema) {
             continue;
         }
+        let span = parsed_index.and_then(|index| {
+            index
+                .struct_decls
+                .iter()
+                .find(|site| site.name == schema.name)
+                .map(|site| site.ident_span)
+        });
         return Err(CompileError::StrictTypingRequired {
             line: None,
             source_name: None,
@@ -513,6 +586,7 @@ fn enforce_strict_rustscript_type_resolution(
                 "struct '{}' contains non-concrete field types; RustScript requires concrete schemas",
                 schema.name
             ),
+            span,
         });
     }
 
@@ -521,6 +595,13 @@ fn enforce_strict_rustscript_type_resolution(
         if let Some(schema) = decl.return_schema.as_ref()
             && !schema_is_fully_known(schema)
         {
+            let span = parsed_index.and_then(|index| {
+                index
+                    .func_decls
+                    .iter()
+                    .find(|site| site.function_index == decl.index)
+                    .map(|site| site.ident_span)
+            });
             return Err(CompileError::StrictTypingRequired {
                 line: function_decl_lines.get(&decl.index).copied(),
                 source_name: parsed.function_sources.get(&decl.index).cloned(),
@@ -528,6 +609,7 @@ fn enforce_strict_rustscript_type_resolution(
                     "function '{}' uses a non-concrete return schema; RustScript requires concrete return types",
                     decl.name
                 ),
+                span,
             });
         }
     }
@@ -536,6 +618,20 @@ fn enforce_strict_rustscript_type_resolution(
         if slot_is_fully_typed(slot, type_info) {
             continue;
         }
+        let span = parsed_index.and_then(|index| {
+            index
+                .local_decls
+                .iter()
+                .find(|decl| decl.slot == slot)
+                .map(|decl| decl.ident_span)
+                .or_else(|| {
+                    index
+                        .local_refs
+                        .iter()
+                        .find(|reference| reference.slot == slot)
+                        .map(|reference| reference.ident_span)
+                })
+        });
         return Err(CompileError::StrictTypingRequired {
             line: site.line,
             source_name: site.source_name,
@@ -543,6 +639,7 @@ fn enforce_strict_rustscript_type_resolution(
                 "{} '{}' does not resolve to a concrete compile-time type in RustScript",
                 site.kind, site.name
             ),
+            span,
         });
     }
 
@@ -580,9 +677,13 @@ fn schema_is_fully_known(schema: &TypeSchema) -> bool {
         | TypeSchema::String
         | TypeSchema::Bytes
         | TypeSchema::GenericParam(_) => true,
+        // A resource is fully known: its key fixes the nominal type statically.
+        TypeSchema::Resource(_) => true,
         TypeSchema::Optional(inner) => schema_is_fully_known(inner),
         TypeSchema::Named(_, type_args) => type_args.iter().all(schema_is_fully_known),
-        TypeSchema::Array(item) | TypeSchema::Map(item) => schema_is_fully_known(item),
+        TypeSchema::Array(item) | TypeSchema::Map(item) => {
+            matches!(item.as_ref(), TypeSchema::Unknown) || schema_is_fully_known(item)
+        }
         TypeSchema::ArrayTuple(items) => items.iter().all(schema_is_fully_known),
         TypeSchema::ArrayTupleRest { prefix, rest } => {
             prefix.iter().all(schema_is_fully_known) && schema_is_fully_known(rest)
@@ -707,6 +808,233 @@ pub fn compile_source(source: &str) -> Result<CompiledProgram, SourceError> {
     compile_source_with_flavor(source, SourceFlavor::RustScript)
 }
 
+/// Analyze a source string without generating bytecode, returning a
+/// [`SemanticModel`] for language-service queries.
+///
+/// This is the primary entry point for editor tooling: it parses, legalizes,
+/// type-checks, and builds the semantic index, but does NOT produce bytecode
+/// or run the VM. The returned [`SemanticModel`] can be used for hover,
+/// signature help, completions, go-to-definition, and diagnostics.
+///
+/// Errors are returned as [`SourceError`] when the source cannot be parsed
+/// or compiled. The caller can still inspect the model's diagnostics for
+/// recoverable errors (typing, host resolution).
+pub fn analyze_source(source: &str) -> Result<SemanticModel, SourceError> {
+    analyze_source_with_flavor(source, SourceFlavor::RustScript)
+}
+
+/// Analyze a source string with a specific flavor, without generating
+/// bytecode. See [`analyze_source`] for details.
+pub fn analyze_source_with_flavor(
+    source: &str,
+    flavor: SourceFlavor,
+) -> Result<SemanticModel, SourceError> {
+    let effective = default_standard_catalog_options(&CompileSourceFileOptions::default());
+    let mut source_map = SourceMap::new();
+    let source_id = source_map.add_source("<source>", source.to_string());
+    let parsed = frontends::parse_source(source, flavor, &effective).map_err(|err| {
+        SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
+    })?;
+    analyze_parsed_output(
+        source.to_string(),
+        parsed,
+        source_map,
+        flavor,
+        effective.host_api_catalog().cloned(),
+        None,
+    )
+}
+
+/// Analyze a source file path without generating bytecode, returning a
+/// [`SemanticModel`] for language-service queries.
+///
+/// See [`analyze_source`] for details. This variant reads the source from
+/// a file path and supports module resolution and custom catalogs.
+pub fn analyze_source_file(path: impl AsRef<Path>) -> Result<SemanticModel, SourcePathError> {
+    analyze_source_file_with_options(path, CompileSourceFileOptions::default())
+}
+
+/// Analyze a source file with custom options (catalog, module overrides, etc.)
+/// without generating bytecode. See [`analyze_source`] for details.
+pub fn analyze_source_file_with_options(
+    path: impl AsRef<Path>,
+    options: CompileSourceFileOptions,
+) -> Result<SemanticModel, SourcePathError> {
+    let path = path.as_ref().to_path_buf();
+    run_with_compiler_stack(move || analyze_source_file_impl(&path, &options))
+}
+
+/// Analyze a source file whose entry text is provided explicitly (in-memory,
+/// e.g. the current editor buffer) instead of being read from disk, without
+/// generating bytecode.
+///
+/// This is the language-server analysis entry: the caller supplies the entry
+/// file's *current* text (which overrides anything on disk), while imported
+/// modules resolve from disk or via `CompileSourceFileOptions` module
+/// overrides. The returned [`SemanticModel`] is identical to what
+/// [`analyze_source_file_with_options`] produces for the same effective text.
+///
+/// The flavor is derived from the path (`.rss` -> RustScript, etc.) exactly
+/// as in [`analyze_source_file_with_options`].
+pub fn analyze_source_from_string_with_options(
+    path: impl AsRef<Path>,
+    source: &str,
+    options: CompileSourceFileOptions,
+) -> Result<SemanticModel, SourcePathError> {
+    let path = path.as_ref().to_path_buf();
+    let source_owned = source.to_string();
+    run_with_compiler_stack(move || {
+        let options_ref = options;
+        analyze_source_string_at_path(
+            &path,
+            flavor_for_path(&path, &options_ref)?,
+            &source_owned,
+            &options_ref,
+        )
+    })
+}
+
+/// Derive the source flavor for a path, honoring the options' source plugins.
+fn flavor_for_path(
+    path: &Path,
+    options: &CompileSourceFileOptions,
+) -> Result<SourceFlavor, SourcePathError> {
+    SourceFlavor::from_path_with_options(path, options)
+}
+
+fn analyze_source_file_impl(
+    path: &Path,
+    options: &CompileSourceFileOptions,
+) -> Result<SemanticModel, SourcePathError> {
+    let flavor = SourceFlavor::from_path_with_options(path, options)?;
+    let source_raw = std::fs::read_to_string(path)?;
+    analyze_source_string_at_path(path, flavor, &source_raw, options)
+}
+
+fn analyze_source_string_at_path(
+    path: &Path,
+    flavor: SourceFlavor,
+    source: &str,
+    options: &CompileSourceFileOptions,
+) -> Result<SemanticModel, SourcePathError> {
+    let effective = default_standard_catalog_options(options);
+    // Module-graph, plugin, and custom-catalog compilations share the same
+    // frontend pipeline as the compile path: the loader parses every unit
+    // verbatim (no second parser), the linker merges the provenance carrier,
+    // and analysis builds the semantic index from the merged IR.
+    if effective.has_module_overrides() || effective.has_source_plugins() {
+        let loaded = load_units_for_source_file(path, flavor, source, &effective)?;
+        let catalog = effective.host_api_catalog().cloned();
+        return analyze_loaded_units(
+            source.to_string(),
+            loaded.units,
+            flavor,
+            loaded.sources,
+            catalog,
+            Some(loaded.module_graph),
+        );
+    }
+
+    let mut source_map = SourceMap::new();
+    let source_id = source_map.add_source(path.display().to_string(), source.to_string());
+    let parsed = frontends::parse_source(source, flavor, &effective).map_err(|err| {
+        SourcePathError::Source(SourceError::Parse(
+            err.with_line_span_from_source(&source_map, source_id),
+        ))
+    })?;
+
+    let catalog = effective.host_api_catalog().cloned();
+    analyze_parsed_output(
+        source.to_string(),
+        parsed,
+        source_map,
+        flavor,
+        catalog,
+        None,
+    )
+    .map_err(SourcePathError::Source)
+}
+
+/// Analyze the merged output of the module loader through the shared
+/// frontend pipeline: merge units, then legalize + type-check + build the
+/// provenance-driven semantic index. No second parser is involved.
+fn analyze_loaded_units(
+    source: String,
+    units: Vec<ParsedUnit>,
+    flavor: SourceFlavor,
+    sources: SourceMap,
+    custom_catalog: Option<Arc<HostApiCatalog>>,
+    module_graph: Option<ModuleGraph>,
+) -> Result<SemanticModel, SourcePathError> {
+    let merged = merge_units(units)?;
+    analyze_parsed_output(
+        source,
+        merged,
+        sources,
+        flavor,
+        custom_catalog,
+        module_graph,
+    )
+    .map_err(SourcePathError::Source)
+}
+
+fn analyze_parsed_output(
+    _source: String,
+    parsed: FrontendIr,
+    source_map: SourceMap,
+    flavor: SourceFlavor,
+    custom_catalog: Option<Arc<HostApiCatalog>>,
+    module_graph: Option<ModuleGraph>,
+) -> Result<SemanticModel, SourceError> {
+    let typing_mode = TypingMode::for_flavor(flavor);
+    let catalog = custom_catalog.unwrap_or_else(default_analyze_catalog);
+
+    // Run legalize and type checking.
+    let legalize_result =
+        typing::legalize_builtins_and_bind_types(parsed.clone(), typing_mode, &[]);
+    let mut errors = Vec::new();
+
+    let (mut parsed_after_legalize, type_info) = match legalize_result {
+        Ok(legalized) => {
+            let type_info = typing::infer_types(&legalized, typing_mode, &[]);
+            (legalized, type_info)
+        }
+        Err(compile_err) => {
+            errors.push(compile_err);
+            // Even on error, run type inference on the original IR for partial results.
+            let type_info = typing::infer_types(&parsed, typing_mode, &[]);
+            (parsed, type_info)
+        }
+    };
+
+    // Run validation, collecting errors.
+    if let Err(compile_err) =
+        typing::validate_if_else_type_consistency(&parsed_after_legalize, typing_mode, &[])
+    {
+        errors.push(compile_err);
+    }
+
+    // Build the semantic index directly from the parser provenance carried
+    // on the legalized IR plus the typed/resolved IR keyed by SemanticNodeId.
+    // No source-text reconstruction is involved.
+    let semantic_index =
+        SemanticIndex::build(type_info.local_schemas.clone(), &parsed_after_legalize);
+
+    // Attach the semantic index to the IR.
+    parsed_after_legalize.semantic_index = Some(semantic_index);
+
+    Ok(match module_graph {
+        Some(module_graph) => SemanticModel::new_with_module_graph(
+            parsed_after_legalize,
+            source_map,
+            catalog,
+            errors,
+            module_graph,
+        ),
+        None => SemanticModel::new(parsed_after_legalize, source_map, catalog, errors),
+    })
+}
+
 pub fn lint_trailing_function_return_semicolons(
     source: &str,
     flavor: SourceFlavor,
@@ -814,11 +1142,8 @@ fn lint_unknown_inferred_local_types_impl(
         .map_err(|err| {
             SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
         })?;
-    Ok(collect_unknown_inferred_local_types(
-        &source_map,
-        source_id,
-        parsed,
-    ))
+    collect_unknown_inferred_local_types(&source_map, source_id, parsed)
+        .map_err(SourceError::Compile)
 }
 
 fn collect_inferred_local_type_hints_impl(
@@ -831,7 +1156,7 @@ fn collect_inferred_local_type_hints_impl(
         .map_err(|err| {
             SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
         })?;
-    Ok(collect_named_local_type_hints(parsed))
+    collect_named_local_type_hints(parsed).map_err(SourceError::Compile)
 }
 
 fn lint_unknown_inferred_local_types_with_options_impl(
@@ -839,7 +1164,10 @@ fn lint_unknown_inferred_local_types_with_options_impl(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<Vec<UnknownInferredLocal>, SourcePathError> {
-    if !options.has_module_overrides() && !options.has_source_plugins() {
+    if !options.has_module_overrides()
+        && !options.has_source_plugins()
+        && options.host_api_catalog().is_none()
+    {
         return lint_unknown_inferred_local_types_impl(source, flavor)
             .map_err(SourcePathError::Source);
     }
@@ -853,7 +1181,10 @@ fn collect_inferred_local_type_hints_with_options_impl(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<Vec<InferredLocalTypeHint>, SourcePathError> {
-    if !options.has_module_overrides() && !options.has_source_plugins() {
+    if !options.has_module_overrides()
+        && !options.has_source_plugins()
+        && options.host_api_catalog().is_none()
+    {
         return collect_inferred_local_type_hints_impl(source, flavor)
             .map_err(SourcePathError::Source);
     }
@@ -877,11 +1208,8 @@ fn lint_unknown_inferred_local_types_at_path_with_options_impl(
         .last()
         .map(|unit| unit.parsed)
         .expect("root parsed unit should always be present");
-    Ok(collect_unknown_inferred_local_types(
-        &source_map,
-        source_id,
-        parsed,
-    ))
+    collect_unknown_inferred_local_types(&source_map, source_id, parsed)
+        .map_err(|error| SourcePathError::Source(SourceError::Compile(error)))
 }
 
 fn collect_inferred_local_type_hints_at_path_with_options_impl(
@@ -897,16 +1225,17 @@ fn collect_inferred_local_type_hints_at_path_with_options_impl(
         .last()
         .map(|unit| unit.parsed)
         .expect("root parsed unit should always be present");
-    Ok(collect_named_local_type_hints(parsed))
+    collect_named_local_type_hints(parsed)
+        .map_err(|error| SourcePathError::Source(SourceError::Compile(error)))
 }
 
 fn collect_unknown_inferred_local_types(
     source_map: &SourceMap,
     source_id: u32,
     parsed: FrontendIr,
-) -> Vec<UnknownInferredLocal> {
+) -> Result<Vec<UnknownInferredLocal>, CompileError> {
     let local_debug_ranges = collect_local_debug_ranges(&parsed.stmts, &parsed.function_impls);
-    let parsed = typing::legalize_builtins_and_bind_types(parsed, TypingMode::DynamicHints, &[]);
+    let parsed = typing::legalize_builtins_and_bind_types(parsed, TypingMode::DynamicHints, &[])?;
     let type_info = typing::infer_types(&parsed, TypingMode::DynamicHints, &[]);
 
     let mut warnings = Vec::new();
@@ -945,13 +1274,15 @@ fn collect_unknown_inferred_local_types(
                 .or_else(|| source_map.line_span(source_id, line)),
         });
     }
-    warnings
+    Ok(warnings)
 }
 
-fn collect_named_local_type_hints(parsed: FrontendIr) -> Vec<InferredLocalTypeHint> {
+fn collect_named_local_type_hints(
+    parsed: FrontendIr,
+) -> Result<Vec<InferredLocalTypeHint>, CompileError> {
     let slot_ranges = collect_local_debug_ranges(&parsed.stmts, &parsed.function_impls);
     let function_decl_lines = collect_function_decl_lines(&parsed.stmts);
-    let parsed = typing::legalize_builtins_and_bind_types(parsed, TypingMode::DynamicHints, &[]);
+    let parsed = typing::legalize_builtins_and_bind_types(parsed, TypingMode::DynamicHints, &[])?;
     let type_info = typing::infer_types(&parsed, TypingMode::DynamicHints, &[]);
 
     let mut hints = Vec::new();
@@ -986,7 +1317,7 @@ fn collect_named_local_type_hints(parsed: FrontendIr) -> Vec<InferredLocalTypeHi
         }
     }
 
-    hints
+    Ok(hints)
 }
 
 fn inferred_slot_type_name(type_info: &typing::TypeInferenceResult, slot: LocalSlot) -> String {
@@ -1205,10 +1536,13 @@ fn compile_source_for_repl_with_locals_impl(
     let source_id = source_map.add_source("<source>", source.to_string());
     // REPL parsing/compiler entry state is separate from normal program compilation so
     // persisted locals do not leak into the generic frontend or IR surface.
-    let parsed =
-        frontends::parse_rustscript_repl_source(source, predefined_locals).map_err(|err| {
-            SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
-        })?;
+    let repl_catalog = None;
+    let parsed = frontends::parse_rustscript_repl_source_with_catalog(
+        source,
+        predefined_locals,
+        repl_catalog,
+    )
+    .map_err(|err| SourceError::Parse(err.with_line_span_from_source(&source_map, source_id)))?;
     let entry_local_types = build_entry_local_types(&parsed.ir, predefined_locals);
     let entry_availability =
         build_entry_local_availability(&parsed.ir, predefined_locals, moved_names);
@@ -1245,22 +1579,27 @@ fn build_entry_local_availability(
         .local_bindings
         .iter()
         .filter_map(|(name, slot)| {
-            let binding = predefined_by_name.get(name.as_str())?;
+            let binding = predefined_by_name.get(name.as_str()).copied()?;
             let schema = binding
                 .schema
                 .as_ref()
                 .map(|schema| schema.split_optional().0);
-            let copyable = matches!(
-                schema,
-                Some(
-                    TypeSchema::Null
-                        | TypeSchema::Int
-                        | TypeSchema::Float
-                        | TypeSchema::Number
-                        | TypeSchema::Bool
-                )
-            );
-            let movable = matches!(schema, Some(TypeSchema::String | TypeSchema::Bytes));
+            // A resource-containing entry local is move-only: never copyable,
+            // always movable (ownership transfers instead of duplicating the
+            // underlying handle).
+            let owned = schema.as_ref().is_some_and(TypeSchema::contains_resource);
+            let copyable = !owned
+                && matches!(
+                    schema,
+                    Some(
+                        TypeSchema::Null
+                            | TypeSchema::Int
+                            | TypeSchema::Float
+                            | TypeSchema::Number
+                            | TypeSchema::Bool
+                    )
+                );
+            let movable = owned || matches!(schema, Some(TypeSchema::String | TypeSchema::Bytes));
             Some(lifetime::EntryLocalAvailability {
                 slot: *slot,
                 copyable,
@@ -1306,8 +1645,9 @@ fn compile_source_with_flavor_impl(
 ) -> Result<CompiledProgram, SourceError> {
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source("<source>", source.to_string());
-    let parsed = frontends::parse_source(source, flavor, &CompileSourceFileOptions::default())
-        .map_err(|err| {
+    let effective = CompileSourceFileOptions::default();
+    let parsed =
+        frontends::parse_source_for_compile(source, flavor, &effective).map_err(|err| {
             SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
         })?;
     match compile_parsed_output(
@@ -1368,11 +1708,21 @@ fn compile_source_with_flavor_and_options_impl(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    if !options.has_module_overrides() && !options.has_source_plugins() {
-        return compile_source_with_flavor_impl(source, flavor, CompileBehavior::DEFAULT)
-            .map_err(SourcePathError::Source);
-    }
+    // Explicit catalogs are forwarded unchanged. The runtime standard catalog
+    // is applied by the analysis entry points; default bytecode compilation
+    // keeps legacy built-in dispatch for the standard surface.
+    let effective = options.clone();
 
+    compile_source_with_flavor_and_options_pipeline(source, flavor, &effective)
+}
+
+/// Runs the module-loading compile pipeline for a source string with the
+/// given options (already carrying an effective catalog).
+fn compile_source_with_flavor_and_options_pipeline(
+    source: &str,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+) -> Result<CompiledProgram, SourcePathError> {
     let path = virtual_inmemory_entry_path(flavor);
     let loaded = load_units_for_source_file(&path, flavor, source, options)?;
     compile_loaded_units(
@@ -1384,13 +1734,46 @@ fn compile_source_with_flavor_and_options_impl(
     )
 }
 
+/// Attach the authoritative standard catalog for analysis when the runtime
+/// surface is enabled and the caller did not supply a custom catalog. Explicit
+/// catalogs remain unchanged; default bytecode compilation keeps the catalog-
+/// free built-in dispatch path.
+fn default_standard_catalog_options(
+    options: &CompileSourceFileOptions,
+) -> CompileSourceFileOptions {
+    #[cfg(feature = "runtime")]
+    {
+        let mut effective = options.clone();
+        if effective.host_api_catalog().is_none() {
+            effective.set_host_api_catalog(crate::builtins::runtime::standard_host_catalog());
+        }
+        effective
+    }
+    #[cfg(not(feature = "runtime"))]
+    {
+        options.clone()
+    }
+}
+
+/// The default catalog for semantic analysis when no custom catalog is
+/// supplied. Legacy builtin names remain handled by the builtin catalog;
+/// explicit host catalogs provide resource-aware resolution.
+fn default_analyze_catalog() -> Arc<HostApiCatalog> {
+    Arc::new(
+        crate::host_api::HostApiBuilder::new()
+            .build()
+            .expect("default catalog"),
+    )
+}
+
 fn compile_source_at_path_with_flavor_and_options_impl(
     path: &Path,
     source: &str,
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    let loaded = load_units_for_source_file(path, flavor, source, options)?;
+    let effective = options.clone();
+    let loaded = load_units_for_source_file(path, flavor, source, &effective)?;
     compile_loaded_units(
         source.to_string(),
         loaded.units,
@@ -1425,9 +1808,10 @@ fn compile_source_file_impl(
     path: &Path,
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    let flavor = SourceFlavor::from_path_with_options(path, options)?;
+    let effective = options.clone();
+    let flavor = SourceFlavor::from_path_with_options(path, &effective)?;
     let source_raw = std::fs::read_to_string(path)?;
-    let loaded = load_units_for_source_file(path, flavor, &source_raw, options)?;
+    let loaded = load_units_for_source_file(path, flavor, &source_raw, &effective)?;
     compile_loaded_units(
         source_raw,
         loaded.units,
@@ -1458,6 +1842,335 @@ where
         match handle.join() {
             Ok(value) => value,
             Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "runtime"))]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::vm::Vm;
+
+    use super::*;
+
+    #[test]
+    fn production_path_callable_use_facts_observed() {
+        // Observe the milestone-5 classification through the real production
+        // pipeline (parse -> module merge -> lifetime -> classification ->
+        // Compiler) via the crate-internal test observation on
+        // CompiledProgram. Facts must be keyed by resolved flat identity
+        // and include the flow-aware dynamic-target and runtime-self facts;
+        // allocation behavior stays untouched (every named function keeps
+        // its prototype and hidden callable slot).
+        let source = r#"
+            fn direct_helper(x: int) -> int { x + 1 }
+            pub fn exported_helper(x: int) -> int { x + 2 }
+            fn stored_helper(x: int) -> int { x + 3 }
+            fn flow_helper() -> int { 4 }
+            fn consume(f) -> int { 1 }
+            fn apply(f) -> int { f(1) }
+            fn direct_recursive(n: int) -> int {
+                if n <= 0 => { 0 } else => { direct_recursive(n - 1) }
+            }
+            let captured = 42;
+            fn read_captured() -> int { captured }
+            fn captured_walk(n: int) -> int {
+                if n <= 0 => { captured } else => { captured_walk(n - 1) }
+            }
+            let stored = stored_helper;
+            let a = flow_helper;
+            let b = a;
+            b();
+            consume(stored_helper);
+            apply(consume);
+            direct_helper(1);
+            exported_helper(1);
+            direct_recursive(3);
+            read_captured;
+            captured_walk(2);
+        "#;
+        let compiled = compile_source(source).expect("classification program should compile");
+        let observations = &compiled.callable_use_facts;
+        let find = |name: &str| {
+            observations
+                .iter()
+                .find(|observation| observation.name == name)
+                .unwrap_or_else(|| panic!("observation for '{name}' missing: {observations:#?}"))
+                .facts
+        };
+        assert_eq!(
+            observations.len(),
+            9,
+            "every named script function must carry production-path facts"
+        );
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.function_index)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            9,
+            "facts must be keyed by distinct resolved flat identities"
+        );
+
+        let direct = find("direct_helper");
+        assert!(direct.called_directly);
+        assert!(!direct.referenced_as_value);
+        assert!(!direct.exported);
+        assert!(!direct.captures_environment);
+        assert!(!direct.dynamic_target_required);
+        assert!(!direct.runtime_self_required);
+        assert!(!direct.requires_callable_slot());
+
+        let exported = find("exported_helper");
+        assert!(exported.called_directly);
+        assert!(exported.exported);
+        assert!(exported.requires_callable_slot());
+
+        let stored = find("stored_helper");
+        assert!(stored.referenced_as_value);
+        assert!(
+            !stored.dynamic_target_required,
+            "passing a function value to a callee that never invokes it must not \
+             mark a dynamic target (tracked flow only)"
+        );
+        assert!(stored.requires_callable_slot());
+
+        let flow = find("flow_helper");
+        assert!(flow.referenced_as_value);
+        assert!(
+            flow.dynamic_target_required,
+            "the alias chain `let a = flow_helper; let b = a; b();` must propagate \
+             to the dynamic invocation"
+        );
+
+        let consume = find("consume");
+        assert!(consume.called_directly);
+        assert!(
+            consume.dynamic_target_required,
+            "consume is passed to `apply`, whose parameter is dynamically invoked"
+        );
+
+        let recursive = find("direct_recursive");
+        assert!(recursive.called_directly);
+        assert!(!recursive.captures_environment);
+        assert!(
+            !recursive.runtime_self_required,
+            "non-capturing direct recursion needs no runtime self identity"
+        );
+        assert!(!recursive.requires_callable_slot());
+
+        let read_captured = find("read_captured");
+        assert!(read_captured.captures_environment);
+        assert!(!read_captured.runtime_self_required);
+
+        let captured_walk = find("captured_walk");
+        assert!(captured_walk.captures_environment);
+        assert!(
+            captured_walk.runtime_self_required,
+            "capturing direct recursion retains the runtime self identity"
+        );
+        assert!(captured_walk.requires_callable_slot());
+
+        // Milestone 6 lowering: every named function keeps its prototype;
+        // direct-only functions (no value reference, export, capture, or
+        // dynamic target) keep no hidden callable slot, while the
+        // materialized functions retain their runtime self slot.
+        assert_eq!(compiled.program.callable_prototypes.len(), 9);
+        let self_slots = compiled
+            .program
+            .callable_prototypes
+            .iter()
+            .filter(|prototype| prototype.self_slot.is_some())
+            .count();
+        assert_eq!(
+            self_slots, 6,
+            "exported, stored, flow, consume, and both capturing functions stay materialized"
+        );
+        assert_eq!(
+            compiled
+                .program
+                .callable_prototypes
+                .iter()
+                .filter(|prototype| prototype.self_slot.is_none())
+                .count(),
+            3,
+            "direct_helper, apply, and direct_recursive are direct-only"
+        );
+        assert_eq!(compiled.program.root_callable_bindings.len(), 4);
+        assert!(
+            compiled
+                .program
+                .code
+                .contains(&(crate::OpCode::CallScript as u8)),
+            "direct-only call sites emit CallScript"
+        );
+
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, crate::vm::VmStatus::Halted);
+    }
+
+    #[test]
+    fn production_path_module_merge_facts_follow_flat_indices() {
+        // Two modules each declare a private `helper` plus a `pub run` that
+        // calls it, merged through the real production pipeline. The
+        // classification must attribute facts to distinct resolved flat
+        // identities; assertions never parse the merged display names (a
+        // mangling policy change must not affect them) and instead check
+        // counts, index uniqueness, and the exported-vs-private semantic
+        // facts.
+        let options = CompileSourceFileOptions::new()
+            .with_module_override_source(
+                "a/util.rss",
+                "pub fn run() { helper(); }\nfn helper() { 11; }\n",
+            )
+            .with_module_override_source(
+                "b/util.rss",
+                "pub fn run() { helper(); }\nfn helper() { 22; }\n",
+            );
+        let source = "use a::util as au;\nuse b::util as bu;\nau::run();\nbu::run();\n";
+        let compiled =
+            compile_source_with_flavor_and_options(source, SourceFlavor::RustScript, options)
+                .expect("same-named module helpers should compile");
+
+        let observations = &compiled.callable_use_facts;
+        assert_eq!(
+            observations.len(),
+            4,
+            "both modules' run and both same-named helpers must carry facts: {observations:#?}"
+        );
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.function_index)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            4,
+            "classification must be keyed by distinct resolved flat identities"
+        );
+
+        let runs = observations
+            .iter()
+            .filter(|observation| observation.facts.exported)
+            .collect::<Vec<_>>();
+        assert_eq!(runs.len(), 2, "both exported runs must survive the merge");
+        for run in runs {
+            assert!(run.facts.called_directly);
+            assert!(run.facts.requires_callable_slot());
+        }
+
+        let helpers = observations
+            .iter()
+            .filter(|observation| !observation.facts.exported)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            helpers.len(),
+            2,
+            "both same-named private helpers must survive the merge"
+        );
+        for helper in helpers {
+            assert!(
+                helper.facts.called_directly,
+                "each module's run calls its own same-named helper"
+            );
+            assert!(!helper.facts.dynamic_target_required);
+            assert!(!helper.facts.requires_callable_slot());
+        }
+
+        // Milestone 6 allocation: every merged function keeps its prototype;
+        // the same-named private helpers are direct-only (no hidden slot),
+        // and both exported runs stay materialized and exported.
+        assert_eq!(compiled.program.callable_prototypes.len(), 4);
+        assert_eq!(
+            compiled
+                .program
+                .callable_prototypes
+                .iter()
+                .filter(|prototype| prototype.self_slot.is_some())
+                .count(),
+            2,
+            "both exported runs keep their runtime self slot"
+        );
+        assert_eq!(
+            compiled
+                .program
+                .callable_prototypes
+                .iter()
+                .filter(|prototype| prototype.self_slot.is_none())
+                .count(),
+            2,
+            "both same-named private helpers are direct-only"
+        );
+        assert_eq!(compiled.program.root_callable_bindings.len(), 2);
+        assert_eq!(compiled.program.exported_callables.len(), 2);
+
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+        let status = vm.run().expect("vm should run");
+        assert_eq!(status, crate::vm::VmStatus::Halted);
+    }
+
+    #[test]
+    fn strict_non_concrete_struct_diagnostic_carries_exact_decl_span() {
+        // Strict RustScript rejects struct schemas whose fields are not fully
+        // concrete. The diagnostic must carry the exact parser-origin span of
+        // the struct declaration (its name identifier), resolved from the
+        // `StructDeclSite` provenance recorded by the parser — never a
+        // line-wide guess or source-text scan. Normal parse always yields
+        // fully-concrete struct schemas (or rejects `unknown` earlier), so a
+        // non-concrete schema models the other owner of the IR: a plugin or
+        // lowered unit that feeds a `struct_schemas` entry whose field type
+        // did not resolve. The provenance carrier and the resolver branch we
+        // exercise are the same production path.
+        let options = CompileSourceFileOptions::default();
+        let mut ir = crate::compiler::frontends::parse_source(
+            "struct Foo {\n    x: int\n}\n",
+            SourceFlavor::RustScript,
+            &options,
+        )
+        .expect("struct source parses");
+        // The parser recorded a struct declaration site with the exact ident
+        // span of the struct name token.
+        let index = ir.parsed_semantic_index.as_mut().expect("parse provenance");
+        let foo_site = index
+            .struct_decls
+            .iter()
+            .find(|site| site.name == "Foo")
+            .expect("Foo decl site recorded");
+        let ident_span = foo_site.ident_span;
+        // Pin the provenance to the real `Foo` name token in the source.
+        assert_eq!(
+            ident_span.lo,
+            "struct Foo {\n    x: int\n}\n"
+                .find("Foo")
+                .expect("Foo offset"),
+            "provenance ident span must point at the Foo name token"
+        );
+        assert_eq!(ident_span.len(), 3, "ident span covers exactly 'Foo'");
+
+        // Simulate a plugin/lowered IR where the field type did not resolve to
+        // a concrete schema, so the strict gate fires. The provenance site is
+        // unchanged and still points at the real declaration.
+        let foo_schema = ir.struct_schemas.get_mut("Foo").expect("Foo schema");
+        foo_schema.body_schema = crate::compiler::ir::TypeSchema::Object(
+            std::iter::once(("x".to_string(), crate::compiler::ir::TypeSchema::Unknown)).collect(),
+        );
+
+        let type_info = typing::infer_types(&ir, TypingMode::StrictRustScript, &[]);
+        let err = enforce_strict_rustscript_type_resolution(&ir, &type_info)
+            .expect_err("non-concrete struct schema must be rejected in strict mode");
+        match err {
+            CompileError::StrictTypingRequired { span, .. } => {
+                let span =
+                    span.expect("strict struct diagnostic must carry the exact declaration span");
+                assert_eq!(
+                    (span.lo, span.hi),
+                    (ident_span.lo, ident_span.hi),
+                    "diagnostic must slice exactly the struct name identifier"
+                );
+            }
+            other => panic!("expected StrictTypingRequired for struct, got {other:?}"),
         }
     }
 }

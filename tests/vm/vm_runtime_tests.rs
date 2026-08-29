@@ -489,23 +489,90 @@ fn host_function_registry_includes_default_runtime_exit() {
 
 #[test]
 fn json_encode_rejects_non_string_map_keys() {
-    match compile_source(
+    // Non-string keys are not representable in `TypeSchema::Map`, so the
+    // compiler admits the map and the runtime encoder rejects the key.
+    let compiled = compile_source(
         r#"
         use json;
         let payload = { 1: "one" };
         json::encode(payload);
     "#,
-    ) {
-        Err(err) => match err {
-            vm::SourceError::Compile(vm::CompileError::CallableArgumentTypeMismatch {
-                detail,
-                ..
-            }) => {
-                assert!(detail.contains("provably strings"), "{detail}");
+    )
+    .expect("non-string-key maps must compile; runtime must reject them");
+
+    let mut vm = Vm::new(compiled.program);
+    let err = vm
+        .run()
+        .expect_err("json::encode must reject non-string map keys");
+    match err {
+        vm::VmError::HostError(message) => {
+            assert!(
+                message.contains("json_encode map keys must be strings"),
+                "{message}"
+            );
+        }
+        other => panic!("unexpected vm error: {other}"),
+    }
+}
+
+#[test]
+fn json_encode_rejects_nan_at_runtime() {
+    // NaN has no JSON representation. The compiler cannot prove the value
+    // non-finite, so the runtime encoder must reject it.
+    let compiled = compile_source(
+        r#"
+        use json;
+        use math;
+        let payload: float = math::nan();
+        json::encode(payload);
+    "#,
+    )
+    .expect("nan float must compile; runtime must reject it");
+
+    let mut vm = Vm::new(compiled.program);
+    let err = vm.run().expect_err("json::encode must reject NaN");
+    match err {
+        vm::VmError::HostError(message) => {
+            assert!(
+                message.contains("json_encode does not support NaN or infinity"),
+                "{message}"
+            );
+        }
+        other => panic!("unexpected vm error: {other}"),
+    }
+}
+
+#[test]
+fn json_encode_rejects_infinite_floats_at_runtime() {
+    // Positive and negative infinity have no JSON representation; the
+    // runtime encoder must reject both.
+    for source in [
+        r#"
+        use json;
+        use math;
+        let payload: float = math::inf();
+        json::encode(payload);
+    "#,
+        r#"
+        use json;
+        use math;
+        let payload: float = math::neg_inf();
+        json::encode(payload);
+    "#,
+    ] {
+        let compiled =
+            compile_source(source).expect("infinite float must compile; runtime must reject it");
+        let mut vm = Vm::new(compiled.program);
+        let err = vm.run().expect_err("json::encode must reject infinity");
+        match err {
+            vm::VmError::HostError(message) => {
+                assert!(
+                    message.contains("json_encode does not support NaN or infinity"),
+                    "{message}"
+                );
             }
-            other => panic!("unexpected compiler error: {other}"),
-        },
-        Ok(_) => panic!("RustScript should reject generic-map json::encode at compile time"),
+            other => panic!("unexpected vm error: {other}"),
+        }
     }
 }
 

@@ -11,12 +11,16 @@
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Wake, Waker};
+#[cfg(feature = "async")]
+use std::task::Wake;
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "async")]
+use vm::{HostAsyncBridge, HostAsyncOpTerminal};
 use vm::{
-    HostAsyncBridge, HostAsyncOpTerminal, HostFunctionRegistry, InvocationError, InvocationItem,
-    InvocationPoll, Store, Value, Vm, VmError, compile_source, compile_source_for_repl_with_locals,
+    HostFunctionRegistry, InvocationError, InvocationItem, InvocationPoll, Store, Value, Vm,
+    VmError, compile_source, compile_source_for_repl_with_locals,
     operation::{
         HostOperation, OperationCancelReason, OperationError, OperationErrorCode, OperationResult,
         OperationSpec,

@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 
 use vm::{
-    ArgInfo, Assembler, BuiltinFunction, BytecodeBuilder, DebugFunction, DebugInfo,
-    DisassembleOptions, HostApiBuilder, HostFunctionSchema, HostImport, HostImportSchema,
-    HostParamPassing, HostParamSchema, HostTypeSchema, LineInfo, LocalInfo, Program,
-    ResourceTypeKey, ResourceTypeSchema, TypeMap, ValidationError, Value, ValueType, WireError,
-    builtin_call_index, decode_program, disassemble_vmbc, disassemble_vmbc_with_options,
-    encode_program, infer_local_count, validate_program,
+    ArgInfo, Assembler, BuiltinFunction, BytecodeBuilder, CallableKind, CallablePrototype,
+    CallableTarget, DebugFunction, DebugInfo, DisassembleOptions, HostApiBuilder,
+    HostFunctionSchema, HostImport, HostImportSchema, HostParamPassing, HostParamSchema,
+    HostTypeSchema, LineInfo, LocalInfo, Program, ResourceTypeKey, ResourceTypeSchema,
+    ScriptFunction, TypeMap, ValidationError, Value, ValueType, WireError, builtin_call_index,
+    decode_program, disassemble_vmbc, disassemble_vmbc_with_options, encode_program,
+    infer_local_count, validate_program,
 };
 
 #[test]
@@ -90,6 +91,231 @@ fn wire_v11_legacy_imports_decode_without_schema_metadata() {
     let decoded = decode_program(&legacy).expect("v11 payload should remain readable");
     assert_eq!(decoded.imports, vec![import]);
     assert!(decoded.host_import_schemas().is_empty());
+}
+
+#[test]
+fn wire_v11_zero_import_program_decodes_by_version() {
+    let program = Program::new(Vec::new(), vec![vm::OpCode::Ret as u8]);
+    let mut encoded = encode_program(&program).expect("v12 encoding should succeed");
+    encoded[4..6].copy_from_slice(&11u16.to_le_bytes());
+
+    let decoded = decode_program(&encoded).expect("schema-less v11 payload should decode");
+    assert_eq!(decoded.code, program.code);
+    assert!(decoded.imports.is_empty());
+    assert!(decoded.host_import_schemas().is_empty());
+}
+
+fn minimal_vmbc_prefix(constant_count: u32, code: &[u8], import_count: u32) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"VMBC");
+    bytes.extend_from_slice(&12u16.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&constant_count.to_le_bytes());
+    bytes.extend_from_slice(&(code.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(code);
+    bytes.extend_from_slice(&import_count.to_le_bytes());
+    bytes
+}
+
+#[test]
+fn decode_rejects_oversized_zero_byte_counts_before_allocation() {
+    const TOO_MANY: u32 = 1_000_001;
+
+    let constants = minimal_vmbc_prefix(TOO_MANY, &[], 0);
+    assert!(matches!(
+        decode_program(&constants),
+        Err(WireError::LengthTooLarge("constants", count)) if count == TOO_MANY as usize
+    ));
+
+    let imports = minimal_vmbc_prefix(0, &[], TOO_MANY);
+    assert!(matches!(
+        decode_program(&imports),
+        Err(WireError::LengthTooLarge("imports", count)) if count == TOO_MANY as usize
+    ));
+}
+
+fn v12_with_local_schema(schema: &[u8]) -> Vec<u8> {
+    let mut bytes = minimal_vmbc_prefix(0, &[vm::OpCode::Ret as u8], 0);
+    bytes.extend_from_slice(&[1, 0]);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.push(ValueType::Unknown as u8);
+    bytes.push(1);
+    bytes.extend_from_slice(schema);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes
+}
+
+fn v12_with_callable_frame_counts(frame_counts: &[u32]) -> Vec<u8> {
+    let mut bytes = minimal_vmbc_prefix(0, &[vm::OpCode::Ret as u8], 0);
+    bytes.extend_from_slice(&[0, 0]); // no type map, no debug info
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // script functions
+    bytes.extend_from_slice(&(frame_counts.len() as u32).to_le_bytes());
+    for frame_count in frame_counts {
+        bytes.extend_from_slice(&[0, 0]); // function item, script target
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // target id
+        bytes.push(0); // arity
+        bytes.extend_from_slice(&frame_count.to_le_bytes());
+        for _ in 0..4 {
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+        }
+        bytes.push(0); // no self slot
+        bytes.push(0); // no callable schema
+    }
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // function regions
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // root callable bindings
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // exported callables
+    bytes
+}
+
+fn v12_with_large_type_map(local_count: u32) -> Vec<u8> {
+    let mut bytes = minimal_vmbc_prefix(0, &[vm::OpCode::Ret as u8], 0);
+    bytes.extend_from_slice(&[1, 0]); // type map, strict=false
+    bytes.extend_from_slice(&local_count.to_le_bytes());
+    bytes.extend(std::iter::repeat_n(
+        ValueType::Unknown as u8,
+        local_count as usize,
+    ));
+    bytes.extend(std::iter::repeat_n(0, local_count as usize)); // optional local schemas
+    bytes.extend_from_slice(&local_count.to_le_bytes());
+    bytes.extend(std::iter::repeat_n(0, local_count as usize));
+    bytes.extend_from_slice(&local_count.to_le_bytes());
+    bytes.extend(std::iter::repeat_n(0, local_count as usize));
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // type map operands
+    bytes.push(0); // no debug info
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // script functions
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // callable prototypes
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // function regions
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // root callable bindings
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // exported callables
+    bytes
+}
+
+#[test]
+fn wire_roundtrip_preserves_root_resource_schema_for_embedded_decoder() {
+    let resource = ResourceTypeKey::new("wire.resource").expect("resource key");
+    let program = Program::new(Vec::new(), vec![vm::OpCode::Ret as u8]).with_type_map(TypeMap {
+        strict_types: true,
+        local_types: vec![ValueType::Unknown],
+        local_schemas: vec![Some(vm::compiler::TypeSchema::Resource(resource))],
+        callable_slots: vec![false],
+        optional_slots: vec![false],
+        operand_types: HashMap::new(),
+    });
+    let encoded = encode_program(&program).expect("resource schema should encode");
+    let decoded = decode_program(&encoded).expect("root decoder should accept tag 17");
+    assert_eq!(decoded.type_map, program.type_map);
+}
+
+#[test]
+fn decode_debits_repeated_callable_frame_counts_from_one_budget() {
+    let bytes = v12_with_callable_frame_counts(&[40_000; 30]);
+    assert!(
+        matches!(
+            decode_program(&bytes),
+            Err(WireError::LengthTooLarge("callable frame locals", 40_000))
+        ),
+        "{:?}",
+        decode_program(&bytes)
+    );
+}
+
+#[test]
+fn decode_rejects_a_single_oversized_callable_frame() {
+    let bytes = v12_with_callable_frame_counts(&[65_537]);
+    assert!(matches!(
+        decode_program(&bytes),
+        Err(WireError::LengthTooLarge("callable frame locals", 65_537))
+    ));
+}
+
+#[test]
+fn decode_rejects_oversized_program_frame_count_from_type_map() {
+    let bytes = v12_with_large_type_map(65_537);
+    assert!(matches!(
+        decode_program(&bytes),
+        Err(WireError::LengthTooLarge("type map locals", 65_537))
+    ));
+}
+
+fn schema_with_oversized_count(tag: u8, count: u32) -> Vec<u8> {
+    let mut schema = vec![tag];
+    if tag == 9 {
+        schema.extend_from_slice(&0u32.to_le_bytes());
+    }
+    schema.extend_from_slice(&count.to_le_bytes());
+    schema
+}
+
+#[test]
+fn decode_rejects_oversized_nested_schema_counts_before_allocation() {
+    const TOO_MANY: u32 = 1_000_001;
+    for (tag, field) in [
+        (9, "schema type args"),
+        (11, "schema tuple items"),
+        (12, "schema tuple prefix"),
+        (14, "schema object fields"),
+        (15, "schema callable params"),
+    ] {
+        let bytes = v12_with_local_schema(&schema_with_oversized_count(tag, TOO_MANY));
+        assert!(matches!(
+            decode_program(&bytes),
+            Err(WireError::LengthTooLarge(actual, count))
+                if actual == field && count == TOO_MANY as usize
+        ));
+    }
+}
+
+#[test]
+fn decode_rejects_oversized_resource_schema_key_before_allocation() {
+    const TOO_MANY: u32 = 16 * 1024 * 1024 + 1;
+    let mut schema = vec![17];
+    schema.extend_from_slice(&TOO_MANY.to_le_bytes());
+    let bytes = v12_with_local_schema(&schema);
+    assert!(matches!(
+        decode_program(&bytes),
+        Err(WireError::LengthTooLarge("string", count)) if count == TOO_MANY as usize
+    ));
+}
+
+fn v12_with_oversized_import_schema_param_count(count: u32) -> Vec<u8> {
+    let mut bytes = minimal_vmbc_prefix(0, &[vm::OpCode::Ret as u8], 1);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.push(b'h');
+    bytes.extend_from_slice(&[0, ValueType::Unknown as u8, 1]);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.push(b'h');
+    bytes.extend_from_slice(&count.to_le_bytes());
+    bytes.push(ValueType::Unknown as u8);
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.push(0);
+    bytes.push(0);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes
+}
+
+#[test]
+fn decode_rejects_oversized_import_schema_parameter_count_before_allocation() {
+    const TOO_MANY: u32 = 1_000_001;
+    let bytes = v12_with_oversized_import_schema_param_count(TOO_MANY);
+    assert!(matches!(
+        decode_program(&bytes),
+        Err(WireError::LengthTooLarge("host import schema parameters", count))
+            if count == TOO_MANY as usize
+    ));
 }
 
 fn rich_host_import_schema() -> HostImportSchema {
@@ -248,7 +474,7 @@ fn validate_accepts_known_good_program() {
 }
 
 #[test]
-fn callable_metadata_roundtrips_vmbc_v11() {
+fn callable_metadata_roundtrips_vmbc_v12() {
     let compiled = vm::compile_source_for_repl(
         r#"
             fn add_one(value: int) -> int { value + 1 }
@@ -270,6 +496,56 @@ fn callable_metadata_roundtrips_vmbc_v11() {
         compiled.program.root_callable_bindings
     );
     validate_program(&decoded, 0).expect("decoded program should validate");
+}
+
+#[test]
+fn closure_shared_capture_vmbc_round_trip() {
+    let compiled = vm::compile_source_with_flavor(
+        r#"
+            let mut state: string = "";
+            let sink = |delta| if true => {
+                state = state + delta;
+                { action: "continue" }
+            } else => {
+                { action: "skip" }
+            };
+            let _ = sink("a");
+            state;
+        "#,
+        vm::SourceFlavor::RustScript,
+    )
+    .expect("mutable capture source should compile");
+    let sink_prototype = compiled
+        .program
+        .callable_prototypes
+        .iter()
+        .find(|prototype| {
+            prototype.kind == vm::CallableKind::Closure
+                && prototype
+                    .capture_modes
+                    .contains(&vm::CaptureBindingMode::BorrowMut)
+        })
+        .expect("closure prototype should carry a BorrowMut capture");
+    assert!(
+        sink_prototype
+            .capture_modes
+            .iter()
+            .all(|mode| *mode != vm::CaptureBindingMode::Move),
+        "mutation capture must not be classified as a move"
+    );
+    let encoded = encode_program(&compiled.program).expect("encode shared capture program");
+    let decoded = decode_program(&encoded).expect("decode shared capture program");
+    assert_eq!(
+        decoded.callable_prototypes, compiled.program.callable_prototypes,
+        "capture modes must survive the VMBC round trip"
+    );
+    validate_program(&decoded, 0).expect("decoded program should validate");
+    let mut runtime = vm::Vm::new(decoded);
+    assert_eq!(
+        runtime.run().expect("decoded program should run"),
+        vm::VmStatus::Halted
+    );
+    assert_eq!(runtime.stack(), &[Value::string("a")]);
 }
 
 #[test]
@@ -556,4 +832,249 @@ fn literal_string_builtin_indices_are_appended_and_publicly_resolved() {
     );
     assert_eq!(BuiltinFunction::StringLowerAscii.call_index(), first + 2);
     assert_eq!(BuiltinFunction::StringSplitLiteral.call_index(), first - 1);
+}
+
+// ---------------------------------------------------------------------------
+// Milestone 6: CallScript wire support (VMBC V12)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn call_script_roundtrips_validation_and_disassembly() {
+    let mut code = vec![0x1A];
+    code.extend_from_slice(&7u32.to_le_bytes());
+    code.push(2);
+    code.push(vm::OpCode::Ret as u8);
+    // The V12 validator resolves the prototype id against the callable
+    // metadata, so the fixture carries a matching prototype (id 7, arity 2,
+    // script-function target) plus one script function boundary.
+    let program = Program::new(vec![], code).with_callable_metadata(
+        vec![ScriptFunction {
+            entry_ip: 6,
+            end_ip: 7,
+        }],
+        (0..8)
+            .map(|_| CallablePrototype {
+                kind: CallableKind::FunctionItem,
+                target: CallableTarget::ScriptFunction(0),
+                arity: 2,
+                frame_local_count: 2,
+                parameter_slots: vec![0, 1],
+                capture_source_slots: Vec::new(),
+                capture_slots: Vec::new(),
+                capture_modes: Vec::new(),
+                self_slot: None,
+                schema: None,
+            })
+            .collect(),
+        Vec::new(),
+        Vec::new(),
+    );
+
+    validate_program(&program, 0).expect("callscript should validate structurally");
+    let bytes = encode_program(&program).expect("callscript should encode");
+    let decoded = decode_program(&bytes).expect("callscript should decode");
+    assert_eq!(decoded.code, program.code);
+    validate_program(&decoded, 0).expect("decoded callscript should validate");
+    assert!(disassemble_vmbc(&bytes).unwrap().contains("callscript 7 2"));
+}
+
+#[test]
+fn call_script_text_assembler_parses_prototype_and_argc() {
+    let program =
+        vm::assemble("callscript 7 2\nret\n").expect("text assembler should parse callscript");
+    let mut expected = vec![0x1A];
+    expected.extend_from_slice(&7u32.to_le_bytes());
+    expected.push(2);
+    expected.push(vm::OpCode::Ret as u8);
+    assert_eq!(program.code, expected);
+}
+
+#[test]
+fn validate_rejects_truncated_call_script_operands() {
+    // No operand bytes at all.
+    let missing_all = Program::new(vec![], vec![0x1A]);
+    assert!(matches!(
+        validate_program(&missing_all, 0),
+        Err(ValidationError::TruncatedOperand {
+            expected_bytes: 5,
+            ..
+        })
+    ));
+    // Four of the five operand bytes present: the u32 prototype id without
+    // the trailing argc byte.
+    let mut missing_argc = vec![0x1A];
+    missing_argc.extend_from_slice(&3u32.to_le_bytes());
+    let missing_argc = Program::new(vec![], missing_argc);
+    assert!(matches!(
+        validate_program(&missing_argc, 0),
+        Err(ValidationError::TruncatedOperand {
+            expected_bytes: 5,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn validate_rejects_out_of_range_call_script_prototype() {
+    // CallScript(7, 2) with no callable prototypes at all: the target id is
+    // out of range and must be rejected deterministically at validation
+    // time instead of surfacing later as a runtime VM error.
+    let mut code = vec![0x1A];
+    code.extend_from_slice(&7u32.to_le_bytes());
+    code.push(2);
+    code.push(vm::OpCode::Ret as u8);
+    let no_prototypes = Program::new(vec![], code);
+    assert!(matches!(
+        validate_program(&no_prototypes, 0),
+        Err(ValidationError::InvalidCallScriptTarget {
+            offset: 0,
+            prototype_id: 7
+        })
+    ));
+
+    // One prototype exists (id 0) but the call targets id 1.
+    let mut code = vec![0x1A];
+    code.extend_from_slice(&1u32.to_le_bytes());
+    code.push(0);
+    code.push(vm::OpCode::Ret as u8);
+    let out_of_range = Program::new(vec![], code).with_callable_metadata(
+        vec![ScriptFunction {
+            entry_ip: 6,
+            end_ip: 7,
+        }],
+        vec![CallablePrototype {
+            kind: CallableKind::FunctionItem,
+            target: CallableTarget::ScriptFunction(0),
+            arity: 0,
+            frame_local_count: 0,
+            parameter_slots: Vec::new(),
+            capture_source_slots: Vec::new(),
+            capture_slots: Vec::new(),
+            capture_modes: Vec::new(),
+            self_slot: None,
+            schema: None,
+        }],
+        Vec::new(),
+        Vec::new(),
+    );
+    assert!(matches!(
+        validate_program(&out_of_range, 0),
+        Err(ValidationError::InvalidCallScriptTarget {
+            offset: 0,
+            prototype_id: 1
+        })
+    ));
+}
+
+#[test]
+fn validate_rejects_call_script_arity_mismatch() {
+    // Prototype 0 declares arity 1 but the call passes 2 operands.
+    let mut code = vec![0x1A];
+    code.extend_from_slice(&0u32.to_le_bytes());
+    code.push(2);
+    code.push(vm::OpCode::Ret as u8);
+    let program = Program::new(vec![], code).with_callable_metadata(
+        vec![ScriptFunction {
+            entry_ip: 6,
+            end_ip: 7,
+        }],
+        vec![CallablePrototype {
+            kind: CallableKind::FunctionItem,
+            target: CallableTarget::ScriptFunction(0),
+            arity: 1,
+            frame_local_count: 1,
+            parameter_slots: vec![0],
+            capture_source_slots: Vec::new(),
+            capture_slots: Vec::new(),
+            capture_modes: Vec::new(),
+            self_slot: None,
+            schema: None,
+        }],
+        Vec::new(),
+        Vec::new(),
+    );
+    assert!(matches!(
+        validate_program(&program, 0),
+        Err(ValidationError::InvalidCallScriptArity {
+            offset: 0,
+            prototype_id: 0,
+            expected: 1,
+            got: 2
+        })
+    ));
+}
+
+#[test]
+fn validate_rejects_call_script_targeting_host_import_prototype() {
+    // `CallScript` is a static script-function call: a host-import
+    // prototype is not a valid target. The VM rejects the same program
+    // shape with the typed `InvalidCallablePrototype` runtime error, so
+    // VMBC must reject it deterministically at validation time too.
+    let mut code = vec![0x1A];
+    code.extend_from_slice(&0u32.to_le_bytes());
+    code.push(1);
+    code.push(vm::OpCode::Ret as u8);
+    let program = Program::with_imports_and_debug(
+        Vec::new(),
+        code,
+        vec![HostImport {
+            name: "host_fn".to_string(),
+            arity: 1,
+            return_type: ValueType::Unknown,
+        }],
+        None,
+    )
+    .with_callable_metadata(
+        Vec::new(),
+        vec![CallablePrototype {
+            kind: CallableKind::HostFunction,
+            target: CallableTarget::HostImport(0),
+            arity: 1,
+            frame_local_count: 1,
+            parameter_slots: vec![0],
+            capture_source_slots: Vec::new(),
+            capture_slots: Vec::new(),
+            capture_modes: Vec::new(),
+            self_slot: None,
+            schema: None,
+        }],
+        Vec::new(),
+        Vec::new(),
+    );
+    assert!(matches!(
+        validate_program(&program, 0),
+        Err(ValidationError::InvalidCallScriptTarget {
+            offset: 0,
+            prototype_id: 0
+        })
+    ));
+}
+
+#[test]
+fn call_script_wire_version_is_v12_and_v11_accepts_schema_less_program() {
+    let program = Program::new(vec![], vec![vm::OpCode::Ret as u8]);
+    let encoded = encode_program(&program).expect("encode should succeed");
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 12);
+
+    let mut old = encoded.clone();
+    old[4..6].copy_from_slice(&11u16.to_le_bytes());
+    decode_program(&old).expect("schema-less v11 program should decode");
+}
+
+#[test]
+fn call_script_no_script_program_code_bytes_unchanged_by_version_bump() {
+    // The V12 bump must not alter instruction bytes for programs without
+    // script calls: encode a plain arithmetic program and verify the
+    // embedded code section is exactly the assembler output.
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.ldc(1);
+    bc.add();
+    bc.ret();
+    let program = Program::new(vec![Value::Int(1), Value::Int(2)], bc.finish());
+    let encoded = encode_program(&program).expect("encode should succeed");
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 12);
+    let decoded = decode_program(&encoded).expect("decode should succeed");
+    assert_eq!(decoded.code, program.code);
+    assert_eq!(decoded.constants, program.constants);
 }

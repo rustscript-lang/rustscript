@@ -2,10 +2,12 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vm::{
-    ParseError, SourceError, SourceFlavor, SourceMap, SourcePathError, Span, Vm,
+    ParseError, SourceError, SourceFlavor, SourceMap, SourcePathError, Span,
     collect_inferred_local_type_hints, compile_source, compile_source_file,
-    lint_unknown_inferred_local_types, render_compile_error, render_source_error, render_vm_error,
+    lint_unknown_inferred_local_types, render_compile_error, render_source_error,
 };
+#[cfg(feature = "runtime")]
+use vm::{Vm, render_vm_error};
 
 #[test]
 fn render_source_error_highlights_exact_range() {
@@ -117,6 +119,7 @@ pub fn ok() {
 }
 
 #[test]
+#[cfg(feature = "runtime")]
 fn render_vm_error_includes_ip_and_source_line() {
     let source = "let value = 1 / 0;\n";
     let compiled = compile_source(source).expect("source should compile");
@@ -394,5 +397,99 @@ fn myfn<T>(v: T) {
     assert!(
         warnings.iter().all(|warning| warning.name != "b"),
         "generic schema local should not be reported as unknown, got {warnings:?}"
+    );
+}
+
+#[test]
+fn frame_local_limit_diagnostic_reports_real_counts() {
+    // Aggregate frame pressure beyond 256 (200 genuinely live data slots in
+    // one function plus 60 exported callables: 60 exported helpers that stay
+    // materialized under milestone-6 lowering) must report the real counts
+    // instead of the old 65535 sentinel. The helpers are exported so they
+    // keep hidden callable slots; direct-only helpers would be omitted and
+    // the aggregate would fit. The sum is right-nested so codegen's
+    // string-classification recursion stays linear (it re-walks each left
+    // operand; left-nested sums of this size are exponential there).
+    let mut source = String::new();
+    for idx in 0..60usize {
+        source.push_str(&format!("pub fn helper_{idx}() -> int {{ 0 }}\n"));
+    }
+    source.push_str("fn crowded() -> int {\n");
+    for idx in 0..200usize {
+        source.push_str(&format!("    let v{idx} = {idx};\n"));
+    }
+    source.push_str("    ");
+    for idx in 0..200usize - 1 {
+        source.push_str(&format!("v{idx} + ("));
+    }
+    source.push_str("v199");
+    for _ in 0..200usize - 1 {
+        source.push(')');
+    }
+    source.push_str(";\n}\ncrowded();\n");
+
+    let err = match compile_source(&source) {
+        Ok(_) => panic!("aggregate frame pressure should fail to compile"),
+        Err(err) => err,
+    };
+    let compile = match err {
+        vm::SourceError::Compile(compile) => compile,
+        other => panic!("expected compile error, got {other:?}"),
+    };
+    match compile {
+        vm::CompileError::FrameLocalLimitExceeded {
+            data_slots,
+            callable_slots,
+            total_slots,
+            max_slots,
+        } => {
+            assert_eq!(data_slots, 200, "data slot count should be real");
+            assert_eq!(callable_slots, 60, "callable slot count should be real");
+            assert_eq!(total_slots, 260, "total should be the real aggregate");
+            assert_eq!(max_slots, 256, "short bytecode ceiling should be 256");
+        }
+        other => panic!("expected FrameLocalLimitExceeded, got {other:?}"),
+    }
+
+    let mut source_map = SourceMap::new();
+    source_map.add_source("inline.rss", &source);
+    let rendered = render_compile_error(&source_map, &compile, false);
+    assert!(
+        rendered.contains(
+            "frame requires 260 local slots (200 data + 60 callable); short bytecode supports 256"
+        ),
+        "unexpected diagnostic: {rendered}"
+    );
+    assert!(
+        !rendered.contains("65535"),
+        "diagnostic must not report the old sentinel slot: {rendered}"
+    );
+}
+
+#[test]
+fn frame_local_limit_diagnostic_reports_saturated_overflow_counts() {
+    // A saturated aggregate (usize overflow) must report the saturated counts
+    // rather than fabricating a concrete slot number.
+    let mut source_map = SourceMap::new();
+    source_map.add_source("inline.rss", "");
+    let err = vm::CompileError::FrameLocalLimitExceeded {
+        data_slots: usize::MAX - 5,
+        callable_slots: 5,
+        total_slots: usize::MAX,
+        max_slots: 256,
+    };
+    let rendered = render_compile_error(&source_map, &err, false);
+    let expected = format!(
+        "frame requires {} local slots ({} data + 5 callable); short bytecode supports 256",
+        usize::MAX,
+        usize::MAX - 5
+    );
+    assert!(
+        rendered.contains(&expected),
+        "unexpected diagnostic: {rendered}"
+    );
+    assert!(
+        !rendered.contains("65535"),
+        "diagnostic must not report the old sentinel slot: {rendered}"
     );
 }

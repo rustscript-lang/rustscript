@@ -258,6 +258,8 @@ pub enum CatalogRegistrationError {
     /// The full schema was valid for the catalog but already occupied a
     /// registry slot, or would be ambiguous with an existing call shape.
     RegistryConflict { name: String, detail: String },
+    /// The caller supplied a schema whose bounded representation is invalid.
+    InvalidSchema { name: String, detail: String },
 }
 
 impl std::fmt::Display for CatalogRegistrationError {
@@ -336,6 +338,9 @@ impl std::fmt::Display for CatalogRegistrationError {
             Self::RegistryConflict { name, detail } => {
                 write!(f, "cannot register catalog function '{name}': {detail}")
             }
+            Self::InvalidSchema { name, detail } => {
+                write!(f, "invalid catalog schema for '{name}': {detail}")
+            }
         }
     }
 }
@@ -388,6 +393,12 @@ impl CatalogSchemaSelection for HostFunctionSchema {
         catalog: &HostApiCatalog,
         name: &str,
     ) -> Result<HostImportSchema, CatalogRegistrationError> {
+        if let Err(error) = self.validate() {
+            return Err(CatalogRegistrationError::InvalidSchema {
+                name: self.name.clone(),
+                detail: error.to_string(),
+            });
+        }
         if self.name != name {
             return Err(CatalogRegistrationError::SchemaMismatch {
                 name: name.to_string(),
@@ -451,6 +462,12 @@ impl CatalogSchemaSelection for HostImportSchema {
         catalog: &HostApiCatalog,
         name: &str,
     ) -> Result<HostImportSchema, CatalogRegistrationError> {
+        if let Err(error) = self.validate() {
+            return Err(CatalogRegistrationError::InvalidSchema {
+                name: self.name.clone(),
+                detail: error.to_string(),
+            });
+        }
         let candidates = catalog_import_schemas(catalog, name);
         if candidates.is_empty() {
             return Err(CatalogRegistrationError::MissingFunction {

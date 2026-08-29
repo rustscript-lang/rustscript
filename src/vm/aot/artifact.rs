@@ -11,8 +11,8 @@ use super::super::jit::JitConfig;
 use super::compile::CompiledProgram;
 
 const MAGIC: [u8; 4] = *b"PAT\0";
-const VERSION: u16 = 7;
-const ABI_VERSION: u16 = 6;
+const VERSION: u16 = 8;
+const ABI_VERSION: u16 = 8;
 const FLAG_INTERPRETER_BOUNDARY_ONLY: u16 = 1;
 const SUPPORTED_FLAGS: u16 = FLAG_INTERPRETER_BOUNDARY_ONLY;
 
@@ -696,7 +696,7 @@ mod tests {
     }
 
     #[test]
-    fn aot_artifact_v7_roundtrips_callable_metadata_and_rejects_old_revisions() {
+    fn aot_artifact_v8_roundtrips_callable_metadata_and_rejects_old_revisions() {
         let compiled =
             crate::compile_source_for_repl("pub fn add_one(value: int) -> int { value + 1 }")
                 .expect("callable program should compile");
@@ -705,20 +705,20 @@ mod tests {
         let encoded = vm
             .encode_aot_artifact()
             .expect("artifact encode should succeed");
-        assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 7);
-        assert_eq!(u16::from_le_bytes([encoded[6], encoded[7]]), 6);
+        assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 8);
+        assert_eq!(u16::from_le_bytes([encoded[6], encoded[7]]), 8);
 
         let mut old_format = encoded.clone();
-        old_format[4..6].copy_from_slice(&6u16.to_le_bytes());
+        old_format[4..6].copy_from_slice(&7u16.to_le_bytes());
         assert!(matches!(
             Vm::new_from_aot_artifact_with_jit_config(&old_format, JitConfig::default()),
-            Err(AotArtifactError::UnsupportedVersion(6))
+            Err(AotArtifactError::UnsupportedVersion(7))
         ));
         let mut old_abi = encoded.clone();
-        old_abi[6..8].copy_from_slice(&5u16.to_le_bytes());
+        old_abi[6..8].copy_from_slice(&7u16.to_le_bytes());
         assert!(matches!(
             Vm::new_from_aot_artifact_with_jit_config(&old_abi, JitConfig::default()),
-            Err(AotArtifactError::UnsupportedAbiVersion(5))
+            Err(AotArtifactError::UnsupportedAbiVersion(7))
         ));
 
         let mut standalone =
@@ -736,6 +736,71 @@ mod tests {
                 .invoke_callable(callable, &[Value::Int(41)])
                 .expect("artifact callable should execute"),
             Value::Int(42)
+        );
+    }
+
+    #[test]
+    fn aot_artifact_v8_roundtrips_direct_call_script_program() {
+        // A real direct-only program: the root body calls a named function
+        // through `CallScript` and the callee is a native AOT body, so the
+        // artifact must embed both the callable metadata and the executable
+        // AOT code for the direct path.
+        let source = r#"
+            fn bump(value: int) -> int { value + 1 }
+            let mut i = 0;
+            let mut total = 0;
+            while i < 16 {
+                total = bump(total);
+                i = i + 1;
+            }
+            total;
+        "#;
+        let compiled =
+            crate::compile_source_for_repl(source).expect("direct call program should compile");
+        assert!(
+            compiled
+                .program
+                .code
+                .contains(&(crate::OpCode::CallScript as u8)),
+            "expected the root body to embed CallScript bytecode"
+        );
+
+        let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+        vm.compile_aot().expect("aot compile should succeed");
+        let encoded = vm
+            .encode_aot_artifact()
+            .expect("artifact encode should succeed");
+        assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 8);
+        assert_eq!(u16::from_le_bytes([encoded[6], encoded[7]]), 8);
+
+        let mut old_format = encoded.clone();
+        old_format[4..6].copy_from_slice(&7u16.to_le_bytes());
+        assert!(matches!(
+            Vm::new_from_aot_artifact_with_jit_config(&old_format, JitConfig::default()),
+            Err(AotArtifactError::UnsupportedVersion(7))
+        ));
+
+        let mut standalone =
+            Vm::new_from_aot_artifact_with_jit_config(&encoded, JitConfig::default())
+                .expect("standalone direct artifact should load");
+        assert!(
+            standalone.has_aot_program(),
+            "standalone vm should install aot"
+        );
+        assert_eq!(
+            standalone.run().expect("direct call program should run"),
+            VmStatus::Halted
+        );
+        assert_eq!(standalone.stack(), &[Value::Int(16)]);
+        assert!(
+            standalone.aot_exec_count() > 0,
+            "standalone artifact should execute through the native AOT path: {}",
+            standalone.dump_aot_info()
+        );
+        assert!(
+            !standalone.dump_aot_info().contains("interpreter-boundary"),
+            "standalone artifact should not fall back to the interpreter: {}",
+            standalone.dump_aot_info()
         );
     }
 }

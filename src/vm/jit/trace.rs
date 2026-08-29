@@ -147,6 +147,7 @@ pub enum JitTraceTerminal {
     Halt,
     BranchExit,
     CallValue,
+    CallScript,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1251,57 +1252,29 @@ fn scan_loop_headers(program: &Program) -> Vec<bool> {
     let mut ip = 0usize;
 
     while ip < code.len() {
-        let opcode = code[ip];
+        let Some(opcode) = OpCode::try_from(code[ip]).ok() else {
+            // Unknown opcode: its length cannot be determined, so advance
+            // a single byte rather than misaligning the scan.
+            ip = ip.saturating_add(1);
+            continue;
+        };
         let instr_ip = ip;
-        ip = ip.saturating_add(1);
-        match opcode {
-            x if x == OpCode::Ldc as u8 => {
-                if read_u32(code, &mut ip).is_none() {
-                    break;
-                }
+        if opcode == OpCode::Br || opcode == OpCode::Brfalse {
+            ip = ip.saturating_add(1);
+            let Some(target_u32) = read_u32(code, &mut ip) else {
+                break;
+            };
+            let target = target_u32 as usize;
+            if target <= instr_ip && target < headers.len() {
+                headers[target] = true;
             }
-            x if x == OpCode::Br as u8 || x == OpCode::Brfalse as u8 => {
-                let Some(target_u32) = read_u32(code, &mut ip) else {
-                    break;
-                };
-                let target = target_u32 as usize;
-                if target <= instr_ip && target < headers.len() {
-                    headers[target] = true;
-                }
-            }
-            x if x == OpCode::Ldloc as u8 || x == OpCode::Stloc as u8 => {
-                if read_u8(code, &mut ip).is_none() {
-                    break;
-                }
-            }
-            x if x == OpCode::Call as u8 => {
-                if read_u16(code, &mut ip).is_none() {
-                    break;
-                }
-                if read_u8(code, &mut ip).is_none() {
-                    break;
-                }
-            }
-            _ => {}
         }
+        // Advance by the full instruction length (opcode plus operands) so
+        // operand bytes are never interpreted as opcodes.
+        ip = instr_ip.saturating_add(1 + opcode.operand_len());
     }
 
     headers
-}
-
-fn read_u8(code: &[u8], ip: &mut usize) -> Option<u8> {
-    let value = *code.get(*ip)?;
-    *ip = ip.saturating_add(1);
-    Some(value)
-}
-
-fn read_u16(code: &[u8], ip: &mut usize) -> Option<u16> {
-    if ip.saturating_add(2) > code.len() {
-        return None;
-    }
-    let bytes = [code[*ip], code[*ip + 1]];
-    *ip = ip.saturating_add(2);
-    Some(u16::from_le_bytes(bytes))
 }
 
 fn read_u32(code: &[u8], ip: &mut usize) -> Option<u32> {
@@ -2020,6 +1993,32 @@ mod tests {
 
         let headers = scan_loop_headers(&program);
         assert!(headers[root_ip as usize]);
+        assert!(!headers[branch_ip as usize]);
+    }
+
+    #[test]
+    fn scan_loop_headers_skips_call_script_operand_bytes() {
+        // CallScript(12, 0) encodes as 0x1A followed by five operand bytes.
+        // The first operand byte is 0x0C (Brfalse) and the remaining bytes
+        // decode as a backward branch target of 0: a walker that does not
+        // advance over the full operand span would mark offset 0 as a false
+        // loop header.
+        let mut code = vec![OpCode::CallScript as u8];
+        code.extend_from_slice(&12u32.to_le_bytes());
+        code.push(0);
+        let loop_ip = code.len() as u32;
+        code.push(OpCode::Nop as u8);
+        let branch_ip = code.len() as u32;
+        code.push(OpCode::Br as u8);
+        code.extend_from_slice(&loop_ip.to_le_bytes());
+        let program = Program::new(vec![], code);
+
+        let headers = scan_loop_headers(&program);
+        assert!(
+            !headers[0],
+            "CallScript operand bytes must not be interpreted as a branch"
+        );
+        assert!(headers[loop_ip as usize]);
         assert!(!headers[branch_ip as usize]);
     }
 

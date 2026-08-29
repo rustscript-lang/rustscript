@@ -1,16 +1,18 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
+use std::hash::Hash;
 
 use crate::builtins::BuiltinFunction;
 use crate::bytecode::{
     CallableKind, CallablePrototype, CallableTarget, CaptureBindingMode, ExportedCallable,
-    FunctionRegion, RootCallableBinding, ScriptFunction, TypeMap, ValueType,
+    FunctionRegion, MAX_FRAME_LOCAL_COUNT, RootCallableBinding, ScriptFunction, TypeMap, ValueType,
 };
 use crate::compiler::ir::TypeSchema;
 use crate::debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
 use crate::host_api::{
     HostApiFingerprint, HostImportParam, HostImportSchema, HostParamPassing, HostTypeSchema,
-    ResourceTypeKey,
+    MAX_HOST_CATALOG_PARAMETERS, MAX_HOST_FUNCTION_NAME_LEN, MAX_HOST_RESOURCE_KEY_LEN,
+    MAX_HOST_SCHEMA_DEPTH, MAX_HOST_SCHEMA_NODES, MAX_HOST_SCHEMA_PROPERTIES, ResourceTypeKey,
 };
 use crate::vm::{HostImport, OpCode, Program, Value};
 
@@ -18,6 +20,11 @@ const MAGIC: [u8; 4] = *b"VMBC";
 const VERSION_V11: u16 = 11;
 const VERSION_V12: u16 = 12;
 const FLAGS: u16 = 0;
+const MAX_WIRE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+const MAX_WIRE_BLOB_BYTES: usize = 16 * 1024 * 1024;
+const MAX_WIRE_COUNT: usize = 1_000_000;
+const MAX_WIRE_AGGREGATE_ITEMS: usize = 1_000_000;
+const MAX_SCHEMA_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireError {
@@ -34,7 +41,9 @@ pub enum WireError {
     InvalidHostSchemaTag(u8),
     InvalidHostParamPassing(u8),
     InvalidHostResourceKey,
+    InvalidResourceKey(String),
     HostSchemaImportMismatch,
+    InvalidHostSchemaComplexity(String),
     InvalidUtf8,
     StringTooLong(usize),
     CodeTooLong(usize),
@@ -69,8 +78,12 @@ impl std::fmt::Display for WireError {
             WireError::InvalidHostResourceKey => {
                 write!(f, "invalid host resource type key")
             }
+            WireError::InvalidResourceKey(reason) => write!(f, "invalid resource key: {reason}"),
             WireError::HostSchemaImportMismatch => {
                 write!(f, "host import schema does not match its import")
+            }
+            WireError::InvalidHostSchemaComplexity(reason) => {
+                write!(f, "invalid host schema complexity: {reason}")
             }
             WireError::InvalidUtf8 => write!(f, "invalid utf-8 string"),
             WireError::StringTooLong(len) => write!(f, "string too long: {len}"),
@@ -113,6 +126,16 @@ pub enum ValidationError {
         expected: u8,
         got: u8,
     },
+    InvalidCallScriptTarget {
+        offset: usize,
+        prototype_id: u32,
+    },
+    InvalidCallScriptArity {
+        offset: usize,
+        prototype_id: u32,
+        expected: u8,
+        got: u8,
+    },
     InvalidJumpTarget {
         offset: usize,
         target: u32,
@@ -149,6 +172,22 @@ impl std::fmt::Display for ValidationError {
             } => write!(
                 f,
                 "invalid call arity {got} for import index {index} at offset {offset}, expected {expected}",
+            ),
+            ValidationError::InvalidCallScriptTarget {
+                offset,
+                prototype_id,
+            } => write!(
+                f,
+                "invalid callscript prototype {prototype_id} at offset {offset}",
+            ),
+            ValidationError::InvalidCallScriptArity {
+                offset,
+                prototype_id,
+                expected,
+                got,
+            } => write!(
+                f,
+                "invalid callscript arity {got} for prototype {prototype_id} at offset {offset}, expected {expected}",
             ),
             ValidationError::InvalidJumpTarget { offset, target } => write!(
                 f,
@@ -225,28 +264,31 @@ fn read_constant(cursor: &mut Cursor<'_>, depth: usize) -> Result<Value, WireErr
             other => Err(WireError::InvalidBool(other)),
         },
         2 => {
-            let len = cursor.read_u32()? as usize;
-            let bytes = cursor.read_exact(len)?;
-            let text = String::from_utf8(bytes.to_vec()).map_err(|_| WireError::InvalidUtf8)?;
+            let text = cursor.read_string_with_field("constant string")?;
             Ok(Value::string(text))
         }
         3 => Ok(Value::Float(cursor.read_f64()?)),
         4 => Ok(Value::Null),
         5 => {
-            let len = cursor.read_u32()? as usize;
-            Ok(Value::bytes(cursor.read_exact(len)?.to_vec()))
+            let bytes = cursor.read_blob("constant bytes")?;
+            let mut owned = Vec::new();
+            reserve_vec(&mut owned, "constant bytes", bytes.len())?;
+            owned.extend_from_slice(bytes);
+            Ok(Value::bytes(owned))
         }
         6 => {
-            let count = cursor.read_u32()? as usize;
-            let mut values = Vec::with_capacity(count);
+            let count = cursor.read_count("constant array", 1)?;
+            let mut values = Vec::new();
+            reserve_vec(&mut values, "constant array", count)?;
             for _ in 0..count {
                 values.push(read_constant(cursor, depth + 1)?);
             }
             Ok(Value::array(values))
         }
         7 => {
-            let count = cursor.read_u32()? as usize;
-            let mut entries = Vec::with_capacity(count);
+            let count = cursor.read_count("constant map", 2)?;
+            let mut entries = Vec::new();
+            reserve_vec(&mut entries, "constant map", count)?;
             for _ in 0..count {
                 entries.push((
                     read_constant(cursor, depth + 1)?,
@@ -274,6 +316,13 @@ pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
     out.extend_from_slice(&program.code);
 
     write_u32_count("imports", program.imports.len(), &mut out)?;
+    if !program.host_import_schemas.is_empty() {
+        if program.host_import_schemas.len() != program.imports.len() {
+            return Err(WireError::HostSchemaImportMismatch);
+        }
+        crate::host_api::validate_optional_host_import_schemas(&program.host_import_schemas)
+            .map_err(|error| WireError::InvalidHostSchemaComplexity(error.to_string()))?;
+    }
     for (index, import) in program.imports.iter().enumerate() {
         write_string("import name", &import.name, &mut out)?;
         out.push(import.arity);
@@ -297,6 +346,9 @@ pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
 }
 
 pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
+    if bytes.len() > MAX_WIRE_PAYLOAD_BYTES {
+        return Err(WireError::LengthTooLarge("payload", bytes.len()));
+    }
     let mut cursor = Cursor::new(bytes);
 
     let magic = cursor.read_exact_array::<4>()?;
@@ -316,24 +368,36 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
         return Err(WireError::UnsupportedFlags(flags));
     }
 
-    let constant_count = cursor.read_u32()? as usize;
-    let mut constants = Vec::with_capacity(constant_count);
+    let constant_count = cursor.read_count("constants", 1)?;
+    let mut constants = Vec::new();
+    reserve_vec(&mut constants, "constants", constant_count)?;
     for _ in 0..constant_count {
         constants.push(read_constant(&mut cursor, 0)?);
     }
 
-    let code_len = cursor.read_u32()? as usize;
-    let code = cursor.read_exact(code_len)?.to_vec();
-    let import_count = cursor.read_u32()? as usize;
-    let mut imports = Vec::with_capacity(import_count);
-    let mut host_import_schemas = if has_host_import_schemas {
-        Vec::with_capacity(import_count)
-    } else {
-        Vec::new()
-    };
+    let code_bytes = cursor.read_blob("code")?;
+    let mut code = Vec::new();
+    reserve_vec(&mut code, "code", code_bytes.len())?;
+    code.extend_from_slice(code_bytes);
+    if version == VERSION_V11 && code.contains(&(OpCode::CallScript as u8)) {
+        // CallScript was added in V12. Keep the legacy version branch based
+        // on the version discriminant, independent of the import count.
+        return Err(WireError::UnsupportedVersion(VERSION_V11));
+    }
+    let import_count = cursor.read_count("imports", if has_host_import_schemas { 7 } else { 6 })?;
+    let mut imports = Vec::new();
+    reserve_vec(&mut imports, "imports", import_count)?;
+    let mut host_import_schemas = Vec::new();
+    // Do not reserve `import_count` here: a V12 payload may contain a large
+    // number of `None` entries, while a schema-bearing payload is bounded by
+    // the shared host-schema budget as each element is decoded.
     for _ in 0..import_count {
         let import = HostImport {
-            name: cursor.read_string()?,
+            name: if has_host_import_schemas {
+                cursor.read_bounded_string("host import name", MAX_HOST_FUNCTION_NAME_LEN)?
+            } else {
+                cursor.read_string()?
+            },
             arity: cursor.read_u8()?,
             return_type: read_value_type(cursor.read_u8()?)?,
         };
@@ -347,6 +411,10 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
             host_import_schemas.push(schema);
         }
         imports.push(import);
+    }
+    if has_host_import_schemas {
+        crate::host_api::validate_optional_host_import_schemas(&host_import_schemas)
+            .map_err(|error| WireError::InvalidHostSchemaComplexity(error.to_string()))?;
     }
     let type_map = read_type_map(&mut cursor)?;
     let debug = read_debug_info(&mut cursor)?;
@@ -537,6 +605,19 @@ pub fn disassemble_program_with_options(program: &Program, options: DisassembleO
                     instruction.push_str(&format!("callvalue {argc}"));
                 } else {
                     instruction.push_str("callvalue <truncated>");
+                    truncated = true;
+                }
+            }
+            x if x == OpCode::CallScript as u8 => {
+                if let Some(prototype_id) = read_u32(code, &mut ip) {
+                    if let Some(argc) = read_u8(code, &mut ip) {
+                        instruction.push_str(&format!("callscript {prototype_id} {argc}"));
+                    } else {
+                        instruction.push_str("callscript <truncated>");
+                        truncated = true;
+                    }
+                } else {
+                    instruction.push_str("callscript <truncated>");
                     truncated = true;
                 }
             }
@@ -813,6 +894,43 @@ fn analyze_program(
                     expected_bytes: 1,
                 })?;
             }
+            x if x == OpCode::CallScript as u8 => {
+                let prototype_id =
+                    read_u32(code, &mut ip).ok_or(ValidationError::TruncatedOperand {
+                        offset: start,
+                        opcode,
+                        expected_bytes: 5,
+                    })?;
+                let argc = read_u8(code, &mut ip).ok_or(ValidationError::TruncatedOperand {
+                    offset: start,
+                    opcode,
+                    expected_bytes: 5,
+                })?;
+                let Some(prototype) = program.callable_prototypes.get(prototype_id as usize) else {
+                    return Err(ValidationError::InvalidCallScriptTarget {
+                        offset: start,
+                        prototype_id,
+                    });
+                };
+                // `CallScript` is a static script-function call: a
+                // host-import prototype must never be routed to the host
+                // path (the VM rejects it with `InvalidCallablePrototype`),
+                // so reject it deterministically here as well.
+                if !matches!(prototype.target, CallableTarget::ScriptFunction(_)) {
+                    return Err(ValidationError::InvalidCallScriptTarget {
+                        offset: start,
+                        prototype_id,
+                    });
+                }
+                if argc != prototype.arity {
+                    return Err(ValidationError::InvalidCallScriptArity {
+                        offset: start,
+                        prototype_id,
+                        expected: prototype.arity,
+                        got: argc,
+                    });
+                }
+            }
 
             other => {
                 return Err(ValidationError::InvalidOpcode {
@@ -962,8 +1080,9 @@ type CallableMetadata = (
 );
 
 fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, WireError> {
-    let function_count = cursor.read_u32()? as usize;
-    let mut script_functions = Vec::with_capacity(function_count);
+    let function_count = cursor.read_count("script functions", 8)?;
+    let mut script_functions = Vec::new();
+    reserve_vec(&mut script_functions, "script functions", function_count)?;
     for _ in 0..function_count {
         script_functions.push(ScriptFunction {
             entry_ip: cursor.read_u32()?,
@@ -971,8 +1090,13 @@ fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, W
         });
     }
 
-    let prototype_count = cursor.read_u32()? as usize;
-    let mut callable_prototypes = Vec::with_capacity(prototype_count);
+    let prototype_count = cursor.read_count("callable prototypes", 29)?;
+    let mut callable_prototypes = Vec::new();
+    reserve_vec(
+        &mut callable_prototypes,
+        "callable prototypes",
+        prototype_count,
+    )?;
     for _ in 0..prototype_count {
         let kind = match cursor.read_u8()? {
             0 => CallableKind::FunctionItem,
@@ -990,12 +1114,17 @@ fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, W
             other => return Err(WireError::InvalidValueType(other)),
         };
         let arity = cursor.read_u8()?;
-        let frame_local_count = cursor.read_u32()? as usize;
+        let frame_local_count = cursor.read_limited_count("callable frame locals")?;
         let parameter_slots = read_u16_list(cursor)?;
         let capture_source_slots = read_u16_list(cursor)?;
         let capture_slots = read_u16_list(cursor)?;
-        let capture_mode_count = cursor.read_u32()? as usize;
-        let mut capture_modes = Vec::with_capacity(capture_mode_count);
+        let capture_mode_count = cursor.read_count("callable capture modes", 1)?;
+        let mut capture_modes = Vec::new();
+        reserve_vec(
+            &mut capture_modes,
+            "callable capture modes",
+            capture_mode_count,
+        )?;
         for _ in 0..capture_mode_count {
             capture_modes.push(match cursor.read_u8()? {
                 0 => CaptureBindingMode::Copy,
@@ -1012,7 +1141,7 @@ fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, W
         };
         let schema = match cursor.read_u8()? {
             0 => None,
-            1 => Some(read_schema(cursor)?),
+            1 => Some(read_schema(cursor, 0)?),
             other => return Err(WireError::InvalidBool(other)),
         };
         callable_prototypes.push(CallablePrototype {
@@ -1029,8 +1158,9 @@ fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, W
         });
     }
 
-    let region_count = cursor.read_u32()? as usize;
-    let mut function_regions = Vec::with_capacity(region_count);
+    let region_count = cursor.read_count("function regions", 9)?;
+    let mut function_regions = Vec::new();
+    reserve_vec(&mut function_regions, "function regions", region_count)?;
     for _ in 0..region_count {
         let start_ip = cursor.read_u32()?;
         let end_ip = cursor.read_u32()?;
@@ -1046,16 +1176,22 @@ fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, W
         });
     }
 
-    let binding_count = cursor.read_u32()? as usize;
-    let mut root_callable_bindings = Vec::with_capacity(binding_count);
+    let binding_count = cursor.read_count("root callable bindings", 6)?;
+    let mut root_callable_bindings = Vec::new();
+    reserve_vec(
+        &mut root_callable_bindings,
+        "root callable bindings",
+        binding_count,
+    )?;
     for _ in 0..binding_count {
         root_callable_bindings.push(RootCallableBinding {
             local_slot: cursor.read_u16()?,
             prototype_id: cursor.read_u32()?,
         });
     }
-    let export_count = cursor.read_u32()? as usize;
-    let mut exported_callables = Vec::with_capacity(export_count);
+    let export_count = cursor.read_count("exported callables", 6)?;
+    let mut exported_callables = Vec::new();
+    reserve_vec(&mut exported_callables, "exported callables", export_count)?;
     for _ in 0..export_count {
         exported_callables.push(ExportedCallable {
             name: cursor.read_string()?,
@@ -1072,8 +1208,9 @@ fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, W
 }
 
 fn read_u16_list(cursor: &mut Cursor<'_>) -> Result<Vec<u16>, WireError> {
-    let len = cursor.read_u32()? as usize;
-    let mut values = Vec::with_capacity(len);
+    let len = cursor.read_count("callable slot list", 2)?;
+    let mut values = Vec::new();
+    reserve_vec(&mut values, "callable slot list", len)?;
     for _ in 0..len {
         values.push(cursor.read_u16()?);
     }
@@ -1137,8 +1274,9 @@ fn read_debug_info(cursor: &mut Cursor<'_>) -> Result<Option<DebugInfo>, WireErr
                 other => return Err(WireError::InvalidDebugFlag(other)),
             };
 
-            let line_count = cursor.read_u32()? as usize;
-            let mut lines = Vec::with_capacity(line_count);
+            let line_count = cursor.read_count("debug lines", 8)?;
+            let mut lines = Vec::new();
+            reserve_vec(&mut lines, "debug lines", line_count)?;
             for _ in 0..line_count {
                 lines.push(LineInfo {
                     offset: cursor.read_u32()?,
@@ -1146,12 +1284,14 @@ fn read_debug_info(cursor: &mut Cursor<'_>) -> Result<Option<DebugInfo>, WireErr
                 });
             }
 
-            let function_count = cursor.read_u32()? as usize;
-            let mut functions = Vec::with_capacity(function_count);
+            let function_count = cursor.read_count("debug functions", 8)?;
+            let mut functions = Vec::new();
+            reserve_vec(&mut functions, "debug functions", function_count)?;
             for _ in 0..function_count {
                 let name = cursor.read_string()?;
-                let arg_count = cursor.read_u32()? as usize;
-                let mut args = Vec::with_capacity(arg_count);
+                let arg_count = cursor.read_count("debug function args", 5)?;
+                let mut args = Vec::new();
+                reserve_vec(&mut args, "debug function args", arg_count)?;
                 for _ in 0..arg_count {
                     args.push(ArgInfo {
                         name: cursor.read_string()?,
@@ -1161,8 +1301,9 @@ fn read_debug_info(cursor: &mut Cursor<'_>) -> Result<Option<DebugInfo>, WireErr
                 functions.push(DebugFunction { name, args });
             }
 
-            let local_count = cursor.read_u32()? as usize;
-            let mut locals = Vec::with_capacity(local_count);
+            let local_count = cursor.read_count("debug locals", 7)?;
+            let mut locals = Vec::new();
+            reserve_vec(&mut locals, "debug locals", local_count)?;
             for _ in 0..local_count {
                 locals.push(LocalInfo {
                     name: cursor.read_string()?,
@@ -1225,20 +1366,26 @@ fn read_type_map(cursor: &mut Cursor<'_>) -> Result<Option<TypeMap>, WireError> 
                 1 => true,
                 other => return Err(WireError::InvalidBool(other)),
             };
-            let local_count = cursor.read_u32()? as usize;
-            let mut local_types = Vec::with_capacity(local_count);
+            let local_count = cursor.read_count_with_overhead("type map locals", 4, 12)?;
+            if local_count > MAX_FRAME_LOCAL_COUNT {
+                return Err(WireError::LengthTooLarge("type map locals", local_count));
+            }
+            let mut local_types = Vec::new();
+            reserve_vec(&mut local_types, "type map locals", local_count)?;
             for _ in 0..local_count {
                 local_types.push(read_value_type(cursor.read_u8()?)?);
             }
-            let mut local_schemas = Vec::with_capacity(local_count);
+            let mut local_schemas = Vec::new();
+            reserve_vec(&mut local_schemas, "type map local schemas", local_count)?;
             for _ in 0..local_count {
                 local_schemas.push(read_optional_schema(cursor)?);
             }
             let callable_slots = read_bool_vec(cursor, local_count)?;
             let optional_slots = read_bool_vec(cursor, local_count)?;
 
-            let operand_count = cursor.read_u32()? as usize;
-            let mut operand_types = HashMap::with_capacity(operand_count);
+            let operand_count = cursor.read_count("type map operands", 6)?;
+            let mut operand_types = HashMap::new();
+            reserve_map(&mut operand_types, "type map operands", operand_count)?;
             for _ in 0..operand_count {
                 let offset = cursor.read_u32()? as usize;
                 let lhs = read_value_type(cursor.read_u8()?)?;
@@ -1308,7 +1455,10 @@ fn read_bool_vec(cursor: &mut Cursor<'_>, expected_len: usize) -> Result<Vec<boo
     if count != expected_len {
         return Err(WireError::TrailingBytes);
     }
-    let mut values = Vec::with_capacity(count);
+    cursor.validate_count("type map boolean vector", count, 1)?;
+    cursor.debit_count("type map boolean vector", count)?;
+    let mut values = Vec::new();
+    reserve_vec(&mut values, "type map boolean vector", count)?;
     for _ in 0..count {
         values.push(match cursor.read_u8()? {
             0 => false,
@@ -1333,12 +1483,10 @@ fn write_optional_schema(schema: Option<&TypeSchema>, out: &mut Vec<u8>) -> Resu
 fn read_optional_schema(cursor: &mut Cursor<'_>) -> Result<Option<TypeSchema>, WireError> {
     match cursor.read_u8()? {
         0 => Ok(None),
-        1 => Ok(Some(read_schema(cursor)?)),
+        1 => Ok(Some(read_schema(cursor, 0)?)),
         other => Err(WireError::InvalidBool(other)),
     }
 }
-
-const MAX_HOST_SCHEMA_DEPTH: usize = 64;
 
 fn write_optional_host_import_schema(
     schema: Option<&HostImportSchema>,
@@ -1365,6 +1513,9 @@ fn read_optional_host_import_schema(
 }
 
 fn write_host_import_schema(schema: &HostImportSchema, out: &mut Vec<u8>) -> Result<(), WireError> {
+    schema
+        .validate()
+        .map_err(|error| WireError::InvalidHostSchemaComplexity(error.to_string()))?;
     write_string("host import schema name", &schema.name, out)?;
     write_u32_count("host import schema parameters", schema.params.len(), out)?;
     for param in &schema.params {
@@ -1383,11 +1534,22 @@ fn write_host_import_schema(schema: &HostImportSchema, out: &mut Vec<u8>) -> Res
 }
 
 fn read_host_import_schema(cursor: &mut Cursor<'_>) -> Result<HostImportSchema, WireError> {
-    let name = cursor.read_string()?;
-    let param_count = cursor.read_u32()? as usize;
-    let mut params = Vec::with_capacity(param_count);
+    let name = cursor.read_bounded_string("host import schema name", MAX_HOST_FUNCTION_NAME_LEN)?;
+    let param_count = cursor.read_count("host import schema parameters", 6)?;
+    if param_count > MAX_HOST_CATALOG_PARAMETERS {
+        return Err(WireError::LengthTooLarge(
+            "host import schema parameters",
+            param_count,
+        ));
+    }
+    cursor.debit_host_parameters(param_count)?;
+    let mut params = Vec::new();
+    reserve_vec(&mut params, "host import schema parameters", param_count)?;
     for _ in 0..param_count {
-        let param_name = cursor.read_string()?;
+        let param_name = cursor.read_bounded_string(
+            "host import parameter name",
+            crate::host_api::MAX_HOST_PARAMETER_NAME_LEN,
+        )?;
         let schema = read_host_type_schema(cursor, 0)?;
         let passing = match cursor.read_u8()? {
             0 => HostParamPassing::Value,
@@ -1404,12 +1566,16 @@ fn read_host_import_schema(cursor: &mut Cursor<'_>) -> Result<HostImportSchema, 
     }
     let return_type = read_host_type_schema(cursor, 0)?;
     let fingerprint = HostApiFingerprint::from_wire(cursor.read_u64()?);
-    Ok(HostImportSchema {
+    let schema = HostImportSchema {
         name,
         params,
         return_type,
         fingerprint,
-    })
+    };
+    schema
+        .validate()
+        .map_err(|error| WireError::InvalidHostSchemaComplexity(error.to_string()))?;
+    Ok(schema)
 }
 
 fn write_host_type_schema(
@@ -1434,15 +1600,15 @@ fn write_host_type_schema(
         HostTypeSchema::Bytes => out.push(7),
         HostTypeSchema::Array(inner) => {
             out.push(8);
-            write_host_type_schema(inner, out, depth + 1)?;
+            write_host_type_schema(inner, out, next_host_schema_depth(depth)?)?;
         }
         HostTypeSchema::Map(inner) => {
             out.push(9);
-            write_host_type_schema(inner, out, depth + 1)?;
+            write_host_type_schema(inner, out, next_host_schema_depth(depth)?)?;
         }
         HostTypeSchema::Optional(inner) => {
             out.push(10);
-            write_host_type_schema(inner, out, depth + 1)?;
+            write_host_type_schema(inner, out, next_host_schema_depth(depth)?)?;
         }
         HostTypeSchema::Callable { params, result } => {
             out.push(11);
@@ -1470,6 +1636,7 @@ fn read_host_type_schema(
             depth,
         ));
     }
+    cursor.debit_host_schema_node()?;
     match cursor.read_u8()? {
         0 => Ok(HostTypeSchema::Unknown),
         1 => Ok(HostTypeSchema::Null),
@@ -1481,32 +1648,52 @@ fn read_host_type_schema(
         7 => Ok(HostTypeSchema::Bytes),
         8 => Ok(HostTypeSchema::Array(Box::new(read_host_type_schema(
             cursor,
-            depth + 1,
+            next_host_schema_depth(depth)?,
         )?))),
         9 => Ok(HostTypeSchema::Map(Box::new(read_host_type_schema(
             cursor,
-            depth + 1,
+            next_host_schema_depth(depth)?,
         )?))),
         10 => Ok(HostTypeSchema::Optional(Box::new(read_host_type_schema(
             cursor,
-            depth + 1,
+            next_host_schema_depth(depth)?,
         )?))),
         11 => {
-            let count = cursor.read_u32()? as usize;
-            let mut params = Vec::with_capacity(count);
-            for _ in 0..count {
-                params.push(read_host_type_schema(cursor, depth + 1)?);
+            let count = cursor.read_count_with_overhead("host callable parameters", 1, 1)?;
+            if count > MAX_HOST_SCHEMA_PROPERTIES {
+                return Err(WireError::LengthTooLarge("host callable parameters", count));
             }
-            let result = Box::new(read_host_type_schema(cursor, depth + 1)?);
+            cursor.debit_host_schema_properties(count)?;
+            let mut params = Vec::new();
+            reserve_vec(&mut params, "host callable parameters", count)?;
+            for _ in 0..count {
+                params.push(read_host_type_schema(
+                    cursor,
+                    next_host_schema_depth(depth)?,
+                )?);
+            }
+            let result = Box::new(read_host_type_schema(
+                cursor,
+                next_host_schema_depth(depth)?,
+            )?);
             Ok(HostTypeSchema::Callable { params, result })
         }
         12 => {
-            let key = ResourceTypeKey::new(cursor.read_string()?)
-                .map_err(|_| WireError::InvalidHostResourceKey)?;
+            let key = ResourceTypeKey::new(
+                cursor.read_bounded_string("host resource type key", MAX_HOST_RESOURCE_KEY_LEN)?,
+            )
+            .map_err(|_| WireError::InvalidHostResourceKey)?;
             Ok(HostTypeSchema::Resource(key))
         }
         other => Err(WireError::InvalidHostSchemaTag(other)),
     }
+}
+
+fn next_host_schema_depth(depth: usize) -> Result<usize, WireError> {
+    depth.checked_add(1).ok_or(WireError::LengthTooLarge(
+        "host schema nesting depth",
+        depth,
+    ))
 }
 
 fn write_schema(schema: &TypeSchema, out: &mut Vec<u8>) -> Result<(), WireError> {
@@ -1576,11 +1763,22 @@ fn write_schema(schema: &TypeSchema, out: &mut Vec<u8>) -> Result<(), WireError>
             }
             write_schema(result, out)?;
         }
+        TypeSchema::Resource(key) => {
+            out.push(17);
+            write_string("schema resource key", key.as_str(), out)?;
+        }
     }
     Ok(())
 }
 
-fn read_schema(cursor: &mut Cursor<'_>) -> Result<TypeSchema, WireError> {
+fn read_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<TypeSchema, WireError> {
+    if depth >= MAX_SCHEMA_DEPTH {
+        return Err(WireError::LengthTooLarge("schema nesting depth", depth));
+    }
+    cursor.debit_count("schema nodes", 1)?;
+    let nested_depth = depth
+        .checked_add(1)
+        .ok_or(WireError::LengthTooLarge("schema nesting depth", depth))?;
     match cursor.read_u8()? {
         0 => Ok(TypeSchema::Unknown),
         1 => Ok(TypeSchema::Null),
@@ -1590,54 +1788,74 @@ fn read_schema(cursor: &mut Cursor<'_>) -> Result<TypeSchema, WireError> {
         5 => Ok(TypeSchema::Bool),
         6 => Ok(TypeSchema::String),
         7 => Ok(TypeSchema::Bytes),
-        16 => Ok(TypeSchema::Optional(Box::new(read_schema(cursor)?))),
+        16 => Ok(TypeSchema::Optional(Box::new(read_schema(
+            cursor,
+            nested_depth,
+        )?))),
         8 => Ok(TypeSchema::GenericParam(cursor.read_string()?)),
         9 => {
             let name = cursor.read_string()?;
-            let count = cursor.read_u32()? as usize;
-            let mut type_args = Vec::with_capacity(count);
+            let count = cursor.read_count("schema type args", 1)?;
+            let mut type_args = Vec::new();
+            reserve_vec(&mut type_args, "schema type args", count)?;
             for _ in 0..count {
-                type_args.push(read_schema(cursor)?);
+                type_args.push(read_schema(cursor, nested_depth)?);
             }
             Ok(TypeSchema::Named(name, type_args))
         }
-        10 => Ok(TypeSchema::Array(Box::new(read_schema(cursor)?))),
+        10 => Ok(TypeSchema::Array(Box::new(read_schema(
+            cursor,
+            nested_depth,
+        )?))),
         11 => {
-            let count = cursor.read_u32()? as usize;
-            let mut items = Vec::with_capacity(count);
+            let count = cursor.read_count("schema tuple items", 1)?;
+            let mut items = Vec::new();
+            reserve_vec(&mut items, "schema tuple items", count)?;
             for _ in 0..count {
-                items.push(read_schema(cursor)?);
+                items.push(read_schema(cursor, nested_depth)?);
             }
             Ok(TypeSchema::ArrayTuple(items))
         }
         12 => {
-            let count = cursor.read_u32()? as usize;
-            let mut prefix = Vec::with_capacity(count);
+            let count = cursor.read_count_with_overhead("schema tuple prefix", 1, 1)?;
+            let mut prefix = Vec::new();
+            reserve_vec(&mut prefix, "schema tuple prefix", count)?;
             for _ in 0..count {
-                prefix.push(read_schema(cursor)?);
+                prefix.push(read_schema(cursor, nested_depth)?);
             }
-            let rest = Box::new(read_schema(cursor)?);
+            let rest = Box::new(read_schema(cursor, nested_depth)?);
             Ok(TypeSchema::ArrayTupleRest { prefix, rest })
         }
-        13 => Ok(TypeSchema::Map(Box::new(read_schema(cursor)?))),
+        13 => Ok(TypeSchema::Map(Box::new(read_schema(
+            cursor,
+            nested_depth,
+        )?))),
         14 => {
-            let count = cursor.read_u32()? as usize;
-            let mut fields = HashMap::with_capacity(count);
+            let count = cursor.read_count("schema object fields", 5)?;
+            let mut fields = HashMap::new();
+            reserve_map(&mut fields, "schema object fields", count)?;
             for _ in 0..count {
                 let name = cursor.read_string()?;
-                let value = read_schema(cursor)?;
+                let value = read_schema(cursor, nested_depth)?;
                 fields.insert(name, value);
             }
             Ok(TypeSchema::Object(fields))
         }
         15 => {
-            let count = cursor.read_u32()? as usize;
-            let mut params = Vec::with_capacity(count);
+            let count = cursor.read_count_with_overhead("schema callable params", 1, 1)?;
+            let mut params = Vec::new();
+            reserve_vec(&mut params, "schema callable params", count)?;
             for _ in 0..count {
-                params.push(read_schema(cursor)?);
+                params.push(read_schema(cursor, nested_depth)?);
             }
-            let result = Box::new(read_schema(cursor)?);
+            let result = Box::new(read_schema(cursor, nested_depth)?);
             Ok(TypeSchema::Callable { params, result })
+        }
+        17 => {
+            let key_text = cursor.read_string()?;
+            let key = ResourceTypeKey::new(key_text)
+                .map_err(|err| WireError::InvalidResourceKey(err.to_string()))?;
+            Ok(TypeSchema::Resource(key))
         }
         other => Err(WireError::InvalidValueType(other)),
     }
@@ -1659,14 +1877,41 @@ fn write_u32_count(field: &'static str, count: usize, out: &mut Vec<u8>) -> Resu
     write_u32_len(field, count, out)
 }
 
+fn reserve_vec<T>(items: &mut Vec<T>, field: &'static str, count: usize) -> Result<(), WireError> {
+    items
+        .try_reserve_exact(count)
+        .map_err(|_| WireError::LengthTooLarge(field, count))
+}
+
+fn reserve_map<K: Eq + Hash, V>(
+    items: &mut HashMap<K, V>,
+    field: &'static str,
+    count: usize,
+) -> Result<(), WireError> {
+    items
+        .try_reserve(count)
+        .map_err(|_| WireError::LengthTooLarge(field, count))
+}
+
 struct Cursor<'a> {
     bytes: &'a [u8],
     offset: usize,
+    remaining_budget: usize,
+    remaining_host_schema_nodes: usize,
+    remaining_host_schema_properties: usize,
+    remaining_host_parameters: usize,
 }
 
 impl<'a> Cursor<'a> {
     fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
+        Self {
+            bytes,
+            offset: 0,
+            remaining_budget: MAX_WIRE_AGGREGATE_ITEMS,
+            remaining_host_schema_nodes: MAX_HOST_SCHEMA_NODES,
+            remaining_host_schema_properties: MAX_HOST_SCHEMA_PROPERTIES,
+            remaining_host_parameters: MAX_HOST_CATALOG_PARAMETERS,
+        }
     }
 
     fn read_u8(&mut self) -> Result<u8, WireError> {
@@ -1704,9 +1949,142 @@ impl<'a> Cursor<'a> {
     }
 
     fn read_string(&mut self) -> Result<String, WireError> {
+        self.read_string_with_field("string")
+    }
+
+    fn read_string_with_field(&mut self, field: &'static str) -> Result<String, WireError> {
+        let bytes = self.read_blob(field)?;
+        let text = std::str::from_utf8(bytes).map_err(|_| WireError::InvalidUtf8)?;
+        let mut owned = String::new();
+        owned
+            .try_reserve_exact(text.len())
+            .map_err(|_| WireError::LengthTooLarge(field, text.len()))?;
+        owned.push_str(text);
+        Ok(owned)
+    }
+
+    fn read_bounded_string(
+        &mut self,
+        field: &'static str,
+        limit: usize,
+    ) -> Result<String, WireError> {
+        let bytes = self.read_blob(field)?;
+        if bytes.len() > limit {
+            return Err(WireError::LengthTooLarge(field, bytes.len()));
+        }
+        let text = std::str::from_utf8(bytes).map_err(|_| WireError::InvalidUtf8)?;
+        let mut owned = String::new();
+        owned
+            .try_reserve_exact(text.len())
+            .map_err(|_| WireError::LengthTooLarge(field, text.len()))?;
+        owned.push_str(text);
+        Ok(owned)
+    }
+
+    fn read_blob(&mut self, field: &'static str) -> Result<&'a [u8], WireError> {
         let len = self.read_u32()? as usize;
-        let bytes = self.read_exact(len)?;
-        String::from_utf8(bytes.to_vec()).map_err(|_| WireError::InvalidUtf8)
+        if len > MAX_WIRE_BLOB_BYTES {
+            return Err(WireError::LengthTooLarge(field, len));
+        }
+        self.read_exact(len)
+    }
+
+    fn read_count(
+        &mut self,
+        field: &'static str,
+        min_item_bytes: usize,
+    ) -> Result<usize, WireError> {
+        self.read_count_with_overhead(field, min_item_bytes, 0)
+    }
+
+    fn read_count_with_overhead(
+        &mut self,
+        field: &'static str,
+        min_item_bytes: usize,
+        fixed_bytes: usize,
+    ) -> Result<usize, WireError> {
+        let count = self.read_u32()? as usize;
+        self.validate_count_with_overhead(field, count, min_item_bytes, fixed_bytes)?;
+        self.debit_count(field, count)?;
+        Ok(count)
+    }
+
+    fn read_limited_count(&mut self, field: &'static str) -> Result<usize, WireError> {
+        let count = self.read_u32()? as usize;
+        if count > MAX_FRAME_LOCAL_COUNT {
+            return Err(WireError::LengthTooLarge(field, count));
+        }
+        self.debit_count(field, count)?;
+        Ok(count)
+    }
+
+    fn debit_host_schema_node(&mut self) -> Result<(), WireError> {
+        self.remaining_host_schema_nodes =
+            self.remaining_host_schema_nodes
+                .checked_sub(1)
+                .ok_or(WireError::LengthTooLarge(
+                    "host schema nodes",
+                    MAX_HOST_SCHEMA_NODES + 1,
+                ))?;
+        Ok(())
+    }
+
+    fn debit_host_schema_properties(&mut self, count: usize) -> Result<(), WireError> {
+        self.remaining_host_schema_properties = self
+            .remaining_host_schema_properties
+            .checked_sub(count)
+            .ok_or(WireError::LengthTooLarge("host schema properties", count))?;
+        Ok(())
+    }
+
+    fn debit_host_parameters(&mut self, count: usize) -> Result<(), WireError> {
+        self.remaining_host_parameters = self
+            .remaining_host_parameters
+            .checked_sub(count)
+            .ok_or(WireError::LengthTooLarge("host schema parameters", count))?;
+        Ok(())
+    }
+
+    fn debit_count(&mut self, field: &'static str, count: usize) -> Result<(), WireError> {
+        if count > MAX_WIRE_COUNT {
+            return Err(WireError::LengthTooLarge(field, count));
+        }
+        self.remaining_budget = self
+            .remaining_budget
+            .checked_sub(count)
+            .ok_or(WireError::LengthTooLarge(field, count))?;
+        Ok(())
+    }
+
+    fn validate_count(
+        &self,
+        field: &'static str,
+        count: usize,
+        min_item_bytes: usize,
+    ) -> Result<(), WireError> {
+        self.validate_count_with_overhead(field, count, min_item_bytes, 0)
+    }
+
+    fn validate_count_with_overhead(
+        &self,
+        field: &'static str,
+        count: usize,
+        min_item_bytes: usize,
+        fixed_bytes: usize,
+    ) -> Result<(), WireError> {
+        if count > MAX_WIRE_COUNT {
+            return Err(WireError::LengthTooLarge(field, count));
+        }
+        let item_bytes = count
+            .checked_mul(min_item_bytes)
+            .ok_or(WireError::LengthTooLarge(field, count))?;
+        let required_bytes = item_bytes
+            .checked_add(fixed_bytes)
+            .ok_or(WireError::LengthTooLarge(field, count))?;
+        if required_bytes > self.remaining() {
+            return Err(WireError::LengthTooLarge(field, count));
+        }
+        Ok(())
     }
 
     fn read_exact_array<const N: usize>(&mut self) -> Result<[u8; N], WireError> {
@@ -1731,6 +2109,10 @@ impl<'a> Cursor<'a> {
 
     fn is_eof(&self) -> bool {
         self.offset == self.bytes.len()
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
     }
 }
 
@@ -1771,4 +2153,36 @@ fn format_call_target(program: &Program, index: u16, argc: u8) -> Option<String>
         .imports
         .get(index as usize)
         .map(|import| format!("import {}/{} (argc={argc})", import.name, import.arity))
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn bool_vectors_debit_one_shared_checked_budget() {
+        const COUNT: usize = 40_000;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(COUNT as u32).to_le_bytes());
+        bytes.extend(std::iter::repeat_n(0, COUNT));
+        bytes.extend_from_slice(&(COUNT as u32).to_le_bytes());
+        bytes.extend(std::iter::repeat_n(0, COUNT));
+        let mut cursor = Cursor::new(&bytes);
+        cursor.remaining_budget = COUNT * 2 - 1;
+
+        assert_eq!(read_bool_vec(&mut cursor, COUNT).unwrap().len(), COUNT);
+        assert_eq!(
+            read_bool_vec(&mut cursor, COUNT),
+            Err(WireError::LengthTooLarge("type map boolean vector", COUNT))
+        );
+    }
+
+    #[test]
+    fn count_size_arithmetic_overflow_is_rejected() {
+        let cursor = Cursor::new(&[]);
+        assert_eq!(
+            cursor.validate_count_with_overhead("overflow", 2, usize::MAX, 0),
+            Err(WireError::LengthTooLarge("overflow", 2))
+        );
+    }
 }

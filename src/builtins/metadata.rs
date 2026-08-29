@@ -11,6 +11,13 @@ pub enum CallableParamType {
     Map,
     Number,
     Resource,
+    Callable(CallableType),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallableType {
+    pub params: &'static [CallableParamType],
+    pub return_type: &'static CallableParamType,
 }
 
 impl CallableParamType {
@@ -27,6 +34,23 @@ impl CallableParamType {
             Self::Map => "map",
             Self::Number => "number",
             Self::Resource => "resource",
+            Self::Callable(_) => "function",
+        }
+    }
+
+    pub fn display_label(self) -> String {
+        match self {
+            Self::Callable(signature) => format!(
+                "fn({}) -> {}",
+                signature
+                    .params
+                    .iter()
+                    .map(|param| param.display_label())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                signature.return_type.display_label()
+            ),
+            other => other.label().to_string(),
         }
     }
 }

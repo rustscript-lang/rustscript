@@ -38,6 +38,11 @@ impl SourcePlugin for ConstantPlugin {
             function_sources: HashMap::new(),
             use_declarations: Vec::new(),
             implicit_extern_names: Vec::new(),
+            host_api_metadata: None,
+            semantic_index: None,
+            parsed_semantic_index: None,
+            catalog_visibility: None,
+            lexer_tokens: Vec::new(),
         })
     }
 }
