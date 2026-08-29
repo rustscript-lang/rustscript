@@ -27,6 +27,22 @@ impl Parser {
         }
     }
 
+    /// Consume an identifier and return it together with the exact span of
+    /// the identifier token. Used by provenance recording so decl/ref sites
+    /// can capture the precise source range without a second lookup.
+    pub(super) fn expect_ident_with_span(
+        &mut self,
+        message: &str,
+    ) -> Result<(String, Span), ParseError> {
+        let name = self.expect_ident(message)?;
+        let span = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|token| token.span)
+            .unwrap_or_else(|| self.current_span());
+        Ok((name, span))
+    }
+
     pub(super) fn expect_string_literal(&mut self, message: &str) -> Result<String, ParseError> {
         if let Some(value) = self.match_string() {
             Ok(value)

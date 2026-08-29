@@ -325,6 +325,15 @@ fn lower_block(
                     kind: "script callable frame operation requires runtime lowering",
                 });
             }
+            OpCode::CallScript => {
+                // `CallScript` is lowered as an explicit terminal; a
+                // mid-block occurrence means the CFG is inconsistent.
+                return Err(AotLowerError::InvalidImmediate {
+                    ip,
+                    opcode,
+                    kind: "unexpected script call terminal in lowered instruction stream",
+                });
+            }
             OpCode::Ret | OpCode::Br | OpCode::Brfalse => {
                 return Err(AotLowerError::InvalidImmediate {
                     ip,
@@ -503,6 +512,16 @@ fn is_explicit_terminal_opcode(
             resume_ip,
         } => Ok(opcode == OpCode::CallValue
             && read_u8(code, ip + 1) == Some(*argc)
+            && ip == *call_ip
+            && next_ip == *resume_ip),
+        AotBlockTerminal::CallScript {
+            prototype_id,
+            argc,
+            call_ip,
+            resume_ip,
+        } => Ok(opcode == OpCode::CallScript
+            && read_u32(code, ip + 1) == Some(*prototype_id)
+            && read_u8(code, ip + 5) == Some(*argc)
             && ip == *call_ip
             && next_ip == *resume_ip),
         AotBlockTerminal::InterpreterExit { exit_ip } => {

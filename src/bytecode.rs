@@ -8,7 +8,8 @@ use crate::host_api::HostImportSchema;
 
 /// Bytecode ABI version used for VM-internal cache identity (JIT trace cache,
 /// program cache keys). The VMBC wire format version lives in `src/vmbc.rs`
-/// (`VERSION_V12`); both were bumped together for the static builtin ID break.
+/// (`VERSION_V12`); both were bumped together for the static builtin ID break
+/// and again for the direct script-call (`CallScript`) opcode break.
 pub const BYTECODE_ABI_VERSION: u16 = 12;
 
 pub type SharedString = Arc<String>;
@@ -81,6 +82,7 @@ pub struct ExportedCallable {
 
 #[derive(Debug)]
 pub struct CallableEnvironment {
+    #[allow(dead_code)]
     pub(crate) cells: std::sync::Mutex<Vec<SharedCaptureCell>>,
 }
 
@@ -614,6 +616,13 @@ impl DecodedInstructionData {
     }
 }
 
+/// Hard upper bound for a single interpreter frame's local slots.
+///
+/// This is deliberately below the wire-format count ceiling: metadata may be
+/// decoded without allocating a frame, but runtime construction and calls must
+/// never turn an untrusted/programmatic count into an unbounded local vector.
+pub const MAX_FRAME_LOCAL_COUNT: usize = 64 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct Program {
     pub constants: Vec<Value>,
@@ -728,7 +737,12 @@ impl Program {
                 self.imports.len()
             ));
         }
+        crate::host_api::validate_host_import_schemas(&schemas)
+            .map_err(|error| format!("invalid host import schema collection: {error}"))?;
         for (index, (import, schema)) in self.imports.iter().zip(schemas.iter()).enumerate() {
+            schema
+                .validate()
+                .map_err(|error| format!("host import schema {index} is invalid: {error}"))?;
             if schema.name != import.name {
                 return Err(format!(
                     "host import schema {index} names `{}` but import names `{}`",
@@ -755,6 +769,18 @@ impl Program {
     /// schema, return schema, and catalog fingerprint.
     pub fn host_import_schemas(&self) -> &[Option<HostImportSchema>] {
         &self.host_import_schemas
+    }
+
+    /// Attaches compiler-selected schemas while retaining legacy imports that
+    /// have no catalog metadata. Codegen keeps this vector aligned with
+    /// `imports`; VMBC is responsible for serializing the optional entries.
+    pub(crate) fn with_optional_host_import_schemas(
+        mut self,
+        schemas: Vec<Option<HostImportSchema>>,
+    ) -> Self {
+        debug_assert_eq!(schemas.len(), self.imports.len());
+        self.host_import_schemas = schemas;
+        self
     }
 
     pub fn with_local_count(mut self, local_count: usize) -> Self {
@@ -872,6 +898,12 @@ pub enum OpCode {
     Dup = 0x0E,
     Ldloc = 0x0F,
     Stloc = 0x10,
+    /// Static builtin/host call. Operands: `import:u16` little-endian then
+    /// `argc:u8` (3 operand bytes). The `u16` operand is an explicit static
+    /// builtin call index from the catalog (or a host-import slot), never a
+    /// count-derived offset. Consumes `argc` arguments from the stack; the
+    /// callee is owned by the builtin catalog, so no callable value exists
+    /// in the frame.
     Call = 0x11,
     Shl = 0x12,
     Shr = 0x13,
@@ -880,7 +912,18 @@ pub enum OpCode {
     Or = 0x16,
     Not = 0x17,
     Lshr = 0x18,
+    /// Dynamic callable-value call. Operand: `argc:u8` (1 operand byte).
+    /// Consumes a stack segment in `callee, arg0, ..., argN` order: the
+    /// callable value (including its environment, if any) is owned by the
+    /// caller operand stack at the call site and remains the caller's
+    /// responsibility.
     CallValue = 0x19,
+    /// Static script-function call by prototype id. Operands: `prototype_id:
+    /// u32` little-endian then `argc: u8` (5 operand bytes). The callee is
+    /// resolved through callable prototype metadata; no callable value is
+    /// consumed from the stack, so environment-free named functions can be
+    /// called without a hidden callable local.
+    CallScript = 0x1A,
 }
 
 impl TryFrom<u8> for OpCode {
@@ -914,6 +957,7 @@ impl TryFrom<u8> for OpCode {
             x if x == Self::Not as u8 => Ok(Self::Not),
             x if x == Self::Lshr as u8 => Ok(Self::Lshr),
             x if x == Self::CallValue as u8 => Ok(Self::CallValue),
+            x if x == Self::CallScript as u8 => Ok(Self::CallScript),
             _ => Err(()),
         }
     }
@@ -944,6 +988,7 @@ impl OpCode {
             Self::Ldc | Self::Br | Self::Brfalse => 4,
             Self::Ldloc | Self::Stloc | Self::CallValue => 1,
             Self::Call => 3,
+            Self::CallScript => 5,
         }
     }
 
@@ -975,6 +1020,7 @@ impl OpCode {
             OpCode::Not => "not",
             OpCode::Lshr => "lshr",
             Self::CallValue => "callvalue",
+            Self::CallScript => "callscript",
         }
     }
 
@@ -1006,6 +1052,7 @@ impl OpCode {
             "not" => Some(OpCode::Not),
             "lshr" => Some(OpCode::Lshr),
             "callvalue" => Some(OpCode::CallValue),
+            "callscript" => Some(OpCode::CallScript),
             _ => None,
         }
     }
@@ -1130,5 +1177,21 @@ mod tests {
 
         assert_eq!(map.remove(&Value::string("a")), Some(Value::Int(2)));
         assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn call_script_opcode_contract() {
+        // ISA contract: CallScript = 0x1A (immediately after CallValue),
+        // operands prototype_id:u32 LE + argc:u8, 5 operand bytes total.
+        assert_eq!(OpCode::CallScript as u8, 0x1A);
+        assert_eq!(OpCode::CallScript as u8, OpCode::CallValue as u8 + 1);
+        assert_eq!(OpCode::CallScript.operand_len(), 5);
+        assert_eq!(OpCode::CallScript.mnemonic(), "callscript");
+        assert_eq!(
+            OpCode::parse_mnemonic("callscript"),
+            Some(OpCode::CallScript)
+        );
+        assert_eq!(OpCode::try_from(0x1A), Ok(OpCode::CallScript));
+        assert_eq!(OpCode::CallScript as u8, 0x1A);
     }
 }

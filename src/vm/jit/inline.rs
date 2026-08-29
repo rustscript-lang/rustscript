@@ -57,12 +57,63 @@ pub(crate) fn classify_static_inline_candidate(
     if bindings.next().is_some() {
         return Err(InlineRejectReason::PolymorphicTarget);
     }
-    if caller_prototype_id == Some(binding.prototype_id) {
+    classify_prototype_inline_candidate(
+        program,
+        binding.prototype_id,
+        caller_prototype_id,
+        argc,
+        remaining_trace_budget,
+    )
+}
+
+/// Classify an inline candidate for a static `CallScript` call site.
+///
+/// The prototype identity comes from the instruction operands instead of a
+/// runtime callable local, so no `root_callable_bindings` lookup or
+/// polymorphic guard is needed. Environment-free eligibility mirrors the
+/// interpreter contract: `CallScript` can never supply captures or a self
+/// binding, so such prototypes are rejected here exactly like
+/// `CallScriptRequiresEnvironment` at runtime.
+pub(crate) fn classify_direct_inline_candidate(
+    program: &Program,
+    caller_frame_key: u64,
+    caller_prototype_id: Option<u32>,
+    prototype_id: u32,
+    argc: u8,
+    remaining_trace_budget: usize,
+) -> Result<InlineCandidate, InlineRejectReason> {
+    if caller_frame_key != ROOT_FRAME_KEY {
+        return Err(InlineRejectReason::NonRootCaller);
+    }
+    let prototype = program
+        .callable_prototypes
+        .get(prototype_id as usize)
+        .ok_or(InlineRejectReason::UnknownTarget)?;
+    if prototype.self_slot.is_some() {
+        return Err(InlineRejectReason::CapturedCallable);
+    }
+    classify_prototype_inline_candidate(
+        program,
+        prototype_id,
+        caller_prototype_id,
+        argc,
+        remaining_trace_budget,
+    )
+}
+
+fn classify_prototype_inline_candidate(
+    program: &Program,
+    prototype_id: u32,
+    caller_prototype_id: Option<u32>,
+    argc: u8,
+    remaining_trace_budget: usize,
+) -> Result<InlineCandidate, InlineRejectReason> {
+    if caller_prototype_id == Some(prototype_id) {
         return Err(InlineRejectReason::Recursive);
     }
     let prototype = program
         .callable_prototypes
-        .get(binding.prototype_id as usize)
+        .get(prototype_id as usize)
         .ok_or(InlineRejectReason::UnknownTarget)?;
     if prototype.kind != CallableKind::FunctionItem
         || !prototype.capture_slots.is_empty()
@@ -99,7 +150,7 @@ pub(crate) fn classify_static_inline_candidate(
         return Err(InlineRejectReason::TraceBudgetExceeded);
     }
     Ok(InlineCandidate {
-        prototype_id: binding.prototype_id,
+        prototype_id,
         entry_ip,
         end_ip,
         parameter_slots: prototype.parameter_slots.clone(),
@@ -173,6 +224,9 @@ fn scan_inline_region(
                 }
             }
             OpCode::CallValue => return Err(InlineRejectReason::NestedScriptCall),
+            // `CallScript` is a nested script call too; inline analysis
+            // support for the direct path lands with backend parity.
+            OpCode::CallScript => return Err(InlineRejectReason::NestedScriptCall),
             OpCode::Call => {
                 let index =
                     read_u16(&program.code, &mut ip).ok_or(InlineRejectReason::UnknownTarget)?;

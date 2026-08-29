@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::Program;
 use crate::assembler::AssemblerError;
-use crate::host_api::{HostApiCatalog, HostImportSchema, HostTypeSchema};
 #[cfg(feature = "runtime")]
 use crate::vm::Vm;
 
@@ -12,16 +12,22 @@ mod codegen;
 pub mod diagnostics;
 mod format;
 mod frontends;
+mod host_call_resolve;
+mod host_conversion;
 pub mod ir;
 mod lifetime;
 mod linker;
+mod materialization;
 mod modules;
 mod parser;
 mod pipeline;
+mod semantic_model;
 mod source_loader;
 pub mod source_map;
 mod typing;
 
+#[cfg(test)]
+use self::materialization::CallableUseObservation;
 use self::source_map::{SourceMap, Span};
 
 pub use self::codegen::Compiler;
@@ -29,9 +35,11 @@ pub use self::format::{
     FormatError, format_source, format_source_with_flavor, format_source_with_flavor_and_options,
 };
 pub use self::frontends::parse_source_with_dialect;
+pub use self::host_call_resolve::{HostCallResolveError, HostCallResolver};
 pub use self::ir::{
     AssignmentKind, ClosureExpr, Expr, FrontendIr, FunctionDecl, FunctionImpl, FunctionParam,
-    LocalIrBuilder, LocalSlot, MatchPattern, MatchTypePattern, Stmt, StructDecl, TypeSchema,
+    LocalIrBuilder, LocalSlot, MatchPattern, MatchTypePattern, ResolvedHostCall, ResolvedHostParam,
+    SemanticIndex, Stmt, StructDecl, TypeSchema,
 };
 pub use self::modules::{
     DeclSymbol, ExportEntry, ImportTargetKind, ImportedBinding, ModuleGraph, ModuleId, ModuleNode,
@@ -39,7 +47,9 @@ pub use self::modules::{
 };
 pub use self::parser::ParserDialect;
 pub use self::pipeline::{
-    InferredLocalTypeHint, UnknownInferredLocal, collect_inferred_local_type_hints,
+    InferredLocalTypeHint, UnknownInferredLocal, analyze_source, analyze_source_file,
+    analyze_source_file_with_options, analyze_source_from_string_with_options,
+    analyze_source_with_flavor, collect_inferred_local_type_hints,
     collect_inferred_local_type_hints_at_path_with_options,
     collect_inferred_local_type_hints_with_options, compile_source,
     compile_source_at_path_with_flavor_and_options, compile_source_file,
@@ -49,16 +59,30 @@ pub use self::pipeline::{
     lint_unknown_inferred_local_types, lint_unknown_inferred_local_types_at_path_with_options,
     lint_unknown_inferred_local_types_with_options, lint_unknown_type_annotations,
 };
+pub use self::semantic_model::{
+    CompletionItemKind, Definition, SemanticCompletion, SemanticDiagnostic, SemanticModel,
+    SourcePosition,
+};
 pub use self::source_loader::{FrontendImportSyntax, ImportClause, ModuleImport, NamedImport};
 
 #[derive(Debug)]
 pub enum CompileError {
     Assembler(AssemblerError),
     CallArityOverflow,
+    HostImportOverflow,
     ClosureUsedAsValue,
     CallableUsedAsValue,
     NonCallableLocal(LocalSlot),
     LocalSlotOverflow(LocalSlot),
+    /// The aggregate frame-local count (data slots plus materialized callable
+    /// slots) exceeds what the short bytecode operands can address. Carries
+    /// the real counts so the diagnostic is actionable instead of a sentinel.
+    FrameLocalLimitExceeded {
+        data_slots: usize,
+        callable_slots: usize,
+        total_slots: usize,
+        max_slots: usize,
+    },
     CallableArityMismatch {
         expected: usize,
         got: usize,
@@ -70,31 +94,64 @@ pub enum CompileError {
         line: Option<u32>,
         source_name: Option<String>,
         detail: String,
+        /// Exact parser-origin span of the failing construct (the if/else
+        /// statement or expression, or the containing statement) when the
+        /// error was produced by real analysis with parser provenance. `None`
+        /// only for synthetic/test errors that carry no position at all.
+        span: Option<crate::compiler::source_map::Span>,
     },
     CallableArgumentTypeMismatch {
         line: Option<u32>,
         source_name: Option<String>,
         detail: String,
+        /// Exact parser-origin span of the failing call/argument construct.
+        /// `None` only for synthetic/test errors that carry no position.
+        span: Option<crate::compiler::source_map::Span>,
     },
     BinaryOperandTypeMismatch {
         line: Option<u32>,
         source_name: Option<String>,
         detail: String,
+        /// Exact parser-origin span of the failing binary construct.
+        /// `None` only for synthetic/test errors that carry no position.
+        span: Option<crate::compiler::source_map::Span>,
     },
     InvalidFieldAccess {
         line: Option<u32>,
         source_name: Option<String>,
         detail: String,
+        /// Exact parser-origin span of the failing access/assignment
+        /// construct. `None` only for synthetic/test errors that carry no
+        /// position.
+        span: Option<crate::compiler::source_map::Span>,
     },
     FunctionParameterTypeConflict {
         line: Option<u32>,
         source_name: Option<String>,
         detail: String,
+        /// Exact parser-origin span of the failing call/declaration
+        /// construct. `None` only for synthetic/test errors that carry no
+        /// position.
+        span: Option<crate::compiler::source_map::Span>,
     },
     StrictTypingRequired {
         line: Option<u32>,
         source_name: Option<String>,
         detail: String,
+        /// Exact parser-origin span of the failing declaration/construct.
+        /// `None` only for synthetic/test errors that carry no position.
+        span: Option<crate::compiler::source_map::Span>,
+    },
+    /// Catalog host-call overload resolution failed at a call site. Carries
+    /// the optional call-site line and source name plus a diagnostic detail
+    /// describing the failed overload selection. When the failing call
+    /// carried parser provenance, `span` is the exact callee token span of
+    /// the failing call site (never a line-wide guess).
+    HostCallResolve {
+        line: Option<u32>,
+        source_name: Option<String>,
+        detail: String,
+        span: Option<crate::compiler::source_map::Span>,
     },
     /// Internal error: a symbol-resolved module call or function value
     /// survived unit merge and reached codegen, where flat function indices
@@ -123,6 +180,9 @@ impl CompileError {
             CompileError::StrictTypingRequired { line, .. } => {
                 line.and_then(|value| usize::try_from(value).ok())
             }
+            CompileError::HostCallResolve { line, .. } => {
+                line.and_then(|value| usize::try_from(value).ok())
+            }
 
             _ => None,
         }
@@ -135,7 +195,8 @@ impl CompileError {
             | CompileError::BinaryOperandTypeMismatch { source_name, .. }
             | CompileError::InvalidFieldAccess { source_name, .. }
             | CompileError::FunctionParameterTypeConflict { source_name, .. }
-            | CompileError::StrictTypingRequired { source_name, .. } => source_name.as_deref(),
+            | CompileError::StrictTypingRequired { source_name, .. }
+            | CompileError::HostCallResolve { source_name, .. } => source_name.as_deref(),
             _ => None,
         }
     }
@@ -145,6 +206,9 @@ impl CompileError {
             CompileError::Assembler(err) => err.to_string(),
             CompileError::CallArityOverflow => {
                 "call arity exceeds the supported bytecode encoding".to_string()
+            }
+            CompileError::HostImportOverflow => {
+                "host import count exceeds the supported bytecode encoding".to_string()
             }
             CompileError::ClosureUsedAsValue => {
                 "closures cannot be used as plain values".to_string()
@@ -156,6 +220,14 @@ impl CompileError {
             CompileError::LocalSlotOverflow(slot) => {
                 format!("local slot {slot} exceeds the supported bytecode encoding")
             }
+            CompileError::FrameLocalLimitExceeded {
+                data_slots,
+                callable_slots,
+                total_slots,
+                max_slots,
+            } => format!(
+                "frame requires {total_slots} local slots ({data_slots} data + {callable_slots} callable); short bytecode supports {max_slots}"
+            ),
             CompileError::CallableArityMismatch { expected, got } => {
                 format!("callable arity mismatch: expected {expected}, got {got}")
             }
@@ -170,6 +242,7 @@ impl CompileError {
             CompileError::InvalidFieldAccess { detail, .. } => detail.clone(),
             CompileError::FunctionParameterTypeConflict { detail, .. } => detail.clone(),
             CompileError::StrictTypingRequired { detail, .. } => detail.clone(),
+            CompileError::HostCallResolve { detail, .. } => detail.clone(),
             CompileError::UnresolvedModuleCall => {
                 "internal compiler error: unresolved module call reached codegen".to_string()
             }
@@ -461,30 +534,6 @@ impl SourceFlavor {
     }
 }
 
-fn compiler_type_matches_host(actual: &TypeSchema, expected: &HostTypeSchema) -> bool {
-    match (actual, expected) {
-        (TypeSchema::Unknown, _) => true,
-        (TypeSchema::Null, HostTypeSchema::Null) => true,
-        (TypeSchema::Int, HostTypeSchema::Int | HostTypeSchema::Number) => true,
-        (TypeSchema::Float, HostTypeSchema::Float | HostTypeSchema::Number) => true,
-        (TypeSchema::Number, HostTypeSchema::Number) => true,
-        (TypeSchema::Bool, HostTypeSchema::Bool) => true,
-        (TypeSchema::String, HostTypeSchema::String) => true,
-        (TypeSchema::Bytes, HostTypeSchema::Bytes) => true,
-        (TypeSchema::Optional(actual), HostTypeSchema::Optional(expected)) => {
-            compiler_type_matches_host(actual, expected)
-        }
-        (TypeSchema::Array(actual), HostTypeSchema::Array(expected)) => {
-            compiler_type_matches_host(actual, expected)
-        }
-        (TypeSchema::Map(actual), HostTypeSchema::Map(expected)) => {
-            compiler_type_matches_host(actual, expected)
-        }
-        (TypeSchema::Callable { .. }, HostTypeSchema::Callable { .. }) => true,
-        _ => false,
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplLocalBinding {
     pub name: String,
@@ -503,76 +552,27 @@ pub struct CompiledProgram {
     pub program: Program,
     pub locals: usize,
     pub functions: Vec<FunctionDecl>,
+    /// Milestone-5 callable-use classification observed through the
+    /// production pipeline, keyed by resolved flat function index and
+    /// sorted by index. Test-only observation compiled into the crate's
+    /// unit-test builds only; never part of the public API.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) callable_use_facts: Vec<CallableUseObservation>,
 }
 
 impl CompiledProgram {
-    /// Attaches the exact catalog schema selected for each compiled host
-    /// import. Binding later uses the full identity, including resource keys,
-    /// return schema and catalog fingerprint.
-    pub fn with_host_import_schemas(
-        mut self,
-        schemas: Vec<HostImportSchema>,
-    ) -> Result<Self, String> {
-        self.program = self.program.with_host_import_schemas(schemas)?;
-        Ok(self)
-    }
-
-    /// Selects and attaches catalog schemas for imports that have one
-    /// unambiguous overload. An import with multiple candidates is rejected
-    /// until the caller supplies [`Self::with_host_import_schemas`] explicitly,
-    /// unless the compiler recorded concrete argument schemas that select one.
-    pub fn with_host_catalog(mut self, catalog: &HostApiCatalog) -> Result<Self, String> {
-        let mut schemas = Vec::with_capacity(self.program.imports.len());
-        for (index, import) in self.program.imports.iter().enumerate() {
-            let candidates: Vec<_> = catalog
-                .functions_named(&import.name)
-                .into_iter()
-                .filter(|function| function.params.len() == import.arity as usize)
-                .collect();
-            if candidates.is_empty() {
-                return Err(format!(
-                    "catalog has no overload for host import `{}` with arity {}",
-                    import.name, import.arity
-                ));
-            }
-            let selected = if candidates.len() == 1 {
-                candidates[0]
-            } else {
-                let declaration = self.functions.get(index);
-                let matching: Vec<_> = candidates
-                    .into_iter()
-                    .filter(|candidate| {
-                        declaration.is_some_and(|declaration| {
-                            declaration.arg_schemas.len() == candidate.params.len()
-                                && declaration
-                                    .arg_schemas
-                                    .iter()
-                                    .zip(candidate.params.iter())
-                                    .all(|(actual, expected)| {
-                                        actual.as_ref().is_none_or(|actual| {
-                                            compiler_type_matches_host(actual, &expected.ty)
-                                        })
-                                    })
-                        })
-                    })
-                    .collect();
-                if matching.len() != 1 {
-                    return Err(format!(
-                        "catalog import `{}` with arity {} is ambiguous; attach its full schema",
-                        import.name, import.arity
-                    ));
-                }
-                matching[0]
-            };
-            schemas.push(HostImportSchema::from_function(catalog, selected));
-        }
-        self.program = self.program.with_host_import_schemas(schemas)?;
-        Ok(self)
-    }
-
     #[cfg(feature = "runtime")]
-    pub fn into_vm(self) -> Vm {
-        Vm::new(self.program)
+    /// Consumes the compiled program and produces a fresh [`Vm`].
+    ///
+    /// Fallible: VM construction allocates one id from the process-unique
+    /// execution-scope arena (and the legacy runtime arena) in lockstep; when
+    /// that identity space is exhausted the construction fails with a typed
+    /// [`VmError`](crate::vm::VmError) instead of panicking. Long-lived or
+    /// pooled construction must propagate this result; there is no infallible
+    /// `into_vm` that can panic on arena exhaustion.
+    pub fn into_vm(self) -> crate::vm::VmResult<Vm> {
+        Vm::try_new(self.program)
     }
 }
 
@@ -586,21 +586,54 @@ pub struct CompileSourceFileOptions {
     module_path_overrides: HashMap<String, PathBuf>,
     module_source_overrides: HashMap<String, String>,
     source_plugins: Vec<&'static dyn SourcePlugin>,
+    host_api_catalog: Option<Arc<crate::host_api::HostApiCatalog>>,
 }
 
 impl fmt::Debug for CompileSourceFileOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CompileSourceFileOptions")
+        let mut debug = f.debug_struct("CompileSourceFileOptions");
+        debug
             .field("module_path_overrides", &self.module_path_overrides)
             .field("module_source_overrides", &self.module_source_overrides)
-            .field("source_plugin_count", &self.source_plugins.len())
-            .finish()
+            .field("source_plugin_count", &self.source_plugins.len());
+        match &self.host_api_catalog {
+            Some(catalog) => {
+                debug.field("host_api_catalog_present", &true);
+                debug.field("host_api_catalog_fingerprint", &Some(catalog.fingerprint()));
+            }
+            None => {
+                debug.field("host_api_catalog_present", &false);
+                debug.field(
+                    "host_api_catalog_fingerprint",
+                    &Option::<crate::host_api::HostApiFingerprint>::None,
+                );
+            }
+        }
+        debug.finish()
     }
 }
 
 impl CompileSourceFileOptions {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_host_api_catalog(mut self, catalog: Arc<crate::host_api::HostApiCatalog>) -> Self {
+        self.set_host_api_catalog(catalog);
+        self
+    }
+
+    pub fn set_host_api_catalog(&mut self, catalog: Arc<crate::host_api::HostApiCatalog>) {
+        self.host_api_catalog = Some(catalog);
+    }
+
+    pub fn host_api_catalog(&self) -> Option<&Arc<crate::host_api::HostApiCatalog>> {
+        self.host_api_catalog.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_host_api_catalog(&self) -> bool {
+        self.host_api_catalog.is_some()
     }
 
     pub fn with_module_override_path(
@@ -735,5 +768,111 @@ fn split_windows_prefix(input: &str) -> (&str, &str) {
         (&input[..2], &input[2..])
     } else {
         ("", input)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::HostApiCatalog;
+    use crate::host_api::{HostApiBuilder, HostFunctionSchema, HostParamSchema, HostTypeSchema};
+
+    use super::{CompileError, CompileSourceFileOptions};
+
+    fn test_catalog() -> Arc<HostApiCatalog> {
+        let mut builder = HostApiBuilder::new();
+        let mut f = HostFunctionSchema::with_return(
+            "unambiguous_unique_marker_fn",
+            vec![HostParamSchema::value("value", HostTypeSchema::Int)],
+            HostTypeSchema::Int,
+        );
+        f.description = "TOP-SECRET-OPTION-DEBUG-DOC".to_string();
+        builder.function(f);
+        Arc::new(builder.build().expect("test catalog must be valid"))
+    }
+
+    #[test]
+    fn default_has_no_host_api_catalog() {
+        let options = CompileSourceFileOptions::default();
+        assert!(options.host_api_catalog().is_none());
+        assert!(!options.has_host_api_catalog());
+    }
+
+    #[test]
+    fn setter_stores_same_catalog() {
+        let catalog = test_catalog();
+        let mut options = CompileSourceFileOptions::default();
+        options.set_host_api_catalog(Arc::clone(&catalog));
+        let stored = options.host_api_catalog().expect("set catalog present");
+        assert!(Arc::ptr_eq(&catalog, stored));
+        assert!(options.has_host_api_catalog());
+    }
+
+    #[test]
+    fn builder_pointer_is_same_catalog() {
+        let catalog = test_catalog();
+        let options =
+            CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog));
+        let stored = options.host_api_catalog().expect("builder catalog present");
+        assert!(Arc::ptr_eq(&catalog, stored));
+    }
+
+    #[test]
+    fn clone_shares_same_catalog() {
+        let options = CompileSourceFileOptions::default().with_host_api_catalog(test_catalog());
+        let cloned = options.clone();
+        let original = options.host_api_catalog().expect("original present");
+        let cloned_catalog = cloned.host_api_catalog().expect("clone present");
+        assert!(Arc::ptr_eq(original, cloned_catalog));
+    }
+
+    #[test]
+    fn debug_reveals_presence_and_fingerprint_only() {
+        let options = CompileSourceFileOptions::default().with_host_api_catalog(test_catalog());
+        let debug = format!("{:?}", options);
+        let fp_debug = format!(
+            "{:?}",
+            options.host_api_catalog().expect("present").fingerprint()
+        );
+        assert!(debug.contains("host_api_catalog_present"));
+        assert!(debug.contains("host_api_catalog_fingerprint"));
+        assert!(debug.contains(&fp_debug));
+        assert!(!debug.contains("unambiguous_unique_marker_fn"));
+        assert!(!debug.contains("TOP-SECRET-OPTION-DEBUG-DOC"));
+
+        let defaults = CompileSourceFileOptions::default();
+        let default_debug = format!("{:?}", defaults);
+        assert!(default_debug.contains("host_api_catalog_present: false"));
+        assert!(default_debug.contains("host_api_catalog_fingerprint: None"));
+    }
+
+    #[test]
+    fn host_call_resolve_accessors() {
+        let with_meta = CompileError::HostCallResolve {
+            line: Some(42),
+            source_name: Some("main.rss".to_string()),
+            detail: "no overload of 'fetch' matches (Int)".to_string(),
+            span: None,
+        };
+        assert_eq!(with_meta.line(), Some(42));
+        assert_eq!(with_meta.source_name(), Some("main.rss"));
+        assert_eq!(
+            with_meta.diagnostic_message(),
+            "no overload of 'fetch' matches (Int)"
+        );
+
+        let without_meta = CompileError::HostCallResolve {
+            line: None,
+            source_name: None,
+            detail: "catalog resolution failed".to_string(),
+            span: None,
+        };
+        assert_eq!(without_meta.line(), None);
+        assert_eq!(without_meta.source_name(), None);
+        assert_eq!(
+            without_meta.diagnostic_message(),
+            "catalog resolution failed"
+        );
     }
 }

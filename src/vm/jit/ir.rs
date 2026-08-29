@@ -251,6 +251,17 @@ pub(crate) enum SsaInstKind {
         import: u16,
         args: Vec<SsaValueId>,
     },
+    /// Materialize the fresh environment-free callable for one root callable
+    /// binding slot of an inlined callee frame.
+    ///
+    /// The runtime helper mints a brand-new `Arc` (never a shared constant)
+    /// and registers it with the VM's owned-callable set on every execution,
+    /// mirroring `enter_script_frame`'s per-entry re-initialization. No
+    /// callable identity is ever shared across runs, so a host handle from a
+    /// previous lifecycle can never be re-legalized by a later run.
+    MaterializeRootCallable {
+        prototype_id: u32,
+    },
 
     IntNeg {
         input: SsaValueId,
@@ -396,6 +407,7 @@ impl SsaInstKind {
         match self {
             Self::Constant(_) => Vec::new(),
             Self::HostCall { args, .. } => args.clone(),
+            Self::MaterializeRootCallable { .. } => Vec::new(),
 
             Self::CloneTagged { input }
             | Self::ValueIsType { input, .. }
@@ -558,6 +570,15 @@ pub(crate) enum SsaTerminator {
         exit: SsaExitId,
     },
     CallValue {
+        argc: u8,
+        call_ip: usize,
+        resume_ip: usize,
+        exit: SsaExitId,
+    },
+    /// Static direct script-function call: the callee prototype is part of
+    /// the instruction, so no runtime callable value is consumed.
+    CallScript {
+        prototype_id: u32,
         argc: u8,
         call_ip: usize,
         resume_ip: usize,
@@ -1044,7 +1065,8 @@ fn verify_terminator(
         }
         SsaTerminator::Exit { exit }
         | SsaTerminator::Return { exit }
-        | SsaTerminator::CallValue { exit, .. } => {
+        | SsaTerminator::CallValue { exit, .. }
+        | SsaTerminator::CallScript { exit, .. } => {
             if !exit_ids.contains(exit) {
                 return Err(SsaVerifyError::UnknownExit(*exit));
             }
@@ -1139,6 +1161,9 @@ fn verify_materialization(
 fn render_inst_kind(kind: &SsaInstKind) -> String {
     match kind {
         SsaInstKind::Constant(value) => format!("const {value:?}"),
+        SsaInstKind::MaterializeRootCallable { prototype_id } => {
+            format!("materialize_root_callable {prototype_id}")
+        }
         SsaInstKind::CloneTagged { input } => format!("clone_tagged {input}"),
         SsaInstKind::ValueIsType { input, tag } => {
             format!("value_is_type {input}, {tag:?}")
@@ -1277,6 +1302,15 @@ fn render_terminator(terminator: &SsaTerminator) -> String {
             resume_ip,
             exit,
         } => format!("call_value argc={argc} call_ip={call_ip} resume_ip={resume_ip} {exit}"),
+        SsaTerminator::CallScript {
+            prototype_id,
+            argc,
+            call_ip,
+            resume_ip,
+            exit,
+        } => format!(
+            "call_script prototype={prototype_id} argc={argc} call_ip={call_ip} resume_ip={resume_ip} {exit}"
+        ),
     }
 }
 

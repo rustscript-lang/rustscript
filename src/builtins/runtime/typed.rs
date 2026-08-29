@@ -1,6 +1,7 @@
 use super::BuiltinCallOutcome;
 pub(super) use crate::bytecode::{SharedArray, SharedBytes, SharedMap, VmMap};
 use crate::vm::{CallOutcome, CallReturn, HostOpId, Value, VmError, VmResult};
+use std::marker::PhantomData;
 
 pub(super) type AnyValue = Value;
 pub(super) type UnknownValue = Value;
@@ -19,6 +20,32 @@ pub(super) type VmArrayHandle = SharedArray;
 pub(super) type VmBytesHandle = SharedBytes;
 #[allow(dead_code)]
 pub(super) type VmMapHandle = SharedMap;
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(super) struct VmCallable<Signature> {
+    value: Value,
+    marker: PhantomData<fn() -> Signature>,
+}
+
+impl<Signature> VmCallable<Signature> {
+    #[allow(dead_code)]
+    pub(super) fn into_value(self) -> Value {
+        self.value
+    }
+}
+
+impl<Signature> FromVmValue<'_> for VmCallable<Signature> {
+    fn from_vm_value(value: &Value, _label: &str) -> VmResult<Self> {
+        if !matches!(value, Value::Callable(_)) {
+            return Err(VmError::TypeMismatch("callable"));
+        }
+        Ok(Self {
+            value: value.clone(),
+            marker: PhantomData,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum NumberValue {

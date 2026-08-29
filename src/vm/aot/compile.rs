@@ -8,8 +8,6 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 #[cfg(feature = "cranelift-jit")]
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "cranelift-jit")]
-use std::time::Instant;
 
 use crate::vm::native::ExecutableBuffer;
 #[cfg(feature = "cranelift-jit")]
@@ -21,10 +19,11 @@ use crate::vm::native::{
     clear_value_slot_entry_address, clone_value_signature, clone_value_to_slot_entry_address,
     collection_get_signature, collection_mutation_signature, collection_set_entry_address,
     copy_bytes_entry_address, copy_bytes_signature, detect_native_stack_layout,
-    enter_call_value_entry_address, enter_call_value_signature, entry_signature,
-    frame_state_entry_address, frame_state_signature, free_buffer_signature, helper_entry_offset,
-    helper_signature, init_null_value_slot_entry_address, jump_with_status,
-    leave_frame_entry_address, leave_frame_signature, pack_shared_signature, resolve_offsets,
+    enter_call_script_entry_address, enter_call_script_signature, enter_call_value_entry_address,
+    enter_call_value_signature, entry_signature, frame_state_entry_address, frame_state_signature,
+    free_buffer_signature, helper_entry_offset, helper_signature,
+    init_null_value_slot_entry_address, jump_with_status, leave_frame_entry_address,
+    leave_frame_signature, pack_shared_signature, resolve_offsets,
     restore_active_exit_state_entry_address, restore_exit_signature,
     restore_exit_state_entry_address, shared_array_from_buffer_entry_address,
     shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
@@ -184,64 +183,16 @@ pub(crate) fn compile_program(program: &Program) -> VmResult<CompiledProgram> {
 
 #[cfg(feature = "cranelift-jit")]
 fn compile_program_inner(program: &Program) -> Result<CompiledProgram, AotCompileError> {
-    let trace_enabled = std::env::var_os("PDVM_TRACE_AOT_COMPILE").is_some();
-    let build_started = Instant::now();
     let ssa = build_aot_ssa(program)?;
-    let build_elapsed = build_started.elapsed();
     let total_block_params = ssa
         .blocks
         .iter()
         .map(|block| block.params.len())
         .sum::<usize>();
-    if trace_enabled {
-        let total_insts = ssa
-            .blocks
-            .iter()
-            .map(|block| block.insts.len())
-            .sum::<usize>();
-        let external_checkpoints = ssa.checkpoints.iter().filter(|cp| cp.external).count();
-        let max_block_params = ssa
-            .blocks
-            .iter()
-            .map(|block| block.params.len())
-            .max()
-            .unwrap_or(0);
-        let total_checkpoint_values = ssa
-            .checkpoints
-            .iter()
-            .map(|cp| cp.stack.len() + cp.locals.len())
-            .sum::<usize>();
-        let max_checkpoint_values = ssa
-            .checkpoints
-            .iter()
-            .map(|cp| cp.stack.len() + cp.locals.len())
-            .max()
-            .unwrap_or(0);
-        eprintln!(
-            "aot trace: code_bytes={} ssa_blocks={} ssa_insts={} block_params_total={} block_params_max={} checkpoints={} external_checkpoints={} checkpoint_values_total={} checkpoint_values_max={} resume_ips={} ssa_build_us={}",
-            program.code.len(),
-            ssa.blocks.len(),
-            total_insts,
-            total_block_params,
-            max_block_params,
-            ssa.checkpoints.len(),
-            external_checkpoints,
-            total_checkpoint_values,
-            max_checkpoint_values,
-            ssa.resume_ips.len(),
-            build_elapsed.as_micros(),
-        );
-    }
     if exceeds_monolithic_aot_block_param_budget(total_block_params) {
-        if trace_enabled {
-            eprintln!(
-                "aot trace: lowering=interpreter-boundary reason=block-param-budget block_params_total={} budget={}",
-                total_block_params, MAX_MONOLITHIC_AOT_BLOCK_PARAMS,
-            );
-        }
         return compile_interpreter_boundary_program();
     }
-    match compile_ssa(program, &ssa, trace_enabled) {
+    match compile_ssa(program, &ssa) {
         Ok(compiled) => Ok(compiled),
         Err(AotCompileError::Codegen(message))
             if message.contains("Code for function is too large") =>
@@ -332,6 +283,7 @@ struct AotDeoptHelperRefs {
     interrupt_ref: cranelift_codegen::ir::SigRef,
     frame_state_ref: cranelift_codegen::ir::SigRef,
     enter_call_value_ref: cranelift_codegen::ir::SigRef,
+    enter_call_script_ref: cranelift_codegen::ir::SigRef,
     leave_frame_ref: cranelift_codegen::ir::SigRef,
     clone_value_ref: cranelift_codegen::ir::SigRef,
     value_eq_ref: cranelift_codegen::ir::SigRef,
@@ -349,6 +301,7 @@ struct AotDeoptHelperAddrs {
     aot_interrupt: usize,
     frame_state: usize,
     enter_call_value: usize,
+    enter_call_script: usize,
     leave_frame: usize,
     clone_value: usize,
     value_eq: usize,
@@ -479,27 +432,17 @@ struct AotMaterializeCtx<'a> {
 }
 
 #[cfg(feature = "cranelift-jit")]
-fn compile_ssa(
-    program: &Program,
-    ssa: &AotSsaProgram,
-    trace_enabled: bool,
-) -> Result<CompiledProgram, AotCompileError> {
-    let total_started = Instant::now();
-    let isa_started = Instant::now();
+fn compile_ssa(program: &Program, ssa: &AotSsaProgram) -> Result<CompiledProgram, AotCompileError> {
     let isa = native_isa()?;
-    let isa_elapsed = isa_started.elapsed();
-    let module_started = Instant::now();
     let jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     let mut module = JITModule::new(jit_builder);
     let pointer_type = module.target_config().pointer_type();
     let call_conv = module.target_config().default_call_conv;
-    let module_elapsed = module_started.elapsed();
-
-    let sigs_started = Instant::now();
     let helper_sig = helper_signature(pointer_type, call_conv);
     let alloc_buffer_sig = alloc_buffer_signature(pointer_type, call_conv);
     let frame_state_sig = frame_state_signature(pointer_type, call_conv);
     let enter_call_value_sig = enter_call_value_signature(pointer_type, call_conv);
+    let enter_call_script_sig = enter_call_script_signature(pointer_type, call_conv);
     let leave_frame_sig = leave_frame_signature(pointer_type, call_conv);
     let free_buffer_sig = free_buffer_signature(pointer_type, call_conv);
     let pack_shared_sig = pack_shared_signature(pointer_type, call_conv);
@@ -513,9 +456,6 @@ fn compile_ssa(
     let array_push_sig = collection_get_signature(pointer_type, call_conv);
     let collection_set_sig = collection_mutation_signature(pointer_type, call_conv);
     let restore_exit_sig = restore_exit_signature(pointer_type, call_conv);
-    let sigs_elapsed = sigs_started.elapsed();
-
-    let addr_setup_started = Instant::now();
     let helper_offset = helper_entry_offset();
     let heap_addrs = HeapIntrinsicAddrs {
         alloc_byte_buffer: alloc_byte_buffer_entry_address(),
@@ -530,6 +470,7 @@ fn compile_ssa(
         aot_interrupt: aot_call_boundary_interrupt_entry_address(),
         frame_state: frame_state_entry_address(),
         enter_call_value: enter_call_value_entry_address(),
+        enter_call_script: enter_call_script_entry_address(),
         leave_frame: leave_frame_entry_address(),
         clone_value: clone_value_to_slot_entry_address(),
         value_eq: value_eq_entry_address(),
@@ -540,17 +481,11 @@ fn compile_ssa(
         collection_set: collection_set_entry_address(),
         restore_exit: restore_active_exit_state_entry_address(),
     };
-    let addr_setup_elapsed = addr_setup_started.elapsed();
-
-    let layout_started = Instant::now();
     let layout = detect_native_stack_layout().map_err(|err| {
         AotCompileError::Codegen(format!("detect native stack layout failed: {err}"))
     })?;
     let offsets = resolve_offsets(layout)
         .map_err(|err| AotCompileError::Codegen(format!("resolve native offsets failed: {err}")))?;
-    let layout_elapsed = layout_started.elapsed();
-
-    let ctx_setup_started = Instant::now();
     let mut ctx = module.make_context();
     ctx.func.signature = entry_signature(pointer_type, call_conv);
 
@@ -563,14 +498,12 @@ fn compile_ssa(
                 AotCompileError::Codegen(format!("declare aot function failed: {err}"))
             })?
     };
-    let ctx_setup_elapsed = ctx_setup_started.elapsed();
 
     let vm_ip_offset =
         i32::try_from(std::mem::offset_of!(Vm, instance.ip)).expect("Vm::ip offset must fit i32");
     let code_len_i64 = i64::try_from(program.code.len())
         .map_err(|_| AotCompileError::Codegen("program length does not fit i64".to_string()))?;
 
-    let ir_build_started = Instant::now();
     {
         let mut fb_ctx = FunctionBuilderContext::new();
         let mut b = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
@@ -587,6 +520,7 @@ fn compile_ssa(
             interrupt_ref: b.import_signature(interrupt_sig),
             frame_state_ref: b.import_signature(frame_state_sig),
             enter_call_value_ref: b.import_signature(enter_call_value_sig),
+            enter_call_script_ref: b.import_signature(enter_call_script_sig),
             leave_frame_ref: b.import_signature(leave_frame_sig),
             clone_value_ref: b.import_signature(clone_value_sig),
             value_eq_ref: b.import_signature(value_eq_sig),
@@ -746,21 +680,15 @@ fn compile_ssa(
         b.seal_all_blocks();
         b.finalize();
     }
-    let ir_build_elapsed = ir_build_started.elapsed();
-
-    let verify_started = Instant::now();
     if let Err(err) = verify_function(&ctx.func, module.isa()) {
         let pretty = pretty_verifier_error(&ctx.func, None, err);
         return Err(AotCompileError::Codegen(format!(
             "aot ssa verifier failed:\n{pretty}"
         )));
     }
-    let verify_elapsed = verify_started.elapsed();
-    let define_started = Instant::now();
     module
         .define_function(func_id, &mut ctx)
         .map_err(|err| AotCompileError::Codegen(format!("define aot function failed: {err}")))?;
-    let define_elapsed = define_started.elapsed();
     let code_len = ctx
         .compiled_code()
         .ok_or_else(|| {
@@ -768,47 +696,18 @@ fn compile_ssa(
         })?
         .code_buffer()
         .len();
-    let clear_ctx_started = Instant::now();
     module.clear_context(&mut ctx);
-    let clear_ctx_elapsed = clear_ctx_started.elapsed();
-    let finalize_started = Instant::now();
     module.finalize_definitions().map_err(|err| {
         AotCompileError::Codegen(format!("finalize aot definitions failed: {err}"))
     })?;
-    let finalize_elapsed = finalize_started.elapsed();
-
-    let copy_started = Instant::now();
     let entry = module.get_finalized_function(func_id);
     let code = if code_len == 0 {
         Vec::new()
     } else {
         unsafe { std::slice::from_raw_parts(entry, code_len).to_vec() }
     };
-    let copy_elapsed = copy_started.elapsed();
-    let program_wrap_started = Instant::now();
     let compiled = CompiledProgram::from_code(code, ssa.resume_ips.clone())
         .map_err(|err| AotCompileError::Codegen(err.to_string()))?;
-    let program_wrap_elapsed = program_wrap_started.elapsed();
-    if trace_enabled {
-        eprintln!(
-            "aot trace: isa_us={} module_us={} sigs_us={} addrs_us={} layout_us={} ctx_us={} ir_build_us={} verify_us={} define_us={} clear_ctx_us={} finalize_us={} copy_us={} wrap_us={} total_codegen_us={} final_code_bytes={}",
-            isa_elapsed.as_micros(),
-            module_elapsed.as_micros(),
-            sigs_elapsed.as_micros(),
-            addr_setup_elapsed.as_micros(),
-            layout_elapsed.as_micros(),
-            ctx_setup_elapsed.as_micros(),
-            ir_build_elapsed.as_micros(),
-            verify_elapsed.as_micros(),
-            define_elapsed.as_micros(),
-            clear_ctx_elapsed.as_micros(),
-            finalize_elapsed.as_micros(),
-            copy_elapsed.as_micros(),
-            program_wrap_elapsed.as_micros(),
-            total_started.elapsed().as_micros(),
-            compiled.code.len(),
-        );
-    }
     Ok(compiled)
 }
 
@@ -1618,6 +1517,58 @@ fn lower_aot_ssa_terminator(
                 helper_refs.enter_call_value_ref,
                 helper_ptr,
                 &[vm_ptr, argc, call_ip, resume_ip],
+            );
+            let status = b.inst_results(call)[0];
+            jump_with_status(b, exit_block, status);
+        }
+        AotSsaTerminator::CallScript {
+            prototype_id,
+            argc,
+            call_ip,
+            resume_ip,
+            stack,
+            locals,
+        } => {
+            materialize_state_to_vm(
+                b,
+                vm_ptr,
+                exit_block,
+                pointer_type,
+                layout,
+                helper_refs,
+                helper_addrs,
+                stack,
+                locals,
+                values,
+                *call_ip,
+            )?;
+            emit_call_boundary_interrupt(
+                b,
+                vm_ptr,
+                helper_refs.interrupt_ref,
+                helper_addrs.aot_interrupt,
+                pointer_type,
+                exit_block,
+            )?;
+            let helper_ptr = iconst_ptr_from_addr(b, pointer_type, helper_addrs.enter_call_script)?;
+            let prototype_id = b.ins().iconst(types::I64, i64::from(*prototype_id));
+            let argc = b.ins().iconst(types::I64, i64::from(*argc));
+            let call_ip = b.ins().iconst(
+                types::I64,
+                i64::try_from(*call_ip).map_err(|_| {
+                    AotCompileError::Codegen("callscript ip does not fit i64".to_string())
+                })?,
+            );
+            let resume_ip = b.ins().iconst(
+                types::I64,
+                i64::try_from(*resume_ip).map_err(|_| {
+                    AotCompileError::Codegen("callscript resume ip does not fit i64".to_string())
+                })?,
+            );
+            let call = b.ins().call_indirect(
+                helper_refs.enter_call_script_ref,
+                helper_ptr,
+                &[vm_ptr, prototype_id, argc, call_ip, resume_ip],
             );
             let status = b.inst_results(call)[0];
             jump_with_status(b, exit_block, status);
