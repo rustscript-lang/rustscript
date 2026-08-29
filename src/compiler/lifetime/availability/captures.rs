@@ -1,5 +1,36 @@
 use super::*;
 
+/// Mutable state threaded through the capture-mode scan of a function or
+/// closure body. The final mode matches what the runtime `BorrowMut` capture
+/// model computes; `implicit_read` additionally records whether the body used
+/// the captured slot through a plain by-value read with no explicit `.copy()`
+/// or borrow wrapper.
+///
+/// `implicit_read` only affects source consumption when the final mode is
+/// `Copy`: it is the availability-side signal that a movable source binding
+/// was consumed by an implicit by-value read even though the runtime clones
+/// the value into the capture. It has no effect on the other modes — `Move`
+/// consumes the source unconditionally, and `Borrow`/`BorrowMut` never
+/// consume it (mutation flows back through the shared cell) regardless of how
+/// the body reads the slot. Bodies that write the slot therefore always end
+/// in `BorrowMut` (or `Move` under a move context) and never consult
+/// `implicit_read` for consumption.
+pub(super) struct CaptureModeScan {
+    mode: CaptureBindingMode,
+    seen: bool,
+    implicit_read: bool,
+}
+
+impl CaptureModeScan {
+    fn new() -> Self {
+        Self {
+            mode: CaptureBindingMode::Copy,
+            seen: false,
+            implicit_read: false,
+        }
+    }
+}
+
 impl AvailabilityAnalyzer {
     pub(super) fn analyze_args(
         &self,
@@ -63,6 +94,11 @@ impl AvailabilityAnalyzer {
         let mut closure_state = FlowState::reachable(self.local_count);
         for slot in &closure.param_slots {
             self.mark_available(&mut closure_state, *slot, line)?;
+            // Resource-typed closure parameters are move-only inside the body.
+            if self.is_owned_slot(*slot) {
+                closure_state.copyable_locals[*slot as usize] = false;
+                closure_state.movable_locals[*slot as usize] = true;
+            }
         }
         for (source_slot, captured_slot) in &closure.capture_copies {
             self.mark_available(&mut closure_state, *captured_slot, line)?;
@@ -113,13 +149,17 @@ impl AvailabilityAnalyzer {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn apply_capture_binding_effect(
         &self,
         state: &mut FlowState,
         source_slot: LocalSlot,
         captured_slot: LocalSlot,
         capture_mode: CaptureBindingMode,
-    ) {
+        implicit_read: bool,
+        capture_escapes: bool,
+        line: u32,
+    ) -> Result<(), ParseError> {
         let source_idx = source_slot as usize;
         let captured_idx = captured_slot as usize;
         if source_idx < self.local_count && captured_idx < self.local_count {
@@ -130,55 +170,125 @@ impl AvailabilityAnalyzer {
         }
         self.copy_local_field_moves(state, source_slot, captured_slot);
         self.copy_local_collection_aliases(state, source_slot, captured_slot);
-        if capture_mode == CaptureBindingMode::Move
+        // Owned (resource-containing) sources can never be aliased or cloned
+        // by a closure: a shared borrow would let the handle escape the call
+        // boundary, and the core has no generic resource clone. The only
+        // legal resource capture is a move — the source becomes unusable and
+        // the handle transfers into the closure cell.
+        if self.is_owned_slot(source_slot)
+            && (capture_mode == CaptureBindingMode::Copy
+                || (capture_escapes
+                    && matches!(
+                        capture_mode,
+                        CaptureBindingMode::Borrow | CaptureBindingMode::BorrowMut
+                    )))
+        {
+            match capture_mode {
+                CaptureBindingMode::Borrow | CaptureBindingMode::BorrowMut => {
+                    let display = self.display_local_name(source_slot);
+                    return Err(ParseError {
+                        span: None,
+                        code: Some("E_OWNERSHIP_BORROW_ESCAPE".to_string()),
+                        line: line as usize,
+                        message: format!(
+                            "closure capture of resource value '{display}' must move it; a shared borrow cannot escape into a closure cell"
+                        ),
+                    });
+                }
+                CaptureBindingMode::Copy => {
+                    let display = self.display_local_name(source_slot);
+                    return Err(ParseError {
+                        span: None,
+                        code: Some("E_OWNERSHIP_COPY_RESOURCE".to_string()),
+                        line: line as usize,
+                        message: format!(
+                            "closure capture of resource value '{display}' must move it; resources cannot be cloned into a closure cell"
+                        ),
+                    });
+                }
+                CaptureBindingMode::Move => {}
+            }
+        }
+        // Availability and codegen consume the same capture-mode classifier.
+        // Codegen only needs the mode; availability additionally applies its
+        // stricter body-use model: a plain by-value use (an implicit read with
+        // no explicit `.copy()` or borrow) of a movable source consumes the
+        // source binding even though the runtime clones the value into the
+        // capture. Shared borrow captures (`Borrow`/`BorrowMut`) leave the
+        // source binding usable so mutation can flow back through the cell.
+        // `implicit_read` is consulted only when the final mode is `Copy`:
+        // `Move` consumes the source regardless, and the shared-borrow modes
+        // never consume it no matter how the body reads the slot. Owned
+        // sources always consume (they are move-only by schema).
+        let consumes_source = self.is_owned_slot(source_slot)
+            || match capture_mode {
+                CaptureBindingMode::Move => true,
+                CaptureBindingMode::Borrow | CaptureBindingMode::BorrowMut => false,
+                CaptureBindingMode::Copy => implicit_read,
+            };
+        if consumes_source
             && self.enable_local_move_semantics
             && source_idx < self.local_count
-            && (state.movable_locals[source_idx]
+            && (self.is_owned_slot(source_slot)
+                || state.movable_locals[source_idx]
                 || !state.collection_aliases[source_idx].is_empty())
         {
             self.mark_local_moved(state, source_slot);
         }
+        Ok(())
     }
 
+    /// Classifies a named-function capture for availability: returns the
+    /// runtime capture mode plus whether the body contains an implicit
+    /// by-value read of the captured slot.
     pub(super) fn function_capture_mode_for_slot(
         &self,
         function_impl: &FunctionImpl,
         captured_slot: LocalSlot,
-    ) -> CaptureBindingMode {
-        let mut mode = CaptureBindingMode::Copy;
-        let mut seen = false;
+    ) -> (CaptureBindingMode, bool) {
+        let mut scan = CaptureModeScan::new();
         self.capture_mode_for_stmts(
             &function_impl.body_stmts,
             captured_slot,
-            CaptureBindingMode::Move,
-            &mut mode,
-            &mut seen,
+            CaptureBindingMode::Copy,
+            true,
+            &mut scan,
         );
         self.capture_mode_for_expr(
             &function_impl.body_expr,
             captured_slot,
-            CaptureBindingMode::Move,
-            &mut mode,
-            &mut seen,
+            CaptureBindingMode::Copy,
+            true,
+            &mut scan,
         );
-        if seen { mode } else { CaptureBindingMode::Move }
+        if scan.seen {
+            (scan.mode, scan.implicit_read)
+        } else {
+            (CaptureBindingMode::Move, scan.implicit_read)
+        }
     }
 
+    /// Classifies a closure capture for availability: returns the runtime
+    /// capture mode plus whether the body contains an implicit by-value read
+    /// of the captured slot.
     pub(super) fn closure_capture_mode_for_slot(
         &self,
         closure: &ClosureExpr,
         captured_slot: LocalSlot,
-    ) -> CaptureBindingMode {
-        let mut mode = CaptureBindingMode::Copy;
-        let mut seen = false;
+    ) -> (CaptureBindingMode, bool) {
+        let mut scan = CaptureModeScan::new();
         self.capture_mode_for_expr(
             &closure.body,
             captured_slot,
-            CaptureBindingMode::Move,
-            &mut mode,
-            &mut seen,
+            CaptureBindingMode::Copy,
+            true,
+            &mut scan,
         );
-        if seen { mode } else { CaptureBindingMode::Move }
+        if scan.seen {
+            (scan.mode, scan.implicit_read)
+        } else {
+            (CaptureBindingMode::Move, scan.implicit_read)
+        }
     }
 
     pub(super) fn runtime_function_capture_mode_for_slot(
@@ -186,23 +296,8 @@ impl AvailabilityAnalyzer {
         function_impl: &FunctionImpl,
         captured_slot: LocalSlot,
     ) -> CaptureBindingMode {
-        let mut mode = CaptureBindingMode::Copy;
-        let mut seen = false;
-        self.capture_mode_for_stmts(
-            &function_impl.body_stmts,
-            captured_slot,
-            CaptureBindingMode::Copy,
-            &mut mode,
-            &mut seen,
-        );
-        self.capture_mode_for_expr(
-            &function_impl.body_expr,
-            captured_slot,
-            CaptureBindingMode::Copy,
-            &mut mode,
-            &mut seen,
-        );
-        if seen { mode } else { CaptureBindingMode::Move }
+        self.function_capture_mode_for_slot(function_impl, captured_slot)
+            .0
     }
 
     pub(super) fn runtime_closure_capture_mode_for_slot(
@@ -210,16 +305,7 @@ impl AvailabilityAnalyzer {
         closure: &ClosureExpr,
         captured_slot: LocalSlot,
     ) -> CaptureBindingMode {
-        let mut mode = CaptureBindingMode::Copy;
-        let mut seen = false;
-        self.capture_mode_for_expr(
-            &closure.body,
-            captured_slot,
-            CaptureBindingMode::Copy,
-            &mut mode,
-            &mut seen,
-        );
-        if seen { mode } else { CaptureBindingMode::Move }
+        self.closure_capture_mode_for_slot(closure, captured_slot).0
     }
 
     pub(super) fn capture_mode_for_stmts(
@@ -227,11 +313,11 @@ impl AvailabilityAnalyzer {
         stmts: &[Stmt],
         captured_slot: LocalSlot,
         context: CaptureBindingMode,
-        mode: &mut CaptureBindingMode,
-        seen: &mut bool,
+        implicit: bool,
+        scan: &mut CaptureModeScan,
     ) {
         for stmt in stmts {
-            self.capture_mode_for_stmt(stmt, captured_slot, context, mode, seen);
+            self.capture_mode_for_stmt(stmt, captured_slot, context, implicit, scan);
         }
     }
 
@@ -240,8 +326,8 @@ impl AvailabilityAnalyzer {
         stmt: &Stmt,
         captured_slot: LocalSlot,
         context: CaptureBindingMode,
-        mode: &mut CaptureBindingMode,
-        seen: &mut bool,
+        implicit: bool,
+        scan: &mut CaptureModeScan,
     ) {
         match stmt {
             Stmt::Noop { .. }
@@ -250,21 +336,30 @@ impl AvailabilityAnalyzer {
             | Stmt::Continue { .. } => {}
             Stmt::Drop { index, .. } => {
                 if *index == captured_slot {
-                    *seen = true;
-                    *mode = (*mode).max(context);
+                    scan.seen = true;
+                    scan.mode = scan.mode.max(context);
                 }
             }
             Stmt::Let { index, expr, .. } | Stmt::Assign { index, expr, .. } => {
                 if *index == captured_slot {
-                    *seen = true;
+                    // Writing the captured slot makes the capture shared-mutable
+                    // (or a move under a move context), covering every
+                    // AssignmentKind: plain `state = other` (write-only, RHS
+                    // never reads the slot) and compound `state += rhs` /
+                    // `state++`, whose synthesized `Add(Var(state), rhs)` RHS
+                    // read is picked up below. Since any write forces the mode
+                    // to at least `BorrowMut`, that read can never make
+                    // `implicit_read` affect source consumption (see
+                    // `apply_capture_binding_effect`).
+                    scan.seen = true;
                     let assignment_mode = if context == CaptureBindingMode::Move {
                         CaptureBindingMode::Move
                     } else {
                         CaptureBindingMode::BorrowMut
                     };
-                    *mode = (*mode).max(assignment_mode);
+                    scan.mode = scan.mode.max(assignment_mode);
                 }
-                self.capture_mode_for_expr(expr, captured_slot, context, mode, seen);
+                self.capture_mode_for_expr(expr, captured_slot, context, implicit, scan);
             }
             Stmt::ClosureLet { closure, .. } => {
                 for (nested_source_slot, nested_captured_slot) in &closure.capture_copies {
@@ -273,15 +368,15 @@ impl AvailabilityAnalyzer {
                             &closure.body,
                             *nested_captured_slot,
                             CaptureBindingMode::Move,
-                            mode,
-                            seen,
+                            true,
+                            scan,
                         );
                     }
                 }
-                self.capture_mode_for_expr(&closure.body, captured_slot, context, mode, seen);
+                self.capture_mode_for_expr(&closure.body, captured_slot, context, implicit, scan);
             }
             Stmt::Expr { expr, .. } => {
-                self.capture_mode_for_expr(expr, captured_slot, context, mode, seen);
+                self.capture_mode_for_expr(expr, captured_slot, context, implicit, scan);
             }
             Stmt::IfElse {
                 condition,
@@ -289,9 +384,9 @@ impl AvailabilityAnalyzer {
                 else_branch,
                 ..
             } => {
-                self.capture_mode_for_expr(condition, captured_slot, context, mode, seen);
-                self.capture_mode_for_stmts(then_branch, captured_slot, context, mode, seen);
-                self.capture_mode_for_stmts(else_branch, captured_slot, context, mode, seen);
+                self.capture_mode_for_expr(condition, captured_slot, context, implicit, scan);
+                self.capture_mode_for_stmts(then_branch, captured_slot, context, implicit, scan);
+                self.capture_mode_for_stmts(else_branch, captured_slot, context, implicit, scan);
             }
             Stmt::For {
                 init,
@@ -300,16 +395,16 @@ impl AvailabilityAnalyzer {
                 body,
                 ..
             } => {
-                self.capture_mode_for_stmt(init, captured_slot, context, mode, seen);
-                self.capture_mode_for_expr(condition, captured_slot, context, mode, seen);
-                self.capture_mode_for_stmt(post, captured_slot, context, mode, seen);
-                self.capture_mode_for_stmts(body, captured_slot, context, mode, seen);
+                self.capture_mode_for_stmt(init, captured_slot, context, implicit, scan);
+                self.capture_mode_for_expr(condition, captured_slot, context, implicit, scan);
+                self.capture_mode_for_stmt(post, captured_slot, context, implicit, scan);
+                self.capture_mode_for_stmts(body, captured_slot, context, implicit, scan);
             }
             Stmt::While {
                 condition, body, ..
             } => {
-                self.capture_mode_for_expr(condition, captured_slot, context, mode, seen);
-                self.capture_mode_for_stmts(body, captured_slot, context, mode, seen);
+                self.capture_mode_for_expr(condition, captured_slot, context, implicit, scan);
+                self.capture_mode_for_stmts(body, captured_slot, context, implicit, scan);
             }
         }
     }
@@ -319,8 +414,8 @@ impl AvailabilityAnalyzer {
         expr: &Expr,
         captured_slot: LocalSlot,
         context: CaptureBindingMode,
-        mode: &mut CaptureBindingMode,
-        seen: &mut bool,
+        implicit: bool,
+        scan: &mut CaptureModeScan,
     ) {
         match expr {
             Expr::Null
@@ -334,35 +429,75 @@ impl AvailabilityAnalyzer {
             | Expr::UnresolvedFunctionRef { .. } => {}
             Expr::Var(index) => {
                 if *index == captured_slot {
-                    *seen = true;
-                    *mode = (*mode).max(context);
+                    scan.seen = true;
+                    scan.mode = scan.mode.max(context);
+                    // A bare by-value read (not wrapped in an explicit
+                    // `.copy()` or borrow) is an implicit read: availability
+                    // treats it as a move for movable source bindings even
+                    // though the runtime clones the value into the capture.
+                    if implicit && context == CaptureBindingMode::Copy {
+                        scan.implicit_read = true;
+                    }
                 }
             }
             Expr::MoveVar(index) => {
                 if *index == captured_slot {
-                    *seen = true;
-                    *mode = CaptureBindingMode::Move;
+                    scan.seen = true;
+                    scan.mode = CaptureBindingMode::Move;
                 }
             }
             Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => {
                 if *root == captured_slot {
-                    *seen = true;
-                    *mode = CaptureBindingMode::Move;
+                    scan.seen = true;
+                    scan.mode = CaptureBindingMode::Move;
                 }
             }
             Expr::OptionalGet { container, key, .. } => {
-                self.capture_mode_for_expr(container, captured_slot, context, mode, seen);
-                self.capture_mode_for_expr(key, captured_slot, context, mode, seen);
+                self.capture_mode_for_expr(container, captured_slot, context, implicit, scan);
+                self.capture_mode_for_expr(key, captured_slot, context, implicit, scan);
             }
             Expr::OptionUnwrapOr {
                 value, fallback, ..
             } => {
-                self.capture_mode_for_expr(value, captured_slot, context, mode, seen);
-                self.capture_mode_for_expr(fallback, captured_slot, context, mode, seen);
+                self.capture_mode_for_expr(value, captured_slot, context, implicit, scan);
+                self.capture_mode_for_expr(fallback, captured_slot, context, implicit, scan);
             }
-            Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) | Expr::ModuleCall(_, _, args) => {
+            Expr::Call(_, _, args, resolution, _) => {
+                for (position, arg) in args.iter().enumerate() {
+                    let arg_mode = resolution
+                        .as_deref()
+                        .and_then(|resolved| resolved.passing.get(position).copied());
+                    match arg_mode {
+                        Some(HostParamPassing::Borrow) => self.capture_mode_for_expr(
+                            arg,
+                            captured_slot,
+                            CaptureBindingMode::Borrow,
+                            false,
+                            scan,
+                        ),
+                        Some(HostParamPassing::BorrowMut) => self.capture_mode_for_expr(
+                            arg,
+                            captured_slot,
+                            CaptureBindingMode::BorrowMut,
+                            false,
+                            scan,
+                        ),
+                        Some(HostParamPassing::TakeOwned) => self.capture_mode_for_expr(
+                            arg,
+                            captured_slot,
+                            CaptureBindingMode::Move,
+                            false,
+                            scan,
+                        ),
+                        Some(HostParamPassing::Value) | None => {
+                            self.capture_mode_for_expr(arg, captured_slot, context, implicit, scan)
+                        }
+                    }
+                }
+            }
+            Expr::LocalCall(_, _, args, _) | Expr::ModuleCall(_, _, args, _) => {
                 for arg in args {
-                    self.capture_mode_for_expr(arg, captured_slot, context, mode, seen);
+                    self.capture_mode_for_expr(arg, captured_slot, context, implicit, scan);
                 }
             }
             Expr::Closure(closure) => {
@@ -372,16 +507,16 @@ impl AvailabilityAnalyzer {
                             &closure.body,
                             *nested_captured_slot,
                             CaptureBindingMode::Move,
-                            mode,
-                            seen,
+                            true,
+                            scan,
                         );
                     }
                 }
-                self.capture_mode_for_expr(&closure.body, captured_slot, context, mode, seen);
+                self.capture_mode_for_expr(&closure.body, captured_slot, context, implicit, scan);
             }
             Expr::ClosureCall(closure, args) => {
                 for arg in args {
-                    self.capture_mode_for_expr(arg, captured_slot, context, mode, seen);
+                    self.capture_mode_for_expr(arg, captured_slot, context, implicit, scan);
                 }
                 for (nested_source_slot, nested_captured_slot) in &closure.capture_copies {
                     if *nested_source_slot == captured_slot {
@@ -389,12 +524,12 @@ impl AvailabilityAnalyzer {
                             &closure.body,
                             *nested_captured_slot,
                             CaptureBindingMode::Move,
-                            mode,
-                            seen,
+                            true,
+                            scan,
                         );
                     }
                 }
-                self.capture_mode_for_expr(&closure.body, captured_slot, context, mode, seen);
+                self.capture_mode_for_expr(&closure.body, captured_slot, context, implicit, scan);
             }
             Expr::Add(lhs, rhs)
             | Expr::Sub(lhs, rhs)
@@ -406,19 +541,22 @@ impl AvailabilityAnalyzer {
             | Expr::Eq(lhs, rhs)
             | Expr::Lt(lhs, rhs)
             | Expr::Gt(lhs, rhs) => {
-                self.capture_mode_for_expr(lhs, captured_slot, context, mode, seen);
-                self.capture_mode_for_expr(rhs, captured_slot, context, mode, seen);
+                self.capture_mode_for_expr(lhs, captured_slot, context, implicit, scan);
+                self.capture_mode_for_expr(rhs, captured_slot, context, implicit, scan);
             }
             Expr::Neg(inner) | Expr::Not(inner) => {
-                self.capture_mode_for_expr(inner, captured_slot, context, mode, seen);
+                self.capture_mode_for_expr(inner, captured_slot, context, implicit, scan);
             }
             Expr::ToOwned(inner) => {
+                // Explicit `.copy()`: the value is duplicated on purpose and
+                // never consumes the source binding, so the inner read is not
+                // an implicit read.
                 self.capture_mode_for_expr(
                     inner,
                     captured_slot,
                     CaptureBindingMode::Copy,
-                    mode,
-                    seen,
+                    false,
+                    scan,
                 );
             }
             Expr::Borrow(inner) => {
@@ -426,8 +564,8 @@ impl AvailabilityAnalyzer {
                     inner,
                     captured_slot,
                     CaptureBindingMode::Borrow,
-                    mode,
-                    seen,
+                    false,
+                    scan,
                 );
             }
             Expr::BorrowMut(inner) => {
@@ -435,8 +573,8 @@ impl AvailabilityAnalyzer {
                     inner,
                     captured_slot,
                     CaptureBindingMode::BorrowMut,
-                    mode,
-                    seen,
+                    false,
+                    scan,
                 );
             }
             Expr::IfElse {
@@ -444,9 +582,9 @@ impl AvailabilityAnalyzer {
                 then_expr,
                 else_expr,
             } => {
-                self.capture_mode_for_expr(condition, captured_slot, context, mode, seen);
-                self.capture_mode_for_expr(then_expr, captured_slot, context, mode, seen);
-                self.capture_mode_for_expr(else_expr, captured_slot, context, mode, seen);
+                self.capture_mode_for_expr(condition, captured_slot, context, implicit, scan);
+                self.capture_mode_for_expr(then_expr, captured_slot, context, implicit, scan);
+                self.capture_mode_for_expr(else_expr, captured_slot, context, implicit, scan);
             }
             Expr::Match {
                 value_slot,
@@ -461,18 +599,21 @@ impl AvailabilityAnalyzer {
                         .iter()
                         .any(|(pattern, _)| pattern.binding_slot() == Some(captured_slot))
                 {
-                    *seen = true;
-                    *mode = (*mode).max(context);
+                    scan.seen = true;
+                    scan.mode = scan.mode.max(context);
+                    if implicit && context == CaptureBindingMode::Copy {
+                        scan.implicit_read = true;
+                    }
                 }
-                self.capture_mode_for_expr(value, captured_slot, context, mode, seen);
+                self.capture_mode_for_expr(value, captured_slot, context, implicit, scan);
                 for (_, arm_expr) in arms {
-                    self.capture_mode_for_expr(arm_expr, captured_slot, context, mode, seen);
+                    self.capture_mode_for_expr(arm_expr, captured_slot, context, implicit, scan);
                 }
-                self.capture_mode_for_expr(default, captured_slot, context, mode, seen);
+                self.capture_mode_for_expr(default, captured_slot, context, implicit, scan);
             }
             Expr::Block { stmts, expr } => {
-                self.capture_mode_for_stmts(stmts, captured_slot, context, mode, seen);
-                self.capture_mode_for_expr(expr, captured_slot, context, mode, seen);
+                self.capture_mode_for_stmts(stmts, captured_slot, context, implicit, scan);
+                self.capture_mode_for_expr(expr, captured_slot, context, implicit, scan);
             }
         }
     }

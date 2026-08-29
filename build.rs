@@ -1220,9 +1220,9 @@ fn render_callable_consts(callables: &[&CallableDecl]) -> String {
         for param in &callable.params {
             writeln!(
                 &mut out,
-                "    CallableParam {{ name: {:?}, ty: CallableParamType::{}, optional: {} }},",
+                "    CallableParam {{ name: {:?}, ty: {}, optional: {} }},",
                 param.name,
-                callable_param_variant(&param.ty_label),
+                callable_param_expr(&param.ty_label),
                 param.optional
             )
             .unwrap();
@@ -1645,20 +1645,39 @@ fn callable_const_base(callable: &CallableDecl) -> String {
     to_shouty_snake(&format!("{prefix}_{}", callable.rust_ident))
 }
 
-fn callable_param_variant(label: &str) -> &'static str {
-    let label = label.strip_suffix(" | null").unwrap_or(label);
+pub(crate) fn callable_param_expr(label: &str) -> String {
     match label {
-        "any" => "Any",
-        "null" => "Null",
-        "int" => "Int",
-        "float" => "Float",
-        "bool" => "Bool",
-        "string" => "String",
-        "bytes" => "Bytes",
-        "array" => "Array",
-        "map" => "Map",
-        "number" => "Number",
-        "resource" => "Resource",
+        "any" => "CallableParamType::Any".to_string(),
+        "null" => "CallableParamType::Null".to_string(),
+        "int" => "CallableParamType::Int".to_string(),
+        "float" => "CallableParamType::Float".to_string(),
+        "bool" => "CallableParamType::Bool".to_string(),
+        "string" => "CallableParamType::String".to_string(),
+        "bytes" => "CallableParamType::Bytes".to_string(),
+        "array" => "CallableParamType::Array".to_string(),
+        "map" => "CallableParamType::Map".to_string(),
+        "number" => "CallableParamType::Number".to_string(),
+        "resource" => "CallableParamType::Resource".to_string(),
+        other if other.starts_with("fn(") => {
+            let (params, result) = other
+                .strip_prefix("fn(")
+                .and_then(|value| value.split_once(") -> "))
+                .unwrap_or_else(|| panic!("invalid callable schema '{other}'"));
+            let params = if params.is_empty() {
+                Vec::new()
+            } else {
+                params
+                    .split(", ")
+                    .map(callable_param_expr)
+                    .collect::<Vec<_>>()
+            };
+            let result = callable_param_expr(result);
+            format!(
+                "CallableParamType::Callable(CallableType {{ params: &[{}], return_type: &{} }})",
+                params.join(", "),
+                result
+            )
+        }
         other => panic!("unsupported callable param type '{other}'"),
     }
 }
@@ -2278,5 +2297,34 @@ mod tests {
                 .expect("selected IO source must contain io::open");
             assert_eq!(open.host_execution, HostExecutionKind::MaySuspend);
         }
+    }
+}
+
+#[cfg(test)]
+mod callable_schema_tests {
+    use super::*;
+    use syn::parse_quote;
+
+    #[test]
+    fn build_metadata_renders_typed_callable_parameters() {
+        let ty: Type = parse_quote!(VmCallable<fn(VmMap) -> VmMap>);
+        assert_eq!(
+            pd_host_schema::type_label(&ty).expect("callable type should parse"),
+            "fn(map) -> map"
+        );
+        assert_eq!(
+            callable_param_expr("fn(map) -> map"),
+            "CallableParamType::Callable(CallableType { params: &[CallableParamType::Map], return_type: &CallableParamType::Map })"
+        );
+
+        let float_ty: Type = parse_quote!(VmCallable<fn(f64) -> f64>);
+        assert_eq!(
+            pd_host_schema::type_label(&float_ty).expect("callable type should parse"),
+            "fn(float) -> float"
+        );
+        assert_eq!(
+            callable_param_expr("fn(float) -> float"),
+            "CallableParamType::Callable(CallableType { params: &[CallableParamType::Float], return_type: &CallableParamType::Float })"
+        );
     }
 }

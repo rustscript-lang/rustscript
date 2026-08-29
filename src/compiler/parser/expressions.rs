@@ -1,6 +1,6 @@
 use super::*;
 
-type MatchBinding = Option<(String, LocalSlot)>;
+type MatchBinding = Option<(String, Span, LocalSlot)>;
 type ParsedMatchPattern = (Option<MatchPattern>, MatchBinding);
 type ParsedMatchConstructor = Option<(MatchPattern, MatchBinding)>;
 
@@ -142,7 +142,8 @@ impl Parser {
             return self.build_builtin_call_expr(BuiltinFunction::TypeOf, vec![inner]);
         }
         if self.dialect.allow_increment_operator() && self.match_kind(&TokenKind::PlusPlus) {
-            let name = self.expect_ident("expected identifier after '++'")?;
+            let (name, ident_span) =
+                self.expect_ident_with_span("expected identifier after '++'")?;
             let index = self.get_local(&name)?;
             self.require_local_mutable_for_operation(
                 index,
@@ -150,6 +151,8 @@ impl Parser {
                 self.current_line_u32(),
                 "increment",
             )?;
+            // Record the prefix increment target as a local reference site.
+            self.record_local_ref(ident_span, index, name);
             return self.build_increment_expr(index, true);
         }
         if self.match_kind(&TokenKind::Minus) {
@@ -183,7 +186,7 @@ impl Parser {
     pub(super) fn is_mut_borrow_target(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Var(_) => true,
-            Expr::Call(index, _, args) => {
+            Expr::Call(index, _, args, _, _) => {
                 if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::Get)
                     || args.len() != 2
                 {
@@ -210,7 +213,7 @@ impl Parser {
     pub(super) fn extract_mut_borrow_root_slot(&self, expr: &Expr) -> Option<LocalSlot> {
         match expr {
             Expr::Var(slot) => Some(*slot),
-            Expr::Call(index, _, args) => {
+            Expr::Call(index, _, args, _, _) => {
                 if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::Get)
                     || args.len() != 2
                 {
@@ -350,8 +353,14 @@ impl Parser {
             return self.parse_single_param_arrow_closure();
         }
         if let Some(name) = self.match_ident() {
+            // Capture the callee_span from the name token for provenance tracking.
+            let name_span = self
+                .tokens
+                .get(self.pos.saturating_sub(1))
+                .map(|t| t.span)
+                .unwrap_or_else(|| self.current_span());
             if self.dialect.allow_dotted_call()
-                && let Some(expr) = self.try_parse_js_dotted_call(&name)?
+                && let Some(expr) = self.try_parse_js_dotted_call(&name, name_span)?
             {
                 return Ok(expr);
             }
@@ -379,6 +388,17 @@ impl Parser {
                     path_segments
                         .push(self.expect_namespace_segment("expected function name after '::'")?);
                 }
+                // The last consumed token before turbofish/`(` parsing is the
+                // final path segment; it bounds the exact callee span of the
+                // full namespace path `name_span.lo .. last_segment.hi`
+                // (e.g. `au::helper`), so callee_span stays the name token
+                // range and never extends over the arguments.
+                let path_hi = self
+                    .tokens
+                    .get(self.pos.saturating_sub(1))
+                    .map(|t| t.span.hi)
+                    .unwrap_or(name_span.hi);
+                let ns_callee_span = Span::new(name_span.source_id, name_span.lo, path_hi);
                 let type_args = self.parse_turbofish_type_args()?;
                 self.expect(
                     &TokenKind::LParen,
@@ -398,7 +418,36 @@ impl Parser {
                     .get(1..)
                     .map(|tail| tail.to_vec())
                     .unwrap_or_default();
-                let expr = if let Some((builtin_namespace, builtin_member)) =
+                let ns_callee_name = if subpath.is_empty() {
+                    format!("{}::{}", name, member)
+                } else {
+                    format!("{}::{}::{}", name, member, subpath.join("::"))
+                };
+                let catalog_host_name = self
+                    .resolve_host_namespace_call_target(&name, &member, &subpath)
+                    .or_else(|| {
+                        let qualified = std::iter::once(name.as_str())
+                            .chain(subpath.iter().map(String::as_str))
+                            .chain(std::iter::once(member.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("::");
+                        self.host_catalog.as_ref().and_then(|catalog| {
+                            (!catalog.functions_named(&qualified).is_empty()).then_some(qualified)
+                        })
+                    });
+                let catalog_declares_host = catalog_host_name.as_deref().is_some_and(|host_name| {
+                    self.host_catalog
+                        .as_ref()
+                        .is_some_and(|catalog| !catalog.functions_named(host_name).is_empty())
+                });
+                let expr = if catalog_declares_host {
+                    let host_name = catalog_host_name
+                        .as_deref()
+                        .expect("catalog host name checked above");
+                    let base =
+                        self.build_host_call_expr_with_type_args(host_name, args, type_args)?;
+                    self.attach_namespace_call_provenance(base, ns_callee_span, ns_callee_name)
+                } else if let Some((builtin_namespace, builtin_member)) =
                     self.resolve_builtins_call_path(&name, &member, &subpath)
                 {
                     let builtin_namespace = builtin_namespace.to_string();
@@ -406,7 +455,9 @@ impl Parser {
                     if let Some(builtin) =
                         resolve_builtin_namespace_call(&builtin_namespace, &builtin_member)
                     {
-                        self.build_builtin_call_expr_with_type_args(builtin, args, type_args)?
+                        let base =
+                            self.build_builtin_call_expr_with_type_args(builtin, args, type_args)?;
+                        self.attach_namespace_call_provenance(base, ns_callee_span, ns_callee_name)
                     } else {
                         return Err(ParseError {
                             span: None,
@@ -418,10 +469,10 @@ impl Parser {
                             ),
                         });
                     }
-                } else if let Some(host_name) =
-                    self.resolve_host_namespace_call_target(&name, &member, &subpath)
-                {
-                    self.build_host_call_expr_with_type_args(&host_name, args, type_args)?
+                } else if let Some(host_name) = catalog_host_name {
+                    let base =
+                        self.build_host_call_expr_with_type_args(&host_name, args, type_args)?;
+                    self.attach_namespace_call_provenance(base, ns_callee_span, ns_callee_name)
                 } else if self.allow_implicit_externs
                     && self.module_namespace_alias(&name).is_some()
                 {
@@ -434,7 +485,15 @@ impl Parser {
                     // which knows the exported type parameters.
                     let qualified = format!("{}::{}", name, path_segments.join("::"));
                     let decl = self.resolve_function_for_call(&qualified, args.len())?;
-                    Expr::Call(decl.index, type_args, args)
+                    self.build_call_expr_with_provenance(
+                        decl.index,
+                        type_args,
+                        args,
+                        None,
+                        ns_callee_span,
+                        ns_callee_name,
+                        true,
+                    )
                 } else {
                     return Err(ParseError {
                         span: None,
@@ -450,7 +509,7 @@ impl Parser {
                 };
                 // Namespace calls participate in postfix access like any
                 // other call (`iter::range(n)[0]`, `json::decode::<T>(s).x`).
-                let expr = self.parse_postfix_access(expr)?;
+                let expr = self.parse_postfix_access(expr, ns_callee_span)?;
                 return Ok(expr);
             }
 
@@ -461,7 +520,14 @@ impl Parser {
                 let type_args = self.parse_turbofish_type_args()?;
                 if self.match_kind(&TokenKind::LParen) {
                     let args = self.parse_call_args()?;
-                    if self.has_local_binding(&name) {
+                    // The closing `)` consumed by `parse_call_args` is the
+                    // last consumed token; it bounds the full call expr span.
+                    let rparen_span = self
+                        .tokens
+                        .get(self.pos.saturating_sub(1))
+                        .map(|t| t.span)
+                        .unwrap_or(name_span);
+                    let call_expr = if self.has_local_binding(&name) {
                         if !type_args.is_empty() {
                             return Err(ParseError {
                                 span: None,
@@ -473,7 +539,11 @@ impl Parser {
                             });
                         }
                         let local = self.get_local(&name)?;
-                        Expr::LocalCall(local, Vec::new(), args)
+                        // Record the local callable callee as a local reference.
+                        self.record_local_ref(name_span, local, name.clone());
+                        let semantic_id =
+                            self.alloc_local_call_id(name_span, rparen_span, local, name.clone());
+                        Expr::LocalCall(local, Vec::new(), args, semantic_id)
                     } else if self.functions.contains_key(&name) {
                         let builtin_alias_call = if matches!(name.as_str(), "print" | "println") {
                             self.functions
@@ -501,7 +571,7 @@ impl Parser {
                             } else {
                                 let decl = self.resolve_function_for_call(&name, args.len())?;
                                 self.validate_named_call_type_args(&decl, &type_args)?;
-                                Expr::Call(decl.index, type_args, args)
+                                Expr::Call(decl.index, type_args, args, None, None)
                             }
                         } else {
                             let decl = self.resolve_function_for_call(&name, args.len())?;
@@ -510,7 +580,7 @@ impl Parser {
                             if !self.is_implicit_extern(&name) {
                                 self.validate_named_call_type_args(&decl, &type_args)?;
                             }
-                            Expr::Call(decl.index, type_args, args)
+                            Expr::Call(decl.index, type_args, args, None, None)
                         }
                     } else if let Some(expr) = self.try_build_language_builtin_call(&name, &args)? {
                         if !type_args.is_empty() {
@@ -536,8 +606,23 @@ impl Parser {
                         if !self.import_scan_mode && !self.is_implicit_extern(&name) {
                             self.validate_named_call_type_args(&decl, &type_args)?;
                         }
-                        Expr::Call(decl.index, type_args, args)
-                    }
+                        Expr::Call(decl.index, type_args, args, None, None)
+                    };
+                    // Wire exact provenance for every ordinary source call
+                    // built by the direct identifier-path + `(args)` branch:
+                    // user functions, language builtins, direct host aliases
+                    // and implicit-extern fallbacks. `callee_span` is the
+                    // callee token range captured before args; the expr span
+                    // extends callee start through the consumed closing `)`.
+                    // Local calls, function-value references and synthetic
+                    // calls produced by helpers lacking direct source syntax
+                    // pass through untouched.
+                    self.attach_ordinary_call_provenance(
+                        call_expr,
+                        name_span,
+                        rparen_span,
+                        name.clone(),
+                    )
                 } else {
                     if self.has_local_binding(&name) {
                         if !type_args.is_empty() {
@@ -551,11 +636,15 @@ impl Parser {
                             });
                         }
                         let index = self.get_local(&name)?;
+                        // Record local variable reference.
+                        self.record_local_ref(name_span, index, name.clone());
                         Expr::Var(index)
                     } else if let Some(decl) = self.functions.get(&name).cloned() {
                         if !type_args.is_empty() {
                             self.validate_named_call_type_args(&decl, &type_args)?;
                         }
+                        // Record function value reference.
+                        self.record_func_ref(name_span, decl.index, name.clone());
                         Expr::FunctionRef(decl.index, type_args)
                     } else if let Some(index) = crate::builtin_call_index(&name) {
                         if !type_args.is_empty() {
@@ -568,11 +657,23 @@ impl Parser {
                                 ),
                             });
                         }
+                        self.record_func_ref(name_span, index, name.clone());
                         Expr::FunctionRef(index, Vec::new())
                     } else if self.allow_implicit_externs {
                         // Module mode: the name may be an imported function
                         // binding the loader resolves to a module symbol
-                        // (`Expr::ModuleFunctionRef`) before unit merge.
+                        // (`Expr::ModuleFunctionRef`) before unit merge. The
+                        // function-value reference is recorded with a
+                        // placeholder flat target; the loader upgrades the
+                        // matching site to `Module(symbol)` when it resolves
+                        // the reference, so the merged carrier never keeps a
+                        // stale unit-local index.
+                        let index = self
+                            .functions
+                            .get(&name)
+                            .map(|decl| decl.index)
+                            .unwrap_or(u16::MAX);
+                        self.record_func_ref(name_span, index, name.clone());
                         Expr::UnresolvedFunctionRef { name, type_args }
                     } else {
                         return Err(ParseError {
@@ -585,23 +686,38 @@ impl Parser {
                 }
             };
             self.contextualize_function_call_args(&mut expr)?;
-            expr = self.parse_postfix_access(expr)?;
+            expr = self.parse_postfix_access(expr, name_span)?;
             return Ok(expr);
         }
         if self.match_kind(&TokenKind::LParen) {
+            let open_span = self
+                .tokens
+                .get(self.pos.saturating_sub(1))
+                .map(|t| t.span)
+                .unwrap_or_else(|| self.current_span());
             let mut expr = self.parse_expr()?;
             self.expect(&TokenKind::RParen, "expected ')' after expression")?;
-            expr = self.parse_postfix_access(expr)?;
+            expr = self.parse_postfix_access(expr, open_span)?;
             return Ok(expr);
         }
         if self.match_kind(&TokenKind::LBracket) {
+            let open_span = self
+                .tokens
+                .get(self.pos.saturating_sub(1))
+                .map(|t| t.span)
+                .unwrap_or_else(|| self.current_span());
             let mut expr = self.parse_array_literal()?;
-            expr = self.parse_postfix_access(expr)?;
+            expr = self.parse_postfix_access(expr, open_span)?;
             return Ok(expr);
         }
         if self.match_kind(&TokenKind::LBrace) {
+            let open_span = self
+                .tokens
+                .get(self.pos.saturating_sub(1))
+                .map(|t| t.span)
+                .unwrap_or_else(|| self.current_span());
             let mut expr = self.parse_brace_literal()?;
-            expr = self.parse_postfix_access(expr)?;
+            expr = self.parse_postfix_access(expr, open_span)?;
             return Ok(expr);
         }
 
@@ -638,77 +754,80 @@ impl Parser {
     }
 
     pub(super) fn parse_if_expr_branch(&mut self) -> Result<Expr, ParseError> {
+        let open_span = self.current_span();
         self.expect(
             &TokenKind::LBrace,
             "expected '{' after '=>' in if expression branch",
         )?;
+        let expr = self.with_scope(open_span, |parser| {
+            let mut stmts = Vec::<Stmt>::new();
+            let mut trailing_expr: Option<Expr> = None;
+            while !parser.check(&TokenKind::RBrace) {
+                if parser.check(&TokenKind::Eof) {
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line: parser.current_line(),
+                        message: "unexpected end of input in if expression branch".to_string(),
+                    });
+                }
 
-        let mut stmts = Vec::<Stmt>::new();
-        let mut trailing_expr: Option<Expr> = None;
-        while !self.check(&TokenKind::RBrace) {
-            if self.check(&TokenKind::Eof) {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line: self.current_line(),
-                    message: "unexpected end of input in if expression branch".to_string(),
-                });
+                if parser.starts_trailing_expr_block_statement() {
+                    stmts.push(parser.parse_stmt()?);
+                    continue;
+                }
+
+                let line = parser.current_line_u32();
+                let expr = parser.parse_expr()?;
+                if parser.check(&TokenKind::RBrace) {
+                    trailing_expr = Some(expr);
+                    break;
+                }
+                parser.expect(
+                    &TokenKind::Semicolon,
+                    "expected ';' after expression in if expression branch",
+                )?;
+                stmts.push(Stmt::Expr { expr, line });
             }
 
-            if self.starts_trailing_expr_block_statement() {
-                stmts.push(self.parse_stmt()?);
-                continue;
-            }
-
-            let line = self.current_line_u32();
-            let expr = self.parse_expr()?;
-            if self.check(&TokenKind::RBrace) {
-                trailing_expr = Some(expr);
-                break;
-            }
-            self.expect(
-                &TokenKind::Semicolon,
-                "expected ';' after expression in if expression branch",
+            parser.expect(
+                &TokenKind::RBrace,
+                "expected '}' to close if expression branch",
             )?;
-            stmts.push(Stmt::Expr { expr, line });
-        }
 
-        self.expect(
-            &TokenKind::RBrace,
-            "expected '}' to close if expression branch",
-        )?;
-
-        let expr = if let Some(expr) = trailing_expr {
-            expr
-        } else {
-            let Some(last_stmt) = stmts.pop() else {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line: self.current_line(),
-                    message: "if expression branch must end with an expression".to_string(),
-                });
-            };
-            if let Stmt::Expr { expr, .. } = last_stmt {
+            let expr = if let Some(expr) = trailing_expr {
                 expr
             } else {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line: self.current_line(),
-                    message: "if expression branch must end with an expression".to_string(),
-                });
-            }
-        };
+                let Some(last_stmt) = stmts.pop() else {
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line: parser.current_line(),
+                        message: "if expression branch must end with an expression".to_string(),
+                    });
+                };
+                if let Stmt::Expr { expr, .. } = last_stmt {
+                    expr
+                } else {
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line: parser.current_line(),
+                        message: "if expression branch must end with an expression".to_string(),
+                    });
+                }
+            };
 
-        if stmts.is_empty() {
-            Ok(expr)
-        } else {
-            Ok(Expr::Block {
-                stmts,
-                expr: Box::new(expr),
-            })
-        }
+            if stmts.is_empty() {
+                Ok(expr)
+            } else {
+                Ok(Expr::Block {
+                    stmts,
+                    expr: Box::new(expr),
+                })
+            }
+        })?;
+        Ok(expr)
     }
 
     pub(super) fn parse_match_expr(&mut self) -> Result<Expr, ParseError> {
@@ -733,20 +852,29 @@ impl Parser {
             let pattern_token_line = self.current_line();
             let (pattern, arm_binding) = self.parse_match_pattern()?;
             self.expect(&TokenKind::FatArrow, "expected '=>' in match arm")?;
-            if let Some((name, slot)) = arm_binding {
+            let arm_expr = if let Some((name, ident_span, slot)) = arm_binding {
                 let mut scope = HashMap::new();
-                scope.insert(name, slot);
+                scope.insert(name.clone(), slot);
                 self.closure_scopes.push(scope);
-            }
-            let arm_expr = self.parse_expr();
-            if pattern
-                .as_ref()
-                .and_then(MatchPattern::binding_slot)
-                .is_some()
-            {
-                self.closure_scopes.pop();
-            }
-            let arm_expr = arm_expr?;
+                let arm_open = self.current_span();
+                let arm_result = self.with_scope(arm_open, |parser| {
+                    // Record the match pattern binding inside the arm body
+                    // scope, with the exact identifier token span.
+                    parser.record_local_decl(ident_span, ident_span, slot, name.clone());
+                    parser.parse_expr()
+                });
+                if pattern
+                    .as_ref()
+                    .and_then(MatchPattern::binding_slot)
+                    .is_some()
+                {
+                    self.closure_scopes.pop();
+                }
+                arm_result?
+            } else {
+                let arm_open = self.current_span();
+                self.with_scope(arm_open, |parser| parser.parse_expr())?
+            };
 
             match pattern {
                 Some(pattern) => {
@@ -873,8 +1001,8 @@ impl Parser {
             &TokenKind::LParen,
             "expected '(' after Some in match type pattern",
         )?;
-        let binding_name =
-            self.expect_ident("expected type name or binding name inside Some(...)")?;
+        let (binding_name, binding_span) =
+            self.expect_ident_with_span("expected type name or binding name inside Some(...)")?;
         self.expect(
             &TokenKind::RParen,
             "expected ')' after Some(...) match pattern",
@@ -894,13 +1022,24 @@ impl Parser {
         self.set_local_slot_mutable(binding_slot, false);
         Ok(Some((
             MatchPattern::SomeBinding(binding_slot),
-            Some((binding_name, binding_slot)),
+            Some((binding_name, binding_span, binding_slot)),
         )))
     }
 
-    pub(super) fn parse_postfix_access(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
+    pub(super) fn parse_postfix_access(
+        &mut self,
+        mut expr: Expr,
+        chain_start: Span,
+    ) -> Result<Expr, ParseError> {
         loop {
             if self.match_kind(&TokenKind::LBracket) {
+                // The `[` token just consumed bounds the callee span of the
+                // subscript operation; the closing `]` bounds its end.
+                let bracket_open = self
+                    .tokens
+                    .get(self.pos.saturating_sub(1))
+                    .map(|t| t.span)
+                    .unwrap_or(chain_start);
                 if self.match_kind(&TokenKind::Colon) {
                     let end = if self.check(&TokenKind::RBracket) {
                         None
@@ -908,7 +1047,21 @@ impl Parser {
                         Some(self.parse_expr()?)
                     };
                     self.expect(&TokenKind::RBracket, "expected ']' after slice expression")?;
-                    expr = self.build_slice_access_expr(expr, None, end)?;
+                    let callee_span = Span::new(
+                        chain_start.source_id,
+                        bracket_open.lo,
+                        self.tokens[self.pos - 1].span.hi,
+                    );
+                    let expr_span =
+                        Span::new(chain_start.source_id, chain_start.lo, callee_span.hi);
+                    let slice_id = self.alloc_call_id(
+                        callee_span,
+                        expr_span,
+                        ParsedCallTarget::Function(BuiltinFunction::Slice.call_index()),
+                        "slice".to_string(),
+                        false,
+                    );
+                    expr = self.build_slice_access_expr(expr, None, end, slice_id)?;
                     continue;
                 }
 
@@ -920,16 +1073,47 @@ impl Parser {
                         Some(self.parse_expr()?)
                     };
                     self.expect(&TokenKind::RBracket, "expected ']' after slice expression")?;
-                    expr = self.build_slice_access_expr(expr, Some(first), end)?;
+                    let callee_span = Span::new(
+                        chain_start.source_id,
+                        bracket_open.lo,
+                        self.tokens[self.pos - 1].span.hi,
+                    );
+                    let expr_span =
+                        Span::new(chain_start.source_id, chain_start.lo, callee_span.hi);
+                    let slice_id = self.alloc_call_id(
+                        callee_span,
+                        expr_span,
+                        ParsedCallTarget::Function(BuiltinFunction::Slice.call_index()),
+                        "slice".to_string(),
+                        false,
+                    );
+                    expr = self.build_slice_access_expr(expr, Some(first), end, slice_id)?;
                     continue;
                 }
 
                 self.expect(&TokenKind::RBracket, "expected ']' after index expression")?;
-                expr = self.build_builtin_call_expr(BuiltinFunction::Get, vec![expr, first])?;
+                let callee_span = Span::new(
+                    chain_start.source_id,
+                    bracket_open.lo,
+                    self.tokens[self.pos - 1].span.hi,
+                );
+                let expr_span = Span::new(chain_start.source_id, chain_start.lo, callee_span.hi);
+                expr = self.build_postfix_builtin_call(
+                    BuiltinFunction::Get,
+                    vec![expr, first],
+                    callee_span,
+                    expr_span,
+                    "get".to_string(),
+                )?;
                 continue;
             }
             if self.match_kind(&TokenKind::Dot) {
                 let member = self.expect_namespace_segment("expected member name after '.'")?;
+                let member_span = self
+                    .tokens
+                    .get(self.pos.saturating_sub(1))
+                    .map(|t| t.span)
+                    .unwrap_or(chain_start);
                 if member == "copy" {
                     self.expect(
                         &TokenKind::LParen,
@@ -956,20 +1140,63 @@ impl Parser {
                         &TokenKind::RParen,
                         "expected ')' after unwrap_or fallback expression",
                     )?;
-                    expr = self.build_option_unwrap_or_expr(expr, fallback)?;
+                    let expr_span = Span::new(
+                        chain_start.source_id,
+                        chain_start.lo,
+                        self.tokens[self.pos - 1].span.hi,
+                    );
+                    expr = self.build_option_unwrap_or_expr(
+                        expr,
+                        fallback,
+                        member_span,
+                        expr_span,
+                        "unwrap_or".to_string(),
+                    )?;
                 } else if member == "length" {
-                    expr = self.build_builtin_call_expr(BuiltinFunction::Len, vec![expr])?;
+                    let expr_span =
+                        Span::new(chain_start.source_id, chain_start.lo, member_span.hi);
+                    expr = self.build_postfix_builtin_call(
+                        BuiltinFunction::Len,
+                        vec![expr],
+                        member_span,
+                        expr_span,
+                        "length".to_string(),
+                    )?;
                 } else if member == "has" && self.check(&TokenKind::LParen) {
                     self.expect(&TokenKind::LParen, "expected '(' after '.has'")?;
                     let mut args = vec![expr];
                     args.extend(self.parse_call_args()?);
-                    expr = self.build_builtin_call_expr(BuiltinFunction::Has, args)?;
+                    let expr_span = Span::new(
+                        chain_start.source_id,
+                        chain_start.lo,
+                        self.tokens[self.pos - 1].span.hi,
+                    );
+                    expr = self.build_postfix_builtin_call(
+                        BuiltinFunction::Has,
+                        args,
+                        member_span,
+                        expr_span,
+                        "has".to_string(),
+                    )?;
                 } else if member == "keys" {
-                    expr = self.build_builtin_call_expr(BuiltinFunction::Keys, vec![expr])?;
+                    let expr_span =
+                        Span::new(chain_start.source_id, chain_start.lo, member_span.hi);
+                    expr = self.build_postfix_builtin_call(
+                        BuiltinFunction::Keys,
+                        vec![expr],
+                        member_span,
+                        expr_span,
+                        "keys".to_string(),
+                    )?;
                 } else {
-                    expr = self.build_builtin_call_expr(
+                    let expr_span =
+                        Span::new(chain_start.source_id, chain_start.lo, member_span.hi);
+                    expr = self.build_postfix_builtin_call(
                         BuiltinFunction::Get,
-                        vec![expr, Expr::String(member)],
+                        vec![expr, Expr::String(member.clone())],
+                        member_span,
+                        expr_span,
+                        member,
                     )?;
                 }
                 continue;
@@ -977,16 +1204,46 @@ impl Parser {
             if self.match_kind(&TokenKind::Question) {
                 self.expect(&TokenKind::Dot, "expected '.' after '?' in optional access")?;
                 if self.match_kind(&TokenKind::LBracket) {
+                    let bracket_open = self
+                        .tokens
+                        .get(self.pos.saturating_sub(1))
+                        .map(|t| t.span)
+                        .unwrap_or(chain_start);
                     let key = self.parse_expr()?;
                     self.expect(
                         &TokenKind::RBracket,
                         "expected ']' after optional index expression",
                     )?;
-                    expr = self.build_optional_get_expr(expr, key)?;
+                    let callee_span = Span::new(
+                        chain_start.source_id,
+                        bracket_open.lo,
+                        self.tokens[self.pos - 1].span.hi,
+                    );
+                    let expr_span =
+                        Span::new(chain_start.source_id, chain_start.lo, callee_span.hi);
+                    expr = self.build_optional_get_expr(
+                        expr,
+                        key,
+                        callee_span,
+                        expr_span,
+                        "get".to_string(),
+                    )?;
                     continue;
                 }
                 let member = self.expect_namespace_segment("expected member name after '?.'")?;
-                expr = self.build_optional_member_get_expr(expr, member)?;
+                let member_span = self
+                    .tokens
+                    .get(self.pos.saturating_sub(1))
+                    .map(|t| t.span)
+                    .unwrap_or(chain_start);
+                let expr_span = Span::new(chain_start.source_id, chain_start.lo, member_span.hi);
+                expr = self.build_optional_member_get_expr(
+                    expr,
+                    member,
+                    member_span,
+                    expr_span,
+                    "get".to_string(),
+                )?;
                 continue;
             }
             if self.dialect.allow_increment_operator() && self.match_kind(&TokenKind::PlusPlus) {
@@ -996,6 +1253,40 @@ impl Parser {
             break;
         }
         Ok(expr)
+    }
+
+    /// Build a postfix-source builtin call (index get, `.length`, `.has`,
+    /// `.keys`, member get) with a recorded provenance site. The callee span
+    /// is the operator/member token range and the expr span is the full
+    /// postfix chain from its base through this step. Compiler-synthetic
+    /// builtin lowering (array/map literals, slice helper calls) keeps
+    /// `None` ids by going through `build_builtin_call_expr` directly.
+    fn build_postfix_builtin_call(
+        &mut self,
+        builtin: BuiltinFunction,
+        args: Vec<Expr>,
+        callee_span: Span,
+        expr_span: Span,
+        name: String,
+    ) -> Result<Expr, ParseError> {
+        let base = self.build_builtin_call_expr_with_type_args(builtin, args, Vec::new())?;
+        let Expr::Call(index, type_args, args, host_resolution, None) = base else {
+            return Ok(base);
+        };
+        let semantic_id = self.alloc_call_id(
+            callee_span,
+            expr_span,
+            ParsedCallTarget::Function(index),
+            name,
+            false,
+        );
+        Ok(Expr::Call(
+            index,
+            type_args,
+            args,
+            host_resolution,
+            semantic_id,
+        ))
     }
 
     pub(super) fn build_numeric_addition_expr(&self, index: LocalSlot, rhs: Expr) -> Expr {
@@ -1061,6 +1352,7 @@ impl Parser {
         container: Expr,
         start: Option<Expr>,
         end: Option<Expr>,
+        slice_id: Option<SemanticNodeId>,
     ) -> Result<Expr, ParseError> {
         let (container_slot, container_bind) = match container {
             Expr::Var(slot) => (slot, None),
@@ -1081,9 +1373,9 @@ impl Parser {
                 else_expr: Box::new(end_var),
             };
             let slice_len = Expr::Sub(Box::new(adjusted_end), Box::new(Expr::Var(start_slot)));
-            let slice_expr = self.build_builtin_call_expr(
-                BuiltinFunction::Slice,
+            let slice_expr = self.build_slice_expr_with_id(
                 vec![Expr::Var(container_slot), Expr::Var(start_slot), slice_len],
+                slice_id,
             )?;
             let with_end = self.bind_hidden_local_expr(end_slot, end_expr, slice_expr)?;
             self.bind_hidden_local_expr(start_slot, start_expr, with_end)?
@@ -1091,9 +1383,9 @@ impl Parser {
             let end_expr = self
                 .build_builtin_call_expr(BuiltinFunction::Len, vec![Expr::Var(container_slot)])?;
             let slice_len = Expr::Sub(Box::new(end_expr), Box::new(Expr::Var(start_slot)));
-            let slice_expr = self.build_builtin_call_expr(
-                BuiltinFunction::Slice,
+            let slice_expr = self.build_slice_expr_with_id(
                 vec![Expr::Var(container_slot), Expr::Var(start_slot), slice_len],
+                slice_id,
             )?;
             self.bind_hidden_local_expr(start_slot, start_expr, slice_expr)?
         };
@@ -1104,16 +1396,46 @@ impl Parser {
         }
     }
 
+    /// Build the `Slice` builtin call that records the parser-assigned slice
+    /// access id. The slice is a direct source expression, so its operative
+    /// `Slice` call carries the id; the surrounding hidden-local `Len` and
+    /// `Match` lowering stays synthetic (`None`).
+    fn build_slice_expr_with_id(
+        &mut self,
+        args: Vec<Expr>,
+        slice_id: Option<SemanticNodeId>,
+    ) -> Result<Expr, ParseError> {
+        let mut expr =
+            self.build_builtin_call_expr_with_type_args(BuiltinFunction::Slice, args, Vec::new())?;
+        if let Some(id) = slice_id
+            && let Expr::Call(_, _, _, _, slot) = &mut expr
+        {
+            *slot = Some(id);
+        }
+        Ok(expr)
+    }
+
     pub(super) fn build_optional_get_expr(
         &mut self,
         container: Expr,
         key: Expr,
+        callee_span: Span,
+        expr_span: Span,
+        name: String,
     ) -> Result<Expr, ParseError> {
+        let semantic_id = self.alloc_call_id(
+            callee_span,
+            expr_span,
+            ParsedCallTarget::Unresolved,
+            name,
+            false,
+        );
         Ok(Expr::OptionalGet {
             container: Box::new(container),
             key: Box::new(key),
             container_slot: self.allocate_hidden_local()?,
             key_slot: self.allocate_hidden_local()?,
+            semantic_id,
         })
     }
 
@@ -1121,19 +1443,39 @@ impl Parser {
         &mut self,
         container: Expr,
         member: String,
+        callee_span: Span,
+        expr_span: Span,
+        name: String,
     ) -> Result<Expr, ParseError> {
-        self.build_optional_get_expr(container, Expr::String(member))
+        self.build_optional_get_expr(
+            container,
+            Expr::String(member),
+            callee_span,
+            expr_span,
+            name,
+        )
     }
 
     pub(super) fn build_option_unwrap_or_expr(
         &mut self,
         value: Expr,
         fallback: Expr,
+        callee_span: Span,
+        expr_span: Span,
+        name: String,
     ) -> Result<Expr, ParseError> {
+        let semantic_id = self.alloc_call_id(
+            callee_span,
+            expr_span,
+            ParsedCallTarget::Unresolved,
+            name,
+            false,
+        );
         Ok(Expr::OptionUnwrapOr {
             value: Box::new(value),
             value_slot: self.allocate_hidden_local()?,
             fallback: Box::new(fallback),
+            semantic_id,
         })
     }
 
@@ -1364,7 +1706,13 @@ impl Parser {
             if args.len() == usize::from(builtin.arity()) + 1
                 && Self::rewrite_regex_flags_arg_into_pattern(builtin, &mut args)
             {
-                return Ok(Expr::Call(builtin.call_index(), type_args, args));
+                return Ok(Expr::Call(
+                    builtin.call_index(),
+                    type_args,
+                    args,
+                    None,
+                    None,
+                ));
             }
             return Err(ParseError {
                 span: None,
@@ -1377,7 +1725,13 @@ impl Parser {
                 ),
             });
         }
-        Ok(Expr::Call(builtin.call_index(), type_args, args))
+        Ok(Expr::Call(
+            builtin.call_index(),
+            type_args,
+            args,
+            None,
+            None,
+        ))
     }
 
     pub(super) fn rewrite_regex_flags_arg_into_pattern(
@@ -1408,16 +1762,22 @@ impl Parser {
             BuiltinFunction::Concat.call_index(),
             Vec::new(),
             vec![Expr::String("(?".to_string()), flags],
+            None,
+            None,
         );
         let prefix = Expr::Call(
             BuiltinFunction::Concat.call_index(),
             Vec::new(),
             vec![prefix, Expr::String(")".to_string())],
+            None,
+            None,
         );
         Expr::Call(
             BuiltinFunction::Concat.call_index(),
             Vec::new(),
             vec![prefix, pattern],
+            None,
+            None,
         )
     }
 
@@ -1618,7 +1978,13 @@ impl Parser {
 
     pub(super) fn build_print_call_expr(&mut self, argument: Expr) -> Result<Expr, ParseError> {
         let decl = self.resolve_function_for_call(STDLIB_PRINT_NAME, 1)?;
-        Ok(Expr::Call(decl.index, Vec::new(), vec![argument]))
+        Ok(Expr::Call(
+            decl.index,
+            Vec::new(),
+            vec![argument],
+            None,
+            None,
+        ))
     }
 
     pub(super) fn build_to_string_expr(&mut self, value: Expr) -> Result<Expr, ParseError> {
@@ -1656,7 +2022,7 @@ impl Parser {
             message: "function arity too large".to_string(),
         })?;
         let decl = self.define_host_function(host_name, arity)?;
-        Ok(Expr::Call(decl.index, type_args, args))
+        Ok(Expr::Call(decl.index, type_args, args, None, None))
     }
 
     /// Whether host type arguments are validated at parse time.
@@ -1728,7 +2094,7 @@ impl Parser {
     }
 
     fn contextualize_function_call_args(&self, expr: &mut Expr) -> Result<(), ParseError> {
-        let Expr::Call(index, type_args, args) = expr else {
+        let Expr::Call(index, type_args, args, _, _) = expr else {
             return Ok(());
         };
         let Some(decl) = self
@@ -1823,6 +2189,9 @@ impl Parser {
                         Self::unify_contextual_schema(lhs, rhs, type_params, bindings)
                     })
             }
+            // Resources unify only on the exact same nominal key. Different
+            // keys (or a resource vs a structural type) do not unify.
+            (TypeSchema::Resource(lhs_key), TypeSchema::Resource(rhs_key)) => lhs_key == rhs_key,
             (TypeSchema::ArrayTuple(lhs), TypeSchema::ArrayTuple(rhs)) => {
                 lhs.len() == rhs.len()
                     && lhs.iter().zip(rhs).all(|(lhs, rhs)| {
@@ -2085,7 +2454,8 @@ impl Parser {
         expect_terminator: bool,
     ) -> Result<Stmt, ParseError> {
         let line = self.current_line_u32();
-        let name = self.expect_ident("expected identifier before indexed assignment")?;
+        let (name, ident_span) =
+            self.expect_ident_with_span("expected identifier before indexed assignment")?;
         let key = if self.match_kind(&TokenKind::LBracket) {
             let key = self.parse_expr()?;
             self.expect(&TokenKind::RBracket, "expected ']' after assignment index")?;
@@ -2111,6 +2481,8 @@ impl Parser {
 
         let index = self.get_local(&name)?;
         self.require_local_mutable_for_operation(index, Some(name.as_str()), line, "mutate")?;
+        // Record the indexed-assignment root as a local reference site.
+        self.record_local_ref(ident_span, index, name);
         let expr =
             self.build_builtin_call_expr(BuiltinFunction::Set, vec![Expr::Var(index), key, value])?;
         Ok(Stmt::Assign {
@@ -2227,10 +2599,10 @@ impl Parser {
 
     pub(super) fn parse_parenthesized_arrow_closure(&mut self) -> Result<Expr, ParseError> {
         self.expect(&TokenKind::LParen, "expected '(' to start arrow parameters")?;
-        let mut params = Vec::<String>::new();
+        let mut params = Vec::<(String, Span)>::new();
         if !self.check(&TokenKind::RParen) {
             loop {
-                params.push(self.expect_ident("expected arrow parameter name")?);
+                params.push(self.expect_ident_with_span("expected arrow parameter name")?);
                 if self.match_kind(&TokenKind::Comma) {
                     continue;
                 }
@@ -2252,7 +2624,7 @@ impl Parser {
     }
 
     pub(super) fn parse_single_param_arrow_closure(&mut self) -> Result<Expr, ParseError> {
-        let param = self.expect_ident("expected arrow parameter name")?;
+        let (param, span) = self.expect_ident_with_span("expected arrow parameter name")?;
         self.expect(&TokenKind::FatArrow, "expected '=>' after arrow parameter")?;
         if self.check(&TokenKind::LBrace) {
             return Err(ParseError {
@@ -2263,12 +2635,13 @@ impl Parser {
                     .to_string(),
             });
         }
-        self.parse_closure_expr_with_params(vec![param])
+        self.parse_closure_expr_with_params(vec![(param, span)])
     }
 
     pub(super) fn try_parse_js_dotted_call(
         &mut self,
         base: &str,
+        base_span: Span,
     ) -> Result<Option<Expr>, ParseError> {
         let save_pos = self.pos;
         if !self.match_kind(&TokenKind::Dot) {
@@ -2284,6 +2657,19 @@ impl Parser {
             }
             break;
         }
+        // The last consumed segment bounds the exact dotted-path callee span
+        // (`console.log`), captured before the argument list is consumed.
+        let path_hi = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|t| t.span.hi)
+            .unwrap_or(base_span.hi);
+        let callee_span = Span::new(base_span.source_id, base_span.lo, path_hi);
+        let callee_name = if segments.is_empty() {
+            base.to_string()
+        } else {
+            format!("{}.{}", base, segments.join("."))
+        };
 
         if !self.match_kind(&TokenKind::LParen) {
             self.pos = save_pos;
@@ -2292,9 +2678,12 @@ impl Parser {
         let mut args = self.parse_call_args()?;
 
         if base == "console" && segments.len() == 1 && segments[0] == "log" {
-            return Ok(Some(
-                self.lower_plain_print_call(std::mem::take(&mut args))?,
-            ));
+            let expr = self.lower_plain_print_call(std::mem::take(&mut args))?;
+            return Ok(Some(self.attach_namespace_call_provenance(
+                expr,
+                callee_span,
+                callee_name,
+            )));
         }
 
         if segments.is_empty() {
@@ -2318,7 +2707,12 @@ impl Parser {
             }
             let member = segments[0].as_str();
             if let Some(builtin) = resolve_builtin_namespace_call(&imported_root, member) {
-                return Ok(Some(self.build_builtin_call_expr(builtin, args)?));
+                let expr = self.build_builtin_call_expr(builtin, args)?;
+                return Ok(Some(self.attach_namespace_call_provenance(
+                    expr,
+                    callee_span,
+                    callee_name,
+                )));
             }
             return Err(ParseError {
                 span: None,
@@ -2331,7 +2725,12 @@ impl Parser {
         let member = segments[0].clone();
         let subpath = segments.into_iter().skip(1).collect::<Vec<_>>();
         if let Some(host_name) = self.resolve_host_namespace_call_target(base, &member, &subpath) {
-            return Ok(Some(self.build_host_call_expr(&host_name, args)?));
+            let expr = self.build_host_call_expr(&host_name, args)?;
+            return Ok(Some(self.attach_namespace_call_provenance(
+                expr,
+                callee_span,
+                callee_name,
+            )));
         }
 
         self.pos = save_pos;
@@ -2339,10 +2738,12 @@ impl Parser {
     }
 
     pub(super) fn parse_closure_literal(&mut self) -> Result<Expr, ParseError> {
-        let mut params = Vec::<String>::new();
+        let mut params = Vec::<(String, Span)>::new();
         if !self.check(&TokenKind::Pipe) {
             loop {
-                params.push(self.expect_ident("expected closure parameter name")?);
+                let (param, span) =
+                    self.expect_ident_with_span("expected closure parameter name")?;
+                params.push((param, span));
                 if self.match_kind(&TokenKind::Comma) {
                     continue;
                 }
@@ -2355,11 +2756,11 @@ impl Parser {
 
     pub(super) fn parse_closure_expr_with_params(
         &mut self,
-        params: Vec<String>,
+        params: Vec<(String, Span)>,
     ) -> Result<Expr, ParseError> {
         let mut param_slots = Vec::new();
         let mut param_scope = HashMap::new();
-        for param_name in &params {
+        for (param_name, _) in &params {
             if param_scope.contains_key(param_name) {
                 return Err(ParseError {
                     span: None,
@@ -2378,7 +2779,21 @@ impl Parser {
             by_name: HashMap::new(),
             capture_copies: Vec::new(),
         });
-        let body = self.parse_expr()?;
+        let body_open = self.current_span();
+        let body_result = self.with_scope(body_open, |parser| {
+            // Record each closure param binding as a local declaration site
+            // inside the closure body scope, with its exact ident span.
+            for (order, (param_name, ident_span)) in params.iter().enumerate() {
+                parser.record_local_decl(
+                    *ident_span,
+                    *ident_span,
+                    param_slots[order],
+                    param_name.clone(),
+                );
+            }
+            parser.parse_expr()
+        });
+        let body = body_result?;
         let capture_context = self
             .closure_capture_contexts
             .pop()

@@ -1,7 +1,13 @@
 // VM-side builtin execution entrypoints.
 // Builtin metadata and call-index mapping live in crate::builtins.
 
+use std::sync::{Arc, OnceLock};
+
 use crate::builtins::BuiltinFunction;
+use crate::host_api::{
+    HostApiBuilder, HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema,
+    HostTypeSchema, ResourceTypeKey, ResourceTypeSchema,
+};
 #[cfg(feature = "async")]
 use crate::vm::CaptureAsyncHostContext;
 #[allow(unused_imports)]
@@ -29,6 +35,167 @@ pub(crate) mod regex;
 pub(crate) mod sqlite;
 pub(crate) mod standard_composition;
 mod typed;
+
+/// Returns the editor/compiler catalog for the built-in host extensions.
+///
+/// The runtime implementation and the semantic catalog intentionally share only
+/// these schemas. Keeping the catalog here lets non-executing tools resolve the
+/// same resource-bearing calls without constructing a VM.
+pub fn io_host_catalog() -> Arc<HostApiCatalog> {
+    static CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
+    Arc::clone(CATALOG.get_or_init(|| {
+        let file_key = ResourceTypeKey::new("io.file").expect("built-in resource key is valid");
+        let mut builder = HostApiBuilder::new();
+        builder.resource(ResourceTypeSchema::new(
+            file_key.clone(),
+            "An open file handle",
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "io::open",
+            vec![
+                HostParamSchema::value("path", HostTypeSchema::String),
+                HostParamSchema::value("mode", HostTypeSchema::String),
+            ],
+            HostTypeSchema::Resource(file_key.clone()),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "io::read_all",
+            vec![HostParamSchema::with_passing(
+                "handle",
+                HostTypeSchema::Resource(file_key.clone()),
+                HostParamPassing::Borrow,
+            )],
+            HostTypeSchema::String,
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "io::close",
+            vec![HostParamSchema::with_passing(
+                "handle",
+                HostTypeSchema::Resource(file_key),
+                HostParamPassing::TakeOwned,
+            )],
+            HostTypeSchema::Bool,
+        ));
+        Arc::new(builder.build().expect("built-in IO catalog is valid"))
+    }))
+}
+
+/// Returns the editor/compiler catalog for the SQLite host extension.
+pub fn sqlite_host_catalog() -> Arc<HostApiCatalog> {
+    static CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
+    Arc::clone(CATALOG.get_or_init(|| {
+        let connection_key =
+            ResourceTypeKey::new("sqlite.connection").expect("built-in resource key is valid");
+        let mut builder = HostApiBuilder::new();
+        builder.resource(ResourceTypeSchema::new(
+            connection_key.clone(),
+            "An open SQLite connection",
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "sqlite::open",
+            vec![HostParamSchema::value("options", HostTypeSchema::Unknown)],
+            HostTypeSchema::Resource(connection_key.clone()),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "sqlite::query",
+            vec![
+                HostParamSchema::with_passing(
+                    "connection",
+                    HostTypeSchema::Resource(connection_key.clone()),
+                    HostParamPassing::Borrow,
+                ),
+                HostParamSchema::value("sql", HostTypeSchema::String),
+                HostParamSchema::value("params", HostTypeSchema::Unknown),
+                HostParamSchema::value("options", HostTypeSchema::Unknown),
+            ],
+            HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown)),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "sqlite::close",
+            vec![HostParamSchema::with_passing(
+                "connection",
+                HostTypeSchema::Resource(connection_key),
+                HostParamPassing::TakeOwned,
+            )],
+            HostTypeSchema::Null,
+        ));
+        Arc::new(builder.build().expect("built-in SQLite catalog is valid"))
+    }))
+}
+
+/// Returns the combined catalog used by default source analysis.
+pub fn standard_host_catalog() -> Arc<HostApiCatalog> {
+    static CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
+    Arc::clone(CATALOG.get_or_init(|| {
+        let file_key = ResourceTypeKey::new("io.file").expect("built-in resource key is valid");
+        let connection_key =
+            ResourceTypeKey::new("sqlite.connection").expect("built-in resource key is valid");
+        let mut builder = HostApiBuilder::new();
+        builder.resource(ResourceTypeSchema::new(
+            file_key.clone(),
+            "An open file handle",
+        ));
+        builder.resource(ResourceTypeSchema::new(
+            connection_key.clone(),
+            "An open SQLite connection",
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "io::open",
+            vec![
+                HostParamSchema::value("path", HostTypeSchema::String),
+                HostParamSchema::value("mode", HostTypeSchema::String),
+            ],
+            HostTypeSchema::Resource(file_key.clone()),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "io::read_all",
+            vec![HostParamSchema::with_passing(
+                "handle",
+                HostTypeSchema::Resource(file_key.clone()),
+                HostParamPassing::Borrow,
+            )],
+            HostTypeSchema::String,
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "io::close",
+            vec![HostParamSchema::with_passing(
+                "handle",
+                HostTypeSchema::Resource(file_key),
+                HostParamPassing::TakeOwned,
+            )],
+            HostTypeSchema::Bool,
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "sqlite::open",
+            vec![HostParamSchema::value("options", HostTypeSchema::Unknown)],
+            HostTypeSchema::Resource(connection_key.clone()),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "sqlite::query",
+            vec![
+                HostParamSchema::with_passing(
+                    "connection",
+                    HostTypeSchema::Resource(connection_key.clone()),
+                    HostParamPassing::Borrow,
+                ),
+                HostParamSchema::value("sql", HostTypeSchema::String),
+                HostParamSchema::value("params", HostTypeSchema::Unknown),
+                HostParamSchema::value("options", HostTypeSchema::Unknown),
+            ],
+            HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown)),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "sqlite::close",
+            vec![HostParamSchema::with_passing(
+                "connection",
+                HostTypeSchema::Resource(connection_key),
+                HostParamPassing::TakeOwned,
+            )],
+            HostTypeSchema::Null,
+        ));
+        Arc::new(builder.build().expect("standard host catalog is valid"))
+    }))
+}
 
 #[cfg(target_arch = "wasm32")]
 use io_wasm as io;

@@ -244,7 +244,7 @@ pub(super) fn compile_native_region(
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cranelift-jit"))]
 mod tests {
     use super::lower::{
         compile_system_owned_tail_wrapper, compile_system_tail_wrapper,

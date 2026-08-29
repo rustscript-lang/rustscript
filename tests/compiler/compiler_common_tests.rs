@@ -1,6 +1,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 use common::*;
+use std::collections::HashMap;
 use vm::OpCode;
 
 const LOCAL_SLOT_COMPAT_THRESHOLD: usize = 8;
@@ -269,6 +270,244 @@ fn compiler_reuses_slots_with_large_programs_that_call_script_functions() {
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(399)]);
 }
+
+/// Generate the storage-shaped frame-local dispatch program: 77 named
+/// functions (32 branch leaves each calling a same-frame helper, plus 13
+/// extra leaves) and a 32-branch dispatcher whose branch live sets union the
+/// callee footprints. Each callee owns two parameters and one local.
+fn frame_local_dispatch_source() -> String {
+    let mut source = String::new();
+    for idx in 0..32usize {
+        source.push_str(&format!(
+            "fn h_{idx}(a: int, b: int) -> int {{\n    let t = a + b;\n    t;\n}}\n"
+        ));
+        source.push_str(&format!(
+            "fn f_{idx}(a: int, b: int) -> int {{\n    let t = a + b;\n    h_{idx}(t, a);\n}}\n"
+        ));
+    }
+    for idx in 32..45usize {
+        source.push_str(&format!(
+            "fn f_{idx}(a: int, b: int) -> int {{\n    let t = a + b;\n    t;\n}}\n"
+        ));
+    }
+    source.push_str("fn dispatch(idx: int) -> int {\n    let mut acc = 0;\n");
+    for idx in 0..32usize {
+        let keyword = if idx == 0 { "if" } else { "else if" };
+        source.push_str(&format!(
+            "    {keyword} idx == {idx} {{ acc = f_{idx}(acc, {}); }}\n",
+            idx + 1
+        ));
+    }
+    source.push_str("    else { acc = f_32(acc, 33); }\n    acc;\n}\n");
+    source.push_str("dispatch(0);\ndispatch(31);\n");
+    source
+}
+
+#[test]
+fn frame_local_dispatch_single_file_pressure_is_bounded() {
+    // Named script calls run in separate runtime frames, so callee body
+    // footprints must not inflate the caller frame's live set. The aggregate
+    // frame-local count must stay within per-frame pressure plus the
+    // currently required hidden callable slots (one per named function).
+    let source = frame_local_dispatch_source();
+    let compiled = compile_source(&source).expect("frame-local dispatch program should compile");
+    assert!(
+        compiled.locals <= 100,
+        "aggregate frame locals should stay within per-frame pressure plus callable slots, got {}",
+        compiled.locals
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(1), Value::Int(32)]);
+}
+
+#[test]
+fn frame_local_function_body_rejects_more_than_256_simultaneously_live_locals() {
+    // Genuine same-frame pressure inside a single function body must still
+    // fail with the frame-local limit: the frame-aware rules only remove
+    // cross-frame interference, never real per-frame pressure.
+    let live_count = (u8::MAX as usize) + 2;
+    let mut source = String::from("fn crowded() {\n");
+    for idx in 0..live_count {
+        source.push_str(&format!("    let v{idx} = {idx};\n"));
+    }
+    source.push_str("    ");
+    for idx in 0..live_count {
+        if idx > 0 {
+            source.push_str(" + ");
+        }
+        source.push_str(&format!("v{idx}"));
+    }
+    source.push_str(";\n}\ncrowded();\n");
+
+    let err = match compile_source(&source) {
+        Ok(_) => panic!("compile should fail"),
+        Err(err) => err,
+    };
+    match err {
+        vm::SourceError::Parse(parse_err) => {
+            assert!(
+                parse_err
+                    .message
+                    .contains("too many simultaneously live locals"),
+                "unexpected parse error: {parse_err:?}"
+            );
+        }
+        other => panic!("expected parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn frame_local_root_accepts_256_simultaneously_live_locals_and_reads_highest_short_slot() {
+    // The 256-slot boundary must still compile and read the highest short
+    // slot; only aggregate pressure beyond 256 is rejected. The sum is the
+    // trailing expression so no extra local joins the live clique, and it is
+    // right-nested so codegen's string-classification recursion stays linear
+    // (it re-walks each left operand).
+    let live_count = (u8::MAX as usize) + 1;
+    let mut source = String::new();
+    for idx in 0..live_count {
+        source.push_str(&format!("let v{idx} = {idx};\n"));
+    }
+    for idx in 0..live_count - 1 {
+        source.push_str(&format!("v{idx} + ("));
+    }
+    source.push_str(&format!("v{}", live_count - 1));
+    for _ in 0..live_count - 1 {
+        source.push(')');
+    }
+    source.push_str(";\n");
+
+    let compiled = compile_source(&source).expect("256-live program should compile");
+    assert_eq!(compiled.locals, 256);
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    let expected: i64 = (0..256).sum();
+    assert_eq!(vm.stack(), &[Value::Int(expected)]);
+}
+
+#[test]
+fn frame_local_slot_reuse_across_recursive_call_frames() {
+    // `a` and `b` run in separate runtime frames even when they call each
+    // other recursively, so their locals must be free to share one relative
+    // slot: caller/callee cross-live edges would needlessly separate them.
+    // The program exceeds the slot-allocator compat threshold so physical
+    // slots are actually compacted.
+    let source = r#"
+        fn a(x: int) -> int {
+            let a1 = x + 1;
+            let a2 = a1 + 1;
+            let a3 = a2 + 1;
+            let a_local = a3 + 1;
+            if x > 0 => { b(x - 1) } else => { a_local }
+        }
+        fn b(y: int) -> int {
+            let b1 = y + 2;
+            let b2 = b1 + 2;
+            let b3 = b2 + 2;
+            let b_local = b3 + 2;
+            if y > 0 => { a(y - 1) } else => { b_local }
+        }
+        a(3);
+    "#;
+    let compiled = compile_source(source).expect("mutual recursion should compile");
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("compiled program should include debug info");
+    let a_local = debug
+        .locals
+        .iter()
+        .find(|local| local.name == "a_local")
+        .expect("a_local should be in debug info");
+    let b_local = debug
+        .locals
+        .iter()
+        .find(|local| local.name == "b_local")
+        .expect("b_local should be in debug info");
+    assert_eq!(
+        a_local.index, b_local.index,
+        "disjoint recursive frames should reuse the same relative slot"
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(8)]);
+}
+
+#[test]
+fn frame_local_same_frame_values_keep_distinct_slots() {
+    // Negative control: two values genuinely live at the same time inside one
+    // function must receive different physical slots even though other frames
+    // may reuse them. The program exceeds the slot-allocator compat threshold
+    // so physical slots are actually compacted.
+    let source = r#"
+        fn overlap(a: int, b: int) -> int {
+            let p = a + 1;
+            let q = p + 1;
+            let x = a + b;
+            let y = q + x;
+            let s = y + 1;
+            let t = s + 1;
+            x + y + t;
+        }
+        overlap(3, 4);
+    "#;
+    let compiled = compile_source(source).expect("overlap should compile");
+    let debug = compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("compiled program should include debug info");
+    let x = debug
+        .locals
+        .iter()
+        .find(|local| local.name == "x")
+        .expect("x should be in debug info");
+    let y = debug
+        .locals
+        .iter()
+        .find(|local| local.name == "y")
+        .expect("y should be in debug info");
+    assert_ne!(
+        x.index, y.index,
+        "simultaneously live values in one frame must keep distinct slots"
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    // p = 4, q = 5, x = 7, y = 12, s = 13, t = 14, result = 33
+    assert_eq!(vm.stack(), &[Value::Int(33)]);
+}
+
+#[test]
+fn frame_local_dispatch_data_pressure_is_small() {
+    // After frame isolation and milestone-6 slot omission the
+    // storage-shaped fixture needs only its own per-frame data slots:
+    // every named function is direct-only, so no hidden callable slots
+    // remain in the aggregate frame-local count.
+    let source = frame_local_dispatch_source();
+    let compiled = compile_source(&source).expect("frame-local dispatch program should compile");
+    let materialized = compiled.program.root_callable_bindings.len();
+    let data_slots = compiled.locals.saturating_sub(materialized);
+    assert!(
+        data_slots <= 20,
+        "per-frame data pressure should stay small, got {data_slots} data slots"
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(1), Value::Int(32)]);
+}
+
 #[test]
 fn compile_source_with_functions() {
     let source = include_str!("../../examples/example.rss");
@@ -1004,16 +1243,22 @@ fn same_local_collection_set_preserves_key_then_rhs_evaluation_order() {
         vm::BuiltinFunction::ArrayNew.call_index(),
         Vec::new(),
         Vec::new(),
+        None,
+        None,
     );
     let array_with_first = Expr::Call(
         vm::BuiltinFunction::ArrayPush.call_index(),
         Vec::new(),
         vec![array_new, Expr::Int(10)],
+        None,
+        None,
     );
     let array = Expr::Call(
         vm::BuiltinFunction::ArrayPush.call_index(),
         Vec::new(),
         vec![array_with_first, Expr::Int(20)],
+        None,
+        None,
     );
     let append_order = |suffix: &str| Stmt::Assign {
         kind: vm::AssignmentKind::Set,
@@ -1034,6 +1279,8 @@ fn same_local_collection_set_preserves_key_then_rhs_evaluation_order() {
             vm::BuiltinFunction::Get.call_index(),
             Vec::new(),
             vec![Expr::Var(0), Expr::Int(1)],
+            None,
+            None,
         )),
     };
 
@@ -1060,6 +1307,8 @@ fn same_local_collection_set_preserves_key_then_rhs_evaluation_order() {
                     vm::BuiltinFunction::Set.call_index(),
                     Vec::new(),
                     vec![Expr::Var(0), key, rhs],
+                    None,
+                    None,
                 ),
                 line: 2,
             },
@@ -1072,6 +1321,8 @@ fn same_local_collection_set_preserves_key_then_rhs_evaluation_order() {
                     vm::BuiltinFunction::Get.call_index(),
                     Vec::new(),
                     vec![Expr::Var(0), Expr::Int(0)],
+                    None,
+                    None,
                 ),
                 line: 3,
             },
@@ -1096,6 +1347,8 @@ fn same_local_array_push_clears_target_immediately_before_call() {
                     vm::BuiltinFunction::ArrayNew.call_index(),
                     Vec::new(),
                     Vec::new(),
+                    None,
+                    None,
                 ),
                 line: 1,
             },
@@ -1106,6 +1359,8 @@ fn same_local_array_push_clears_target_immediately_before_call() {
                     vm::BuiltinFunction::ArrayPush.call_index(),
                     Vec::new(),
                     vec![Expr::Var(0), Expr::Int(7)],
+                    None,
+                    None,
                 ),
                 line: 2,
             },
@@ -1496,3 +1751,507 @@ fn stack_is_clean_after_halt_with_single_result() {
 // NOTE: function parameter slot cleanup is covered by
 // `script_function_frame_values_are_released_after_return` in
 // compiler_rustscript_tests.rs.
+
+#[test]
+fn named_callable_materialization_omits_direct_only_slots() {
+    // Milestone 6: direct-only named functions keep a prototype but no
+    // hidden callable slot, root binding, or runtime self slot. Exported
+    // and value-referenced functions stay materialized.
+    let source = r#"
+        fn direct_helper(x: int) -> int { x + 1 }
+        fn exported_helper(x: int) -> int { x + 2 }
+        fn stored_helper(x: int) -> int { x + 3 }
+        pub fn exported(x: int) -> int { exported_helper(x) }
+        let stored = stored_helper;
+        direct_helper(1);
+        exported(1);
+        stored(1);
+    "#;
+    let compiled = compile_source(source).expect("classification program should compile");
+    let program = &compiled.program;
+    assert_eq!(
+        program.callable_prototypes.len(),
+        4,
+        "every named function keeps a prototype"
+    );
+    let direct = program
+        .callable_prototypes
+        .iter()
+        .find(|prototype| prototype.parameter_slots.len() == 1)
+        .expect("direct-only helper prototype");
+    // All four prototypes are FunctionItem here; identify the direct-only
+    // helper as the one with no root binding and no self slot.
+    let bound = program
+        .root_callable_bindings
+        .iter()
+        .map(|binding| binding.prototype_id)
+        .collect::<Vec<_>>();
+    assert_eq!(bound.len(), 2, "only stored and exported stay materialized");
+    let direct_only = program
+        .callable_prototypes
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !bound.contains(&(*index as u32)))
+        .map(|(_, prototype)| prototype)
+        .collect::<Vec<_>>();
+    assert_eq!(direct_only.len(), 2, "two functions are direct-only");
+    for prototype in direct_only {
+        assert_eq!(
+            prototype.self_slot, None,
+            "direct-only functions keep no runtime self slot"
+        );
+    }
+    assert_eq!(direct.self_slot, None);
+    for binding in &program.root_callable_bindings {
+        let prototype = &program.callable_prototypes[binding.prototype_id as usize];
+        assert!(
+            prototype.self_slot.is_some(),
+            "materialized functions keep their runtime self slot"
+        );
+    }
+    assert!(
+        program
+            .exported_callables
+            .iter()
+            .any(|exported| exported.name == "exported"),
+        "exported function stays materialized and resolvable"
+    );
+    assert!(
+        program.code.windows(1).any(|window| window[0] == 0x1A),
+        "direct-only call sites must emit CallScript"
+    );
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(2), Value::Int(3), Value::Int(4)]);
+}
+
+#[test]
+fn named_callable_materialization_capturing_allocation_unchanged() {
+    // A capturing named function keeps its closure prototype, environment
+    // layout, and runtime self slot until the direct-call milestone: it can
+    // never use an environment-free direct call path.
+    let compiled = vm::compile_source_for_repl(
+        r#"
+            let captured = 42;
+            fn read_captured() { captured }
+            fn walk(n: int) -> int {
+                if n <= 0 => { captured } else => { walk(n - 1) }
+            }
+            read_captured;
+            walk(2);
+        "#,
+    )
+    .expect("capturing named functions should compile");
+    let program = &compiled.program;
+    let capturing = program
+        .callable_prototypes
+        .iter()
+        .filter(|prototype| !prototype.capture_slots.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        capturing.len(),
+        2,
+        "both capturing named functions keep their environment layouts"
+    );
+    for prototype in capturing {
+        assert_eq!(prototype.kind, vm::CallableKind::Closure);
+        assert!(
+            prototype.self_slot.is_some(),
+            "capturing recursion retains the runtime self slot"
+        );
+    }
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack().len(), 2, "callable value plus recursion result");
+    assert!(
+        matches!(vm.stack()[0], Value::Callable(_)),
+        "the bare function value expression still materializes the callable"
+    );
+    assert_eq!(vm.stack()[1], Value::Int(42));
+}
+
+#[test]
+fn named_callable_without_facts_keeps_legacy_materialization() {
+    // The public `Compiler` API cannot supply milestone-5 classification
+    // facts (`set_callable_use_facts` is compiler-internal). A direct
+    // `Compiler::new().set_function_impls(...).compile_program(...)` path
+    // with a named script function must keep compiling under the legacy
+    // conservative contract: every named function stays materialized with
+    // its hidden callable slot.
+    let mut compiler = Compiler::new();
+    compiler.set_function_impls(HashMap::from([(
+        0u16,
+        vm::compiler::ir::FunctionImpl {
+            param_slots: Vec::new(),
+            capture_copies: Vec::new(),
+            body_stmts: Vec::new(),
+            body_expr: vm::compiler::ir::Expr::Int(1),
+            body_expr_line: 1,
+        },
+    )]));
+    compiler.set_function_decls(HashMap::from([(
+        0u16,
+        vm::compiler::ir::FunctionDecl {
+            name: "legacy_helper".to_string(),
+            arity: 0,
+            index: 0,
+            args: Vec::new(),
+            arg_schemas: Vec::new(),
+            return_schema: None,
+            type_params: Vec::new(),
+            exported: false,
+            return_type: vm::ValueType::Int,
+            symbol: None,
+        },
+    )]));
+    let stmts = [
+        vm::compiler::ir::Stmt::FuncDecl {
+            name: "legacy_helper".to_string(),
+            index: 0,
+            arity: 0,
+            args: Vec::new(),
+            exported: false,
+            has_impl: true,
+            line: 1,
+        },
+        vm::compiler::ir::Stmt::Expr {
+            expr: vm::compiler::ir::Expr::Call(0, Vec::new(), Vec::new(), None, None),
+            line: 1,
+        },
+    ];
+    let program = compiler
+        .compile_program(&stmts)
+        .expect("direct Compiler without facts must still compile named functions");
+
+    // Legacy materialization: the hidden callable slot and its root binding
+    // are retained even though no classification facts were provided.
+    assert_eq!(program.callable_prototypes.len(), 1);
+    assert!(
+        program.callable_prototypes[0].self_slot.is_some(),
+        "absent facts must conservatively retain the hidden callable slot"
+    );
+    assert_eq!(program.root_callable_bindings.len(), 1);
+
+    let mut vm = Vm::new(program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(1)]);
+}
+
+// ---------------------------------------------------------------------------
+// Milestone 6: direct script-call lowering
+// ---------------------------------------------------------------------------
+
+#[test]
+fn direct_script_call_lowering_omits_ldloc_and_bindings() {
+    // A program whose only named functions are called directly must emit
+    // `CallScript` at every call site and no `Ldloc`/`Stloc` at all: no
+    // hidden callable slot exists to load.
+    let source = r#"
+        fn helper(x: int) -> int { x + 1 }
+        fn outer() -> int { helper(1) }
+        outer();
+    "#;
+    let compiled = compile_source(source).expect("direct-only program should compile");
+    let program = &compiled.program;
+
+    assert_eq!(
+        program.root_callable_bindings.len(),
+        0,
+        "direct-only functions get no root callable bindings"
+    );
+    assert!(
+        program
+            .callable_prototypes
+            .iter()
+            .all(|prototype| prototype.self_slot.is_none()),
+        "direct-only functions keep no runtime self slot"
+    );
+    assert_eq!(
+        program.code.iter().filter(|byte| **byte == 0x1A).count(),
+        2,
+        "both call sites emit CallScript"
+    );
+    // Every local access stays within the data-slot frame: no hidden
+    // callable slot exists to load or store. `helper` reads its parameter
+    // through `Ldloc`, so local loads are legal; they must never reference
+    // a slot at or beyond the data-slot count.
+    let mut ip = 0usize;
+    while ip < program.code.len() {
+        if matches!(
+            program.code[ip],
+            byte if byte == vm::OpCode::Ldloc as u8 || byte == vm::OpCode::Stloc as u8
+        ) {
+            let operand = program.code[ip + 1];
+            assert!(
+                usize::from(operand) < compiled.locals,
+                "local access {operand} exceeds the data-slot frame of {}",
+                compiled.locals
+            );
+        }
+        ip += 1;
+    }
+    assert!(
+        !program.code.contains(&(vm::OpCode::CallValue as u8)),
+        "direct-only call sites must not use CallValue"
+    );
+    // local_count is exactly the data-slot pressure: no callable slots.
+    assert_eq!(compiled.locals, 1, "one parameter slot for outer/helper");
+
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(2)]);
+}
+
+#[test]
+fn materialized_call_sites_retain_callvalue_lowering() {
+    // Exported, stored, and capturing named functions keep their hidden
+    // slot and are invoked through `Ldloc + CallValue`.
+    let compiled = vm::compile_source_for_repl(
+        r#"
+            let captured = 7;
+            fn read_captured() { captured }
+            pub fn exported(x: int) -> int { x + 1 }
+            let stored = exported;
+            read_captured;
+            exported(1);
+            stored(2);
+        "#,
+    )
+    .expect("materialized program should compile");
+    let program = &compiled.program;
+    assert_eq!(
+        program.root_callable_bindings.len(),
+        1,
+        "only the exported function gets a root binding; the capturing function has none"
+    );
+    assert_eq!(
+        program.code.iter().filter(|byte| **byte == 0x1A).count(),
+        0,
+        "materialized call sites never emit CallScript"
+    );
+    assert!(
+        program.code.contains(&(vm::OpCode::CallValue as u8)),
+        "materialized call sites keep CallValue"
+    );
+    assert!(
+        program
+            .callable_prototypes
+            .iter()
+            .all(|prototype| prototype.self_slot.is_some()),
+        "materialized and capturing functions keep their runtime self slot"
+    );
+}
+
+#[test]
+fn direct_script_call_forward_and_mutual_recursion_run() {
+    // Forward calls (callee declared later), direct recursion, and mutual
+    // recursion all execute through the direct script-call path.
+    let source = r#"
+        fn even(n: int) -> int {
+            if n == 0 => { 1 } else => { odd(n - 1) }
+        }
+        fn odd(n: int) -> int {
+            if n == 0 => { 0 } else => { even(n - 1) }
+        }
+        fn later(x: int) -> int { x * 2 }
+        fn countdown(n: int) -> int {
+            if n <= 0 => { 0 } else => { countdown(n - 1) }
+        }
+        later(21);
+        countdown(5);
+        even(10);
+        odd(7);
+    "#;
+    let compiled = compile_source(source).expect("recursion source should compile");
+    assert!(
+        compiled
+            .program
+            .code
+            .iter()
+            .filter(|byte| **byte == 0x1A)
+            .count()
+            >= 4,
+        "direct recursion and mutual recursion use CallScript"
+    );
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(
+        vm.stack(),
+        &[Value::Int(42), Value::Int(0), Value::Int(1), Value::Int(1)]
+    );
+}
+
+#[test]
+fn direct_script_call_generic_functions_use_their_prototype() {
+    // A generic function called directly is lowered through `CallScript`
+    // with a prototype, and generic function values keep using the
+    // specialized prototype machinery.
+    let source = r#"
+        fn identity<T>(value: T) -> T { value }
+        identity::<int>(42);
+    "#;
+    let compiled = compile_source(source).expect("generic call should compile");
+    assert_eq!(
+        compiled.program.callable_prototypes.len(),
+        2,
+        "the generic function keeps its base prototype plus the direct-call specialization"
+    );
+    assert!(
+        compiled.program.code.contains(&0x1A),
+        "generic direct call emits CallScript"
+    );
+    assert!(
+        compiled
+            .program
+            .callable_prototypes
+            .iter()
+            .all(|prototype| prototype.self_slot.is_none()),
+        "direct generic calls allocate no hidden callable slot"
+    );
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+
+    // Specialized generic values keep the substituted-schema prototype and
+    // the dynamic callable path.
+    let compiled = compile_source(
+        r#"
+            fn identity<T>(value: T) -> T { value }
+            let f = identity::<int>;
+            f(42);
+        "#,
+    )
+    .expect("specialized value should compile");
+    assert_eq!(
+        compiled.program.root_callable_bindings.len(),
+        2,
+        "base plus specialized prototype both stay materialized"
+    );
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+}
+
+#[test]
+fn direct_script_call_generic_resolves_instantiated_prototype_schema() {
+    // A direct generic call with explicit type arguments must resolve the
+    // prototype whose schema is the instantiated concrete schema, not the
+    // generic base prototype whose placeholder schema accepts all values.
+    // This keeps the runtime schema check and the wire-visible prototype
+    // metadata aligned with the call-site types.
+    let source = r#"
+        fn identity<T>(value: T) -> T { value }
+        identity::<int>(42);
+    "#;
+    let compiled = compile_source(source).expect("generic call should compile");
+    let code = &compiled.program.code;
+    let mut ip = 0usize;
+    let mut targets = Vec::new();
+    while ip < code.len() {
+        if code[ip] == vm::OpCode::CallScript as u8 {
+            let prototype_id = u32::from_le_bytes(code[ip + 1..ip + 5].try_into().unwrap());
+            targets.push(prototype_id);
+            ip += 1 + vm::OpCode::CallScript.operand_len();
+        } else {
+            ip += 1;
+        }
+    }
+    assert_eq!(
+        targets,
+        vec![1],
+        "direct generic call must target the specialized prototype"
+    );
+    let prototype = &compiled.program.callable_prototypes[targets[0] as usize];
+    let vm::compiler::TypeSchema::Callable { params, result } = prototype
+        .schema
+        .as_ref()
+        .expect("named prototype carries a callable schema")
+    else {
+        panic!("expected a callable schema");
+    };
+    assert_eq!(
+        params,
+        &[vm::compiler::TypeSchema::Int],
+        "specialized prototype schema must use the instantiated parameter type"
+    );
+    assert_eq!(
+        result.as_ref(),
+        &vm::compiler::TypeSchema::Int,
+        "specialized prototype schema must use the instantiated result type"
+    );
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+
+    // The static checker still rejects wrong-typed instantiations at
+    // compile time; the instantiated schema on the direct prototype is the
+    // runtime backstop and the wire-visible identity for the call site.
+    let rejected = compile_source(
+        r#"
+            fn identity<T>(value: T) -> T { value }
+            identity::<int>("not an int");
+        "#,
+    );
+    assert!(
+        matches!(
+            rejected,
+            Err(vm::SourceError::Compile(
+                vm::CompileError::CallableArgumentTypeMismatch { .. }
+            ))
+        ),
+        "wrong-typed generic instantiation must be rejected at compile time"
+    );
+}
+
+#[test]
+fn direct_script_call_exported_resolution_is_unchanged() {
+    // `ExportedCallable.local_slot` and `resolve_exported_callable` keep
+    // working when other functions are direct-only.
+    let compiled = compile_source(
+        r#"
+            fn hidden_helper(x: int) -> int { x + 1 }
+            pub fn exported(x: int) -> int { hidden_helper(x) }
+            exported(41);
+        "#,
+    )
+    .expect("exported program should compile");
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+    let resolved = vm
+        .resolve_exported_callable("exported")
+        .expect("exported callable must resolve");
+    assert!(
+        matches!(resolved, Value::Callable(_)),
+        "resolved exported value is a callable"
+    );
+}
+
+#[test]
+fn direct_script_call_pressure_improves_with_slot_omission() {
+    // The 77-function dispatch fixture: every named function is called
+    // directly, so zero hidden callable slots remain and the aggregate
+    // frame-local count falls to the data-slot pressure.
+    let source = frame_local_dispatch_source();
+    let compiled = compile_source(&source).expect("frame-local dispatch program should compile");
+    assert!(
+        compiled.locals <= 30,
+        "direct-only functions must not consume hidden callable slots, got {}",
+        compiled.locals
+    );
+    let mut vm = Vm::new(compiled.program);
+    let status = vm.run().expect("vm should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(1), Value::Int(32)]);
+}

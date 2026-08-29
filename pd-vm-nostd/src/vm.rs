@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 
 use super::{
     CallableEnvironment, CallableTarget, CallableValue, HostBinding, HostDispatcher, HostFunction,
-    OpCode, Program, Value, VmError, resolve_host_functions,
+    MAX_FRAME_LOCAL_COUNT, OpCode, Program, Value, VmError, resolve_host_functions,
 };
 
 pub type VmResult<T> = Result<T, VmError>;
@@ -46,11 +46,50 @@ pub struct Vm<C = ()> {
     fuel: Option<u64>,
     max_script_call_depth: usize,
     frames: Vec<ExecutionFrame>,
+    frame_allocation_error: Option<(usize, usize)>,
+}
+
+fn find_frame_allocation_error(program: &Program) -> Option<(usize, usize)> {
+    if program.local_count() > MAX_FRAME_LOCAL_COUNT {
+        return Some((program.local_count(), MAX_FRAME_LOCAL_COUNT));
+    }
+    program
+        .callable_prototypes()
+        .iter()
+        .find(|prototype| prototype.frame_local_count > MAX_FRAME_LOCAL_COUNT)
+        .map(|prototype| (prototype.frame_local_count, MAX_FRAME_LOCAL_COUNT))
+}
+
+fn validate_frame_allocation_limits(program: &Program) -> VmResult<()> {
+    if let Some((requested, limit)) = find_frame_allocation_error(program) {
+        return Err(VmError::FrameAllocationLimit { requested, limit });
+    }
+    Ok(())
+}
+
+fn checked_frame_end(local_base: usize, local_count: usize) -> VmResult<usize> {
+    if local_count > MAX_FRAME_LOCAL_COUNT {
+        return Err(VmError::FrameAllocationLimit {
+            requested: local_count,
+            limit: MAX_FRAME_LOCAL_COUNT,
+        });
+    }
+    local_base
+        .checked_add(local_count)
+        .ok_or(VmError::FrameAllocationLimit {
+            requested: local_count,
+            limit: MAX_FRAME_LOCAL_COUNT,
+        })
 }
 
 impl Vm<()> {
     pub fn new(program: Program) -> Self {
         Self::from_parts(program, (), Vec::new(), None)
+    }
+
+    pub fn try_new(program: Program) -> VmResult<Self> {
+        validate_frame_allocation_limits(&program)?;
+        Ok(Self::new(program))
     }
 }
 
@@ -60,6 +99,7 @@ impl<C> Vm<C> {
         context: C,
         bindings: &[HostBinding<C>],
     ) -> VmResult<Self> {
+        validate_frame_allocation_limits(&program)?;
         let host_functions = resolve_host_functions(&program, bindings)?;
         Ok(Self::from_parts(program, context, host_functions, None))
     }
@@ -78,7 +118,12 @@ impl<C> Vm<C> {
         host_functions: Vec<HostFunction<C>>,
         host_dispatcher: Option<HostDispatcher<C>>,
     ) -> Self {
-        let local_count = program.local_count();
+        let frame_allocation_error = find_frame_allocation_error(&program);
+        let local_count = if frame_allocation_error.is_none() {
+            program.local_count()
+        } else {
+            0
+        };
         let mut vm = Self {
             program,
             ip: 0,
@@ -91,6 +136,7 @@ impl<C> Vm<C> {
             fuel: None,
             max_script_call_depth: DEFAULT_MAX_SCRIPT_CALL_DEPTH,
             frames: Vec::new(),
+            frame_allocation_error,
         };
         vm.initialize_root_callables();
         vm
@@ -121,7 +167,10 @@ impl<C> Vm<C> {
     }
 
     fn absolute_local(&self, index: u8) -> VmResult<usize> {
-        let absolute = self.active_local_base().saturating_add(index as usize);
+        let absolute = self
+            .active_local_base()
+            .checked_add(index as usize)
+            .ok_or(VmError::InvalidLocal(index))?;
         (absolute < self.locals.len())
             .then_some(absolute)
             .ok_or(VmError::InvalidLocal(index))
@@ -154,7 +203,9 @@ impl<C> Vm<C> {
                     mode,
                     super::CaptureBindingMode::Borrow | super::CaptureBindingMode::BorrowMut
                 ) {
-                let absolute = active_base.saturating_add(usize::from(*source));
+                let absolute = active_base
+                    .checked_add(usize::from(*source))
+                    .ok_or(VmError::InvalidCallablePrototype(prototype_id))?;
                 if absolute >= self.locals.len() {
                     return Err(VmError::InvalidCallablePrototype(prototype_id));
                 }
@@ -198,6 +249,12 @@ impl<C> Vm<C> {
             .get(callable.prototype_id as usize)
             .cloned()
             .ok_or(VmError::InvalidCallablePrototype(callable.prototype_id))?;
+        if prototype.frame_local_count > MAX_FRAME_LOCAL_COUNT {
+            return Err(VmError::FrameAllocationLimit {
+                requested: prototype.frame_local_count,
+                limit: MAX_FRAME_LOCAL_COUNT,
+            });
+        }
         if prototype.arity != argc || prototype.parameter_slots.len() != operands.len() {
             return Err(VmError::InvalidCallArity {
                 import: String::from("script callable"),
@@ -223,7 +280,14 @@ impl<C> Vm<C> {
                         .frames
                         .last()
                         .map_or(self.locals.len(), |frame| frame.local_count);
-                    self.locals[base..base.saturating_add(count)]
+                    let end = checked_frame_end(base, count)?;
+                    let locals = self
+                        .locals
+                        .get(base..end)
+                        .ok_or(VmError::InvalidFrameState(
+                            "active local frame range is invalid",
+                        ))?;
+                    locals
                         .iter()
                         .enumerate()
                         .filter_map(|(slot, value)| match value {
@@ -233,26 +297,29 @@ impl<C> Vm<C> {
                         .collect::<Vec<_>>()
                 };
                 let local_base = self.locals.len();
-                self.locals.resize(
-                    local_base.saturating_add(prototype.frame_local_count),
-                    Value::Null,
-                );
+                let local_end = checked_frame_end(local_base, prototype.frame_local_count)?;
+                self.locals.resize(local_end, Value::Null);
                 for binding in self.program.root_callable_bindings() {
-                    if let Some(binding_prototype) = self
+                    // Mirror the interpreter's `enter_script_frame`: every
+                    // root binding must fit the callee frame and reference a
+                    // known prototype; a malformed program errors instead of
+                    // silently skipping the slot.
+                    let binding_prototype = self
                         .program
                         .callable_prototypes()
                         .get(binding.prototype_id as usize)
-                    {
-                        let slot = binding.local_slot as usize;
-                        if slot < prototype.frame_local_count {
-                            self.locals[local_base + slot] =
-                                Value::Callable(Rc::new(CallableValue {
-                                    prototype_id: binding.prototype_id,
-                                    kind: binding_prototype.kind,
-                                    env: None,
-                                }));
-                        }
+                        .ok_or(VmError::InvalidCallablePrototype(binding.prototype_id))?;
+                    let slot = binding.local_slot as usize;
+                    if slot >= prototype.frame_local_count {
+                        return Err(VmError::InvalidFrameState(
+                            "root callable binding is outside the script frame",
+                        ));
                     }
+                    self.locals[local_base + slot] = Value::Callable(Rc::new(CallableValue {
+                        prototype_id: binding.prototype_id,
+                        kind: binding_prototype.kind,
+                        env: None,
+                    }));
                 }
                 for (slot, value) in inherited {
                     if slot < prototype.frame_local_count {
@@ -299,6 +366,130 @@ impl<C> Vm<C> {
         }
     }
 
+    /// Execute a static `CallScript(prototype_id, argc)` instruction.
+    ///
+    /// Mirrors [`Self::call_value`] but resolves the callee from the static
+    /// prototype metadata: no runtime callable value exists, so
+    /// capture- or self-requiring prototypes fail with
+    /// [`VmError::CallScriptRequiresEnvironment`] and host-import prototypes
+    /// are never routed to the host path.
+    fn call_script(&mut self, prototype_id: u32, argc: u8) -> VmResult<()> {
+        // Mirror the interpreter contract: the operand underflow check comes
+        // before any prototype-driven rejection so a malformed call with a
+        // short stack reports `StackUnderflow`, not an environment error.
+        let operand_count = argc as usize;
+        if self.stack.len() < operand_count {
+            return Err(VmError::StackUnderflow);
+        }
+        let prototype = self
+            .program
+            .callable_prototypes()
+            .get(prototype_id as usize)
+            .cloned()
+            .ok_or(VmError::InvalidCallablePrototype(prototype_id))?;
+        if prototype.frame_local_count > MAX_FRAME_LOCAL_COUNT {
+            return Err(VmError::FrameAllocationLimit {
+                requested: prototype.frame_local_count,
+                limit: MAX_FRAME_LOCAL_COUNT,
+            });
+        }
+        // A static script call can never supply a callable environment.
+        if !prototype.capture_slots.is_empty() || prototype.self_slot.is_some() {
+            return Err(VmError::CallScriptRequiresEnvironment(prototype_id));
+        }
+        let stack_base = self.stack.len() - operand_count;
+        let operands = self.stack.split_off(stack_base);
+        if prototype.arity != argc || prototype.parameter_slots.len() != operands.len() {
+            return Err(VmError::InvalidCallArity {
+                import: String::from("script call"),
+                expected: prototype.arity,
+                got: argc,
+            });
+        }
+        let CallableTarget::ScriptFunction(function_id) = prototype.target else {
+            // `CallScript` is a static script-function call and must never
+            // route a host-import prototype to the host path.
+            return Err(VmError::InvalidCallablePrototype(prototype_id));
+        };
+        if self.frames.len() >= self.max_script_call_depth {
+            return Err(VmError::CallStackOverflow);
+        }
+        let function = self
+            .program
+            .script_functions()
+            .get(function_id as usize)
+            .cloned()
+            .ok_or(VmError::InvalidCallablePrototype(prototype_id))?;
+        let inherited = {
+            let base = self.active_local_base();
+            let count = self
+                .frames
+                .last()
+                .map_or(self.locals.len(), |frame| frame.local_count);
+            let end = checked_frame_end(base, count)?;
+            let locals = self
+                .locals
+                .get(base..end)
+                .ok_or(VmError::InvalidFrameState(
+                    "active local frame range is invalid",
+                ))?;
+            locals
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, value)| match value {
+                    Value::Callable(_) => Some((slot, value.clone())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let local_base = self.locals.len();
+        let local_end = checked_frame_end(local_base, prototype.frame_local_count)?;
+        self.locals.resize(local_end, Value::Null);
+        for binding in self.program.root_callable_bindings() {
+            // Mirror the interpreter's `enter_script_frame`: every root
+            // binding must fit the callee frame and reference a known
+            // prototype; a malformed program errors instead of silently
+            // skipping the slot.
+            let binding_prototype = self
+                .program
+                .callable_prototypes()
+                .get(binding.prototype_id as usize)
+                .ok_or(VmError::InvalidCallablePrototype(binding.prototype_id))?;
+            let slot = binding.local_slot as usize;
+            if slot >= prototype.frame_local_count {
+                return Err(VmError::InvalidFrameState(
+                    "root callable binding is outside the script frame",
+                ));
+            }
+            self.locals[local_base + slot] = Value::Callable(Rc::new(CallableValue {
+                prototype_id: binding.prototype_id,
+                kind: binding_prototype.kind,
+                env: None,
+            }));
+        }
+        for (slot, value) in inherited {
+            if slot < prototype.frame_local_count {
+                self.locals[local_base + slot] = value;
+            }
+        }
+        for (slot, argument) in prototype.parameter_slots.iter().zip(operands) {
+            let slot = *slot as usize;
+            if slot >= prototype.frame_local_count {
+                return Err(VmError::InvalidCallablePrototype(prototype_id));
+            }
+            self.locals[local_base + slot] = argument;
+        }
+        self.frames.push(ExecutionFrame {
+            return_ip: self.ip,
+            operand_stack_base: stack_base,
+            local_base,
+            local_count: prototype.frame_local_count,
+            prototype_id,
+        });
+        self.ip = function.entry_ip as usize;
+        Ok(())
+    }
+
     fn return_from_frame(&mut self) -> VmResult<bool> {
         let Some(frame) = self.frames.pop() else {
             return Ok(false);
@@ -312,7 +503,7 @@ impl<C> Vm<C> {
             Value::Null
         };
         self.stack.truncate(frame.operand_stack_base);
-        let frame_end = frame.local_base.saturating_add(frame.local_count);
+        let frame_end = checked_frame_end(frame.local_base, frame.local_count)?;
         self.capture_cells
             .retain(|absolute, _| *absolute < frame.local_base || *absolute >= frame_end);
         self.locals.truncate(frame.local_base);
@@ -322,6 +513,9 @@ impl<C> Vm<C> {
     }
 
     pub fn run(&mut self) -> VmResult<VmStatus> {
+        if let Some((requested, limit)) = self.frame_allocation_error {
+            return Err(VmError::FrameAllocationLimit { requested, limit });
+        }
         loop {
             self.charge_fuel()?;
             let raw = self.read_u8()?;
@@ -408,6 +602,11 @@ impl<C> Vm<C> {
                 OpCode::CallValue => {
                     let arity = self.read_u8()?;
                     self.call_value(arity)?;
+                }
+                OpCode::CallScript => {
+                    let prototype_id = self.read_u32()?;
+                    let arity = self.read_u8()?;
+                    self.call_script(prototype_id, arity)?;
                 }
 
                 OpCode::Shl => {
@@ -982,4 +1181,42 @@ fn checked_int_rem(lhs: i64, rhs: i64) -> VmResult<i64> {
         return Err(VmError::IntegerOverflow("remainder"));
     }
     Ok(lhs % rhs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_program_oversized_root_frame_does_not_allocate_or_run() {
+        let program = Program::new(Vec::new(), vec![OpCode::Ret as u8], Vec::new())
+            .with_local_count(1_000_000);
+        assert!(matches!(
+            Vm::try_new(program.clone()),
+            Err(VmError::FrameAllocationLimit {
+                requested: 1_000_000,
+                limit: MAX_FRAME_LOCAL_COUNT,
+            })
+        ));
+        let mut vm = Vm::new(program);
+        assert!(vm.locals.is_empty());
+        assert!(matches!(
+            vm.run(),
+            Err(VmError::FrameAllocationLimit {
+                requested: 1_000_000,
+                limit: MAX_FRAME_LOCAL_COUNT,
+            })
+        ));
+    }
+
+    #[test]
+    fn checked_frame_end_rejects_usize_overflow() {
+        assert!(matches!(
+            checked_frame_end(usize::MAX, 1),
+            Err(VmError::FrameAllocationLimit {
+                requested: 1,
+                limit: MAX_FRAME_LOCAL_COUNT,
+            })
+        ));
+    }
 }

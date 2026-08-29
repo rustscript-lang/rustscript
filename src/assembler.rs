@@ -303,6 +303,11 @@ impl Assembler {
         self.emit_opcode(OpCode::CallValue);
         self.emit_u8(argc);
     }
+    pub fn call_script(&mut self, prototype_id: u32, argc: u8) {
+        self.emit_opcode(OpCode::CallScript);
+        self.emit_u32(prototype_id);
+        self.emit_u8(argc);
+    }
 
     pub fn shl(&mut self) {
         self.emit_opcode(OpCode::Shl);
@@ -449,6 +454,11 @@ impl BytecodeBuilder {
 
     pub fn call_value(&mut self, argc: u8) {
         self.emit_opcode(OpCode::CallValue);
+        self.emit_u8(argc);
+    }
+    pub fn call_script(&mut self, prototype_id: u32, argc: u8) {
+        self.emit_opcode(OpCode::CallScript);
+        self.emit_u32(prototype_id);
         self.emit_u8(argc);
     }
 
@@ -748,6 +758,12 @@ pub fn assemble(source: &str) -> Result<Program, AsmParseError> {
                 let argc = parse_u8(next_token(&mut parts, line_no, "arg count")?, line_no)?;
                 assembler.call_value(argc);
             }
+            OpCode::CallScript => {
+                let prototype_id =
+                    parse_u32(next_token(&mut parts, line_no, "prototype id")?, line_no)?;
+                let argc = parse_u8(next_token(&mut parts, line_no, "arg count")?, line_no)?;
+                assembler.call_script(prototype_id, argc);
+            }
             OpCode::Shl => assembler.shl(),
             OpCode::Shr => assembler.shr(),
             OpCode::Lshr => assembler.lshr(),
@@ -803,6 +819,12 @@ fn parse_u16(token: &str, line_no: usize) -> Result<u16, AsmParseError> {
     token.parse::<u16>().map_err(|_| AsmParseError {
         line: line_no,
         message: format!("invalid u16 '{token}'"),
+    })
+}
+fn parse_u32(token: &str, line_no: usize) -> Result<u32, AsmParseError> {
+    token.parse::<u32>().map_err(|_| AsmParseError {
+        line: line_no,
+        message: format!("invalid u32 '{token}'"),
     })
 }
 

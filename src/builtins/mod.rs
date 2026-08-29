@@ -5,6 +5,8 @@ mod metadata;
 #[cfg(feature = "runtime")]
 pub(crate) mod runtime;
 
+#[cfg(test)]
+pub use self::metadata::CallableType;
 pub use self::metadata::{
     CallableDef, CallableParam, CallableParamType, CallableSignature, HostExecution,
 };

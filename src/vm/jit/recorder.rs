@@ -7,10 +7,13 @@ use crate::vm::{OpCode, Program, Value, ValueType, checked_int_div};
 use super::JitTraceTerminal;
 use super::builtin_spec::{self, InputRepr, OutputKind};
 use super::deopt::materialize_ssa_values;
-use super::inline::{InlineCandidate, InlineRejectReason, classify_static_inline_candidate};
+use super::inline::{
+    InlineCandidate, InlineRejectReason, classify_direct_inline_candidate,
+    classify_static_inline_candidate,
+};
 use super::ir::{
-    SsaBranchTarget, SsaInstKind, SsaMaterialization, SsaTerminator, SsaTrace, SsaTraceBuilder,
-    SsaValue, SsaValueId, SsaValueRepr, VirtualFrameSnapshot,
+    SsaBlockId, SsaBranchTarget, SsaInstKind, SsaMaterialization, SsaTerminator, SsaTrace,
+    SsaTraceBuilder, SsaValue, SsaValueId, SsaValueRepr, VirtualFrameSnapshot,
 };
 
 pub(super) const MAX_PROFITABLE_FRAME_LOCALS: usize = 64;
@@ -212,11 +215,14 @@ impl AnalysisFrame {
         entry_stack_depth: usize,
         local_count: usize,
         entry_local_types: Option<&[ValueType]>,
+        entry_callable_prototypes: Option<&[Option<u32>]>,
     ) -> Self {
         Self {
             stack: vec![ValueInfo::tagged(); entry_stack_depth],
             locals: (0..local_count)
-                .map(|local| entry_local_info(program, local, entry_local_types))
+                .map(|local| {
+                    entry_local_info(program, local, entry_local_types, entry_callable_prototypes)
+                })
                 .collect(),
         }
     }
@@ -250,10 +256,31 @@ fn entry_local_info(
     program: &Program,
     local: usize,
     entry_local_types: Option<&[ValueType]>,
+    entry_callable_prototypes: Option<&[Option<u32>]>,
 ) -> ValueInfo {
     let known_type = entry_local_types
         .and_then(|types| types.get(local))
         .copied()
+        .or_else(|| {
+            // The runtime observed a callable in this slot at trace entry:
+            // mirror `enter_script_frame`'s inheritance of callable-valued
+            // caller locals at the same slot index.
+            entry_callable_prototypes
+                .and_then(|prototypes| prototypes.get(local))
+                .copied()
+                .flatten()
+                .map(|_| ValueType::Callable)
+        })
+        .or_else(|| {
+            // Root callable binding slots always hold environment-free
+            // callables at frame entry: mirror `enter_script_frame`'s fresh
+            // binding re-initialization even for programs without a type map.
+            program
+                .root_callable_bindings
+                .iter()
+                .any(|binding| usize::from(binding.local_slot) == local)
+                .then_some(ValueType::Callable)
+        })
         .or_else(|| {
             program
                 .type_map
@@ -263,6 +290,164 @@ fn entry_local_info(
         })
         .filter(|ty| *ty != ValueType::Unknown);
     known_type.map_or_else(ValueInfo::tagged, ValueInfo::tagged_typed)
+}
+
+/// Build the callee-local SSA state for an inline frame, mirroring the
+/// interpreter's `enter_script_frame` initialization:
+///
+/// 1. every root callable binding slot is freshly bound to an
+///    environment-free callable of the binding's prototype (never copied
+///    from the caller's current slot value);
+/// 2. every remaining callable-valued caller local is inherited at the same
+///    slot index;
+/// 3. a root binding outside the callee frame rejects the trace, matching
+///    the interpreter's `InvalidFrameState` instead of silently skipping.
+///
+/// The second element of the returned pair lists the slots inherited from
+/// the caller frame (step 2), so the caller can record entry guards for
+/// callable-valued inherited locals.
+fn init_inline_callee_locals(
+    builder: &mut SsaTraceBuilder,
+    current_block: SsaBlockId,
+    ip: usize,
+    program: &Program,
+    frame_local_count: usize,
+    frame: &SymbolicFrame,
+) -> Result<(Vec<SymbolicValue>, Vec<usize>), TraceRecordError> {
+    let null = builder
+        .append_value_inst(
+            current_block,
+            ip,
+            SsaValueRepr::Tagged,
+            SsaInstKind::Constant(Value::Null),
+        )
+        .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+    let null = SymbolicValue {
+        value: null,
+        info: ValueInfo::tagged_typed(ValueType::Null),
+    };
+    let mut callee_locals = vec![null; frame_local_count];
+    let mut binding_slots = Vec::with_capacity(program.root_callable_bindings.len());
+    for binding in &program.root_callable_bindings {
+        let slot = usize::from(binding.local_slot);
+        if slot >= callee_locals.len() {
+            return Err(TraceRecordError::UnsupportedTrace(
+                "root callable binding is outside the script frame".to_string(),
+            ));
+        }
+        binding_slots.push(slot);
+        // Validate the prototype at record time; the runtime helper re-derives
+        // the kind from the program on every materialization, so the IR inst
+        // only needs the id.
+        program
+            .callable_prototypes
+            .get(binding.prototype_id as usize)
+            .ok_or(TraceRecordError::UnsupportedTrace(
+                "root callable binding references an unknown prototype".to_string(),
+            ))?;
+        let fresh = builder
+            .append_value_inst(
+                current_block,
+                ip,
+                SsaValueRepr::Tagged,
+                SsaInstKind::MaterializeRootCallable {
+                    prototype_id: binding.prototype_id,
+                },
+            )
+            .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+        callee_locals[slot] = SymbolicValue {
+            value: fresh,
+            info: ValueInfo::tagged_typed(ValueType::Callable),
+        };
+    }
+    let mut inherited_callable_slots = Vec::new();
+    for (slot, local) in frame
+        .locals
+        .iter()
+        .copied()
+        .enumerate()
+        .take(callee_locals.len())
+    {
+        if local.info.known_type == Some(ValueType::Callable) && !binding_slots.contains(&slot) {
+            callee_locals[slot] = local;
+            inherited_callable_slots.push(slot);
+        }
+    }
+    Ok((callee_locals, inherited_callable_slots))
+}
+
+/// Record entry guards for callable-valued caller locals inherited into an
+/// inline callee frame.
+///
+/// The interpreter's `enter_script_frame` copies every callable-valued
+/// caller local into the callee frame at the same slot index, and the
+/// inline simulation mirrors that inheritance. The callee can specialize on
+/// the inherited value's recorded type (for example a folded `typeof`), so
+/// when the callable type comes from the trace-entry observation and the
+/// caller slot was not rewritten on the recorded path, the trace must treat
+/// the observed prototype as an entry contract: cache lookup then rejects
+/// the trace after an interpreter handoff rewrote the slot, and the
+/// loop-header guard check rejects native loops that rewrite it.
+fn record_inherited_callable_guards(
+    entry_callable_guards: &mut Vec<(u8, u32)>,
+    entry_callable_prototypes: Option<&[Option<u32>]>,
+    frame: &SymbolicFrame,
+    inherited_callable_slots: &[usize],
+) {
+    for &slot in inherited_callable_slots {
+        let Some(prototype_id) = entry_callable_prototypes
+            .and_then(|prototypes| prototypes.get(slot))
+            .copied()
+            .flatten()
+        else {
+            continue;
+        };
+        if frame.dirty_locals.get(slot).copied().unwrap_or(false) {
+            // The recorded path wrote the slot before the call site, so the
+            // runtime value is the trace's own write and cannot drift from
+            // the recorded type.
+            continue;
+        }
+        let entry_guard = (slot as u8, prototype_id);
+        if !entry_callable_guards.contains(&entry_guard) {
+            entry_callable_guards.push(entry_guard);
+        }
+    }
+}
+
+/// Type-only twin of [`init_inline_callee_locals`] for the loop-header
+/// analysis pass, which tracks `ValueInfo` without SSA values. Out-of-frame
+/// root bindings are skipped here (the SSA build rejects them); the analysis
+/// must stay conservative so its own checks (for example mutated inline
+/// callable sources) keep firing.
+fn analysis_inline_callee_locals(
+    program: &Program,
+    frame_local_count: usize,
+    frame: &AnalysisFrame,
+) -> Vec<ValueInfo> {
+    let null = ValueInfo::tagged_typed(ValueType::Null);
+    let mut callee_locals = vec![null; frame_local_count];
+    let mut binding_slots = Vec::with_capacity(program.root_callable_bindings.len());
+    for binding in &program.root_callable_bindings {
+        let slot = usize::from(binding.local_slot);
+        if slot >= callee_locals.len() {
+            continue;
+        }
+        binding_slots.push(slot);
+        callee_locals[slot] = ValueInfo::tagged_typed(ValueType::Callable);
+    }
+    for (slot, local) in frame
+        .locals
+        .iter()
+        .copied()
+        .enumerate()
+        .take(callee_locals.len())
+    {
+        if local.known_type == Some(ValueType::Callable) && !binding_slots.contains(&slot) {
+            callee_locals[slot] = local;
+        }
+    }
+    callee_locals
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -287,6 +472,7 @@ fn inline_schema_guard_type(schema: &TypeSchema) -> Option<Option<ValueType>> {
         }
         TypeSchema::Null => Some(Some(ValueType::Null)),
         TypeSchema::Number | TypeSchema::Optional(_) | TypeSchema::Callable { .. } => None,
+        TypeSchema::Resource(_) => None,
     }
 }
 
@@ -553,6 +739,12 @@ enum DecodedOp {
         argc: u8,
         resume_ip: usize,
     },
+    CallScript {
+        ip: usize,
+        prototype_id: u32,
+        argc: u8,
+        resume_ip: usize,
+    },
 }
 
 impl DecodedOp {
@@ -572,7 +764,8 @@ impl DecodedOp {
             | Self::Brfalse { ip, .. }
             | Self::Br { ip, .. }
             | Self::Call { ip, .. }
-            | Self::CallValue { ip, .. } => ip,
+            | Self::CallValue { ip, .. }
+            | Self::CallScript { ip, .. } => ip,
         }
     }
 
@@ -599,7 +792,8 @@ impl DecodedOp {
             | Self::Dup { .. }
             | Self::Br { .. }
             | Self::Call { .. }
-            | Self::CallValue { .. } => false,
+            | Self::CallValue { .. }
+            | Self::CallScript { .. } => false,
             Self::Stloc { .. }
             | Self::Neg { .. }
             | Self::Not { .. }
@@ -898,6 +1092,19 @@ impl<'a> TraceCursor<'a> {
                 argc,
                 resume_ip: self.ip,
             }
+        } else if opcode == OpCode::CallScript as u8 {
+            self.recorded_ops += 1;
+            let prototype_id = read_u32(&self.program.code, &mut self.ip).ok_or(
+                TraceRecordError::InvalidImmediate("callscript prototype id"),
+            )?;
+            let argc = read_u8(&self.program.code, &mut self.ip)
+                .ok_or(TraceRecordError::InvalidImmediate("callscript argc"))?;
+            DecodedOp::CallScript {
+                ip: instr_ip,
+                prototype_id,
+                argc,
+                resume_ip: self.ip,
+            }
         } else {
             return Err(TraceRecordError::UnsupportedOpcode(opcode));
         };
@@ -951,6 +1158,7 @@ pub(crate) fn record_trace_with_local_count(
         entry_stack_depth,
         local_count,
         entry_local_types,
+        entry_callable_prototypes,
         max_trace_len,
         non_yielding_host_imports,
     )?;
@@ -975,7 +1183,12 @@ pub(crate) fn record_trace_with_local_count(
                 .append_param(entry, SsaValueRepr::Tagged, format!("local{local}"))
                 .map(|value| SymbolicValue {
                     value,
-                    info: entry_local_info(program, local, entry_local_types),
+                    info: entry_local_info(
+                        program,
+                        local,
+                        entry_local_types,
+                        entry_callable_prototypes,
+                    ),
                 })
                 .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))
         })
@@ -1563,25 +1776,20 @@ pub(crate) fn record_trace_with_local_count(
                     let mut operands = frame.stack.split_off(operand_base);
                     let _callable = operands.remove(0);
                     let prototype = &program.callable_prototypes[candidate.prototype_id as usize];
-                    let null = builder
-                        .append_value_inst(
-                            current_block,
-                            ip,
-                            SsaValueRepr::Tagged,
-                            SsaInstKind::Constant(Value::Null),
-                        )
-                        .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
-                    let null = SymbolicValue {
-                        value: null,
-                        info: ValueInfo::tagged_typed(ValueType::Null),
-                    };
-                    let mut callee_locals = vec![null; prototype.frame_local_count];
-                    for binding in &program.root_callable_bindings {
-                        let slot = usize::from(binding.local_slot);
-                        if slot < callee_locals.len() && slot < frame.locals.len() {
-                            callee_locals[slot] = frame.locals[slot];
-                        }
-                    }
+                    let (mut callee_locals, inherited_callable_slots) = init_inline_callee_locals(
+                        &mut builder,
+                        current_block,
+                        ip,
+                        program,
+                        prototype.frame_local_count,
+                        &frame,
+                    )?;
+                    record_inherited_callable_guards(
+                        &mut entry_callable_guards,
+                        entry_callable_prototypes,
+                        &frame,
+                        &inherited_callable_slots,
+                    );
                     for (slot, mut argument) in candidate.parameter_slots.iter().zip(operands) {
                         if argument.info.repr == SsaValueRepr::Tagged {
                             let cloned = builder
@@ -1634,6 +1842,140 @@ pub(crate) fn record_trace_with_local_count(
                 has_call = true;
                 has_yielding_call = true;
                 terminal = Some(JitTraceTerminal::CallValue);
+                break;
+            }
+            DecodedOp::CallScript {
+                ip,
+                prototype_id,
+                argc,
+                resume_ip,
+            } => {
+                if frame.stack.len() < usize::from(argc) {
+                    return Err(TraceRecordError::StackUnderflow);
+                }
+                let caller_prototype_id = (caller_frame_key != crate::vm::native::ROOT_FRAME_KEY)
+                    .then_some(caller_frame_key as u32);
+                // The prototype identity is static: no callable local is
+                // loaded and no polymorphic entry guard is required.
+                let candidate = classify_direct_inline_candidate(
+                    program,
+                    caller_frame_key,
+                    caller_prototype_id,
+                    prototype_id,
+                    argc,
+                    max_trace_len.saturating_sub(cursor.recorded_ops),
+                );
+                let inline_reject_reason = candidate.as_ref().err().copied();
+                if inline_frame.is_none()
+                    && let Ok(candidate) = candidate
+                {
+                    let prototype = &program.callable_prototypes[prototype_id as usize];
+                    let argument_start = frame.stack.len() - usize::from(argc);
+                    let schema_guard = append_inline_argument_schema_guards(
+                        &mut builder,
+                        current_block,
+                        ip,
+                        &frame.stack[argument_start..],
+                        prototype.schema.as_ref(),
+                    )?;
+                    if let Some(schema_guard) = schema_guard {
+                        let schema_exit =
+                            add_symbolic_exit(&mut builder, ip, &frame, inline_frame.as_ref());
+                        let (guarded_block, guarded_frame, guard_args) =
+                            continue_with_inline_frame(
+                                &mut builder,
+                                &frame,
+                                &mut inline_frame,
+                                "inline_callable_schema",
+                            )?;
+                        builder
+                            .set_terminator(
+                                current_block,
+                                SsaTerminator::BranchBool {
+                                    condition: schema_guard,
+                                    if_true: SsaBranchTarget::Block {
+                                        target: guarded_block,
+                                        args: guard_args,
+                                    },
+                                    if_false: SsaBranchTarget::Exit(schema_exit),
+                                },
+                            )
+                            .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+                        current_block = guarded_block;
+                        frame = guarded_frame;
+                    }
+
+                    // `CallScript` pushes no callable operand: the arguments
+                    // are exactly the top `argc` stack values.
+                    let operand_base = frame.stack.len() - usize::from(argc);
+                    let operands = frame.stack.split_off(operand_base);
+                    let (mut callee_locals, inherited_callable_slots) = init_inline_callee_locals(
+                        &mut builder,
+                        current_block,
+                        ip,
+                        program,
+                        prototype.frame_local_count,
+                        &frame,
+                    )?;
+                    record_inherited_callable_guards(
+                        &mut entry_callable_guards,
+                        entry_callable_prototypes,
+                        &frame,
+                        &inherited_callable_slots,
+                    );
+                    for (slot, mut argument) in candidate.parameter_slots.iter().zip(operands) {
+                        if argument.info.repr == SsaValueRepr::Tagged {
+                            let cloned = builder
+                                .append_value_inst(
+                                    current_block,
+                                    ip,
+                                    SsaValueRepr::Tagged,
+                                    SsaInstKind::CloneTagged {
+                                        input: argument.value.id,
+                                    },
+                                )
+                                .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+                            argument.value = cloned;
+                        }
+                        callee_locals[usize::from(*slot)] = argument;
+                    }
+                    op_names.push(format!("inline_call:{prototype_id}"));
+                    let caller = std::mem::replace(
+                        &mut frame,
+                        SymbolicFrame::new(Vec::new(), callee_locals),
+                    );
+                    inline_frame = Some(InlineRecorderFrame {
+                        candidate: candidate.clone(),
+                        call_ip: ip,
+                        return_ip: resume_ip,
+                        caller,
+                    });
+                    cursor.jump_to(candidate.entry_ip)?;
+                    has_call = true;
+                    continue;
+                }
+                if let Some(reason) = inline_reject_reason {
+                    op_names.push(format!("inline_reject:{reason:?}"));
+                } else if inline_frame.is_some() {
+                    op_names.push("inline_reject:NestedCallable".to_string());
+                }
+                op_names.push("call_script".to_string());
+                let exit = add_symbolic_exit(&mut builder, ip, &frame, inline_frame.as_ref());
+                builder
+                    .set_terminator(
+                        current_block,
+                        SsaTerminator::CallScript {
+                            prototype_id,
+                            argc,
+                            call_ip: ip,
+                            resume_ip,
+                            exit,
+                        },
+                    )
+                    .map_err(|err| TraceRecordError::InvalidIr(err.to_string()))?;
+                has_call = true;
+                has_yielding_call = true;
+                terminal = Some(JitTraceTerminal::CallScript);
                 break;
             }
             DecodedOp::Call {
@@ -1754,7 +2096,11 @@ pub(crate) fn record_trace_with_local_count(
     }
 
     let terminal = terminal.ok_or(TraceRecordError::MissingTerminal)?;
-    if loop_header_plan.is_some()
+    // A native loop re-iterates the recorded body without a cache lookup, so
+    // a guarded callable source local must stay untouched by the recorded
+    // path. This applies to every `LoopBack` trace, including loop-header
+    // plans the analysis pass declined to build.
+    if matches!(terminal, JitTraceTerminal::LoopBack)
         && entry_callable_guards.iter().any(|(local, _)| {
             let local = usize::from(*local);
             frame.dirty_locals.get(local).copied().unwrap_or(false)
@@ -1791,11 +2137,18 @@ fn infer_loop_header_plan(
     entry_stack_depth: usize,
     local_count: usize,
     entry_local_types: Option<&[ValueType]>,
+    entry_callable_prototypes: Option<&[Option<u32>]>,
     max_trace_len: usize,
     non_yielding_host_imports: &[bool],
 ) -> Result<Option<LoopHeaderPlan>, TraceRecordError> {
     let mut cursor = TraceCursor::new(program, root_ip, max_trace_len);
-    let mut frame = AnalysisFrame::new(program, entry_stack_depth, local_count, entry_local_types);
+    let mut frame = AnalysisFrame::new(
+        program,
+        entry_stack_depth,
+        local_count,
+        entry_local_types,
+        entry_callable_prototypes,
+    );
     let mut entry_use = vec![EntryUseState::Untouched; local_count];
     let mut local_written = vec![false; local_count];
     let mut inline_frame: Option<(AnalysisFrame, usize)> = None;
@@ -2011,14 +2364,47 @@ fn infer_loop_header_plan(
                 let operand_base = frame.stack.len() - usize::from(argc) - 1;
                 let mut operands = frame.stack.split_off(operand_base);
                 let _callable = operands.remove(0);
-                let null = ValueInfo::tagged_typed(ValueType::Null);
-                let mut callee_locals = vec![null; prototype.frame_local_count];
-                for binding in &program.root_callable_bindings {
-                    let slot = usize::from(binding.local_slot);
-                    if slot < callee_locals.len() && slot < frame.locals.len() {
-                        callee_locals[slot] = frame.locals[slot];
-                    }
+                let mut callee_locals =
+                    analysis_inline_callee_locals(program, prototype.frame_local_count, &frame);
+                for (slot, argument) in candidate.parameter_slots.iter().zip(operands) {
+                    callee_locals[usize::from(*slot)] = argument;
                 }
+                let caller = std::mem::replace(
+                    &mut frame,
+                    AnalysisFrame {
+                        stack: Vec::new(),
+                        locals: callee_locals,
+                    },
+                );
+                inline_frame = Some((caller, resume_ip));
+                cursor.jump_to(candidate.entry_ip)?;
+            }
+            DecodedOp::CallScript {
+                prototype_id,
+                argc,
+                resume_ip,
+                ..
+            } => {
+                if inline_frame.is_some() || frame.stack.len() < usize::from(argc) {
+                    return Ok(None);
+                }
+                let caller_prototype_id = (caller_frame_key != crate::vm::native::ROOT_FRAME_KEY)
+                    .then_some(caller_frame_key as u32);
+                let Ok(candidate) = classify_direct_inline_candidate(
+                    program,
+                    caller_frame_key,
+                    caller_prototype_id,
+                    prototype_id,
+                    argc,
+                    max_trace_len.saturating_sub(cursor.recorded_ops),
+                ) else {
+                    return Ok(None);
+                };
+                let prototype = &program.callable_prototypes[prototype_id as usize];
+                let operand_base = frame.stack.len() - usize::from(argc);
+                let operands = frame.stack.split_off(operand_base);
+                let mut callee_locals =
+                    analysis_inline_callee_locals(program, prototype.frame_local_count, &frame);
                 for (slot, argument) in candidate.parameter_slots.iter().zip(operands) {
                     callee_locals[usize::from(*slot)] = argument;
                 }
@@ -5036,7 +5422,11 @@ mod tests {
                         kind: CallableKind::FunctionItem,
                         target: CallableTarget::ScriptFunction(0),
                         arity: 0,
-                        frame_local_count: 1,
+                        // The callee frame must span both root binding slots
+                        // (0 and 1); a smaller frame would be rejected by the
+                        // interpreter's `enter_script_frame` before the
+                        // mutation check this test exercises.
+                        frame_local_count: 2,
                         parameter_slots: Vec::new(),
                         capture_source_slots: Vec::new(),
                         capture_slots: Vec::new(),
@@ -5273,5 +5663,110 @@ mod tests {
                 .iter()
                 .all(|block| !matches!(block.terminator, Some(SsaTerminator::CallValue { .. })))
         );
+    }
+
+    #[test]
+    fn rejects_inline_callee_with_root_binding_outside_frame() {
+        // Root: i = 0; loop: i = i + 1; callscript 1 0; i < 2; brfalse end;
+        // br loop; end: ldc 0; ret. Prototype 1 (the inlinable callee) has a
+        // frame_local_count of 2 while the root binding for prototype 0
+        // lives at slot 3: the interpreter's `enter_script_frame` raises
+        // `InvalidFrameState`, so the recorder must reject the trace instead
+        // of silently skipping the out-of-frame binding.
+        let mut bc = BytecodeBuilder::new();
+        bc.ldc(0);
+        bc.stloc(0);
+        let root_ip = bc.position();
+        bc.ldloc(0);
+        bc.ldc(1);
+        bc.add();
+        bc.stloc(0);
+        bc.call_script(1, 0);
+        bc.ldloc(0);
+        bc.ldc(2);
+        bc.clt();
+        let branch_ip = bc.position();
+        bc.brfalse(0);
+        let end_label = bc.position();
+        bc.ldc(0);
+        bc.ret();
+        let br_ip = bc.position();
+        bc.br(0);
+        let mut code = bc.finish();
+        patch_branch_target(&mut code, branch_ip, end_label);
+        patch_branch_target(&mut code, br_ip, root_ip);
+        let callee_entry = code.len() as u32;
+        code.extend_from_slice(&[OpCode::Ldc as u8, 0, 0, 0, 0, OpCode::Ret as u8]);
+        let callee_end = code.len() as u32;
+
+        let program = Program::new(vec![Value::Int(0), Value::Int(1), Value::Int(2)], code)
+            .with_local_count(4)
+            .with_callable_metadata(
+                vec![
+                    ScriptFunction {
+                        entry_ip: callee_entry,
+                        end_ip: callee_end,
+                    },
+                    ScriptFunction {
+                        entry_ip: callee_entry,
+                        end_ip: callee_end,
+                    },
+                ],
+                vec![
+                    CallablePrototype {
+                        kind: CallableKind::FunctionItem,
+                        target: CallableTarget::ScriptFunction(0),
+                        arity: 0,
+                        frame_local_count: 1,
+                        parameter_slots: Vec::new(),
+                        capture_source_slots: Vec::new(),
+                        capture_slots: Vec::new(),
+                        capture_modes: Vec::new(),
+                        self_slot: None,
+                        schema: None,
+                    },
+                    CallablePrototype {
+                        kind: CallableKind::FunctionItem,
+                        target: CallableTarget::ScriptFunction(1),
+                        arity: 0,
+                        frame_local_count: 2,
+                        parameter_slots: Vec::new(),
+                        capture_source_slots: Vec::new(),
+                        capture_slots: Vec::new(),
+                        capture_modes: Vec::new(),
+                        self_slot: None,
+                        schema: None,
+                    },
+                ],
+                vec![
+                    FunctionRegion {
+                        start_ip: 0,
+                        end_ip: callee_entry,
+                        prototype_id: None,
+                    },
+                    FunctionRegion {
+                        start_ip: callee_entry,
+                        end_ip: callee_end,
+                        prototype_id: Some(0),
+                    },
+                    FunctionRegion {
+                        start_ip: callee_entry,
+                        end_ip: callee_end,
+                        prototype_id: Some(1),
+                    },
+                ],
+                vec![RootCallableBinding {
+                    local_slot: 3,
+                    prototype_id: 0,
+                }],
+            );
+
+        let error = record_trace(&program, root_ip as usize, 0, 64, &[])
+            .expect_err("out-of-frame root binding must reject the trace, not silently skip");
+        assert!(matches!(
+            error,
+            TraceRecordError::UnsupportedTrace(detail)
+                if detail == "root callable binding is outside the script frame"
+        ));
     }
 }

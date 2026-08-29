@@ -452,11 +452,67 @@ pub(super) fn use_path_to_spec(
     Ok(spec)
 }
 
+/// Convert a joined `use` path spelling into a normalized module specifier,
+/// applying the *same* leading self/super-qualifier and extension rules as
+/// [`use_path_to_spec`].
+///
+/// The parser records a module namespace alias's path as the joined literal
+/// spelling (`self::nested`, `super::shared`, `a::util`) in
+/// [`ModuleNamespaceAlias::module_path`]. The semantic model re-resolves that
+/// spelling to the imported module's source identity, so it must translate
+/// leading qualifiers exactly like the loader's [`use_path_to_spec`]: a
+/// leading `self` is a no-op (the module is relative to the current file),
+/// each leading `super` becomes a `..` climb, and any later `self`/`super` is
+/// a literal file segment. Sharing one routine keeps the loader and the
+/// language-service resolver from drifting on these edge spellings.
+///
+/// Unlike [`use_path_to_spec`] this helper accepts the already-joined string,
+/// so callers that only retained the spelling (rather than the structured
+/// segments) get identical results without re-splitting logic.
+pub fn use_path_string_to_spec(module_path: &str) -> String {
+    let segments = module_path.split("::");
+    let mut prefix = std::path::PathBuf::new();
+    let mut iter = segments.clone();
+    let mut explicit_self = false;
+    // Leading qualifier words (`self`, `super`) translate like the structured
+    // path; the first regular identifier ends the qualifier run.
+    for segment in iter.by_ref() {
+        match segment {
+            "self" => explicit_self = true,
+            "super" => prefix.push(".."),
+            _ => {
+                prefix.push(segment);
+                break;
+            }
+        }
+    }
+    // Remaining segments are literal file path components (identity words
+    // included), mirroring `use_path_to_spec`'s mid-path handling.
+    for segment in iter {
+        prefix.push(segment);
+    }
+    let mut spec = prefix.to_string_lossy().replace('\\', "/");
+    if spec.is_empty() {
+        // `self::` alone or an empty path has no module name; use_path_to_spec
+        // would reject it. Keep parity by yielding `./` so the caller's
+        // normalization still produces a deterministic (non-panicking) result;
+        // real parser-produced aliases always carry a final module segment.
+        spec = "./".to_string();
+    }
+    if explicit_self && !spec.starts_with("../") {
+        spec = format!("./{spec}");
+    }
+    if !spec.ends_with(".rss") {
+        spec.push_str(".rss");
+    }
+    spec
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ImportTargetKind, ImportedBinding, ModuleGraph, ModuleId, ResolvedImport, SourceId,
-        SymbolId, UsePathSegment, use_path_to_spec,
+        SymbolId, UsePathSegment, use_path_string_to_spec, use_path_to_spec,
     };
     use crate::compiler::source_loader::ImportClause;
     use crate::compiler::source_map::Span;
@@ -503,6 +559,51 @@ mod tests {
         )
         .expect("spec should resolve");
         assert_eq!(spec, "./x.rss");
+    }
+
+    #[test]
+    fn use_path_string_to_spec_matches_structured_resolution() {
+        // The joined spelling (as recorded by the parser for a module
+        // namespace alias) must resolve to the exact same spec as the
+        // structured `use_path_to_spec` for the equivalent segment list.
+        let path = PathBuf::from("/root/pkg/main.rss");
+        let cases = [
+            (vec![UsePathSegment::Self_, ident("nested")], "self::nested"),
+            (
+                vec![UsePathSegment::Super, ident("shared")],
+                "super::shared",
+            ),
+            (
+                vec![UsePathSegment::Ident("a".into()), ident("util")],
+                "a::util",
+            ),
+            (
+                vec![
+                    UsePathSegment::Self_,
+                    UsePathSegment::Super,
+                    ident("nested"),
+                ],
+                "self::super::nested",
+            ),
+            (
+                vec![UsePathSegment::Self_, UsePathSegment::Self_, ident("x")],
+                "self::self::x",
+            ),
+            // A mid-path `super`/`self` word is a literal file segment, not a
+            // qualifier; both resolve `a/self/b.rss`.
+            (
+                vec![ident("a"), UsePathSegment::Self_, ident("b")],
+                "a::self::b",
+            ),
+        ];
+        for (segments, spelling) in cases {
+            let structured = use_path_to_spec(&path, 1, &segments).expect("structured spec");
+            let from_spelling = use_path_string_to_spec(spelling);
+            assert_eq!(
+                from_spelling, structured,
+                "spelling '{spelling}' must match structured {structured}"
+            );
+        }
     }
 
     #[test]

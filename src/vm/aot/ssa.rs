@@ -420,6 +420,14 @@ pub(crate) enum AotSsaTerminator {
         stack: Vec<AotSsaMaterialization>,
         locals: Vec<AotSsaMaterialization>,
     },
+    CallScript {
+        prototype_id: u32,
+        argc: u8,
+        call_ip: usize,
+        resume_ip: usize,
+        stack: Vec<AotSsaMaterialization>,
+        locals: Vec<AotSsaMaterialization>,
+    },
     InterpreterBoundary {
         ip: usize,
         stack: Vec<AotSsaMaterialization>,
@@ -744,6 +752,7 @@ fn verify_terminator(
         }
         AotSsaTerminator::CallBoundary { stack, locals, .. }
         | AotSsaTerminator::CallValue { stack, locals, .. }
+        | AotSsaTerminator::CallScript { stack, locals, .. }
         | AotSsaTerminator::InterpreterBoundary { stack, locals, .. }
         | AotSsaTerminator::Return { stack, locals, .. } => {
             for materialization in stack.iter().chain(locals.iter()) {
@@ -846,6 +855,14 @@ enum ProcessResult {
         resume_frame: Frame,
     },
     CallValue {
+        argc: u8,
+        call_ip: usize,
+        resume_ip: usize,
+        frame: Frame,
+        resume_frame: Frame,
+    },
+    CallScript {
+        prototype_id: u32,
         argc: u8,
         call_ip: usize,
         resume_ip: usize,
@@ -960,6 +977,9 @@ impl<'a> Builder<'a> {
                 }
             }
             if let AotBlockTerminal::CallValue {
+                call_ip, resume_ip, ..
+            }
+            | AotBlockTerminal::CallScript {
                 call_ip, resume_ip, ..
             } = block.terminal
             {
@@ -1114,6 +1134,21 @@ impl<'a> Builder<'a> {
                     stack: materialize_values(&frame.stack),
                     locals: materialize_values(&frame.locals),
                 },
+                ProcessResult::CallScript {
+                    prototype_id,
+                    argc,
+                    call_ip,
+                    resume_ip,
+                    frame,
+                    resume_frame: _,
+                } => AotSsaTerminator::CallScript {
+                    prototype_id,
+                    argc,
+                    call_ip,
+                    resume_ip,
+                    stack: materialize_values(&frame.stack),
+                    locals: materialize_values(&frame.locals),
+                },
                 ProcessResult::InterpreterBoundary { ip, frame } => {
                     AotSsaTerminator::InterpreterBoundary {
                         ip,
@@ -1209,6 +1244,13 @@ impl<'a> Builder<'a> {
                     self.merge_shape(call.resume_ip, resume_frame.shape(), &mut queue)?;
                 }
                 ProcessResult::CallValue {
+                    resume_ip,
+                    resume_frame,
+                    ..
+                } => {
+                    self.merge_shape(resume_ip, resume_frame.shape(), &mut queue)?;
+                }
+                ProcessResult::CallScript {
                     resume_ip,
                     resume_frame,
                     ..
@@ -1507,6 +1549,31 @@ impl<'a> Builder<'a> {
                     resume_frame,
                 })
             }
+            AotBlockTerminal::CallScript {
+                prototype_id,
+                argc,
+                call_ip,
+                resume_ip,
+            } => {
+                // `CallScript` pushes no callable operand: the arguments are
+                // exactly the top `argc` stack values.
+                let mut resume_frame = frame.clone();
+                for _ in 0..usize::from(*argc) {
+                    resume_frame.pop(*call_ip, "callscript")?;
+                }
+                let return_repr = value_type_repr(operand_types_at(self.program, *call_ip).1);
+                resume_frame.stack.push(FrameValue {
+                    value: AotSsaValue::new(AotSsaValueId::new(0), return_repr),
+                });
+                Ok(ProcessResult::CallScript {
+                    prototype_id: *prototype_id,
+                    argc: *argc,
+                    call_ip: *call_ip,
+                    resume_ip: *resume_ip,
+                    frame: frame.clone(),
+                    resume_frame,
+                })
+            }
             AotBlockTerminal::Return => Ok(ProcessResult::Return {
                 ip: block
                     .terminal_ip
@@ -1564,7 +1631,8 @@ fn terminal_ip(block: &super::ir::AotIrBlock) -> Option<usize> {
             block.end_ip.checked_sub(5)
         }
         AotBlockTerminal::Fallthrough { .. } | AotBlockTerminal::Stop => None,
-        AotBlockTerminal::CallValue { call_ip, .. } => Some(call_ip),
+        AotBlockTerminal::CallValue { call_ip, .. }
+        | AotBlockTerminal::CallScript { call_ip, .. } => Some(call_ip),
         AotBlockTerminal::InterpreterExit { exit_ip } => Some(exit_ip),
     }
 }

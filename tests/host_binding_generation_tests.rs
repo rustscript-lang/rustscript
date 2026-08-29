@@ -3,7 +3,8 @@
 mod build_script;
 
 use build_script::{
-    HostBindingKind, HostExecutionKind, classify_host_binding, infer_host_execution,
+    HostBindingKind, HostExecutionKind, callable_param_expr, classify_host_binding,
+    infer_host_execution,
 };
 use syn::parse_quote;
 use vm::{
@@ -38,6 +39,29 @@ fn build_scanner_uses_the_shared_host_type_parser() {
     assert_eq!(
         pd_host_schema::type_label(&parse_quote!(VmResult<Option<String>>)).unwrap(),
         "string | null"
+    );
+}
+
+#[test]
+fn preserves_typed_callable_host_parameter_schema() {
+    let ty: syn::Type = parse_quote!(VmCallable<fn(VmMap) -> VmMap>);
+    assert_eq!(
+        pd_host_schema::type_label(&ty).expect("callable type should parse"),
+        "fn(map) -> map"
+    );
+    assert_eq!(
+        callable_param_expr("fn(map) -> map"),
+        "CallableParamType::Callable(CallableType { params: &[CallableParamType::Map], return_type: &CallableParamType::Map })"
+    );
+
+    let float_ty: syn::Type = parse_quote!(VmCallable<fn(f64) -> f64>);
+    assert_eq!(
+        pd_host_schema::type_label(&float_ty).expect("callable type should parse"),
+        "fn(float) -> float"
+    );
+    assert_eq!(
+        callable_param_expr("fn(float) -> float"),
+        "CallableParamType::Callable(CallableType { params: &[CallableParamType::Float], return_type: &CallableParamType::Float })"
     );
 }
 

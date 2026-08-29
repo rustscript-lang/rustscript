@@ -7,6 +7,7 @@ use super::super::TypingMode;
 use super::super::ir::{
     ClosureExpr, Expr, FunctionDecl, FunctionImpl, LocalSlot, Stmt, StructDecl, TypeSchema,
 };
+use super::super::source_map::Span;
 use super::helpers::{
     bind_expr_result_to_slot, bound_type_label, display_name_for_builtin,
     function_body_contains_param_add, infer_binary_type, infer_unary_type, is_numeric_bound_type,
@@ -21,6 +22,80 @@ use super::validate::{
     DiagnosticSite, validate_function_argument_schemas, validate_host_signature,
     validate_json_encode_argument, validate_signature_overloads,
 };
+
+/// Maximum number of times the same named declaration may be re-entered
+/// on the active expansion path before `resolve_schema` stops expanding
+/// it and emits a cycle marker instead.
+///
+/// The seen-set terminates exact cycle re-entries (a key that repeats on
+/// the active path), and trip collapse terminates named wrapping
+/// (`Node<Node<T>>` re-enters the same collapsed identity). Neither helps
+/// when a recursion re-enters the *same declaration* while wrapping its
+/// type argument in a container at every re-entry
+/// (`Node<T>{ child: Node<[T]> }` resolves to `Node<int>`, `Node<[int]>`,
+/// `Node<[[int]]>`, ...): every key is structurally fresh, so the walk
+/// would grow without bound. This budget is the hard bound for exactly
+/// that case: it counts repeated re-entries of the *same declaration
+/// identity* on the active path, so a deep non-recursive chain of
+/// distinct structs never consumes it and expands in full, while a
+/// recursive family is stopped at the budget. Hitting the budget emits
+/// the node - with its fully resolved arguments - as a cycle marker
+/// exactly like a seen-trip, so caller cycle keys stay consistent.
+///
+/// A marker usually carries concrete arguments, but it may retain raw
+/// generic parameters when an argument could not be concretized (an
+/// unbound parameter, or a self-referential binding the
+/// `schema_mentions_generic_param` guard refuses to expand). Re-resolving
+/// such a marker terminates: the retained parameter fails to resolve
+/// (the guard leaves it unresolved), so the marker re-renders itself
+/// instead of restarting the growth - the failed resolution closes the
+/// expansion rather than reopening it.
+///
+/// 32 re-entries of one declaration is far beyond any practical JSON
+/// payload depth (each level is one more container wrap of the type
+/// argument), and the walk cost grows quadratically with the budget
+/// (every level re-resolves its own increasingly wrapped arguments), so
+/// the bound also keeps the compile-time walk fast and shallow enough
+/// for the constrained-stack regression probes.
+const MAX_NAMED_SCHEMA_REENTRY: usize = 32;
+
+/// True when `schema` mentions the generic parameter `name` anywhere.
+/// Used to break self-referential bindings (`T` bound to `[T]`): such a
+/// binding can only arise from an unbound parameter root, and expanding
+/// it would loop through containers forever without ever re-entering a
+/// named declaration (so the named re-entry budget would never trip), so
+/// the parameter is left unresolved instead - the honest marker for a
+/// circular binding.
+fn schema_mentions_generic_param(schema: &TypeSchema, name: &str) -> bool {
+    match schema {
+        TypeSchema::GenericParam(other) => other == name,
+        TypeSchema::Named(_, type_args) => type_args
+            .iter()
+            .any(|arg| schema_mentions_generic_param(arg, name)),
+        TypeSchema::Array(element) => schema_mentions_generic_param(element, name),
+        TypeSchema::ArrayTuple(items) => items
+            .iter()
+            .any(|item| schema_mentions_generic_param(item, name)),
+        TypeSchema::ArrayTupleRest { prefix, rest } => {
+            prefix
+                .iter()
+                .any(|item| schema_mentions_generic_param(item, name))
+                || schema_mentions_generic_param(rest, name)
+        }
+        TypeSchema::Map(value) => schema_mentions_generic_param(value, name),
+        TypeSchema::Optional(inner) => schema_mentions_generic_param(inner, name),
+        TypeSchema::Object(fields) => fields
+            .values()
+            .any(|value| schema_mentions_generic_param(value, name)),
+        TypeSchema::Callable { params, result } => {
+            params
+                .iter()
+                .any(|param| schema_mentions_generic_param(param, name))
+                || schema_mentions_generic_param(result, name)
+        }
+        _ => false,
+    }
+}
 
 pub(super) struct TypeContext<'a> {
     pub(super) function_impls: &'a HashMap<u16, FunctionImpl>,
@@ -43,6 +118,10 @@ pub(super) struct TypeContext<'a> {
     observed_optional_returns: HashMap<u16, bool>,
     active_observed_returns: Vec<(u16, Vec<String>)>,
     active_optional_returns: Vec<u16>,
+    /// Parser provenance used to resolve exact source spans for typed
+    /// diagnostics. `None` for hand-built test IRs and plugin frontends that
+    /// carry no parser index.
+    parsed: Option<&'a crate::compiler::ir::ParsedSemanticIndex>,
 }
 
 struct CallableBody<'a> {
@@ -54,6 +133,7 @@ struct CallableBody<'a> {
 }
 
 impl<'a> TypeContext<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         function_impls: &'a HashMap<u16, FunctionImpl>,
         function_decls: &'a HashMap<u16, FunctionDecl>,
@@ -62,6 +142,7 @@ impl<'a> TypeContext<'a> {
         host_import_return_types: &'a HashMap<u16, BoundType>,
         host_import_signatures: &'a HashMap<u16, HostCallableSignature>,
         typing_mode: TypingMode,
+        parsed: Option<&'a crate::compiler::ir::ParsedSemanticIndex>,
     ) -> Self {
         Self {
             function_impls,
@@ -84,11 +165,70 @@ impl<'a> TypeContext<'a> {
             observed_optional_returns: HashMap::new(),
             active_observed_returns: Vec::new(),
             active_optional_returns: Vec::new(),
+            parsed,
         }
     }
 
     pub(super) fn is_strict(&self) -> bool {
         self.typing_mode.is_strict()
+    }
+
+    /// Exact parser-origin span for a semantic node id: the call-site
+    /// expression span for calls/optional accesses, or the identifier token
+    /// span for declarations/references. `None` when the id is unknown to the
+    /// parser provenance (synthetic/test nodes).
+    pub(super) fn node_span(&self, id: crate::compiler::ir::SemanticNodeId) -> Option<Span> {
+        let parsed = self.parsed?;
+        for site in &parsed.call_sites {
+            if site.id == id {
+                return Some(site.expr_span);
+            }
+        }
+        for decl in &parsed.local_decls {
+            if decl.id == id {
+                return Some(decl.ident_span);
+            }
+        }
+        for reference in &parsed.local_refs {
+            if reference.id == id {
+                return Some(reference.ident_span);
+            }
+        }
+        for decl in &parsed.func_decls {
+            if decl.id == id {
+                return Some(decl.ident_span);
+            }
+        }
+        for reference in &parsed.func_refs {
+            if reference.id == id {
+                return Some(reference.ident_span);
+            }
+        }
+        None
+    }
+
+    /// The exact parser-origin span of the outermost statement whose first
+    /// token is on `line`, if the parser recorded one. Multiple statements on
+    /// one line each record their own independent span; when nested
+    /// statements share a line, the widest (outermost) span wins because the
+    /// diagnostic targets the statement construct being validated, not an
+    /// inner sub-statement. The parser's spans are never line-wide guesses.
+    pub(super) fn stmt_span(&self, line: u32) -> Option<Span> {
+        self.parsed?
+            .stmt_spans
+            .iter()
+            .filter(|site| site.line == line)
+            .max_by_key(|site| site.span.hi - site.span.lo)
+            .map(|site| site.span)
+    }
+
+    /// The exact parser-origin identifier span of a function declaration.
+    pub(super) fn function_decl_span(&self, function_index: u16) -> Option<Span> {
+        self.parsed?
+            .func_decls
+            .iter()
+            .find(|decl| decl.function_index == function_index)
+            .map(|decl| decl.ident_span)
     }
 
     pub(super) fn function_name(&self, index: u16) -> &str {
@@ -159,78 +299,243 @@ impl<'a> TypeContext<'a> {
         schema: &TypeSchema,
         seen: &mut HashSet<String>,
     ) -> TypeSchema {
+        self.resolve_schema_with_seen_tripped(schema, seen, &mut HashMap::new())
+            .0
+    }
+
+    /// Resolves `schema` against `seen`, also reporting the innermost cycle
+    /// key the resolution re-entered. `Some(key)` means the resolution
+    /// terminated on a cycle, so the result is a cycle marker for an
+    /// active ancestor; `None` means it completed without re-entering one.
+    ///
+    /// The trip key lets callers build cycle keys from the *identity* of a
+    /// resolved argument instead of its structural render. A recursive
+    /// generic whose type arguments wrap the recursion in a named type
+    /// (`Node<Node<T>>`) re-enters with one more nesting at every level,
+    /// so a structural key (`Node<int>`, `Node<Node<int>>`,
+    /// `Node<Node<Node<int>>>`, ...) never repeats and the walk never
+    /// terminates. Collapsing a wrapped chain to the trip key of its
+    /// innermost re-entry keeps the key stable across every wrap depth
+    /// while still distinguishing chains rooted at different ancestors.
+    /// Containers (`Array`/`Map`/`Object`/tuples/`Optional`/`Callable`)
+    /// propagate their children's innermost trip, so a resolved argument
+    /// that *contains* a cycle marker collapses to the same identity
+    /// instead of re-rendering the marker one nesting deeper per re-entry.
+    ///
+    /// `reentries` is the named re-entry budget
+    /// (`MAX_NAMED_SCHEMA_REENTRY`): it counts how many times each
+    /// declaration identity is already being expanded on the active path.
+    /// When a recursion wraps its type argument in a *container* at every
+    /// re-entry (`Node<T>{ child: Node<[T]> }`), even the collapsed keys
+    /// stay structurally fresh (`Node<[int]>`, `Node<[[int]]>`, ...), so
+    /// neither the seen-set nor trip collapse can terminate the walk. The
+    /// budget is the hard bound for that recursive family: at the limit
+    /// the node is emitted - with its fully resolved arguments - as a
+    /// cycle marker, exactly like a seen-trip. Declarations with distinct
+    /// identities never accumulate a count, so deep non-recursive chains
+    /// expand in full.
+    fn resolve_schema_with_seen_tripped(
+        &mut self,
+        schema: &TypeSchema,
+        seen: &mut HashSet<String>,
+        reentries: &mut HashMap<String, usize>,
+    ) -> (TypeSchema, Option<String>) {
         match schema {
             TypeSchema::GenericParam(name) => {
                 let bound = self.resolve_generic_binding(name).cloned();
-                bound.map_or_else(
-                    || schema.clone(),
-                    |bound| {
-                        if bound == *schema {
-                            schema.clone()
-                        } else {
-                            self.resolve_schema_with_seen(&bound, seen)
-                        }
-                    },
-                )
+                match bound {
+                    Some(bound)
+                        if bound != *schema && !schema_mentions_generic_param(&bound, name) =>
+                    {
+                        self.resolve_schema_with_seen_tripped(&bound, seen, reentries)
+                    }
+                    _ => (schema.clone(), None),
+                }
             }
             TypeSchema::Named(name, type_args) => {
-                let substituted_args = type_args
-                    .iter()
-                    .map(|arg| self.resolve_schema_with_seen(arg, seen))
-                    .collect::<Vec<_>>();
+                let mut resolved_args = Vec::with_capacity(type_args.len());
+                let mut arg_trips = Vec::with_capacity(type_args.len());
+                for arg in type_args {
+                    let (resolved, trip) =
+                        self.resolve_schema_with_seen_tripped(arg, seen, reentries);
+                    resolved_args.push(resolved);
+                    arg_trips.push(trip);
+                }
+                let reentry_count = reentries.get(name.as_str()).copied().unwrap_or(0);
+                if reentry_count >= MAX_NAMED_SCHEMA_REENTRY {
+                    // Container-wrapped recursion has no repeating key to
+                    // trip on; the same declaration has re-entered the
+                    // active path past the budget, so stop expanding and
+                    // emit the node with its fully resolved arguments as a
+                    // cycle marker. Concrete arguments matter: a marker
+                    // with raw generic parameters would push a
+                    // self-referential binding when re-resolved (`T` bound
+                    // to `[T]`). Raw parameters can still appear when an
+                    // argument itself failed to concretize (unbound or
+                    // self-referential binding); re-resolving such a
+                    // marker terminates because the retained parameter
+                    // fails to resolve, closing the expansion instead of
+                    // restarting its growth.
+                    let key = schema_instance_key(name, &resolved_args, &arg_trips);
+                    return (TypeSchema::Named(name.clone(), resolved_args), Some(key));
+                }
                 let Some(decl) = self.struct_schemas.get(name) else {
-                    return TypeSchema::Named(name.clone(), substituted_args);
+                    return (TypeSchema::Named(name.clone(), resolved_args), None);
                 };
-                if decl.type_params.len() != substituted_args.len() {
-                    return TypeSchema::Named(name.clone(), substituted_args);
+                if decl.type_params.len() != resolved_args.len() {
+                    return (TypeSchema::Named(name.clone(), resolved_args), None);
                 }
-                let key =
-                    render_schema_label(&TypeSchema::Named(name.clone(), substituted_args.clone()));
+                let key = schema_instance_key(name, &resolved_args, &arg_trips);
                 if !seen.insert(key.clone()) {
-                    return TypeSchema::Named(name.clone(), substituted_args);
+                    // Re-entered an active cycle. Report the innermost
+                    // re-entry of the resolved arguments (this node's own
+                    // key when the arguments resolved without a trip) so a
+                    // wrapped chain collapses to one stable identity.
+                    let trip = arg_trips.into_iter().flatten().next().unwrap_or(key);
+                    return (TypeSchema::Named(name.clone(), resolved_args), Some(trip));
                 }
-                self.push_generic_bindings(&decl.type_params, &substituted_args);
-                let resolved = self.resolve_schema_with_seen(&decl.body_schema, seen);
+                reentries.insert(name.clone(), reentry_count + 1);
+                self.push_generic_bindings(&decl.type_params, &resolved_args);
+                let (resolved, body_trip) =
+                    self.resolve_schema_with_seen_tripped(&decl.body_schema, seen, reentries);
                 self.pop_generic_bindings();
                 seen.remove(&key);
-                resolved
+                if reentry_count == 0 {
+                    reentries.remove(name);
+                } else {
+                    reentries.insert(name.clone(), reentry_count);
+                }
+                // The node's own key was fresh, but its body re-entered a
+                // cycle: the resolved form embeds that cycle marker, so the
+                // node's identity collapses to the body's innermost trip
+                // instead of re-rendering the marker one nesting deeper.
+                (resolved, body_trip)
             }
             TypeSchema::Array(element) => {
-                TypeSchema::Array(Box::new(self.resolve_schema_with_seen(element, seen)))
+                let (resolved, trip) =
+                    self.resolve_schema_with_seen_tripped(element, seen, reentries);
+                (TypeSchema::Array(Box::new(resolved)), trip)
             }
-            TypeSchema::ArrayTuple(items) => TypeSchema::ArrayTuple(
-                items
-                    .iter()
-                    .map(|item| self.resolve_schema_with_seen(item, seen))
-                    .collect(),
-            ),
-            TypeSchema::ArrayTupleRest { prefix, rest } => TypeSchema::ArrayTupleRest {
-                prefix: prefix
-                    .iter()
-                    .map(|item| self.resolve_schema_with_seen(item, seen))
-                    .collect(),
-                rest: Box::new(self.resolve_schema_with_seen(rest, seen)),
-            },
+            TypeSchema::ArrayTuple(items) => {
+                let mut resolved = Vec::with_capacity(items.len());
+                let mut innermost_trip = None;
+                for item in items {
+                    let (resolved_item, trip) =
+                        self.resolve_schema_with_seen_tripped(item, seen, reentries);
+                    if innermost_trip.is_none() {
+                        innermost_trip = trip;
+                    }
+                    resolved.push(resolved_item);
+                }
+                (TypeSchema::ArrayTuple(resolved), innermost_trip)
+            }
+            TypeSchema::ArrayTupleRest { prefix, rest } => {
+                let mut resolved_prefix = Vec::with_capacity(prefix.len());
+                let mut innermost_trip = None;
+                for item in prefix {
+                    let (resolved_item, trip) =
+                        self.resolve_schema_with_seen_tripped(item, seen, reentries);
+                    if innermost_trip.is_none() {
+                        innermost_trip = trip;
+                    }
+                    resolved_prefix.push(resolved_item);
+                }
+                let (resolved_rest, trip) =
+                    self.resolve_schema_with_seen_tripped(rest, seen, reentries);
+                if innermost_trip.is_none() {
+                    innermost_trip = trip;
+                }
+                (
+                    TypeSchema::ArrayTupleRest {
+                        prefix: resolved_prefix,
+                        rest: Box::new(resolved_rest),
+                    },
+                    innermost_trip,
+                )
+            }
             TypeSchema::Map(value) => {
-                TypeSchema::Map(Box::new(self.resolve_schema_with_seen(value, seen)))
+                let (resolved, trip) =
+                    self.resolve_schema_with_seen_tripped(value, seen, reentries);
+                (TypeSchema::Map(Box::new(resolved)), trip)
             }
             TypeSchema::Optional(inner) => {
-                TypeSchema::Optional(Box::new(self.resolve_schema_with_seen(inner, seen)))
+                let (resolved, trip) =
+                    self.resolve_schema_with_seen_tripped(inner, seen, reentries);
+                (TypeSchema::Optional(Box::new(resolved)), trip)
             }
-            TypeSchema::Object(fields) => TypeSchema::Object(
-                fields
-                    .iter()
-                    .map(|(key, value)| (key.clone(), self.resolve_schema_with_seen(value, seen)))
-                    .collect(),
-            ),
-            TypeSchema::Callable { params, result } => TypeSchema::Callable {
-                params: params
-                    .iter()
-                    .map(|param| self.resolve_schema_with_seen(param, seen))
-                    .collect(),
-                result: Box::new(self.resolve_schema_with_seen(result, seen)),
-            },
-            _ => schema.clone(),
+            TypeSchema::Object(fields) => {
+                let mut resolved_fields = HashMap::with_capacity(fields.len());
+                let mut innermost_trip = None;
+                // `TypeSchema::Object` is a HashMap, so raw iteration order
+                // is per-process random. The first trip on the path is the
+                // one propagated to the parent's cycle key, so which field
+                // contributes it must be deterministic: visit fields in
+                // sorted name order.
+                let mut sorted_fields: Vec<(&String, &TypeSchema)> = fields.iter().collect();
+                sorted_fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+                for (name, value) in sorted_fields {
+                    let (resolved_value, trip) =
+                        self.resolve_schema_with_seen_tripped(value, seen, reentries);
+                    if innermost_trip.is_none() {
+                        innermost_trip = trip;
+                    }
+                    resolved_fields.insert(name.clone(), resolved_value);
+                }
+                (TypeSchema::Object(resolved_fields), innermost_trip)
+            }
+            TypeSchema::Callable { params, result } => {
+                let mut resolved_params = Vec::with_capacity(params.len());
+                let mut innermost_trip = None;
+                for param in params {
+                    let (resolved_param, trip) =
+                        self.resolve_schema_with_seen_tripped(param, seen, reentries);
+                    if innermost_trip.is_none() {
+                        innermost_trip = trip;
+                    }
+                    resolved_params.push(resolved_param);
+                }
+                let (resolved_result, trip) =
+                    self.resolve_schema_with_seen_tripped(result, seen, reentries);
+                if innermost_trip.is_none() {
+                    innermost_trip = trip;
+                }
+                (
+                    TypeSchema::Callable {
+                        params: resolved_params,
+                        result: Box::new(resolved_result),
+                    },
+                    innermost_trip,
+                )
+            }
+            _ => (schema.clone(), None),
+        }
+    }
+
+    /// Cycle key for a named schema: the struct name plus the identity of
+    /// each type argument resolved through the current context. Arguments
+    /// that resolve to a cycle marker contribute the key of the innermost
+    /// re-entry they collapsed to; everything else contributes its fully
+    /// resolved render. The identity is stable across wrap depths, so
+    /// different instantiations that re-enter the same cycle class share
+    /// one key and are not mistaken for fresh expansions.
+    pub(super) fn schema_cycle_key(
+        &mut self,
+        schema: &TypeSchema,
+        seen: &mut HashSet<String>,
+    ) -> String {
+        match schema {
+            TypeSchema::Named(name, type_args) => {
+                let mut resolved_args = Vec::with_capacity(type_args.len());
+                let mut arg_trips = Vec::with_capacity(type_args.len());
+                for arg in type_args {
+                    let (resolved, trip) =
+                        self.resolve_schema_with_seen_tripped(arg, seen, &mut HashMap::new());
+                    resolved_args.push(resolved);
+                    arg_trips.push(trip);
+                }
+                schema_instance_key(name, &resolved_args, &arg_trips)
+            }
+            _ => render_schema_label(schema),
         }
     }
 
@@ -267,7 +572,7 @@ impl<'a> TypeContext<'a> {
             Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
                 self.expr_has_declared_schema(inner, state)
             }
-            Expr::Call(index, _, args) => match BuiltinFunction::from_call_index(*index) {
+            Expr::Call(index, _, args, _, _) => match BuiltinFunction::from_call_index(*index) {
                 Some(BuiltinFunction::Get)
                 | Some(BuiltinFunction::Set)
                 | Some(BuiltinFunction::Slice)
@@ -340,7 +645,7 @@ impl<'a> TypeContext<'a> {
             Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
                 self.expr_has_struct_schema_source(inner, state)
             }
-            Expr::Call(index, _, args) => match BuiltinFunction::from_call_index(*index) {
+            Expr::Call(index, _, args, _, _) => match BuiltinFunction::from_call_index(*index) {
                 Some(BuiltinFunction::Get)
                 | Some(BuiltinFunction::Set)
                 | Some(BuiltinFunction::Slice)
@@ -399,11 +704,14 @@ impl<'a> TypeContext<'a> {
             Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => state.is_optional(*root),
             Expr::OptionalGet { .. } => true,
             Expr::OptionUnwrapOr { .. } => false,
-            Expr::Call(index, _, _) => {
-                BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::ReFind)
+            Expr::Call(index, _, _, resolution, _) => {
+                resolution
+                    .as_ref()
+                    .is_some_and(|resolved| resolved.return_type.is_optional())
+                    || BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::ReFind)
                     || self.function_returns_optional(*index)
             }
-            Expr::LocalCall(slot, _, _) => match state.callable(*slot) {
+            Expr::LocalCall(slot, _, _, _) => match state.callable(*slot) {
                 Some(InferredCallable::Function(index)) => {
                     BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::ReFind)
                         || self.function_returns_optional(*index)
@@ -527,7 +835,9 @@ impl<'a> TypeContext<'a> {
         state: &LocalTypeState,
     ) -> Option<TypeSchema> {
         match expr {
-            Expr::Var(slot) | Expr::MoveVar(slot) => state.schema(*slot).cloned(),
+            Expr::Var(slot) | Expr::MoveVar(slot) => {
+                state.schema(*slot).map(TypeSchema::clone_inner_if_optional)
+            }
             Expr::OptionalGet { container, key, .. } => self
                 .infer_expr_schema(container, state)
                 .and_then(|schema| infer_access_schema(&schema, key, self, state).ok()),
@@ -803,14 +1113,16 @@ impl<'a> TypeContext<'a> {
                 params: vec![TypeSchema::Unknown; closure.param_slots.len()],
                 result: Box::new(TypeSchema::Unknown),
             }),
-            Expr::Call(index, type_args, args) => {
-                if let Some(builtin) = BuiltinFunction::from_call_index(*index) {
+            Expr::Call(index, type_args, args, resolution, _) => {
+                if let Some(resolved) = resolution {
+                    Some(resolved.return_type.clone())
+                } else if let Some(builtin) = BuiltinFunction::from_call_index(*index) {
                     self.infer_builtin_call_schema(builtin, type_args, args, state)
                 } else {
                     self.infer_named_call_schema(*index, type_args, args, state)
                 }
             }
-            Expr::LocalCall(slot, type_args, args) => match state.callable(*slot).cloned() {
+            Expr::LocalCall(slot, type_args, args, _) => match state.callable(*slot).cloned() {
                 Some(InferredCallable::Function(index)) => {
                     self.infer_named_call_schema(index, type_args, args, state)
                 }
@@ -820,12 +1132,14 @@ impl<'a> TypeContext<'a> {
                 None => self.infer_declared_callable_call_schema(*slot, args, state),
             },
             Expr::IfElse {
+                condition,
                 then_expr,
                 else_expr,
-                ..
             } => {
-                let then_schema = self.infer_expr_schema(then_expr, state);
-                let else_schema = self.infer_expr_schema(else_expr, state);
+                let then_state = refine_state_for_condition(state, condition, true);
+                let else_state = refine_state_for_condition(state, condition, false);
+                let then_schema = self.infer_expr_schema(then_expr, &then_state);
+                let else_schema = self.infer_expr_schema(else_expr, &else_state);
                 match (then_schema, else_schema) {
                     (Some(TypeSchema::Null), rhs) => rhs,
                     (lhs, Some(TypeSchema::Null)) => lhs,
@@ -949,12 +1263,14 @@ impl<'a> TypeContext<'a> {
                 infer_unary_type(expr, inner_ty)
             }
             Expr::IfElse {
-                condition: _,
+                condition,
                 then_expr,
                 else_expr,
             } => {
-                let then_ty = self.infer_expr_type(then_expr, state);
-                let else_ty = self.infer_expr_type(else_expr, state);
+                let then_state = refine_state_for_condition(state, condition, true);
+                let else_state = refine_state_for_condition(state, condition, false);
+                let then_ty = self.infer_expr_type(then_expr, &then_state);
+                let else_ty = self.infer_expr_type(else_expr, &else_state);
                 if then_ty == else_ty {
                     then_ty
                 } else {
@@ -1014,7 +1330,10 @@ impl<'a> TypeContext<'a> {
         state: &LocalTypeState,
     ) -> BoundType {
         match expr {
-            Expr::Call(index, type_args, args) => {
+            Expr::Call(index, type_args, args, resolution, _) => {
+                if let Some(resolved) = resolution {
+                    return self.bound_type_for_schema(&resolved.return_type);
+                }
                 if let Some(builtin) = BuiltinFunction::from_call_index(*index) {
                     self.infer_builtin_call_like_expr_type(builtin, type_args, args, state)
                 } else {
@@ -1037,7 +1356,7 @@ impl<'a> TypeContext<'a> {
                     }
                 }
             }
-            Expr::LocalCall(slot, type_args, args) => match state.callable(*slot).cloned() {
+            Expr::LocalCall(slot, type_args, args, _) => match state.callable(*slot).cloned() {
                 Some(InferredCallable::Function(index)) => {
                     if let Some(decl) = self.function_decls.get(&index)
                         && let inferred =
@@ -1825,8 +2144,21 @@ impl<'a> TypeContext<'a> {
         line_context: Option<u32>,
         source_name: Option<&str>,
     ) -> Result<(), CompileError> {
+        let expr_span = match expr {
+            Expr::Call(_, _, _, _, Some(id))
+            | Expr::ModuleCall(_, _, _, Some(id))
+            | Expr::LocalCall(_, _, _, Some(id)) => self.node_span(*id),
+            _ => self.stmt_span(line_context.unwrap_or_default()),
+        };
         match expr {
-            Expr::Call(index, type_args, args) => {
+            Expr::Call(index, type_args, args, resolution, _) => {
+                // A catalog-resolved direct call was already validated for
+                // schema, arity, and parameter passing by the exact resolver;
+                // the child expressions are still recursively validated by the
+                // surrounding traversal, so bypass this legacy signature check.
+                if resolution.is_some() {
+                    return Ok(());
+                }
                 if let Some(builtin) = BuiltinFunction::from_call_index(*index) {
                     self.validate_builtin_argument_types(
                         builtin,
@@ -1834,6 +2166,7 @@ impl<'a> TypeContext<'a> {
                         state,
                         line_context,
                         source_name,
+                        expr_span,
                     )
                 } else if let Some(signature) = self.host_import_signatures.get(index).cloned() {
                     self.validate_host_argument_types(
@@ -1842,6 +2175,7 @@ impl<'a> TypeContext<'a> {
                         state,
                         line_context,
                         source_name,
+                        expr_span,
                     )
                 } else if let Some(function_decl) = self.function_decls.get(index).cloned() {
                     let param_schemas = self
@@ -1857,6 +2191,7 @@ impl<'a> TypeContext<'a> {
                         DiagnosticSite {
                             line: line_context,
                             source_name,
+                            span: expr_span,
                         },
                         self,
                     )
@@ -1864,7 +2199,7 @@ impl<'a> TypeContext<'a> {
                     Ok(())
                 }
             }
-            Expr::LocalCall(slot, type_args, args) => match state.callable(*slot).cloned() {
+            Expr::LocalCall(slot, type_args, args, _) => match state.callable(*slot).cloned() {
                 Some(InferredCallable::Function(index)) => {
                     if let Some(builtin) = BuiltinFunction::from_call_index(index) {
                         self.validate_builtin_argument_types(
@@ -1873,6 +2208,7 @@ impl<'a> TypeContext<'a> {
                             state,
                             line_context,
                             source_name,
+                            expr_span,
                         )
                     } else if let Some(signature) = self.host_import_signatures.get(&index).cloned()
                     {
@@ -1882,6 +2218,7 @@ impl<'a> TypeContext<'a> {
                             state,
                             line_context,
                             source_name,
+                            expr_span,
                         )
                     } else if let Some(function_decl) = self.function_decls.get(&index).cloned() {
                         let param_schemas = self
@@ -1897,6 +2234,7 @@ impl<'a> TypeContext<'a> {
                             DiagnosticSite {
                                 line: line_context,
                                 source_name,
+                                span: expr_span,
                             },
                             self,
                         )
@@ -1917,7 +2255,7 @@ impl<'a> TypeContext<'a> {
                         .map(|index| format!("arg{}", index + 1))
                         .collect::<Vec<_>>();
                     validate_function_argument_schemas(
-                        &format!("local slot {}", slot),
+                        &format!("local slot {slot}"),
                         "callable",
                         &param_names,
                         &param_schemas,
@@ -1926,6 +2264,7 @@ impl<'a> TypeContext<'a> {
                         DiagnosticSite {
                             line: line_context,
                             source_name,
+                            span: expr_span,
                         },
                         self,
                     )
@@ -1942,6 +2281,7 @@ impl<'a> TypeContext<'a> {
         state: &LocalTypeState,
         line_context: Option<u32>,
         source_name: Option<&str>,
+        span: Option<Span>,
     ) -> Result<(), CompileError> {
         if builtin == BuiltinFunction::JsonEncode {
             let arg = args.first().expect("json::encode arity is fixed");
@@ -1952,6 +2292,7 @@ impl<'a> TypeContext<'a> {
                 DiagnosticSite {
                     line: line_context,
                     source_name,
+                    span,
                 },
             );
         }
@@ -1965,6 +2306,7 @@ impl<'a> TypeContext<'a> {
             super::validate::DiagnosticSite {
                 line: line_context,
                 source_name,
+                span,
             },
         )
     }
@@ -1976,7 +2318,37 @@ impl<'a> TypeContext<'a> {
         state: &LocalTypeState,
         line_context: Option<u32>,
         source_name: Option<&str>,
+        span: Option<Span>,
     ) -> Result<(), CompileError> {
+        for (index, param) in signature.params.iter().enumerate() {
+            let crate::builtins::CallableParamType::Callable(callable) = param.ty else {
+                continue;
+            };
+            let Some(arg) = args.get(index) else {
+                continue;
+            };
+            let expected = crate::compiler::TypeSchema::Callable {
+                params: callable
+                    .params
+                    .iter()
+                    .copied()
+                    .map(callable_param_schema)
+                    .collect(),
+                result: Box::new(callable_param_schema(*callable.return_type)),
+            };
+            super::validate::validate_callable_expr_against_schema(
+                &format!("argument '{}'", param.name),
+                &expected,
+                arg,
+                state,
+                super::validate::DiagnosticSite {
+                    line: line_context,
+                    source_name,
+                    span,
+                },
+                self,
+            )?;
+        }
         if matches!(signature.name.as_str(), "print" | "println") {
             if args
                 .first()
@@ -1987,8 +2359,16 @@ impl<'a> TypeContext<'a> {
             }
             return Ok(());
         }
+        // `stream::emit(value)` accepts any single value; the per-item event
+        // bound is validated at runtime by the invocation stream. The
+        // exemption is tied to the authoritative runtime builtin identity; a
+        // same-name function registered through another catalog does not
+        // inherit it. The identity constant lives in the `runtime`-featured
+        // builtins module, so in non-runtime builds the comparison is
+        // compiled out and the exemption does not apply.
         #[cfg(feature = "runtime")]
-        if signature.runtime_builtin && signature.name == crate::builtins::runtime::STREAM_EMIT_NAME
+        if signature.runtime_builtin
+            && signature.name == crate::builtins::runtime::context::STREAM_EMIT_NAME
         {
             return validate_host_signature(
                 &signature.name,
@@ -1998,6 +2378,7 @@ impl<'a> TypeContext<'a> {
                 self,
                 line_context,
                 source_name,
+                span,
             );
         }
         if self.is_strict()
@@ -2013,6 +2394,7 @@ impl<'a> TypeContext<'a> {
                     "host function '{}' uses dynamically typed 'any' parameters and is not available from strict RustScript without a typed wrapper",
                     signature.name
                 ),
+                span: self.stmt_span(line_context.unwrap_or_default()),
             });
         }
         validate_host_signature(
@@ -2023,6 +2405,7 @@ impl<'a> TypeContext<'a> {
             self,
             line_context,
             source_name,
+            span,
         )
     }
 
@@ -2202,6 +2585,33 @@ impl<'a> TypeContext<'a> {
     }
 }
 
+fn callable_param_schema(param: crate::builtins::CallableParamType) -> crate::compiler::TypeSchema {
+    use crate::builtins::CallableParamType;
+    use crate::compiler::TypeSchema;
+    match param {
+        CallableParamType::Any => TypeSchema::Unknown,
+        CallableParamType::Null => TypeSchema::Null,
+        CallableParamType::Int => TypeSchema::Int,
+        CallableParamType::Float => TypeSchema::Float,
+        CallableParamType::Number => TypeSchema::Number,
+        CallableParamType::Bool => TypeSchema::Bool,
+        CallableParamType::String => TypeSchema::String,
+        CallableParamType::Bytes => TypeSchema::Bytes,
+        CallableParamType::Array => TypeSchema::Array(Box::new(TypeSchema::Unknown)),
+        CallableParamType::Map => TypeSchema::Map(Box::new(TypeSchema::Unknown)),
+        CallableParamType::Resource => TypeSchema::Unknown,
+        CallableParamType::Callable(signature) => TypeSchema::Callable {
+            params: signature
+                .params
+                .iter()
+                .copied()
+                .map(callable_param_schema)
+                .collect(),
+            result: Box::new(callable_param_schema(*signature.return_type)),
+        },
+    }
+}
+
 fn merge_observed_function_param_schema(
     current: Option<TypeSchema>,
     next: Option<TypeSchema>,
@@ -2299,6 +2709,9 @@ pub(crate) fn bound_type_from_schema(schema: &TypeSchema) -> BoundType {
             BoundType::Array
         }
         TypeSchema::Map(_) | TypeSchema::Object(_) => BoundType::Map,
+        // Resources are opaque (nominal) values: they are never reduced to the
+        // `Map` bound or to an integral token in semantic inference.
+        TypeSchema::Resource(_) => BoundType::Unknown,
     }
 }
 
@@ -2506,6 +2919,7 @@ pub(super) fn schema_label(schema: &TypeSchema) -> &'static str {
             "array"
         }
         TypeSchema::Map(_) | TypeSchema::Object(_) => "map",
+        TypeSchema::Resource(_) => "resource",
     }
 }
 
@@ -2564,6 +2978,9 @@ pub(crate) fn render_schema_label(schema: &TypeSchema) -> String {
             format!("[{}]", parts.join(", "))
         }
         TypeSchema::Map(value) => format!("map<{}>", render_schema_label(value)),
+        // Resources render as their nominal key (`resource<io.file>`), never as
+        // their physical integer ABI token or a structural `map<...>` shape.
+        TypeSchema::Resource(key) => format!("resource<{key}>"),
         TypeSchema::Object(fields) => {
             let mut entries = fields
                 .iter()
@@ -2572,6 +2989,29 @@ pub(crate) fn render_schema_label(schema: &TypeSchema) -> String {
             entries.sort();
             format!("{{ {} }}", entries.join(", "))
         }
+    }
+}
+
+/// Cycle key for a named schema instantiation: the struct name plus, for
+/// each resolved type argument, the innermost re-entry key it collapsed to
+/// (when the argument resolved to a cycle marker) or its fully resolved
+/// render. Two wrapped re-entries of the same recursive instantiation
+/// (`Node<Node<int>>` re-entered from `Node<int>`) therefore produce the
+/// same key, while chains rooted at different ancestors stay distinct.
+fn schema_instance_key(
+    name: &str,
+    resolved_args: &[TypeSchema],
+    arg_trips: &[Option<String>],
+) -> String {
+    if resolved_args.is_empty() {
+        name.to_string()
+    } else {
+        let parts = resolved_args
+            .iter()
+            .zip(arg_trips)
+            .map(|(arg, trip)| trip.clone().unwrap_or_else(|| render_schema_label(arg)))
+            .collect::<Vec<_>>();
+        format!("{name}<{}>", parts.join(", "))
     }
 }
 
@@ -2621,4 +3061,354 @@ fn literal_int_index(key: &Expr) -> Option<usize> {
         return None;
     };
     usize::try_from(*index).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builtins::{CallableParam, CallableParamType};
+    use crate::compiler::ir::{ResolvedHostCall, ResolvedHostParam};
+    use crate::host_api::{HostApiFingerprint, HostParamPassing};
+
+    #[test]
+    fn host_signature_mismatch_carries_available_call_span() {
+        // L1-residual: when a host call's argument types do not match a
+        // positional (non-callable) host signature, the fallthrough into
+        // `validate_host_signature` must forward the exact available call
+        // span into `CallableArgumentTypeMismatch` — never `span: None`.
+        // The span is the callee's parsed node span, so producers hand it to
+        // `validate_host_argument_types` and it must survive the generic
+        // host-signature mismatch path.
+        let empty_impls: HashMap<u16, FunctionImpl> = HashMap::new();
+        let empty_decls: HashMap<u16, FunctionDecl> = HashMap::new();
+        let empty_structs: HashMap<String, StructDecl> = HashMap::new();
+        let empty_names: HashMap<u16, String> = HashMap::new();
+        let empty_returns: HashMap<u16, BoundType> = HashMap::new();
+        let empty_signatures: HashMap<u16, HostCallableSignature> = HashMap::new();
+        let mut context = TypeContext::new(
+            &empty_impls,
+            &empty_decls,
+            &empty_structs,
+            &empty_names,
+            &empty_returns,
+            &empty_signatures,
+            TypingMode::DynamicHints,
+            None,
+        );
+        let signature = HostCallableSignature {
+            name: "flat::consume".to_string(),
+            params: vec![CallableParam {
+                name: "count",
+                ty: CallableParamType::Int,
+                optional: false,
+            }],
+            runtime_builtin: false,
+        };
+        // A call whose argument is a float against an `int` parameter: the
+        // exact call boundary has a span available, and the diagnostic must
+        // carry it verbatim.
+        let expr_span = crate::compiler::source_map::Span::new(7, 20, 40);
+        let state = LocalTypeState::default();
+        let args = [Expr::Float(1.0)];
+        let error = context
+            .validate_host_argument_types(
+                &signature,
+                &args,
+                &state,
+                Some(3),
+                Some("main.rss"),
+                Some(expr_span),
+            )
+            .expect_err("float arg against int param must be rejected");
+        match error {
+            CompileError::CallableArgumentTypeMismatch { span, detail, .. } => {
+                assert_eq!(
+                    span,
+                    Some(expr_span),
+                    "host-signature mismatch must carry the available call span, got {span:?}: {detail}"
+                );
+            }
+            other => panic!("expected CallableArgumentTypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generated_callable_float_schema_remains_distinct_from_number() {
+        assert_eq!(
+            callable_param_schema(CallableParamType::Float),
+            TypeSchema::Float
+        );
+        assert_eq!(
+            callable_param_schema(CallableParamType::Number),
+            TypeSchema::Number
+        );
+    }
+
+    #[test]
+    fn generated_float_callable_metadata_rejects_non_float_callback_results() {
+        static FLOAT_PARAMS: &[CallableParamType] = &[CallableParamType::Float];
+        static FLOAT_RESULT: CallableParamType = CallableParamType::Float;
+        let signature = HostCallableSignature {
+            name: "test::float_callback".to_string(),
+            params: vec![CallableParam {
+                name: "callback",
+                ty: CallableParamType::Callable(crate::builtins::CallableType {
+                    params: FLOAT_PARAMS,
+                    return_type: &FLOAT_RESULT,
+                }),
+                optional: false,
+            }],
+            runtime_builtin: true,
+        };
+        let empty_impls = HashMap::new();
+        let empty_decls = HashMap::new();
+        let empty_structs = HashMap::new();
+        let empty_names = HashMap::new();
+        let empty_returns = HashMap::new();
+        let empty_signatures = HashMap::new();
+        let mut context = TypeContext::new(
+            &empty_impls,
+            &empty_decls,
+            &empty_structs,
+            &empty_names,
+            &empty_returns,
+            &empty_signatures,
+            TypingMode::StrictRustScript,
+            None,
+        );
+        let state = LocalTypeState::default();
+        let wrong = [Expr::Closure(ClosureExpr {
+            param_slots: vec![0],
+            capture_copies: vec![],
+            body: Box::new(Expr::Int(1)),
+        })];
+        let error = context
+            .validate_host_argument_types(&signature, &wrong, &state, None, None, None)
+            .expect_err("fn(float) -> float metadata must reject an int result");
+        assert!(
+            error.to_string().contains("float") && error.to_string().contains("int"),
+            "unexpected compiler diagnostic: {error}"
+        );
+
+        let valid = [Expr::Closure(ClosureExpr {
+            param_slots: vec![0],
+            capture_copies: vec![],
+            body: Box::new(Expr::Float(1.0)),
+        })];
+        context
+            .validate_host_argument_types(&signature, &valid, &state, None, None, None)
+            .expect("fn(float) -> float metadata must accept a float result");
+    }
+
+    /// The authoritative `stream::emit` signature: one `any` payload.
+    #[cfg(feature = "runtime")]
+    fn emit_signature(runtime_builtin: bool) -> HostCallableSignature {
+        HostCallableSignature {
+            name: crate::builtins::runtime::context::STREAM_EMIT_NAME.to_string(),
+            params: vec![CallableParam {
+                name: "value",
+                ty: CallableParamType::Any,
+                optional: false,
+            }],
+            runtime_builtin,
+        }
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn stream_emit_any_payload_exemption_requires_authoritative_builtin_identity() {
+        let empty_impls: HashMap<u16, FunctionImpl> = HashMap::new();
+        let empty_decls: HashMap<u16, FunctionDecl> = HashMap::new();
+        let empty_structs: HashMap<String, StructDecl> = HashMap::new();
+        let empty_names: HashMap<u16, String> = HashMap::new();
+        let empty_returns: HashMap<u16, BoundType> = HashMap::new();
+        let empty_signatures: HashMap<u16, HostCallableSignature> = HashMap::new();
+        let mut context = TypeContext::new(
+            &empty_impls,
+            &empty_decls,
+            &empty_structs,
+            &empty_names,
+            &empty_returns,
+            &empty_signatures,
+            TypingMode::StrictRustScript,
+            None,
+        );
+        let state = LocalTypeState::default();
+        let args = [Expr::Int(1)];
+
+        assert!(
+            context
+                .validate_host_argument_types(
+                    &emit_signature(true),
+                    &args,
+                    &state,
+                    None,
+                    None,
+                    None
+                )
+                .is_ok(),
+            "the authoritative stream::emit builtin must accept any payload in strict mode"
+        );
+
+        // A same-name signature that is not the authoritative runtime builtin
+        // (for example one registered through another host catalog) must not
+        // inherit the strict-typing exemption.
+        assert!(
+            matches!(
+                context.validate_host_argument_types(
+                    &emit_signature(false),
+                    &args,
+                    &state,
+                    None,
+                    None,
+                    None,
+                ),
+                Err(CompileError::StrictTypingRequired { .. })
+            ),
+            "a same-name non-builtin signature must not inherit the stream::emit exemption"
+        );
+    }
+
+    fn fingerprint(n: u64) -> HostApiFingerprint {
+        serde_json::from_value(serde_json::Value::Number(n.into())).unwrap()
+    }
+
+    /// A minimal resolved host call with a privately constructed fingerprint,
+    /// mirroring the helper used in `ir.rs` call-resolution carrier tests.
+    fn resolution(return_type: TypeSchema) -> ResolvedHostCall {
+        ResolvedHostCall {
+            name: "annotated_host".to_string(),
+            params: vec![ResolvedHostParam {
+                name: "value".to_string(),
+                schema: TypeSchema::Int,
+            }],
+            return_type,
+            passing: vec![HostParamPassing::Value],
+            fingerprint: fingerprint(0x88),
+        }
+    }
+
+    #[test]
+    fn resolved_host_call_annotation_drives_schema_and_bound_type() {
+        let mut decls = HashMap::new();
+        decls.insert(
+            30u16,
+            FunctionDecl {
+                name: "legacy_diff".to_string(),
+                arity: 1,
+                index: 30,
+                args: vec!["value".to_string()],
+                arg_schemas: vec![Some(TypeSchema::Int)],
+                return_schema: Some(TypeSchema::Int),
+                type_params: vec![],
+                exported: false,
+                return_type: crate::bytecode::ValueType::Int,
+                symbol: None,
+            },
+        );
+        let empty_impls: HashMap<u16, FunctionImpl> = HashMap::new();
+        let empty_structs: HashMap<String, StructDecl> = HashMap::new();
+        let empty_names: HashMap<u16, String> = HashMap::new();
+        // Legacy host return for index 30 is `Int`; the annotation below is
+        // `String`, so consuming the annotation must win over both the legacy
+        // FunctionDecl return_schema and the host_import_return_types map.
+        let mut returns = HashMap::new();
+        returns.insert(30u16, BoundType::Int);
+        let empty_signatures: HashMap<u16, HostCallableSignature> = HashMap::new();
+        let mut context = TypeContext::new(
+            &empty_impls,
+            &decls,
+            &empty_structs,
+            &empty_names,
+            &returns,
+            &empty_signatures,
+            TypingMode::StrictRustScript,
+            None,
+        );
+        let state = LocalTypeState::default();
+        let annotated = Expr::Call(
+            30,
+            Vec::new(),
+            vec![Expr::Int(1)],
+            Some(Box::new(resolution(TypeSchema::String))),
+            None,
+        );
+        let bare = Expr::Call(30, Vec::new(), vec![Expr::Int(1)], None, None);
+
+        // Schema inference follows the annotation, not the legacy decl.
+        assert_eq!(
+            context.infer_expr_schema(&annotated, &state),
+            Some(TypeSchema::String)
+        );
+        assert_eq!(
+            context.infer_expr_schema(&bare, &state),
+            Some(TypeSchema::Int)
+        );
+
+        // Bound-type inference follows the annotation, not the legacy host map.
+        assert_eq!(
+            context.infer_call_like_expr_type(&annotated, &state),
+            BoundType::String
+        );
+        assert_eq!(
+            context.infer_call_like_expr_type(&bare, &state),
+            BoundType::Int
+        );
+    }
+
+    #[test]
+    fn resolved_host_call_annotation_bypasses_incompatible_legacy_signature() {
+        let empty_impls: HashMap<u16, FunctionImpl> = HashMap::new();
+        let empty_decls: HashMap<u16, FunctionDecl> = HashMap::new();
+        let empty_structs: HashMap<String, StructDecl> = HashMap::new();
+        let empty_names: HashMap<u16, String> = HashMap::new();
+        let empty_returns: HashMap<u16, BoundType> = HashMap::new();
+        // The legacy signature expects a `string`, but the call site passes an
+        // `int`. The exact resolver already validated schema/arity/passing for
+        // an annotated call, so that call bypasses this mismatched check; the
+        // unannotated (None) call still reports the mismatch.
+        let mut signatures: HashMap<u16, HostCallableSignature> = HashMap::new();
+        signatures.insert(
+            31u16,
+            HostCallableSignature {
+                name: "string_only".to_string(),
+                params: vec![CallableParam {
+                    name: "value",
+                    ty: CallableParamType::String,
+                    optional: false,
+                }],
+                runtime_builtin: false,
+            },
+        );
+        let mut context = TypeContext::new(
+            &empty_impls,
+            &empty_decls,
+            &empty_structs,
+            &empty_names,
+            &empty_returns,
+            &signatures,
+            TypingMode::StrictRustScript,
+            None,
+        );
+        let state = LocalTypeState::default();
+
+        let bare = Expr::Call(31, Vec::new(), vec![Expr::Int(1)], None, None);
+        assert!(
+            context
+                .validate_call_argument_types(&bare, &state, None, None)
+                .is_err(),
+            "None direct call must still validate against the legacy host signature"
+        );
+
+        let annotated = Expr::Call(
+            31,
+            Vec::new(),
+            vec![Expr::Int(1)],
+            Some(Box::new(resolution(TypeSchema::String))),
+            None,
+        );
+        context
+            .validate_call_argument_types(&annotated, &state, None, None)
+            .expect("a catalog-resolved call must bypass the incompatible legacy signature");
+    }
 }

@@ -1,7 +1,10 @@
+use std::collections::{HashMap, HashSet};
+
 use crate::builtins::{BuiltinFunction, CallableParam, CallableParamType, CallableSignature};
 
 use super::super::CompileError;
 use super::super::ir::{Expr, LocalSlot, MatchPattern, TypeSchema};
+use super::super::source_map::Span;
 use super::context::{TypeContext, infer_access_schema, render_schema_label};
 use super::helpers::{
     bind_expr_result_to_slot, bound_type_label, find_declared_schema_mismatch, infer_binary_type,
@@ -15,6 +18,10 @@ use super::state::{
 pub(super) struct DiagnosticSite<'a> {
     pub(super) line: Option<u32>,
     pub(super) source_name: Option<&'a str>,
+    /// Exact parser-origin span of the construct being diagnosed, when the
+    /// production site can resolve one from parser provenance. `None` for
+    /// sites that carry no position at all.
+    pub(super) span: Option<crate::compiler::source_map::Span>,
 }
 
 struct CallableBody<'a> {
@@ -35,8 +42,8 @@ fn observe_direct_function_call_types(
     context: &mut TypeContext<'_>,
 ) -> Result<(), CompileError> {
     let function_index = match expr {
-        Expr::Call(index, _, _) if context.function_impls.contains_key(index) => Some(*index),
-        Expr::LocalCall(slot, _, _) => match state.callable(*slot).cloned() {
+        Expr::Call(index, _, _, _, _) if context.function_impls.contains_key(index) => Some(*index),
+        Expr::LocalCall(slot, _, _, _) => match state.callable(*slot).cloned() {
             Some(InferredCallable::Function(index))
                 if context.function_impls.contains_key(&index) =>
             {
@@ -52,7 +59,7 @@ fn observe_direct_function_call_types(
     };
 
     let args = match expr {
-        Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) => args,
+        Expr::Call(_, _, args, _, _) | Expr::LocalCall(_, _, args, _) => args,
         _ => return Ok(()),
     };
     if context
@@ -71,6 +78,7 @@ fn observe_direct_function_call_types(
             line: line_context,
             source_name: owned_source_name(source_name),
             detail,
+            span: expr_span_of(expr, context),
         });
     }
     Ok(())
@@ -89,9 +97,13 @@ pub(super) fn validate_signature_overloads(
         .iter()
         .map(|arg| context.infer_expr_type(arg, state))
         .collect::<Vec<_>>();
+    // Legacy builtin adapters can cross a module boundary without preserving
+    // a schema; keep Unknown dynamic for those calls while strict user and
+    // explicit host-catalog signatures remain checked.
+    let signature_strict = context.is_strict() && callable_kind != "builtin";
     if signatures
         .iter()
-        .any(|signature| signature_matches_actual(signature, &actual, context.is_strict()))
+        .any(|signature| signature_matches_actual(signature, &actual, signature_strict))
     {
         return Ok(());
     }
@@ -104,9 +116,11 @@ pub(super) fn validate_signature_overloads(
             format_actual_arg_types(&actual),
             format_signature_overloads(callable_name, signatures),
         ),
+        span: site.span,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn validate_host_signature(
     callable_name: &str,
     params: &[CallableParam],
@@ -115,6 +129,7 @@ pub(super) fn validate_host_signature(
     context: &mut TypeContext<'_>,
     line_context: Option<u32>,
     source_name: Option<&str>,
+    span: Option<Span>,
 ) -> Result<(), CompileError> {
     let actual = args
         .iter()
@@ -133,6 +148,7 @@ pub(super) fn validate_host_signature(
             callable_name,
             format_param_types(params),
         ),
+        span,
     })
 }
 
@@ -144,6 +160,7 @@ fn callable_argument_mismatch(
         line: site.line,
         source_name: owned_source_name(site.source_name),
         detail,
+        span: site.span,
     })
 }
 
@@ -154,6 +171,12 @@ fn bound_type_matches_schema(
 ) -> bool {
     let resolved = context.resolve_schema(expected);
     let (expected, expected_optional) = resolved.split_optional();
+    if actual == BoundType::Unknown && !context.is_strict() {
+        // Imported legacy prelude calls can lose their schema at the flat
+        // module boundary; dynamic typing defers those checks to the builtin
+        // runtime while explicit catalog schemas remain exact below.
+        return true;
+    }
     if expected_optional && actual == BoundType::Null {
         return true;
     }
@@ -223,7 +246,7 @@ fn validate_expr_matches_schema(
     )
 }
 
-fn validate_callable_expr_against_schema(
+pub(super) fn validate_callable_expr_against_schema(
     label: &str,
     expected_schema: &TypeSchema,
     expr: &Expr,
@@ -295,7 +318,131 @@ fn validate_json_schema(
     context: &mut TypeContext<'_>,
     path: &str,
 ) -> Result<(), String> {
-    match context.resolve_schema(schema) {
+    validate_json_schema_with_seen(
+        schema,
+        context,
+        path,
+        &mut HashSet::new(),
+        &mut HashMap::new(),
+    )
+}
+
+/// Maximum number of times the same named declaration may be re-entered
+/// on the active walk path before the `json::encode` compile-time walk
+/// accepts the node as a structural recursion edge. The resolver's own
+/// budget (`MAX_NAMED_SCHEMA_REENTRY`) bounds every schema it returns,
+/// but the walk re-resolves each named node it visits, so a
+/// container-wrapped recursion (`Node<T>{ child: Node<[T]> }`) would
+/// still descend one bounded tree after another forever. This budget is
+/// the walk's own hard bound for exactly that recursive family; it
+/// matches the resolver budget so the walk always stops before it could
+/// re-resolve a budget marker.
+///
+/// The budget counts repeated re-entries of the *same declaration
+/// identity* on the active walk path, so distinct declaration names never
+/// consume it: a deep non-recursive chain of distinct structs is walked
+/// in full and every unsupported field it contains is rejected with its
+/// precise path. Hitting the budget accepts the node as a structural
+/// recursion edge, per the JSON compile/runtime contract: the node's
+/// struct body is the same body already walked at every shallower level
+/// of this chain, so fixed unsupported fields (`bytes`, callables) were
+/// already rejected at the first level, and fields derived from the type
+/// argument are container-wrapped encodables. The runtime encoder
+/// remains the final gate for actual values (string keys, bytes,
+/// callables, NaN/infinity), and every runtime value of a structurally
+/// recursive type is finite.
+const MAX_JSON_SCHEMA_VALIDATION_REENTRY: usize = 32;
+
+/// Walks `schema` for `json::encode` legality. `seen` tracks the named
+/// schemas currently being expanded on the active path, so a self- or
+/// mutually-recursive struct terminates instead of re-resolving its own
+/// cycle marker one level deeper on every descent (the resolver leaves a
+/// raw `TypeSchema::Named` marker for the schema already being expanded,
+/// and re-entering that marker on the active path is the encodable cycle
+/// edge, so it is accepted). `seen` is shared across every recursion -
+/// `Array`/`Optional`/`Object`/`Map`/tuples all descend through the same
+/// set - and each name is removed on exit, so a name reused by *different*
+/// branches of the tree is still fully validated.
+///
+/// The key for a named schema is its name plus the type arguments resolved
+/// through the current context (`TypeContext::schema_cycle_key`), not the
+/// raw render of the node. A raw render would collide across generic
+/// parameter shadowing (a struct named `T` and a parameter named `T` both
+/// render `Node<T>`) and would grow without bound for wrapped re-entries
+/// of a recursive instantiation (`Node<Node<T>>` renders one nesting
+/// deeper at every level), so the walk would either short-circuit a
+/// different instantiation or never terminate. The resolved-identity key
+/// collapses wrapped re-entries into one cycle class while keeping
+/// instantiations rooted at different ancestors distinct.
+///
+/// The walk matches the raw schema instead of a whole-tree
+/// `resolve_schema`: a blanket resolution would re-expand the cycle
+/// markers inside already-resolved bodies before the guard could see them.
+/// `Named` and `GenericParam` are resolved lazily at their own level, and
+/// `Named` bodies resolve with a fresh seen so the first encounter always
+/// expands the node before its cycle edge is accepted. `reentries` is the
+/// walk's own budget (`MAX_JSON_SCHEMA_VALIDATION_REENTRY`): it counts
+/// repeated re-entries of the *same declaration identity* on the active
+/// walk path, so container-wrapped recursion is accepted at the budget
+/// while distinct declarations are always walked in full; see its
+/// documentation for the contract at the boundary.
+fn validate_json_schema_with_seen(
+    schema: &TypeSchema,
+    context: &mut TypeContext<'_>,
+    path: &str,
+    seen: &mut HashSet<String>,
+    reentries: &mut HashMap<String, usize>,
+) -> Result<(), String> {
+    match schema {
+        TypeSchema::GenericParam(name) => {
+            let resolved = context.resolve_schema(schema);
+            if resolved == *schema {
+                Err(format!(
+                    "{path} depends on generic schema parameter '{name}', which is not concrete enough for json::encode"
+                ))
+            } else {
+                validate_json_schema_with_seen(&resolved, context, path, seen, reentries)
+            }
+        }
+        TypeSchema::Named(name, _) => {
+            let reentry_count = reentries.get(name.as_str()).copied().unwrap_or(0);
+            if reentry_count >= MAX_JSON_SCHEMA_VALIDATION_REENTRY {
+                // Budget exhausted: this re-entry is a pure structural
+                // recursion edge (container-wrapped recursion has no
+                // repeating cycle key to trip the seen-set). Accept it
+                // per the contract documented on the budget constant:
+                // its body is the same struct already walked at
+                // shallower levels, so unsupported sibling fields were
+                // already rejected there, and the runtime encoder stays
+                // the final gate for values.
+                return Ok(());
+            }
+            // The cycle key is the struct name plus the type arguments
+            // resolved through the current context (see
+            // `TypeContext::schema_cycle_key`): a raw render would collide
+            // across generic-parameter shadowing and grow without bound for
+            // wrapped re-entries of the same recursive instantiation.
+            let key = context.schema_cycle_key(schema, seen);
+            if !seen.insert(key.clone()) {
+                // This named schema is already being expanded on the
+                // active path: the recursion edge itself is encodable.
+                return Ok(());
+            }
+            // Resolve the body with a fresh seen: the resolver must expand
+            // this node at least once even though its cycle key is now on
+            // the active path, or the first encounter would short-circuit
+            // as its own cycle edge.
+            reentries.insert(name.clone(), reentry_count + 1);
+            let resolved = context.resolve_schema(schema);
+            let result = validate_json_schema_with_seen(&resolved, context, path, seen, reentries);
+            seen.remove(&key);
+            if reentry_count == 0 {
+                reentries.remove(name);
+            } else {
+                reentries.insert(name.clone(), reentry_count);
+            }
+            result
+        }
         TypeSchema::Unknown => Err(format!("{path} has unknown schema")),
         TypeSchema::Null
         | TypeSchema::Int
@@ -306,43 +453,79 @@ fn validate_json_schema(
         TypeSchema::Bytes => Err(format!(
             "{path} uses bytes, which json::encode does not support"
         )),
-        TypeSchema::Optional(inner) => validate_json_schema(&inner, context, path),
-        TypeSchema::GenericParam(name) => Err(format!(
-            "{path} depends on generic schema parameter '{name}', which is not concrete enough for json::encode"
+        TypeSchema::Resource(key) => Err(format!(
+            "{path} is resource '{key}', which json::encode does not support"
         )),
+        TypeSchema::Optional(inner) => {
+            validate_json_schema_with_seen(inner, context, path, seen, reentries)
+        }
         TypeSchema::Callable { .. } => Err(format!(
             "{path} is callable, which json::encode does not support"
         )),
-        TypeSchema::Named(_, _) | TypeSchema::Object(_) => match context.resolve_schema(schema) {
-            TypeSchema::Object(fields) => {
-                for (field, value_schema) in &fields {
-                    let child_path = if path.is_empty() {
-                        format!("field '{field}'")
-                    } else {
-                        format!("{path}.{field}")
-                    };
-                    validate_json_schema(value_schema, context, child_path.as_str())?;
-                }
-                Ok(())
+        TypeSchema::Object(fields) => {
+            // `TypeSchema::Object` is a HashMap, so raw iteration order is
+            // per-process random. The first unsupported field decides the
+            // rejection path; walking fields in sorted name order keeps
+            // the diagnostic (and probe assertions on it) deterministic
+            // across processes and runs.
+            let mut sorted_fields: Vec<(&String, &TypeSchema)> = fields.iter().collect();
+            sorted_fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+            for (field, value_schema) in sorted_fields {
+                let child_path = if path.is_empty() {
+                    format!("field '{field}'")
+                } else {
+                    format!("{path}.{field}")
+                };
+                validate_json_schema_with_seen(
+                    value_schema,
+                    context,
+                    child_path.as_str(),
+                    seen,
+                    reentries,
+                )?;
             }
-            other => validate_json_schema(&other, context, path),
-        },
-        TypeSchema::Array(element) => validate_json_schema(&element, context, path),
+            Ok(())
+        }
+        TypeSchema::Array(element) => {
+            validate_json_schema_with_seen(element, context, path, seen, reentries)
+        }
         TypeSchema::ArrayTuple(items) => {
             for (index, item) in items.iter().enumerate() {
-                validate_json_schema(item, context, format!("{path}[{index}]").as_str())?;
+                validate_json_schema_with_seen(
+                    item,
+                    context,
+                    format!("{path}[{index}]").as_str(),
+                    seen,
+                    reentries,
+                )?;
             }
             Ok(())
         }
         TypeSchema::ArrayTupleRest { prefix, rest } => {
             for (index, item) in prefix.iter().enumerate() {
-                validate_json_schema(item, context, format!("{path}[{index}]").as_str())?;
+                validate_json_schema_with_seen(
+                    item,
+                    context,
+                    format!("{path}[{index}]").as_str(),
+                    seen,
+                    reentries,
+                )?;
             }
-            validate_json_schema(&rest, context, path)
+            validate_json_schema_with_seen(rest, context, path, seen, reentries)
         }
-        TypeSchema::Map(_) => Err(format!(
-            "{path} is a generic map; json::encode in RustScript requires object/struct-shaped data so keys are provably strings"
-        )),
+        TypeSchema::Map(inner) => {
+            // Runtime maps carry no compile-time key type, so key legality
+            // cannot be proven statically. Admit the map and defer the
+            // recursive checks: an `Unknown` inner schema means the runtime
+            // encoder's own string-key and encodable-value checks decide;
+            // a concrete inner schema is still checked statically so bytes
+            // and callable values fail at compile time when provable.
+            if matches!(inner.as_ref(), TypeSchema::Unknown) {
+                Ok(())
+            } else {
+                validate_json_schema_with_seen(inner, context, path, seen, reentries)
+            }
+        }
     }
 }
 
@@ -365,6 +548,7 @@ pub(super) fn validate_json_encode_argument(
                 line: site.line,
                 source_name: owned_source_name(site.source_name),
                 detail: format!("builtin 'json::encode' cannot encode this value: {detail}"),
+                span: site.span,
             }
         });
     }
@@ -424,9 +608,8 @@ fn param_accepts_bound_type(expected: CallableParamType, actual: BoundType, stri
         }
         CallableParamType::Map => matches!(actual, BoundType::Map | BoundType::MapOf(_)),
         CallableParamType::Number => is_numeric_bound_type(actual),
-        // Resource handles are represented by guest integers at the bytecode
-        // boundary; the host wrapper performs the typed table lookup.
-        CallableParamType::Resource => actual == BoundType::Int,
+        CallableParamType::Resource => false,
+        CallableParamType::Callable(_) => actual == BoundType::Callable,
     }
 }
 
@@ -443,9 +626,9 @@ fn format_param_types(params: &[CallableParam]) -> String {
         .iter()
         .map(|param| {
             if param.optional {
-                format!("{}?: {}", param.name, param.ty.label())
+                format!("{}?: {}", param.name, param.ty.display_label())
             } else {
-                format!("{}: {}", param.name, param.ty.label())
+                format!("{}: {}", param.name, param.ty.display_label())
             }
         })
         .collect::<Vec<_>>()
@@ -528,6 +711,7 @@ pub(super) fn validate_expr(
                     line_context,
                     source_name,
                     "unwrap_or() requires an optional value",
+                    expr_span_of(value, context),
                 ));
             }
             ensure_expr_not_optional(
@@ -546,6 +730,7 @@ pub(super) fn validate_expr(
                 inner_ty,
                 fallback_ty,
                 context.is_strict(),
+                context.stmt_span(line_context.unwrap_or_default()),
             )?;
             context.infer_expr_type(expr, state)
         }
@@ -626,6 +811,7 @@ pub(super) fn validate_expr(
                         line_context,
                         source_name,
                         "binary operation",
+                        expr_span_of(expr, context),
                     ));
                 }
             }
@@ -642,6 +828,7 @@ pub(super) fn validate_expr(
                         bound_type_label(lhs_ty),
                         bound_type_label(rhs_ty)
                     ),
+                    span: context.stmt_span(line_context.unwrap_or_default()),
                 });
             }
             inferred
@@ -660,6 +847,7 @@ pub(super) fn validate_expr(
                     line_context,
                     source_name,
                     "unary operation",
+                    expr_span_of(inner, context),
                 ));
             }
             infer_unary_type(expr, inner_ty)
@@ -729,6 +917,7 @@ pub(super) fn validate_expr(
                 then_ty,
                 else_ty,
                 context.is_strict(),
+                context.stmt_span(line_context.unwrap_or_default()),
             )?;
             ensure_compatible_callable_schemas(
                 line_context,
@@ -736,6 +925,7 @@ pub(super) fn validate_expr(
                 "if/else expression result",
                 context.infer_expr_schema(then_expr, &then_state),
                 context.infer_expr_schema(else_expr, &else_state),
+                context.stmt_span(line_context.unwrap_or_default()),
             )?;
             if then_ty == else_ty || matches!(static_condition, Some(true)) {
                 then_ty
@@ -773,7 +963,14 @@ pub(super) fn validate_expr(
             let mut arm_type = None;
             let mut arm_schema = None;
             for (pattern, arm_expr) in arms {
-                validate_match_pattern(pattern, *value_slot, &nested, line_context, source_name)?;
+                validate_match_pattern(
+                    pattern,
+                    *value_slot,
+                    &nested,
+                    line_context,
+                    source_name,
+                    context.stmt_span(line_context.unwrap_or_default()),
+                )?;
                 let arm_state = refine_state_for_match_pattern(&nested, pattern, *value_slot);
                 let ty = validate_expr(
                     arm_expr,
@@ -790,6 +987,7 @@ pub(super) fn validate_expr(
                     "match arm result",
                     arm_schema.clone(),
                     schema.clone(),
+                    context.stmt_span(line_context.unwrap_or_default()),
                 )?;
                 arm_schema = arm_schema.or(schema);
                 arm_type = Some(match arm_type {
@@ -802,6 +1000,7 @@ pub(super) fn validate_expr(
                             current,
                             ty,
                             context.is_strict(),
+                            context.stmt_span(line_context.unwrap_or_default()),
                         )?;
                         merge_bound_types(current, ty)
                     }
@@ -827,6 +1026,7 @@ pub(super) fn validate_expr(
                     arm_type,
                     default_ty,
                     context.is_strict(),
+                    context.stmt_span(line_context.unwrap_or_default()),
                 )?;
                 ensure_compatible_callable_schemas(
                     line_context,
@@ -834,6 +1034,7 @@ pub(super) fn validate_expr(
                     "match result",
                     arm_schema,
                     default_schema,
+                    context.stmt_span(line_context.unwrap_or_default()),
                 )?;
                 merge_bound_types(arm_type, default_ty)
             }
@@ -869,7 +1070,7 @@ fn validate_expr_children(
     strict_function_add_types: bool,
 ) -> Result<(), CompileError> {
     match expr {
-        Expr::Call(_, _, args) | Expr::LocalCall(_, _, args) => {
+        Expr::Call(_, _, args, _, _) | Expr::LocalCall(_, _, args, _) => {
             for arg in args {
                 let _ = validate_expr(
                     arg,
@@ -880,7 +1081,7 @@ fn validate_expr_children(
                     strict_function_add_types,
                 )?;
             }
-            if let Expr::LocalCall(slot, _, args) = expr
+            if let Expr::LocalCall(slot, _, args, _) = expr
                 && let Some(InferredCallable::Closure(closure)) = state.callable(*slot).cloned()
             {
                 let declared_callable = state.callable_schema(*slot).cloned();
@@ -918,6 +1119,7 @@ fn validate_expr_children(
                     DiagnosticSite {
                         line: line_context,
                         source_name,
+                        span: context.stmt_span(line_context.unwrap_or_default()),
                     },
                     context,
                 )?;
@@ -939,6 +1141,7 @@ fn validate_expr_children(
                     DiagnosticSite {
                         line: line_context,
                         source_name,
+                        span: context.stmt_span(line_context.unwrap_or_default()),
                     },
                     context,
                 )?;
@@ -969,6 +1172,7 @@ fn validate_expr_children(
                 DiagnosticSite {
                     line: line_context,
                     source_name,
+                    span: context.stmt_span(line_context.unwrap_or_default()),
                 },
                 context,
             )?;
@@ -1034,7 +1238,7 @@ fn validate_schema_access(
     source_name: Option<&str>,
     context: &mut TypeContext<'_>,
 ) -> Result<(), CompileError> {
-    let Expr::Call(index, _, args) = expr else {
+    let Expr::Call(index, _, args, _, semantic_id) = expr else {
         return Ok(());
     };
     if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::Get) || args.len() != 2 {
@@ -1045,6 +1249,7 @@ fn validate_schema_access(
             line_context,
             source_name,
             "member/index access",
+            semantic_id.and_then(|id| context.node_span(id)),
         ));
     }
     let Some(container_schema) = context.infer_expr_schema(&args[0], state) else {
@@ -1059,6 +1264,7 @@ fn validate_schema_access(
             line: line_context,
             source_name: owned_source_name(source_name),
             detail,
+            span: semantic_id.and_then(|id| context.node_span(id)),
         })
 }
 
@@ -1069,14 +1275,22 @@ fn validate_optional_get_access(
     source_name: Option<&str>,
     context: &mut TypeContext<'_>,
 ) -> Result<(), CompileError> {
-    let Expr::OptionalGet { container, key, .. } = expr else {
+    let Expr::OptionalGet {
+        container,
+        key,
+        semantic_id,
+        ..
+    } = expr
+    else {
         return Ok(());
     };
+    let span = semantic_id.and_then(|id| context.node_span(id));
     if context.is_strict() && !context.expr_has_declared_schema(container, state) {
         return Err(CompileError::InvalidFieldAccess {
             line: line_context,
             source_name: owned_source_name(source_name),
             detail: "optional access requires a user-declared schema in RustScript".to_string(),
+            span,
         });
     }
     if !context.expr_has_declared_schema(container, state) {
@@ -1091,6 +1305,7 @@ fn validate_optional_get_access(
             line: line_context,
             source_name: owned_source_name(source_name),
             detail,
+            span,
         })
 }
 
@@ -1098,11 +1313,28 @@ fn optional_usage_error(
     line: Option<u32>,
     source_name: Option<&str>,
     context: &str,
+    span: Option<Span>,
 ) -> CompileError {
     CompileError::InvalidFieldAccess {
         line,
         source_name: owned_source_name(source_name),
         detail: format!("optional value must be unwrapped before {context}"),
+        span,
+    }
+}
+
+/// The exact parser-origin span of an expression, resolved from its semantic
+/// node id when the node carries one (calls, optional accesses), else the
+/// containing statement's exact span by line.
+fn expr_span_of(expr: &Expr, context: &TypeContext<'_>) -> Option<Span> {
+    match expr {
+        Expr::Call(_, _, _, _, Some(id))
+        | Expr::ModuleCall(_, _, _, Some(id))
+        | Expr::LocalCall(_, _, _, Some(id)) => context.node_span(*id),
+        Expr::OptionalGet { semantic_id, .. } | Expr::OptionUnwrapOr { semantic_id, .. } => {
+            semantic_id.and_then(|id| context.node_span(id))
+        }
+        _ => None,
     }
 }
 
@@ -1115,7 +1347,12 @@ fn ensure_expr_not_optional(
     usage: &str,
 ) -> Result<(), CompileError> {
     if context.expr_is_optional(expr, state) {
-        return Err(optional_usage_error(line_context, source_name, usage));
+        return Err(optional_usage_error(
+            line_context,
+            source_name,
+            usage,
+            expr_span_of(expr, context),
+        ));
     }
     Ok(())
 }
@@ -1130,12 +1367,14 @@ fn validate_match_pattern(
     state: &LocalTypeState,
     line_context: Option<u32>,
     source_name: Option<&str>,
+    span: Option<Span>,
 ) -> Result<(), CompileError> {
     if pattern.requires_optional_value() && !state.is_optional(value_slot) {
         return Err(CompileError::InvalidFieldAccess {
             line: line_context,
             source_name: owned_source_name(source_name),
             detail: "Some(...) and None match patterns require an optional value".to_string(),
+            span,
         });
     }
     Ok(())
@@ -1193,7 +1432,7 @@ fn extract_non_null_guard(condition: &Expr) -> Option<LocalSlot> {
 }
 
 fn extract_type_guard_side(lhs: &Expr, rhs: &Expr) -> Option<(LocalSlot, BoundType)> {
-    let Expr::Call(index, _, args) = lhs else {
+    let Expr::Call(index, _, args, _, _) = lhs else {
         return None;
     };
     if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::TypeOf) || args.len() != 1
@@ -1245,6 +1484,7 @@ fn ensure_compatible_if_else_types(
     lhs: BoundType,
     rhs: BoundType,
     strict: bool,
+    span: Option<Span>,
 ) -> Result<(), CompileError> {
     if are_compatible_bound_types_in_mode(lhs, rhs, strict) {
         return Ok(());
@@ -1257,6 +1497,7 @@ fn ensure_compatible_if_else_types(
             bound_type_label(lhs),
             bound_type_label(rhs)
         ),
+        span,
     })
 }
 
@@ -1266,6 +1507,7 @@ fn ensure_compatible_callable_schemas(
     context: &str,
     lhs: Option<TypeSchema>,
     rhs: Option<TypeSchema>,
+    span: Option<Span>,
 ) -> Result<(), CompileError> {
     let (Some(lhs @ TypeSchema::Callable { .. }), Some(rhs @ TypeSchema::Callable { .. })) =
         (lhs, rhs)
@@ -1283,6 +1525,7 @@ fn ensure_compatible_callable_schemas(
             render_schema_label(&lhs),
             render_schema_label(&rhs)
         ),
+        span,
     })
 }
 
@@ -1361,6 +1604,7 @@ pub(super) fn validate_branch_state_merge(
     lhs: &LocalTypeState,
     rhs: &LocalTypeState,
     strict: bool,
+    span: Option<Span>,
 ) -> Result<(), CompileError> {
     for slot in lhs.iter_slots().chain(rhs.iter_slots()) {
         let left_present = lhs.has_binding(slot);
@@ -1376,6 +1620,7 @@ pub(super) fn validate_branch_state_merge(
             "control-flow local",
             lhs.schema(slot).cloned(),
             rhs.schema(slot).cloned(),
+            span,
         )?;
         if are_compatible_bound_types_in_mode(left, right, strict) {
             continue;
@@ -1389,6 +1634,7 @@ pub(super) fn validate_branch_state_merge(
                 bound_type_label(left),
                 bound_type_label(right)
             ),
+            span,
         });
     }
     Ok(())

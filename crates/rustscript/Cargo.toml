@@ -20,3 +20,4 @@ cranelift-jit = ["pd_vm_crate/cranelift-jit"]
 
 [dependencies]
 pd_vm_crate = { package = "pd-vm", path = "../..", version = ">=0.1.0, <1.0.0" }
+serde_json = "1"
