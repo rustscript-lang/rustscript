@@ -31,6 +31,15 @@ pub(crate) fn install_default_host_functions(registry: &mut vm::HostFunctionRegi
     builtins::runtime::register_default_host_functions(registry);
 }
 
+#[cfg(all(
+    feature = "runtime",
+    feature = "http-client",
+    not(target_family = "wasm")
+))]
+pub use builtins::runtime::http::{
+    HttpConfig, HttpExtension, HttpHostExt, http_host_catalog, register_http_builtin_module,
+    register_http_builtin_module_from_catalog,
+};
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::{
     BorrowVmValue, FromVmValue, HostCallResult, IntoHostCallOutcome, TakeVmValue, arg, borrow_arg,
@@ -52,7 +61,7 @@ pub use builtins::{
 pub use bytecode::{
     CallableEnvironment, CallableKind, CallablePrototype, CallableTarget, CallableValue,
     CaptureBindingMode, ExportedCallable, FunctionRegion, HostImport, MAX_FRAME_LOCAL_COUNT,
-    OpCode, Program, RootCallableBinding, ScriptFunction, TypeMap, Value, ValueType,
+    OpCode, Program, RootCallableBinding, ScriptFunction, TypeMap, Value, ValueType, VmMap,
 };
 pub use host_api::{
     FunctionNameError, HostApiBuilder, HostApiCatalog, HostApiCatalogError, HostApiFingerprint,

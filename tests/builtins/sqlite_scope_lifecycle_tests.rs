@@ -15,6 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use vm::{SqliteHostExt, Vm, VmError, VmStatus, compile_source};
 
+use super::vm_reset::reset_for_reuse_to_ready;
+
 /// Helper: run a SQLite source to completion. Scripts use `assert(...)` for
 /// value checks; a failed assert surfaces as a host error.
 fn run_sqlite_source(policy: vm::SqlitePolicy, source: &str) -> Result<(), VmError> {
@@ -298,7 +300,7 @@ fn sqlite_close_cancels_siblings_and_reset_retires_all() {
         matches!(status, VmStatus::Waiting(_)),
         "long query should leave the VM waiting, got: {status:?}"
     );
-    let _ = vm.reset_for_reuse();
+    reset_for_reuse_to_ready(&mut vm).expect("reset should reach quiescence");
     assert!(
         vm.execution_scope().operations().is_empty(),
         "reset must retire all pending sqlite operations"
@@ -334,5 +336,42 @@ fn sqlite_pending_operation_slots_are_reclaimed_after_completion() {
         "#,
     )
     .expect("sequential operations beyond the pending limit should succeed after reclaim");
+    fs::remove_dir_all(root).expect("temporary SQLite root should be removed");
+}
+
+#[test]
+fn sqlite_pending_reset_repeatedly_drains_workers_and_keeps_vm_reusable() {
+    let root = temporary_root("reset-stress");
+    let policy = policy_for(&root);
+    let compiled = compile_source(
+        "use sqlite;\nlet db = sqlite::open({ path: \"state.db\", mode: \"read_write_create\", limits: { max_transaction_ms: 10000, max_result_bytes: 65536 } });\nlet pending = sqlite::query(db, \"WITH RECURSIVE numbers(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM numbers LIMIT 2000000) SELECT sum(value) FROM numbers\", [], { max_rows: 1, max_result_bytes: 65536 });",
+    )
+    .expect("stress source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.configure_sqlite(policy);
+
+    for iteration in 0..32 {
+        assert!(
+            matches!(
+                vm.run().expect("stress run should start"),
+                VmStatus::Waiting(_)
+            ),
+            "iteration {iteration} should leave the SQLite query pending"
+        );
+        reset_for_reuse_to_ready(&mut vm).expect("stress reset should reach quiescence");
+        assert!(
+            vm.execution_scope().operations().is_empty(),
+            "iteration {iteration} leaked an SQLite operation"
+        );
+        assert!(
+            vm.execution_scope().resources().is_empty(),
+            "iteration {iteration} leaked an SQLite resource"
+        );
+        assert!(
+            vm.is_reusable(),
+            "iteration {iteration} left VM non-reusable"
+        );
+    }
+
     fs::remove_dir_all(root).expect("temporary SQLite root should be removed");
 }

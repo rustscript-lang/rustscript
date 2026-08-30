@@ -8,7 +8,7 @@ use crate::vm::operation::{OperationCancelReason, OperationId, OperationOutcome}
 use crate::vm::resource::handle::ResourceHandle;
 use crate::vm::resource::table::ResourceTable;
 
-use super::async_host::{HostFuture, HostFutureOutput};
+use super::async_host::{HostFuture, HostFutureOutput, preserve_stream_cleanup};
 use super::capability::CapabilityProfile;
 use super::*;
 
@@ -723,6 +723,56 @@ impl HostFunctionRegistry {
         function: StaticHostFunction,
     ) -> Result<u16, RegistrySchemaError> {
         self.register_catalog_entry(schema, RegistryEntryKind::Static(function))
+    }
+
+    /// Applies a registry extension to a private snapshot and publishes it
+    /// only after every registration succeeds. Extensions use this to keep
+    /// catalog and dispatch state atomic when a later schema is invalid.
+    pub fn transactionally<R, F>(&mut self, register: F) -> VmResult<R>
+    where
+        F: FnOnce(&mut Self) -> VmResult<R>,
+    {
+        let mut staged = self.clone();
+        let result = register(&mut staged)?;
+        *self = staged;
+        Ok(result)
+    }
+
+    /// Registers one exact catalog entry while checking the source-level
+    /// function identity supplied by an extension.
+    pub fn register_exact_static(
+        &mut self,
+        name: &str,
+        arity: u8,
+        schema: HostImportSchema,
+        function: StaticHostFunction,
+    ) -> VmResult<u16> {
+        if schema.name != name || schema.arity() != usize::from(arity) {
+            return Err(VmError::HostError(format!(
+                "host schema for '{name}' does not match its exact adapter identity"
+            )));
+        }
+        self.register_catalog_static(schema, function)
+            .map_err(|error| VmError::HostError(error.to_string()))
+    }
+
+    /// Grants a registered extension import its host capability without
+    /// coupling the VM to the extension's concrete domain.
+    pub fn authorize_registered_builtin_import(&mut self, name: &str) {
+        self.capability_profile = Arc::new(self.capability_profile.with_host_import(name));
+        self.invalidate_plan_cache();
+    }
+
+    /// Marks an exact import as owning its pending operation. Pending
+    /// dispatch is resolved from the generic VM operation/stream registries;
+    /// the marker is intentionally a registration hook with no domain state.
+    pub fn mark_exact_runtime_owned_pending(&mut self, name: &str) -> VmResult<()> {
+        if !self.contains_name(name) {
+            return Err(VmError::HostError(format!(
+                "cannot mark unregistered host import '{name}' as runtime-owned"
+            )));
+        }
+        Ok(())
     }
 
     pub fn register_catalog_stack<F>(
@@ -1482,6 +1532,8 @@ pub(super) enum WaitingHostOpSource {
     HostBridge,
     Manual,
     ScopedOperation,
+    CallableStream,
+    CallableStreamTermination,
 }
 
 struct NoopWake;
@@ -1973,11 +2025,19 @@ impl Vm {
                     VmError::ExecutionScope(ExecutionScopeError::Operation(error))
                 })?;
                 self.host.scoped_operation_completions.remove(&op_id);
-                self.execution_scope()
-                    .abort_operation(op_id, reason)
-                    .map(|_| ())
-                    .map_err(VmError::ExecutionScope)
+                let scope = self.execution_scope();
+                scope
+                    .cancel_operation(op_id, reason)
+                    .map_err(VmError::ExecutionScope)?;
+                let waker = Waker::noop();
+                let mut cx = Context::from_waker(waker);
+                match scope.poll_operation_quiescence(op_id, &mut cx) {
+                    Poll::Pending | Poll::Ready(Ok(_)) => Ok(()),
+                    Poll::Ready(Err(error)) => Err(VmError::ExecutionScope(error)),
+                }
             }
+            WaitingHostOpSource::CallableStream => self.cancel_callable_stream_with_reason(reason),
+            WaitingHostOpSource::CallableStreamTermination => Ok(()),
         }
     }
 
@@ -1990,7 +2050,12 @@ impl Vm {
         };
         match waiting.source {
             WaitingHostOpSource::HostBridge => {
-                self.host.request_cancel_host_op(waiting.op_id, reason)
+                let bridge_cleanup = self.host.request_cancel_host_op(waiting.op_id, reason);
+                let stream_cleanup = self.cancel_callable_stream_with_reason(reason);
+                match bridge_cleanup {
+                    Ok(()) => stream_cleanup,
+                    Err(error) => Err(preserve_stream_cleanup(error, stream_cleanup)),
+                }
             }
             WaitingHostOpSource::Manual => {
                 self.instance.waiting_host_op = None;
@@ -1999,6 +2064,14 @@ impl Vm {
             WaitingHostOpSource::ScopedOperation => {
                 self.instance.waiting_host_op = None;
                 self.cleanup_waiting_host_op(waiting, reason)
+            }
+            WaitingHostOpSource::CallableStream => {
+                self.instance.waiting_host_op = None;
+                self.cancel_callable_stream_with_reason(reason)
+            }
+            WaitingHostOpSource::CallableStreamTermination => {
+                self.instance.waiting_host_op = None;
+                Ok(())
             }
         }
     }
@@ -2047,6 +2120,10 @@ impl Vm {
             WaitingHostOpSource::ScopedOperation => {
                 self.cleanup_waiting_host_op(waiting, OperationCancelReason::Requested)
             }
+            WaitingHostOpSource::CallableStream => Ok(()),
+            WaitingHostOpSource::CallableStreamTermination => Err(VmError::HostError(
+                "callable stream termination cannot be completed as a host operation".to_string(),
+            )),
         };
         cleanup_result?;
         self.instance.waiting_host_op = None;
@@ -2059,7 +2136,10 @@ impl Vm {
 
     pub fn poll_waiting_host_op(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<()>> {
         let Some(waiting) = self.instance.waiting_host_op.clone() else {
-            return Poll::Ready(Ok(()));
+            return match self.host.poll_stream_terminations(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(result) => Poll::Ready(result),
+            };
         };
 
         if matches!(waiting.source, WaitingHostOpSource::HostBridge)
@@ -2080,6 +2160,25 @@ impl Vm {
 
         let bridge_owned = matches!(waiting.source, WaitingHostOpSource::HostBridge)
             && self.host.is_bridge_operation_tracked(waiting.op_id);
+        if matches!(waiting.source, WaitingHostOpSource::CallableStream) {
+            return self.poll_callable_stream(waiting.op_id, cx);
+        }
+        if matches!(
+            waiting.source,
+            WaitingHostOpSource::CallableStreamTermination
+        ) {
+            return match self.host.poll_stream_terminations(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(())) => {
+                    self.instance.waiting_host_op = None;
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(error)) => {
+                    self.instance.waiting_host_op = None;
+                    Poll::Ready(Err(error))
+                }
+            };
+        }
         let submitted = self.host.submitted_host_ops.contains(&waiting.op_id);
         let poll_result: Poll<VmResult<HostFutureOutput>> = match waiting.source {
             WaitingHostOpSource::HostBridge => {
@@ -2113,6 +2212,10 @@ impl Vm {
                 ))));
             }
             WaitingHostOpSource::ScopedOperation => self.poll_scoped_operation(waiting.op_id, cx),
+            WaitingHostOpSource::CallableStream => unreachable!("callable stream handled above"),
+            WaitingHostOpSource::CallableStreamTermination => {
+                unreachable!("callable stream termination handled above")
+            }
         };
 
         match poll_result {
@@ -2914,7 +3017,7 @@ impl Vm {
                 let resume_ip = self.call_resume_ip(call_ip)?;
                 self.set_waiting_host_op_with_return(
                     op_id,
-                    self.host_call_pending_source(),
+                    self.host_call_pending_source(op_id),
                     expected_return_type,
                     expected_return_schema,
                 )?;
@@ -3059,7 +3162,7 @@ impl Vm {
                 let resume_ip = self.call_resume_ip(call_ip)?;
                 self.set_waiting_host_op_with_return(
                     op_id,
-                    self.host_call_pending_source(),
+                    self.host_call_pending_source(op_id),
                     expected_return_type,
                     expected_return_schema,
                 )?;
@@ -3134,7 +3237,7 @@ impl Vm {
                 let resume_ip = self.call_resume_ip(call_ip)?;
                 self.set_waiting_host_op_with_return(
                     op_id,
-                    self.host_call_pending_source(),
+                    self.host_call_pending_source(op_id),
                     expected_return_type,
                     expected_return_schema,
                 )?;
@@ -3164,7 +3267,20 @@ impl Vm {
         Ok(resume_ip)
     }
 
-    fn host_call_pending_source(&self) -> WaitingHostOpSource {
+    fn host_call_pending_source(&self, op_id: HostOpId) -> WaitingHostOpSource {
+        if self.host.stream_drivers.contains_key(&op_id) {
+            return WaitingHostOpSource::CallableStream;
+        }
+        if let Ok(operation_id) = OperationId::from_raw(op_id)
+            && self
+                .host
+                .execution_scope
+                .operations()
+                .status(operation_id)
+                .is_ok()
+        {
+            return WaitingHostOpSource::ScopedOperation;
+        }
         if self.host.async_bridge.is_some() {
             WaitingHostOpSource::HostBridge
         } else {

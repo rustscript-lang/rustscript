@@ -8,7 +8,7 @@ use crate::host_api::{
     HostApiBuilder, HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema,
     HostTypeSchema, ResourceTypeKey, ResourceTypeSchema,
 };
-#[cfg(feature = "async")]
+#[cfg(all(feature = "async", not(target_family = "wasm")))]
 use crate::vm::CaptureAsyncHostContext;
 #[allow(unused_imports)]
 use crate::vm::{CallOutcome, CallReturn, HostOpId, Value, Vm, VmError, VmResult};
@@ -21,6 +21,8 @@ pub(crate) mod core;
 pub(crate) mod error;
 pub(crate) mod event;
 mod host;
+#[cfg(all(feature = "http-client", not(target_family = "wasm")))]
+pub(crate) mod http;
 #[cfg(not(target_arch = "wasm32"))]
 mod io;
 #[cfg(target_arch = "wasm32")]
@@ -193,6 +195,16 @@ pub fn standard_host_catalog() -> Arc<HostApiCatalog> {
             )],
             HostTypeSchema::Null,
         ));
+        #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
+        {
+            let http_catalog = http::http_host_catalog();
+            for resource in http_catalog.resources() {
+                builder.resource(resource.clone());
+            }
+            for function in http_catalog.functions() {
+                builder.function(function.clone());
+            }
+        }
         Arc::new(builder.build().expect("standard host catalog is valid"))
     }))
 }

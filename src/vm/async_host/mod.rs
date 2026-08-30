@@ -23,6 +23,15 @@ use std::pin::Pin;
 
 use super::*;
 
+mod stream;
+
+#[allow(unused_imports)]
+pub(crate) use stream::{
+    HostStreamAction, HostStreamAdmissionError, HostStreamAdmissionRollback,
+    HostStreamContinuation, HostStreamDriver, HostStreamPoll, HostStreamTermination,
+    PendingHostStreamTermination, preserve_stream_cleanup,
+};
+
 /// A completion closure that runs against the VM after the async call's
 /// future has resolved.
 pub type HostVmCompletion<T> = Box<dyn FnOnce(&mut Vm) -> VmResult<T> + Send + 'static>;

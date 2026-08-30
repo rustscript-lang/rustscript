@@ -25,9 +25,10 @@ use crate::builtins::default_host_callable;
 /// The concrete standard-surface composition for this build.
 ///
 /// Feature-gated composition happens through the existing standard builtin
-/// helpers: IO is always present under `runtime`, HTTP under `http-client`,
-/// SQLite under `sqlite`. Required/present/stage is one opaque operation;
-/// the VM core never sees a surface mask or count.
+/// helpers: IO is always present under `runtime`, native HTTP/SSE under
+/// `http-client` on non-wasm targets, and SQLite under `sqlite`. Required/
+/// present/stage is one opaque operation; the VM core never sees a surface mask
+/// or count.
 #[derive(Debug)]
 pub(crate) struct StandardSurfaceCompositionImpl;
 

@@ -423,6 +423,19 @@ impl ExecutionScope {
         }
     }
 
+    /// Polls a previously terminal operation through its quiescence boundary
+    /// without driving it a second time.
+    pub fn poll_operation_quiescence(
+        &mut self,
+        id: OperationId,
+        cx: &mut Context<'_>,
+    ) -> Poll<ExecutionScopeResult<OperationOutcome>> {
+        match self.operations.poll_quiescent(id, cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => Poll::Ready(result.map_err(ExecutionScopeError::Operation)),
+        }
+    }
+
     /// Aborts a started operation in one step so it never produces a
     /// guest-visible result: cancels the driver exactly once if pending
     /// (recording the first reason), waits through the driver's
@@ -467,6 +480,18 @@ impl ExecutionScope {
             .map_err(ExecutionScopeError::Resource)
     }
 
+    /// Polls a resource that has already entered the closing state.
+    #[allow(dead_code)]
+    pub(crate) fn poll_resource_close<T: HostResource>(
+        &mut self,
+        handle: ResourceHandle,
+        cx: &mut Context<'_>,
+    ) -> Poll<ExecutionScopeResult<()>> {
+        self.resources
+            .poll_close(Resource::<T>::from_handle(handle), cx)
+            .map_err(ExecutionScopeError::Resource)
+    }
+
     /// The first cleanup failure recorded so far, if any.
     pub fn first_error(&self) -> Option<&ScopeCloseError> {
         self.first_error.as_ref()
@@ -507,16 +532,6 @@ impl ExecutionScope {
                 }
             }
         }
-    }
-
-    pub(crate) fn cancel_operations_and_wait(
-        &mut self,
-        reason: OperationCancelReason,
-    ) -> OperationCancelSummary {
-        let summary = self.operations.cancel_all_and_wait(reason);
-        self.record_operation_summary(&summary);
-        self.operations_drained = true;
-        summary
     }
 
     /// Runs the VM-Drop-only nonblocking resource close launch after the normal
