@@ -1640,7 +1640,7 @@ mod tests {
         #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
         let mut modules = vec!["bytes", "io", "re", "json", "jit", "math"];
         #[cfg(not(all(feature = "sqlite", not(target_arch = "wasm32"))))]
-        let modules = vec!["bytes", "io", "re", "json", "jit", "math"];
+        let modules = ["bytes", "io", "re", "json", "jit", "math"];
         #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
         modules.push("sqlite");
         assert_eq!(

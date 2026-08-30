@@ -22,6 +22,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::host_api::HostImportSchema;
+use crate::vm::async_host::{
+    HostStreamAdmissionRollback, HostStreamDriver, HostStreamTermination,
+    PendingHostStreamTermination, preserve_stream_cleanup,
+};
 use crate::vm::execution_scope::{ExecutionScope, ExecutionScopeError, ScopeCloseOutcome};
 use crate::vm::host::{
     HostAsyncBridge, HostAsyncOpTerminal, HostOpId, ScopedOperationCompletion, VmHostFunction,
@@ -79,6 +83,9 @@ pub(crate) struct HostRuntime {
     /// reset must stay non-reusable and must not silently start another reset
     /// or publish a callback registry on a later poll.
     scope_reset_error: Option<ExecutionScopeError>,
+    /// An early reset failure that is outside the generic scope error domain.
+    /// This remains authoritative so an empty active scope cannot look reusable.
+    reset_error: Option<String>,
     /// The one replacement scope allocated for the current reset. It remains
     /// unpublished until the old scope in `execution_scope` reaches
     /// quiescence.
@@ -121,6 +128,12 @@ pub(crate) struct HostRuntime {
     bridge_operations: HashMap<HostOpId, BridgeOperationState>,
     /// Adapter-owned completions for operations driven by the execution scope.
     pub(crate) scoped_operation_completions: HashMap<OperationId, ScopedOperationCompletion>,
+    /// Host-owned callable stream drivers. The VM stores only this generic
+    /// driver contract; HTTP/SSE state remains in the adapter module.
+    pub(crate) stream_drivers: HashMap<HostOpId, Box<dyn HostStreamDriver>>,
+    /// Drivers whose callable continuation has ended but whose worker/resource
+    /// cleanup still needs asynchronous polling.
+    pub(crate) pending_stream_terminations: HashMap<HostOpId, PendingHostStreamTermination>,
 }
 
 impl HostRuntime {
@@ -148,6 +161,7 @@ impl HostRuntime {
                 .expect("host runtime execution-scope identity space must be available"),
             scope_reset_pending: false,
             scope_reset_error: None,
+            reset_error: None,
             replacement_execution_scope: None,
             module_state_store: super::host_state::ModuleStateStore::new(),
             allow_default_builtin_capabilities: true,
@@ -159,6 +173,8 @@ impl HostRuntime {
             submitted_host_ops: HashSet::new(),
             bridge_operations: HashMap::new(),
             scoped_operation_completions: HashMap::new(),
+            stream_drivers: HashMap::new(),
+            pending_stream_terminations: HashMap::new(),
         }
     }
 
@@ -461,9 +477,17 @@ impl HostRuntime {
         if let Some(error) = self.scope_reset_error.clone() {
             return Err(VmError::ExecutionScope(error));
         }
+        if let Some(error) = self.reset_error.clone() {
+            return Err(VmError::HostError(error));
+        }
 
         if !self.scope_reset_pending {
-            self.request_cancel_submitted_host_ops(OperationCancelReason::VmReset)?;
+            if let Err(error) =
+                self.request_cancel_submitted_host_ops(OperationCancelReason::VmReset)
+            {
+                self.mark_reset_failed(&error);
+                return Err(error);
+            }
             // Allocate the replacement before publishing or closing anything.
             // There is no second allocation after the old scope quiesces.
             let replacement = match ExecutionScope::new() {
@@ -482,12 +506,15 @@ impl HostRuntime {
                 return Err(VmError::ExecutionScope(error));
             }
             self.scoped_operation_completions.clear();
-            self.execution_scope
-                .cancel_operations_and_wait(crate::vm::operation::OperationCancelReason::VmReset);
             self.replacement_execution_scope = Some(replacement);
             self.scope_reset_pending = true;
         } else {
-            self.request_cancel_submitted_host_ops(OperationCancelReason::VmReset)?;
+            if let Err(error) =
+                self.request_cancel_submitted_host_ops(OperationCancelReason::VmReset)
+            {
+                self.mark_reset_failed(&error);
+                return Err(error);
+            }
             self.scoped_operation_completions.clear();
         }
 
@@ -509,8 +536,7 @@ impl HostRuntime {
                 .begin_close(crate::vm::resource::ResourceCloseReason::VmReset);
         }
         self.scoped_operation_completions.clear();
-        self.execution_scope
-            .cancel_operations_and_wait(crate::vm::operation::OperationCancelReason::VmReset);
+        self.stream_drivers.clear();
         self.replacement_execution_scope = None;
         self.scope_reset_pending = false;
         self.scope_reset_error = Some(error);
@@ -527,9 +553,15 @@ impl HostRuntime {
         if let Some(error) = self.scope_reset_error.clone() {
             return Poll::Ready(Err(VmError::ExecutionScope(error)));
         }
+        if let Some(error) = self.reset_error.clone() {
+            return Poll::Ready(Err(VmError::HostError(error)));
+        }
         match self.poll_bridge_operations(cx) {
             Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Ready(Err(error)) => {
+                self.mark_reset_failed(&error);
+                return Poll::Ready(Err(error));
+            }
             Poll::Ready(Ok(())) => {}
         }
         if !self.scope_reset_pending {
@@ -549,6 +581,8 @@ impl HostRuntime {
                     .take()
                     .expect("pending scope reset must retain one replacement scope");
                 self.execution_scope = replacement;
+                self.stream_drivers.clear();
+                self.pending_stream_terminations.clear();
                 self.scope_reset_pending = false;
                 Poll::Ready(Ok(()))
             }
@@ -564,16 +598,179 @@ impl HostRuntime {
         }
     }
 
+    pub(crate) fn begin_stream_termination(
+        &mut self,
+        op_id: HostOpId,
+        termination: HostStreamTermination,
+    ) -> VmResult<()> {
+        if self.pending_stream_terminations.contains_key(&op_id) {
+            return Ok(());
+        }
+        let Some(mut driver) = self.stream_drivers.remove(&op_id) else {
+            return Err(VmError::HostError(format!(
+                "missing callable stream driver {op_id}"
+            )));
+        };
+        if let Err(error) = driver.begin_termination(&mut self.execution_scope, termination) {
+            self.pending_stream_terminations.insert(
+                op_id,
+                PendingHostStreamTermination {
+                    driver,
+                    termination,
+                    admission_error: None,
+                    termination_started: false,
+                    cleanup_error: Some(VmError::HostError(error.to_string())),
+                },
+            );
+            return Err(error);
+        }
+        self.pending_stream_terminations.insert(
+            op_id,
+            PendingHostStreamTermination {
+                driver,
+                termination,
+                admission_error: None,
+                termination_started: true,
+                cleanup_error: None,
+            },
+        );
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn retain_stream_admission_rollback(
+        &mut self,
+        rollback: HostStreamAdmissionRollback,
+        primary: VmError,
+    ) -> HostOpId {
+        let op_id = self.next_host_op_id;
+        self.next_host_op_id = self.next_host_op_id.wrapping_add(1).max(1);
+        self.pending_stream_terminations.insert(
+            op_id,
+            PendingHostStreamTermination {
+                driver: rollback.driver,
+                termination: rollback.termination,
+                admission_error: Some(primary),
+                termination_started: false,
+                cleanup_error: None,
+            },
+        );
+        op_id
+    }
+
+    pub(crate) fn poll_stream_terminations(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<()>> {
+        let ids: Vec<HostOpId> = self.pending_stream_terminations.keys().copied().collect();
+        let has_admission_rollback = ids.iter().any(|op_id| {
+            self.pending_stream_terminations
+                .get(op_id)
+                .is_some_and(|pending| pending.admission_error.is_some())
+        });
+        let mut completed = Vec::new();
+        let mut first_error = None;
+        let mut immediate_cleanup_error = false;
+        for op_id in ids {
+            let Some(pending) = self.pending_stream_terminations.get_mut(&op_id) else {
+                continue;
+            };
+            if !pending.termination_started {
+                match pending
+                    .driver
+                    .begin_termination(&mut self.execution_scope, pending.termination)
+                {
+                    Ok(()) => pending.termination_started = true,
+                    Err(error) => {
+                        if pending.cleanup_error.is_none() {
+                            pending.cleanup_error = Some(error);
+                        }
+                        if let Some(primary) = pending.admission_error.as_ref() {
+                            if first_error.is_none() {
+                                first_error = Some(VmError::HostError(format!(
+                                    "{primary}; cleanup failed: {}",
+                                    pending
+                                        .cleanup_error
+                                        .as_ref()
+                                        .expect("cleanup error recorded"),
+                                )));
+                            }
+                            immediate_cleanup_error = true;
+                        }
+                        continue;
+                    }
+                }
+            }
+            match pending.driver.poll_termination(
+                &mut self.execution_scope,
+                pending.termination,
+                cx,
+            ) {
+                Poll::Pending => {}
+                Poll::Ready(Ok(())) => completed.push(op_id),
+                Poll::Ready(Err(error)) => {
+                    completed.push(op_id);
+                    if pending.cleanup_error.is_none() {
+                        pending.cleanup_error = Some(error);
+                    }
+                }
+            }
+        }
+        for op_id in completed {
+            if let Some(pending) = self.pending_stream_terminations.remove(&op_id) {
+                let cleanup = pending.cleanup_error;
+                let error = match (pending.admission_error, cleanup) {
+                    (Some(primary), Some(cleanup)) => {
+                        preserve_stream_cleanup(primary, Err(cleanup))
+                    }
+                    (Some(primary), None) => primary,
+                    (None, Some(cleanup)) => cleanup,
+                    (None, None) => continue,
+                };
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        if immediate_cleanup_error {
+            Poll::Ready(Err(first_error.expect("cleanup error recorded")))
+        } else if has_admission_rollback && !self.pending_stream_terminations.is_empty() {
+            Poll::Pending
+        } else if let Some(error) = first_error {
+            Poll::Ready(Err(error))
+        } else if self.pending_stream_terminations.is_empty() {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    pub(crate) fn has_pending_stream_terminations(&self) -> bool {
+        !self.pending_stream_terminations.is_empty()
+    }
+
     pub(crate) fn scope_reset_error(&self) -> Option<&ExecutionScopeError> {
         self.scope_reset_error.as_ref()
+    }
+
+    pub(crate) fn mark_reset_failed(&mut self, error: &VmError) {
+        if self.scope_reset_error.is_none() && self.reset_error.is_none() {
+            self.reset_error = Some(error.to_string());
+        }
+    }
+
+    pub(crate) fn reset_error(&self) -> Option<VmError> {
+        self.reset_error
+            .as_ref()
+            .map(|error| VmError::HostError(error.clone()))
     }
 
     pub(crate) fn is_reusable(&self) -> bool {
         !self.scope_reset_pending
             && self.scope_reset_error.is_none()
+            && self.reset_error.is_none()
             && self.execution_scope.is_reusable()
             && self.bridge_operations.is_empty()
             && self.scoped_operation_completions.is_empty()
+            && self.stream_drivers.is_empty()
+            && self.pending_stream_terminations.is_empty()
     }
 }
 

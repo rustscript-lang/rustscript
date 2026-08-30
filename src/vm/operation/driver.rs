@@ -73,6 +73,26 @@ pub trait HostOperation: Any + Send + 'static {
     /// Registers a waker for the transition to quiescent after cancellation.
     fn register_quiescence_waker(&mut self, _cx: &Context<'_>) {}
 
+    /// Polls the transition to quiescence without a check-then-register race.
+    ///
+    /// The default compatibility implementation deliberately keeps the
+    /// existing `is_quiescent` and `register_quiescence_waker` hooks: it checks
+    /// once, registers the caller's waker, then checks again. A driver that
+    /// publishes quiescence between those two operations is therefore observed
+    /// in this poll, while a publication after the second check wakes the
+    /// registered task.
+    fn poll_quiescent(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.is_quiescent() {
+            return Poll::Ready(());
+        }
+        self.register_quiescence_waker(cx);
+        if self.is_quiescent() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+
     /// Cancels and waits for the driver's worker to terminate.
     ///
     /// This method is the cancellation/quiescence boundary. Implementations
