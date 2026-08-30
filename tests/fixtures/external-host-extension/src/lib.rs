@@ -96,6 +96,7 @@ pub struct DemoPolicy {
 pub struct CounterOp {
     pub remaining: u64,
     pub cancelled: Arc<AtomicUsize>,
+    pub quiescent: bool,
 }
 
 impl vm::operation::HostOperation for CounterOp {
@@ -117,7 +118,12 @@ impl vm::operation::HostOperation for CounterOp {
     ) -> vm::operation::OperationResult<()> {
         self.cancelled.fetch_add(1, Ordering::SeqCst);
         self.remaining = 0;
+        self.quiescent = true;
         Ok(())
+    }
+
+    fn is_quiescent(&self) -> bool {
+        self.quiescent
     }
 }
 
@@ -249,6 +255,7 @@ fn spawn_op(vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
     let spec = vm::operation::OperationSpec::new(CounterOp {
         remaining: 2,
         cancelled: Arc::clone(&cancelled),
+        quiescent: false,
     });
     let id = vm
         .host_context()
@@ -545,6 +552,7 @@ fn reset_driven_scope_cleanup_closes_resources_and_cancels_operations() {
     let spec = vm::operation::OperationSpec::new(CounterOp {
         remaining: 200,
         cancelled: Arc::clone(&cancelled),
+        quiescent: false,
     });
     vm.host_context().start_operation(spec).expect("op start");
     assert_eq!(vm.host_context().resource_count(), 2);

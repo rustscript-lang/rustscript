@@ -2,6 +2,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use vm::{Value, Vm, VmError, VmStatus, compile_source};
 
+use super::vm_reset::reset_for_reuse_to_ready;
+
 fn run_source(source: &str) -> Result<Vec<Value>, VmError> {
     let compiled =
         compile_source(&format!("use io;\n{source}")).expect("async io source should compile");
@@ -236,10 +238,13 @@ fn async_io_reset_kills_and_reaps_the_entire_popen_process_group() {
         descendant: Some(descendant_pid),
     };
 
-    let _ = vm.reset_for_reuse();
+    tokio::runtime::Runtime::new()
+        .expect("reset runtime should build")
+        .block_on(async {
+            reset_for_reuse_to_ready(&mut vm).expect("reset should reach quiescence");
+        });
     assert!(vm.execution_scope().resources().is_empty());
     assert!(vm.execution_scope().operations().is_empty());
-    std::thread::sleep(std::time::Duration::from_millis(1_200));
     assert!(
         !marker_path.exists(),
         "a killed process group must not run descendants"

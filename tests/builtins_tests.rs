@@ -1,5 +1,8 @@
 #![cfg(feature = "runtime")]
 
+#[path = "support/vm_reset.rs"]
+mod vm_reset;
+
 #[cfg(feature = "async")]
 #[path = "support/async_test_bridge.rs"]
 mod async_test_bridge;

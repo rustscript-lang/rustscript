@@ -12,8 +12,13 @@ struct TokioTestBridge {
 
 impl TokioTestBridge {
     fn new() -> Self {
+        #[cfg(not(target_family = "wasm"))]
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        #[cfg(target_family = "wasm")]
+        let mut builder = tokio::runtime::Builder::new_current_thread();
+
         Self {
-            runtime: tokio::runtime::Builder::new_multi_thread()
+            runtime: builder
                 .enable_all()
                 .build()
                 .expect("test runtime should build"),

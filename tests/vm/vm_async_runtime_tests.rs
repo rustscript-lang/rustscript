@@ -115,6 +115,32 @@ impl HostAsyncBridge for TestAsyncBridge {
     }
 }
 
+struct RejectingCancelBridge;
+
+impl HostAsyncBridge for RejectingCancelBridge {
+    fn submit_op(&mut self, _op_id: HostOpId, _future: vm::HostFuture) -> Result<(), VmError> {
+        Ok(())
+    }
+
+    fn poll_op(
+        &mut self,
+        _op_id: HostOpId,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<vm::CallReturn, VmError>> {
+        Poll::Pending
+    }
+
+    fn request_cancel_op(
+        &mut self,
+        _op_id: HostOpId,
+        _reason: vm::operation::OperationCancelReason,
+    ) -> Result<(), VmError> {
+        Err(VmError::HostError(
+            "cancellation request rejected".to_string(),
+        ))
+    }
+}
+
 struct AsyncAddOneFunction {
     ops: SharedAsyncOps,
     calls: Arc<AtomicUsize>,
@@ -247,6 +273,30 @@ async fn reset_cancels_pending_host_bridge_operation() {
     let _ = vm.reset_for_reuse();
     assert_eq!(ops.lock().unwrap().pending.len(), 0);
     assert_eq!(vm.waiting_host_op_id(), None);
+}
+
+#[test]
+fn failed_bridge_reset_does_not_mark_vm_reusable() {
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![vm::OpCode::Ret as u8]));
+    vm.set_async_bridge(Box::new(RejectingCancelBridge))
+        .expect("bridge should install");
+    vm.submit_host_future(Box::pin(std::future::pending::<
+        Result<vm::HostFutureOutput, VmError>,
+    >()))
+    .expect("bridge should accept pending future");
+
+    let error = vm
+        .reset_for_reuse()
+        .expect_err("rejected cancellation must fail reset");
+    assert!(
+        matches!(error, VmError::HostError(ref message) if message.contains("rejected")),
+        "unexpected reset error: {error:?}"
+    );
+    assert!(!vm.is_reusable(), "failed reset must poison VM reuse");
+    assert!(
+        matches!(vm.run(), Err(VmError::HostError(message)) if message.contains("rejected")),
+        "failed reset must block execution"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

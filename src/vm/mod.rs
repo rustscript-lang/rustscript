@@ -35,6 +35,7 @@ mod superinstructions;
 #[cfg(test)]
 mod tests;
 pub use self::aot::AotArtifactError;
+use self::async_host::preserve_stream_cleanup;
 pub use self::async_host::{CaptureAsyncHostContext, HostFuture, HostFutureOutput};
 pub use self::capability::{CapabilityProfile, CapabilityProfileBuilder};
 use self::engine::Engine;
@@ -976,11 +977,28 @@ impl Vm {
     /// retired through the generic execution-scope lifecycle. If generic close
     /// is still pending, the old scope remains retained and VM execution is
     /// blocked until `poll_reset_for_reuse` reaches quiescence.
+    /// A successful return only starts the reset; callers must poll
+    /// `poll_reset_for_reuse` to obtain the deterministic completion result
+    /// before observing an empty scope or reusing the VM.
     pub fn reset_for_reuse(&mut self) -> VmResult<()> {
-        validate_frame_allocation_limits(&self.program)?;
-        self.cancel_waiting_host_op_with_reason(
+        if let Err(error) = validate_frame_allocation_limits(&self.program) {
+            self.host.mark_reset_failed(&error);
+            return Err(error);
+        }
+        let waiting_cleanup = self.cancel_waiting_host_op_with_reason(
             crate::vm::operation::OperationCancelReason::VmReset,
-        )?;
+        );
+        let stream_cleanup = self.cancel_callable_stream_with_reason(
+            crate::vm::operation::OperationCancelReason::VmReset,
+        );
+        let cleanup_result = match waiting_cleanup {
+            Ok(()) => stream_cleanup,
+            Err(error) => Err(preserve_stream_cleanup(error, stream_cleanup)),
+        };
+        if let Err(error) = cleanup_result {
+            self.host.mark_reset_failed(&error);
+            return Err(error);
+        }
         if let Err(error) = self.host.reset_execution_scope() {
             self.instance.invalidate_callback_registries();
             return Err(error);
@@ -1031,6 +1049,22 @@ impl Vm {
         }
         if let Some(error) = self.host.scope_reset_error().cloned() {
             return Err(VmError::ExecutionScope(error));
+        }
+        if let Some(error) = self.host.reset_error() {
+            return Err(error);
+        }
+        if self.host.has_pending_stream_terminations() {
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            match self.host.poll_stream_terminations(&mut cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Err(error),
+                Poll::Pending => {
+                    return Err(VmError::HostError(
+                        "callable stream termination is not quiescent".to_string(),
+                    ));
+                }
+            }
         }
         if !self.host.scope_reset_pending {
             if self.host.has_pending_bridge_cancellations() {
@@ -1330,7 +1364,14 @@ impl Vm {
 
     pub fn run(&mut self) -> VmResult<VmStatus> {
         self.ensure_scope_ready()?;
-        self.run_internal(None, true)
+        let status = match self.run_internal(None, true) {
+            Ok(status) => status,
+            Err(error) => {
+                let cleanup = self.abort_callable_stream_on_run_error();
+                return Err(preserve_stream_cleanup(error, cleanup));
+            }
+        };
+        self.resume_callable_stream_after_run(status)
     }
 
     pub fn run_with_debugger(
@@ -1338,13 +1379,26 @@ impl Vm {
         debugger: &mut crate::debugger::Debugger,
     ) -> VmResult<VmStatus> {
         self.ensure_scope_ready()?;
-        self.run_internal(Some(debugger), false)
+        let status = match self.run_internal(Some(debugger), false) {
+            Ok(status) => status,
+            Err(error) => {
+                let cleanup = self.abort_callable_stream_on_run_error();
+                return Err(preserve_stream_cleanup(error, cleanup));
+            }
+        };
+        self.resume_callable_stream_after_run(status)
     }
 }
 
 impl Drop for Vm {
     fn drop(&mut self) {
         let _ = self.cancel_waiting_host_op_with_reason(
+            crate::vm::operation::OperationCancelReason::VmDrop,
+        );
+        let _ = self.cancel_callable_stream_with_reason(
+            crate::vm::operation::OperationCancelReason::VmDrop,
+        );
+        let _ = self.terminate_all_callable_streams_with_reason(
             crate::vm::operation::OperationCancelReason::VmDrop,
         );
         self.host
@@ -3110,7 +3164,14 @@ impl Vm {
                 .map(|frame| &frame.continuation),
             Some(FrameContinuation::ReturnToHost)
         );
-        self.run_internal(None, allow_jit)
+        let status = match self.run_internal(None, allow_jit) {
+            Ok(status) => status,
+            Err(error) => {
+                let cleanup = self.abort_callable_stream_on_run_error();
+                return Err(preserve_stream_cleanup(error, cleanup));
+            }
+        };
+        self.resume_callable_stream_after_run(status)
     }
 
     pub fn stack(&self) -> &[Value] {
@@ -3318,15 +3379,24 @@ impl Vm {
         let _ = self.cancel_waiting_host_op_with_reason(
             crate::vm::operation::OperationCancelReason::VmDrop,
         );
+        let _ = self.cancel_callable_stream_with_reason(
+            crate::vm::operation::OperationCancelReason::VmDrop,
+        );
+        let _ = self.terminate_all_callable_streams_with_reason(
+            crate::vm::operation::OperationCancelReason::VmDrop,
+        );
         self.host
             .cancel_submitted_host_ops(crate::vm::operation::OperationCancelReason::VmDrop);
-        self.host.scoped_operation_completions.clear();
         // Begin execution-scope shutdown (first-reason-wins; sealing the
         // operation registry) before tearing down interpreter state.
         let _ = self
             .host
             .execution_scope
             .begin_close(crate::vm::resource::ResourceCloseReason::VmDrop);
+        self.host.scoped_operation_completions.clear();
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let _ = self.host.execution_scope.poll_close(&mut cx);
         self.instance.queued_callables.clear();
         self.instance.completed_callable_results.clear();
         self.instance.owned_callables.clear();

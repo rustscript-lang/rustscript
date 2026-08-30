@@ -129,6 +129,17 @@ struct NamespaceDecl {
     runtime_supported_on_wasm: bool,
 }
 
+/// HTTP/SSE is a native transport extension. Keep this predicate identical to
+/// the `cfg` boundary used by the runtime and public exports: the Cargo
+/// feature remains selectable on wasm, but it must not publish transport
+/// sources or generated host/catalog entries there.
+pub(crate) fn http_transport_enabled(http_client_feature: bool, target_family: &str) -> bool {
+    http_client_feature
+        && !target_family
+            .split(',')
+            .any(|family| family.trim() == "wasm")
+}
+
 #[derive(Clone, Debug)]
 struct Group<'a> {
     key: String,
@@ -166,7 +177,8 @@ fn main() {
         catalog.retain(|entry| !entry.source_name.starts_with("sqlite::"));
     }
 
-    let host_sources = vec![
+    let target_family = env::var("CARGO_CFG_TARGET_FAMILY").expect("missing target family");
+    let mut host_sources = vec![
         SourceSpec {
             path: "src/builtins/runtime/host.rs".to_string(),
             module: "host".to_string(),
@@ -178,6 +190,21 @@ fn main() {
             category: SourceCategory::DefaultHost,
         },
     ];
+    if http_transport_enabled(
+        env::var_os("CARGO_FEATURE_HTTP_CLIENT").is_some(),
+        &target_family,
+    ) {
+        host_sources.push(SourceSpec {
+            path: "src/builtins/runtime/http/mod.rs".to_string(),
+            module: "http".to_string(),
+            category: SourceCategory::DefaultHost,
+        });
+        host_sources.push(SourceSpec {
+            path: "src/builtins/runtime/http/sse.rs".to_string(),
+            module: "http::sse".to_string(),
+            category: SourceCategory::DefaultHost,
+        });
+    }
     let async_enabled = env::var_os("CARGO_FEATURE_ASYNC").is_some();
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("missing target architecture");
     let builtin_sources = builtin_source_specs(&namespaces, async_enabled, &target_arch);
@@ -2216,10 +2243,20 @@ fn find_matching_paren(source: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        HostExecutionKind, NamespaceDecl, SourceCategory, builtin_source_specs, parse_source_file,
-        select_io_source_path,
+        HostExecutionKind, NamespaceDecl, SourceCategory, builtin_source_specs,
+        http_transport_enabled, parse_source_file, select_io_source_path,
     };
     use std::path::Path;
+
+    #[test]
+    fn http_transport_predicate_matches_source_and_catalog_boundary() {
+        assert!(http_transport_enabled(true, "unix"));
+        assert!(http_transport_enabled(true, "windows"));
+        assert!(!http_transport_enabled(true, "wasm"));
+        assert!(!http_transport_enabled(true, "wasm,unix"));
+        assert!(!http_transport_enabled(false, "unix"));
+        assert!(!http_transport_enabled(false, "wasm"));
+    }
 
     fn io_namespace() -> NamespaceDecl {
         NamespaceDecl {
