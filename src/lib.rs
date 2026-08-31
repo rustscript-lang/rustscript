@@ -29,6 +29,9 @@ pub use builtins::runtime::{
     BorrowVmValue, FromVmValue, HostCallResult, IntoHostCallOutcome, TakeVmValue, arg, borrow_arg,
     return_one, take_arg,
 };
+#[cfg(feature = "runtime")]
+#[path = "builtins/runtime/io/confined_fs.rs"]
+mod confined_fs;
 #[cfg(feature = "http-client")]
 pub use builtins::runtime::{
     HttpConfig, HttpHostExt, http_host_catalog, register_http_builtin_module,
@@ -57,6 +60,14 @@ pub use bytecode::{
     CaptureBindingMode, ExportedCallable, FunctionRegion, HostImport, HostImportParam,
     HostImportSchema, NamedStructSchema, OpCode, Program, RootCallableBinding, ScriptFunction,
     TypeMap, Value, ValueType, VmMap,
+};
+#[cfg(feature = "runtime")]
+pub use confined_fs::{
+    ConfinedDirEntry, ConfinedFile, ConfinedFileType, ConfinedFsError, ConfinedFsErrorKind,
+    ConfinedFsLimits, ConfinedFsRoot, ConfinedMetadata, ConfinedObservedIdentity,
+    ConfinedPublication, ConfinedPublicationState, ConfinedTempFile, EnumerationBudget,
+    MAX_COMPONENT_BYTES, MAX_ENUM_ENTRIES, MAX_PATH_BYTES, MAX_READ_BYTES, MAX_TEMP_ATTEMPTS,
+    MAX_TEMP_PREFIX_BYTES, MAX_WRITE_BYTES, publication_supported,
 };
 pub fn builtin_call_index(name: &str) -> Option<u16> {
     use builtins::BuiltinFunction;
