@@ -288,7 +288,7 @@ fn drop_contract_counts_overwrites_and_reset_clears_counter() {
         "expected drop contract to observe overwrite cleanup, got {after_run}"
     );
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     let after_reset = vm.drop_contract_event_count();
     assert_eq!(
         after_reset, 0,
@@ -321,7 +321,7 @@ fn reset_for_reuse_counts_cleanup_drops_from_live_state() {
         "cleanup should not have run before reset"
     );
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert_eq!(
         vm.drop_contract_event_count(),
         5,

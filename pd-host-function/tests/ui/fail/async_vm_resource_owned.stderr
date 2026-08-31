@@ -1,0 +1,5 @@
+error: async host functions cannot borrow Vm; capture owned host context before submission
+  --> tests/ui/fail/async_vm_resource_owned.rs:18:17
+   |
+18 |             vm: &mut Vm,
+   |                 ^^^^^^^

@@ -2,43 +2,67 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 
 pub(crate) mod aot;
+pub mod async_host;
+mod capability;
 pub mod diagnostics;
 mod engine;
 mod epoch;
 pub mod execution_scope;
 mod fuel;
 mod host;
+pub mod host_context;
+pub mod host_extension;
 mod host_runtime;
 pub(crate) mod host_state;
 mod instance;
+pub mod invocation;
 pub(crate) mod jit;
 mod map_iter;
 pub(crate) mod native;
 pub mod operation;
 pub mod program;
+pub(crate) mod regex_cache;
 pub mod resource;
 mod run_context;
+pub mod runtime;
+pub mod standard_composition;
+pub(crate) mod standard_ops;
 mod store;
 mod superinstructions;
 #[cfg(test)]
 mod tests;
 pub use self::aot::AotArtifactError;
+pub use self::async_host::{CaptureAsyncHostContext, HostFuture, HostFutureOutput};
+pub use self::capability::{CapabilityProfile, CapabilityProfileBuilder};
 use self::engine::Engine;
 pub use self::epoch::{EpochCheckpoint, EpochHandle};
 use self::execution_scope::ExecutionScopeError;
 pub use self::fuel::FuelCheckpoint;
 pub use self::host::{
-    CallOutcome, CallReturn, HostArgsFunction, HostAsyncBridge, HostBindingPlan, HostFunction,
-    HostFunctionRegistry, HostOpId, HostStackFunction, StaticHostArgsFunction, StaticHostFunction,
-    StaticHostStackFunction,
+    CallOutcome, CallReturn, HostArgsFunction, HostAsyncBridge, HostAsyncOpTerminal,
+    HostBindingPlan, HostFunction, HostFunctionRegistry, HostOpId, HostStackFunction,
+    RegistrySchemaError, StaticHostArgsFunction, StaticHostFunction, StaticHostStackFunction,
 };
 use self::host::{HostCallExecOutcome, VmHostFunction};
+pub use self::host_context::{
+    HostContext, HostContextError, HostContextErrorKind, HostContextResult, HostModule,
+    HostModule as HostModuleState,
+};
+pub use self::host_extension::{
+    CatalogRegistrationError, CatalogSchemaSelection, HostExtension, HostImportParam,
+    HostImportSchema, catalog_import_schemas, register_catalog_function,
+    register_catalog_static_function, validate_catalog_import_schemas,
+    validate_catalog_import_schemas_with_fingerprints,
+};
 use self::host_runtime::HostRuntime;
 use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable};
+pub use self::invocation::{Invocation, InvocationError, InvocationItem, InvocationPoll};
 pub use self::resource::ResourceCloseReason;
 use self::run_context::{InterruptMode, RunContext};
+pub use self::standard_composition::StandardSurfaceComposition;
 pub use crate::bytecode::{
     CallableTarget, CallableValue, HostImport, OpCode, Program, Value, ValueType,
 };
@@ -362,6 +386,11 @@ fn compute_program_cache_key(program: &Program) -> u64 {
         hash_value(constant, &mut hasher);
     }
     program.imports.hash(&mut hasher);
+    let has_host_import_schemas = program.host_import_schemas.iter().any(Option::is_some);
+    has_host_import_schemas.hash(&mut hasher);
+    if has_host_import_schemas {
+        program.host_import_schemas.hash(&mut hasher);
+    }
     program.script_functions.hash(&mut hasher);
     program.function_regions.hash(&mut hasher);
     program.root_callable_bindings.hash(&mut hasher);
@@ -552,7 +581,7 @@ impl Vm {
             engine,
             instance,
             run_ctx: RunContext::default(),
-            host: HostRuntime::default(),
+            host: HostRuntime::with_standard_composition(crate::standard_composition()),
         }
     }
 
@@ -692,14 +721,81 @@ impl Vm {
     ///
     /// Locals are reset to `Null`, stack is cleared, and instruction pointer is
     /// rewound to the program entry. In-flight IO work and live IO handles are
-    /// retired through the generic execution-scope lifecycle (the old scope is
-    /// dropped and replaced with a fresh one).
-    pub fn reset_for_reuse(&mut self) {
-        self.cancel_waiting_host_op();
-        self.host.reset_execution_scope();
+    /// retired through the generic execution-scope lifecycle. If generic close
+    /// is still pending, the old scope remains retained and VM execution is
+    /// blocked until `poll_reset_for_reuse` reaches quiescence.
+    pub fn reset_for_reuse(&mut self) -> VmResult<()> {
+        self.cancel_waiting_host_op_with_reason(
+            crate::vm::operation::OperationCancelReason::VmReset,
+        )?;
+        if let Err(error) = self.host.reset_execution_scope() {
+            self.instance.invalidate_callback_registries();
+            return Err(error);
+        }
         self.run_ctx.reset_for_reuse();
         self.instance.reset(&self.program);
         self.engine.reset_runtime_state(&self.program);
+        Ok(())
+    }
+
+    /// Whether a reset is still waiting for the generic execution scope to
+    /// reach quiescence. A pending reset blocks VM execution and pool reuse.
+    pub fn scope_reset_pending(&self) -> bool {
+        self.host.scope_reset_pending
+    }
+
+    /// Whether a reset has reached a terminal error. A terminal reset error
+    /// prevents execution and callback publication until the VM is replaced.
+    pub(crate) fn scope_reset_error(&self) -> Option<&ExecutionScopeError> {
+        self.host.scope_reset_error()
+    }
+
+    /// Whether the VM is safe to return to a reuse pool. The execution scope
+    /// must still be Active and no reset may be waiting on the old scope.
+    pub fn is_reusable(&self) -> bool {
+        self.host.is_reusable()
+            && self.run_ctx.is_reusable()
+            && self.instance.is_reusable(&self.program)
+    }
+
+    /// Polls a reset's generic operation/resource close boundary.
+    ///
+    /// A replacement scope is created only after this returns `Ready(Ok(()))`.
+    /// Callers that maintain a VM pool can use this method with their own
+    /// waker instead of releasing the VM while its old scope is Closing.
+    pub fn poll_reset_for_reuse(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<()>> {
+        match self.host.poll_reset_execution_scope(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+        }
+    }
+
+    fn ensure_scope_ready(&mut self) -> VmResult<()> {
+        if self.instance.shutdown {
+            return Err(VmError::InvalidFrameState("vm is shut down"));
+        }
+        if let Some(error) = self.host.scope_reset_error().cloned() {
+            return Err(VmError::ExecutionScope(error));
+        }
+        if !self.host.scope_reset_pending {
+            if self.host.has_pending_bridge_cancellations() {
+                return Err(VmError::HostError(
+                    "bridge host operation is not quiescent".to_string(),
+                ));
+            }
+            if self.host.execution_scope.is_active() {
+                return Ok(());
+            }
+            return Err(VmError::ExecutionScope(ExecutionScopeError::ScopeClosing));
+        }
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        match self.poll_reset_for_reuse(&mut cx) {
+            Poll::Ready(Ok(())) => Ok(()),
+            Poll::Ready(Err(error)) => Err(error),
+            Poll::Pending => Err(VmError::ExecutionScope(ExecutionScopeError::ScopeClosing)),
+        }
     }
 
     fn validate_map_iterator_slot(&self, slot: usize) -> VmResult<()> {
@@ -977,6 +1073,7 @@ impl Vm {
     }
 
     pub fn run(&mut self) -> VmResult<VmStatus> {
+        self.ensure_scope_ready()?;
         self.run_internal(None, true)
     }
 
@@ -984,13 +1081,18 @@ impl Vm {
         &mut self,
         debugger: &mut crate::debugger::Debugger,
     ) -> VmResult<VmStatus> {
+        self.ensure_scope_ready()?;
         self.run_internal(Some(debugger), false)
     }
 }
 
 impl Drop for Vm {
     fn drop(&mut self) {
-        self.cancel_waiting_host_op();
+        let _ = self.cancel_waiting_host_op_with_reason(
+            crate::vm::operation::OperationCancelReason::VmDrop,
+        );
+        self.host
+            .cancel_submitted_host_ops(crate::vm::operation::OperationCancelReason::VmDrop);
         self.instance.drop_cleanup();
         // Live IO handles and in-flight IO operations are retired by the
         // `ExecutionScope`'s own `Drop`, which runs as part of `HostRuntime`.
@@ -2078,7 +2180,9 @@ impl Vm {
         debugger: Option<&mut crate::debugger::Debugger>,
         allow_jit: bool,
     ) -> VmResult<VmStatus> {
+        self.instance.run_depth = self.instance.run_depth.saturating_add(1);
         let result = self.run_internal_impl(debugger, allow_jit);
+        self.instance.run_depth = self.instance.run_depth.saturating_sub(1);
         if result.is_err() {
             self.close_all_map_iterators();
         }
@@ -2125,7 +2229,7 @@ impl Vm {
     ) -> VmResult<VmStatus> {
         self.ensure_call_bindings()?;
         self.sync_jit_non_yielding_host_imports();
-        if let Some(waiting) = self.instance.waiting_host_op {
+        if let Some(waiting) = self.instance.waiting_host_op.as_ref() {
             self.instance.last_yield_reason = None;
             let status = VmStatus::Waiting(waiting.op_id);
             self.notify_debugger_status(&mut debugger, status);
@@ -2628,6 +2732,7 @@ impl Vm {
     }
 
     pub fn resume(&mut self) -> VmResult<VmStatus> {
+        self.ensure_scope_ready()?;
         let allow_jit = !matches!(
             self.instance
                 .execution_frames
@@ -2669,6 +2774,30 @@ impl Vm {
     /// starting/cancelling operations without reaching into VM private state.
     pub fn execution_scope(&mut self) -> &mut crate::vm::execution_scope::ExecutionScope {
         &mut self.host.execution_scope
+    }
+
+    /// Returns the generic host boundary for this VM.
+    ///
+    /// [`HostContext`](crate::vm::host_context::HostContext) exposes typed
+    /// per-VM module state and the generic host-agnostic execution-scope SDK
+    /// to external host extensions without leaking the underlying host runtime
+    /// or naming a builtin domain module.
+    pub fn host_context(&mut self) -> crate::vm::host_context::HostContext<'_> {
+        crate::vm::host_context::HostContext::new(self)
+    }
+
+    /// Installs a [`HostExtension`](crate::vm::host_extension::HostExtension)
+    /// onto this VM.
+    ///
+    /// Registration (into the VM's bound host-function registry) is
+    /// transactional and runs before the install phase, so a fallible
+    /// registration/registry-binding failure surfaces before any per-VM
+    /// module state is installed.
+    pub fn install_extension(
+        &mut self,
+        extension: &dyn crate::vm::host_extension::HostExtension,
+    ) -> VmResult<()> {
+        extension.install_into(self)
     }
 
     pub fn has_bound_function(&self, name: &str) -> bool {
@@ -2811,7 +2940,12 @@ impl Vm {
 
     pub fn shutdown(&mut self) {
         self.invalidate_callback_registries();
-        self.cancel_waiting_host_op();
+        let _ = self.cancel_waiting_host_op_with_reason(
+            crate::vm::operation::OperationCancelReason::VmDrop,
+        );
+        self.host
+            .cancel_submitted_host_ops(crate::vm::operation::OperationCancelReason::VmDrop);
+        self.host.scoped_operation_completions.clear();
         // Begin execution-scope shutdown (first-reason-wins; sealing the
         // operation registry) before tearing down interpreter state.
         let _ = self
@@ -2832,6 +2966,7 @@ impl Vm {
         self.instance.call_depth = 0;
         self.instance.host_return = None;
         self.instance.waiting_host_op = None;
+        self.instance.drop_invocation_state();
         self.instance.shutdown = true;
     }
 
@@ -2844,6 +2979,7 @@ impl Vm {
     }
 
     pub fn start_callable(&mut self, callable: Value, args: &[Value]) -> VmResult<VmStatus> {
+        self.ensure_scope_ready()?;
         if self.instance.shutdown {
             return Err(VmError::InvalidFrameState("vm is shut down"));
         }
@@ -2967,13 +3103,20 @@ impl Vm {
         }
         self.instance.call_depth = self.script_frame_depth();
         self.instance.host_return = None;
-        self.cancel_waiting_host_op();
+        let _ = self.cancel_waiting_host_op();
         self.instance.last_yield_reason = None;
         self.instance
             .map_iterators
             .truncate(self.instance.call_depth.saturating_add(1));
     }
 
+    pub(crate) fn take_invocation_result(&mut self) -> Option<Value> {
+        self.instance.host_return.take()
+    }
+
+    /// Takes the next result from the callback completion queue. If no queued
+    /// callback result exists, this also retains the legacy fallback to the
+    /// current host return slot.
     pub fn take_callable_result(&mut self) -> Option<Value> {
         self.instance
             .completed_callable_results

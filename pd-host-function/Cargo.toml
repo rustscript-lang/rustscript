@@ -11,6 +11,11 @@ repository = "https://github.com/rustscript-lang/rustscript"
 proc-macro = true
 
 [dependencies]
+pd-host-schema = { path = "../crates/pd-host-schema", version = "0.1.0" }
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full"] }
+
+[dev-dependencies]
+trybuild = "1"
+vm = { package = "pd-vm", path = "..", default-features = false, features = ["runtime"] }

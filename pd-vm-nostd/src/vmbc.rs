@@ -9,6 +9,7 @@ use super::{
 
 const MAGIC: [u8; 4] = *b"VMBC";
 const VERSION_V11: u16 = 11;
+const VERSION_V12: u16 = 12;
 const FLAGS: u16 = 0;
 const MAX_SCHEMA_DEPTH: usize = 64;
 const MAX_CONSTANT_DEPTH: usize = 64;
@@ -57,9 +58,11 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     }
 
     let version = cursor.read_u16()?;
-    if version != VERSION_V11 {
-        return Err(WireError::UnsupportedVersion(version));
-    }
+    let has_host_import_schemas = match version {
+        VERSION_V11 => false,
+        VERSION_V12 => true,
+        _ => return Err(WireError::UnsupportedVersion(version)),
+    };
     let flags = cursor.read_u16()?;
     if flags != FLAGS {
         return Err(WireError::UnsupportedFlags(flags));
@@ -82,6 +85,13 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
             arity: cursor.read_u8()?,
             return_type: read_value_type(cursor.read_u8()?)?,
         });
+        if has_host_import_schemas {
+            match cursor.read_u8()? {
+                0 => {}
+                1 => skip_host_import_schema(&mut cursor)?,
+                value => return Err(WireError::InvalidBool(value)),
+            }
+        }
     }
 
     let encoded_local_count = skip_type_map(&mut cursor)?;
@@ -161,6 +171,40 @@ fn skip_bool_vector(cursor: &mut Cursor<'_>, expected: usize) -> Result<(), Wire
         cursor.read_bool()?;
     }
     Ok(())
+}
+
+fn skip_host_import_schema(cursor: &mut Cursor<'_>) -> Result<(), WireError> {
+    cursor.skip_string()?;
+    let parameter_count = cursor.read_u32()? as usize;
+    for _ in 0..parameter_count {
+        cursor.skip_string()?;
+        skip_host_schema(cursor, 0)?;
+        match cursor.read_u8()? {
+            0..=3 => {}
+            value => return Err(WireError::InvalidValueType(value)),
+        }
+    }
+    skip_host_schema(cursor, 0)?;
+    cursor.read_exact(8).map(|_| ())
+}
+
+fn skip_host_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<(), WireError> {
+    if depth >= MAX_SCHEMA_DEPTH {
+        return Err(WireError::SchemaTooDeep);
+    }
+    match cursor.read_u8()? {
+        0..=7 => Ok(()),
+        8..=10 => skip_host_schema(cursor, depth + 1),
+        11 => {
+            let parameter_count = cursor.read_u32()? as usize;
+            for _ in 0..parameter_count {
+                skip_host_schema(cursor, depth + 1)?;
+            }
+            skip_host_schema(cursor, depth + 1)
+        }
+        12 => cursor.skip_string(),
+        value => Err(WireError::InvalidValueType(value)),
+    }
 }
 
 fn skip_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<(), WireError> {

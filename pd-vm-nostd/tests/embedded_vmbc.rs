@@ -4,8 +4,10 @@ use pd_vm_nostd::{
 };
 use vm::compiler::TypeSchema;
 use vm::{
-    HostImport, OpCode, Program, ReplLocalBinding, Value, ValueType, compile_source,
-    compile_source_for_repl, compile_source_for_repl_with_locals, encode_program,
+    HostApiBuilder, HostFunctionSchema, HostImport, HostImportSchema, HostParamPassing,
+    HostParamSchema, HostTypeSchema, OpCode, Program, ReplLocalBinding, ResourceTypeKey,
+    ResourceTypeSchema, Value, ValueType, compile_source, compile_source_for_repl,
+    compile_source_for_repl_with_locals, encode_program,
 };
 
 fn encoded_scalar_program() -> Vec<u8> {
@@ -29,9 +31,9 @@ fn encoded_scalar_program() -> Vec<u8> {
 }
 
 #[test]
-fn embedded_decoder_reads_host_generated_v11() {
+fn embedded_decoder_reads_host_generated_v12() {
     let bytes = encoded_scalar_program();
-    let program = decode_program(&bytes).expect("embedded decoder should accept VMBC v11");
+    let program = decode_program(&bytes).expect("embedded decoder should accept VMBC v12");
 
     assert_eq!(
         program.code(),
@@ -50,6 +52,54 @@ fn embedded_decoder_reads_host_generated_v11() {
     assert_eq!(program.imports().len(), 1);
     assert_eq!(program.imports()[0].name, "serial::write");
     assert_eq!(program.imports()[0].arity, 1);
+}
+
+#[test]
+fn embedded_decoder_skips_full_host_schema_metadata() {
+    let resource = ResourceTypeKey::new("embedded.resource").expect("resource key");
+    let function = HostFunctionSchema::with_return(
+        "embedded::schema",
+        vec![HostParamSchema::with_passing(
+            "value",
+            HostTypeSchema::Array(Box::new(HostTypeSchema::Resource(resource.clone()))),
+            HostParamPassing::Borrow,
+        )],
+        HostTypeSchema::Callable {
+            params: vec![HostTypeSchema::Int],
+            result: Box::new(HostTypeSchema::Optional(Box::new(HostTypeSchema::String))),
+        },
+    );
+    let mut builder = HostApiBuilder::new();
+    builder.resource(ResourceTypeSchema::new(resource, "embedded resource"));
+    builder.function(function.clone());
+    let catalog = builder.build().expect("catalog");
+    let schema = HostImportSchema::from_function(&catalog, &function);
+
+    let mut program = Program::new(Vec::new(), vec![OpCode::Ret as u8]);
+    program.imports.push(HostImport {
+        name: "embedded::schema".to_string(),
+        arity: 1,
+        return_type: ValueType::Callable,
+    });
+    let program = program
+        .with_host_import_schemas(vec![schema])
+        .expect("schema alignment");
+    let bytes = encode_program(&program).expect("schema payload should encode");
+    let decoded = decode_program(&bytes).expect("embedded decoder should skip schema payload");
+    assert_eq!(decoded.imports().len(), 1);
+}
+
+#[test]
+fn embedded_decoder_reads_legacy_v11_without_schema_markers() {
+    let program = Program::new(
+        vec![Value::Int(7)],
+        vec![OpCode::Ldc as u8, 0, 0, 0, 0, OpCode::Ret as u8],
+    );
+    let mut bytes = encode_program(&program).expect("legacy fixture should encode");
+    bytes[4..6].copy_from_slice(&11u16.to_le_bytes());
+
+    let decoded = decode_program(&bytes).expect("embedded decoder should accept VMBC v11");
+    assert_eq!(decoded.constants()[0], EmbeddedValue::Int(7));
 }
 
 #[test]

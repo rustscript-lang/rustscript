@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::builtins::BuiltinFunction;
+use crate::BuiltinFunction;
 use crate::compiler::TypeSchema;
 use crate::vm::{OpCode, Program, Value, ValueType, checked_int_div};
 

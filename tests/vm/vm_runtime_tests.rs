@@ -1,7 +1,9 @@
 #[path = "../common/mod.rs"]
 mod common;
 use common::*;
+use std::sync::Arc;
 use vm::OpCode;
+use vm::{HostImport, StandardSurfaceComposition};
 
 fn non_yielding_returns_none(_: &[Value]) -> Result<CallOutcome, vm::VmError> {
     Ok(CallOutcome::Return(vm::CallReturn::none()))
@@ -248,6 +250,10 @@ fn call_can_wait_for_host_op_and_resume_without_replay() {
 
     let status = vm.run().expect("first run should wait on host op");
     assert_eq!(status, VmStatus::Waiting(99));
+    assert!(
+        !vm.is_reusable(),
+        "waiting host operation makes VM unavailable for pool reuse"
+    );
 
     vm.complete_host_op(99, vec![Value::Int(7)])
         .expect("host op completion should succeed");
@@ -421,7 +427,7 @@ fn runtime_sleep_host_import_can_be_overridden_by_host_binding() {
     impl HostFunction for RuntimeSleepOverride {
         fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
             assert_eq!(args, &[Value::Int(3)]);
-            Ok(CallOutcome::Return(vec![Value::Int(7)].into()))
+            Ok(CallOutcome::Return(vec![Value::Bool(true)].into()))
         }
     }
 
@@ -437,7 +443,7 @@ fn runtime_sleep_host_import_can_be_overridden_by_host_binding() {
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Int(7)]);
+    assert_eq!(vm.stack(), &[Value::Bool(true)]);
 }
 
 #[test]
@@ -1339,4 +1345,82 @@ fn program_new_infers_locals_through_new_zero_operand_opcodes() {
         ],
     );
     assert_eq!(program.local_count, 6);
+}
+
+struct CompositionValueHost(i64);
+
+impl HostArgsFunction for CompositionValueHost {
+    fn call(&mut self, args: &[Value]) -> vm::VmResult<CallOutcome> {
+        assert!(args.is_empty());
+        Ok(CallOutcome::Return(vm::CallReturn::one(Value::Int(self.0))))
+    }
+}
+
+struct TestStandardComposition {
+    value: i64,
+}
+
+impl StandardSurfaceComposition for TestStandardComposition {
+    fn import_in_standard(&self, import: &HostImport) -> bool {
+        import.name == "composition_value"
+    }
+
+    fn ensure_surfaces(
+        &self,
+        imports: &[HostImport],
+        registry: &mut HostFunctionRegistry,
+    ) -> vm::VmResult<bool> {
+        if imports.iter().any(|import| self.import_in_standard(import)) {
+            let value = self.value;
+            registry.register_args("composition_value", 0, move || {
+                Box::new(CompositionValueHost(value))
+            });
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn build_default_registry(&self) -> vm::VmResult<HostFunctionRegistry> {
+        Ok(HostFunctionRegistry::empty())
+    }
+
+    fn bind_default_name(&self, _vm: &mut Vm, _name: &str) -> bool {
+        false
+    }
+}
+
+#[test]
+fn registry_standard_composition_controls_vm_binding() {
+    let compiled = compile_source("fn composition_value() -> int; composition_value();")
+        .expect("composition test program should compile");
+    let mut registry = HostFunctionRegistry::empty();
+    registry.set_standard_composition(Arc::new(TestStandardComposition { value: 13 }));
+
+    let mut vm = Vm::new(compiled.program);
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("registry composition should stage and bind the import");
+    assert_eq!(vm.run().expect("bound vm should run"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(13)]);
+    assert!(vm.standard_composition().is_some());
+}
+
+#[test]
+fn standard_composition_isolated_per_vm_and_controls_default_binding() {
+    let compiled = compile_source("fn composition_value() -> int; composition_value();")
+        .expect("composition test program should compile");
+
+    let mut first = Vm::new(compiled.program.clone());
+    first.set_standard_composition(Arc::new(TestStandardComposition { value: 7 }));
+    assert_eq!(first.run().expect("first vm should run"), VmStatus::Halted);
+    assert_eq!(first.stack(), &[Value::Int(7)]);
+
+    let mut second = Vm::new(compiled.program);
+    second.set_standard_composition(Arc::new(TestStandardComposition { value: 42 }));
+    assert_eq!(
+        second.run().expect("second vm should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(second.stack(), &[Value::Int(42)]);
 }

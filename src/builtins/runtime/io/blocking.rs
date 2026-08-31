@@ -1,9 +1,9 @@
-use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
@@ -14,30 +14,11 @@ use super::HostCallResult;
 use crate::vm::operation::driver::HostOperation;
 use crate::vm::operation::error::{OperationError, OperationErrorCode, OperationResult};
 use crate::vm::operation::reason::OperationCancelReason;
-use crate::vm::operation::{OperationId, OperationSpec};
+use crate::vm::operation::{OperationId, OperationOutcome, OperationSpec};
 use crate::vm::resource::close::{CloseProgress, HostResource};
 use crate::vm::resource::error::{ResourceError, ResourceErrorCode, ResourceResult};
 use crate::vm::resource::{ResourceCloseReason, ResourceHandle};
 use crate::vm::{CallReturn, HostOpId, Value, Vm, VmError, VmResult};
-
-/// Adapter-declared per-VM IO host state.
-///
-/// Live IO handles are typed [`IoResource`]s owned by the VM's execution
-/// scope; in-flight IO work is driven by concrete [`HostOperation`] drivers
-/// registered in the same scope. This state itself lives in the execution
-/// scope's typed arena (accessed lazily through
-/// `ExecutionScope::scope_state_or_insert_with`), so it follows the scope
-/// lifecycle: it is destroyed on reset/drop and recreated fresh on next use.
-/// The only state kept here is the per-op completion mailbox that carries the
-/// guest-visible result value from the worker thread back to
-/// [`poll_builtin_io_op`]. Polling and cancellation of the operations
-/// themselves go directly through the scope's operation registry — this map
-/// is a value mailbox, not a poller table.
-#[derive(Default)]
-pub(crate) struct IoState {
-    /// Packed [`OperationId::raw`] -> completion mailbox for pending IO ops.
-    pending_results: HashMap<HostOpId, Arc<IoOpShared>>,
-}
 
 /// A file / child-process backed IO handle.
 pub(super) enum IoHandle {
@@ -46,54 +27,253 @@ pub(super) enum IoHandle {
     PopenWrite { child: Child },
 }
 
-/// The typed resource stored in the execution scope for one IO handle.
+/// Shared lifecycle state for one typed IO resource.
 ///
-/// The handle lives behind an `Arc<Mutex<Option<...>>>` so a worker thread
-/// performing read/write/flush/close can transiently take the handle while
-/// the resource itself stays in the scope table. Closing is exact-once: the
-/// first close (via `io::close` worker or the generic scope close) takes the
-/// handle and releases the OS resource.
+/// The handle cell is also the admission lock for workers: a worker increments
+/// `active_workers` while holding the cell lock before taking the handle, and a
+/// close marks the resource closed before inspecting that same cell. This
+/// makes a close racing with a worker either reject the worker or observe it as
+/// active; it can never mistake an owned handle for an idle resource.
+struct IoResourceState {
+    handle: Mutex<Option<IoHandle>>,
+    closed: AtomicBool,
+    active_workers: AtomicUsize,
+    close_waker: Mutex<Option<Waker>>,
+    close_error: Mutex<Option<String>>,
+}
+
+impl IoResourceState {
+    fn new(handle: IoHandle) -> Self {
+        Self {
+            handle: Mutex::new(Some(handle)),
+            closed: AtomicBool::new(false),
+            active_workers: AtomicUsize::new(0),
+            close_waker: Mutex::new(None),
+            close_error: Mutex::new(None),
+        }
+    }
+
+    /// Takes the handle for one worker and records its ownership before
+    /// releasing the admission lock.
+    fn take_handle(self: &Arc<Self>) -> Option<IoHandleLease> {
+        let mut slot = self
+            .handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        let handle = slot.take()?;
+        self.active_workers.fetch_add(1, Ordering::AcqRel);
+        Some(IoHandleLease {
+            state: Arc::clone(self),
+            handle: Some(handle),
+            active: true,
+        })
+    }
+
+    fn mark_closed(&self) {
+        let _guard = self
+            .handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.closed.store(true, Ordering::Release);
+    }
+
+    fn register_close_waker(&self, waker: &Waker) {
+        let mut guard = self
+            .close_waker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.active_workers.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        *guard = Some(waker.clone());
+        if self.active_workers.load(Ordering::Acquire) == 0
+            && let Some(waker) = guard.take()
+        {
+            waker.wake();
+        }
+    }
+
+    fn release_worker(&self) {
+        let previous = self.active_workers.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "IO worker release without an active worker");
+        if previous == 1
+            && let Some(waker) = self
+                .close_waker
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        {
+            waker.wake();
+        }
+    }
+
+    fn record_close_error(&self, error: &VmError) {
+        let mut guard = self
+            .close_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.is_none() {
+            *guard = Some(error.to_string());
+        }
+    }
+
+    fn cleanup_error(&self) -> Option<ResourceError> {
+        self.close_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|message| {
+                ResourceError::new(
+                    ResourceErrorCode::ResourceCleanupFailed,
+                    "io::resource",
+                    message.clone(),
+                )
+            })
+    }
+}
+
+impl Drop for IoResourceState {
+    fn drop(&mut self) {
+        let handle = self
+            .handle
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(handle) = handle {
+            let _ = close_io_handle(handle);
+        }
+    }
+}
+
+/// A worker-owned handle lease. Normal completion explicitly restores the
+/// handle to an open resource, while close/cancellation/unwind paths close it
+/// instead. In either case the active-worker count is decremented and a
+/// pending resource close is woken.
+struct IoHandleLease {
+    state: Arc<IoResourceState>,
+    handle: Option<IoHandle>,
+    active: bool,
+}
+
+impl Deref for IoHandleLease {
+    type Target = IoHandle;
+
+    fn deref(&self) -> &Self::Target {
+        self.handle.as_ref().expect("active IO lease has a handle")
+    }
+}
+
+impl DerefMut for IoHandleLease {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.handle.as_mut().expect("active IO lease has a handle")
+    }
+}
+
+impl IoHandleLease {
+    fn restore(mut self) -> VmResult<()> {
+        self.release_inner(false)
+    }
+
+    fn close(mut self) -> VmResult<()> {
+        self.release_inner(true)
+    }
+
+    fn release_inner(&mut self, force_close: bool) -> VmResult<()> {
+        if !self.active {
+            return Ok(());
+        }
+        let Some(handle) = self.handle.take() else {
+            self.active = false;
+            self.state.release_worker();
+            return Ok(());
+        };
+
+        let mut handle = Some(handle);
+        let should_close = if force_close {
+            true
+        } else {
+            let mut slot = self
+                .state
+                .handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.state.closed.load(Ordering::Acquire) {
+                true
+            } else {
+                *slot = handle.take();
+                false
+            }
+        };
+
+        let result = if should_close {
+            close_io_handle(handle.expect("IO lease close owns its handle"))
+        } else {
+            Ok(())
+        };
+        if let Err(error) = &result {
+            self.state.record_close_error(error);
+        }
+        self.active = false;
+        self.state.release_worker();
+        result
+    }
+}
+
+impl Drop for IoHandleLease {
+    fn drop(&mut self) {
+        if self.active {
+            // A normal worker calls `restore`/`close` explicitly. Reaching this
+            // guard means an unwind or failed handoff, so never return a live
+            // process handle to the resource table implicitly.
+            let _ = self.release_inner(true);
+        }
+    }
+}
+
+/// The typed resource stored in the execution scope for one IO handle.
 struct IoResource {
-    handle: Arc<Mutex<Option<IoHandle>>>,
-    closed: Arc<AtomicBool>,
+    state: Arc<IoResourceState>,
 }
 
 impl IoResource {
     fn new(handle: IoHandle) -> Self {
         Self {
-            handle: Arc::new(Mutex::new(Some(handle))),
-            closed: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(IoResourceState::new(handle)),
         }
     }
 
-    /// Takes the inner handle for a worker thread (exact-once per close).
-    fn take_handle(&self) -> Option<IoHandle> {
-        self.handle
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-    }
-
-    /// Restores a handle a worker took, unless the resource is already
-    /// closing — in which case the handle is dropped to release the OS
-    /// resource rather than re-inserted into a closing resource.
-    fn restore_handle(&self, handle: IoHandle) {
-        if self.closed.load(Ordering::SeqCst) {
-            let _ = close_io_handle(handle);
-            return;
-        }
-        *self
-            .handle
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
+    /// Takes the inner handle for a worker thread and records its lease.
+    fn take_handle(&self) -> Option<IoHandleLease> {
+        self.state.take_handle()
     }
 }
 
 impl HostResource for IoResource {
     fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
-        self.closed.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.take_handle() {
+        // Marking closed while holding the same admission lock used by worker
+        // leases makes the close boundary linearizable: a worker either
+        // restores before close begins, or observes closed and cleans up.
+        let mut slot = self
+            .state
+            .handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.state.closed.store(true, Ordering::Release);
+        if self.state.active_workers.load(Ordering::Acquire) != 0 {
+            return Ok(CloseProgress::Pending);
+        }
+        let handle = slot.take();
+        drop(slot);
+
+        if let Some(error) = self.state.cleanup_error() {
+            return Err(error);
+        }
+        if let Some(handle) = handle {
             close_io_handle(handle).map_err(|error| {
+                self.state.record_close_error(&error);
                 ResourceError::new(
                     ResourceErrorCode::ResourceCleanupFailed,
                     "io::resource",
@@ -103,10 +283,40 @@ impl HostResource for IoResource {
         }
         Ok(CloseProgress::Ready)
     }
+
+    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
+        if self.state.active_workers.load(Ordering::Acquire) != 0 {
+            self.state.register_close_waker(cx.waker());
+            if self.state.active_workers.load(Ordering::Acquire) != 0 {
+                return Poll::Pending;
+            }
+        }
+
+        if let Some(error) = self.state.cleanup_error() {
+            return Poll::Ready(Err(error));
+        }
+        let handle = self
+            .state
+            .handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(handle) = handle
+            && let Err(error) = close_io_handle(handle)
+        {
+            self.state.record_close_error(&error);
+            return Poll::Ready(Err(ResourceError::new(
+                ResourceErrorCode::ResourceCleanupFailed,
+                "io::resource",
+                error.to_string(),
+            )));
+        }
+        Poll::Ready(Ok(()))
+    }
 }
 
 /// Shared state between one IO worker thread, its [`IoOpDriver`] operation,
-/// and [`poll_builtin_io_op`] on the VM thread.
+/// and the adapter-owned completion hook on the VM thread.
 ///
 /// The worker writes the terminal [`signal`](IoOpShared::signal), the
 /// guest-visible [`value`](IoOpShared::value), and any opened handle or
@@ -259,14 +469,33 @@ impl IoOpShared {
         self.publish(Err(message));
     }
 
-    /// The worker's success path: records the guest-visible value and
-    /// publishes a success signal.
-    fn succeed(&self, value: CallReturn) {
+    /// Publishes a terminal operation while preserving a guest-visible value
+    /// (including an error that must still retire a close target).
+    fn complete(&self, value: VmResult<CallReturn>) {
         *self
             .value
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Ok(value));
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(value);
         self.publish(Ok(()));
+    }
+
+    /// The worker's success path: records the guest-visible value and
+    /// publishes a success signal.
+    fn succeed(&self, value: CallReturn) {
+        self.complete(Ok(value));
+    }
+}
+
+impl Drop for IoOpShared {
+    fn drop(&mut self) {
+        let handle = self
+            .opened
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(handle) = handle {
+            let _ = close_io_handle(handle);
+        }
     }
 }
 
@@ -356,141 +585,89 @@ impl Drop for IoOpDriver {
     }
 }
 
-/// Cancels one pending builtin IO operation through the execution scope.
-pub(crate) fn cancel_pending_op(vm: &mut Vm, op_id: HostOpId) {
-    let Ok(id) = OperationId::from_raw(op_id) else {
-        return;
-    };
-    // Drop the completion mailbox from the adapter-declared scope state; the
-    // operation's driver is cancelled through the registry (which forwards to
-    // the driver's `cancel`).
-    if let Ok(state) = io_mailbox(vm) {
-        state.pending_results.remove(&op_id);
-    }
-    let _ = vm
-        .execution_scope()
-        .cancel_operation(id, OperationCancelReason::Requested);
-}
-
-/// Polls one pending builtin IO operation through the execution scope's
-/// operation registry, delivering the worker's guest-visible value.
-pub(crate) fn poll_builtin_io_op(
+/// Completes one operation after the generic scope registry reports a
+/// terminal outcome. The adapter owns the mailbox and any resource-table
+/// mutation; the VM only invokes this opaque completion hook.
+fn finish_io_operation(
     vm: &mut Vm,
-    op_id: HostOpId,
-    cx: &mut Context<'_>,
-) -> Poll<VmResult<CallReturn>> {
-    let id = match OperationId::from_raw(op_id) {
-        Ok(id) => id,
-        Err(error) => {
-            return Poll::Ready(Err(VmError::HostError(format!(
-                "invalid builtin io op {op_id}: {error}"
-            ))));
+    op_id: OperationId,
+    outcome: OperationOutcome,
+    shared: Arc<IoOpShared>,
+) -> VmResult<CallReturn> {
+    if matches!(outcome, OperationOutcome::Cancelled(_)) || shared.cancelled.load(Ordering::Acquire)
+    {
+        // The completion hook can be discarded after cancellation. Clean up
+        // an opened child here as well as in `IoOpShared::drop`, so ownership
+        // is released as soon as the worker has quiesced.
+        if let Some(handle) = shared
+            .opened
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = close_io_handle(handle);
         }
-    };
+        return Err(VmError::HostError("IO operation cancelled".to_string()));
+    }
 
-    let poll_result = vm.execution_scope().poll_operation(id, cx);
-    match poll_result {
-        Poll::Pending => Poll::Pending,
-        Poll::Ready(Err(error)) => {
-            // Drop the completion mailbox from the adapter-declared scope
-            // state; the operation itself already failed terminal.
-            if let Ok(state) = io_mailbox(vm) {
-                state.pending_results.remove(&op_id);
-            }
-            Poll::Ready(Err(VmError::HostError(format!(
-                "builtin io op {op_id} failed: {error}"
-            ))))
-        }
-        Poll::Ready(Ok(outcome)) => {
-            // The worker wrote the authoritative guest-visible result into
-            // the completion mailbox before signalling terminal. Extract the
-            // mailbox entry (an `Arc`) so the scope borrow ends before the
-            // resource insertion below re-borrows the scope.
-            let shared = match io_mailbox(vm) {
-                Ok(state) => {
-                    let Some(shared) = state.pending_results.remove(&op_id) else {
-                        return Poll::Ready(Err(VmError::HostError(format!(
-                            "builtin io op {op_id} has no completion mailbox"
-                        ))));
-                    };
-                    shared
-                }
-                Err(error) => {
-                    return Poll::Ready(Err(VmError::HostError(format!(
-                        "builtin io op {op_id} mailbox unavailable: {error}"
-                    ))));
-                }
-            };
-            if matches!(
-                outcome,
-                crate::vm::operation::driver::OperationOutcome::Cancelled(_)
-            ) || shared.cancelled.load(Ordering::Acquire)
-            {
-                return Poll::Ready(Err(VmError::HostError(
-                    "IO operation cancelled".to_string(),
-                )));
-            }
+    // An opened handle (io::open / io::popen) becomes a typed IO resource in
+    // the scope; the script-visible handle is its raw resource token. The
+    // resource state's drop guard closes the handle if table admission fails.
+    if let Some(handle) = shared
+        .opened
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    {
+        let resource = IoResource::new(handle);
+        let token = vm
+            .execution_scope()
+            .push_resource(resource)
+            .map_err(|error| {
+                VmError::HostError(format!(
+                    "scoped operation {} resource insert failed: {error}",
+                    op_id.raw()
+                ))
+            })?;
+        *shared
+            .value
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Ok(CallReturn::one(Value::Int(token.handle().raw() as i64))));
+    }
 
-            // An opened handle (io::open / io::popen) becomes a typed IO
-            // resource in the scope; the script-visible handle is its raw
-            // resource token.
-            if let Some(handle) = shared
-                .opened
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take()
-            {
-                let token = match vm.execution_scope().push_resource(IoResource::new(handle)) {
-                    Ok(token) => token,
-                    Err(error) => {
-                        return Poll::Ready(Err(VmError::HostError(format!(
-                            "builtin io op {op_id} resource insert failed: {error}"
-                        ))));
-                    }
-                };
-                *shared
-                    .value
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                    Some(Ok(CallReturn::one(Value::Int(token.handle().raw() as i64))));
-            }
-
-            // A closed handle (io::close) retires the exact resource entry
-            // through the generic scope close (exact-once).
-            if let Some(target) = shared
-                .target
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take()
-            {
-                let _ = vm
-                    .execution_scope()
-                    .close_resource::<IoResource>(target, ResourceCloseReason::Requested);
-            }
-
-            let value = shared
-                .value
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
-            match value {
-                Some(value) => Poll::Ready(value),
-                None => Poll::Ready(Err(VmError::HostError(format!(
-                    "builtin io op {op_id} completed without a result"
-                )))),
-            }
+    // A closed handle (io::close) retires the exact resource entry through
+    // the generic scope close (exact-once). A close operation is successful
+    // only once both the underlying handle and the scope entry are retired.
+    if let Some(target) = shared
+        .target
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    {
+        let progress = vm
+            .execution_scope()
+            .close_resource::<IoResource>(target, ResourceCloseReason::Requested)
+            .map_err(VmError::ExecutionScope)?;
+        if progress != CloseProgress::Ready {
+            return Err(VmError::HostError(format!(
+                "scoped operation {} resource retirement remained pending",
+                op_id.raw()
+            )));
         }
     }
-}
 
-/// Returns the adapter-declared IO scope state (the per-op completion
-/// mailbox), creating the empty default on first access while the scope is
-/// Active. The state is owned by the execution-scope arena, so it is
-/// destroyed with the scope on reset and recreated lazily on next use.
-fn io_mailbox(vm: &mut Vm) -> VmResult<&mut IoState> {
-    vm.execution_scope()
-        .scope_state_or_insert_with(IoState::default)
-        .map_err(|error| VmError::HostError(format!("io scope state unavailable: {error}")))
+    let value = shared
+        .value
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    value.ok_or_else(|| {
+        VmError::HostError(format!(
+            "scoped operation {} completed without a result",
+            op_id.raw()
+        ))
+    })?
 }
 
 /// Maximum UTF-8 byte length passed to `thread::Builder::name` for an IO
@@ -546,6 +723,15 @@ fn schedule_io_task(
                 worker_name
             ))
         })?;
+    if let Err(error) = vm.register_scoped_operation_completion(op_id, {
+        let completion_shared = Arc::clone(&shared);
+        move |vm, outcome| finish_io_operation(vm, op_id, outcome, completion_shared)
+    }) {
+        let _ = vm
+            .execution_scope()
+            .abort_operation(op_id, OperationCancelReason::Requested);
+        return Err(error);
+    }
     let raw = op_id.raw();
     let thread_name = io_worker_thread_name(&worker_name);
 
@@ -567,14 +753,25 @@ fn schedule_io_task(
         .map_err(|error| {
             // Roll back the registered operation so no orphaned op lingers.
             shared.mark_worker_done();
+            vm.discard_scoped_operation_completion(op_id);
             let _ = vm
                 .execution_scope()
                 .abort_operation(op_id, OperationCancelReason::Requested);
             VmError::HostError(format!("failed to spawn io task: {error}"))
         })?;
 
-    io_mailbox(vm)?.pending_results.insert(raw, shared);
     Ok(raw)
+}
+
+fn finish_io_worker(shared: &IoOpShared, handle: IoHandleLease, result: VmResult<CallReturn>) {
+    let result = match handle.restore() {
+        Ok(()) => result,
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(value) => shared.succeed(value),
+        Err(error) => shared.fail(error),
+    }
 }
 
 /// Opens a file handle for runtime I/O.
@@ -664,26 +861,31 @@ pub(super) fn builtin_io_popen(
                 return;
             }
         };
-        let child_pid = child.id();
+        let child_guard = SpawnedChildGuard::new(child);
+        let child_pid = child_guard.id();
         shared.install_cancel_hook(move || terminate_process_tree(child_pid));
         let handle = match mode.as_str() {
             "r" => {
-                if child.stdout.is_none() {
+                if child_guard.stdout_is_none() {
                     let err =
                         VmError::HostError("io_popen('r') did not provide stdout pipe".to_string());
                     shared.fail(err);
                     return;
                 }
-                IoHandle::PopenRead { child }
+                IoHandle::PopenRead {
+                    child: child_guard.into_child(),
+                }
             }
             "w" => {
-                if child.stdin.is_none() {
+                if child_guard.stdin_is_none() {
                     let err =
                         VmError::HostError("io_popen('w') did not provide stdin pipe".to_string());
                     shared.fail(err);
                     return;
                 }
-                IoHandle::PopenWrite { child }
+                IoHandle::PopenWrite {
+                    child: child_guard.into_child(),
+                }
             }
             _ => unreachable!("mode validated above"),
         };
@@ -709,43 +911,27 @@ pub(super) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<HostC
                 return;
             }
         };
-        install_process_cancel_hook(shared, &handle);
+        install_process_cancel_hook(shared, &handle, &resource.state);
         let mut out = String::new();
-        let result = match &mut handle {
+        let result = match &mut *handle {
             IoHandle::File(file) => file
                 .read_to_string(&mut out)
                 .map_err(|err| VmError::HostError(format!("io_read_all failed: {err}")))
                 .map(|_| CallReturn::one(Value::string(out))),
-            IoHandle::PopenRead { child } => {
-                let stdout = match child.stdout.as_mut() {
-                    Some(stdout) => stdout,
-                    None => {
-                        resource.restore_handle(handle);
-                        let err = VmError::HostError(
-                            "io_read_all popen handle missing stdout".to_string(),
-                        );
-                        shared.fail(err);
-                        return;
-                    }
-                };
-                stdout
+            IoHandle::PopenRead { child } => match child.stdout.as_mut() {
+                Some(stdout) => stdout
                     .read_to_string(&mut out)
                     .map_err(|err| VmError::HostError(format!("io_read_all failed: {err}")))
-                    .map(|_| CallReturn::one(Value::string(out)))
-            }
+                    .map(|_| CallReturn::one(Value::string(out))),
+                None => Err(VmError::HostError(
+                    "io_read_all popen handle missing stdout".to_string(),
+                )),
+            },
             IoHandle::PopenWrite { .. } => Err(VmError::HostError(
                 "io_read_all requires a readable handle".to_string(),
             )),
         };
-        resource.restore_handle(handle);
-        match result {
-            Ok(value) => {
-                shared.succeed(value);
-            }
-            Err(err) => {
-                shared.fail(err);
-            }
-        }
+        finish_io_worker(shared, handle, result);
     })?;
     Ok(HostCallResult::Pending(op_id))
 }
@@ -766,38 +952,24 @@ pub(super) fn builtin_io_read_line(
                 return;
             }
         };
-        install_process_cancel_hook(shared, &handle);
-        let result = match &mut handle {
+        install_process_cancel_hook(shared, &handle, &resource.state);
+        let result = match &mut *handle {
             IoHandle::File(file) => {
                 read_line_from_reader(file).map(|line| CallReturn::one(Value::string(line)))
             }
-            IoHandle::PopenRead { child } => {
-                let stdout = match child.stdout.as_mut() {
-                    Some(stdout) => stdout,
-                    None => {
-                        resource.restore_handle(handle);
-                        let err = VmError::HostError(
-                            "io_read_line popen handle missing stdout".to_string(),
-                        );
-                        shared.fail(err);
-                        return;
-                    }
-                };
-                read_line_from_reader(stdout).map(|line| CallReturn::one(Value::string(line)))
-            }
+            IoHandle::PopenRead { child } => match child.stdout.as_mut() {
+                Some(stdout) => {
+                    read_line_from_reader(stdout).map(|line| CallReturn::one(Value::string(line)))
+                }
+                None => Err(VmError::HostError(
+                    "io_read_line popen handle missing stdout".to_string(),
+                )),
+            },
             IoHandle::PopenWrite { .. } => Err(VmError::HostError(
                 "io_read_line requires a readable handle".to_string(),
             )),
         };
-        resource.restore_handle(handle);
-        match result {
-            Ok(value) => {
-                shared.succeed(value);
-            }
-            Err(err) => {
-                shared.fail(err);
-            }
-        }
+        finish_io_worker(shared, handle, result);
     })?;
     Ok(HostCallResult::Pending(op_id))
 }
@@ -828,41 +1000,26 @@ pub(super) fn builtin_io_write(
                 return;
             }
         };
-        install_process_cancel_hook(shared, &handle);
-        let result = match &mut handle {
+        install_process_cancel_hook(shared, &handle, &resource.state);
+        let result = match &mut *handle {
             IoHandle::File(file) => file
                 .write(&bytes)
                 .map_err(|err| VmError::HostError(format!("io_write failed: {err}")))
                 .map(|written| CallReturn::one(Value::Int(written as i64))),
-            IoHandle::PopenWrite { child } => {
-                let stdin = match child.stdin.as_mut() {
-                    Some(stdin) => stdin,
-                    None => {
-                        resource.restore_handle(handle);
-                        let err =
-                            VmError::HostError("io_write popen handle missing stdin".to_string());
-                        shared.fail(err);
-                        return;
-                    }
-                };
-                stdin
+            IoHandle::PopenWrite { child } => match child.stdin.as_mut() {
+                Some(stdin) => stdin
                     .write(&bytes)
                     .map_err(|err| VmError::HostError(format!("io_write failed: {err}")))
-                    .map(|written| CallReturn::one(Value::Int(written as i64)))
-            }
+                    .map(|written| CallReturn::one(Value::Int(written as i64))),
+                None => Err(VmError::HostError(
+                    "io_write popen handle missing stdin".to_string(),
+                )),
+            },
             IoHandle::PopenRead { .. } => Err(VmError::HostError(
                 "io_write requires a writable handle".to_string(),
             )),
         };
-        resource.restore_handle(handle);
-        match result {
-            Ok(value) => {
-                shared.succeed(value);
-            }
-            Err(err) => {
-                shared.fail(err);
-            }
-        }
+        finish_io_worker(shared, handle, result);
     })?;
     Ok(HostCallResult::Pending(op_id))
 }
@@ -880,39 +1037,24 @@ pub(super) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<HostCall
                 return;
             }
         };
-        install_process_cancel_hook(shared, &handle);
-        let result = match &mut handle {
+        install_process_cancel_hook(shared, &handle, &resource.state);
+        let result = match &mut *handle {
             IoHandle::File(file) => file
                 .flush()
                 .map_err(|err| VmError::HostError(format!("io_flush failed: {err}")))
                 .map(|_| CallReturn::one(Value::Bool(true))),
-            IoHandle::PopenWrite { child } => {
-                let stdin = match child.stdin.as_mut() {
-                    Some(stdin) => stdin,
-                    None => {
-                        resource.restore_handle(handle);
-                        let err =
-                            VmError::HostError("io_flush popen handle missing stdin".to_string());
-                        shared.fail(err);
-                        return;
-                    }
-                };
-                stdin
+            IoHandle::PopenWrite { child } => match child.stdin.as_mut() {
+                Some(stdin) => stdin
                     .flush()
                     .map_err(|err| VmError::HostError(format!("io_flush failed: {err}")))
-                    .map(|_| CallReturn::one(Value::Bool(true)))
-            }
+                    .map(|_| CallReturn::one(Value::Bool(true))),
+                None => Err(VmError::HostError(
+                    "io_flush popen handle missing stdin".to_string(),
+                )),
+            },
             IoHandle::PopenRead { .. } => Ok(CallReturn::one(Value::Bool(true))),
         };
-        resource.restore_handle(handle);
-        match result {
-            Ok(value) => {
-                shared.succeed(value);
-            }
-            Err(err) => {
-                shared.fail(err);
-            }
-        }
+        finish_io_worker(shared, handle, result);
     })?;
     Ok(HostCallResult::Pending(op_id))
 }
@@ -925,8 +1067,8 @@ pub(super) fn builtin_io_close(vm: &mut Vm, handle_id: i64) -> VmResult<HostCall
         // Close the underlying handle exactly once on the worker thread.
         let result = match resource.take_handle() {
             Some(handle) => {
-                install_process_cancel_hook(shared, &handle);
-                close_io_handle(handle)
+                install_process_cancel_hook(shared, &handle, &resource.state);
+                handle.close()
             }
             None => Err(VmError::HostError(
                 "io_close handle is already closing".to_string(),
@@ -937,12 +1079,8 @@ pub(super) fn builtin_io_close(vm: &mut Vm, handle_id: i64) -> VmResult<HostCall
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(target);
         match result {
-            Ok(()) => {
-                shared.succeed(CallReturn::one(Value::Bool(true)));
-            }
-            Err(err) => {
-                shared.fail(err);
-            }
+            Ok(()) => shared.succeed(CallReturn::one(Value::Bool(true))),
+            Err(error) => shared.complete(Err(error)),
         }
     })?;
     Ok(HostCallResult::Pending(op_id))
@@ -962,37 +1100,161 @@ pub(super) fn builtin_io_exists(vm: &mut Vm, path: &str) -> VmResult<HostCallRes
     Ok(HostCallResult::Pending(op_id))
 }
 
-fn install_process_cancel_hook(shared: &IoOpShared, handle: &IoHandle) {
+struct SpawnedChildGuard {
+    child: Option<Child>,
+}
+
+impl SpawnedChildGuard {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.as_ref().expect("child guard owns a child").id()
+    }
+
+    fn stdout_is_none(&self) -> bool {
+        self.child
+            .as_ref()
+            .expect("child guard owns a child")
+            .stdout
+            .is_none()
+    }
+
+    fn stdin_is_none(&self) -> bool {
+        self.child
+            .as_ref()
+            .expect("child guard owns a child")
+            .stdin
+            .is_none()
+    }
+
+    fn into_child(mut self) -> Child {
+        self.child.take().expect("child guard owns a child")
+    }
+}
+
+impl Drop for SpawnedChildGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = terminate_child_tree(child);
+        }
+    }
+}
+
+fn install_process_cancel_hook(
+    shared: &IoOpShared,
+    handle: &IoHandle,
+    state: &Arc<IoResourceState>,
+) {
     let pid = match handle {
         IoHandle::PopenRead { child } | IoHandle::PopenWrite { child } => child.id(),
         IoHandle::File(_) => return,
     };
-    shared.install_cancel_hook(move || terminate_process_tree(pid));
+    let state = Arc::clone(state);
+    shared.install_cancel_hook(move || {
+        // A cancelled process operation has already invalidated the process
+        // stream. Marking the resource closed makes the worker lease reap the
+        // child instead of restoring a killed, unreaped Child.
+        state.mark_closed();
+        terminate_process_tree(pid);
+    });
 }
 
 fn terminate_process_tree(pid: u32) {
+    let _ = terminate_process_tree_result(pid);
+}
+
+fn terminate_process_tree_result(pid: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        let Ok(pid) = libc::pid_t::try_from(pid) else {
-            return;
-        };
+        let pid = libc::pid_t::try_from(pid).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid child pid")
+        })?;
         // `spawn_shell_command` puts the shell in its own process group, so a
         // negative pid terminates the shell and descendants without touching
         // the VM process group.
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
+        let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        if result == 0 {
+            Ok(())
+        } else {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(())
+            } else {
+                Err(error)
+            }
         }
     }
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
+        let status = Command::new("taskkill")
             .args(["/T", "/F", "/PID", &pid.to_string()])
-            .status();
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("taskkill exited with {status}"),
+            ))
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
+        Ok(())
     }
+}
+
+/// Terminates a child and reaps it. The only `wait` below is reached after a
+/// tree termination signal and a direct leader kill have been attempted; an
+/// already exited child is reaped by `try_wait` instead.
+fn terminate_child_tree(child: &mut Child) -> VmResult<()> {
+    let tree_error = terminate_process_tree_result(child.id()).err();
+    let status = child
+        .try_wait()
+        .map_err(|error| VmError::HostError(format!("io_close popen status failed: {error}")))?;
+    if status.is_some() {
+        return Ok(());
+    }
+
+    let mut reaped = false;
+    let direct_error = match child.kill() {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            if child
+                .try_wait()
+                .map_err(|status_error| {
+                    VmError::HostError(format!("io_close popen status failed: {status_error}"))
+                })?
+                .is_some()
+            {
+                reaped = true;
+                None
+            } else {
+                Some(error)
+            }
+        }
+        Err(error) => Some(error),
+    };
+    if let Some(error) = direct_error {
+        return Err(VmError::HostError(format!(
+            "io_close popen terminate failed: {error}"
+        )));
+    }
+
+    if !reaped {
+        child
+            .wait()
+            .map_err(|error| VmError::HostError(format!("io_close popen wait failed: {error}")))?;
+    }
+    if let Some(error) = tree_error {
+        return Err(VmError::HostError(format!(
+            "io_close popen process-tree terminate failed: {error}"
+        )));
+    }
+    Ok(())
 }
 
 fn spawn_shell_command(command: &str, mode: &str) -> VmResult<Child> {
@@ -1051,13 +1313,12 @@ fn io_resource_for_handle(
         .map_err(|error| {
             VmError::HostError(format!("io handle {handle_id} borrow failed: {error}"))
         })?;
-    // Clone the shared cells so the worker can take/restore the handle while
-    // the resource itself stays in the scope table.
+    // Clone the shared resource state so the worker can take/restore the
+    // handle while the resource itself stays in the scope table.
     Ok((
         handle,
         Arc::new(IoResource {
-            handle: Arc::clone(&resource.handle),
-            closed: Arc::clone(&resource.closed),
+            state: Arc::clone(&resource.state),
         }),
     ))
 }
@@ -1124,22 +1385,15 @@ fn canonicalize_blocking_target(path: &Path) -> VmResult<PathBuf> {
 
 fn close_io_handle(mut handle: IoHandle) -> VmResult<()> {
     match &mut handle {
-        IoHandle::File(file) => {
-            file.flush().ok();
-        }
-        IoHandle::PopenRead { child } => {
-            child
-                .wait()
-                .map_err(|err| VmError::HostError(format!("io_close popen wait failed: {err}")))?;
-        }
+        IoHandle::File(file) => file
+            .flush()
+            .map_err(|err| VmError::HostError(format!("io_close flush failed: {err}"))),
+        IoHandle::PopenRead { child } => terminate_child_tree(child),
         IoHandle::PopenWrite { child } => {
             let _ = child.stdin.take();
-            child
-                .wait()
-                .map_err(|err| VmError::HostError(format!("io_close popen wait failed: {err}")))?;
+            terminate_child_tree(child)
         }
     }
-    Ok(())
 }
 
 fn read_line_from_reader(reader: &mut impl Read) -> VmResult<String> {
@@ -1205,5 +1459,321 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(driver.poll(&mut cx), Poll::Ready(Ok(()))));
+    }
+
+    #[test]
+    fn io_resource_close_stays_pending_while_worker_owns_handle() {
+        let path = std::env::temp_dir().join(format!(
+            "pd-vm-blocking-io-resource-close-{}",
+            std::process::id()
+        ));
+        let file = std::fs::File::create(&path).expect("test file should open");
+        let mut resource = IoResource::new(IoHandle::File(file));
+        let worker_handle = resource.take_handle().expect("worker should take handle");
+        let close = resource
+            .begin_close(ResourceCloseReason::Requested)
+            .expect("begin close should succeed");
+        assert_eq!(close, CloseProgress::Pending);
+
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        struct CloseWake(Arc<AtomicUsize>);
+        impl std::task::Wake for CloseWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let waker = Waker::from(Arc::new(CloseWake(Arc::clone(&wake_count))));
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            HostResource::poll_close(&mut resource, &mut cx),
+            Poll::Pending
+        ));
+        drop(worker_handle);
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+
+        assert!(matches!(
+            HostResource::poll_close(&mut resource, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn io_resource_worker_release_after_close_does_not_restore_handle() {
+        let path = std::env::temp_dir().join(format!(
+            "pd-vm-blocking-io-resource-worker-close-{}",
+            std::process::id()
+        ));
+        let file = std::fs::File::create(&path).expect("test file should open");
+        let mut resource = IoResource::new(IoHandle::File(file));
+        let worker_handle = resource.take_handle().expect("worker should take handle");
+        assert_eq!(
+            resource
+                .begin_close(ResourceCloseReason::Requested)
+                .expect("begin close should succeed"),
+            CloseProgress::Pending
+        );
+
+        worker_handle
+            .restore()
+            .expect("worker cleanup after close should succeed");
+        assert_eq!(resource.state.active_workers.load(Ordering::Acquire), 0);
+        assert!(
+            resource
+                .state
+                .handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none()
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            HostResource::poll_close(&mut resource, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    struct ProcessTreeCleanup {
+        leader: u32,
+        descendant: i32,
+        marker: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Drop for ProcessTreeCleanup {
+        fn drop(&mut self) {
+            terminate_process_tree(self.leader);
+            unsafe {
+                libc::kill(self.descendant, libc::SIGKILL);
+            }
+            let _ = std::fs::remove_file(&self.marker);
+        }
+    }
+
+    #[cfg(unix)]
+    fn live_popen_for_test() -> (SpawnedChildGuard, PathBuf, i32) {
+        static TEST_PROCESS_COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let suffix = TEST_PROCESS_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let marker = std::env::temp_dir().join(format!(
+            "pd-vm-blocking-io-popen-{0}-{suffix}.marker",
+            std::process::id()
+        ));
+        let command = format!(
+            r#"sleep 30 & child=$!; printf '%s\n' "$child" > '{}'; wait "$child""#,
+            marker.display()
+        );
+        let child = spawn_shell_command(&command, "r").expect("test popen should spawn");
+        let guard = SpawnedChildGuard::new(child);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let descendant = loop {
+            if let Ok(contents) = std::fs::read_to_string(&marker)
+                && let Ok(pid) = contents.trim().parse::<i32>()
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "popen test child did not publish its descendant marker"
+            );
+            std::thread::yield_now();
+        };
+        (guard, marker, descendant)
+    }
+
+    #[cfg(unix)]
+    fn process_is_running(pid: i32) -> bool {
+        let path = format!("/proc/{pid}/stat");
+        let Ok(stat) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        let Some((_, state)) = stat.split_once(") ") else {
+            return true;
+        };
+        !state.starts_with('Z')
+    }
+
+    #[cfg(unix)]
+    fn wait_for_process_exit(pid: i32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while process_is_running(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "popen descendant remained alive after process-tree close"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closing_live_popen_terminates_and_reaps_the_process_tree() {
+        let (child, marker, descendant) = live_popen_for_test();
+        let _cleanup = ProcessTreeCleanup {
+            leader: child.id(),
+            descendant,
+            marker: marker.clone(),
+        };
+        close_io_handle(IoHandle::PopenRead {
+            child: child.into_child(),
+        })
+        .expect("closing a live popen must terminate and reap it");
+        wait_for_process_exit(descendant);
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_worker_lease_drop_terminates_and_reaps_process_tree() {
+        let (child, marker, descendant) = live_popen_for_test();
+        let leader = child.id();
+        let _cleanup = ProcessTreeCleanup {
+            leader,
+            descendant,
+            marker: marker.clone(),
+        };
+        let resource = IoResource::new(IoHandle::PopenRead {
+            child: child.into_child(),
+        });
+        let worker_handle = resource.take_handle().expect("worker should take handle");
+        drop(worker_handle);
+        wait_for_process_exit(descendant);
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_resource_handoff_terminates_and_reaps_opened_process_tree() {
+        let (child, marker, descendant) = live_popen_for_test();
+        let _cleanup = ProcessTreeCleanup {
+            leader: child.id(),
+            descendant,
+            marker: marker.clone(),
+        };
+        let mut vm = Vm::new(crate::Program::new(
+            Vec::new(),
+            vec![crate::OpCode::Ret as u8],
+        ));
+        let shared = Arc::new(IoOpShared::new());
+        *shared
+            .opened
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(IoHandle::PopenRead {
+            child: child.into_child(),
+        });
+        let op_id = vm
+            .execution_scope()
+            .start_operation(OperationSpec::new(IoOpDriver::new(
+                Arc::clone(&shared),
+                "io::test-handoff",
+            )))
+            .expect("test operation should start");
+        vm.execution_scope()
+            .begin_close(ResourceCloseReason::Requested)
+            .expect("scope should start closing");
+        let error = finish_io_operation(&mut vm, op_id, OperationOutcome::Completed, shared)
+            .expect_err("resource insertion into a closing scope must fail");
+        assert!(error.to_string().contains("resource insert failed"));
+        wait_for_process_exit(descendant);
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[test]
+    fn close_completion_does_not_report_success_while_resource_retirement_is_pending() {
+        let path = std::env::temp_dir().join(format!(
+            "pd-vm-blocking-io-close-pending-{}",
+            std::process::id()
+        ));
+        let file = std::fs::File::create(&path).expect("test file should open");
+        let resource = IoResource::new(IoHandle::File(file));
+        let worker_resource = IoResource {
+            state: Arc::clone(&resource.state),
+        };
+        let mut vm = Vm::new(crate::Program::new(
+            Vec::new(),
+            vec![crate::OpCode::Ret as u8],
+        ));
+        let token = vm
+            .execution_scope()
+            .push_resource(resource)
+            .expect("resource should insert");
+        let worker_handle = worker_resource
+            .take_handle()
+            .expect("worker should take handle");
+        let shared = Arc::new(IoOpShared::new());
+        *shared
+            .target
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(token.handle());
+        *shared
+            .value
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Ok(CallReturn::one(Value::Bool(true))));
+        let op_id = vm
+            .execution_scope()
+            .start_operation(OperationSpec::new(IoOpDriver::new(
+                Arc::clone(&shared),
+                "io::test-close-pending",
+            )))
+            .expect("test operation should start");
+
+        let error = finish_io_operation(&mut vm, op_id, OperationOutcome::Completed, shared)
+            .expect_err("pending resource retirement must not report success");
+        assert!(error.to_string().contains("remained pending"));
+
+        worker_handle
+            .restore()
+            .expect("worker cleanup after close should succeed");
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            vm.execution_scope()
+                .resources_mut()
+                .poll_close(token, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn close_completion_reports_scope_retirement_errors() {
+        let mut vm = Vm::new(crate::Program::new(
+            Vec::new(),
+            vec![crate::OpCode::Ret as u8],
+        ));
+        let file = std::fs::File::open("Cargo.toml").expect("test file should open");
+        let token = vm
+            .execution_scope()
+            .push_resource(IoResource::new(IoHandle::File(file)))
+            .expect("resource should insert");
+        vm.execution_scope()
+            .close_resource::<IoResource>(token.handle(), ResourceCloseReason::Requested)
+            .expect("initial close should retire resource");
+
+        let shared = Arc::new(IoOpShared::new());
+        *shared
+            .target
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(token.handle());
+        *shared
+            .value
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Ok(CallReturn::one(Value::Bool(true))));
+        let op_id = vm
+            .execution_scope()
+            .start_operation(OperationSpec::new(IoOpDriver::new(
+                Arc::clone(&shared),
+                "io::test-close",
+            )))
+            .expect("test operation should start");
+        let error = finish_io_operation(&mut vm, op_id, OperationOutcome::Completed, shared)
+            .expect_err("stale scope retirement must be visible to the caller");
+        assert!(error.to_string().contains("execution scope"));
     }
 }

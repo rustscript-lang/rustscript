@@ -21,7 +21,9 @@ use super::operation::driver::{OperationOutcome, OperationSpec};
 use super::operation::error::OperationError;
 use super::operation::id::OperationId;
 use super::operation::reason::OperationCancelReason;
-use super::operation::registry::{DEFAULT_MAX_PENDING_OPERATIONS, OperationRegistry};
+use super::operation::registry::{
+    DEFAULT_MAX_PENDING_OPERATIONS, OperationCancelSummary, OperationRegistry,
+};
 use super::resource::HostResource;
 use super::resource::close::CloseProgress;
 use super::resource::error::ResourceError;
@@ -69,6 +71,11 @@ pub enum ExecutionScopeError {
     Resource(ResourceError),
     /// The underlying operation start/cancel failed.
     Operation(OperationError),
+    /// Scope cleanup reached quiescence but reported one or more failures.
+    ///
+    /// The complete terminal outcome is retained so reset/reuse callers do not
+    /// lose the first error or the aggregate failure count.
+    Close(ScopeCloseOutcome),
 }
 
 impl std::fmt::Display for ExecutionScopeError {
@@ -97,6 +104,9 @@ impl std::fmt::Display for ExecutionScopeError {
             Self::Operation(error) => {
                 write!(formatter, "execution scope operation error: {error}")
             }
+            Self::Close(outcome) => {
+                write!(formatter, "execution scope close outcome: {outcome:?}")
+            }
         }
     }
 }
@@ -107,6 +117,12 @@ impl ExecutionScopeError {
     pub fn into_operation_error(self) -> Option<OperationError> {
         match self {
             ExecutionScopeError::Operation(error) => Some(error),
+            ExecutionScopeError::Close(ScopeCloseOutcome::SuccessWithErrors(failure)) => {
+                match failure.first {
+                    ScopeCloseError::Operation(error) => Some(error),
+                    ScopeCloseError::Resource(_) => None,
+                }
+            }
             _ => None,
         }
     }
@@ -118,6 +134,12 @@ impl ExecutionScopeError {
             ExecutionScopeError::Resource(error) | ExecutionScopeError::ArenaExhausted(error) => {
                 Some(error)
             }
+            ExecutionScopeError::Close(ScopeCloseOutcome::SuccessWithErrors(failure)) => {
+                match failure.first {
+                    ScopeCloseError::Resource(error) => Some(error),
+                    ScopeCloseError::Operation(_) => None,
+                }
+            }
             _ => None,
         }
     }
@@ -128,6 +150,7 @@ impl std::error::Error for ExecutionScopeError {
         match self {
             Self::ArenaExhausted(error) | Self::Resource(error) => Some(error),
             Self::Operation(error) => Some(error),
+            Self::Close(_) => None,
             _ => None,
         }
     }
@@ -224,6 +247,10 @@ impl ExecutionScope {
         self.state == ScopeState::Active
     }
 
+    pub(crate) fn is_reusable(&self) -> bool {
+        self.is_active() && self.resources.is_clean() && self.operations.is_empty()
+    }
+
     /// Whether shutdown has begun but is not yet quiescent.
     pub fn is_closing(&self) -> bool {
         self.state == ScopeState::Closing
@@ -243,6 +270,18 @@ impl ExecutionScope {
     /// validation). New inserts must go through the guarded scope API.
     pub fn resources(&self) -> &ResourceTable {
         &self.resources
+    }
+
+    /// Mutable access to the owned resource table (typed borrows for the
+    /// duration of a host call). New inserts must still go through the guarded
+    /// scope API.
+    /// Returns mutable access for VM-internal typed resource operations.
+    ///
+    /// Public callers must use the guarded `push_resource`/`resource_*` methods
+    /// on [`ExecutionScope`]; exposing this raw table would allow admission to
+    /// bypass the scope's `Open` lifecycle state.
+    pub(crate) fn resources_mut(&mut self) -> &mut ResourceTable {
+        &mut self.resources
     }
 
     // ---- typed scope-state arena -------------------------------------------------
@@ -308,6 +347,27 @@ impl ExecutionScope {
             .map_err(ExecutionScopeError::Resource)
     }
 
+    /// Takes an open typed resource out of the current scope and transfers its
+    /// concrete value to the caller. Validation precedes slot mutation; a
+    /// rejected take leaves the resource available.
+    pub fn take_resource<T: HostResource>(
+        &mut self,
+        handle: ResourceHandle,
+    ) -> ExecutionScopeResult<T> {
+        self.resources
+            .take::<T>(handle)
+            .map_err(ExecutionScopeError::Resource)
+    }
+
+    /// Alias for [`Self::take_resource`] using the ownership terminology used
+    /// by host-function declarations.
+    pub fn take_owned<T: HostResource>(
+        &mut self,
+        handle: ResourceHandle,
+    ) -> ExecutionScopeResult<T> {
+        self.take_resource::<T>(handle)
+    }
+
     /// Registers a host operation while the scope is Active.
     pub fn start_operation(&mut self, spec: OperationSpec) -> ExecutionScopeResult<OperationId> {
         self.ensure_accepting()?;
@@ -365,15 +425,16 @@ impl ExecutionScope {
 
     /// Aborts a started operation in one step so it never produces a
     /// guest-visible result: cancels the driver exactly once if pending
-    /// (recording the first reason), then consumes and immediately releases
-    /// the slot, restoring full registry capacity and making the id stale.
+    /// (recording the first reason), waits through the driver's
+    /// `cancel_and_wait` boundary, then consumes/releases the slot, restoring
+    /// full registry capacity and making the id stale.
     ///
     /// This is the rollback counterpart to
     /// [`start_operation`](Self::start_operation), intended for call sites
     /// that register an operation and then hit a fallible handoff. Even when
-    /// the driver's `cancel` reports a typed failure, the slot is still
-    /// released. A stale/foreign/out-of-range id is rejected with the typed
-    /// error and no registry mutation.
+    /// the driver's cancellation boundary reports a typed failure, the slot
+    /// is still released. A stale/foreign/out-of-range id is rejected with
+    /// the typed error and no registry mutation.
     pub fn abort_operation(
         &mut self,
         id: OperationId,
@@ -448,6 +509,16 @@ impl ExecutionScope {
         }
     }
 
+    pub(crate) fn cancel_operations_and_wait(
+        &mut self,
+        reason: OperationCancelReason,
+    ) -> OperationCancelSummary {
+        let summary = self.operations.cancel_all_and_wait(reason);
+        self.record_operation_summary(&summary);
+        self.operations_drained = true;
+        summary
+    }
+
     /// Runs the VM-Drop-only nonblocking resource close launch after the normal
     /// scope close poll has cancelled operations and begun all current leaves.
     /// This never changes the scope state or claims quiescence.
@@ -492,14 +563,7 @@ impl ExecutionScope {
         // Phase 1 — operations: cancel every pending operation exactly once.
         if !self.operations_drained {
             let summary = self.operations.cancel_all(operation_reason(reason));
-            if let Some(error) = summary.first_error() {
-                self.record_failure(ScopeCloseError::Operation(error.clone()));
-            }
-            // Every failed operation cancellation/cleanup counts toward the
-            // failure total; `failed` includes the first-error case above.
-            self.failed_count += summary
-                .failed()
-                .saturating_sub(usize::from(summary.first_error().is_some()));
+            self.record_operation_summary(&summary);
             self.operations_drained = true;
         }
 
@@ -559,6 +623,17 @@ impl ExecutionScope {
             self.first_error = Some(error);
         }
         self.failed_count += 1;
+    }
+
+    /// Records a batch cancellation without allowing a reset's synchronous
+    /// cancel-and-wait path to discard its first error or failure count.
+    fn record_operation_summary(&mut self, summary: &OperationCancelSummary) {
+        if let Some(error) = summary.first_error() {
+            self.record_failure(ScopeCloseError::Operation(error.clone()));
+        }
+        self.failed_count += summary
+            .failed()
+            .saturating_sub(usize::from(summary.first_error().is_some()));
     }
 
     /// Freezes the terminal outcome once both registries are empty.

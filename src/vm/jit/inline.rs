@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::builtins::BuiltinFunction;
+use crate::BuiltinFunction;
 use crate::vm::native::ROOT_FRAME_KEY;
 use crate::{CallableKind, CallableTarget, OpCode, Program};
 

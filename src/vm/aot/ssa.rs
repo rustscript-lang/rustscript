@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt::{self, Write};
 
-use crate::builtins::BuiltinFunction;
+use crate::BuiltinFunction;
 use crate::vm::{Program, Value, ValueType};
 
 use super::cfg::AotBlockTerminal;

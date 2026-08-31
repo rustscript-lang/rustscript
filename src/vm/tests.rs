@@ -1,12 +1,269 @@
 use super::*;
-use crate::builtins::BuiltinFunction;
+use crate::BuiltinFunction;
 use crate::bytecode::TypeMap;
+use crate::host_api::{
+    HostApiBuilder, HostFunctionSchema, HostImportSchema, HostTypeSchema, ResourceTypeKey,
+    ResourceTypeSchema,
+};
+use crate::vm::host::WaitingHostOpSource;
+use crate::vm::operation::driver::{HostOperation, OperationSpec};
+use crate::vm::operation::{OperationCancelReason, OperationResult};
+use crate::{BytecodeBuilder, decode_program, encode_program};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll, Waker};
 
 fn native_cache_test_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[test]
+fn program_cache_key_includes_full_host_import_schema() {
+    let function =
+        HostFunctionSchema::with_return("cache::schema", Vec::new(), HostTypeSchema::Int);
+    let mut builder = HostApiBuilder::new();
+    builder.function(function.clone());
+    let catalog = builder.build().expect("catalog");
+    let schema = HostImportSchema::from_function(&catalog, &function);
+
+    let import = HostImport {
+        name: schema.name.clone(),
+        arity: 0,
+        return_type: ValueType::Int,
+    };
+    let first = Program::with_imports_and_debug(
+        Vec::new(),
+        vec![OpCode::Ret as u8],
+        vec![import.clone()],
+        None,
+    )
+    .with_host_import_schemas(vec![schema.clone()])
+    .expect("first schema");
+    let mut changed_schema = schema;
+    changed_schema.return_type = HostTypeSchema::String;
+    let second =
+        Program::with_imports_and_debug(Vec::new(), vec![OpCode::Ret as u8], vec![import], None)
+            .with_host_import_schemas(vec![changed_schema])
+            .expect("second schema");
+
+    assert_ne!(
+        compute_program_cache_key(&first),
+        compute_program_cache_key(&second),
+        "host schema changes must invalidate program-semantic caches"
+    );
+}
+
+#[test]
+fn legacy_and_marker_only_schema_absence_share_cache_identity() {
+    let import = HostImport {
+        name: "legacy::cache".to_string(),
+        arity: 0,
+        return_type: ValueType::Unknown,
+    };
+    let plain =
+        Program::with_imports_and_debug(Vec::new(), vec![OpCode::Ret as u8], vec![import], None);
+    let marked = decode_program(&encode_program(&plain).expect("marker-only encoding"))
+        .expect("marker-only decoding");
+    assert_eq!(
+        compute_program_cache_key(&plain),
+        compute_program_cache_key(&marked)
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn builtin_pending_completion_uses_declared_return_type() {
+    struct PendingBridge;
+
+    impl HostAsyncBridge for PendingBridge {
+        fn submit_op(&mut self, _op_id: HostOpId, _future: HostFuture) -> VmResult<()> {
+            Ok(())
+        }
+
+        fn poll_op(
+            &mut self,
+            _op_id: HostOpId,
+            _cx: &mut Context<'_>,
+        ) -> Poll<VmResult<CallReturn>> {
+            Poll::Pending
+        }
+    }
+
+    let builtin = BuiltinFunction::from_namespaced_name("io::exists")
+        .expect("io::exists builtin should be available");
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.ldc(0);
+    bytecode.call(builtin.call_index(), 1);
+    bytecode.ret();
+
+    let mut vm = Vm::new(Program::new(vec![Value::string(".")], bytecode.finish()));
+    vm.set_async_bridge(Box::new(PendingBridge))
+        .expect("pending bridge should install");
+    let VmStatus::Waiting(op_id) = vm.run().expect("builtin should enter pending") else {
+        panic!("io::exists should suspend");
+    };
+    let error = vm
+        .complete_host_op(op_id, CallReturn::one(Value::string("wrong")))
+        .expect_err("pending completion must reject the wrong type");
+    assert!(matches!(error, VmError::TypeMismatch("bool")), "{error:?}");
+
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.ldc(0);
+    bytecode.call(builtin.call_index(), 1);
+    bytecode.ret();
+    let mut vm = Vm::new(Program::new(vec![Value::string(".")], bytecode.finish()));
+    vm.set_async_bridge(Box::new(PendingBridge))
+        .expect("pending bridge should install");
+    let VmStatus::Waiting(op_id) = vm.run().expect("builtin should enter pending") else {
+        panic!("io::exists should suspend");
+    };
+    vm.complete_host_op(op_id, CallReturn::one(Value::Bool(true)))
+        .expect("matching pending completion should be accepted");
+    assert_eq!(
+        vm.resume().expect("resume after completion"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Bool(true)]);
+}
+
+#[test]
+fn pending_completion_validates_scalar_resource_and_collection_schemas() {
+    let make_schema = |name: &str, return_type: HostTypeSchema| {
+        let function = HostFunctionSchema::with_return(name, Vec::new(), return_type);
+        let mut builder = HostApiBuilder::new();
+        builder.function(function.clone());
+        let catalog = builder.build().expect("catalog");
+        HostImportSchema::from_function(&catalog, &function)
+    };
+
+    let cases = [
+        (
+            make_schema("pending::string", HostTypeSchema::String),
+            Value::Int(1),
+            "string",
+        ),
+        (
+            make_schema(
+                "pending::array",
+                HostTypeSchema::Array(Box::new(HostTypeSchema::Int)),
+            ),
+            Value::array(vec![Value::string("wrong")]),
+            "int",
+        ),
+    ];
+    for (schema, wrong, expected) in cases {
+        let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+        vm.set_waiting_host_op_with_return(
+            77,
+            WaitingHostOpSource::HostBridge,
+            None,
+            Some(&schema),
+        )
+        .expect("waiting state");
+        let error = vm
+            .complete_waiting_host_op(77, CallReturn::one(wrong))
+            .expect_err("wrong pending completion should fail");
+        assert!(matches!(error, VmError::TypeMismatch(actual) if actual == expected));
+    }
+
+    let resource = ResourceTypeKey::new("pending.resource").expect("resource key");
+    let function = HostFunctionSchema::with_return(
+        "pending::resource",
+        Vec::new(),
+        HostTypeSchema::Resource(resource.clone()),
+    );
+    let mut builder = HostApiBuilder::new();
+    builder.resource(ResourceTypeSchema::new(resource, "pending resource"));
+    builder.function(function.clone());
+    let catalog = builder.build().expect("resource catalog");
+    let schema = HostImportSchema::from_function(&catalog, &function);
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.set_waiting_host_op_with_return(78, WaitingHostOpSource::HostBridge, None, Some(&schema))
+        .expect("waiting state");
+    let error = vm
+        .complete_waiting_host_op(78, CallReturn::one(Value::string("wrong")))
+        .expect_err("wrong resource completion should fail");
+    assert!(matches!(error, VmError::TypeMismatch("resource")));
+
+    let schema = make_schema(
+        "pending::array_ok",
+        HostTypeSchema::Array(Box::new(HostTypeSchema::Int)),
+    );
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.set_waiting_host_op_with_return(
+        79,
+        WaitingHostOpSource::ScopedOperation,
+        None,
+        Some(&schema),
+    )
+    .expect("waiting state");
+    vm.complete_waiting_host_op(
+        79,
+        CallReturn::one(Value::array(vec![Value::Int(1), Value::Int(2)])),
+    )
+    .expect("matching collection completion should pass");
+    assert_eq!(
+        vm.stack(),
+        &[Value::array(vec![Value::Int(1), Value::Int(2)])]
+    );
+}
+
+#[test]
+fn pending_callable_completion_uses_authoritative_prototype_schema() {
+    let expected_callable = HostTypeSchema::Callable {
+        params: vec![HostTypeSchema::Int],
+        result: Box::new(HostTypeSchema::String),
+    };
+    let function =
+        HostFunctionSchema::with_return("pending::callable", Vec::new(), expected_callable);
+    let mut builder = HostApiBuilder::new();
+    builder.function(function.clone());
+    let catalog = builder.build().expect("callable catalog");
+    let schema = HostImportSchema::from_function(&catalog, &function);
+    let callable = Value::Callable(Arc::new(crate::CallableValue {
+        prototype_id: 0,
+        kind: crate::CallableKind::FunctionItem,
+        env: None,
+    }));
+
+    let complete = |result: crate::compiler::TypeSchema| {
+        let program = Program::new(Vec::new(), vec![OpCode::Ret as u8]).with_callable_metadata(
+            Vec::new(),
+            vec![crate::CallablePrototype {
+                kind: crate::CallableKind::FunctionItem,
+                target: crate::CallableTarget::ScriptFunction(0),
+                arity: 1,
+                frame_local_count: 1,
+                parameter_slots: vec![0],
+                capture_source_slots: Vec::new(),
+                capture_slots: Vec::new(),
+                capture_modes: Vec::new(),
+                self_slot: None,
+                schema: Some(crate::compiler::TypeSchema::Callable {
+                    params: vec![crate::compiler::TypeSchema::Int],
+                    result: Box::new(result),
+                }),
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut vm = Vm::new(program);
+        vm.set_waiting_host_op_with_return(
+            80,
+            WaitingHostOpSource::HostBridge,
+            None,
+            Some(&schema),
+        )?;
+        vm.complete_waiting_host_op(80, CallReturn::one(callable.clone()))
+    };
+
+    complete(crate::compiler::TypeSchema::String).expect("matching callable should pass");
+    assert!(matches!(
+        complete(crate::compiler::TypeSchema::Bool),
+        Err(VmError::TypeMismatch("callable"))
+    ));
 }
 
 #[test]
@@ -22,7 +279,7 @@ fn root_ret_completes_explicit_halt_frame() {
     assert!(vm.instance.execution_frames.is_empty());
     assert!(vm.stack().is_empty());
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert_eq!(vm.instance.execution_frames.len(), 1);
     assert_eq!(vm.stack(), &[]);
 }
@@ -31,8 +288,255 @@ fn root_ret_completes_explicit_halt_frame() {
 fn reset_for_reuse_keeps_host_operation_ids_monotonic() {
     let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
     assert_eq!(vm.allocate_host_op_id(), 1);
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert_eq!(vm.allocate_host_op_id(), 2);
+}
+
+#[test]
+fn invocation_callable_ownership_walk_handles_shared_and_cyclic_captures() {
+    let program = Program::new(Vec::new(), vec![OpCode::Ret as u8]).with_callable_metadata(
+        vec![crate::ScriptFunction {
+            entry_ip: 0,
+            end_ip: 1,
+        }],
+        vec![crate::CallablePrototype {
+            kind: crate::CallableKind::FunctionItem,
+            target: crate::CallableTarget::ScriptFunction(0),
+            arity: 1,
+            frame_local_count: 1,
+            parameter_slots: vec![0],
+            capture_source_slots: Vec::new(),
+            capture_slots: Vec::new(),
+            capture_modes: Vec::new(),
+            self_slot: None,
+            schema: None,
+        }],
+        vec![crate::FunctionRegion {
+            start_ip: 0,
+            end_ip: 1,
+            prototype_id: Some(0),
+        }],
+        Vec::new(),
+    );
+    let mut vm = Vm::new(program);
+    let entry = Arc::new(crate::CallableValue {
+        prototype_id: 0,
+        kind: crate::CallableKind::FunctionItem,
+        env: None,
+    });
+    vm.instance.owned_callables.push(Arc::downgrade(&entry));
+    assert_eq!(vm.run().expect("root should halt"), VmStatus::Halted);
+
+    let cell = Arc::new(Mutex::new(Value::Null));
+    let environment = Arc::new(crate::CallableEnvironment {
+        cells: Mutex::new(vec![Arc::clone(&cell)]),
+    });
+    let cyclic = Arc::new(crate::CallableValue {
+        prototype_id: 0,
+        kind: crate::CallableKind::Closure,
+        env: Some(environment),
+    });
+    *cell.lock().expect("capture cell lock") = Value::Callable(Arc::clone(&cyclic));
+    vm.instance.owned_callables.push(Arc::downgrade(&cyclic));
+
+    let shared = Value::array(vec![Value::Callable(cyclic)]);
+    let args = vec![Value::array(vec![shared.clone(), shared])];
+    let mut invocation = vm
+        .start_invocation(Value::Callable(Arc::clone(&entry)), args)
+        .expect("shared cyclic callable graph should be traversable");
+    assert!(matches!(
+        invocation
+            .poll_next()
+            .expect("invocation poll should succeed"),
+        InvocationPoll::Ready(Some(Ok(InvocationItem::Complete(Value::Null))))
+    ));
+    drop(invocation);
+
+    let mut foreign_vm = Vm::new(vm.program().clone());
+    let foreign = Arc::new(crate::CallableValue {
+        prototype_id: 0,
+        kind: crate::CallableKind::FunctionItem,
+        env: None,
+    });
+    foreign_vm
+        .instance
+        .owned_callables
+        .push(Arc::downgrade(&foreign));
+    let captured_cell = Arc::new(Mutex::new(Value::Callable(foreign)));
+    let captured_environment = Arc::new(crate::CallableEnvironment {
+        cells: Mutex::new(vec![captured_cell]),
+    });
+    let captured = Arc::new(crate::CallableValue {
+        prototype_id: 0,
+        kind: crate::CallableKind::Closure,
+        env: Some(captured_environment),
+    });
+    vm.instance.owned_callables.push(Arc::downgrade(&captured));
+    let before_ip = vm.ip();
+    let before_locals = vm.locals().to_vec();
+    assert!(matches!(
+        vm.start_invocation(
+            Value::Callable(entry),
+            vec![Value::array(vec![Value::Callable(captured)])]
+        ),
+        Err(VmError::InvalidCallable)
+    ));
+    assert_eq!(vm.ip(), before_ip);
+    assert_eq!(vm.locals(), before_locals.as_slice());
+    assert!(vm.execution_frames().is_empty());
+    assert!(vm.stack().is_empty());
+    assert_eq!(vm.call_depth(), 0);
+    drop(foreign_vm);
+}
+
+struct ReserveBeforeSubmitBridge {
+    submissions: Arc<Mutex<Vec<HostOpId>>>,
+    fail_submission: Arc<AtomicBool>,
+}
+
+impl HostAsyncBridge for ReserveBeforeSubmitBridge {
+    fn submit_op(&mut self, op_id: HostOpId, _future: HostFuture) -> VmResult<()> {
+        self.submissions
+            .lock()
+            .expect("submission lock")
+            .push(op_id);
+        if self.fail_submission.load(Ordering::SeqCst) {
+            Err(VmError::HostError("injected submit failure".to_string()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn poll_op(&mut self, _op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
+        Poll::Pending
+    }
+}
+
+fn empty_host_future() -> HostFuture {
+    Box::pin(async { Ok(HostFutureOutput::returning(CallReturn::none())) })
+}
+
+#[test]
+fn submitted_bridge_operation_reserves_before_submit_and_rolls_back_on_failure() {
+    let submissions = Arc::new(Mutex::new(Vec::new()));
+    let fail_submission = Arc::new(AtomicBool::new(false));
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.set_async_bridge(Box::new(ReserveBeforeSubmitBridge {
+        submissions: Arc::clone(&submissions),
+        fail_submission: Arc::clone(&fail_submission),
+    }))
+    .expect("bridge should install");
+
+    vm.host.next_host_op_id = 17;
+    vm.host
+        .track_bridge_host_op(17)
+        .expect("existing operation should be tracked");
+    let collision = vm
+        .submit_host_future(empty_host_future())
+        .expect_err("colliding operation id should be rejected");
+    assert!(
+        collision
+            .to_string()
+            .contains("bridge host op 17 is already tracked")
+    );
+    assert!(
+        submissions.lock().expect("submission lock").is_empty(),
+        "the bridge must not receive a colliding operation"
+    );
+
+    vm.host
+        .complete_bridge_operation(17, HostAsyncOpTerminal::Completed)
+        .expect("existing operation should be retired");
+    vm.host.next_host_op_id = HostOpId::MAX;
+    let wrapped = vm
+        .submit_host_future(empty_host_future())
+        .expect_err("wrapping operation id should be rejected");
+    assert!(wrapped.to_string().contains("operation id space exhausted"));
+    assert!(
+        submissions.lock().expect("submission lock").is_empty(),
+        "the bridge must not receive an operation after id exhaustion"
+    );
+
+    vm.host.next_host_op_id = 23;
+    fail_submission.store(true, Ordering::SeqCst);
+    let failed = vm
+        .submit_host_future(empty_host_future())
+        .expect_err("injected submit failure should propagate");
+    assert!(failed.to_string().contains("injected submit failure"));
+    assert_eq!(vm.host.next_host_op_id, 23);
+    assert!(!vm.host.submitted_host_ops.contains(&23));
+    assert!(!vm.host.is_bridge_operation_tracked(23));
+
+    fail_submission.store(false, Ordering::SeqCst);
+    assert_eq!(
+        vm.submit_host_future(empty_host_future())
+            .expect("rolled back operation id should be reusable"),
+        CallOutcome::Pending(23)
+    );
+    assert_eq!(
+        submissions.lock().expect("submission lock").as_slice(),
+        &[23, 23]
+    );
+}
+
+struct ReasonAwareCleanupOnlyBridge {
+    cleanups: Arc<Mutex<Vec<(HostOpId, OperationCancelReason)>>>,
+}
+
+impl HostAsyncBridge for ReasonAwareCleanupOnlyBridge {
+    fn submit_op(&mut self, _op_id: HostOpId, _future: HostFuture) -> VmResult<()> {
+        Ok(())
+    }
+
+    fn poll_op(&mut self, _op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
+        Poll::Pending
+    }
+
+    fn cancel_op_with_reason(&mut self, op_id: HostOpId, reason: OperationCancelReason) {
+        self.cleanups
+            .lock()
+            .expect("cleanup lock")
+            .push((op_id, reason));
+    }
+}
+
+#[test]
+fn default_bridge_cleanup_routes_every_terminal_state_through_reason_aware_hook() {
+    let cleanups = Arc::new(Mutex::new(Vec::new()));
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.set_async_bridge(Box::new(ReasonAwareCleanupOnlyBridge {
+        cleanups: Arc::clone(&cleanups),
+    }))
+    .expect("bridge should install");
+
+    let mut op_ids = Vec::new();
+    for _ in 0..3 {
+        let CallOutcome::Pending(op_id) = vm
+            .submit_host_future(empty_host_future())
+            .expect("submission should succeed")
+        else {
+            panic!("submission should suspend");
+        };
+        op_ids.push(op_id);
+    }
+    for (op_id, terminal) in op_ids.iter().copied().zip([
+        HostAsyncOpTerminal::Completed,
+        HostAsyncOpTerminal::Failed,
+        HostAsyncOpTerminal::Cancelled,
+    ]) {
+        vm.host
+            .complete_bridge_operation(op_id, terminal)
+            .expect("terminal cleanup should succeed");
+    }
+
+    assert_eq!(
+        *cleanups.lock().expect("cleanup lock"),
+        op_ids
+            .into_iter()
+            .map(|op_id| (op_id, OperationCancelReason::Requested))
+            .collect::<Vec<_>>()
+    );
+    assert!(vm.host.submitted_host_ops.is_empty());
 }
 
 #[test]
@@ -268,7 +772,7 @@ fn host_can_invoke_exported_callable_and_reset_rebinds_program_owned_value() {
         Err(VmError::InvalidFrameState("vm is shut down"))
     ));
 
-    vm.reset_for_reuse();
+    let _ = vm.reset_for_reuse();
     assert_eq!(vm.run().expect("reset root should halt"), VmStatus::Halted);
     let rebound = vm.locals()[0].clone();
     assert_eq!(
@@ -618,7 +1122,7 @@ fn store_reset_and_replacement_invalidate_callback_registries() {
         .expect("first callback should bind");
     let prepared = callback.prepare((1,)).expect("callback should prepare");
 
-    store.reset_for_reuse();
+    let _ = store.reset_for_reuse();
     assert!(!callback.is_subscribed());
     assert!(matches!(
         store.enqueue_callback(prepared),
@@ -1992,4 +2496,900 @@ fn call_ret_fusion_pattern_requires_immediate_ret() {
     let mut vm_no_next = Vm::new(no_next);
     vm_no_next.instance.ip = 4;
     assert!(!vm_no_next.can_fuse_call_ret_pattern());
+}
+
+#[test]
+fn async_host_future_is_submitted_to_the_host_bridge() {
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingBridge {
+        submitted: Arc<Mutex<Vec<HostOpId>>>,
+        future: Arc<Mutex<Option<HostFuture>>>,
+    }
+
+    impl HostAsyncBridge for RecordingBridge {
+        fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
+            self.submitted.lock().expect("submitted lock").push(op_id);
+            *self.future.lock().expect("future lock") = Some(future);
+            Ok(())
+        }
+
+        fn poll_op(
+            &mut self,
+            _op_id: HostOpId,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<VmResult<CallReturn>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    let submitted = Arc::new(Mutex::new(Vec::new()));
+    let future = Arc::new(Mutex::new(None));
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.set_async_bridge(Box::new(RecordingBridge {
+        submitted: Arc::clone(&submitted),
+        future: Arc::clone(&future),
+    }))
+    .expect("recording bridge should install");
+
+    let outcome = vm
+        .submit_host_future(Box::pin(async {
+            Ok(HostFutureOutput::returning(CallReturn::one(Value::Int(42))))
+        }))
+        .expect("host bridge should accept future");
+    let CallOutcome::Pending(op_id) = outcome else {
+        panic!("async host submission should suspend");
+    };
+
+    assert_eq!(*submitted.lock().expect("submitted lock"), vec![op_id]);
+    assert!(future.lock().expect("future lock").is_some());
+    assert!(
+        vm.host.submitted_host_ops.contains(&op_id),
+        "submitted bridge op should be tracked in the host runtime"
+    );
+}
+
+#[test]
+fn async_host_future_completion_error_cleans_up_bridge_operation_once() {
+    struct FailingCompletionBridge {
+        cleanup_calls: Arc<Mutex<Vec<HostOpId>>>,
+    }
+
+    impl HostAsyncBridge for FailingCompletionBridge {
+        fn submit_op(&mut self, _op_id: HostOpId, _future: HostFuture) -> VmResult<()> {
+            Ok(())
+        }
+
+        fn poll_op(
+            &mut self,
+            _op_id: HostOpId,
+            _cx: &mut Context<'_>,
+        ) -> Poll<VmResult<CallReturn>> {
+            Poll::Pending
+        }
+
+        fn poll_submitted_op(
+            &mut self,
+            _op_id: HostOpId,
+            _cx: &mut Context<'_>,
+        ) -> Poll<VmResult<HostFutureOutput>> {
+            Poll::Ready(Ok(HostFutureOutput::complete(|_vm| {
+                Err(VmError::HostError("completion failed".to_string()))
+            })))
+        }
+
+        fn cancel_op(&mut self, op_id: HostOpId) {
+            self.cleanup_calls.lock().expect("cleanup lock").push(op_id);
+        }
+    }
+
+    struct NoopWake;
+    impl std::task::Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    let cleanup_calls = Arc::new(Mutex::new(Vec::new()));
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.set_async_bridge(Box::new(FailingCompletionBridge {
+        cleanup_calls: Arc::clone(&cleanup_calls),
+    }))
+    .expect("failing completion bridge should install");
+    let CallOutcome::Pending(op_id) = vm
+        .submit_host_future(Box::pin(async {
+            Ok(HostFutureOutput::returning(CallReturn::none()))
+        }))
+        .expect("host bridge should accept future")
+    else {
+        panic!("async host submission should suspend");
+    };
+    vm.set_waiting_host_op_with_return(op_id, WaitingHostOpSource::HostBridge, None, None)
+        .expect("vm should wait on submitted operation");
+
+    let waker = Waker::from(Arc::new(NoopWake));
+    let mut cx = Context::from_waker(&waker);
+    let result = vm.poll_waiting_host_op(&mut cx);
+    assert!(
+        matches!(result, Poll::Ready(Err(VmError::HostError(message))) if message == "completion failed")
+    );
+    assert_eq!(vm.waiting_host_op_id(), None);
+    assert!(!vm.host.submitted_host_ops.contains(&op_id));
+    assert_eq!(*cleanup_calls.lock().expect("cleanup lock"), vec![op_id]);
+
+    assert!(matches!(
+        vm.poll_waiting_host_op(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(*cleanup_calls.lock().expect("cleanup lock"), vec![op_id]);
+}
+
+#[derive(Default)]
+struct CleanupRecordingBridge {
+    cancellations: Arc<Mutex<Vec<(HostOpId, OperationCancelReason)>>>,
+    submissions: Arc<Mutex<Vec<HostOpId>>>,
+}
+
+impl HostAsyncBridge for CleanupRecordingBridge {
+    fn submit_op(&mut self, op_id: HostOpId, _future: HostFuture) -> VmResult<()> {
+        self.submissions
+            .lock()
+            .expect("submission lock")
+            .push(op_id);
+        Ok(())
+    }
+
+    fn poll_op(&mut self, _op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
+        Poll::Pending
+    }
+
+    fn cancel_op_with_reason(&mut self, op_id: HostOpId, reason: OperationCancelReason) {
+        self.cancellations
+            .lock()
+            .expect("cancellation lock")
+            .push((op_id, reason));
+    }
+
+    fn request_cancel_op(
+        &mut self,
+        op_id: HostOpId,
+        reason: OperationCancelReason,
+    ) -> VmResult<()> {
+        self.cancel_op_with_reason(op_id, reason);
+        Ok(())
+    }
+
+    fn poll_cancel_op(&mut self, _op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn cleanup_op(&mut self, op_id: HostOpId, terminal: HostAsyncOpTerminal) -> VmResult<()> {
+        if terminal == HostAsyncOpTerminal::Completed {
+            self.cancel_op_with_reason(op_id, OperationCancelReason::Requested);
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn manually_completing_submitted_bridge_op_retires_entry_once() {
+    let cancellations = Arc::new(Mutex::new(Vec::new()));
+    let submissions = Arc::new(Mutex::new(Vec::new()));
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.set_async_bridge(Box::new(CleanupRecordingBridge {
+        cancellations: Arc::clone(&cancellations),
+        submissions: Arc::clone(&submissions),
+    }))
+    .expect("cleanup bridge should install");
+
+    let CallOutcome::Pending(op_id) = vm
+        .submit_host_future(Box::pin(async {
+            Ok(HostFutureOutput::returning(CallReturn::none()))
+        }))
+        .expect("submission")
+    else {
+        panic!("submission should suspend");
+    };
+    vm.set_waiting_host_op_with_return(op_id, WaitingHostOpSource::HostBridge, None, None)
+        .expect("waiting state");
+
+    vm.complete_host_op(op_id, CallReturn::one(Value::Int(7)))
+        .expect("manual completion");
+
+    assert_eq!(vm.waiting_host_op_id(), None);
+    assert!(vm.host.submitted_host_ops.is_empty());
+    assert_eq!(vm.stack(), &[Value::Int(7)]);
+    assert_eq!(
+        *cancellations.lock().expect("cancellation lock"),
+        vec![(op_id, OperationCancelReason::Requested)]
+    );
+    assert_eq!(*submissions.lock().expect("submission lock"), vec![op_id]);
+
+    let error = vm
+        .complete_host_op(op_id, CallReturn::none())
+        .expect_err("a second completion has no waiting operation");
+    assert!(error.to_string().contains("not waiting on any op"));
+    assert_eq!(
+        cancellations.lock().expect("cancellation lock").as_slice(),
+        &[(op_id, OperationCancelReason::Requested)]
+    );
+}
+
+#[test]
+fn legacy_manual_pending_without_bridge_is_untracked_and_resets_cleanly() {
+    struct LegacyManualPending;
+
+    impl HostFunction for LegacyManualPending {
+        fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+            Ok(CallOutcome::Pending(404))
+        }
+    }
+
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.call(0, 0);
+    bytecode.ret();
+    let mut vm = Vm::new(Program::new(Vec::new(), bytecode.finish()));
+    vm.register_function(Box::new(LegacyManualPending));
+
+    assert_eq!(
+        vm.run().expect("legacy host op should suspend"),
+        VmStatus::Waiting(404)
+    );
+    let waiting = vm
+        .instance
+        .waiting_host_op
+        .as_ref()
+        .expect("legacy pending operation should be recorded");
+    assert_eq!(waiting.source, WaitingHostOpSource::Manual);
+    assert!(
+        !vm.host.is_bridge_operation_tracked(404),
+        "manual completion must not enter bridge tracking"
+    );
+
+    vm.reset_for_reuse()
+        .expect("reset must clear a legacy manual pending operation");
+    assert_eq!(vm.waiting_host_op_id(), None);
+    assert!(!vm.host.is_bridge_operation_tracked(404));
+    assert!(vm.is_reusable());
+}
+
+struct ScopedPendingDriver {
+    cancellations: Arc<Mutex<Vec<OperationCancelReason>>>,
+}
+
+impl HostOperation for ScopedPendingDriver {
+    fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
+        Poll::Pending
+    }
+
+    fn cancel(&mut self, reason: OperationCancelReason) -> OperationResult<()> {
+        self.cancellations
+            .lock()
+            .expect("scoped cancellation lock")
+            .push(reason);
+        Ok(())
+    }
+
+    fn is_quiescent(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn manually_completing_scoped_op_retires_operation_and_completion() {
+    let cancellations = Arc::new(Mutex::new(Vec::new()));
+    let completion_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    let op_id = vm
+        .execution_scope()
+        .start_operation(OperationSpec::new(ScopedPendingDriver {
+            cancellations: Arc::clone(&cancellations),
+        }))
+        .expect("scoped operation");
+    let completion_calls_for_hook = Arc::clone(&completion_calls);
+    vm.register_scoped_operation_completion(op_id, move |_vm, _outcome| {
+        completion_calls_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(CallReturn::none())
+    })
+    .expect("completion hook");
+    vm.set_waiting_host_op_with_return(
+        op_id.raw(),
+        WaitingHostOpSource::ScopedOperation,
+        None,
+        None,
+    )
+    .expect("waiting state");
+
+    vm.complete_host_op(op_id.raw(), CallReturn::none())
+        .expect("manual completion");
+
+    assert_eq!(vm.waiting_host_op_id(), None);
+    assert_eq!(vm.host.execution_scope.operations().len(), 0);
+    assert!(vm.host.scoped_operation_completions.is_empty());
+    assert_eq!(
+        cancellations
+            .lock()
+            .expect("scoped cancellation lock")
+            .as_slice(),
+        &[OperationCancelReason::Requested]
+    );
+    assert_eq!(
+        completion_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "manual completion must remove the adapter hook instead of invoking it"
+    );
+}
+
+#[test]
+fn reset_cancels_all_submitted_bridge_ops_and_retires_scoped_state() {
+    let cancellations = Arc::new(Mutex::new(Vec::new()));
+    let submissions = Arc::new(Mutex::new(Vec::new()));
+    let scoped_cancellations = Arc::new(Mutex::new(Vec::new()));
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.set_async_bridge(Box::new(CleanupRecordingBridge {
+        cancellations: Arc::clone(&cancellations),
+        submissions: Arc::clone(&submissions),
+    }))
+    .expect("cleanup bridge should install");
+    let CallOutcome::Pending(first) = vm
+        .submit_host_future(Box::pin(async {
+            Ok(HostFutureOutput::returning(CallReturn::none()))
+        }))
+        .expect("first submission")
+    else {
+        panic!("first submission should suspend");
+    };
+    let CallOutcome::Pending(second) = vm
+        .submit_host_future(Box::pin(async {
+            Ok(HostFutureOutput::returning(CallReturn::none()))
+        }))
+        .expect("second submission")
+    else {
+        panic!("second submission should suspend");
+    };
+    let scoped_id = vm
+        .execution_scope()
+        .start_operation(OperationSpec::new(ScopedPendingDriver {
+            cancellations: Arc::clone(&scoped_cancellations),
+        }))
+        .expect("scoped operation");
+    vm.register_scoped_operation_completion(scoped_id, |_vm, _outcome| Ok(CallReturn::none()))
+        .expect("scoped completion");
+
+    let _ = vm.reset_for_reuse();
+
+    let mut bridge_cancellations = cancellations.lock().expect("cancellation lock").clone();
+    bridge_cancellations.sort_unstable();
+    assert_eq!(
+        bridge_cancellations,
+        vec![
+            (first, OperationCancelReason::VmReset),
+            (second, OperationCancelReason::VmReset),
+        ]
+    );
+    assert_eq!(
+        *submissions.lock().expect("submission lock"),
+        vec![first, second]
+    );
+    assert!(vm.host.submitted_host_ops.is_empty());
+    assert!(vm.host.scoped_operation_completions.is_empty());
+    assert_eq!(vm.host.execution_scope.operations().len(), 0);
+    assert_eq!(
+        scoped_cancellations
+            .lock()
+            .expect("scoped cancellation lock")
+            .as_slice(),
+        &[OperationCancelReason::VmReset]
+    );
+}
+
+#[test]
+fn dropping_vm_cancels_all_submitted_bridge_ops_once() {
+    let cancellations = Arc::new(Mutex::new(Vec::new()));
+    let submissions = Arc::new(Mutex::new(Vec::new()));
+    {
+        let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+        vm.set_async_bridge(Box::new(CleanupRecordingBridge {
+            cancellations: Arc::clone(&cancellations),
+            submissions: Arc::clone(&submissions),
+        }))
+        .expect("cleanup bridge should install");
+        let CallOutcome::Pending(first) = vm
+            .submit_host_future(Box::pin(async {
+                Ok(HostFutureOutput::returning(CallReturn::none()))
+            }))
+            .expect("first submission")
+        else {
+            panic!("first submission should suspend");
+        };
+        let CallOutcome::Pending(second) = vm
+            .submit_host_future(Box::pin(async {
+                Ok(HostFutureOutput::returning(CallReturn::none()))
+            }))
+            .expect("second submission")
+        else {
+            panic!("second submission should suspend");
+        };
+        assert_eq!(
+            *submissions.lock().expect("submission lock"),
+            vec![first, second]
+        );
+    }
+
+    let mut recorded = cancellations.lock().expect("cancellation lock").clone();
+    recorded.sort_unstable();
+    let submitted = submissions.lock().expect("submission lock").clone();
+    assert_eq!(
+        recorded,
+        submitted
+            .into_iter()
+            .map(|id| (id, OperationCancelReason::VmDrop))
+            .collect::<Vec<_>>()
+    );
+}
+
+struct QuiescentAdmissionResource;
+
+impl crate::vm::resource::HostResource for QuiescentAdmissionResource {}
+
+struct PendingResetResource {
+    ready: Arc<AtomicBool>,
+}
+
+impl crate::vm::resource::HostResource for PendingResetResource {
+    fn begin_close(
+        &mut self,
+        _reason: ResourceCloseReason,
+    ) -> crate::vm::resource::error::ResourceResult<crate::vm::resource::CloseProgress> {
+        Ok(crate::vm::resource::CloseProgress::Pending)
+    }
+
+    fn poll_close(
+        &mut self,
+        _cx: &mut Context<'_>,
+    ) -> Poll<crate::vm::resource::error::ResourceResult<()>> {
+        if self.ready.load(Ordering::SeqCst) {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+#[test]
+fn reset_retains_one_replacement_scope_until_old_scope_quiesces() {
+    static ARENA_SOURCE: AtomicU64 = AtomicU64::new(1);
+    static REGISTRY_SOURCE: AtomicU64 = AtomicU64::new(1);
+    ARENA_SOURCE.store(1, Ordering::SeqCst);
+    REGISTRY_SOURCE.store(1, Ordering::SeqCst);
+
+    let ready = Arc::new(AtomicBool::new(false));
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.execution_scope()
+        .push_resource(PendingResetResource {
+            ready: Arc::clone(&ready),
+        })
+        .expect("pending resource should enter the active scope");
+    assert!(!vm.is_reusable(), "旧 scope 持有资源时 VM 不应进入复用池");
+
+    let _arena_source =
+        crate::vm::resource::table::test_seam::ScopedArenaSource::install(&ARENA_SOURCE);
+    let _registry_source =
+        crate::vm::operation::id::test_seam::ScopedRegistryTagSource::install(&REGISTRY_SOURCE);
+
+    vm.reset_for_reuse()
+        .expect("reset should retain the replacement while close is pending");
+    assert!(
+        vm.scope_reset_pending(),
+        "旧 scope 未 quiescent 时 reset 应保持 pending"
+    );
+    assert_eq!(
+        ARENA_SOURCE.load(Ordering::SeqCst),
+        2,
+        "每次 reset 只应分配一个 replacement arena identity"
+    );
+    assert_eq!(
+        REGISTRY_SOURCE.load(Ordering::SeqCst),
+        2,
+        "每次 reset 只应分配一个 replacement registry identity"
+    );
+
+    // If polling tried to allocate a second scope, both sources would reject
+    // the allocation. A retained replacement must let the old close finish.
+    ARENA_SOURCE.store(
+        crate::vm::resource::handle::MAX_HANDLE_ARENA_ID + 1,
+        Ordering::SeqCst,
+    );
+    REGISTRY_SOURCE.store(
+        crate::vm::operation::id::MAX_REGISTRY_TAG + 1,
+        Ordering::SeqCst,
+    );
+    ready.store(true, Ordering::SeqCst);
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        vm.poll_reset_for_reuse(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    assert!(!vm.scope_reset_pending());
+    assert_eq!(
+        ARENA_SOURCE.load(Ordering::SeqCst),
+        crate::vm::resource::handle::MAX_HANDLE_ARENA_ID + 1,
+        "完成 close 后不得再次消耗 arena identity"
+    );
+    assert_eq!(
+        REGISTRY_SOURCE.load(Ordering::SeqCst),
+        crate::vm::operation::id::MAX_REGISTRY_TAG + 1,
+        "完成 close 后不得再次消耗 registry identity"
+    );
+
+    ARENA_SOURCE.store(2, Ordering::SeqCst);
+    REGISTRY_SOURCE.store(2, Ordering::SeqCst);
+    vm.reset_for_reuse()
+        .expect("第二次 reset 应只创建一个 replacement");
+    assert_eq!(ARENA_SOURCE.load(Ordering::SeqCst), 3);
+    assert_eq!(REGISTRY_SOURCE.load(Ordering::SeqCst), 3);
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        vm.poll_reset_for_reuse(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(ARENA_SOURCE.load(Ordering::SeqCst), 3);
+    assert_eq!(REGISTRY_SOURCE.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn replacement_scope_allocation_failure_is_terminal_and_not_reusable() {
+    static ARENA_SOURCE: AtomicU64 = AtomicU64::new(1);
+    ARENA_SOURCE.store(
+        crate::vm::resource::handle::MAX_HANDLE_ARENA_ID + 1,
+        Ordering::SeqCst,
+    );
+
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    let _arena_source =
+        crate::vm::resource::table::test_seam::ScopedArenaSource::install(&ARENA_SOURCE);
+
+    let error = vm
+        .reset_for_reuse()
+        .expect_err("replacement scope allocation failure must be reported");
+    assert!(matches!(
+        error,
+        VmError::ExecutionScope(crate::vm::execution_scope::ExecutionScopeError::ArenaExhausted(_))
+    ));
+    assert!(
+        !vm.scope_reset_pending(),
+        "terminal reset error 不应伪装为 pending"
+    );
+    assert!(
+        !vm.is_reusable(),
+        "terminal reset error 下 VM 不得进入复用池"
+    );
+
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        vm.poll_reset_for_reuse(&mut cx),
+        Poll::Ready(Err(VmError::ExecutionScope(
+            crate::vm::execution_scope::ExecutionScopeError::ArenaExhausted(_)
+        )))
+    ));
+    assert!(
+        !vm.is_reusable(),
+        "重复 poll 后 terminal reset error 仍应保持"
+    );
+}
+
+#[test]
+fn store_does_not_publish_callback_registry_after_reset_allocation_failure() {
+    static ARENA_SOURCE: AtomicU64 = AtomicU64::new(1);
+    ARENA_SOURCE.store(
+        crate::vm::resource::handle::MAX_HANDLE_ARENA_ID + 1,
+        Ordering::SeqCst,
+    );
+
+    let compiled = crate::compile_source("pub fn value() -> int { 1 }")
+        .expect("callback failure program should compile");
+    let mut store = crate::vm::Store::new(Vm::new(compiled.program), ());
+    let callback = store
+        .script_callback_by_name::<(), i64>("value")
+        .expect("callback should exist before reset failure");
+    let _arena_source =
+        crate::vm::resource::table::test_seam::ScopedArenaSource::install(&ARENA_SOURCE);
+
+    assert!(store.reset_for_reuse().is_err(), "reset 失败应返回错误");
+    assert!(!callback.is_subscribed(), "reset 失败应使旧 callback 失效");
+    assert!(!store.is_reusable(), "reset 失败后 store 不得进入复用池");
+    assert!(matches!(
+        store.script_callback_by_name::<(), i64>("value"),
+        Err(VmError::ExecutionScope(
+            crate::vm::execution_scope::ExecutionScopeError::ArenaExhausted(_)
+        ))
+    ));
+}
+
+#[test]
+fn shutdown_vm_is_not_reusable() {
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    assert!(vm.is_reusable(), "fresh VM 应可复用");
+    vm.shutdown();
+    assert!(!vm.is_reusable(), "shutdown VM 不得进入复用池");
+}
+
+#[test]
+fn pending_invocation_makes_vm_non_reusable() {
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.instance.invocation = Some(crate::vm::invocation::InvocationState {
+        phase: crate::vm::invocation::InvocationPhase::Running,
+        emit_yield_pending: false,
+        pending_error: None,
+        cancel_reason: None,
+        stack_base: 0,
+        frame_count: vm.instance.execution_frames.len(),
+    });
+
+    assert!(
+        !vm.is_reusable(),
+        "pending invocation 存在时 VM 不应进入复用池"
+    );
+}
+
+#[test]
+fn quiescent_scope_rejects_resource_admission() {
+    let mut scope = crate::vm::execution_scope::ExecutionScope::new().expect("scope");
+    scope
+        .begin_close(ResourceCloseReason::Requested)
+        .expect("close");
+    assert!(matches!(
+        scope.poll_close(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Ok(crate::vm::execution_scope::ScopeCloseOutcome::Success))
+    ));
+    let error = scope
+        .push_resource(QuiescentAdmissionResource)
+        .expect_err("quiescent scope rejects resource insertion");
+    assert_eq!(
+        error,
+        crate::vm::execution_scope::ExecutionScopeError::ScopeClosing
+    );
+}
+
+#[test]
+fn capability_profile_allow_all_and_deny_all_differ() {
+    let allow_all = crate::vm::CapabilityProfile::allow_all();
+    let deny_all = crate::vm::CapabilityProfile::deny_all();
+    assert!(allow_all.allows_builtin(crate::BuiltinFunction::Len));
+    assert!(allow_all.allows_host_import("anything::at::all"));
+    assert!(!deny_all.allows_builtin(crate::BuiltinFunction::Len));
+    assert!(!deny_all.allows_host_import("anything::at::all"));
+    assert_ne!(allow_all.fingerprint(), deny_all.fingerprint());
+}
+
+struct DelayedCancellationBridge {
+    acknowledgement: Arc<AtomicBool>,
+    cancellations: Arc<Mutex<Vec<(HostOpId, OperationCancelReason)>>>,
+    cleanups: Arc<Mutex<Vec<(HostOpId, HostAsyncOpTerminal)>>>,
+}
+
+impl HostAsyncBridge for DelayedCancellationBridge {
+    fn submit_op(&mut self, _op_id: HostOpId, _future: HostFuture) -> VmResult<()> {
+        Ok(())
+    }
+
+    fn poll_op(&mut self, _op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
+        Poll::Pending
+    }
+
+    fn request_cancel_op(
+        &mut self,
+        op_id: HostOpId,
+        reason: OperationCancelReason,
+    ) -> VmResult<()> {
+        self.cancellations
+            .lock()
+            .expect("cancellation lock")
+            .push((op_id, reason));
+        Ok(())
+    }
+
+    fn poll_cancel_op(&mut self, _op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<()>> {
+        if self.acknowledgement.load(Ordering::SeqCst) {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn cleanup_op(&mut self, op_id: HostOpId, terminal: HostAsyncOpTerminal) -> VmResult<()> {
+        self.cleanups
+            .lock()
+            .expect("cleanup lock")
+            .push((op_id, terminal));
+        Ok(())
+    }
+}
+
+struct NoAcknowledgementBridge;
+
+impl HostAsyncBridge for NoAcknowledgementBridge {
+    fn submit_op(&mut self, _op_id: HostOpId, _future: HostFuture) -> VmResult<()> {
+        Ok(())
+    }
+
+    fn poll_op(&mut self, _op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
+        Poll::Pending
+    }
+}
+
+fn submitted_host_future(vm: &mut Vm) -> HostOpId {
+    let CallOutcome::Pending(op_id) = vm
+        .submit_host_future(Box::pin(async {
+            Ok(HostFutureOutput::returning(CallReturn::none()))
+        }))
+        .expect("host bridge should accept future")
+    else {
+        panic!("host submission should suspend");
+    };
+    op_id
+}
+
+#[test]
+fn bridge_cancellation_acknowledgement_gates_reset_and_pool_reuse() {
+    let acknowledgement = Arc::new(AtomicBool::new(false));
+    let cancellations = Arc::new(Mutex::new(Vec::new()));
+    let cleanups = Arc::new(Mutex::new(Vec::new()));
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.set_async_bridge(Box::new(DelayedCancellationBridge {
+        acknowledgement: Arc::clone(&acknowledgement),
+        cancellations: Arc::clone(&cancellations),
+        cleanups: Arc::clone(&cleanups),
+    }))
+    .expect("bridge installation should succeed");
+    let op_id = submitted_host_future(&mut vm);
+    let mut store = Store::from_vm(vm);
+
+    store
+        .reset_for_reuse()
+        .expect("reset may remain pending while cancellation is unacknowledged");
+    assert!(store.vm().scope_reset_pending());
+    assert!(!store.is_reusable());
+    assert!(store.vm().host.submitted_host_ops.contains(&op_id));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(matches!(store.poll_reset_for_reuse(&mut cx), Poll::Pending));
+    assert!(!store.is_reusable());
+    assert_eq!(
+        *cancellations.lock().expect("cancellation lock"),
+        vec![(op_id, OperationCancelReason::VmReset)]
+    );
+    assert!(cleanups.lock().expect("cleanup lock").is_empty());
+
+    acknowledgement.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        store.poll_reset_for_reuse(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    assert!(store.is_reusable());
+    assert!(store.vm().host.submitted_host_ops.is_empty());
+    assert_eq!(
+        *cleanups.lock().expect("cleanup lock"),
+        vec![(op_id, HostAsyncOpTerminal::Cancelled)]
+    );
+}
+
+#[test]
+fn bridge_without_cancellation_acknowledgement_fails_closed() {
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.set_async_bridge(Box::new(NoAcknowledgementBridge))
+        .expect("bridge installation should succeed");
+    let op_id = submitted_host_future(&mut vm);
+
+    let error = vm
+        .reset_for_reuse()
+        .expect_err("a bridge without cancellation acknowledgement must not report reset success");
+    assert!(
+        matches!(error, VmError::HostError(ref message) if message.contains("cancellation acknowledgement")),
+        "unexpected reset error: {error:?}"
+    );
+    assert!(vm.host.submitted_host_ops.contains(&op_id));
+    assert!(!vm.is_reusable());
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        vm.poll_reset_for_reuse(&mut cx),
+        Poll::Ready(Err(VmError::HostError(message))) if message.contains("cancellation acknowledgement")
+    ));
+}
+
+#[test]
+fn repeated_bridge_cancellation_preserves_first_reason_and_cleans_once() {
+    let acknowledgement = Arc::new(AtomicBool::new(false));
+    let cancellations = Arc::new(Mutex::new(Vec::new()));
+    let cleanups = Arc::new(Mutex::new(Vec::new()));
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.set_async_bridge(Box::new(DelayedCancellationBridge {
+        acknowledgement: Arc::clone(&acknowledgement),
+        cancellations: Arc::clone(&cancellations),
+        cleanups: Arc::clone(&cleanups),
+    }))
+    .expect("bridge installation should succeed");
+    let op_id = submitted_host_future(&mut vm);
+    vm.set_waiting_host_op_with_return(op_id, WaitingHostOpSource::HostBridge, None, None)
+        .expect("submitted operation should become the waiting operation");
+
+    vm.cancel_waiting_host_op_with_reason(OperationCancelReason::Deadline)
+        .expect("first cancellation request should be accepted");
+    vm.cancel_waiting_host_op_with_reason(OperationCancelReason::VmReset)
+        .expect("repeated cancellation should be idempotent");
+    assert_eq!(
+        *cancellations.lock().expect("cancellation lock"),
+        vec![(op_id, OperationCancelReason::Deadline)]
+    );
+
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(matches!(vm.poll_waiting_host_op(&mut cx), Poll::Pending));
+    acknowledgement.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        vm.poll_waiting_host_op(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    assert!(vm.host.submitted_host_ops.is_empty());
+    assert_eq!(
+        *cleanups.lock().expect("cleanup lock"),
+        vec![(op_id, HostAsyncOpTerminal::Cancelled)]
+    );
+    assert!(matches!(
+        vm.poll_waiting_host_op(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(
+        *cleanups.lock().expect("cleanup lock"),
+        vec![(op_id, HostAsyncOpTerminal::Cancelled)]
+    );
+}
+
+#[test]
+fn active_bridge_operation_rejects_bridge_replacement_until_quiescent() {
+    let acknowledgement = Arc::new(AtomicBool::new(false));
+    let cancellations = Arc::new(Mutex::new(Vec::new()));
+    let cleanups = Arc::new(Mutex::new(Vec::new()));
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.set_async_bridge(Box::new(DelayedCancellationBridge {
+        acknowledgement: Arc::clone(&acknowledgement),
+        cancellations,
+        cleanups,
+    }))
+    .expect("bridge installation should succeed");
+    let op_id = submitted_host_future(&mut vm);
+
+    let error = vm
+        .set_async_bridge(Box::new(NoAcknowledgementBridge))
+        .expect_err("active old bridge operations must reject replacement");
+    assert!(
+        matches!(error, VmError::HostError(ref message) if message.contains("active host operation")),
+        "unexpected replacement error: {error:?}"
+    );
+    assert!(vm.host.submitted_host_ops.contains(&op_id));
+
+    vm.reset_for_reuse()
+        .expect("reset should wait for the old bridge acknowledgement");
+    acknowledgement.store(true, Ordering::SeqCst);
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        vm.poll_reset_for_reuse(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    vm.set_async_bridge(Box::new(NoAcknowledgementBridge))
+        .expect("replacement is allowed after old bridge quiescence");
+}
+
+#[test]
+fn dropping_vm_requests_bridge_cancellation_without_claiming_reuse() {
+    let acknowledgement = Arc::new(AtomicBool::new(false));
+    let cancellations = Arc::new(Mutex::new(Vec::new()));
+    let cleanups = Arc::new(Mutex::new(Vec::new()));
+    {
+        let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+        vm.set_async_bridge(Box::new(DelayedCancellationBridge {
+            acknowledgement,
+            cancellations: Arc::clone(&cancellations),
+            cleanups,
+        }))
+        .expect("bridge installation should succeed");
+        let _ = submitted_host_future(&mut vm);
+    }
+    assert_eq!(cancellations.lock().expect("cancellation lock").len(), 1);
 }

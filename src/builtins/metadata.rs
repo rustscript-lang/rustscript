@@ -10,6 +10,7 @@ pub enum CallableParamType {
     Array,
     Map,
     Number,
+    Resource,
 }
 
 impl CallableParamType {
@@ -25,6 +26,7 @@ impl CallableParamType {
             Self::Array => "array",
             Self::Map => "map",
             Self::Number => "number",
+            Self::Resource => "resource",
         }
     }
 }

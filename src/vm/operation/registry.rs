@@ -222,6 +222,26 @@ impl OperationRegistry {
         Ok(outcome)
     }
 
+    /// Consumes a terminal outcome after `cancel_and_wait` has returned.
+    ///
+    /// `cancel_and_wait` is the driver's quiescence boundary: its contract
+    /// requires the underlying work to be stopped before it returns, including
+    /// when it returns an error. This path therefore releases the slot without
+    /// asking the driver for a second quiescence observation.
+    fn take_outcome_after_cancel_and_wait(
+        &mut self,
+        id: OperationId,
+    ) -> OperationResult<OperationOutcome> {
+        let slot = self.location(id)?;
+        let outcome = self.slots[slot]
+            .operation
+            .as_ref()
+            .and_then(|operation| operation.status.terminal_outcome())
+            .ok_or_else(|| pending_outcome(id))?;
+        self.release_slot(slot);
+        Ok(outcome)
+    }
+
     /// Drives the operation one step.
     ///
     /// Polls the owning driver first; a `Ready` driver result wins even if a
@@ -392,10 +412,10 @@ impl OperationRegistry {
     }
 
     /// Aborts a started operation that must never produce a guest-visible
-    /// result: cancels the driver exactly once if it is still pending, then
-    /// consumes/immediately releases the slot so the id becomes stale and
-    /// full registry capacity is restored (the same "cancel then consume"
-    /// sequence the batch drain helpers use).
+    /// result: cancels the driver exactly once if it is still pending, waits
+    /// through the driver's `cancel_and_wait` boundary, then consumes/releases
+    /// the slot so the id becomes stale and full registry capacity is restored
+    /// (the same "cancel then consume" sequence the batch drain helpers use).
     ///
     /// This is the rollback counterpart to [`start`](Self::start), for call
     /// sites that register an operation and then hit a fallible handoff
@@ -404,18 +424,19 @@ impl OperationRegistry {
     /// - **Pending** — the driver is cancelled exactly once with `reason`
     ///   (first-reason-wins), the resulting terminal outcome is consumed and
     ///   the slot released, and `Ok(true)` is returned. If the driver's
-    ///   `cancel` itself fails, that failure is recorded as the first
-    ///   `Failed` status, the cleanup runs once, the slot is still released,
-    ///   and the driver error is returned — the slot is never left occupied
-    ///   regardless of the cancel outcome.
+    ///   `cancel_and_wait` boundary returns an error, that failure is recorded
+    ///   as the first `Failed` status, the cleanup runs once, the slot is still
+    ///   released, and the driver error is returned — the slot is never left
+    ///   occupied regardless of the cancellation outcome.
     /// - **Already terminal** — the terminal outcome is consumed, the slot
     ///   released, and `Ok(false)` returned (the driver is not invoked again).
     /// - **Stale / foreign / out-of-range** — rejected with the usual typed
     ///   error and **no** registry mutation.
     ///
-    /// After a successful abort the id is stale under an incremented slot
-    /// generation, so a later `poll`, `status`, `take_outcome`, `remove` or
-    /// second `abort` on it all report `OperationStale`.
+    /// After aborting a valid pending operation, whether cancellation returns
+    /// `Ok` or an error, the id is stale under an incremented slot generation,
+    /// so a later `poll`, `status`, `take_outcome`, `remove` or second `abort`
+    /// on it all report `OperationStale`.
     pub fn abort(
         &mut self,
         id: OperationId,
@@ -423,19 +444,46 @@ impl OperationRegistry {
     ) -> OperationResult<bool> {
         // Validate fully before any mutation; an unresolvable id is rejected
         // without touching cancel/consume state.
-        let _slot = self.location(id)?;
+        let slot = self.location(id)?;
+        let pending = self.slots[slot]
+            .operation
+            .as_ref()
+            .is_some_and(|operation| matches!(operation.status, OperationStatus::Pending));
         let cancel_result = self.cancel_with_wait(id, reason, true);
-        // Whether the driver cancelled cleanly, the driver's cancel failed
-        // (the entry is now terminal `Failed`), or the entry was already
-        // terminal before this call, consuming the outcome releases the slot
-        // and makes the id stale exactly once. Preserve the first transition
-        // error, while still surfacing an outcome-consumption error when the
-        // cancellation itself succeeded.
-        let take_result = self.take_outcome(id);
+        // A pending operation has crossed the driver's cancel-and-wait
+        // boundary, so release its terminal slot even when that boundary
+        // returned an error. Already-terminal operations still use the normal
+        // quiescence-checked take path.
+        let take_result = if pending {
+            self.take_outcome_after_cancel_and_wait(id)
+        } else {
+            self.take_outcome(id)
+        };
         match (cancel_result, take_result) {
             (Err(error), _) | (Ok(_), Err(error)) => Err(error),
             (Ok(cancelled), Ok(_)) => Ok(cancelled),
         }
+    }
+
+    /// Cancels every pending operation through the driver's synchronous
+    /// `cancel_and_wait` boundary and consumes each terminal slot. This is used
+    /// by VM reset, where the pool cannot retain a pending operation across the
+    /// reset boundary. Drivers with background work must implement
+    /// `cancel_and_wait` so it returns only after that work is quiescent.
+    pub fn cancel_all_and_wait(&mut self, reason: OperationCancelReason) -> OperationCancelSummary {
+        let mut summary = OperationCancelSummary::default();
+        for id in self.occupied_ids() {
+            let pending = self
+                .location(id)
+                .ok()
+                .and_then(|slot| self.slots[slot].operation.as_ref())
+                .is_some_and(|operation| matches!(operation.status, OperationStatus::Pending));
+            if !pending {
+                continue;
+            }
+            summary.record(self.abort(id, reason));
+        }
+        summary
     }
 
     /// Cancels every pending operation and records the outcome in a
@@ -984,6 +1032,33 @@ mod tests {
         }
     }
 
+    /// Driver that reports a cancellation error from the blocking cancellation
+    /// boundary while deliberately reporting a non-quiescent worker. `abort`
+    /// must still retire the slot after `cancel_and_wait` returns.
+    struct CancelAndWaitFailDriver;
+
+    impl HostOperation for CancelAndWaitFailDriver {
+        fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
+            Poll::Pending
+        }
+
+        fn cancel(&mut self, _reason: OperationCancelReason) -> OperationResult<()> {
+            Ok(())
+        }
+
+        fn cancel_and_wait(&mut self, _reason: OperationCancelReason) -> OperationResult<()> {
+            Err(OperationError::new(
+                OperationErrorCode::OperationDriverFailed,
+                "test",
+                "cancel-and-wait failed after reaching its boundary",
+            ))
+        }
+
+        fn is_quiescent(&self) -> bool {
+            false
+        }
+    }
+
     #[test]
     fn start_assigns_distinct_ids_and_capacity_is_bounded() {
         let mut registry = OperationRegistry::with_limit(2).expect("registry");
@@ -1204,6 +1279,30 @@ mod tests {
         registry
             .start(OperationSpec::new(RecordingDriver::completed()))
             .expect("capacity restored");
+    }
+
+    #[test]
+    fn abort_releases_slot_even_when_cancel_and_wait_fails() {
+        let mut registry = OperationRegistry::with_limit(1).expect("registry");
+        let id = registry
+            .start(OperationSpec::new(CancelAndWaitFailDriver))
+            .expect("start");
+
+        let error = registry
+            .abort(id, OperationCancelReason::VmReset)
+            .expect_err("cancel-and-wait failure surfaces");
+        assert_eq!(error.code(), OperationErrorCode::OperationDriverFailed);
+        assert_eq!(registry.len(), 0, "failed abort must retire the slot");
+        assert_eq!(
+            registry
+                .status(id)
+                .expect_err("retired operation id is stale")
+                .code(),
+            OperationErrorCode::OperationStale
+        );
+        registry
+            .start(OperationSpec::new(RecordingDriver::completed()))
+            .expect("capacity is restored after failed abort");
     }
 
     #[test]

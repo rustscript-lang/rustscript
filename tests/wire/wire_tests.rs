@@ -2,9 +2,11 @@ use std::collections::HashMap;
 
 use vm::{
     ArgInfo, Assembler, BuiltinFunction, BytecodeBuilder, DebugFunction, DebugInfo,
-    DisassembleOptions, HostImport, LineInfo, LocalInfo, Program, TypeMap, ValidationError, Value,
-    ValueType, WireError, builtin_call_index, decode_program, disassemble_vmbc,
-    disassemble_vmbc_with_options, encode_program, infer_local_count, validate_program,
+    DisassembleOptions, HostApiBuilder, HostFunctionSchema, HostImport, HostImportSchema,
+    HostParamPassing, HostParamSchema, HostTypeSchema, LineInfo, LocalInfo, Program,
+    ResourceTypeKey, ResourceTypeSchema, TypeMap, ValidationError, Value, ValueType, WireError,
+    builtin_call_index, decode_program, disassemble_vmbc, disassemble_vmbc_with_options,
+    encode_program, infer_local_count, validate_program,
 };
 
 #[test]
@@ -55,7 +57,7 @@ fn wire_roundtrip_preserves_constants_and_code() {
     });
 
     let encoded = encode_program(&program).expect("encode should succeed");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 11);
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 12);
     let decoded = decode_program(&encoded).expect("decode should succeed");
 
     assert_eq!(decoded.constants, program.constants);
@@ -63,6 +65,80 @@ fn wire_roundtrip_preserves_constants_and_code() {
     assert_eq!(decoded.imports, program.imports);
     assert_eq!(decoded.debug, program.debug);
     assert_eq!(decoded.type_map, program.type_map);
+}
+
+#[test]
+fn wire_v11_legacy_imports_decode_without_schema_metadata() {
+    let import = HostImport {
+        name: "legacy::import".to_string(),
+        arity: 0,
+        return_type: ValueType::Unknown,
+    };
+    let program = Program::with_imports_and_debug(
+        Vec::new(),
+        vec![vm::OpCode::Ret as u8],
+        vec![import.clone()],
+        None,
+    );
+    let encoded = encode_program(&program).expect("v12 encoding should succeed");
+    let marker_offset = 8 + 4 + 4 + program.code.len() + 4 + 4 + import.name.len() + 2;
+    assert_eq!(encoded[marker_offset], 0);
+    let mut legacy = encoded;
+    legacy.drain(marker_offset..marker_offset + 1);
+    legacy[4..6].copy_from_slice(&11u16.to_le_bytes());
+
+    let decoded = decode_program(&legacy).expect("v11 payload should remain readable");
+    assert_eq!(decoded.imports, vec![import]);
+    assert!(decoded.host_import_schemas().is_empty());
+}
+
+fn rich_host_import_schema() -> HostImportSchema {
+    let resource = ResourceTypeKey::new("wire.resource").expect("resource key");
+    let callback = HostTypeSchema::Callable {
+        params: vec![HostTypeSchema::Array(Box::new(HostTypeSchema::Resource(
+            resource.clone(),
+        )))],
+        result: Box::new(HostTypeSchema::Optional(Box::new(HostTypeSchema::String))),
+    };
+    let function = HostFunctionSchema::with_return(
+        "demo::wire_schema",
+        vec![HostParamSchema::with_passing(
+            "callback",
+            callback,
+            HostParamPassing::Borrow,
+        )],
+        HostTypeSchema::Map(Box::new(HostTypeSchema::Callable {
+            params: vec![HostTypeSchema::Int],
+            result: Box::new(HostTypeSchema::Resource(resource.clone())),
+        })),
+    );
+    let mut builder = HostApiBuilder::new();
+    builder.resource(ResourceTypeSchema::new(resource, "wire resource"));
+    builder.function(function.clone());
+    let catalog = builder.build().expect("catalog");
+    HostImportSchema::from_function(&catalog, &function)
+}
+
+#[test]
+fn wire_roundtrip_preserves_full_host_import_schema_identity() {
+    let schema = rich_host_import_schema();
+    let program = Program::with_imports_and_debug(
+        Vec::new(),
+        vec![vm::OpCode::Ret as u8],
+        vec![HostImport {
+            name: schema.name.clone(),
+            arity: schema.arity() as u8,
+            return_type: ValueType::Map,
+        }],
+        None,
+    )
+    .with_host_import_schemas(vec![schema.clone()])
+    .expect("schema metadata should align");
+
+    let encoded = encode_program(&program).expect("full schema should encode");
+    let decoded = decode_program(&encoded).expect("full schema should decode");
+
+    assert_eq!(decoded.host_import_schemas(), &[Some(schema)]);
 }
 
 #[test]

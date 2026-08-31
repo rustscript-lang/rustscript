@@ -1,0 +1,5 @@
+error: ResourceMut cannot be a host function return; resource borrows cannot cross the host boundary
+  --> tests/ui/fail/direct_resource_mut_return.rs:16:44
+   |
+16 |         fn direct_resource_mut_return() -> ResourceMut<'static, Counter> {
+   |                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
