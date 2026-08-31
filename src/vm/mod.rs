@@ -1,29 +1,44 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 
 pub(crate) mod aot;
 pub mod diagnostics;
+mod engine;
 mod epoch;
+pub mod execution_scope;
 mod fuel;
 mod host;
+mod host_runtime;
+pub(crate) mod host_state;
+mod instance;
 pub(crate) mod jit;
 mod map_iter;
 pub(crate) mod native;
+pub mod operation;
+pub mod program;
+pub mod resource;
+mod run_context;
 mod store;
 mod superinstructions;
 #[cfg(test)]
 mod tests;
 pub use self::aot::AotArtifactError;
+use self::engine::Engine;
 pub use self::epoch::{EpochCheckpoint, EpochHandle};
+use self::execution_scope::ExecutionScopeError;
 pub use self::fuel::FuelCheckpoint;
 pub use self::host::{
     CallOutcome, CallReturn, HostArgsFunction, HostAsyncBridge, HostBindingPlan, HostFunction,
     HostFunctionRegistry, HostOpId, HostStackFunction, StaticHostArgsFunction, StaticHostFunction,
     StaticHostStackFunction,
 };
-use self::host::{HostCallExecOutcome, VmHostFunction, WaitingHostOp};
+use self::host::{HostCallExecOutcome, VmHostFunction};
+use self::host_runtime::HostRuntime;
+use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable};
+pub use self::resource::ResourceCloseReason;
+use self::run_context::{InterruptMode, RunContext};
 pub use crate::bytecode::{
     CallableTarget, CallableValue, HostImport, OpCode, Program, Value, ValueType,
 };
@@ -98,6 +113,10 @@ pub enum VmError {
     BytecodeBounds,
     HostError(String),
     JitNative(String),
+    /// A structured failure from the execution scope (resource or operation
+    /// registry state/close error), preserved for the modern resource and
+    /// operation lifecycle.
+    ExecutionScope(ExecutionScopeError),
     InvalidFuelCheckInterval(u32),
     InvalidEpochCheckInterval(u32),
     InterruptionModeConflict {
@@ -174,6 +193,7 @@ impl std::fmt::Display for VmError {
             VmError::BytecodeBounds => write!(f, "bytecode bounds"),
             VmError::HostError(message) => write!(f, "host error: {message}"),
             VmError::JitNative(message) => write!(f, "jit native error: {message}"),
+            VmError::ExecutionScope(error) => write!(f, "execution scope error: {error}"),
             VmError::InvalidFuelCheckInterval(value) => {
                 write!(f, "invalid fuel check interval {value}, expected >= 1")
             }
@@ -228,25 +248,6 @@ pub struct InterpreterMetrics {
     pub local_type_hint_hit_count: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-enum InterruptMode {
-    None = 0,
-    Fuel = 1,
-    Epoch = 2,
-}
-
-impl InterruptMode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Fuel => "fuel",
-            Self::Epoch => "epoch",
-        }
-    }
-}
-type RuntimePrintSink = dyn FnMut(String) + Send;
-
 type PackedOperandTypes = u8;
 
 const NO_OPERAND_TYPE_HINT: PackedOperandTypes = 0;
@@ -283,129 +284,17 @@ pub struct VmExecutionFrameSnapshot {
     pub prototype_id: Option<u32>,
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum FrameContinuation {
-    Halt,
-    ResumeBytecode { return_ip: usize },
-    ReturnToHost,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub(crate) struct ExecutionFrame {
-    pub(crate) continuation: FrameContinuation,
-    pub(crate) operand_stack_base: usize,
-    pub(crate) local_base: usize,
-    pub(crate) local_count: usize,
-    pub(crate) prototype_id: Option<u32>,
-}
-
-impl ExecutionFrame {
-    fn root(local_count: usize) -> Self {
-        Self {
-            continuation: FrameContinuation::Halt,
-            operand_stack_base: 0,
-            local_base: 0,
-            local_count,
-            prototype_id: None,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct QueuedCallable {
-    callable: Value,
-    args: Vec<Value>,
-    subscription: Option<Arc<AtomicBool>>,
-}
-
 pub struct Vm {
     program: Arc<Program>,
-    #[allow(dead_code)]
-    program_constants_ptr: usize,
-    #[allow(dead_code)]
-    program_constants_len: usize,
-    #[allow(dead_code)]
-    native_helper_fn: usize,
-    #[allow(dead_code)]
-    native_interrupt_helper_fn: usize,
-    program_cache_key: u64,
-    program_cache_key_ready: bool,
-    ip: usize,
-    stack: Vec<Value>,
-    locals: Vec<Value>,
-    capture_cells: HashMap<usize, crate::bytecode::SharedCaptureCell>,
-    shared_capture_slots: HashSet<usize>,
-    operand_type_hints: Option<Arc<[PackedOperandTypes]>>,
-    decoded_instruction_data: Arc<crate::bytecode::DecodedInstructionData>,
-    host_functions: Vec<VmHostFunction>,
-    host_function_symbols: HashMap<String, u16>,
-    builtin_overrides: HashMap<u16, u16>,
-    resolved_calls: Vec<u16>,
-    resolved_calls_dirty: bool,
-    call_depth: usize,
-    max_script_call_depth: usize,
-    execution_frames: Vec<ExecutionFrame>,
-    active_local_base_cache: usize,
-    active_operand_stack_base_cache: usize,
-    host_return: Option<Value>,
-    queued_callables: VecDeque<QueuedCallable>,
-    completed_callable_results: VecDeque<Value>,
-    owned_callables: Vec<Weak<CallableValue>>,
-    callback_registry_flags: Vec<Weak<AtomicBool>>,
-    draining_queued_callables: bool,
-    shutdown: bool,
-    aot_program: Option<aot::CompiledProgram>,
-    aot_exec_count: u64,
-    aot_interpreter_boundary_hit: bool,
-    jit: jit::TraceJitEngine,
-    native_traces: Vec<Option<jit::NativeTrace>>,
-    native_trace_exec_count: u64,
-    jit_native_region_entry_count: u64,
-    jit_native_region_edge_count: u64,
-    jit_native_direct_link_count: u64,
-    jit_native_direct_links_enabled: bool,
-    jit_native_direct_cross_frame_enabled: bool,
-    jit_native_active_direct_trace_id: usize,
-    jit_native_direct_escape_streak: u16,
-    jit_native_direct_region_fallback: bool,
-    jit_native_compile_time_ns: u64,
-    jit_native_region_compile_time_ns: u64,
-    jit_trace_exit_count: u64,
-    jit_native_loop_back_count: u64,
-    jit_native_link_handoff_count: u64,
-    jit_native_link_dispatch_depth: u32,
-    jit_helper_fallback_count: u64,
-    jit_native_bridge_stats_enabled: bool,
-    jit_native_bridge_counts: HashMap<&'static str, u64>,
-    async_bridge: Option<Box<dyn HostAsyncBridge>>,
-    runtime_print_sink: Option<Box<RuntimePrintSink>>,
-    waiting_host_op: Option<WaitingHostOp>,
-    next_host_op_id: HostOpId,
+    pub(crate) engine: Engine,
+    pub(crate) instance: Instance,
+    pub(crate) run_ctx: RunContext,
+    pub(crate) host: HostRuntime,
+    /// Legacy pre-scope IO runtime state.
+    ///
+    /// This commit keeps IO ownership on the `Vm` facade; the generic
+    /// scope-lifecycle migration relocates it in a later commit.
     pub(crate) io_state: crate::builtins::runtime::IoState,
-    regex_cache: crate::builtins::runtime::regex::RegexCache,
-    map_iterators: Vec<Vec<Option<map_iter::MapIteratorState>>>,
-    epoch_handle: EpochHandle,
-    #[allow(dead_code)]
-    epoch_counter_ptr: usize,
-    interrupt_mode: InterruptMode,
-    fuel_remaining: u64,
-    fuel_check_interval: u32,
-    fuel_ops_until_check: u32,
-    epoch_deadline: u64,
-    epoch_deadline_delta: u64,
-    epoch_rearm_pending: bool,
-    last_yield_reason: Option<VmYieldReason>,
-    drop_contract_events_enabled: bool,
-    drop_contract_events: u64,
-    operand_hint_hit_count: u64,
-    operand_hint_miss_count: u64,
-    typed_builtin_fast_path_count: u64,
-    projection_fast_path_count: u64,
-    generic_builtin_call_count: u64,
-    scalar_superinstruction_count: u64,
-    local_type_hint_hit_count: u64,
 }
 
 pub(crate) enum ExecOutcome {
@@ -660,126 +549,22 @@ impl Vm {
     }
 
     pub fn new_shared_with_jit_config(program: Arc<Program>, jit_config: jit::JitConfig) -> Self {
-        let program_constants_ptr = program.constants.as_ptr();
-        let program_constants_len = program.constants.len();
-        let local_count = program.local_count;
-        let operand_type_hints = program.shared_operand_type_hints();
-        let decoded_instruction_data = program.shared_decoded_instruction_data();
-        let epoch_handle = EpochHandle::default();
-        let epoch_counter_ptr = epoch_handle.as_ptr() as usize;
-        let mut vm = Self {
+        let engine = Engine::new(jit_config, &program);
+        let mut instance = Instance::new(&program);
+        instance.initialize_root_callable_bindings(&program);
+        Self {
             program,
-            program_constants_ptr: program_constants_ptr as usize,
-            program_constants_len,
-            native_helper_fn: native::helper_entry_address(),
-            native_interrupt_helper_fn: native::interrupt_helper_entry_address(),
-            program_cache_key: 0,
-            program_cache_key_ready: false,
-            ip: 0,
-            stack: Vec::new(),
-            locals: vec![Value::Null; local_count],
-            capture_cells: HashMap::new(),
-            shared_capture_slots: HashSet::new(),
-            operand_type_hints,
-            decoded_instruction_data,
-            host_functions: Vec::new(),
-            host_function_symbols: HashMap::new(),
-            builtin_overrides: HashMap::new(),
-            resolved_calls: Vec::new(),
-            resolved_calls_dirty: true,
-            call_depth: 0,
-            max_script_call_depth: DEFAULT_MAX_SCRIPT_CALL_DEPTH,
-            execution_frames: vec![ExecutionFrame::root(local_count)],
-            active_local_base_cache: 0,
-            active_operand_stack_base_cache: 0,
-            host_return: None,
-            queued_callables: VecDeque::new(),
-            completed_callable_results: VecDeque::new(),
-            owned_callables: Vec::new(),
-            callback_registry_flags: Vec::new(),
-            draining_queued_callables: false,
-            shutdown: false,
-            aot_program: None,
-            aot_exec_count: 0,
-            aot_interpreter_boundary_hit: false,
-            jit: jit::TraceJitEngine::new(jit_config),
-            native_traces: Vec::new(),
-            native_trace_exec_count: 0,
-            jit_native_region_entry_count: 0,
-            jit_native_region_edge_count: 0,
-            jit_native_direct_link_count: 0,
-            jit_native_direct_links_enabled: true,
-            jit_native_direct_cross_frame_enabled: false,
-            jit_native_active_direct_trace_id: usize::MAX,
-            jit_native_direct_escape_streak: 0,
-            jit_native_direct_region_fallback: false,
-            jit_native_compile_time_ns: 0,
-            jit_native_region_compile_time_ns: 0,
-            jit_trace_exit_count: 0,
-            jit_native_loop_back_count: 0,
-            jit_native_link_handoff_count: 0,
-            jit_native_link_dispatch_depth: 0,
-            jit_helper_fallback_count: 0,
-            jit_native_bridge_stats_enabled: false,
-            jit_native_bridge_counts: HashMap::new(),
-            async_bridge: None,
-            runtime_print_sink: None,
-            waiting_host_op: None,
-            next_host_op_id: 1,
+            engine,
+            instance,
+            run_ctx: RunContext::default(),
+            host: HostRuntime::default(),
             io_state: crate::builtins::runtime::IoState::default(),
-            regex_cache: crate::builtins::runtime::regex::RegexCache::default(),
-            map_iterators: Vec::new(),
-            epoch_handle,
-            epoch_counter_ptr,
-            interrupt_mode: InterruptMode::None,
-            fuel_remaining: 0,
-            fuel_check_interval: 1,
-            fuel_ops_until_check: 1,
-            epoch_deadline: 0,
-            epoch_deadline_delta: 0,
-            epoch_rearm_pending: false,
-            last_yield_reason: None,
-            drop_contract_events_enabled: false,
-            drop_contract_events: 0,
-            operand_hint_hit_count: 0,
-            operand_hint_miss_count: 0,
-            typed_builtin_fast_path_count: 0,
-            projection_fast_path_count: 0,
-            generic_builtin_call_count: 0,
-            scalar_superinstruction_count: 0,
-            local_type_hint_hit_count: 0,
-        };
-        vm.initialize_root_callable_bindings();
-        vm
-    }
-
-    fn initialize_root_callable_bindings(&mut self) {
-        let bindings = self.program.root_callable_bindings.clone();
-        for binding in bindings {
-            let Some(kind) = self
-                .program
-                .callable_prototypes
-                .get(binding.prototype_id as usize)
-                .map(|prototype| prototype.kind)
-            else {
-                continue;
-            };
-            if binding.local_slot as usize >= self.locals.len() {
-                continue;
-            }
-            let callable = Arc::new(CallableValue {
-                prototype_id: binding.prototype_id,
-                kind,
-                env: None,
-            });
-            self.owned_callables.push(Arc::downgrade(&callable));
-            self.locals[binding.local_slot as usize] = Value::Callable(callable);
         }
     }
 
     /// Returns the maximum number of simultaneously active script call frames.
     pub fn max_script_call_depth(&self) -> usize {
-        self.max_script_call_depth
+        self.instance.max_script_call_depth
     }
 
     /// Sets the maximum number of simultaneously active script call frames.
@@ -790,38 +575,34 @@ impl Vm {
         if limit == 0 {
             return Err(VmError::InvalidCallStackLimit(limit));
         }
-        self.max_script_call_depth = limit;
+        self.instance.max_script_call_depth = limit;
         Ok(())
     }
 
     fn ensure_program_cache_key(&mut self) -> u64 {
-        if !self.program_cache_key_ready {
-            self.program_cache_key = compute_program_cache_key(&self.program);
-            self.program_cache_key_ready = true;
-        }
-        self.program_cache_key
+        self.engine.ensure_program_cache_key(&self.program)
     }
 
     #[inline(always)]
     fn fuel_metering_enabled(&self) -> bool {
-        self.interrupt_mode == InterruptMode::Fuel
+        self.run_ctx.interrupt_mode == InterruptMode::Fuel
     }
 
     #[inline(always)]
     fn epoch_interruption_enabled(&self) -> bool {
-        self.interrupt_mode == InterruptMode::Epoch
+        self.run_ctx.interrupt_mode == InterruptMode::Epoch
     }
 
     #[inline(always)]
     fn interruption_enabled(&self) -> bool {
-        self.interrupt_mode != InterruptMode::None
+        self.run_ctx.interrupt_mode != InterruptMode::None
     }
 
     /// Returns the maximum number of compiled regular expressions retained by this VM.
     ///
     /// New VMs default to 512 entries. A capacity of zero disables caching.
     pub fn regex_cache_capacity(&self) -> usize {
-        self.regex_cache.capacity()
+        self.engine.regex_cache.capacity()
     }
 
     /// Changes this VM's compiled regular-expression cache capacity.
@@ -829,67 +610,68 @@ impl Vm {
     /// Shrinking evicts least-recently-used entries immediately. Setting zero clears
     /// all entries and disables caching until a positive capacity is configured.
     pub fn set_regex_cache_capacity(&mut self, capacity: usize) {
-        self.regex_cache.set_capacity(capacity);
+        self.engine.regex_cache.set_capacity(capacity);
     }
 
     pub fn regex_cache_entry_count(&self) -> usize {
-        self.regex_cache.len()
+        self.engine.regex_cache.len()
     }
 
     pub fn regex_cache_compile_count(&self) -> u64 {
-        self.regex_cache.compile_count()
+        self.engine.regex_cache.compile_count()
     }
 
     pub fn regex_cache_hit_count(&self) -> u64 {
-        self.regex_cache.hit_count()
+        self.engine.regex_cache.hit_count()
     }
 
     pub(crate) fn cached_regex(
         &mut self,
         pattern: &str,
     ) -> Result<std::sync::Arc<regex::Regex>, regex::Error> {
-        self.regex_cache.get_or_compile(pattern)
+        self.engine.regex_cache.get_or_compile(pattern)
     }
 
     pub fn set_jit_native_bridge_stats_enabled(&mut self, enabled: bool) {
-        self.jit_native_bridge_stats_enabled = enabled;
+        self.engine.jit_native_bridge_stats_enabled = enabled;
         if !enabled {
-            self.jit_native_bridge_counts.clear();
+            self.engine.jit_native_bridge_counts.clear();
         }
     }
 
     pub fn jit_native_bridge_stats_enabled(&self) -> bool {
-        self.jit_native_bridge_stats_enabled
+        self.engine.jit_native_bridge_stats_enabled
     }
 
     pub fn clear_jit_native_bridge_stats(&mut self) {
-        self.jit_native_bridge_counts.clear();
+        self.engine.jit_native_bridge_counts.clear();
     }
 
     pub fn interpreter_metrics_snapshot(&self) -> InterpreterMetrics {
         InterpreterMetrics {
-            operand_hint_hit_count: self.operand_hint_hit_count,
-            operand_hint_miss_count: self.operand_hint_miss_count,
-            typed_builtin_fast_path_count: self.typed_builtin_fast_path_count,
-            projection_fast_path_count: self.projection_fast_path_count,
-            generic_builtin_call_count: self.generic_builtin_call_count,
-            scalar_superinstruction_count: self.scalar_superinstruction_count,
-            local_type_hint_hit_count: self.local_type_hint_hit_count,
+            operand_hint_hit_count: self.instance.operand_hint_hit_count,
+            operand_hint_miss_count: self.instance.operand_hint_miss_count,
+            typed_builtin_fast_path_count: self.instance.typed_builtin_fast_path_count,
+            projection_fast_path_count: self.instance.projection_fast_path_count,
+            generic_builtin_call_count: self.instance.generic_builtin_call_count,
+            scalar_superinstruction_count: self.instance.scalar_superinstruction_count,
+            local_type_hint_hit_count: self.instance.local_type_hint_hit_count,
         }
     }
 
     pub fn clear_interpreter_metrics(&mut self) {
-        self.operand_hint_hit_count = 0;
-        self.operand_hint_miss_count = 0;
-        self.typed_builtin_fast_path_count = 0;
-        self.projection_fast_path_count = 0;
-        self.generic_builtin_call_count = 0;
-        self.scalar_superinstruction_count = 0;
-        self.local_type_hint_hit_count = 0;
+        self.instance.operand_hint_hit_count = 0;
+        self.instance.operand_hint_miss_count = 0;
+        self.instance.typed_builtin_fast_path_count = 0;
+        self.instance.projection_fast_path_count = 0;
+        self.instance.generic_builtin_call_count = 0;
+        self.instance.scalar_superinstruction_count = 0;
+        self.instance.local_type_hint_hit_count = 0;
     }
 
     pub fn jit_native_bridge_stats_snapshot(&self) -> Vec<(&'static str, u64)> {
         let mut entries: Vec<(&'static str, u64)> = self
+            .engine
             .jit_native_bridge_counts
             .iter()
             .map(|(name, count)| (*name, *count))
@@ -900,10 +682,11 @@ impl Vm {
 
     #[allow(dead_code)]
     pub(in crate::vm) fn record_native_bridge_hit(&mut self, bridge_name: &'static str) {
-        if !self.jit_native_bridge_stats_enabled {
+        if !self.engine.jit_native_bridge_stats_enabled {
             return;
         }
         let entry = self
+            .engine
             .jit_native_bridge_counts
             .entry(bridge_name)
             .or_insert(0);
@@ -916,44 +699,12 @@ impl Vm {
     /// Locals are reset to `Null`, stack is cleared, and instruction pointer is
     /// rewound to the program entry.
     pub fn reset_for_reuse(&mut self) {
-        self.invalidate_callback_registries();
         self.cancel_waiting_host_op();
-        self.ip = 0;
-        self.drop_contract_events = 0;
-        self.last_yield_reason = None;
-        self.epoch_rearm_pending = false;
-        self.clear_fuel();
-        self.clear_epoch_deadline();
-        self.clear_stack_with_drop_contract();
-        self.capture_cells.clear();
-        self.shared_capture_slots.clear();
-        self.clear_locals_with_drop_contract();
-        self.owned_callables.clear();
-        self.locals.resize(self.program.local_count, Value::Null);
-        self.initialize_root_callable_bindings();
         crate::builtins::runtime::close_all_handles(self);
-        self.call_depth = 0;
-        self.execution_frames.clear();
-        self.execution_frames
-            .push(ExecutionFrame::root(self.program.local_count));
-        self.active_local_base_cache = 0;
-        self.active_operand_stack_base_cache = 0;
-        self.host_return = None;
-        self.queued_callables.clear();
-        self.completed_callable_results.clear();
-        self.owned_callables.clear();
-        self.draining_queued_callables = false;
-        self.shutdown = false;
-        self.aot_interpreter_boundary_hit = self
-            .aot_program
-            .as_ref()
-            .is_some_and(|program| program.interpreter_boundary_only);
-        self.waiting_host_op = None;
         self.io_state = crate::builtins::runtime::IoState::default();
-        self.map_iterators.clear();
-        self.jit.reset_runtime_backoff();
-        self.jit.clear_call_site_profiles();
-        self.clear_interpreter_metrics();
+        self.run_ctx.reset_for_reuse();
+        self.instance.reset(&self.program);
+        self.engine.reset_runtime_state(&self.program);
     }
 
     fn validate_map_iterator_slot(&self, slot: usize) -> VmResult<()> {
@@ -972,11 +723,11 @@ impl Vm {
         map: crate::bytecode::SharedMap,
     ) -> VmResult<()> {
         self.validate_map_iterator_slot(slot)?;
-        let depth = self.call_depth;
-        if self.map_iterators.len() <= depth {
-            self.map_iterators.resize_with(depth + 1, Vec::new);
+        let depth = self.instance.call_depth;
+        if self.instance.map_iterators.len() <= depth {
+            self.instance.map_iterators.resize_with(depth + 1, Vec::new);
         }
-        let frame = &mut self.map_iterators[depth];
+        let frame = &mut self.instance.map_iterators[depth];
         if frame.len() <= slot {
             frame.resize_with(slot + 1, || None);
         }
@@ -986,9 +737,13 @@ impl Vm {
 
     pub(crate) fn advance_map_iterator(&mut self, slot: usize) -> VmResult<bool> {
         self.validate_map_iterator_slot(slot)?;
-        let frame = self.map_iterators.get_mut(self.call_depth).ok_or_else(|| {
-            VmError::HostError("map iterator frame is not initialized".to_string())
-        })?;
+        let frame = self
+            .instance
+            .map_iterators
+            .get_mut(self.instance.call_depth)
+            .ok_or_else(|| {
+                VmError::HostError("map iterator frame is not initialized".to_string())
+            })?;
         let state = frame
             .get_mut(slot)
             .and_then(Option::as_mut)
@@ -1002,8 +757,9 @@ impl Vm {
 
     pub(crate) fn take_map_iterator_key(&mut self, slot: usize) -> VmResult<Value> {
         self.validate_map_iterator_slot(slot)?;
-        self.map_iterators
-            .get_mut(self.call_depth)
+        self.instance
+            .map_iterators
+            .get_mut(self.instance.call_depth)
             .and_then(|frame| frame.get_mut(slot))
             .and_then(Option::as_mut)
             .and_then(map_iter::MapIteratorState::take_key)
@@ -1012,8 +768,9 @@ impl Vm {
 
     pub(crate) fn take_map_iterator_value(&mut self, slot: usize) -> VmResult<Value> {
         self.validate_map_iterator_slot(slot)?;
-        self.map_iterators
-            .get_mut(self.call_depth)
+        self.instance
+            .map_iterators
+            .get_mut(self.instance.call_depth)
             .and_then(|frame| frame.get_mut(slot))
             .and_then(Option::as_mut)
             .and_then(map_iter::MapIteratorState::take_value)
@@ -1023,8 +780,9 @@ impl Vm {
     pub(crate) fn close_map_iterator(&mut self, slot: usize) -> VmResult<()> {
         self.validate_map_iterator_slot(slot)?;
         if let Some(state) = self
+            .instance
             .map_iterators
-            .get_mut(self.call_depth)
+            .get_mut(self.instance.call_depth)
             .and_then(|frame| frame.get_mut(slot))
         {
             *state = None;
@@ -1033,7 +791,7 @@ impl Vm {
     }
 
     fn close_all_map_iterators(&mut self) {
-        for frame in &mut self.map_iterators {
+        for frame in &mut self.instance.map_iterators {
             for state in frame {
                 state.take();
             }
@@ -1042,19 +800,21 @@ impl Vm {
 
     #[inline(always)]
     pub(super) fn active_operand_stack_base(&self) -> usize {
-        self.active_operand_stack_base_cache
+        self.instance.active_operand_stack_base_cache
     }
 
     #[inline(always)]
     pub(super) fn active_operand_stack_len(&self) -> usize {
-        self.stack
+        self.instance
+            .stack
             .len()
             .saturating_sub(self.active_operand_stack_base())
     }
 
     #[inline(always)]
     pub(super) fn active_frame_key(&self) -> u64 {
-        self.execution_frames
+        self.instance
+            .execution_frames
             .last()
             .and_then(|frame| frame.prototype_id)
             .map(u64::from)
@@ -1063,11 +823,11 @@ impl Vm {
 
     #[inline(always)]
     pub(super) fn active_local_base(&self) -> usize {
-        self.active_local_base_cache
+        self.instance.active_local_base_cache
     }
 
     pub(super) fn active_local_types(&self) -> Vec<ValueType> {
-        self.locals[self.active_local_base()..]
+        self.instance.locals[self.active_local_base()..]
             .iter()
             .map(|value| match value {
                 Value::Null => ValueType::Null,
@@ -1085,9 +845,10 @@ impl Vm {
 
     pub(super) fn active_local_callable_prototypes(&self) -> Option<Vec<Option<u32>>> {
         let base = self.active_local_base();
-        let mut prototypes = Vec::with_capacity(self.locals.len().saturating_sub(base));
-        for (offset, value) in self.locals[base..].iter().enumerate() {
-            let prototype_id = if let Some(cell) = self.capture_cells.get(&(base + offset)) {
+        let mut prototypes = Vec::with_capacity(self.instance.locals.len().saturating_sub(base));
+        for (offset, value) in self.instance.locals[base..].iter().enumerate() {
+            let prototype_id = if let Some(cell) = self.instance.capture_cells.get(&(base + offset))
+            {
                 let value = cell.lock().ok()?;
                 inline_compatible_callable_prototype(&value)
             } else {
@@ -1099,21 +860,23 @@ impl Vm {
     }
 
     pub(super) fn active_frame_has_shared_capture_cells(&self) -> bool {
-        if self.shared_capture_slots.is_empty() {
+        if self.instance.shared_capture_slots.is_empty() {
             return false;
         }
-        let Some(frame) = self.execution_frames.last() else {
+        let Some(frame) = self.instance.execution_frames.last() else {
             return false;
         };
         let base = frame.local_base;
         let end = base.saturating_add(frame.local_count);
-        self.shared_capture_slots
+        self.instance
+            .shared_capture_slots
             .iter()
             .any(|absolute| base <= *absolute && *absolute < end)
     }
 
     fn script_frame_depth(&self) -> usize {
-        self.execution_frames
+        self.instance
+            .execution_frames
             .iter()
             .filter(|frame| frame.prototype_id.is_some())
             .count()
@@ -1125,7 +888,8 @@ impl Vm {
             .active_local_base()
             .checked_add(index as usize)
             .ok_or(VmError::InvalidLocal(index))?;
-        self.locals
+        self.instance
+            .locals
             .get(absolute)
             .map(|_| absolute)
             .ok_or(VmError::InvalidLocal(index))
@@ -1134,8 +898,8 @@ impl Vm {
     #[inline(always)]
     fn load_local_value(&self, index: u8) -> VmResult<Value> {
         let absolute = self.absolute_local_index(index)?;
-        if self.capture_cells.is_empty() {
-            return Ok(self.locals[absolute].clone());
+        if self.instance.capture_cells.is_empty() {
+            return Ok(self.instance.locals[absolute].clone());
         }
         self.load_local_value_with_captures(absolute, index)
     }
@@ -1143,13 +907,14 @@ impl Vm {
     #[cold]
     #[inline(never)]
     fn load_local_value_with_captures(&self, absolute: usize, index: u8) -> VmResult<Value> {
-        if let Some(cell) = self.capture_cells.get(&absolute) {
+        if let Some(cell) = self.instance.capture_cells.get(&absolute) {
             return cell
                 .lock()
                 .map(|value| value.clone())
                 .map_err(|_| VmError::InvalidFrameState("capture cell lock is poisoned"));
         }
-        self.locals
+        self.instance
+            .locals
             .get(absolute)
             .cloned()
             .ok_or(VmError::InvalidLocal(index))
@@ -1158,8 +923,8 @@ impl Vm {
     #[inline(always)]
     pub(super) fn local_numeric_value(&self, index: u8) -> Option<NumericValue> {
         let absolute = self.absolute_local_index(index).ok()?;
-        if self.capture_cells.is_empty() {
-            return match self.locals.get(absolute)? {
+        if self.instance.capture_cells.is_empty() {
+            return match self.instance.locals.get(absolute)? {
                 Value::Int(value) => Some(NumericValue::Int(*value)),
                 Value::Float(value) => Some(NumericValue::Float(*value)),
                 _ => None,
@@ -1172,10 +937,14 @@ impl Vm {
     #[inline(never)]
     fn local_numeric_value_with_captures(&self, absolute: usize) -> Option<NumericValue> {
         let captured = self
+            .instance
             .capture_cells
             .get(&absolute)
             .and_then(|cell| cell.lock().ok().map(|value| value.clone()));
-        match captured.as_ref().or_else(|| self.locals.get(absolute))? {
+        match captured
+            .as_ref()
+            .or_else(|| self.instance.locals.get(absolute))?
+        {
             Value::Int(value) => Some(NumericValue::Int(*value)),
             Value::Float(value) => Some(NumericValue::Float(*value)),
             _ => None,
@@ -1183,33 +952,33 @@ impl Vm {
     }
 
     pub fn drop_contract_event_count(&self) -> u64 {
-        self.drop_contract_events
+        self.instance.drop_contract_events
     }
 
     pub fn set_drop_contract_events_enabled(&mut self, enabled: bool) {
-        if self.drop_contract_events_enabled != enabled {
+        if self.instance.drop_contract_events_enabled != enabled {
             self.disconnect_native_regions();
-            self.native_traces.clear();
+            self.engine.invalidate_codegen_caches();
         }
-        self.drop_contract_events_enabled = enabled;
+        self.instance.drop_contract_events_enabled = enabled;
         if !enabled {
-            self.drop_contract_events = 0;
+            self.instance.drop_contract_events = 0;
         }
     }
 
     pub fn drop_contract_events_enabled(&self) -> bool {
-        self.drop_contract_events_enabled
+        self.instance.drop_contract_events_enabled
     }
 
     fn interruption_mode_conflict(&self, requested: InterruptMode) -> VmError {
         VmError::InterruptionModeConflict {
-            active: self.interrupt_mode.label(),
+            active: self.run_ctx.interrupt_mode.label(),
             requested: requested.label(),
         }
     }
 
     fn reset_interrupt_countdown(&mut self) {
-        self.fuel_ops_until_check = self.fuel_check_interval.max(1);
+        self.run_ctx.reset_interrupt_countdown();
     }
 
     pub fn run(&mut self) -> VmResult<VmStatus> {
@@ -1227,17 +996,14 @@ impl Vm {
 impl Drop for Vm {
     fn drop(&mut self) {
         self.cancel_waiting_host_op();
-        self.clear_stack_with_drop_contract();
-        self.capture_cells.clear();
-        self.shared_capture_slots.clear();
-        self.clear_locals_with_drop_contract();
+        self.instance.drop_cleanup();
         crate::builtins::runtime::close_all_handles(self);
     }
 }
 
 impl Vm {
     pub(super) fn pop_value(&mut self) -> VmResult<Value> {
-        self.stack.pop().ok_or(VmError::StackUnderflow)
+        self.instance.stack.pop().ok_or(VmError::StackUnderflow)
     }
 
     pub(crate) fn bind_callable_value(
@@ -1276,18 +1042,19 @@ impl Vm {
                 let absolute = active_base
                     .checked_add(usize::from(*source))
                     .ok_or(VmError::InvalidFrameState("capture source slot overflow"))?;
-                if absolute >= self.locals.len() {
+                if absolute >= self.instance.locals.len() {
                     return Err(VmError::InvalidFrameState(
                         "capture source exceeds active frame locals",
                     ));
                 }
                 let cell = self
+                    .instance
                     .capture_cells
                     .entry(absolute)
                     .or_insert_with(|| Arc::new(Mutex::new(value)))
                     .clone();
-                self.shared_capture_slots.insert(absolute);
-                self.locals[absolute] = cell
+                self.instance.shared_capture_slots.insert(absolute);
+                self.instance.locals[absolute] = cell
                     .lock()
                     .map_err(|_| VmError::InvalidFrameState("capture cell lock is poisoned"))?
                     .clone();
@@ -1309,7 +1076,9 @@ impl Vm {
             kind: prototype.kind,
             env,
         });
-        self.owned_callables.push(Arc::downgrade(&callable));
+        self.instance
+            .owned_callables
+            .push(Arc::downgrade(&callable));
         Ok(Value::Callable(callable))
     }
 
@@ -1319,11 +1088,11 @@ impl Vm {
         call_site_ip: Option<usize>,
     ) -> VmResult<ExecOutcome> {
         let operand_count = argc as usize + 1;
-        if self.stack.len() < operand_count {
+        if self.instance.stack.len() < operand_count {
             return Err(VmError::StackUnderflow);
         }
-        let operand_stack_base = self.stack.len() - operand_count;
-        let mut operands = self.stack.split_off(operand_stack_base);
+        let operand_stack_base = self.instance.stack.len() - operand_count;
+        let mut operands = self.instance.stack.split_off(operand_stack_base);
         let callee = operands.remove(0);
         let Value::Callable(callable) = callee else {
             return Err(VmError::InvalidCallable);
@@ -1354,15 +1123,15 @@ impl Vm {
         match prototype.target {
             CallableTarget::ScriptFunction(function_id) => {
                 if let Some(call_ip) = call_site_ip {
-                    self.jit.observe_script_call_target(
+                    self.engine.jit.observe_script_call_target(
                         self.active_frame_key(),
                         call_ip,
                         callable.prototype_id,
                     );
                 }
-                if self.call_depth >= self.max_script_call_depth {
+                if self.instance.call_depth >= self.instance.max_script_call_depth {
                     return Err(VmError::CallStackOverflow {
-                        limit: self.max_script_call_depth,
+                        limit: self.instance.max_script_call_depth,
                     });
                 }
                 let function = self
@@ -1379,10 +1148,11 @@ impl Vm {
                     });
                 }
                 let inherited_callables = self
+                    .instance
                     .execution_frames
                     .last()
                     .map(|frame| {
-                        self.locals[frame.local_base..frame.local_base + frame.local_count]
+                        self.instance.locals[frame.local_base..frame.local_base + frame.local_count]
                             .iter()
                             .enumerate()
                             .filter(|(_, value)| matches!(value, Value::Callable(_)))
@@ -1390,9 +1160,10 @@ impl Vm {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                let local_base = self.locals.len();
+                let local_base = self.instance.locals.len();
                 let local_count = prototype.frame_local_count;
-                self.locals
+                self.instance
+                    .locals
                     .resize(local_base.saturating_add(local_count), Value::Null);
                 for binding in &self.program.root_callable_bindings {
                     let relative = binding.local_slot as usize;
@@ -1412,12 +1183,14 @@ impl Vm {
                         kind,
                         env: None,
                     });
-                    self.owned_callables.push(Arc::downgrade(&callable));
-                    self.locals[local_base + relative] = Value::Callable(callable);
+                    self.instance
+                        .owned_callables
+                        .push(Arc::downgrade(&callable));
+                    self.instance.locals[local_base + relative] = Value::Callable(callable);
                 }
                 for (slot, value) in inherited_callables {
                     if slot < local_count {
-                        self.locals[local_base + slot] = value;
+                        self.instance.locals[local_base + slot] = value;
                     }
                 }
                 for (slot, argument) in prototype.parameter_slots.iter().zip(operands) {
@@ -1427,7 +1200,7 @@ impl Vm {
                             "parameter slot is outside the script frame",
                         ));
                     }
-                    self.locals[local_base + relative] = argument;
+                    self.instance.locals[local_base + relative] = argument;
                 }
                 if let Some(environment) = &callable.env {
                     let cells = environment
@@ -1452,20 +1225,20 @@ impl Vm {
                             ));
                         }
                         let absolute = local_base + relative;
-                        self.locals[absolute] = cell
+                        self.instance.locals[absolute] = cell
                             .lock()
                             .map_err(|_| {
                                 VmError::InvalidFrameState("capture cell lock is poisoned")
                             })?
                             .clone();
                         if prototype.self_slot != Some(*slot) {
-                            self.capture_cells.insert(absolute, cell.clone());
+                            self.instance.capture_cells.insert(absolute, cell.clone());
                             if matches!(
                                 mode,
                                 crate::CaptureBindingMode::Borrow
                                     | crate::CaptureBindingMode::BorrowMut
                             ) {
-                                self.shared_capture_slots.insert(absolute);
+                                self.instance.shared_capture_slots.insert(absolute);
                             }
                         }
                     }
@@ -1477,31 +1250,32 @@ impl Vm {
                             "self slot is outside the script frame",
                         ));
                     }
-                    self.locals[local_base + relative] = Value::Callable(callable.clone());
+                    self.instance.locals[local_base + relative] = Value::Callable(callable.clone());
                 }
-                let return_ip = self.ip;
-                self.execution_frames.push(ExecutionFrame {
+                let return_ip = self.instance.ip;
+                self.instance.execution_frames.push(ExecutionFrame {
                     continuation: FrameContinuation::ResumeBytecode { return_ip },
                     operand_stack_base,
                     local_base,
                     local_count,
                     prototype_id: Some(callable.prototype_id),
                 });
-                self.active_local_base_cache = local_base;
-                self.active_operand_stack_base_cache = operand_stack_base;
-                self.call_depth = self.script_frame_depth();
-                self.ip = function.entry_ip as usize;
+                self.instance.active_local_base_cache = local_base;
+                self.instance.active_operand_stack_base_cache = operand_stack_base;
+                self.instance.call_depth = self.script_frame_depth();
+                self.instance.ip = function.entry_ip as usize;
                 self.charge_interrupt_tick()?;
                 Ok(ExecOutcome::Continue)
             }
             CallableTarget::HostImport(import_index) => {
-                self.stack.extend(operands);
-                let call_ip = self.ip.saturating_sub(2);
+                self.instance.stack.extend(operands);
+                let call_ip = self.instance.ip.saturating_sub(2);
                 match self.execute_host_call(import_index, argc, call_ip)? {
                     HostCallExecOutcome::Returned => Ok(ExecOutcome::Continue),
                     HostCallExecOutcome::Halted => Ok(ExecOutcome::Halted),
                     HostCallExecOutcome::Yielded => {
-                        self.stack
+                        self.instance
+                            .stack
                             .insert(operand_stack_base, Value::Callable(callable));
                         Ok(ExecOutcome::Yielded)
                     }
@@ -1513,45 +1287,57 @@ impl Vm {
 
     fn complete_active_frame(&mut self) -> VmResult<ExecOutcome> {
         let frame = self
+            .instance
             .execution_frames
             .pop()
             .ok_or(VmError::InvalidFrameState("missing active frame"))?;
-        self.active_local_base_cache = self
+        self.instance.active_local_base_cache = self
+            .instance
             .execution_frames
             .last()
             .map(|frame| frame.local_base)
             .unwrap_or(0);
-        self.active_operand_stack_base_cache = self
+        self.instance.active_operand_stack_base_cache = self
+            .instance
             .execution_frames
             .last()
             .map(|frame| frame.operand_stack_base)
             .unwrap_or(0);
-        if self.stack.len() < frame.operand_stack_base {
+        if self.instance.stack.len() < frame.operand_stack_base {
             return Err(VmError::InvalidFrameState(
                 "operand stack is below the active frame base",
             ));
         }
         if matches!(frame.continuation, FrameContinuation::Halt) {
-            self.call_depth = self.script_frame_depth();
+            self.instance.call_depth = self.script_frame_depth();
             return Ok(ExecOutcome::Halted);
         }
 
-        let result = if self.stack.len() > frame.operand_stack_base {
-            self.stack.pop().expect("stack length checked above")
+        let result = if self.instance.stack.len() > frame.operand_stack_base {
+            self.instance
+                .stack
+                .pop()
+                .expect("stack length checked above")
         } else {
             Value::Null
         };
-        while self.stack.len() > frame.operand_stack_base {
-            let value = self.stack.pop().expect("stack length checked above");
+        while self.instance.stack.len() > frame.operand_stack_base {
+            let value = self
+                .instance
+                .stack
+                .pop()
+                .expect("stack length checked above");
             self.drop_value_with_contract(value);
         }
-        self.call_depth = self.script_frame_depth();
+        self.instance.call_depth = self.script_frame_depth();
 
         if frame.prototype_id.is_some() {
             let frame_end = frame.local_base.saturating_add(frame.local_count);
-            self.capture_cells
+            self.instance
+                .capture_cells
                 .retain(|absolute, _| *absolute < frame.local_base || *absolute >= frame_end);
-            self.shared_capture_slots
+            self.instance
+                .shared_capture_slots
                 .retain(|absolute| *absolute < frame.local_base || *absolute >= frame_end);
         }
 
@@ -1560,12 +1346,16 @@ impl Vm {
                 .local_base
                 .checked_add(frame.local_count)
                 .ok_or(VmError::InvalidFrameState("local frame range overflow"))?;
-            if frame_end != self.locals.len() {
+            if frame_end != self.instance.locals.len() {
                 return Err(VmError::InvalidFrameState(
                     "active local frame does not end at the local stack tail",
                 ));
             }
-            let drained = self.locals.drain(frame.local_base..).collect::<Vec<_>>();
+            let drained = self
+                .instance
+                .locals
+                .drain(frame.local_base..)
+                .collect::<Vec<_>>();
             for value in drained {
                 self.drop_value_with_contract(value);
             }
@@ -1585,16 +1375,16 @@ impl Vm {
 
         match frame.continuation {
             FrameContinuation::Halt => {
-                self.stack.push(result);
+                self.instance.stack.push(result);
                 Ok(ExecOutcome::Halted)
             }
             FrameContinuation::ResumeBytecode { return_ip } => {
-                self.ip = return_ip;
-                self.stack.push(result);
+                self.instance.ip = return_ip;
+                self.instance.stack.push(result);
                 Ok(ExecOutcome::Continue)
             }
             FrameContinuation::ReturnToHost => {
-                self.host_return = Some(result);
+                self.instance.host_return = Some(result);
                 Ok(ExecOutcome::Halted)
             }
         }
@@ -1602,25 +1392,25 @@ impl Vm {
 
     pub(super) fn can_fuse_call_ret_pattern(&self) -> bool {
         let code = &self.program.code;
-        self.ip < code.len() && code[self.ip] == OpCode::Ret as u8
+        self.instance.ip < code.len() && code[self.instance.ip] == OpCode::Ret as u8
     }
 
     pub(super) fn clear_stack_with_drop_contract(&mut self) {
-        let drained = self.stack.drain(..).collect::<Vec<_>>();
+        let drained = self.instance.stack.drain(..).collect::<Vec<_>>();
         for value in drained {
             self.drop_value_with_contract(value);
         }
     }
 
     pub(super) fn clear_locals_with_drop_contract(&mut self) {
-        for slot in 0..self.locals.len() {
-            let previous = std::mem::replace(&mut self.locals[slot], Value::Null);
+        for slot in 0..self.instance.locals.len() {
+            let previous = std::mem::replace(&mut self.instance.locals[slot], Value::Null);
             self.drop_value_with_contract(previous);
         }
     }
 
     pub(super) fn drop_value_with_contract(&mut self, value: Value) {
-        if self.drop_contract_events_enabled {
+        if self.instance.drop_contract_events_enabled {
             self.count_value_drop_contract(&value);
         }
     }
@@ -1629,13 +1419,15 @@ impl Vm {
         match value {
             Value::Null => {}
             Value::Array(values) => {
-                self.drop_contract_events = self.drop_contract_events.saturating_add(1);
+                self.instance.drop_contract_events =
+                    self.instance.drop_contract_events.saturating_add(1);
                 for item in values.iter() {
                     self.count_value_drop_contract(item);
                 }
             }
             Value::Map(entries) => {
-                self.drop_contract_events = self.drop_contract_events.saturating_add(1);
+                self.instance.drop_contract_events =
+                    self.instance.drop_contract_events.saturating_add(1);
                 for (key, value) in entries.iter() {
                     self.count_value_drop_contract(key);
                     self.count_value_drop_contract(value);
@@ -1647,14 +1439,15 @@ impl Vm {
             | Value::String(_)
             | Value::Bytes(_)
             | Value::Callable(_) => {
-                self.drop_contract_events = self.drop_contract_events.saturating_add(1);
+                self.instance.drop_contract_events =
+                    self.instance.drop_contract_events.saturating_add(1);
             }
         }
     }
 
     #[inline(always)]
     pub(in crate::vm) fn charge_interrupt_tick(&mut self) -> VmResult<()> {
-        match self.interrupt_mode {
+        match self.run_ctx.interrupt_mode {
             InterruptMode::None => Ok(()),
             InterruptMode::Fuel => self.charge_fuel_tick(),
             InterruptMode::Epoch => self.charge_epoch_tick(),
@@ -1664,15 +1457,15 @@ impl Vm {
     #[inline(always)]
     #[allow(dead_code)]
     pub(in crate::vm) fn charge_aot_call_boundary_interrupt(&mut self) -> VmResult<()> {
-        match self.interrupt_mode {
+        match self.run_ctx.interrupt_mode {
             InterruptMode::None => Ok(()),
             InterruptMode::Fuel => self.charge_fuel(1),
             InterruptMode::Epoch => {
                 let current = self.current_epoch();
-                if current >= self.epoch_deadline {
+                if current >= self.run_ctx.epoch_deadline {
                     return Err(VmError::EpochDeadlineReached {
                         current,
-                        deadline: self.epoch_deadline,
+                        deadline: self.run_ctx.epoch_deadline,
                     });
                 }
                 Ok(())
@@ -1681,7 +1474,7 @@ impl Vm {
     }
 
     pub(super) fn peek_value(&self) -> VmResult<&Value> {
-        self.stack.last().ok_or(VmError::StackUnderflow)
+        self.instance.stack.last().ok_or(VmError::StackUnderflow)
     }
 
     pub(super) fn pop_int(&mut self) -> VmResult<i64> {
@@ -1705,7 +1498,8 @@ impl Vm {
 
     #[inline(always)]
     pub(super) fn operand_type_hint(&self, ip: usize) -> PackedOperandTypes {
-        self.operand_type_hints
+        self.engine
+            .operand_type_hints
             .as_deref()
             .map_or(NO_OPERAND_TYPE_HINT, |hints| hints[ip])
     }
@@ -1727,57 +1521,68 @@ impl Vm {
 
     #[inline(always)]
     pub(super) fn record_local_type_hint_hit(&mut self) {
-        self.local_type_hint_hit_count = self.local_type_hint_hit_count.saturating_add(1);
+        self.instance.local_type_hint_hit_count =
+            self.instance.local_type_hint_hit_count.saturating_add(1);
     }
 
     #[inline(always)]
     pub(super) fn record_scalar_superinstruction(&mut self) {
-        self.scalar_superinstruction_count = self.scalar_superinstruction_count.saturating_add(1);
+        self.instance.scalar_superinstruction_count = self
+            .instance
+            .scalar_superinstruction_count
+            .saturating_add(1);
     }
 
     #[inline(always)]
     pub(super) fn record_typed_builtin_fast_path(&mut self) {
-        self.typed_builtin_fast_path_count = self.typed_builtin_fast_path_count.saturating_add(1);
+        self.instance.typed_builtin_fast_path_count = self
+            .instance
+            .typed_builtin_fast_path_count
+            .saturating_add(1);
     }
 
     #[inline(always)]
     pub(super) fn record_projection_fast_path(&mut self) {
-        self.projection_fast_path_count = self.projection_fast_path_count.saturating_add(1);
+        self.instance.projection_fast_path_count =
+            self.instance.projection_fast_path_count.saturating_add(1);
     }
 
     #[inline(always)]
     pub(super) fn record_generic_builtin_call(&mut self) {
-        self.generic_builtin_call_count = self.generic_builtin_call_count.saturating_add(1);
+        self.instance.generic_builtin_call_count =
+            self.instance.generic_builtin_call_count.saturating_add(1);
     }
 
     #[inline(always)]
     fn record_operand_hint_hit(&mut self) {
-        self.operand_hint_hit_count = self.operand_hint_hit_count.saturating_add(1);
+        self.instance.operand_hint_hit_count =
+            self.instance.operand_hint_hit_count.saturating_add(1);
     }
 
     #[inline(always)]
     fn record_operand_hint_miss(&mut self) {
-        self.operand_hint_miss_count = self.operand_hint_miss_count.saturating_add(1);
+        self.instance.operand_hint_miss_count =
+            self.instance.operand_hint_miss_count.saturating_add(1);
     }
 
     #[inline(always)]
     pub(super) fn unary_not_op(&mut self) -> VmResult<()> {
         let value = self.pop_bool()?;
-        self.stack.push(Value::Bool(!value));
+        self.instance.stack.push(Value::Bool(!value));
         Ok(())
     }
 
     pub(super) fn int_add_op(&mut self) -> VmResult<()> {
         let rhs = self.pop_int()?;
         let lhs = self.pop_int()?;
-        self.stack.push(Value::Int(lhs.wrapping_add(rhs)));
+        self.instance.stack.push(Value::Int(lhs.wrapping_add(rhs)));
         Ok(())
     }
 
     pub(super) fn float_add_op(&mut self) -> VmResult<()> {
         let rhs = self.pop_float_exact()?;
         let lhs = self.pop_float_exact()?;
-        self.stack.push(Value::Float(lhs + rhs));
+        self.instance.stack.push(Value::Float(lhs + rhs));
         Ok(())
     }
 
@@ -1793,7 +1598,7 @@ impl Vm {
         let mut out = String::with_capacity(lhs.len() + rhs.len());
         out.push_str(lhs.as_str());
         out.push_str(rhs.as_str());
-        self.stack.push(Value::string(out));
+        self.instance.stack.push(Value::string(out));
         Ok(())
     }
 
@@ -1808,7 +1613,7 @@ impl Vm {
         };
         let mut out = crate::bytecode::unwrap_or_clone_shared(lhs);
         out.extend(crate::bytecode::unwrap_or_clone_shared(rhs));
-        self.stack.push(Value::bytes(out));
+        self.instance.stack.push(Value::bytes(out));
         Ok(())
     }
 
@@ -1818,7 +1623,7 @@ impl Vm {
     ) -> VmResult<()> {
         let rhs = self.pop_int()?;
         let lhs = self.pop_int()?;
-        self.stack.push(Value::Int(op(lhs, rhs)?));
+        self.instance.stack.push(Value::Int(op(lhs, rhs)?));
         Ok(())
     }
 
@@ -1828,40 +1633,40 @@ impl Vm {
     ) -> VmResult<()> {
         let rhs = self.pop_float_exact()?;
         let lhs = self.pop_float_exact()?;
-        self.stack.push(Value::Float(op(lhs, rhs)?));
+        self.instance.stack.push(Value::Float(op(lhs, rhs)?));
         Ok(())
     }
 
     pub(super) fn int_neg_op(&mut self) -> VmResult<()> {
         let value = self.pop_int()?;
-        self.stack.push(Value::Int(value.wrapping_neg()));
+        self.instance.stack.push(Value::Int(value.wrapping_neg()));
         Ok(())
     }
 
     pub(super) fn float_neg_op(&mut self) -> VmResult<()> {
         let value = self.pop_float_exact()?;
-        self.stack.push(Value::Float(-value));
+        self.instance.stack.push(Value::Float(-value));
         Ok(())
     }
 
     pub(super) fn int_eq_op(&mut self) -> VmResult<()> {
         let rhs = self.pop_int()?;
         let lhs = self.pop_int()?;
-        self.stack.push(Value::Bool(lhs == rhs));
+        self.instance.stack.push(Value::Bool(lhs == rhs));
         Ok(())
     }
 
     pub(super) fn float_eq_op(&mut self) -> VmResult<()> {
         let rhs = self.pop_float_exact()?;
         let lhs = self.pop_float_exact()?;
-        self.stack.push(Value::Bool(lhs == rhs));
+        self.instance.stack.push(Value::Bool(lhs == rhs));
         Ok(())
     }
 
     pub(super) fn bool_eq_op(&mut self) -> VmResult<()> {
         let rhs = self.pop_bool()?;
         let lhs = self.pop_bool()?;
-        self.stack.push(Value::Bool(lhs == rhs));
+        self.instance.stack.push(Value::Bool(lhs == rhs));
         Ok(())
     }
 
@@ -1874,7 +1679,7 @@ impl Vm {
             Value::String(value) => value,
             _ => return Err(VmError::TypeMismatch("string")),
         };
-        self.stack.push(Value::Bool(lhs == rhs));
+        self.instance.stack.push(Value::Bool(lhs == rhs));
         Ok(())
     }
 
@@ -1883,7 +1688,7 @@ impl Vm {
         let lhs = self.pop_value()?;
         match (lhs, rhs) {
             (Value::Null, Value::Null) => {
-                self.stack.push(Value::Bool(true));
+                self.instance.stack.push(Value::Bool(true));
                 Ok(())
             }
             _ => Err(VmError::TypeMismatch("null")),
@@ -1893,14 +1698,14 @@ impl Vm {
     pub(super) fn int_compare_op(&mut self, op: impl FnOnce(i64, i64) -> bool) -> VmResult<()> {
         let rhs = self.pop_int()?;
         let lhs = self.pop_int()?;
-        self.stack.push(Value::Bool(op(lhs, rhs)));
+        self.instance.stack.push(Value::Bool(op(lhs, rhs)));
         Ok(())
     }
 
     pub(super) fn float_compare_op(&mut self, op: impl FnOnce(f64, f64) -> bool) -> VmResult<()> {
         let rhs = self.pop_float_exact()?;
         let lhs = self.pop_float_exact()?;
-        self.stack.push(Value::Bool(op(lhs, rhs)));
+        self.instance.stack.push(Value::Bool(op(lhs, rhs)));
         Ok(())
     }
 
@@ -1909,26 +1714,32 @@ impl Vm {
         let lhs = self.pop_value()?;
         match (lhs, rhs) {
             (Value::Int(lhs), Value::Int(rhs)) => {
-                self.stack.push(Value::Int(lhs.wrapping_add(rhs)))
+                self.instance.stack.push(Value::Int(lhs.wrapping_add(rhs)))
             }
-            (Value::Int(lhs), Value::Float(rhs)) => self.stack.push(Value::Float(lhs as f64 + rhs)),
-            (Value::Float(lhs), Value::Int(rhs)) => self.stack.push(Value::Float(lhs + rhs as f64)),
-            (Value::Float(lhs), Value::Float(rhs)) => self.stack.push(Value::Float(lhs + rhs)),
+            (Value::Int(lhs), Value::Float(rhs)) => {
+                self.instance.stack.push(Value::Float(lhs as f64 + rhs))
+            }
+            (Value::Float(lhs), Value::Int(rhs)) => {
+                self.instance.stack.push(Value::Float(lhs + rhs as f64))
+            }
+            (Value::Float(lhs), Value::Float(rhs)) => {
+                self.instance.stack.push(Value::Float(lhs + rhs))
+            }
             (Value::String(lhs), Value::String(rhs)) => {
                 let mut out = String::with_capacity(lhs.len() + rhs.len());
                 out.push_str(lhs.as_str());
                 out.push_str(rhs.as_str());
-                self.stack.push(Value::string(out));
+                self.instance.stack.push(Value::string(out));
             }
             (Value::Bytes(lhs), Value::Bytes(rhs)) => {
                 let mut out = crate::bytecode::unwrap_or_clone_shared(lhs);
                 out.extend(crate::bytecode::unwrap_or_clone_shared(rhs));
-                self.stack.push(Value::bytes(out));
+                self.instance.stack.push(Value::bytes(out));
             }
             (Value::Array(lhs), Value::Array(rhs)) => {
                 let mut out = crate::bytecode::unwrap_or_clone_shared(lhs);
                 out.extend(crate::bytecode::unwrap_or_clone_shared(rhs));
-                self.stack.push(Value::array(out));
+                self.instance.stack.push(Value::array(out));
             }
             _ => {
                 return Err(VmError::TypeMismatch(
@@ -1948,7 +1759,7 @@ impl Vm {
         let lhs = self.pop_numeric()?;
         match (lhs, rhs) {
             (NumericValue::Int(lhs), NumericValue::Int(rhs)) => {
-                self.stack.push(Value::Int(int_op(lhs, rhs)?));
+                self.instance.stack.push(Value::Int(int_op(lhs, rhs)?));
             }
             (lhs, rhs) => {
                 let lhs = match lhs {
@@ -1959,7 +1770,7 @@ impl Vm {
                     NumericValue::Int(v) => v as f64,
                     NumericValue::Float(v) => v,
                 };
-                self.stack.push(Value::Float(float_op(lhs, rhs)?));
+                self.instance.stack.push(Value::Float(float_op(lhs, rhs)?));
             }
         }
         Ok(())
@@ -1986,7 +1797,7 @@ impl Vm {
                 float_op(lhs, rhs)
             }
         };
-        self.stack.push(Value::Bool(result));
+        self.instance.stack.push(Value::Bool(result));
         Ok(())
     }
 
@@ -2015,8 +1826,9 @@ impl Vm {
         index: u8,
         value: Value,
     ) -> VmResult<()> {
-        if self.capture_cells.is_empty() {
+        if self.instance.capture_cells.is_empty() {
             let slot = self
+                .instance
                 .locals
                 .get_mut(absolute)
                 .ok_or(VmError::InvalidLocal(index))?;
@@ -2035,7 +1847,7 @@ impl Vm {
         index: u8,
         value: Value,
     ) -> VmResult<()> {
-        if let Some(cell) = self.capture_cells.get(&absolute).cloned() {
+        if let Some(cell) = self.instance.capture_cells.get(&absolute).cloned() {
             if Self::value_references_capture_cell(&value, &cell, &mut HashSet::new())? {
                 return Err(VmError::InvalidFrameState(
                     "callable capture ownership cycle is unsupported",
@@ -2047,11 +1859,12 @@ impl Vm {
                     .map_err(|_| VmError::InvalidFrameState("capture cell lock is poisoned"))?;
                 std::mem::replace(&mut *captured, value.clone())
             };
-            self.locals[absolute] = value;
+            self.instance.locals[absolute] = value;
             self.drop_value_with_contract(previous);
             return Ok(());
         }
         let slot = self
+            .instance
             .locals
             .get_mut(absolute)
             .ok_or(VmError::InvalidLocal(index))?;
@@ -2113,8 +1926,9 @@ impl Vm {
 
     pub(crate) fn detach_local_with_drop_contract(&mut self, index: u8) -> VmResult<()> {
         let absolute = self.absolute_local_index(index)?;
-        self.capture_cells.remove(&absolute);
+        self.instance.capture_cells.remove(&absolute);
         let slot = self
+            .instance
             .locals
             .get_mut(absolute)
             .ok_or(VmError::InvalidLocal(index))?;
@@ -2124,11 +1938,11 @@ impl Vm {
     }
 
     pub(super) fn read_u8(&mut self) -> VmResult<u8> {
-        if self.ip >= self.program.code.len() {
+        if self.instance.ip >= self.program.code.len() {
             return Err(VmError::BytecodeBounds);
         }
-        let value = self.program.code[self.ip];
-        self.ip += 1;
+        let value = self.program.code[self.instance.ip];
+        self.instance.ip += 1;
         Ok(value)
     }
 
@@ -2143,12 +1957,13 @@ impl Vm {
     }
 
     pub(super) fn read_bytes(&mut self, count: usize) -> VmResult<[u8; 4]> {
-        if self.ip + count > self.program.code.len() {
+        if self.instance.ip + count > self.program.code.len() {
             return Err(VmError::BytecodeBounds);
         }
         let mut buf = [0u8; 4];
-        buf[..count].copy_from_slice(&self.program.code[self.ip..self.ip + count]);
-        self.ip += count;
+        buf[..count]
+            .copy_from_slice(&self.program.code[self.instance.ip..self.instance.ip + count]);
+        self.instance.ip += count;
         Ok(buf)
     }
 
@@ -2158,6 +1973,7 @@ impl Vm {
         }
         if !self.program.function_regions.is_empty() {
             let active_prototype = self
+                .instance
                 .execution_frames
                 .last()
                 .and_then(|frame| frame.prototype_id);
@@ -2191,7 +2007,7 @@ impl Vm {
                 return Err(VmError::InvalidBranchTarget { target });
             }
         }
-        self.ip = target;
+        self.instance.ip = target;
         Ok(())
     }
 }
@@ -2248,10 +2064,10 @@ impl Vm {
     ) -> Option<VmStatus> {
         match outcome {
             ExecOutcome::Continue => {}
-            ExecOutcome::Halted | ExecOutcome::Waiting(_) => self.last_yield_reason = None,
+            ExecOutcome::Halted | ExecOutcome::Waiting(_) => self.instance.last_yield_reason = None,
             ExecOutcome::Yielded => {
-                if self.last_yield_reason.is_none() {
-                    self.last_yield_reason = Some(VmYieldReason::Host);
+                if self.instance.last_yield_reason.is_none() {
+                    self.instance.last_yield_reason = Some(VmYieldReason::Host);
                 }
             }
         }
@@ -2274,7 +2090,7 @@ impl Vm {
 
     fn run_fast_interpreter(&mut self, allow_jit: bool) -> VmResult<Option<VmStatus>> {
         loop {
-            if self.ip >= self.program.code.len() {
+            if self.instance.ip >= self.program.code.len() {
                 return Err(VmError::BytecodeBounds);
             }
             let opcode = self.read_u8()?;
@@ -2282,17 +2098,17 @@ impl Vm {
             match outcome {
                 ExecOutcome::Continue => {}
                 ExecOutcome::Halted => {
-                    self.last_yield_reason = None;
+                    self.instance.last_yield_reason = None;
                     return Ok(Some(VmStatus::Halted));
                 }
                 ExecOutcome::Yielded => {
-                    if self.last_yield_reason.is_none() {
-                        self.last_yield_reason = Some(VmYieldReason::Host);
+                    if self.instance.last_yield_reason.is_none() {
+                        self.instance.last_yield_reason = Some(VmYieldReason::Host);
                     }
                     return Ok(Some(VmStatus::Yielded));
                 }
                 ExecOutcome::Waiting(op_id) => {
-                    self.last_yield_reason = None;
+                    self.instance.last_yield_reason = None;
                     return Ok(Some(VmStatus::Waiting(op_id)));
                 }
             }
@@ -2312,28 +2128,28 @@ impl Vm {
     ) -> VmResult<VmStatus> {
         self.ensure_call_bindings()?;
         self.sync_jit_non_yielding_host_imports();
-        if let Some(waiting) = self.waiting_host_op {
-            self.last_yield_reason = None;
+        if let Some(waiting) = self.instance.waiting_host_op {
+            self.instance.last_yield_reason = None;
             let status = VmStatus::Waiting(waiting.op_id);
             self.notify_debugger_status(&mut debugger, status);
             return Ok(status);
         }
-        self.last_yield_reason = None;
-        if self.epoch_rearm_pending {
+        self.instance.last_yield_reason = None;
+        if self.run_ctx.epoch_rearm_pending {
             self.rearm_epoch_after_yield_if_needed();
         }
         if debugger.is_none()
             && !self.interruption_enabled()
             && (!allow_jit
                 || (!self.jit_config().enabled
-                    && (!self.has_aot_program() || self.aot_interpreter_boundary_hit)))
+                    && (!self.has_aot_program() || self.engine.aot_interpreter_boundary_hit)))
             && let Some(status) = self.run_fast_interpreter(allow_jit)?
         {
             return Ok(status);
         }
 
         loop {
-            if self.epoch_rearm_pending {
+            if self.run_ctx.epoch_rearm_pending {
                 self.rearm_epoch_after_yield_if_needed();
             }
             if let Some(active_debugger) = debugger.as_deref_mut() {
@@ -2342,7 +2158,7 @@ impl Vm {
 
             if allow_jit
                 && self.has_aot_program()
-                && !self.aot_interpreter_boundary_hit
+                && !self.engine.aot_interpreter_boundary_hit
                 && !self.drop_contract_events_enabled()
             {
                 let outcome = match self.execute_aot_entry() {
@@ -2369,7 +2185,7 @@ impl Vm {
                 continue;
             }
 
-            if self.aot_interpreter_boundary_hit
+            if self.engine.aot_interpreter_boundary_hit
                 && debugger.is_none()
                 && !self.interruption_enabled()
                 && !self.jit_config().enabled
@@ -2380,12 +2196,12 @@ impl Vm {
 
             if allow_jit
                 && self.jit_config().enabled
-                && self.builtin_overrides.is_empty()
+                && self.host.builtin_overrides.is_empty()
                 && !self.drop_contract_events_enabled()
                 && !self.active_frame_has_shared_capture_cells()
             {
                 let frame_key = self.active_frame_key();
-                let trace_id = if self.jit.callable_frame_is_blocked(frame_key) {
+                let trace_id = if self.engine.jit.callable_frame_is_blocked(frame_key) {
                     None
                 } else {
                     let stack_depth = self.active_operand_stack_len();
@@ -2393,9 +2209,9 @@ impl Vm {
                         .then(|| self.active_local_types());
                     let entry_callable_prototypes = self.active_local_callable_prototypes();
                     let program = &self.program;
-                    self.jit.observe_hot_entry_with_local_types(
+                    self.engine.jit.observe_hot_entry_with_local_types(
                         frame_key,
-                        self.ip,
+                        self.instance.ip,
                         stack_depth,
                         entry_local_types.as_deref(),
                         entry_callable_prototypes.as_deref(),
@@ -2428,7 +2244,7 @@ impl Vm {
                 }
             }
 
-            if self.ip >= self.program.code.len() {
+            if self.instance.ip >= self.program.code.len() {
                 return Err(VmError::BytecodeBounds);
             }
 
@@ -2487,9 +2303,9 @@ impl Vm {
             x if x == OpCode::Nop as u8 => {}
             x if x == OpCode::Ret as u8 => return self.complete_active_frame(),
             x if x == OpCode::Ldc as u8 => {
-                let opcode_ip = self.ip - 1;
+                let opcode_ip = self.instance.ip - 1;
                 let value = if let Some(value) = self.decoded_ldc_value_at(opcode_ip).cloned() {
-                    self.ip += 4;
+                    self.instance.ip += 4;
                     value
                 } else {
                     let index = self.read_u32()?;
@@ -2499,10 +2315,10 @@ impl Vm {
                         .cloned()
                         .ok_or(VmError::InvalidConstant(index))?
                 };
-                self.stack.push(value);
+                self.instance.stack.push(value);
             }
             x if x == OpCode::Add as u8 => {
-                let ip = self.ip - 1;
+                let ip = self.instance.ip - 1;
                 match self.operand_type_hint(ip) {
                     INT_INT_OPERAND_TYPE_HINT => {
                         self.record_operand_hint_hit();
@@ -2527,7 +2343,7 @@ impl Vm {
                 }
             }
             x if x == OpCode::Sub as u8 => {
-                let ip = self.ip - 1;
+                let ip = self.instance.ip - 1;
                 match self.operand_type_hint(ip) {
                     INT_INT_OPERAND_TYPE_HINT => {
                         self.record_operand_hint_hit();
@@ -2547,7 +2363,7 @@ impl Vm {
                 }
             }
             x if x == OpCode::Mul as u8 => {
-                let ip = self.ip - 1;
+                let ip = self.instance.ip - 1;
                 match self.operand_type_hint(ip) {
                     INT_INT_OPERAND_TYPE_HINT => {
                         self.record_operand_hint_hit();
@@ -2567,7 +2383,7 @@ impl Vm {
                 }
             }
             x if x == OpCode::Div as u8 => {
-                let ip = self.ip - 1;
+                let ip = self.instance.ip - 1;
                 match self.operand_type_hint(ip) {
                     INT_INT_OPERAND_TYPE_HINT => {
                         self.record_operand_hint_hit();
@@ -2586,20 +2402,22 @@ impl Vm {
             x if x == OpCode::Shl as u8 => {
                 let rhs = self.pop_shift_amount()?;
                 let lhs = self.pop_int()?;
-                self.stack.push(Value::Int(lhs.wrapping_shl(rhs)));
+                self.instance.stack.push(Value::Int(lhs.wrapping_shl(rhs)));
             }
             x if x == OpCode::Shr as u8 => {
                 let rhs = self.pop_shift_amount()?;
                 let lhs = self.pop_int()?;
-                self.stack.push(Value::Int(lhs.wrapping_shr(rhs)));
+                self.instance.stack.push(Value::Int(lhs.wrapping_shr(rhs)));
             }
             x if x == OpCode::Lshr as u8 => {
                 let rhs = self.pop_shift_amount()?;
                 let lhs = self.pop_int()?;
-                self.stack.push(Value::Int(logical_shr_i64(lhs, rhs)));
+                self.instance
+                    .stack
+                    .push(Value::Int(logical_shr_i64(lhs, rhs)));
             }
             x if x == OpCode::Mod as u8 => {
-                let ip = self.ip - 1;
+                let ip = self.instance.ip - 1;
                 match self.operand_type_hint(ip) {
                     INT_INT_OPERAND_TYPE_HINT => {
                         self.record_operand_hint_hit();
@@ -2618,16 +2436,16 @@ impl Vm {
             x if x == OpCode::And as u8 => {
                 let rhs = self.pop_bool()?;
                 let lhs = self.pop_bool()?;
-                self.stack.push(Value::Bool(lhs && rhs));
+                self.instance.stack.push(Value::Bool(lhs && rhs));
             }
             x if x == OpCode::Or as u8 => {
                 let rhs = self.pop_bool()?;
                 let lhs = self.pop_bool()?;
-                self.stack.push(Value::Bool(lhs || rhs));
+                self.instance.stack.push(Value::Bool(lhs || rhs));
             }
             x if x == OpCode::Not as u8 => self.unary_not_op()?,
             x if x == OpCode::Neg as u8 => {
-                let ip = self.ip - 1;
+                let ip = self.instance.ip - 1;
                 match self.operand_type_hint(ip) {
                     INT_UNARY_OPERAND_TYPE_HINT => {
                         self.record_operand_hint_hit();
@@ -2641,15 +2459,17 @@ impl Vm {
                         self.record_operand_hint_miss();
                         match self.pop_numeric()? {
                             NumericValue::Int(value) => {
-                                self.stack.push(Value::Int(value.wrapping_neg()))
+                                self.instance.stack.push(Value::Int(value.wrapping_neg()))
                             }
-                            NumericValue::Float(value) => self.stack.push(Value::Float(-value)),
+                            NumericValue::Float(value) => {
+                                self.instance.stack.push(Value::Float(-value))
+                            }
                         }
                     }
                 }
             }
             x if x == OpCode::Ceq as u8 => {
-                let ip = self.ip - 1;
+                let ip = self.instance.ip - 1;
                 match self.operand_type_hint(ip) {
                     INT_INT_OPERAND_TYPE_HINT => {
                         self.record_operand_hint_hit();
@@ -2675,12 +2495,12 @@ impl Vm {
                         self.record_operand_hint_miss();
                         let rhs = self.pop_value()?;
                         let lhs = self.pop_value()?;
-                        self.stack.push(Value::Bool(lhs == rhs));
+                        self.instance.stack.push(Value::Bool(lhs == rhs));
                     }
                 }
             }
             x if x == OpCode::Clt as u8 => {
-                let ip = self.ip - 1;
+                let ip = self.instance.ip - 1;
                 match self.operand_type_hint(ip) {
                     INT_INT_OPERAND_TYPE_HINT => {
                         self.record_operand_hint_hit();
@@ -2697,7 +2517,7 @@ impl Vm {
                 }
             }
             x if x == OpCode::Cgt as u8 => {
-                let ip = self.ip - 1;
+                let ip = self.instance.ip - 1;
                 match self.operand_type_hint(ip) {
                     INT_INT_OPERAND_TYPE_HINT => {
                         self.record_operand_hint_hit();
@@ -2714,23 +2534,23 @@ impl Vm {
                 }
             }
             x if x == OpCode::Br as u8 => {
-                let opcode_ip = self.ip - 1;
+                let opcode_ip = self.instance.ip - 1;
                 let target = if let Some(target) = self.decoded_jump_target_at(opcode_ip) {
-                    self.ip += 4;
+                    self.instance.ip += 4;
                     target
                 } else {
                     self.read_u32()? as usize
                 };
                 if self.decoded_jump_target_is_valid_at(opcode_ip) {
-                    self.ip = target;
+                    self.instance.ip = target;
                 } else {
                     self.jump_to(target)?;
                 }
             }
             x if x == OpCode::Brfalse as u8 => {
-                let opcode_ip = self.ip - 1;
+                let opcode_ip = self.instance.ip - 1;
                 let target = if let Some(target) = self.decoded_jump_target_at(opcode_ip) {
-                    self.ip += 4;
+                    self.instance.ip += 4;
                     target
                 } else {
                     self.read_u32()? as usize
@@ -2738,7 +2558,7 @@ impl Vm {
                 let condition = self.pop_bool()?;
                 if !condition {
                     if self.decoded_jump_target_is_valid_at(opcode_ip) {
-                        self.ip = target;
+                        self.instance.ip = target;
                     } else {
                         self.jump_to(target)?;
                     }
@@ -2749,12 +2569,12 @@ impl Vm {
             }
             x if x == OpCode::Dup as u8 => {
                 let value = self.peek_value()?.clone();
-                self.stack.push(value);
+                self.instance.stack.push(value);
             }
             x if x == OpCode::Ldloc as u8 => {
-                let opcode_ip = self.ip - 1;
+                let opcode_ip = self.instance.ip - 1;
                 let index = if let Some(index) = self.decoded_local_index_at(opcode_ip) {
-                    self.ip += 1;
+                    self.instance.ip += 1;
                     index
                 } else {
                     self.read_u8()?
@@ -2763,12 +2583,12 @@ impl Vm {
                     return Ok(ExecOutcome::Continue);
                 }
                 let value = self.load_local_value(index)?;
-                self.stack.push(value);
+                self.instance.stack.push(value);
             }
             x if x == OpCode::Stloc as u8 => {
-                let opcode_ip = self.ip - 1;
+                let opcode_ip = self.instance.ip - 1;
                 let index = if let Some(index) = self.decoded_local_index_at(opcode_ip) {
-                    self.ip += 1;
+                    self.instance.ip += 1;
                     index
                 } else {
                     self.read_u8()?
@@ -2777,7 +2597,7 @@ impl Vm {
                 self.store_local_with_drop_contract(index, value)?;
             }
             x if x == OpCode::Call as u8 => {
-                let call_ip = self.ip - 1;
+                let call_ip = self.instance.ip - 1;
                 let index = self.read_u16()?;
                 let argc_u8 = self.read_u8()?;
                 let can_fuse_tail_halt = self.can_fuse_call_ret_pattern();
@@ -2787,13 +2607,13 @@ impl Vm {
                             if self.interruption_enabled() {
                                 self.charge_interrupt_tick()?;
                             }
-                            self.ip = self.ip.saturating_add(1);
+                            self.instance.ip = self.instance.ip.saturating_add(1);
                             return self.complete_active_frame();
                         }
                     }
                     HostCallExecOutcome::Halted => return Ok(ExecOutcome::Halted),
                     HostCallExecOutcome::Yielded => {
-                        self.last_yield_reason = Some(VmYieldReason::Host);
+                        self.instance.last_yield_reason = Some(VmYieldReason::Host);
                         return Ok(ExecOutcome::Yielded);
                     }
                     HostCallExecOutcome::Pending(op_id) => return Ok(ExecOutcome::Waiting(op_id)),
@@ -2801,7 +2621,7 @@ impl Vm {
             }
 
             x if x == OpCode::CallValue as u8 => {
-                let call_ip = self.ip.saturating_sub(1);
+                let call_ip = self.instance.ip.saturating_sub(1);
                 let argc = self.read_u8()?;
                 return self.execute_call_value(argc, Some(call_ip));
             }
@@ -2812,7 +2632,8 @@ impl Vm {
 
     pub fn resume(&mut self) -> VmResult<VmStatus> {
         let allow_jit = !matches!(
-            self.execution_frames
+            self.instance
+                .execution_frames
                 .last()
                 .map(|frame| &frame.continuation),
             Some(FrameContinuation::ReturnToHost)
@@ -2821,16 +2642,16 @@ impl Vm {
     }
 
     pub fn stack(&self) -> &[Value] {
-        &self.stack
+        &self.instance.stack
     }
 
     pub fn locals(&self) -> &[Value] {
-        &self.locals
+        &self.instance.locals
     }
 
     pub fn set_local(&mut self, index: u8, value: Value) -> VmResult<()> {
         self.store_local_with_drop_contract(index, value)?;
-        let config = *self.jit.config();
+        let config = *self.engine.jit.config();
         self.set_jit_config(config);
         Ok(())
     }
@@ -2839,23 +2660,33 @@ impl Vm {
         self.program.as_ref()
     }
 
+    /// Returns the bound host function count.
     pub fn bound_function_count(&self) -> usize {
-        self.host_functions.len()
+        self.host.host_functions.len()
+    }
+
+    /// Mutable access to the VM's isolated execution scope.
+    ///
+    /// The scope owns one resource registry and one operation registry; this
+    /// is the host-facing surface for allocating/borrowing resources and
+    /// starting/cancelling operations without reaching into VM private state.
+    pub fn execution_scope(&mut self) -> &mut crate::vm::execution_scope::ExecutionScope {
+        &mut self.host.execution_scope
     }
 
     pub fn has_bound_function(&self, name: &str) -> bool {
-        self.host_function_symbols.contains_key(name)
+        self.host.host_function_symbols.contains_key(name)
     }
 
     pub fn ip(&self) -> usize {
-        self.ip
+        self.instance.ip
     }
 
     pub(super) fn owns_callable(&self, value: &Value) -> bool {
         let Value::Callable(target) = value else {
             return false;
         };
-        self.owned_callables.iter().any(|owned| {
+        self.instance.owned_callables.iter().any(|owned| {
             owned
                 .upgrade()
                 .is_some_and(|owned| Arc::ptr_eq(&owned, target))
@@ -2872,6 +2703,7 @@ impl Vm {
                 VmError::HostError(format!("unknown exported script function '{name}'"))
             })?;
         let value = self
+            .instance
             .locals
             .get(exported.local_slot as usize)
             .cloned()
@@ -2892,7 +2724,7 @@ impl Vm {
     }
 
     pub fn call_depth(&self) -> usize {
-        self.call_depth
+        self.instance.call_depth
     }
 
     pub fn queue_callable(&mut self, callable: Value, args: Vec<Value>) -> VmResult<()> {
@@ -2905,13 +2737,13 @@ impl Vm {
         args: Vec<Value>,
         subscription: Option<Arc<AtomicBool>>,
     ) -> VmResult<()> {
-        if self.shutdown {
+        if self.instance.shutdown {
             return Err(VmError::InvalidFrameState("vm is shut down"));
         }
         if !matches!(&callable, Value::Callable(_)) {
             return Err(VmError::InvalidCallable);
         }
-        self.queued_callables.push_back(QueuedCallable {
+        self.instance.queued_callables.push_back(QueuedCallable {
             callable,
             args,
             subscription,
@@ -2920,23 +2752,23 @@ impl Vm {
     }
 
     pub fn queued_callable_count(&self) -> usize {
-        self.queued_callables.len()
+        self.instance.queued_callables.len()
     }
 
     pub fn drain_callable_queue(&mut self) -> VmResult<Vec<Value>> {
-        if self.draining_queued_callables {
+        if self.instance.draining_queued_callables {
             return Err(VmError::InvalidFrameState(
                 "callable queue is already being drained",
             ));
         }
-        if !self.execution_frames.is_empty() {
+        if !self.instance.execution_frames.is_empty() {
             return Err(VmError::InvalidFrameState(
                 "queued callables can only run after the root frame halts",
             ));
         }
-        self.draining_queued_callables = true;
-        let mut results = Vec::with_capacity(self.queued_callables.len());
-        while let Some(queued) = self.queued_callables.pop_front() {
+        self.instance.draining_queued_callables = true;
+        let mut results = Vec::with_capacity(self.instance.queued_callables.len());
+        while let Some(queued) = self.instance.queued_callables.pop_front() {
             if queued
                 .subscription
                 .as_ref()
@@ -2946,9 +2778,9 @@ impl Vm {
             }
             match self.start_callable(queued.callable, &queued.args) {
                 Ok(VmStatus::Halted) => {
-                    let Some(result) = self.host_return.take() else {
-                        self.completed_callable_results.extend(results);
-                        self.draining_queued_callables = false;
+                    let Some(result) = self.instance.host_return.take() else {
+                        self.instance.completed_callable_results.extend(results);
+                        self.instance.draining_queued_callables = false;
                         return Err(VmError::InvalidFrameState(
                             "queued invocation completed without a result",
                         ));
@@ -2956,84 +2788,84 @@ impl Vm {
                     results.push(result);
                 }
                 Ok(VmStatus::Yielded) => {
-                    self.completed_callable_results.extend(results);
-                    self.draining_queued_callables = false;
+                    self.instance.completed_callable_results.extend(results);
+                    self.instance.draining_queued_callables = false;
                     return Err(VmError::InvalidFrameState(
                         "queued invocation yielded; resume it before draining again",
                     ));
                 }
                 Ok(VmStatus::Waiting(_)) => {
-                    self.completed_callable_results.extend(results);
-                    self.draining_queued_callables = false;
+                    self.instance.completed_callable_results.extend(results);
+                    self.instance.draining_queued_callables = false;
                     return Err(VmError::InvalidFrameState(
                         "queued invocation is waiting; resume it before draining again",
                     ));
                 }
                 Err(err) => {
-                    self.completed_callable_results.extend(results);
-                    self.draining_queued_callables = false;
+                    self.instance.completed_callable_results.extend(results);
+                    self.instance.draining_queued_callables = false;
                     return Err(err);
                 }
             }
         }
-        self.draining_queued_callables = false;
+        self.instance.draining_queued_callables = false;
         Ok(results)
     }
 
     pub fn shutdown(&mut self) {
         self.invalidate_callback_registries();
         self.cancel_waiting_host_op();
-        self.queued_callables.clear();
-        self.completed_callable_results.clear();
-        self.owned_callables.clear();
-        self.draining_queued_callables = false;
+        // Begin execution-scope shutdown (first-reason-wins; sealing the
+        // operation registry) before tearing down interpreter state.
+        let _ = self
+            .host
+            .execution_scope
+            .begin_close(crate::vm::resource::ResourceCloseReason::VmDrop);
+        self.instance.queued_callables.clear();
+        self.instance.completed_callable_results.clear();
+        self.instance.owned_callables.clear();
+        self.instance.draining_queued_callables = false;
         self.clear_stack_with_drop_contract();
-        self.capture_cells.clear();
-        self.shared_capture_slots.clear();
+        self.instance.capture_cells.clear();
+        self.instance.shared_capture_slots.clear();
         self.clear_locals_with_drop_contract();
-        self.execution_frames.clear();
-        self.active_local_base_cache = 0;
-        self.active_operand_stack_base_cache = 0;
-        self.call_depth = 0;
-        self.host_return = None;
-        self.waiting_host_op = None;
+        self.instance.execution_frames.clear();
+        self.instance.active_local_base_cache = 0;
+        self.instance.active_operand_stack_base_cache = 0;
+        self.instance.call_depth = 0;
+        self.instance.host_return = None;
+        self.instance.waiting_host_op = None;
         crate::builtins::runtime::close_all_handles(self);
-        self.shutdown = true;
+        self.instance.shutdown = true;
     }
 
     pub(super) fn register_callback_registry(&mut self, active: &Arc<AtomicBool>) {
-        self.callback_registry_flags.push(Arc::downgrade(active));
+        self.instance.register_callback_registry(active);
     }
 
     fn invalidate_callback_registries(&mut self) {
-        for active in self
-            .callback_registry_flags
-            .drain(..)
-            .filter_map(|flag| flag.upgrade())
-        {
-            active.store(false, Ordering::Release);
-        }
+        self.instance.invalidate_callback_registries();
     }
 
     pub fn start_callable(&mut self, callable: Value, args: &[Value]) -> VmResult<VmStatus> {
-        if self.shutdown {
+        if self.instance.shutdown {
             return Err(VmError::InvalidFrameState("vm is shut down"));
         }
         if !matches!(&callable, Value::Callable(_)) {
             return Err(VmError::InvalidCallable);
         }
-        if !self.execution_frames.is_empty() {
+        if !self.instance.execution_frames.is_empty() {
             return Err(VmError::InvalidFrameState(
                 "host invocation requires a halted VM",
             ));
         }
         let argc = u8::try_from(args.len())
             .map_err(|_| VmError::InvalidFrameState("too many arguments"))?;
-        let stack_base = self.stack.len();
-        let frame_count = self.execution_frames.len();
-        self.stack.push(callable);
-        self.stack.extend_from_slice(args);
-        self.host_return = None;
+        let stack_base = self.instance.stack.len();
+        let frame_count = self.instance.execution_frames.len();
+        self.instance.stack.push(callable);
+        self.instance.stack.extend_from_slice(args);
+        self.instance.host_return = None;
         let outcome = match self.execute_call_value(argc, None) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -3041,10 +2873,10 @@ impl Vm {
                 return Err(error);
             }
         };
-        if self.execution_frames.len() == frame_count {
+        if self.instance.execution_frames.len() == frame_count {
             let result = match outcome {
                 ExecOutcome::Continue | ExecOutcome::Halted => {
-                    self.stack.pop().unwrap_or(Value::Null)
+                    self.instance.stack.pop().unwrap_or(Value::Null)
                 }
                 ExecOutcome::Yielded => {
                     self.abort_host_invocation(stack_base, frame_count);
@@ -3059,11 +2891,11 @@ impl Vm {
                     ));
                 }
             };
-            self.stack.truncate(stack_base);
-            self.host_return = Some(result);
+            self.instance.stack.truncate(stack_base);
+            self.instance.host_return = Some(result);
             return Ok(VmStatus::Halted);
         }
-        if let Some(frame) = self.execution_frames.last_mut() {
+        if let Some(frame) = self.instance.execution_frames.last_mut() {
             frame.continuation = FrameContinuation::ReturnToHost;
         }
         match self.run_internal(None, false) {
@@ -3076,12 +2908,16 @@ impl Vm {
     }
 
     pub fn invoke_callable(&mut self, callable: Value, args: &[Value]) -> VmResult<Value> {
-        let stack_base = self.stack.len();
-        let frame_count = self.execution_frames.len();
+        let stack_base = self.instance.stack.len();
+        let frame_count = self.instance.execution_frames.len();
         match self.start_callable(callable, args)? {
-            VmStatus::Halted => self.host_return.take().ok_or(VmError::InvalidFrameState(
-                "host invocation completed without a result",
-            )),
+            VmStatus::Halted => self
+                .instance
+                .host_return
+                .take()
+                .ok_or(VmError::InvalidFrameState(
+                    "host invocation completed without a result",
+                )),
             VmStatus::Yielded => {
                 self.abort_host_invocation(stack_base, frame_count);
                 Err(VmError::InvalidFrameState("host invocation yielded"))
@@ -3094,53 +2930,64 @@ impl Vm {
     }
 
     fn abort_host_invocation(&mut self, stack_base: usize, frame_count: usize) {
-        while self.execution_frames.len() > frame_count {
-            let Some(frame) = self.execution_frames.pop() else {
+        while self.instance.execution_frames.len() > frame_count {
+            let Some(frame) = self.instance.execution_frames.pop() else {
                 break;
             };
             let frame_end = frame.local_base.saturating_add(frame.local_count);
-            self.capture_cells
+            self.instance
+                .capture_cells
                 .retain(|absolute, _| *absolute < frame.local_base || *absolute >= frame_end);
-            self.shared_capture_slots
+            self.instance
+                .shared_capture_slots
                 .retain(|absolute| *absolute < frame.local_base || *absolute >= frame_end);
-            if frame.local_base <= self.locals.len() {
-                let drained = self.locals.drain(frame.local_base..).collect::<Vec<_>>();
+            if frame.local_base <= self.instance.locals.len() {
+                let drained = self
+                    .instance
+                    .locals
+                    .drain(frame.local_base..)
+                    .collect::<Vec<_>>();
                 for value in drained {
                     self.drop_value_with_contract(value);
                 }
             }
         }
-        self.active_local_base_cache = self
+        self.instance.active_local_base_cache = self
+            .instance
             .execution_frames
             .last()
             .map(|frame| frame.local_base)
             .unwrap_or(0);
-        self.active_operand_stack_base_cache = self
+        self.instance.active_operand_stack_base_cache = self
+            .instance
             .execution_frames
             .last()
             .map(|frame| frame.operand_stack_base)
             .unwrap_or(0);
-        while self.stack.len() > stack_base {
-            if let Some(value) = self.stack.pop() {
+        while self.instance.stack.len() > stack_base {
+            if let Some(value) = self.instance.stack.pop() {
                 self.drop_value_with_contract(value);
             }
         }
-        self.call_depth = self.script_frame_depth();
-        self.host_return = None;
+        self.instance.call_depth = self.script_frame_depth();
+        self.instance.host_return = None;
         self.cancel_waiting_host_op();
-        self.last_yield_reason = None;
-        self.map_iterators
-            .truncate(self.call_depth.saturating_add(1));
+        self.instance.last_yield_reason = None;
+        self.instance
+            .map_iterators
+            .truncate(self.instance.call_depth.saturating_add(1));
     }
 
     pub fn take_callable_result(&mut self) -> Option<Value> {
-        self.completed_callable_results
+        self.instance
+            .completed_callable_results
             .pop_front()
-            .or_else(|| self.host_return.take())
+            .or_else(|| self.instance.host_return.take())
     }
 
     pub fn execution_frames(&self) -> Vec<VmExecutionFrameSnapshot> {
-        self.execution_frames
+        self.instance
+            .execution_frames
             .iter()
             .map(|frame| VmExecutionFrameSnapshot {
                 continuation: match frame.continuation {
