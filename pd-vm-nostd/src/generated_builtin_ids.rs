@@ -5,6 +5,9 @@
 // pd-vm-nostd dispatches on the same static indices without a build script.
 // The workspace test `static_builtin_ids_are_frozen` fails when this file
 // drifts from the catalog; do not edit by hand.
+//
+// The top-u16 range 0xFFFC..=0xFFFF is reserved for SQLite's frozen IDs;
+// never allocate a new builtin there by incrementing an integer cursor.
 
 #![allow(dead_code)]
 
@@ -50,6 +53,11 @@ pub const IO_WRITE_CALL_INDEX: u16 = 0xFFB9;
 pub const IO_FLUSH_CALL_INDEX: u16 = 0xFFBA;
 pub const IO_CLOSE_CALL_INDEX: u16 = 0xFFBB;
 pub const IO_EXISTS_CALL_INDEX: u16 = 0xFFBC;
+pub const SQLITE_OPEN_CALL_INDEX: u16 = 0xFFC3;
+pub const SQLITE_EXECUTE_CALL_INDEX: u16 = 0xFFFC;
+pub const SQLITE_QUERY_CALL_INDEX: u16 = 0xFFFD;
+pub const SQLITE_TRANSACTION_CALL_INDEX: u16 = 0xFFFE;
+pub const SQLITE_CLOSE_CALL_INDEX: u16 = 0xFFFF;
 pub const RE_MATCH_CALL_INDEX: u16 = 0xFFBD;
 pub const RE_FIND_CALL_INDEX: u16 = 0xFFBE;
 pub const RE_REPLACE_CALL_INDEX: u16 = 0xFFBF;
@@ -163,6 +171,7 @@ pub const ALL_CALL_INDICES: &[u16] = &[
     RE_SPLIT_CALL_INDEX,
     RE_CAPTURES_CALL_INDEX,
     JSON_ENCODE_CALL_INDEX,
+    SQLITE_OPEN_CALL_INDEX,
     JSON_DECODE_CALL_INDEX,
     JIT_SET_CONFIG_CALL_INDEX,
     JIT_GET_CONFIG_CALL_INDEX,
@@ -219,4 +228,8 @@ pub const ALL_CALL_INDICES: &[u16] = &[
     MATH_CLAMP_CALL_INDEX,
     MATH_MUL_ADD_CALL_INDEX,
     COUNT_CALL_INDEX,
+    SQLITE_EXECUTE_CALL_INDEX,
+    SQLITE_QUERY_CALL_INDEX,
+    SQLITE_TRANSACTION_CALL_INDEX,
+    SQLITE_CLOSE_CALL_INDEX,
 ];

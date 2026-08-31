@@ -223,13 +223,13 @@ fn generate_vm_wrapper(
 
     Ok(quote! {
         #[allow(dead_code)]
-        pub(super) fn #wrapper_name(#(#imm_wrapper_params),*) -> #wrapper_output {
+        pub(crate) fn #wrapper_name(#(#imm_wrapper_params),*) -> #wrapper_output {
             #(#imm_extract_stmts)*
             #call_expr
         }
 
         #[allow(dead_code)]
-        pub(super) fn #mutable_wrapper_name(#(#mut_wrapper_params),*) -> #wrapper_output {
+        pub(crate) fn #mutable_wrapper_name(#(#mut_wrapper_params),*) -> #wrapper_output {
             #(#mut_extract_stmts)*
             #call_expr
         }

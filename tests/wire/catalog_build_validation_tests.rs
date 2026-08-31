@@ -17,8 +17,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use build_script::{
     CatalogClass, CatalogEntry, ORDINARY_BLOCK_START, SPECIAL_CALL_BLOCK_END,
-    SPECIAL_CALL_BLOCK_START, builtin_variant_name, parse_catalog_source,
-    validate_catalog_contract,
+    SPECIAL_CALL_BLOCK_START, SQLITE_RESERVED_TOP_END, SQLITE_RESERVED_TOP_START,
+    builtin_variant_name, parse_catalog_source, validate_catalog_contract,
 };
 
 fn assert_panics<F, R>(f: F)
@@ -55,6 +55,13 @@ fn parse_catalog_source_accepts_the_checked_in_catalog() {
     ))
     .expect("read authoritative catalog");
     let entries = parse_catalog_source(&source, "catalog.rs");
+    // The SQLite namespace is optional (mirrors the build.rs feature filter):
+    // when the feature is off, the generated catalog excludes it.
+    #[cfg(not(feature = "sqlite"))]
+    let entries: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| !entry.source_name.starts_with("sqlite::"))
+        .collect();
     assert!(!entries.is_empty());
     assert_eq!(entries.len(), vm::BUILTIN_CATALOG.len());
 }
@@ -131,6 +138,16 @@ fn validate_catalog_contract_accepts_a_valid_catalog() {
     let discovered = names(&["len", "__detach_local", "type"]);
     let special = names(&["DetachLocal", "TypeOf"]);
     validate_catalog_contract(&entries, &discovered, &special);
+}
+
+#[test]
+fn validate_catalog_contract_rejects_arithmetic_allocation_in_sqlite_top_range() {
+    for id in SQLITE_RESERVED_TOP_START..=SQLITE_RESERVED_TOP_END {
+        let entries = vec![entry(id, "len", CatalogClass::Ordinary)];
+        let discovered = names(&["len"]);
+        let special = HashSet::new();
+        assert_panics(|| validate_catalog_contract(&entries, &discovered, &special));
+    }
 }
 
 #[test]
