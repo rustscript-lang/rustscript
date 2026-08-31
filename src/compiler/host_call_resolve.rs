@@ -931,6 +931,14 @@ fn schema_label(schema: &crate::host_api::HostTypeSchema) -> String {
         HostTypeSchema::Bytes => "bytes".to_string(),
         HostTypeSchema::Array(inner) => format!("array<{}>", schema_label(inner)),
         HostTypeSchema::Map(inner) => format!("map<{}>", schema_label(inner)),
+        HostTypeSchema::Object(fields) => {
+            let body = fields
+                .iter()
+                .map(|(key, ty)| format!("{key}: {}", schema_label(ty)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{{body}}}")
+        }
         HostTypeSchema::Optional(inner) => format!("optional<{}>", schema_label(inner)),
         HostTypeSchema::Callable { params, result } => {
             let params = params

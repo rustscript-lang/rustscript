@@ -12,6 +12,7 @@
 use pd_host_function::pd_host_function;
 
 use super::super::HostCallResult;
+use super::super::typed::{VmArrayRef, VmMap};
 use super::shared::*;
 
 // ---- IO builtin functions (thin wrappers with #[pd_host_function]) ----
@@ -37,6 +38,17 @@ pub(crate) fn builtin_io_popen(
     mode: &str,
 ) -> VmResult<HostCallResult<i64>> {
     builtin_io_popen_body(vm, command, mode)
+}
+
+/// Executes a bounded argv-only process and returns bounded output metadata.
+#[pd_host_function(name = "io::exec")]
+pub(crate) fn builtin_io_exec(
+    vm: &mut Vm,
+    argv: VmArrayRef<'_>,
+    timeout_ms: i64,
+    max_output_bytes: i64,
+) -> VmResult<HostCallResult<VmMap>> {
+    builtin_io_exec_body(vm, argv, timeout_ms, max_output_bytes)
 }
 
 /// Reads all remaining text from an I/O handle.

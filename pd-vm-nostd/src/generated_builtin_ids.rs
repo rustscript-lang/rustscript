@@ -112,6 +112,7 @@ pub const MATH_COPYSIGN_CALL_INDEX: u16 = 0xFFF8;
 pub const MATH_CLAMP_CALL_INDEX: u16 = 0xFFF9;
 pub const MATH_MUL_ADD_CALL_INDEX: u16 = 0xFFFA;
 pub const COUNT_CALL_INDEX: u16 = 0xFFFB;
+pub const IO_EXEC_CALL_INDEX: u16 = 0xFFFC;
 
 /// Every static builtin call index, ascending.
 pub const ALL_CALL_INDICES: &[u16] = &[
@@ -219,4 +220,5 @@ pub const ALL_CALL_INDICES: &[u16] = &[
     MATH_CLAMP_CALL_INDEX,
     MATH_MUL_ADD_CALL_INDEX,
     COUNT_CALL_INDEX,
+    IO_EXEC_CALL_INDEX,
 ];

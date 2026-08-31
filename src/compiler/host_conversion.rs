@@ -49,6 +49,12 @@ impl HostTypeSchema {
             HostTypeSchema::Bytes => TypeSchema::Bytes,
             HostTypeSchema::Array(inner) => TypeSchema::Array(Box::new(inner.to_compiler_schema())),
             HostTypeSchema::Map(inner) => TypeSchema::Map(Box::new(inner.to_compiler_schema())),
+            HostTypeSchema::Object(fields) => TypeSchema::Object(
+                fields
+                    .iter()
+                    .map(|(key, ty)| (key.clone(), ty.to_compiler_schema()))
+                    .collect(),
+            ),
             HostTypeSchema::Optional(inner) => {
                 TypeSchema::Optional(Box::new(inner.to_compiler_schema()))
             }

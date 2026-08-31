@@ -32,6 +32,15 @@ pub use builtins::runtime::{
 #[cfg(feature = "runtime")]
 #[path = "builtins/runtime/io/confined_fs.rs"]
 mod confined_fs;
+#[cfg(all(feature = "runtime", not(target_arch = "wasm32")))]
+pub use builtins::runtime::{
+    BoundedExecError, BoundedExecOutput, BoundedProcess, BoundedProcessError, BoundedProcessHandle,
+    BoundedProcessRequest, CancellationToken, DEFAULT_OUTPUT_BYTES, DEFAULT_TIMEOUT, LogSnapshot,
+    LogStream, MAX_ARG_COUNT, MAX_ARG_ITEM_BYTES, MAX_ARG_TOTAL_BYTES, MAX_ENV_COUNT,
+    MAX_ENV_KEY_BYTES, MAX_ENV_TOTAL_BYTES, MAX_ENV_VALUE_BYTES, MAX_OUTPUT_BYTES, MAX_STDIN_BYTES,
+    MAX_STDIN_WRITE_BYTES, MAX_TIMEOUT, ProcessHandle, ProcessStatus, ProcessValidationError,
+    SpawnError, SpawnErrorKind, exec_bounded,
+};
 #[cfg(feature = "http-client")]
 pub use builtins::runtime::{
     HttpConfig, HttpHostExt, http_host_catalog, register_http_builtin_module,

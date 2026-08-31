@@ -1,6 +1,7 @@
 use pd_host_function::pd_host_function;
 
 use super::HostCallResult;
+use super::typed::{VmArrayRef, VmMap};
 use crate::vm::{Vm, VmError, VmResult};
 
 /// Opens a file handle for runtime I/O.
@@ -24,6 +25,19 @@ pub(super) fn builtin_io_popen(
 ) -> VmResult<HostCallResult<i64>> {
     Err(VmError::HostError(
         "io::popen is unsupported on wasm32 runtime".to_string(),
+    ))
+}
+
+/// Executes a bounded argv-only process.
+#[pd_host_function(name = "io::exec")]
+pub(super) fn builtin_io_exec(
+    _vm: &mut Vm,
+    _argv: VmArrayRef<'_>,
+    _timeout_ms: i64,
+    _max_output_bytes: i64,
+) -> VmResult<HostCallResult<VmMap>> {
+    Err(VmError::HostError(
+        "io::exec is unsupported on wasm32 runtime".to_string(),
     ))
 }
 

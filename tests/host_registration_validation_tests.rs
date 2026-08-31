@@ -19,7 +19,7 @@ fn coarse_return_type(schema: &HostTypeSchema) -> ValueType {
         HostTypeSchema::String => ValueType::String,
         HostTypeSchema::Bytes => ValueType::Bytes,
         HostTypeSchema::Array(_) => ValueType::Array,
-        HostTypeSchema::Map(_) => ValueType::Map,
+        HostTypeSchema::Map(_) | HostTypeSchema::Object(_) => ValueType::Map,
         HostTypeSchema::Optional(inner) => coarse_return_type(inner),
         HostTypeSchema::Callable { .. } => ValueType::Callable,
         HostTypeSchema::Unknown | HostTypeSchema::Number | HostTypeSchema::Resource(_) => {

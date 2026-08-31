@@ -28,10 +28,15 @@ use std::thread::JoinHandle;
 use std::os::unix::process::CommandExt;
 
 use super::super::HostCallResult;
+use super::bounded_process::{
+    BoundedExecError, BoundedExecOutput, BoundedProcessRequest, MAX_OUTPUT_BYTES, MAX_TIMEOUT,
+    exec_bounded_with_cancel_hook_for_host, validate_argv,
+};
 use super::ops::{
     CloseCompletionOperation, CloseCompletionState, PipeTransferGuard, ReadyOperation,
     ThreadedOperation, ThreadedWorkerPublisher, restore_reader_or_drop, restore_writer_or_drop,
 };
+pub(crate) use crate::bytecode::VmMap;
 use crate::host_api::ResourceTypeKey;
 use crate::vm::operation::{OperationCancelReason, OperationId, OperationSpec};
 use crate::vm::resource::{
@@ -680,6 +685,197 @@ pub(crate) fn builtin_io_popen_body(
     );
 
     Ok(HostCallResult::Pending(raw))
+}
+
+/// Executes a bounded argv-only process and returns a bounded metadata map.
+pub(crate) fn builtin_io_exec_body(
+    vm: &mut Vm,
+    argv: &[Value],
+    timeout_ms: i64,
+    max_output_bytes: i64,
+) -> VmResult<HostCallResult<VmMap>> {
+    if let Some(policy) = super::io_policy(vm)
+        && !policy.allow_process
+    {
+        return Err(VmError::HostError(
+            "io::exec requires the process capability".to_string(),
+        ));
+    }
+    if timeout_ms <= 0 {
+        return Err(VmError::HostError(
+            "io::exec timeout_ms must be positive".to_string(),
+        ));
+    }
+    let timeout_ms = u64::try_from(timeout_ms).map_err(|_| {
+        VmError::HostError("io::exec timeout_ms exceeds the supported range".to_string())
+    })?;
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    if timeout > MAX_TIMEOUT {
+        return Err(VmError::HostError(
+            "io::exec timeout_ms exceeds the supported bound".to_string(),
+        ));
+    }
+    if max_output_bytes <= 0
+        || usize::try_from(max_output_bytes).map_or(true, |limit| limit > MAX_OUTPUT_BYTES)
+    {
+        return Err(VmError::HostError(
+            "io::exec max_output_bytes is outside the supported bound".to_string(),
+        ));
+    }
+    let max_output_bytes = usize::try_from(max_output_bytes).map_err(|_| {
+        VmError::HostError("io::exec max_output_bytes is outside the supported range".to_string())
+    })?;
+    let owned_argv = preflight_exec_argv(argv)?;
+    let workspace = std::env::current_dir().map_err(|_error| {
+        VmError::HostError("io::exec workspace root is unavailable".to_string())
+    })?;
+    let request = BoundedProcessRequest::new(owned_argv)
+        .with_workspace_root(workspace)
+        .with_timeout(timeout)
+        .with_output_limits(max_output_bytes, max_output_bytes, max_output_bytes);
+    request
+        .validate()
+        .map_err(|error| VmError::HostError(format!("io::exec invalid request: {error}")))?;
+
+    let shared: Arc<Mutex<Option<Result<VmMap, String>>>> = Arc::new(Mutex::new(None));
+    let shared_worker = Arc::clone(&shared);
+    let (operation, tx, state) = ThreadedOperation::prepare("io::exec");
+    let op_id = register_threaded_operation(vm, operation, None)?;
+    let raw = op_id.raw();
+    let raw_state = state.clone();
+    if let Err(message) = ThreadedOperation::spawn_worker(
+        "io::exec",
+        raw_state,
+        tx,
+        move |state, tx: ThreadedWorkerPublisher| {
+            let result = exec_bounded_with_cancel_hook_for_host(request, || {
+                state.cancelled.load(Ordering::SeqCst)
+            });
+            match result {
+                Ok(output) => {
+                    *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(Ok(bounded_exec_output_to_map(&output, false, false)));
+                    let _ = tx.send(Ok(()));
+                }
+                Err(BoundedExecError::TimedOut(output)) => {
+                    *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(Ok(bounded_exec_output_to_map(&output, true, false)));
+                    let _ = tx.send(Ok(()));
+                }
+                Err(BoundedExecError::Cancelled(output)) => {
+                    *shared_worker.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(Ok(bounded_exec_output_to_map(&output, false, true)));
+                    let _ = tx.send(Ok(()));
+                }
+                Err(BoundedExecError::Spawn(error) | BoundedExecError::Failed(error)) => {
+                    let _ = tx.send(Err(error.to_string()));
+                }
+            }
+        },
+    ) {
+        return Err(rollback_threaded_start(
+            vm,
+            op_id,
+            VmError::HostError(message),
+        ));
+    }
+
+    let shared_provider = Arc::clone(&shared);
+    vm.host.register_pending_op_result(
+        raw,
+        Box::new(move |_vm: &mut Vm| {
+            match shared_provider
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                Some(Ok(map)) => Ok(CallReturn::one(Value::Map(Arc::new(map)))),
+                Some(Err(message)) => Err(VmError::HostError(message)),
+                None => Err(VmError::HostError(
+                    "io::exec worker did not produce a result".to_string(),
+                )),
+            }
+        }),
+    );
+
+    Ok(HostCallResult::Pending(raw))
+}
+
+fn preflight_exec_argv(argv: &[Value]) -> VmResult<Vec<String>> {
+    let mut owned = Vec::with_capacity(argv.len());
+    for value in argv {
+        let Value::String(value) = value else {
+            return Err(VmError::HostError(
+                "io::exec argv entries must be strings".to_string(),
+            ));
+        };
+        owned.push(value.as_str().to_owned());
+    }
+    validate_argv(&owned).map_err(|error| VmError::HostError(error.to_string()))?;
+    Ok(owned)
+}
+
+fn u64_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn bounded_exec_output_to_map(
+    output: &BoundedExecOutput,
+    timed_out: bool,
+    cancelled: bool,
+) -> VmMap {
+    use super::bounded_process::ProcessStatus;
+
+    let (status, exit_code, signal) = match output.status {
+        ProcessStatus::Exited { code } => ("exited", code, None),
+        ProcessStatus::Signaled { signal } => ("signaled", None, Some(signal)),
+        ProcessStatus::Unknown => ("unknown", None, None),
+    };
+    VmMap::from_entries(vec![
+        (Value::string("status"), Value::string(status)),
+        (
+            Value::string("exit_code"),
+            exit_code.map_or(Value::Null, |code| Value::Int(i64::from(code))),
+        ),
+        (
+            Value::string("signal"),
+            signal.map_or(Value::Null, |signal| Value::Int(i64::from(signal))),
+        ),
+        (
+            Value::string("success"),
+            Value::Bool(output.status.is_success()),
+        ),
+        (Value::string("stdout"), Value::bytes(output.stdout.clone())),
+        (Value::string("stderr"), Value::bytes(output.stderr.clone())),
+        (
+            Value::string("stdout_offset"),
+            Value::Int(u64_to_i64(output.stdout_offset)),
+        ),
+        (
+            Value::string("stdout_next_offset"),
+            Value::Int(u64_to_i64(output.stdout_next_offset)),
+        ),
+        (
+            Value::string("stdout_truncated"),
+            Value::Bool(output.stdout_truncated),
+        ),
+        (Value::string("stdout_gap"), Value::Bool(output.stdout_gap)),
+        (
+            Value::string("stderr_offset"),
+            Value::Int(u64_to_i64(output.stderr_offset)),
+        ),
+        (
+            Value::string("stderr_next_offset"),
+            Value::Int(u64_to_i64(output.stderr_next_offset)),
+        ),
+        (
+            Value::string("stderr_truncated"),
+            Value::Bool(output.stderr_truncated),
+        ),
+        (Value::string("stderr_gap"), Value::Bool(output.stderr_gap)),
+        (Value::string("timed_out"), Value::Bool(timed_out)),
+        (Value::string("cancelled"), Value::Bool(cancelled)),
+    ])
 }
 
 /// Reads all remaining text from an I/O handle. Body shared by async and
@@ -1552,7 +1748,7 @@ pub(crate) fn canonicalize_io_target(path: &Path) -> VmResult<PathBuf> {
 // ============================================================================
 
 #[cfg(unix)]
-fn set_pipe_nonblocking(pipe: &impl std::os::fd::AsRawFd) -> std::io::Result<()> {
+pub(super) fn set_pipe_nonblocking(pipe: &impl std::os::fd::AsRawFd) -> std::io::Result<()> {
     let fd = pipe.as_raw_fd();
     // SAFETY: `fd` is borrowed from a live child-pipe object for the duration
     // of each fcntl call; no ownership is transferred.
@@ -1567,9 +1763,22 @@ fn set_pipe_nonblocking(pipe: &impl std::os::fd::AsRawFd) -> std::io::Result<()>
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn set_pipe_nonblocking<T>(_pipe: &T) -> std::io::Result<()> {
-    Ok(())
+#[cfg(windows)]
+pub(super) fn set_pipe_nonblocking(
+    _pipe: &impl std::os::windows::io::AsRawHandle,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Windows child pipes require cancellable I/O rather than PIPE_NOWAIT",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(super) fn set_pipe_nonblocking<T>(_pipe: &T) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "nonblocking or cancellable child pipes are required",
+    ))
 }
 
 fn read_pipe_to_string_with_limit(

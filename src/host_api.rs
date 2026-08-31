@@ -245,6 +245,8 @@ pub enum HostTypeSchema {
     Bytes,
     Array(Box<HostTypeSchema>),
     Map(Box<HostTypeSchema>),
+    /// Fixed-key object schema. Keys are sorted in the fingerprint encoding.
+    Object(std::collections::BTreeMap<String, HostTypeSchema>),
     Optional(Box<HostTypeSchema>),
     Callable {
         params: Vec<HostTypeSchema>,
@@ -275,6 +277,7 @@ impl HostTypeSchema {
             Self::Array(inner) | Self::Map(inner) | Self::Optional(inner) => {
                 inner.contains_resource()
             }
+            Self::Object(fields) => fields.values().any(Self::contains_resource),
             Self::Callable { params, result } => {
                 params.iter().any(|param| param.contains_resource()) || result.contains_resource()
             }
@@ -295,6 +298,11 @@ impl HostTypeSchema {
             Self::Resource(key) => out.push(key),
             Self::Array(inner) | Self::Map(inner) | Self::Optional(inner) => {
                 inner.collect_resource_keys(out);
+            }
+            Self::Object(fields) => {
+                for field in fields.values() {
+                    field.collect_resource_keys(out);
+                }
             }
             Self::Callable { params, result } => {
                 for param in params {
@@ -327,6 +335,16 @@ impl fmt::Display for HostTypeSchema {
             Self::Bytes => write!(f, "bytes"),
             Self::Array(inner) => write!(f, "array<{inner}>"),
             Self::Map(inner) => write!(f, "map<{inner}>"),
+            Self::Object(fields) => {
+                write!(f, "{{")?;
+                for (index, (key, ty)) in fields.iter().enumerate() {
+                    if index > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{key}: {ty}")?;
+                }
+                write!(f, "}}")
+            }
             Self::Optional(inner) => write!(f, "optional<{inner}>"),
             Self::Callable { params, result } => {
                 write!(f, "fn(")?;
@@ -1015,6 +1033,14 @@ fn push_type(bytes: &mut Vec<u8>, schema: &HostTypeSchema) {
         HostTypeSchema::Map(inner) => {
             push_tag(bytes, b'{');
             push_type(bytes, inner);
+        }
+        HostTypeSchema::Object(fields) => {
+            push_tag(bytes, b'O');
+            push_len(bytes, fields.len());
+            for (key, ty) in fields {
+                push_len_str(bytes, key);
+                push_type(bytes, ty);
+            }
         }
         HostTypeSchema::Optional(inner) => {
             push_tag(bytes, b'?');

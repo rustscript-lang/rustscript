@@ -126,6 +126,28 @@ pub(crate) fn io_pipe_key() -> ResourceTypeKey {
     ResourceTypeKey::new("io.pipe").expect("io.pipe resource type key must be valid")
 }
 
+fn exec_output_schema() -> std::collections::BTreeMap<String, HostTypeSchema> {
+    let optional_int = HostTypeSchema::Optional(Box::new(HostTypeSchema::Int));
+    std::collections::BTreeMap::from([
+        ("status".into(), HostTypeSchema::String),
+        ("exit_code".into(), optional_int.clone()),
+        ("signal".into(), optional_int),
+        ("success".into(), HostTypeSchema::Bool),
+        ("stdout".into(), HostTypeSchema::Bytes),
+        ("stderr".into(), HostTypeSchema::Bytes),
+        ("stdout_offset".into(), HostTypeSchema::Int),
+        ("stdout_next_offset".into(), HostTypeSchema::Int),
+        ("stdout_truncated".into(), HostTypeSchema::Bool),
+        ("stdout_gap".into(), HostTypeSchema::Bool),
+        ("stderr_offset".into(), HostTypeSchema::Int),
+        ("stderr_next_offset".into(), HostTypeSchema::Int),
+        ("stderr_truncated".into(), HostTypeSchema::Bool),
+        ("stderr_gap".into(), HostTypeSchema::Bool),
+        ("timed_out".into(), HostTypeSchema::Bool),
+        ("cancelled".into(), HostTypeSchema::Bool),
+    ])
+}
+
 /// The shared [`HostApiCatalog`] describing every IO host function.
 ///
 /// The compiler and the runtime registry consume this same catalog, so the
@@ -163,6 +185,18 @@ fn build_io_host_catalog() -> Arc<HostApiCatalog> {
             HostParamSchema::value("mode", HostTypeSchema::String),
         ],
         HostTypeSchema::Resource(io_pipe_key()),
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        "io::exec",
+        vec![
+            HostParamSchema::value(
+                "argv",
+                HostTypeSchema::Array(Box::new(HostTypeSchema::String)),
+            ),
+            HostParamSchema::value("timeout_ms", HostTypeSchema::Int),
+            HostParamSchema::value("max_output_bytes", HostTypeSchema::Int),
+        ],
+        HostTypeSchema::Object(exec_output_schema()),
     ));
     for (name, result) in [
         ("io::read_all", HostTypeSchema::String),
@@ -227,6 +261,11 @@ const IO_ADAPTER_CONTRACTS: &[IoAdapterContract] = &[
         name: "io::popen",
         arity: 2,
         adapter: popen_adapter,
+    },
+    IoAdapterContract {
+        name: "io::exec",
+        arity: 3,
+        adapter: exec_adapter,
     },
     IoAdapterContract {
         name: "io::read_all",
@@ -353,6 +392,16 @@ fn popen_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     }
 }
 
+fn exec_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+    use super::HostCallResult;
+    match io_impl::builtin_io_exec(vm, args)? {
+        HostCallResult::Return(result) => Ok(CallOutcome::Return(CallReturn::one(Value::Map(
+            Arc::new(result),
+        )))),
+        HostCallResult::Pending(op_id) => Ok(CallOutcome::Pending(op_id)),
+    }
+}
+
 fn read_all_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     use super::HostCallResult;
     match io_impl::builtin_io_read_all(vm, args)? {
@@ -434,7 +483,7 @@ impl crate::vm::HostExtension for IoExtension {
 /// * otherwise → `blocking` (thread-based worker path).
 #[cfg(target_arch = "wasm32")]
 pub(super) mod io_impl {
-    pub(super) use super::super::super::io_wasm::*;
+    pub(super) use super::super::io_wasm::*;
 }
 #[cfg(all(not(target_arch = "wasm32"), feature = "async"))]
 mod io_impl {
@@ -445,14 +494,29 @@ mod io_impl {
     pub(super) use super::blocking::*;
 }
 
-#[cfg(feature = "async")]
+#[cfg(all(feature = "async", not(target_arch = "wasm32")))]
 mod async_io;
-#[cfg(not(feature = "async"))]
+#[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
 mod blocking;
+#[cfg(not(target_arch = "wasm32"))]
+mod bounded_process;
+#[cfg(not(target_arch = "wasm32"))]
+pub use bounded_process::{
+    BoundedExecError, BoundedExecOutput, BoundedProcess, BoundedProcessError, BoundedProcessHandle,
+    BoundedProcessRequest, CancellationToken, DEFAULT_OUTPUT_BYTES, DEFAULT_TIMEOUT, LogSnapshot,
+    LogStream, MAX_ARG_COUNT, MAX_ARG_ITEM_BYTES, MAX_ARG_TOTAL_BYTES, MAX_ENV_COUNT,
+    MAX_ENV_KEY_BYTES, MAX_ENV_TOTAL_BYTES, MAX_ENV_VALUE_BYTES, MAX_OUTPUT_BYTES, MAX_STDIN_BYTES,
+    MAX_STDIN_WRITE_BYTES, MAX_TIMEOUT, ProcessHandle, ProcessStatus, ProcessValidationError,
+    SpawnError, SpawnErrorKind, exec_bounded,
+};
+#[cfg(not(target_arch = "wasm32"))]
 mod ops;
+#[cfg(not(target_arch = "wasm32"))]
 mod shared;
 #[cfg(windows)]
 mod windows_process_tree;
+#[cfg(windows)]
+mod windows_stdio;
 
 #[cfg(target_arch = "wasm32")]
 pub(super) use super::io_wasm::*;
@@ -492,6 +556,33 @@ mod contract_tests {
                 };
                 assert!(registry.resolve_import(&import).is_ok(), "{}", entry.name);
             }
+        }
+    }
+
+    #[test]
+    fn io_exec_catalog_uses_fixed_output_key_schema() {
+        let catalog = io_host_catalog();
+        let exec = catalog
+            .functions()
+            .iter()
+            .find(|function| function.name == "io::exec")
+            .expect("io::exec");
+        match &exec.return_type {
+            crate::host_api::HostTypeSchema::Object(fields) => {
+                for key in [
+                    "status",
+                    "exit_code",
+                    "signal",
+                    "success",
+                    "stdout",
+                    "stderr",
+                    "timed_out",
+                    "cancelled",
+                ] {
+                    assert!(fields.contains_key(key), "missing {key}");
+                }
+            }
+            other => panic!("expected object schema, got {other:?}"),
         }
     }
 }

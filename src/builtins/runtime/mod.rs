@@ -39,6 +39,15 @@ pub use http::{
     HttpConfig, HttpHostExt, http_host_catalog, register_http_builtin_module,
     register_http_builtin_module_from_catalog,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use io::{
+    BoundedExecError, BoundedExecOutput, BoundedProcess, BoundedProcessError, BoundedProcessHandle,
+    BoundedProcessRequest, CancellationToken, DEFAULT_OUTPUT_BYTES, DEFAULT_TIMEOUT, LogSnapshot,
+    LogStream, MAX_ARG_COUNT, MAX_ARG_ITEM_BYTES, MAX_ARG_TOTAL_BYTES, MAX_ENV_COUNT,
+    MAX_ENV_KEY_BYTES, MAX_ENV_TOTAL_BYTES, MAX_ENV_VALUE_BYTES, MAX_OUTPUT_BYTES, MAX_STDIN_BYTES,
+    MAX_STDIN_WRITE_BYTES, MAX_TIMEOUT, ProcessHandle, ProcessStatus, ProcessValidationError,
+    SpawnError, SpawnErrorKind, exec_bounded,
+};
 pub use io::{
     IoExtension, IoHostExt, IoPolicy, io_host_catalog, register_io_builtin_module,
     register_io_builtin_module_from_catalog,

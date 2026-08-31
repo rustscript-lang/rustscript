@@ -612,7 +612,12 @@ impl SemanticModel {
             TypeSchema::ArrayTupleRest { prefix: _, rest: _ } => {
                 HostTypeSchema::Array(Box::new(HostTypeSchema::Unknown))
             }
-            TypeSchema::Object(_) => HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown)),
+            TypeSchema::Object(fields) => HostTypeSchema::Object(
+                fields
+                    .iter()
+                    .map(|(key, ty)| (key.clone(), self.compiler_schema_to_host_schema(ty)))
+                    .collect(),
+            ),
         }
     }
 

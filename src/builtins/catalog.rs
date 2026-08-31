@@ -125,6 +125,7 @@ builtin_id!(0xFFF8, "math::copysign", MathCopySign, Ordinary, none);
 builtin_id!(0xFFF9, "math::clamp", MathClamp, Ordinary, none);
 builtin_id!(0xFFFA, "math::mul_add", MathMulAdd, Ordinary, none);
 builtin_id!(0xFFFB, "count", Count, Ordinary, none);
+builtin_id!(0xFFFC, "io::exec", IoExec, Ordinary, none);
 builtin_id!(0xFF9E, "__format_template", FormatTemplate, Internal, none);
 builtin_id!(0xFF9F, "__to_string", ToString, Internal, none);
 builtin_id!(0xFFA0, "type", TypeOf, Special, none);
