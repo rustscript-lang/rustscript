@@ -11,12 +11,15 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use vm::operation::OperationCancelReason;
 use vm::operation::OperationId;
 use vm::resource::close::{CloseProgress, HostResource};
 use vm::resource::{ResourceCloseReason, ResourceResult};
 use vm::{Value, Vm, VmError, VmStatus, compile_source};
+
+use super::vm_reset::reset_for_reuse_to_ready;
 
 /// Helper: run an IO source to completion, returning the final stack.
 fn run_source(source: &str) -> Result<Vec<Value>, VmError> {
@@ -368,7 +371,7 @@ fn reset_for_reuse_joins_pending_io_worker() {
     ));
     assert_eq!(vm.execution_scope().operations().len(), 1);
 
-    let _ = vm.reset_for_reuse();
+    reset_for_reuse_to_ready(&mut vm).expect("reset should reach quiescence");
     assert!(vm.execution_scope().operations().is_empty());
     assert!(vm.execution_scope().resources().is_empty());
 }
@@ -381,7 +384,7 @@ fn reset_for_reuse_retires_io_resources_through_scope() {
         "open leaves a live IO resource in the scope"
     );
 
-    let _ = vm.reset_for_reuse();
+    reset_for_reuse_to_ready(&mut vm).expect("reset should reach quiescence");
 
     assert!(
         vm.execution_scope().resources().is_empty() && vm.execution_scope().operations().is_empty(),
@@ -434,7 +437,7 @@ fn reset_for_reuse_terminates_live_popen_process_tree() {
         marker: marker.clone(),
     };
 
-    let _ = vm.reset_for_reuse();
+    reset_for_reuse_to_ready(&mut vm).expect("reset should reach quiescence");
     assert!(vm.execution_scope().resources().is_empty());
     wait_for_process_exit(descendant);
     let _ = std::fs::remove_file(marker);
