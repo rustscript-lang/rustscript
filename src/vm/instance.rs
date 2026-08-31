@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Weak};
 
-use crate::bytecode::{CallableValue, Program, SharedCaptureCell, Value};
+use crate::bytecode::{CallableValue, MAX_FRAME_LOCAL_COUNT, Program, SharedCaptureCell, Value};
 use crate::vm::host::WaitingHostOp;
 use crate::vm::invocation::{InvocationPhase, InvocationState};
 use crate::vm::map_iter::MapIteratorState;
@@ -102,7 +102,11 @@ pub(crate) struct Instance {
 impl Instance {
     /// Creates a halted instance positioned at program entry.
     pub(crate) fn new(program: &Program) -> Self {
-        let local_count = program.local_count;
+        let local_count = if program.local_count <= MAX_FRAME_LOCAL_COUNT {
+            program.local_count
+        } else {
+            0
+        };
         Self {
             ip: 0,
             stack: Vec::new(),

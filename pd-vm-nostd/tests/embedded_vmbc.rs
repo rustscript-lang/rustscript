@@ -6,7 +6,7 @@ use vm::compiler::TypeSchema;
 use vm::{
     HostApiBuilder, HostFunctionSchema, HostImport, HostImportSchema, HostParamPassing,
     HostParamSchema, HostTypeSchema, OpCode, Program, ReplLocalBinding, ResourceTypeKey,
-    ResourceTypeSchema, Value, ValueType, compile_source, compile_source_for_repl,
+    ResourceTypeSchema, TypeMap, Value, ValueType, compile_source, compile_source_for_repl,
     compile_source_for_repl_with_locals, encode_program,
 };
 
@@ -100,6 +100,224 @@ fn embedded_decoder_reads_legacy_v11_without_schema_markers() {
 
     let decoded = decode_program(&bytes).expect("embedded decoder should accept VMBC v11");
     assert_eq!(decoded.constants()[0], EmbeddedValue::Int(7));
+}
+
+fn minimal_vmbc_prefix(constant_count: u32, code: &[u8], import_count: u32) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"VMBC");
+    bytes.extend_from_slice(&12u16.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&constant_count.to_le_bytes());
+    bytes.extend_from_slice(&(code.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(code);
+    bytes.extend_from_slice(&import_count.to_le_bytes());
+    bytes
+}
+
+#[test]
+fn embedded_decoder_rejects_oversized_zero_byte_counts_before_allocation() {
+    const TOO_MANY: u32 = 1_000_001;
+
+    let constants = minimal_vmbc_prefix(TOO_MANY, &[], 0);
+    assert!(matches!(
+        decode_program(&constants),
+        Err(WireError::LengthTooLarge("constants", count)) if count == TOO_MANY as usize
+    ));
+
+    let imports = minimal_vmbc_prefix(0, &[], TOO_MANY);
+    assert!(matches!(
+        decode_program(&imports),
+        Err(WireError::LengthTooLarge("imports", count)) if count == TOO_MANY as usize
+    ));
+}
+
+fn v12_with_local_schema(schema: &[u8]) -> Vec<u8> {
+    let mut bytes = minimal_vmbc_prefix(0, &[EmbeddedOpCode::Ret as u8], 0);
+    bytes.extend_from_slice(&[1, 0]);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.push(0);
+    bytes.push(1);
+    bytes.extend_from_slice(schema);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes
+}
+
+fn v12_with_callable_frame_counts(frame_counts: &[u32]) -> Vec<u8> {
+    let mut bytes = minimal_vmbc_prefix(0, &[EmbeddedOpCode::Ret as u8], 0);
+    bytes.extend_from_slice(&[0, 0]); // no type map, no debug info
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // script functions
+    bytes.extend_from_slice(&(frame_counts.len() as u32).to_le_bytes());
+    for frame_count in frame_counts {
+        bytes.extend_from_slice(&[0, 0]); // function item, script target
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // target id
+        bytes.push(0); // arity
+        bytes.extend_from_slice(&frame_count.to_le_bytes());
+        for _ in 0..4 {
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+        }
+        bytes.push(0); // no self slot
+        bytes.push(0); // no callable schema
+    }
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // function regions
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // root callable bindings
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // exported callables
+    bytes
+}
+
+fn v12_with_large_type_map(local_count: u32) -> Vec<u8> {
+    let mut bytes = minimal_vmbc_prefix(0, &[EmbeddedOpCode::Ret as u8], 0);
+    bytes.extend_from_slice(&[1, 0]); // type map, strict=false
+    bytes.extend_from_slice(&local_count.to_le_bytes());
+    bytes.extend(std::iter::repeat_n(
+        ValueType::Unknown as u8,
+        local_count as usize,
+    ));
+    bytes.extend(std::iter::repeat_n(0, local_count as usize)); // optional local schemas
+    bytes.extend_from_slice(&local_count.to_le_bytes());
+    bytes.extend(std::iter::repeat_n(0, local_count as usize));
+    bytes.extend_from_slice(&local_count.to_le_bytes());
+    bytes.extend(std::iter::repeat_n(0, local_count as usize));
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // type map operands
+    bytes.push(0); // no debug info
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // script functions
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // callable prototypes
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // function regions
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // root callable bindings
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // exported callables
+    bytes
+}
+
+#[test]
+fn embedded_decoder_accepts_root_resource_schema_tag_17() {
+    let resource = ResourceTypeKey::new("embedded.resource").expect("resource key");
+    let program = Program::new(Vec::new(), vec![OpCode::Ret as u8]).with_type_map(TypeMap {
+        strict_types: true,
+        local_types: vec![ValueType::Unknown],
+        local_schemas: vec![Some(TypeSchema::Resource(resource))],
+        callable_slots: vec![false],
+        optional_slots: vec![false],
+        operand_types: std::collections::HashMap::new(),
+    });
+    let bytes = encode_program(&program).expect("resource schema should encode");
+
+    let decoded = decode_program(&bytes).expect("embedded decoder should accept tag 17");
+    assert_eq!(decoded.local_count(), 1);
+}
+
+#[test]
+fn embedded_decoder_debits_repeated_callable_frame_counts_from_one_budget() {
+    let bytes = v12_with_callable_frame_counts(&[40_000; 30]);
+    assert!(
+        matches!(
+            decode_program(&bytes),
+            Err(WireError::LengthTooLarge("callable frame locals", 40_000))
+        ),
+        "{:?}",
+        decode_program(&bytes)
+    );
+}
+
+#[test]
+fn embedded_decoder_validates_the_complete_resource_schema_key() {
+    for key in [
+        b"".as_slice(),
+        b".bad".as_slice(),
+        b"bad.".as_slice(),
+        b"Bad".as_slice(),
+    ] {
+        let mut schema = vec![17];
+        schema.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        schema.extend_from_slice(key);
+        assert!(matches!(
+            decode_program(&v12_with_local_schema(&schema)),
+            Err(WireError::InvalidResourceKey)
+        ));
+    }
+
+    let key_with_trailing_byte = b"embedded.resource\0";
+    let mut schema = vec![17];
+    schema.extend_from_slice(&(key_with_trailing_byte.len() as u32).to_le_bytes());
+    schema.extend_from_slice(key_with_trailing_byte);
+    assert!(matches!(
+        decode_program(&v12_with_local_schema(&schema)),
+        Err(WireError::InvalidResourceKey)
+    ));
+}
+
+#[test]
+fn embedded_decoder_rejects_a_single_oversized_callable_frame() {
+    let bytes = v12_with_callable_frame_counts(&[65_537]);
+    assert!(matches!(
+        decode_program(&bytes),
+        Err(WireError::LengthTooLarge("callable frame locals", 65_537))
+    ));
+}
+
+#[test]
+fn embedded_decoder_rejects_oversized_program_frame_count_from_type_map() {
+    let bytes = v12_with_large_type_map(65_537);
+    assert!(matches!(
+        decode_program(&bytes),
+        Err(WireError::LengthTooLarge("type map locals", 65_537))
+    ));
+}
+
+fn schema_with_oversized_count(tag: u8, count: u32) -> Vec<u8> {
+    let mut schema = vec![tag];
+    if tag == 9 {
+        schema.extend_from_slice(&0u32.to_le_bytes());
+    }
+    schema.extend_from_slice(&count.to_le_bytes());
+    schema
+}
+
+#[test]
+fn embedded_decoder_rejects_oversized_nested_schema_counts() {
+    const TOO_MANY: u32 = 1_000_001;
+    for tag in [9, 11, 12, 14, 15] {
+        let bytes = v12_with_local_schema(&schema_with_oversized_count(tag, TOO_MANY));
+        assert!(matches!(
+            decode_program(&bytes),
+            Err(WireError::LengthTooLarge(_, count)) if count == TOO_MANY as usize
+        ));
+    }
+}
+
+#[test]
+fn embedded_decoder_rejects_oversized_import_schema_parameter_count() {
+    const TOO_MANY: u32 = 1_000_001;
+    let mut bytes = minimal_vmbc_prefix(0, &[EmbeddedOpCode::Ret as u8], 1);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.push(b'h');
+    bytes.extend_from_slice(&[0, 0, 1]);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.push(b'h');
+    bytes.extend_from_slice(&TOO_MANY.to_le_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.push(0);
+    bytes.push(0);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+
+    assert!(matches!(
+        decode_program(&bytes),
+        Err(WireError::LengthTooLarge("host import schema parameters", count))
+            if count == TOO_MANY as usize
+    ));
 }
 
 #[test]
@@ -232,7 +450,13 @@ fn embedded_runtime_executes_compiler_generated_capturing_callable() {
 }
 
 #[test]
-fn removed_callable_creation_opcode_is_rejected() {
-    assert!(OpCode::try_from(0x1a).is_err());
-    assert!(EmbeddedOpCode::try_from(0x1a).is_err());
+fn call_script_opcode_is_0x1a_in_both_crates() {
+    // The historical callable-creation opcode slot (0x1A) is now the static
+    // script-call opcode in both the std and embedded opcode tables.
+    assert_eq!(OpCode::try_from(0x1a), Ok(OpCode::CallScript));
+    assert_eq!(
+        EmbeddedOpCode::try_from(0x1a),
+        Ok(EmbeddedOpCode::CallScript)
+    );
+    assert!(EmbeddedOpCode::try_from(0x7f).is_err());
 }

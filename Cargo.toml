@@ -55,6 +55,21 @@ name = "pd-vm-run"
 path = "src/bin/pd-vm-run.rs"
 required-features = ["cli"]
 
+[[example]]
+name = "mini_bench"
+path = "examples/mini_bench.rs"
+required-features = ["runtime"]
+
+[[example]]
+name = "collection_rebind_bench"
+path = "examples/collection_rebind_bench.rs"
+required-features = ["runtime"]
+
+[[example]]
+name = "rustscript_fuzz"
+path = "examples/rustscript_fuzz.rs"
+required-features = ["runtime"]
+
 [dependencies]
 base64 = "0.22"
 cranelift-codegen = { version = "0.129.1", optional = true }

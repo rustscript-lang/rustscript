@@ -12,8 +12,46 @@ fn classify_use_segment(segment: &str) -> UsePathSegment {
     }
 }
 
+/// The parser-reported line of a parsed statement (its first token's line).
+fn stmt_line_of(stmt: &Stmt) -> u32 {
+    match stmt {
+        Stmt::Noop { line }
+        | Stmt::Let { line, .. }
+        | Stmt::Assign { line, .. }
+        | Stmt::ClosureLet { line, .. }
+        | Stmt::FuncDecl { line, .. }
+        | Stmt::Expr { line, .. }
+        | Stmt::IfElse { line, .. }
+        | Stmt::For { line, .. }
+        | Stmt::While { line, .. }
+        | Stmt::Break { line, .. }
+        | Stmt::Continue { line, .. }
+        | Stmt::Drop { line, .. } => *line,
+    }
+}
+
 impl Parser {
+    /// Parse one statement and record its exact source span in the semantic
+    /// provenance index. The span runs from the statement's first consumed
+    /// token through its last, so diagnostics can slice the exact construct
+    /// (including multiline if/else statements) instead of a same-line guess.
     pub(super) fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
+        let start_span = self.current_span();
+        let stmt = self.parse_stmt_inner()?;
+        let end = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|token| token.span.hi)
+            .unwrap_or(start_span.hi);
+        let span = Span::new(start_span.source_id, start_span.lo, end.max(start_span.lo));
+        let line = stmt_line_of(&stmt);
+        self.parsed_semantic_index
+            .stmt_spans
+            .push(StmtSpanSite { line, span });
+        Ok(stmt)
+    }
+
+    fn parse_stmt_inner(&mut self) -> Result<Stmt, ParseError> {
         if self.match_kind(&TokenKind::Pub) {
             if self.match_kind(&TokenKind::Fn) {
                 return self.parse_fn_decl(true);
@@ -27,6 +65,13 @@ impl Parser {
         }
         if self.match_kind(&TokenKind::Use) {
             return self.parse_use_stmt();
+        }
+        if self.check(&TokenKind::Import) && !self.dialect.allow_import_stmt() {
+            return Err(ParseError::at_span(
+                self.current_span(),
+                "RustScript uses 'use', not 'import'",
+            )
+            .with_code("E_INVALID_IMPORT_SYNTAX"));
         }
         if self.dialect.allow_import_stmt() && self.match_kind(&TokenKind::Import) {
             return self.parse_js_import_stmt();
@@ -467,13 +512,35 @@ impl Parser {
 
     pub(super) fn parse_struct_decl(&mut self) -> Result<Stmt, ParseError> {
         let line = self.last_line();
+        // The `struct` keyword was already consumed by the caller
+        // (`parse_stmt_inner` matched `TokenKind::Struct`), so the previous
+        // token is the keyword. Its span start opens the declaration; the
+        // closing `}`'s span peak closes it.
+        let decl_lo = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|token| token.span.lo)
+            .unwrap_or_else(|| self.current_span().lo);
         let name = self.expect_ident("expected struct name after 'struct'")?;
+        let name_span = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|token| token.span)
+            .unwrap_or_else(|| self.current_span());
         let type_params = self.parse_type_params("struct", &name)?;
         self.push_active_type_params(&type_params);
         self.expect(&TokenKind::LBrace, "expected '{' after struct name")?;
         let fields = self.parse_object_type_schema_fields()?;
         self.pop_active_type_params();
         self.expect(&TokenKind::RBrace, "expected '}' after struct body")?;
+        // Full declaration span: from the `struct` keyword through the close
+        // brace (the last consumed token).
+        let decl_hi = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|token| token.span.hi)
+            .unwrap_or(decl_lo);
+        let decl_span = Span::new(name_span.source_id, decl_lo, decl_hi.max(decl_lo));
         if self
             .struct_schemas
             .insert(
@@ -493,6 +560,7 @@ impl Parser {
                 message: format!("duplicate struct schema '{name}'"),
             });
         }
+        self.record_struct_decl(name_span, decl_span, name.clone());
         Ok(Stmt::Noop { line })
     }
 
@@ -608,18 +676,27 @@ impl Parser {
     pub(super) fn parse_fn_decl(&mut self, exported: bool) -> Result<Stmt, ParseError> {
         let line = self.last_line();
         let name = self.expect_ident("expected function name after 'fn'")?;
+        // Capture the function name token span for provenance.
+        let fn_name_span = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|t| t.span)
+            .unwrap_or_else(|| self.current_span());
         let type_params = self.parse_type_params("function", &name)?;
         self.push_active_type_params(&type_params);
         self.expect(&TokenKind::LParen, "expected '(' after function name")?;
         let mut params = Vec::new();
+        // Exact identifier token spans for each param, for decl-site provenance.
+        let mut param_idents = Vec::<(String, Span)>::new();
         if !self.check(&TokenKind::RParen) {
             loop {
-                let param = self.expect_ident("expected parameter name")?;
+                let (param, param_span) = self.expect_ident_with_span("expected parameter name")?;
                 let schema = if self.match_kind(&TokenKind::Colon) {
                     Some(self.parse_declared_type_schema()?)
                 } else {
                     None
                 };
+                param_idents.push((param.clone(), param_span));
                 params.push(FunctionParam {
                     name: param,
                     schema,
@@ -709,16 +786,19 @@ impl Parser {
 
         self.push_active_type_params(&type_params);
         let has_impl = if self.match_kind(&TokenKind::Equal) {
-            let function_impl = self.parse_function_impl_expr(&params)?;
+            let body_open = self.current_span();
+            let function_impl = self.parse_function_impl_expr(&params, &param_idents, body_open)?;
             self.expect(
                 &TokenKind::Semicolon,
                 "expected ';' after function definition",
             )?;
             self.function_impls.insert(index, function_impl);
             true
-        } else if self.match_kind(&TokenKind::LBrace) {
-            let function_impl = self.parse_function_impl_block(&params)?;
-            self.expect(&TokenKind::RBrace, "expected '}' after function body")?;
+        } else if self.check(&TokenKind::LBrace) {
+            let body_open = self.current_span();
+            self.match_kind(&TokenKind::LBrace);
+            let function_impl =
+                self.parse_function_impl_block(&params, &param_idents, body_open)?;
             self.function_impls.insert(index, function_impl);
             // Optional trailing semicolon for compatibility.
             self.match_kind(&TokenKind::Semicolon);
@@ -731,6 +811,9 @@ impl Parser {
             false
         };
         self.pop_active_type_params();
+
+        // Record function declaration provenance.
+        self.record_func_decl(fn_name_span, index, name.clone());
 
         Ok(Stmt::FuncDecl {
             name,
@@ -746,8 +829,10 @@ impl Parser {
     pub(super) fn parse_function_impl_expr(
         &mut self,
         params: &[crate::compiler::ir::FunctionParam],
+        param_idents: &[(String, Span)],
+        body_open: Span,
     ) -> Result<FunctionImpl, ParseError> {
-        self.parse_function_impl(params, |parser| {
+        self.parse_function_impl(params, param_idents, body_open, |parser| {
             let body_expr_line = parser.current_line_u32();
             Ok((Vec::new(), parser.parse_expr()?, body_expr_line))
         })
@@ -909,6 +994,22 @@ impl Parser {
                         TypeSchema::Map(Box::new(TypeSchema::Unknown))
                     }
                 }
+                "resource" => {
+                    self.expect(&TokenKind::Less, "expected '<' after resource type")?;
+                    let mut key = self.expect_ident("expected resource type key")?;
+                    while self.match_kind(&TokenKind::Dot) {
+                        key.push('.');
+                        key.push_str(&self.expect_ident("expected resource type key segment")?);
+                    }
+                    self.expect(&TokenKind::Greater, "expected '>' after resource type key")?;
+                    let key = ResourceTypeKey::new(&key).map_err(|error| ParseError {
+                        span: Some(span),
+                        code: None,
+                        line: self.current_line(),
+                        message: format!("invalid resource type: {error}"),
+                    })?;
+                    TypeSchema::Resource(key)
+                }
                 other => {
                     let type_args = if self.check(&TokenKind::Less) {
                         self.expect(&TokenKind::Less, "expected '<' before type arguments")?;
@@ -968,8 +1069,10 @@ impl Parser {
     pub(super) fn parse_function_impl_block(
         &mut self,
         params: &[crate::compiler::ir::FunctionParam],
+        param_idents: &[(String, Span)],
+        body_open: Span,
     ) -> Result<FunctionImpl, ParseError> {
-        self.parse_function_impl(params, |parser| {
+        self.parse_function_impl(params, param_idents, body_open, |parser| {
             let mut body_stmts = Vec::new();
             let mut trailing_expr: Option<Expr> = None;
             let mut trailing_expr_line: Option<u32> = None;
@@ -1025,6 +1128,8 @@ impl Parser {
                 }
             };
 
+            parser.expect(&TokenKind::RBrace, "expected '}' after function body")?;
+
             Ok((body_stmts, body_expr, body_expr_line))
         })
     }
@@ -1032,6 +1137,8 @@ impl Parser {
     pub(super) fn parse_function_impl<F>(
         &mut self,
         params: &[crate::compiler::ir::FunctionParam],
+        param_idents: &[(String, Span)],
+        body_open: Span,
         parse_body: F,
     ) -> Result<FunctionImpl, ParseError>
     where
@@ -1061,8 +1168,25 @@ impl Parser {
             capture_copies: Vec::new(),
         });
         self.function_body_depth += 1;
-        let (body_stmts, body_expr, body_expr_line) = parse_body(self)?;
+        let body_result = self.with_scope(body_open, |parser| {
+            // Record each param binding as a local declaration site inside
+            // the function body scope, with its exact identifier token span.
+            for (order, param) in params.iter().enumerate() {
+                let ident_span = param_idents
+                    .get(order)
+                    .map(|(_, span)| *span)
+                    .unwrap_or_else(|| Span::new(body_open.source_id, 0, 0));
+                parser.record_local_decl(
+                    ident_span,
+                    ident_span,
+                    param_slots[order],
+                    param.name.clone(),
+                );
+            }
+            parse_body(parser)
+        });
         self.function_body_depth = self.function_body_depth.saturating_sub(1);
+        let (body_stmts, body_expr, body_expr_line) = body_result?;
         let capture_context = self
             .closure_capture_contexts
             .pop()
@@ -1097,6 +1221,12 @@ impl Parser {
         } else {
             self.expect_ident("expected identifier after 'let'")?
         };
+        // Capture the exact identifier token span for declaration provenance.
+        let ident_span = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|token| token.span)
+            .unwrap_or_else(|| Span::new(0, 0, 0));
         let declared_schema = if self.match_kind(&TokenKind::Colon) {
             Some(self.parse_declared_type_schema()?)
         } else {
@@ -1176,6 +1306,15 @@ impl Parser {
             self.local_schemas.remove(&index);
         }
         self.apply_let_binding_mutability(index, declared_mutable, created);
+        // Record local declaration provenance with the exact identifier token
+        // captured at the start of the statement.
+        let stmt_end = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|t| t.span.hi)
+            .unwrap_or(ident_span.hi);
+        let stmt_span = Span::new(ident_span.source_id, ident_span.lo, stmt_end);
+        self.record_local_decl(ident_span, stmt_span, index, name);
         Ok(Stmt::Let {
             index,
             declared_schema,
@@ -1189,9 +1328,11 @@ impl Parser {
         expect_terminator: bool,
     ) -> Result<Stmt, ParseError> {
         let line = self.current_line_u32();
-        let name = self.expect_ident("expected identifier before '='")?;
+        let (name, ident_span) = self.expect_ident_with_span("expected identifier before '='")?;
         let index = self.get_local(&name)?;
         self.require_local_mutable_for_operation(index, Some(name.as_str()), line, "assign to")?;
+        // Record the assignment target as a local reference site.
+        self.record_local_ref(ident_span, index, name.clone());
 
         let (kind, expr) = if self.match_kind(&TokenKind::Equal) {
             (AssignmentKind::Set, self.parse_expr()?)
@@ -1226,15 +1367,17 @@ impl Parser {
         expect_terminator: bool,
     ) -> Result<Stmt, ParseError> {
         let line = self.current_line_u32();
-        let name = if self.match_kind(&TokenKind::PlusPlus) {
-            self.expect_ident("expected identifier after '++'")?
+        let (name, ident_span) = if self.match_kind(&TokenKind::PlusPlus) {
+            self.expect_ident_with_span("expected identifier after '++'")?
         } else {
-            let name = self.expect_ident("expected identifier before '++'")?;
+            let name = self.expect_ident_with_span("expected identifier before '++'")?;
             self.expect(&TokenKind::PlusPlus, "expected '++' after identifier")?;
             name
         };
         let index = self.get_local(&name)?;
         self.require_local_mutable_for_operation(index, Some(name.as_str()), line, "increment")?;
+        // Record the increment target as a local reference site.
+        self.record_local_ref(ident_span, index, name);
         if expect_terminator {
             self.consume_stmt_terminator("expected ';' after increment")?;
         }
@@ -1283,10 +1426,10 @@ impl Parser {
 
         let declared_mutable =
             self.dialect.allow_let_mut_binding() && self.match_ident_literal("mut");
-        let name = if declared_mutable {
-            self.expect_ident("expected identifier after 'for mut'")?
+        let (name, ident_span) = if declared_mutable {
+            self.expect_ident_with_span("expected identifier after 'for mut'")?
         } else {
-            self.expect_ident("expected identifier after 'for'")?
+            self.expect_ident_with_span("expected identifier after 'for'")?
         };
         if !self.match_ident_literal("in") {
             return Err(ParseError {
@@ -1318,6 +1461,9 @@ impl Parser {
         if self.enforce_mutable_bindings {
             self.set_local_slot_mutable(index, declared_mutable);
         }
+        // Record the range-for iterator binding as a local declaration site;
+        // it lands in the enclosing scope (matching the synthetic `let` init).
+        self.record_local_decl(ident_span, ident_span, index, name);
 
         self.loop_depth += 1;
         let body = self.parse_block("expected '{' after for range")?;
@@ -1350,7 +1496,7 @@ impl Parser {
 
     fn parse_map_for_in(&mut self, line: u32) -> Result<Stmt, ParseError> {
         self.expect(&TokenKind::LParen, "expected '(' after 'for'")?;
-        let key_name = self.expect_ident("expected map key binding")?;
+        let (key_name, key_ident_span) = self.expect_ident_with_span("expected map key binding")?;
         let key_schema = if self.match_kind(&TokenKind::Colon) {
             Some(self.parse_declared_type_schema()?)
         } else {
@@ -1360,7 +1506,8 @@ impl Parser {
             &TokenKind::Comma,
             "expected ',' between map iterator bindings",
         )?;
-        let value_name = self.expect_ident("expected map value binding")?;
+        let (value_name, value_ident_span) =
+            self.expect_ident_with_span("expected map value binding")?;
         if value_name == key_name {
             return Err(ParseError {
                 span: Some(self.current_span()),
@@ -1486,6 +1633,16 @@ impl Parser {
 
         let previous_key_slot = self.replace_current_local_binding(&key_name, key_slot);
         let previous_value_slot = self.replace_current_local_binding(&value_name, value_slot);
+        // Record the map iterator bindings as local declaration sites in the
+        // enclosing scope (where the parser binds them), with exact ident
+        // spans captured from the `for (key, value)` header.
+        self.record_local_decl(key_ident_span, key_ident_span, key_slot, key_name.clone());
+        self.record_local_decl(
+            value_ident_span,
+            value_ident_span,
+            value_slot,
+            value_name.clone(),
+        );
         let previous_key_schema = self.local_schemas.get(&key_slot).cloned();
         let previous_value_schema = self.local_schemas.get(&value_slot).cloned();
         if let Some(schema) = key_schema.as_ref() {
@@ -1708,20 +1865,24 @@ impl Parser {
     }
 
     pub(super) fn parse_block(&mut self, message: &str) -> Result<Vec<Stmt>, ParseError> {
+        let open_span = self.current_span();
         self.expect(&TokenKind::LBrace, message)?;
-        let mut stmts = Vec::new();
-        while !self.check(&TokenKind::RBrace) {
-            if self.check(&TokenKind::Eof) {
-                return Err(ParseError {
-                    span: None,
-                    code: None,
-                    line: self.current_line(),
-                    message: "unexpected end of input in block".to_string(),
-                });
+        let stmts = self.with_scope(open_span, |parser| {
+            let mut stmts = Vec::new();
+            while !parser.check(&TokenKind::RBrace) {
+                if parser.check(&TokenKind::Eof) {
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line: parser.current_line(),
+                        message: "unexpected end of input in block".to_string(),
+                    });
+                }
+                stmts.push(parser.parse_stmt()?);
             }
-            stmts.push(self.parse_stmt()?);
-        }
-        self.expect(&TokenKind::RBrace, "expected '}' to close block")?;
+            parser.expect(&TokenKind::RBrace, "expected '}' to close block")?;
+            Ok(stmts)
+        })?;
         Ok(stmts)
     }
 

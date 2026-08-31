@@ -809,6 +809,7 @@ fn aot_executes_script_callable_frames_without_interpreter_boundary() {
     let compiled = crate::compile_source_for_repl(
         r#"
             fn add_one(value: int) -> int { value + 1 }
+            let f = add_one;
             add_one(41);
         "#,
     )
@@ -830,6 +831,7 @@ fn aot_executes_typed_script_callable_parameter_equality_without_interpreter_bou
     let compiled = crate::compile_source(
         r#"
             fn is_zero(value: int) -> bool { value == 0 }
+            let f = is_zero;
             is_zero(0);
         "#,
     )
@@ -850,6 +852,7 @@ fn aot_executes_script_callable_bool_return_in_branch_without_interpreter_bounda
     let compiled = crate::compile_source(
         r#"
             fn is_zero(value: int) -> bool { value == 0 }
+            let f = is_zero;
             let selected = if is_zero(0) => { 1 } else => { 2 };
             selected;
         "#,
@@ -913,6 +916,7 @@ fn aot_callable_call_resumes_after_fuel_yield_without_interpreter_boundary() {
     let compiled = crate::compile_source_for_repl(
         r#"
             fn add_one(value: int) -> int { value + 1 }
+            let f = add_one;
             add_one(41);
         "#,
     )
@@ -941,6 +945,8 @@ fn aot_executes_nested_script_callables_without_interpreter_boundary() {
         r#"
             fn inc(value: int) -> int { value + 1 }
             fn twice(value: int) -> int { inc(inc(value)) }
+            let f = inc;
+            let g = twice;
             twice(40);
         "#,
     )
@@ -961,6 +967,7 @@ fn aot_recursive_script_callable_reports_depth_limit_without_interpreter_boundar
     let compiled = crate::compile_source_for_repl(
         r#"
             fn recurse(value: int) -> int { recurse(value) }
+            let f = recurse;
             recurse(1);
         "#,
     )
@@ -2550,6 +2557,38 @@ fn async_host_future_is_submitted_to_the_host_bridge() {
 }
 
 #[test]
+fn program_cache_key_distinguishes_call_script_from_call_value() {
+    // A direct-only call lowers to `CallScript`; the same call through a
+    // materialized callable lowers to `CallValue`. The static cache identity
+    // must treat the two programs as different even when their metadata
+    // otherwise matches, because the native call boundary differs.
+    let direct = crate::compile_source("fn add2(value: int) -> int { value + 2 } add2(40);")
+        .expect("direct call source should compile");
+    let materialized =
+        crate::compile_source("fn add2(value: int) -> int { value + 2 } let f = add2; f(40);")
+            .expect("materialized call source should compile");
+
+    let mut direct_vm = Vm::new(direct.program);
+    let mut materialized_vm = Vm::new(materialized.program);
+    let direct_key = direct_vm.ensure_program_cache_key();
+    let materialized_key = materialized_vm.ensure_program_cache_key();
+    assert_ne!(
+        direct_key, materialized_key,
+        "CallScript and CallValue programs must not share cache identity"
+    );
+
+    // The same direct program reproduces the same key across VMs.
+    let direct_repeat = crate::compile_source("fn add2(value: int) -> int { value + 2 } add2(40);")
+        .expect("direct call source should compile");
+    let mut repeat_vm = Vm::new(direct_repeat.program);
+    assert_eq!(
+        repeat_vm.ensure_program_cache_key(),
+        direct_key,
+        "identical programs must share cache identity"
+    );
+}
+
+#[test]
 fn async_host_future_completion_error_cleans_up_bridge_operation_once() {
     struct FailingCompletionBridge {
         cleanup_calls: Arc<Mutex<Vec<HostOpId>>>,
@@ -3392,4 +3431,273 @@ fn dropping_vm_requests_bridge_cancellation_without_claiming_reuse() {
         let _ = submitted_host_future(&mut vm);
     }
     assert_eq!(cancellations.lock().expect("cancellation lock").len(), 1);
+}
+
+#[test]
+fn native_callable_abi_version_covers_direct_script_calls() {
+    // `CallScript` adds a new native boundary helper and exit contract, and
+    // the JIT inline ownership bridge adds the root-callable materialization
+    // helper; the native callable ABI revision must reflect both so every
+    // directly coupled program/native cache is invalidated exactly once.
+    assert_eq!(
+        super::native::NATIVE_CALLABLE_ABI_VERSION,
+        7,
+        "native callable ABI revision must cover direct script call and root-callable materialization semantics"
+    );
+    let direct = crate::compile_source("fn add2(value: int) -> int { value + 2 } add2(40);")
+        .expect("direct call source should compile");
+    let mut vm = Vm::new(direct.program);
+    let key = vm.ensure_program_cache_key();
+    assert_ne!(key, 0, "cache key must be non-trivial");
+}
+
+#[cfg(test)]
+mod callable_resource_schema_tests {
+    use super::*;
+    use crate::bytecode::VmMap;
+    use crate::compiler::TypeSchema;
+    use crate::vm::resource::{CloseProgress, HostResource, ResourceCloseReason, ResourceHandle};
+    use crate::{CallableKind, CallablePrototype, FunctionRegion, ScriptFunction};
+
+    #[derive(Debug)]
+    struct SchemaResource;
+
+    impl HostResource for SchemaResource {
+        fn resource_type_key() -> Option<ResourceTypeKey>
+        where
+            Self: Sized,
+        {
+            Some(ResourceTypeKey::new("test.schema.resource").expect("resource key"))
+        }
+
+        fn begin_close(
+            &mut self,
+            _reason: ResourceCloseReason,
+        ) -> crate::vm::resource::ResourceResult<CloseProgress> {
+            Ok(CloseProgress::Ready)
+        }
+    }
+
+    #[derive(Debug)]
+    struct OtherSchemaResource;
+
+    impl HostResource for OtherSchemaResource {
+        fn resource_type_key() -> Option<ResourceTypeKey>
+        where
+            Self: Sized,
+        {
+            Some(ResourceTypeKey::new("test.schema.other").expect("resource key"))
+        }
+    }
+
+    fn resource_key() -> ResourceTypeKey {
+        ResourceTypeKey::new("test.schema.resource").expect("resource key")
+    }
+
+    fn callable_vm(
+        callee_body: &[u8],
+        constants: Vec<Value>,
+        parameter_schema: TypeSchema,
+        result_schema: TypeSchema,
+    ) -> (Vm, Value) {
+        let function_entry = 1u32;
+        let function_end = function_entry + callee_body.len() as u32;
+        let mut code = vec![OpCode::Ret as u8];
+        code.extend_from_slice(callee_body);
+        let program = Program::new(constants, code)
+            .with_local_count(0)
+            .with_callable_metadata(
+                vec![ScriptFunction {
+                    entry_ip: function_entry,
+                    end_ip: function_end,
+                }],
+                vec![CallablePrototype {
+                    kind: CallableKind::FunctionItem,
+                    target: CallableTarget::ScriptFunction(0),
+                    arity: 1,
+                    frame_local_count: 1,
+                    parameter_slots: vec![0],
+                    capture_source_slots: Vec::new(),
+                    capture_slots: Vec::new(),
+                    capture_modes: Vec::new(),
+                    self_slot: None,
+                    schema: Some(TypeSchema::Callable {
+                        params: vec![parameter_schema],
+                        result: Box::new(result_schema),
+                    }),
+                }],
+                vec![
+                    FunctionRegion {
+                        start_ip: 0,
+                        end_ip: function_entry,
+                        prototype_id: None,
+                    },
+                    FunctionRegion {
+                        start_ip: function_entry,
+                        end_ip: function_end,
+                        prototype_id: Some(0),
+                    },
+                ],
+                Vec::new(),
+            );
+        let mut vm = Vm::new(program);
+        let callable = vm
+            .bind_callable_value(0, Vec::new())
+            .expect("callable should bind");
+        vm.run().expect("root program should halt");
+        (vm, callable)
+    }
+
+    fn resource_handle(vm: &mut Vm) -> i64 {
+        vm.execution_scope()
+            .push_resource(SchemaResource)
+            .expect("resource should be admitted")
+            .into_handle()
+            .raw() as i64
+    }
+
+    fn other_resource_handle(vm: &mut Vm) -> i64 {
+        vm.execution_scope()
+            .push_resource(OtherSchemaResource)
+            .expect("other resource should be admitted")
+            .into_handle()
+            .raw() as i64
+    }
+
+    fn assert_resource_schema_error(error: VmError, code: &str) {
+        let VmError::HostError(message) = error else {
+            panic!("expected resource validation error, got {error:?}");
+        };
+        assert!(
+            message.contains(code),
+            "expected resource error code {code:?}, got {message:?}"
+        );
+    }
+
+    #[test]
+    fn callable_argument_requires_a_live_handle_from_the_active_scope() {
+        let (mut vm, callable) = callable_vm(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            TypeSchema::Resource(resource_key()),
+            TypeSchema::Null,
+        );
+
+        let error = vm
+            .invoke_callable(callable.clone(), &[Value::Int(41)])
+            .expect_err("arbitrary ints must not satisfy resource schemas");
+        assert_resource_schema_error(error, "invalid_resource_handle");
+
+        let handle = resource_handle(&mut vm);
+        let value = vm
+            .invoke_callable(callable.clone(), &[Value::Int(handle)])
+            .expect("a live handle from this scope should pass");
+        assert_eq!(value, Value::Null);
+
+        let (mut foreign_vm, _) = callable_vm(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            TypeSchema::Resource(resource_key()),
+            TypeSchema::Null,
+        );
+        let foreign_handle = resource_handle(&mut foreign_vm);
+        let error = vm
+            .invoke_callable(callable.clone(), &[Value::Int(foreign_handle)])
+            .expect_err("handles from another scope must be rejected");
+        assert_resource_schema_error(error, "resource_handle_wrong_table");
+
+        let wrong_type_handle = other_resource_handle(&mut vm);
+        let error = vm
+            .invoke_callable(callable.clone(), &[Value::Int(wrong_type_handle)])
+            .expect_err("handles with another resource key must be rejected");
+        assert_resource_schema_error(error, "resource_type_key_mismatch");
+
+        let closed_handle = resource_handle(&mut vm);
+        let closed = ResourceHandle::from_raw(closed_handle as u64).expect("valid handle");
+        vm.execution_scope()
+            .close_resource::<SchemaResource>(closed, ResourceCloseReason::Requested)
+            .expect("close should complete");
+        let error = vm
+            .invoke_callable(callable.clone(), &[Value::Int(closed_handle)])
+            .expect_err("closed handles must be rejected");
+        assert_resource_schema_error(error, "resource_already_closed");
+
+        let replacement_handle = resource_handle(&mut vm);
+        assert_ne!(replacement_handle, closed_handle);
+        let error = vm
+            .invoke_callable(callable, &[Value::Int(closed_handle)])
+            .expect_err("a handle from an older generation must be rejected");
+        assert_resource_schema_error(error, "resource_stale");
+    }
+
+    #[test]
+    fn callable_return_requires_a_live_handle_with_the_expected_key() {
+        let handle_body = [0x0F, 0x00, OpCode::Ret as u8];
+        let (mut vm, callable) = callable_vm(
+            &handle_body,
+            Vec::new(),
+            TypeSchema::Resource(resource_key()),
+            TypeSchema::Resource(resource_key()),
+        );
+        let handle = resource_handle(&mut vm);
+        let value = vm
+            .invoke_callable(callable, &[Value::Int(handle)])
+            .expect("a matching return handle should pass");
+        assert_eq!(value, Value::Int(handle));
+
+        let (mut vm, callable) = callable_vm(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            TypeSchema::Resource(resource_key()),
+            TypeSchema::Resource(resource_key()),
+        );
+        let error = vm
+            .invoke_callable(callable, &[Value::Int(41)])
+            .expect_err("invalid argument should fail before return");
+        assert_resource_schema_error(error, "invalid_resource_handle");
+
+        let (mut vm, callable) = callable_vm(
+            &[OpCode::Ldc as u8, 0, 0, 0, 0, OpCode::Ret as u8],
+            vec![Value::Int(41)],
+            TypeSchema::Resource(resource_key()),
+            TypeSchema::Resource(resource_key()),
+        );
+        let handle = resource_handle(&mut vm);
+        let error = vm
+            .invoke_callable(callable, &[Value::Int(handle)])
+            .expect_err("invalid return handles must be rejected");
+        assert_resource_schema_error(error, "invalid_resource_handle");
+    }
+
+    #[test]
+    fn callable_container_schemas_recurse_into_resource_values() {
+        let mut fields = HashMap::new();
+        fields.insert("resource".to_string(), TypeSchema::Resource(resource_key()));
+        let schema = TypeSchema::Optional(Box::new(TypeSchema::ArrayTuple(vec![TypeSchema::Map(
+            Box::new(TypeSchema::Object(fields)),
+        )])));
+        let (mut vm, callable) =
+            callable_vm(&[OpCode::Ret as u8], Vec::new(), schema, TypeSchema::Null);
+        let handle = resource_handle(&mut vm);
+        let mut object = VmMap::new();
+        object.insert(Value::string("resource"), Value::Int(handle));
+        let mut map = VmMap::new();
+        map.insert(Value::string("entry"), Value::Map(object.into()));
+        let valid = Value::Array(vec![Value::Map(map.into())].into());
+        assert_eq!(
+            vm.invoke_callable(callable.clone(), &[valid])
+                .expect("nested live resource should pass"),
+            Value::Null
+        );
+
+        let mut bad_object = VmMap::new();
+        bad_object.insert(Value::string("resource"), Value::Int(41));
+        let mut bad_map = VmMap::new();
+        bad_map.insert(Value::string("entry"), Value::Map(bad_object.into()));
+        let invalid = Value::Array(vec![Value::Map(bad_map.into())].into());
+        let error = vm
+            .invoke_callable(callable, &[invalid])
+            .expect_err("nested arbitrary ints must not satisfy resources");
+        assert_resource_schema_error(error, "invalid_resource_handle");
+    }
 }

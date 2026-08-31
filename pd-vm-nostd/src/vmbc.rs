@@ -3,14 +3,19 @@ use alloc::vec::Vec;
 
 use super::{
     CallableKind, CallablePrototype, CallableTarget, CaptureBindingMode, ExportedCallable,
-    FunctionRegion, HostImport, Program, RootCallableBinding, ScriptFunction, Value, ValueType,
-    WireError,
+    FunctionRegion, HostImport, MAX_FRAME_LOCAL_COUNT, OpCode, Program, RootCallableBinding,
+    ScriptFunction, Value, ValueType, WireError,
 };
 
 const MAGIC: [u8; 4] = *b"VMBC";
 const VERSION_V11: u16 = 11;
 const VERSION_V12: u16 = 12;
 const FLAGS: u16 = 0;
+const MAX_WIRE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+const MAX_WIRE_BLOB_BYTES: usize = 16 * 1024 * 1024;
+const MAX_WIRE_COUNT: usize = 1_000_000;
+const MAX_WIRE_AGGREGATE_ITEMS: usize = 1_000_000;
+const MAX_RESOURCE_KEY_LEN: usize = 128;
 const MAX_SCHEMA_DEPTH: usize = 64;
 const MAX_CONSTANT_DEPTH: usize = 64;
 
@@ -24,9 +29,15 @@ fn read_constant(cursor: &mut Cursor<'_>, depth: usize) -> Result<Value, WireErr
         2 => Ok(Value::string(cursor.read_string()?)),
         3 => Ok(Value::Float(cursor.read_f64()?)),
         4 => Ok(Value::Null),
-        5 => Ok(Value::bytes(cursor.read_blob()?.to_vec())),
+        5 => {
+            let bytes = cursor.read_blob("constant bytes")?;
+            let mut owned = Vec::new();
+            reserve(&mut owned, "constant bytes", bytes.len())?;
+            owned.extend_from_slice(bytes);
+            Ok(Value::bytes(owned))
+        }
         6 => {
-            let count = cursor.read_u32()? as usize;
+            let count = cursor.read_count("constant array", 1)?;
             let mut values = Vec::new();
             reserve(&mut values, "constant array", count)?;
             for _ in 0..count {
@@ -35,7 +46,7 @@ fn read_constant(cursor: &mut Cursor<'_>, depth: usize) -> Result<Value, WireErr
             Ok(Value::array(values))
         }
         7 => {
-            let count = cursor.read_u32()? as usize;
+            let count = cursor.read_count("constant map", 2)?;
             let mut entries = Vec::new();
             reserve(&mut entries, "constant map", count)?;
             for _ in 0..count {
@@ -51,6 +62,9 @@ fn read_constant(cursor: &mut Cursor<'_>, depth: usize) -> Result<Value, WireErr
 }
 
 pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
+    if bytes.len() > MAX_WIRE_PAYLOAD_BYTES {
+        return Err(WireError::LengthTooLarge("payload", bytes.len()));
+    }
     let mut cursor = Cursor::new(bytes);
     let magic = cursor.read_array::<4>()?;
     if magic != MAGIC {
@@ -68,15 +82,21 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
         return Err(WireError::UnsupportedFlags(flags));
     }
 
-    let constant_count = cursor.read_u32()? as usize;
+    let constant_count = cursor.read_count("constants", 1)?;
     let mut constants = Vec::new();
     reserve(&mut constants, "constants", constant_count)?;
     for _ in 0..constant_count {
         constants.push(read_constant(&mut cursor, 0)?);
     }
 
-    let code = cursor.read_blob()?.to_vec();
-    let import_count = cursor.read_u32()? as usize;
+    let code_bytes = cursor.read_blob("code")?;
+    let mut code = Vec::new();
+    reserve(&mut code, "code", code_bytes.len())?;
+    code.extend_from_slice(code_bytes);
+    if version == VERSION_V11 && code.contains(&(OpCode::CallScript as u8)) {
+        return Err(WireError::UnsupportedVersion(VERSION_V11));
+    }
+    let import_count = cursor.read_count("imports", if has_host_import_schemas { 7 } else { 6 })?;
     let mut imports = Vec::new();
     reserve(&mut imports, "imports", import_count)?;
     for _ in 0..import_count {
@@ -106,6 +126,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     if !cursor.is_empty() {
         return Err(WireError::TrailingBytes);
     }
+    validate_call_script_operands(&code, &callable_prototypes)?;
 
     let program = Program::new(constants, code, imports);
     let program = match encoded_local_count {
@@ -136,7 +157,10 @@ fn skip_type_map(cursor: &mut Cursor<'_>) -> Result<Option<usize>, WireError> {
         0 => Ok(None),
         1 => {
             cursor.read_bool()?;
-            let local_count = cursor.read_u32()? as usize;
+            let local_count = cursor.read_count_with_overhead("type map locals", 4, 12)?;
+            if local_count > MAX_FRAME_LOCAL_COUNT {
+                return Err(WireError::LengthTooLarge("type map locals", local_count));
+            }
             for _ in 0..local_count {
                 read_value_type(cursor.read_u8()?)?;
             }
@@ -150,7 +174,7 @@ fn skip_type_map(cursor: &mut Cursor<'_>) -> Result<Option<usize>, WireError> {
             skip_bool_vector(cursor, local_count)?;
             skip_bool_vector(cursor, local_count)?;
 
-            let operand_count = cursor.read_u32()? as usize;
+            let operand_count = cursor.read_count("type map operands", 6)?;
             for _ in 0..operand_count {
                 cursor.read_u32()?;
                 read_value_type(cursor.read_u8()?)?;
@@ -167,6 +191,8 @@ fn skip_bool_vector(cursor: &mut Cursor<'_>, expected: usize) -> Result<(), Wire
     if count != expected {
         return Err(WireError::TrailingBytes);
     }
+    cursor.validate_count("type map boolean vector", count, 1)?;
+    cursor.debit_count("type map boolean vector", count)?;
     for _ in 0..count {
         cursor.read_bool()?;
     }
@@ -175,7 +201,7 @@ fn skip_bool_vector(cursor: &mut Cursor<'_>, expected: usize) -> Result<(), Wire
 
 fn skip_host_import_schema(cursor: &mut Cursor<'_>) -> Result<(), WireError> {
     cursor.skip_string()?;
-    let parameter_count = cursor.read_u32()? as usize;
+    let parameter_count = cursor.read_count("host import schema parameters", 6)?;
     for _ in 0..parameter_count {
         cursor.skip_string()?;
         skip_host_schema(cursor, 0)?;
@@ -196,7 +222,8 @@ fn skip_host_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<(), WireErr
         0..=7 => Ok(()),
         8..=10 => skip_host_schema(cursor, depth + 1),
         11 => {
-            let parameter_count = cursor.read_u32()? as usize;
+            let parameter_count =
+                cursor.read_count_with_overhead("host callable parameters", 1, 1)?;
             for _ in 0..parameter_count {
                 skip_host_schema(cursor, depth + 1)?;
             }
@@ -211,13 +238,14 @@ fn skip_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<(), WireError> {
     if depth >= MAX_SCHEMA_DEPTH {
         return Err(WireError::SchemaTooDeep);
     }
-    let nested_depth = depth + 1;
+    cursor.debit_count("schema nodes", 1)?;
+    let nested_depth = depth.checked_add(1).ok_or(WireError::SchemaTooDeep)?;
     match cursor.read_u8()? {
         0..=7 => Ok(()),
         8 => cursor.skip_string(),
         9 => {
             cursor.skip_string()?;
-            let count = cursor.read_u32()? as usize;
+            let count = cursor.read_count("schema type args", 1)?;
             for _ in 0..count {
                 skip_schema(cursor, nested_depth)?;
             }
@@ -225,21 +253,21 @@ fn skip_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<(), WireError> {
         }
         10 | 13 | 16 => skip_schema(cursor, nested_depth),
         11 => {
-            let count = cursor.read_u32()? as usize;
+            let count = cursor.read_count("schema tuple items", 1)?;
             for _ in 0..count {
                 skip_schema(cursor, nested_depth)?;
             }
             Ok(())
         }
         12 => {
-            let count = cursor.read_u32()? as usize;
+            let count = cursor.read_count_with_overhead("schema tuple prefix", 1, 1)?;
             for _ in 0..count {
                 skip_schema(cursor, nested_depth)?;
             }
             skip_schema(cursor, nested_depth)
         }
         14 => {
-            let count = cursor.read_u32()? as usize;
+            let count = cursor.read_count("schema object fields", 5)?;
             for _ in 0..count {
                 cursor.skip_string()?;
                 skip_schema(cursor, nested_depth)?;
@@ -247,14 +275,42 @@ fn skip_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<(), WireError> {
             Ok(())
         }
         15 => {
-            let count = cursor.read_u32()? as usize;
+            let count = cursor.read_count_with_overhead("schema callable params", 1, 1)?;
             for _ in 0..count {
                 skip_schema(cursor, nested_depth)?;
             }
             skip_schema(cursor, nested_depth)
         }
+        17 => skip_resource_key(cursor),
         value => Err(WireError::InvalidValueType(value)),
     }
+}
+
+fn skip_resource_key(cursor: &mut Cursor<'_>) -> Result<(), WireError> {
+    let bytes = cursor.read_blob("schema resource key")?;
+    if bytes.is_empty() || bytes.len() > MAX_RESOURCE_KEY_LEN {
+        return Err(WireError::InvalidResourceKey);
+    }
+    core::str::from_utf8(bytes).map_err(|_| WireError::InvalidUtf8)?;
+    let mut segment_start = 0;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        let allowed = byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
+            || matches!(byte, b'_' | b'-' | b'.');
+        if !allowed {
+            return Err(WireError::InvalidResourceKey);
+        }
+        if byte == b'.' {
+            if index == segment_start {
+                return Err(WireError::InvalidResourceKey);
+            }
+            segment_start = index + 1;
+        }
+    }
+    if segment_start == bytes.len() {
+        return Err(WireError::InvalidResourceKey);
+    }
+    Ok(())
 }
 
 type CallableMetadata = (
@@ -266,7 +322,7 @@ type CallableMetadata = (
 );
 
 fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, WireError> {
-    let function_count = cursor.read_u32()? as usize;
+    let function_count = cursor.read_count("script functions", 8)?;
     let mut script_functions = Vec::new();
     reserve(&mut script_functions, "script functions", function_count)?;
     for _ in 0..function_count {
@@ -276,7 +332,7 @@ fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, W
         });
     }
 
-    let prototype_count = cursor.read_u32()? as usize;
+    let prototype_count = cursor.read_count("callable prototypes", 29)?;
     let mut prototypes = Vec::new();
     reserve(&mut prototypes, "callable prototypes", prototype_count)?;
     for _ in 0..prototype_count {
@@ -296,14 +352,14 @@ fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, W
             value => return Err(WireError::InvalidValueType(value)),
         };
         let arity = cursor.read_u8()?;
-        let frame_local_count = cursor.read_u32()? as usize;
-        let parameter_count = cursor.read_u32()? as usize;
+        let frame_local_count = cursor.read_limited_count("callable frame locals")?;
+        let parameter_count = cursor.read_count("callable parameters", 2)?;
         let mut parameter_slots = Vec::new();
         reserve(&mut parameter_slots, "callable parameters", parameter_count)?;
         for _ in 0..parameter_count {
             parameter_slots.push(cursor.read_u16()?);
         }
-        let capture_source_count = cursor.read_u32()? as usize;
+        let capture_source_count = cursor.read_count("callable capture sources", 2)?;
         let mut capture_source_slots = Vec::new();
         reserve(
             &mut capture_source_slots,
@@ -313,13 +369,13 @@ fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, W
         for _ in 0..capture_source_count {
             capture_source_slots.push(cursor.read_u16()?);
         }
-        let capture_count = cursor.read_u32()? as usize;
+        let capture_count = cursor.read_count("callable captures", 2)?;
         let mut capture_slots = Vec::new();
         reserve(&mut capture_slots, "callable captures", capture_count)?;
         for _ in 0..capture_count {
             capture_slots.push(cursor.read_u16()?);
         }
-        let capture_mode_count = cursor.read_u32()? as usize;
+        let capture_mode_count = cursor.read_count("callable capture modes", 1)?;
         let mut capture_modes = Vec::new();
         reserve(
             &mut capture_modes,
@@ -352,7 +408,7 @@ fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, W
         });
     }
 
-    let region_count = cursor.read_u32()? as usize;
+    let region_count = cursor.read_count("function regions", 9)?;
     let mut regions = Vec::new();
     reserve(&mut regions, "function regions", region_count)?;
     for _ in 0..region_count {
@@ -366,7 +422,7 @@ fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, W
         });
     }
 
-    let binding_count = cursor.read_u32()? as usize;
+    let binding_count = cursor.read_count("root callable bindings", 6)?;
     let mut bindings = Vec::new();
     reserve(&mut bindings, "root callable bindings", binding_count)?;
     for _ in 0..binding_count {
@@ -375,7 +431,7 @@ fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, W
             prototype_id: cursor.read_u32()?,
         });
     }
-    let export_count = cursor.read_u32()? as usize;
+    let export_count = cursor.read_count("exported callables", 6)?;
     let mut exported_callables = Vec::new();
     reserve(&mut exported_callables, "exported callables", export_count)?;
     for _ in 0..export_count {
@@ -393,6 +449,64 @@ fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, W
     ))
 }
 
+/// Deterministically reject malformed or inconsistent `CallScript` operands,
+/// mirroring the std VMBC V12 decoder: truncated operands, out-of-range
+/// prototype ids, prototypes that do not target a script function, and argc
+/// values that disagree with the prototype arity.
+fn validate_call_script_operands(
+    code: &[u8],
+    prototypes: &[CallablePrototype],
+) -> Result<(), WireError> {
+    let mut ip = 0usize;
+    while ip < code.len() {
+        let opcode_byte = code[ip];
+        let Ok(opcode) = OpCode::try_from(opcode_byte) else {
+            // Unknown opcodes surface as `InvalidOpcode` at run time; skip a
+            // single byte so the walk stays aligned for the opcodes that
+            // follow.
+            ip = ip.saturating_add(1);
+            continue;
+        };
+        let operand_len = opcode.operand_len();
+        let operands_start = ip.saturating_add(1);
+        let operands_end = operands_start
+            .checked_add(operand_len)
+            .ok_or(WireError::LengthTooLarge("code", code.len()))?;
+        if operands_end > code.len() {
+            return Err(WireError::TruncatedOperand {
+                opcode: opcode_byte,
+                expected_bytes: operand_len,
+            });
+        }
+        if matches!(opcode, OpCode::CallScript) {
+            let prototype_id = u32::from_le_bytes(
+                code[operands_start..operands_start + 4]
+                    .try_into()
+                    .expect("operand width validated above"),
+            );
+            let argc = code[operands_start + 4];
+            let Some(prototype) = prototypes.get(prototype_id as usize) else {
+                return Err(WireError::InvalidCallScriptTarget { prototype_id });
+            };
+            // `CallScript` is a static script-function call: a host-import
+            // prototype must never be routed to the host path, so reject it
+            // deterministically here as well.
+            if !matches!(prototype.target, CallableTarget::ScriptFunction(_)) {
+                return Err(WireError::InvalidCallScriptTarget { prototype_id });
+            }
+            if argc != prototype.arity {
+                return Err(WireError::InvalidCallScriptArity {
+                    prototype_id,
+                    expected: prototype.arity,
+                    got: argc,
+                });
+            }
+        }
+        ip = operands_end;
+    }
+    Ok(())
+}
+
 fn skip_debug_info(cursor: &mut Cursor<'_>) -> Result<(), WireError> {
     match cursor.read_u8()? {
         0 => Ok(()),
@@ -403,20 +517,20 @@ fn skip_debug_info(cursor: &mut Cursor<'_>) -> Result<(), WireError> {
                 value => return Err(WireError::InvalidDebugFlag(value)),
             }
 
-            let line_count = cursor.read_u32()? as usize;
+            let line_count = cursor.read_count("debug lines", 8)?;
             cursor.skip_count("debug lines", line_count, 8)?;
 
-            let function_count = cursor.read_u32()? as usize;
+            let function_count = cursor.read_count("debug functions", 8)?;
             for _ in 0..function_count {
                 cursor.skip_string()?;
-                let arg_count = cursor.read_u32()? as usize;
+                let arg_count = cursor.read_count("debug function args", 5)?;
                 for _ in 0..arg_count {
                     cursor.skip_string()?;
                     cursor.read_u8()?;
                 }
             }
 
-            let local_count = cursor.read_u32()? as usize;
+            let local_count = cursor.read_count("debug locals", 7)?;
             for _ in 0..local_count {
                 cursor.skip_string()?;
                 cursor.read_u8()?;
@@ -443,11 +557,16 @@ fn skip_optional_u32(cursor: &mut Cursor<'_>) -> Result<(), WireError> {
 struct Cursor<'a> {
     bytes: &'a [u8],
     offset: usize,
+    remaining_budget: usize,
 }
 
 impl<'a> Cursor<'a> {
     fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
+        Self {
+            bytes,
+            offset: 0,
+            remaining_budget: MAX_WIRE_AGGREGATE_ITEMS,
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -505,17 +624,98 @@ impl<'a> Cursor<'a> {
         Ok(bytes)
     }
 
-    fn read_blob(&mut self) -> Result<&'a [u8], WireError> {
+    fn read_blob(&mut self, field: &'static str) -> Result<&'a [u8], WireError> {
         let length = self.read_u32()? as usize;
+        if length > MAX_WIRE_BLOB_BYTES {
+            return Err(WireError::LengthTooLarge(field, length));
+        }
         self.read_exact(length)
     }
 
     fn read_string(&mut self) -> Result<String, WireError> {
-        String::from_utf8(self.read_blob()?.to_vec()).map_err(|_| WireError::InvalidUtf8)
+        let bytes = self.read_blob("string")?;
+        let text = core::str::from_utf8(bytes).map_err(|_| WireError::InvalidUtf8)?;
+        let mut owned = String::new();
+        owned
+            .try_reserve_exact(text.len())
+            .map_err(|_| WireError::LengthTooLarge("string", text.len()))?;
+        owned.push_str(text);
+        Ok(owned)
     }
 
     fn skip_string(&mut self) -> Result<(), WireError> {
-        self.read_blob().map(|_| ())
+        self.read_blob("string").map(|_| ())
+    }
+
+    fn read_count(
+        &mut self,
+        field: &'static str,
+        min_item_bytes: usize,
+    ) -> Result<usize, WireError> {
+        self.read_count_with_overhead(field, min_item_bytes, 0)
+    }
+
+    fn read_count_with_overhead(
+        &mut self,
+        field: &'static str,
+        min_item_bytes: usize,
+        fixed_bytes: usize,
+    ) -> Result<usize, WireError> {
+        let count = self.read_u32()? as usize;
+        self.validate_count_with_overhead(field, count, min_item_bytes, fixed_bytes)?;
+        self.debit_count(field, count)?;
+        Ok(count)
+    }
+
+    fn read_limited_count(&mut self, field: &'static str) -> Result<usize, WireError> {
+        let count = self.read_u32()? as usize;
+        if count > MAX_FRAME_LOCAL_COUNT {
+            return Err(WireError::LengthTooLarge(field, count));
+        }
+        self.debit_count(field, count)?;
+        Ok(count)
+    }
+
+    fn debit_count(&mut self, field: &'static str, count: usize) -> Result<(), WireError> {
+        if count > MAX_WIRE_COUNT {
+            return Err(WireError::LengthTooLarge(field, count));
+        }
+        self.remaining_budget = self
+            .remaining_budget
+            .checked_sub(count)
+            .ok_or(WireError::LengthTooLarge(field, count))?;
+        Ok(())
+    }
+
+    fn validate_count(
+        &self,
+        field: &'static str,
+        count: usize,
+        min_item_bytes: usize,
+    ) -> Result<(), WireError> {
+        self.validate_count_with_overhead(field, count, min_item_bytes, 0)
+    }
+
+    fn validate_count_with_overhead(
+        &self,
+        field: &'static str,
+        count: usize,
+        min_item_bytes: usize,
+        fixed_bytes: usize,
+    ) -> Result<(), WireError> {
+        if count > MAX_WIRE_COUNT {
+            return Err(WireError::LengthTooLarge(field, count));
+        }
+        let item_bytes = count
+            .checked_mul(min_item_bytes)
+            .ok_or(WireError::LengthTooLarge(field, count))?;
+        let required_bytes = item_bytes
+            .checked_add(fixed_bytes)
+            .ok_or(WireError::LengthTooLarge(field, count))?;
+        if required_bytes > self.remaining() {
+            return Err(WireError::LengthTooLarge(field, count));
+        }
+        Ok(())
     }
 
     fn skip_count(
@@ -528,5 +728,41 @@ impl<'a> Cursor<'a> {
             .checked_mul(item_size)
             .ok_or(WireError::LengthTooLarge(field, count))?;
         self.read_exact(length).map(|_| ())
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn bool_vectors_debit_one_shared_checked_budget() {
+        const COUNT: usize = 40_000;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(COUNT as u32).to_le_bytes());
+        bytes.extend(core::iter::repeat_n(0, COUNT));
+        bytes.extend_from_slice(&(COUNT as u32).to_le_bytes());
+        bytes.extend(core::iter::repeat_n(0, COUNT));
+        let mut cursor = Cursor::new(&bytes);
+        cursor.remaining_budget = COUNT * 2 - 1;
+
+        skip_bool_vector(&mut cursor, COUNT).unwrap();
+        assert_eq!(
+            skip_bool_vector(&mut cursor, COUNT),
+            Err(WireError::LengthTooLarge("type map boolean vector", COUNT))
+        );
+    }
+
+    #[test]
+    fn count_size_arithmetic_overflow_is_rejected() {
+        let cursor = Cursor::new(&[]);
+        assert_eq!(
+            cursor.validate_count_with_overhead("overflow", 2, usize::MAX, 0),
+            Err(WireError::LengthTooLarge("overflow", 2))
+        );
     }
 }

@@ -49,13 +49,47 @@
 
 use std::fmt;
 
-use serde::Deserialize;
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, VariantAccess, Visitor};
+use serde::ser::{SerializeStruct, SerializeStructVariant};
+use serde::{Deserialize, Serialize};
 
 /// Max byte length of a validated [`ResourceTypeKey`] name.
-const MAX_RESOURCE_KEY_LEN: usize = 128;
+pub const MAX_HOST_RESOURCE_KEY_LEN: usize = 128;
+const MAX_RESOURCE_KEY_LEN: usize = MAX_HOST_RESOURCE_KEY_LEN;
 
 /// Max byte length of a validated host function name.
-const MAX_FUNCTION_NAME_LEN: usize = 128;
+pub const MAX_HOST_FUNCTION_NAME_LEN: usize = 128;
+const MAX_FUNCTION_NAME_LEN: usize = MAX_HOST_FUNCTION_NAME_LEN;
+
+/// Maximum number of schema nodes along any single schema path. The root is
+/// counted as depth one. Keeping this at 64 bounds both validation work and
+/// the recursion used by serializers after validation.
+pub const MAX_HOST_SCHEMA_DEPTH: usize = 64;
+
+/// Maximum aggregate [`HostTypeSchema`] nodes in one schema or catalog.
+/// Arrays, maps, options and callable results count as nodes; callable
+/// parameter schemas count as nodes too.
+pub const MAX_HOST_SCHEMA_NODES: usize = 16_384;
+
+/// Maximum aggregate callable parameter/property slots in one schema or
+/// catalog. This bounds wide callable signatures and leaves room for future
+/// object-property schema variants without changing the budget contract.
+pub const MAX_HOST_SCHEMA_PROPERTIES: usize = 4_096;
+
+/// Maximum aggregate host-function/import parameter records in one catalog.
+pub const MAX_HOST_CATALOG_PARAMETERS: usize = 4_096;
+
+/// Maximum resource declarations in one catalog.
+pub const MAX_HOST_CATALOG_RESOURCES: usize = 1_024;
+
+/// Maximum function/overload declarations in one catalog.
+pub const MAX_HOST_CATALOG_FUNCTIONS: usize = 1_024;
+
+/// Maximum byte length of names on host parameter records.
+pub const MAX_HOST_PARAMETER_NAME_LEN: usize = 128;
+
+/// Maximum byte length of host resource/function documentation.
+pub const MAX_HOST_DESCRIPTION_LEN: usize = 4_096;
 
 /// 8-byte domain magic prepended to every fingerprint so digest bytes in one
 /// domain (host API catalogs) cannot be confused with unrelated FNV digests
@@ -141,12 +175,88 @@ impl fmt::Display for ResourceTypeKey {
     }
 }
 
+struct BoundedStringVisitor {
+    field: &'static str,
+    limit: usize,
+}
+
+impl<'de> Visitor<'de> for BoundedStringVisitor {
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "a UTF-8 string of at most {} bytes", self.limit)
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(value)
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if value.len() > self.limit {
+            return Err(E::custom(HostSchemaValidationError::StringTooLong {
+                field: self.field,
+                len: value.len(),
+                limit: self.limit,
+            }));
+        }
+        Ok(value.to_owned())
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if value.len() > self.limit {
+            return Err(E::custom(HostSchemaValidationError::StringTooLong {
+                field: self.field,
+                len: value.len(),
+                limit: self.limit,
+            }));
+        }
+        Ok(value)
+    }
+}
+
+fn deserialize_bounded_string<'de, D>(
+    deserializer: D,
+    field: &'static str,
+    limit: usize,
+) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserializer.deserialize_str(BoundedStringVisitor { field, limit })
+}
+
+struct BoundedStringSeed {
+    field: &'static str,
+    limit: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for BoundedStringSeed {
+    type Value = String;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_bounded_string(deserializer, self.field, self.limit)
+    }
+}
+
 impl<'de> Deserialize<'de> for ResourceTypeKey {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let text = String::deserialize(deserializer)?;
+        let text =
+            deserialize_bounded_string(deserializer, "resource type key", MAX_RESOURCE_KEY_LEN)?;
         Self::new(text).map_err(serde::de::Error::custom)
     }
 }
@@ -233,7 +343,7 @@ impl HostParamPassing {
 /// Covers the same scalar / collection / callable / unknown surface used by
 /// the compiler's inference pass, and adds an explicit [`Self::Resource`]
 /// variant that references a declared [`ResourceTypeKey`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum HostTypeSchema {
     Unknown,
     Null,
@@ -259,63 +369,387 @@ impl HostTypeSchema {
     /// single optional layer) denotes a host resource. This is a shallow
     /// helper; use [`Self::contains_resource`] for the full recursive test.
     pub fn resource_key(&self) -> Option<&ResourceTypeKey> {
-        match self {
-            Self::Resource(key) => Some(key),
-            Self::Optional(inner) => inner.resource_key(),
-            _ => None,
+        let mut current = self;
+        for _ in 0..MAX_HOST_SCHEMA_DEPTH {
+            match current {
+                Self::Resource(key) => return Some(key),
+                Self::Optional(inner) => current = inner,
+                _ => return None,
+            }
         }
+        None
+    }
+
+    /// Validates the complete schema using the shared bounded validator.
+    pub fn validate(&self) -> Result<(), HostSchemaValidationError> {
+        let mut budget = ComplexityBudget::default();
+        let mut on_resource = |_key: &ResourceTypeKey| {};
+        validate_type_schema_with_budget(self, &mut budget, &mut on_resource).map(|_| ())
     }
 
     /// Whether this schema references at least one resource, anywhere in the
     /// tree (direct, `Optional`, `Array`, `Map` value, or inside a `Callable`
     /// parameter/result).
     pub fn contains_resource(&self) -> bool {
-        match self {
-            Self::Resource(_) => true,
-            Self::Array(inner) | Self::Map(inner) | Self::Optional(inner) => {
-                inner.contains_resource()
-            }
-            Self::Callable { params, result } => {
-                params.iter().any(|param| param.contains_resource()) || result.contains_resource()
-            }
-            Self::Unknown
-            | Self::Null
-            | Self::Int
-            | Self::Float
-            | Self::Number
-            | Self::Bool
-            | Self::String
-            | Self::Bytes => false,
-        }
+        let mut budget = ComplexityBudget::default();
+        let mut on_resource = |_key: &ResourceTypeKey| {};
+        validate_type_schema_with_budget(self, &mut budget, &mut on_resource).unwrap_or(false)
     }
 
     /// Collects every resource key referenced anywhere in this schema tree.
     pub fn collect_resource_keys<'a>(&'a self, out: &mut Vec<&'a ResourceTypeKey>) {
+        let mut budget = ComplexityBudget::default();
+        let mut on_resource = |key: &'a ResourceTypeKey| out.push(key);
+        let _ = validate_type_schema_with_budget(self, &mut budget, &mut on_resource);
+    }
+}
+
+impl Serialize for HostTypeSchema {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
         match self {
-            Self::Resource(key) => out.push(key),
-            Self::Array(inner) | Self::Map(inner) | Self::Optional(inner) => {
-                inner.collect_resource_keys(out);
+            Self::Unknown => serializer.serialize_unit_variant("HostTypeSchema", 0, "Unknown"),
+            Self::Null => serializer.serialize_unit_variant("HostTypeSchema", 1, "Null"),
+            Self::Int => serializer.serialize_unit_variant("HostTypeSchema", 2, "Int"),
+            Self::Float => serializer.serialize_unit_variant("HostTypeSchema", 3, "Float"),
+            Self::Number => serializer.serialize_unit_variant("HostTypeSchema", 4, "Number"),
+            Self::Bool => serializer.serialize_unit_variant("HostTypeSchema", 5, "Bool"),
+            Self::String => serializer.serialize_unit_variant("HostTypeSchema", 6, "String"),
+            Self::Bytes => serializer.serialize_unit_variant("HostTypeSchema", 7, "Bytes"),
+            Self::Array(inner) => {
+                serializer.serialize_newtype_variant("HostTypeSchema", 8, "Array", inner)
+            }
+            Self::Map(inner) => {
+                serializer.serialize_newtype_variant("HostTypeSchema", 9, "Map", inner)
+            }
+            Self::Optional(inner) => {
+                serializer.serialize_newtype_variant("HostTypeSchema", 10, "Optional", inner)
             }
             Self::Callable { params, result } => {
-                for param in params {
-                    param.collect_resource_keys(out);
-                }
-                result.collect_resource_keys(out);
+                let mut state =
+                    serializer.serialize_struct_variant("HostTypeSchema", 11, "Callable", 2)?;
+                state.serialize_field("params", params)?;
+                state.serialize_field("result", result)?;
+                state.end()
             }
-            Self::Unknown
-            | Self::Null
-            | Self::Int
-            | Self::Float
-            | Self::Number
-            | Self::Bool
-            | Self::String
-            | Self::Bytes => {}
+            Self::Resource(key) => {
+                serializer.serialize_newtype_variant("HostTypeSchema", 12, "Resource", key)
+            }
         }
+    }
+}
+
+#[derive(Deserialize)]
+enum HostTypeSchemaVariant {
+    Unknown,
+    Null,
+    Int,
+    Float,
+    Number,
+    Bool,
+    String,
+    Bytes,
+    Array,
+    Map,
+    Optional,
+    Callable,
+    Resource,
+}
+
+struct HostTypeSchemaSeed<'a> {
+    budget: &'a mut ComplexityBudget,
+    depth: usize,
+    property: bool,
+}
+
+impl<'de> DeserializeSeed<'de> for HostTypeSchemaSeed<'_> {
+    type Value = HostTypeSchema;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if self.depth > MAX_HOST_SCHEMA_DEPTH {
+            return Err(de::Error::custom(
+                HostSchemaValidationError::NestingDepthExceeded {
+                    limit: MAX_HOST_SCHEMA_DEPTH,
+                },
+            ));
+        }
+        if self.property {
+            self.budget
+                .charge_properties(1)
+                .map_err(de::Error::custom)?;
+        }
+        self.budget.charge_nodes(1).map_err(de::Error::custom)?;
+        deserializer.deserialize_enum(
+            "HostTypeSchema",
+            &[
+                "Unknown", "Null", "Int", "Float", "Number", "Bool", "String", "Bytes", "Array",
+                "Map", "Optional", "Callable", "Resource",
+            ],
+            HostTypeSchemaVisitor {
+                budget: self.budget,
+                depth: self.depth,
+            },
+        )
+    }
+}
+
+struct HostTypeSchemaVisitor<'a> {
+    budget: &'a mut ComplexityBudget,
+    depth: usize,
+}
+
+impl<'de> Visitor<'de> for HostTypeSchemaVisitor<'_> {
+    type Value = HostTypeSchema;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded HostTypeSchema enum")
+    }
+
+    fn visit_enum<A>(self, data: A) -> Result<Self::Value, A::Error>
+    where
+        A: de::EnumAccess<'de>,
+    {
+        let (variant, access) = data.variant::<HostTypeSchemaVariant>()?;
+        match variant {
+            HostTypeSchemaVariant::Unknown => {
+                access.unit_variant().map(|()| HostTypeSchema::Unknown)
+            }
+            HostTypeSchemaVariant::Null => access.unit_variant().map(|()| HostTypeSchema::Null),
+            HostTypeSchemaVariant::Int => access.unit_variant().map(|()| HostTypeSchema::Int),
+            HostTypeSchemaVariant::Float => access.unit_variant().map(|()| HostTypeSchema::Float),
+            HostTypeSchemaVariant::Number => access.unit_variant().map(|()| HostTypeSchema::Number),
+            HostTypeSchemaVariant::Bool => access.unit_variant().map(|()| HostTypeSchema::Bool),
+            HostTypeSchemaVariant::String => access.unit_variant().map(|()| HostTypeSchema::String),
+            HostTypeSchemaVariant::Bytes => access.unit_variant().map(|()| HostTypeSchema::Bytes),
+            HostTypeSchemaVariant::Array => {
+                let depth = next_schema_depth::<A::Error>(self.depth)?;
+                access
+                    .newtype_variant_seed(HostTypeSchemaSeed {
+                        budget: self.budget,
+                        depth,
+                        property: false,
+                    })
+                    .map(|inner| HostTypeSchema::Array(Box::new(inner)))
+            }
+            HostTypeSchemaVariant::Map => {
+                let depth = next_schema_depth::<A::Error>(self.depth)?;
+                access
+                    .newtype_variant_seed(HostTypeSchemaSeed {
+                        budget: self.budget,
+                        depth,
+                        property: false,
+                    })
+                    .map(|inner| HostTypeSchema::Map(Box::new(inner)))
+            }
+            HostTypeSchemaVariant::Optional => {
+                let depth = next_schema_depth::<A::Error>(self.depth)?;
+                access
+                    .newtype_variant_seed(HostTypeSchemaSeed {
+                        budget: self.budget,
+                        depth,
+                        property: false,
+                    })
+                    .map(|inner| HostTypeSchema::Optional(Box::new(inner)))
+            }
+            HostTypeSchemaVariant::Callable => access
+                .newtype_variant_seed(CallableSchemaSeed {
+                    budget: self.budget,
+                    depth: self.depth,
+                })
+                .map(|(params, result)| HostTypeSchema::Callable { params, result }),
+            HostTypeSchemaVariant::Resource => access
+                .newtype_variant::<ResourceTypeKey>()
+                .map(HostTypeSchema::Resource),
+        }
+    }
+}
+
+fn next_schema_depth<E>(depth: usize) -> Result<usize, E>
+where
+    E: de::Error,
+{
+    depth.checked_add(1).ok_or_else(|| {
+        E::custom(HostSchemaValidationError::IntegerOverflow {
+            field: "schema depth",
+        })
+    })
+}
+
+impl<'de> Deserialize<'de> for HostTypeSchema {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut budget = ComplexityBudget::default();
+        HostTypeSchemaSeed {
+            budget: &mut budget,
+            depth: 1,
+            property: false,
+        }
+        .deserialize(deserializer)
+    }
+}
+
+struct CallableSchemaSeed<'a> {
+    budget: &'a mut ComplexityBudget,
+    depth: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for CallableSchemaSeed<'_> {
+    type Value = (Vec<HostTypeSchema>, Box<HostTypeSchema>);
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let child_depth = next_schema_depth::<D::Error>(self.depth)?;
+        deserializer.deserialize_struct(
+            "HostTypeSchema::Callable",
+            &["params", "result"],
+            CallableSchemaVisitor {
+                budget: self.budget,
+                child_depth,
+            },
+        )
+    }
+}
+
+struct CallableSchemaVisitor<'a> {
+    budget: &'a mut ComplexityBudget,
+    child_depth: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum CallableField {
+    Params,
+    Result,
+}
+
+impl<'de> Visitor<'de> for CallableSchemaVisitor<'_> {
+    type Value = (Vec<HostTypeSchema>, Box<HostTypeSchema>);
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a callable schema object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        bounded_map_size_hint(map.size_hint(), "callable schema", 2)?;
+        let mut entries = 0;
+        let mut params = None;
+        let mut result = None;
+        loop {
+            let Some(field) = map.next_key::<CallableField>()? else {
+                break;
+            };
+            bounded_map_entry(&mut entries, "callable schema", 2)?;
+            match field {
+                CallableField::Params => {
+                    if params.is_some() {
+                        return Err(de::Error::duplicate_field("params"));
+                    }
+                    params = Some(map.next_value_seed(HostSchemaListSeed {
+                        budget: self.budget,
+                        depth: self.child_depth,
+                    })?);
+                }
+                CallableField::Result => {
+                    if result.is_some() {
+                        return Err(de::Error::duplicate_field("result"));
+                    }
+                    result = Some(Box::new(map.next_value_seed(HostTypeSchemaSeed {
+                        budget: self.budget,
+                        depth: self.child_depth,
+                        property: false,
+                    })?));
+                }
+            }
+        }
+        let params = params.ok_or_else(|| de::Error::missing_field("params"))?;
+        let result = result.ok_or_else(|| de::Error::missing_field("result"))?;
+        Ok((params, result))
+    }
+}
+
+struct HostSchemaListSeed<'a> {
+    budget: &'a mut ComplexityBudget,
+    depth: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for HostSchemaListSeed<'_> {
+    type Value = Vec<HostTypeSchema>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(HostSchemaListVisitor {
+            budget: self.budget,
+            depth: self.depth,
+        })
+    }
+}
+
+struct HostSchemaListVisitor<'a> {
+    budget: &'a mut ComplexityBudget,
+    depth: usize,
+}
+
+impl<'de> Visitor<'de> for HostSchemaListVisitor<'_> {
+    type Value = Vec<HostTypeSchema>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded schema list")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let hint = seq.size_hint();
+        let capacity = bounded_sequence_capacity(
+            hint,
+            MAX_HOST_SCHEMA_PROPERTIES - self.budget.properties,
+            HostSchemaValidationError::PropertyBudgetExceeded {
+                limit: MAX_HOST_SCHEMA_PROPERTIES,
+            },
+        )?;
+        let mut values = Vec::new();
+        if capacity != 0 {
+            values.try_reserve_exact(capacity).map_err(|_| {
+                de::Error::custom(HostSchemaValidationError::AllocationFailed {
+                    field: "callable parameters",
+                })
+            })?;
+        }
+        while let Some(value) = seq.next_element_seed(HostTypeSchemaSeed {
+            budget: self.budget,
+            depth: self.depth,
+            property: true,
+        })? {
+            values.try_reserve_exact(1).map_err(|_| {
+                de::Error::custom(HostSchemaValidationError::AllocationFailed {
+                    field: "callable parameters",
+                })
+            })?;
+            values.push(value);
+        }
+        Ok(values)
     }
 }
 
 impl fmt::Display for HostTypeSchema {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.validate().map_err(|_| fmt::Error)?;
         match self {
             Self::Unknown => write!(f, "unknown"),
             Self::Null => write!(f, "null"),
@@ -344,7 +778,7 @@ impl fmt::Display for HostTypeSchema {
 }
 
 /// Semantic description of one declared host resource type.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResourceTypeSchema {
     /// The stable, validated resource type key.
     pub key: ResourceTypeKey,
@@ -361,8 +795,88 @@ impl ResourceTypeSchema {
     }
 }
 
+impl Serialize for ResourceTypeSchema {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        validate_description(&self.description).map_err(serde::ser::Error::custom)?;
+        let mut state = serializer.serialize_struct("ResourceTypeSchema", 2)?;
+        state.serialize_field("key", &self.key)?;
+        state.serialize_field("description", &self.description)?;
+        state.end()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum ResourceSchemaField {
+    Key,
+    Description,
+}
+
+struct ResourceTypeSchemaVisitor;
+
+impl<'de> Visitor<'de> for ResourceTypeSchemaVisitor {
+    type Value = ResourceTypeSchema;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded resource type schema object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        bounded_map_size_hint(map.size_hint(), "resource schema", 2)?;
+        let mut entries = 0;
+        let mut key = None;
+        let mut description = None;
+        loop {
+            let Some(field) = map.next_key::<ResourceSchemaField>()? else {
+                break;
+            };
+            bounded_map_entry(&mut entries, "resource schema", 2)?;
+            match field {
+                ResourceSchemaField::Key => {
+                    if key.is_some() {
+                        return Err(de::Error::duplicate_field("key"));
+                    }
+                    key = Some(map.next_value::<ResourceTypeKey>()?);
+                }
+                ResourceSchemaField::Description => {
+                    if description.is_some() {
+                        return Err(de::Error::duplicate_field("description"));
+                    }
+                    description = Some(map.next_value_seed(BoundedStringSeed {
+                        field: "description",
+                        limit: MAX_HOST_DESCRIPTION_LEN,
+                    })?);
+                }
+            }
+        }
+        Ok(ResourceTypeSchema {
+            key: key.ok_or_else(|| de::Error::missing_field("key"))?,
+            description: description.ok_or_else(|| de::Error::missing_field("description"))?,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ResourceTypeSchema {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_struct(
+            "ResourceTypeSchema",
+            &["key", "description"],
+            ResourceTypeSchemaVisitor,
+        )
+    }
+}
+
 /// Semantic description of one host function parameter.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HostParamSchema {
     /// Parameter name, unique within its function.
     pub name: String,
@@ -399,7 +913,7 @@ impl HostParamSchema {
 ///
 /// Only semantic fields (name, parameters, passing modes, return type) feed
 /// the catalog fingerprint; `description` is documentation and is excluded.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostFunctionSchema {
     pub name: String,
     pub params: Vec<HostParamSchema>,
@@ -436,44 +950,78 @@ impl HostFunctionSchema {
         self
     }
 
+    /// Returns a stable, collision-free token for this function's semantic
+    /// identity. The token includes the canonical name, every parameter name,
+    /// parameter schema, passing mode and return schema; documentation is not
+    /// part of the token. It is suitable for an opaque URI segment used by a
+    /// language-service definition location.
+    pub fn identity_discriminator(&self) -> String {
+        self.try_identity_discriminator()
+            .unwrap_or_else(|error| format!("invalid-host-schema:{error}"))
+    }
+
+    /// Fallible identity rendering for callers that need to surface malformed
+    /// manually-constructed schemas instead of using the compatibility fallback.
+    pub fn try_identity_discriminator(&self) -> Result<String, HostSchemaValidationError> {
+        let bytes = self.try_semantic_bytes()?;
+        let capacity =
+            bytes
+                .len()
+                .checked_mul(2)
+                .ok_or(HostSchemaValidationError::IntegerOverflow {
+                    field: "identity discriminator",
+                })?;
+        let mut identity = String::new();
+        identity.try_reserve_exact(capacity).map_err(|_| {
+            HostSchemaValidationError::AllocationFailed {
+                field: "identity discriminator",
+            }
+        })?;
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in bytes {
+            identity.push(char::from(HEX[usize::from(byte >> 4)]));
+            identity.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        Ok(identity)
+    }
+
     /// Canonical semantic bytes for this function: name, then the parameter
     /// list (each parameter’s name, type and passing mode), then the return
     /// type. This is the full semantic encoding used by the catalog
     /// fingerprint, so any semantic change (including a parameter-label or
     /// return-type change) alters the digest. It is **not** used for overload
-    /// identity — see [`Self::overload_identity_bytes`].
+    /// identity — see [`Self::try_overload_identity_bytes`].
     fn semantic_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        push_len_str(&mut bytes, &self.name);
-        push_len(&mut bytes, self.params.len());
-        for param in &self.params {
-            push_len_str(&mut bytes, &param.name);
-            push_type(&mut bytes, &param.ty);
-            push_tag(&mut bytes, passing_tag(param.passing));
-        }
-        push_type(&mut bytes, &self.return_type);
-        bytes
+        self.try_semantic_bytes()
+            .unwrap_or_else(|error| invalid_schema_bytes(&error))
     }
 
-    /// Canonical overload-identity bytes: the function name plus the ordered
-    /// parameter type schemas and passing modes only. Parameter names, the
-    /// return schema and documentation are deliberately excluded, so two
-    /// functions have the same identity precisely when their name and argument
-    /// type/passing sequence match. Because argument shape is what dispatch
-    /// and call sites resolve on, that identity being shared makes the
-    /// overload set ambiguous regardless of labels or return type.
-    ///
-    /// This key feeds overload duplicate detection only — never the catalog
-    /// fingerprint, which keeps using [`Self::semantic_bytes`].
-    fn overload_identity_bytes(&self) -> Vec<u8> {
+    fn try_semantic_bytes(&self) -> Result<Vec<u8>, HostSchemaValidationError> {
+        let mut budget = ComplexityBudget::default();
+        validate_function_shape(self, &mut budget)?;
         let mut bytes = Vec::new();
-        push_len_str(&mut bytes, &self.name);
-        push_len(&mut bytes, self.params.len());
+        push_len_str(&mut bytes, &self.name)?;
+        push_len(&mut bytes, self.params.len())?;
         for param in &self.params {
-            push_type(&mut bytes, &param.ty);
+            push_len_str(&mut bytes, &param.name)?;
+            try_push_type(&mut bytes, &param.ty)?;
             push_tag(&mut bytes, passing_tag(param.passing));
         }
-        bytes
+        try_push_type(&mut bytes, &self.return_type)?;
+        Ok(bytes)
+    }
+
+    fn try_overload_identity_bytes(&self) -> Result<Vec<u8>, HostSchemaValidationError> {
+        let mut budget = ComplexityBudget::default();
+        validate_function_shape(self, &mut budget)?;
+        let mut bytes = Vec::new();
+        push_len_str(&mut bytes, &self.name)?;
+        push_len(&mut bytes, self.params.len())?;
+        for param in &self.params {
+            try_push_type(&mut bytes, &param.ty)?;
+            push_tag(&mut bytes, passing_tag(param.passing));
+        }
+        Ok(bytes)
     }
 }
 
@@ -482,7 +1030,7 @@ impl HostFunctionSchema {
 /// The field names intentionally mirror the public catalog schema while
 /// keeping the import representation independent from the catalog's prose
 /// documentation.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HostImportParam {
     pub name: String,
     pub schema: HostTypeSchema,
@@ -494,7 +1042,7 @@ pub struct HostImportParam {
 /// Runtime binding uses every field here. In particular, parameter resource
 /// keys, the return schema, the function name and the catalog fingerprint are
 /// retained; arity is only a cheap preliminary check and never an identity.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HostImportSchema {
     pub name: String,
     pub params: Vec<HostImportParam>,
@@ -525,7 +1073,680 @@ impl HostImportSchema {
     }
 }
 
-/// Why a host function name is invalid.
+impl HostParamSchema {
+    /// Validates this parameter's bounded name and type structure.
+    pub fn validate(&self) -> Result<(), HostSchemaValidationError> {
+        validate_parameter_name(&self.name)?;
+        let mut budget = ComplexityBudget::default();
+        let mut on_resource = |_key: &ResourceTypeKey| {};
+        validate_type_schema_with_budget(&self.ty, &mut budget, &mut on_resource).map(|_| ())
+    }
+}
+
+impl HostImportParam {
+    /// Validates this import parameter's bounded name and type structure.
+    pub fn validate(&self) -> Result<(), HostSchemaValidationError> {
+        validate_parameter_name(&self.name)?;
+        let mut budget = ComplexityBudget::default();
+        let mut on_resource = |_key: &ResourceTypeKey| {};
+        validate_type_schema_with_budget(&self.schema, &mut budget, &mut on_resource).map(|_| ())
+    }
+}
+
+impl HostFunctionSchema {
+    /// Validates the bounded structure of this function schema.
+    pub fn validate(&self) -> Result<(), HostSchemaValidationError> {
+        let mut budget = ComplexityBudget::default();
+        validate_function_shape(self, &mut budget)
+    }
+}
+
+impl HostImportSchema {
+    /// Validates the bounded structure of this compiled import schema.
+    pub fn validate(&self) -> Result<(), HostSchemaValidationError> {
+        let mut budget = ComplexityBudget::default();
+        validate_import_shape(self, &mut budget)
+    }
+}
+
+impl Serialize for HostParamSchema {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        let mut state = serializer.serialize_struct("HostParamSchema", 3)?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field("ty", &self.ty)?;
+        state.serialize_field("passing", &self.passing)?;
+        state.end()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum HostParamSchemaField {
+    Name,
+    Ty,
+    Passing,
+}
+
+struct HostParamSchemaSeed<'a> {
+    budget: &'a mut ComplexityBudget,
+    charge_parameter: bool,
+}
+
+impl<'de> DeserializeSeed<'de> for HostParamSchemaSeed<'_> {
+    type Value = HostParamSchema;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if self.charge_parameter {
+            self.budget
+                .charge_parameters(1)
+                .map_err(de::Error::custom)?;
+        }
+        deserializer.deserialize_struct(
+            "HostParamSchema",
+            &["name", "ty", "passing"],
+            HostParamSchemaVisitor {
+                budget: self.budget,
+            },
+        )
+    }
+}
+
+struct HostParamSchemaVisitor<'a> {
+    budget: &'a mut ComplexityBudget,
+}
+
+impl<'de> Visitor<'de> for HostParamSchemaVisitor<'_> {
+    type Value = HostParamSchema;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded host parameter schema object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        bounded_map_size_hint(map.size_hint(), "host parameter schema", 3)?;
+        let mut entries = 0;
+        let mut name = None;
+        let mut ty = None;
+        let mut passing = None;
+        loop {
+            let Some(field) = map.next_key::<HostParamSchemaField>()? else {
+                break;
+            };
+            bounded_map_entry(&mut entries, "host parameter schema", 3)?;
+            match field {
+                HostParamSchemaField::Name => {
+                    if name.is_some() {
+                        return Err(de::Error::duplicate_field("name"));
+                    }
+                    name = Some(map.next_value_seed(BoundedStringSeed {
+                        field: "parameter name",
+                        limit: MAX_HOST_PARAMETER_NAME_LEN,
+                    })?);
+                }
+                HostParamSchemaField::Ty => {
+                    if ty.is_some() {
+                        return Err(de::Error::duplicate_field("ty"));
+                    }
+                    ty = Some(map.next_value_seed(HostTypeSchemaSeed {
+                        budget: self.budget,
+                        depth: 1,
+                        property: false,
+                    })?);
+                }
+                HostParamSchemaField::Passing => {
+                    if passing.is_some() {
+                        return Err(de::Error::duplicate_field("passing"));
+                    }
+                    passing = Some(map.next_value::<HostParamPassing>()?);
+                }
+            }
+        }
+        Ok(HostParamSchema {
+            name: name.ok_or_else(|| de::Error::missing_field("name"))?,
+            ty: ty.ok_or_else(|| de::Error::missing_field("ty"))?,
+            passing: passing.ok_or_else(|| de::Error::missing_field("passing"))?,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for HostParamSchema {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut budget = ComplexityBudget::default();
+        HostParamSchemaSeed {
+            budget: &mut budget,
+            charge_parameter: false,
+        }
+        .deserialize(deserializer)
+    }
+}
+
+impl Serialize for HostFunctionSchema {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        let mut state = serializer.serialize_struct("HostFunctionSchema", 4)?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field("params", &self.params)?;
+        state.serialize_field("return_type", &self.return_type)?;
+        state.serialize_field("description", &self.description)?;
+        state.end()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum HostFunctionSchemaField {
+    Name,
+    Params,
+    ReturnType,
+    Description,
+}
+
+struct HostFunctionSchemaSeed<'a> {
+    budget: &'a mut ComplexityBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for HostFunctionSchemaSeed<'_> {
+    type Value = HostFunctionSchema;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_struct(
+            "HostFunctionSchema",
+            &["name", "params", "return_type", "description"],
+            HostFunctionSchemaVisitor {
+                budget: self.budget,
+            },
+        )
+    }
+}
+
+struct HostFunctionSchemaVisitor<'a> {
+    budget: &'a mut ComplexityBudget,
+}
+
+impl<'de> Visitor<'de> for HostFunctionSchemaVisitor<'_> {
+    type Value = HostFunctionSchema;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded host function schema object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        bounded_map_size_hint(map.size_hint(), "host function schema", 4)?;
+        let mut entries = 0;
+        let mut name = None;
+        let mut params = None;
+        let mut return_type = None;
+        let mut description = None;
+        loop {
+            let Some(field) = map.next_key::<HostFunctionSchemaField>()? else {
+                break;
+            };
+            bounded_map_entry(&mut entries, "host function schema", 4)?;
+            match field {
+                HostFunctionSchemaField::Name => {
+                    if name.is_some() {
+                        return Err(de::Error::duplicate_field("name"));
+                    }
+                    name = Some(map.next_value_seed(BoundedStringSeed {
+                        field: "function name",
+                        limit: MAX_FUNCTION_NAME_LEN,
+                    })?);
+                }
+                HostFunctionSchemaField::Params => {
+                    if params.is_some() {
+                        return Err(de::Error::duplicate_field("params"));
+                    }
+                    params = Some(map.next_value_seed(HostParamListSeed {
+                        budget: self.budget,
+                    })?);
+                }
+                HostFunctionSchemaField::ReturnType => {
+                    if return_type.is_some() {
+                        return Err(de::Error::duplicate_field("return_type"));
+                    }
+                    return_type = Some(map.next_value_seed(HostTypeSchemaSeed {
+                        budget: self.budget,
+                        depth: 1,
+                        property: false,
+                    })?);
+                }
+                HostFunctionSchemaField::Description => {
+                    if description.is_some() {
+                        return Err(de::Error::duplicate_field("description"));
+                    }
+                    description = Some(map.next_value_seed(BoundedStringSeed {
+                        field: "description",
+                        limit: MAX_HOST_DESCRIPTION_LEN,
+                    })?);
+                }
+            }
+        }
+        Ok(HostFunctionSchema {
+            name: name.ok_or_else(|| de::Error::missing_field("name"))?,
+            params: params.ok_or_else(|| de::Error::missing_field("params"))?,
+            return_type: return_type.ok_or_else(|| de::Error::missing_field("return_type"))?,
+            description: description.ok_or_else(|| de::Error::missing_field("description"))?,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for HostFunctionSchema {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut budget = ComplexityBudget::default();
+        let schema = HostFunctionSchemaSeed {
+            budget: &mut budget,
+        }
+        .deserialize(deserializer)?;
+        schema.validate().map_err(de::Error::custom)?;
+        Ok(schema)
+    }
+}
+
+struct HostParamListSeed<'a> {
+    budget: &'a mut ComplexityBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for HostParamListSeed<'_> {
+    type Value = Vec<HostParamSchema>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(HostParamListVisitor {
+            budget: self.budget,
+        })
+    }
+}
+
+struct HostParamListVisitor<'a> {
+    budget: &'a mut ComplexityBudget,
+}
+
+impl<'de> Visitor<'de> for HostParamListVisitor<'_> {
+    type Value = Vec<HostParamSchema>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded host parameter list")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let hint = seq.size_hint();
+        let capacity = bounded_sequence_capacity(
+            hint,
+            MAX_HOST_CATALOG_PARAMETERS - self.budget.parameters,
+            HostSchemaValidationError::ParameterBudgetExceeded {
+                limit: MAX_HOST_CATALOG_PARAMETERS,
+            },
+        )?;
+        let mut values = Vec::new();
+        if capacity != 0 {
+            values.try_reserve_exact(capacity).map_err(|_| {
+                de::Error::custom(HostSchemaValidationError::AllocationFailed {
+                    field: "host parameters",
+                })
+            })?;
+        }
+        while let Some(value) = seq.next_element_seed(HostParamSchemaSeed {
+            budget: self.budget,
+            charge_parameter: true,
+        })? {
+            values.try_reserve_exact(1).map_err(|_| {
+                de::Error::custom(HostSchemaValidationError::AllocationFailed {
+                    field: "host parameters",
+                })
+            })?;
+            values.push(value);
+        }
+        Ok(values)
+    }
+}
+
+impl Serialize for HostImportParam {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        let mut state = serializer.serialize_struct("HostImportParam", 3)?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field("schema", &self.schema)?;
+        state.serialize_field("passing", &self.passing)?;
+        state.end()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum HostImportParamField {
+    Name,
+    Schema,
+    Passing,
+}
+
+struct HostImportParamSeed<'a> {
+    budget: &'a mut ComplexityBudget,
+    charge_parameter: bool,
+}
+
+impl<'de> DeserializeSeed<'de> for HostImportParamSeed<'_> {
+    type Value = HostImportParam;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if self.charge_parameter {
+            self.budget
+                .charge_parameters(1)
+                .map_err(de::Error::custom)?;
+        }
+        deserializer.deserialize_struct(
+            "HostImportParam",
+            &["name", "schema", "passing"],
+            HostImportParamVisitor {
+                budget: self.budget,
+            },
+        )
+    }
+}
+
+struct HostImportParamVisitor<'a> {
+    budget: &'a mut ComplexityBudget,
+}
+
+impl<'de> Visitor<'de> for HostImportParamVisitor<'_> {
+    type Value = HostImportParam;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded host import parameter object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        bounded_map_size_hint(map.size_hint(), "host import parameter", 3)?;
+        let mut entries = 0;
+        let mut name = None;
+        let mut schema = None;
+        let mut passing = None;
+        loop {
+            let Some(field) = map.next_key::<HostImportParamField>()? else {
+                break;
+            };
+            bounded_map_entry(&mut entries, "host import parameter", 3)?;
+            match field {
+                HostImportParamField::Name => {
+                    if name.is_some() {
+                        return Err(de::Error::duplicate_field("name"));
+                    }
+                    name = Some(map.next_value_seed(BoundedStringSeed {
+                        field: "parameter name",
+                        limit: MAX_HOST_PARAMETER_NAME_LEN,
+                    })?);
+                }
+                HostImportParamField::Schema => {
+                    if schema.is_some() {
+                        return Err(de::Error::duplicate_field("schema"));
+                    }
+                    schema = Some(map.next_value_seed(HostTypeSchemaSeed {
+                        budget: self.budget,
+                        depth: 1,
+                        property: false,
+                    })?);
+                }
+                HostImportParamField::Passing => {
+                    if passing.is_some() {
+                        return Err(de::Error::duplicate_field("passing"));
+                    }
+                    passing = Some(map.next_value::<HostParamPassing>()?);
+                }
+            }
+        }
+        Ok(HostImportParam {
+            name: name.ok_or_else(|| de::Error::missing_field("name"))?,
+            schema: schema.ok_or_else(|| de::Error::missing_field("schema"))?,
+            passing: passing.ok_or_else(|| de::Error::missing_field("passing"))?,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for HostImportParam {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut budget = ComplexityBudget::default();
+        HostImportParamSeed {
+            budget: &mut budget,
+            charge_parameter: false,
+        }
+        .deserialize(deserializer)
+    }
+}
+
+impl Serialize for HostImportSchema {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        let mut state = serializer.serialize_struct("HostImportSchema", 4)?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field("params", &self.params)?;
+        state.serialize_field("return_type", &self.return_type)?;
+        state.serialize_field("fingerprint", &self.fingerprint)?;
+        state.end()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum HostImportSchemaField {
+    Name,
+    Params,
+    ReturnType,
+    Fingerprint,
+}
+
+struct HostImportSchemaSeed<'a> {
+    budget: &'a mut ComplexityBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for HostImportSchemaSeed<'_> {
+    type Value = HostImportSchema;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_struct(
+            "HostImportSchema",
+            &["name", "params", "return_type", "fingerprint"],
+            HostImportSchemaVisitor {
+                budget: self.budget,
+            },
+        )
+    }
+}
+
+struct HostImportSchemaVisitor<'a> {
+    budget: &'a mut ComplexityBudget,
+}
+
+impl<'de> Visitor<'de> for HostImportSchemaVisitor<'_> {
+    type Value = HostImportSchema;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded host import schema object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        bounded_map_size_hint(map.size_hint(), "host import schema", 4)?;
+        let mut entries = 0;
+        let mut name = None;
+        let mut params = None;
+        let mut return_type = None;
+        let mut fingerprint = None;
+        loop {
+            let Some(field) = map.next_key::<HostImportSchemaField>()? else {
+                break;
+            };
+            bounded_map_entry(&mut entries, "host import schema", 4)?;
+            match field {
+                HostImportSchemaField::Name => {
+                    if name.is_some() {
+                        return Err(de::Error::duplicate_field("name"));
+                    }
+                    name = Some(map.next_value_seed(BoundedStringSeed {
+                        field: "function name",
+                        limit: MAX_FUNCTION_NAME_LEN,
+                    })?);
+                }
+                HostImportSchemaField::Params => {
+                    if params.is_some() {
+                        return Err(de::Error::duplicate_field("params"));
+                    }
+                    params = Some(map.next_value_seed(HostImportParamListSeed {
+                        budget: self.budget,
+                    })?);
+                }
+                HostImportSchemaField::ReturnType => {
+                    if return_type.is_some() {
+                        return Err(de::Error::duplicate_field("return_type"));
+                    }
+                    return_type = Some(map.next_value_seed(HostTypeSchemaSeed {
+                        budget: self.budget,
+                        depth: 1,
+                        property: false,
+                    })?);
+                }
+                HostImportSchemaField::Fingerprint => {
+                    if fingerprint.is_some() {
+                        return Err(de::Error::duplicate_field("fingerprint"));
+                    }
+                    fingerprint = Some(map.next_value::<HostApiFingerprint>()?);
+                }
+            }
+        }
+        Ok(HostImportSchema {
+            name: name.ok_or_else(|| de::Error::missing_field("name"))?,
+            params: params.ok_or_else(|| de::Error::missing_field("params"))?,
+            return_type: return_type.ok_or_else(|| de::Error::missing_field("return_type"))?,
+            fingerprint: fingerprint.ok_or_else(|| de::Error::missing_field("fingerprint"))?,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for HostImportSchema {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut budget = ComplexityBudget::default();
+        let schema = HostImportSchemaSeed {
+            budget: &mut budget,
+        }
+        .deserialize(deserializer)?;
+        schema.validate().map_err(de::Error::custom)?;
+        Ok(schema)
+    }
+}
+
+struct HostImportParamListSeed<'a> {
+    budget: &'a mut ComplexityBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for HostImportParamListSeed<'_> {
+    type Value = Vec<HostImportParam>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(HostImportParamListVisitor {
+            budget: self.budget,
+        })
+    }
+}
+
+struct HostImportParamListVisitor<'a> {
+    budget: &'a mut ComplexityBudget,
+}
+
+impl<'de> Visitor<'de> for HostImportParamListVisitor<'_> {
+    type Value = Vec<HostImportParam>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded host import parameter list")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let hint = seq.size_hint();
+        let capacity = bounded_sequence_capacity(
+            hint,
+            MAX_HOST_CATALOG_PARAMETERS - self.budget.parameters,
+            HostSchemaValidationError::ParameterBudgetExceeded {
+                limit: MAX_HOST_CATALOG_PARAMETERS,
+            },
+        )?;
+        let mut values = Vec::new();
+        if capacity != 0 {
+            values.try_reserve_exact(capacity).map_err(|_| {
+                de::Error::custom(HostSchemaValidationError::AllocationFailed {
+                    field: "host import parameters",
+                })
+            })?;
+        }
+        while let Some(value) = seq.next_element_seed(HostImportParamSeed {
+            budget: self.budget,
+            charge_parameter: true,
+        })? {
+            values.try_reserve_exact(1).map_err(|_| {
+                de::Error::custom(HostSchemaValidationError::AllocationFailed {
+                    field: "host import parameters",
+                })
+            })?;
+            values.push(value);
+        }
+        Ok(values)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionNameError {
     Empty,
@@ -556,6 +1777,367 @@ impl fmt::Display for FunctionNameError {
 }
 
 impl std::error::Error for FunctionNameError {}
+
+/// Resource and recursive-shape limits shared by the in-memory validator,
+/// serializers, fingerprints and serde visitors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostSchemaValidationError {
+    NestingDepthExceeded {
+        limit: usize,
+    },
+    NodeBudgetExceeded {
+        limit: usize,
+    },
+    PropertyBudgetExceeded {
+        limit: usize,
+    },
+    ParameterBudgetExceeded {
+        limit: usize,
+    },
+    ResourceBudgetExceeded {
+        limit: usize,
+    },
+    FunctionBudgetExceeded {
+        limit: usize,
+    },
+    MapEntriesExceeded {
+        field: &'static str,
+        limit: usize,
+    },
+    StringTooLong {
+        field: &'static str,
+        len: usize,
+        limit: usize,
+    },
+    InvalidFunctionName {
+        name: String,
+        reason: FunctionNameError,
+    },
+    AllocationFailed {
+        field: &'static str,
+    },
+    IntegerOverflow {
+        field: &'static str,
+    },
+}
+
+impl fmt::Display for HostSchemaValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NestingDepthExceeded { limit } => {
+                write!(f, "host schema nesting depth exceeds maximum of {limit}")
+            }
+            Self::NodeBudgetExceeded { limit } => {
+                write!(f, "host schema node budget exceeds maximum of {limit}")
+            }
+            Self::PropertyBudgetExceeded { limit } => {
+                write!(f, "host schema property budget exceeds maximum of {limit}")
+            }
+            Self::ParameterBudgetExceeded { limit } => {
+                write!(
+                    f,
+                    "host catalog parameter budget exceeds maximum of {limit}"
+                )
+            }
+            Self::ResourceBudgetExceeded { limit } => {
+                write!(f, "host catalog resource budget exceeds maximum of {limit}")
+            }
+            Self::FunctionBudgetExceeded { limit } => {
+                write!(f, "host catalog function budget exceeds maximum of {limit}")
+            }
+            Self::MapEntriesExceeded { field, limit } => {
+                write!(f, "host {field} map contains more than {limit} entries")
+            }
+            Self::StringTooLong { field, len, limit } => {
+                write!(f, "host {field} is {len} bytes; the maximum is {limit}")
+            }
+            Self::InvalidFunctionName { name, reason } => {
+                write!(f, "invalid host function name `{name}`: {reason}")
+            }
+            Self::AllocationFailed { field } => {
+                write!(f, "host schema allocation failed while reading {field}")
+            }
+            Self::IntegerOverflow { field } => {
+                write!(f, "host schema length overflow while encoding {field}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HostSchemaValidationError {}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ComplexityBudget {
+    nodes: usize,
+    properties: usize,
+    parameters: usize,
+    resources: usize,
+    functions: usize,
+}
+
+impl ComplexityBudget {
+    fn charge_nodes(&mut self, amount: usize) -> Result<(), HostSchemaValidationError> {
+        self.nodes = checked_budget_add(
+            self.nodes,
+            amount,
+            MAX_HOST_SCHEMA_NODES,
+            HostSchemaValidationError::NodeBudgetExceeded {
+                limit: MAX_HOST_SCHEMA_NODES,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn charge_properties(&mut self, amount: usize) -> Result<(), HostSchemaValidationError> {
+        self.properties = checked_budget_add(
+            self.properties,
+            amount,
+            MAX_HOST_SCHEMA_PROPERTIES,
+            HostSchemaValidationError::PropertyBudgetExceeded {
+                limit: MAX_HOST_SCHEMA_PROPERTIES,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn charge_parameters(&mut self, amount: usize) -> Result<(), HostSchemaValidationError> {
+        self.parameters = checked_budget_add(
+            self.parameters,
+            amount,
+            MAX_HOST_CATALOG_PARAMETERS,
+            HostSchemaValidationError::ParameterBudgetExceeded {
+                limit: MAX_HOST_CATALOG_PARAMETERS,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn charge_resources(&mut self, amount: usize) -> Result<(), HostSchemaValidationError> {
+        self.resources = checked_budget_add(
+            self.resources,
+            amount,
+            MAX_HOST_CATALOG_RESOURCES,
+            HostSchemaValidationError::ResourceBudgetExceeded {
+                limit: MAX_HOST_CATALOG_RESOURCES,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn charge_functions(&mut self, amount: usize) -> Result<(), HostSchemaValidationError> {
+        self.functions = checked_budget_add(
+            self.functions,
+            amount,
+            MAX_HOST_CATALOG_FUNCTIONS,
+            HostSchemaValidationError::FunctionBudgetExceeded {
+                limit: MAX_HOST_CATALOG_FUNCTIONS,
+            },
+        )?;
+        Ok(())
+    }
+}
+
+fn checked_budget_add(
+    current: usize,
+    amount: usize,
+    limit: usize,
+    error: HostSchemaValidationError,
+) -> Result<usize, HostSchemaValidationError> {
+    let next = current.checked_add(amount).ok_or_else(|| error.clone())?;
+    if next > limit {
+        return Err(error);
+    }
+    Ok(next)
+}
+
+fn bounded_map_size_hint<E>(hint: Option<usize>, field: &'static str, limit: usize) -> Result<(), E>
+where
+    E: de::Error,
+{
+    if hint.is_some_and(|hint| hint > limit) {
+        return Err(E::custom(HostSchemaValidationError::MapEntriesExceeded {
+            field,
+            limit,
+        }));
+    }
+    Ok(())
+}
+
+fn bounded_map_entry<E>(entries: &mut usize, field: &'static str, limit: usize) -> Result<(), E>
+where
+    E: de::Error,
+{
+    *entries = entries
+        .checked_add(1)
+        .ok_or_else(|| E::custom(HostSchemaValidationError::MapEntriesExceeded { field, limit }))?;
+    if *entries > limit {
+        return Err(E::custom(HostSchemaValidationError::MapEntriesExceeded {
+            field,
+            limit,
+        }));
+    }
+    Ok(())
+}
+
+fn bounded_sequence_capacity<E>(
+    hint: Option<usize>,
+    remaining: usize,
+    error: HostSchemaValidationError,
+) -> Result<usize, E>
+where
+    E: de::Error,
+{
+    let capacity = hint.unwrap_or(0);
+    if capacity > remaining {
+        return Err(E::custom(error));
+    }
+    Ok(capacity)
+}
+
+fn bounded_string_error(
+    field: &'static str,
+    len: usize,
+    limit: usize,
+) -> Result<(), HostSchemaValidationError> {
+    if len > limit {
+        return Err(HostSchemaValidationError::StringTooLong { field, len, limit });
+    }
+    Ok(())
+}
+
+fn validate_parameter_name(name: &str) -> Result<(), HostSchemaValidationError> {
+    bounded_string_error("parameter name", name.len(), MAX_HOST_PARAMETER_NAME_LEN)
+}
+
+fn validate_description(description: &str) -> Result<(), HostSchemaValidationError> {
+    bounded_string_error("description", description.len(), MAX_HOST_DESCRIPTION_LEN)
+}
+
+fn validate_type_schema_with_budget<'a, F>(
+    schema: &'a HostTypeSchema,
+    budget: &mut ComplexityBudget,
+    on_resource: &mut F,
+) -> Result<bool, HostSchemaValidationError>
+where
+    F: FnMut(&'a ResourceTypeKey),
+{
+    let mut pending: Vec<(&HostTypeSchema, usize)> = Vec::new();
+    pending
+        .try_reserve(1)
+        .map_err(|_| HostSchemaValidationError::AllocationFailed {
+            field: "schema traversal",
+        })?;
+    pending.push((schema, 1));
+    let mut contains_resource = false;
+
+    while let Some((current, depth)) = pending.pop() {
+        if depth > MAX_HOST_SCHEMA_DEPTH {
+            return Err(HostSchemaValidationError::NestingDepthExceeded {
+                limit: MAX_HOST_SCHEMA_DEPTH,
+            });
+        }
+        budget.charge_nodes(1)?;
+
+        match current {
+            HostTypeSchema::Resource(key) => {
+                contains_resource = true;
+                on_resource(key);
+            }
+            HostTypeSchema::Array(inner)
+            | HostTypeSchema::Map(inner)
+            | HostTypeSchema::Optional(inner) => {
+                let child_depth =
+                    depth
+                        .checked_add(1)
+                        .ok_or(HostSchemaValidationError::IntegerOverflow {
+                            field: "schema depth",
+                        })?;
+                pending.try_reserve(1).map_err(|_| {
+                    HostSchemaValidationError::AllocationFailed {
+                        field: "schema traversal",
+                    }
+                })?;
+                pending.push((inner, child_depth));
+            }
+            HostTypeSchema::Callable { params, result } => {
+                budget.charge_properties(params.len())?;
+                let child_depth =
+                    depth
+                        .checked_add(1)
+                        .ok_or(HostSchemaValidationError::IntegerOverflow {
+                            field: "schema depth",
+                        })?;
+                let needed = params.len().checked_add(1).ok_or(
+                    HostSchemaValidationError::IntegerOverflow {
+                        field: "schema traversal capacity",
+                    },
+                )?;
+                pending.try_reserve(needed).map_err(|_| {
+                    HostSchemaValidationError::AllocationFailed {
+                        field: "schema traversal",
+                    }
+                })?;
+                pending.push((result, child_depth));
+                for param in params.iter().rev() {
+                    pending.push((param, child_depth));
+                }
+            }
+            HostTypeSchema::Unknown
+            | HostTypeSchema::Null
+            | HostTypeSchema::Int
+            | HostTypeSchema::Float
+            | HostTypeSchema::Number
+            | HostTypeSchema::Bool
+            | HostTypeSchema::String
+            | HostTypeSchema::Bytes => {}
+        }
+    }
+
+    Ok(contains_resource)
+}
+
+fn validate_function_shape(
+    function: &HostFunctionSchema,
+    budget: &mut ComplexityBudget,
+) -> Result<(), HostSchemaValidationError> {
+    validate_function_name(&function.name).map_err(|reason| {
+        HostSchemaValidationError::InvalidFunctionName {
+            name: function.name.clone(),
+            reason,
+        }
+    })?;
+    bounded_string_error("function name", function.name.len(), MAX_FUNCTION_NAME_LEN)?;
+    validate_description(&function.description)?;
+    budget.charge_parameters(function.params.len())?;
+    let mut on_resource = |_key: &ResourceTypeKey| {};
+    for param in &function.params {
+        validate_parameter_name(&param.name)?;
+        validate_type_schema_with_budget(&param.ty, budget, &mut on_resource)?;
+    }
+    validate_type_schema_with_budget(&function.return_type, budget, &mut on_resource)?;
+    Ok(())
+}
+
+fn validate_import_shape(
+    schema: &HostImportSchema,
+    budget: &mut ComplexityBudget,
+) -> Result<(), HostSchemaValidationError> {
+    validate_function_name(&schema.name).map_err(|reason| {
+        HostSchemaValidationError::InvalidFunctionName {
+            name: schema.name.clone(),
+            reason,
+        }
+    })?;
+    bounded_string_error("function name", schema.name.len(), MAX_FUNCTION_NAME_LEN)?;
+    budget.charge_parameters(schema.params.len())?;
+    let mut on_resource = |_key: &ResourceTypeKey| {};
+    for param in &schema.params {
+        validate_parameter_name(&param.name)?;
+        validate_type_schema_with_budget(&param.schema, budget, &mut on_resource)?;
+    }
+    validate_type_schema_with_budget(&schema.return_type, budget, &mut on_resource)?;
+    Ok(())
+}
 
 /// Validate a host function name against the grammar used by the standard
 /// catalog, e.g. `len`, `__bind_callable`, `bytes::from_utf8`, `io::open`,
@@ -653,6 +2235,7 @@ pub enum HostApiCatalogError {
         function: String,
         parameter: String,
     },
+    SchemaValidation(HostSchemaValidationError),
 }
 
 impl fmt::Display for HostApiCatalogError {
@@ -696,7 +2279,14 @@ impl fmt::Display for HostApiCatalogError {
                 "host function `{function}` passes resource-containing parameter `{parameter}` \
                  by `Value`; an explicit Borrow/BorrowMut/TakeOwned is required",
             ),
+            Self::SchemaValidation(error) => error.fmt(f),
         }
+    }
+}
+
+impl From<HostSchemaValidationError> for HostApiCatalogError {
+    fn from(error: HostSchemaValidationError) -> Self {
+        Self::SchemaValidation(error)
     }
 }
 
@@ -707,7 +2297,7 @@ impl std::error::Error for HostApiCatalogError {}
 /// Construction is done via the builder ([`HostApiCatalog::builder`]) or via
 /// serde; both routes run the same validation, so a catalog is only exposed
 /// once all cross-references, passing-mode and name/overload invariants hold.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostApiCatalog {
     resources: Vec<ResourceTypeSchema>,
     functions: Vec<HostFunctionSchema>,
@@ -757,12 +2347,235 @@ impl fmt::Display for HostApiFingerprint {
     }
 }
 
-/// Mirror of [`HostApiCatalog`]’s serialized shape so `Deserialize` can parse
-/// it and then re-validate, keeping serde as safe as the builder.
-#[derive(serde::Deserialize)]
-struct HostApiCatalogRepr {
-    resources: Vec<ResourceTypeSchema>,
-    functions: Vec<HostFunctionSchema>,
+impl Serialize for HostApiCatalog {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        let mut state = serializer.serialize_struct("HostApiCatalog", 2)?;
+        state.serialize_field("resources", &self.resources)?;
+        state.serialize_field("functions", &self.functions)?;
+        state.end()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum HostApiCatalogField {
+    Resources,
+    Functions,
+}
+
+struct CatalogResourceSeed<'a> {
+    budget: &'a mut ComplexityBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for CatalogResourceSeed<'_> {
+    type Value = ResourceTypeSchema;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        self.budget.charge_resources(1).map_err(de::Error::custom)?;
+        ResourceTypeSchema::deserialize(deserializer)
+    }
+}
+
+struct CatalogFunctionSeed<'a> {
+    budget: &'a mut ComplexityBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for CatalogFunctionSeed<'_> {
+    type Value = HostFunctionSchema;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        self.budget.charge_functions(1).map_err(de::Error::custom)?;
+        HostFunctionSchemaSeed {
+            budget: self.budget,
+        }
+        .deserialize(deserializer)
+    }
+}
+
+struct CatalogResourceListSeed<'a> {
+    budget: &'a mut ComplexityBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for CatalogResourceListSeed<'_> {
+    type Value = Vec<ResourceTypeSchema>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(CatalogResourceListVisitor {
+            budget: self.budget,
+        })
+    }
+}
+
+struct CatalogResourceListVisitor<'a> {
+    budget: &'a mut ComplexityBudget,
+}
+
+impl<'de> Visitor<'de> for CatalogResourceListVisitor<'_> {
+    type Value = Vec<ResourceTypeSchema>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded catalog resource list")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let hint = seq.size_hint();
+        let capacity = bounded_sequence_capacity(
+            hint,
+            MAX_HOST_CATALOG_RESOURCES - self.budget.resources,
+            HostSchemaValidationError::ResourceBudgetExceeded {
+                limit: MAX_HOST_CATALOG_RESOURCES,
+            },
+        )?;
+        let mut values = Vec::new();
+        if capacity != 0 {
+            values.try_reserve_exact(capacity).map_err(|_| {
+                de::Error::custom(HostSchemaValidationError::AllocationFailed {
+                    field: "catalog resources",
+                })
+            })?;
+        }
+        while let Some(value) = seq.next_element_seed(CatalogResourceSeed {
+            budget: self.budget,
+        })? {
+            values.try_reserve_exact(1).map_err(|_| {
+                de::Error::custom(HostSchemaValidationError::AllocationFailed {
+                    field: "catalog resources",
+                })
+            })?;
+            values.push(value);
+        }
+        Ok(values)
+    }
+}
+
+struct CatalogFunctionListSeed<'a> {
+    budget: &'a mut ComplexityBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for CatalogFunctionListSeed<'_> {
+    type Value = Vec<HostFunctionSchema>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(CatalogFunctionListVisitor {
+            budget: self.budget,
+        })
+    }
+}
+
+struct CatalogFunctionListVisitor<'a> {
+    budget: &'a mut ComplexityBudget,
+}
+
+impl<'de> Visitor<'de> for CatalogFunctionListVisitor<'_> {
+    type Value = Vec<HostFunctionSchema>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded catalog function list")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let hint = seq.size_hint();
+        let capacity = bounded_sequence_capacity(
+            hint,
+            MAX_HOST_CATALOG_FUNCTIONS - self.budget.functions,
+            HostSchemaValidationError::FunctionBudgetExceeded {
+                limit: MAX_HOST_CATALOG_FUNCTIONS,
+            },
+        )?;
+        let mut values = Vec::new();
+        if capacity != 0 {
+            values.try_reserve_exact(capacity).map_err(|_| {
+                de::Error::custom(HostSchemaValidationError::AllocationFailed {
+                    field: "catalog functions",
+                })
+            })?;
+        }
+        while let Some(value) = seq.next_element_seed(CatalogFunctionSeed {
+            budget: self.budget,
+        })? {
+            values.try_reserve_exact(1).map_err(|_| {
+                de::Error::custom(HostSchemaValidationError::AllocationFailed {
+                    field: "catalog functions",
+                })
+            })?;
+            values.push(value);
+        }
+        Ok(values)
+    }
+}
+
+struct HostApiCatalogVisitor<'a> {
+    budget: &'a mut ComplexityBudget,
+}
+
+impl<'de> Visitor<'de> for HostApiCatalogVisitor<'_> {
+    type Value = HostApiCatalog;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded host API catalog object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        bounded_map_size_hint(map.size_hint(), "host API catalog", 2)?;
+        let mut entries = 0;
+        let mut resources = None;
+        let mut functions = None;
+        loop {
+            let Some(field) = map.next_key::<HostApiCatalogField>()? else {
+                break;
+            };
+            bounded_map_entry(&mut entries, "host API catalog", 2)?;
+            match field {
+                HostApiCatalogField::Resources => {
+                    if resources.is_some() {
+                        return Err(de::Error::duplicate_field("resources"));
+                    }
+                    resources = Some(map.next_value_seed(CatalogResourceListSeed {
+                        budget: self.budget,
+                    })?);
+                }
+                HostApiCatalogField::Functions => {
+                    if functions.is_some() {
+                        return Err(de::Error::duplicate_field("functions"));
+                    }
+                    functions = Some(map.next_value_seed(CatalogFunctionListSeed {
+                        budget: self.budget,
+                    })?);
+                }
+            }
+        }
+        HostApiBuilder {
+            resources: resources.ok_or_else(|| de::Error::missing_field("resources"))?,
+            functions: functions.ok_or_else(|| de::Error::missing_field("functions"))?,
+        }
+        .build()
+        .map_err(de::Error::custom)
+    }
 }
 
 impl<'de> Deserialize<'de> for HostApiCatalog {
@@ -770,12 +2583,14 @@ impl<'de> Deserialize<'de> for HostApiCatalog {
     where
         D: serde::Deserializer<'de>,
     {
-        let repr = HostApiCatalogRepr::deserialize(deserializer)?;
-        let builder = HostApiBuilder {
-            resources: repr.resources,
-            functions: repr.functions,
-        };
-        builder.build().map_err(serde::de::Error::custom)
+        let mut budget = ComplexityBudget::default();
+        deserializer.deserialize_struct(
+            "HostApiCatalog",
+            &["resources", "functions"],
+            HostApiCatalogVisitor {
+                budget: &mut budget,
+            },
+        )
     }
 }
 
@@ -826,6 +2641,22 @@ impl HostApiCatalog {
             .collect()
     }
 
+    /// Looks up a function by the complete compiled host-import identity.
+    ///
+    /// Name and arity are only preliminary facts. The parameter labels,
+    /// schemas (including nominal resource keys), passing modes, return schema
+    /// and catalog fingerprint all participate in the match. Documentation is
+    /// intentionally excluded because it is not part of a compiled import's
+    /// identity.
+    pub fn function_for_import(&self, import: &HostImportSchema) -> Option<&HostFunctionSchema> {
+        if import.validate().is_err() {
+            return None;
+        }
+        self.functions
+            .iter()
+            .find(|function| HostImportSchema::from_function(self, function) == *import)
+    }
+
     /// Looks up a declared resource type by key text.
     pub fn resource(&self, key: &str) -> Option<&ResourceTypeSchema> {
         self.resources
@@ -848,10 +2679,22 @@ impl HostApiCatalog {
         &self.functions
     }
 
+    /// Validates this catalog with the same bounded traversal used by the
+    /// builder and all identity paths.
+    pub fn validate(&self) -> Result<(), HostApiCatalogError> {
+        validate_surface(&self.resources, &self.functions)
+    }
+
     /// Canonical semantic bytes for the whole catalog: `FINGERPRINT_DOMAIN_MAGIC`
     /// ++ `FINGERPRINT_FORMAT_VERSION` ++ resources (sorted by key) ++
     /// functions (sorted by full semantic signature bytes).
     fn canonical_bytes(&self) -> Vec<u8> {
+        self.try_canonical_bytes()
+            .unwrap_or_else(|error| invalid_catalog_bytes(&error))
+    }
+
+    fn try_canonical_bytes(&self) -> Result<Vec<u8>, HostApiCatalogError> {
+        self.validate()?;
         let mut bytes = Vec::new();
 
         bytes.extend_from_slice(FINGERPRINT_DOMAIN_MAGIC);
@@ -861,23 +2704,27 @@ impl HostApiCatalog {
         let mut resources: Vec<&ResourceTypeSchema> = self.resources.iter().collect();
         resources.sort_by(|a, b| a.key.cmp(&b.key));
         push_tag(&mut bytes, b'R');
-        push_len(&mut bytes, resources.len());
+        push_len(&mut bytes, resources.len())?;
         for resource in &resources {
-            push_len_str(&mut bytes, resource.key.as_str());
+            push_len_str(&mut bytes, resource.key.as_str())?;
         }
 
         // Functions sorted by their full canonical semantic signature bytes so
         // overloaded registration order is irrelevant (exact duplicates are
         // already rejected at build time).
-        let mut functions: Vec<&HostFunctionSchema> = self.functions.iter().collect();
-        functions.sort_by_key(|a| a.semantic_bytes());
+        let mut functions: Vec<(Vec<u8>, &HostFunctionSchema)> = self
+            .functions
+            .iter()
+            .map(|function| (function.semantic_bytes(), function))
+            .collect();
+        functions.sort_by(|a, b| a.0.cmp(&b.0));
         push_tag(&mut bytes, b'F');
-        push_len(&mut bytes, functions.len());
-        for function in &functions {
-            bytes.extend(function.semantic_bytes());
+        push_len(&mut bytes, functions.len())?;
+        for (semantic, _) in functions {
+            bytes.extend(semantic);
         }
 
-        bytes
+        Ok(bytes)
     }
 
     /// Deterministic, order-independent fingerprint of the semantic contents.
@@ -890,6 +2737,39 @@ impl HostApiCatalog {
     pub fn fingerprint(&self) -> HostApiFingerprint {
         HostApiFingerprint(fnv1a(&self.canonical_bytes()))
     }
+
+    /// Fallible fingerprint calculation for callers loading a catalog from an
+    /// external source and needing a stable validation error.
+    pub fn try_fingerprint(&self) -> Result<HostApiFingerprint, HostApiCatalogError> {
+        Ok(HostApiFingerprint(fnv1a(&self.try_canonical_bytes()?)))
+    }
+}
+
+/// Validates a complete collection of host import schemas with one aggregate
+/// budget. This is used by public program-loading and registration boundaries.
+pub fn validate_host_import_schemas(
+    schemas: &[HostImportSchema],
+) -> Result<(), HostSchemaValidationError> {
+    validate_host_import_schema_iter(schemas.iter())
+}
+
+#[cfg(feature = "runtime")]
+pub(crate) fn validate_optional_host_import_schemas(
+    schemas: &[Option<HostImportSchema>],
+) -> Result<(), HostSchemaValidationError> {
+    validate_host_import_schema_iter(schemas.iter().filter_map(Option::as_ref))
+}
+
+fn validate_host_import_schema_iter<'a, I>(schemas: I) -> Result<(), HostSchemaValidationError>
+where
+    I: IntoIterator<Item = &'a HostImportSchema>,
+{
+    let mut budget = ComplexityBudget::default();
+    for schema in schemas {
+        budget.charge_functions(1)?;
+        validate_import_shape(schema, &mut budget)?;
+    }
+    Ok(())
 }
 
 /// Validate the caller-supplied resource/function collections. Shared by the
@@ -898,6 +2778,18 @@ fn validate_surface(
     resources: &[ResourceTypeSchema],
     functions: &[HostFunctionSchema],
 ) -> Result<(), HostApiCatalogError> {
+    let mut budget = ComplexityBudget::default();
+    budget
+        .charge_resources(resources.len())
+        .map_err(HostApiCatalogError::from)?;
+    budget
+        .charge_functions(functions.len())
+        .map_err(HostApiCatalogError::from)?;
+
+    for resource in resources {
+        validate_description(&resource.description).map_err(HostApiCatalogError::from)?;
+    }
+
     // Duplicate resource keys.
     for (i, resource) in resources.iter().enumerate() {
         if resources[..i].iter().any(|prior| prior.key == resource.key) {
@@ -909,16 +2801,22 @@ fn validate_surface(
 
     // Per-function invariants.
     for function in functions {
-        // Valid function name.
+        // Preserve the catalog-specific name error for callers that already
+        // match this public error variant.
         if let Err(reason) = validate_function_name(&function.name) {
             return Err(HostApiCatalogError::InvalidFunctionName {
                 name: function.name.clone(),
                 reason,
             });
         }
+        validate_description(&function.description).map_err(HostApiCatalogError::from)?;
+        budget
+            .charge_parameters(function.params.len())
+            .map_err(HostApiCatalogError::from)?;
 
         // Unique parameter names.
         for (i, param) in function.params.iter().enumerate() {
+            validate_parameter_name(&param.name).map_err(HostApiCatalogError::from)?;
             if function.params[..i]
                 .iter()
                 .any(|prior| prior.name == param.name)
@@ -930,9 +2828,25 @@ fn validate_surface(
             }
         }
 
-        // Passing-mode and resource-reference invariants.
+        // Passing-mode and resource-reference invariants. The same iterative
+        // schema validator also performs the aggregate node/property accounting.
         for param in &function.params {
-            let contains_resource = param.ty.contains_resource();
+            let mut missing_key = None;
+            let mut on_resource = |key: &ResourceTypeKey| {
+                if missing_key.is_none() && !resources.iter().any(|resource| &resource.key == key) {
+                    missing_key = Some(key.clone());
+                }
+            };
+            let contains_resource =
+                validate_type_schema_with_budget(&param.ty, &mut budget, &mut on_resource)
+                    .map_err(HostApiCatalogError::from)?;
+
+            if let Some(key) = missing_key {
+                return Err(HostApiCatalogError::UnknownResourceReference {
+                    function: function.name.clone(),
+                    key,
+                });
+            }
             if contains_resource {
                 // A resource-containing parameter must use an explicit mode.
                 if param.passing == HostParamPassing::Value {
@@ -949,30 +2863,22 @@ fn validate_surface(
                     passing: param.passing,
                 });
             }
-
-            // Every referenced resource key must be declared.
-            let mut keys = Vec::new();
-            param.ty.collect_resource_keys(&mut keys);
-            for key in keys {
-                if !resources.iter().any(|resource| &resource.key == key) {
-                    return Err(HostApiCatalogError::UnknownResourceReference {
-                        function: function.name.clone(),
-                        key: key.clone(),
-                    });
-                }
-            }
         }
 
         // Return references must be declared too.
-        let mut keys = Vec::new();
-        function.return_type.collect_resource_keys(&mut keys);
-        for key in keys {
-            if !resources.iter().any(|resource| &resource.key == key) {
-                return Err(HostApiCatalogError::UnknownResourceReference {
-                    function: function.name.clone(),
-                    key: key.clone(),
-                });
+        let mut missing_key = None;
+        let mut on_resource = |key: &ResourceTypeKey| {
+            if missing_key.is_none() && !resources.iter().any(|resource| &resource.key == key) {
+                missing_key = Some(key.clone());
             }
+        };
+        validate_type_schema_with_budget(&function.return_type, &mut budget, &mut on_resource)
+            .map_err(HostApiCatalogError::from)?;
+        if let Some(key) = missing_key {
+            return Err(HostApiCatalogError::UnknownResourceReference {
+                function: function.name.clone(),
+                key,
+            });
         }
     }
 
@@ -982,9 +2888,15 @@ fn validate_surface(
     // only in labels or return schema are rejected. Legal overloads (same name,
     // distinct argument schema) are allowed.
     for (i, function) in functions.iter().enumerate() {
-        let identity = function.overload_identity_bytes();
+        let identity = function
+            .try_overload_identity_bytes()
+            .map_err(HostApiCatalogError::from)?;
         for prior in &functions[..i] {
-            if prior.overload_identity_bytes() == identity {
+            if prior
+                .try_overload_identity_bytes()
+                .map_err(HostApiCatalogError::from)?
+                == identity
+            {
                 return Err(HostApiCatalogError::DuplicateFunctionSignature {
                     name: function.name.clone(),
                 });
@@ -1036,52 +2948,107 @@ fn push_tag(bytes: &mut Vec<u8>, tag: u8) {
     bytes.push(tag);
 }
 
-fn push_len(bytes: &mut Vec<u8>, value: usize) {
+fn push_len(bytes: &mut Vec<u8>, value: usize) -> Result<(), HostSchemaValidationError> {
     // Fixed 8-byte little-endian length so encodings are unambiguous, and any
     // structural field write is order-independent in aggregate.
-    bytes.extend_from_slice(&(value as u64).to_le_bytes());
+    let value = u64::try_from(value)
+        .map_err(|_| HostSchemaValidationError::IntegerOverflow { field: "length" })?;
+    bytes.extend_from_slice(&value.to_le_bytes());
+    Ok(())
 }
 
-fn push_len_str(bytes: &mut Vec<u8>, value: &str) {
-    push_len(bytes, value.len());
+fn push_len_str(bytes: &mut Vec<u8>, value: &str) -> Result<(), HostSchemaValidationError> {
+    push_len(bytes, value.len())?;
     bytes.extend_from_slice(value.as_bytes());
+    Ok(())
 }
 
-fn push_type(bytes: &mut Vec<u8>, schema: &HostTypeSchema) {
-    match schema {
-        HostTypeSchema::Unknown => push_tag(bytes, b'U'),
-        HostTypeSchema::Null => push_tag(bytes, b'N'),
-        HostTypeSchema::Int => push_tag(bytes, b'I'),
-        HostTypeSchema::Float => push_tag(bytes, b'F'),
-        HostTypeSchema::Number => push_tag(bytes, b'#'),
-        HostTypeSchema::Bool => push_tag(bytes, b'B'),
-        HostTypeSchema::String => push_tag(bytes, b'S'),
-        HostTypeSchema::Bytes => push_tag(bytes, b'Y'),
-        HostTypeSchema::Array(inner) => {
-            push_tag(bytes, b'[');
-            push_type(bytes, inner);
-        }
-        HostTypeSchema::Map(inner) => {
-            push_tag(bytes, b'{');
-            push_type(bytes, inner);
-        }
-        HostTypeSchema::Optional(inner) => {
-            push_tag(bytes, b'?');
-            push_type(bytes, inner);
-        }
-        HostTypeSchema::Callable { params, result } => {
-            push_tag(bytes, b'c');
-            push_len(bytes, params.len());
-            for param in params {
-                push_type(bytes, param);
+fn try_push_type(
+    bytes: &mut Vec<u8>,
+    schema: &HostTypeSchema,
+) -> Result<(), HostSchemaValidationError> {
+    let mut pending: Vec<&HostTypeSchema> = Vec::new();
+    pending
+        .try_reserve(1)
+        .map_err(|_| HostSchemaValidationError::AllocationFailed {
+            field: "schema encoding",
+        })?;
+    pending.push(schema);
+
+    while let Some(current) = pending.pop() {
+        match current {
+            HostTypeSchema::Unknown => push_tag(bytes, b'U'),
+            HostTypeSchema::Null => push_tag(bytes, b'N'),
+            HostTypeSchema::Int => push_tag(bytes, b'I'),
+            HostTypeSchema::Float => push_tag(bytes, b'F'),
+            HostTypeSchema::Number => push_tag(bytes, b'#'),
+            HostTypeSchema::Bool => push_tag(bytes, b'B'),
+            HostTypeSchema::String => push_tag(bytes, b'S'),
+            HostTypeSchema::Bytes => push_tag(bytes, b'Y'),
+            HostTypeSchema::Array(inner) => {
+                push_tag(bytes, b'[');
+                pending.try_reserve(1).map_err(|_| {
+                    HostSchemaValidationError::AllocationFailed {
+                        field: "schema encoding",
+                    }
+                })?;
+                pending.push(inner);
             }
-            push_type(bytes, result);
-        }
-        HostTypeSchema::Resource(key) => {
-            push_tag(bytes, b'r');
-            push_len_str(bytes, key.as_str());
+            HostTypeSchema::Map(inner) => {
+                push_tag(bytes, b'{');
+                pending.try_reserve(1).map_err(|_| {
+                    HostSchemaValidationError::AllocationFailed {
+                        field: "schema encoding",
+                    }
+                })?;
+                pending.push(inner);
+            }
+            HostTypeSchema::Optional(inner) => {
+                push_tag(bytes, b'?');
+                pending.try_reserve(1).map_err(|_| {
+                    HostSchemaValidationError::AllocationFailed {
+                        field: "schema encoding",
+                    }
+                })?;
+                pending.push(inner);
+            }
+            HostTypeSchema::Callable { params, result } => {
+                push_tag(bytes, b'c');
+                push_len(bytes, params.len())?;
+                let needed = params.len().checked_add(1).ok_or(
+                    HostSchemaValidationError::IntegerOverflow {
+                        field: "schema encoding capacity",
+                    },
+                )?;
+                pending.try_reserve(needed).map_err(|_| {
+                    HostSchemaValidationError::AllocationFailed {
+                        field: "schema encoding",
+                    }
+                })?;
+                pending.push(result);
+                for param in params.iter().rev() {
+                    pending.push(param);
+                }
+            }
+            HostTypeSchema::Resource(key) => {
+                push_tag(bytes, b'r');
+                push_len_str(bytes, key.as_str())?;
+            }
         }
     }
+    Ok(())
+}
+
+fn invalid_schema_bytes(error: &HostSchemaValidationError) -> Vec<u8> {
+    let mut bytes = b"invalid-host-schema:".to_vec();
+    bytes.extend_from_slice(error.to_string().as_bytes());
+    bytes
+}
+
+fn invalid_catalog_bytes(error: &HostApiCatalogError) -> Vec<u8> {
+    let mut bytes = b"invalid-host-api-catalog:".to_vec();
+    bytes.extend_from_slice(error.to_string().as_bytes());
+    bytes
 }
 
 fn passing_tag(passing: HostParamPassing) -> u8 {
@@ -2000,6 +3967,204 @@ mod tests {
         let back: HostApiFingerprint = serde_json::from_str(&s).unwrap();
         assert_eq!(back, fp);
         assert_eq!(back.as_u64(), fp.as_u64());
+    }
+
+    // --- Recursive complexity limits ---
+
+    fn nested_array(depth: usize) -> HostTypeSchema {
+        let mut schema = HostTypeSchema::Int;
+        for _ in 0..depth {
+            schema = HostTypeSchema::Array(Box::new(schema));
+        }
+        schema
+    }
+
+    fn catalog_with_return(return_type: HostTypeSchema) -> HostApiCatalog {
+        let mut builder = HostApiCatalog::builder();
+        builder.function(HostFunctionSchema::with_return(
+            "limits::probe",
+            Vec::new(),
+            return_type,
+        ));
+        builder.build().expect("test catalog should build")
+    }
+
+    #[test]
+    fn catalog_accepts_schema_depth_boundary_and_rejects_one_more_level() {
+        // The root is depth one, so 63 wrappers plus the scalar occupy the
+        // documented 64-node path boundary.
+        assert_eq!(
+            catalog_with_return(nested_array(MAX_HOST_SCHEMA_DEPTH - 1))
+                .functions()
+                .len(),
+            1
+        );
+        let mut over_builder = HostApiCatalog::builder();
+        over_builder.function(HostFunctionSchema::with_return(
+            "limits::too_deep",
+            Vec::new(),
+            nested_array(MAX_HOST_SCHEMA_DEPTH),
+        ));
+        assert!(over_builder.build().is_err());
+    }
+
+    #[test]
+    fn callable_property_budget_accepts_boundary_and_rejects_one_more() {
+        const MAX_PROPERTIES: usize = MAX_HOST_SCHEMA_PROPERTIES;
+        let boundary = (0..MAX_PROPERTIES).map(|_| HostTypeSchema::Int).collect();
+        let mut boundary_builder = HostApiCatalog::builder();
+        boundary_builder.function(HostFunctionSchema::with_return(
+            "limits::properties",
+            Vec::new(),
+            HostTypeSchema::Callable {
+                params: boundary,
+                result: Box::new(HostTypeSchema::Int),
+            },
+        ));
+        assert!(boundary_builder.build().is_ok());
+
+        let over = (0..=MAX_PROPERTIES).map(|_| HostTypeSchema::Int).collect();
+        let mut over_builder = HostApiCatalog::builder();
+        over_builder.function(HostFunctionSchema::with_return(
+            "limits::properties_over",
+            Vec::new(),
+            HostTypeSchema::Callable {
+                params: over,
+                result: Box::new(HostTypeSchema::Int),
+            },
+        ));
+        assert!(over_builder.build().is_err());
+    }
+
+    #[test]
+    fn catalog_parameter_budget_accepts_boundary_and_rejects_one_more() {
+        const MAX_PARAMETERS: usize = MAX_HOST_CATALOG_PARAMETERS;
+        let boundary = (0..MAX_PARAMETERS)
+            .map(|index| HostParamSchema::value(format!("p{index}"), HostTypeSchema::Int))
+            .collect();
+        let mut boundary_builder = HostApiCatalog::builder();
+        boundary_builder.function(HostFunctionSchema::with_return(
+            "limits::parameters",
+            boundary,
+            HostTypeSchema::Int,
+        ));
+        assert!(boundary_builder.build().is_ok());
+
+        let over = (0..=MAX_PARAMETERS)
+            .map(|index| HostParamSchema::value(format!("p{index}"), HostTypeSchema::Int))
+            .collect();
+        let mut over_builder = HostApiCatalog::builder();
+        over_builder.function(HostFunctionSchema::with_return(
+            "limits::parameters_over",
+            over,
+            HostTypeSchema::Int,
+        ));
+        assert!(over_builder.build().is_err());
+    }
+
+    #[test]
+    fn schema_node_budget_accepts_boundary_and_rejects_one_more() {
+        let branch = || nested_array(MAX_HOST_SCHEMA_DEPTH - 2);
+        let boundary = (0..260).map(|_| branch()).collect();
+        let mut boundary_builder = HostApiCatalog::builder();
+        boundary_builder.function(HostFunctionSchema::with_return(
+            "limits::nodes",
+            Vec::new(),
+            HostTypeSchema::Callable {
+                params: boundary,
+                result: Box::new(HostTypeSchema::Int),
+            },
+        ));
+        assert!(boundary_builder.build().is_ok());
+
+        let over = (0..261).map(|_| branch()).collect();
+        let mut over_builder = HostApiCatalog::builder();
+        over_builder.function(HostFunctionSchema::with_return(
+            "limits::nodes_over",
+            Vec::new(),
+            HostTypeSchema::Callable {
+                params: over,
+                result: Box::new(HostTypeSchema::Int),
+            },
+        ));
+        assert!(over_builder.build().is_err());
+    }
+
+    #[test]
+    fn invalid_schema_serialization_and_identity_are_bounded() {
+        let schema = nested_array(MAX_HOST_SCHEMA_DEPTH);
+        assert!(serde_json::to_string(&schema).is_err());
+        let function = HostFunctionSchema::with_return("limits::invalid", Vec::new(), schema);
+        let identity = function.identity_discriminator();
+        assert!(identity.starts_with("invalid-host-schema:"));
+        assert!(identity.len() < 256);
+    }
+    #[test]
+    fn catalog_function_list_overflow_is_rejected_before_loading_entries() {
+        let mut functions = String::new();
+        functions.push('[');
+        for index in 0..(MAX_HOST_CATALOG_FUNCTIONS + 1) {
+            if index != 0 {
+                functions.push(',');
+            }
+            functions.push_str(&format!(
+                "{{\"name\":\"limits::overload{index}\",\"params\":[],\"return_type\":\"Int\",\"description\":\"\"}}"
+            ));
+        }
+        functions.push(']');
+        let json = format!("{{\"resources\":[],\"functions\":{functions}}}");
+        assert!(serde_json::from_str::<HostApiCatalog>(&json).is_err());
+    }
+
+    #[test]
+    fn deeply_nested_json_is_rejected_without_unwinding_the_process() {
+        let depth = 1024;
+        let mut nested = String::with_capacity(depth * 10 + 5);
+        for _ in 0..depth {
+            nested.push_str("{\"Array\":");
+        }
+        nested.push_str("\"Int\"");
+        for _ in 0..depth {
+            nested.push('}');
+        }
+        let raw = format!(
+            "{{\"resources\":[],\"functions\":[{{\"name\":\"limits::json\",\"params\":[],\"return_type\":{nested},\"description\":\"\"}}]}}"
+        );
+        let result = std::panic::catch_unwind(|| serde_json::from_str::<HostApiCatalog>(&raw));
+        assert!(result.is_ok(), "deep JSON must not panic");
+        assert!(
+            result.expect("deep JSON result").is_err(),
+            "deep JSON must exceed the schema-depth limit"
+        );
+    }
+
+    #[test]
+    fn wide_callable_json_is_rejected_at_the_schema_boundary() {
+        let params = (0..4097).map(|_| "\"Int\"").collect::<Vec<_>>().join(",");
+        let raw = format!("{{\"Callable\":{{\"params\":[{params}],\"result\":\"Int\"}}}}");
+        assert!(serde_json::from_str::<HostTypeSchema>(&raw).is_err());
+    }
+
+    #[test]
+    fn deeply_nested_import_schema_json_is_rejected_before_identity_use() {
+        let depth = 1024;
+        let mut nested = String::with_capacity(depth * 10 + 5);
+        for _ in 0..depth {
+            nested.push_str("{\"Optional\":");
+        }
+        nested.push_str("\"Int\"");
+        for _ in 0..depth {
+            nested.push('}');
+        }
+        let raw = format!(
+            "{{\"name\":\"limits::import\",\"params\":[],\"return_type\":{nested},\"fingerprint\":0}}"
+        );
+        let result = std::panic::catch_unwind(|| serde_json::from_str::<HostImportSchema>(&raw));
+        assert!(result.is_ok(), "deep import JSON must not panic");
+        assert!(
+            result.expect("deep import result").is_err(),
+            "deep import JSON must exceed the schema-depth limit"
+        );
     }
 
     // --- helpers used by tests above ---

@@ -14,6 +14,17 @@ pub enum VmError {
     InvalidCall(u16),
     InvalidCallable,
     InvalidCallablePrototype(u32),
+    /// Frame metadata (root binding slots, parameter or capture slots)
+    /// does not match the script frame layout.
+    InvalidFrameState(&'static str),
+    /// A program requested more local slots than one runtime frame may own.
+    FrameAllocationLimit {
+        requested: usize,
+        limit: usize,
+    },
+    /// `CallScript` targeted a prototype whose capture layout requires an
+    /// environment; a static script call can never supply one.
+    CallScriptRequiresEnvironment(u32),
     CallStackOverflow,
     InvalidCallStackLimit(usize),
     InvalidCallArity {
@@ -52,6 +63,15 @@ impl fmt::Display for VmError {
             Self::InvalidCallablePrototype(index) => {
                 write!(f, "invalid callable prototype: {index}")
             }
+            Self::InvalidFrameState(detail) => write!(f, "invalid frame state: {detail}"),
+            Self::FrameAllocationLimit { requested, limit } => write!(
+                f,
+                "frame local allocation of {requested} slots exceeds limit {limit}"
+            ),
+            Self::CallScriptRequiresEnvironment(prototype_id) => write!(
+                f,
+                "callscript prototype {prototype_id} requires a callable environment"
+            ),
             Self::CallStackOverflow => f.write_str("script call stack overflow"),
             Self::InvalidCallStackLimit(limit) => {
                 write!(
@@ -95,7 +115,24 @@ pub enum WireError {
     InvalidTypeMapFlag(u8),
     InvalidDebugFlag(u8),
     InvalidValueType(u8),
+    InvalidResourceKey,
     InvalidCaptureBindingMode(u8),
+    /// `CallScript` referenced a prototype id that is out of range or does
+    /// not target a script function.
+    InvalidCallScriptTarget {
+        prototype_id: u32,
+    },
+    /// `CallScript` declared an argc that disagrees with the prototype arity.
+    InvalidCallScriptArity {
+        prototype_id: u32,
+        expected: u8,
+        got: u8,
+    },
+    /// An instruction operand is truncated by the end of the code blob.
+    TruncatedOperand {
+        opcode: u8,
+        expected_bytes: usize,
+    },
     InvalidUtf8,
     LengthTooLarge(&'static str, usize),
     SchemaTooDeep,
@@ -116,9 +153,29 @@ impl fmt::Display for WireError {
             Self::InvalidTypeMapFlag(value) => write!(f, "invalid type-map flag: {value}"),
             Self::InvalidDebugFlag(value) => write!(f, "invalid debug flag: {value}"),
             Self::InvalidValueType(value) => write!(f, "invalid value type: {value}"),
+            Self::InvalidResourceKey => f.write_str("invalid resource type key"),
             Self::InvalidCaptureBindingMode(value) => {
                 write!(f, "invalid capture binding mode: {value}")
             }
+            Self::InvalidCallScriptTarget { prototype_id } => write!(
+                f,
+                "callscript prototype {prototype_id} does not target a script function"
+            ),
+            Self::InvalidCallScriptArity {
+                prototype_id,
+                expected,
+                got,
+            } => write!(
+                f,
+                "callscript prototype {prototype_id} arity mismatch: expected {expected}, got {got}"
+            ),
+            Self::TruncatedOperand {
+                opcode,
+                expected_bytes,
+            } => write!(
+                f,
+                "truncated operand for opcode {opcode:#04x}: expected {expected_bytes} bytes"
+            ),
             Self::InvalidUtf8 => f.write_str("invalid UTF-8 in VMBC string"),
             Self::LengthTooLarge(field, length) => {
                 write!(f, "{field} length is too large: {length}")

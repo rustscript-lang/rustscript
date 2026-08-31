@@ -245,6 +245,10 @@ pub enum RegistrySchemaError {
         existing: Box<HostImportSchema>,
         requested: Box<HostImportSchema>,
     },
+    InvalidSchema {
+        name: String,
+        detail: String,
+    },
 }
 
 type HostPlanCache =
@@ -271,6 +275,12 @@ impl std::fmt::Display for RegistrySchemaError {
                 "catalog schemas for '{}' have the same dispatch shape but differ in identity: existing {existing:?}, requested {requested:?}",
                 requested.name
             ),
+            Self::InvalidSchema { name, detail } => {
+                write!(
+                    f,
+                    "catalog schema for '{name}' exceeds host schema limits: {detail}"
+                )
+            }
         }
     }
 }
@@ -290,6 +300,17 @@ fn normalize_import_schemas(
             imports.len(),
             schemas.len()
         )));
+    }
+    crate::host_api::validate_optional_host_import_schemas(schemas).map_err(|error| {
+        VmError::HostError(format!("invalid host import schema collection: {error}"))
+    })?;
+    for schema in schemas.iter().flatten() {
+        schema.validate().map_err(|error| {
+            VmError::HostError(format!(
+                "invalid host import schema '{}': {error}",
+                schema.name
+            ))
+        })?;
     }
     Ok(schemas.to_vec())
 }
@@ -643,6 +664,12 @@ impl HostFunctionRegistry {
         schema: HostImportSchema,
         kind: RegistryEntryKind,
     ) -> Result<u16, RegistrySchemaError> {
+        if let Err(error) = schema.validate() {
+            return Err(RegistrySchemaError::InvalidSchema {
+                name: schema.name.clone(),
+                detail: error.to_string(),
+            });
+        }
         let arity =
             u8::try_from(schema.arity()).map_err(|_| RegistrySchemaError::InvalidArity {
                 name: schema.name.clone(),
@@ -1240,7 +1267,7 @@ fn callable_schema_matches(
                     .all(|(expected, actual)| callable_schema_matches(expected, actual))
                 && callable_schema_matches(expected_result, actual_result)
         }
-        (HostTypeSchema::Resource(_), _) => false,
+        (HostTypeSchema::Resource(expected), TypeSchema::Resource(actual)) => expected == actual,
         _ => false,
     }
 }
@@ -3325,5 +3352,147 @@ impl Vm {
             .get(index as usize)
             .copied()
             .ok_or(VmError::InvalidCall(index))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::callable_schema_matches;
+    use crate::ResourceTypeKey;
+    use crate::compiler::TypeSchema;
+    use crate::host_api::{
+        HostApiCatalog, HostFunctionSchema, HostImportSchema, HostTypeSchema, MAX_HOST_SCHEMA_DEPTH,
+    };
+
+    fn key(name: &str) -> ResourceTypeKey {
+        ResourceTypeKey::new(name).expect("test resource key")
+    }
+
+    #[test]
+    fn callable_schema_matches_direct_resources_by_key() {
+        let expected_key = key("test.resource");
+        let other_key = key("other.resource");
+
+        assert!(callable_schema_matches(
+            &HostTypeSchema::Resource(expected_key.clone()),
+            &TypeSchema::Resource(expected_key),
+        ));
+        assert!(!callable_schema_matches(
+            &HostTypeSchema::Resource(key("test.resource")),
+            &TypeSchema::Resource(other_key),
+        ));
+    }
+
+    #[test]
+    fn callable_schema_matches_resource_callable_parameters_by_key() {
+        let expected_key = key("test.parameter");
+        let other_key = key("other.parameter");
+        let expected = HostTypeSchema::Callable {
+            params: vec![HostTypeSchema::Resource(expected_key.clone())],
+            result: Box::new(HostTypeSchema::Null),
+        };
+
+        assert!(callable_schema_matches(
+            &expected,
+            &TypeSchema::Callable {
+                params: vec![TypeSchema::Resource(expected_key)],
+                result: Box::new(TypeSchema::Null),
+            },
+        ));
+        assert!(!callable_schema_matches(
+            &expected,
+            &TypeSchema::Callable {
+                params: vec![TypeSchema::Resource(other_key)],
+                result: Box::new(TypeSchema::Null),
+            },
+        ));
+    }
+
+    #[test]
+    fn callable_schema_matches_resource_callable_returns_by_key() {
+        let expected_key = key("test.return");
+        let other_key = key("other.return");
+        let expected = HostTypeSchema::Callable {
+            params: Vec::new(),
+            result: Box::new(HostTypeSchema::Resource(expected_key.clone())),
+        };
+
+        assert!(callable_schema_matches(
+            &expected,
+            &TypeSchema::Callable {
+                params: Vec::new(),
+                result: Box::new(TypeSchema::Resource(expected_key)),
+            },
+        ));
+        assert!(!callable_schema_matches(
+            &expected,
+            &TypeSchema::Callable {
+                params: Vec::new(),
+                result: Box::new(TypeSchema::Resource(other_key)),
+            },
+        ));
+    }
+
+    fn nested_expected(key: ResourceTypeKey) -> HostTypeSchema {
+        HostTypeSchema::Callable {
+            params: vec![HostTypeSchema::Optional(Box::new(HostTypeSchema::Array(
+                Box::new(HostTypeSchema::Resource(key.clone())),
+            )))],
+            result: Box::new(HostTypeSchema::Map(Box::new(HostTypeSchema::Resource(key)))),
+        }
+    }
+
+    fn nested_actual(key: ResourceTypeKey) -> TypeSchema {
+        let mut object_fields = HashMap::new();
+        object_fields.insert("resource".to_string(), TypeSchema::Resource(key.clone()));
+        TypeSchema::Callable {
+            params: vec![TypeSchema::Optional(Box::new(TypeSchema::ArrayTupleRest {
+                prefix: vec![TypeSchema::Resource(key.clone())],
+                rest: Box::new(TypeSchema::Resource(key)),
+            }))],
+            result: Box::new(TypeSchema::Object(object_fields)),
+        }
+    }
+
+    #[test]
+    fn callable_schema_matches_nested_resource_parameters_and_returns_by_key() {
+        let expected_key = key("test.nested");
+        let other_key = key("other.nested");
+
+        assert!(callable_schema_matches(
+            &nested_expected(expected_key.clone()),
+            &nested_actual(expected_key),
+        ));
+        assert!(!callable_schema_matches(
+            &nested_expected(key("test.nested")),
+            &nested_actual(other_key),
+        ));
+    }
+
+    #[test]
+    fn catalog_registration_rejects_overdepth_schema_before_mutation() {
+        let valid_function =
+            HostFunctionSchema::with_return("limits::registry", Vec::new(), HostTypeSchema::Int);
+        let mut builder = HostApiCatalog::builder();
+        builder.function(valid_function.clone());
+        let catalog = builder.build().expect("valid catalog");
+        let mut invalid = HostImportSchema::from_function(&catalog, &valid_function);
+        let mut nested = HostTypeSchema::Int;
+        for _ in 0..MAX_HOST_SCHEMA_DEPTH {
+            nested = HostTypeSchema::Array(Box::new(nested));
+        }
+        invalid.return_type = nested;
+
+        let mut registry = super::HostFunctionRegistry::empty();
+        let error = registry
+            .register_catalog_static(invalid, |_, _| Ok(super::CallOutcome::Halt))
+            .expect_err("invalid schema must be rejected");
+        assert!(matches!(
+            error,
+            super::RegistrySchemaError::InvalidSchema { .. }
+        ));
+        assert!(registry.catalog_by_schema.is_empty());
     }
 }

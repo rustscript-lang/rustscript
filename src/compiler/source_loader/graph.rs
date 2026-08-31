@@ -2,10 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::compiler::source_map::SourceMap;
+use crate::host_api::HostApiCatalog;
 
 use super::super::{
     CompileSourceFileOptions, ParseError, SourceError, SourceFlavor, SourcePathError, frontends,
-    ir::{Expr, FrontendIr, FunctionDecl, Stmt, TypeSchema},
+    ir::{
+        Expr, FrontendIr, FunctionDecl, FunctionRefTarget, ParsedCallTarget, ParsedSemanticIndex,
+        Stmt, TypeSchema,
+    },
     linker::{ParsedUnit, module_scope_prefix},
     modules::{ImportTargetKind, ImportedBinding, ModuleGraph, ModuleId, ResolvedImport, SymbolId},
 };
@@ -44,24 +48,25 @@ pub(super) fn collect_module_units(
         path.display().to_string(),
         source.to_string(),
     );
-    let (imports, decls) = scan_module_imports(source, flavor, path, options).map_err(|err| {
-        // Nested module sources surface their parse errors through the same
-        // path-prefixed diagnostic shape the compile parse uses. The root is
-        // scanned (and fails, if at all) in `load_units_for_source_file`
-        // before this point, so it never receives a prefix here. The scan
-        // parser numbers spans with its own local source id 0, so the span
-        // is always rebuilt against the owning module's graph source id —
-        // offsets from one module must never be interpreted in another.
-        match err {
-            SourcePathError::Source(SourceError::Parse(mut parse)) => {
-                parse.message = format!("{}: {}", path.display(), parse.message);
-                parse.span = None;
-                parse = parse.with_line_span_from_source(&state.sources, current_source_id.0);
-                SourcePathError::Source(SourceError::Parse(parse))
+    let (imports, decls) = scan_module_imports(source, flavor, path, options, current_source_id.0)
+        .map_err(|err| {
+            // Nested module sources surface their parse errors through the same
+            // path-prefixed diagnostic shape the compile parse uses. The root is
+            // scanned (and fails, if at all) in `load_units_for_source_file`
+            // before this point, so it never receives a prefix here. The scan
+            // parser numbers spans with its own local source id 0, so the span
+            // is always rebuilt against the owning module's graph source id —
+            // offsets from one module must never be interpreted in another.
+            match err {
+                SourcePathError::Source(SourceError::Parse(mut parse)) => {
+                    parse.message = format!("{}: {}", path.display(), parse.message);
+                    parse.span = None;
+                    parse = parse.with_line_span_from_source(&state.sources, current_source_id.0);
+                    SourcePathError::Source(SourceError::Parse(parse))
+                }
+                other => other,
             }
-            other => other,
-        }
-    })?;
+        })?;
     for (import_index, import) in imports.iter().enumerate() {
         let spec = import.spec.clone();
         let span = decls
@@ -172,18 +177,19 @@ pub(super) fn collect_module_units(
         )?;
         state.visiting.pop();
 
-        let module_imports = parse_module_imports(
-            &module_source_raw,
-            SourceFlavor::RustScript,
-            &resolved,
-            options,
-        )?;
         let module_source_id = state
             .module_graph
             .module_id_for_identity(&key)
             .and_then(|module| state.module_graph.node(module))
             .map(|node| node.source.0)
             .unwrap_or(0);
+        let module_imports = parse_module_imports(
+            &module_source_raw,
+            SourceFlavor::RustScript,
+            &resolved,
+            options,
+            module_source_id,
+        )?;
         let mut parsed = frontends::parse_module_source_with_source_id(
             &module_source_raw,
             SourceFlavor::RustScript,
@@ -237,6 +243,7 @@ pub(super) fn collect_module_units(
             source_name: resolved.display().to_string(),
             module: target,
             source_id: module_source_id,
+            host_catalog_supplied: options.host_api_catalog().is_some(),
         });
         state.module_graph.add_import(
             current_id,
@@ -310,10 +317,11 @@ fn namespace_alias_for_import(import: &ResolvedImport) -> Option<String> {
     }
 }
 
-/// File-module import targets that bind `namespace`, either through a clause
-/// alias (`use a::util as au;` binds `au`) or through the spec stem
-/// (host-form single-segment imports such as `use module;` whose namespace
-/// the parser resolved as a host root).
+/// File-module import targets that bind `namespace`, using the structured
+/// clause metadata already recorded on the graph edge. An explicit namespace
+/// alias owns only that alias; an all-public import owns the source stem.
+/// Single-segment named/prefix forms retain their source stem as an internal
+/// lookup key because the parser records their direct host aliases that way.
 fn file_module_targets_for_namespace(
     graph: &ModuleGraph,
     module: ModuleId,
@@ -330,12 +338,17 @@ fn file_module_targets_for_namespace(
         let Some(target) = import.target else {
             continue;
         };
-        let stem = Path::new(&import.spec)
-            .file_stem()
-            .and_then(|stem| stem.to_str());
-        if (namespace_alias_for_import(import).as_deref() == Some(namespace)
-            || stem == Some(namespace))
-            && !targets.contains(&target)
+        let binds_visible_namespace =
+            namespace_alias_for_import(import).as_deref() == Some(namespace);
+        let binds_single_segment_host_key = matches!(
+            &import.clause,
+            ImportClause::Named(_) | ImportClause::Prefix(_)
+        ) && Path::new(&import.spec).components().count() == 1
+            && Path::new(&import.spec)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                == Some(namespace);
+        if (binds_visible_namespace || binds_single_segment_host_key) && !targets.contains(&target)
         {
             targets.push(target);
         }
@@ -581,6 +594,7 @@ pub(super) fn record_module_symbols(
         &signatures,
         &extern_names,
         parsed,
+        options.host_api_catalog().map(|catalog| &**catalog),
     )
 }
 
@@ -634,6 +648,7 @@ struct CallResolutionContext<'a> {
     graph: &'a ModuleGraph,
     sources: &'a SourceMap,
     source_id: u32,
+    host_catalog: Option<&'a HostApiCatalog>,
 }
 
 impl<'a> CallResolutionContext<'a> {
@@ -686,6 +701,12 @@ impl<'a> CallResolutionContext<'a> {
         type_args: &[TypeSchema],
         line: u32,
     ) -> Result<Option<SymbolId>, SourcePathError> {
+        if self
+            .host_catalog
+            .is_some_and(|catalog| !catalog.functions_named(qualified).is_empty())
+        {
+            return Ok(None);
+        }
         if member.contains("::") {
             // Multi-level module member paths are not supported; the legacy
             // pipeline reported the same call as an unknown namespace call.
@@ -840,6 +861,7 @@ impl<'a> CallResolutionContext<'a> {
 /// Local calls (declarations that own a symbol) and host/builtin calls are
 /// left untouched; the linker remaps them by symbol or keeps their reserved
 /// builtin index.
+#[allow(clippy::too_many_arguments)]
 fn resolve_imported_call_sites(
     module: ModuleId,
     path: &Path,
@@ -848,6 +870,7 @@ fn resolve_imported_call_sites(
     signatures: &HashMap<SymbolId, ExportedFunctionSignature>,
     extern_names: &HashSet<String>,
     parsed: &mut FrontendIr,
+    host_catalog: Option<&HostApiCatalog>,
 ) -> Result<(), SourcePathError> {
     let source_id = graph.node(module).map(|node| node.source.0).unwrap_or(0);
     let mut plain_symbols = HashMap::<String, SymbolId>::new();
@@ -885,22 +908,21 @@ fn resolve_imported_call_sites(
         graph,
         sources,
         source_id,
+        host_catalog,
     };
 
-    let resolve_stmt = |stmt: &mut Stmt| -> Result<(), SourcePathError> {
-        resolve_stmt_imported_calls(&ctx, stmt)
-    };
     for stmt in &mut parsed.stmts {
-        resolve_stmt(stmt)?;
+        resolve_stmt_imported_calls(&ctx, stmt, parsed.parsed_semantic_index.as_mut())?;
     }
     for function_impl in parsed.function_impls.values_mut() {
         for stmt in &mut function_impl.body_stmts {
-            resolve_stmt(stmt)?;
+            resolve_stmt_imported_calls(&ctx, stmt, parsed.parsed_semantic_index.as_mut())?;
         }
         resolve_expr_imported_calls(
             &ctx,
             &mut function_impl.body_expr,
             function_impl.body_expr_line.max(1),
+            parsed.parsed_semantic_index.as_mut(),
         )?;
     }
     Ok(())
@@ -991,15 +1013,21 @@ fn ambiguous_imported_call_error(
 fn resolve_stmt_imported_calls(
     ctx: &CallResolutionContext<'_>,
     stmt: &mut Stmt,
+    mut parsed_semantic_index: Option<&mut ParsedSemanticIndex>,
 ) -> Result<(), SourcePathError> {
     let line = stmt_line(stmt);
     match stmt {
         Stmt::Noop { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
         Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
-            resolve_expr_imported_calls(ctx, expr, line)?;
+            resolve_expr_imported_calls(ctx, expr, line, parsed_semantic_index.as_deref_mut())?;
         }
         Stmt::ClosureLet { closure, .. } => {
-            resolve_expr_imported_calls(ctx, &mut closure.body, line)?;
+            resolve_expr_imported_calls(
+                ctx,
+                &mut closure.body,
+                line,
+                parsed_semantic_index.as_deref_mut(),
+            )?;
         }
         Stmt::FuncDecl { .. } => {}
         Stmt::IfElse {
@@ -1008,12 +1036,17 @@ fn resolve_stmt_imported_calls(
             else_branch,
             ..
         } => {
-            resolve_expr_imported_calls(ctx, condition, line)?;
+            resolve_expr_imported_calls(
+                ctx,
+                condition,
+                line,
+                parsed_semantic_index.as_deref_mut(),
+            )?;
             for nested in then_branch {
-                resolve_stmt_imported_calls(ctx, nested)?;
+                resolve_stmt_imported_calls(ctx, nested, parsed_semantic_index.as_deref_mut())?;
             }
             for nested in else_branch {
-                resolve_stmt_imported_calls(ctx, nested)?;
+                resolve_stmt_imported_calls(ctx, nested, parsed_semantic_index.as_deref_mut())?;
             }
         }
         Stmt::For {
@@ -1023,19 +1056,29 @@ fn resolve_stmt_imported_calls(
             body,
             ..
         } => {
-            resolve_stmt_imported_calls(ctx, init)?;
-            resolve_expr_imported_calls(ctx, condition, line)?;
-            resolve_stmt_imported_calls(ctx, post)?;
+            resolve_stmt_imported_calls(ctx, init, parsed_semantic_index.as_deref_mut())?;
+            resolve_expr_imported_calls(
+                ctx,
+                condition,
+                line,
+                parsed_semantic_index.as_deref_mut(),
+            )?;
+            resolve_stmt_imported_calls(ctx, post, parsed_semantic_index.as_deref_mut())?;
             for nested in body {
-                resolve_stmt_imported_calls(ctx, nested)?;
+                resolve_stmt_imported_calls(ctx, nested, parsed_semantic_index.as_deref_mut())?;
             }
         }
         Stmt::While {
             condition, body, ..
         } => {
-            resolve_expr_imported_calls(ctx, condition, line)?;
+            resolve_expr_imported_calls(
+                ctx,
+                condition,
+                line,
+                parsed_semantic_index.as_deref_mut(),
+            )?;
             for nested in body {
-                resolve_stmt_imported_calls(ctx, nested)?;
+                resolve_stmt_imported_calls(ctx, nested, parsed_semantic_index.as_deref_mut())?;
             }
         }
         Stmt::Drop { .. } => {}
@@ -1047,11 +1090,12 @@ fn resolve_expr_imported_calls(
     ctx: &CallResolutionContext<'_>,
     expr: &mut Expr,
     line: u32,
+    mut parsed_semantic_index: Option<&mut ParsedSemanticIndex>,
 ) -> Result<(), SourcePathError> {
     match expr {
-        Expr::Call(index, type_args, args) => {
+        Expr::Call(index, type_args, args, _host_annotation, semantic_id) => {
             for arg in args.iter_mut() {
-                resolve_expr_imported_calls(ctx, arg, line)?;
+                resolve_expr_imported_calls(ctx, arg, line, parsed_semantic_index.as_deref_mut())?;
             }
             let Some(decl) = ctx.functions_by_index.get(index) else {
                 // Builtin calls use the reserved builtin index space and are
@@ -1070,7 +1114,38 @@ fn resolve_expr_imported_calls(
             }
             let name = decl.name.as_str();
             if let Some(symbol) = ctx.target_for_call(name, args.len(), type_args, line)? {
-                *expr = Expr::ModuleCall(symbol, std::mem::take(type_args), std::mem::take(args));
+                // Post-merge annotation ordering invariant: imported-call
+                // resolution runs before merge/typing, while the exact host
+                // annotation is attached only post-merge, so this loader
+                // never receives `Some` here and [`Expr::ModuleCall`] carries
+                // no host resolution. The parser-assigned semantic id (and
+                // the parsed call-site target) survives the rewrite so the
+                // same source call keeps one identity end-to-end.
+                if let Some(parsed) = parsed_semantic_index
+                    && let Some(id) = semantic_id
+                {
+                    if let Some(site) = parsed.call_sites.iter_mut().find(|site| site.id == *id) {
+                        site.target = ParsedCallTarget::Module(symbol);
+                    }
+                    // The parser recorded the implicit-extern callee as a
+                    // function-value reference with the unit-local flat
+                    // index (in `attach_ordinary_call_provenance`, the
+                    // func_ref gets its own id distinct from the call
+                    // site); upgrade every reference to this resolved
+                    // name to the module symbol so the merged carrier
+                    // never aliases an unrelated flat function.
+                    for reference in parsed.func_refs.iter_mut() {
+                        if reference.name == name {
+                            reference.target = FunctionRefTarget::Module(symbol);
+                        }
+                    }
+                }
+                *expr = Expr::ModuleCall(
+                    symbol,
+                    std::mem::take(type_args),
+                    std::mem::take(args),
+                    *semantic_id,
+                );
             } else {
                 return Err(unknown_function_error(
                     ctx.path,
@@ -1097,6 +1172,15 @@ fn resolve_expr_imported_calls(
         }
         Expr::UnresolvedFunctionRef { name, type_args } => {
             if let Some(symbol) = ctx.target_for_function_ref(name, line)? {
+                // Upgrade the parser-recorded function-value reference from
+                // its placeholder flat index to the resolved module symbol.
+                if let Some(parsed) = parsed_semantic_index {
+                    for reference in parsed.func_refs.iter_mut() {
+                        if reference.name == *name {
+                            reference.target = FunctionRefTarget::Module(symbol);
+                        }
+                    }
+                }
                 *expr = Expr::ModuleFunctionRef(symbol, std::mem::take(type_args));
             } else {
                 return Err(unknown_function_error(
@@ -1125,30 +1209,47 @@ fn resolve_expr_imported_calls(
             key,
             container_slot: _,
             key_slot: _,
+            semantic_id: _,
         } => {
-            resolve_expr_imported_calls(ctx, container, line)?;
-            resolve_expr_imported_calls(ctx, key, line)?;
+            resolve_expr_imported_calls(
+                ctx,
+                container,
+                line,
+                parsed_semantic_index.as_deref_mut(),
+            )?;
+            resolve_expr_imported_calls(ctx, key, line, parsed_semantic_index.as_deref_mut())?;
         }
         Expr::OptionUnwrapOr {
             value,
             value_slot: _,
             fallback,
+            semantic_id: _,
         } => {
-            resolve_expr_imported_calls(ctx, value, line)?;
-            resolve_expr_imported_calls(ctx, fallback, line)?;
+            resolve_expr_imported_calls(ctx, value, line, parsed_semantic_index.as_deref_mut())?;
+            resolve_expr_imported_calls(ctx, fallback, line, parsed_semantic_index.as_deref_mut())?;
         }
-        Expr::LocalCall(_, _, args) => {
+        Expr::LocalCall(_, _, args, _) => {
             for arg in args.iter_mut() {
-                resolve_expr_imported_calls(ctx, arg, line)?;
+                resolve_expr_imported_calls(ctx, arg, line, parsed_semantic_index.as_deref_mut())?;
             }
         }
         Expr::Closure(closure) => {
-            resolve_expr_imported_calls(ctx, &mut closure.body, line)?;
+            resolve_expr_imported_calls(
+                ctx,
+                &mut closure.body,
+                line,
+                parsed_semantic_index.as_deref_mut(),
+            )?;
         }
         Expr::ClosureCall(closure, args) => {
-            resolve_expr_imported_calls(ctx, &mut closure.body, line)?;
+            resolve_expr_imported_calls(
+                ctx,
+                &mut closure.body,
+                line,
+                parsed_semantic_index.as_deref_mut(),
+            )?;
             for arg in args.iter_mut() {
-                resolve_expr_imported_calls(ctx, arg, line)?;
+                resolve_expr_imported_calls(ctx, arg, line, parsed_semantic_index.as_deref_mut())?;
             }
         }
         Expr::Add(lhs, rhs)
@@ -1161,24 +1262,39 @@ fn resolve_expr_imported_calls(
         | Expr::Eq(lhs, rhs)
         | Expr::Lt(lhs, rhs)
         | Expr::Gt(lhs, rhs) => {
-            resolve_expr_imported_calls(ctx, lhs, line)?;
-            resolve_expr_imported_calls(ctx, rhs, line)?;
+            resolve_expr_imported_calls(ctx, lhs, line, parsed_semantic_index.as_deref_mut())?;
+            resolve_expr_imported_calls(ctx, rhs, line, parsed_semantic_index.as_deref_mut())?;
         }
         Expr::Neg(inner)
         | Expr::Not(inner)
         | Expr::ToOwned(inner)
         | Expr::Borrow(inner)
         | Expr::BorrowMut(inner) => {
-            resolve_expr_imported_calls(ctx, inner, line)?;
+            resolve_expr_imported_calls(ctx, inner, line, parsed_semantic_index.as_deref_mut())?;
         }
         Expr::IfElse {
             condition,
             then_expr,
             else_expr,
         } => {
-            resolve_expr_imported_calls(ctx, condition, line)?;
-            resolve_expr_imported_calls(ctx, then_expr, line)?;
-            resolve_expr_imported_calls(ctx, else_expr, line)?;
+            resolve_expr_imported_calls(
+                ctx,
+                condition,
+                line,
+                parsed_semantic_index.as_deref_mut(),
+            )?;
+            resolve_expr_imported_calls(
+                ctx,
+                then_expr,
+                line,
+                parsed_semantic_index.as_deref_mut(),
+            )?;
+            resolve_expr_imported_calls(
+                ctx,
+                else_expr,
+                line,
+                parsed_semantic_index.as_deref_mut(),
+            )?;
         }
         Expr::Match {
             value_slot: _,
@@ -1187,17 +1303,22 @@ fn resolve_expr_imported_calls(
             arms,
             default,
         } => {
-            resolve_expr_imported_calls(ctx, value, line)?;
+            resolve_expr_imported_calls(ctx, value, line, parsed_semantic_index.as_deref_mut())?;
             for (_, arm_expr) in arms.iter_mut() {
-                resolve_expr_imported_calls(ctx, arm_expr, line)?;
+                resolve_expr_imported_calls(
+                    ctx,
+                    arm_expr,
+                    line,
+                    parsed_semantic_index.as_deref_mut(),
+                )?;
             }
-            resolve_expr_imported_calls(ctx, default, line)?;
+            resolve_expr_imported_calls(ctx, default, line, parsed_semantic_index.as_deref_mut())?;
         }
         Expr::Block { stmts, expr } => {
             for stmt in stmts.iter_mut() {
-                resolve_stmt_imported_calls(ctx, stmt)?;
+                resolve_stmt_imported_calls(ctx, stmt, parsed_semantic_index.as_deref_mut())?;
             }
-            resolve_expr_imported_calls(ctx, expr, line)?;
+            resolve_expr_imported_calls(ctx, expr, line, parsed_semantic_index)?;
         }
     }
     Ok(())

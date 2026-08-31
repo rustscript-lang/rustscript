@@ -32,14 +32,16 @@ pub(crate) fn install_default_host_functions(registry: &mut vm::HostFunctionRegi
 }
 
 #[cfg(feature = "runtime")]
-pub use builtins::runtime::standard_composition;
-#[cfg(feature = "runtime")]
 pub use builtins::runtime::{
     BorrowVmValue, FromVmValue, HostCallResult, IntoHostCallOutcome, TakeVmValue, arg, borrow_arg,
     return_one, take_arg,
 };
 #[cfg(all(feature = "runtime", not(target_arch = "wasm32")))]
 pub use builtins::runtime::{IoHostExt, IoPolicy};
+#[cfg(feature = "runtime")]
+pub use builtins::runtime::{
+    io_host_catalog, sqlite_host_catalog, standard_composition, standard_host_catalog,
+};
 pub use builtins::{
     BUILTIN_CATALOG, BuiltinFunction, BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec,
     CallableDef, CallableParam, CallableParamType, CallableSignature, HostExecution,
@@ -49,13 +51,17 @@ pub use builtins::{
 };
 pub use bytecode::{
     CallableEnvironment, CallableKind, CallablePrototype, CallableTarget, CallableValue,
-    CaptureBindingMode, ExportedCallable, FunctionRegion, HostImport, OpCode, Program,
-    RootCallableBinding, ScriptFunction, TypeMap, Value, ValueType,
+    CaptureBindingMode, ExportedCallable, FunctionRegion, HostImport, MAX_FRAME_LOCAL_COUNT,
+    OpCode, Program, RootCallableBinding, ScriptFunction, TypeMap, Value, ValueType,
 };
 pub use host_api::{
     FunctionNameError, HostApiBuilder, HostApiCatalog, HostApiCatalogError, HostApiFingerprint,
-    HostFunctionSchema, HostParamPassing, HostParamSchema, HostTypeSchema, ResourceTypeKey,
-    ResourceTypeKeyError, ResourceTypeSchema,
+    HostFunctionSchema, HostParamPassing, HostParamSchema, HostSchemaValidationError,
+    HostTypeSchema, MAX_HOST_CATALOG_FUNCTIONS, MAX_HOST_CATALOG_PARAMETERS,
+    MAX_HOST_CATALOG_RESOURCES, MAX_HOST_DESCRIPTION_LEN, MAX_HOST_FUNCTION_NAME_LEN,
+    MAX_HOST_PARAMETER_NAME_LEN, MAX_HOST_RESOURCE_KEY_LEN, MAX_HOST_SCHEMA_DEPTH,
+    MAX_HOST_SCHEMA_NODES, MAX_HOST_SCHEMA_PROPERTIES, ResourceTypeKey, ResourceTypeKeyError,
+    ResourceTypeSchema, validate_host_import_schemas,
 };
 #[cfg(feature = "runtime")]
 pub use vm::runtime::{
@@ -73,12 +79,14 @@ pub use compiler::diagnostics::{
 pub use compiler::source_map::{LineSpanMapping, LoweredSource, SourceId, SourceMap, Span};
 pub use compiler::{
     AssignmentKind, ClosureExpr, CompileError, CompileSourceFileOptions, CompiledProgram,
-    CompiledReplProgram, Compiler, DeclSymbol, ExportEntry, Expr, FormatError,
-    FrontendImportSyntax, FrontendIr, FunctionDecl, ImportClause, ImportTargetKind,
+    CompiledReplProgram, Compiler, CompletionItemKind, DeclSymbol, Definition, ExportEntry, Expr,
+    FormatError, FrontendImportSyntax, FrontendIr, FunctionDecl, ImportClause, ImportTargetKind,
     ImportedBinding, InferredLocalTypeHint, LocalIrBuilder, LocalSlot, ModuleGraph, ModuleId,
     ModuleImport, ModuleNode, NamedImport, ParseError, ParserDialect, ReplLocalBinding,
-    ReplLocalState, ResolvedImport, SharedParserOptions, SourceError, SourceFlavor,
-    SourcePathError, SourcePlugin, Stmt, SymbolId, UnknownInferredLocal, UseDecl, UsePathSegment,
+    ReplLocalState, ResolvedImport, SemanticCompletion, SemanticDiagnostic, SemanticModel,
+    SharedParserOptions, SourceError, SourceFlavor, SourcePathError, SourcePlugin, SourcePosition,
+    Stmt, SymbolId, TypeSchema, UnknownInferredLocal, UseDecl, UsePathSegment, analyze_source,
+    analyze_source_from_string_with_options, analyze_source_with_flavor,
     collect_inferred_local_type_hints, collect_inferred_local_type_hints_at_path_with_options,
     collect_inferred_local_type_hints_with_options, compile_source,
     compile_source_at_path_with_flavor_and_options, compile_source_file,
