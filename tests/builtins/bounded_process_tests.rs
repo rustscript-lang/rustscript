@@ -7,6 +7,8 @@ use vm::{
     CancellationToken, IoHostExt, IoPolicy, ProcessStatus, Value, Vm, VmStatus, compile_source,
     exec_bounded, standard_composition,
 };
+#[cfg(unix)]
+use vm::{ConfinedDirectory, ConfinedFsRoot};
 
 #[cfg(unix)]
 fn argv(parts: &[&str]) -> Vec<String> {
@@ -657,4 +659,213 @@ fn try_wait_includes_stdout_tail_once_terminal() {
     assert!(status.is_success());
     let snapshot = process.stdout_snapshot();
     assert_eq!(snapshot.bytes, b"6789");
+}
+
+#[cfg(unix)]
+fn confined_temp_dir(label: &str) -> std::path::PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock should be after the epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "rustscript-confined-cwd-{label}-{}-{stamp}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&path).expect("temporary test directory should be created");
+    path
+}
+
+#[cfg(unix)]
+fn remove_any(path: &std::path::Path) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.file_type().is_dir() {
+        std::fs::remove_dir_all(path).expect("temporary directory should be removed");
+    } else {
+        std::fs::remove_file(path).expect("temporary entry should be removed");
+    }
+}
+
+#[cfg(unix)]
+fn confined_exec(
+    directory: ConfinedDirectory,
+    argv: &[&str],
+) -> Result<vm::BoundedExecOutput, BoundedExecError> {
+    exec_bounded(
+        BoundedProcessRequest::new(argv.iter().map(|part| (*part).to_owned()).collect())
+            .with_confined_cwd(directory)
+            .with_timeout(Duration::from_secs(5)),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn open_fd_count() -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .expect("process fd directory should be readable")
+        .count()
+}
+
+#[cfg(unix)]
+#[test]
+fn confined_cwd_runs_in_a_nested_retained_directory() {
+    let root_path = confined_temp_dir("nested");
+    std::fs::create_dir_all(root_path.join("nested/leaf")).expect("nested leaf should be created");
+    std::fs::write(root_path.join("root-marker"), b"root").expect("root marker should be written");
+    std::fs::write(root_path.join("nested/leaf/marker"), b"nested")
+        .expect("nested marker should be written");
+    let root = ConfinedFsRoot::new(&root_path).expect("root directory should open");
+    let nested = root
+        .open_directory("nested/leaf")
+        .expect("nested directory should open");
+    let selected_root = root
+        .open_directory("")
+        .expect("empty path should select the retained root");
+
+    let nested_result = confined_exec(nested, &["/bin/cat", "marker"]).expect("nested cwd spawn");
+    assert!(nested_result.status.is_success());
+    assert_eq!(nested_result.stdout, b"nested");
+
+    let root_result =
+        confined_exec(selected_root, &["/bin/cat", "root-marker"]).expect("root cwd spawn");
+    assert!(root_result.status.is_success());
+    assert_eq!(root_result.stdout, b"root");
+
+    remove_any(&root_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn confined_cwd_survives_parent_and_leaf_swaps() {
+    let root_path = confined_temp_dir("swap");
+    let outside_path = confined_temp_dir("swap-outside");
+    std::fs::create_dir_all(root_path.join("parent/leaf")).expect("leaf should be created");
+    std::fs::write(root_path.join("parent/leaf/marker"), b"inside")
+        .expect("inside marker should be written");
+    std::fs::write(outside_path.join("marker"), b"outside")
+        .expect("outside marker should be written");
+    let root = ConfinedFsRoot::new(&root_path).expect("root directory should open");
+    let directory = root
+        .open_directory("parent/leaf")
+        .expect("leaf directory should open");
+
+    std::fs::rename(root_path.join("parent/leaf"), root_path.join("leaf-moved"))
+        .expect("leaf should be renamed away");
+    std::os::unix::fs::symlink(&outside_path, root_path.join("parent/leaf"))
+        .expect("leaf symlink should be installed");
+    std::fs::rename(root_path.join("parent"), root_path.join("parent-moved"))
+        .expect("parent should be renamed away");
+    std::os::unix::fs::symlink(&outside_path, root_path.join("parent"))
+        .expect("parent symlink should be installed");
+
+    match confined_exec(directory, &["/bin/cat", "marker"]) {
+        Ok(result) => {
+            assert_ne!(
+                result.stdout, b"outside",
+                "retained cwd must not follow a swapped path"
+            );
+            assert_eq!(result.stdout, b"inside");
+            assert!(result.status.is_success());
+        }
+        Err(error) => {
+            let text = error.to_string();
+            assert!(
+                !text.contains("outside")
+                    && !text.contains(outside_path.to_string_lossy().as_ref()),
+                "fail-closed spawn must stay path-free: {text}"
+            );
+        }
+    }
+
+    remove_any(&root_path);
+    remove_any(&outside_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn confined_cwd_rejects_path_cwd_and_capability_together() {
+    let root_path = confined_temp_dir("conflict");
+    let root = ConfinedFsRoot::new(&root_path).expect("root directory should open");
+    let directory = root
+        .open_directory("")
+        .expect("root directory capability should open");
+
+    let with_cwd = BoundedProcessRequest::new(vec!["/bin/true".to_owned()])
+        .with_cwd(root_path.clone())
+        .with_confined_cwd(directory.clone());
+    assert_eq!(
+        with_cwd.validate(),
+        Err(vm::ProcessValidationError::ConflictingCwd)
+    );
+
+    let with_workspace = BoundedProcessRequest::new(vec!["/bin/true".to_owned()])
+        .with_workspace_root(root_path.clone())
+        .with_confined_cwd(directory);
+    assert_eq!(
+        with_workspace.validate(),
+        Err(vm::ProcessValidationError::ConflictingCwd)
+    );
+
+    remove_any(&root_path);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn confined_cwd_does_not_leak_descriptors_across_repeated_spawn() {
+    let root_path = confined_temp_dir("fd-leak");
+    let root = ConfinedFsRoot::new(&root_path).expect("root directory should open");
+    let directory = root
+        .open_directory("")
+        .expect("root directory capability should open");
+    let before = open_fd_count();
+    for _ in 0..16 {
+        let result = confined_exec(directory.clone(), &["/bin/true"]).expect("repeated spawn");
+        assert!(result.status.is_success());
+    }
+    let after = open_fd_count();
+    assert!(
+        after <= before,
+        "repeated confined spawn leaked {} descriptors ({before} -> {after})",
+        after.saturating_sub(before)
+    );
+
+    remove_any(&root_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_absolute_cwd_path_still_sets_the_working_directory() {
+    let root_path = confined_temp_dir("path-cwd");
+    std::fs::write(root_path.join("marker"), b"path-cwd").expect("marker should be written");
+    let result = exec_bounded(
+        BoundedProcessRequest::new(vec!["/bin/cat".to_owned(), "marker".to_owned()])
+            .with_cwd(root_path.clone())
+            .with_timeout(Duration::from_secs(5)),
+    )
+    .expect("absolute path cwd should still spawn");
+    assert!(result.status.is_success());
+    assert_eq!(result.stdout, b"path-cwd");
+    remove_any(&root_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn confined_cwd_debug_omits_paths_and_descriptors() {
+    let root_path = confined_temp_dir("debug");
+    let root = ConfinedFsRoot::new(&root_path).expect("root directory should open");
+    let directory = root
+        .open_directory("")
+        .expect("root directory capability should open");
+    let request =
+        BoundedProcessRequest::new(vec!["/bin/true".to_owned()]).with_confined_cwd(directory);
+    let debug = format!("{request:?}");
+    assert!(
+        !debug.contains(root_path.to_string_lossy().as_ref()),
+        "request debug must not leak the root path: {debug}"
+    );
+    assert!(
+        !debug.contains("fd"),
+        "request debug must not leak a descriptor: {debug}"
+    );
+    remove_any(&root_path);
 }

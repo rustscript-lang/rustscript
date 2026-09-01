@@ -72,11 +72,11 @@ pub use bytecode::{
 };
 #[cfg(feature = "runtime")]
 pub use confined_fs::{
-    ConfinedDirEntry, ConfinedFile, ConfinedFileType, ConfinedFsError, ConfinedFsErrorKind,
-    ConfinedFsLimits, ConfinedFsRoot, ConfinedMetadata, ConfinedObservedIdentity,
-    ConfinedPublication, ConfinedPublicationState, ConfinedTempFile, EnumerationBudget,
-    MAX_COMPONENT_BYTES, MAX_ENUM_ENTRIES, MAX_PATH_BYTES, MAX_READ_BYTES, MAX_TEMP_ATTEMPTS,
-    MAX_TEMP_PREFIX_BYTES, MAX_WRITE_BYTES, publication_supported,
+    ConfinedDirEntry, ConfinedDirectory, ConfinedFile, ConfinedFileType, ConfinedFsError,
+    ConfinedFsErrorKind, ConfinedFsLimits, ConfinedFsRoot, ConfinedMetadata,
+    ConfinedObservedIdentity, ConfinedPublication, ConfinedPublicationState, ConfinedTempFile,
+    EnumerationBudget, MAX_COMPONENT_BYTES, MAX_ENUM_ENTRIES, MAX_PATH_BYTES, MAX_READ_BYTES,
+    MAX_TEMP_ATTEMPTS, MAX_TEMP_PREFIX_BYTES, MAX_WRITE_BYTES, publication_supported,
 };
 pub fn builtin_call_index(name: &str) -> Option<u16> {
     use builtins::BuiltinFunction;

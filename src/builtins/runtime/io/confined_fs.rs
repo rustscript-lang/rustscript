@@ -41,6 +41,8 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(unix)]
+use std::sync::Arc;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -673,6 +675,45 @@ impl ConfinedFile {
     }
 }
 
+/// An opaque retained directory handle opened through a [`ConfinedFsRoot`].
+///
+/// The capability owns the directory descriptor and exposes no public path or
+/// raw-fd accessor. Cloning retains the same directory through an `Arc`.
+#[derive(Clone)]
+pub struct ConfinedDirectory {
+    #[cfg(unix)]
+    inner: Arc<ConfinedDirectoryInner>,
+    #[cfg(not(unix))]
+    _private: (),
+}
+
+#[cfg(unix)]
+struct ConfinedDirectoryInner {
+    fd: OwnedFd,
+}
+
+impl fmt::Debug for ConfinedDirectory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfinedDirectory")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ConfinedDirectory {
+    #[cfg(unix)]
+    fn from_fd(fd: OwnedFd) -> Self {
+        Self {
+            inner: Arc::new(ConfinedDirectoryInner { fd }),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn as_raw_fd(&self) -> RawFd {
+        self.inner.fd.as_raw_fd()
+    }
+}
+
 /// A securely created temporary file and its retained parent directory.
 #[derive(Debug)]
 pub struct ConfinedTempFile {
@@ -1083,6 +1124,29 @@ impl ConfinedFsRoot {
         {
             let _ = path;
             Err(unsupported_error("fs::metadata"))
+        }
+    }
+
+    /// Opens a directory relative to the retained root and keeps the handle.
+    ///
+    /// Passing an empty path selects the retained root itself. Traversal uses
+    /// the same no-follow component walk and root-binding verification as other
+    /// confined operations. The returned capability owns the directory handle
+    /// and does not expose a path or raw descriptor.
+    pub fn open_directory(&self, path: &str) -> Result<ConfinedDirectory, ConfinedFsError> {
+        let path = validate_directory_path(path, "fs::open_directory")?;
+        #[cfg(unix)]
+        {
+            self.ensure_bound("fs::open_directory")?;
+            let fd = unix::open_directory(self.fd.as_raw_fd(), &path.components)
+                .map_err(|error| ConfinedFsError::os("fs::open_directory", &error))?;
+            self.ensure_bound("fs::open_directory")?;
+            Ok(ConfinedDirectory::from_fd(fd))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(unsupported_error("fs::open_directory"))
         }
     }
 

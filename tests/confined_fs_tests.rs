@@ -7,8 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use vm::{
-    ConfinedFileType, ConfinedFsError, ConfinedFsLimits, EnumerationBudget, MAX_COMPONENT_BYTES,
-    MAX_PATH_BYTES,
+    ConfinedDirectory, ConfinedFileType, ConfinedFsError, ConfinedFsLimits, EnumerationBudget,
+    MAX_COMPONENT_BYTES, MAX_PATH_BYTES,
 };
 use vm::{ConfinedFsErrorKind, ConfinedFsRoot};
 
@@ -712,6 +712,57 @@ mod unix_tests {
         assert_eq!(
             fs::read(outside_path.join("data")).expect("outside fixture should remain"),
             b"outside"
+        );
+
+        remove_any(&root_path);
+        remove_any(&outside_path);
+    }
+
+    #[test]
+    fn open_directory_selects_nested_and_empty_root_paths() {
+        let root_path = unique_temp_dir("open-directory");
+        fs::create_dir(root_path.join("nested")).expect("nested directory should be created");
+        fs::create_dir(root_path.join("nested/leaf")).expect("leaf directory should be created");
+        let root = ConfinedFsRoot::new(&root_path).expect("root directory should open");
+
+        let nested = root
+            .open_directory("nested/leaf")
+            .expect("nested directory should open");
+        let selected_root = root
+            .open_directory("")
+            .expect("empty path should select the retained root");
+        let cloned = nested.clone();
+
+        let debug = format!("{nested:?}{selected_root:?}{cloned:?}");
+        assert!(
+            !debug.contains(root_path.to_string_lossy().as_ref()),
+            "directory debug must not leak the root path: {debug}"
+        );
+        assert!(
+            !debug.contains("nested"),
+            "directory debug must not leak the relative path: {debug}"
+        );
+        assert!(
+            !debug.contains("fd"),
+            "directory debug must not leak a descriptor: {debug}"
+        );
+        let _ = ConfinedDirectory::clone(&cloned);
+
+        remove_any(&root_path);
+    }
+
+    #[test]
+    fn open_directory_denies_symlink_components() {
+        let root_path = unique_temp_dir("open-directory-symlink");
+        let outside_path = unique_temp_dir("open-directory-symlink-outside");
+        fs::create_dir(outside_path.join("leaf")).expect("outside leaf should be created");
+        symlink(&outside_path, root_path.join("link")).expect("parent symlink should work");
+        let root = ConfinedFsRoot::new(&root_path).expect("root directory should open");
+
+        assert_kind(
+            root.open_directory("link/leaf")
+                .expect_err("symlink component must not be followed"),
+            ConfinedFsErrorKind::SymlinkDenied,
         );
 
         remove_any(&root_path);

@@ -17,6 +17,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::confined_fs::ConfinedDirectory;
+
 #[cfg(windows)]
 use super::windows_process_tree::ProcessJob;
 #[cfg(unix)]
@@ -97,6 +99,10 @@ pub struct BoundedProcessRequest {
     pub argv: Vec<String>,
     /// Optional explicit working directory. Must be absolute when present.
     pub cwd: Option<PathBuf>,
+    /// Optional retained confined directory used as the child cwd.
+    ///
+    /// Mutually exclusive with [`Self::cwd`] and [`Self::workspace_root`].
+    pub confined_cwd: Option<ConfinedDirectory>,
     /// Workspace root used as the child cwd when `cwd` is omitted.
     pub workspace_root: Option<PathBuf>,
     /// Explicit environment entries. They are allowlisted; inheritance is
@@ -129,6 +135,7 @@ impl fmt::Debug for BoundedProcessRequest {
             .debug_struct("BoundedProcessRequest")
             .field("argv_count", &self.argv.len())
             .field("cwd_present", &self.cwd.is_some())
+            .field("confined_cwd_present", &self.confined_cwd.is_some())
             .field("workspace_root_present", &self.workspace_root.is_some())
             .field("env_count", &self.env.len())
             .field("inherit_env", &self.inherit_env)
@@ -183,6 +190,7 @@ impl BoundedProcessRequest {
         Self {
             argv,
             cwd: None,
+            confined_cwd: None,
             workspace_root: None,
             env: BTreeMap::new(),
             inherit_env: false,
@@ -198,6 +206,11 @@ impl BoundedProcessRequest {
 
     pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
         self.cwd = Some(cwd.into());
+        self
+    }
+
+    pub fn with_confined_cwd(mut self, cwd: ConfinedDirectory) -> Self {
+        self.confined_cwd = Some(cwd);
         self
     }
 
@@ -262,22 +275,32 @@ impl BoundedProcessRequest {
     pub fn validate(&self) -> Result<(), ValidationError> {
         validate_argv(&self.argv)?;
 
-        if let Some(cwd) = self.resolved_cwd() {
-            let cwd_len = os_string_len(cwd.as_os_str());
-            if cwd_len == 0 {
-                return Err(ValidationError::EmptyCwd);
+        let has_path_cwd = self.cwd.is_some() || self.workspace_root.is_some();
+        if self.confined_cwd.is_some() && has_path_cwd {
+            return Err(ValidationError::ConflictingCwd);
+        }
+        if self.confined_cwd.is_none() {
+            if let Some(cwd) = self.resolved_cwd() {
+                let cwd_len = os_string_len(cwd.as_os_str());
+                if cwd_len == 0 {
+                    return Err(ValidationError::EmptyCwd);
+                }
+                if cwd_len > MAX_ARG_TOTAL_BYTES {
+                    return Err(ValidationError::CwdTooLong);
+                }
+                if os_string_has_nul(cwd.as_os_str()) {
+                    return Err(ValidationError::CwdContainsNul);
+                }
+                if !cwd.is_absolute() {
+                    return Err(ValidationError::CwdNotAbsolute);
+                }
+            } else {
+                return Err(ValidationError::CwdRequired);
             }
-            if cwd_len > MAX_ARG_TOTAL_BYTES {
-                return Err(ValidationError::CwdTooLong);
-            }
-            if os_string_has_nul(cwd.as_os_str()) {
-                return Err(ValidationError::CwdContainsNul);
-            }
-            if !cwd.is_absolute() {
-                return Err(ValidationError::CwdNotAbsolute);
-            }
-        } else {
-            return Err(ValidationError::CwdRequired);
+        }
+        #[cfg(not(unix))]
+        if self.confined_cwd.is_some() {
+            return Err(ValidationError::ConfinedCwdUnsupported);
         }
 
         if self.inherit_env {
@@ -427,6 +450,8 @@ pub enum ValidationError {
     CwdNotAbsolute,
     CwdTooLong,
     CwdContainsNul,
+    ConflictingCwd,
+    ConfinedCwdUnsupported,
     EnvCountExceeded,
     InvalidEnvKey,
     EnvKeyTooLong,
@@ -460,6 +485,8 @@ impl fmt::Display for ValidationError {
             Self::CwdNotAbsolute => "cwd must be an absolute path",
             Self::CwdTooLong => "cwd exceeds the configured bound",
             Self::CwdContainsNul => "cwd contains a NUL byte",
+            Self::ConflictingCwd => "cwd path and confined cwd cannot both be specified",
+            Self::ConfinedCwdUnsupported => "confined cwd is unavailable on this target",
             Self::EnvCountExceeded => "environment entry count exceeds the configured bound",
             Self::InvalidEnvKey => "environment key has invalid grammar",
             Self::EnvKeyTooLong => "environment key exceeds the configured bound",
@@ -1981,15 +2008,44 @@ impl BoundedProcess {
             return Err(BoundedProcessError::Cancelled);
         }
 
-        let cwd = request
-            .resolved_cwd()
-            .cloned()
-            .ok_or(BoundedProcessError::InvalidRequest(
-                ValidationError::CwdRequired,
-            ))?;
+        let confined_cwd = request.confined_cwd.clone();
         let mut command = std::process::Command::new(&request.argv[0]);
         command.args(&request.argv[1..]);
-        command.current_dir(cwd);
+        if let Some(directory) = &confined_cwd {
+            #[cfg(unix)]
+            {
+                let fd = directory.as_raw_fd();
+                // SAFETY: `fchdir` is async-signal-safe. The retained directory
+                // descriptor stays alive in `confined_cwd` until `spawn` returns,
+                // and close-on-exec remains set so the child does not inherit it
+                // across `exec`.
+                unsafe {
+                    command.pre_exec(move || {
+                        if libc::fchdir(fd) != 0 {
+                            Err(std::io::Error::last_os_error())
+                        } else {
+                            Ok(())
+                        }
+                    });
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = directory;
+                return Err(BoundedProcessError::InvalidRequest(
+                    ValidationError::ConfinedCwdUnsupported,
+                ));
+            }
+        } else {
+            let cwd =
+                request
+                    .resolved_cwd()
+                    .cloned()
+                    .ok_or(BoundedProcessError::InvalidRequest(
+                        ValidationError::CwdRequired,
+                    ))?;
+            command.current_dir(cwd);
+        }
         command.env_clear();
         command.envs(&request.env);
         command
@@ -2004,6 +2060,7 @@ impl BoundedProcess {
         let mut child = command
             .spawn()
             .map_err(|error| BoundedProcessError::Spawn(spawn_error(&error)))?;
+        drop(confined_cwd);
         let pid = child.id();
         #[cfg(target_os = "linux")]
         let pidfd = match linux_pidfd::PidFd::open(pid) {
