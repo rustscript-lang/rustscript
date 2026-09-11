@@ -251,7 +251,10 @@ impl Vm {
         }
         if let Some(TypeSchema::Callable { params, result }) = &prototype.schema
             && (!matches!(params.as_slice(), [TypeSchema::Map(_)])
-                || !matches!(result.as_ref(), TypeSchema::Map(_)))
+                || !matches!(
+                    result.as_ref(),
+                    TypeSchema::Map(_) | TypeSchema::Named(_, _) | TypeSchema::Object(_)
+                ))
         {
             return Err(VmError::TypeMismatch("fn(map) -> map"));
         }

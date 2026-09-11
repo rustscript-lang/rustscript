@@ -201,6 +201,9 @@ pub fn standard_host_catalog() -> Arc<HostApiCatalog> {
             for resource in http_catalog.resources() {
                 builder.resource(resource.clone());
             }
+            for schema in http_catalog.structs() {
+                builder.named_struct(schema.clone());
+            }
             for function in http_catalog.functions() {
                 builder.function(function.clone());
             }
