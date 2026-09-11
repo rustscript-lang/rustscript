@@ -38,6 +38,10 @@ pub(crate) mod sqlite;
 pub(crate) mod standard_composition;
 mod typed;
 
+pub use jit::{
+    jit_host_catalog, register_jit_builtin_module, register_jit_builtin_module_from_catalog,
+};
+
 /// Returns the editor/compiler catalog for the built-in host extensions.
 ///
 /// The runtime implementation and the semantic catalog intentionally share only
@@ -311,6 +315,15 @@ pub fn standard_host_catalog() -> Arc<HostApiCatalog> {
                 builder.named_struct(schema.clone());
             }
             for function in http_catalog.functions() {
+                builder.function(function.clone());
+            }
+        }
+        {
+            let jit_catalog = jit_host_catalog();
+            for schema in jit_catalog.structs() {
+                builder.named_struct(schema.clone());
+            }
+            for function in jit_catalog.functions() {
                 builder.function(function.clone());
             }
         }
