@@ -1005,6 +1005,175 @@ fn sqlite_query_reports_row_and_result_byte_truncation() {
 }
 
 #[test]
+fn sqlite_query_envelope_emits_null_next_cursor_when_absent() {
+    let root = temporary_root("next-cursor");
+    let mut vm = new_vm();
+    let db_id = open_db(
+        &mut vm,
+        open_options(&root, "state.db", "read_write_create", limits([])),
+    );
+    execute(
+        &mut vm,
+        db_id,
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)",
+        empty_params(),
+    )
+    .expect("table creation should succeed");
+
+    let empty = query(
+        &mut vm,
+        db_id,
+        "SELECT id FROM items ORDER BY id",
+        empty_params(),
+        limits([]),
+    )
+    .expect("empty query should succeed");
+    assert_eq!(field(&empty, "next_cursor"), &Value::Null);
+
+    execute(
+        &mut vm,
+        db_id,
+        "INSERT INTO items (id, label) VALUES (7, 'seven')",
+        empty_params(),
+    )
+    .expect("row insertion should succeed");
+    let numbered = query(
+        &mut vm,
+        db_id,
+        "SELECT id FROM items ORDER BY id",
+        empty_params(),
+        limits([]),
+    )
+    .expect("numbered query should succeed");
+    assert_eq!(field(&numbered, "next_cursor"), &Value::Int(7));
+
+    let labeled = query(
+        &mut vm,
+        db_id,
+        "SELECT label FROM items ORDER BY id",
+        empty_params(),
+        limits([]),
+    )
+    .expect("text query should succeed");
+    assert_eq!(field(&labeled, "next_cursor"), &Value::Null);
+
+    sqlite::close_all(&mut vm);
+    fs::remove_dir_all(root).expect("temporary SQLite root should be removed");
+}
+
+#[test]
+fn sqlite_present_null_optional_fields_match_omitted_defaults() {
+    let root = temporary_root("null-optional");
+    let mut vm = new_vm();
+    vm.configure_sqlite(vm::SqlitePolicy {
+        database_root: Some(root.to_string_lossy().into_owned()),
+        ..vm::SqlitePolicy::default()
+    });
+
+    let omitted_mode = open_db(
+        &mut vm,
+        map_value([
+            ("root", Value::string(root.to_string_lossy().into_owned())),
+            ("path", Value::string("omitted.db")),
+            ("limits", limits([])),
+        ]),
+    );
+    execute(
+        &mut vm,
+        omitted_mode,
+        "CREATE TABLE items (value INTEGER)",
+        empty_params(),
+    )
+    .expect("omitted mode should default to read_write_create");
+
+    let null_mode = open_db(
+        &mut vm,
+        map_value([
+            ("root", Value::string(root.to_string_lossy().into_owned())),
+            ("path", Value::string("null-mode.db")),
+            ("mode", Value::Null),
+            ("limits", Value::Null),
+        ]),
+    );
+    execute(
+        &mut vm,
+        null_mode,
+        "CREATE TABLE items (value INTEGER)",
+        empty_params(),
+    )
+    .expect("null mode and limits should default like omission");
+
+    let null_open = sqlite::open(
+        &mut vm,
+        &[map_value([
+            ("root", Value::Null),
+            ("path", Value::string("null-root.db")),
+            ("mode", Value::string("read_write_create")),
+            ("limits", Value::Null),
+        ])],
+    )
+    .expect("null root should be treated as omitted");
+    execute(
+        &mut vm,
+        null_open,
+        "CREATE TABLE items (value INTEGER)",
+        empty_params(),
+    )
+    .expect("open with null root and limits should succeed");
+
+    execute(
+        &mut vm,
+        omitted_mode,
+        "INSERT INTO items (value) VALUES (1)",
+        empty_params(),
+    )
+    .expect("seed row should insert");
+    let statements = Value::array(vec![map_value([
+        ("sql", Value::string("INSERT INTO items (value) VALUES (2)")),
+        ("params", Value::Null),
+        ("query", Value::Null),
+        ("limits", Value::Null),
+    ])]);
+    let transaction = sqlite::transaction(&mut vm, &[Value::Int(omitted_mode), statements])
+        .expect("transaction should return");
+    let results = host_array(&mut vm, Ok(transaction)).expect("null optional statement fields");
+    assert_eq!(results.len(), 1);
+    let Value::Map(result) = &results[0] else {
+        panic!("transaction result should be a map");
+    };
+    assert_eq!(field(result, "rows_affected"), &Value::Int(1));
+
+    let limited = query(
+        &mut vm,
+        omitted_mode,
+        "SELECT value FROM items",
+        empty_params(),
+        map_value([("max_rows", Value::Null)]),
+    )
+    .expect("null limit keys should keep the ceiling");
+    let Value::Array(rows) = field(&limited, "rows") else {
+        panic!("SQLite rows should be an array");
+    };
+    assert_eq!(rows.len(), 2);
+
+    let unknown_null = query(
+        &mut vm,
+        omitted_mode,
+        "SELECT value FROM items",
+        empty_params(),
+        map_value([("nope", Value::Null)]),
+    )
+    .expect_err("unknown null limit keys remain unknown");
+    assert!(
+        unknown_null.to_string().contains("unknown SQLite limit"),
+        "unexpected unknown-null-limit error: {unknown_null}"
+    );
+
+    sqlite::close_all(&mut vm);
+    fs::remove_dir_all(root).expect("temporary SQLite root should be removed");
+}
+
+#[test]
 fn sqlite_pending_operations_can_be_cancelled_and_cleaned_up() {
     let root = temporary_root("cancel");
     let mut vm = new_vm();

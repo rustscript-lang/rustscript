@@ -177,8 +177,8 @@ pub(super) fn builtin_sqlite_truncated_impl(value: VmMapRef<'_>) -> VmResult<boo
 pub(super) fn builtin_sqlite_next_cursor_impl(value: VmMapRef<'_>) -> VmResult<i64> {
     match value.get(&Value::string("next_cursor")) {
         Some(Value::Int(value)) => Ok(*value),
+        Some(Value::Null) | None => Ok(0),
         Some(_) => Err(VmError::TypeMismatch("SQLite next_cursor integer")),
-        None => Ok(0),
     }
 }
 
@@ -371,8 +371,8 @@ fn required_string(map: &VmMap, key: &str) -> VmResult<String> {
         Some(Value::String(_)) => Err(VmError::HostError(format!(
             "SQLite {key} must not be empty"
         ))),
+        Some(Value::Null) | None => Err(VmError::HostError(format!("missing SQLite {key}"))),
         Some(_) => Err(VmError::TypeMismatch("SQLite option string")),
-        None => Err(VmError::HostError(format!("missing SQLite {key}"))),
     }
 }
 
@@ -412,6 +412,9 @@ fn parse_limits(value: Option<&Value>, ceiling: SqliteLimits) -> VmResult<Sqlite
     let Some(value) = value else {
         return Ok(ceiling);
     };
+    if matches!(value, Value::Null) {
+        return Ok(ceiling);
+    }
     let Value::Map(map) = value else {
         return Err(VmError::TypeMismatch("SQLite limits map"));
     };
@@ -421,6 +424,18 @@ fn parse_limits(value: Option<&Value>, ceiling: SqliteLimits) -> VmResult<Sqlite
             return Err(VmError::TypeMismatch("SQLite limit name"));
         };
         match key.as_str() {
+            "max_connections"
+            | "max_statements"
+            | "max_rows"
+            | "max_columns"
+            | "max_result_bytes"
+            | "max_statement_bytes"
+            | "max_parameters"
+            | "max_parameter_bytes"
+            | "max_pending_operations"
+            | "max_transaction_ms"
+            | "busy_timeout_ms"
+                if matches!(value, Value::Null) => {}
             "max_connections" => {
                 limits.max_connections =
                     parse_positive_usize(value, key)?.min(ceiling.max_connections)
@@ -943,9 +958,13 @@ fn query_with_connection(
         (Value::string("rows"), Value::array(values)),
         (Value::string("truncated"), Value::Bool(truncated)),
     ];
-    if let Some(next_cursor) = next_cursor {
-        entries.push((Value::string("next_cursor"), Value::Int(next_cursor)));
-    }
+    entries.push((
+        Value::string("next_cursor"),
+        match next_cursor {
+            Some(next_cursor) => Value::Int(next_cursor),
+            None => Value::Null,
+        },
+    ));
     Ok(VmMap::from_entries(entries))
 }
 
@@ -1412,18 +1431,18 @@ fn parse_transaction_statements(
             validate_sql(&sql, limits, allow_unsafe_sql)?;
             let params = match map_value(statement, "params") {
                 Some(Value::Array(params)) => sqlite_params(params, limits)?,
+                Some(Value::Null) | None => Vec::new(),
                 Some(_) => return Err(VmError::TypeMismatch("SQLite parameter array")),
-                None => Vec::new(),
             };
             let query = match map_value(statement, "query") {
                 Some(Value::Bool(query)) => *query,
+                Some(Value::Null) | None => false,
                 Some(_) => return Err(VmError::TypeMismatch("SQLite query flag")),
-                None => false,
             };
             let statement_limits = match map_value(statement, "limits") {
                 Some(Value::Map(statement_limits)) => parse_query_limits(statement_limits, limits)?,
+                Some(Value::Null) | None => limits,
                 Some(_) => return Err(VmError::TypeMismatch("SQLite limits map")),
-                None => limits,
             };
             Ok(TransactionStatement {
                 sql,
@@ -1569,7 +1588,7 @@ fn sqlite_query_result_struct() -> HostStructSchema {
         ],
     )
     .with_description(
-        "Query result envelope. Rows stay arrays of arrays; next_cursor is omitted when absent.",
+        "Query result envelope. Rows stay arrays of arrays; next_cursor is null when absent.",
     )
 }
 

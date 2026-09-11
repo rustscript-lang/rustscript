@@ -30,21 +30,22 @@ let db = sqlite::open({
 });
 ```
 
-All fields are optional in object literals. Runtime still requires a non-empty `path`.
+All fields are optional in object literals. Present `null` matches omission. Runtime still
+requires a non-empty `path`; `null` path is missing.
 
 | Field | Compile-time | Runtime |
 | --- | --- | --- |
-| `path` | optional string | required non-empty path |
-| `mode` | optional string | `read`, `write`, `create`, `memory`, or omitted |
-| `root` | optional string | optional filesystem root for path confinement |
-| `limits` | optional `SqliteLimits` | omitted keys keep the embedding ceiling |
+| `path` | optional string | required non-empty path; `null` is missing |
+| `mode` | optional string | `memory`, `read_only`, `read_write`, or `read_write_create`; omitted or `null` defaults to `read_write_create` |
+| `root` | optional string | optional filesystem root for path confinement; omitted or `null` uses the embedding policy |
+| `limits` | optional `SqliteLimits` | omitted or `null` keeps the embedding ceiling |
 
 Unknown fields are rejected at compile time.
 
 ## Limits (`SqliteLimits`)
 
-Every implementation-defined ceiling is an optional int. Omitted keys keep the host ceiling.
-Present keys must be positive integers and cannot exceed the ceiling.
+Every implementation-defined ceiling is an optional int. Omitted or `null` keys keep the host
+ceiling. Present keys must be positive integers and cannot exceed the ceiling.
 
 - `max_connections`
 - `max_statements`
@@ -90,7 +91,7 @@ let truncated = queried.truncated;
 | `columns` | array of string |
 | `rows` | array of arrays of dynamic cells |
 | `truncated` | bool |
-| `next_cursor` | optional int; omitted when absent |
+| `next_cursor` | optional int; `null` when absent |
 
 Row cells stay positional arrays. Index `queried.rows[0]` for the first row. Do not treat rows
 as objects.
@@ -107,12 +108,12 @@ sqlite::transaction(&db, [
 ]);
 ```
 
-| Field | Compile-time |
-| --- | --- |
-| `sql` | required string |
-| `params` | optional positional array of dynamic cells |
-| `query` | optional bool |
-| `limits` | optional `SqliteLimits` |
+| Field | Compile-time | Runtime |
+| --- | --- | --- |
+| `sql` | required string | required non-empty SQL |
+| `params` | optional positional array of dynamic cells | omitted or `null` is no parameters |
+| `query` | optional bool | omitted or `null` is execute (`false`) |
+| `limits` | optional `SqliteLimits` | omitted or `null` keeps the connection ceiling |
 
 The transaction return is `array<unknown>` because execute and query envelopes mix. Params on
 `execute` / `query` / `SqliteStatement` stay dynamic arrays, not named structs.
@@ -122,7 +123,7 @@ The transaction return is `array<unknown>` because execute and query envelopes m
 Named struct identity is a compile-time schema. Successful host values are still maps:
 
 - execute results expose `rows_affected` and `last_insert_rowid`
-- query envelopes expose `columns`, `rows`, `truncated`, and optionally `next_cursor`
+- query envelopes expose `columns`, `rows`, `truncated`, and `next_cursor` (`null` when absent)
 
 Field access (`inserted.rows_affected`) is the typed script surface. Extra or wrong-typed
 object-literal fields are compile errors.
