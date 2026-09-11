@@ -136,10 +136,10 @@ pub use vm::{
     InvocationPoll, QueuedScriptInvocation, RegistrySchemaError, ResourceCloseReason, ScriptArgs,
     ScriptCallback, ScriptResult, StandardSurfaceComposition, StaticHostArgsFunction,
     StaticHostFunction, StaticHostStackFunction, Store, Vm, VmError, VmResult, VmStatus,
-    VmYieldReason, async_host, catalog_import_schemas, catalog_named_struct_schemas,
-    execution_scope, host_context, host_extension, operation, register_catalog_function,
-    register_catalog_static_function, resource, validate_catalog_import_schemas,
-    validate_catalog_import_schemas_with_fingerprints,
+    VmYieldReason, async_host, catalog_import_schemas, catalog_import_schemas_into,
+    catalog_named_struct_schemas, execution_scope, host_context, host_extension, operation,
+    register_catalog_function, register_catalog_static_function, register_host_extension, resource,
+    validate_catalog_import_schemas, validate_catalog_import_schemas_with_fingerprints,
 };
 #[cfg(feature = "runtime")]
 pub use vmbc::{

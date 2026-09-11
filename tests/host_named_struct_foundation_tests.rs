@@ -14,7 +14,8 @@ use vm::host_api::{
     HostStructField, HostStructSchema, HostTypeSchema, ResourceTypeKey, ResourceTypeSchema,
 };
 use vm::{
-    CompiledProgram, SourcePathError, SourcePosition, analyze_source_from_string_with_options,
+    CallOutcome, CallReturn, CompiledProgram, HostExtension, HostFunctionRegistry, SourcePathError,
+    SourcePosition, Vm, analyze_source_from_string_with_options,
 };
 
 fn point_fields() -> Vec<HostStructField> {
@@ -221,7 +222,44 @@ fn handle_catalog() -> Arc<HostApiCatalog> {
         )],
         HostTypeSchema::Null,
     ));
+    builder.function(HostFunctionSchema::with_return(
+        "handles::take",
+        vec![HostParamSchema::with_passing(
+            "h",
+            handle.as_type(),
+            HostParamPassing::TakeOwned,
+        )],
+        HostTypeSchema::Null,
+    ));
     Arc::new(builder.build().expect("handle catalog"))
+}
+
+fn empty_vm() -> Vm {
+    let compiled = compile("0;", point_catalog()).expect("empty program");
+    Vm::try_new(compiled.program).expect("test VM construction must not fail")
+}
+
+fn noop_host(_vm: &mut Vm, _args: &[vm::Value]) -> vm::VmResult<CallOutcome> {
+    Ok(CallOutcome::Return(CallReturn::None))
+}
+
+struct NamedHandleExtension {
+    catalog: Arc<HostApiCatalog>,
+    name: &'static str,
+    arity: u8,
+}
+
+impl HostExtension for NamedHandleExtension {
+    fn catalog(&self) -> Option<&HostApiCatalog> {
+        Some(self.catalog.as_ref())
+    }
+
+    fn register(&self, registry: &mut HostFunctionRegistry) -> vm::VmResult<()> {
+        for schema in vm::catalog_import_schemas(self.catalog.as_ref(), self.name) {
+            registry.register_exact_static(self.name, self.arity, schema, noop_host)?;
+        }
+        Ok(())
+    }
 }
 
 #[test]
@@ -314,4 +352,51 @@ fn resource_bearing_named_return_is_classified_without_rejecting_registration() 
             Ok(vm::CallOutcome::Return(vm::CallReturn::None))
         })
         .expect("target registry accepts named-struct returns with nested resources");
+}
+
+#[test]
+fn install_extension_installs_named_struct_bodies_without_manual_schema_install() {
+    let mut vm = empty_vm();
+    vm.install_extension(&NamedHandleExtension {
+        catalog: handle_catalog(),
+        name: "handles::borrow",
+        arity: 1,
+    })
+    .expect("target install_extension accepts nested resources as named-struct maps");
+}
+
+#[test]
+fn catalog_import_schemas_into_installs_named_struct_bodies() {
+    let catalog = handle_catalog();
+    let mut registry = HostFunctionRegistry::empty();
+    let schema = vm::catalog_import_schemas_into(&mut registry, &catalog, "handles::borrow")
+        .into_iter()
+        .next()
+        .expect("borrow schema");
+    assert!(schema.params[0].schema.contains_resource());
+    assert!(
+        matches!(
+            registry.named_struct_schemas().get("HandleBox"),
+            Some(TypeSchema::Object(fields))
+                if fields.get("file").is_some_and(|ty| matches!(ty, TypeSchema::Resource(_)))
+        ),
+        "catalog_import_schemas_into must install named-struct bodies"
+    );
+    registry
+        .register_exact_static("handles::borrow", 1, schema, noop_host)
+        .expect("target registry accepts nested resources after catalog import");
+}
+
+#[test]
+fn named_struct_fields_are_inline_without_a_side_table() {
+    let catalog = handle_catalog();
+    let schema = vm::catalog_import_schemas(&catalog, "handles::borrow")
+        .into_iter()
+        .next()
+        .expect("borrow schema");
+    assert!(schema.params[0].schema.contains_resource());
+    let mut registry = HostFunctionRegistry::empty();
+    registry
+        .register_exact_static("handles::borrow", 1, schema, noop_host)
+        .expect("HostTypeSchema::Named carries fields inline, so registration does not require a side table");
 }
