@@ -42,6 +42,8 @@ mod typed;
 pub use jit::{
     jit_host_catalog, register_jit_builtin_module, register_jit_builtin_module_from_catalog,
 };
+#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+pub use sqlite::{register_sqlite_builtin_module, register_sqlite_builtin_module_from_catalog};
 
 /// Returns the editor/compiler catalog for the built-in host extensions.
 ///

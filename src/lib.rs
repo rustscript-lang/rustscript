@@ -26,6 +26,10 @@ pub use assembler::{AsmParseError, Assembler, AssemblerError, BytecodeBuilder, a
 pub use builtins::runtime::print::{PrintHostFunction, PrintlnHostFunction, format_value};
 #[cfg(all(feature = "runtime", feature = "sqlite", not(target_arch = "wasm32")))]
 pub use builtins::runtime::sqlite::{SqliteHostExt, SqliteLimits, SqlitePolicy};
+#[cfg(all(feature = "runtime", feature = "sqlite", not(target_arch = "wasm32")))]
+pub use builtins::runtime::{
+    register_sqlite_builtin_module, register_sqlite_builtin_module_from_catalog,
+};
 #[cfg(feature = "runtime")]
 pub(crate) fn install_default_host_functions(registry: &mut vm::HostFunctionRegistry) {
     builtins::runtime::register_default_host_functions(registry);

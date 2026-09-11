@@ -12,7 +12,7 @@ fn main() {
     let n = inserted.rows_affected;
     let id = inserted.last_insert_rowid;
     let truncated = queried.truncated;
-    sqlite::close(&db);
+    sqlite::close(db);
     n + id;
     truncated;
 }
