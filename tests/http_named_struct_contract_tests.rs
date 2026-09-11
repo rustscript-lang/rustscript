@@ -18,8 +18,8 @@ use vm::compiler::{
 use vm::{
     CallReturn, HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput, HostOpId,
     HostStructSchema, HostTypeSchema, HttpConfig, HttpHostExt, Value, Vm, VmError, VmResult,
-    VmStatus, catalog_import_schemas, http_host_catalog, register_http_builtin_module,
-    standard_host_catalog,
+    VmStatus, catalog_import_schemas, compile_source, http_host_catalog,
+    register_http_builtin_module, standard_host_catalog,
 };
 
 fn opt(inner: HostTypeSchema) -> HostTypeSchema {
@@ -397,6 +397,68 @@ fn sse_object_literal_and_action_struct_compile() {
             on_event
         );
         "#,
+    );
+}
+
+const SSE_NAMED_ACTION_SOURCE: &str = r#"
+    use http;
+    fn on_event(item: map) -> SseCallbackAction {
+        { action: "continue" }
+    }
+    http::client::sse(
+        { method: "GET", url: "http://127.0.0.1:1/events" },
+        on_event
+    );
+"#;
+
+#[test]
+fn compile_source_installs_sse_named_structs_and_exact_schema() {
+    let compiled = compile_source(SSE_NAMED_ACTION_SOURCE).unwrap_or_else(|err| {
+        panic!("default compile_source must admit SseCallbackAction, got {err}")
+    });
+    let index = compiled
+        .program
+        .imports
+        .iter()
+        .position(|import| import.name == "http::client::sse")
+        .expect("default compile must admit http::client::sse");
+    let schema = compiled
+        .program
+        .host_import_schemas()
+        .get(index)
+        .and_then(Option::as_ref)
+        .expect("default compile must emit the exact SSE import schema");
+    assert_eq!(schema.fingerprint, http_host_catalog().fingerprint());
+    let mut vm = Vm::new(compiled.program);
+    HostFunctionRegistry::new()
+        .bind_vm_cached(&mut vm)
+        .expect("default registry must exact-bind catalog-backed SSE");
+}
+
+#[test]
+fn options_compile_without_catalog_installs_sse_named_structs() {
+    let compiled = compile_source_with_flavor_and_options(
+        SSE_NAMED_ACTION_SOURCE,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::default(),
+    )
+    .unwrap_or_else(|err| {
+        panic!("default options compile must admit SseCallbackAction, got {err}")
+    });
+    let index = compiled
+        .program
+        .imports
+        .iter()
+        .position(|import| import.name == "http::client::sse")
+        .expect("default options compile must admit http::client::sse");
+    assert!(
+        compiled
+            .program
+            .host_import_schemas()
+            .get(index)
+            .and_then(Option::as_ref)
+            .is_some(),
+        "default options compile must emit the exact SSE import schema"
     );
 }
 
