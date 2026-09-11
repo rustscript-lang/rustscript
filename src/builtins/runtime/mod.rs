@@ -5,8 +5,9 @@ use std::sync::{Arc, OnceLock};
 
 use crate::builtins::BuiltinFunction;
 use crate::host_api::{
-    HostApiBuilder, HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema,
-    HostStructField, HostStructSchema, HostTypeSchema, ResourceTypeKey, ResourceTypeSchema,
+    HostApiBuilder, HostApiCatalog, HostApiFingerprint, HostFunctionSchema, HostParamPassing,
+    HostParamSchema, HostStructField, HostStructSchema, HostTypeSchema, ResourceTypeKey,
+    ResourceTypeSchema,
 };
 #[cfg(all(feature = "async", not(target_family = "wasm")))]
 use crate::vm::CaptureAsyncHostContext;
@@ -329,6 +330,11 @@ pub fn standard_host_catalog() -> Arc<HostApiCatalog> {
         }
         Arc::new(builder.build().expect("standard host catalog is valid"))
     }))
+}
+
+/// Returns the cached fingerprint for [`standard_host_catalog`].
+pub fn standard_host_catalog_fingerprint() -> HostApiFingerprint {
+    standard_host_catalog().fingerprint()
 }
 
 #[cfg(target_arch = "wasm32")]
