@@ -1,6 +1,7 @@
 //! JIT config host maps migrate to one named struct `JitConfig`.
 //!
-//! Runtime values remain maps. Compiler/VM consume `jit_host_catalog()`.
+//! Runtime values remain maps. Production compile/bind uses the standard
+//! catalog; `jit_host_catalog()` remains the JIT subcatalog.
 
 #![cfg(feature = "runtime")]
 
@@ -12,7 +13,8 @@ use vm::compiler::{
 use vm::host_api::{HostApiCatalog, HostTypeSchema};
 use vm::{
     CompiledProgram, HostFunctionRegistry, HostImport, SourcePathError, Value, ValueType, Vm,
-    VmStatus, jit_host_catalog, register_jit_builtin_module,
+    VmStatus, compile_source, jit_host_catalog, register_jit_builtin_module,
+    register_jit_builtin_module_from_catalog, standard_composition, standard_host_catalog,
 };
 
 const JIT_CONFIG: &str = "JitConfig";
@@ -46,7 +48,8 @@ fn run_jit_host(source: &str) -> Vec<Value> {
     let compiled = compile(source, Arc::clone(&catalog)).expect("compile should succeed");
     let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let mut registry = HostFunctionRegistry::empty();
-    register_jit_builtin_module(&mut registry).expect("JIT exact registration should succeed");
+    register_jit_builtin_module_from_catalog(&mut registry, catalog.as_ref())
+        .expect("JIT exact registration should succeed");
     registry
         .bind_vm_cached(&mut vm)
         .expect("JIT exact host imports should bind");
@@ -93,12 +96,37 @@ fn jit_get_config_returns_named_struct() {
 #[test]
 fn jit_set_config_takes_named_struct() {
     let catalog = jit_host_catalog();
-    let functions = catalog.functions_named(SET_CONFIG);
-    assert_eq!(functions.len(), 1);
-    assert_eq!(functions[0].params.len(), 1);
-    assert_eq!(functions[0].params[0].name, "config");
-    assert_eq!(functions[0].params[0].ty, jit_config_type(&catalog));
-    assert_eq!(functions[0].return_type, jit_config_type(&catalog));
+    let named = catalog
+        .functions_named(SET_CONFIG)
+        .into_iter()
+        .find(|function| function.params.len() == 1)
+        .expect("jit::set_config(JitConfig) overload must exist");
+    assert_eq!(named.params[0].name, "config");
+    assert_eq!(named.params[0].ty, jit_config_type(&catalog));
+    assert_eq!(named.return_type, jit_config_type(&catalog));
+}
+
+#[test]
+fn jit_set_config_keeps_positional_overload() {
+    let catalog = jit_host_catalog();
+    let positional = catalog
+        .functions_named(SET_CONFIG)
+        .into_iter()
+        .find(|function| function.params.len() == 3)
+        .expect("jit::set_config(bool, int, int) overload must exist");
+    assert_eq!(
+        positional
+            .params
+            .iter()
+            .map(|param| (param.name.as_str(), &param.ty))
+            .collect::<Vec<_>>(),
+        [
+            ("enabled", &HostTypeSchema::Bool),
+            ("hot_loop_threshold", &HostTypeSchema::Int),
+            ("max_trace_len", &HostTypeSchema::Int),
+        ]
+    );
+    assert_eq!(positional.return_type, jit_config_type(&catalog));
 }
 
 #[test]
@@ -226,7 +254,8 @@ fn wrong_field_type_is_rejected() {
 fn exact_registration_resolves_jit_config_imports() {
     let catalog = jit_host_catalog();
     let mut registry = HostFunctionRegistry::empty();
-    register_jit_builtin_module(&mut registry).expect("register JIT");
+    register_jit_builtin_module_from_catalog(&mut registry, catalog.as_ref())
+        .expect("register JIT");
     for name in [GET_CONFIG, SET_CONFIG] {
         for schema in vm::catalog_import_schemas(&catalog, name) {
             let import = HostImport {
@@ -267,7 +296,8 @@ fn runtime_carrier_remains_map() {
         .expect("get_config should compile");
     let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let mut registry = HostFunctionRegistry::empty();
-    register_jit_builtin_module(&mut registry).expect("register JIT");
+    register_jit_builtin_module_from_catalog(&mut registry, catalog.as_ref())
+        .expect("register JIT");
     registry.bind_vm_cached(&mut vm).expect("bind JIT");
     match vm.run().expect("run") {
         VmStatus::Halted => {}
@@ -314,16 +344,150 @@ fn unrelated_generated_host_schemas_are_unchanged() {
 }
 
 #[test]
-fn jit_catalog_is_not_the_standard_snapshot() {
+fn standard_catalog_includes_typed_jit_config() {
     let jit = jit_host_catalog();
-    let standard = vm::standard_host_catalog();
+    let standard = standard_host_catalog();
     assert_ne!(
         jit.fingerprint(),
         standard.fingerprint(),
-        "JIT-local catalog must not rewrite the standard combined snapshot"
+        "JIT-local catalog remains a subcatalog of the combined snapshot"
     );
-    assert!(
-        standard.struct_named(JIT_CONFIG).is_none(),
-        "standard catalog must not pick up JitConfig unless this surface is composed in"
+    let schema = standard
+        .struct_named(JIT_CONFIG)
+        .expect("standard catalog must declare JitConfig whenever JIT builtins are available");
+    assert_eq!(
+        schema
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["enabled", "hot_loop_threshold", "max_trace_len"]
     );
+    let get = standard.functions_named(GET_CONFIG);
+    assert_eq!(get.len(), 1);
+    assert!(get[0].params.is_empty());
+    assert_eq!(get[0].return_type, jit_config_type(&standard));
+    let set = standard.functions_named(SET_CONFIG);
+    assert_eq!(set.len(), 2, "named and positional set_config overloads");
+    assert!(set.iter().any(|function| function.params.len() == 1));
+    assert!(set.iter().any(|function| function.params.len() == 3));
+}
+
+fn compile_defaults(source: &str) -> CompiledProgram {
+    compile_source(source).expect("default compiler should attach the standard catalog")
+}
+
+fn run_defaults(source: &str) -> Vec<Value> {
+    let compiled = compile_defaults(source);
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+    vm.set_standard_composition(standard_composition());
+    loop {
+        match vm.run().expect("vm should run") {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => continue,
+            VmStatus::Waiting(_) => panic!("JIT config calls must not pending"),
+        }
+    }
+    vm.stack().to_vec()
+}
+
+#[test]
+fn default_compiler_emits_standard_jit_config_imports() {
+    let compiled = compile_defaults(
+        r#"
+        use jit;
+        let cfg = jit::get_config();
+        cfg.enabled;
+        "#,
+    );
+    let import = compiled
+        .program
+        .imports
+        .iter()
+        .find(|import| import.name == GET_CONFIG)
+        .expect("default compiler must not lower jit::get_config as a namespaced builtin");
+    let schema = import.schema.as_ref().expect("exact schema");
+    assert_eq!(
+        schema.return_type,
+        TypeSchema::Named(JIT_CONFIG.to_string(), vec![])
+    );
+    assert_eq!(schema.fingerprint, standard_host_catalog().fingerprint());
+}
+
+#[test]
+fn default_compiler_accepts_positional_set_config() {
+    let compiled = compile_defaults("use jit; jit::set_config(true, 3, 64);");
+    let import = compiled
+        .program
+        .imports
+        .iter()
+        .find(|import| import.name == SET_CONFIG)
+        .expect("positional jit::set_config must be a catalog host import");
+    let schema = import.schema.as_ref().expect("exact schema");
+    assert_eq!(schema.params.len(), 3);
+    assert_eq!(schema.fingerprint, standard_host_catalog().fingerprint());
+}
+
+#[test]
+fn standard_registry_resolves_default_jit_imports() {
+    let compiled = compile_defaults(
+        r#"
+        use jit;
+        jit::get_config();
+        jit::set_config(true, 3, 64);
+        jit::set_config({
+            enabled: false,
+            hot_loop_threshold: 1,
+            max_trace_len: 8
+        });
+        "#,
+    );
+    let mut registry = HostFunctionRegistry::empty();
+    register_jit_builtin_module(&mut registry).expect("production JIT registration");
+    for import in &compiled.program.imports {
+        assert!(
+            registry.resolve_import(import).is_ok(),
+            "standard fingerprint registration must resolve {}",
+            import.name
+        );
+    }
+}
+
+#[test]
+fn default_vm_installs_typed_jit_config() {
+    let stack = run_defaults(
+        r#"
+        use jit;
+        let _positional = jit::set_config(true, 3, 64);
+        let named = jit::set_config({
+            enabled: true,
+            hot_loop_threshold: 5,
+            max_trace_len: 32
+        });
+        named.hot_loop_threshold;
+        "#,
+    );
+    assert_eq!(stack, vec![Value::Int(5)]);
+}
+
+#[test]
+fn default_registry_bind_installs_typed_jit_config() {
+    let compiled = compile_defaults(
+        r#"
+        use jit;
+        let _updated = jit::set_config(false, 7, 16);
+        let cfg = jit::get_config();
+        cfg.max_trace_len;
+        "#,
+    );
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+    let registry = HostFunctionRegistry::new();
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("default registry must stage JIT exact adapters");
+    match vm.run().expect("run") {
+        VmStatus::Halted => {}
+        other => panic!("expected halt, got {other:?}"),
+    }
+    assert_eq!(vm.stack(), &[Value::Int(16)]);
 }

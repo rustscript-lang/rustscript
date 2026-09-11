@@ -2,9 +2,9 @@
 //!
 //! This module implements [`StandardSurfaceComposition`] for the same-crate
 //! standard builtin layer. It is the *only* place that knows which concrete
-//! standard domains exist (`io::`, `http::`, `sqlite::`) and which builtin
-//! modules implement them. `src/vm` consumes it through the generic trait and
-//! never names a domain, namespace prefix, or feature.
+//! standard domains exist (`io::`, `http::`, `sqlite::`, `jit::`) and which
+//! builtin modules implement them. `src/vm` consumes it through the generic
+//! trait and never names a domain, namespace prefix, or feature.
 //!
 //! The implementation is *caller-provided per-instance state*: the outer
 //! standard-runtime constructor installs one instance on the standard
@@ -24,8 +24,8 @@ use super::{standard_host_catalog, standard_host_catalog_fingerprint, standard_h
 ///
 /// Feature-gated composition happens through the existing standard builtin
 /// helpers: IO is always present under `runtime`, HTTP under `http-client`,
-/// SQLite under `sqlite`. Required/present/stage is one opaque operation;
-/// the VM core never sees a surface mask or count.
+/// SQLite under `sqlite`, JIT config under `runtime`. Required/present/stage
+/// is one opaque operation; the VM core never sees a surface mask or count.
 #[derive(Debug)]
 pub(crate) struct StandardSurfaceCompositionImpl;
 

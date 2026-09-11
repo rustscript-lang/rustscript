@@ -55,7 +55,7 @@ pub use sqlite::{
 /// The authoritative standard host API catalog snapshot for this build.
 ///
 /// This is the single combined snapshot of every *enabled* standard host
-/// surface (SQLite, IO, HTTP), composed into one validated
+/// surface (SQLite, IO, HTTP, JIT), composed into one validated
 /// [`HostApiCatalog`]. The compiler's standard compile entry and the LSP
 /// consume this same snapshot, and the standard extensions register their
 /// exact imports against it — so the whole-catalog fingerprint embedded in a
@@ -66,7 +66,9 @@ pub use sqlite::{
 ///
 /// * `sqlite` feature → the SQLite surface is included;
 /// * `runtime` feature → the IO surface is included;
-/// * `http-client` feature → the HTTP surface is included.
+/// * `http-client` feature → the HTTP surface is included;
+/// * JIT builtins (always present under `runtime`) → the JIT config surface
+///   is included.
 ///
 /// When only one surface is enabled, this equals that surface's own
 /// subcatalog; when several are enabled, it is their combined snapshot. The
@@ -109,6 +111,7 @@ fn standard_host_catalog_snapshot() -> &'static StandardHostCatalogSnapshot {
         push(&mut builder, &io_host_catalog());
         #[cfg(feature = "http-client")]
         push(&mut builder, &http_host_catalog());
+        push(&mut builder, &jit_host_catalog());
         let catalog = Arc::new(
             builder
                 .build()
@@ -123,9 +126,9 @@ fn standard_host_catalog_snapshot() -> &'static StandardHostCatalogSnapshot {
 
 /// Builds a fresh registry carrying every *enabled* standard adapter surface
 /// for the current build (IO under `runtime`, HTTP under `http-client`,
-/// SQLite under `sqlite`), used by the VM's default-fallback path for exact
-/// imports. Lives in the composition layer so `src/vm` never names a concrete
-/// domain module or feature.
+/// SQLite under `sqlite`, JIT config under `runtime`), used by the VM's
+/// default-fallback path for exact imports. Lives in the composition layer so
+/// `src/vm` never names a concrete domain module or feature.
 pub(crate) fn standard_host_registry() -> VmResult<HostFunctionRegistry> {
     #[allow(unused_mut)]
     let mut registry = HostFunctionRegistry::empty();
@@ -135,6 +138,7 @@ pub(crate) fn standard_host_registry() -> VmResult<HostFunctionRegistry> {
     register_http_builtin_module(&mut registry)?;
     #[cfg(feature = "sqlite")]
     register_sqlite_builtin_module(&mut registry)?;
+    register_jit_builtin_module(&mut registry)?;
     Ok(registry)
 }
 

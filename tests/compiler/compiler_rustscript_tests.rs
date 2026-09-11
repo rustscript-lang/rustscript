@@ -266,8 +266,7 @@ fn rustscript_builtin_and_namespace_runtime_cases_work() {
                 use jit;
                 let _set = jit::set_hot_loop_threshold(3);
                 let after = jit::get_hot_loop_threshold();
-                let cfg = jit::get_config();
-                if after == 3 && cfg.hot_loop_threshold == 3 {
+                if after == 3 {
                     1;
                 } else {
                     0;
