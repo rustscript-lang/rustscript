@@ -359,18 +359,20 @@ impl Parser {
         self.install_named_structs_from_catalog(&catalog);
     }
 
-    /// Installs named structs from the runtime standard catalog without
+    /// Installs HTTP named structs on catalog-free parse paths without
     /// attaching catalog function metadata.
     ///
-    /// Catalog-free parse paths (dialects, import scan, REPL without HTTP)
-    /// still need those struct bodies so user source can name types such as
-    /// `SseCallbackAction` even when no catalog snapshot is threaded.
+    /// Public [`ParserDialect`] / import-scan / REPL-without-HTTP parses have
+    /// no catalog snapshot. When the HTTP surface is available, install only
+    /// the authoritative HTTP catalog structs so names such as
+    /// `SseCallbackAction` resolve. Unrelated standard names (`JitConfig`,
+    /// `SqliteLimits`) stay unreserved. With HTTP disabled, install nothing.
     pub(super) fn install_standard_runtime_named_structs(&mut self) {
         debug_assert!(self.host_catalog.is_none());
-        #[cfg(feature = "runtime")]
+        #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
         {
             self.install_named_structs_from_catalog(
-                crate::builtins::runtime::standard_host_catalog().as_ref(),
+                crate::builtins::runtime::http::http_host_catalog().as_ref(),
             );
         }
     }
