@@ -180,7 +180,7 @@ async fn io_and_http_execute_together() {
         use http;
         let exists = io::exists("/");
         let response = http::client::request({{"method": "GET", "url": "http://127.0.0.1:{port}/"}});
-        response["status"];
+        response.status;
         "#
     );
     let compiled = compile_source(&source).expect("combined source should compile");
@@ -297,7 +297,7 @@ async fn worker_cleanup_reaches_quiescence_after_io_and_http() {
         use http;
         let response = http::client::request({{"method": "GET", "url": "http://127.0.0.1:{port}/"}});
         let exists = io::exists("/");
-        response["status"];
+        response.status;
         "#
     );
     let compiled = compile_source(&source).expect("combined source should compile");

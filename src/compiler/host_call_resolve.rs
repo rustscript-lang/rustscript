@@ -614,6 +614,13 @@ fn score_pair(expected: &TypeSchema, actual: &TypeSchema) -> MatchScore {
         (Array(e), Array(a)) | (Map(e), Map(a)) => MatchScore::default()
             .plus_exact()
             .combined(score_pair(e, a)),
+        (Array(e), ArrayTuple(items)) => {
+            let mut total = MatchScore::default().plus_exact();
+            for item in items {
+                total = total.combined(score_pair(e, item));
+            }
+            total
+        }
         (Map(e), Object(a_fields)) => {
             let mut total = MatchScore::default().plus_exact();
             for a_schema in a_fields.values() {
