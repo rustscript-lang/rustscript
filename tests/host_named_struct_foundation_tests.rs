@@ -14,7 +14,9 @@ use vm::host_api::{
     HostStructField, HostStructSchema, HostTypeSchema, ResourceTypeKey, ResourceTypeSchema,
 };
 use vm::{
-    CompiledProgram, SourcePathError, SourcePosition, analyze_source_from_string_with_options,
+    CallOutcome, CallReturn, CompiledProgram, HostExtension, HostFunctionRegistry, HostImportParam,
+    HostImportSchema, NamedStructSchema, SourcePathError, SourcePosition, Vm,
+    analyze_source_from_string_with_options,
 };
 
 fn point_fields() -> Vec<HostStructField> {
@@ -223,7 +225,59 @@ fn handle_catalog() -> Arc<HostApiCatalog> {
         )],
         HostTypeSchema::Null,
     ));
+    builder.function(HostFunctionSchema::with_return(
+        "handles::take",
+        vec![HostParamSchema::with_passing(
+            "h",
+            handle.as_type(),
+            HostParamPassing::TakeOwned,
+        )],
+        HostTypeSchema::Null,
+    ));
     Arc::new(builder.build().expect("handle catalog"))
+}
+
+fn empty_vm() -> Vm {
+    let compiled = compile("0;", point_catalog()).expect("empty program");
+    Vm::try_new(compiled.program).expect("test VM construction must not fail")
+}
+
+fn noop_host(_vm: &mut Vm, _args: &[vm::Value]) -> vm::VmResult<CallOutcome> {
+    Ok(CallOutcome::Return(CallReturn::None))
+}
+
+struct NamedHandleExtension {
+    catalog: Arc<HostApiCatalog>,
+    name: &'static str,
+    arity: u8,
+}
+
+impl HostExtension for NamedHandleExtension {
+    fn catalog(&self) -> Option<&HostApiCatalog> {
+        Some(self.catalog.as_ref())
+    }
+
+    fn register(&self, registry: &mut HostFunctionRegistry) -> vm::VmResult<()> {
+        for schema in vm::catalog_import_schemas(self.catalog.as_ref(), self.name) {
+            registry.register_exact_static(self.name, self.arity, schema, noop_host)?;
+        }
+        Ok(())
+    }
+}
+
+fn assert_nested_resource_rejection(err: &vm::VmError, kind: &str) {
+    let text = err.to_string();
+    assert!(
+        !text.contains("contains no resource"),
+        "{kind} must not mis-detect Named as resource-free: {text}"
+    );
+    assert!(
+        text.contains("not directly")
+            || text.contains("addressable")
+            || text.contains("nested")
+            || text.contains("aggregate"),
+        "{kind} expected nested-resource rejection, got {text}"
+    );
 }
 
 #[test]
@@ -288,5 +342,122 @@ fn resource_bearing_named_return_is_rejected_as_nested_at_exact_registration() {
     assert!(
         text.contains("nested") || text.contains("aggregate"),
         "got {text}"
+    );
+}
+
+#[test]
+fn install_extension_rejects_resource_bearing_named_borrow_without_manual_schema_install() {
+    let mut vm = empty_vm();
+    let err = vm
+        .install_extension(&NamedHandleExtension {
+            catalog: handle_catalog(),
+            name: "handles::borrow",
+            arity: 1,
+        })
+        .expect_err("nested resource in named Borrow must be rejected");
+    assert_nested_resource_rejection(&err, "install_extension Borrow");
+}
+
+#[test]
+fn install_extension_rejects_resource_bearing_named_take_owned_without_manual_schema_install() {
+    let mut vm = empty_vm();
+    let err = vm
+        .install_extension(&NamedHandleExtension {
+            catalog: handle_catalog(),
+            name: "handles::take",
+            arity: 1,
+        })
+        .expect_err("nested resource in named TakeOwned must be rejected");
+    assert_nested_resource_rejection(&err, "install_extension TakeOwned");
+}
+
+#[test]
+fn install_extension_rejects_resource_bearing_named_return_without_manual_schema_install() {
+    let mut vm = empty_vm();
+    let err = vm
+        .install_extension(&NamedHandleExtension {
+            catalog: handle_catalog(),
+            name: "handles::open",
+            arity: 0,
+        })
+        .expect_err("named struct return with nested resource must be rejected");
+    assert_nested_resource_rejection(&err, "install_extension return");
+}
+
+#[test]
+fn catalog_import_schemas_into_installs_named_struct_bodies() {
+    let catalog = handle_catalog();
+    let mut registry = HostFunctionRegistry::empty();
+    let schema = vm::catalog_import_schemas_into(&mut registry, &catalog, "handles::borrow")
+        .into_iter()
+        .next()
+        .expect("borrow schema");
+    let err = registry
+        .register_exact_static("handles::borrow", 1, schema, noop_host)
+        .expect_err("nested resource must be detected after catalog import");
+    assert_nested_resource_rejection(&err, "catalog_import_schemas_into Borrow");
+}
+
+#[test]
+fn missing_named_struct_body_is_a_precise_registration_error() {
+    let catalog = handle_catalog();
+    let schema = vm::catalog_import_schemas(&catalog, "handles::borrow")
+        .into_iter()
+        .next()
+        .expect("borrow schema");
+    let mut registry = HostFunctionRegistry::empty();
+    let err = registry
+        .register_exact_static("handles::borrow", 1, schema, noop_host)
+        .expect_err("missing Named body must not be silent");
+    let text = err.to_string();
+    assert!(
+        !text.contains("contains no resource"),
+        "must not mis-detect missing Named body as resource-free: {text}"
+    );
+    assert!(
+        text.contains("HandleBox")
+            || text.contains("named struct")
+            || text.contains("installed")
+            || text.contains("unknown"),
+        "expected precise missing-body registration error, got {text}"
+    );
+}
+
+#[test]
+fn failed_named_struct_instantiation_is_a_precise_registration_error() {
+    let file = ResourceTypeKey::new("io.file").expect("key");
+    let mut fields = std::collections::HashMap::new();
+    fields.insert("file".to_string(), TypeSchema::Resource(file.clone()));
+    let mut registry = HostFunctionRegistry::empty();
+    registry.install_named_struct_schemas(std::collections::HashMap::from([(
+        "Box".to_string(),
+        NamedStructSchema {
+            type_params: vec!["T".to_string()],
+            body_schema: TypeSchema::Object(fields),
+        },
+    )]));
+    let schema = HostImportSchema {
+        params: vec![HostImportParam {
+            name: "h".into(),
+            schema: TypeSchema::Named("Box".into(), Vec::new()),
+            passing: HostParamPassing::Borrow,
+        }],
+        return_type: TypeSchema::Null,
+        fingerprint: HostApiCatalog::default().fingerprint(),
+    };
+    let err = registry
+        .register_exact_static("handles::box", 1, schema, noop_host)
+        .expect_err("failed Named instantiation must not be silent");
+    let text = err.to_string();
+    assert!(
+        !text.contains("contains no resource"),
+        "must not mis-detect failed instantiate as resource-free: {text}"
+    );
+    assert!(
+        text.contains("Box")
+            || text.contains("instantiat")
+            || text.contains("type argument")
+            || text.contains("named struct"),
+        "expected precise instantiation error, got {text}"
     );
 }

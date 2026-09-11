@@ -54,7 +54,10 @@ use self::host::{HostCallExecOutcome, VmHostFunction};
 pub use self::host_context::{
     HostContext, HostContextError, HostContextErrorKind, HostContextResult, HostModule,
 };
-pub use self::host_extension::{HostExtension, HostModuleState, catalog_import_schemas};
+pub use self::host_extension::{
+    HostExtension, HostModuleState, catalog_import_schemas, catalog_import_schemas_into,
+    catalog_named_struct_schemas, register_host_extension,
+};
 use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable};
 pub use self::invocation::{Invocation, InvocationError, InvocationItem, InvocationPoll};
 use self::operation::{OperationError, OperationErrorCode};
@@ -1035,7 +1038,10 @@ impl Vm {
     /// that registry is bound with
     /// [`HostFunctionRegistry::bind_vm_cached`]. Both are fallible; then the
     /// now-infallible [`HostExtension::install`] installs persistent per-VM
-    /// module state. Because every fallible step runs before `install`, the
+    /// module state. Named-struct bodies from [`HostExtension::catalog`] are
+    /// installed onto the registry before [`HostExtension::register`] so exact
+    /// resource walks can resolve `TypeSchema::Named` without a manual schema
+    /// table install. Because every fallible step runs before `install`, the
     /// call is **transactional**: on any registration or binding failure the
     /// VM is left exactly as it was — unbound and with no module state — so a
     /// corrected `install_extension` can be retried on the same VM. A
@@ -1044,10 +1050,11 @@ impl Vm {
     /// Because `bind_vm_cached` requires an unbound VM, call this before the
     /// first `run` (and before any other registry binding); controls needing a
     /// restricted/capability-granted registry should instead call
-    /// [`HostExtension::register`] directly and bind the registry themselves.
+    /// [`crate::vm::host_extension::register_host_extension`] and bind the
+    /// registry themselves.
     pub fn install_extension(&mut self, extension: &dyn HostExtension) -> VmResult<()> {
         let mut registry = HostFunctionRegistry::new();
-        extension.register(&mut registry)?;
+        crate::vm::host_extension::register_host_extension(&mut registry, extension)?;
         registry.bind_vm_cached(self)?;
         extension.install(self);
         Ok(())

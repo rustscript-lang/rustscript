@@ -109,7 +109,8 @@ pub use host_api::{
 };
 #[cfg(feature = "runtime")]
 pub use host_extension::{
-    HostExtension, HostModuleState, catalog_import_schemas, catalog_named_struct_schemas,
+    HostExtension, HostModuleState, catalog_import_schemas, catalog_import_schemas_into,
+    catalog_named_struct_schemas, register_host_extension,
     validate_catalog_import_schemas_with_fingerprints,
 };
 #[cfg(feature = "runtime")]

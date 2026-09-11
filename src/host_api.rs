@@ -781,7 +781,7 @@ impl fmt::Display for HostApiCatalogError {
             ),
             Self::UnknownStructReference { function, name } => write!(
                 f,
-                "host function `{function}` references undeclared named struct `{name}`"
+                "undeclared named struct `{name}` referenced from `{function}`"
             ),
             Self::StructFieldMismatch { function, name } => write!(
                 f,
@@ -2553,8 +2553,24 @@ mod tests {
             )],
         ));
         match builder.build() {
-            Err(HostApiCatalogError::UnknownStructReference { name, .. }) => {
-                assert_eq!(name, "Inner");
+            Err(err) => {
+                let text = err.to_string();
+                match &err {
+                    HostApiCatalogError::UnknownStructReference { name, .. } => {
+                        assert_eq!(name, "Inner");
+                    }
+                    other => {
+                        panic!("undeclared nested named struct must be rejected, got {other:?}")
+                    }
+                }
+                assert!(
+                    !text.contains("host function `Outer`"),
+                    "struct context should not be labeled as a host function: {text}"
+                );
+                assert!(
+                    text.contains("Inner") && text.contains("Outer"),
+                    "display should name both the missing struct and its referrer, got {text}"
+                );
             }
             other => panic!("undeclared nested named struct must be rejected, got {other:?}"),
         }

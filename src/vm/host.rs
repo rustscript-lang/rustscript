@@ -244,10 +244,22 @@ fn schema_walk_has_resource_in(
                 return Ok(false);
             }
             let Some(def) = named_struct_schemas.get(name) else {
-                return Ok(false);
+                return Err(HostImportBindingError::InvalidSchema {
+                    import: name.clone(),
+                    reason: format!(
+                        "named struct '{name}' has no installed body; catalog named-struct \
+                         schemas must be installed before exact registration"
+                    ),
+                });
             };
             let Some(body) = def.instantiate(type_args) else {
-                return Ok(false);
+                return Err(HostImportBindingError::InvalidSchema {
+                    import: name.clone(),
+                    reason: format!(
+                        "named struct '{name}' could not be instantiated with {} type argument(s)",
+                        type_args.len()
+                    ),
+                });
             };
             active.push(name.clone());
             let found =
