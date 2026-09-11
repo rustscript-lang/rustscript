@@ -985,13 +985,17 @@ fn expand_actual_named(
                 result: expected_result,
             },
         ) => TypeSchema::Callable {
-            params: params
-                .iter()
-                .zip(expected_params.iter())
-                .map(|(actual_param, expected_param)| {
-                    expand_actual_named(actual_param, expected_param)
-                })
-                .collect(),
+            params: if params.len() != expected_params.len() {
+                params.clone()
+            } else {
+                params
+                    .iter()
+                    .zip(expected_params.iter())
+                    .map(|(actual_param, expected_param)| {
+                        expand_actual_named(actual_param, expected_param)
+                    })
+                    .collect()
+            },
             result: Box::new(expand_actual_named(result, expected_result)),
         },
         _ => actual.clone(),
@@ -2685,5 +2689,47 @@ mod tests {
         resolver
             .resolve("take_cb", &[actual])
             .expect("callable whose param is a nested named struct should match");
+    }
+
+    #[test]
+    fn callable_unequal_arity_is_rejected() {
+        let mut builder = HostApiBuilder::new();
+        builder.function(HostFunctionSchema::with_return(
+            "apply",
+            vec![value_param(
+                "cb",
+                HostTypeSchema::Callable {
+                    params: vec![HostTypeSchema::Int],
+                    result: Box::new(HostTypeSchema::Int),
+                },
+            )],
+            HostTypeSchema::Int,
+        ));
+        let catalog = builder.build().expect("valid callable catalog");
+        let resolver = HostCallResolver::new(&catalog);
+
+        let extra_actual = Ts::Callable {
+            params: vec![Ts::Int, Ts::String],
+            result: Box::new(Ts::Int),
+        };
+        assert!(
+            matches!(
+                resolver.resolve("apply", &[extra_actual]),
+                Err(HostCallResolveError::NoMatch { .. })
+            ),
+            "extra callable parameter must not be dropped by zip expansion"
+        );
+
+        let fewer_actual = Ts::Callable {
+            params: Vec::new(),
+            result: Box::new(Ts::Int),
+        };
+        assert!(
+            matches!(
+                resolver.resolve("apply", &[fewer_actual]),
+                Err(HostCallResolveError::NoMatch { .. })
+            ),
+            "fewer callable parameters must not match"
+        );
     }
 }
