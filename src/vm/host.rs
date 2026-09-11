@@ -1516,6 +1516,18 @@ fn validate_host_value(
                 .validate_resource_type_key(handle, key)
                 .map_err(|error| VmError::HostError(error.to_string()))
         }
+        HostTypeSchema::Named { fields, .. } => {
+            let Value::Map(values) = value else {
+                return Err(VmError::TypeMismatch("map"));
+            };
+            for field in fields {
+                let Some(field_value) = values.get(&Value::string(&field.name)) else {
+                    return Err(VmError::TypeMismatch("map"));
+                };
+                validate_host_value(field_value, &field.ty, program, resources)?;
+            }
+            Ok(())
+        }
     }
 }
 
