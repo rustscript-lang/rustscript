@@ -118,6 +118,20 @@ pub fn catalog_import_schemas(catalog: &HostApiCatalog, name: &str) -> Vec<HostI
     catalog_import_schemas_with_fingerprint(catalog, name, fingerprint)
 }
 
+/// Named struct bodies for VM resource walks. Compiler import schemas keep
+/// `TypeSchema::Named` identity; install these on
+/// [`HostFunctionRegistry::install_named_struct_schemas`] so nested resources
+/// inside named structs remain visible after catalog registration.
+pub fn catalog_named_struct_schemas(
+    catalog: &HostApiCatalog,
+) -> std::collections::HashMap<String, crate::compiler::TypeSchema> {
+    catalog
+        .structs()
+        .iter()
+        .map(|schema| (schema.name.clone(), schema.to_compiler_object_schema()))
+        .collect()
+}
+
 fn catalog_import_schemas_with_fingerprint(
     catalog: &HostApiCatalog,
     name: &str,

@@ -66,11 +66,11 @@ pub use bytecode::{
 pub use host_api::{
     FunctionNameError, HostApiBuilder, HostApiCatalog, HostApiCatalogError, HostApiFingerprint,
     HostFunctionSchema, HostParamPassing, HostParamSchema, HostSchemaValidationError,
-    HostTypeSchema, MAX_HOST_CATALOG_FUNCTIONS, MAX_HOST_CATALOG_PARAMETERS,
-    MAX_HOST_CATALOG_RESOURCES, MAX_HOST_DESCRIPTION_LEN, MAX_HOST_FUNCTION_NAME_LEN,
-    MAX_HOST_PARAMETER_NAME_LEN, MAX_HOST_RESOURCE_KEY_LEN, MAX_HOST_SCHEMA_DEPTH,
-    MAX_HOST_SCHEMA_NODES, MAX_HOST_SCHEMA_PROPERTIES, ResourceTypeKey, ResourceTypeKeyError,
-    ResourceTypeSchema, validate_host_import_schemas,
+    HostStructField, HostStructSchema, HostTypeSchema, MAX_HOST_CATALOG_FUNCTIONS,
+    MAX_HOST_CATALOG_PARAMETERS, MAX_HOST_CATALOG_RESOURCES, MAX_HOST_DESCRIPTION_LEN,
+    MAX_HOST_FUNCTION_NAME_LEN, MAX_HOST_PARAMETER_NAME_LEN, MAX_HOST_RESOURCE_KEY_LEN,
+    MAX_HOST_SCHEMA_DEPTH, MAX_HOST_SCHEMA_NODES, MAX_HOST_SCHEMA_PROPERTIES, ResourceTypeKey,
+    ResourceTypeKeyError, ResourceTypeSchema, validate_host_import_schemas,
 };
 #[cfg(feature = "runtime")]
 pub use vm::runtime::{
@@ -136,9 +136,10 @@ pub use vm::{
     InvocationPoll, QueuedScriptInvocation, RegistrySchemaError, ResourceCloseReason, ScriptArgs,
     ScriptCallback, ScriptResult, StandardSurfaceComposition, StaticHostArgsFunction,
     StaticHostFunction, StaticHostStackFunction, Store, Vm, VmError, VmResult, VmStatus,
-    VmYieldReason, async_host, catalog_import_schemas, execution_scope, host_context,
-    host_extension, operation, register_catalog_function, register_catalog_static_function,
-    resource, validate_catalog_import_schemas, validate_catalog_import_schemas_with_fingerprints,
+    VmYieldReason, async_host, catalog_import_schemas, catalog_named_struct_schemas,
+    execution_scope, host_context, host_extension, operation, register_catalog_function,
+    register_catalog_static_function, resource, validate_catalog_import_schemas,
+    validate_catalog_import_schemas_with_fingerprints,
 };
 #[cfg(feature = "runtime")]
 pub use vmbc::{
