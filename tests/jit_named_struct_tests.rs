@@ -390,16 +390,16 @@ fn default_compiler_emits_standard_jit_config_imports() {
         cfg.enabled;
         "#,
     );
-    let import = compiled
+    let schema = compiled
         .program
-        .imports
+        .host_import_schemas()
         .iter()
-        .find(|import| import.name == GET_CONFIG)
+        .flatten()
+        .find(|schema| schema.name == GET_CONFIG)
         .expect("default compiler must not lower jit::get_config as a namespaced builtin");
-    let schema = import.schema.as_ref().expect("exact schema");
     assert_eq!(
         schema.return_type,
-        TypeSchema::Named(JIT_CONFIG.to_string(), vec![])
+        jit_config_type(&standard_host_catalog())
     );
     assert_eq!(schema.fingerprint, standard_host_catalog().fingerprint());
 }
@@ -407,13 +407,13 @@ fn default_compiler_emits_standard_jit_config_imports() {
 #[test]
 fn default_compiler_accepts_positional_set_config() {
     let compiled = compile_defaults("use jit; jit::set_config(true, 3, 64);");
-    let import = compiled
+    let schema = compiled
         .program
-        .imports
+        .host_import_schemas()
         .iter()
-        .find(|import| import.name == SET_CONFIG)
+        .flatten()
+        .find(|schema| schema.name == SET_CONFIG)
         .expect("positional jit::set_config must be a catalog host import");
-    let schema = import.schema.as_ref().expect("exact schema");
     assert_eq!(schema.params.len(), 3);
     assert_eq!(schema.fingerprint, standard_host_catalog().fingerprint());
 }
@@ -432,15 +432,12 @@ fn standard_registry_resolves_default_jit_imports() {
         });
         "#,
     );
+    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
     let mut registry = HostFunctionRegistry::empty();
     register_jit_builtin_module(&mut registry).expect("production JIT registration");
-    for import in &compiled.program.imports {
-        assert!(
-            registry.resolve_import(import).is_ok(),
-            "standard fingerprint registration must resolve {}",
-            import.name
-        );
-    }
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("standard fingerprint registration must bind JIT imports");
 }
 
 #[test]
