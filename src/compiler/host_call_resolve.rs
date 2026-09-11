@@ -606,10 +606,20 @@ fn score_pair(expected: &TypeSchema, actual: &TypeSchema) -> MatchScore {
     }
 
     match (expected, actual) {
-        (Optional(e), Optional(a)) | (Array(e), Array(a)) | (Map(e), Map(a)) => {
-            MatchScore::default()
-                .plus_exact()
-                .combined(score_pair(e, a))
+        (Optional(e), Optional(a)) => MatchScore::default()
+            .plus_exact()
+            .combined(score_pair(e, a)),
+        (Optional(_), Null) => MatchScore::default().plus_exact(),
+        (Optional(e), a) => score_pair(e, a),
+        (Array(e), Array(a)) | (Map(e), Map(a)) => MatchScore::default()
+            .plus_exact()
+            .combined(score_pair(e, a)),
+        (Map(e), Object(a_fields)) => {
+            let mut total = MatchScore::default().plus_exact();
+            for a_schema in a_fields.values() {
+                total = total.combined(score_pair(e, a_schema));
+            }
+            total
         }
         (ArrayTuple(e_items), ArrayTuple(a_items)) => {
             if e_items.len() != a_items.len() {
@@ -674,14 +684,18 @@ fn score_pair(expected: &TypeSchema, actual: &TypeSchema) -> MatchScore {
             }
         }
         (Object(e_fields), Object(a_fields)) => {
-            if e_fields.len() != a_fields.len()
-                || e_fields.keys().any(|name| !a_fields.contains_key(name))
-            {
+            if a_fields.keys().any(|name| !e_fields.contains_key(name)) {
                 MatchScore::default().plus_mismatch()
             } else {
                 let mut total = MatchScore::default().plus_exact();
                 for (name, e_schema) in e_fields.iter() {
-                    total = total.combined(score_pair(e_schema, &a_fields[name]));
+                    match a_fields.get(name) {
+                        Some(a_schema) => {
+                            total = total.combined(score_pair(e_schema, a_schema));
+                        }
+                        None if matches!(e_schema, Optional(_)) => {}
+                        None => return MatchScore::default().plus_mismatch(),
+                    }
                 }
                 total
             }

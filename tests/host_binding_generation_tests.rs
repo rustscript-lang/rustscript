@@ -8,8 +8,8 @@ use build_script::{
 };
 use syn::parse_quote;
 use vm::{
-    BuiltinFunction, CapabilityProfile, HostFunctionRegistry, JitConfig, JitTraceTerminal, Value,
-    Vm, VmStatus, compile_source,
+    BuiltinFunction, CapabilityProfile, HostExecution, HostFunctionRegistry, JitConfig,
+    JitTraceTerminal, Value, Vm, VmStatus, compile_source, default_host_callables,
 };
 
 fn native_jit_supported() -> bool {
@@ -328,6 +328,74 @@ fn restricted_capabilities_disable_trace_jit_for_host_imports_and_builtins() {
                 .contains("capability profile does not allow")
         );
         assert_eq!(vm.jit_native_exec_count(), 0);
+    }
+}
+
+#[cfg(all(feature = "http-client", not(target_family = "wasm")))]
+#[test]
+fn generated_http_imports_are_unique_typed_and_independently_capability_gated() {
+    const IMPORTS: [&str; 2] = ["http::client::request", "http::client::sse"];
+    let callables = default_host_callables();
+    for name in IMPORTS {
+        let discovered = callables
+            .iter()
+            .filter(|callable| callable.name == name)
+            .collect::<Vec<_>>();
+        assert_eq!(discovered.len(), 1, "{name} discovery count");
+        let callable = discovered[0];
+        assert_eq!(callable.signature.return_type, "map");
+        if name == "http::client::request" {
+            assert_eq!(callable.signature.params.len(), 1);
+            assert_eq!(callable.signature.params[0].ty.display_label(), "map");
+        } else {
+            assert_eq!(callable.signature.params.len(), 2);
+            assert_eq!(callable.signature.params[0].ty.display_label(), "map");
+            assert_eq!(
+                callable.signature.params[1].ty.display_label(),
+                "fn(map) -> map"
+            );
+            assert_eq!(callable.host_execution, HostExecution::MaySuspend);
+        }
+    }
+
+    for mask in 0_u8..4 {
+        let mut builder = CapabilityProfile::builder();
+        for (index, name) in IMPORTS.iter().enumerate() {
+            if mask & (1 << index) != 0 {
+                builder = builder.allow_host_import(*name);
+            }
+        }
+        let profile = builder.build();
+        for (index, name) in IMPORTS.iter().enumerate() {
+            assert_eq!(
+                profile.allows_host_import(name),
+                mask & (1 << index) != 0,
+                "mask {mask:02b}, import {name}"
+            );
+        }
+
+        let source = r#"
+            use http;
+            fn callback(item: map) -> SseCallbackAction { { action: "stop" } }
+            http::client::request({ method: "GET", url: "https://example.test/" });
+            http::client::sse({ method: "GET", url: "https://example.test/" }, callback);
+        "#;
+        let compiled = compile_source(source).expect("HTTP imports should compile");
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+        let mut registry = HostFunctionRegistry::new();
+        // The standard compile entry emits exact V13 imports, so register the
+        // standard HTTP extension against the combined snapshot — the
+        // capability profile gate is orthogonal to exact registration.
+        vm::register_http_builtin_module(&mut registry)
+            .expect("standard HTTP registration should succeed");
+        registry.set_capability_profile(profile);
+        let result = registry.bind_vm_cached(&mut vm);
+        if mask == 0b11 {
+            result.expect("both explicit capabilities should bind");
+        } else {
+            let error = result.expect_err("a missing HTTP capability must reject binding");
+            assert!(error.to_string().contains("capability profile"), "{error}");
+        }
     }
 }
 
