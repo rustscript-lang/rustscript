@@ -713,6 +713,11 @@ pub enum HostApiCatalogError {
         function: String,
         name: String,
     },
+    /// A named struct field referenced an undeclared resource type.
+    UnknownStructResourceReference {
+        struct_name: String,
+        key: ResourceTypeKey,
+    },
 }
 
 impl fmt::Display for HostApiCatalogError {
@@ -782,6 +787,10 @@ impl fmt::Display for HostApiCatalogError {
                 f,
                 "host function `{function}` uses named struct `{name}` with fields that do not \
                  match the catalog declaration"
+            ),
+            Self::UnknownStructResourceReference { struct_name, key } => write!(
+                f,
+                "named host struct `{struct_name}` references undeclared resource type `{key}`"
             ),
         }
     }
@@ -1290,15 +1299,27 @@ fn validate_structs(
             field.ty.collect_resource_keys(&mut keys);
             for key in keys {
                 if !resources.iter().any(|resource| &resource.key == key) {
-                    return Err(HostApiCatalogError::UnknownResourceReference {
-                        function: schema.name.clone(),
+                    return Err(HostApiCatalogError::UnknownStructResourceReference {
+                        struct_name: schema.name.clone(),
                         key: key.clone(),
                     });
                 }
             }
+            validate_named_struct_refs(&schema.name, &field.ty, structs)?;
         }
     }
     Ok(())
+}
+
+fn struct_fields_equivalent(left: &[HostStructField], right: &[HostStructField]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut left_sorted: Vec<_> = left.iter().map(|field| (&field.name, &field.ty)).collect();
+    let mut right_sorted: Vec<_> = right.iter().map(|field| (&field.name, &field.ty)).collect();
+    left_sorted.sort_by(|a, b| a.0.cmp(b.0));
+    right_sorted.sort_by(|a, b| a.0.cmp(b.0));
+    left_sorted == right_sorted
 }
 
 fn validate_named_struct_refs(
@@ -1314,7 +1335,7 @@ fn validate_named_struct_refs(
                     name: name.clone(),
                 });
             };
-            if declared.fields != *fields {
+            if !struct_fields_equivalent(&declared.fields, fields) {
                 return Err(HostApiCatalogError::StructFieldMismatch {
                     function: function.to_string(),
                     name: name.clone(),
@@ -2516,6 +2537,127 @@ mod tests {
         let catalog: HostApiCatalog =
             serde_json::from_value(valid_catalog_json()).expect("legacy JSON should deserialize");
         assert!(catalog.structs().is_empty());
+    }
+
+    #[test]
+    fn nested_named_struct_is_validated_without_function_reference() {
+        let mut builder = HostApiCatalog::builder();
+        builder.named_struct(HostStructSchema::new(
+            "Outer",
+            vec![HostStructField::new(
+                "inner",
+                HostTypeSchema::named_struct(
+                    "Inner",
+                    vec![HostStructField::new("x", HostTypeSchema::Int)],
+                ),
+            )],
+        ));
+        match builder.build() {
+            Err(HostApiCatalogError::UnknownStructReference { name, .. }) => {
+                assert_eq!(name, "Inner");
+            }
+            other => panic!("undeclared nested named struct must be rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_named_struct_field_mismatch_is_rejected_without_function() {
+        let mut builder = HostApiCatalog::builder();
+        builder.named_struct(HostStructSchema::new(
+            "Inner",
+            vec![HostStructField::new("x", HostTypeSchema::Int)],
+        ));
+        builder.named_struct(HostStructSchema::new(
+            "Outer",
+            vec![HostStructField::new(
+                "inner",
+                HostTypeSchema::named_struct(
+                    "Inner",
+                    vec![HostStructField::new("x", HostTypeSchema::String)],
+                ),
+            )],
+        ));
+        match builder.build() {
+            Err(HostApiCatalogError::StructFieldMismatch { name, .. }) => {
+                assert_eq!(name, "Inner");
+            }
+            other => panic!("nested named field shape must match declaration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_named_struct_is_accepted_without_function_when_declared() {
+        let mut builder = HostApiCatalog::builder();
+        builder.named_struct(HostStructSchema::new(
+            "Inner",
+            vec![HostStructField::new("x", HostTypeSchema::Int)],
+        ));
+        builder.named_struct(HostStructSchema::new(
+            "Outer",
+            vec![HostStructField::new(
+                "inner",
+                HostTypeSchema::named_struct(
+                    "Inner",
+                    vec![HostStructField::new("x", HostTypeSchema::Int)],
+                ),
+            )],
+        ));
+        builder
+            .build()
+            .expect("declared nested named struct is valid without a function");
+    }
+
+    #[test]
+    fn struct_field_mismatch_is_order_insensitive() {
+        let mut builder = HostApiCatalog::builder();
+        builder.named_struct(HostStructSchema::new(
+            "Point",
+            vec![
+                HostStructField::new("x", HostTypeSchema::Int),
+                HostStructField::new("y", HostTypeSchema::Int),
+            ],
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "take_point",
+            vec![HostParamSchema::value(
+                "p",
+                HostTypeSchema::named_struct(
+                    "Point",
+                    vec![
+                        HostStructField::new("y", HostTypeSchema::Int),
+                        HostStructField::new("x", HostTypeSchema::Int),
+                    ],
+                ),
+            )],
+            HostTypeSchema::Int,
+        ));
+        builder
+            .build()
+            .expect("named struct field order must not affect catalog matching");
+    }
+
+    #[test]
+    fn undeclared_resource_in_struct_field_names_struct_context() {
+        let mut builder = HostApiCatalog::builder();
+        builder.named_struct(HostStructSchema::new(
+            "HandleBox",
+            vec![HostStructField::new(
+                "file",
+                HostTypeSchema::Resource(io_file_key()),
+            )],
+        ));
+        let err = builder
+            .build()
+            .expect_err("struct field resource must be declared");
+        let text = err.to_string();
+        assert!(
+            text.contains("HandleBox"),
+            "struct name should appear in the diagnostic, got {text}"
+        );
+        assert!(
+            !text.contains("host function `HandleBox`"),
+            "struct-field resource errors should not pretend the struct is a function, got {text}"
+        );
     }
 
     // --- helpers used by tests above ---

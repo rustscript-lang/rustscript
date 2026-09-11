@@ -104,12 +104,12 @@ pub use debugger::{
 };
 pub use host_api::{
     FunctionNameError, HostApiBuilder, HostApiCatalog, HostApiCatalogError, HostApiFingerprint,
-    HostFunctionSchema, HostParamPassing, HostParamSchema, HostTypeSchema, ResourceTypeKey,
-    ResourceTypeKeyError, ResourceTypeSchema,
+    HostFunctionSchema, HostParamPassing, HostParamSchema, HostStructField, HostStructSchema,
+    HostTypeSchema, ResourceTypeKey, ResourceTypeKeyError, ResourceTypeSchema,
 };
 #[cfg(feature = "runtime")]
 pub use host_extension::{
-    HostExtension, HostModuleState, catalog_import_schemas,
+    HostExtension, HostModuleState, catalog_import_schemas, catalog_named_struct_schemas,
     validate_catalog_import_schemas_with_fingerprints,
 };
 #[cfg(feature = "runtime")]

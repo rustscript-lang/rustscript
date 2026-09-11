@@ -196,3 +196,97 @@ fn nested_resource_field_is_preserved_in_compiler_schema() {
         TypeSchema::Named("HandleBox".to_string(), vec![])
     );
 }
+
+fn handle_catalog() -> Arc<HostApiCatalog> {
+    let file = ResourceTypeKey::new("io.file").expect("key");
+    let handle = HostStructSchema::new(
+        "HandleBox",
+        vec![HostStructField::new(
+            "file",
+            HostTypeSchema::Resource(file.clone()),
+        )],
+    );
+    let mut builder = HostApiBuilder::new();
+    builder.resource(ResourceTypeSchema::new(file.clone(), "file"));
+    builder.named_struct(handle.clone());
+    builder.function(HostFunctionSchema::with_return(
+        "handles::open",
+        vec![],
+        handle.as_type(),
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        "handles::borrow",
+        vec![HostParamSchema::with_passing(
+            "h",
+            handle.as_type(),
+            HostParamPassing::Borrow,
+        )],
+        HostTypeSchema::Null,
+    ));
+    Arc::new(builder.build().expect("handle catalog"))
+}
+
+#[test]
+fn catalog_import_schema_preserves_named_identity_for_resource_struct() {
+    let catalog = handle_catalog();
+    let schemas = vm::catalog_import_schemas(&catalog, "handles::borrow");
+    assert_eq!(
+        schemas[0].params[0].schema,
+        TypeSchema::Named("HandleBox".to_string(), vec![])
+    );
+    let schemas = vm::catalog_import_schemas(&catalog, "handles::open");
+    assert_eq!(
+        schemas[0].return_type,
+        TypeSchema::Named("HandleBox".to_string(), vec![])
+    );
+}
+
+#[test]
+fn resource_bearing_named_param_is_detected_at_exact_registration() {
+    let catalog = handle_catalog();
+    let schema = vm::catalog_import_schemas(&catalog, "handles::borrow")
+        .into_iter()
+        .next()
+        .expect("borrow schema");
+    let mut registry = vm::HostFunctionRegistry::empty();
+    registry.install_named_struct_schemas(vm::catalog_named_struct_schemas(&catalog));
+    let err = registry
+        .register_exact_static("handles::borrow", 1, schema, |_, _| {
+            Ok(vm::CallOutcome::Return(vm::CallReturn::None))
+        })
+        .expect_err("nested resource in named struct is not handle-addressable");
+    let text = err.to_string();
+    assert!(
+        text.contains("not directly") || text.contains("addressable"),
+        "expected nested-resource addressability rejection, got {text}"
+    );
+    assert!(
+        !text.contains("contains no resource"),
+        "must not mis-detect Named as resource-free: {text}"
+    );
+}
+
+#[test]
+fn resource_bearing_named_return_is_rejected_as_nested_at_exact_registration() {
+    let catalog = handle_catalog();
+    let schema = vm::catalog_import_schemas(&catalog, "handles::open")
+        .into_iter()
+        .next()
+        .expect("open schema");
+    assert_eq!(
+        schema.return_type,
+        TypeSchema::Named("HandleBox".to_string(), vec![])
+    );
+    let mut registry = vm::HostFunctionRegistry::empty();
+    registry.install_named_struct_schemas(vm::catalog_named_struct_schemas(&catalog));
+    let err = registry
+        .register_exact_static("handles::open", 0, schema, |_, _| {
+            Ok(vm::CallOutcome::Return(vm::CallReturn::None))
+        })
+        .expect_err("named struct return with nested resource must be rejected");
+    let text = err.to_string();
+    assert!(
+        text.contains("nested") || text.contains("aggregate"),
+        "got {text}"
+    );
+}

@@ -192,9 +192,32 @@ fn addressable_resource_key(
 /// guaranteed to stay within the bound. All resource-bearing params are
 /// probed here once at registration; scalars return `false` without
 /// recursion.
+#[cfg(test)]
 fn schema_walk_has_resource(
     schema: &crate::compiler::TypeSchema,
     depth: u8,
+) -> Result<bool, HostImportBindingError> {
+    schema_walk_has_resource_in(schema, depth, &HashMap::new(), &mut Vec::new())
+}
+
+fn schema_contains_resource_named(
+    schema: &crate::compiler::TypeSchema,
+    named_struct_schemas: &HashMap<String, crate::bytecode::NamedStructSchema>,
+) -> bool {
+    schema_walk_has_resource_in(schema, 0, named_struct_schemas, &mut Vec::new()).unwrap_or(true)
+}
+
+/// Depth-bounded resource probe that resolves [`TypeSchema::Named`] bodies
+/// through the catalog/runtime named-struct table.
+///
+/// Compiler identity stays `TypeSchema::Named`; this walk is the VM resource
+/// semantics path. Recursive named edges are instantiated one body at a time
+/// with a cycle set so a finite declaration cannot unbounded-recurse.
+fn schema_walk_has_resource_in(
+    schema: &crate::compiler::TypeSchema,
+    depth: u8,
+    named_struct_schemas: &HashMap<String, crate::bytecode::NamedStructSchema>,
+    active: &mut Vec<String>,
 ) -> Result<bool, HostImportBindingError> {
     use crate::compiler::TypeSchema;
     if depth > MAX_EXACT_SCHEMA_DEPTH {
@@ -206,27 +229,76 @@ fn schema_walk_has_resource(
             ),
         });
     }
-    let probe = |child: &TypeSchema| schema_walk_has_resource(child, depth + 1);
-    Ok(match schema {
-        TypeSchema::Resource(_) => true,
-        TypeSchema::Optional(inner) => probe(inner)?,
-        TypeSchema::Named(_, type_args) => type_args
-            .iter()
-            .try_fold(false, |found, arg| Ok(found || probe(arg)?))?,
-        TypeSchema::Array(element) => probe(element)?,
-        TypeSchema::ArrayTuple(items) => items
-            .iter()
-            .try_fold(false, |found, item| Ok(found || probe(item)?))?,
-        TypeSchema::ArrayTupleRest { prefix, rest } => prefix
-            .iter()
-            .try_fold(probe(rest)?, |found, item| Ok(found || probe(item)?))?,
-        TypeSchema::Map(value) => probe(value)?,
-        TypeSchema::Object(fields) => fields
-            .values()
-            .try_fold(false, |found, value| Ok(found || probe(value)?))?,
-        TypeSchema::Callable { params, result } => params
-            .iter()
-            .try_fold(probe(result)?, |found, param| Ok(found || probe(param)?))?,
+    match schema {
+        TypeSchema::Resource(_) => Ok(true),
+        TypeSchema::Optional(inner) => {
+            schema_walk_has_resource_in(inner, depth + 1, named_struct_schemas, active)
+        }
+        TypeSchema::Named(name, type_args) => {
+            for arg in type_args {
+                if schema_walk_has_resource_in(arg, depth + 1, named_struct_schemas, active)? {
+                    return Ok(true);
+                }
+            }
+            if active.iter().any(|seen| seen == name) {
+                return Ok(false);
+            }
+            let Some(def) = named_struct_schemas.get(name) else {
+                return Ok(false);
+            };
+            let Some(body) = def.instantiate(type_args) else {
+                return Ok(false);
+            };
+            active.push(name.clone());
+            let found =
+                schema_walk_has_resource_in(&body, depth + 1, named_struct_schemas, active)?;
+            active.pop();
+            Ok(found)
+        }
+        TypeSchema::Array(element) => {
+            schema_walk_has_resource_in(element, depth + 1, named_struct_schemas, active)
+        }
+        TypeSchema::ArrayTuple(items) => {
+            for item in items {
+                if schema_walk_has_resource_in(item, depth + 1, named_struct_schemas, active)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        TypeSchema::ArrayTupleRest { prefix, rest } => {
+            if schema_walk_has_resource_in(rest, depth + 1, named_struct_schemas, active)? {
+                return Ok(true);
+            }
+            for item in prefix {
+                if schema_walk_has_resource_in(item, depth + 1, named_struct_schemas, active)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        TypeSchema::Map(value) => {
+            schema_walk_has_resource_in(value, depth + 1, named_struct_schemas, active)
+        }
+        TypeSchema::Object(fields) => {
+            for value in fields.values() {
+                if schema_walk_has_resource_in(value, depth + 1, named_struct_schemas, active)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        TypeSchema::Callable { params, result } => {
+            if schema_walk_has_resource_in(result, depth + 1, named_struct_schemas, active)? {
+                return Ok(true);
+            }
+            for param in params {
+                if schema_walk_has_resource_in(param, depth + 1, named_struct_schemas, active)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
         TypeSchema::Unknown
         | TypeSchema::Null
         | TypeSchema::Int
@@ -235,8 +307,8 @@ fn schema_walk_has_resource(
         | TypeSchema::Bool
         | TypeSchema::String
         | TypeSchema::Bytes
-        | TypeSchema::GenericParam(_) => false,
-    })
+        | TypeSchema::GenericParam(_) => Ok(false),
+    }
 }
 
 /// Registration-time exact-schema validation (C1 addressability).
@@ -265,13 +337,24 @@ fn schema_walk_has_resource(
 /// * For args-only (non-VM-aware) registrations, **any** resource-passing
 ///   param is rejected: such a function has no `&mut Vm`, so it cannot
 ///   enforce or observe the resource contract.
+#[cfg(test)]
 fn validate_exact_registration_schema(
     name: &str,
     schema: &HostImportSchema,
     vm_aware: bool,
 ) -> Result<(), HostImportBindingError> {
+    validate_exact_registration_schema_with_named(name, schema, vm_aware, &HashMap::new())
+}
+
+fn validate_exact_registration_schema_with_named(
+    name: &str,
+    schema: &HostImportSchema,
+    vm_aware: bool,
+    named_struct_schemas: &HashMap<String, crate::bytecode::NamedStructSchema>,
+) -> Result<(), HostImportBindingError> {
     for param in &schema.params {
-        let has_resource = schema_walk_has_resource(&param.schema, 0)?;
+        let has_resource =
+            schema_walk_has_resource_in(&param.schema, 0, named_struct_schemas, &mut Vec::new())?;
         if !has_resource {
             if param.passing != crate::host_api::HostParamPassing::Value {
                 return Err(HostImportBindingError::InvalidSchema {
@@ -318,8 +401,12 @@ fn validate_exact_registration_schema(
     }
     // Exact return shape (finding: only `Resource(key)` and
     // `Optional<Resource(key)>` may carry a resource across the boundary).
-    if schema_walk_has_resource(&schema.return_type, 0)?
-        && addressable_resource_key(&schema.return_type).is_none()
+    if schema_walk_has_resource_in(
+        &schema.return_type,
+        0,
+        named_struct_schemas,
+        &mut Vec::new(),
+    )? && addressable_resource_key(&schema.return_type).is_none()
     {
         return Err(HostImportBindingError::InvalidSchema {
             import: name.to_string(),
@@ -673,6 +760,10 @@ pub struct HostFunctionRegistry {
     /// `Some` enables the standard auto-stage / fallback paths; `None` means
     /// this registry has no standard composition (e.g. `HostFunctionRegistry::empty`).
     composition: Option<Arc<dyn super::standard_composition::StandardSurfaceComposition>>,
+    /// Named struct bodies used by VM resource walks. Compiler `HostImportSchema`
+    /// identity stays `TypeSchema::Named`; this table supplies the Object body
+    /// for nested-resource detection at exact registration.
+    named_struct_schemas: Arc<HashMap<String, crate::bytecode::NamedStructSchema>>,
 }
 
 /// A memoized fully-staged standard snapshot plus the source-registry
@@ -729,6 +820,7 @@ impl Clone for HostFunctionRegistry {
                 self.standard_staging_registrations.load(Ordering::Acquire),
             )),
             composition: self.composition.clone(),
+            named_struct_schemas: Arc::clone(&self.named_struct_schemas),
         }
     }
 }
@@ -751,7 +843,18 @@ impl HostFunctionRegistry {
             standard_staging_snapshot: Arc::new(RwLock::new(None)),
             standard_staging_registrations: Arc::new(AtomicU64::new(0)),
             composition: None,
+            named_struct_schemas: Arc::new(HashMap::new()),
         }
+    }
+
+    /// Installs named struct bodies used by VM resource walks at exact
+    /// registration. Compiler import identity remains `TypeSchema::Named`.
+    pub fn install_named_struct_schemas(
+        &mut self,
+        schemas: HashMap<String, crate::bytecode::NamedStructSchema>,
+    ) {
+        let map = Arc::make_mut(&mut self.named_struct_schemas);
+        map.extend(schemas);
     }
 
     /// Derives a fresh, isolated registry origin from an immutable registry
@@ -855,6 +958,7 @@ impl HostFunctionRegistry {
             // (per-instance state), so `bind_vm_cached` on the staged registry
             // can still auto-stage missing surfaces.
             composition: self.composition.clone(),
+            named_struct_schemas: Arc::clone(&self.named_struct_schemas),
         }
     }
 
@@ -1164,8 +1268,13 @@ impl HostFunctionRegistry {
         factory: impl Fn() -> Box<dyn HostFunction> + Send + Sync + 'static,
     ) -> VmResult<u16> {
         let name = name.into();
-        validate_exact_registration_schema(&name, &schema, true)
-            .map_err(VmError::HostImportBinding)?;
+        validate_exact_registration_schema_with_named(
+            &name,
+            &schema,
+            true,
+            &self.named_struct_schemas,
+        )
+        .map_err(VmError::HostImportBinding)?;
         let guarded = schema_requires_guard(&schema);
         let factory: Arc<HostFactory> = Arc::new(factory);
         let kind = if guarded {
@@ -1191,8 +1300,13 @@ impl HostFunctionRegistry {
         function: StaticHostFunction,
     ) -> VmResult<u16> {
         let name = name.into();
-        validate_exact_registration_schema(&name, &schema, true)
-            .map_err(VmError::HostImportBinding)?;
+        validate_exact_registration_schema_with_named(
+            &name,
+            &schema,
+            true,
+            &self.named_struct_schemas,
+        )
+        .map_err(VmError::HostImportBinding)?;
         let guarded = schema_requires_guard(&schema);
         if guarded {
             let schema_for_guard = schema.clone();
@@ -1220,8 +1334,13 @@ impl HostFunctionRegistry {
         factory: impl Fn() -> Box<dyn HostStackFunction> + Send + Sync + 'static,
     ) -> VmResult<u16> {
         let name = name.into();
-        validate_exact_registration_schema(&name, &schema, true)
-            .map_err(VmError::HostImportBinding)?;
+        validate_exact_registration_schema_with_named(
+            &name,
+            &schema,
+            true,
+            &self.named_struct_schemas,
+        )
+        .map_err(VmError::HostImportBinding)?;
         let guarded = schema_requires_guard(&schema);
         let factory: Arc<HostStackFactory> = Arc::new(factory);
         let kind = if guarded {
@@ -1247,8 +1366,13 @@ impl HostFunctionRegistry {
         function: StaticHostStackFunction,
     ) -> VmResult<u16> {
         let name = name.into();
-        validate_exact_registration_schema(&name, &schema, true)
-            .map_err(VmError::HostImportBinding)?;
+        validate_exact_registration_schema_with_named(
+            &name,
+            &schema,
+            true,
+            &self.named_struct_schemas,
+        )
+        .map_err(VmError::HostImportBinding)?;
         let guarded = schema_requires_guard(&schema);
         if guarded {
             let schema_for_guard = schema.clone();
@@ -1281,8 +1405,13 @@ impl HostFunctionRegistry {
         factory: impl Fn() -> Box<dyn HostArgsFunction> + Send + Sync + 'static,
     ) -> VmResult<u16> {
         let name = name.into();
-        validate_exact_registration_schema(&name, &schema, false)
-            .map_err(VmError::HostImportBinding)?;
+        validate_exact_registration_schema_with_named(
+            &name,
+            &schema,
+            false,
+            &self.named_struct_schemas,
+        )
+        .map_err(VmError::HostImportBinding)?;
         self.push_exact(
             name,
             arity,
@@ -1299,8 +1428,13 @@ impl HostFunctionRegistry {
         function: StaticHostArgsFunction,
     ) -> VmResult<u16> {
         let name = name.into();
-        validate_exact_registration_schema(&name, &schema, false)
-            .map_err(VmError::HostImportBinding)?;
+        validate_exact_registration_schema_with_named(
+            &name,
+            &schema,
+            false,
+            &self.named_struct_schemas,
+        )
+        .map_err(VmError::HostImportBinding)?;
         self.push_exact(name, arity, schema, RegistryEntryKind::ArgsStatic(function))
     }
 
@@ -1312,8 +1446,13 @@ impl HostFunctionRegistry {
         function: StaticHostArgsFunction,
     ) -> VmResult<u16> {
         let name = name.into();
-        validate_exact_registration_schema(&name, &schema, false)
-            .map_err(VmError::HostImportBinding)?;
+        validate_exact_registration_schema_with_named(
+            &name,
+            &schema,
+            false,
+            &self.named_struct_schemas,
+        )
+        .map_err(VmError::HostImportBinding)?;
         self.push_exact(
             name,
             arity,
@@ -1973,7 +2112,15 @@ impl ExactHostReturnPolicy {
 }
 
 /// Classifies an import's exact-return policy from its resolved exact schema.
+#[cfg(test)]
 pub(crate) fn exact_host_return_policy(import: Option<&HostImport>) -> ExactHostReturnPolicy {
+    exact_host_return_policy_with_named(import, &HashMap::new())
+}
+
+pub(crate) fn exact_host_return_policy_with_named(
+    import: Option<&HostImport>,
+    named_struct_schemas: &HashMap<String, crate::bytecode::NamedStructSchema>,
+) -> ExactHostReturnPolicy {
     use crate::compiler::TypeSchema;
     let Some(schema) = import.and_then(|import| import.schema.as_ref()) else {
         return ExactHostReturnPolicy::Legacy;
@@ -1982,10 +2129,14 @@ pub(crate) fn exact_host_return_policy(import: Option<&HostImport>) -> ExactHost
         TypeSchema::Resource(key) => ExactHostReturnPolicy::Resource(key.clone()),
         TypeSchema::Optional(inner) => match inner.as_ref() {
             TypeSchema::Resource(key) => ExactHostReturnPolicy::OptionalResource(key.clone()),
-            other if other.contains_resource() => ExactHostReturnPolicy::NestedResource,
+            other if schema_contains_resource_named(other, named_struct_schemas) => {
+                ExactHostReturnPolicy::NestedResource
+            }
             _ => ExactHostReturnPolicy::Legacy,
         },
-        other if other.contains_resource() => ExactHostReturnPolicy::NestedResource,
+        other if schema_contains_resource_named(other, named_struct_schemas) => {
+            ExactHostReturnPolicy::NestedResource
+        }
         _ => ExactHostReturnPolicy::Legacy,
     }
 }
@@ -2376,7 +2527,10 @@ impl Vm {
     }
 
     fn effective_exact_host_return_policy(&self, import_index: u16) -> ExactHostReturnPolicy {
-        let policy = exact_host_return_policy(self.program.imports.get(usize::from(import_index)));
+        let policy = exact_host_return_policy_with_named(
+            self.program.imports.get(usize::from(import_index)),
+            &self.program.named_struct_schemas,
+        );
         if !matches!(policy, ExactHostReturnPolicy::Legacy) {
             return policy;
         }
@@ -3595,17 +3749,25 @@ impl Vm {
     /// and the exact ownership contract (C2/C4) that lives in the interpreter's
     /// guarded call machinery. Only `ArgsStaticNonYielding` bindings are
     /// eligible in the first place.
+    #[cfg(test)]
     pub(super) fn jit_import_is_inline_eligible(
         schema: Option<&HostImportSchema>,
         host_fn: Option<&VmHostFunction>,
     ) -> bool {
-        let schema_has_resource = schema.is_some_and(|schema| {
-            schema
-                .params
-                .iter()
-                .any(|param| param.schema.contains_resource())
-                || schema.return_type.contains_resource()
-        });
+        Self::jit_import_is_inline_eligible_with_named(schema, host_fn, &HashMap::new())
+    }
+
+    fn jit_import_is_inline_eligible_with_named(
+        schema: Option<&HostImportSchema>,
+        host_fn: Option<&VmHostFunction>,
+        named_struct_schemas: &HashMap<String, crate::bytecode::NamedStructSchema>,
+    ) -> bool {
+        let schema_has_resource =
+            schema.is_some_and(|schema| {
+                schema.params.iter().any(|param| {
+                    schema_contains_resource_named(&param.schema, named_struct_schemas)
+                }) || schema_contains_resource_named(&schema.return_type, named_struct_schemas)
+            });
         if schema_has_resource {
             return false;
         }
@@ -3632,7 +3794,11 @@ impl Vm {
                     .get(index)
                     .and_then(|import| import.schema.as_ref());
                 let host_fn = self.host.host_functions.get(usize::from(slot));
-                Self::jit_import_is_inline_eligible(schema, host_fn)
+                Self::jit_import_is_inline_eligible_with_named(
+                    schema,
+                    host_fn,
+                    &self.program.named_struct_schemas,
+                )
             })
             .collect();
         if self.engine.jit.set_non_yielding_host_imports(imports) {

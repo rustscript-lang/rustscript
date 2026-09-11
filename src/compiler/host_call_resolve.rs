@@ -967,6 +967,33 @@ fn expand_actual_named(
         (TypeSchema::Map(inner), HostTypeSchema::Map(expected_inner)) => {
             TypeSchema::Map(Box::new(expand_actual_named(inner, expected_inner)))
         }
+        (TypeSchema::Object(actual_fields), HostTypeSchema::Named { fields, .. }) => {
+            let mut expanded = std::collections::HashMap::new();
+            for (name, actual_ty) in actual_fields {
+                if let Some(field) = fields.iter().find(|field| field.name == *name) {
+                    expanded.insert(name.clone(), expand_actual_named(actual_ty, &field.ty));
+                } else {
+                    expanded.insert(name.clone(), actual_ty.clone());
+                }
+            }
+            TypeSchema::Object(expanded)
+        }
+        (
+            TypeSchema::Callable { params, result },
+            HostTypeSchema::Callable {
+                params: expected_params,
+                result: expected_result,
+            },
+        ) => TypeSchema::Callable {
+            params: params
+                .iter()
+                .zip(expected_params.iter())
+                .map(|(actual_param, expected_param)| {
+                    expand_actual_named(actual_param, expected_param)
+                })
+                .collect(),
+            result: Box::new(expand_actual_named(result, expected_result)),
+        },
         _ => actual.clone(),
     }
 }
@@ -2585,5 +2612,78 @@ mod tests {
             .resolve("take_point", &[Ts::Object(fields)])
             .unwrap_err();
         assert!(matches!(err, HostCallResolveError::NoMatch { .. }));
+    }
+
+    fn inner_type() -> HostTypeSchema {
+        HostTypeSchema::named_struct(
+            "Inner",
+            vec![crate::host_api::HostStructField::new(
+                "x",
+                HostTypeSchema::Int,
+            )],
+        )
+    }
+
+    fn nested_named_catalog() -> HostApiCatalog {
+        let inner_fields = vec![crate::host_api::HostStructField::new(
+            "x",
+            HostTypeSchema::Int,
+        )];
+        let mut b = HostApiBuilder::new();
+        b.named_struct(crate::host_api::HostStructSchema::new(
+            "Inner",
+            inner_fields,
+        ));
+        b.named_struct(crate::host_api::HostStructSchema::new(
+            "Outer",
+            vec![crate::host_api::HostStructField::new("inner", inner_type())],
+        ));
+        b.function(HostFunctionSchema::with_return(
+            "take_outer",
+            vec![value_param(
+                "o",
+                HostTypeSchema::named_struct(
+                    "Outer",
+                    vec![crate::host_api::HostStructField::new("inner", inner_type())],
+                ),
+            )],
+            HostTypeSchema::Int,
+        ));
+        b.function(HostFunctionSchema::with_return(
+            "take_cb",
+            vec![value_param(
+                "cb",
+                HostTypeSchema::Callable {
+                    params: vec![inner_type()],
+                    result: Box::new(HostTypeSchema::Int),
+                },
+            )],
+            HostTypeSchema::Int,
+        ));
+        b.build().expect("nested named catalog")
+    }
+
+    #[test]
+    fn nested_named_field_in_object_literal_matches() {
+        let catalog = nested_named_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        let mut outer = std::collections::HashMap::new();
+        outer.insert("inner".to_string(), Ts::Named("Inner".to_string(), vec![]));
+        resolver
+            .resolve("take_outer", &[Ts::Object(outer)])
+            .expect("object literal with a nested named field should match");
+    }
+
+    #[test]
+    fn nested_named_in_callable_param_matches() {
+        let catalog = nested_named_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        let actual = Ts::Callable {
+            params: vec![Ts::Named("Inner".to_string(), vec![])],
+            result: Box::new(Ts::Int),
+        };
+        resolver
+            .resolve("take_cb", &[actual])
+            .expect("callable whose param is a nested named struct should match");
     }
 }
