@@ -829,6 +829,7 @@ fn combined_compile_rejects_subcatalog_fingerprint_registration() {
     // pre-repair extension path did.
     let mut registry = HostFunctionRegistry::new();
     let subcatalog = vm::sqlite_host_catalog();
+    registry.install_named_struct_schemas(vm::catalog_named_struct_schemas(&subcatalog));
     for schema in vm::catalog_import_schemas(&subcatalog, "sqlite::open") {
         registry
             .register_exact_static("sqlite::open", 1, schema, sqlite_open_adapter_stub())

@@ -34,6 +34,9 @@ fn without_function(base: &HostApiCatalog, removed: &str) -> Arc<HostApiCatalog>
     for resource in base.resources() {
         builder.resource(resource.clone());
     }
+    for schema in base.structs() {
+        builder.named_struct(schema.clone());
+    }
     for function in base.functions() {
         if function.name != removed {
             builder.function(function.clone());
@@ -46,6 +49,9 @@ fn with_incompatible_write_schema(base: &HostApiCatalog) -> Arc<HostApiCatalog> 
     let mut builder = HostApiBuilder::new();
     for resource in base.resources() {
         builder.resource(resource.clone());
+    }
+    for schema in base.structs() {
+        builder.named_struct(schema.clone());
     }
     for function in base.functions() {
         if function.name == "io::write" {
@@ -67,6 +73,9 @@ fn with_extra_function(base: &HostApiCatalog) -> Arc<HostApiCatalog> {
     let mut builder = HostApiBuilder::new();
     for resource in base.resources() {
         builder.resource(resource.clone());
+    }
+    for schema in base.structs() {
+        builder.named_struct(schema.clone());
     }
     for function in base.functions() {
         builder.function(function.clone());

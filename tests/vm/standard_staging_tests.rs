@@ -82,6 +82,8 @@ fn bind_exact_imports(registry: &HostFunctionRegistry, imports: Vec<HostImport>)
 }
 
 fn register_override(registry: &mut HostFunctionRegistry, import: &HostImport) -> u16 {
+    let catalog = standard_host_catalog();
+    registry.install_named_struct_schemas(vm::catalog_named_struct_schemas(&catalog));
     registry
         .register_exact_static(
             import.name.clone(),

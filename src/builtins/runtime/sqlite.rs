@@ -16,7 +16,7 @@ use super::typed::{VmArrayRef, VmMapRef};
 use super::{HostCallResult, VmMap};
 use crate::host_api::{
     HostApiBuilder, HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema,
-    HostTypeSchema, ResourceTypeSchema,
+    HostStructField, HostStructSchema, HostTypeSchema, ResourceTypeSchema,
 };
 use crate::vm::operation::{
     HostOperation, OperationCancelReason, OperationError, OperationErrorCode, OperationResult,
@@ -1503,6 +1503,89 @@ pub fn sqlite_host_catalog() -> Arc<HostApiCatalog> {
 
 static SQLITE_HOST_CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
 
+fn optional_type(inner: HostTypeSchema) -> HostTypeSchema {
+    HostTypeSchema::Optional(Box::new(inner))
+}
+
+fn array_type(inner: HostTypeSchema) -> HostTypeSchema {
+    HostTypeSchema::Array(Box::new(inner))
+}
+
+fn sqlite_limits_struct() -> HostStructSchema {
+    HostStructSchema::new(
+        "SqliteLimits",
+        [
+            "max_connections",
+            "max_statements",
+            "max_rows",
+            "max_columns",
+            "max_result_bytes",
+            "max_statement_bytes",
+            "max_parameters",
+            "max_parameter_bytes",
+            "max_pending_operations",
+            "max_transaction_ms",
+            "busy_timeout_ms",
+        ]
+        .into_iter()
+        .map(|name| HostStructField::new(name, optional_type(HostTypeSchema::Int)))
+        .collect(),
+    )
+    .with_description("Effective SQLite host limits. Omitted keys keep the embedding ceiling.")
+}
+
+fn sqlite_open_options_struct(limits: &HostStructSchema) -> HostStructSchema {
+    HostStructSchema::new(
+        "SqliteOpenOptions",
+        vec![
+            HostStructField::new("path", optional_type(HostTypeSchema::String)),
+            HostStructField::new("mode", optional_type(HostTypeSchema::String)),
+            HostStructField::new("root", optional_type(HostTypeSchema::String)),
+            HostStructField::new("limits", optional_type(limits.as_type())),
+        ],
+    )
+    .with_description("SQLite open options. Runtime still requires a non-empty path.")
+}
+
+fn sqlite_execute_result_struct() -> HostStructSchema {
+    HostStructSchema::new(
+        "SqliteExecuteResult",
+        vec![
+            HostStructField::new("rows_affected", HostTypeSchema::Int),
+            HostStructField::new("last_insert_rowid", HostTypeSchema::Int),
+        ],
+    )
+    .with_description("Result envelope for sqlite::execute. Runtime value remains a map.")
+}
+
+fn sqlite_query_result_struct() -> HostStructSchema {
+    HostStructSchema::new(
+        "SqliteQueryResult",
+        vec![
+            HostStructField::new("columns", array_type(HostTypeSchema::String)),
+            HostStructField::new("rows", array_type(array_type(HostTypeSchema::Unknown))),
+            HostStructField::new("truncated", HostTypeSchema::Bool),
+            HostStructField::new("next_cursor", optional_type(HostTypeSchema::Int)),
+        ],
+    )
+    .with_description(
+        "Query result envelope. Rows stay arrays of arrays; next_cursor is omitted when absent.",
+    )
+}
+
+fn sqlite_statement_struct(limits: &HostStructSchema) -> HostStructSchema {
+    HostStructSchema::new(
+        "SqliteStatement",
+        vec![
+            HostStructField::new("sql", HostTypeSchema::String),
+            HostStructField::new("params", optional_type(array_type(HostTypeSchema::Unknown))),
+            HostStructField::new("query", optional_type(HostTypeSchema::Bool)),
+            HostStructField::new("limits", optional_type(limits.as_type())),
+        ],
+    )
+    .with_description("One sqlite::transaction statement. Params remain a positional array.")
+}
+
 fn build_sqlite_host_catalog() -> Arc<HostApiCatalog> {
     let key = sqlite_connection_key();
     let mut builder = HostApiBuilder::new();
@@ -1511,15 +1594,24 @@ fn build_sqlite_host_catalog() -> Arc<HostApiCatalog> {
         "An open SQLite database connection",
     ));
 
-    // The dynamic option/parameter/statement/envelope containers are accepted
-    // as `unknown` because RustScript object/array literals are exact record /
-    // array types; the sqlite implementation validates the concrete contents
-    // at runtime. Schemas, keys, passing modes and fingerprints still come
-    // from this one catalog, so compiler and registry agree byte-for-byte.
+    let limits = sqlite_limits_struct();
+    let open_options = sqlite_open_options_struct(&limits);
+    let execute_result = sqlite_execute_result_struct();
+    let query_result = sqlite_query_result_struct();
+    let statement = sqlite_statement_struct(&limits);
+    builder.named_struct(limits.clone());
+    builder.named_struct(open_options.clone());
+    builder.named_struct(execute_result.clone());
+    builder.named_struct(query_result.clone());
+    builder.named_struct(statement.clone());
+
+    // Positional params stay `unknown` (arrays of dynamic cells). Transaction
+    // results stay `array<unknown>` because execute and query envelopes mix.
+    // Fixed-shape maps are named structs; runtime values remain maps.
 
     builder.function(HostFunctionSchema::with_return(
         "sqlite::open",
-        vec![HostParamSchema::value("options", HostTypeSchema::Unknown)],
+        vec![HostParamSchema::value("options", open_options.as_type())],
         HostTypeSchema::Resource(key.clone()),
     ));
     builder.function(HostFunctionSchema::with_return(
@@ -1529,7 +1621,7 @@ fn build_sqlite_host_catalog() -> Arc<HostApiCatalog> {
             HostParamSchema::value("sql", HostTypeSchema::String),
             HostParamSchema::value("params", HostTypeSchema::Unknown),
         ],
-        HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown)),
+        execute_result.as_type(),
     ));
     builder.function(HostFunctionSchema::with_return(
         "sqlite::query",
@@ -1537,34 +1629,38 @@ fn build_sqlite_host_catalog() -> Arc<HostApiCatalog> {
             borrow_connection(&key),
             HostParamSchema::value("sql", HostTypeSchema::String),
             HostParamSchema::value("params", HostTypeSchema::Unknown),
-            HostParamSchema::value("limits", HostTypeSchema::Unknown),
+            HostParamSchema::value("limits", limits.as_type()),
         ],
-        HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown)),
+        query_result.as_type(),
     ));
     builder.function(HostFunctionSchema::with_return(
         "sqlite::transaction",
         vec![
             borrow_connection(&key),
-            HostParamSchema::value("statements", HostTypeSchema::Unknown),
+            HostParamSchema::value("statements", array_type(statement.as_type())),
         ],
-        HostTypeSchema::Array(Box::new(HostTypeSchema::Unknown)),
+        array_type(HostTypeSchema::Unknown),
     ));
     builder.function(HostFunctionSchema::with_return(
         "sqlite::close",
         vec![borrow_connection(&key)],
         HostTypeSchema::Null,
     ));
-    for (name, result) in [
-        ("sqlite::rows_affected", HostTypeSchema::Int),
-        ("sqlite::truncated", HostTypeSchema::Bool),
-        ("sqlite::next_cursor", HostTypeSchema::Int),
-    ] {
-        builder.function(HostFunctionSchema::with_return(
-            name,
-            vec![HostParamSchema::value("envelope", HostTypeSchema::Unknown)],
-            result,
-        ));
-    }
+    builder.function(HostFunctionSchema::with_return(
+        "sqlite::rows_affected",
+        vec![HostParamSchema::value("envelope", execute_result.as_type())],
+        HostTypeSchema::Int,
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        "sqlite::truncated",
+        vec![HostParamSchema::value("envelope", query_result.as_type())],
+        HostTypeSchema::Bool,
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        "sqlite::next_cursor",
+        vec![HostParamSchema::value("envelope", query_result.as_type())],
+        HostTypeSchema::Int,
+    ));
 
     Arc::new(builder.build().expect("sqlite catalog must build"))
 }
@@ -1675,6 +1771,9 @@ pub fn register_sqlite_builtin_module_from_catalog(
         .collect::<VmResult<Vec<_>>>()?;
 
     registry.transactionally(|staged| {
+        staged.install_named_struct_schemas(
+            crate::vm::host_extension::catalog_named_struct_schemas(catalog),
+        );
         for (entry, schemas) in &schemas {
             for schema in schemas.iter().cloned() {
                 staged.register_exact_static(entry.name, entry.arity, schema, entry.adapter)?;
@@ -1690,6 +1789,14 @@ pub fn register_sqlite_builtin_module_from_catalog(
 pub struct SqliteExtension;
 
 impl crate::vm::HostExtension for SqliteExtension {
+    fn catalog(&self) -> Option<&HostApiCatalog> {
+        Some(
+            SQLITE_HOST_CATALOG
+                .get_or_init(build_sqlite_host_catalog)
+                .as_ref(),
+        )
+    }
+
     fn register(&self, registry: &mut HostFunctionRegistry) -> VmResult<()> {
         register_sqlite_builtin_module(registry)
     }

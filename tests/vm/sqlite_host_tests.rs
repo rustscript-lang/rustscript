@@ -57,6 +57,12 @@ pub mod vm {
 
         pub fn authorize_registered_builtin_import(&mut self, _name: &str) {}
 
+        pub fn install_named_struct_schemas(
+            &mut self,
+            _schemas: std::collections::HashMap<String, rustscript_vm::bytecode::NamedStructSchema>,
+        ) {
+        }
+
         /// Mock transaction surface: the included registration path compiles
         /// against this stub; every registration method is a no-op, so the
         /// staging closure can run against the mock directly.
@@ -97,6 +103,10 @@ pub mod vm {
     /// `HostExtension` trait is bound to the real `Vm`, which the mock cannot
     /// satisfy).
     pub trait HostExtension: Send + Sync + 'static {
+        fn catalog(&self) -> Option<&crate::host_api::HostApiCatalog> {
+            None
+        }
+
         fn register(&self, registry: &mut HostFunctionRegistry) -> VmResult<()> {
             let _ = registry;
             Ok(())
@@ -285,7 +295,7 @@ pub mod vm {
 pub mod host_api {
     pub use rustscript_vm::host_api::{
         HostApiBuilder, HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema,
-        HostTypeSchema, ResourceTypeKey, ResourceTypeSchema,
+        HostStructField, HostStructSchema, HostTypeSchema, ResourceTypeKey, ResourceTypeSchema,
     };
 }
 
@@ -1834,6 +1844,9 @@ mod production_crate {
         let mut builder = rustscript_vm::HostApiBuilder::new();
         for resource in standard.resources() {
             builder.resource(resource.clone());
+        }
+        for schema in standard.structs() {
+            builder.named_struct(schema.clone());
         }
         for function in standard.functions() {
             builder.function(function.clone());
