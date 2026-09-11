@@ -246,11 +246,12 @@ fn extra_field_on_open_options_is_rejected() {
         "#,
     );
     assert!(
-        message.contains("SqliteOpenOptions")
-            || message.contains("extra")
-            || message.contains("field")
-            || message.contains("match"),
-        "extra field diagnostic, got {message}"
+        message.contains("sqlite::open") && message.contains("SqliteOpenOptions"),
+        "extra field diagnostic should name the function and struct, got {message}"
+    );
+    assert!(
+        message.contains("extra"),
+        "extra field diagnostic should name the extra key, got {message}"
     );
 }
 
@@ -264,11 +265,12 @@ fn extra_field_on_limits_is_rejected() {
         "#,
     );
     assert!(
-        message.contains("SqliteLimits")
-            || message.contains("extra")
-            || message.contains("field")
-            || message.contains("match"),
-        "extra limits field diagnostic, got {message}"
+        message.contains("sqlite::query") && message.contains("SqliteLimits"),
+        "extra limits field diagnostic should name the function and struct, got {message}"
+    );
+    assert!(
+        message.contains("nope"),
+        "extra limits field diagnostic should name the extra key, got {message}"
     );
 }
 
@@ -282,11 +284,8 @@ fn missing_sql_on_transaction_statement_is_rejected() {
         "#,
     );
     assert!(
-        message.contains("SqliteStatement")
-            || message.contains("sql")
-            || message.contains("field")
-            || message.contains("match"),
-        "missing sql diagnostic, got {message}"
+        message.contains("sqlite::transaction") && message.contains("SqliteStatement"),
+        "missing sql diagnostic should name the function and struct, got {message}"
     );
 }
 
@@ -299,12 +298,12 @@ fn wrong_field_type_on_open_path_is_rejected() {
         "#,
     );
     assert!(
-        message.contains("path")
-            || message.contains("string")
-            || message.contains("int")
-            || message.contains("match")
-            || message.contains("SqliteOpenOptions"),
-        "wrong path type diagnostic, got {message}"
+        message.contains("sqlite::open") && message.contains("SqliteOpenOptions"),
+        "wrong path type diagnostic should name the function and struct, got {message}"
+    );
+    assert!(
+        message.contains("path") && message.contains("int"),
+        "wrong path type diagnostic should mention path and int, got {message}"
     );
 }
 
@@ -398,6 +397,97 @@ fn runtime_execute_and_query_results_remain_maps_with_typed_fields() {
         "#,
     )
     .expect("runtime field-access script should compile");
+    let mut vm = vm::vm::Vm::try_new(compiled.program).expect("vm");
+    HostFunctionRegistry::new()
+        .bind_vm_cached(&mut vm)
+        .expect("bind sqlite");
+    vm.configure_sqlite(SqlitePolicy::default());
+    drive_to_halt(&mut vm);
+}
+
+#[test]
+fn documented_open_modes_compile() {
+    compile(
+        r#"
+        use sqlite;
+        sqlite::open({ path: ":memory:", mode: "memory" });
+        sqlite::open({ path: "state.db", mode: "read_only" });
+        sqlite::open({ path: "state.db", mode: "read_write" });
+        sqlite::open({ path: "state.db", mode: "read_write_create" });
+        sqlite::open({ path: "state.db" });
+        "#,
+    )
+    .expect("exact open modes and omitted default should compile");
+}
+
+#[test]
+fn optional_null_fields_compile_as_omitted() {
+    compile(
+        r#"
+        use sqlite;
+        let db = sqlite::open({
+            path: ":memory:",
+            mode: "memory",
+            root: null,
+            limits: null,
+        });
+        sqlite::execute(&db, "CREATE TABLE t (a INTEGER)", []);
+        sqlite::query(&db, "SELECT a FROM t", [], { max_rows: null });
+        sqlite::transaction(&db, [{
+            sql: "INSERT INTO t VALUES (1)",
+            params: null,
+            query: null,
+            limits: null,
+        }]);
+        sqlite::close(&db);
+        "#,
+    )
+    .expect("present Null on optional sqlite fields should compile");
+}
+
+#[test]
+fn next_cursor_field_access_compiles() {
+    compile(
+        r#"
+        use sqlite;
+        let db = sqlite::open({ path: ":memory:", mode: "memory", limits: {} });
+        sqlite::execute(&db, "CREATE TABLE t (a INTEGER)", []);
+        let queried = sqlite::query(&db, "SELECT a FROM t", [], {});
+        let cursor = queried.next_cursor;
+        sqlite::close(&db);
+        "#,
+    )
+    .expect("optional next_cursor field access should compile");
+}
+
+#[test]
+fn runtime_null_optional_fields_and_next_cursor_field_access() {
+    let compiled = compile_standard(
+        r#"
+        use sqlite;
+        let db = sqlite::open({
+            path: ":memory:",
+            mode: "memory",
+            root: null,
+            limits: null,
+        });
+        sqlite::execute(&db, "CREATE TABLE t (a INTEGER)", []);
+        let empty = sqlite::query(&db, "SELECT a FROM t", [], { max_rows: null });
+        let empty_cursor = empty.next_cursor;
+        sqlite::transaction(&db, [{
+            sql: "INSERT INTO t VALUES (9)",
+            params: null,
+            query: null,
+            limits: null,
+        }]);
+        let queried = sqlite::query(&db, "SELECT a FROM t", [], {});
+        let cursor = queried.next_cursor;
+        sqlite::close(&db);
+        empty_cursor;
+        cursor;
+        "#,
+    )
+    .expect("null optional fields and next_cursor access should compile");
     let mut vm = vm::vm::Vm::try_new(compiled.program).expect("vm");
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
