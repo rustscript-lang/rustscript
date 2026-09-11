@@ -1658,7 +1658,7 @@ mod linker_metadata_remap_tests {
     }
 
     fn host_candidate(name: &str, params: Vec<HostParamSchema>) -> HostFunctionSchema {
-        HostFunctionSchema::with_return(name, params, HostTypeSchema::Unknown)
+        HostFunctionSchema::with_return(name, params, crate::host_api::HostTypeSchema::Unknown)
     }
 
     fn symbol(module: u32, index: u32) -> SymbolId {
@@ -2107,6 +2107,8 @@ mod linker_metadata_remap_tests {
             return_type: TypeSchema::Int,
             passing: vec![crate::host_api::HostParamPassing::Borrow],
             fingerprint: fingerprint(4),
+            host_params: Vec::new(),
+            host_return_type: crate::host_api::HostTypeSchema::Unknown,
         };
         let mut annotated =
             Expr::Call(7, Vec::new(), Vec::new(), Some(Box::new(res.clone())), None);

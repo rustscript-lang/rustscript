@@ -2013,6 +2013,8 @@ mod call_resolution_carrier_tests {
             return_type: TypeSchema::Int,
             passing: vec![HostParamPassing::Borrow],
             fingerprint: fingerprint(3),
+            host_params: Vec::new(),
+            host_return_type: crate::host_api::HostTypeSchema::Unknown,
         }
     }
 

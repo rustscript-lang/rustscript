@@ -3,7 +3,9 @@ use std::hash::{Hash, Hasher};
 
 use crate::ValueType;
 use crate::builtins::default_host_callable;
-use crate::host_api::{HostApiFingerprint, HostFunctionSchema, HostParamPassing, ResourceTypeKey};
+use crate::host_api::{
+    HostApiFingerprint, HostFunctionSchema, HostParamPassing, HostTypeSchema, ResourceTypeKey,
+};
 
 use super::ParseError;
 use super::modules::SymbolId;
@@ -419,6 +421,13 @@ pub struct ResolvedHostCall {
     pub passing: Vec<HostParamPassing>,
     /// The catalog fingerprint at resolution time, for provenance/ABI ties.
     pub fingerprint: HostApiFingerprint,
+    /// Host-facing parameter schemas, index-aligned with [`Self::params`].
+    ///
+    /// These preserve [`HostTypeSchema::Named`] identity for the VMBC sidecar
+    /// instead of collapsing named structs onto `map`.
+    pub host_params: Vec<HostTypeSchema>,
+    /// Host-facing return schema, including named-struct identity.
+    pub host_return_type: HostTypeSchema,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1875,7 +1884,7 @@ mod host_api_ir_metadata_tests {
 mod call_resolution_carrier_tests {
     use super::{Expr, ResolvedHostCall, TypeSchema};
     use crate::compiler::ResolvedHostParam;
-    use crate::host_api::{HostApiFingerprint, HostParamPassing};
+    use crate::host_api::{HostApiFingerprint, HostParamPassing, HostTypeSchema};
 
     fn fingerprint(n: u64) -> HostApiFingerprint {
         serde_json::from_value(serde_json::Value::Number(n.into())).unwrap()
@@ -1891,6 +1900,8 @@ mod call_resolution_carrier_tests {
             return_type: TypeSchema::Int,
             passing: vec![HostParamPassing::Borrow],
             fingerprint: fingerprint(7),
+            host_params: vec![HostTypeSchema::Int],
+            host_return_type: HostTypeSchema::Int,
         }
     }
 

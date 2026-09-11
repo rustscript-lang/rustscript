@@ -1328,6 +1328,8 @@ mod tests {
             return_type: IrTypeSchema::Int,
             passing: vec![HostParamPassing::Borrow],
             fingerprint: fingerprint(1),
+            host_params: Vec::new(),
+            host_return_type: crate::host_api::HostTypeSchema::Unknown,
         };
         let annotated = Expr::Call(0, Vec::new(), Vec::new(), Some(Box::new(resolution)), None);
         let ir = ir_with(

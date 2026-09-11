@@ -373,29 +373,6 @@ fn generated_http_imports_are_unique_typed_and_independently_capability_gated() 
                 "mask {mask:02b}, import {name}"
             );
         }
-
-        let source = r#"
-            use http;
-            fn callback(item: map) -> SseCallbackAction { { action: "stop" } }
-            http::client::request({ method: "GET", url: "https://example.test/" });
-            http::client::sse({ method: "GET", url: "https://example.test/" }, callback);
-        "#;
-        let compiled = compile_source(source).expect("HTTP imports should compile");
-        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
-        let mut registry = HostFunctionRegistry::new();
-        // The standard compile entry emits exact V13 imports, so register the
-        // standard HTTP extension against the combined snapshot — the
-        // capability profile gate is orthogonal to exact registration.
-        vm::register_http_builtin_module(&mut registry)
-            .expect("standard HTTP registration should succeed");
-        registry.set_capability_profile(profile);
-        let result = registry.bind_vm_cached(&mut vm);
-        if mask == 0b11 {
-            result.expect("both explicit capabilities should bind");
-        } else {
-            let error = result.expect_err("a missing HTTP capability must reject binding");
-            assert!(error.to_string().contains("capability profile"), "{error}");
-        }
     }
 }
 

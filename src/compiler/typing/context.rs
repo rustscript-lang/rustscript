@@ -3285,6 +3285,8 @@ mod tests {
             return_type,
             passing: vec![HostParamPassing::Value],
             fingerprint: fingerprint(0x88),
+            host_params: Vec::new(),
+            host_return_type: crate::host_api::HostTypeSchema::Unknown,
         }
     }
 

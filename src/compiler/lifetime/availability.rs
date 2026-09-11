@@ -2302,6 +2302,8 @@ mod tests {
             return_type: TypeSchema::Null,
             passing: vec![HostParamPassing::TakeOwned],
             fingerprint: HostApiFingerprint::from_wire(1),
+            host_params: Vec::new(),
+            host_return_type: crate::host_api::HostTypeSchema::Unknown,
         })
     }
 
@@ -2337,6 +2339,8 @@ mod tests {
                 return_type: TypeSchema::Null,
                 passing: vec![mode],
                 fingerprint: HostApiFingerprint::from_wire(2),
+                host_params: Vec::new(),
+                host_return_type: crate::host_api::HostTypeSchema::Unknown,
             })),
             None,
         )

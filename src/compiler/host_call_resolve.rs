@@ -502,6 +502,12 @@ fn build_resolved(
         return_type: function.return_type.to_compiler_schema(),
         passing: function.params.iter().map(|param| param.passing).collect(),
         fingerprint,
+        host_params: function
+            .params
+            .iter()
+            .map(|param| param.ty.clone())
+            .collect(),
+        host_return_type: function.return_type.clone(),
     }
 }
 
