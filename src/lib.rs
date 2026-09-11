@@ -49,7 +49,9 @@ pub use builtins::runtime::{
 pub use builtins::runtime::{IoHostExt, IoPolicy};
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::{
-    io_host_catalog, sqlite_host_catalog, standard_composition, standard_host_catalog,
+    io_host_catalog, jit_host_catalog, register_jit_builtin_module,
+    register_jit_builtin_module_from_catalog, sqlite_host_catalog, standard_composition,
+    standard_host_catalog,
 };
 pub use builtins::{
     BUILTIN_CATALOG, BuiltinFunction, BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec,
