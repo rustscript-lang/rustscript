@@ -435,8 +435,9 @@ fn resolve_candidate_refs<'a, A: ActualCallArgView>(
         let mut score = MatchScore::default();
         let mut passing_conforms = true;
         for (param, arg) in function.params.iter().zip(args.iter()) {
-            let expected_schema = param.ty.to_compiler_schema();
-            score = score.combined(score_pair(&expected_schema, arg.schema()));
+            let expected_schema = param.ty.to_compiler_object_schema();
+            let actual_schema = expand_actual_named(arg.schema(), &param.ty);
+            score = score.combined(score_pair(&expected_schema, &actual_schema));
             if passing_conforms && !arg.passing_matches_param(param.passing) {
                 passing_conforms = false;
             }
@@ -764,8 +765,9 @@ fn best_concrete_mismatch<'f, A: ActualCallArgView>(
         .zip(args.iter())
         .enumerate()
         .find_map(|(index, (param, arg))| {
-            let expected_schema = param.ty.to_compiler_schema();
-            if score_pair(&expected_schema, arg.schema()).mismatches > 0 {
+            let expected_schema = param.ty.to_compiler_object_schema();
+            let actual_schema = expand_actual_named(arg.schema(), &param.ty);
+            if score_pair(&expected_schema, &actual_schema).mismatches > 0 {
                 Some(ConcreteMismatch {
                     index,
                     expected: schema_label(&param.ty),
@@ -941,6 +943,31 @@ fn schema_label(schema: &crate::host_api::HostTypeSchema) -> String {
             format!("fn({params}) -> {}", schema_label(result))
         }
         HostTypeSchema::Resource(key) => format!("resource<{key}>"),
+        HostTypeSchema::Named { name, .. } => name.clone(),
+    }
+}
+
+fn expand_actual_named(
+    actual: &TypeSchema,
+    expected: &crate::host_api::HostTypeSchema,
+) -> TypeSchema {
+    use crate::host_api::HostTypeSchema;
+    match (actual, expected) {
+        (TypeSchema::Named(actual_name, _), HostTypeSchema::Named { name, .. })
+            if actual_name == name =>
+        {
+            expected.to_compiler_object_schema()
+        }
+        (TypeSchema::Optional(inner), HostTypeSchema::Optional(expected_inner)) => {
+            TypeSchema::Optional(Box::new(expand_actual_named(inner, expected_inner)))
+        }
+        (TypeSchema::Array(inner), HostTypeSchema::Array(expected_inner)) => {
+            TypeSchema::Array(Box::new(expand_actual_named(inner, expected_inner)))
+        }
+        (TypeSchema::Map(inner), HostTypeSchema::Map(expected_inner)) => {
+            TypeSchema::Map(Box::new(expand_actual_named(inner, expected_inner)))
+        }
+        _ => actual.clone(),
     }
 }
 #[cfg(test)]
@@ -2462,5 +2489,101 @@ mod tests {
             passing_result, schema_result,
             "deferred passing must equal the schema-only result"
         );
+    }
+
+    fn point_type() -> HostTypeSchema {
+        HostTypeSchema::named_struct(
+            "Point",
+            vec![
+                crate::host_api::HostStructField::new("x", HostTypeSchema::Int),
+                crate::host_api::HostStructField::new("y", HostTypeSchema::Int),
+            ],
+        )
+    }
+
+    fn point_catalog() -> HostApiCatalog {
+        let mut b = HostApiBuilder::new();
+        b.named_struct(crate::host_api::HostStructSchema::new(
+            "Point",
+            vec![
+                crate::host_api::HostStructField::new("x", HostTypeSchema::Int),
+                crate::host_api::HostStructField::new("y", HostTypeSchema::Int),
+            ],
+        ));
+        b.function(HostFunctionSchema::with_return(
+            "make_point",
+            vec![],
+            point_type(),
+        ));
+        b.function(HostFunctionSchema::with_return(
+            "take_point",
+            vec![value_param("p", point_type())],
+            HostTypeSchema::Int,
+        ));
+        b.build().expect("point catalog")
+    }
+
+    #[test]
+    fn named_struct_return_stays_named() {
+        let catalog = point_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        let resolved = resolver.resolve("make_point", &[]).expect("resolve");
+        assert_eq!(resolved.return_type, Ts::Named("Point".to_string(), vec![]));
+    }
+
+    #[test]
+    fn object_literal_matches_named_struct_param() {
+        let catalog = point_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("x".to_string(), Ts::Int);
+        fields.insert("y".to_string(), Ts::Int);
+        let resolved = resolver
+            .resolve("take_point", &[Ts::Object(fields)])
+            .expect("object literal should match named struct");
+        assert_eq!(
+            resolved.params[0].schema,
+            Ts::Named("Point".to_string(), vec![])
+        );
+    }
+
+    #[test]
+    fn named_value_matches_named_struct_param() {
+        let catalog = point_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        let resolved = resolver
+            .resolve("take_point", &[Ts::Named("Point".to_string(), vec![])])
+            .expect("named Point should match named Point");
+        assert_eq!(resolved.name, "take_point");
+    }
+
+    #[test]
+    fn dynamic_map_does_not_match_named_struct_param() {
+        let catalog = point_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        let err = resolver
+            .resolve("take_point", &[Ts::Map(Box::new(Ts::Int))])
+            .unwrap_err();
+        match err {
+            HostCallResolveError::NoMatch { detail, .. } => {
+                assert!(
+                    detail.contains("Point") || detail.contains("object"),
+                    "mismatch should mention named struct or object, got {detail}"
+                );
+            }
+            other => panic!("expected NoMatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_literal_missing_field_does_not_match_named_struct() {
+        let catalog = point_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("x".to_string(), Ts::Int);
+        let err = resolver
+            .resolve("take_point", &[Ts::Object(fields)])
+            .unwrap_err();
+        assert!(matches!(err, HostCallResolveError::NoMatch { .. }));
     }
 }

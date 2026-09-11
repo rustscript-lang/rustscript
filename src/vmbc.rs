@@ -10,9 +10,10 @@ use crate::bytecode::{
 use crate::compiler::ir::TypeSchema;
 use crate::debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
 use crate::host_api::{
-    HostApiFingerprint, HostImportParam, HostImportSchema, HostParamPassing, HostTypeSchema,
-    MAX_HOST_CATALOG_PARAMETERS, MAX_HOST_FUNCTION_NAME_LEN, MAX_HOST_RESOURCE_KEY_LEN,
-    MAX_HOST_SCHEMA_DEPTH, MAX_HOST_SCHEMA_NODES, MAX_HOST_SCHEMA_PROPERTIES, ResourceTypeKey,
+    HostApiFingerprint, HostImportParam, HostImportSchema, HostParamPassing, HostStructField,
+    HostTypeSchema, MAX_HOST_CATALOG_PARAMETERS, MAX_HOST_FUNCTION_NAME_LEN,
+    MAX_HOST_PARAMETER_NAME_LEN, MAX_HOST_RESOURCE_KEY_LEN, MAX_HOST_SCHEMA_DEPTH,
+    MAX_HOST_SCHEMA_NODES, MAX_HOST_SCHEMA_PROPERTIES, ResourceTypeKey,
 };
 use crate::vm::{HostImport, OpCode, Program, Value};
 
@@ -1622,6 +1623,15 @@ fn write_host_type_schema(
             out.push(12);
             write_string("host resource type key", key.as_str(), out)?;
         }
+        HostTypeSchema::Named { name, fields } => {
+            out.push(13);
+            write_string("host named struct name", name, out)?;
+            write_u32_count("host named struct fields", fields.len(), out)?;
+            for field in fields {
+                write_string("host named struct field name", &field.name, out)?;
+                write_host_type_schema(&field.ty, out, next_host_schema_depth(depth)?)?;
+            }
+        }
     }
     Ok(())
 }
@@ -1684,6 +1694,26 @@ fn read_host_type_schema(
             )
             .map_err(|_| WireError::InvalidHostResourceKey)?;
             Ok(HostTypeSchema::Resource(key))
+        }
+        13 => {
+            let name =
+                cursor.read_bounded_string("host named struct name", MAX_HOST_FUNCTION_NAME_LEN)?;
+            let count = cursor.read_count_with_overhead("host named struct fields", 1, 1)?;
+            if count > MAX_HOST_SCHEMA_PROPERTIES {
+                return Err(WireError::LengthTooLarge("host named struct fields", count));
+            }
+            cursor.debit_host_schema_properties(count)?;
+            let mut fields = Vec::new();
+            reserve_vec(&mut fields, "host named struct fields", count)?;
+            for _ in 0..count {
+                let field_name = cursor.read_bounded_string(
+                    "host named struct field name",
+                    MAX_HOST_PARAMETER_NAME_LEN,
+                )?;
+                let ty = read_host_type_schema(cursor, next_host_schema_depth(depth)?)?;
+                fields.push(HostStructField::new(field_name, ty));
+            }
+            Ok(HostTypeSchema::Named { name, fields })
         }
         other => Err(WireError::InvalidHostSchemaTag(other)),
     }
