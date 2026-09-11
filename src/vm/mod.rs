@@ -54,8 +54,8 @@ pub use self::host_context::{
 };
 pub use self::host_extension::{
     CatalogRegistrationError, CatalogSchemaSelection, HostExtension, HostImportParam,
-    HostImportSchema, catalog_import_schemas, register_catalog_function,
-    register_catalog_static_function, validate_catalog_import_schemas,
+    HostImportSchema, catalog_import_schemas, catalog_named_struct_schemas,
+    register_catalog_function, register_catalog_static_function, validate_catalog_import_schemas,
     validate_catalog_import_schemas_with_fingerprints,
 };
 use self::host_runtime::HostRuntime;

@@ -361,6 +361,9 @@ pub struct HostFunctionRegistry {
     /// This is explicit per-instance state: the outer standard-runtime
     /// constructor installs it; `src/vm` never names a concrete domain.
     standard_composition: Option<Arc<dyn super::standard_composition::StandardSurfaceComposition>>,
+    /// Catalog named-struct bodies. Compiler identity stays `TypeSchema::Named`;
+    /// this table supplies Object bodies for nested-resource classification.
+    named_struct_schemas: Arc<HashMap<String, crate::compiler::TypeSchema>>,
 }
 
 impl Default for HostFunctionRegistry {
@@ -384,6 +387,7 @@ impl HostFunctionRegistry {
             registry_generation_token: Arc::new(()),
             registry_generation: Arc::new(AtomicU64::new(0)),
             standard_composition: None,
+            named_struct_schemas: Arc::new(HashMap::new()),
         }
     }
 
@@ -426,6 +430,22 @@ impl HostFunctionRegistry {
     ) {
         self.standard_composition = Some(composition);
         self.invalidate_plan_cache();
+    }
+
+    /// Installs catalog named-struct bodies used to classify nested resources
+    /// inside `TypeSchema::Named` values. Compiler identity stays named;
+    /// runtime values remain maps.
+    pub fn install_named_struct_schemas(
+        &mut self,
+        schemas: HashMap<String, crate::compiler::TypeSchema>,
+    ) {
+        self.named_struct_schemas = Arc::new(schemas);
+        self.invalidate_plan_cache();
+    }
+
+    /// Catalog named-struct object bodies installed for VM resource walks.
+    pub fn named_struct_schemas(&self) -> &HashMap<String, crate::compiler::TypeSchema> {
+        &self.named_struct_schemas
     }
 
     /// The installed standard-surface composition strategy, if any.
