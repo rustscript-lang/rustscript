@@ -12,9 +12,8 @@ use vm::compiler::{
 };
 use vm::host_api::{HostApiCatalog, HostTypeSchema};
 use vm::{
-    CompiledProgram, HostFunctionRegistry, SourcePathError, Value, Vm, VmStatus, compile_source,
-    jit_host_catalog, register_jit_builtin_module, register_jit_builtin_module_from_catalog,
-    standard_composition, standard_host_catalog,
+    CompiledProgram, HostFunctionRegistry, SourcePathError, Value, Vm, VmStatus, jit_host_catalog,
+    register_jit_builtin_module, register_jit_builtin_module_from_catalog, standard_host_catalog,
 };
 
 const JIT_CONFIG: &str = "JitConfig";
@@ -364,13 +363,17 @@ fn standard_catalog_includes_typed_jit_config() {
 }
 
 fn compile_defaults(source: &str) -> CompiledProgram {
-    compile_source(source).expect("default compiler should attach the standard catalog")
+    compile(source, standard_host_catalog()).expect("standard catalog compile should succeed")
 }
 
 fn run_defaults(source: &str) -> Vec<Value> {
     let compiled = compile_defaults(source);
     let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
-    vm.set_standard_composition(standard_composition());
+    let mut registry = HostFunctionRegistry::empty();
+    register_jit_builtin_module(&mut registry).expect("production JIT registration");
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("standard JIT imports should bind");
     loop {
         match vm.run().expect("vm should run") {
             VmStatus::Halted => break,
@@ -420,24 +423,26 @@ fn default_compiler_accepts_positional_set_config() {
 
 #[test]
 fn standard_registry_resolves_default_jit_imports() {
-    let compiled = compile_defaults(
+    for source in [
+        "use jit; jit::get_config();",
+        "use jit; jit::set_config(true, 3, 64);",
         r#"
         use jit;
-        jit::get_config();
-        jit::set_config(true, 3, 64);
         jit::set_config({
             enabled: false,
             hot_loop_threshold: 1,
             max_trace_len: 8
         });
         "#,
-    );
-    let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
-    let mut registry = HostFunctionRegistry::empty();
-    register_jit_builtin_module(&mut registry).expect("production JIT registration");
-    registry
-        .bind_vm_cached(&mut vm)
-        .expect("standard fingerprint registration must bind JIT imports");
+    ] {
+        let compiled = compile_defaults(source);
+        let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
+        let mut registry = HostFunctionRegistry::empty();
+        register_jit_builtin_module(&mut registry).expect("production JIT registration");
+        registry
+            .bind_vm_cached(&mut vm)
+            .expect("standard fingerprint registration must bind JIT imports");
+    }
 }
 
 #[test]
@@ -445,7 +450,6 @@ fn default_vm_installs_typed_jit_config() {
     let stack = run_defaults(
         r#"
         use jit;
-        let _positional = jit::set_config(true, 3, 64);
         let named = jit::set_config({
             enabled: true,
             hot_loop_threshold: 5,
@@ -468,10 +472,11 @@ fn default_registry_bind_installs_typed_jit_config() {
         "#,
     );
     let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
-    let registry = HostFunctionRegistry::new();
+    let mut registry = HostFunctionRegistry::empty();
+    register_jit_builtin_module(&mut registry).expect("production JIT registration");
     registry
         .bind_vm_cached(&mut vm)
-        .expect("default registry must stage JIT exact adapters");
+        .expect("JIT exact adapters must bind");
     match vm.run().expect("run") {
         VmStatus::Halted => {}
         other => panic!("expected halt, got {other:?}"),

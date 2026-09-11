@@ -12,11 +12,14 @@ use std::net::TcpListener;
 use std::task::{Context, Poll};
 use std::thread;
 
+use vm::compiler::{
+    CompileSourceFileOptions, SourceFlavor, compile_source_with_flavor_and_options,
+};
 use vm::{
     CallReturn, HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput, HostOpId,
     HostStructSchema, HostTypeSchema, HttpConfig, HttpHostExt, Value, Vm, VmError, VmResult,
-    VmStatus, catalog_import_schemas, compile_source, http_host_catalog,
-    register_http_builtin_module,
+    VmStatus, catalog_import_schemas, http_host_catalog, register_http_builtin_module,
+    standard_host_catalog,
 };
 
 fn opt(inner: HostTypeSchema) -> HostTypeSchema {
@@ -55,14 +58,23 @@ fn field_ty<'a>(schema: &'a HostStructSchema, name: &str) -> &'a HostTypeSchema 
 }
 
 fn compile_ok(source: &str) {
-    compile_source(source).unwrap_or_else(|err| panic!("expected compile success, got {err}"));
+    compile_with_http_catalog(source)
+        .unwrap_or_else(|err| panic!("expected compile success, got {err}"));
 }
 
 fn compile_err(source: &str) -> String {
-    match compile_source(source) {
+    match compile_with_http_catalog(source) {
         Ok(_) => panic!("expected compile error"),
         Err(err) => err.to_string(),
     }
+}
+
+fn compile_with_http_catalog(source: &str) -> Result<vm::CompiledProgram, vm::SourcePathError> {
+    compile_source_with_flavor_and_options(
+        source,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::default().with_host_api_catalog(standard_host_catalog()),
+    )
 }
 
 #[test]
@@ -497,7 +509,7 @@ impl HostAsyncBridge for TokioHostDriver {
 }
 
 fn standard_http_registry() -> HostFunctionRegistry {
-    let mut registry = HostFunctionRegistry::new();
+    let mut registry = HostFunctionRegistry::empty();
     register_http_builtin_module(&mut registry).expect("register HTTP");
     registry
 }
@@ -527,7 +539,7 @@ fn local_http_config(port: u16) -> HttpConfig {
 }
 
 fn bind_http_vm(source: &str, port: u16) -> Vm {
-    let compiled = compile_source(source).expect("source should compile");
+    let compiled = compile_with_http_catalog(source).expect("source should compile");
     let mut vm = Vm::try_new(compiled.program).expect("vm");
     vm.configure_http(local_http_config(port)).expect("config");
     vm.set_async_bridge(Box::<TokioHostDriver>::default())
@@ -675,7 +687,7 @@ fn null_sse_timeout_is_treated_as_omitted() {
             on_event
         );
     "#;
-    let compiled = compile_source(source).expect("null timeout_ms should compile");
+    let compiled = compile_with_http_catalog(source).expect("null timeout_ms should compile");
     let mut vm = Vm::try_new(compiled.program).expect("vm");
     vm.set_http_max_in_flight(0);
     vm.configure_http(local_http_config(1)).expect("config");
@@ -693,7 +705,7 @@ fn null_sse_timeout_is_treated_as_omitted() {
 
 #[test]
 fn sse_callback_runtime_schema_rejects_arbitrary_map_result() {
-    let compiled = compile_source(
+    let compiled = compile_with_http_catalog(
         r#"
         pub fn callback(item: map) -> map { { action: "continue" } }
         "#,
@@ -717,7 +729,7 @@ fn sse_callback_runtime_schema_rejects_arbitrary_map_result() {
 
 #[test]
 fn sse_callback_runtime_schema_accepts_named_action() {
-    let compiled = compile_source(
+    let compiled = compile_with_http_catalog(
         r#"
         use http;
         pub fn callback(item: map) -> SseCallbackAction { { action: "continue" } }
