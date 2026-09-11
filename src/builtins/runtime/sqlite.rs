@@ -635,8 +635,8 @@ fn required_string(map: &VmMap, key: &str) -> VmResult<String> {
         Some(Value::String(_)) => Err(VmError::HostError(format!(
             "SQLite {key} must not be empty"
         ))),
+        Some(Value::Null) | None => Err(VmError::HostError(format!("missing SQLite {key}"))),
         Some(_) => Err(VmError::TypeMismatch("SQLite option string")),
-        None => Err(VmError::HostError(format!("missing SQLite {key}"))),
     }
 }
 
@@ -676,6 +676,9 @@ fn parse_limits(value: Option<&Value>, ceiling: SqliteLimits) -> VmResult<Sqlite
     let Some(value) = value else {
         return Ok(ceiling);
     };
+    if matches!(value, Value::Null) {
+        return Ok(ceiling);
+    }
     let Value::Map(map) = value else {
         return Err(VmError::TypeMismatch("SQLite limits map"));
     };
@@ -684,6 +687,9 @@ fn parse_limits(value: Option<&Value>, ceiling: SqliteLimits) -> VmResult<Sqlite
         let Value::String(key) = key else {
             return Err(VmError::TypeMismatch("SQLite limit name"));
         };
+        if matches!(value, Value::Null) {
+            continue;
+        }
         match key.as_str() {
             "max_connections" => {
                 limits.max_connections =
@@ -1143,9 +1149,13 @@ fn query_with_connection(
         (Value::string("rows"), Value::array(values)),
         (Value::string("truncated"), Value::Bool(truncated)),
     ];
-    if let Some(next_cursor) = next_cursor {
-        entries.push((Value::string("next_cursor"), Value::Int(next_cursor)));
-    }
+    entries.push((
+        Value::string("next_cursor"),
+        match next_cursor {
+            Some(next_cursor) => Value::Int(next_cursor),
+            None => Value::Null,
+        },
+    ));
     Ok(VmMap::from_entries(entries))
 }
 
@@ -1453,18 +1463,18 @@ fn parse_transaction_statements(
             validate_sql(&sql, limits, allow_unsafe_sql)?;
             let params = match map_value(statement, "params") {
                 Some(Value::Array(params)) => sqlite_params(params, limits)?,
+                Some(Value::Null) | None => Vec::new(),
                 Some(_) => return Err(VmError::TypeMismatch("SQLite parameter array")),
-                None => Vec::new(),
             };
             let query = match map_value(statement, "query") {
                 Some(Value::Bool(query)) => *query,
+                Some(Value::Null) | None => false,
                 Some(_) => return Err(VmError::TypeMismatch("SQLite query flag")),
-                None => false,
             };
             let statement_limits = match map_value(statement, "limits") {
                 Some(Value::Map(statement_limits)) => parse_query_limits(statement_limits, limits)?,
+                Some(Value::Null) | None => limits,
                 Some(_) => return Err(VmError::TypeMismatch("SQLite limits map")),
-                None => limits,
             };
             Ok(TransactionStatement {
                 sql,

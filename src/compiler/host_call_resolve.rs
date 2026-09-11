@@ -2753,4 +2753,133 @@ mod tests {
             "fewer callable parameters must not match"
         );
     }
+
+    fn maybe_point_fields() -> Vec<crate::host_api::HostStructField> {
+        vec![
+            crate::host_api::HostStructField::new(
+                "x",
+                HostTypeSchema::Optional(Box::new(HostTypeSchema::Int)),
+            ),
+            crate::host_api::HostStructField::new("y", HostTypeSchema::Int),
+        ]
+    }
+
+    fn optional_field_catalog() -> HostApiCatalog {
+        let mut b = HostApiBuilder::new();
+        b.named_struct(crate::host_api::HostStructSchema::new(
+            "MaybePoint",
+            maybe_point_fields(),
+        ));
+        b.function(HostFunctionSchema::with_return(
+            "take_maybe",
+            vec![value_param(
+                "p",
+                HostTypeSchema::named_struct("MaybePoint", maybe_point_fields()),
+            )],
+            HostTypeSchema::Int,
+        ));
+        b.build().expect("optional field catalog")
+    }
+
+    fn object_fields(entries: &[(&str, Ts)]) -> Ts {
+        Ts::Object(
+            entries
+                .iter()
+                .map(|(name, ty)| ((*name).to_string(), ty.clone()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn object_literal_omitted_or_null_optional_field_matches_named_struct() {
+        let catalog = optional_field_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        resolver
+            .resolve("take_maybe", &[object_fields(&[("y", Ts::Int)])])
+            .expect("omitted optional field should match");
+        resolver
+            .resolve(
+                "take_maybe",
+                &[object_fields(&[("x", Ts::Null), ("y", Ts::Int)])],
+            )
+            .expect("explicit null optional field should match");
+        resolver
+            .resolve(
+                "take_maybe",
+                &[object_fields(&[("x", Ts::Int), ("y", Ts::Int)])],
+            )
+            .expect("present optional inner type should match");
+    }
+
+    #[test]
+    fn object_literal_extra_or_wrong_optional_field_does_not_match() {
+        let catalog = optional_field_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        let extra = resolver
+            .resolve(
+                "take_maybe",
+                &[object_fields(&[("y", Ts::Int), ("z", Ts::Int)])],
+            )
+            .unwrap_err();
+        match extra {
+            HostCallResolveError::NoMatch { detail, .. } => {
+                assert!(
+                    detail.contains("MaybePoint") && detail.contains("z"),
+                    "extra field diagnostic should name the struct and key, got {detail}"
+                );
+            }
+            other => panic!("expected NoMatch, got {other:?}"),
+        }
+
+        let wrong = resolver
+            .resolve(
+                "take_maybe",
+                &[object_fields(&[("x", Ts::String), ("y", Ts::Int)])],
+            )
+            .unwrap_err();
+        assert!(matches!(wrong, HostCallResolveError::NoMatch { .. }));
+    }
+
+    fn take_ints_catalog() -> HostApiCatalog {
+        let mut b = HostApiBuilder::new();
+        b.function(HostFunctionSchema::with_return(
+            "take_ints",
+            vec![value_param(
+                "xs",
+                HostTypeSchema::Array(Box::new(HostTypeSchema::Int)),
+            )],
+            HostTypeSchema::Int,
+        ));
+        b.build().expect("array catalog")
+    }
+
+    #[test]
+    fn array_param_matches_array_tuple_of_same_element() {
+        let catalog = take_ints_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        resolver
+            .resolve("take_ints", &[Ts::Array(Box::new(Ts::Int))])
+            .expect("array<int> should match array<int>");
+        resolver
+            .resolve("take_ints", &[Ts::ArrayTuple(vec![Ts::Int, Ts::Int])])
+            .expect("array tuple of ints should match array<int>");
+    }
+
+    #[test]
+    fn array_param_rejects_array_tuple_with_wrong_element() {
+        let catalog = take_ints_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        let err = resolver
+            .resolve("take_ints", &[Ts::ArrayTuple(vec![Ts::Int, Ts::String])])
+            .unwrap_err();
+        match err {
+            HostCallResolveError::NoMatch { detail, .. } => {
+                assert!(
+                    detail.contains("array<int>"),
+                    "array/tuple mismatch should name array<int>, got {detail}"
+                );
+            }
+            other => panic!("expected NoMatch, got {other:?}"),
+        }
+    }
 }
