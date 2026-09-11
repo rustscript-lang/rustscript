@@ -36,9 +36,10 @@ pub use builtins::runtime::{
 };
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::{
-    IoExtension, IoHostExt, IoPolicy, io_host_catalog, register_io_builtin_module,
-    register_io_builtin_module_from_catalog, standard_composition, standard_host_catalog,
-    standard_host_catalog_fingerprint,
+    IoExtension, IoHostExt, IoPolicy, io_host_catalog, jit_host_catalog,
+    register_io_builtin_module, register_io_builtin_module_from_catalog,
+    register_jit_builtin_module, register_jit_builtin_module_from_catalog, standard_composition,
+    standard_host_catalog, standard_host_catalog_fingerprint,
 };
 #[cfg(feature = "sqlite")]
 pub use builtins::runtime::{

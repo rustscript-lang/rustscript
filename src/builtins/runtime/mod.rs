@@ -43,6 +43,9 @@ pub use io::{
     IoExtension, IoHostExt, IoPolicy, io_host_catalog, register_io_builtin_module,
     register_io_builtin_module_from_catalog,
 };
+pub use jit::{
+    jit_host_catalog, register_jit_builtin_module, register_jit_builtin_module_from_catalog,
+};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{
     SqliteExtension, SqliteHostExt, SqliteLimits, SqlitePolicy, register_sqlite_builtin_module,
