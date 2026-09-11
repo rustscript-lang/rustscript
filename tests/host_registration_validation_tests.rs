@@ -25,6 +25,7 @@ fn coarse_return_type(schema: &HostTypeSchema) -> ValueType {
         HostTypeSchema::Unknown | HostTypeSchema::Number | HostTypeSchema::Resource(_) => {
             ValueType::Unknown
         }
+        HostTypeSchema::Named { .. } => ValueType::Map,
     }
 }
 

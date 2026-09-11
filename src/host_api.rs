@@ -10,8 +10,9 @@
 //! ## Design invariants
 //!
 //! * **Host-agnostic.** The catalog carries only semantic signatures: scalar,
-//!   collection, callable and unknown schemas plus typed resource references.
-//!   It does not talk about handles, bytecode or VM state.
+//!   collection, callable, named fixed-shape structs and unknown schemas plus
+//!   typed resource references. It does not talk about handles, bytecode or VM
+//!   state. Named structs are compile-time shapes; runtime values remain maps.
 //! * **Owned and serializable-friendly.** Every type owns its data (`String` /
 //!   `Vec`) and derives or implements [`serde::Serialize`] /
 //!   [`serde::Deserialize`]. No lifetimes, no `&'static` slices, no
@@ -22,9 +23,9 @@
 //!   cannot enter through serde — the same rules the builder enforces.
 //! * **Explicit resource ownership.** A parameter whose type **contains any
 //!   resource**, directly or recursively (`Optional`, `Array`, `Map`,
-//!   `Callable`), must use an explicit borrow/ownership passing mode; `Value`
-//!   is forbidden. A parameter whose type contains **no** resource must use
-//!   `Value`; a borrow/ownership mode is forbidden.
+//!   `Callable`, named struct fields), must use an explicit borrow/ownership
+//!   passing mode; `Value` is forbidden. A parameter whose type contains **no**
+//!   resource must use `Value`; a borrow/ownership mode is forbidden.
 //! * **Overloading.** Host functions may legally share a name with distinct
 //!   argument signatures (standard builtins such as `len` dispatch for string,
 //!   array, bytes and map). Overloads must differ in their **argument type /
@@ -57,6 +58,9 @@ const MAX_RESOURCE_KEY_LEN: usize = 128;
 /// Max byte length of a validated host function name.
 const MAX_FUNCTION_NAME_LEN: usize = 128;
 
+/// Max byte length of a validated named-struct or struct-field identifier.
+const MAX_STRUCT_IDENT_LEN: usize = 128;
+
 /// 8-byte domain magic prepended to every fingerprint so digest bytes in one
 /// domain (host API catalogs) cannot be confused with unrelated FNV digests
 /// produced by other tooling.
@@ -65,7 +69,7 @@ const FINGERPRINT_DOMAIN_MAGIC: &[u8; 8] = b"rss-hapi";
 /// The fingerprint wire/format version. Bump whenever the canonical byte
 /// encoding or semantic interpretation changes so old and new digests are
 /// never compared across versions.
-const FINGERPRINT_FORMAT_VERSION: u8 = 1;
+const FINGERPRINT_FORMAT_VERSION: u8 = 2;
 
 /// Error returned when a [`ResourceTypeKey`] cannot be constructed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -228,11 +232,71 @@ impl HostParamPassing {
     }
 }
 
+/// One field of a named host struct.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct HostStructField {
+    /// Field identifier.
+    pub name: String,
+    /// Field type.
+    pub ty: HostTypeSchema,
+}
+
+impl HostStructField {
+    /// Constructs a named field.
+    pub fn new(name: impl Into<String>, ty: HostTypeSchema) -> Self {
+        Self {
+            name: name.into(),
+            ty,
+        }
+    }
+}
+
+/// Catalog-level named fixed-shape host struct.
+///
+/// Functions reference the same shape via [`HostTypeSchema::Named`]. Runtime
+/// values remain maps; the name is a compile-time identity used for field
+/// access, object-literal compatibility, display, and LSP.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct HostStructSchema {
+    /// Struct type name (identifier).
+    pub name: String,
+    /// Declared fields in registration order.
+    pub fields: Vec<HostStructField>,
+    /// Human-readable documentation. Excluded from the fingerprint.
+    pub description: String,
+}
+
+impl HostStructSchema {
+    /// Constructs a named struct with empty documentation.
+    pub fn new(name: impl Into<String>, fields: Vec<HostStructField>) -> Self {
+        Self {
+            name: name.into(),
+            fields,
+            description: String::new(),
+        }
+    }
+
+    /// Sets the documentation string.
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+
+    /// Type used in function params/returns for this struct.
+    pub fn as_type(&self) -> HostTypeSchema {
+        HostTypeSchema::Named {
+            name: self.name.clone(),
+            fields: self.fields.clone(),
+        }
+    }
+}
+
 /// Semantic schema of a single host value type.
 ///
 /// Covers the same scalar / collection / callable / unknown surface used by
 /// the compiler's inference pass, and adds an explicit [`Self::Resource`]
-/// variant that references a declared [`ResourceTypeKey`].
+/// variant that references a declared [`ResourceTypeKey`] plus
+/// [`Self::Named`] for catalog-declared fixed-shape structs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum HostTypeSchema {
     Unknown,
@@ -252,9 +316,22 @@ pub enum HostTypeSchema {
     },
     /// A host resource identified by a declared [`ResourceTypeKey`].
     Resource(ResourceTypeKey),
+    /// Named fixed-shape struct. Runtime values remain maps.
+    Named {
+        name: String,
+        fields: Vec<HostStructField>,
+    },
 }
 
 impl HostTypeSchema {
+    /// Named fixed-shape struct used in function params/returns.
+    pub fn named_struct(name: impl Into<String>, fields: Vec<HostStructField>) -> Self {
+        Self::Named {
+            name: name.into(),
+            fields,
+        }
+    }
+
     /// Returns the resource key when this schema (directly, or wrapped in a
     /// single optional layer) denotes a host resource. This is a shallow
     /// helper; use [`Self::contains_resource`] for the full recursive test.
@@ -267,8 +344,8 @@ impl HostTypeSchema {
     }
 
     /// Whether this schema references at least one resource, anywhere in the
-    /// tree (direct, `Optional`, `Array`, `Map` value, or inside a `Callable`
-    /// parameter/result).
+    /// tree (direct, `Optional`, `Array`, `Map` value, named struct field, or
+    /// inside a `Callable` parameter/result).
     pub fn contains_resource(&self) -> bool {
         match self {
             Self::Resource(_) => true,
@@ -278,6 +355,7 @@ impl HostTypeSchema {
             Self::Callable { params, result } => {
                 params.iter().any(|param| param.contains_resource()) || result.contains_resource()
             }
+            Self::Named { fields, .. } => fields.iter().any(|field| field.ty.contains_resource()),
             Self::Unknown
             | Self::Null
             | Self::Int
@@ -301,6 +379,11 @@ impl HostTypeSchema {
                     param.collect_resource_keys(out);
                 }
                 result.collect_resource_keys(out);
+            }
+            Self::Named { fields, .. } => {
+                for field in fields {
+                    field.ty.collect_resource_keys(out);
+                }
             }
             Self::Unknown
             | Self::Null
@@ -339,6 +422,7 @@ impl fmt::Display for HostTypeSchema {
                 write!(f, ") -> {result}")
             }
             Self::Resource(key) => write!(f, "resource<{key}>"),
+            Self::Named { name, .. } => write!(f, "{name}"),
         }
     }
 }
@@ -605,6 +689,30 @@ pub enum HostApiCatalogError {
         function: String,
         parameter: String,
     },
+    DuplicateStructName {
+        name: String,
+    },
+    InvalidStructName {
+        name: String,
+        reason: String,
+    },
+    DuplicateStructField {
+        struct_name: String,
+        field: String,
+    },
+    InvalidStructFieldName {
+        struct_name: String,
+        field: String,
+        reason: String,
+    },
+    UnknownStructReference {
+        function: String,
+        name: String,
+    },
+    StructFieldMismatch {
+        function: String,
+        name: String,
+    },
 }
 
 impl fmt::Display for HostApiCatalogError {
@@ -648,6 +756,33 @@ impl fmt::Display for HostApiCatalogError {
                 "host function `{function}` passes resource-containing parameter `{parameter}` \
                  by `Value`; an explicit Borrow/BorrowMut/TakeOwned is required",
             ),
+            Self::DuplicateStructName { name } => {
+                write!(f, "duplicate named host struct `{name}`")
+            }
+            Self::InvalidStructName { name, reason } => {
+                write!(f, "invalid named host struct `{name}`: {reason}")
+            }
+            Self::DuplicateStructField { struct_name, field } => write!(
+                f,
+                "named host struct `{struct_name}` declares duplicate field `{field}`"
+            ),
+            Self::InvalidStructFieldName {
+                struct_name,
+                field,
+                reason,
+            } => write!(
+                f,
+                "named host struct `{struct_name}` has invalid field `{field}`: {reason}"
+            ),
+            Self::UnknownStructReference { function, name } => write!(
+                f,
+                "host function `{function}` references undeclared named struct `{name}`"
+            ),
+            Self::StructFieldMismatch { function, name } => write!(
+                f,
+                "host function `{function}` uses named struct `{name}` with fields that do not \
+                 match the catalog declaration"
+            ),
         }
     }
 }
@@ -662,6 +797,8 @@ impl std::error::Error for HostApiCatalogError {}
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct HostApiCatalog {
     resources: Vec<ResourceTypeSchema>,
+    #[serde(default)]
+    structs: Vec<HostStructSchema>,
     functions: Vec<HostFunctionSchema>,
 }
 
@@ -713,6 +850,8 @@ impl fmt::Display for HostApiFingerprint {
 #[derive(serde::Deserialize)]
 struct HostApiCatalogRepr {
     resources: Vec<ResourceTypeSchema>,
+    #[serde(default)]
+    structs: Vec<HostStructSchema>,
     functions: Vec<HostFunctionSchema>,
 }
 
@@ -724,6 +863,7 @@ impl<'de> Deserialize<'de> for HostApiCatalog {
         let repr = HostApiCatalogRepr::deserialize(deserializer)?;
         let builder = HostApiBuilder {
             resources: repr.resources,
+            structs: repr.structs,
             functions: repr.functions,
         };
         builder.build().map_err(serde::de::Error::custom)
@@ -739,6 +879,7 @@ impl<'de> Deserialize<'de> for HostApiCatalog {
 #[derive(Clone, Debug, Default)]
 pub struct HostApiBuilder {
     resources: Vec<ResourceTypeSchema>,
+    structs: Vec<HostStructSchema>,
     functions: Vec<HostFunctionSchema>,
 }
 
@@ -794,6 +935,16 @@ impl HostApiCatalog {
         &self.resources
     }
 
+    /// Looks up a declared named struct by name.
+    pub fn struct_named(&self, name: &str) -> Option<&HostStructSchema> {
+        self.structs.iter().find(|schema| schema.name == name)
+    }
+
+    /// All declared named structs (in registration order).
+    pub fn structs(&self) -> &[HostStructSchema] {
+        &self.structs
+    }
+
     /// All host functions (in registration order).
     pub fn functions(&self) -> &[HostFunctionSchema] {
         &self.functions
@@ -801,6 +952,7 @@ impl HostApiCatalog {
 
     /// Canonical semantic bytes for the whole catalog: `FINGERPRINT_DOMAIN_MAGIC`
     /// ++ `FINGERPRINT_FORMAT_VERSION` ++ resources (sorted by key) ++
+    /// named structs (sorted by name, fields sorted by field name) ++
     /// functions (sorted by full semantic signature bytes).
     fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -815,6 +967,17 @@ impl HostApiCatalog {
         push_len(&mut bytes, resources.len());
         for resource in &resources {
             push_len_str(&mut bytes, resource.key.as_str());
+        }
+
+        // Named structs sorted by name; fields sorted by field name so
+        // registration order does not affect the digest. Descriptions are
+        // excluded.
+        let mut structs: Vec<&HostStructSchema> = self.structs.iter().collect();
+        structs.sort_by(|a, b| a.name.cmp(&b.name));
+        push_tag(&mut bytes, b'T');
+        push_len(&mut bytes, structs.len());
+        for schema in &structs {
+            push_struct_def(&mut bytes, schema);
         }
 
         // Functions sorted by their full canonical semantic signature bytes so
@@ -833,11 +996,11 @@ impl HostApiCatalog {
 
     /// Deterministic, order-independent fingerprint of the semantic contents.
     ///
-    /// The fingerprint covers resource keys and every function’s name,
-    /// parameter (name, type, passing mode) and return type. It excludes
-    /// documentation and registration order. See the module doc for the
-    /// security caveat: this 64-bit FNV digest is equality / change-detection
-    /// only, never authentication.
+    /// The fingerprint covers resource keys, named-struct names and field
+    /// types, and every function’s name, parameter (name, type, passing mode)
+    /// and return type. It excludes documentation and registration order. See
+    /// the module doc for the security caveat: this 64-bit FNV digest is
+    /// equality / change-detection only, never authentication.
     pub fn fingerprint(&self) -> HostApiFingerprint {
         HostApiFingerprint(fnv1a(&self.canonical_bytes()))
     }
@@ -847,6 +1010,7 @@ impl HostApiCatalog {
 /// builder and the serde path so both reject the same malformed inputs.
 fn validate_surface(
     resources: &[ResourceTypeSchema],
+    structs: &[HostStructSchema],
     functions: &[HostFunctionSchema],
 ) -> Result<(), HostApiCatalogError> {
     // Duplicate resource keys.
@@ -857,6 +1021,8 @@ fn validate_surface(
             ));
         }
     }
+
+    validate_structs(resources, structs)?;
 
     // Per-function invariants.
     for function in functions {
@@ -925,6 +1091,11 @@ fn validate_surface(
                 });
             }
         }
+
+        validate_named_struct_refs(&function.name, &function.return_type, structs)?;
+        for param in &function.params {
+            validate_named_struct_refs(&function.name, &param.ty, structs)?;
+        }
     }
 
     // Reject ambiguous overloads: two functions sharing a name and an identical
@@ -957,6 +1128,11 @@ impl HostApiBuilder {
         self.resources.push(resource);
     }
 
+    /// Registers a named fixed-shape host struct.
+    pub fn named_struct(&mut self, schema: HostStructSchema) {
+        self.structs.push(schema);
+    }
+
     /// Registers a host function signature. Same-name functions with distinct
     /// signatures (overloads) are allowed.
     pub fn function(&mut self, function: HostFunctionSchema) {
@@ -975,9 +1151,10 @@ impl HostApiBuilder {
 
     /// Validates and freezes the catalog.
     pub fn build(self) -> Result<HostApiCatalog, HostApiCatalogError> {
-        validate_surface(&self.resources, &self.functions)?;
+        validate_surface(&self.resources, &self.structs, &self.functions)?;
         Ok(HostApiCatalog {
             resources: self.resources,
+            structs: self.structs,
             functions: self.functions,
         })
     }
@@ -1032,6 +1209,132 @@ fn push_type(bytes: &mut Vec<u8>, schema: &HostTypeSchema) {
             push_tag(bytes, b'r');
             push_len_str(bytes, key.as_str());
         }
+        HostTypeSchema::Named { name, fields } => {
+            push_tag(bytes, b'n');
+            push_len_str(bytes, name);
+            push_named_fields(bytes, fields);
+        }
+    }
+}
+
+fn push_named_fields(bytes: &mut Vec<u8>, fields: &[HostStructField]) {
+    let mut fields: Vec<&HostStructField> = fields.iter().collect();
+    fields.sort_by(|a, b| a.name.cmp(&b.name));
+    push_len(bytes, fields.len());
+    for field in fields {
+        push_len_str(bytes, &field.name);
+        push_type(bytes, &field.ty);
+    }
+}
+
+fn push_struct_def(bytes: &mut Vec<u8>, schema: &HostStructSchema) {
+    push_len_str(bytes, &schema.name);
+    push_named_fields(bytes, &schema.fields);
+}
+
+fn validate_struct_ident(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    if name.len() > MAX_STRUCT_IDENT_LEN {
+        return Err(format!(
+            "is {} bytes; the maximum is {MAX_STRUCT_IDENT_LEN}",
+            name.len()
+        ));
+    }
+    let mut chars = name.chars();
+    let first = chars.next().expect("name is non-empty");
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return Err("must start with an ASCII letter or '_'".to_string());
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err("must be ASCII alphanumeric or '_'".to_string());
+    }
+    Ok(())
+}
+
+fn validate_structs(
+    resources: &[ResourceTypeSchema],
+    structs: &[HostStructSchema],
+) -> Result<(), HostApiCatalogError> {
+    for (i, schema) in structs.iter().enumerate() {
+        if structs[..i].iter().any(|prior| prior.name == schema.name) {
+            return Err(HostApiCatalogError::DuplicateStructName {
+                name: schema.name.clone(),
+            });
+        }
+        if let Err(reason) = validate_struct_ident(&schema.name) {
+            return Err(HostApiCatalogError::InvalidStructName {
+                name: schema.name.clone(),
+                reason,
+            });
+        }
+        for (j, field) in schema.fields.iter().enumerate() {
+            if schema.fields[..j]
+                .iter()
+                .any(|prior| prior.name == field.name)
+            {
+                return Err(HostApiCatalogError::DuplicateStructField {
+                    struct_name: schema.name.clone(),
+                    field: field.name.clone(),
+                });
+            }
+            if let Err(reason) = validate_struct_ident(&field.name) {
+                return Err(HostApiCatalogError::InvalidStructFieldName {
+                    struct_name: schema.name.clone(),
+                    field: field.name.clone(),
+                    reason,
+                });
+            }
+            let mut keys = Vec::new();
+            field.ty.collect_resource_keys(&mut keys);
+            for key in keys {
+                if !resources.iter().any(|resource| &resource.key == key) {
+                    return Err(HostApiCatalogError::UnknownResourceReference {
+                        function: schema.name.clone(),
+                        key: key.clone(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_named_struct_refs(
+    function: &str,
+    schema: &HostTypeSchema,
+    structs: &[HostStructSchema],
+) -> Result<(), HostApiCatalogError> {
+    match schema {
+        HostTypeSchema::Named { name, fields } => {
+            let Some(declared) = structs.iter().find(|schema| schema.name == *name) else {
+                return Err(HostApiCatalogError::UnknownStructReference {
+                    function: function.to_string(),
+                    name: name.clone(),
+                });
+            };
+            if declared.fields != *fields {
+                return Err(HostApiCatalogError::StructFieldMismatch {
+                    function: function.to_string(),
+                    name: name.clone(),
+                });
+            }
+            for field in fields {
+                validate_named_struct_refs(function, &field.ty, structs)?;
+            }
+            Ok(())
+        }
+        HostTypeSchema::Array(inner)
+        | HostTypeSchema::Map(inner)
+        | HostTypeSchema::Optional(inner) => validate_named_struct_refs(function, inner, structs),
+        HostTypeSchema::Callable { params, result } => {
+            for param in params {
+                validate_named_struct_refs(function, param, structs)?;
+            }
+            validate_named_struct_refs(function, result, structs)
+        }
+        _ => Ok(()),
     }
 }
 
@@ -1629,8 +1932,8 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_version_is_one() {
-        assert_eq!(FINGERPRINT_FORMAT_VERSION, 1);
+    fn fingerprint_version_is_two() {
+        assert_eq!(FINGERPRINT_FORMAT_VERSION, 2);
     }
 
     #[test]
@@ -1951,6 +2254,268 @@ mod tests {
         let back: HostApiFingerprint = serde_json::from_str(&s).unwrap();
         assert_eq!(back, fp);
         assert_eq!(back.as_u64(), fp.as_u64());
+    }
+
+    // --- Named host structs ---
+
+    fn point_fields() -> Vec<HostStructField> {
+        vec![
+            HostStructField::new("x", HostTypeSchema::Int),
+            HostStructField::new("y", HostTypeSchema::Int),
+        ]
+    }
+
+    fn point_struct() -> HostStructSchema {
+        HostStructSchema::new("Point", point_fields()).with_description("A 2D point")
+    }
+
+    fn point_type() -> HostTypeSchema {
+        point_struct().as_type()
+    }
+
+    #[test]
+    fn named_struct_can_be_declared_and_used_as_param_and_return() {
+        let mut builder = HostApiCatalog::builder();
+        builder.named_struct(point_struct());
+        builder.function(HostFunctionSchema::with_return(
+            "make_point",
+            vec![
+                HostParamSchema::value("x", HostTypeSchema::Int),
+                HostParamSchema::value("y", HostTypeSchema::Int),
+            ],
+            point_type(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "take_point",
+            vec![HostParamSchema::value("p", point_type())],
+            HostTypeSchema::Int,
+        ));
+        let catalog = builder.build().expect("named struct catalog must build");
+        assert_eq!(catalog.structs().len(), 1);
+        assert_eq!(catalog.struct_named("Point").expect("Point").name, "Point");
+        assert_eq!(
+            catalog
+                .function("make_point")
+                .expect("make_point")
+                .return_type,
+            point_type()
+        );
+        assert_eq!(
+            catalog.function("take_point").expect("take_point").params[0].ty,
+            point_type()
+        );
+    }
+
+    #[test]
+    fn named_struct_display_is_the_struct_name() {
+        assert_eq!(format!("{}", point_type()), "Point");
+        assert_eq!(
+            format!("{}", HostTypeSchema::Optional(Box::new(point_type()))),
+            "optional<Point>"
+        );
+    }
+
+    #[test]
+    fn named_struct_keeps_dynamic_map_distinct() {
+        let named = point_type();
+        let dynamic = HostTypeSchema::Map(Box::new(HostTypeSchema::Int));
+        assert_ne!(named, dynamic);
+        assert!(!named.contains_resource());
+        assert!(!dynamic.contains_resource());
+    }
+
+    #[test]
+    fn nested_resource_in_named_struct_requires_explicit_passing() {
+        let handle = HostStructSchema::new(
+            "HandleBox",
+            vec![HostStructField::new(
+                "file",
+                HostTypeSchema::Resource(io_file_key()),
+            )],
+        );
+        let mut builder = HostApiCatalog::builder();
+        builder.resource(io_file_resource());
+        builder.named_struct(handle.clone());
+        builder.function(HostFunctionSchema::with_return(
+            "take_box",
+            vec![HostParamSchema::value("box", handle.as_type())],
+            HostTypeSchema::Null,
+        ));
+        assert_eq!(
+            builder.build(),
+            Err(HostApiCatalogError::ResourceValuePassing {
+                function: "take_box".to_string(),
+                parameter: "box".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn nested_resource_in_named_struct_borrow_is_allowed() {
+        let handle = HostStructSchema::new(
+            "HandleBox",
+            vec![HostStructField::new(
+                "file",
+                HostTypeSchema::Resource(io_file_key()),
+            )],
+        );
+        let mut builder = HostApiCatalog::builder();
+        builder.resource(io_file_resource());
+        builder.named_struct(handle.clone());
+        builder.function(HostFunctionSchema::with_return(
+            "borrow_box",
+            vec![HostParamSchema::with_passing(
+                "box",
+                handle.as_type(),
+                HostParamPassing::Borrow,
+            )],
+            HostTypeSchema::Null,
+        ));
+        builder
+            .build()
+            .expect("borrow of resource-bearing named struct is valid");
+    }
+
+    #[test]
+    fn undeclared_named_struct_reference_is_rejected() {
+        let mut builder = HostApiCatalog::builder();
+        builder.function(HostFunctionSchema::with_return(
+            "make_point",
+            vec![],
+            point_type(),
+        ));
+        assert!(matches!(
+            builder.build(),
+            Err(HostApiCatalogError::UnknownStructReference { .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_struct_name_is_rejected() {
+        let mut builder = HostApiCatalog::builder();
+        builder.named_struct(point_struct());
+        builder.named_struct(point_struct());
+        assert!(matches!(
+            builder.build(),
+            Err(HostApiCatalogError::DuplicateStructName { .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_struct_field_is_rejected() {
+        let mut builder = HostApiCatalog::builder();
+        builder.named_struct(HostStructSchema::new(
+            "Dup",
+            vec![
+                HostStructField::new("x", HostTypeSchema::Int),
+                HostStructField::new("x", HostTypeSchema::String),
+            ],
+        ));
+        assert!(matches!(
+            builder.build(),
+            Err(HostApiCatalogError::DuplicateStructField { .. })
+        ));
+    }
+
+    #[test]
+    fn named_struct_fingerprint_is_order_independent_and_excludes_docs() {
+        let mut a = HostApiCatalog::builder();
+        a.named_struct(point_struct());
+        a.function(HostFunctionSchema::with_return(
+            "make_point",
+            vec![],
+            point_type(),
+        ));
+        let catalog_a = a.build().expect("valid");
+
+        let mut b = HostApiCatalog::builder();
+        b.function(HostFunctionSchema::with_return(
+            "make_point",
+            vec![],
+            HostTypeSchema::named_struct(
+                "Point",
+                vec![
+                    HostStructField::new("y", HostTypeSchema::Int),
+                    HostStructField::new("x", HostTypeSchema::Int),
+                ],
+            ),
+        ));
+        b.named_struct(
+            HostStructSchema::new(
+                "Point",
+                vec![
+                    HostStructField::new("y", HostTypeSchema::Int),
+                    HostStructField::new("x", HostTypeSchema::Int),
+                ],
+            )
+            .with_description("docs must not affect fingerprint"),
+        );
+        let catalog_b = b.build().expect("valid");
+        assert_eq!(catalog_a.fingerprint(), catalog_b.fingerprint());
+
+        let mut c = HostApiCatalog::builder();
+        c.named_struct(HostStructSchema::new(
+            "Point",
+            vec![
+                HostStructField::new("x", HostTypeSchema::Int),
+                HostStructField::new("y", HostTypeSchema::Float),
+            ],
+        ));
+        c.function(HostFunctionSchema::with_return(
+            "make_point",
+            vec![],
+            HostTypeSchema::named_struct(
+                "Point",
+                vec![
+                    HostStructField::new("x", HostTypeSchema::Int),
+                    HostStructField::new("y", HostTypeSchema::Float),
+                ],
+            ),
+        ));
+        let catalog_c = c.build().expect("valid");
+        assert_ne!(catalog_a.fingerprint(), catalog_c.fingerprint());
+    }
+
+    #[test]
+    fn named_struct_canonical_bytes_are_deterministic() {
+        let mut builder = HostApiCatalog::builder();
+        builder.named_struct(point_struct());
+        builder.function(HostFunctionSchema::with_return(
+            "make_point",
+            vec![],
+            point_type(),
+        ));
+        let catalog = builder.build().expect("valid");
+        let bytes = catalog.canonical_bytes();
+        assert_eq!(
+            &bytes[..FINGERPRINT_DOMAIN_MAGIC.len()],
+            FINGERPRINT_DOMAIN_MAGIC
+        );
+        assert_eq!(bytes[FINGERPRINT_DOMAIN_MAGIC.len()], 2);
+        assert_eq!(catalog.canonical_bytes(), bytes);
+    }
+
+    #[test]
+    fn serde_round_trip_named_struct_catalog() {
+        let mut builder = HostApiCatalog::builder();
+        builder.named_struct(point_struct());
+        builder.function(HostFunctionSchema::with_return(
+            "make_point",
+            vec![],
+            point_type(),
+        ));
+        let catalog = builder.build().expect("valid");
+        let json = serde_json::to_value(&catalog).expect("serialize");
+        let back: HostApiCatalog = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.fingerprint(), catalog.fingerprint());
+        assert_eq!(back.struct_named("Point").unwrap().fields.len(), 2);
+    }
+
+    #[test]
+    fn serde_catalog_without_structs_field_still_loads() {
+        let catalog: HostApiCatalog =
+            serde_json::from_value(valid_catalog_json()).expect("legacy JSON should deserialize");
+        assert!(catalog.structs().is_empty());
     }
 
     // --- helpers used by tests above ---

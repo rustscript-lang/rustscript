@@ -288,6 +288,7 @@ impl Parser {
         )?;
         parser.host_api_metadata = Some(HostApiIrMetadata::new(catalog.fingerprint()));
         parser.host_catalog = Some(catalog);
+        parser.install_host_catalog_structs();
         Ok(parser)
     }
 
@@ -339,11 +340,22 @@ impl Parser {
         if let Some(catalog) = host_catalog {
             parser.host_api_metadata = Some(HostApiIrMetadata::new(catalog.fingerprint()));
             parser.host_catalog = Some(catalog);
+            parser.install_host_catalog_structs();
         }
         for binding in predeclared_locals {
             parser.predeclare_local(binding)?;
         }
         Ok(parser)
+    }
+
+    fn install_host_catalog_structs(&mut self) {
+        let Some(catalog) = self.host_catalog.clone() else {
+            return;
+        };
+        for schema in catalog.structs() {
+            self.struct_schemas
+                .insert(schema.name.clone(), schema.to_struct_decl());
+        }
     }
 
     pub(super) fn use_declarations(&self) -> Vec<UseDecl> {
