@@ -275,8 +275,8 @@ pub enum CatalogRegistrationError {
     ParameterTypeMismatch {
         name: String,
         index: usize,
-        expected: HostTypeSchema,
-        actual: HostTypeSchema,
+        expected: Box<HostTypeSchema>,
+        actual: Box<HostTypeSchema>,
     },
     /// A parameter's passing mode differs from the catalog declaration.
     ParameterPassingMismatch {
@@ -295,8 +295,8 @@ pub enum CatalogRegistrationError {
     /// The selected declaration has a different return schema.
     ReturnTypeMismatch {
         name: String,
-        expected: HostTypeSchema,
-        actual: HostTypeSchema,
+        expected: Box<HostTypeSchema>,
+        actual: Box<HostTypeSchema>,
     },
     /// More than one catalog overload matches an arity-only selection.
     AmbiguousOverload {
@@ -481,8 +481,8 @@ fn schema_field_mismatch(
             return Some(CatalogRegistrationError::ParameterTypeMismatch {
                 name: name.to_string(),
                 index,
-                expected: expected.schema.clone(),
-                actual: actual.schema.clone(),
+                expected: Box::new(expected.schema.clone()),
+                actual: Box::new(actual.schema.clone()),
             });
         }
         if expected.passing != actual.passing {
@@ -505,8 +505,8 @@ fn schema_field_mismatch(
     if candidate.return_type != selected.return_type {
         return Some(CatalogRegistrationError::ReturnTypeMismatch {
             name: name.to_string(),
-            expected: candidate.return_type.clone(),
-            actual: selected.return_type.clone(),
+            expected: Box::new(candidate.return_type.clone()),
+            actual: Box::new(selected.return_type.clone()),
         });
     }
     None

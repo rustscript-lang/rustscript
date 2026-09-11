@@ -530,7 +530,8 @@ fn bind_http_vm(source: &str, port: u16) -> Vm {
     let compiled = compile_source(source).expect("source should compile");
     let mut vm = Vm::try_new(compiled.program).expect("vm");
     vm.configure_http(local_http_config(port)).expect("config");
-    vm.set_async_bridge(Box::<TokioHostDriver>::default());
+    vm.set_async_bridge(Box::<TokioHostDriver>::default())
+        .expect("test async bridge should install");
     standard_http_registry()
         .bind_vm_cached(&mut vm)
         .expect("bind");
